@@ -1,0 +1,76 @@
+{
+  "id": "partitioned-attention",
+  "category": "attention",
+  "summary": "Interleaved sequence ownership and stable merging of attention partials",
+  "implementation_status": "reference",
+  "implementation_scope": "Host sequence/page mapping, causal dense or sparse partial attention, log-sum-exp reduction and head-major scatter; native kernels and transport are external",
+  "agent_guidance": {
+    "use_when": "Long KV sequences benefit from disjoint storage across ranks evaluating identical queries",
+    "avoid_when": "Short contexts or communication overhead outweigh memory and compute savings",
+    "provides": [
+      "Balanced interleaved ownership and local page addresses",
+      "Stable normalized attention partials with global causal and sparse masks",
+      "Log-normalizer weighted reduction with explicit empty-shard handling",
+      "Host head-major combine-and-scatter for multiple queries"
+    ],
+    "engine_supplies": [
+      "Query/key projections, position transforms and state buffers",
+      "Disjoint complete key ownership and identical query/scale/selection semantics",
+      "Native attention kernels, collectives, completion and failure propagation",
+      "State remapping when partition count changes"
+    ],
+    "preserve": [
+      "Each selected visible key contributes exactly once",
+      "Global positions define causality",
+      "Match head/query/value geometry and normalization convention",
+      "Reject invalid nonempty partials and withhold failed output"
+    ],
+    "adapt": [
+      "Partition layout and page size",
+      "Kernel tiling, fusion and transport",
+      "All-gather normalizers with weighted reduce-scatter or another equivalent reduction"
+    ]
+  },
+  "path": "inference/partitioned-attention/README.md",
+  "code_path": "inference/partitioned-attention/code",
+  "code_files": [
+    {
+      "path": "inference/partitioned-attention/code/implementation.py",
+      "purpose": "Sequence ownership, causal partial attention and stable head-major reduction"
+    }
+  ],
+  "requires": {
+    "hardware": "Python 3.11+ and standard library for the host reference; distributed hardware is an engine choice",
+    "model": "Attention over disjoint key/value positions with a shared query, scale and selection",
+    "workload": "Dense or sparse causal attention; head scatter requires head count divisible by rank count"
+  },
+  "contract": {
+    "input": "Global positions and transformed queries/keys/values, or normalized per-rank outputs with log normalizers",
+    "output": "Local sequence/page addresses, attention partials or merged head-major output with global log normalizers",
+    "ownership": "Reference owns immutable result tuples; engine owns state, rank membership, buffers and collective lifetimes",
+    "failure": "Reject duplicates within a shard, geometry mismatches, NaN/+inf and all-empty global attention; engine verifies cross-rank completeness and disjointness",
+    "core_boundary": "Optional attention strategy; Core requires only ordinary request, resource, readiness and publication contracts"
+  },
+  "dependencies": [
+    "Python standard library"
+  ],
+  "symbols": [
+    "SequencePartition",
+    "AttentionPartial",
+    "attention_partial",
+    "merge_partials",
+    "combine_and_scatter"
+  ],
+  "interactions": [
+    "attention-state"
+  ],
+  "techniques": [
+    "partitioned-attention",
+    "attention-state"
+  ],
+  "validation": {
+    "host": "Direct-softmax comparisons for dense/sparse causal masks, uneven/empty shards, page boundaries, extreme normalizers, head layout and invalid inputs",
+    "native": "Native attention, multi-device collectives and complete-model behavior remain unqualified",
+    "performance": "Unmeasured; the sharded KV fraction is not a claim about total engine memory or latency"
+  }
+}

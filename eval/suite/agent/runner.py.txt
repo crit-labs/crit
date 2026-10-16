@@ -1,0 +1,180 @@
+"""Run one engine through the suite: `crit eval run --adapter FILE --model DIR --data DIR --out FILE`."""
+import datetime
+import importlib.util
+import json
+import platform
+import sys
+import time
+from pathlib import Path
+
+from . import CONTRACT, EVAL_DIR, load_json, write_json
+from . import headroom, metrics
+from .prepare import PREPARED
+from .reference import REFERENCE
+
+
+def load_adapter(path):
+    path = Path(path).resolve()
+    spec = importlib.util.spec_from_file_location(f"crit_eval_adapter_{abs(hash(str(path)))}", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(path.parent))
+    spec.loader.exec_module(module)
+    if not hasattr(module, "create_eval_engine"):
+        raise SystemExit(f"{path} does not export create_eval_engine(context); see eval/README.md")
+    return module
+
+
+def open_engine(module, model, config, speculative):
+    context = {"contract": CONTRACT, "model": str(model), "config": dict(config), "speculative": speculative}
+    engine = module.create_eval_engine(context)
+    info = engine.info()
+    for key in ("name", "configuration", "max_context"):
+        if key not in info:
+            raise SystemExit(f"engine.info() is missing {key!r}")
+    return engine, info
+
+
+def timed_generate(engine, prompt, output_tokens):
+    deliveries = []
+
+    def on_tokens(tokens):
+        deliveries.append((time.perf_counter(), list(tokens)))
+    started = time.perf_counter()
+    result = engine.generate(list(prompt), output_tokens, on_tokens)
+    tokens = list(result["tokens"])
+    streamed = [t for _, chunk in deliveries for t in chunk]
+    if streamed != tokens:
+        raise RuntimeError("tokens passed to on_tokens differ from the returned tokens")
+    if len(tokens) != output_tokens:
+        raise RuntimeError(f"engine returned {len(tokens)} tokens, expected {output_tokens} (stop tokens must be disabled)")
+    first = next(t for t, chunk in deliveries if chunk)
+    sample = metrics.speed_sample(len(prompt), tokens, started, first, deliveries[-1][0], result.get("rounds"))
+    sample["engine_timing"] = result.get("timing")
+    sample["accepted"] = result.get("accepted")
+    return tokens, sample
+
+
+def run_speed(engine, info, prepared, protocol, warmups, repetitions, log):
+    cases = {}
+    stop_ids = set(prepared["stop_ids"])
+    for case in prepared["speed"]:
+        prompt, n = case["prompt_ids"], case["output_tokens"]
+        if len(prompt) + n > info["max_context"]:
+            cases[case["id"]] = {"status": "skipped", "reason": f"needs {len(prompt) + n} tokens of context"}
+            log(f"speed {case['id']}: skipped (context)")
+            continue
+        samples, outputs = [], []
+        for i in range(warmups + repetitions):
+            tokens, sample = timed_generate(engine, prompt, n)
+            sample["warmup"] = i < warmups
+            samples.append(sample)
+            if i >= warmups:
+                outputs.append(tokens)
+        measured = [s for s in samples if not s["warmup"]]
+        summary = {key: metrics.median([s[key] for s in measured if s[key] is not None])
+                   for key in ("decode_tps", "prefill_tps", "ttft_ms", "request_ms", "tokens_per_round", "round_ms")}
+        crossed = [i for i, t in enumerate(outputs[0]) if t in stop_ids]
+        cases[case["id"]] = {
+            "status": "measured", "kind": case["kind"], "prompt_tokens": len(prompt), "output_tokens": n, **summary,
+            "repeatable": all(o == outputs[0] for o in outputs),
+            "stop_crossed": bool(crossed), "first_stop_index": crossed[0] if crossed else None,
+            "tokens": outputs[0], "samples": samples,
+        }
+        log(f"speed {case['id']}: decode {summary['decode_tps']:.1f} tok/s, prefill {summary['prefill_tps']:.0f} tok/s, "
+            f"tokens/round {summary['tokens_per_round'] or 0:.2f}, round {summary['round_ms'] or 0:.2f} ms")
+    measured = [c for c in cases.values() if c["status"] == "measured"]
+    return {
+        "warmup_runs": warmups, "repetitions": repetitions,
+        "decode_score": metrics.geometric_mean([c["decode_tps"] for c in measured]),
+        "complete": len(measured) == len(cases),
+        "cases": cases,
+    }
+
+
+def run_quality(engine, info, prepared, reference, protocol, log):
+    paths = [p for p in protocol["quality"]["paths"] if p in info.get("score_paths", [])]
+    by_id = {c["id"]: c["targets"] for c in reference["conversations"]}
+    out = {"paths": {}, "unsupported": [p for p in protocol["quality"]["paths"] if p not in paths]}
+    thresholds = protocol["quality"]["thresholds"]
+    for path in paths:
+        started = time.time()
+        reference_rows, engine_rows = [], []
+        for conversation in prepared["quality"]:
+            targets = by_id[conversation["id"]]
+            scored = engine.score(conversation["ids"], conversation["first_target"], path, [t["top_ids"] for t in targets])
+            argmax = scored.get("argmax") or [None] * len(targets)
+            for target, lp, query, best in zip(targets, scored["target_logprobs"], scored["query_logprobs"], argmax):
+                engine_rows.append({"target_logprob": lp, "top_logprobs": query, "argmax": best})
+            reference_rows += targets
+        result = metrics.quality_path(reference_rows, engine_rows)
+        failures = metrics.judge(result, thresholds)
+        result.update(seconds=time.time() - started, passed=not failures, failures=failures)
+        out["paths"][path] = result
+        log(f"quality {path}: ppl ratio {result['ppl_ratio']:.5f}, KLD mean {result['kld_mean']:.2e}, "
+            f"p99 {result['kld_p99']:.2e}, top-1 {result['top1_agreement']:.3f} ({'pass' if not failures else 'FAIL'})")
+    out["passed"] = bool(out["paths"]) and all(p["passed"] for p in out["paths"].values())
+    return out
+
+
+def run_exactness(module, model, config, prepared, speed, log):
+    engine, info = open_engine(module, model, config, speculative=False)
+    try:
+        cases, samples = {}, []
+        for case in prepared["speed"]:
+            measured = speed["cases"].get(case["id"], {})
+            if measured.get("status") != "measured":
+                continue
+            tokens, sample = timed_generate(engine, case["prompt_ids"], case["output_tokens"])
+            samples.append(sample)
+            diverge = next((i for i, (a, b) in enumerate(zip(tokens, measured["tokens"])) if a != b), None)
+            cases[case["id"]] = {"identical": diverge is None, "first_difference": diverge}
+            log(f"exactness {case['id']}: {'identical' if diverge is None else f'differs at token {diverge}'}")
+        return {"baseline": info["configuration"], "cases": cases, "passed": all(c["identical"] for c in cases.values()),
+                "step_ms": headroom.step_ms_from(samples)}
+    finally:
+        engine.close()
+
+
+def run(adapter, model, data, out, config=None, parts=("speed", "quality", "exactness"), warmups=None,
+        repetitions=None, label=None, log=print, bandwidth_gbs=None):
+    protocol = load_json(EVAL_DIR / "protocol.json")
+    prepared = load_json(Path(data) / PREPARED)
+    reference = load_json(Path(data) / REFERENCE) if "quality" in parts else None
+    if reference and reference["prepared_model_sha256"] != prepared["model"]["sha256"]:
+        raise SystemExit("reference.json was built from different prepared data")
+    module = load_adapter(adapter)
+    result = {
+        "contract": CONTRACT, "protocol": protocol["protocol"], "label": label,
+        "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "model_sha256": prepared["model"]["sha256"], "suite_sha256": prepared["suite_sha256"],
+        "host": {"platform": platform.platform(), "python": platform.python_version()},
+        "adapter": str(Path(adapter).resolve()),
+    }
+    started = time.perf_counter()
+    engine, info = open_engine(module, model, config or {}, speculative=True)
+    result["load_ms"] = (time.perf_counter() - started) * 1000
+    result["engine"] = info
+    log(f"loaded {info['name']} in {result['load_ms'] / 1000:.1f} s")
+    try:
+        if "speed" in parts:
+            result["speed"] = run_speed(engine, info, prepared, protocol,
+                                        protocol["speed"]["warmup_runs"] if warmups is None else warmups,
+                                        protocol["speed"]["repetitions"] if repetitions is None else repetitions, log)
+        if "quality" in parts:
+            result["quality"] = run_quality(engine, info, prepared, reference, protocol, log)
+    finally:
+        engine.close()
+    if "exactness" in parts and "speed" in result and info.get("speculative"):
+        result["exactness"] = run_exactness(module, model, config or {}, prepared, result["speed"], log)
+    if "speed" in result:
+        if info.get("speculative"):
+            step_ms = result.get("exactness", {}).get("step_ms")
+        else:
+            step_ms = headroom.step_ms_from([s for c in result["speed"]["cases"].values()
+                                             for s in c.get("samples", []) if not s["warmup"]])
+        result["headroom"] = headroom.summarize(info, result["speed"], step_ms, bandwidth_gbs, protocol["headroom"])
+        for warning in result["headroom"]["warnings"]:
+            log("headroom: " + warning)
+    result["ended_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    write_json(out, result)
+    return result

@@ -1,0 +1,81 @@
+{
+  "id": "stored-tile-gemm",
+  "category": "projections",
+  "summary": "One value-preserving tensor-core tile layout read by both the decode GEMV and FP8 / NVFP4 prompt GEMMs, with a k permutation and an intra-quad exchange instead of per-call re-layout",
+  "implementation_status": "native_source",
+  "implementation_scope": "CUDA repack kernels for row-major FP8 and NVFP4 weights, per-token FP8 and static-scale NVFP4 activation packing, W8A8 (mma m16n8k32 e4m3) and W4A4 (mma m16n8k64 kind::mxf4nvf4 scale_vec::4X) prompt GEMMs with register-ring weights, cp.async activations, two row tiles per warp and fixed-order split-K, host launch planning; a device fragment probe; a pure-Python model of tiles, register assembly and both MMAs. The decode GEMV over the same tiles and fusion are engine supplied.",
+  "agent_guidance": {
+    "use_when": "Weights are stored in a block-scaled low-precision format with a matching tensor-core MMA, and prompts of every length should use it without a second weight copy or per-call re-layout",
+    "avoid_when": "The device has no matching low-precision MMA, the engine can afford a second weight copy in a library's layout, or the format's scale grouping cannot be reconciled with the instruction's",
+    "provides": [
+      "FP8 16x32 and NVFP4 16x64 tile repacking that moves bytes without re-encoding, plus NVFP4 scale tiles",
+      "FP8 W8A8 GEMM: a per-half k permutation turns each lane's tile bytes into its MMA fragment with byte permutes",
+      "NVFP4 W4A4 GEMM: lanes t and t^2 swap one word per register pair so each 16-value scale group sits in one lane pair",
+      "Activation packing in the matching slot order: per-token E4M3, or NVFP4 with the checkpoint's static input scale",
+      "Register-ring weight streaming, a 3-stage cp.async activation ring, two row tiles per warp and fixed-order split-K",
+      "Launch planning with scratch sizes and an fp4_mma_compiled() capability check",
+      "A device probe that measures the block-scaled MMA's scale-operand mapping and checks its value layout",
+      "A host model that proves the permutation, exchange and activation order with exact arithmetic"
+    ],
+    "engine_supplies": [
+      "The stored tensors, repacked once at load before any reader",
+      "The 1-8 token decode GEMV over the same tiles (their byte order is its FP16 fragment)",
+      "Scratch buffers sized from the plan for the largest prompt chunk",
+      "Plan parameters for its shapes and device, and fusion of activation quantization or epilogues",
+      "Whole-model quality measurement of the W8A8 / W4A4 activation quantization"
+    ],
+    "preserve": [
+      "Every stored code and scale keeps its value; repacking only moves bytes",
+      "Activation slot order equals weight slot order, and scale groups stay inside one MMA scale group",
+      "A fixed accumulation order for a given launch shape, including the split-K finish",
+      "NVFP4 dequantization 1 / (weight_global_scale * input_global_scale) and the checkpoint's activation scale rule"
+    ],
+    "adapt": [
+      "Tile shape and the permutation/exchange for another MMA instruction or format",
+      "Tokens per block, row tiles per warp, ring depth and the split threshold",
+      "Activation quantization fused into its producer instead of a separate packing pass"
+    ]
+  },
+  "path": "inference/stored-tile-gemm/README.md",
+  "code_path": "inference/stored-tile-gemm/code",
+  "code_files": [
+    {"path": "inference/stored-tile-gemm/code/stored_tile_gemm.h", "purpose": "Tile layouts, plan, weight/scratch descriptors and launch interface"},
+    {"path": "inference/stored-tile-gemm/code/stored_tile_gemm.cu", "purpose": "Repack, activation packing, FP8 and NVFP4 tensor-core GEMM and split-K finish kernels with launchers"},
+    {"path": "inference/stored-tile-gemm/code/fragment_probe.cu", "purpose": "Standalone device probe of the block-scaled NVFP4 MMA scale-operand mapping and value layout"},
+    {"path": "inference/stored-tile-gemm/code/layout.py", "purpose": "Host model of tiles, register assembly and both MMAs with exact product checks"}
+  ],
+  "requires": {
+    "hardware": "CUDA C++17+; FP8 kernels need sm_89+, NVFP4 kernels an sm_120a or sm_121a build; Python 3.11+ standard library for the host model",
+    "model": "Projection weights stored as FP8 E4M3 with per-row scales, or NVFP4 (E2M1 codes, E4M3 group-16 scales, FP32 global scale) with a static input global scale",
+    "workload": "Prompt GEMMs from one token to a full prefill chunk, sharing weights with a decode GEMV"
+  },
+  "contract": {
+    "input": "Row-major stored codes and scales (repacked once); BF16 activations [T][K]; plan, scratch and a CUDA stream",
+    "output": "FP32 [T][ldo] results written or added per element; tiles and scale tiles that a GEMV can share",
+    "ownership": "The engine owns weights, tiles, activations, outputs and scratch; launches borrow them until the stream reaches them",
+    "failure": "Unsupported shapes, non-positive sizes or global scales return cudaErrorInvalidValue; the NVFP4 kernel traps where the block-scaled MMA is not compiled; launch errors are returned from cudaGetLastError",
+    "core_boundary": "No Core change; these are engine kernels inside its forward pass"
+  },
+  "dependencies": [
+    "CUDA runtime with cuda_fp8.h and cuda_fp4.h",
+    "Python standard library for the host model"
+  ],
+  "symbols": [
+    "Plan", "plan", "Fp8Weights", "Fp4Weights", "Scratch",
+    "enqueue_repack_fp8", "enqueue_repack_fp4", "enqueue_fp8", "enqueue_fp4", "fp4_mma_compiled",
+    "check_fp8", "check_fp4", "fp4_mma_column", "fp8_slot_column"
+  ],
+  "interactions": [
+    "quantized-projections",
+    "recorded-selection"
+  ],
+  "techniques": [
+    "stored-tile-gemm",
+    "quantized-projections"
+  ],
+  "validation": {
+    "host": "Exact host model: the FP8 permutation and the NVFP4 exchange reproduce direct dot products; wrong selectors or exchange partners do not; activation slots cover every column once",
+    "native": "CUDA test against an FP64 host reference with the same activation quantization for 1-300 tokens, split and unsplit, one or two row tiles per warp and add; fragment probe of the scale mapping and value layout on sm_120",
+    "performance": "One measured engine: 670 vs 550 TFLOPS (library GEMM with re-layout) on 17408x5120 NVFP4 matrices at 1,536 tokens on an sm_120 device; no claim for other devices or shapes"
+  }
+}

@@ -1,0 +1,8 @@
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+find_dependency(Threads REQUIRED)
+if(@CRIT_CORE_CUDA@)
+  find_dependency(CUDAToolkit 13.1 REQUIRED)
+endif()
+include("${CMAKE_CURRENT_LIST_DIR}/critCoreTargets.cmake")
+check_required_components(critCore)

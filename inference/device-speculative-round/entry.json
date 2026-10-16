@@ -1,0 +1,108 @@
+{
+  "id": "device-speculative-round",
+  "category": "speculation",
+  "summary": "GPU-resident greedy speculative round: draft, verify, device accept and frontier advance in two CUDA graphs with one readback",
+  "implementation_status": "native_source",
+  "implementation_scope": "CUDA reference greedy-accept and truncation kernels, a single-row C++20 round controller over Core CudaBackend with Forward/Finish graph capture, one readback_async per round and stage timing, a C++/Python round/step budget, and a composed toy (synthetic attention plus gated-delta target, bigram drafter) through a real Core Engine. Engine draft, verify and state steps are supplied callables; no tuned or model-specific kernels.",
+  "agent_guidance": {
+    "use_when": "A synchronous speculative loop is correct but host round trips, per-token readbacks or host acceptance dominate the round",
+    "avoid_when": "Verifying K+1 columns costs about K+1 ordinary steps, the engine cannot keep per-column state for prefix selection, or sampled acceptance is required; or routed experts stream from host memory, where every verify column adds its own expert misses",
+    "provides": [
+      "Device greedy acceptance matching GreedySpeculator: prefix match, correction or bonus, allowance bound and stop handling",
+      "Device-resident control block with frontier advance by n_emitted and pending-token update, without host writes during decoding",
+      "Device truncation for a smaller Core-accepted count, rerunning engine state selection",
+      "Forward and Finish CUDA graph capture of engine steps with an eager mode for comparison",
+      "Exactly one readback_async of the packed {n_emitted, tokens[K+1]} result per round and Forward/Finish stage timings",
+      "RoundBudget tokens per round, round/step ratio, implied speedup and pass/fail at a default 1.3 threshold",
+      "Fixed-width catch-up plan for stateful drafters, so the draft step's launch shape never depends on the device-held emitted count",
+      "A host check that a batched operator computes every column bitwise identically at any batch width, with fixed-order and width-dependent reference operators"
+    ],
+    "engine_supplies": [
+      "Capture-safe draft, verify and commit_state device steps for the actual model",
+      "Per-column provisional state (KV columns, recurrent checkpoints or saved inputs) sufficient to select any accepted prefix",
+      "Prefill, Core Session adapter and resource reservations for per-column state",
+      "Ordinary-step timing baseline and the decision to keep speculation from measured round cost"
+    ],
+    "preserve": [
+      "Acceptance stays on the device and uses the greedy prefix/correction/stop rule",
+      "One device-to-host copy per round and no host fence inside launch",
+      "Frontier advances by n_emitted and the accepted state is verify column n_emitted minus one",
+      "A Core truncation is applied to device state before the next round",
+      "commit_state is idempotent from round-start state",
+      "A stateful drafter writes each position before reading it, so fixed-width catch-up junk is overwritten before any read",
+      "Verify and step kernels compute each column identically for any number of columns (fixed K split and reduction order)"
+    ],
+    "adapt": [
+      "Drafter, draft width and per-configuration graph slots; sweep the width on mixed text (prose, code, reasoning, another language) rather than one prompt, or choose it per round from recent acceptance",
+      "Drafter cost: a draft-only weight copy in a cheaper encoding or a draft vocabulary subset changes acceptance only, so it lets a wider draft pay",
+      "Provisional state strategy: checkpoints versus recomputation from saved inputs",
+      "Batching rows through the multi-row accept kernel and fusing accept into the verify epilogue"
+    ]
+  },
+  "path": "inference/device-speculative-round/README.md",
+  "code_path": "inference/device-speculative-round/code",
+  "code_files": [
+    {"path": "inference/device-speculative-round/code/greedy_accept.h", "purpose": "Device control block layout, packed result width and greedy accept/truncate launch interfaces"},
+    {"path": "inference/device-speculative-round/code/greedy_accept.cu", "purpose": "Reference one-thread-per-row greedy accept and truncation kernels, not for performance"},
+    {"path": "inference/device-speculative-round/code/device_round.h", "purpose": "Single-row device round controller interface, engine step contract and round configuration"},
+    {"path": "inference/device-speculative-round/code/device_round.cpp", "purpose": "Forward/Finish capture, launch with stage timing, one readback_async, validated tokens and device truncation on commit"},
+    {"path": "inference/device-speculative-round/code/toy_model.h", "purpose": "Synthetic toy target dimensions, weights/state views and reference kernel launch interfaces"},
+    {"path": "inference/device-speculative-round/code/toy_model.cu", "purpose": "Reference attention, gated-delta input, head, round-input, bigram-draft and commit kernels for the toy target"},
+    {"path": "inference/device-speculative-round/code/toy_example.cpp", "purpose": "Core Engine adapter running one device round per advance with ordinary-greedy, readback, trace and round/step checks"},
+    {"path": "inference/device-speculative-round/code/round_budget.h", "purpose": "C++ round/step ratio, tokens per round and threshold check from Core DeviceTiming"},
+    {"path": "inference/device-speculative-round/code/round_budget.py", "purpose": "Python round/step budget reference and worked example"},
+    {"path": "inference/device-speculative-round/code/catch_up.py", "purpose": "Fixed-width catch-up position plan for stateful drafters and a toy positional drafter"},
+    {"path": "inference/device-speculative-round/code/column_invariance.py", "purpose": "Column-invariance check for batched operators with fixed-order and width-dependent reference dot products"}
+  ],
+  "requires": {
+    "hardware": "CUDA 13.1+ GPU through Core CRIT_CORE_CUDA, CMake 3.28+ with CUDA C++20; Python 3.11+ for the budget reference",
+    "model": "Greedy target with capture-safe draft and K+1-column verify steps and selectable per-column state",
+    "workload": "Single-row greedy speculative decoding with a fixed draft width per captured configuration"
+  },
+  "contract": {
+    "input": "Core CudaBackend, draft width, vocabulary, context capacity, stop IDs and engine draft/verify/commit_state steps; per round a positive output allowance",
+    "output": "Per round the device-chosen tokens (1..K+1), a readiness event, Forward/Finish DeviceTiming values and an advanced device frontier",
+    "ownership": "The controller owns control, draft, prediction and result buffers, pinned result/allowance buffers, the completion event, the stage timer and graphs; steps own their model state. Borrowed tokens expire at commit or the next launch. Serialize access",
+    "failure": "Reject missing steps, out-of-vocabulary stops, rounds past context, launches before start or with a pending round, invalid device counts or tokens and over-long commits. A failed truncation leaves device state undefined and the request must fail. Destruction drains the stream and retains graphs if draining fails",
+    "core_boundary": "Session.advance launches one round and returns its readback event as readiness with deferred_tokens; Session.ready_tokens returns the device-chosen tokens after Core's single wait; device_timings returns the stage timings; Session.commit applies the accepted count; Session.close abandons a round Core cancelled after launch"
+  },
+  "dependencies": [
+    "Core crit::cuda (CudaBackend, CudaBuffer, CudaEvent, CudaStageTimer)",
+    "CUDA runtime 13.1+",
+    "Python standard library"
+  ],
+  "symbols": [
+    "DeviceSpeculativeRound",
+    "RoundConfig",
+    "RoundSteps",
+    "RoundView",
+    "DeviceStep",
+    "AcceptRows",
+    "enqueue_greedy_accept",
+    "enqueue_truncate",
+    "result_width",
+    "RoundBudget",
+    "RoundBudgetReport",
+    "catch_up_plan",
+    "PositionalDrafter",
+    "check",
+    "fixed_order_dot",
+    "width_split_dot"
+  ],
+  "interactions": [
+    "mtp-decode",
+    "recurrent-state-recovery",
+    "attention-state"
+  ],
+  "techniques": [
+    "device-speculative-round",
+    "mtp-decode",
+    "recurrent-state-recovery",
+    "attention-state"
+  ],
+  "validation": {
+    "host": "Python and C++ RoundBudget ratio, speedup and threshold checks; fixed-width drafter catch-up equal to exact variable-width ingestion over 120 randomized rounds (draft widths 1, 3, 5); column-invariance check: a fixed summation order passes and a width-dependent split is detected",
+    "native": "CUDA accept kernel against host GreedySpeculator on 4000 randomized rows (K 1..4, all-match, first mismatch, stop, output budget, zero budget) with frontier and truncation checks; synthetic hash-chain target for graph replay versus eager, ordinary-greedy equality for K 0..4, truncated continuation and one device-to-host copy per round counted at the CUDA API; composed toy through Core Engine matching ordinary greedy output for two prompts, graph and eager mode and K 0, one readback and one Forward/Finish trace event pair per round, and request-stop truncation; per-request device stop replacement and abandon() of a launched round left uncommitted by cancellation",
+    "performance": "No speed claim; the reference kernels are not tuned and RoundBudget measures each engine's own round. The toy prints its round/step ratio, which typically fails 1.3 because its attention reference processes verify columns serially"
+  }
+}

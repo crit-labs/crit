@@ -1,0 +1,161 @@
+{
+  "id": "checkpoint-storage",
+  "category": "memory-and-loading",
+  "summary": "Complete prefix bundles, paced leased tiers and deadline-aware live prefetch",
+  "implementation_status": "reference",
+  "implementation_scope": "Single-writer file envelopes, exact component codec/extent/digest validation, private receipt-bound restoration, paced read/hash/write staging, split-safe immutable leases, admission/capture policies, aligned heterogeneous layout and common-prefix intersection, and generation-checked host tier copies; native codecs/allocations/copies remain external; bounded queued prefetch using caller-supplied remaining-cost estimates and owned complete-prefix fallback",
+  "agent_guidance": {
+    "use_when": "Reuse serialized state for an exactly compatible request prefix",
+    "avoid_when": "State cannot be safely serialized/restored, prefix compatibility is unclear, or reuse cannot repay storage work",
+    "provides": [
+      "Checksummed envelope binding fingerprint, codec, prefix and payload",
+      "Bounded immutable record writes through temporary-file replacement",
+      "Exact and longest byte-prefix lookup with corruption rejection",
+      "Complete bounded opaque component manifest with per-component digests",
+      "Private all-or-nothing restore and retained ambiguous submission/settlement failures",
+      "Physical write source leases shared by later range splits",
+      "Caller-paced read/write transfer windows, incremental component digests, staging backpressure and synchronous file adapters",
+      "Complete-state source gates and explicit restore-plus-prefill comparisons against recomputation",
+      "Prioritized semantic captures and bounded chunk-aligned history captures outside excluded spans",
+      "Per-component aligned physical page planning without common-page padding",
+      "Greatest compatible complete-state prefix across aligned and exact checkpoint frontiers",
+      "Generation leases, charged retired readers and private host tier migration with post-copy publication",
+      "Bounded live transfer controller with wait, owned complete-prefix reuse and recomputation decisions"
+    ],
+    "engine_supplies": [
+      "Canonical prefix encoding with semantic boundary checks",
+      "Verified weight/conditioning identity, codec and restoration into owned state at captured boundaries",
+      "Directory coordination, eviction and stronger durability if needed",
+      "Exact complete component inventory and semantic after-token boundary validation",
+      "Private native destination views, allocator/copy hooks and physical reader/completion receipts",
+      "Explicit drain proofs for unknown work and failure-path capacity planning",
+      "Immutable snapshot leases, private bounded destinations, native staging reservations and durable file publication",
+      "Measured prefill/transfer costs, source generation revalidation and lease acquisition after admission planning",
+      "Truthful component restore frontiers, complete semantic identities and lease revalidation after planning",
+      "Native tier allocators/copy hooks, codec semantics and workload-specific residency policy",
+      "Live measured remaining transfer estimates, monotonic deadlines and cleanup polling until physical settlement"
+    ],
+    "preserve": [
+      "State/layout identity, non-token conditioning and compatible captured prefix semantics",
+      "Complete validated records before restore",
+      "Single-writer assumption or equivalent explicit coordination",
+      "All source/destination/receipt owners until every physical reader and copy settles",
+      "All required sibling state before one complete bundle publication"
+    ],
+    "adapt": [
+      "State codec and prefix representation",
+      "Storage index, capacity/eviction policy and durability mechanism",
+      "Additional retained tiers with restore leases, mutable clones and measured cost-aware selection"
+    ]
+  },
+  "path": "inference/checkpoint-storage/README.md",
+  "code_path": "inference/checkpoint-storage/code",
+  "code_files": [
+    {
+      "path": "inference/checkpoint-storage/code/implementation.py",
+      "purpose": "Single-writer file envelopes with identity/digest checks and longest byte-prefix lookup; state serialization is external"
+    },
+    {
+      "path": "inference/checkpoint-storage/code/bundles.py",
+      "purpose": "Exact opaque component codec/extent/digest validation, private restore transaction and split-safe source leases"
+    },
+    {
+      "path": "inference/checkpoint-storage/code/bundle_example.py",
+      "purpose": "Runnable host component copy, paced file-to-private-state transport and all-or-nothing publication example"
+    },
+    {
+      "path": "inference/checkpoint-storage/code/transfers.py",
+      "purpose": "Bounded caller-paced read/hash/write windows with physical settlement receipts, file adapters, cancellation and retained failures"
+    },
+    {
+      "path": "inference/checkpoint-storage/code/planning.py",
+      "purpose": "Complete compatible snapshot admission by restore plus remaining prefill cost, recomputation fallback and semantic/chunk capture planning"
+    },
+    {
+      "path": "inference/checkpoint-storage/code/coordination.py",
+      "purpose": "Aligned heterogeneous physical regions and greatest common reusable boundary across dense and checkpoint-only state"
+    },
+    {
+      "path": "inference/checkpoint-storage/code/tiers.py",
+      "purpose": "Byte-bounded host tiers, immutable generation leases and private paced migration with checked publication and eviction"
+    },
+    {
+      "path": "inference/checkpoint-storage/code/prefetch.py",
+      "purpose": "Bounded caller-paced live prefetch, deadline/cost choices, generation-checked ready leases and retained cancellation"
+    },
+    {
+      "path": "inference/checkpoint-storage/code/prefetch_example.py",
+      "purpose": "Runnable tier copy through wait, complete publication and owned prefix reuse"
+    }
+  ],
+  "requires": {
+    "hardware": "Python 3.11+ and standard library for the host reference; backend hardware is an engine choice",
+    "model": "Caller-serializable state with an explicit compatibility fingerprint and codec",
+    "workload": "Repeated compatible prefixes with enough reuse to amortize serialization and reads"
+  },
+  "contract": {
+    "input": "Caller-owned cache directory, immutable state fingerprint and bundle/component codecs, semantic prefix bytes and exact bounded opaque components; transfer parts, staging/pump quotas, leased sources and private destinations",
+    "output": "Checksum-verified Checkpoint, validated RestorePlan or complete PublishedBundle with private destination owners",
+    "ownership": "Storage owns immutable encoded records. Restore transactions retain all source, destination, reader, receipt and callback owners through settlement; active/failed work has bounded strong retention. Native callbacks own partial failures.",
+    "failure": "Bundle decoding rejects incomplete/incompatible components, codec/extent/digest errors and overflow before destination allocation. Streaming transport hashes incrementally into private destinations and fails on short I/O or digest mismatch. Copy/reader failure never publishes partial state; ambiguous submission or settlement retains the complete transaction until explicit backend proof.",
+    "core_boundary": "Restore into a separately owned consumer state only after byte/codec validation; core still owns the live request lifetime."
+  },
+  "dependencies": [
+    "Python standard library"
+  ],
+  "symbols": [
+    "CheckpointStore",
+    "Checkpoint",
+    "ComponentSpec",
+    "BundleSpec",
+    "BundleStore",
+    "RestorePlan",
+    "RestoreTransaction",
+    "ActiveWriteLease",
+    "TransferPart",
+    "TransferLimits",
+    "TransferWindow",
+    "BoundedTransfer",
+    "read_file_window",
+    "write_file_window",
+    "retained_transfers",
+    "PrefillCost",
+    "TransferCost",
+    "PrefixSource",
+    "AdmissionPlan",
+    "choose_prefix",
+    "CaptureHint",
+    "plan_captures",
+    "StateLayout",
+    "StateRegion",
+    "plan_state_layout",
+    "PrefixFrontier",
+    "common_prefix",
+    "MemoryTier",
+    "TierLease",
+    "TierMove",
+    "ReadyPrefix",
+    "PreparedPrefetch",
+    "PrefetchDecision",
+    "PrefetchController",
+    "tier_prefix",
+    "tier_prefetch"
+  ],
+  "interactions": [
+    "artifact-loading",
+    "attention-state",
+    "recurrent-state-recovery",
+    "mtp-decode"
+  ],
+  "techniques": [
+    "checkpoint-storage",
+    "artifact-loading",
+    "attention-state",
+    "recurrent-state-recovery"
+  ],
+  "validation": {
+    "host": "Host fixtures and examples cover exact/longest lookup, immutable identities, complete components, capacity/corruption, private publication, pending readers, failures and split-source leases; transfer tests cover staged file copies, byte/callback quotas, backpressure, reordered completion, cancelled/failed/short I/O, incremental digests and retained unknown work; admission tests cover source gates, tier costs, recomputation and capture boundaries; 400 prefix intersections against explicit sets; heterogeneous alignment/overflow checks; real host tier copies, source/destination races, delayed readers, capacity, corruption and ambiguous submission retention; live queued decisions, aggregate quotas, deadline fallback, source/destination races, corruption and retained cancelled/ambiguous readers",
+    "native": "Native state restoration, crash durability and model continuation remain unqualified by host fixtures",
+    "performance": "Unmeasured for a native engine; host fixture success is not a speed claim"
+  }
+}

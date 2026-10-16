@@ -1,0 +1,146 @@
+{
+  "id": "mtp-decode",
+  "category": "speculation",
+  "summary": "Indexed token-history proposals and native greedy/probability-preserving speculation with transactional state and tagged budgets; independent physical batch/workspace integration",
+  "implementation_status": "native_source",
+  "implementation_scope": "Python indexed copy helpers and a portable C++20 incremental accepted-history index plus C++20 greedy and dense/sparse sampled target/draft verification, branch repair, private RNG and publication controllers; temperature/top-k/top-p/min-p filtering, canonical sparse supports with complete dense fallback and tagged supported-width cost policy. Model arithmetic, device sparse filtering/block verification and learned MTP heads are engine supplied. Runnable synthetic native integration of separate target/draft physical caps and scratch, ordered catch-up, transactional recovery and recorded cap selection.",
+  "agent_guidance": {
+    "use_when": "Cheap copy or trained-model drafts can amortize causal target verification while private target/draft state and probability-correct publication remain available",
+    "avoid_when": "The engine cannot isolate and settle branches, or complete draft/verification/repair costs exceed ordinary decoding; or routed experts stream from host memory, where verifying several tokens loads the union of their experts",
+    "provides": [
+      "Exact token-window lookup with bounded recent occurrence buckets",
+      "Accepted-context append/rewind, longer history matches and draft/stop/vocabulary limits",
+      "Batch cost accounting for shared padded width plus a target bonus per row",
+      "Greedy prefix acceptance, correction/bonus and commit handoff",
+      "Native prepare/commit separation with private target forks, partial acceptance, correction/bonus materialization and accepted-history publication",
+      "Native bounded-window copying, single-use round IDs, stop/context/output limits, cancellation and failed-branch retirement",
+      "Probability-based sampled acceptance and positive-residual correction, target bonus and private transactional RNG",
+      "Temperature/fixed-count top-k/top-p/min-p distributions with explicit score/ID tie rules",
+      "Canonical duplicate-merging sparse supports, exact dense fallback, sparse sampling/acceptance/correction and synchronized target/draft repair",
+      "Explicit supported budgets, issued producing-width/configuration tickets, stale/replay rejection and separately recorded preparation costs",
+      "Native incremental exact-window accepted-history index with bounded occurrence search, rollback and context-capacity-independent lookup",
+      "Executable independent physical batch integration with actual host scratch, fixed logical draft width, private state recovery and recorded cap replay"
+    ],
+    "engine_supplies": [
+      "Exact target arithmetic and causal D+1 predictions; native target fork, append and rewind restoring logits and non-KV state",
+      "Synchronous physical completion on success/failure and isolated mutable branches, or a separately qualified async/device adaptation such as device-speculative-round, with this loop as its correctness oracle",
+      "Core arena/scratch/history/output reservations and integration of prepared rows with accepted-prefix commit",
+      "Compatible trained draft/MTP arithmetic and tokenizer, correctly filtered distributions and complete pipeline timings",
+      "Validated device support layout/token remapping, complete overflow fallback and actual executed-width/event ownership",
+      "Per-phase legal split/atomic/padding rules, exact workspace layouts and backend completion/capture compatibility for physical batches"
+    ],
+    "preserve": [
+      "Target predictions use the correct prefix at each position",
+      "Emitted tokens, accepted state and remaining output budget agree",
+      "Stop semantics and rejection handling remain explicit",
+      "Rejected state never replaces the committed parent; correction/bonus state exists before successful publication",
+      "A failed commit consumes the round and cannot be retried; target forks isolate all mutable state",
+      "Draft and target share token IDs; sampling and acceptance use each model actual filtered probabilities, with private RNG published only alongside accepted state",
+      "Sparse storage never truncates required target/draft mass or overwrites a duplicate positive probability with padding",
+      "Delayed costs train their issued producing width and configuration generation exactly once, after physical settlement",
+      "Physical caps preserve logical proposals, conditioned predictions, accepted state and required context; whole-block operations reject unsafe splitting"
+    ],
+    "adapt": [
+      "Proposer, native copy window/lookback and per-round draft budget",
+      "Verification batching and native state layout priced by actual executed columns and branch state",
+      "Sampling filters, sparse capacity/full fallback and complete-round cost policy, preserving the probability acceptance/correction contract",
+      "Supported graph widths, preparation accounting and engine-controlled payback rule without accepting old-generation timings"
+    ]
+  },
+  "path": "inference/mtp-decode/README.md",
+  "code_path": "inference/mtp-decode/code",
+  "code_files": [
+    {
+      "path": "inference/mtp-decode/code/implementation.py",
+      "purpose": "Greedy token-prefix acceptance with correction/bonus, output bounds and commit handoff; draft/target execution and state reconciliation are external"
+    },
+    {
+      "path": "inference/mtp-decode/code/prompt_copy.py",
+      "purpose": "Bounded exact-window prompt/history index, rewind and rectangular verification budgeting"
+    },
+    {
+      "path": "inference/mtp-decode/code/speculative.h",
+      "purpose": "Complete native greedy prepare/verify/rewind/correction/commit controller, synchronous isolated target interface and bounded stateless copy proposer"
+    },
+    {
+      "path": "inference/mtp-decode/code/speculative_example.cpp",
+      "purpose": "Runnable multi-round copy/verification/repair example with a synthetic cycle target and ordinary-greedy-equivalent output"
+    },
+    {
+      "path": "inference/mtp-decode/code/sampled.h",
+      "purpose": "Dense/canonical sparse probability owners and exact sampled transactions with private RNG, ordered min-p and issued supported-width timing/preparation policy"
+    },
+    {
+      "path": "inference/mtp-decode/code/sampled_example.cpp",
+      "purpose": "Runnable min-p sampled loop with sparse draft/complete dense target fallback, tagged supported-width observations and same-draw dense comparison"
+    },
+    {
+      "path": "inference/mtp-decode/code/prompt_copy.h",
+      "purpose": "Bounded exact-window native history index, incremental append/rewind and limited prompt/history proposal search"
+    },
+    {
+      "path": "inference/mtp-decode/code/physical_batches_example.cpp",
+      "purpose": "Complete synthetic greedy host integration of independent physical caps, real scratch allocation, ordered draft catch-up, failure recovery and measured recorded selection"
+    }
+  ],
+  "requires": {
+    "hardware": "Python 3.11+ for indexed host helpers; C++20 standard library for native loop, with engine-selected synchronous target hardware",
+    "model": "Autoregressive greedy or probability target, plus compatible probability draft for sampled mode; isolated materialized prefixes, complete rewind/append and causal D+1 verification; no learned MTP heads supplied",
+    "workload": "Bounded greedy or sampled speculative rounds with private state, partial publication and explicit probability filtering"
+  },
+  "contract": {
+    "input": "Accepted prompt/history, bounded proposals, correctly conditioned target predictions, context/output/draft allowances and stop IDs; native target owns fully materialized prefix and next prediction; sampled mode takes compatible target/draft probability states and a private seed",
+    "output": "Python copy batches/commit plans or native provisional round ID/tokens followed by committed tokens and acceptance/repair counts",
+    "ownership": "Serialize access. Native controller owns committed target/history and one private pending branch; borrowed round tokens expire on commit/discard. Targets settle all work before return/throw and isolate mutable fork state. Sampled mode owns both committed models, probability rows and RNG; sparse support/dense views borrow their owner. Failed/discarded rounds leave committed RNG unchanged. Noncopyable adaptive policy owns bounded issued timing records; the engine retains and settles physical events.",
+    "failure": "Reject token/extent/budget errors, malformed probability supports, stale rounds, malformed target histories/predictions and incomplete verification. Complete sparse overflow falls back without losing mass. Failed native commit consumes the branch but leaves a correctly isolated parent unchanged; detected shared parent mutation poisons the controller. Foreign/changed/replayed timing tickets are rejected; valid old-generation observations retire without learning.",
+    "core_boundary": "Return prepared tokens from Session.advance; call native commit(id, accepted) from Session.commit. Core copies borrowed accepted output and publishes only after successful state repair; account branch and temporary storage explicitly."
+  },
+  "dependencies": [
+    "Python standard library",
+    "C++20 standard library; native target arithmetic and physical completion supplied by engine"
+  ],
+  "symbols": [
+    "CommitPlan",
+    "verify",
+    "commit",
+    "PromptCopyIndex",
+    "CopyBatch",
+    "propose_batch",
+    "GreedyTargetState",
+    "GreedySpeculator",
+    "PromptCopyProposer",
+    "SpeculationLimits",
+    "SpeculativeRound",
+    "SpeculativeCommit",
+    "Distribution",
+    "ProbabilityMass",
+    "SparseDistribution",
+    "ProbabilityState",
+    "SparseProbabilityState",
+    "SampledSpeculator",
+    "SparseSampledSpeculator",
+    "AdaptiveDraftBudget",
+    "DraftObservation",
+    "DraftBudgetStatistics",
+    "acceptance_probability",
+    "rejection_distribution",
+    "IndexedPromptCopy"
+  ],
+  "interactions": [
+    "attention-state",
+    "concurrent-request-execution",
+    "device-speculative-round",
+    "session-scheduling",
+    "recorded-selection"
+  ],
+  "techniques": [
+    "mtp-decode",
+    "attention-state",
+    "concurrent-request-execution"
+  ],
+  "validation": {
+    "host": "Prompt/history lookup, repeat bounds, append/rewind, stop/vocabulary caps, shared batch costs, greedy mismatch/bonus and commit handoff",
+    "native": "Greedy transactions and Core/paged-attention synthetic integration, including independent interleaved requests with accepted drafts followed by empty proposals or zero budgets at page boundaries; sampled exhaustive sparse capacity/support and conditional path mass, duplicate permutations, score/filter/tie/min-p combinations, 90000 two-token Markov histories, dense/sparse same-draw transactions, partial/cancelled/failed repair, RNG rollback and issued/stale/foreign/replayed adaptive observations. Generic fixtures do not qualify learned heads or device/model performance.; indexed history: 1000 append/rewind mutations and 8000 proposals against an independent scan oracle at two capacities, aliased input, stop/vocabulary bounds and invalid mutations; physical batching example: independent scratch payloads, caps 1-17, fixed proposals, ordinary-greedy output and recurrent-state/rewind equivalence, padding, partial/zero-budget rounds, failed ingestion/verification/repair, cancellation, retries and recorded-choice replay",
+    "performance": "No native-engine speed claim; serial fallback, history checks/copies, proposal cost, target verification and repair must be measured together"
+  }
+}

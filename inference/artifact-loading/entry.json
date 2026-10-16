@@ -1,0 +1,78 @@
+{
+  "id": "artifact-loading",
+  "category": "memory-and-loading",
+  "summary": "Exact tensor-region reads and retained materialization",
+  "implementation_status": "reference",
+  "implementation_scope": "Checked host byte-region reader and copy handoff. Native chunked reads with direct I/O, buffered fallback and overlap are Core's ReadOnlyFile::read_chunks and Checkpoint::read_chunks; artifact parsing beyond safetensors and physical upload are engine services",
+  "agent_guidance": {
+    "use_when": "Load named immutable encoded regions while retaining asynchronous copy endpoints",
+    "avoid_when": "The existing loader already guarantees the same extent, integrity and lifetime contract",
+    "provides": [
+      "Region bounds, non-overlap and representation metadata validation",
+      "Per-read digest and length checks",
+      "Materialization retaining source bytes, destination owner and readiness",
+      "Guidance for native bulk reads through Core's ReadOnlyFile::read_chunks (direct I/O, buffered fallback, overlapped chunks in file order) and Checkpoint tensor reads"
+    ],
+    "engine_supplies": [
+      "Artifact parser and trusted tensor descriptors",
+      "allocate/copy/retain_failed hooks with actual physical ownership",
+      "Successful completion checks before destination use",
+      "Independent model and engine lifetimes with an explicit immutable-source policy when reusing loaded bytes",
+      "A chunk consumer that copies or completes its upload before returning"
+    ],
+    "preserve": [
+      "Exact encoded extents and content identity",
+      "Both copy endpoints survive every physical read",
+      "Shape and encoding interpretation remains explicit"
+    ],
+    "adapt": [
+      "File access and integrity-check strategy under a declared immutable-source policy",
+      "Staging allocator, copy backend and descriptor format",
+      "Chunk size, alignment, direct versus buffered I/O and overlap"
+    ]
+  },
+  "path": "inference/artifact-loading/README.md",
+  "code_path": "inference/artifact-loading/code",
+  "code_files": [
+    {
+      "path": "inference/artifact-loading/code/implementation.py",
+      "purpose": "Checked host byte-region reader and copy handoff; artifact parsing and physical upload are engine services"
+    }
+  ],
+  "requires": {
+    "hardware": "Python 3.11+ and standard library for the host reference; native reads use Core's files library (crit::core); backend hardware is an engine choice",
+    "model": "Any tensor artifact whose parser supplies offset, byte extent, logical shape, encoding and digest",
+    "workload": "Named region reads or uploads; source artifact remains immutable for its declared identity"
+  },
+  "contract": {
+    "input": "TensorRegion records plus a read-only local artifact",
+    "output": "Verified bytes or Materialization(owner, source_bytes, readiness)",
+    "ownership": "The caller owns core allocation and readiness. Failed asynchronous copies must retain both endpoints through retain_failed.",
+    "failure": "Reject overlapping/extending regions, malformed identities, truncation and changed bytes before reuse.",
+    "core_boundary": "Native file access is Core's: ReadOnlyFile::read_chunks for chunked direct or buffered region reads, Sha256 for digests and Checkpoint for safetensors descriptors and tensor reads. Use Services.resources and the CUDA service for physical allocation; the region manifest, its validation and the copy handoff stay here, and interpretation and encoding stay outside Core."
+  },
+  "dependencies": [
+    "Python standard library",
+    "Core's files and model libraries (crit::core) for native reads"
+  ],
+  "symbols": [
+    "TensorRegion",
+    "ArtifactReader",
+    "Materialization"
+  ],
+  "interactions": [
+    "checkpoint-storage",
+    "ssd-expert-materialization",
+    "host-memory-admission"
+  ],
+  "techniques": [
+    "artifact-loading",
+    "checkpoint-storage",
+    "ssd-expert-materialization"
+  ],
+  "validation": {
+    "host": "Host fixtures and worked example cover extent/digest rejection and copy endpoint retention",
+    "native": "No native code here; Core's files fixture covers the chunked reader (direct and buffered I/O, overlap on and off, unaligned regions, ordered chunks, past-end errors and consumer exceptions); native upload and model loading remain engine work",
+    "performance": "Unmeasured; direct I/O and overlap speed depend on the storage and file system"
+  }
+}

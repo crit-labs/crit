@@ -1,0 +1,88 @@
+{
+  "id": "token-constraints",
+  "category": "sampling-and-constraints",
+  "summary": "Constrained speculative decoding: Core structured-output matchers inside sampled speculation",
+  "implementation_status": "native_source",
+  "implementation_scope": "Header-only C++20 adapter joining Core's request-private TokenMatcher (crit/constraints.h: finite choices, JSON objects, compiled grammars) with an isolated raw-logit LogitState into mtp-decode's ProbabilityState, plus constrained_logits and a stdlib Python host reference of the constrained law, acceptance and residual repair, (mask before temperature/top-k/top-p/min-p on mtp-decode Distributions). Matchers, masked Core sampling, the schema/regex/EBNF compiler, preparation and tokenizer byte tables are Core's structured-output service. Device masks and per-position verification masks remain engine work.",
+  "agent_guidance": {
+    "use_when": "A request carries a structured-output constraint and the engine decodes with mtp-decode's SampledSpeculator",
+    "avoid_when": "Decoding is ordinary one token at a time (use Core's Sampler with AllowedTokens directly) or output is unconstrained",
+    "provides": [
+      "Sorted permitted-token masks applied before temperature/top-k/top-p/min-p with the existing token-ID tie rule",
+      "A concrete constrained ProbabilityState with private copied matcher frontiers, validated forks and complete rewind",
+      "Matcher validation before model mutation and enforced retirement after failed model appends or rewinds",
+      "Runnable ordinary/speculative example through the existing sampled controller with choice, JSON and compiled-grammar matchers"
+    ],
+    "engine_supplies": [
+      "Isolated LogitState forks, fully materialized prefixes, complete rewind and settled arithmetic on success or failure",
+      "Core ByteVocabulary from exact decoded pieces, the same language and token IDs for target and draft, EOS in controller stop IDs",
+      "Per-request Core matchers (fresh per request), device masks per verification position and request resource reservations"
+    ],
+    "preserve": [
+      "Mask before probability filters and use each model's actual constrained law for acceptance/residual correction",
+      "Matcher and model describe the same accepted prefix; discarded or failed branches never publish matcher state",
+      "EOS terminates only at a complete accepted output; absorbing terminal next laws do not authorize appending after EOS"
+    ],
+    "adapt": [
+      "Device-side mask generation for draft and verify positions measured against complete-round costs",
+      "Any Core TokenMatcher implementation with exact isolated forks and complete rewind"
+    ]
+  },
+  "path": "inference/token-constraints/README.md",
+  "code_path": "inference/token-constraints/code",
+  "code_files": [
+    {
+      "path": "inference/token-constraints/code/constrained_state.h",
+      "purpose": "constrained_logits and the ConstrainedProbabilityState adapter over Core's TokenMatcher for SampledSpeculator"
+    },
+    {
+      "path": "inference/token-constraints/code/example.cpp",
+      "purpose": "Runnable constrained sampled speculation on a synthetic logit model with choice, JSON and compiled-grammar matchers"
+    },
+    {
+      "path": "inference/token-constraints/code/constrained.py",
+      "purpose": "Host reference of the constrained law, speculative acceptance and positive-residual repair under a mask"
+    }
+  ],
+  "requires": {
+    "hardware": "C++20 standard library and Core's crit::core; optional Python 3.11+ standard library for the host reference",
+    "model": "Compatible decoded vocabulary pieces/EOS and a physically settled isolated raw-logit state for target and draft",
+    "workload": "Structured outputs under probability-correct speculative rounds"
+  },
+  "contract": {
+    "input": "A fresh Core TokenMatcher, an isolated LogitState positioned after the prompt, finite full logits and sampling parameters",
+    "output": "Full-vocabulary Distribution with zero forbidden mass, or a private constrained ProbabilityState",
+    "ownership": "Each state owns one model state and one matcher; forks isolate both. Core vocabularies and grammars are shared immutably. LogitState and TokenMatcher calls are serialized and settle all work before return or throw.",
+    "failure": "Reject malformed IDs, nonfinite logits, empty support, invalid tokens before model append, malformed forks and rewinds into the prompt. Failed model mutations poison the branch; it must be retired, not retried.",
+    "core_boundary": "Languages, matchers and masked sampling are Core's structured-output service (crit/constraints.h, crit_core.constraints); use next laws inside SampledSpeculator, expose only prepared output from Session.advance and coordinate model/matcher publication through successful Session.commit."
+  },
+  "dependencies": [
+    "Python standard library",
+    "C++20 standard library",
+    "Core crit/constraints.h",
+    "Local mtp-decode sampled.h and speculative.h"
+  ],
+  "symbols": [
+    "constrained_logits",
+    "LogitState",
+    "ConstraintSampling",
+    "ConstrainedProbabilityState",
+    "constrained_law",
+    "accept_probability",
+    "residual"
+  ],
+  "interactions": [
+    "mtp-decode",
+    "device-speculative-round",
+    "session-scheduling"
+  ],
+  "techniques": [
+    "token-constraints",
+    "mtp-decode"
+  ],
+  "validation": {
+    "host": "Worked example checks the host constrained law (mask before filters, greedy ties), acceptance and in-language residual repair; Core's Python tests cover the compiler, preparation and byte tables",
+    "native": "C++ fixtures cover constraint-first filters, ties, private forks, partial acceptance, RNG discard, failed repair, poisoned states, malformed model and matcher forks, independent constrained ordinary/speculative answer probabilities for choice and JSON languages, and seeded compiled-grammar/choice parity; no device/model qualification",
+    "performance": "No model speed or quality measurement; per-position vocabulary scans, matcher-history copies and dense law materialization require workload profiling"
+  }
+}

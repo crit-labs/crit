@@ -1,0 +1,87 @@
+"""Side-by-side comparison of result files: `crit eval compare A.json B.json ...`."""
+from pathlib import Path
+
+from . import load_json
+
+
+def _fmt(value, spec):
+    return "–" if value is None else format(value, spec)
+
+
+def compare(paths):
+    results = [load_json(p) for p in paths]
+    names = [r.get("label") or r["engine"]["name"] or Path(p).stem for r, p in zip(results, paths)]
+    rows = [("Engine", [r["engine"]["name"] for r in results]),
+            ("Host", [r["host"]["platform"] for r in results]),
+            ("Model data", [r["model_sha256"][:12] for r in results])]
+    warn = []
+    if len({r["model_sha256"] for r in results}) > 1 or len({r["suite_sha256"] for r in results}) > 1:
+        warn.append("Results use different prepared data or suites; they are not comparable.")
+    case_ids = []
+    for r in results:
+        for case in r.get("speed", {}).get("cases", {}):
+            if case not in case_ids:
+                case_ids.append(case)
+    if case_ids:
+        rows.append(("**Decode score** (geomean tok/s)", [_fmt(r.get("speed", {}).get("decode_score"), ".1f") for r in results]))
+        for case in case_ids:
+            cells = []
+            for r in results:
+                c = r.get("speed", {}).get("cases", {}).get(case)
+                if not c or c["status"] != "measured":
+                    cells.append("skipped" if c else "–")
+                    continue
+                cell = f"{c['decode_tps']:.1f}"
+                if c.get("tokens_per_round"):
+                    cell += f" ({c['tokens_per_round']:.2f}/round"
+                    saturation = r.get("headroom", {}).get("cases", {}).get(case, {}).get("saturation")
+                    cell += f", {saturation:.0%} of cap)" if saturation is not None else ")"
+                if c.get("stop_crossed"):
+                    cell += " ⚠stop"
+                cells.append(cell)
+            rows.append((f"Decode tok/s: {case}", cells))
+        for case in case_ids:
+            if all(r.get("speed", {}).get("cases", {}).get(case, {}).get("prompt_tokens", 0) >= 2048 for r in results):
+                rows.append((f"Prefill tok/s: {case}",
+                             [_fmt(r["speed"]["cases"][case].get("prefill_tps"), ".0f") for r in results]))
+                rows.append((f"TTFT ms: {case}", [_fmt(r["speed"]["cases"][case].get("ttft_ms"), ".0f") for r in results]))
+    if any(r.get("headroom") for r in results):
+        cells = []
+        for r in results:
+            h = r.get("headroom") or {}
+            cells.append("–" if h.get("pass_efficiency") is None else
+                         f"{h['step_ms']:.2f} ms vs {h['pass_floor_ms']:.2f} ms floor ({h['pass_efficiency']:.0%})")
+        rows.append(("Model pass vs bandwidth floor", cells))
+        cells = []
+        for r in results:
+            p = (r.get("headroom") or {}).get("projection") or {}
+            cells.append("–" if not p.get("speed_of_light_score") else
+                         f"{p['speed_of_light_score']:.1f} (width {p['best_width_at_floor']}; "
+                         f"at {p['fraction_of_speed_of_light']:.0%})")
+        rows.append(("Speed-of-light decode score", cells))
+    paths_seen = []
+    for r in results:
+        for path in r.get("quality", {}).get("paths", {}):
+            if path not in paths_seen:
+                paths_seen.append(path)
+    for path in paths_seen:
+        cells = []
+        for r in results:
+            q = r.get("quality", {}).get("paths", {}).get(path)
+            cells.append("unsupported" if q is None else
+                         f"PPL ×{q['ppl_ratio']:.4f}, KLD {q['kld_mean']:.1e} (p99 {q['kld_p99']:.1e}), "
+                         f"top-1 {q['top1_agreement']:.3f} {'✓' if q['passed'] else '✗'}")
+        rows.append((f"Quality: {path}", cells))
+    if any("exactness" in r for r in results):
+        cells = []
+        for r in results:
+            e = r.get("exactness")
+            if e is None:
+                cells.append("–")
+            else:
+                same = sum(c["identical"] for c in e["cases"].values())
+                cells.append(f"{same}/{len(e['cases'])} cases identical {'✓' if e['passed'] else '✗'}")
+        rows.append(("Speculative = plain greedy", cells))
+    lines = ["| | " + " | ".join(names) + " |", "| --- |" + " --- |" * len(names)]
+    lines += ["| " + label + " | " + " | ".join(cells) + " |" for label, cells in rows]
+    return "\n".join(warn + lines)

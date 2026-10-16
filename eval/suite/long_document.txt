@@ -1,0 +1,503 @@
+# crit Core
+
+
+Core is the engine foundation. [Forge](../forge/README.md) supplies optional
+techniques and [Market](../market/README.md) guides kernel selection. Neither a
+technique nor an external kernel provider is required to integrate an engine.
+
+The core owns shared lifecycle and resource infrastructure. Model semantics,
+kernels, state layouts and tokenizer behavior belong to engine adaptations.
+
+A complete engine integrates through the public Model/Session/Backend boundary:
+declare capabilities and resource needs, advance requests, expose ready progress,
+commit accepted output and drain owned work. Its internal execution strategy
+stays with the engine. Dense or expert-routed computation, CPU or accelerator
+execution, caches and graph capture do not change that common boundary.
+CUDA and concurrent requests are opt-in; Forge techniques are optional.
+The SDK covers token generation and scoring. Each integration must validate its
+model/backend combination; the interface alone does not establish compatibility.
+Per-request [sampling, stop and extension options](runtime/README.md#request-options)
+are capability-checked and retained through request retirement.
+
+| Part | Responsibility | Source |
+| --- | --- | --- |
+| [Runtime](runtime/README.md) | Requests, bounded scheduling, readiness, commit/publication, cancellation and retirement | [runtime.cpp](runtime/runtime.cpp) |
+| [Memory](memory/README.md) | Resource budgets and reservation accounting | [resources.cpp](memory/resources.cpp) |
+| [CUDA backend](backends/cuda/README.md) | Explicit allocation, streams/events and ownership services | [cuda.cpp](backends/cuda/cuda.cpp) |
+| Public SDK | Stable headers consumed by model adaptations | [core.h](include/crit/core.h), [cuda.h](include/crit/cuda.h) |
+| [Contracts](contracts/README.md) | Current native ownership and request responsibilities | [CONTRACTS.json](contracts/CONTRACTS.json) |
+
+## Build and use
+
+For a small engine built directly from this checkout, start with the
+[Core + Forge walkthrough](examples/forge-projection/README.md). It connects a
+native quantized projection to a Model and Session, with no installed SDK step.
+
+Use CMake 3.28+ and a C++20 compiler: GCC, Clang or MSVC. CUDA is off by default;
+enable `CRIT_CORE_CUDA` with Toolkit 13.1+. MSVC uses `/W4 /WX`; GCC/Clang builds
+use `-Wall -Wextra -Wpedantic -Werror`. The optional `CRIT_CORE_SANITIZERS` setting
+currently accepts only GCC/Clang driver flags.
+
+```sh
+cmake -S core -B build/core -DBUILD_TESTING=ON
+cmake --build build/core
+ctest --test-dir build/core --output-on-failure
+cmake --install build/core --prefix build/core-install
+```
+
+For multi-configuration generators such as Visual Studio, append `--config
+Release` to build/install commands and `-C Release` to CTest. With `CRIT_CORE_CUDA=ON`,
+portable CUDA fixtures run on Windows and Linux and require an accessible device.
+Staged-graph and foreign stream ordering fixtures also run on both platforms.
+Additional injected allocation/drain/graph failures require linker `--wrap`;
+configuration reports when those additional cases are omitted. Host tests alone
+do not validate CUDA execution.
+
+Verify the installed public headers and library with independent host consumers:
+
+```sh
+cmake -S tests/core/concurrency_consumer -B build/consumer -DCMAKE_PREFIX_PATH=/absolute/path/to/build/core-install
+cmake --build build/consumer
+ctest --test-dir build/consumer --output-on-failure
+```
+
+These consumers exercise concurrent generation and independent text decoders
+without accessing private Core headers or linking its sources directly.
+
+The SDK is version 0.3.0. Include `<crit/core.h>` and link the installed target:
+
+```cmake
+find_package(critCore 0.3.0 EXACT CONFIG REQUIRED)
+target_link_libraries(your_engine PRIVATE crit::core)
+```
+
+Supply `build/core-install` through `CMAKE_PREFIX_PATH`. Optional CUDA services
+use `<crit/cuda.h>` and `crit::cuda`. See the
+[installed consumer example](../tests/core/concurrency_consumer/main.cpp).
+
+Adapters can return an independent `TextFrontend` from `Model::text_frontend()`
+for tokenization during generation and private incremental text decoders. Existing
+adapters keep their idle-only model callbacks. See the
+[text service contract](runtime/README.md#text-services) and
+[native fixture](../tests/core/frontend_tests.cpp).
+
+For lifecycle diagnostics, enable `Profile::trace` and read `Engine::trace()`.
+The [runtime guide](runtime/README.md#lifecycle-tracing) explains bounded storage,
+phase timing and loss counters. Tracing is disabled by default.
+
+Host fixtures cover lifecycle, resource accounting and concurrency. They do not
+establish model arithmetic, CUDA correctness or workload performance; qualify
+those in your [engine project](../docs/BUILDING_ENGINES.md).
+
+# Build and publish an engine
+
+Use [Core](../core/README.md) for runtime contracts, [Forge](../forge/README.md)
+for implementation techniques and [Market](../market/README.md) for kernels.
+Agents start with [AGENTS.md](../AGENTS.md). All model-specific source,
+dependencies, builds and results belong in the run workspace.
+
+## 1. Define the workload
+
+Agree on model/encoding, hardware/OS, prompt/output/context sizes, concurrency,
+cold or resident operation, correctness criteria, performance objectives,
+headroom, deadline, attempts and any provider spend limit. Preflight models,
+compiler/API availability and dependencies before creating the run: **creation
+starts the segment clock**. Reserve time for packaging, chat and cleanup.
+
+Create `request.json` using real paths and agreed criteria:
+
+```json
+{
+  "model_path": "ABSOLUTE_LOCAL_MODEL_PATH",
+  "correctness_criteria": "REPLACE_WITH_FIXED_CRITERIA",
+  "kv_tokens": 8192,
+  "vram_headroom_gib": 1,
+  "ram_headroom_gib": 2,
+  "budget_minutes": 30,
+  "attempt_limit": 32,
+  "verification_level": "artifact_verified",
+  "workload": {
+    "prompt_tokens": 512, "output_tokens": 128, "concurrency": 1,
+    "repetitions": 3, "warmup_runs": 1, "mode": "resident"
+  },
+  "targets": {}
+}
+```
+
+The values are a template, not model acceptance criteria. Use `cases` for multiple
+workloads; [run records](RUN_RECORDS.md) defines every payload below.
+Replace uppercase placeholders. Global options precede the action.
+
+```text
+crit run --project CRIT_ROOT --root RUN_ROOT create --record request.json
+crit --workspace RUN_ROOT --project CRIT_ROOT
+```
+
+Use the returned `run.run_id` and read its
+`segments/segment-0001/agent_request.md`. Continue a supplied run instead of
+creating a duplicate. Default workspace: `CRIT_ROOT/runs/`.
+Provider credentials and currency/token caps are configured separately.
+
+## 2. Freeze inputs and source
+
+Retain exact workload files under `RUN_ROOT/RUN_ID/captured/`. Supply nonempty
+hardware/environment manifests and path/size/SHA-256 manifests for every case.
+The coordinator verifies them and hashes the requested model.
+
+```text
+crit run --project CRIT_ROOT --root RUN_ROOT --id RUN_ID resolve --record inputs.json
+crit run --project CRIT_ROOT --root RUN_ROOT --id RUN_ID candidate --source SOURCE_DIR --record proposal.json
+```
+
+The proposal identifies label, rationale, strategy, configuration and applicable
+Forge decisions (`implemented`, `inherited`, `rejected`, `untested`) in
+`store_decisions`. Record parent/origin IDs when reusing earlier work. The
+coordinator allocates IDs and copies complete source; build in the run's mutable
+`work/` area. Changed source, flags, dependencies or configuration need a new candidate.
+
+## 3. Build, check and compare
+
+Reserve each process **before** launch. `reserve` consumes an attempt; it does
+not launch anything. Supervise the process tree to the returned deadline and
+settle descendants, logs and cleanup after exit, including failures.
+
+```text
+crit run --root RUN_ROOT --id RUN_ID reserve --candidate CANDIDATE_ID --operation build --seconds PROCESS_CAP
+crit run --root RUN_ROOT --id RUN_ID settle --reservation RESERVATION_PATH --record result.json
+crit run --root RUN_ROOT --id RUN_ID package --candidate CANDIDATE_ID --source PACKAGE_DIR --record recipe.json
+crit run --root RUN_ROOT --id RUN_ID check --candidate CANDIDATE_ID --record check.json
+crit run --root RUN_ROOT --id RUN_ID benchmark --candidate CANDIDATE_ID --record benchmark.json
+```
+
+Run these from the crit checkout or add `--project CRIT_ROOT`. Use the exact
+reservation path returned by the coordinator. The package contains runnable
+files and dependencies/notices; omit `manifest.json`, which crit creates.
+Build/launch recipes are literal argument data, without shell expansion.
+
+| Check | What to retain |
+| --- | --- |
+| Baseline | Requests through Core admission, session, commit and retirement; exact source/package identities. When continuing earlier work, re-record the previous best engine as this run's baseline: the same package can measure several percent differently in another session on a desktop GPU |
+| Strategy | Measured bottleneck; plausible alternatives; applicable Forge code and the hooks your engine supplies |
+| Correctness | Separate arithmetic, functional and resource gates with fixed criteria; failures stay failed |
+| Repeatability | The same request gives the same output in a fresh process, not only within one process ([recorded selection](../forge/recorded-selection/README.md)) |
+| Quality | When arithmetic changes, perplexity and KL divergence from a reference path on a fixed corpus ([distribution comparison](../forge/distribution-comparison/README.md)). Read the run's fixed criteria first: a run with `weights_policy: as_stored` does not accept requantized or pruned weights, and each candidate declares `weights` |
+| Performance | Matched inputs/protocol, warmups, every repetition, prefill/decode/request/load costs and physical memory |
+| Coverage | Representative contexts and request shapes; isolated operator tests do not qualify a complete model |
+
+Compare strategies as well as settings. Read actual technique code and kernel
+requirements; preserve representation, ownership and readiness invariants when
+specializing or fusing them. Keep model policy out of Core. For caches, use the
+[expert execution checklist](EXPERT_EXECUTION.md#validation).
+
+Measure cold and changing-request behavior as well as repeated warm prompts.
+Charge initialization, prefill, transfers, synchronization and refresh to the
+relevant service measurement. Keep polling outside timed paths. Define aggregation
+first; hit rate, allocation success or one fast sample is not a performance result.
+Exact completion equality is required only when the agreed criteria require it.
+
+Choose implementations (kernel variants, library algorithms) by a table recorded in
+the candidate configuration, not by timing at load: timing near-ties resolve
+differently per process and can change outputs. For speculative decoding, record
+`accepted_tokens_per_round` with decode speed, since generated text changes it.
+
+## 4. Package resident chat and seal
+
+Implement [chat integration](CHAT.md) before sealing: declare `chat-json-v1` and
+`chat-resident-v1`, export `create_engine(context)`, retain the adapter and reuse
+model allocations across replies. Verify consecutive prompts, graph navigation,
+compatible A → B → A switching, cancellation and exit. Use actual tokenizer
+counts and synchronized phase times. Declare `chat-config-v1` and report the applied
+configuration so the host rejects an adapter that drops or changes a key.
+
+```text
+crit run --root RUN_ROOT --id RUN_ID seal --candidate CANDIDATE_ID --lifecycle completed
+```
+
+Use `built` when runnable chat is ready but benchmarks are absent, or the actual
+failure lifecycle. Sealing requires settled attempts and permanently closes the
+candidate; later changes or measurements require a new candidate. A failed gate
+does not prevent chat, but prevents qualification.
+
+## 5. Deliver
+
+Review initialization, model lifetime, memory/state growth, prefill, decode,
+sampling, synchronization and cleanup. Continue the strongest feasible improvement
+within the agreed bounds. Stop for the objective, exhausted search, a blocker,
+cancellation or budget; never extend a deadline to finish a critique.
+
+```text
+crit run --root RUN_ROOT --id RUN_ID stop --record stop.json
+crit --workspace RUN_ROOT --project CRIT_ROOT
+```
+
+Save `summary.md` at the run root with target/workload, baseline versus selected
+candidate, measurements, checks, limitations, technique/kernel choices, remaining
+opportunities and artifact paths. Identify the project and candidate to open;
+say when none qualified. Include toolkit feedback in this summary.
+
+After optimization cleanup, open the observer when a local terminal is available.
+For headless work, deliver transferable artifacts and target-machine instructions.
+Resume needs explicit new bounds and settled cleanup; it preserves prior attempts,
+criteria and sealed results. See [recovery](RUN_RECORDS.md#recovery-and-resume).
+
+# Chat integration
+
+Terminal chat loads a sealed package on entry and reuses it on Send. Declare
+**`chat-json-v1` and `chat-resident-v1`**; `launch[0]` is a retained Python module
+exporting `create_engine(context)`. Native engines can supply a Python wrapper.
+A runnable candidate may be tried with failed/missing checks; chat never changes
+its benchmark evidence or passes a quality gate.
+
+## Factory and lifetimes
+
+`context.configuration` is the frozen candidate configuration; `context.arguments`
+contains remaining literal launch arguments. Relative helper imports use a
+content-specific package namespace. Return an engine with these methods:
+
+| Method | Contract |
+| --- | --- |
+| `generate(request, cancellation)` | Use the complete request below; return its response dictionary. Poll `cancellation.is_set()` or call `cancellation.check()`. Enforce token/context/headroom/deadline limits. Do not write a response file. |
+| `reset()` | Called after every generation, including failure/cancellation. Drain queues, graphs, borrowed pointers, writes and producers; release/reset private turn state. Retain weights/setup. |
+| `close()` | Drain and release engine-private resources before switching/unloading. crit releases registered model leases/views only after this returns. |
+
+Load weights in the factory, not on each `generate()`. The host serializes
+commands. Streaming is opt-in as described below; concurrent generation is
+unsupported by this chat host.
+
+| Owner | Retained data / lifetime |
+| --- | --- |
+| Conversation | Successful messages and draft, durable per candidate/chat ID |
+| Engine | Adapter, tokenizer, private KV/recurrent state, scratch and graphs; until switch or failure |
+| Model pool | Verified immutable host bytes and compatible device weights; until CLI exit or runtime retirement |
+
+A → B → A closes each old engine before constructing the next; shared model
+allocations may survive. Conversation A resumes from messages, not B's KV state.
+New chat and workspace/graph navigation retain weights. CLI exit drains engines
+and frees models. Different model identities/representations occupy distinct
+pool entries; there is no automatic eviction.
+
+Packages share a process and crash boundary. Release derived views, mutable
+globals and all workers on close; imported Python/native libraries may remain.
+Construction, reset or close failure can retire the entire runtime. A one-second
+cancellation grace permits cooperative reset; a stuck adapter is terminated.
+Ambiguous cleanup blocks further admission until physical retirement is proven.
+
+## Model access and allocation
+
+| API | Behavior |
+| --- | --- |
+| `context.host("relative/model/file")` | Read-only memoryview of a verified private snapshot; first use copies/hashes bytes before mapping |
+| `context.model_file(name)` | Verified native-loader path when `chat-model-file-v1` is also declared; retains source handles without making a second model copy |
+| `context.limits` | Fixed context and physical RAM/VRAM headroom requirements |
+| `context.device(compatibility, nbytes, allocate)` | Generation-bound lease; `lease.buffer` is valid within the engine lifetime |
+
+Model identity is the complete frozen path/size/SHA-256 manifest, not its display
+name. Changed bytes, paths or sizes reject reuse. Release derived views before
+detach. Snapshot mappings are pageable, require temporary disk capacity and are
+not pinned RAM. Native file handles deny writes/replacement on Windows; elsewhere,
+adapters must preserve immutability and changed file identities reject reuse.
+
+Device keys must describe the complete representation:
+
+```python
+compatibility = {
+    "device": "backend/device-uuid/context-identity",
+    "representation": "weight-bundle-and-transform-version",
+    "dtype": "encoded-scalar-type",
+    "quantization": "exact-format-and-parameters",
+    "layout": "packing-and-strides-version",
+    "shape": [1024, 1024],
+    "abi": "backend-runtime-and-allocation-ABI-version",
+}
+```
+
+The model manifest digest is added automatically. Equal names/byte counts or
+using the same accelerator are insufficient. `allocate()` returns
+`crit.chat_models.DeviceAllocation(buffer, nbytes, wait, free)` after upload/
+initialization settles. Charge actual bytes, including padding. Pass requested
+`nbytes=None` when only the allocator can determine the extent.
+
+`wait()` proves all asynchronous uses/borrowers settled; `free()` physically
+releases the allocation. crit fences lease release and final free. Wait/free/
+accounting failures quarantine ownership and retire the host, including owners
+returned with invalid size/type/callback metadata. Ownership is retained before
+validating that metadata; a valid actual extent is charged even when it differs
+from the requested extent. Ambiguous frees
+are never retried in that host. Allocator exceptions must unwind or be reclaimable
+by process retirement. Remote/external allocations do not satisfy this contract.
+
+Optional resident RAM/VRAM caps cover **pool-owned model bytes**, not total RSS
+or device usage. The adapter budgets tokenizer, private state, expanded weights,
+scratch and physical headroom. Exhausted caps reject new representations.
+
+## Request
+
+Requests have integer `schema_version: 1`, `record_kind: "chat_request"`,
+run/chat/request/candidate IDs, canonical `package_sha256`, UTC creation time,
+model locator and frozen model manifest, package path, configuration, `limits`
+and `messages: [{role, content}, ...]`.
+
+- Messages alternate user/assistant and end with user; the complete successful
+  conversation is supplied. Use the exact engine/model, tokenizer, template and
+  sampling. Verify the model manifest; no silent model substitution.
+- `limits` contains `max_output_tokens`, `kv_tokens`, `vram_headroom_bytes`,
+  `ram_headroom_bytes`, `timeout_seconds`. Tokenize the complete templated input
+  first; reject overflow instead of truncating messages. Enforce the output cap.
+- Terminal defaults: 128 output tokens, 120 seconds per turn; maximum 32 turns
+  and 65,536 conversation characters. `--output-tokens` accepts 1–4096.
+- Treat model/package/input paths as read-only. Work in turn scratch. Artifacts
+  are verified before loading/execution; unchanged file identities reuse checks,
+  while changed artifacts trigger revalidation and invalidate affected replies.
+
+## Response and telemetry
+
+Return this shape with real identities and measured values; numbers here are
+illustrative. The host writes the resident response record.
+
+```json
+{
+  "schema_version": 1,
+  "record_kind": "chat_response",
+  "request_id": "COPY_FROM_REQUEST",
+  "candidate_id": "COPY_FROM_REQUEST",
+  "package_sha256": "COPY_FROM_REQUEST",
+  "assistant": "Reply text",
+  "telemetry": {
+    "prompt_tokens": 512, "output_tokens": 128,
+    "prefill_tokens": 512, "prefill_ms": 256,
+    "decode_tokens": 127, "decode_ms": 3175,
+    "ttft_ms": 290, "missing": {}
+  }
+}
+```
+
+| Measurement | Meaning |
+| --- | --- |
+| `prompt_tokens` | Full templated input token count |
+| `output_tokens` | All generated tokens, including the first |
+| `prefill_tokens`, `prefill_ms` | Tokens actually timed in prefill; may exclude a reused prefix |
+| `decode_tokens`, `decode_ms` | Tokens actually timed in decode; may exclude the first token generated in prefill |
+| `ttft_ms` | Request admission through first emitted token |
+
+Rates use phase tokens ÷ elapsed milliseconds × 1000. Synchronize device work
+at phase boundaries. Phase timing excludes unrelated startup/model loading;
+host request latency separately includes launch, load, IPC and cleanup. Never
+estimate tokens from characters or reuse benchmark speeds.
+
+Missing prefill/decode sets **both** count and time to `null`, with a reason in
+`missing.prefill`/`missing.decode`. Missing TTFT uses `ttft_ms: null` and
+`missing.ttft`. Zero timed tokens produces no speed. Counts are integers, numbers
+finite, decode count ≤ output count, and prompt + output must fit KV capacity.
+Responses are UTF-8 JSON under 1 MiB. Identity mismatch, malformed output,
+artifact mutation, failed cleanup or violated limits fails the turn without speeds.
+
+## Streaming resident replies
+
+Add **`chat-stream-v1`** to a package that already declares `chat-json-v1` and
+`chat-resident-v1`. In addition to the existing methods, implement
+`generate_stream(request, cancellation, emit)`. The host calls this method
+instead of `generate` for that package. Return the same final response shape.
+Keep `generate` available for clients using the original resident interface.
+
+```python
+def generate_stream(self, request, cancellation, emit):
+    pieces = []
+    for chunk in self.decode_text(request, cancellation):
+        cancellation.check()
+        emit(chunk)
+        pieces.append(chunk)
+    # self.measured_response supplies real token counts and phase timings.
+    return self.measured_response(request, assistant="".join(pieces))
+```
+
+`emit` accepts a nonempty UTF-8-encodable string without NUL. Call it synchronously
+on the generation thread, before `generate_stream` returns. Append decoded text
+only when the engine has accepted it; speculative proposals must not be emitted.
+Chunks may contain whitespace or parts of a Unicode grapheme. crit concatenates
+them exactly, without trimming. There is no text replacement/retraction event.
+The total limit is 65,536 characters, independently of the request's token cap.
+The final `assistant` must equal all emitted chunks concatenated, byte for byte
+after UTF-8 encoding. Callback errors during generation fail the turn even if
+the adapter catches them. `reset` and `close` retain their normal settlement
+obligations, including stopping every producer that could call the callback.
+
+The host publishes the first chunk immediately, coalesces subsequent updates
+at most once every 50 ms and flushes the remainder on return. Publication uses
+one bounded atomic snapshot; intermediate chunks are not queued. The supervisor
+checks command, owner, request, package and candidate identities, monotonic
+sequences and text prefixes. The terminal polls roughly every 200 ms and marks
+the provisional reply `streaming`. This is display latency, not token timing;
+the final response supplies measured telemetry using the usual definitions.
+
+Provisional text is exposed as `partial_assistant` only while a turn is running.
+It is not a successful message, a result record or benchmark evidence. Final
+response validation, artifact checks and reset must all succeed before it enters
+conversation history. Cancellation, failure, timeout or interrupted cleanup
+discards it; the terminal then shows the turn's failure/status. A settled turn
+removes the private snapshot, as does runtime retirement/recovery. One-shot
+`chat-json-v1` clients continue to receive complete responses only.
+
+## Effective configuration
+
+Add **`chat-config-v1`** when the engine can report the configuration it actually
+applied. Implement `effective_configuration()` returning a dictionary. After the
+factory returns, the host compares it with `context.configuration`: every frozen
+key must be present with an equal value. Extra keys (derived or defaulted
+settings) are allowed. A missing or changed key closes the engine and fails the
+load with the ignored and changed keys named, so an adapter that filters or
+renames keys cannot silently run a different engine than the benchmarked one.
+
+```python
+def effective_configuration(self):
+    return dict(self.native.applied_configuration())  # what the native engine parsed
+```
+
+Report what the engine parsed, not a copy of `context.configuration`.
+
+## Ownership and recovery
+
+One durable per-user machine-local guard coordinates crit runtimes across
+workspaces, including idle resident hosts and configured runners. The default
+directory is OS temp under `crit-runtime-USER`; `CRIT_RUNTIME_DIRECTORY` can
+choose a shared location. Different locations partition the lock and must not
+be used to bypass an owner. Independent agents/OS users schedule their own hardware.
+
+The launch guardian publishes process identity before engine execution, monitors
+client death and retires the Windows Job Object/POSIX process group. Escaped
+groups and remote services are outside this contract. Stop, timeout and shutdown
+retain the guard until cleanup settles.
+
+Before admitting engine execution, the guardian reports its actual PID and birth
+identity through a token-bound handshake. The supervisor verifies that it belongs
+to the owned Windows Job Object (or is the POSIX group leader), then records and
+acknowledges that identity. This supports Windows virtual-environment launchers,
+whose PID differs from their interpreter, while retaining the engine's original
+Python environment. Unverified identities never grant execution.
+
+After a crash, run `crit ui --recover-runtime`. Recovery refuses live/ambiguous
+owners or unresolved descendants, verifies retirement, records recovery, removes
+private snapshots and only then releases admission. Cross-boot or unavailable
+birth identity needs platform inspection. Never delete the guard to force entry.
+
+Settled failed/cancelled turns can continue; interrupted/unsettled turns need
+recovery and New chat. Once cleanup succeeds, New chat is available; the old
+conversation remains interrupted and its evidence is unchanged. Terminal shutdown
+requests loading cancellation before waiting for preparation to finish, including
+shutdown through Ctrl+C. Requests, responses, result identities and per-turn log
+hashes stay under `run-*/chats/chat-UUID/turn-NNNN/`, separate from seals,
+benchmarks and optimization budgets. Only successful turns become history.
+
+## One-shot clients
+
+The lower-level coordinator accepts `chat-json-v1` alone; the terminal requires
+residency. It launches literal arguments, adding `--crit-chat-request PATH` and
+`--crit-chat-response PATH`. A `.py` entry uses Python with `-B`; native files
+launch directly, without a shell. The working directory is a fresh turn folder.
+
+Write the same response atomically, exit zero after cleanup, and put diagnostics
+in stdout/stderr (`engine.log`). Each turn owns a fresh process; external-process
+borrowing does not transfer cleanup or enable model sharing.
+
+See [synthetic residency fixtures](../tests/test_chat_residency.py) for executable
+adapters. Real model arithmetic, device fences and allocation behavior remain
+the integrating engine's validation responsibility.

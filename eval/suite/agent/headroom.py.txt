@@ -1,0 +1,117 @@
+"""Distance to the physical ceiling, and which change buys the most decode speed.
+
+Decode speed is tokens per round divided by round time. A full model pass (one ordinary
+step, or a verify of a few columns while it stays memory bound) cannot beat bytes read per
+pass divided by achievable bandwidth; a draft step cannot beat its own bytes divided by
+bandwidth. With greedy acceptance, the drafts accepted at width K also tell the tokens per
+round at every smaller width, so one run at a generous width projects the whole curve:
+
+    tokens(k)   = 1 + sum_{j<=k} P(accepted >= j)
+    round(k)    = pass + k * draft
+    speed(k)    = tokens(k) / round(k)
+
+At measured pass and draft costs this gives the best width now; at the floors it gives the
+speed-of-light decode score, the ceiling every candidate is compared with.
+"""
+from . import metrics
+
+
+def pass_floor_ms(bytes_per_pass, bandwidth_gbs):
+    if not bytes_per_pass or not bandwidth_gbs:
+        return None
+    return bytes_per_pass / (bandwidth_gbs * 1e9) * 1000
+
+
+def tokens_by_width(accepted, width):
+    """Expected tokens per round for widths 0..width from per-round accepted-draft counts."""
+    if not accepted:
+        return None
+    rounds = len(accepted)
+    curve, total = [1.0], 1.0
+    for j in range(1, width + 1):
+        total += sum(1 for a in accepted if a >= j) / rounds
+        curve.append(total)
+    return curve
+
+
+def best_width(curves, pass_ms, draft_ms):
+    """Width maximizing the geometric mean over cases, and that mean (tok/s)."""
+    best = (0, None)
+    for k in range(len(min(curves, key=len))):
+        score = metrics.geometric_mean([1000 * c[k] / (pass_ms + k * draft_ms) for c in curves])
+        if score and (best[1] is None or score > best[1]):
+            best = (k, score)
+    return best
+
+
+def summarize(info, speed, step_ms, bandwidth_gbs, thresholds):
+    """info: adapter info(); speed: run_speed() result; step_ms: median ordinary one-token step
+    in ms (None when unmeasured); bandwidth_gbs: achievable device bandwidth in GB/s."""
+    width = info.get("draft_width")
+    bandwidth_gbs = bandwidth_gbs or info.get("bandwidth_gbs")
+    floor = pass_floor_ms(info.get("bytes_per_pass"), bandwidth_gbs)
+    draft_floor = pass_floor_ms(info.get("draft_bytes_per_step"), bandwidth_gbs)
+    polished, saturated = thresholds["polished_pass_efficiency"], thresholds["saturation_warning"]
+    cases, warnings, curves = {}, [], []
+    for case_id, case in (speed or {}).get("cases", {}).items():
+        if case.get("status") != "measured":
+            continue
+        row = {"round_ms": case.get("round_ms"), "tokens_per_round": case.get("tokens_per_round")}
+        if width and case.get("tokens_per_round"):
+            row["saturation"] = case["tokens_per_round"] / (width + 1)
+            if row["saturation"] >= saturated:
+                warnings.append(f"{case_id}: {case['tokens_per_round']:.2f} tokens/round is "
+                                f"{row['saturation']:.0%} of the draft-width cap {width + 1}; draft width limits speed")
+        if floor and case.get("round_ms"):
+            row["round_over_pass_floor"] = case["round_ms"] / floor
+        accepted = [a for s in case.get("samples", []) if not s.get("warmup") for a in (s.get("accepted") or [])]
+        if width and accepted:
+            row["tokens_by_width"] = tokens_by_width(accepted, width)
+            curves.append(row["tokens_by_width"])
+        cases[case_id] = row
+
+    efficiency = floor / step_ms if floor and step_ms else None
+    if efficiency is None:
+        missing = [name for name, value in (("bytes_per_pass", info.get("bytes_per_pass")),
+                                            ("bandwidth", bandwidth_gbs), ("ordinary step", step_ms)) if not value]
+        warnings.append("pass efficiency unmeasured: missing " + ", ".join(missing))
+    elif efficiency < polished:
+        warnings.append(f"model pass {step_ms:.2f} ms is {efficiency:.0%} of its {floor:.2f} ms bandwidth floor")
+
+    # Draft cost per step: reported by the adapter, else what a round costs beyond one pass.
+    rounds = [c["round_ms"] for c in cases.values() if c.get("round_ms")]
+    draft_ms = info.get("draft_ms")
+    if draft_ms is None and width and step_ms and rounds:
+        draft_ms = max(0.0, (metrics.median(rounds) - step_ms) / width)
+    projection = None
+    score = (speed or {}).get("decode_score")
+    if curves and step_ms and draft_ms is not None:
+        now_width, now_score = best_width(curves, step_ms, draft_ms)
+        projection = {"draft_ms": draft_ms, "draft_floor_ms": draft_floor,
+                      "best_width_now": now_width, "score_at_best_width_now": now_score}
+        if now_width != width and score and now_score > score * 1.05:
+            warnings.append(f"draft width {width} -> {now_width} projects {now_score:.1f} tok/s at current costs "
+                            f"(+{now_score / score - 1:.0%})")
+        if floor and draft_floor is not None:
+            sol_width, sol_score = best_width(curves, floor, draft_floor)
+            projection.update(best_width_at_floor=sol_width, speed_of_light_score=sol_score,
+                              fraction_of_speed_of_light=score / sol_score if score else None)
+            if score:
+                warnings.append(f"decode score {score:.1f} is {score / sol_score:.0%} of speed-of-light {sol_score:.1f} "
+                                f"(draft width {sol_width} at floor costs)")
+        if width in (projection.get("best_width_now"), projection.get("best_width_at_floor")):
+            warnings.append(f"best projected width is the widest measured ({width}); "
+                            "measure acceptance at a wider draft to see beyond it")
+    elif width:
+        warnings.append("speed-of-light projection needs per-round `accepted` counts from generate() and an ordinary step")
+    return {
+        "draft_width": width, "bytes_per_pass": info.get("bytes_per_pass"), "bandwidth_gbs": bandwidth_gbs,
+        "pass_floor_ms": floor, "step_ms": step_ms, "pass_efficiency": efficiency,
+        "pass_polished": efficiency is not None and efficiency >= polished,
+        "projection": projection, "cases": cases, "warnings": warnings,
+    }
+
+
+def step_ms_from(samples):
+    """Median ordinary one-token step from plain greedy speed samples."""
+    return metrics.median([1000 / s["decode_tps"] for s in samples if s.get("decode_tps")])

@@ -1,0 +1,209 @@
+cmake_minimum_required(VERSION 3.28)
+project(crit_core VERSION 0.1.0 LANGUAGES CXX)
+find_package(Threads REQUIRED)
+function(crit_strict_warnings target)
+  if(MSVC)
+    target_compile_options(${target} PRIVATE /W4 /WX /permissive-)
+  else()
+    # -Wshadow catches the local, parameter and member hiding that MSVC /W4 rejects (C4456-C4458). For C4459 (a
+    # local hiding a namespace-scope variable) GCC misses variables in anonymous namespaces, which only Clang
+    # reports (CI also builds Core with Clang on Linux), and neither reports a variable of an enclosing named
+    # namespace seen from a nested one.
+    target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Werror)
+  endif()
+endfunction()
+add_library(crit_core STATIC src/runtime/runtime.cpp src/runtime/trace.cpp src/runtime/operators.cpp src/memory/resources.cpp src/memory/host_memory.cpp
+  src/text/text.cpp src/sampling/sampling.cpp src/state/state_cache.cpp src/io/file.cpp src/io/sha256.cpp
+  src/io/json.cpp src/model/safetensors.cpp src/model/model_config.cpp src/constraints/constraints.cpp src/constraints/grammar.cpp
+  src/backends/device_graph.cpp src/backends/device_memory.cpp)
+add_library(crit::core ALIAS crit_core)
+set_target_properties(crit_core PROPERTIES EXPORT_NAME core)
+target_include_directories(crit_core PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
+target_compile_features(crit_core PUBLIC cxx_std_20)
+target_link_libraries(crit_core PUBLIC Threads::Threads)
+crit_strict_warnings(crit_core)
+set(CRIT_CORE_SANITIZERS "" CACHE STRING "Optional compiler sanitizers, e.g. address,undefined")
+option(CRIT_CORE_CUDA "Build the explicit CUDA backend services" OFF)
+option(CRIT_CORE_NVTX "Build crit::trace::NvtxSink into crit_core (NVTX 3 headers) and define CRIT_TRACE_NVTX for consumers" OFF)
+if(CRIT_CORE_NVTX)
+  find_package(CUDAToolkit QUIET)
+  find_path(CRIT_CORE_NVTX_INCLUDE_DIR nvtx3/nvToolsExt.h HINTS ${CUDAToolkit_INCLUDE_DIRS})
+  if(NOT CRIT_CORE_NVTX_INCLUDE_DIR)
+    message(FATAL_ERROR "CRIT_CORE_NVTX needs NVTX 3 headers: set CRIT_CORE_NVTX_INCLUDE_DIR to the directory holding nvtx3/")
+  endif()
+  # NvtxSink is implemented in src/runtime/nvtx.cpp; consumers see only its declaration, never the NVTX headers
+  # (on Windows they include windows.h).
+  target_sources(crit_core PRIVATE src/runtime/nvtx.cpp)
+  target_include_directories(crit_core PRIVATE ${CRIT_CORE_NVTX_INCLUDE_DIR})
+  target_compile_definitions(crit_core PUBLIC CRIT_TRACE_NVTX)
+  target_link_libraries(crit_core PRIVATE ${CMAKE_DL_LIBS})
+endif()
+if(CRIT_CORE_SANITIZERS)
+  if(MSVC)
+    message(FATAL_ERROR "CRIT_CORE_SANITIZERS uses GCC/Clang -fsanitize flags; it is not supported with the MSVC driver")
+  endif()
+  target_compile_options(crit_core PUBLIC -fsanitize=${CRIT_CORE_SANITIZERS} -fno-omit-frame-pointer)
+  target_link_options(crit_core PUBLIC -fsanitize=${CRIT_CORE_SANITIZERS})
+endif()
+include(CTest)
+if(CRIT_CORE_CUDA)
+  find_package(CUDAToolkit 13.1 REQUIRED)
+  add_library(crit_core_cuda STATIC src/backends/cuda/cuda.cpp src/backends/cuda/category_timer.cpp
+    src/backends/cuda/cuda_graph.cpp src/backends/cuda/cuda_memory.cpp)
+  add_library(crit::cuda ALIAS crit_core_cuda)
+  set_target_properties(crit_core_cuda PROPERTIES EXPORT_NAME cuda)
+  target_link_libraries(crit_core_cuda PUBLIC crit_core CUDA::cudart)
+  crit_strict_warnings(crit_core_cuda)
+endif()
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+install(TARGETS crit_core EXPORT critCoreTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(FILES include/crit/core.h include/crit/text.h include/crit/sampling.h include/crit/state.h
+  include/crit/json.h include/crit/file.h include/crit/sha256.h include/crit/host_memory.h
+  include/crit/safetensors.h include/crit/model_config.h include/crit/constraints.h include/crit/trace.h
+  include/crit/device_graph.h include/crit/device_memory.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/crit)
+install(FILES ../LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/crit)
+if(CRIT_CORE_CUDA)
+  install(TARGETS crit_core_cuda EXPORT critCoreTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+  install(FILES include/crit/cuda.h include/crit/cuda_graph.h include/crit/cuda_memory.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/crit)
+endif()
+configure_package_config_file(cmake/critCoreConfig.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/critCoreConfig.cmake
+  INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/critCore)
+write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/critCoreConfigVersion.cmake
+  VERSION ${PROJECT_VERSION} COMPATIBILITY ExactVersion)
+install(EXPORT critCoreTargets NAMESPACE crit:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/critCore)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/critCoreConfig.cmake
+  ${CMAKE_CURRENT_BINARY_DIR}/critCoreConfigVersion.cmake DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/critCore)
+# Core's own fixtures. Technique examples and fixtures build in their own project
+# against this SDK; this project compiles only Core.
+if(BUILD_TESTING AND PROJECT_IS_TOP_LEVEL)
+  add_executable(crit_core_tests ../tests/core/runtime_tests.cpp)
+  target_link_libraries(crit_core_tests PRIVATE crit_core)
+  crit_strict_warnings(crit_core_tests)
+  foreach(_test resources generation readiness cancel retained_owner retained_cancel errors score_ownership abandoned startup borrowed_startup cancel_wait drain_retry drain_fatal tracing deferred timing reuse query_scoring
+    declarations logprobs logprob_rows deferred_logprobs wait_output text_storage logprob_scoring release_race sink_unwind)
+    add_test(NAME crit_core_${_test} COMMAND crit_core_tests ${_test})
+    set_tests_properties(crit_core_${_test} PROPERTIES TIMEOUT 30)
+  endforeach()
+  add_executable(crit_core_request_options_tests ../tests/core/request_options_tests.cpp)
+  target_link_libraries(crit_core_request_options_tests PRIVATE crit_core)
+  crit_strict_warnings(crit_core_request_options_tests)
+  add_test(NAME crit_core_request_options COMMAND crit_core_request_options_tests)
+  set_tests_properties(crit_core_request_options PROPERTIES TIMEOUT 30)
+  add_executable(crit_core_frontend_tests ../tests/core/frontend_tests.cpp)
+  target_link_libraries(crit_core_frontend_tests PRIVATE crit_core)
+  crit_strict_warnings(crit_core_frontend_tests)
+  add_test(NAME crit_core_frontend COMMAND crit_core_frontend_tests)
+  set_tests_properties(crit_core_frontend PROPERTIES TIMEOUT 30)
+  add_executable(crit_core_concurrency_tests ../tests/core/concurrency_tests.cpp)
+  target_link_libraries(crit_core_concurrency_tests PRIVATE crit_core)
+  crit_strict_warnings(crit_core_concurrency_tests)
+  add_test(NAME crit_core_concurrency COMMAND crit_core_concurrency_tests)
+  set_tests_properties(crit_core_concurrency PROPERTIES TIMEOUT 120)
+  # Component fixtures: one executable per area, each case selected by argv[1].
+  function(crit_core_cases fixture timeout)
+    add_executable(crit_core_${fixture} ../tests/core/${fixture}.cpp)
+    target_link_libraries(crit_core_${fixture} PRIVATE crit_core)
+    crit_strict_warnings(crit_core_${fixture})
+    foreach(_case IN LISTS ARGN)
+      add_test(NAME crit_core_${_case} COMMAND crit_core_${fixture} ${_case})
+      set_tests_properties(crit_core_${_case} PROPERTIES TIMEOUT ${timeout})
+    endforeach()
+  endfunction()
+
+  crit_core_cases(text_tests 30 text_stop_rules text_stop_oracle text_stop_linear text_stream text_offset_rules
+    text_offset_bytes text_offset_sentencepiece text_offset_bounds text_stream_offsets text_utf8)
+
+  crit_core_cases(sampling_tests 60 sampling_philox sampling_uniform sampling_validate sampling_history sampling_copy sampling_greedy sampling_law sampling_frequency sampling_redo sampling_penalties sampling_bias sampling_min_tokens sampling_logprobs sampling_infinity sampling_errors sampling_allocation sampling_scale sampling_score_rows sampling_accept sampling_suppress_padding sampling_magnitude sampling_constraint)
+
+  crit_core_cases(constraints_tests 120 constraint_vocabulary constraint_choices constraint_json constraint_grammar
+    constraint_readout constraint_sampling)
+  # Independent standard-library oracles feed generated, mutated and truncated byte strings to the native matchers.
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    foreach(_oracle json grammar)
+      add_test(NAME crit_core_constraint_${_oracle}_oracle COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/core/${_oracle}_constraint_oracle.py" $<TARGET_FILE:crit_core_constraints_tests>)
+      set_tests_properties(crit_core_constraint_${_oracle}_oracle PROPERTIES TIMEOUT 120)
+    endforeach()
+  endif()
+
+  crit_core_cases(state_tests 120 state_config state_transactions state_ownership state_prefixes state_collisions state_reuse state_completeness state_index state_lru state_epochs state_forks state_recurrent state_hybrid state_failures state_randomized state_capacity state_layout state_metadata state_hot_path state_checkpoints)
+
+  crit_core_cases(io_tests 120 json_valid json_rejects json_utf8 json_strings json_numbers json_nonfinite json_limits json_access json_file json_random sha256_vectors sha256_chunked file_identity file_change file_read_exact file_read_chunks file_read_errors file_map file_open_errors host_memory_v2 host_memory_v1 host_memory_malformed host_memory_admission host_memory_live)
+
+  crit_core_cases(model_tests 60 model_dtypes model_header_valid model_header_rejects model_limits model_subbyte model_header_only model_index model_extra_files model_directory model_symlinks model_bytes model_digests model_change_detection model_retained model_random model_config_eval model_config_types model_generation model_stop_ids)
+
+  # Operator ranges, compiled in (every case but trace_disabled) and compiled out (trace_disabled).
+  set(_crit_trace_cases trace_scopes trace_bounds trace_binding trace_reader trace_engine)
+  if(CRIT_CORE_NVTX)
+    list(APPEND _crit_trace_cases trace_nvtx)
+  endif()
+  crit_core_cases(trace_tests 60 ${_crit_trace_cases})
+  target_compile_definitions(crit_core_trace_tests PRIVATE CRIT_TRACE_ENABLED)
+  add_executable(crit_core_trace_disabled_tests ../tests/core/trace_tests.cpp)
+  target_link_libraries(crit_core_trace_disabled_tests PRIVATE crit_core)
+  crit_strict_warnings(crit_core_trace_disabled_tests)
+  add_test(NAME crit_core_trace_disabled COMMAND crit_core_trace_disabled_tests trace_disabled)
+  set_tests_properties(crit_core_trace_disabled PROPERTIES TIMEOUT 30)
+
+  crit_core_cases(graph_tests 30 graph_key graph_identity graph_generations graph_prerequisites graph_failures graph_receipts
+    graph_plan graph_state graph_state_failures)
+
+  crit_core_cases(device_memory_tests 30 memory_leases memory_lifetime memory_settle_failure memory_release_failure
+    memory_threads mapped_contiguous mapped_discontinuous mapped_rejects mapped_generations)
+
+  if(CRIT_CORE_CUDA)
+    add_executable(crit_core_cuda_tests ../tests/core/cuda_tests.cpp)
+    target_link_libraries(crit_core_cuda_tests PRIVATE crit_core_cuda)
+    crit_strict_warnings(crit_core_cuda_tests)
+    foreach(_test allocations ordering release partial engine timer readback stages retained spare)
+      add_test(NAME crit_core_cuda_${_test} COMMAND crit_core_cuda_tests ${_test})
+      set_tests_properties(crit_core_cuda_${_test} PROPERTIES TIMEOUT 45)
+    endforeach()
+    add_executable(crit_core_cuda_category_timer_tests ../tests/core/cuda_category_timer_tests.cpp)
+    target_link_libraries(crit_core_cuda_category_timer_tests PRIVATE crit_core_cuda)
+    crit_strict_warnings(crit_core_cuda_category_timer_tests)
+    add_test(NAME crit_core_cuda_category_timer COMMAND crit_core_cuda_category_timer_tests)
+    set_tests_properties(crit_core_cuda_category_timer PROPERTIES TIMEOUT 45)
+    # Graph capture harness; cuBLAS supplies capture-safe library calls for the fixture only.
+    add_executable(crit_core_cuda_graph_tests ../tests/core/cuda_graph_tests.cpp)
+    target_link_libraries(crit_core_cuda_graph_tests PRIVATE crit_core_cuda CUDA::cublas)
+    crit_strict_warnings(crit_core_cuda_graph_tests)
+    foreach(_test arithmetic ordering failures widths)
+      add_test(NAME crit_core_cuda_graph_${_test} COMMAND crit_core_cuda_graph_tests ${_test})
+      set_tests_properties(crit_core_cuda_graph_${_test} PROPERTIES TIMEOUT 45)
+    endforeach()
+    add_executable(crit_core_cuda_memory_tests ../tests/core/cuda_memory_tests.cpp)
+    target_link_libraries(crit_core_cuda_memory_tests PRIVATE crit_core_cuda)
+    crit_strict_warnings(crit_core_cuda_memory_tests)
+    foreach(_test leases mapping)
+      add_test(NAME crit_core_cuda_memory_${_test} COMMAND crit_core_cuda_memory_tests ${_test})
+      set_tests_properties(crit_core_cuda_memory_${_test} PROPERTIES TIMEOUT 45)
+    endforeach()
+    add_executable(crit_foreign_stream_tests ../tests/core/foreign_stream_tests.cpp)
+    target_include_directories(crit_foreign_stream_tests PRIVATE ../kernels/examples/foreign-stream)
+    target_link_libraries(crit_foreign_stream_tests PRIVATE crit_core_cuda)
+    crit_strict_warnings(crit_foreign_stream_tests)
+    add_test(NAME crit_foreign_stream COMMAND crit_foreign_stream_tests)
+    set_tests_properties(crit_foreign_stream PROPERTIES TIMEOUT 45)
+    include(CheckLinkerFlag)
+    check_linker_flag(CXX "LINKER:--wrap=crit_link_probe" CRIT_CORE_HAS_LINKER_WRAP)
+    if(CRIT_CORE_HAS_LINKER_WRAP)
+      target_compile_definitions(crit_core_cuda_tests PRIVATE CRIT_TEST_LINKER_WRAP=1)
+      target_link_options(crit_core_cuda_tests PRIVATE
+        -Wl,--wrap=cudaStreamSynchronize -Wl,--wrap=cudaMalloc
+        -Wl,--wrap=cudaMallocHost -Wl,--wrap=cudaFree -Wl,--wrap=cudaFreeHost
+        -Wl,--wrap=cudaStreamCreateWithFlags -Wl,--wrap=cudaStreamDestroy)
+      add_test(NAME crit_core_cuda_faults COMMAND crit_core_cuda_tests faults)
+      set_tests_properties(crit_core_cuda_faults PROPERTIES TIMEOUT 45)
+      target_compile_definitions(crit_core_cuda_graph_tests PRIVATE CRIT_TEST_LINKER_WRAP=1)
+      target_link_options(crit_core_cuda_graph_tests PRIVATE -Wl,--wrap=cudaGraphLaunch -Wl,--wrap=cudaStreamSynchronize)
+      add_test(NAME crit_core_cuda_graph_quarantine COMMAND crit_core_cuda_graph_tests quarantine)
+      set_tests_properties(crit_core_cuda_graph_quarantine PROPERTIES TIMEOUT 45)
+    else()
+      message(STATUS "Portable CUDA lifetime fixtures enabled; linker-injected failure fixtures require --wrap and are omitted.")
+    endif()
+  endif()
+endif()

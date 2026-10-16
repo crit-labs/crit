@@ -1,0 +1,2 @@
+# Preserve source bytes and declared hashes across platforms.
+* -text -filter -ident

@@ -1,0 +1,69 @@
+{
+  "id": "model-import-audit",
+  "category": "memory-and-loading",
+  "summary": "Bounded Safetensors headers, exact tensor roles and packed-shard geometry",
+  "implementation_status": "reference",
+  "implementation_scope": "Metadata inspection through Core's strict safetensors reader (crit_core.model) under the audit policy, and engine-supplied role/capability/packed-geometry audits; no tensor payload decoding or inference",
+  "agent_guidance": {
+    "use_when": "Check that an imported artifact contains the exact tensor roles and local codec geometry required by an engine",
+    "avoid_when": "A qualified importer already enforces these checks, or unsupported container/dtype/layout semantics are needed",
+    "provides": [
+      "Audit policy over Core's strict reader: strict flat indexes, no symbolic links, tighter limits and byte-addressable dtypes only",
+      "Actual header shape/storage-dtype matching against exact required tensor roles",
+      "Requested-capability metadata status separate from observed proposer invocation",
+      "Packed local K-word/group-scale geometry and namespace checks"
+    ],
+    "engine_supplies": [
+      "Immutable trusted source snapshot, complete required roles and architecture/config/tokenizer interpretation",
+      "Exact codec value semantics, numerical validation, tensor loading and payload content identity",
+      "Qualified synchronous proposer, target verification, mutable-state repair and publication",
+      "Physical allocations, stream completion and source retention when loading audited regions"
+    ],
+    "preserve": [
+      "Read actual tensor headers rather than trusting names, counts or descriptive dtype claims",
+      "Reject inconsistent shard maps, unsupported representations and incomplete requested roles",
+      "Keep local packed words and scales aligned to the same K slice and declared matrix namespace",
+      "Metadata readiness never establishes runtime arithmetic, model quality or performance"
+    ],
+    "adapt": [
+      "Bounded container/dtype support and engine-supplied architecture schemas",
+      "Additional explicit codec geometry, tensor naming and runtime observation hooks"
+    ]
+  },
+  "path": "inference/model-import-audit/README.md",
+  "code_path": "inference/model-import-audit/code",
+  "code_files": [
+    {
+      "path": "inference/model-import-audit/code/implementation.py",
+      "purpose": "Checked metadata reader, exact role/capability audit, packed K-shard geometry and separate proposer probe"
+    },
+    {
+      "path": "inference/model-import-audit/code/example.py",
+      "purpose": "Runnable tiny synthetic artifact, required MTP roles, local packed-scale audit and observed toy proposer invocation"
+    }
+  ],
+  "requires": {
+    "hardware": "Python 3.11+ with crit_core (Core's Python package, standard library only); no GPU or model download",
+    "model": "Supported byte-addressable Safetensors headers and exact engine-supplied tensor-role/codec schemas",
+    "workload": "Read-only import preflight on a bounded immutable source snapshot; no tensor arithmetic"
+  },
+  "contract": {
+    "input": "One .safetensors file or strict flat .safetensors.index.json plus ModelSchema with exact required roles",
+    "output": "Immutable ModelInventory metadata and AuditResult bindings/capability_status, with an optional separate ProposerProbe",
+    "ownership": "Metadata file descriptors close after inspection. The engine freezes source bytes, rechecks identity before loading and retains actual allocations through completion.",
+    "failure": "Reject duplicate/malformed JSON, invalid extents, holes/overlap/truncation, index escapes/contradictions, missing roles and inconsistent packed shard geometry. I/O and probe hook failures propagate.",
+    "core_boundary": "Container parsing is Core's strict safetensors reader (crit_core.model inspect_safetensors/inspect_model; natively crit::core::Checkpoint); the audit adds its policy and keeps architecture roles and encoding interpretation outside Core. Audited metadata is not an allocation, readiness or model-correctness receipt."
+  },
+  "dependencies": ["Python standard library", "crit_core.model (Core's Python package)"],
+  "symbols": [
+    "Limits", "TensorInfo", "ShardInfo", "ModelInventory", "inspect_safetensors", "inspect_model",
+    "TensorRole", "CapabilityRequirement", "PackedMatrix", "ModelSchema", "audit_model", "probe_proposer"
+  ],
+  "interactions": ["artifact-loading", "quantized-projections", "mtp-decode"],
+  "techniques": ["model-import-audit", "artifact-loading", "quantized-projections", "mtp-decode"],
+  "validation": {
+    "host": "Adversarial synthetic header/index/schema fixtures and the runnable example cover actual dtype/shape checks, requested proposer invocation and local K-scale geometry",
+    "native": "No native parser, GGUF, sub-byte dtype support, FP8 numerical decoding, learned MTP head or model execution is supplied or qualified",
+    "performance": "Header work is bounded; model import/inference speed and trained-model quality are unmeasured"
+  }
+}

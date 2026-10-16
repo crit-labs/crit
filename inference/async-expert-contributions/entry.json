@@ -1,0 +1,69 @@
+{
+  "id": "async-expert-contributions",
+  "category": "experts",
+  "summary": "Join asynchronous route contributions after complete settlement",
+  "implementation_status": "reference",
+  "implementation_scope": "Occurrence-keyed host join with retained owners and ordered reduction; producer execution is external",
+  "agent_guidance": {
+    "use_when": "Independent producers contribute to one routed result and need a shared publication boundary",
+    "avoid_when": "A single fused operation already produces the complete result without separate contributions",
+    "provides": [
+      "Unique occurrence acceptance and source retention",
+      "All-producer readiness, ordered reduction and terminal error propagation",
+      "Abort retaining owners until quiescence"
+    ],
+    "engine_supplies": [
+      "Already-weighted equal-width contribution vectors",
+      "Execution receipts whose done/result certify completion and success",
+      "Launch-failure ownership and producer quiescence"
+    ],
+    "preserve": [
+      "One result per route occurrence, including repeated experts",
+      "All readers settle before owners release",
+      "Successful complete join before output publication"
+    ],
+    "adapt": [
+      "Executor and host/device placement",
+      "Reduction method with declared numerical criteria",
+      "Native dependency ordering in place of host polling"
+    ]
+  },
+  "path": "inference/async-expert-contributions/README.md",
+  "code_path": "inference/async-expert-contributions/code",
+  "code_files": [
+    {
+      "path": "inference/async-expert-contributions/code/implementation.py",
+      "purpose": "Occurrence-keyed host join with retained owners and ordered reduction; producer execution is external"
+    }
+  ],
+  "requires": {
+    "hardware": "Python 3.11+ and standard library for the host reference; backend hardware is an engine choice",
+    "model": "Any operation with multiple independent contributions; no fixed expert or vector geometry",
+    "workload": "Potential producer overlap where transfer and join costs are worth paying"
+  },
+  "contract": {
+    "input": "Unique route positions, physical-settlement receipts and retained source owners",
+    "output": "Merged contribution or terminal error after complete settlement",
+    "ownership": "Accepted work retains its source. The caller supplies execution/quiescence; receipt.done must certify physical completion.",
+    "failure": "Reject duplicate/unknown work and early settlement. Failed quiescence retains the accepted owner set.",
+    "core_boundary": "Connect contribution readiness to core progress and include every producer in drain/retirement."
+  },
+  "dependencies": [
+    "Python standard library"
+  ],
+  "symbols": [
+    "ContributionGroup"
+  ],
+  "interactions": [
+    "heterogeneous-expert-dispatch"
+  ],
+  "techniques": [
+    "async-expert-contributions",
+    "heterogeneous-expert-dispatch"
+  ],
+  "validation": {
+    "host": "Host fixtures and worked example cover missing/delayed contributions, ordered joins, errors and abort retention",
+    "native": "Native overlap, stream ordering and arithmetic remain unqualified by host fixtures",
+    "performance": "Unmeasured for a native engine; host fixture success is not a speed claim"
+  }
+}

@@ -1,0 +1,96 @@
+{
+  "id": "rmsnorm-bf16",
+  "category": "projections",
+  "summary": "BF16 RMS normalization with optional offset gain or SiLU gate",
+  "implementation_status": "native_source",
+  "implementation_scope": "CUDA row kernel, validated borrowed BF16 views, host formula and standalone native mode/shape/alias POC; engine quality/performance remain external",
+  "agent_guidance": {
+    "use_when": "Contiguous BF16 row normalization matches the engine formula and an optional gate belongs at its epilogue",
+    "avoid_when": "Views or formulas differ without adaptation, or an existing fused kernel already handles normalization efficiently",
+    "provides": [
+      "CUDA FP32 row reduction with BF16 output and plain/unit-offset/gated modes",
+      "Native shape, stride, workspace and alias validation",
+      "CMake target and executable Python formula reference",
+      "Host reference for folding split-reduction partials into the residual in a fixed order before normalizing (deterministic, no atomics)"
+    ],
+    "engine_supplies": [
+      "Device views, caller stream and lifetime/readiness integration",
+      "Native toolchain build and supported target configuration",
+      "Native numerical, alias, shape-boundary and performance validation"
+    ],
+    "preserve": [
+      "Gain convention and epsilon placement",
+      "Declared input/output representations, supported aliases and view lifetime",
+      "Rounding and reduction behavior assessed under engine criteria"
+    ],
+    "adapt": [
+      "Thread/reduction structure and vectorization",
+      "Supported layouts, dimensions and fusion",
+      "Kernel dispatch based on actual workload measurements"
+    ]
+  },
+  "path": "inference/rmsnorm-bf16/README.md",
+  "code_path": "inference/rmsnorm-bf16/code",
+  "code_files": [
+    {
+      "path": "inference/rmsnorm-bf16/code/CMakeLists.txt",
+      "purpose": "Native component build recipe"
+    },
+    {
+      "path": "inference/rmsnorm-bf16/code/implementation.cu",
+      "purpose": "CUDA FP32 reduction and BF16 normalization/gated epilogue"
+    },
+    {
+      "path": "inference/rmsnorm-bf16/code/include/crit/rmsnorm.h",
+      "purpose": "Native borrowed-view interface"
+    },
+    {
+      "path": "inference/rmsnorm-bf16/code/interface.cpp",
+      "purpose": "Native view/alias validation"
+    },
+    {
+      "path": "inference/rmsnorm-bf16/code/reference.py",
+      "purpose": "Executable host contract/formula reference"
+    },
+    {
+      "path": "inference/rmsnorm-bf16/code/example.cpp",
+      "purpose": "Standalone native borrowed-view POC with independent BF16 oracle, boundary shapes, aliases and metadata rejection"
+    }
+  ],
+  "requires": {
+    "hardware": "Python 3.11+ for the formula; native source requires CMake 3.28+, C++/CUDA 20, the CUDA toolkit and a device compatible with the chosen build",
+    "model": "Row RMS normalization on BF16 input/gain/output; optional equal-shaped gate",
+    "workload": "Native source accepts width 1..8192, rows 1..49152 and contiguous two-byte elements"
+  },
+  "contract": {
+    "input": "BF16 device views, gain row, optional gate, positive FP32 epsilon and caller stream",
+    "output": "Enqueued BF16 output plus Dispatch metadata",
+    "ownership": "Caller retains all device views until stream completion. Exact input/output or gate/output aliases are admitted; partial aliases and output/gain overlap are rejected.",
+    "failure": "Host validation rejects unsupported views, shapes, modes, epsilon, workspace and aliases before enqueue. Launch errors throw; caller handles physical settlement.",
+    "core_boundary": "Use core-owned device buffers and stream; normalization arithmetic remains a technique/consumer component."
+  },
+  "dependencies": [
+    "Python standard library for the formula",
+    "CMake 3.28+ and C++/CUDA 20 for native build",
+    "CUDA runtime and BF16 headers for native source"
+  ],
+  "symbols": [
+    "validate",
+    "enqueue",
+    "normalize",
+    "fold_partials",
+    "fold_and_normalize"
+  ],
+  "interactions": [
+    "quantized-projections"
+  ],
+  "techniques": [
+    "rmsnorm-bf16",
+    "quantized-projections"
+  ],
+  "validation": {
+    "host": "Python formula fixtures and worked example cover modes, shapes, finite values and gain conventions; no CUDA execution",
+    "native": "Standalone CUDA example checks 91 bounded finite mode/shape/alias cases against an independent double/BF16 formula, width/row limits and metadata rejection; extreme numerical ranges, full-model quality and speed require consumer evidence",
+    "performance": "Unmeasured for a native engine; host fixture success is not a speed claim"
+  }
+}

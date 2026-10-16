@@ -1,0 +1,139 @@
+{
+  "id": "attention-state",
+  "category": "attention",
+  "summary": "FP32 or encoded int8 KV page storage for Core's StateCache and ragged batched CPU attention with GQA/MQA, masks and RoPE",
+  "implementation_status": "native_source",
+  "implementation_scope": "FP32 and G32 int8 KV page storage behind Core's StateCache (which keeps pages, rounds, copy-on-write, prefix reuse and retirement), head-range decoding, scalar paged attention, tiled CPU attention and keyed ragged batches; scalar or optional synchronous GEMM, Core continuous-batching example; fused/device attention external",
+  "agent_guidance": {
+    "use_when": "Share committed causal prefixes, branch speculative KV and run bounded-workspace CPU prefill/decode with explicit heads, masks and positions",
+    "avoid_when": "The model has no KV attention, prefix reuse lacks complete sibling-state identity, or a device/fused kernel is required; encoded KV uses G32 int8 and needs the codec in the cache identity for prefix reuse",
+    "provides": [
+      "Committed/pending KV transactions with partial acceptance, rollback and rewind (dense Python reference; native rounds through Core's StateCache)",
+      "Host FP32 page storage behind Core's StateCache: StateStorage copy-on-write hook, checked row staging at Round::kv and block-table views for attention",
+      "Single-query scalar paged attention, tiled MHA/GQA/MQA prefill/decode, causal/window/keep/bias masks and partial RoPE",
+      "Private bounded scratch with retained KV image, synchronous GEMM contract, cancellation and optional OpenBLAS integration",
+      "Physically compressed G32 int8 page storage behind Core's StateCache with bounded head-range decoding into attention scratch",
+      "Keyed ragged batches with retained private plans, aggregate resource limits and all-or-nothing result return; synthetic Core mixed-scheduling integration"
+    ],
+    "engine_supplies": [
+      "Model projections, head geometry, RoPE frequencies/layout/position IDs, attention scale and allowed causal prefixes",
+      "Core reservations for arena/scratch/result/metadata and provider overhead, request admission, one thread for StateCache calls and retire() after physical completion",
+      "Device allocation/encoding, write readiness, optimized arithmetic and physical completion when adapting beyond CPU",
+      "Complete state/representation identity and any logits, sampler or non-KV state needed for prefix reuse"
+    ],
+    "preserve": [
+      "Only accepted rows become committed and reused prefixes contain only committed state",
+      "Shared or indexed pages stay immutable (the cache copies a shared tail through copy_rows); released pages are reused only after retire() covers their epoch",
+      "Rejected rows and rejected rounds cannot publish partial KV",
+      "Token identity, representation identity, geometry and logical capacity remain consistent",
+      "Query logical rows and rotary positions remain distinct; GEMM outputs are complete and synchronous before any result is published"
+    ],
+    "adapt": [
+      "Page geometry, row layout, KV codec and device allocator (another StateStorage)",
+      "GEMM provider, arithmetic profile, tile sizes, head dispatch, batching and mask representation",
+      "StateCache configuration (page count, prefix reuse, identity) and coordinated request resource accounting"
+    ]
+  },
+  "path": "inference/attention-state/README.md",
+  "code_path": "inference/attention-state/code",
+  "code_files": [
+    {
+      "path": "inference/attention-state/code/implementation.py",
+      "purpose": "Dense Python KV transaction and single-query stable-softmax formula"
+    },
+    {
+      "path": "inference/attention-state/code/paged_example.cpp",
+      "purpose": "Runnable StateCache prefix reuse, scalar paged attention over reused and staged rows, discard and retirement example"
+    },
+    {
+      "path": "inference/attention-state/code/attention.h",
+      "purpose": "Strided head views, rotary transforms, scalar paged attention and tiled paged CPU attention with masks, GQA/MQA, bounded private workspace and synchronous GEMM"
+    },
+    {
+      "path": "inference/attention-state/code/attention_example.cpp",
+      "purpose": "Runnable native RoPE, GQA prefill, StateCache prefix reuse and decode example with memory payload reporting"
+    },
+    {
+      "path": "inference/attention-state/code/encoded_kv.h",
+      "purpose": "G32 int8 KV page storage for Core's StateCache (encoded staging, copy-on-write hook) with requested-head decoding into bounded attention scratch"
+    },
+    {
+      "path": "inference/attention-state/code/encoded_example.cpp",
+      "purpose": "Runnable encoded KV attention and StateCache branch rollback with payload/scratch reporting"
+    },
+    {
+      "path": "inference/attention-state/code/state_pages.h",
+      "purpose": "Host FP32 KV rows indexed by Core's StateCache page ids: StateStorage copy-on-write, checked row staging at Round::kv and block-table views (rows, prefixes) for attention"
+    },
+    {
+      "path": "inference/attention-state/code/batch_attention.h",
+      "purpose": "Strided head views, rotary transforms, scalar paged attention and tiled paged CPU attention with masks, GQA/MQA, bounded private workspace and synchronous GEMM"
+    },
+    {
+      "path": "inference/attention-state/code/batch_example.cpp",
+      "purpose": "Runnable Core mixed prefill/decode integration with 16 active lanes, refill and 24 synthetic requests on Core's StateCache, checked against independent dense generation, plus a fork copy-on-write check"
+    }
+  ],
+  "requires": {
+    "hardware": "Python 3.11+ for the dense reference; C++20 standard library and 32-bit IEEE float for native CPU storage and arithmetic",
+    "model": "Dot-product attention with explicit key/value rows; key and value widths may differ",
+    "workload": "KV transactions, shared prompt prefixes, speculative branches, full/chunked prefill and decode with explicit logical query indices"
+  },
+  "contract": {
+    "input": "Finite FP32 KV/query values, geometry/capacities, logical query rows, explicit RoPE positions/frequencies, optional masks/bias, exact tokens and complete representation identity",
+    "output": "Packed attention values/logsumexp over block-table views of StateCache sequences; all-masked rows produce zero/-inf",
+    "ownership": "StatePages or EncodedPages hold the rows; Core's StateCache owns which sequence references which page. Views and plans copy a block table and own no pages: pages a sequence releases stay readable until retire() covers the releasing epoch, so device adapters retire only after physical completion. A later round of the same sequence may overwrite an unshared tail past a rewind. Attention plans read one KV image and own private scratch; input/mask spans and synchronous GEMM providers remain live through run, with no simultaneous workspace reuse. Batch plans retain every request view and private workspace; input permutation is resolved by request/generation identity. One batch rejects concurrent or reentrant execution.",
+    "failure": "Reject invalid geometry/domain, nonfinite rows (before StateCache::begin, so nothing changes), rows outside a page and empty attention; StateCache rejects capacity, stale ids and invalid commit/rewind. Native attention rejects nonfinite scores/results. Tiled attention validates strides, masks and scratch admission; cancellation or failed/incomplete GEMM returns no partial result and leaves KV unchanged. Batch identity validation precedes arithmetic; aggregate request/query/workspace/output/metadata limits apply and no partial batch result escapes a failure.",
+    "core_boundary": "Core owns request/resource/lifetime policy and all KV page/sequence/round/copy-on-write/prefix bookkeeping and retirement (crit/state.h StateCache). Inference keeps only storage formats (StatePages FP32, EncodedPages G32 int8, both StateStorage implementations) and attention math. The engine reserves the arena, calls StateCache from one thread and supplies model arithmetic and physical completion."
+  },
+  "dependencies": [
+    "Python standard library",
+    "C++20 standard library for native pages and attention",
+    "Optional separately retained OpenBLAS provider via Kernels attention_gemm.h; no provider required for scalar execution",
+    "Core's state cache (crit::core) for every native page storage, example and fixture",
+    "Native encoded KV additionally includes quantized-projections/code/grouped_int.h; add both code directories to the include path"
+  ],
+  "symbols": [
+    "KVState",
+    "paged_attention",
+    "HeadTensorView",
+    "rotary",
+    "AttentionGeometry",
+    "AttentionMask",
+    "AttentionResult",
+    "ScalarAttentionGemm",
+    "PagedAttentionPlan",
+    "EncodedPages",
+    "EncodedPagesView",
+    "BasicAttentionPlan",
+    "AttentionRequestKey",
+    "AttentionBatchSpec",
+    "AttentionBatchInput",
+    "AttentionBatchResult",
+    "AttentionBatchLimits",
+    "BasicAttentionBatch",
+    "PagedAttentionBatch",
+    "StatePages",
+    "StatePagesView"
+  ],
+  "interactions": [
+    "mtp-decode",
+    "session-scheduling",
+    "checkpoint-storage",
+    "concurrent-request-execution",
+    "quantized-projections"
+  ],
+  "techniques": [
+    "attention-state",
+    "mtp-decode",
+    "session-scheduling",
+    "checkpoint-storage",
+    "concurrent-request-execution",
+    "quantized-projections"
+  ],
+  "validation": {
+    "host": "Python fixtures retain the dense transaction/formula example; native StatePages fixtures cover row staging, partial commit, discard, rewind, fork copy-on-write, prefix reuse through StateCache, rejected rows and 5000 randomized transitions against a value oracle",
+    "native": "StatePages fixtures plus 2304 independent dense-reference attention cases, RoPE/prefill/decode/COW comparisons, varied continuation chunks and shared-prefix boundaries around page edges, cancellation, extreme logits and failed kernels; optional retained OpenBLAS profile repeats numerical/integration checks. Device fences and full-model behavior remain unqualified; native encoded KV fixture covers packed storage accounting, StateCache COW, rollback/rewind, invalid append, capacity rejection and generic attention against decoded KV; ragged batch fixture adds 74 dense comparisons, mixed geometry, permuted/stale/duplicate identities, aggregate limits, cancellation/reentrancy and later-row failure; encoded batch identity/results and 24 Core synthetic dense-generation comparisons on Core's StateCache with StatePages, plus a fork copy-on-write check",
+    "performance": "No engine throughput/latency claim; page sharing and workspace bounds are functional properties, and synchronous CPU GEMM provider speed requires workload-specific measurement"
+  }
+}

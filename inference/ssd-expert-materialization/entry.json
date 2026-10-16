@@ -1,0 +1,99 @@
+{
+  "id": "ssd-expert-materialization",
+  "category": "experts",
+  "summary": "Checked expert reads and bounded native mapped gather with batched read-ahead",
+  "implementation_status": "native_source",
+  "implementation_scope": "Checked host expert reads/upload retention plus a native coalesced-advice, bounded parallel gather with task draining over Core's read-only file mapping (crit::core::ReadOnlyFile)",
+  "agent_guidance": {
+    "use_when": "Expert demand reads encoded file regions and useful read-ahead can hide some source latency",
+    "avoid_when": "Weights are already resident, reads are not a bottleneck, or speculative traffic consumes more bandwidth than it saves",
+    "provides": [
+      "Length/digest checked demand reads and executor-based read-ahead",
+      "Reuse of pending reads and retained source/destination materializations",
+      "Separate read quiescence and ambiguous-upload recovery boundary",
+      "Native mapped-file region gather with request-order outputs, coalesced read-ahead and bounded workers",
+      "Private output allocation, cancellation checks and join-before-release on worker/submission errors"
+    ],
+    "engine_supplies": [
+      "Trusted encoded descriptors, verified artifact identity and immutable-file guarantees; native gather worker/output limits",
+      "upload hook with destination ownership and physical readiness",
+      "Read-ahead prediction, staging limits and upload quiescence"
+    ],
+    "preserve": [
+      "Exact encoded identity and complete reads",
+      "Source bytes survive all upload readers",
+      "Read completion is separate from upload completion and cache readiness"
+    ],
+    "adapt": [
+      "File I/O API, batching and staging allocation; optional platform-specific resident/buffered/direct read selection",
+      "Causal prediction and outstanding-work limits with urgent demand protected from speculative queues",
+      "Integrity policy under explicit immutable-source assumptions"
+    ]
+  },
+  "path": "inference/ssd-expert-materialization/README.md",
+  "code_path": "inference/ssd-expert-materialization/code",
+  "code_files": [
+    {
+      "path": "inference/ssd-expert-materialization/code/implementation.py",
+      "purpose": "Immutable region reads, deduplicated pending futures and upload-retention protocol; prediction and physical upload are external"
+    },
+    {
+      "path": "inference/ssd-expert-materialization/code/mapped_gather.h",
+      "purpose": "Bounded native immutable mapping and sparse region gather with prefetch hints, private output and worker draining"
+    }
+  ],
+  "requires": {
+    "hardware": "Python 3.11+ and standard library for the host reference; backend hardware is an engine choice; C++20 and Core's files library (crit::core) for native gather",
+    "model": "Expert weights described as immutable encoded file regions; no fixed tensor shape or storage device",
+    "workload": "Demand/read-ahead file materialization with bounded staging and separate read/upload lifetimes"
+  },
+  "contract": {
+    "input": "ExpertRegion records, immutable file and executor/upload hooks",
+    "output": "Encoded expert bytes or Materialization(owner, encoded_source, readiness); native gather returns owned bytes in region order and advice/worker counters",
+    "ownership": "Source owns pending reads and retains bytes/upload services after ambiguous enqueue. Successful Materialization retains both copy endpoints/readiness. Upload service retains partial destinations; read quiescence does not prove upload quiescence. Native gathers retain their immutable mapping, borrowed request descriptors and private output through every joined task; POSIX callers prevent file mutation/truncation.",
+    "failure": "Reject malformed/changed extents, missing experts and closed-source reads. Failed-upload staging survives until explicit physical upload-quiescence proof. Native mapping validates byte/region/worker caps and drains launched tasks; mapping does not verify checksums or convert OS mapping faults into C++ exceptions.",
+    "core_boundary": "The native file handle, read-only mapping, change detection and read-ahead hint are Core's ReadOnlyFile; this entry adds the sparse coalesced gather. Use core-owned upload buffers/streams; expert representation and prefetch selection remain consumer policy."
+  },
+  "dependencies": [
+    "Python standard library",
+    "C++20 threads/futures and Core's files library (crit::core)"
+  ],
+  "symbols": [
+    "ExpertRegion",
+    "Materialization",
+    "FileExpertSource",
+    "crit::storage::MappedFile",
+    "crit::storage::ByteRegion",
+    "crit::storage::GatherLimits",
+    "crit::storage::GatherResult"
+  ],
+  "interactions": [
+    "expert-residency",
+    "quantized-projections"
+  ],
+  "techniques": [
+    "ssd-expert-materialization",
+    "expert-residency",
+    "quantized-projections"
+  ],
+  "validation": {
+    "host": "Host fixtures and worked example cover checked file reads, pending reuse, read failure and failed-upload retention/recovery",
+    "native": "Windows and Linux fixtures check mapped page boundaries, duplicates, coalescing, sequential/parallel equivalence, empty files, bounds, cancellation and retry; no storage-throughput or GPU-upload qualification",
+    "performance": "Unmeasured for a native engine; host fixture success is not a speed claim"
+  },
+  "native_integration": {
+    "status": "Native mapped gather supplied; physical upload, pinned staging and cache publication remain engine services",
+    "required_hooks": [
+      "Exact immutable region reads and explicit read-completion/quiescence",
+      "Owned staging and partial destination cleanup for the selected upload service",
+      "Operation-specific read-to-upload and upload-to-consumer ordering with physical-reader quiescence"
+    ],
+    "guide": "inference/expert-residency/README.md",
+    "integration_scope": "Optional file-backed expert materialization. Resident engines need no file source; batching, prediction and CUDA uploads are choices.",
+    "optimization_candidates": [
+      "Batched asynchronous file/source fetching and component upload",
+      "Deduplicated causal read-ahead that charges unused terminal work",
+      "Measured cold/warm native read-path selection with aligned extents, pinned ownership and bounded urgent/background staging"
+    ]
+  }
+}

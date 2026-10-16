@@ -1,0 +1,95 @@
+{
+  "id": "concurrent-request-execution",
+  "category": "execution",
+  "summary": "Compact request rows, produce host metadata deltas and execute bounded independent CPU batches with completion notification",
+  "implementation_status": "native_source",
+  "implementation_scope": "Ready-row compaction, immutable stable-slot metadata snapshots and bounded incremental patches, owned candidate copies, single-use commit handoff and retirement barrier; native uploads and model batching are external; C++20 HostBatch executes independent CPU tasks through Core async batch lifecycle",
+  "agent_guidance": {
+    "use_when": "Several requests produce variable candidate rows with independent readiness and lifetime",
+    "avoid_when": "Only one request runs, or existing core/engine staging already supplies the same handoff",
+    "provides": [
+      "Ordered ready-row selection with admitted row limit",
+      "Copied and reserved candidate groups consumed once at commit",
+      "Receipt-based independent owner retirement",
+      "Stable request/generation slots with immutable retained snapshots and changed-row byte patches",
+      "Exact-base delta validation, atomic host apply and independently ordered row gathers",
+      "Real asynchronous host batch execution with private result storage and retained owners"
+    ],
+    "engine_supplies": [
+      "Active request/generation mapping and model execution",
+      "Success checks beyond done(), byte reservations and partial-failure cleanup",
+      "Model commit/recovery and core publication",
+      "Snapshot and native replica memory reservations, ordered patch uploads and physical reader retention",
+      "Thread-safe shared model inspection and independent per-operation workspaces, accounting and cancellation"
+    ],
+    "preserve": [
+      "Compact rows retain original request/generation identity",
+      "Copy and reserve before borrowed storage is invalidated",
+      "Commit success before publication; physical completion before retirement"
+    ],
+    "adapt": [
+      "Compaction layout, group size and request selection policy",
+      "Reservation representation and native dependency handling",
+      "Physical row selectors for optional pooled graphs, independent of logical request/generation identity"
+    ]
+  },
+  "path": "inference/concurrent-request-execution/README.md",
+  "code_path": "inference/concurrent-request-execution/code",
+  "code_files": [
+    {
+      "path": "inference/concurrent-request-execution/code/implementation.py",
+      "purpose": "Ready-row compaction, owned candidate copies, single-use commit handoff and retirement barrier; model batching is external"
+    },
+    {
+      "path": "inference/concurrent-request-execution/code/metadata.py",
+      "purpose": "Stable keyed metadata rows, immutable snapshots, changed-byte deltas and atomic host replica/gather updates"
+    },
+    {
+      "path": "inference/concurrent-request-execution/code/host_batch.h",
+      "purpose": "Owned CPU batch execution, nonblocking future readiness, single-use commit and joining lifetime for Core pipeline"
+    }
+  ],
+  "requires": {
+    "hardware": "Python 3.11+ and standard library for the host reference; backend hardware is an engine choice; C++20 host threads for native helper",
+    "model": "Engine with independent request state and variable nonempty candidate rows",
+    "workload": "Concurrent requests with declared per-request output budgets and physical receipts"
+  },
+  "contract": {
+    "input": "Row identities, candidates, physical readiness, per-request output budgets and reservation hooks",
+    "output": "Copied StagedGroup rows and a pollable RetirementBarrier",
+    "ownership": "Consumer owns state/group commit. Native core owns admission, scheduling, publication, poison/quarantine and final producer/backend retirement.",
+    "failure": "Reject duplicate/unsettled rows, excess candidates and repeat commit; a failed model callback is not automatically rolled back",
+    "core_boundary": "Map compact rows to native Model concurrent callbacks; preserve the header contract rather than copying a worker/runtime."
+  },
+  "dependencies": [
+    "Python standard library",
+    "C++20 standard library and Core SDK for HostBatch"
+  ],
+  "symbols": [
+    "Row",
+    "compact_ready",
+    "StagedGroup",
+    "RetirementBarrier",
+    "MetadataRow",
+    "MetadataSnapshot",
+    "MetadataDelta",
+    "MetadataTable",
+    "MetadataReplica",
+    "OwnedBatchRow",
+    "HostBatch"
+  ],
+  "interactions": [
+    "session-scheduling",
+    "mtp-decode"
+  ],
+  "techniques": [
+    "concurrent-request-execution",
+    "session-scheduling",
+    "mtp-decode"
+  ],
+  "validation": {
+    "host": "Host fixtures and worked example cover row compaction, copies, budgets, failed commit and independent retirement; 500 metadata mutation/gather comparisons, stale deltas, slot rebinding, immutable old readers and invalid-patch non-publication",
+    "native": "C++ CPU integration tests exercise independent overlap, ordered output, cancellation, refill, prepare/submit/producer/commit failure, stale membership, deadline cleanup and quarantine; immediate/racing completion notification, no idle batch polling, retained trace spans and slow/failure classification; device arithmetic remains unqualified",
+    "performance": "Unmeasured for a native engine; host fixture success is not a speed claim"
+  }
+}

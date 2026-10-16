@@ -1,0 +1,97 @@
+{
+  "id": "recorded-selection",
+  "category": "execution",
+  "summary": "Select compatible eager/full/partial replay by measured costs and retain reproducible per-shape implementation choices",
+  "implementation_status": "native_source",
+  "implementation_scope": "Python and header-only C++20 recorded choice tables and repeatability checks, plus a portable Python phase/shape/capability/memory replay selector with cold-setup amortization; candidate execution, native capture and costs are engine supplied",
+  "agent_guidance": {
+    "use_when": "The engine chooses among interchangeable implementations whose rounding differs, or among supported eager/full/partial execution offers with measured costs and memory limits",
+    "avoid_when": "Only one execution path is available and reproducible, or replay offers lack trustworthy compatibility identities and costs",
+    "provides": [
+      "Power-of-two width buckets with a minimum and cap, and canonical shape keys",
+      "Choice table: recorded indices replay exactly, tuning picks the fastest with lower-index ties and skips candidates that cannot run, otherwise candidate 0",
+      "Export of every choice as a flat JSON table for the frozen configuration, and a strict native parser",
+      "Out-of-range detection when a recorded index exceeds the current candidate list",
+      "Cross-process repeatability runner with first differing JSON path and sequence index, usable as functional-check evidence",
+      "Compatible eager/full/partial selection using measured run/setup costs, memory limits and explicit padding permission"
+    ],
+    "engine_supplies": [
+      "Stable candidate lists per key (for example a library heuristic list queried at the bucket width)",
+      "Synchronized device timing on representative inputs and a warm-up pass per bucket",
+      "Exact-shape acceptance check before reusing a bucket choice at another width, with a deterministic fallback",
+      "Library version and device identity stored beside the table, and the command that writes comparable output",
+      "Complete backend/representation/allocation identities, supported execution offers and revalidated launch resources"
+    ],
+    "preserve": [
+      "Timing never runs on the serving path; recorded choices replay exactly",
+      "Candidate order is reproducible for the recorded software and device",
+      "A bucket choice is used at another width only when the backend accepts it",
+      "Repeatability compares complete outputs of separate processes"
+    ],
+    "adapt": [
+      "Key dimensions, bucket minimum and cap",
+      "Candidate sources and timing method",
+      "Warm-up widths and the compared output format"
+    ]
+  },
+  "path": "inference/recorded-selection/README.md",
+  "code_path": "inference/recorded-selection/code",
+  "code_files": [
+    {
+      "path": "inference/recorded-selection/code/selection.py",
+      "purpose": "Width buckets, keys, table validation and the recorded/tuned/fallback choice table with export"
+    },
+    {
+      "path": "inference/recorded-selection/code/selection.h",
+      "purpose": "Header-only C++20 buckets, choice table with timing callback, JSON export and strict parser"
+    },
+    {
+      "path": "inference/recorded-selection/code/repeatability.py",
+      "purpose": "Runs a command in fresh processes and reports the first differing JSON path and sequence index"
+    },
+    {
+      "path": "inference/recorded-selection/code/replay.py",
+      "purpose": "Backend-neutral eager/full/partial replay choice with complete identities, padding permission, memory feasibility and amortized measured costs"
+    }
+  ],
+  "requires": {
+    "hardware": "Python 3.11+ standard library; C++20 standard library for the native table",
+    "model": "No model or tensor layout requirement",
+    "workload": "Any engine that selects among implementations per shape, and any command that can write its result as JSON"
+  },
+  "contract": {
+    "input": "Operation names, shape dimensions and widths; candidate counts with an optional timing callback; a recorded flat JSON table; a command containing {output}",
+    "output": "(index, source) per key, an exported table, and a repeatability report with per-run digests and first differences",
+    "ownership": "The table owns its recorded and chosen maps; the engine owns candidates, plans and timing; the runner owns its temporary output directory",
+    "failure": "Reject non-positive widths, non-power-of-two minimums, widths above the cap, empty candidate lists, recorded indices beyond the list, malformed tables and commands without {output}; a failed run reports exit status 2",
+    "core_boundary": "No Core change; choices live in the engine configuration and the runner is a check tool outside the serving path"
+  },
+  "dependencies": [
+    "Python standard library",
+    "C++20 standard library for the native table"
+  ],
+  "symbols": [
+    "bucket",
+    "key",
+    "validate",
+    "Table",
+    "crit::techniques::selection::Table",
+    "first_difference",
+    "compare",
+    "ExecutionShape",
+    "ReplayOffer",
+    "ReplayChoice",
+    "select_replay"
+  ],
+  "interactions": [
+    "quantized-projections"
+  ],
+  "techniques": [
+    "recorded-selection"
+  ],
+  "validation": {
+    "host": "Buckets and caps, keys, table validation, tuning ties and unavailable candidates, replay without timing, out-of-range indices, difference reports for values, lengths, types and nested sequences, and fresh-process runs that are identical, different or failing; Replay amortization, phase/identity gates, padding, resident/cold memory limits and partial fallback",
+    "native": "Header-only table: bucket rules, tuning ties, replay without timing, fallback, out-of-range indices, to_json/parse round trip and malformed tables",
+    "performance": "No speed or determinism claim for any candidate; both are the engine's measurements"
+  }
+}

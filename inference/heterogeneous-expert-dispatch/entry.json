@@ -1,0 +1,139 @@
+{
+  "id": "heterogeneous-expert-dispatch",
+  "category": "experts",
+  "summary": "Measured CPU/device dispatch with host working-set admission, exact source plans and native router/shared fusion",
+  "implementation_status": "native_source",
+  "implementation_scope": "Host placement, measured capacity-bounded prefix splits with immutable calibration identities and exact-count timing medians, and mixed-source plans; compact-batch CUDA FP8 router/shared-SwiGLU entry and top-k/shared-down grid. Timing collection, allocation and routed-expert arithmetic remain external. Optional exact-identity HostMemoryCosts account for CPU scratch, loader bytes, pinned staging and additional file pages on CPU and upload paths; injected admission gates ranking and can be revalidated before allocation.",
+  "agent_guidance": {
+    "use_when": "Compare placement or mixed-source dispatch, select CPU/device splits from measured workload-specific costs, or combine independent router/shared-expert branches for 1-8 tokens",
+    "avoid_when": "Dispatch adds no useful choice and branch launches are not a bottleneck; native fusion requires the declared FP8/BF16 layouts, SiLU product and selected-logit softmax semantics; measured lane curves require comparable work geometry and explicit overlap, otherwise measure whole candidate implementations",
+    "provides": [
+      "Feasible host-prefix/device-suffix plans including fixed bytes and headroom",
+      "Occurrence-preserving split dispatch and weighted contribution combination",
+      "Measured CPU/upload/device cost curves, exact identity checks and byte/occurrence-bounded prefix split ranking without interpolation",
+      "Deduplicated exact miss demands, protected-source plan validation and one quantize/project handoff",
+      "One-grid FP8 router and shared gate/up projection with BF16 SiLU product",
+      "One-grid deterministic top-k/selected softmax and independent BF16 shared-down projection",
+      "Per-candidate anonymous/pinned/file working-set costs and admission reasons; fresh admission revalidation before submission"
+    ],
+    "engine_supplies": [
+      "Validated encoded device views, routed-expert arithmetic, model-specific shared gating and physical placement",
+      "Protected READY snapshot plus complete scratch staging before reads",
+      "Exact fallback execution, receipts and measured strategy selection",
+      "Matched current model/layout/workload/code/topology identities, measured lane and common-overhead samples under representative contention, valid dual-path misses and protected resident sources",
+      "Disjoint incremental peak costs and fresh OS observations, independent device reservations, allocation failure cleanup and an admitted exact fallback"
+    ],
+    "preserve": [
+      "Every occurrence keeps its expert identity, position and weight",
+      "Repeated experts share compatible sources; scratch cannot alias READY content",
+      "Overflow uses exact fallback rather than wrapping expert IDs",
+      "Miss substitution and gate reweighting are outside this exact dispatch contract and require separate consumer quality criteria",
+      "Routing ties select the lower original expert ID; shared-down output is unweighted and kept separate from routed contributions",
+      "Never rank an unmeasured split as zero cost; deduplicate bundle uploads while retaining every weighted route occurrence; calibration identities must match",
+      "Missing memory estimates cannot win; file-backed working sets are not automatically charged as anonymous commit; admission snapshots do not reserve memory"
+    ],
+    "adapt": [
+      "Static placement order and source-selection policy",
+      "Host/device routing, staging and kernel fusion",
+      "Scratch capacity and arithmetic implementation under declared criteria",
+      "Miss ordering, calibrated work classes, CPU/device overlap model and occurrence/staging limits"
+    ]
+  },
+  "path": "inference/heterogeneous-expert-dispatch/README.md",
+  "code_path": "inference/heterogeneous-expert-dispatch/code",
+  "code_files": [
+    {
+      "path": "inference/heterogeneous-expert-dispatch/code/implementation.py",
+      "purpose": "Executable host placement and source-selection algorithms; optimized quantization, projection and staging are explicit backend hooks"
+    },
+    {
+      "path": "inference/heterogeneous-expert-dispatch/code/measured_dispatch.py",
+      "purpose": "Immutable sample curves and identities; measured prefix dispatch planning with exact routes, unique uploads, explicit overlap and capacity/missing-data handling"
+    },
+    {
+      "path": "inference/heterogeneous-expert-dispatch/code/fused_moe.h",
+      "purpose": "Native router/shared branch geometry, routing semantics and ownership"
+    },
+    {
+      "path": "inference/heterogeneous-expert-dispatch/code/fused_moe.cu",
+      "purpose": "Fused compact-batch FP8 entry and independent routing/shared-down CUDA grid"
+    },
+    {
+      "path": "inference/heterogeneous-expert-dispatch/code/CMakeLists.txt",
+      "purpose": "Native fusion library and FP8 dependency build"
+    }
+  ],
+  "requires": {
+    "hardware": "Python 3.11+ and standard library for the host reference; backend hardware is an engine choice; C++/CUDA20 and SM80+ for the optional fused component",
+    "model": "Expert-routed execution with explicit route occurrences and compatible source representations",
+    "workload": "Memory-constrained placement or mixed-source routed projections; fixed/scratch capacities use different units; native router/shared fusion supports 1-8 tokens, 1-1024 experts and top-k up to 32"
+  },
+  "contract": {
+    "input": "Ordered routing occurrences; protected READY slot/generation snapshot, explicit capacity and disjoint scratch; static allocation groups and fixed/workspace/headroom byte extents; native fusion takes contiguous encoded matrices/activations and caller-owned output spans/stream; measured planning also takes current calibration identity, raw timing curves, complete upload extents and staging/route limits; optional HostMemoryCosts with exact route/upload tables and an injected admission callback",
+    "output": "Host/device partitions or a single exact cache/scratch/stock plan with deduplicated staging demands; one quantize/project submission through declared hooks; feasible static prefix plans; native router scores, BF16 shared activations, original expert IDs/weights and unweighted FP32 shared output; feasible measured split candidates with missing-sample reasons and an optional best estimate; incremental host memory bytes and admission decisions/reasons retained for each candidate",
+    "ownership": "Caller retains leases for every source, route buffer, activation and result until completion. READY snapshots do not pin owners; scratch is reserved for the operation.",
+    "failure": "Reject conflicting/duplicate occurrences, invalid weights, source-slot aliases, unprotected scratch overlap, invalid generations and fabricated demands. Scratch exhaustion preserves original stock expert IDs. Measured planning rejects identity mismatches and invalid samples; absent samples cannot win and no measured feasible plan returns best=None for caller fallback. Missing or rejected memory costs cannot win; failed revalidation requires replanning or exact fallback before allocation/submission.",
+    "core_boundary": "Consumer owns partition policy/arithmetic; core owns physical services and producer quiescence."
+  },
+  "dependencies": [
+    "Python standard library",
+    "CUDA toolkit, CMake 3.28+ and the quantized-projections native component"
+  ],
+  "symbols": [
+    "Route",
+    "partition",
+    "combine",
+    "ResidencyGroup",
+    "ResidencyPlan",
+    "prefix_residency_plans",
+    "ReadySlot",
+    "MixedRoute",
+    "MixedSourcePlan",
+    "mixed_source_plan",
+    "execute_mixed",
+    "crit::moe::entry_cuda",
+    "crit::moe::route_down_cuda",
+    "CalibrationKey",
+    "TimingCurve",
+    "DispatchCalibration",
+    "DispatchCandidate",
+    "DispatchDecision",
+    "plan_dispatch",
+    "HostMemoryCosts",
+    "revalidate_memory"
+  ],
+  "interactions": [
+    "async-expert-contributions",
+    "expert-residency",
+    "quantized-projections",
+    "recorded-selection",
+    "host-memory-admission"
+  ],
+  "techniques": [
+    "heterogeneous-expert-dispatch",
+    "async-expert-contributions",
+    "expert-residency"
+  ],
+  "validation": {
+    "host": "Host fixtures and worked example cover budget feasibility, repeated routes, exact fallback, scratch separation and one activation preparation; measured policy fixtures check median/sparse/nonlinear costs, identity changes, explicit overlap, byte and occurrence limits, arbitrary widths, repeated expert uploads and weighted result preservation; RAM/commit/cgroup limits, unknown costs/observations, distinct experts and upload sources, fresh revalidation, zero incremental resident paths and route preservation",
+    "native": "RTX 5090 CUDA fixtures compare 24 router/shared fusion cases to host arithmetic and shared activations exactly to separate CUDA calls; selected softmax, ties and aliases are checked. Mixed cache/stock expert kernels and complete model behavior remain consumer work",
+    "performance": "Unmeasured for a native engine; host fixture success is not a speed claim"
+  },
+  "native_integration": {
+    "status": "Native router/shared branch fusion supplied; mixed-source routed-expert arithmetic and physical cache staging remain engine services",
+    "required_hooks": [
+      "Route-preserving projection arithmetic and physical source/result ownership for the selected path",
+      "One quantization and one source-aware projection hook when execute_mixed is selected",
+      "Complete scratch-bundle staging before projection reads when scratch is used",
+      "Scheduler copies and projection use the same protected READY snapshot/version when caching is used"
+    ],
+    "guide": "inference/expert-residency/README.md",
+    "integration_scope": "Optional consumer dispatch. Split execution does not require the mixed-source hook or device routing.",
+    "optimization_candidates": [
+      "Choose a unified cache/stock native projection over split execution when duplicate work is a measured bottleneck",
+      "Device route resolution without host readback",
+      "Stable graph-native exact-demand scratch staging"
+    ],
+    "first_native_milestone": "Real-layer mixed resident/original projection, exact misses and scheduler copies using the same protected snapshot, with actual backend placement asserted after allocation and activation provenance declared. Then verify full-model decode and source transitions independently; isolated parity or configuration tuning is insufficient."
+  }
+}

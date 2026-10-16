@@ -1,0 +1,19 @@
+# Publish only these root files and complete product folders.
+/*
+!/.gitignore
+!/.gitattributes
+!/AGENTS.md
+!/CLAUDE.md
+!/README.md
+!/CHANGELOG.md
+!/LICENSE
+!/pyproject.toml
+!/core/
+!/inference/
+!/kernels/
+!/tests/
+!/docs/
+!/eval/
+!/cli/
+!/api/
+!/.github/

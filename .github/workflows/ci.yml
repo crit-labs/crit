@@ -1,0 +1,101 @@
+name: Host and installed SDK
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+        python: ['3.11', '3.14']
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Use a canonical temporary directory
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          temporary = (Path(os.environ['GITHUB_WORKSPACE']).resolve() / 'build' / 'ci-temp')
+          temporary.mkdir(parents=True, exist_ok=True)
+          temporary = temporary.resolve()
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as environment:
+              for name in ('TMP', 'TEMP', 'TMPDIR'):
+                  environment.write(f'{name}={temporary}\n')
+          print(f'Temporary fixtures: {temporary}')
+          PY
+      - name: Install pinned runtime dependencies
+        run: python -m pip install tokenizers==0.23.3 jinja2==3.1.6
+      - name: Host contracts and chat processes
+        run: python -B -m unittest discover -s tests -v
+      - name: Build native host SDK
+        run: |
+          cmake -S core -B build/core -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/core --config Release --parallel 2
+          ctest --test-dir build/core -C Release --output-on-failure
+          cmake --install build/core --config Release --prefix "$PWD/build/core-install"
+          cmp LICENSE build/core-install/share/licenses/crit/LICENSE
+      - name: Build native host SDK with Clang
+        # GCC -Wshadow misses a local that hides an anonymous-namespace variable; Clang -Wshadow reports it.
+        if: runner.os == 'Linux'
+        run: |
+          cmake -S core -B build/core-clang -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++
+          cmake --build build/core-clang --config Release --parallel 2
+          ctest --test-dir build/core-clang -C Release --output-on-failure
+      - name: Build Inference native examples and fixtures against Core
+        run: |
+          cmake -S inference -B build/inference -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/inference --config Release --parallel 2
+          ctest --test-dir build/inference -C Release --output-on-failure
+      - name: Inference against the installed Core SDK
+        run: |
+          cmake -S inference -B build/inference-installed -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release -DCRIT_INFERENCE_INSTALLED_CORE=ON -DCMAKE_PREFIX_PATH="$PWD/build/core-install"
+          cmake --build build/inference-installed --config Release --parallel 2
+          ctest --test-dir build/inference-installed -C Release --output-on-failure
+      - name: Core and Inference walkthrough from checkout
+        run: |
+          cmake -S inference/examples/core-projection -B build/core-projection -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/core-projection --config Release --parallel 2
+          ctest --test-dir build/core-projection -C Release --output-on-failure
+      - name: Independent installed SDK consumers
+        run: |
+          cmake -S tests/core/concurrency_consumer -B build/consumer -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$PWD/build/core-install"
+          cmake --build build/consumer --config Release --parallel 2
+          ctest --test-dir build/consumer -C Release --output-on-failure
+      - name: Native Kernels integration and retained dependency fixtures
+        run: |
+          cmake -S kernels/examples/openblas -B build/kernels -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release -DPython3_EXECUTABLE="$(python -c 'import sys; print(sys.executable)')"
+          cmake --build build/kernels --config Release --parallel 2
+          ctest --test-dir build/kernels -C Release --output-on-failure
+      - name: Build and install Python package from a disposable snapshot
+        run: |
+          python -m pip install setuptools==84.0.0 wheel==0.48.0
+          mkdir -p build/package-source
+          git archive HEAD | tar -x -C build/package-source
+          python -B -c "import os; from setuptools.build_meta import build_sdist, build_wheel; os.chdir('build/package-source'); build_sdist('../dist'); build_wheel('../dist')"
+          python -m pip install --no-deps build/dist/*.whl
+          cd build/ci-temp
+          crit --version
+          crit kernels
+      - name: Verify source stayed unchanged
+        run: git diff --exit-code

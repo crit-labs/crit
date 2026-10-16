@@ -1,0 +1,64 @@
+{
+  "protocol": "crit-eval-v3",
+  "speed": {
+    "warmup_runs": 1,
+    "repetitions": 3,
+    "output_tokens": 256,
+    "sampling": "greedy",
+    "stop_tokens": "disabled; a stop token inside the output is reported as stop_crossed",
+    "aggregate": "median per case; the decode score is the geometric mean of the case medians",
+    "prefill_cases": ["long-summary", "agent-long"],
+    "prefill_aggregate": "prefill tok/s = prompt tokens / time to first token; the prefill score is the geometric mean over prefill_cases",
+    "ttft_aggregate": "the TTFT score is the geometric mean of the case medians of time to first token in ms, over every case",
+    "decode_text": "with a pinned continuation (crit eval pin) and a replaying adapter, speed is measured by replaying that text; otherwise on each engine's own greedy output. Decode scores on different texts are not compared"
+  },
+  "quality": {
+    "top_k": 16,
+    "paths": ["prefill", "decode", "verify"],
+    "kl": "KL(reference || engine) over the reference top-k plus one lumped tail bucket",
+    "thresholds": {
+      "ppl_ratio_max": 1.05,
+      "kld_mean_max": 0.05,
+      "kld_p99_max": 0.5
+    },
+    "budget": "the thresholds are a drift budget to spend on speed, not a score to minimise; a run sets its own with --quality-budget"
+  },
+  "exactness": {
+    "rule": "greedy speculative output equals the engine's own non-speculative greedy output token for token",
+    "default": "reported",
+    "modes": "reported: agreement is shown and every emitted path is judged by the quality budget; required: any difference fails the gate"
+  },
+  "headroom": {
+    "pass_floor": "bytes read per model pass (adapter bytes_per_pass plus KV bytes at the case's context) / achievable device bandwidth",
+    "prefill_floor": "model FLOPs per prompt token by stored weight format / device GEMM rate of that format, plus attention and recurrent FLOPs at the BF16 rate",
+    "decode_ceiling": "the larger of this drafter's speed of light and a drafter whose later drafts are accepted as often as its first, at floor costs, up to acceptance_ceiling_width",
+    "acceptance_ceiling_width": 8,
+    "ttft_floor": "the larger of the prompt's compute floor and one read of the weights plus its KV writes at the device bandwidth"
+  },
+  "context": {
+    "max_context": "min(model limit, device limit): the positions config.json declares, and the KV cache that fits in the device's free memory (crit eval probe) after the VRAM headroom, the reserve, the weights read on every pass and the fixed state, at kv_precision, rounded down to granularity",
+    "kv_precision": "fp8",
+    "kv_bytes_per_element": 1,
+    "reserve_gib": 3,
+    "granularity": 1024,
+    "engine": "every engine is opened with context_tokens = the required context; the speed cases, quality and exactness all run on that build",
+    "curve": "after the speed cases and quality, on the same engine, one greedy request per point fills the context exactly (prompt + output = point): powers of two from curve_from below the requirement, then the requirement itself; the prompt is copies of the longest speed case's prompt ending with a whole one",
+    "curve_from": 32768,
+    "output_tokens": 256,
+    "repetitions": 1,
+    "capacity": "the engine reports max_context of at least the requirement and completes the request at the requirement",
+    "lower_context": "the speed cases on an engine opened at lower_fraction of the requirement (never below the longest speed case), measured just before the engine built for the requirement; no case may decode slower or reach its first token later than at the requirement by more than its tolerance",
+    "lower_fraction": 0.25,
+    "tolerance": 0.05,
+    "tolerance_rule": "per case and KPI, the larger of tolerance and the run-to-run spread of that case in either measurement"
+  },
+  "heldout": {
+    "purpose": "speed gains must generalize: the held-out prompts (suite/heldout.json, several languages and domains) are outside the speed suite, and no engine choice may be tuned or selected on them",
+    "measure": "on the engine built for the required context, after the speed cases: each prompt decodes its own greedy output, output_tokens long, repetitions times; the median decode tok/s and tokens per round per prompt, and the held-out decode score as their geometric mean",
+    "output_tokens": 256,
+    "repetitions": 2,
+    "generality": "against a baseline result that measured the held-out prompts: the held-out decode score may not fall by more than tolerance, and no held-out prompt may decode slower than in the baseline by more than prompt_tolerance; how far the held-out change trails the suite's is reported; without such a baseline the gate is unmeasured and the scores are reported",
+    "tolerance": 0.05,
+    "prompt_tolerance": 0.1
+  }
+}

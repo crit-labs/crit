@@ -1,0 +1,116 @@
+{
+  "id": "device-expert-cache",
+  "category": "experts",
+  "summary": "Device cache planning/copies and portable policy replay with capacity changes, live pins, aging and phase/speculative traffic accounting",
+  "implementation_status": "native_source",
+  "implementation_scope": "CUDA warp planner with pinned clock replacement, bundle copies and lookahead prefetch; Python directory reference. Independent portable replay compares LRU/LFU/clock/hindsight eviction and optional second-touch admission over arbitrary byte-sized bundles. Physical execution, calibration, predictor and phase switching remain engine supplied. Replay supports explicit capacity/aging/pin events, optional prefill population and recent decode protection, and phase/traffic fetch and prefetch-waste accounting without using draft outcomes in online decisions.",
+  "agent_guidance": {
+    "use_when": "Routed experts live in device-readable host memory behind a device slot cache, and per-layer host round trips dominate short decode steps; use portable replay to screen replacement/admission policies on retained demand traces before native adaptation",
+    "avoid_when": "All experts fit on the device, the host plan already overlaps device work, or large prefill batches touch most experts of a layer anyway",
+    "provides": [
+      "Device directory arrays with stamp pins, clock hand, failure flag and hit/miss/pool counters",
+      "One-warp plan of up to 32 distinct routes per group with hits pinned before any admission",
+      "Warp-parallel clock victims identical to scanning one slot at a time",
+      "Copy jobs from the store or from a tagged prefetch pool, and a multi-block bundle copy kernel",
+      "Lookahead prefetch planner over a two-half pool selected by group parity",
+      "Host reference ClockDirectory and a hit-rate simulator for recorded routing traces",
+      "Offline byte-budget replay with grouped hit pins, exact bypass, warmup-excluded scores, fetch bytes and optional additive measured miss costs",
+      "LRU, cumulative LFU, clock and farthest-next-use comparison from identical input; always or second-touch admission",
+      "Capacity changes with atomic refusal under live pins; independent pin owners and explicit frequency decay",
+      "Prefill reuse/population policy, recent decode protection and phase/demand/draft/prefetch costs with unused versus wasted prefetch bytes"
+    ],
+    "engine_supplies": [
+      "Device-visible store with one contiguous bundle per key and the slot/pool allocations",
+      "Initial directory contents and the switch to and from host planning phases",
+      "Router outputs, expert arithmetic reading Use bundles and the lookahead predictor",
+      "Side-stream fork after the group's own fill and the join before the next plan",
+      "Checking the failure flag before trusting a step",
+      "Complete demand groups, content/representation-keyed bundle extents, measured miss costs where available, held-out traces and actual execution validation",
+      "Faithful phase/traffic events, explicit lifetime pins valid for each policy, and actual capacity/aging schedules"
+    ],
+    "preserve": [
+      "Every route of a plan is pinned against that plan's admissions",
+      "Copies complete before arithmetic reads a slot; a key maps to at most one slot",
+      "The pool half being consumed is not refilled before its plan",
+      "Host and device apply the same replacement rule when both plan",
+      "Replay misses always retain exact demand identity; unknown costs stay unknown; hindsight results and additive miss costs are not online throughput evidence",
+      "Accepted and rejected draft labels use identical online replacement decisions; hindsight is confined to farthest-next-use",
+      "Refused capacity shrink does not partially evict live content or change the budget"
+    ],
+    "adapt": [
+      "Replacement policy that respects pins, bundle layout and copy granularity",
+      "Blocks per copy, prefetch width and predictor",
+      "Mapped reads versus DMA copies, and graph capture boundaries",
+      "Offline byte budgets, replacement/admission policies and warmup; native policy changes still require host/device parity and lifetime validation"
+    ]
+  },
+  "path": "inference/device-expert-cache/README.md",
+  "code_path": "inference/device-expert-cache/code",
+  "code_files": [
+    {
+      "path": "inference/device-expert-cache/code/device_cache.h",
+      "purpose": "Directory, Use and Fill types and the plan, fill and prefetch launch interface"
+    },
+    {
+      "path": "inference/device-expert-cache/code/device_cache.cu",
+      "purpose": "Warp planner with pinned clock admission, bundle copy kernel and lookahead prefetch planner"
+    },
+    {
+      "path": "inference/device-expert-cache/code/device_cache.py",
+      "purpose": "Host reference of the directory rules and a trace hit-rate simulator"
+    },
+    {
+      "path": "inference/device-expert-cache/code/replay.py",
+      "purpose": "Portable byte-budget policy comparison with complete-group pins, exact bypass, warmup, measured miss-cost accounting and a hindsight eviction reference"
+    }
+  ],
+  "requires": {
+    "hardware": "CUDA C++20 with device-readable host memory for the store; Python 3.11+ standard library for the reference; portable replay uses only Python's standard library and needs no device",
+    "model": "Routed experts with at most 32 distinct routes per group and fixed-size bundles (a multiple of 16 bytes); offline replay instead accepts arbitrary complete bundle sizes and group widths",
+    "workload": "Decode steps where host planning latency per routed layer is significant and expert reuse is high; replay also supports recorded grouped accesses under byte pressure independently of CUDA geometry"
+  },
+  "contract": {
+    "input": "Directory pointers and geometry; group index; device route ids and optional weights; predicted ids for prefetch; replay takes ordered complete demand groups, exact bundle keys/extents, optional miss costs, a byte budget and warmup prefix; optional Demand phase/traffic labels and Capacity, Decay, Pin and Release events",
+    "output": "Use per route (slot bundle, key, weight); copy jobs and their count; updated directory, pool tags and counters; replay returns distinct-demand hit/miss scores, fetch bytes, admission/bypass/eviction counts, optional additive cost and peak retained bytes; initial/final capacity, refused shrinks, phase/traffic counters and wasted/unused prefetch bytes",
+    "ownership": "The engine owns every array, the store, slots and pool; kernels borrow them on the caller's stream; uses stay valid until a later plan of the same directory evicts the slot. Replay copies input metadata into private analysis state and owns no physical allocations.",
+    "failure": "Launches reject invalid geometry, more than 32 or more than slot-count routes and null pointers; on the device an out-of-range or duplicate route sets state[2] = 1 and yields a null use; a plan without a victim sets state[2] = 2. Replay rejects unknown keys, invalid budgets/extents/costs or policies; insufficient admission space bypasses without partial eviction and still charges the exact miss. Invalid/nonresident pins and unknown releases fail; impossible shrink is reported atomically.",
+    "core_boundary": "No Core change; Core supplies allocations, streams and readiness; residency policy stays with the engine"
+  },
+  "dependencies": [
+    "CUDA runtime",
+    "Python standard library for the reference"
+  ],
+  "symbols": [
+    "Directory",
+    "Use",
+    "Fill",
+    "enqueue_plan",
+    "enqueue_fill",
+    "enqueue_prefetch_plan",
+    "ClockDirectory",
+    "simulate",
+    "Bundle",
+    "ReplayResult",
+    "replay",
+    "compare_policies",
+    "Demand",
+    "Capacity",
+    "Decay",
+    "Pin",
+    "Release",
+    "TrafficStats"
+  ],
+  "interactions": [
+    "expert-residency",
+    "heterogeneous-expert-dispatch",
+    "device-speculative-round"
+  ],
+  "techniques": [
+    "device-expert-cache"
+  ],
+  "validation": {
+    "host": "ClockDirectory pins hits before admissions, chooses clock victims, copies predicted misses from the pool, rejects duplicates and out-of-range routes; byte replay checks variable sizes, grouped pins, second-touch, warmup and missing costs; randomized clock comparison against ClockDirectory and exhaustive equal-size single-demand mandatory-admission hindsight oracle; capacity/pin atomicity and ownership, growth, aging, phase isolation, warmup control boundaries and speculative outcome independence",
+    "native": "600 random plans with lookahead prefetch on 24 and 72 slots against a host replica: identical slots, hit/miss/pool counters, complete bundle bytes, duplicate-route flag and rejected launches",
+    "performance": "No throughput claim"
+  }
+}

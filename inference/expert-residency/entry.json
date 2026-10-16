@@ -1,0 +1,139 @@
+{
+  "id": "expert-residency",
+  "category": "experts",
+  "summary": "Complete expert bundles, phase-aware admission, bank planning and temporary cache memory loans",
+  "implementation_status": "native_source",
+  "implementation_scope": "Python cache/bundle ownership, phase-aware host admission, physical bank/copy planning and C++ slot/region-loan state machines; actual backend transfers and projection are external",
+  "agent_guidance": {
+    "use_when": "Routed weight reuse can repay cache management when preferred-device capacity is limited",
+    "avoid_when": "Reuse is poor, weights already fit, or exact direct access/static placement is cheaper",
+    "provides": [
+      "Byte-bounded ready-object cache with leases and settled-only eviction",
+      "Fixed-slot complete-component upload/publication and protected uses",
+      "C++ slot generations, upload/use identities and sequence exhaustion guards",
+      "Temporary contiguous cache-region loans, transactional survivor relocation, private operation owners, settled return and graph-binding invalidation",
+      "Phase-aware population/read-only reuse with protected reads that preserve replacement ages",
+      "Compatible-layout bank budgets including guards/alignment and dual-contiguous component copy runs",
+      "Original-demand occurrence/unique counts with caller-measured phase/mode transfer and synchronization costs"
+    ],
+    "engine_supplies": [
+      "Representation-complete keys/component layouts, initialized guards and actual bank/map/staging reservations",
+      "Actual copies, ordered READY publication and operation-specific receipts",
+      "Loan region/survivor policy, complete contiguous slot geometry, scratch alignment and lifetime retention through failed-drain recovery",
+      "Projection, policy selection, teardown and backend failure recovery"
+    ],
+    "preserve": [
+      "Correct content identity and generation for every read",
+      "All components ready before publication; all readers settled before overwrite",
+      "Failed overwrite never resurrects old content; account actual physical bytes",
+      "Loans alias one charged backing reservation; all copy and scratch dependencies settle before capacity returns"
+    ],
+    "adapt": [
+      "Replacement/admission policy and pool capacity, including decayed original-demand scores and measured marginal benefit per byte",
+      "Key, component layout and metadata representation",
+      "Host or device management and integration with a fused backend",
+      "Population token bound, layout-group budget shares and native transfer granularity"
+    ]
+  },
+  "path": "inference/expert-residency/README.md",
+  "code_path": "inference/expert-residency/code",
+  "code_files": [
+    {
+      "path": "inference/expert-residency/code/implementation.py",
+      "purpose": "Python byte-cache leases and complete-component bundle directory with retained upload/use identities"
+    },
+    {
+      "path": "inference/expert-residency/code/settled_slots.h",
+      "purpose": "C++ content directory with protected acquisitions, settled publication, transactional region loans/relocation, retained operation owners and binding generations"
+    },
+    {
+      "path": "inference/expert-residency/code/loan_example.cpp",
+      "purpose": "Runnable native host copy/scratch/refill example with one retained Core backing reservation"
+    },
+    {
+      "path": "inference/expert-residency/code/planning.py",
+      "purpose": "Phase-aware exact cache admission, compatible bank sizing, coalesced component ranges and cost observations"
+    },
+    {
+      "path": "inference/expert-residency/code/example.py",
+      "purpose": "Runnable host byte-storage POC for complete staging, exact fallback and read-only prefill"
+    }
+  ],
+  "requires": {
+    "hardware": "Python 3.11+ for reference protocols; C++20 for the slot directory; device integration requires its chosen backend",
+    "model": "Expert-routed computation with caller-defined revisions, layouts, encodings and complete bundles",
+    "workload": "Repeated routed demands under a bounded memory envelope; profitability depends on locality and miss costs"
+  },
+  "contract": {
+    "input": "Representation-complete expert keys and exact extents; fixed slot-indexed component encodings/extents, reserved backing owners and ticket-bound enqueue receipts; explicit workload phase, complete bank geometry/budget and unique expert/slot copy pairs",
+    "output": "Owner leases or ready slot/generation maps and unique bundle upload/use identities; admission, physically sized bank spans, component transfer ranges and phase/mode observations; generation-bound loan/copy/borrow handles and exclusive scratch extents",
+    "ownership": "Directory owns serialized metadata and retains caller-reserved backing/staging owners. Every read remains protected until settlement; complete upload publication waits for all component copies. Register loan copies/borrowers before enqueue and retain the directory until close succeeds. Ambiguous submissions require physical quiescence before settlement; loans keep their backing reservation charged once.",
+    "failure": "Reject protected/loading exhaustion, duplicate or foreign tickets/uses, missing components, stale receipts, encoding/extent mismatch and unsettled publication. Failed copies leave overwritten content empty. C++ sequence exhaustion cannot wrap identities.",
+    "core_boundary": "Consumer owns expert representation/reuse policy. Core supplies byte reservations, allocation and CUDA readiness."
+  },
+  "dependencies": [
+    "Python standard library",
+    "C++20 standard library for settled_slots.h",
+    "crit Core resources for loan_example.cpp only"
+  ],
+  "symbols": [
+    "ExpertKey",
+    "ExpertCache",
+    "ExpertLease",
+    "crit::techniques::SettledSlots",
+    "begin_loan",
+    "begin_relocation",
+    "activate_loan",
+    "acquire_loan",
+    "settle_loan_use",
+    "begin_return",
+    "reclaim_loan",
+    "BundleComponent",
+    "BundleTicket",
+    "BundleReceipt",
+    "BundleUse",
+    "BundleDirectory",
+    "CacheAdmission",
+    "cache_admission",
+    "BankComponent",
+    "LayerExperts",
+    "BankSpan",
+    "BankAllocation",
+    "BankPlan",
+    "size_banks",
+    "CopyRun",
+    "copy_runs",
+    "CacheObservation",
+    "observe_cache"
+  ],
+  "interactions": [
+    "ssd-expert-materialization",
+    "heterogeneous-expert-dispatch"
+  ],
+  "techniques": [
+    "expert-residency",
+    "ssd-expert-materialization",
+    "heterogeneous-expert-dispatch"
+  ],
+  "validation": {
+    "host": "Python fixtures cover bundle publication, phase/bank/copy planning and failures. Native CPU fixtures cover loan admission, overlap/fragmentation, protected regions, partial relocation failure, independent sessions, retained owners, binding invalidation and 1,250 real byte-copy loan/return cycles; the example checks Core reservation lifetime.",
+    "native": "Native cache transfers, device publication, encoded projections and model behavior remain unqualified by host fixtures",
+    "performance": "Unmeasured for a native engine; host fixture success is not a speed claim"
+  },
+  "native_integration": {
+    "status": "unqualified; hooks are not supplied by the host reference",
+    "required_hooks": [
+      "Physical storage and complete copies/materialization of every declared slot-indexed component",
+      "Operation-specific physical completion and success attestation",
+      "Ordered complete-bundle visibility before readers use the slot",
+      "Protected uses and backend quiescence before overwriting or releasing storage"
+    ],
+    "guide": "inference/expert-residency/README.md",
+    "integration_scope": "Optional consumer residency. Correctness hooks apply to the selected cache path; device routing and refresh are not core requirements.",
+    "optimization_candidates": [
+      "Device READY maps and graph-native exact-demand staging when a GPU path is selected",
+      "Response-boundary route statistics and transactional base refresh",
+      "Demand-based scoring and cost-aware admission with bounded background work and independently executable exact misses"
+    ]
+  }
+}

@@ -1,0 +1,113 @@
+{
+  "id": "session-scheduling",
+  "category": "execution",
+  "summary": "Transactional prefill cursors, latency chunk policy, independent physical batch/workspace limits and borrowed-progress staging",
+  "implementation_status": "native_source",
+  "implementation_scope": "Adapter-side pending/committed chunk cursor with optional short-tail folding, immutable token staging and bounded exact-word repeated-passage observation over accepted reasoning; scheduling, model state and recovery/stop policy remain external; C++20 monotonic shape-cost chunk selector with fixed/linear/attention-pair/decode costs, hard bounds and fixed fallback; portable ordered physical batch plans with explicit atomic/padding rules, per-shape workspace bounds and an owned synchronous host scratch executor",
+  "agent_guidance": {
+    "use_when": "Expose bounded prompt work and preserve borrowed output tokens through model commit",
+    "avoid_when": "Existing engine/session helpers already meet the core handoff; this is not a scheduler replacement",
+    "provides": [
+      "Bounded next chunk with commit/rollback cursor",
+      "Short-tail folding: a remainder of at most fold_limit tokens joins the previous chunk, and chunk_plan gives the lengths",
+      "Wait, copy, output-bound validation and logical token-byte reservation",
+      "Owned token snapshot plus its reservation owner",
+      "Streaming Unicode word accumulation and exact repeated-passage union coverage with bounded history",
+      "Largest feasible prefill chunk under a calibrated latency estimate, with occupied context, co-batched decode cost, alignment, workspace and quota bounds",
+      "Independent inherited/overridden physical column caps, safe atomic splitting, padded-shape byte planning and fixed-size host scratch reuse"
+    ],
+    "engine_supplies": [
+      "Model work and transactional state coordinated with the cursor at valid completed chunk boundaries",
+      "Successful readiness and physical resource reservations",
+      "Core scheduling, commit/publication and reservation lifetime",
+      "Accepted reasoning-channel text, workload-calibrated observation cadence/thresholds and explicit compatible stop or recovery policy",
+      "Legal splitting/padding declaration, exact workspace layout sizing, private state rollback and settled backend allocation/reservations"
+    ],
+    "preserve": [
+      "Pending work never advances the committed cursor early",
+      "Copy borrowed tokens before invalidation",
+      "Admitted output limit and owned-storage lifetime",
+      "A folded chunk exceeds the chunk limit by at most the fold limit; buffers are sized for that",
+      "Physical tiling preserves logical work and ordered state; scratch cannot be reused until each call settles; no automatic split of whole-block operations"
+    ],
+    "adapt": [
+      "Chunk size and prefill/decode policy priced by inter-token latency, prompt time and throughput",
+      "Token storage and readiness mechanism",
+      "Cursor implementation integrated into engine state",
+      "Fold limit priced by the cost of re-reading the weights for a short chunk",
+      "Separate target/draft physical caps selected by measured complete-round cost and memory at fixed context and logical draft width"
+    ]
+  },
+  "path": "inference/session-scheduling/README.md",
+  "code_path": "inference/session-scheduling/code",
+  "code_files": [
+    {
+      "path": "inference/session-scheduling/code/implementation.py",
+      "purpose": "Adapter-side pending/committed chunk cursor and immutable token staging; scheduling and model-state transitions remain external"
+    },
+    {
+      "path": "inference/session-scheduling/code/reasoning_guard.py",
+      "purpose": "Bounded streaming Unicode word history and exact repeated-passage coverage; observation only, without model mutation or automatic stopping"
+    },
+    {
+      "path": "inference/session-scheduling/code/latency_chunks.h",
+      "purpose": "Hardware/model-neutral latency chunk policy with explicit cost coefficients, exhaustive-oracle native tests and safe fallback"
+    },
+    {
+      "path": "inference/session-scheduling/code/physical_batches.h",
+      "purpose": "Portable physical caps, ordered atomic/padded shapes, exact per-shape scratch planning and synchronous owned host workspace"
+    }
+  ],
+  "requires": {
+    "hardware": "Python 3.11+ standard library for host cursors; C++20 standard library for native policies and host scratch; backend hardware is an engine choice",
+    "model": "Engine exposes incremental prompt work and generated token candidates",
+    "workload": "Bounded work opportunities and signed 32-bit token staging with declared output limits"
+  },
+  "contract": {
+    "input": "Prompt, chunk/output budgets, borrowed tokens and readiness; physical cap, explicit split/padding rules, logical column extent and exact shape-to-workspace sizing",
+    "output": "Committed prefill cursor and owned StagedProgress; ordered physical shapes and peak scratch bytes",
+    "ownership": "Consumer owns model cursor/state. Core owns work selection, reservation lifetime, commit/publication and retirement.",
+    "failure": "Reject double advance, missing commit, invalid work budgets, token representation overflow and excess output. Physical plans reject illegal splits, overflow and over-budget workspaces before execution; callback failure/cancellation stops calls but engine state rollback remains external.",
+    "core_boundary": "Map next_chunk and staged progress to Session.advance/commit; return borrowed progress only under its lifetime contract."
+  },
+  "dependencies": [
+    "Python standard library",
+    "C++20 standard library for native policies and host scratch execution"
+  ],
+  "symbols": [
+    "PrefillCursor",
+    "StagedProgress",
+    "stage_progress",
+    "ReasoningLoopGuard",
+    "LoopObservation",
+    "chunk_plan",
+    "ChunkLatency",
+    "ChunkWindow",
+    "ChunkChoice",
+    "choose_prefill_chunk",
+    "BatchLimit",
+    "SplitRules",
+    "BatchShape",
+    "PhysicalBatch",
+    "LinearWorkspace",
+    "BatchPlan",
+    "HostWorkspace",
+    "BatchCancelled"
+  ],
+  "interactions": [
+    "attention-state",
+    "concurrent-request-execution",
+    "mtp-decode",
+    "recorded-selection"
+  ],
+  "techniques": [
+    "session-scheduling",
+    "attention-state",
+    "concurrent-request-execution"
+  ],
+  "validation": {
+    "host": "Host fixtures and worked example cover chunk rollback, empty prompt, staging order and token-byte accounting; repetition fixtures cover Unicode fragment equivalence, warmup, overlap union, bounded aging, unique text and atomic word-overflow failure",
+    "native": "Native chunk policy checked against 6000 exhaustive feasible searches, linear/context-dependent models and malformed calibration; Core integration tests enforce advice/grant bounds. No device or model qualification. Physical batches: 5000 shape-oracle cases, atomic/padded boundaries, independent caps, nonlinear workspace sizing, overflow, empty work, real scratch allocation/reuse and cancellation/failure/concurrent-use rejection.",
+    "performance": "Unmeasured for a native engine; host fixture success is not a speed claim"
+  }
+}
