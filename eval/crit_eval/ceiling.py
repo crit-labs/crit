@@ -123,7 +123,10 @@ def prefill_floor_ms(ceiling, tflops, prompt_tokens):
     n = prompt_tokens
     matmul = sum(n * flops / (tflops[f] * 1e12) for f, flops in ceiling["matmul_flops_per_token"].items()) * 1000
     pairs = n * (n + 1) / 2
-    attention = pairs * (ceiling.get("attention_flops_per_pair") or 0) / (tflops["bf16"] * 1e12) * 1000
+    # Attention at the faster of the BF16 and FP8 rates: engines run Q K^T and P V on FP8 tensor cores within
+    # the quality budget, so a BF16-only floor is one they beat.
+    attention_rate = max(tflops["bf16"], tflops.get("fp8") or 0)
+    attention = pairs * (ceiling.get("attention_flops_per_pair") or 0) / (attention_rate * 1e12) * 1000
     recurrent = n * (ceiling.get("recurrent_flops_per_token") or 0) / (tflops["bf16"] * 1e12) * 1000
     return {"matmul_ms": matmul, "attention_ms": attention, "recurrent_ms": recurrent,
             "total_ms": matmul + attention + recurrent}, []

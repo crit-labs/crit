@@ -124,10 +124,20 @@ held-out ones; hindsight results are not an online implementation.
 
 A plan costs a few microseconds plus a clock scan of at most four passes over the
 slots. Mapped-memory miss copies are bound by the host link and occupy SMs while
-waiting, so too many prefetch blocks slow the main stream. Speculative verification of
-several tokens multiplies distinct misses because each column routes independently.
-Routes beyond the directory set the failure flag and produce null uses; check the flag
-before trusting a step's output. A higher hit rate alone does not prove a faster
+waiting, so too many prefetch blocks slow the main stream. One measurement, on an RTX
+5090 with experts in host memory and a decode graph of 4-token verify passes:
+- **Prediction worked.** The next layer's router, applied to the hidden state after
+  the current layer, caught 75% of misses with 3% extra reads.
+- **SM copies did not overlap.** On a side stream they ran only between the pass's
+  kernels, so each prefetched expert cost as much as a miss.
+- **Late copy-engine copies stalled.** Copies issued from a host thread after the
+  prediction arrived too late, and the consuming layer waited for them.
+- **The copy engine can overlap.** It ran alongside decode GEMVs at 27 GB/s with 2%
+  slowdown, so its transfers must start well before the consuming layer.
+
+Speculative verification of several tokens multiplies distinct misses because each
+column routes independently. Routes beyond the directory set the failure flag and
+produce null uses; check the flag before trusting a step's output. A higher hit rate alone does not prove a faster
 engine: miss sizes, dispatch, copy contention and admission overhead can reverse it.
 
 [device_expert_cache_tests.cpp](../../tests/inference/device_expert_cache_tests.cpp)

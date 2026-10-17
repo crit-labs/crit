@@ -32,7 +32,13 @@ def model_identity(model):
                  "generation_config.json", "model.safetensors.index.json"):
         if (model / name).is_file():
             parts[name] = file_sha256(model / name)
-    parts["weight_files"] = {p.name: p.stat().st_size for p in sorted(model.glob("*.safetensors"))}
+    # The weight files beside the config and those the index lists, which may sit in a subfolder (tensors/...).
+    names = {p.name for p in model.glob("*.safetensors")}
+    index = model / "model.safetensors.index.json"
+    if index.is_file():
+        names |= {name for name in json.loads(index.read_text(encoding="utf-8")).get("weight_map", {}).values()
+                  if isinstance(name, str) and (model / name).is_file()}
+    parts["weight_files"] = {name: (model / name).stat().st_size for name in sorted(names)}
     blob = json.dumps(parts, sort_keys=True).encode()
     return {"sha256": hashlib.sha256(blob).hexdigest(), "files": parts}
 

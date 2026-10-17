@@ -848,6 +848,51 @@ def candidate_projection(root, run, candidate_id, overlay=None):
                   failure=failure, unresolved_cleanup=unresolved, attempt_count=attempt_count)
 
 
+def exploratory_reason(item):
+    """Why a benchmark series (telemetry `series` entry) does not qualify."""
+    unbound = [g for g, v in item["gates"].items() if v == "unverified"]
+    failed = [g for g, v in item["gates"].items() if v == "failed"]
+    if item["outcome"] != "completed":
+        return f"its outcome is {item['outcome']}"
+    if failed:
+        return "gate " + ", ".join(failed) + " failed" + (" (free memory below the run's headroom)" if "resources" in failed else "")
+    if unbound:
+        return ("it cites no passed check for " + ", ".join(unbound) +
+                " (publish the case's checks first and list their records in the benchmark's checks)")
+    return "its cited checks are reported, not artifact_verified"
+
+
+def ineligibility(run, candidate):
+    """Why a candidate (its view from RunStore.get) is not eligible, one entry per blocker, so seal and select can
+    say what to fix. Derived when asked and never stored, so telemetry keeps the projection earlier runs retain."""
+    if candidate["eligible"]:
+        return []
+    if not candidate.get("sealed"):
+        return ["it is not sealed"]
+    reasons = []
+    if not candidate["identities"]["package_sha256"]:
+        reasons.append("no package is retained")
+    if candidate["unresolved_cleanup"]:
+        reasons.append("an attempt's cleanup is unresolved")
+    for gate, status in candidate["gates"].items():
+        if status != "passed":
+            reasons.append(f"required gate {gate} is {status}" + (" (some case has no check for it)" if status == "unverified" else ""))
+    for case in run["spec"]["cases"]:
+        mine = [s for s in candidate["series"] if s["case_id"] == case["case_id"]]
+        if not mine:
+            reasons.append(f"{case['case_id']} has no benchmark")
+        for item in mine:
+            if item["qualification"] != "qualified":
+                reasons.append(f"{item['benchmark_id']} ({case['case_id']}) is exploratory: {exploratory_reason(item)}")
+    # The weights policy is the one reason telemetry records itself.
+    policy = (candidate.get("extensions") or {}).get("ineligible_reason")
+    if policy:
+        reasons.append(policy)
+    if candidate["lifecycle"] != "completed":
+        reasons.append(f"the candidate was sealed {candidate['lifecycle']}, not completed")
+    return reasons
+
+
 def read_candidates(root, run):
     candidates, errors = [], []
     folders = sorted(safe_path(root, "candidates").glob("candidate-*"))

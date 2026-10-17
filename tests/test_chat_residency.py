@@ -349,6 +349,15 @@ class ResidentTests(ServeFixture, unittest.TestCase):
         self.assertEqual([c['candidate_id'] for c in engine.candidates()], [self.a, self.b])
 
 
+class LoadBoundTests(ServeFixture, unittest.TestCase):
+    def test_load_bound_grows_with_the_model_unless_set(self):
+        engine = self.engine(open=False)
+        spec = engine.spec(self.a)
+        size = sum(row['bytes'] for row in spec['model_manifest'])
+        self.assertAlmostEqual(engine.load_seconds(spec), 600 + size / 50e6)
+        self.assertEqual(self.engine(open=False, load_timeout=1234).load_seconds(spec), 1234)
+
+
 class LifecycleTests(ServeFixture, unittest.TestCase):
     def test_cleanup_failure_blocks_requests_and_other_clients_until_closed(self):
         engine = self.engine()

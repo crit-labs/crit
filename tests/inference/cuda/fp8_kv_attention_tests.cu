@@ -95,7 +95,8 @@ double rel_error(const std::vector<float>& got, const std::vector<double>& want)
     return worst / top;
 }
 
-bool prefill_case(int hd, int heads, int kv_heads, int T, int pos0, std::mt19937& rng) {
+// fp8: prefill_fp8 (E4M3 queries and probabilities), checked against the same FP64 reference with a wider bound.
+bool prefill_case(int hd, int heads, int kv_heads, int T, int pos0, std::mt19937& rng, bool fp8 = false) {
     Setup s(hd, heads, kv_heads, pos0 + T, rng);
     std::normal_distribution<float> normal(0.f, 1.f);
     std::vector<__nv_bfloat16> q(static_cast<std::size_t>(T) * heads * hd);
@@ -105,7 +106,7 @@ bool prefill_case(int hd, int heads, int kv_heads, int T, int pos0, std::mt19937
     cudaMemcpy(dq, q.data(), q.size() * 2, cudaMemcpyHostToDevice);
     const float scale = 1.f / std::sqrt(static_cast<float>(hd));
     const kv::Prefill p{dq, heads * hd, s.cache, dout, heads * hd, T, pos0, heads, scale};
-    const cudaError_t e = kv::prefill(p, nullptr);
+    const cudaError_t e = fp8 ? kv::prefill_fp8(p, nullptr) : kv::prefill(p, nullptr);
     std::vector<float> got(q.size());
     const bool ran = e == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess &&
                      cudaMemcpy(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
@@ -116,8 +117,11 @@ bool prefill_case(int hd, int heads, int kv_heads, int T, int pos0, std::mt19937
         want.insert(want.end(), row.begin(), row.end());
     }
     const double rel = rel_error(got, want);
-    std::printf("prefill hd %d heads %d/%d T %d pos0 %d: %.2e of max |out|; write error %.2f of its bound\n", hd, heads, kv_heads, T, pos0, rel, s.worst_write);
-    return rel < 1e-2 && s.worst_write <= 1.f;
+    std::printf("prefill%s hd %d heads %d/%d T %d pos0 %d: %.2e of max |out|; write error %.2f of its bound\n", fp8 ? "_fp8" : "", hd, heads,
+                kv_heads, T, pos0, rel, s.worst_write);
+    // prefill_fp8 rounds queries and probabilities to E4M3 (3 mantissa bits): a few % of max |out| on random data,
+    // where a layout error would be of order 1.
+    return rel < (fp8 ? 1e-1 : 1e-2) && s.worst_write <= 1.f;
 }
 
 bool decode_case(int hd, int heads, int kv_heads, int T, int pos0, int blocks, std::mt19937& rng) {
@@ -173,10 +177,17 @@ int main() {
         ok = decode_case(hd, 8, 2, 4, 0, 3, rng) && ok;
         ok = decode_case(hd, 6, 1, 8, 900, 3, rng) && ok;  // several 128-key pieces per block
     }
+    for(const int hd : {64, 128, 256}) {
+        ok = prefill_case(hd, 8, 2, 1, 0, rng, true) && ok;
+        ok = prefill_case(hd, 8, 2, 150, 0, rng, true) && ok;     // several 64-key tiles, diagonal masking
+        ok = prefill_case(hd, 6, 1, 70, 300, rng, true) && ok;    // a later chunk over earlier positions
+    }
     ok = prefill_case(128, 4, 4, 33, 7, rng) && ok;       // multi-head (no grouping)
+    ok = prefill_case(128, 4, 4, 33, 7, rng, true) && ok;
     ok = decode_case(128, 4, 4, 1, 4000, 7, rng) && ok;
     const kv::Cache none{};
     ok = kv::prefill(kv::Prefill{}, nullptr) == cudaErrorInvalidValue && ok;
+    ok = kv::prefill_fp8(kv::Prefill{}, nullptr) == cudaErrorInvalidValue && ok;
     ok = kv::decode(kv::Decode{}, nullptr) == cudaErrorInvalidValue && ok;
     ok = kv::write(none, nullptr, nullptr, 0, 1, 0, nullptr) == cudaErrorInvalidValue && ok;
     std::printf(ok ? "fp8 kv attention passed\n" : "fp8 kv attention FAILED\n");

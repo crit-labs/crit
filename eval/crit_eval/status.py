@@ -262,7 +262,11 @@ def build(result, protocol, baseline=None):
     if exactness_note:
         notes.append(exactness_note)
     if ((result.get("context") or {}).get("points") or {}):
-        notes.append("long-context points decode each engine's own output, after copies of the longest speed case's prompt")
+        ctext = (result.get("context") or {}).get("decode_text") or {"source": "generated"}
+        notes.append(f"long-context points replay {ctext.get('case')}'s pinned continuation {ctext['sha256'][:12]}, after copies "
+                     "of its prompt" if ctext["source"] == "pinned" else
+                     "long-context points decode each engine's own output, after copies of the longest speed case's prompt"
+                     + (f" ({ctext['reason']})" if ctext.get("reason") else ""))
     text = speed.get("decode_text")
     if text:
         notes.append(f"decode measured on the pinned continuation {text['sha256'][:12]}" if text["source"] == "pinned"
@@ -334,6 +338,7 @@ def changes(result, baseline):
     worst = lambda q: max((p["kld_mean"] for p in q.get("paths", {}).values()), default=None)  # noqa: E731
     same_text = decode_text_identity(result) == decode_text_identity(baseline)
     same_context = (result.get("context") or {}).get("tokens") == (baseline.get("context") or {}).get("tokens")
+    same_context_text = same_context and context_text_identity(result) == context_text_identity(baseline)
     long_now = (result.get("headroom") or {}).get("context") or {}
     long_before = (baseline.get("headroom") or {}).get("context") or {}
     return {"comparable": True, "label": baseline.get("label") or (baseline.get("engine") or {}).get("name"),
@@ -346,14 +351,21 @@ def changes(result, baseline):
             # Faster first tokens count as a gain, like the other scores.
             "ttft_score": ratio((baseline.get("speed") or {}).get("ttft_score_ms"),
                                 (result.get("speed") or {}).get("ttft_score_ms")),
-            # Long-context scores compare only at the same required context.
+            # Long-context scores compare only at the same required context, and decode only on the same text.
             "context_decode": ratio(long_now.get("decode", {}).get("score"), long_before.get("decode", {}).get("score"))
-            if same_context else None,
+            if same_context_text else None,
             "context_ttft": ratio(long_before.get("ttft", {}).get("score_ms"), long_now.get("ttft", {}).get("score_ms"))
             if same_context else None,
             "worst_kld_mean": ratio(worst(q_now), worst(q_before)),
             "heldout_decode": ratio((result.get("heldout") or {}).get("decode_score"),
                                     (baseline.get("heldout") or {}).get("decode_score"))}
+
+
+def context_text_identity(result):
+    """The long-context points' pinned continuation sha256, or "generated" (own output; results from before
+    the points replayed one)."""
+    text = (result.get("context") or {}).get("decode_text") or {"source": "generated"}
+    return text.get("sha256") if text.get("source") == "pinned" else "generated"
 
 
 def decode_text_identity(result):
@@ -492,5 +504,7 @@ def _signed(value):
 
 def status_of(path, protocol, baseline_path=None):
     result = load_json(path)
+    if result.get("aborted"):
+        raise SystemExit(f"{path} is an aborted round with no status: {result['aborted']['detail']}")
     baseline = load_json(baseline_path) if baseline_path else None
     return build(result, protocol, baseline)

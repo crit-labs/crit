@@ -16,6 +16,18 @@ Install from the repo root with `python -m pip install -e .`, then run `crit ...
   `device` in `<crit-repo>/settings.toml`); `kv_tokens` then becomes Eval's max
   context for the model on it. Set `kv_tokens` only when the user asks. Preflight
   model, tools and dependencies before starting the clock.
+- **Study the model before the first candidate.** After `create`, run
+  `crit run --id RUN_ID recon` (`candidate` refuses a model folder without it): it reads `generation_config.json` (sampling defaults),
+  the tokenizer files and chat templates (BOS/EOS and stop tokens, template switches
+  such as `enable_thinking`) and `config.json` (rope scaling, MTP or draft heads,
+  attention layout), writes the facts with file hashes to `work/recon.json` and
+  scaffolds `work/recon.md`. Finish `recon.md` from the model card (recommended
+  sampling per mode, e.g. thinking vs non-thinking, known issues, context limits) and
+  the reference implementation in transformers or vLLM (norm and attention quirks),
+  citing sources. Where they override the files, edit the `frozen` block of
+  `recon.json` and say why under Decisions. Every later candidate freezes that block
+  (sampling, chat template and its variables, stop tokens) as `configuration["recon"]`
+  instead of defaulting to greedy; Eval's speed and exactness cases stay greedy by protocol.
 - Create the run per [Building engines](docs/BUILDING_ENGINES.md) in the user's
   workspace (default `<crit-repo>/runs/`). Keep source, models, dependencies, builds
   and results out of product folders; develop in the run's `work/`. Never alter
@@ -37,8 +49,13 @@ Install from the repo root with `python -m pip install -e .`, then run `crit ...
   before writing optimized arithmetic, unless the criteria exclude outside sources.
   Check operations, formats, shapes, OS/device, licenses, dependencies and the three
   checks Kernels lists.
+- **[Models](models/README.md):** only when the run's `weights_policy` is `transformable`:
+  quantize the source with `crit models ptq`, run the output through `crit models eval`
+  against the source's Eval data, and keep both records with the candidate.
 - **[Eval](docs/eval/README.md):** connect the engine through an eval adapter; use the
-  same prepared data and reference for every engine of one model.
+  same prepared data and reference for every engine of one model. A Core engine built
+  as a shared [engine library](core/src/runtime/README.md#engine-libraries) gets the
+  Eval and serve adapters from `crit_core.native`.
 
 Retain Core revision/build inputs, dependency identities/notices and adaptations with
 candidate source. Keep model-specific changes in the engine; record toolkit gaps in the summary.
@@ -92,8 +109,11 @@ Follow [Building engines](docs/BUILDING_ENGINES.md) and [Run records](docs/RUN_R
   Retain adapter, applied configuration, data, reference and results; report skipped
   cases. Eval results neither publish records nor qualify a candidate.
 - **Record through `crit run`:** freeze inputs, create candidates, retain source and
-  packages, publish checks and benchmarks, seal. Reserve before launch; settle results
-  and cleanup. Record parent, changes, rationale, build, results, selection reasoning
+  packages, publish each case's checks, then benchmark with `crit run measure`, which
+  replays one pinned text per case for every candidate and binds the checks; seal
+  (check telemetry's eligibility first: sealed candidates are immutable). Reserve
+  before launch; settle results and cleanup.
+  Record parent, changes, rationale, build, results, selection reasoning
   and technique decisions; keep failures visible. Changed source, configuration or
   dependencies need a new candidate.
 - **Compare and select** on the same model and workload; explain missing metrics.

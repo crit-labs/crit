@@ -256,6 +256,234 @@ __global__ void __launch_bounds__(kPrefillThreads, 1) prefill_kernel(Prefill p) 
     }
 }
 
+
+// ------------------------------------------------------------------------------------------------ prefill, FP8 tensor cores
+// prefill_fp8: S = Q K^T and O = P V on E4M3 mma.m16n8k32. Queries are quantized per row and head (scale max |q| / 448);
+// key and value codes are used as stored. The per-key value scale is folded into the probabilities before they are
+// rounded to E4M3: P' = p * v_scale[key] * 448 / sigma, where sigma is the largest value scale the block has seen, so
+// P' <= 448 and the accumulator is kept in units of sigma / 448 (rescaled only when a row maximum or sigma grows).
+// B fragments of V come from ldmatrix.trans on b16 pairs of codes, re-packed with byte permutes; the k index of the
+// probability fragment is permuted to match. 64-key tiles are double buffered with cp.async (one barrier per tile)
+// and only tiles reaching the diagonal are masked.
+constexpr int kK8 = 64;
+
+__device__ __forceinline__ void mma_fp8(float (&c)[4], const std::uint32_t (&a)[4], std::uint32_t b0, std::uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ std::uint32_t prmt(std::uint32_t a, std::uint32_t b, std::uint32_t sel) {
+    std::uint32_t r;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(sel));
+    return r;
+}
+__device__ __forceinline__ std::uint32_t fp8x4(float a, float b, float c, float d) {
+    const std::uint32_t lo = __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
+    const std::uint32_t hi = __nv_cvt_float2_to_fp8x2(make_float2(c, d), __NV_SATFINITE, __NV_E4M3);
+    return lo | (hi << 16);
+}
+__device__ __forceinline__ float ex2(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+__device__ __forceinline__ void cp_async16_zfill(void* smem, const void* gmem, bool ok) {
+    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(s), "l"(gmem), "r"(ok ? 16 : 0));
+}
+__device__ __forceinline__ void cp_async4_zfill(void* smem, const void* gmem, bool ok) {
+    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" :: "r"(s), "l"(gmem), "r"(ok ? 4 : 0));
+}
+
+// Rows of HD one-byte codes in 16-byte chunks, XOR swizzled for conflict-free ldmatrix.
+template <int HD>
+struct Fp8Layout {
+    static constexpr int C = HD / 16;
+    static constexpr int kMask = (C < 8 ? C : 8) - 1;
+    __device__ __forceinline__ static int swz(int r, int c) { return r * C + (c ^ (r & kMask)); }
+    static constexpr std::size_t q_bytes = static_cast<std::size_t>(kQ) * HD;
+    static constexpr std::size_t tile_bytes = static_cast<std::size_t>(kK8) * HD;
+    static constexpr std::size_t bytes = q_bytes + 4 * tile_bytes + 4 * (kQ + 4 * kK8);
+};
+
+template <int HD>
+__device__ __forceinline__ void fetch_fp8(uint4* K, uint4* V, float* ks, float* vs, const Cache& c, int g, int key0, int nkeys,
+                                          int tid) {
+    using L = Fp8Layout<HD>;
+#pragma unroll
+    for(int i = 0; i < kK8 * L::C / kPrefillThreads; ++i) {
+        const int e = tid + kPrefillThreads * i, r = e / L::C, cc = e % L::C, key = key0 + r;
+        const bool ok = key < nkeys;
+        const std::size_t off = (static_cast<std::size_t>(ok ? key : 0) * c.kv_heads + g) * HD + cc * 16;
+        cp_async16_zfill(K + L::swz(r, cc), c.k + off, ok);
+        cp_async16_zfill(V + L::swz(r, cc), c.v + off, ok);
+    }
+    if(tid < 2 * kK8) {
+        const int r = tid % kK8, key = key0 + r;
+        const bool ok = key < nkeys;
+        const std::size_t si = static_cast<std::size_t>(ok ? key : 0) * c.kv_heads + g;
+        if(tid < kK8) cp_async4_zfill(ks + r, c.k_scale + si, ok);
+        else cp_async4_zfill(vs + r, c.v_scale + si, ok);
+    }
+    asm volatile("cp.async.commit_group;");
+}
+
+template <int HD>
+__global__ void __launch_bounds__(kPrefillThreads, 1) prefill_fp8_kernel(Prefill p) {
+    using L = Fp8Layout<HD>;
+    extern __shared__ uint4 smem[];
+    unsigned char* base = reinterpret_cast<unsigned char*>(smem);
+    uint4* Qs = smem;
+    // Stage b (0 or 1): keys, values and their scales.
+    auto Kb = [&](int b) { return reinterpret_cast<uint4*>(base + L::q_bytes + b * L::tile_bytes); };
+    auto Vb = [&](int b) { return reinterpret_cast<uint4*>(base + L::q_bytes + (2 + b) * L::tile_bytes); };
+    float* qsc = reinterpret_cast<float*>(base + L::q_bytes + 4 * L::tile_bytes);
+    auto ksb = [&](int b) { return qsc + kQ + b * kK8; };
+    auto vsb = [&](int b) { return qsc + kQ + (2 + b) * kK8; };
+    const int h = blockIdx.y, g = h / (p.heads / p.cache.kv_heads);
+    const int qt0 = (gridDim.x - 1 - blockIdx.x) * kQ;  // the latest (heaviest) query tile first
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gl = lane >> 2, t4 = lane & 3;
+    const int last_q = min(p.T, qt0 + kQ) - 1;
+    const int nkeys = p.pos0 + last_q + 1;
+    const int ntiles = (nkeys + kK8 - 1) / kK8;
+    fetch_fp8<HD>(Kb(0), Vb(0), ksb(0), vsb(0), p.cache, g, 0, nkeys, tid);
+    // This warp's 16 query rows to E4M3: a lane quantizes 8 values, HD / 8 lanes per row.
+    constexpr int kLanes = HD / 8, kRows = 32 / kLanes;
+    const int qr0 = warp * 16;
+    for(int r0 = 0; r0 < 16; r0 += kRows) {
+        const int row = qr0 + r0 + lane / kLanes, seg = lane % kLanes, t = qt0 + row;
+        uint4 u = make_uint4(0u, 0u, 0u, 0u);
+        if(t < p.T) u = *reinterpret_cast<const uint4*>(p.q + static_cast<std::size_t>(t) * p.q_stride + static_cast<std::size_t>(h) * HD + seg * 8);
+        const __nv_bfloat162* b = reinterpret_cast<const __nv_bfloat162*>(&u);
+        float x[8];
+        float am = 0.f;
+#pragma unroll
+        for(int i = 0; i < 4; ++i) {
+            const float2 v2 = __bfloat1622float2(b[i]);
+            x[2 * i] = v2.x;
+            x[2 * i + 1] = v2.y;
+            am = fmaxf(am, fmaxf(fabsf(v2.x), fabsf(v2.y)));
+        }
+#pragma unroll
+        for(int o = kLanes / 2; o; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+        const float sc = am > 0.f ? am / 448.f : 1.f;
+        const std::uint32_t w0 = fp8x4(x[0] / sc, x[1] / sc, x[2] / sc, x[3] / sc);
+        const std::uint32_t w1 = fp8x4(x[4] / sc, x[5] / sc, x[6] / sc, x[7] / sc);
+        *(reinterpret_cast<uint2*>(Qs + L::swz(row, seg >> 1)) + (seg & 1)) = make_uint2(w0, w1);
+        if(seg == 0) qsc[row] = sc;
+    }
+    __syncwarp();
+    constexpr float kLog2e = 1.4426950408889634f;
+    const int qpos0 = p.pos0 + qt0 + qr0 + gl, qpos1 = qpos0 + 8, warp_first = p.pos0 + qt0 + qr0, warp_last = warp_first + 15;
+    const float qs0 = qsc[qr0 + gl] * p.scale * kLog2e, qs1 = qsc[qr0 + gl + 8] * p.scale * kLog2e;  // scores in log2 units
+    float o[HD / 8][4];
+#pragma unroll
+    for(int n = 0; n < HD / 8; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f, sig = 0.f;
+    for(int j = 0; j < ntiles; ++j) {
+        const int buf = j & 1;
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
+        __syncthreads();
+        if(j + 1 < ntiles) fetch_fp8<HD>(Kb(buf ^ 1), Vb(buf ^ 1), ksb(buf ^ 1), vsb(buf ^ 1), p.cache, g, (j + 1) * kK8, nkeys, tid);
+        const int kfirst = j * kK8;
+        if(kfirst > warp_last) continue;  // every later tile too; the barriers above still run
+        const uint4* K = Kb(buf);
+        const uint4* V = Vb(buf);
+        const float* ks = ksb(buf);
+        const float* vs = vsb(buf);
+        float s[8][4];
+#pragma unroll
+        for(int n = 0; n < 8; ++n) s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.f;
+#pragma unroll
+        for(int kc = 0; kc < HD / 32; ++kc) {
+            std::uint32_t qa[4];
+            ldsm_x4(qa, Qs + L::swz(qr0 + (lane & 15), kc * 2 + (lane >> 4)));
+#pragma unroll
+            for(int np = 0; np < 4; ++np) {
+                std::uint32_t b[4];
+                ldsm_x4(b, K + L::swz(np * 16 + (lane & 7) + ((lane >> 4) << 3), kc * 2 + ((lane >> 3) & 1)));
+                mma_fp8(s[2 * np], qa, b[0], b[1]);
+                mma_fp8(s[2 * np + 1], qa, b[2], b[3]);
+            }
+        }
+        const bool diag = kfirst + kK8 - 1 > warp_first;
+#pragma unroll
+        for(int n = 0; n < 8; ++n) {
+            const float k0 = ks[n * 8 + 2 * t4], k1 = ks[n * 8 + 2 * t4 + 1];
+            s[n][0] *= qs0 * k0; s[n][1] *= qs0 * k1; s[n][2] *= qs1 * k0; s[n][3] *= qs1 * k1;
+            if(diag) {
+                const int key = kfirst + n * 8 + 2 * t4;
+                if(key > qpos0) s[n][0] = -INFINITY;
+                if(key + 1 > qpos0) s[n][1] = -INFINITY;
+                if(key > qpos1) s[n][2] = -INFINITY;
+                if(key + 1 > qpos1) s[n][3] = -INFINITY;
+            }
+        }
+        float mx0 = m0, mx1 = m1;
+#pragma unroll
+        for(int n = 0; n < 8; ++n) { mx0 = fmaxf(mx0, fmaxf(s[n][0], s[n][1])); mx1 = fmaxf(mx1, fmaxf(s[n][2], s[n][3])); }
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1)); mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1)); mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+        const float nsig = fmaxf(sig, warp_max(fmaxf(vs[lane], vs[lane + 32])));
+        const float c0 = mx0 == m0 ? 1.f : (m0 == -INFINITY ? 0.f : ex2(m0 - mx0));
+        const float c1 = mx1 == m1 ? 1.f : (m1 == -INFINITY ? 0.f : ex2(m1 - mx1));
+        const float ru = nsig == sig ? 1.f : (sig > 0.f ? sig / nsig : 0.f);
+        m0 = mx0; m1 = mx1; sig = nsig;
+        const float f8 = sig > 0.f ? 448.f / sig : 0.f;
+        float rs0 = 0.f, rs1 = 0.f;
+#pragma unroll
+        for(int n = 0; n < 8; ++n) {
+            const float vs0 = vs[n * 8 + 2 * t4] * f8, vs1 = vs[n * 8 + 2 * t4 + 1] * f8;
+            const float e0 = mx0 == -INFINITY ? 0.f : ex2(s[n][0] - mx0), e1 = mx0 == -INFINITY ? 0.f : ex2(s[n][1] - mx0);
+            const float e2 = mx1 == -INFINITY ? 0.f : ex2(s[n][2] - mx1), e3 = mx1 == -INFINITY ? 0.f : ex2(s[n][3] - mx1);
+            rs0 += e0 + e1;
+            rs1 += e2 + e3;
+            s[n][0] = e0 * vs0; s[n][1] = e1 * vs1; s[n][2] = e2 * vs0; s[n][3] = e3 * vs1;
+        }
+        l0 = l0 * c0 + rs0; l1 = l1 * c1 + rs1;
+        const float o0 = c0 * ru, o1 = c1 * ru;
+        if(__any_sync(0xffffffffu, o0 != 1.f || o1 != 1.f)) {
+#pragma unroll
+            for(int n = 0; n < HD / 8; ++n) { o[n][0] *= o0; o[n][1] *= o0; o[n][2] *= o1; o[n][3] *= o1; }
+        }
+#pragma unroll
+        for(int half = 0; half < 2; ++half) {
+            // k index 4 * t4 + i of the probability fragment <-> key {2t4, 2t4 + 1, 8 + 2t4, 9 + 2t4}[i] (+16 for a2, a3).
+            const int b0 = half * 4;
+            const std::uint32_t af[4] = {fp8x4(s[b0][0], s[b0][1], s[b0 + 1][0], s[b0 + 1][1]),
+                                         fp8x4(s[b0][2], s[b0][3], s[b0 + 1][2], s[b0 + 1][3]),
+                                         fp8x4(s[b0 + 2][0], s[b0 + 2][1], s[b0 + 3][0], s[b0 + 3][1]),
+                                         fp8x4(s[b0 + 2][2], s[b0 + 2][3], s[b0 + 3][2], s[b0 + 3][3])};
+            const int key = half * 32 + (lane >> 3) * 8 + (lane & 7);
+#pragma unroll
+            for(int dp = 0; dp < HD / 16; ++dp) {
+                // Transposed b16 tiles of keys 0-7 / 8-15 / 16-23 / 24-31 over dims 16dp..16dp+15: each register holds
+                // (key 2t4: dims 2gl, 2gl+1), (key 2t4+1: dims 2gl, 2gl+1); even dims go to tile 2dp, odd to 2dp+1.
+                std::uint32_t r[4];
+                ldsm_x4_t(r, V + L::swz(key, dp));
+                mma_fp8(o[2 * dp], af, prmt(r[0], r[1], 0x6420), prmt(r[2], r[3], 0x6420));
+                mma_fp8(o[2 * dp + 1], af, prmt(r[0], r[1], 0x7531), prmt(r[2], r[3], 0x7531));
+            }
+        }
+    }
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    l0 += __shfl_xor_sync(0xffffffffu, l0, 1); l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
+    l1 += __shfl_xor_sync(0xffffffffu, l1, 1); l1 += __shfl_xor_sync(0xffffffffu, l1, 2);
+    const float u = sig / 448.f;
+    const float j0 = l0 > 0.f ? u / l0 : 0.f, j1 = l1 > 0.f ? u / l1 : 0.f;
+    const int t0r = qt0 + qr0 + gl, t1r = t0r + 8;
+#pragma unroll
+    for(int dp = 0; dp < HD / 16; ++dp) {
+        const int d = dp * 16 + 4 * t4;
+        if(t0r < p.T)
+            *reinterpret_cast<float4*>(p.out + static_cast<std::size_t>(t0r) * p.out_stride + static_cast<std::size_t>(h) * HD + d) =
+                make_float4(o[2 * dp][0] * j0, o[2 * dp + 1][0] * j0, o[2 * dp][1] * j0, o[2 * dp + 1][1] * j0);
+        if(t1r < p.T)
+            *reinterpret_cast<float4*>(p.out + static_cast<std::size_t>(t1r) * p.out_stride + static_cast<std::size_t>(h) * HD + d) =
+                make_float4(o[2 * dp][2] * j1, o[2 * dp + 1][2] * j1, o[2 * dp][3] * j1, o[2 * dp + 1][3] * j1);
+    }
+}
+
 // ------------------------------------------------------------------------------------------------ decode
 constexpr int kDecodeThreads = 128;
 
@@ -368,6 +596,15 @@ cudaError_t run_prefill(const Prefill& p, cudaStream_t s) {
 }
 
 template <int HD>
+cudaError_t run_prefill_fp8(const Prefill& p, cudaStream_t s) {
+    const std::size_t bytes = Fp8Layout<HD>::bytes;
+    const cudaError_t attr = cudaFuncSetAttribute(prefill_fp8_kernel<HD>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes));
+    if(attr != cudaSuccess) return attr;
+    prefill_fp8_kernel<HD><<<dim3((p.T + kQ - 1) / kQ, p.heads), kPrefillThreads, bytes, s>>>(p);
+    return cudaGetLastError();
+}
+
+template <int HD>
 cudaError_t run_decode(const Decode& p, cudaStream_t s) {
     const std::size_t bytes = static_cast<std::size_t>(kDecodeRows + 2 * kK) * HD * 2;
     const cudaError_t attr = cudaFuncSetAttribute(decode_kernel<HD>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes));
@@ -400,6 +637,25 @@ cudaError_t prefill(const Prefill& p, cudaStream_t s) {
     case 64: return run_prefill<64>(p, s);
     case 128: return run_prefill<128>(p, s);
     default: return run_prefill<256>(p, s);
+    }
+}
+
+std::size_t prefill_fp8_shared_bytes(int head_dim) {
+    switch(head_dim) {
+    case 64: return Fp8Layout<64>::bytes;
+    case 128: return Fp8Layout<128>::bytes;
+    default: return Fp8Layout<256>::bytes;
+    }
+}
+
+cudaError_t prefill_fp8(const Prefill& p, cudaStream_t s) {
+    if(!valid(p.cache) || !p.q || !p.out || p.T <= 0 || p.pos0 < 0 || p.heads <= 0 || p.heads % p.cache.kv_heads ||
+       p.q_stride % 8 || p.q_stride < p.heads * p.cache.head_dim || p.out_stride % 4 || p.out_stride < p.heads * p.cache.head_dim)
+        return cudaErrorInvalidValue;
+    switch(p.cache.head_dim) {
+    case 64: return run_prefill_fp8<64>(p, s);
+    case 128: return run_prefill_fp8<128>(p, s);
+    default: return run_prefill_fp8<256>(p, s);
     }
 }
 

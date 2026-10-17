@@ -12,6 +12,7 @@ origin. See [licensing](LICENSES.md).
 | `core/` | C++ request lifecycle, scheduling, resources and retirement; text, sampling, state cache, file and model libraries; the `crit_core` Python package (`python/`) |
 | `inference/` | Reusable technique descriptions, contracts and code |
 | `kernels/` | Kernel inspection/retention, the `crit_kernels` package behind `crit kernels`, integration examples |
+| `models/` | Weight transforms (PTQ), their recipes and records, the `crit_models` package behind `crit models` |
 | `eval/` | Common evaluation suite, preparation, reference scoring and comparisons |
 | `cli/` | The `crit` command, run records, process trees and runtime ownership |
 | `api/` | `crit serve`, the OpenAI-compatible API |
@@ -49,9 +50,9 @@ a clean snapshot:
 mkdir -p build/package-source
 git archive HEAD | tar -x -C build/package-source
 python -B -c "import os; from setuptools.build_meta import build_sdist, build_wheel; os.chdir('build/package-source'); build_sdist('../dist'); build_wheel('../dist')"
-python -m pip install build/dist/crit-0.1.0-py3-none-any.whl
+python -m pip install build/dist/crit-0.2.0-py3-none-any.whl
 ```
 
-The wheel holds `crit`, `crit_api`, `crit_eval`, `crit_kernels` and `crit_core` and
+The wheel holds `crit`, `crit_api`, `crit_eval`, `crit_kernels`, `crit_models` and `crit_core` and
 depends on `tokenizers` and `jinja2`. Core's native SDK is a separate CMake project;
 Inference and Eval's suite data ship in the source checkout.

@@ -63,9 +63,11 @@ returns.
 ### Index rules
 
 The index is strict JSON with a `weight_map` from tensor name to shard file name,
-and optional `metadata`. Shard names must be flat portable names
-(`[A-Za-z0-9][A-Za-z0-9._-]*\.safetensors`, no Windows device names), so no path
-leaves the index's directory. A tensor in two shards, in a shard but not listed,
+and optional `metadata`. Shard names are portable relative paths. They have at most
+8 `/`-separated components of `[A-Za-z0-9][A-Za-z0-9._-]*`, and the last one ends in
+`.safetensors`, as in `tensors/model-00001-of-00004.safetensors`. No component is a
+Windows device name, and none can be `.` or `..`, so no path leaves the index's
+directory except through a link. A tensor in two shards, in a shard but not listed,
 listed for another shard, or listed but absent are errors.
 
 | Aspect | `IndexPolicy::strict` | `IndexPolicy::compatible` (default) |

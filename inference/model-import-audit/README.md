@@ -11,7 +11,7 @@ values.
 
 ## When to use it
 
-Use it before an engine loads tensor payloads, for single files and strict flat shard
+Use it before an engine loads tensor payloads, for single files and strict shard
 indexes. Use an already qualified importer instead when it supplies equivalent checks.
 GGUF, pickle/PyTorch files, remote URLs and sub-byte dtypes are unsupported; FP8 support
 covers only storage size and dtype/shape checks. Architecture configuration, tokenizer
@@ -38,9 +38,10 @@ bad scales, a wrong codebook or a dishonest storage label in the payload.
 **Indexes.** A `.safetensors.index.json` may hold only `weight_map` and optional
 `metadata.total_size`. Every referenced header is read; the union of header tensors
 must equal the index keys, each in its declared shard with no duplicates, and
-`total_size` must equal the summed extents. Shard names must be portable flat ASCII
-`.safetensors` filenames; paths, subdirectories, drive/stream names, reserved Windows
-device names and static symlinks are rejected.
+`total_size` must equal the summed extents. Shard names must be portable relative ASCII
+paths ending in a `.safetensors` filename (a subfolder such as `tensors/` is allowed).
+Absolute paths, `..`, drive and stream names, reserved Windows device names and static
+symlinks are rejected.
 
 **Roles and capabilities.** The engine supplies `TensorRole(role, key, shape, dtype)`
 requirements and `audit_model` matches each against the actual headers; missing,

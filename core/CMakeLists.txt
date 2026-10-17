@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_core VERSION 0.1.0 LANGUAGES CXX)
+project(crit_core VERSION 0.2.0 LANGUAGES CXX)
 find_package(Threads REQUIRED)
 function(crit_strict_warnings target)
   if(MSVC)
@@ -12,12 +12,13 @@ function(crit_strict_warnings target)
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Werror)
   endif()
 endfunction()
-add_library(crit_core STATIC src/runtime/runtime.cpp src/runtime/trace.cpp src/runtime/operators.cpp src/memory/resources.cpp src/memory/host_memory.cpp
+add_library(crit_core STATIC src/runtime/runtime.cpp src/runtime/trace.cpp src/runtime/operators.cpp src/runtime/native_engine.cpp src/memory/resources.cpp src/memory/host_memory.cpp
   src/text/text.cpp src/sampling/sampling.cpp src/state/state_cache.cpp src/io/file.cpp src/io/sha256.cpp
   src/io/json.cpp src/model/safetensors.cpp src/model/model_config.cpp src/constraints/constraints.cpp src/constraints/grammar.cpp
   src/backends/device_graph.cpp src/backends/device_memory.cpp)
 add_library(crit::core ALIAS crit_core)
-set_target_properties(crit_core PROPERTIES EXPORT_NAME core)
+# Position-independent: engines link Core into the shared library their adapter loads.
+set_target_properties(crit_core PROPERTIES EXPORT_NAME core POSITION_INDEPENDENT_CODE ON)
 target_include_directories(crit_core PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
 target_compile_features(crit_core PUBLIC cxx_std_20)
 target_link_libraries(crit_core PUBLIC Threads::Threads)
@@ -51,7 +52,7 @@ if(CRIT_CORE_CUDA)
   add_library(crit_core_cuda STATIC src/backends/cuda/cuda.cpp src/backends/cuda/category_timer.cpp
     src/backends/cuda/cuda_graph.cpp src/backends/cuda/cuda_memory.cpp)
   add_library(crit::cuda ALIAS crit_core_cuda)
-  set_target_properties(crit_core_cuda PROPERTIES EXPORT_NAME cuda)
+  set_target_properties(crit_core_cuda PROPERTIES EXPORT_NAME cuda POSITION_INDEPENDENT_CODE ON)
   target_link_libraries(crit_core_cuda PUBLIC crit_core CUDA::cudart)
   crit_strict_warnings(crit_core_cuda)
 endif()
@@ -61,7 +62,7 @@ install(TARGETS crit_core EXPORT critCoreTargets ARCHIVE DESTINATION ${CMAKE_INS
 install(FILES include/crit/core.h include/crit/text.h include/crit/sampling.h include/crit/state.h
   include/crit/json.h include/crit/file.h include/crit/sha256.h include/crit/host_memory.h
   include/crit/safetensors.h include/crit/model_config.h include/crit/constraints.h include/crit/trace.h
-  include/crit/device_graph.h include/crit/device_memory.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/crit)
+  include/crit/device_graph.h include/crit/device_memory.h include/crit/native_engine.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/crit)
 install(FILES ../LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/crit)
 if(CRIT_CORE_CUDA)
   install(TARGETS crit_core_cuda EXPORT critCoreTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
@@ -127,6 +128,13 @@ if(BUILD_TESTING AND PROJECT_IS_TOP_LEVEL)
         "${CMAKE_CURRENT_SOURCE_DIR}/../tests/core/${_oracle}_constraint_oracle.py" $<TARGET_FILE:crit_core_constraints_tests>)
       set_tests_properties(crit_core_constraint_${_oracle}_oracle PROPERTIES TIMEOUT 120)
     endforeach()
+    # The engine C ABI (crit/native_engine.h) through crit_core.native's stock adapters, against a toy engine.
+    add_library(crit_core_native_engine_fixture SHARED ../tests/core/native_engine_fixture.cpp)
+    target_link_libraries(crit_core_native_engine_fixture PRIVATE crit_core)
+    crit_strict_warnings(crit_core_native_engine_fixture)
+    add_test(NAME crit_core_native_engine COMMAND "${Python3_EXECUTABLE}" -B
+      "${CMAKE_CURRENT_SOURCE_DIR}/../tests/core/native_engine_check.py" $<TARGET_FILE:crit_core_native_engine_fixture>)
+    set_tests_properties(crit_core_native_engine PROPERTIES TIMEOUT 60)
   endif()
 
   crit_core_cases(state_tests 120 state_config state_transactions state_ownership state_prefixes state_collisions state_reuse state_completeness state_index state_lru state_epochs state_forks state_recurrent state_hybrid state_failures state_randomized state_capacity state_layout state_metadata state_hot_path state_checkpoints)

@@ -517,11 +517,12 @@ void model_index() {
                             "tensor 'a': appears in shards 'first.safetensors' and 'second.safetensors'");
     write_tensors(root / "second.safetensors", {{"b", "BF16", {2}}});
     // Path escapes and non-portable or reserved shard names.
-    for(const std::string name:{"../outside.safetensors", "/tmp/a.safetensors", "C:\\\\a.safetensors", "sub/a.safetensors", "a\\\\b.safetensors",
+    for(const std::string name:{"../outside.safetensors", "/tmp/a.safetensors", "C:\\\\a.safetensors", "sub/../a.safetensors", "sub//a.safetensors",
+                                "sub/.hidden/a.safetensors", "a/a/a/a/a/a/a/a/a.safetensors", "a\\\\b.safetensors",
                                 "file:stream.safetensors", "a.gguf", ".safetensors", "-a.safetensors", "a b.safetensors", "\\u00e9.safetensors"})
         rejects_as<FormatError>([&] { (void)Checkpoint::open(write_index(root, R"({"weight_map":{"a":")" + name + "\"}}")); },
-                                "is not a portable flat .safetensors file name");
-    for(const std::string name:{"CON.safetensors", "nul.safetensors", "com1.safetensors", "LPT9.x.safetensors", "aux.safetensors"})
+                                "is not a portable relative .safetensors path");
+    for(const std::string name:{"CON.safetensors", "nul.safetensors", "com1.safetensors", "LPT9.x.safetensors", "aux.safetensors", "con/a.safetensors"})
         rejects_as<FormatError>([&] { (void)Checkpoint::open(write_index(root, R"({"weight_map":{"a":")" + name + "\"}}")); }, "is a reserved device name");
     // Metadata bounds: strict rejects every deviation; compatible notes unknown keys and a stale total_size.
     const std::string one = R"("weight_map":{"a":"first.safetensors"})";
@@ -637,6 +638,17 @@ void model_index() {
     rejects_as<FormatError>([&] { (void)Checkpoint::open(index); }, display_path(root / "second.safetensors") + ": payload: payload has 1 unindexed trailing bytes");
     fs::remove(root / "second.safetensors");
     rejects_as<std::system_error>([&] { (void)Checkpoint::open(index); }, "second.safetensors: open");
+    // Shards listed with a portable path in a subfolder (tensors/...).
+    TempDir nested;
+    fs::create_directories(nested.path / "tensors");
+    write_tensors(nested.path / "tensors" / "first.safetensors", {{"a", "BF16", {2}}});
+    write_tensors(nested.path / "tensors" / "second.safetensors", {{"b", "I32", {3}}});
+    const auto nested_index = write_index(nested.path, R"({"weight_map":{"a":"tensors/first.safetensors","b":"tensors/second.safetensors"}})");
+    for(const auto& options:{CheckpointOptions{}, strict_index()}) {
+        const auto checkpoint = Checkpoint::open(nested_index, options);
+        require(checkpoint.tensors().size() == 2 && checkpoint.shards().size() == 2 &&
+                checkpoint.shards()[1].file().path().filename() == "second.safetensors", "index shards in a subfolder");
+    }
 }
 
 void model_extra_files() {

@@ -18,18 +18,22 @@ def main(argv=None):
     if arguments and arguments[0] == "kernels":
         from crit_kernels import main as kernels_main
         return kernels_main(arguments[1:])
+    if arguments and arguments[0] == "models":
+        from crit_models import main as models_main
+        return models_main(arguments[1:])
     if arguments and arguments[0] == "eval":
         from crit_eval import SUITE_DIR
         if not SUITE_DIR.is_dir():
             raise SystemExit("crit eval runs from a crit checkout; install it with python -m pip install -e . and run crit eval")
         from crit_eval.cli import main as eval_main
         return eval_main(arguments[1:])
-    parser = argparse.ArgumentParser(description="crit Core, Inference, Kernels, Eval, run records and the serving API")
+    parser = argparse.ArgumentParser(description="crit Core, Inference, Kernels, Models, Eval, run records and the serving API")
     from . import __version__
     parser.add_argument("--version", action="version", version="crit " + __version__)
     subs = parser.add_subparsers(dest="command", required=True)
     subs.add_parser("contracts", help="Print native core contract locations")
     subs.add_parser("kernels", help="Inspect kernel applicability and retain verified dependency bytes")
+    subs.add_parser("models", help="Transform model weights (PTQ) and record how; use crit models --help")
     subs.add_parser("serve", help="Serve a sealed candidate as an OpenAI-compatible API; use crit serve --help")
     subs.add_parser("run", help="Publish retained run/candidate records; use crit run --help")
     subs.add_parser("eval", help="Run the common speed, quality and exactness suite from a checkout; use crit eval --help")

@@ -53,6 +53,27 @@ class KernelTraceTest(unittest.TestCase):
         self.assertIn("only 96 blocks for 170 SMs", text)
         self.assertIn("50% of peak", text)
 
+    def test_overlapping_launch_is_charged_only_after_its_predecessor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            # norm_kernel launches early (programmatic dependent launch) and waits 0.9 ms on gemm_kernel.
+            write_trace(directory, 1, 0, [
+                (0, 1_000_000, 340, "gemm_kernel"),
+                (100_000, 1_100_000, 340, "norm_kernel"),
+                (1_200_000, 1_300_000, 340, "gemm_kernel"),
+            ])
+            marks = {"info": {"name": "toy"}, "cases": [{"id": "c", "prompt_tokens": 10, "output_tokens": 1,
+                                                          "start": 0, "first": 2_000_000, "end": 2_000_001}]}
+            found, device = kernels.read_traces(directory)
+            result = kernels.analyze(found, device, marks)
+        prefill = result["phases"]["prefill"]
+        rows = {r["kernel"]: r for r in prefill["kernels"]}
+        self.assertAlmostEqual(rows["norm_kernel"]["ms"], 0.1)
+        self.assertAlmostEqual(rows["norm_kernel"]["span_ms"], 1.0)
+        self.assertAlmostEqual(rows["gemm_kernel"]["ms"], 1.1)
+        self.assertAlmostEqual(prefill["kernel_ms"], 1.2)  # never more than the GPU was busy
+        self.assertAlmostEqual(prefill["idle_ms"], 0.8)
+        self.assertIn("not charged", kernels.render({"engine": {"name": "toy"}, **result}))
+
     def test_short_name_drops_parameters_not_templates(self):
         self.assertEqual(kernels.short_name("void ns::k<a(b), 2>(float const*, int)"), "ns::k<a(b), 2>")
         self.assertTrue(kernels.short_name("x" * 200).endswith("..."))

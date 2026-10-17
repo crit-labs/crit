@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crit"
-version = "0.1.0"
+version = "0.2.0"
 description = "crit: inference runtime, reusable techniques, kernel discovery, evaluation and an OpenAI-compatible serving API"
 readme = "README.md"
 license = "Apache-2.0"
@@ -19,5 +19,5 @@ Repository = "https://github.com/crit-labs/crit"
 crit = "crit.cli:main"
 
 [tool.setuptools.packages.find]
-where = ["cli", "api", "eval", "kernels", "core/python"]
-include = ["crit*", "crit_api*", "crit_eval*", "crit_kernels*", "crit_core*"]
+where = ["cli", "api", "eval", "kernels", "models", "core/python"]
+include = ["crit*", "crit_api*", "crit_eval*", "crit_kernels*", "crit_models*", "crit_core*"]

@@ -117,7 +117,7 @@ def inspect_safetensors(path, limits=Limits()):
 
 
 def inspect_model(path, limits=Limits()):
-    """Inspect one container or a strict flat-shard .safetensors.index.json (Core's reader, strict policy)."""
+    """Inspect one container or a strict .safetensors.index.json (Core's reader, strict policy)."""
     path = Path(path)
     if path.suffix != ".safetensors" and not path.name.endswith(_safetensors.INDEX_SUFFIX):
         raise AuditError("Unsupported model container/index format")

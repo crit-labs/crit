@@ -10,6 +10,8 @@
     "prefill_cases": ["long-summary", "agent-long"],
     "prefill_aggregate": "prefill tok/s = prompt tokens / time to first token; the prefill score is the geometric mean over prefill_cases",
     "ttft_aggregate": "the TTFT score is the geometric mean of the case medians of time to first token in ms, over every case",
+    "disturbed_spread": 0.25,
+    "disturbed": "a speed case whose measured decode speeds spread (max - min over the median) by more than disturbed_spread stops the round: the device was disturbed (quiet rounds recorded at most about 10%); the result keeps what was measured, marked aborted, and has no status",
     "decode_text": "with a pinned continuation (crit eval pin) and a replaying adapter, speed is measured by replaying that text; otherwise on each engine's own greedy output. Decode scores on different texts are not compared"
   },
   "quality": {
@@ -26,6 +28,7 @@
   "exactness": {
     "rule": "greedy speculative output equals the engine's own non-speculative greedy output token for token",
     "default": "reported",
+    "engine": "the plain greedy output comes from the speculative engine itself when its adapter declares plain decoding (info plain, generate_plain), else from a second engine opened with speculative false",
     "modes": "reported: agreement is shown and every emitted path is judged by the quality budget; required: any difference fails the gate"
   },
   "headroom": {

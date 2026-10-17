@@ -360,3 +360,53 @@ operation: expiry fails the engine. Failure or shutdown calls every operation's
 idempotent `quiesce`, then model quiescence and backend drain. Commit must hand
 newly launched state work to the sessions before the operation is destroyed. The
 bound limits operation count, not bytes; adapters reserve all workspace.
+
+## Engine libraries
+
+`crit/native_engine.h` exports an engine as a shared library with a small C ABI,
+so crit's Python tools reach it without engine-specific glue. Write a factory
+that builds the engine from a JSON configuration and export it once:
+
+```cpp
+#include <crit/native_engine.h>
+
+crit::core::NativeEngine open_engine(std::string_view configuration_json) {
+    crit::core::NativeEngine native;
+    native.owner = /* backend, weights and anything else the engine borrows */;
+    native.engine = std::make_unique<crit::core::Engine>(profile, backend, factory);
+    native.info = [] { return std::string(R"({"speculative": true, "replay": true})"); };
+    return native;
+}
+CRIT_EXPORT_ENGINE(open_engine)
+```
+
+The configuration is the adapter's configuration plus `model` (the model
+directory) and `context_tokens` (the context to serve); Eval also passes
+`speculative`. Link the static `crit::core` into the library (it builds
+position-independent). The ABI (version 1) opens and closes engines, reports
+`ModelInfo` merged with `NativeEngine::info`, generates with stop tokens,
+sampling options and a replay continuation, streams tokens to a callback that
+can cancel, and scores with optional query rows and a named path. Each
+generation's result carries Core's [request timing](#request-timing) in
+milliseconds, merged with `NativeEngine::request` (per-request facts such as
+`accepted`, `verify_ms` and `draft_ms`). Eval counts one round per `accepted`
+entry; report `rounds` when target passes differ from that, because Core's
+`decode_steps` also counts steps without a target pass (seeding a drafter, for
+example). Errors return -1 with the message from
+`crit_engine_last_error()`; nothing throws across the boundary.
+
+A generation with `"replay"` passes the continuation to the session as a
+`ReplayContinuation` in `RequestOptions::context`: accept a draft while it equals
+the continuation's next token and take every correction or bonus token from it,
+so every engine decodes the same text. Declare `"replay": true` in the info facts
+only when the session implements this. A generation with `"plain": true` passes a
+`PlainDecoding` instead: decode one token per target pass without drafting. Eval
+then checks exactness on the loaded engine rather than opening a second one;
+declare `"plain": true` when the session implements it.
+
+`crit_core.native` ([Python](../../python/README.md)) loads such a library and
+supplies the stock adapters: `eval_engine(context, library, defaults)` for
+[eval-v1](../../../docs/eval/ADAPTER.md) and `resident_engine(context, library,
+defaults)` for crit serve's [chat-resident-v1](../../../docs/SERVING.md#adapter-contract).
+The [toy engine fixture](../../../tests/core/native_engine_fixture.cpp) and its
+[check](../../../tests/core/native_engine_check.py) exercise both.

@@ -11,6 +11,7 @@
 #include <crit/host_memory.h>
 #include <crit/json.h>
 #include <crit/model_config.h>
+#include <crit/native_engine.h>
 #include <crit/safetensors.h>
 #include <crit/sampling.h>
 #include <crit/sha256.h>
@@ -204,6 +205,18 @@ void check_device_memory() {
     require(resolved.device_address == 65568 && resolved.owners.size() == 1, "device_memory.h: mapped source");
 }
 
+// crit/native_engine.h
+cc::NativeEngine refusing_factory(std::string_view) { throw std::runtime_error("consumer factory refused"); }
+
+void check_native_engine() {
+    cc::ReplayContinuation replay;
+    replay.tokens = {1, 2, 3};
+    require(replay.host_bytes() == 3 * sizeof(cc::Token) && cc::native_api::abi_version == 1, "native_engine.h: types");
+    require(cc::native_api::open(&refusing_factory, "{}") == nullptr &&
+                std::string_view(cc::native_api::last_error()) == "consumer factory refused",
+            "native_engine.h: a failing factory");
+}
+
 // crit/model_config.h
 void check_model_config(const std::filesystem::path& directory) {
     write_file(directory / "config.json", R"({"model_type":"llama","vocab_size":32,"hidden_size":64,)"
@@ -227,6 +240,7 @@ int main() {
         check_trace();
         check_device_graph();
         check_device_memory();
+        check_native_engine();
         const TemporaryDirectory directory;
         check_file(directory.path());
         check_safetensors(directory.path());

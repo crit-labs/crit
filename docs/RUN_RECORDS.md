@@ -20,7 +20,7 @@ Optional, untracked `CRIT_ROOT/settings.toml` holds machine settings that `creat
 uses when the request omits them; unknown keys are an error:
 
 ```toml
-wsl_run_root = "/llm/engines/crit"  # folder for work that must run under WSL; empty: none
+wsl_run_root = "/srv/crit/runs"  # folder for work that must run under WSL; empty: none
 device = "device.json"              # crit eval probe result (relative: from CRIT_ROOT)
 ram_headroom_gib = 2                # host memory free at the engine's peak (default 2)
 vram_headroom_gib = 1               # device memory free at the engine's peak (default 1)
@@ -40,6 +40,7 @@ and speed techniques; a larger one trades context for that room.
 | `settle` | `--reservation RUN_RELATIVE_PATH --record result.json`; exit, logs, cleanup |
 | `package` | `--candidate ID --source DIR --record recipe.json`; runnable files and manifest |
 | `check`, `benchmark` | `--candidate ID --record payload.json`; appends evidence |
+| `measure` | `--candidate ID --adapter EVAL_ADAPTER [--model DIR] [--config JSON] [--seconds N]`; reserves a benchmark attempt, measures every resident case through the package's eval-v1 adapter in a child process, settles it and records one benchmark per case bound to the case's checks |
 | `seal` | `--candidate ID --lifecycle STATE [--failure TEXT]`; closes the candidate |
 | `select` | `--candidate ID`; selects a sealed eligible candidate |
 | `stop` | `--record stop.json` |
@@ -83,11 +84,13 @@ responsibility.
 | Payload | Fields |
 | --- | --- |
 | Inputs | Nonempty `hardware_manifest`, `environment_manifest`; `case_manifests` mapping **every** fixed case ID to an ordered nonempty list of `{path, bytes, sha256}` under the run's `captured/` |
-| Proposal | `label`, `rationale`, `strategy`, `configuration` object, `store_decisions` object; optional `parent_candidate_id`, `origin_candidate_id` (earlier retained candidates); `weights` (`as_stored` or `transformed`, required when `weights_policy` is `as_stored`) |
+| Proposal | `label`, `rationale`, `strategy`, `configuration` object, `store_decisions` object; optional `parent_candidate_id`, `origin_candidate_id` (earlier retained candidates); `weights` (`as_stored` or `transformed`, required when `weights_policy` is `as_stored`). A run whose model is a folder needs `work/recon.json` (`recon`) before its first candidate; crit adds its `frozen` block as `configuration.recon` (a supplied `recon` must equal it) and `extensions.recon` with its path and SHA-256 |
 | Package recipe | `build: {toolchain: {...}, dependencies: [...], command: [...]}`, literal `launch` argument list, `capabilities` list |
 
 In an `as_stored` run, a candidate declaring `transformed` weights (requantized,
-pruned or changed) is measured but never eligible. The coordinator cannot inspect
+pruned or changed) is measured but never eligible. In a `transformable` run, [Models](../models/README.md)
+produces transformed weights with a record of recipe, calibration data, seed, hashes and
+cost. The coordinator cannot inspect
 weights; declare honestly. `as_stored` covers the target weights that compute every
 published token. It does not cover draft-only weights (a drafter may use any encoding
 when stored target weights verify every token; declare `as_stored` and record the
@@ -136,6 +139,15 @@ exact `workload`, `metrics`, `missing_metrics`, `checks`, `outcome`, `started_at
 list, and the hardware and environment manifests. Use canonical package-manifest, case
 and protocol hashes, not file hashes of differently formatted JSON.
 
+`checks` lists the `{path, sha256}` records of the case's checks
+(`candidates/ID/checks/check-NNNN.json`). When it is missing or empty, `benchmark`
+binds the case's latest recorded check per gate for the same package, so publish a
+case's checks first. A benchmark qualifies only when its cited checks pass every
+required gate at the run's evidence level. Otherwise it stays `exploratory` and the
+candidate cannot be selected.
+A sealed candidate cannot be fixed, so `benchmark` and `seal` warn, and `select` names
+what blocks eligibility.
+
 Each metric is `{unit, samples}` with exactly the declared repetitions:
 
 | Metric | Unit / boundary |
@@ -156,6 +168,21 @@ model/input/hardware/environment, case, protocol and correctness policy (context
 concurrency and cold/resident modes group separately). Eligibility requires the fixed
 gates and evidence level; target satisfaction checks all retained benchmarks across
 required cases, not the fastest series. Served request timing never enters projections.
+
+### Measured benchmarks
+
+`crit run measure` reads each case's prompt from a retained JSON file
+`{"ids": [token ids]}` in its manifest (the workload's `prompt_tokens` long). The first
+candidate measured pins its plain greedy output of every case as `pins/CASE.json`, when
+two runs give the same text (otherwise the case stays unpinned until a later candidate
+repeats). Every later measurement of any candidate decodes that text through the
+adapter's `replay` when it declares one, so speculative candidates are compared on the
+same tokens and drafts. Without `replay` or a pin, a candidate decodes its own text, and
+`extensions.decode_text` records which and why. Times are host-observed from token delivery, as
+in Eval. Memory is sampled during each request: host `MemAvailable` (Linux) or
+`GlobalMemoryStatusEx` (Windows), the process's resident memory, and free device memory
+from `nvidia-smi` for GPU 0. Device memory is the driver's whole-GPU view, and metrics a
+host cannot measure go to `missing_metrics`.
 
 ### Eval evidence
 
@@ -197,6 +224,7 @@ run-ID/
   events/event-NNNNNNNN.json     ordered events
   captured/                     retained workload files
   work/                         mutable build scratch
+  work/recon.json, recon.md     model recon: gathered facts with sources, frozen block, notes
   candidates/candidate-NNNN/
     candidate.json              fixed proposal/configuration
     source/, source.manifest.json

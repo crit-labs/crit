@@ -4,7 +4,9 @@ Runs the speed cases once each (after one warmup) in a child process with a CUPT
 (probe/kernel_trace.cpp), so every kernel the engine launches is recorded, CUDA-graph nodes included, with no
 change to the engine. The first delivered token splits each case into prefill and decode. For each phase the
 report ranks kernels by total time and shows calls, average duration and launch width (blocks against the
-device's SMs; a kernel with fewer blocks than SMs leaves part of the GPU idle). When the adapter declares
+device's SMs; a kernel with fewer blocks than SMs leaves part of the GPU idle). Time is exclusive: a kernel that
+starts before the previous one ends (programmatic dependent launch, or another stream) is charged only from that
+end, so a kernel waiting on its predecessor is not charged the wait; `span_ms` keeps the raw durations. When the adapter declares
 `kernel_work` estimates, it also shows achieved TFLOPS and GB/s against the device ceilings from `crit eval probe`.
 Linux only; needs a CUDA toolkit with CUPTI.
 """
@@ -161,6 +163,17 @@ def _work_rule(rules, name):
     return None
 
 
+def exclusive(inside):
+    """(kernel, exclusive ns) in start order: each kernel's time after every earlier kernel has ended. The
+    charges sum to the time the GPU ran any kernel."""
+    out, covered = [], None
+    for k in sorted(inside, key=lambda k: (k[0], k[1])):
+        start = k[0] if covered is None else max(k[0], covered)
+        out.append((k, max(0, k[1] - start)))
+        covered = k[1] if covered is None else max(covered, k[1])
+    return out
+
+
 def analyze(kernels, device, marks, device_ceilings=None):
     names = demangle(k[4] for k in kernels)
     rules = (marks.get("info") or {}).get("kernel_work")
@@ -172,12 +185,12 @@ def analyze(kernels, device, marks, device_ceilings=None):
         spans = {"prefill": (case["start"], case["first"]), "decode": (case["first"], case["end"])}
         cases[case["id"]] = {}
         for phase, (lo, hi) in spans.items():
-            inside = [k for k in kernels if lo <= k[0] < hi]
+            inside = exclusive([k for k in kernels if lo <= k[0] < hi])
             wall = (hi - lo) / 1e6
-            busy = sum(k[1] - k[0] for k in inside) / 1e6
+            busy = sum(ns for _, ns in inside) / 1e6
             per = {}
-            for k in inside:
-                per[names.get(k[4], k[4])] = per.get(names.get(k[4], k[4]), 0.0) + (k[1] - k[0]) / 1e6
+            for k, ns in inside:
+                per[names.get(k[4], k[4])] = per.get(names.get(k[4], k[4]), 0.0) + ns / 1e6
             heavy = sorted(per.items(), key=lambda x: -x[1])[:5]
             cases[case["id"]][phase] = {"wall_ms": wall, "kernel_ms": busy, "launches": len(inside),
                                         "top": [{"kernel": short_name(n), "ms": t, "share": t / busy if busy else 0.0}
@@ -187,11 +200,12 @@ def analyze(kernels, device, marks, device_ceilings=None):
             agg["kernel_ms"] += busy
             agg["launches"] += len(inside)
             tokens = case["prompt_tokens"] if phase == "prefill" else case["output_tokens"]
-            for start, end, blocks, threads, raw in inside:
+            for (start, end, blocks, threads, raw), ns in inside:
                 name = names.get(raw, raw)
-                row = agg["by"].setdefault(name, {"ms": 0.0, "calls": 0, "blocks": [], "flops": 0.0, "bytes": 0.0,
-                                                  "cases": set()})
-                row["ms"] += (end - start) / 1e6
+                row = agg["by"].setdefault(name, {"ms": 0.0, "span_ms": 0.0, "calls": 0, "blocks": [], "flops": 0.0,
+                                                  "bytes": 0.0, "cases": set()})
+                row["ms"] += ns / 1e6
+                row["span_ms"] += (end - start) / 1e6
                 row["calls"] += 1
                 row["blocks"].append(blocks)
                 rule = _work_rule(rules, name)
@@ -206,7 +220,8 @@ def analyze(kernels, device, marks, device_ceilings=None):
         rows = []
         for name, row in sorted(agg["by"].items(), key=lambda x: -x[1]["ms"]):
             blocks = int(statistics.median(row["blocks"]))
-            entry = {"kernel": short_name(name), "ms": row["ms"], "share": row["ms"] / agg["kernel_ms"] if agg["kernel_ms"] else 0.0,
+            entry = {"kernel": short_name(name), "ms": row["ms"], "span_ms": row["span_ms"],
+                     "share": row["ms"] / agg["kernel_ms"] if agg["kernel_ms"] else 0.0,
                      "calls": row["calls"], "avg_us": 1000 * row["ms"] / row["calls"], "blocks": blocks,
                      "underfills": bool(device.get("sms")) and blocks < device["sms"]}
             seconds = row["ms"] / 1000
@@ -242,9 +257,10 @@ def render(result, top=TOP):
                 extra.append(f"only {row['blocks']} blocks for {sms} SMs")
             lines.append(f"  {row['ms']:9.1f} ms {row['share']:5.1%}  x{row['calls']:<6d} {row['avg_us']:8.1f} us  "
                          f"{row['kernel']}" + (f"  [{'; '.join(extra)}]" if extra else ""))
-        if agg["kernel_ms"] > agg["wall_ms"] * 1.02:
-            lines.append("  (kernel time exceeds wall time: kernels overlap, e.g. under programmatic dependent launch, "
-                         "so durations include waiting; trace with it off for exact per-kernel times)")
+        overlapped = sum(r["span_ms"] - r["ms"] for r in agg["kernels"])
+        if overlapped > 0.02 * agg["kernel_ms"]:
+            lines.append(f"  ({overlapped:.1f} ms of kernel spans overlapped an earlier kernel, e.g. under programmatic "
+                         "dependent launch, and are not charged; span_ms in the JSON keeps raw durations)")
     lines.append("by case, top kernels per phase:")
     for case, phases in result["cases"].items():
         for phase, entry in phases.items():

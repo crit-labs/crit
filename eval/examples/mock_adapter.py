@@ -23,6 +23,7 @@ class MockEngine:
             with open(self.config["reference"], encoding="utf-8") as handle:
                 self.reference = json.load(handle)
         self.noise = float(self.config.get("noise", 0.0))
+        self.calls = 0
 
     def info(self):
         return {"name": "mock", "configuration": self.config, "max_context": self.capacity,
@@ -32,12 +33,18 @@ class MockEngine:
                 "draft_bytes_per_step": self.config.get("draft_bytes_per_step"),
                 "kv_bytes_per_token": self.config.get("kv_bytes_per_token"),
                 # Optional: replay(prompt, continuation, on_tokens) decodes a pinned continuation.
-                "replay": bool(self.config.get("replay", True))}
+                "replay": bool(self.config.get("replay", True)),
+                # Optional: generate_plain(prompt, max_new_tokens, on_tokens) decodes plain greedy on this
+                # speculative engine, so the exactness check opens no second engine.
+                "plain": bool(self.config.get("plain", True)) and self.config["draft_tokens"] > 0}
 
-    def _rounds(self, tokens, on_tokens):
-        step = self.config["draft_tokens"] + 1
+    def _rounds(self, tokens, on_tokens, plain=False):
+        step = 1 if plain else self.config["draft_tokens"] + 1
         # Test knob: an engine that gets slower when it is opened at a smaller context.
         pause = 0.0005 + (0.005 if self.capacity < int(self.config.get("slow_below_context", 0)) else 0.0)
+        if self.config.get("disturbed"):
+            # Test knob: a device something else is using: decoding takes 0.1 s, every other request twice that.
+            pause += 0.1 * (1 + self.calls % 2) / -(-len(tokens) // step)
         for i in range(0, len(tokens), step):
             time.sleep(pause)
             on_tokens(tokens[i:i + step])
@@ -54,7 +61,14 @@ class MockEngine:
         # Test knob: an engine that runs out of memory beyond a context it nevertheless claims.
         if len(prompt) + max_new_tokens > int(self.config.get("fails_above_context", 1 << 62)):
             raise RuntimeError("out of device memory")
-        return self._rounds([(sum(prompt) + i) % 1000 for i in range(max_new_tokens)], on_tokens)
+        # Test knob: an engine whose greedy text changes from one request to the next.
+        shift = self.calls if self.config.get("unrepeatable") else 0
+        self.calls += 1
+        return self._rounds([(sum(prompt) + i + shift) % 1000 for i in range(max_new_tokens)], on_tokens)
+
+    def generate_plain(self, prompt, max_new_tokens, on_tokens):
+        """One token per target pass, no drafting: the same greedy text."""
+        return self._rounds([(sum(prompt) + i) % 1000 for i in range(max_new_tokens)], on_tokens, plain=True)
 
     def replay(self, prompt, continuation, on_tokens):
         """Decode `continuation` as if it were the engine's own greedy output (drafts accepted while
