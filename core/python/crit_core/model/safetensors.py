@@ -27,6 +27,8 @@ INDEX_NAME = "model" + INDEX_SUFFIX
 SINGLE_NAME = "model.safetensors"
 RECORD_KEYS = frozenset({"dtype", "shape", "data_offsets"})
 SHARD_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\.safetensors")
+SHARD_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+SHARD_DEPTH = 8     # path components of an index shard ("tensors/model-00001-of-00002.safetensors" has 2)
 UNKNOWN_SHOWN = 8   # unknown index keys named in one error or note
 JSON_DEPTH = 64     # nesting limit of headers and indexes (the native reader's at both call sites)
 
@@ -246,6 +248,21 @@ def _shard_name(value, label, limits):
     return value
 
 
+def _shard_path(value, label, limits):
+    """An index shard: a relative "/"-separated path of portable components ending in a flat shard name, as
+    checkpoints that keep their shards in a subfolder (tensors/...) list them. Every component starts with a letter
+    or digit, so none is "." or "..", and nothing leaves the index's directory but through a link."""
+    _name(value, label, limits)
+    parts = value.split("/")
+    if (len(parts) > SHARD_DEPTH or not SHARD_NAME.fullmatch(parts[-1]) or
+            not all(SHARD_COMPONENT.fullmatch(part) for part in parts[:-1])):
+        _fail(f"{label} {_short(value)} is not a portable relative .safetensors path")
+    for part in parts:
+        if RESERVED_DEVICE.fullmatch(part.split(".", 1)[0].upper()):
+            _fail(f"{label} {_short(value)} is a reserved device name")
+    return value
+
+
 def _shape(value, dtype, limits, label):
     if len(value) > limits.max_rank:
         _fail(f"{label}: rank {len(value)} exceeds the {limits.max_rank} limit")
@@ -285,7 +302,7 @@ def _path_identity(info):
 @contextmanager
 def _regular_file(path, follow_symlinks):
     # Yields a raw descriptor: a buffered stream would fill its buffer past the header with tensor bytes.
-    # Flat shard names plus this check reject path escapes; without follow_symlinks also links. This detects
+    # Portable shard paths plus this check reject path escapes; without follow_symlinks also links. This detects
     # changes during the read; it is neither a sandbox against a hostile filesystem nor a payload digest.
     before = path.stat() if follow_symlinks else path.lstat()
     if not stat.S_ISREG(before.st_mode):
@@ -440,7 +457,7 @@ def _read_index(path, limits, follow_symlinks):
 
 def inspect_model(path, limits=None, *, index_policy=IndexPolicy.COMPATIBLE, header_only=False,
                   follow_symlinks=True, extra_files=()):
-    """Inspect a .safetensors file, a flat-shard .safetensors.index.json or a model directory; returns a Checkpoint.
+    """Inspect a .safetensors file, a .safetensors.index.json or a model directory; returns a Checkpoint.
 
     A directory resolves to model.safetensors.index.json, else model.safetensors, else its only .safetensors file;
     anything else is an error that names the candidates. extra_files are flat names beside the source (for example
@@ -476,7 +493,7 @@ def inspect_model(path, limits=None, *, index_policy=IndexPolicy.COMPATIBLE, hea
             _fail(f"{path}: weight_map lists {len(weight_map)} tensors, more than {limits.max_tensors}")
         for key, name in weight_map.items():
             _name(key, f"{path}: weight_map tensor name", limits)
-            _shard_name(name, f"{path}: weight_map shard for {key!r}", limits)
+            _shard_path(name, f"{path}: weight_map shard for {key!r}", limits)
         names = sorted(set(weight_map.values()))
         if len(names) > limits.max_shards:
             _fail(f"{path}: {len(names)} shards exceed the {limits.max_shards}-shard limit")

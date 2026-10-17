@@ -48,7 +48,8 @@ memory and host memory. Pass it with `run --device`; `--bandwidth GBS` overrides
 projection in its stored format (BF16, FP8 or NVFP4), excluding gathered embeddings, the vision
 tower, draft layers and the output head; 4 × heads × head dim per query-key pair in each
 full-attention layer; and the chunked linear-attention recurrence. The floor is matmul FLOPs at
-each format's GEMM rate plus attention and recurrence at the BF16 rate.
+each format's GEMM rate, attention at the faster of the BF16 and FP8 rates (FP8 Q·Kᵀ and P·V fit
+the quality budget, so a BF16 attention floor can be beaten), and the recurrence at the BF16 rate.
 
 **TTFT floor:** the larger of the prompt's compute floor and one weight read (`bytes_per_pass`,
 else the language-model and output-head bytes) plus the prompt's KV writes at device bandwidth.
@@ -100,8 +101,10 @@ NVFP4), streaming layers onto the GPU one at a time.
 
 For a speculative engine, Eval compares each measured speed case's greedy output with the same
 engine's non-speculative output and reports whether they are identical, the first differing
-token and the agreeing prefix. By default (`--exactness reported`) this is information, since
-verify and decode may sum in different orders and the drift budget judges both;
+token and the agreeing prefix. An engine declaring `plain` decodes the non-speculative output
+itself before it closes; otherwise Eval opens a second engine with `speculative` false
+(`exactness.engine` is `shared` or `separate`). By default (`--exactness reported`) this is
+information, since verify and decode may sum in different orders and the drift budget judges both;
 `--exactness required` makes any difference fail. Teacher-forced scoring cannot see a lossy
 acceptance rule (accepting drafts that are not the target's argmax), so such an engine records
 the rule in its configuration and needs criteria that allow it.

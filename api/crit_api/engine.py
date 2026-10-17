@@ -17,6 +17,7 @@ CAPABILITY = "chat-json-v1"
 CONSTRAINTS_CAPABILITY = "chat-constraints-v1"
 MAX_REPLY = 65536
 MAX_CONVERSATION = 1_000_000
+LOAD_BYTES_PER_SECOND = 50e6  # model bytes per second assumed by the default load bound (copy, hash, engine load)
 
 
 class EngineError(Exception):
@@ -91,12 +92,13 @@ class ServedEngine:
     The server owns the machine's crit runtime while it runs: no other crit process can load an engine.
     """
     def __init__(self, workspace, run_id=None, candidate_id=None, project=ROOT, runtime_directory=None,
-                 host_limit=None, device_limit=None, timeout=600):
+                 host_limit=None, device_limit=None, timeout=600, load_timeout=None):
         self.store = RunStore(workspace, project)
         self.run_id = run_id or single_run(self.store)
         self.requested_candidate = candidate_id
         self.default = None
         self.timeout = number(timeout, "request timeout", .01, 86400)
+        self.load_timeout = None if load_timeout is None else number(load_timeout, "load timeout", .01, 7 * 86400)
         self.ownership = RuntimeOwnership(runtime_directory)
         self.runtime = ResidentRuntime(self.ownership, host_limit, device_limit)
         self.lock = threading.Lock()
@@ -183,12 +185,20 @@ class ServedEngine:
             self.candidates(refresh=True)
             self.ownership.acquire()
             try:
-                result = self.runtime.call("load", {"spec": spec}, stop or threading.Event(), 600)
+                result = self.runtime.call("load", {"spec": spec}, stop or threading.Event(), self.load_seconds(spec))
                 if result["status"] != "completed":
                     raise ValueError(result["error"] or "Engine loading failed")
             except BaseException:
                 self._release()
                 raise
+
+    def load_seconds(self, spec):
+        """Bound on loading a candidate: --load-timeout, else 600 s plus the model's bytes at 50 MB/s. The host
+        copies and hashes every model file into its private snapshot before the engine reads them, so loading
+        grows with the checkpoint; a fixed bound fails large models on ordinary disks."""
+        if self.load_timeout is not None:
+            return self.load_timeout
+        return 600 + sum(row["bytes"] for row in spec["model_manifest"]) / LOAD_BYTES_PER_SECOND
 
     def _release(self):
         try:

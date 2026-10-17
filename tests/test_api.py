@@ -4,6 +4,7 @@ import json
 import os
 import threading
 import unittest
+from unittest import mock
 
 from test_chat_residency import ServeFixture
 from crit_api.server import Api, RequestError, Server, conversation, stops
@@ -243,7 +244,8 @@ class CommandTests(ServeFixture, unittest.TestCase):
     def test_launchers_repeat_the_command_without_the_api_key(self):
         import contextlib, io
         from crit_api.cli import main
-        with contextlib.redirect_stdout(io.StringIO()):
+        environment = {k: v for k, v in os.environ.items() if k != "WSL_DISTRO_NAME"}
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.dict(os.environ, environment, clear=True):
             self.assertEqual(main(["--workspace", str(self.store.root), "--api-key", "secret", "--port", "8123", "--write-launchers"]), 0)
         for name in ("serve.cmd", "serve.sh"):
             script = (self.directory / name).read_text(encoding="utf-8")
@@ -251,3 +253,13 @@ class CommandTests(ServeFixture, unittest.TestCase):
             self.assertIn("8123", script)
             self.assertIn(self.run_id, script)
             self.assertNotIn("secret", script)
+
+    @unittest.skipIf(os.name == "nt", "WSL launchers are written from the Linux side")
+    def test_wsl_windows_launcher_starts_the_posix_script_in_its_distribution(self):
+        import contextlib, io
+        from crit_api.cli import main
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.dict(os.environ, {"WSL_DISTRO_NAME": "Fixture-Linux"}):
+            self.assertEqual(main(["--workspace", str(self.store.root), "--port", "8123", "--write-launchers"]), 0)
+        script = (self.directory / "serve.cmd").read_text(encoding="utf-8")
+        self.assertIn("wsl.exe -d Fixture-Linux -e " + str(self.directory / "serve.sh"), script)
+        self.assertIn("8123", (self.directory / "serve.sh").read_text(encoding="utf-8"))

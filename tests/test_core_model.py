@@ -1576,6 +1576,15 @@ class SafetensorsIndexTests(SafetensorsFixture):
             self.assertEqual((checkpoint.source, checkpoint.notes, checkpoint.tensor_bytes), (path.absolute(), (), 16))
         self.assertEqual(self.strict(path).index_policy, "strict")
 
+    def test_index_shards_in_a_subfolder(self):
+        (self.root / "tensors").mkdir()
+        self.tensors((("a", "BF16", (2,)),), "first.safetensors", folder=self.root / "tensors")
+        self.tensors((("b", "I32", (3,)),), "second.safetensors", folder=self.root / "tensors")
+        path = self.index({"a": "tensors/first.safetensors", "b": "tensors/second.safetensors"})
+        for checkpoint in self.both(path):
+            self.assertEqual(set(checkpoint.tensors), {"a", "b"})
+            self.assertEqual(checkpoint.tensors["b"].shard, (self.root / "tensors" / "second.safetensors").absolute())
+
     def test_index_missing_undeclared_duplicate_and_wrong_shard_tensors(self):
         self.tensors((("a", "BF16", (2,)),), "first.safetensors")
         self.tensors((("b", "I32", (3,)),), "second.safetensors")
@@ -1592,8 +1601,10 @@ class SafetensorsIndexTests(SafetensorsFixture):
                      "tensor 'a' appears in shards 'first.safetensors' and 'second.safetensors'")
 
     def test_index_path_escape_and_portability_rejection(self):
-        for name, message in (("../outside.safetensors", "not a portable flat"), ("/tmp/a.safetensors", "not a portable"),
-                              ("C:\\a.safetensors", "not a portable"), ("sub/a.safetensors", "not a portable"),
+        for name, message in (("../outside.safetensors", "not a portable relative"), ("/tmp/a.safetensors", "not a portable"),
+                              ("C:\\a.safetensors", "not a portable"), ("sub/../a.safetensors", "not a portable"),
+                              ("sub//a.safetensors", "not a portable"), ("sub/.hidden/a.safetensors", "not a portable"),
+                              ("CON/a.safetensors", "reserved device name"), ("a/" * 8 + "a.safetensors", "not a portable"),
                               ("a\\b.safetensors", "not a portable"), ("file:stream.safetensors", "not a portable"),
                               ("CON.safetensors", "reserved device name"), ("lpt1.x.safetensors", "reserved device"),
                               ("a.gguf", "not a portable"), (".safetensors", "not a portable"),
@@ -1935,7 +1946,7 @@ class PackageTests(unittest.TestCase):
 
     def test_core_sources_never_name_the_technique_store(self):
         for path in (ROOT / "core/python/crit_core/model").rglob("*"):
-            if path.is_file():
+            if path.is_file() and "__pycache__" not in path.parts:
                 self.assertNotRegex(path.read_text(encoding="utf-8").lower(), r"inference/|crit_inference", path)
 
 

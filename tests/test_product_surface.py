@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "cli"))
 from crit import inference as store
 LAUNCHER = str(ROOT / "tests/run_crit.py")
-PRODUCT_FOLDERS = ("core", "inference", "kernels", "eval", "api", "tests", "docs", "cli", ".github")
+PRODUCT_FOLDERS = ("core", "inference", "kernels", "models", "eval", "api", "tests", "docs", "cli", ".github")
 
 
 class ProductTests(unittest.TestCase):
@@ -126,7 +126,7 @@ class ProductTests(unittest.TestCase):
 
     def test_whole_folders_include_unknown_extensions_and_exclude_local_roots(self):
         allowed = ["README.md", "CLAUDE.md", "inference/example/code/new.extension", "core/deep/data.json",
-                   "tests/fixture.raw", "docs/new.record", "cli/new.extension", "api/new.extension", "kernels/new.extension", ".github/workflows/ci.yml"]
+                   "tests/fixture.raw", "docs/new.record", "cli/new.extension", "api/new.extension", "kernels/new.extension", "models/new.extension", ".github/workflows/ci.yml"]
         ignored = ["scratch.txt", "tools/deep/source.anything", "private/source.py", "archive/history.json", "evidence/result.json", "build/output.cpp",
                    "dist/package.json", "runs/ledger.json", ".idea/workspace.xml", "research/source.cpp",
                    "temp/new-ui.py", "other-ui-proposal/source.py", "ui/radar.py"]
@@ -197,10 +197,11 @@ class ProductTests(unittest.TestCase):
     def test_cli_only_package_has_one_entrypoint_and_no_browser_sources(self):
         package = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertEqual(package["project"]["scripts"], {"crit": "crit.cli:main"})
-        self.assertEqual(package["tool"]["setuptools"]["packages"]["find"]["where"], ["cli", "api", "eval", "kernels", "core/python"])
+        self.assertEqual(package["tool"]["setuptools"]["packages"]["find"]["where"], ["cli", "api", "eval", "kernels", "models", "core/python"])
         self.assertEqual({p.name for p in (ROOT / "cli").iterdir() if p.is_dir()}, {"crit"})
         self.assertEqual({p.name for p in (ROOT / "api").iterdir() if p.is_dir()}, {"crit_api"})
         self.assertEqual({p.name for p in (ROOT / "kernels").iterdir() if p.is_dir()}, {"crit_kernels", "examples"})
+        self.assertEqual({p.name for p in (ROOT / "models").iterdir() if p.is_dir()}, {"crit_models"})
         assets = [p for folder in PRODUCT_FOLDERS for p in (ROOT / folder).rglob("*")
                   if p.is_file() and p.suffix in {".html", ".css", ".js"}]
         self.assertEqual(assets, [])

@@ -13,6 +13,7 @@ and `crit_core.__version__` is crit's version. From a checkout, put
 | [jsonfile.py](crit_core/jsonfile.py) | `loads`, `read`, `JsonError`: strict JSON | [crit/json.h](../include/crit/json.h) |
 | [model](crit_core/model/README.md) | `load_model_config`, `ModelConfig`, crit eval's config rules, `inspect_safetensors`, `inspect_model` | [crit/model_config.h](../include/crit/model_config.h), [crit/safetensors.h](../include/crit/safetensors.h) |
 | [text](crit_core/text/README.md) | `Tokenizer`, chat templates, `GenerationConfig`, `IncrementalDetokenizer`, `StopMatcher`, `TextStream`, `load_model_text` | [crit/text.h](../include/crit/text.h) |
+| [native.py](crit_core/native.py) | `NativeEngine` (ctypes over an [engine library](../src/runtime/README.md#engine-libraries)), the stock adapters `eval_engine` (eval-v1) and `resident_engine` (chat-resident-v1) | [crit/native_engine.h](../include/crit/native_engine.h) |
 | [constraints](crit_core/constraints) | `compile_language`, `CompilerCache`, `PreparationService`, `byte_vocabulary`, `matches`, `json_object_matches` ([guide](../src/constraints/README.md)) | [crit/constraints.h](../include/crit/constraints.h) |
 
 Everything but `crit_core.text` uses the standard library only. The text layer
@@ -51,4 +52,6 @@ exist only in Python; a native engine tokenizes through its `TextFrontend`
 suite in `tests/`. The text tests build tiny tokenizers in-process
 ([core_text_fixtures.py](../../tests/core_text_fixtures.py)) and need `tokenizers`
 and `jinja2`; the model tests compare the config rules with crit-eval-v2's own
-([eval_v2_rules.py](../../tests/eval_v2_rules.py)).
+([eval_v2_rules.py](../../tests/eval_v2_rules.py)). `crit_core.native` is tested
+by Core's CTest against a toy engine library
+([native_engine_check.py](../../tests/core/native_engine_check.py)).

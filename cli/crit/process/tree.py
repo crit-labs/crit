@@ -9,7 +9,7 @@ import uuid
 
 from crit.run.records import keys, read_json, write_json
 
-from .ownership import group_alive, process_identity
+from .ownership import RETIREMENT_SECONDS, group_alive, process_identity
 
 
 class ProcessTree:
@@ -154,7 +154,7 @@ class ProcessTree:
                 _fields_ = [("user", c.c_int64), ("kernel", c.c_int64), ("period_user", c.c_int64),
                             ("period_kernel", c.c_int64), ("faults", w.DWORD), ("total", w.DWORD),
                             ("active", w.DWORD), ("terminated", w.DWORD)]
-            end = time.monotonic() + 5
+            end = time.monotonic() + RETIREMENT_SECONDS
             # Job accounting can reach zero before asynchronous termination has
             # settled a descendant's I/O. Retain process handles before killing
             # the job, then wait for those actual processes as well as the job.
@@ -174,7 +174,7 @@ class ProcessTree:
                     if c.get_last_error() != 234:  # ERROR_MORE_DATA
                         raise c.WinError(c.get_last_error())
                     if time.monotonic() >= end:
-                        raise subprocess.TimeoutExpired("Windows job member snapshot", 5)
+                        raise subprocess.TimeoutExpired("Windows job member snapshot", RETIREMENT_SECONDS)
                     capacity = max(capacity * 2, members.assigned)
                 for pid in members.ids[:members.count]:
                     handle = self.api.OpenProcess(0x00100000 | 0x1000, False, pid)
@@ -198,13 +198,13 @@ class ProcessTree:
                     if not value.active:
                         break
                     if time.monotonic() >= end:
-                        raise subprocess.TimeoutExpired("Windows job retirement", 5)
+                        raise subprocess.TimeoutExpired("Windows job retirement", RETIREMENT_SECONDS)
                     time.sleep(.02)
                 for handle in handles:
                     remaining = max(0, int((end - time.monotonic()) * 1000))
                     status = self.api.WaitForSingleObject(handle, remaining)
                     if status == 258:  # WAIT_TIMEOUT
-                        raise subprocess.TimeoutExpired("Windows process retirement", 5)
+                        raise subprocess.TimeoutExpired("Windows process retirement", RETIREMENT_SECONDS)
                     if status != 0:  # WAIT_OBJECT_0
                         raise c.WinError(c.get_last_error())
             finally:
@@ -224,18 +224,18 @@ class ProcessTree:
         if self.process:
             if self.process.poll() is None:
                 self.process.kill()
-            self.process.wait(timeout=5)
+            self.process.wait(timeout=RETIREMENT_SECONDS)
             if os.name == "nt":
                 # Popen otherwise retains its kernel handle until garbage
                 # collection. Release this owner at the explicit close boundary;
                 # wait()/poll() still use the cached return code afterwards.
                 self.process._handle.Close()
             if os.name != "nt":
-                end = time.monotonic() + 5
+                end = time.monotonic() + RETIREMENT_SECONDS
                 while group_alive(self.process.pid) and time.monotonic() < end:
                     time.sleep(.02)
                 if group_alive(self.process.pid):
-                    raise subprocess.TimeoutExpired("Process group retirement", 5)
+                    raise subprocess.TimeoutExpired("Process group retirement", RETIREMENT_SECONDS)
         self.closed = True
 
 

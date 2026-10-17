@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 project(crit_concurrency_consumer LANGUAGES CXX)
-find_package(critCore 0.1.0 EXACT CONFIG REQUIRED)
+find_package(critCore 0.2.0 EXACT CONFIG REQUIRED)
 add_executable(crit_concurrency_consumer main.cpp)
 target_link_libraries(crit_concurrency_consumer PRIVATE crit::core)
 if(MSVC)

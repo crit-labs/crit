@@ -13,6 +13,20 @@ before the action.
 Agree on model/encoding, hardware/OS, prompt/output sizes, concurrency, cold or
 resident mode, correctness criteria, objectives, headroom, candidate budget, attempts
 and provider spend. Preflight models, compilers, Eval requirements and dependencies.
+After `create`, gather the model's sampling defaults, stop tokens, chat templates and
+`config.json` fields, then finish the scaffolded `work/recon.md` from the model card and
+reference code ([AGENTS.md](../AGENTS.md)):
+
+```text
+crit run --project CRIT_ROOT --root RUN_ROOT --id RUN_ID recon
+```
+
+`candidate` refuses a run whose model is a folder until recon has run; a single-file
+model needs none. `work/recon.json` names every file it read with its SHA-256. Its `frozen` block
+(`sampling`, `chat_template`, `template_variables`, `stop_token_ids`, `stop_strings`)
+goes into each later candidate's configuration as `recon`; edit the block, with the
+reason in `recon.md`, before the candidate it should change. `--force` gathers again
+and keeps `recon.md`.
 `candidate_budget` counts complete candidates; there is no time budget, only a 30-day
 safety window.
 
@@ -26,8 +40,6 @@ only when the user asks.
   "model_path": "ABSOLUTE_LOCAL_MODEL_PATH",
   "correctness_criteria": "REPLACE_WITH_FIXED_CRITERIA",
   "device": "ABSOLUTE_PATH_TO_DEVICE_JSON",
-  "vram_headroom_gib": 1,
-  "ram_headroom_gib": 2,
   "candidate_budget": 3,
   "attempt_limit": 32,
   "verification_level": "artifact_verified",
@@ -40,6 +52,9 @@ only when the user asks.
 ```
 
 These values are a template, not acceptance criteria; use `cases` for multiple workloads.
+Free-memory headroom comes from `settings.toml` (`vram_headroom_gib`,
+`ram_headroom_gib`; defaults 1 and 2 GiB), and `create` freezes it. A value in the
+request replaces the machine's setting, so add one only when the user asks for it.
 
 ```text
 crit run --project CRIT_ROOT --root RUN_ROOT create --record request.json
@@ -53,7 +68,8 @@ configured separately.
 
 Retain workload files under `RUN_ROOT/RUN_ID/captured/` with nonempty hardware and
 environment manifests and path/size/SHA-256 manifests for every case. The coordinator
-verifies them and hashes the model.
+verifies them and hashes the model. Keep each case's prompt as a JSON file
+`{"ids": [token ids]}` so `crit run measure` can benchmark it.
 
 ```text
 crit run --project CRIT_ROOT --root RUN_ROOT --id RUN_ID resolve --record inputs.json
@@ -77,11 +93,15 @@ crit run --root RUN_ROOT --id RUN_ID reserve --candidate CANDIDATE_ID --operatio
 crit run --root RUN_ROOT --id RUN_ID settle --reservation RESERVATION_PATH --record result.json
 crit run --root RUN_ROOT --id RUN_ID package --candidate CANDIDATE_ID --source PACKAGE_DIR --record recipe.json
 crit run --root RUN_ROOT --id RUN_ID check --candidate CANDIDATE_ID --record check.json
-crit run --root RUN_ROOT --id RUN_ID benchmark --candidate CANDIDATE_ID --record benchmark.json
+crit run --root RUN_ROOT --id RUN_ID measure --candidate CANDIDATE_ID --adapter EVAL_ADAPTER.py
 ```
 
 Run these from the checkout or add `--project CRIT_ROOT`; use the exact reservation
-path returned. The package holds runnable files, dependencies and notices, without
+path returned. `measure` reserves, runs and settles its own benchmark attempt and
+records one benchmark per case after the case's checks. Every candidate decodes the
+same pinned text, so their decode speeds compare. A `benchmark --record` payload
+remains for workloads `measure` does not cover (cold mode, concurrency above 1).
+The package holds runnable files, dependencies and notices, without
 `manifest.json` (crit creates it). Build/launch recipes are literal arguments, without
 shell expansion.
 
@@ -111,6 +131,8 @@ process and can change outputs. For speculative decoding, record
 ### Run the common Eval suite
 
 Retain an [Eval adapter](eval/ADAPTER.md) for the candidate's engine with its source.
+An engine built as a Core [engine library](../core/src/runtime/README.md#engine-libraries)
+uses the stock adapters in `crit_core.native` for Eval and for serving.
 Every candidate of a model uses the same prepared data, reference and pinned
 continuation (`crit eval pin`, with the adapter's `replay`). Keep data and results in
 the run workspace and run evaluation under the same reservation and settlement.

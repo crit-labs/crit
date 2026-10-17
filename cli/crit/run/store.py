@@ -10,8 +10,9 @@ import socket
 import uuid
 
 from .records import (LIFECYCLES, MAX_CANDIDATES, SAFETY_WINDOW_MINUTES, STOP_REASONS, WEIGHTS, amendment, candidate_projection, quality_terms, digest, evidence,
-    file_sha, header, headroom_record, ident, inputs, inventory, keys, load_run, now, number, read_candidates,
+    file_sha, header, headroom_record, ident, ineligibility, inputs, inventory, keys, load_run, now, number, read_candidates,
     read_json, record, request_spec, safe_path, segment, text, timestamp, write_json)
+from . import recon
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -411,6 +412,17 @@ class RunStore:
             rows = inventory(source)
             if not rows:
                 raise ValueError("Candidate needs complete retained source")
+            # The model recon's sampling, chat template and stop tokens are frozen into every candidate.
+            frozen, recon_ref = recon.load(root, run)
+            if frozen is None and Path(run["spec"]["model_path"]).is_dir():
+                raise ValueError(f"Run recon before the first candidate: crit run --id {run_id} recon writes "
+                                 f"{recon.RECON_JSON}, then finish {recon.RECON_MD}")
+            configuration, extensions = proposal["configuration"], proposal.get("extensions", {})
+            if frozen is not None:
+                if not isinstance(configuration, dict) or configuration.get("recon", frozen) != frozen:
+                    raise ValueError(f"configuration.recon differs from {recon.RECON_JSON}; change its frozen block, with "
+                                     f"the reason in {recon.RECON_MD}, before the candidate")
+                configuration, extensions = {**configuration, "recon": frozen}, {**extensions, "recon": recon_ref}
             candidate_id = next_id(root / "candidates", "candidate")
             folder = root / "candidates" / candidate_id
             # Validate every record before the folder exists: a rejected proposal leaves nothing behind and
@@ -418,9 +430,9 @@ class RunStore:
             source_manifest = record("source_manifest", run_id, candidate_id=candidate_id, files=rows)
             value = record("candidate", run_id, candidate_id=candidate_id, segment_id=bounds["segment_id"], ordinal=int(candidate_id.split("-")[1]),
                 parent_candidate_id=proposal.get("parent_candidate_id"), origin_candidate_id=proposal.get("origin_candidate_id"), created_at=now(),
-                **{k: proposal[k] for k in ("label", "rationale", "strategy", "configuration", "store_decisions")},
+                **{k: proposal[k] for k in ("label", "rationale", "strategy", "store_decisions")}, configuration=configuration,
                 **({"weights": proposal["weights"]} if "weights" in proposal else {}),
-                extensions=proposal.get("extensions", {}), source_manifest_sha256=digest(source_manifest), inputs_manifest_sha256=resolved["manifest_sha256"], request_sha256=run["request_sha256"])
+                extensions=extensions, source_manifest_sha256=digest(source_manifest), inputs_manifest_sha256=resolved["manifest_sha256"], request_sha256=run["request_sha256"])
             overlays = {f"candidates/{candidate_id}/candidate.json": value, f"candidates/{candidate_id}/source.manifest.json": source_manifest}
             folder.mkdir()
             try:
@@ -435,6 +447,13 @@ class RunStore:
             self._refresh(root, candidate_id)
             self._state(root)
             self._event(root, "candidate_created", candidate_id, detail={"parent_candidate_id": value["parent_candidate_id"], "rationale": value["rationale"]})
+        return value
+
+    def recon(self, run_id, force=False):
+        root = self.directory(run_id)
+        with lease(root):
+            value = recon.write(root, load_run(root), force)
+            self._event(root, "model_recon", reference={"path": recon.RECON_JSON, "sha256": file_sha(root / recon.RECON_JSON)})
         return value
 
     def package(self, run_id, candidate_id, source, recipe):
@@ -475,9 +494,22 @@ class RunStore:
             if kind not in {"check", "benchmark"}:
                 raise ValueError("Append requires check or benchmark")
             directory = root / "candidates" / candidate_id / ("checks" if kind == "check" else "benchmarks")
+            if kind == "benchmark" and isinstance(data, dict) and not data.get("checks"):
+                data = {**data, "checks": self._case_checks(root, candidate_id, data.get("case_id"), data.get("package_sha256"))}
             record_id = next_id(directory, kind, ".json")
             value = record(kind, run_id, candidate_id=candidate_id, segment_id=candidate["segment_id"], **{kind + "_id": record_id}, **data)
             return self._publish(root, candidate_id, f"{directory.name}/{record_id}.json", value)
+
+    @staticmethod
+    def _case_checks(root, candidate_id, case_id, package_sha256):
+        """A benchmark that cites no checks binds the case's latest check per gate for its package: the checks
+        recorded before it, so publication order no longer decides whether it can qualify."""
+        latest = {}
+        for path in sorted((root / "candidates" / candidate_id / "checks").glob("check-*.json")):
+            check = read_json(path)
+            if check.get("case_id") == case_id and check.get("package_sha256") == package_sha256:
+                latest[check.get("gate")] = path
+        return [{"path": path.relative_to(root).as_posix(), "sha256": file_sha(path)} for path in sorted(latest.values())]
 
     def reserve(self, run_id, candidate_id, operation, seconds=None):
         root = self.directory(run_id)
@@ -585,8 +617,12 @@ class RunStore:
         with lease(root):
             data = self.get(run_id)
             candidate = next((c for c in data["candidates"] if c["candidate_id"] == candidate_id), None)
-            if not candidate or not candidate["eligible"]:
+            if not candidate:
                 raise ValueError("Select requires a sealed eligible candidate")
+            if not candidate["eligible"]:
+                reasons = ineligibility(data["run"], candidate)
+                raise ValueError(f"Select requires a sealed eligible candidate; {candidate_id} is not eligible" +
+                                 (": " + "; ".join(reasons) if reasons else ""))
             self._state(root, selected_candidate_id=candidate_id)
             self._event(root, "candidate_selected", candidate_id)
         return self.get(run_id)
@@ -728,6 +764,10 @@ applied settings, prepared data, reference and result JSON; report skipped cases
 Use the same prepared data and reference for comparisons, and include Eval results in the handoff.
 Eval result JSON is separate evidence; it does not automatically publish run checks or benchmarks.
 Use the record coordinator: crit run --project "{self.project}" --root "{self.root}" --id {run['run_id']} --help
+Before the first candidate, run recon (required for a model folder; crit run ... --id {run['run_id']} recon): it writes work/recon.json from the
+model's generation_config.json, tokenizer files, chat templates and config.json, and scaffolds work/recon.md. Finish
+recon.md from the model card and the transformers reference code; every candidate freezes recon.json's frozen
+block (sampling, chat template, stop tokens) into configuration["recon"] instead of defaulting to greedy.
 Develop source and builds under this run's work/; keep candidates and failures visible with decision reasoning.
 Capture fixed benchmark inputs under captured/. Freeze inputs before construction with resolve.
 Create each candidate through candidate --source DIR --record proposal.json; it retains a complete source copy.

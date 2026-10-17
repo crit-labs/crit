@@ -189,6 +189,17 @@ class CharacterText:
 
 
 class PrepareTests(unittest.TestCase):
+    def test_model_identity_counts_index_shards_in_a_subfolder(self):
+        with tempfile.TemporaryDirectory() as folder:
+            model = Path(folder)
+            (model / "tensors").mkdir()
+            (model / "tensors" / "a.safetensors").write_bytes(b"x" * 5)
+            (model / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"w": "tensors/a.safetensors"}}))
+            first = prepare.model_identity(model)
+            self.assertEqual(first["files"]["weight_files"], {"tensors/a.safetensors": 5})
+            (model / "tensors" / "a.safetensors").write_bytes(b"x" * 6)
+            self.assertNotEqual(prepare.model_identity(model)["sha256"], first["sha256"])
+
     def test_long_context_prompt_has_the_exact_length(self):
         class Model(CharacterText):
             def render(self, messages, tools=None, **variables):
@@ -295,10 +306,14 @@ class CeilingTests(unittest.TestCase):
         floor, missing = ceiling.prefill_floor_ms(model, {"nvfp4": 1000, "fp8": 500, "bf16": 200}, 1000)
         self.assertEqual(missing, [])
         self.assertAlmostEqual(floor["matmul_ms"], 1000 * (4e9 / 1e15 + 2e9 / 5e14) * 1000)
-        self.assertAlmostEqual(floor["attention_ms"], 1000 * 1001 / 2 * 1e5 / 2e14 * 1000)
+        # Attention runs at the faster FP8 rate (500 TFLOPS); the recurrence stays at BF16.
+        self.assertAlmostEqual(floor["attention_ms"], 1000 * 1001 / 2 * 1e5 / 5e14 * 1000)
         self.assertAlmostEqual(floor["recurrent_ms"], 1000 * 1e6 / 2e14 * 1000)
         self.assertAlmostEqual(floor["total_ms"], floor["matmul_ms"] + floor["attention_ms"] + floor["recurrent_ms"])
         self.assertEqual(ceiling.prefill_floor_ms(model, {"nvfp4": 1000, "bf16": 200}, 10)[1], ["fp8 GEMM rate"])
+        bf16_only = {"matmul_flops_per_token": {"bf16": 1e9}, "attention_flops_per_pair": 1e5}
+        self.assertAlmostEqual(ceiling.prefill_floor_ms(bf16_only, {"bf16": 200}, 10)[0]["attention_ms"],
+                               10 * 11 / 2 * 1e5 / 2e14 * 1000)
         self.assertIsNone(ceiling.prefill_floor_ms(model, None, 10)[0])
 
     def test_ttft_floor_is_the_larger_of_compute_and_one_weight_read(self):
@@ -534,6 +549,51 @@ class StatusTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 runner.run(MOCK, "unused-model", data, data / "bad.json", config, warmups=0, repetitions=1,
                            log=lambda message: None, quality_budget={"kld_max": 1.0})
+
+    def test_exactness_runs_on_the_loaded_engine_when_it_decodes_plain_greedy(self):
+        opened = []
+        original = runner.open_engine
+
+        def counting(module, model, config, speculative, context_tokens=None):
+            opened.append(speculative)
+            return original(module, model, config, speculative, context_tokens)
+        runner.open_engine = counting
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                data = Path(directory)
+                fixture(data)
+                for plain, engine, opens in ((True, "shared", [True]), (False, "separate", [True, False])):
+                    opened.clear()
+                    result = runner.run(MOCK, "unused-model", data, data / "result.json",
+                                        {"max_context": 128, "plain": plain}, parts=("speed", "exactness"),
+                                        warmups=0, repetitions=2, log=lambda message: None, exactness="required")
+                    self.assertEqual(opened, opens)
+                    self.assertEqual(result["exactness"]["engine"], engine)
+                    self.assertTrue(result["exactness"]["identical"])
+                    # Plain decoding is one target pass per token, whichever engine ran it.
+                    self.assertGreater(result["exactness"]["step_ms"], 0)
+        finally:
+            runner.open_engine = original
+
+    def test_a_disturbed_device_stops_the_round(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            fixture(data)
+            config = {"reference": str(data / "reference.json"), "max_context": 128, "disturbed": True}
+            result = runner.run(MOCK, "unused-model", data, data / "result.json", config, warmups=0, repetitions=2,
+                                log=lambda message: None)
+            self.assertEqual(result["aborted"]["reason"], "disturbed")
+            self.assertIn("speed short: decode varied", result["aborted"]["detail"])
+            self.assertNotIn("status", result)
+            self.assertNotIn("quality", result)  # nothing after the disturbed case is measured
+            self.assertEqual(json.loads((data / "result.json").read_text())["aborted"], result["aborted"])
+            protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+            with self.assertRaises(SystemExit):
+                status.status_of(data / "result.json", protocol)
+            kept = runner.run(MOCK, "unused-model", data, data / "kept.json", config, warmups=0, repetitions=2,
+                              log=lambda message: None, abort_disturbed=False)
+            self.assertNotIn("aborted", kept)
+            self.assertIn("status", kept)
 
     def test_differences_from_plain_greedy_fail_only_when_exactness_is_required(self):
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
@@ -839,6 +899,58 @@ class ContextTests(unittest.TestCase):
                     "headroom": {"context": {"decode": {"score": score}, "ttft": {"score_ms": 1000.0}}}}
         self.assertAlmostEqual(status.changes(result(8192, 110.0), result(8192, 100.0))["context_decode"], 0.1)
         self.assertIsNone(status.changes(result(8192, 110.0), result(4096, 100.0))["context_decode"])
+
+
+
+class ContextTextTests(unittest.TestCase):
+    """Long-context points replay the longest speed case's pinned continuation, like the speed cases."""
+
+    class Engine:
+        def __init__(self):
+            self.calls = []
+
+        def generate(self, prompt, n, on_tokens):
+            self.calls.append(("generate", len(prompt)))
+            tokens = [7] * n
+            on_tokens(tokens)
+            return {"tokens": tokens, "rounds": n}
+
+        def replay(self, prompt, continuation, on_tokens):
+            self.calls.append(("replay", len(prompt)))
+            on_tokens(list(continuation))
+            return {"tokens": list(continuation), "rounds": 2}
+
+    prepared = {"speed": [{"id": "short", "prompt_ids": [1, 2]}, {"id": "long", "prompt_ids": [3, 4, 5, 6]}]}
+    settings = {"output_tokens": 4, "curve_from": 16, "repetitions": 1}
+    pinned = {"sha256": "ab" * 32, "engine": "fixture", "cases": {"short": [9] * 6, "long": [5, 6, 7, 8, 9, 10]}}
+
+    def run_points(self, info, continuations):
+        engine = self.Engine()
+        points, text = runner.run_context(engine, {"max_context": 64, **info}, self.prepared, self.settings, 32,
+                                          lambda message: None, continuations)
+        return engine, points, text
+
+    def test_points_replay_the_longest_cases_pinned_text(self):
+        engine, points, text = self.run_points({"replay": True, "speculative": True}, self.pinned)
+        self.assertEqual(text["source"], "pinned")
+        self.assertEqual(text["case"], "long")
+        self.assertTrue(engine.calls and all(kind == "replay" for kind, _ in engine.calls))
+        self.assertTrue(all(p["status"] == "measured" for p in points.values()))
+
+    def test_points_fall_back_to_own_output_without_replay_or_enough_text(self):
+        engine, _, text = self.run_points({"replay": False, "speculative": True}, self.pinned)
+        self.assertEqual(text["source"], "generated")
+        self.assertTrue(all(kind == "generate" for kind, _ in engine.calls))
+        short = {**self.pinned, "cases": {"long": [5, 6]}}
+        _, _, text = self.run_points({"replay": True, "speculative": True}, short)
+        self.assertEqual(text["source"], "generated")
+        self.assertIn("fewer than the 4", text["reason"])
+
+    def test_context_decode_compares_only_on_the_same_text(self):
+        pinned = {"context": {"tokens": 32, "decode_text": {"source": "pinned", "sha256": "ab" * 32}}}
+        own = {"context": {"tokens": 32}}
+        self.assertEqual(status.context_text_identity(pinned), "ab" * 32)
+        self.assertEqual(status.context_text_identity(own), "generated")
 
 
 if __name__ == "__main__":

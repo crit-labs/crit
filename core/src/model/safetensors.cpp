@@ -109,6 +109,39 @@ std::optional<std::string> shard_name_problem(std::string_view name, std::uint64
     if(device == "CON" || device == "PRN" || device == "AUX" || device == "NUL" || numbered) return std::string("is a reserved device name");
     return std::nullopt;
 }
+// An index shard: a relative "/"-separated path of at most shard_depth portable components ending in a flat shard
+// name, as checkpoints that keep their shards in a subfolder (tensors/...) list them. Every component starts with a
+// letter or digit, so none is "." or "..", and nothing leaves the index's directory but through a link.
+constexpr std::size_t shard_depth = 8;
+std::optional<std::string> shard_path_problem(std::string_view name, std::uint64_t limit) {
+    if(auto problem = name_problem(name, limit)) return problem;
+    std::vector<std::string_view> parts;
+    for(std::size_t start = 0;;) {
+        const auto end = name.find('/', start);
+        parts.push_back(name.substr(start, end == std::string_view::npos ? std::string_view::npos : end - start));
+        if(end == std::string_view::npos) break;
+        start = end + 1;
+    }
+    const auto component = [](std::string_view part) {
+        return !part.empty() && alnum(part.front()) &&
+               std::all_of(part.begin(), part.end(), [](char c) { return alnum(c) || c == '.' || c == '_' || c == '-'; });
+    };
+    bool portable = parts.size() <= shard_depth && std::all_of(parts.begin(), parts.end() - 1, component);
+    if(portable) {
+        if(auto problem = shard_name_problem(parts.back(), limit)) {
+            if(*problem != "is a reserved device name") portable = false;
+            else return problem;
+        }
+    }
+    if(!portable) return std::string("is not a portable relative .safetensors path");
+    for(const auto part:parts) {
+        std::string device(part.substr(0, part.find('.')));
+        for(auto& c:device) if(c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
+        const bool numbered = device.size() == 4 && (device.starts_with("COM") || device.starts_with("LPT")) && device[3] >= '0' && device[3] <= '9';
+        if(device == "CON" || device == "PRN" || device == "AUX" || device == "NUL" || numbered) return std::string("is a reserved device name");
+    }
+    return std::nullopt;
+}
 // model.safetensors.index.json, else model.safetensors, else the directory's only *.safetensors entry. Each
 // candidate must be a regular file or a link (a dangling one included); a directory by that name is skipped.
 fs::path resolve_directory(const fs::path& directory) {
@@ -460,7 +493,7 @@ Checkpoint Checkpoint::open(const std::filesystem::path& path, const CheckpointO
             if(auto problem = name_problem(entry.key, limits.name_bytes)) throw FormatError(source, "index weight_map", "tensor " + shown(entry.key) + ": " + *problem);
             if(entry.value.kind() != json::Kind::string)
                 throw FormatError(source, "index weight_map", "shard for " + shown(entry.key) + " must be a string, not " + describe(entry.value));
-            if(auto problem = shard_name_problem(entry.value.string(), limits.name_bytes))
+            if(auto problem = shard_path_problem(entry.value.string(), limits.name_bytes))
                 throw FormatError(source, "index weight_map", "shard " + shown(entry.value.string()) + " for " + shown(entry.key) + " " + *problem);
             names.insert(entry.value.string());
         }

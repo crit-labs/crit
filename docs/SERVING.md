@@ -31,9 +31,10 @@ reply = client.chat.completions.create(model="default", messages=[{"role": "user
 | `--cors-origin ORIGIN` | Allow browser requests from this origin, or `*` |
 | `--model-name NAME` | Model ID reported for the default candidate |
 | `--timeout SECONDS` | Limit per request; default 600 |
+| `--load-timeout SECONDS` | Limit on loading the starting candidate; default 600 plus the model's bytes at 50 MB/s, since the host copies and hashes every model file before the engine loads |
 | `--resident-ram-gib N`, `--resident-vram-gib N` | Optional caps on pool-owned model bytes, not total process/device memory |
 | `--project PATH` | crit checkout used to verify packages; default this checkout |
-| `--write-launchers` | Write `serve.cmd` (Windows, double-click) and `serve.sh` with the same options into the run folder, then exit. They never contain the API key; set `CRIT_API_KEY` |
+| `--write-launchers` | Write `serve.cmd` (Windows, double-click) and `serve.sh` with the same options into the run folder, then exit. Under WSL, `serve.cmd` starts `serve.sh` in the same distribution. They never contain the API key; set `CRIT_API_KEY` |
 | `--recover-runtime` | Verify retirement of a crashed runtime, release ownership, exit |
 
 Ctrl+C stops accepting requests, unloads the engine and releases model memory.
@@ -92,7 +93,11 @@ failed final check becomes an error event.
 
 A package is servable when it declares **`chat-json-v1` and `chat-resident-v1`** and
 `launch[0]` is a retained Python module exporting `create_engine(context)` (native
-engines can use a Python wrapper). Serving works with failed or missing checks and
+engines can use a Python wrapper; a Core engine library exported with
+`CRIT_EXPORT_ENGINE` can return `crit_core.native.resident_engine(context, library,
+defaults)`, which applies the model's chat template and stop tokens, streams text and
+reports Core's timing, see [engine libraries](../core/src/runtime/README.md#engine-libraries)).
+Serving works with failed or missing checks and
 never changes benchmark evidence or passes a gate. [Eval](eval/ADAPTER.md) uses a
 separate `eval-v1` adapter (`create_eval_engine(context)`); both can wrap one engine.
 

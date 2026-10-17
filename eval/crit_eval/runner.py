@@ -78,12 +78,37 @@ def timed_generate(engine, prompt, output_tokens):
     return _timed(lambda on_tokens: engine.generate(list(prompt), output_tokens, on_tokens), prompt, output_tokens)
 
 
+def timed_plain(engine, prompt, output_tokens):
+    """Plain one-token greedy decoding on a speculative engine that declares it (info "plain")."""
+    return _timed(lambda on_tokens: engine.generate_plain(list(prompt), output_tokens, on_tokens), prompt, output_tokens)
+
+
 def timed_replay(engine, prompt, continuation):
     """The engine's speculative loop on a fixed continuation: drafts are accepted while they match it and
     each round's correction is its next token, so every engine decodes the same text."""
     continuation = list(continuation)
     return _timed(lambda on_tokens: engine.replay(list(prompt), list(continuation), on_tokens), prompt,
                   len(continuation), expected=continuation)
+
+
+class Disturbed(Exception):
+    """A speed case's repetitions disagree far beyond any quiet engine's run-to-run spread: something else
+    is using the device. The round stops instead of measuring the rest on a disturbed device."""
+
+
+DISTURBED_MIN_REQUEST_MS = 100  # shorter requests vary with timer and scheduler jitter, not with the device
+
+
+def check_disturbed(case_id, samples, limit):
+    """Raise Disturbed when the measured decode speeds of one case spread (max - min over the median) by more
+    than `limit`. Quiet rounds recorded at most about 10%; a disturbed one 37%."""
+    measured = [s for s in samples if not s.get("warmup")]
+    if not limit or not measured or metrics.median([s["request_ms"] for s in measured]) < DISTURBED_MIN_REQUEST_MS:
+        return
+    spread = headroom.spread([s["decode_tps"] for s in measured if s.get("decode_tps")])
+    if spread is not None and spread > limit:
+        raise Disturbed(f"speed {case_id}: decode varied {spread:.0%} between repetitions (limit {limit:.0%}); "
+                        "the device was disturbed. Measure again when nothing else uses it")
 
 
 SUMMARY_KEYS = ("decode_tps", "prefill_tps", "ttft_ms", "request_ms", "tokens_per_round", "round_ms")
@@ -103,10 +128,11 @@ def decode_text(info, continuations):
     return {"source": "generated", "reason": reason}
 
 
-def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, continuations=None):
+def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, continuations=None, disturbed_spread=None):
     """Speed cases. With a pinned continuation and a replaying adapter, every speed KPI comes from replays
     of the pinned text (identical for every engine) and two free generations record the engine's own
-    output for repeatability and exactness; otherwise the KPIs come from free generation."""
+    output for repeatability and exactness; otherwise the KPIs come from free generation.
+    disturbed_spread: stop the round (Disturbed) when a case's decode speeds spread by more than this."""
     cases = {}
     stop_ids = set(prepared["stop_ids"])
     text = decode_text(info, continuations)
@@ -136,6 +162,7 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
                 samples.append(sample)
                 if i >= warmups:
                     outputs.append(tokens)
+        check_disturbed(case["id"], samples, disturbed_spread)
         summary = _summary([s for s in samples if not s["warmup"]])
         crossed = [i for i, t in enumerate(outputs[0]) if t in stop_ids]
         cases[case["id"]] = {
@@ -252,15 +279,28 @@ def run_quality(engine, info, prepared, reference, protocol, log, thresholds=Non
     return out
 
 
-def run_exactness(module, model, config, prepared, speed, log, mode="reported", context_tokens=None):
-    engine, info = open_engine(module, model, config, speculative=False, context_tokens=context_tokens)
+def plain_on_engine(engine, info):
+    """Whether the speculative engine itself decodes plain one-token greedy (info "plain", generate_plain),
+    so exactness needs no second engine."""
+    return bool(info.get("speculative") and info.get("plain") and callable(getattr(engine, "generate_plain", None)))
+
+
+def run_exactness(module, model, config, prepared, speed, log, mode="reported", context_tokens=None, engine=None,
+                  info=None):
+    """Plain greedy output of every measured speed case against the speculative output. With `engine` (a
+    speculative engine whose plain_on_engine holds) the plain requests run on it; otherwise on a second
+    engine opened with speculative false."""
+    shared = engine is not None
+    if not shared:
+        engine, info = open_engine(module, model, config, speculative=False, context_tokens=context_tokens)
+    generate = timed_plain if shared else timed_generate
     try:
         cases, samples, steps = {}, [], {}
         for case in prepared["speed"]:
             measured = speed["cases"].get(case["id"], {})
             if measured.get("status") != "measured":
                 continue
-            tokens, sample = timed_generate(engine, case["prompt_ids"], case["output_tokens"])
+            tokens, sample = generate(engine, case["prompt_ids"], case["output_tokens"])
             samples.append(sample)
             steps[case["id"]] = headroom.step_ms_from([sample])
             diverge = next((i for i, (a, b) in enumerate(zip(tokens, measured["tokens"])) if a != b), None)
@@ -268,12 +308,14 @@ def run_exactness(module, model, config, prepared, speed, log, mode="reported", 
             cases[case["id"]] = {"identical": diverge is None, "first_difference": diverge,
                                  "agreeing_prefix": agreeing / max(len(tokens), 1)}
             log(f"exactness {case['id']}: {'identical' if diverge is None else f'differs at token {diverge}'}")
-        return {"mode": mode, "baseline": info["configuration"], "cases": cases,
+        return {"mode": mode, "baseline": info["configuration"], "engine": "shared" if shared else "separate",
+                "cases": cases,
                 "identical": all(c["identical"] for c in cases.values()),
                 "passed": mode == "reported" or all(c["identical"] for c in cases.values()),
                 "step_ms": headroom.step_ms_from(samples), "steps_ms": steps}
     finally:
-        engine.close()
+        if not shared:
+            engine.close()
 
 
 def context_requirement(model, device, context_tokens, vram_headroom_bytes, settings):
@@ -284,12 +326,30 @@ def context_requirement(model, device, context_tokens, vram_headroom_bytes, sett
     return {**max_context(model, device, vram_headroom_bytes, settings), "source": "computed"}
 
 
-def run_context(engine, info, prepared, settings, required, log):
+def context_text(info, continuations, prepared, output_tokens):
+    """The text the long-context points decode, and the replayed tokens: the longest speed case's pinned
+    continuation (its first output_tokens), since every point's prompt ends with that case's whole prompt,
+    when the data has one and the adapter replays; else each engine's own greedy output."""
+    text = decode_text(info, continuations)
+    if text["source"] != "pinned":
+        return text, None
+    longest = max(prepared["speed"], key=lambda case: len(case["prompt_ids"]))
+    pinned = continuations["cases"].get(longest["id"]) or []
+    if len(pinned) < output_tokens:
+        return {"source": "generated", "reason": f"the pinned continuation of {longest['id']} has {len(pinned)} tokens, "
+                f"fewer than the {output_tokens} each point decodes"}, None
+    return {**text, "case": longest["id"]}, list(pinned[:output_tokens])
+
+
+def run_context(engine, info, prepared, settings, required, log, continuations=None):
     """One greedy request per curve point, each filling the context exactly (prompt plus output equal
     the point). The prompt is copies of the longest speed case's prompt ending with a whole one, so the
-    engine decodes an answer to it. A request the engine cannot serve is recorded as failed."""
+    engine decodes an answer to it: a replay of that case's pinned continuation when there is one (the
+    same text for every engine, as in the speed cases), else the engine's own output. A request the
+    engine cannot serve is recorded as failed. Returns (points, decode text)."""
     base = max((case["prompt_ids"] for case in prepared["speed"]), key=len)
     n = int(settings["output_tokens"])
+    text, continuation = context_text(info, continuations, prepared, n)
     points = {}
     for point in curve_points(required, settings):
         if point > info["max_context"]:
@@ -304,7 +364,10 @@ def run_context(engine, info, prepared, settings, required, log):
         samples = []
         try:
             for _ in range(int(settings.get("repetitions", 1))):
-                _, sample = timed_generate(engine, prompt, n)
+                if continuation is not None:
+                    _, sample = timed_replay(engine, prompt, continuation)
+                else:
+                    _, sample = timed_generate(engine, prompt, n)
                 samples.append(sample)
         except Exception as error:  # an engine that cannot hold the context fails here, however it fails
             points[str(point)] = {"status": "failed", "context": point, "error": f"{type(error).__name__}: {error}"[:2000]}
@@ -315,7 +378,7 @@ def run_context(engine, info, prepared, settings, required, log):
                               **summary, "samples": samples}
         log(f"context {point:,}: decode {summary['decode_tps'] or 0:.1f} tok/s, first token after {summary['ttft_ms']:,.0f} ms, "
             f"tokens/round {summary['tokens_per_round'] or 0:.2f}")
-    return points
+    return points, text
 
 
 def _spread(case, key):
@@ -355,7 +418,7 @@ def compare_lower(at_max, at_lower, lower, settings):
 
 
 def run_lower_context(module, model, config, prepared, protocol, required, warmups, repetitions, log,
-                      continuations=None):
+                      continuations=None, disturbed_spread=None):
     """The speed cases on an engine opened at a lower context. It runs just before the engine built for the
     required context, so the two speed runs sit side by side and ahead of the long-context curve's heat.
     Lowering the context frees device memory and must never make a case slower (compare_lower)."""
@@ -370,9 +433,11 @@ def run_lower_context(module, model, config, prepared, protocol, required, warmu
         engine, info = open_engine(module, model, config, speculative=True, context_tokens=lower)
         try:
             measured = run_speed(engine, info, prepared, protocol, warmups, repetitions,
-                                 lambda message: log("lower context: " + message), continuations)
+                                 lambda message: log("lower context: " + message), continuations, disturbed_spread)
         finally:
             engine.close()
+    except Disturbed:
+        raise
     except Exception as error:  # an engine that cannot run at a lower context fails the gate, however it fails
         log(f"lower context: failed ({type(error).__name__}: {error})")
         return {"context": lower, "passed": False, "error": f"{type(error).__name__}: {error}"[:2000]}
@@ -384,7 +449,8 @@ PARTS = ("speed", "quality", "exactness", "context", "heldout")
 
 def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
         repetitions=None, label=None, log=print, bandwidth_gbs=None, device=None, baseline=None,
-        quality_budget=None, exactness=None, context_tokens=None, vram_headroom_bytes=None, context_reserve_bytes=None):
+        quality_budget=None, exactness=None, context_tokens=None, vram_headroom_bytes=None, context_reserve_bytes=None,
+        abort_disturbed=True):
     """device: `crit eval probe` result (bandwidth_gbs, tflops, free memory); bandwidth_gbs overrides its bandwidth.
     baseline: an earlier result to show KPI changes against.
     quality_budget: the run's drift limits over the protocol's (ppl_ratio_max, kld_mean_max, kld_p99_max).
@@ -392,7 +458,9 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
     context_tokens: the context every engine is built for (a run's kv_tokens); without it, Eval's max context
     for the model on the device, with vram_headroom_bytes (default 1 GiB) left free. The `context` part
     measures the long-context curve up to it and the speed cases again at a lower context. The `heldout` part
-    decodes the held-out prompts; with a baseline that measured them, the generality gate judges them."""
+    decodes the held-out prompts; with a baseline that measured them, the generality gate judges them.
+    abort_disturbed: stop the round when a speed case's repetitions show a disturbed device (protocol
+    speed.disturbed_spread); the result then holds what was measured and `aborted`, and no status."""
     protocol = load_json(EVAL_DIR / "protocol.json")
     thresholds = quality_thresholds(protocol, quality_budget)
     exactness = exactness or protocol["exactness"].get("default", "required")
@@ -441,12 +509,28 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
             + "); engines use their own")
     warmups = protocol["speed"]["warmup_runs"] if warmups is None else warmups
     repetitions = protocol["speed"]["repetitions"] if repetitions is None else repetitions
+    disturbed = protocol["speed"].get("disturbed_spread") if abort_disturbed else None
+    try:
+        return _measure(result, module, model, config or {}, prepared, protocol, parts, warmups, repetitions, log,
+                        continuations, required, settings, reference, thresholds, exactness, disturbed, bandwidth_gbs,
+                        device, ceiling, baseline, out)
+    except Disturbed as error:
+        log(f"aborted: {error}")
+        result["aborted"] = {"reason": "disturbed", "detail": str(error)}
+        result["ended_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        write_json(out, result)
+        return result
+
+
+def _measure(result, module, model, config, prepared, protocol, parts, warmups, repetitions, log, continuations,
+             required, settings, reference, thresholds, exactness, disturbed, bandwidth_gbs, device, ceiling, baseline,
+             out):
     lower = None
     if "context" in parts and "speed" in parts and required:
-        lower = run_lower_context(module, model, config or {}, prepared, protocol, required, warmups, repetitions, log,
-                                  continuations)
+        lower = run_lower_context(module, model, config, prepared, protocol, required, warmups, repetitions, log,
+                                  continuations, disturbed)
     started = time.perf_counter()
-    engine, info = open_engine(module, model, config or {}, speculative=True, context_tokens=required)
+    engine, info = open_engine(module, model, config, speculative=True, context_tokens=required)
     result["load_ms"] = (time.perf_counter() - started) * 1000
     result["engine"] = info
     result["context"]["engine_max_context"] = info["max_context"]
@@ -455,17 +539,23 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
     log(f"loaded {info['name']} in {result['load_ms'] / 1000:.1f} s")
     try:
         if "speed" in parts:
-            result["speed"] = run_speed(engine, info, prepared, protocol, warmups, repetitions, log, continuations)
+            result["speed"] = run_speed(engine, info, prepared, protocol, warmups, repetitions, log, continuations,
+                                        disturbed)
         if "heldout" in parts:
             result["heldout"] = run_heldout(engine, info, prepared, protocol, log)
         if "quality" in parts:
             result["quality"] = run_quality(engine, info, prepared, reference, protocol, log, thresholds)
         if "context" in parts and required:
-            result["context"]["points"] = run_context(engine, info, prepared, settings, required, log)
+            result["context"]["points"], result["context"]["decode_text"] = run_context(
+                engine, info, prepared, settings, required, log, continuations)
+        if "exactness" in parts and "speed" in result and plain_on_engine(engine, info):
+            # The engine decodes plain greedy itself: no second engine to load.
+            result["exactness"] = run_exactness(module, model, config, prepared, result["speed"], log, exactness,
+                                                engine=engine, info=info)
     finally:
         engine.close()
-    if "exactness" in parts and "speed" in result and info.get("speculative"):
-        result["exactness"] = run_exactness(module, model, config or {}, prepared, result["speed"], log, exactness,
+    if "exactness" in parts and "speed" in result and info.get("speculative") and "exactness" not in result:
+        result["exactness"] = run_exactness(module, model, config, prepared, result["speed"], log, exactness,
                                             context_tokens=required)
     if lower is not None and "speed" in lower:
         result["context"]["lower"] = {**compare_lower(result["speed"], lower["speed"], lower["context"], settings),

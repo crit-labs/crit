@@ -44,7 +44,7 @@ class RunSettingsTest(unittest.TestCase):
         self.assertEqual(self.limits(output)["ram_headroom_bytes"], 2 * GIB)
 
     def test_settings_fill_omitted_headroom_and_request_wins(self):
-        (self.project / "settings.toml").write_text('# This machine\nwsl_run_root = "/llm/engines/crit"\n'
+        (self.project / "settings.toml").write_text('# This machine\nwsl_run_root = "/srv/crit/runs"\n'
                                                     'ram_headroom_gib = 8\nvram_headroom_gib = 0.5\n', encoding="utf-8")
         code, output = self.create()
         self.assertEqual(code, 0)

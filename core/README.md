@@ -30,6 +30,7 @@ the Python package in `python/` and the [contracts](contracts/README.md) in
 | Part | Responsibility | Header |
 | --- | --- | --- |
 | [Runtime](src/runtime/README.md) | Requests, bounded scheduling, readiness, commit/publication, cancellation, retirement | [core.h](include/crit/core.h) |
+| [Engine libraries](src/runtime/README.md#engine-libraries) | C ABI for an engine shared library; stock Eval and serve adapters in `crit_core.native` | [native_engine.h](include/crit/native_engine.h) |
 | [Tracing](src/runtime/README.md#lifecycle-tracing) | Bounded lifecycle trace and [operator ranges](src/runtime/README.md#operator-ranges), optional NVTX sink | [trace.h](include/crit/trace.h) |
 | [Memory](src/memory/README.md) | Resource budgets, reservations, [host-memory admission](src/memory/README.md#host-memory-admission) | [host_memory.h](include/crit/host_memory.h) |
 | [Text](src/text/README.md) | Stop strings, reply text streams, incremental decoding over `detokenize()` | [text.h](include/crit/text.h) |
@@ -74,10 +75,10 @@ cmake --build build/consumer
 ctest --test-dir build/consumer --output-on-failure
 ```
 
-The SDK is version 0.1.0. Include `<crit/core.h>` and link the installed target:
+The SDK is version 0.2.0. Include `<crit/core.h>` and link the installed target:
 
 ```cmake
-find_package(critCore 0.1.0 EXACT CONFIG REQUIRED)
+find_package(critCore 0.2.0 EXACT CONFIG REQUIRED)
 target_link_libraries(your_engine PRIVATE crit::core)
 ```
 

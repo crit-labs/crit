@@ -105,6 +105,11 @@ def windows_job_settled(name):
         api.CloseHandle(handle)
 
 
+# How long a killed process tree may take to exit before cleanup counts as failed. Exit is not immediate: a process
+# that pinned tens of GB of host memory or holds a GPU context releases it after SIGKILL (several seconds here).
+RETIREMENT_SECONDS = 60
+
+
 def default_directory():
     user = str(os.getuid()) if hasattr(os, "getuid") else hashlib.sha256(getpass.getuser().encode()).hexdigest()[:16]
     return Path(os.environ.get("CRIT_RUNTIME_DIRECTORY", str(Path(tempfile.gettempdir()) / ("crit-runtime-" + user))))
@@ -247,7 +252,7 @@ class RuntimeOwnership:
                         raise ValueError("Live group has no matching birth-identified guardian; refusing ambiguous recovery")
                     if group_alive(child["pid"]):
                         os.killpg(child["pid"], signal.SIGKILL)
-                    end = time.monotonic() + 5
+                    end = time.monotonic() + RETIREMENT_SECONDS
                     while group_alive(child["pid"]) and time.monotonic() < end:
                         time.sleep(.02)
                     if group_alive(child["pid"]):

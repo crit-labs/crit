@@ -42,6 +42,9 @@ def main(argv=None):
                           "protocol's reserve_gib)")
     run.add_argument("--vram-headroom-gib", type=float, default=None,
                      help="Device memory left free when Eval computes the max context (default 1)")
+    run.add_argument("--keep-disturbed", action="store_true",
+                     help="Finish the round even when a speed case's repetitions show a disturbed device (by default "
+                          "the round stops there; protocol speed.disturbed_spread)")
 
     context = subs.add_parser("context", help="The max context for a model on a device: the model's positions and "
                                               "the KV cache that fits next to its weights")
@@ -191,8 +194,12 @@ def main(argv=None):
                     baseline=baseline, quality_budget=json.loads(args.quality_budget) if args.quality_budget else None,
                     exactness=args.exactness, context_tokens=args.context,
                     vram_headroom_bytes=round(headroom_gib(args) * (1 << 30)),
-                    context_reserve_bytes=round(reserve_gib(args) * (1 << 30)) if reserve_gib(args) is not None else None)
+                    context_reserve_bytes=round(reserve_gib(args) * (1 << 30)) if reserve_gib(args) is not None else None,
+                    abort_disturbed=not args.keep_disturbed)
     print(f"wrote {args.out}")
+    if result.get("aborted"):
+        print(f"aborted: {result['aborted']['detail']}")
+        return 3
     print(render(result["status"]))
     return 0
 

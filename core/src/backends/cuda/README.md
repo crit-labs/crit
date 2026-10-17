@@ -26,7 +26,11 @@ Rules that apply everywhere:
 `spare_device_bytes(margin)` reports the smaller of free device memory and the
 remaining device budget, less a margin; `allocate_spare(bytes, margin)` allocates
 only when that covers it. Place optional speedups there after the required state,
-largest gain first. `CudaBuffer::device_address()` gives kernels the device
+largest gain first. Under WDDM (Windows, WSL2) `cudaMemGetInfo` and the driver
+(`nvidia-smi`) disagree on free memory. On an RTX 5090 under WSL2, nvidia-smi kept
+showing about 0.75 GiB free at peak whatever the margin, so allocations past that
+landed in shared system memory without an error. Size the margin from driver
+readings at peak, not from a margin of zero. `CudaBuffer::device_address()` gives kernels the device
 mapping of pinned host memory, so a gathered table such as token embeddings can
 stay on the host.
 

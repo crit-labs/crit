@@ -26,6 +26,16 @@ Prompt blocks own 128 queries of one head. Decode uses a fixed `blocks` per KV
 head, each merging 128-key pieces in key order, then a fixed-order combine; a
 multi-column verify is one launch.
 
+**E4M3 prompt attention (opt-in).** `prefill_fp8` takes the same `Prefill` and
+runs Q·Kᵀ and P·V on E4M3 tensor cores: queries are quantized per row and head,
+key and value codes are used as stored, and each probability is multiplied by
+its key's value scale over the largest value scale seen so far before rounding
+to E4M3 (the accumulator is kept in those units and rescaled only when a row
+maximum or that scale grows). V's B fragments come from `ldmatrix.trans` on b16
+code pairs re-packed with byte permutes. 64-key tiles are double buffered with
+`cp.async`. It trades BF16 rounding for E4M3 in queries and probabilities, so
+measure whole-model quality before adopting it.
+
 **Column invariance.** Tiles after a row's position leave it bit for bit
 unchanged and the combine order is fixed, so a decode column alone gives exactly
 its bits inside a multi-column verify.
@@ -52,6 +62,7 @@ namespace kv = crit::fp8_kv;
 kv::Cache cache{k_codes, v_codes, k_scales, v_scales, kv_heads, head_dim};
 kv::write(cache, k_rows, v_rows, kv_heads * head_dim, T, pos0, stream);  // chunk's keys and values first
 kv::prefill({q, heads * head_dim, cache, out, heads * head_dim, T, pos0, heads, scale}, stream);
+// or kv::prefill_fp8 with the same problem (out_stride a multiple of 4)
 // decode / verify inside a captured graph: the position comes from device memory
 kv::decode({q, heads * head_dim, cache, out, heads * head_dim, columns, 0, heads, device_pos0, scale,
             blocks, partial}, stream);
@@ -67,3 +78,8 @@ and 256 against an FP64 softmax over the dequantized cache (at most 1.5e-3 of th
 output magnitude on sm_120) and decode columns bit for bit against multi-column
 calls. In one measured engine (Qwen3.8-27B, RTX 5090) the FP8 cache raised the
 context that fits from about 122K to 244,736 tokens at 0.2% of the quality budget.
+`prefill_fp8` passes the same cases within 7.3e-2 of the output magnitude (E4M3
+rounding of queries and probabilities) and, on the RTX 5090 with 4,096 queries
+over 131K keys, runs in 35.7 ms instead of 73.1 ms at head dimension 256 and
+29.7 ms instead of 54.9 ms at 128. In one engine it cost 2 points of the prefill
+quality budget (16.7% to 18.8%).

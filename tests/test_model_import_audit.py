@@ -207,7 +207,7 @@ class ImportAuditTests(unittest.TestCase):
 
     def test_index_path_escape_and_portability_rejection(self):
         for name in ("../outside.safetensors", "/tmp/a.safetensors", "C:\\a.safetensors",
-                     "sub/a.safetensors", "a\\b.safetensors", "file:stream.safetensors",
+                     "sub/../a.safetensors", "a\\b.safetensors", "file:stream.safetensors",
                      "CON.safetensors", "a.gguf"):
             with self.subTest(name=name), self.assertRaises(m.AuditError):
                 m.inspect_model(self.index({"a": name}))

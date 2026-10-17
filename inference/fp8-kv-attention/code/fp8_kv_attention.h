@@ -41,6 +41,13 @@ struct Prefill {
 cudaError_t prefill(const Prefill& problem, cudaStream_t stream);
 std::size_t prefill_shared_bytes(int head_dim);
 
+// The same problem on E4M3 tensor cores: queries quantized per row and head, key and value codes used as stored,
+// probabilities rounded to E4M3 with the per-key value scale folded in (over the largest value scale seen so far).
+// About twice prefill's throughput at long contexts with larger rounding error (E4M3 instead of BF16 queries and
+// probabilities), so an engine opts in after measuring whole-model quality. out_stride must be a multiple of 4.
+cudaError_t prefill_fp8(const Prefill& problem, cudaStream_t stream);
+std::size_t prefill_fp8_shared_bytes(int head_dim);
+
 // Decode attention for T query columns at positions pos0 + t over keys 0 .. pos0 + T - 1. The grid is fixed: blocks
 // per key/value head, each merging 128-key pieces b, b + blocks, ... in key order, so neither the launch nor the work
 // depends on the cache's capacity, and a CUDA graph captured once serves every length. A tile after a column's position

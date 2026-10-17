@@ -68,6 +68,12 @@ with each score:
   `requirements` records the drift budget and exactness mode used.
 - Physical RAM/VRAM use, cancellation and lifecycle need separate engine measurements.
 
+A round stops early when a speed case's measured decode speeds spread by more than the protocol's
+`disturbed_spread` (25%; quiet engines stay near 10% at most): something else was using the device.
+The result keeps what was measured, with `aborted` and no status, and `run` exits with code 3.
+Measure again when the device is quiet; `--keep-disturbed` finishes the round anyway. Requests
+shorter than 100 ms are not judged, since timer jitter dominates them.
+
 `crit eval status result.json` (also printed by `run`, stored as `status`) reports the gates,
 goals, each KPI against its limit, the gaps and missing inputs, with no verdict or ranking.
 `--baseline earlier.json` adds each KPI's change; `--json` prints the structure.
@@ -105,7 +111,9 @@ TFLOPS and GB/s against the `--device` ceilings:
 ]
 ```
 
-`match` is a substring of the demangled name; the first matching rule applies. Overlapping
-kernels (for example under programmatic dependent launch) include their waiting time; trace
-with overlap off when exact times matter. After each candidate, compare the heaviest kernels
+`match` is a substring of the demangled name; the first matching rule applies. Times are
+exclusive: a kernel that starts before the previous one ends (programmatic dependent launch,
+another stream) is charged only from that end, so a kernel waiting on its predecessor is not
+charged the wait and the kernel total never exceeds wall time; `span_ms` keeps raw durations.
+After each candidate, compare the heaviest kernels
 with their floors and search [Kernels](../../kernels/README.md) before writing a replacement.
