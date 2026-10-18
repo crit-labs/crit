@@ -3,7 +3,10 @@
 The reference runs the model's official Hugging Face `transformers` modeling code with FP32
 activations and the stored weights dequantized exactly to FP32. Decoder layers are streamed
 onto the GPU one at a time, so a model larger than device memory still runs. It writes, for
-every scored target, the target log-probability and the reference's top-k tokens.
+every scored target, the target log-probability and the reference's top-k tokens: the suite's
+conversations, and the long prefill_decode prompts (protocol quality.prefill_decode). The conversations
+use eager attention with an explicit causal mask; the long prompts the same FP32 arithmetic in blocks of
+query rows (chunked_attention), since a 32K-token mask and score matrix would not fit.
 
 Supported stored formats (compressed-tensors): unquantized tensors, FP8 E4M3 with per-channel
 or per-tensor scales, and NVFP4 (E2M1 values, E4M3 group-16 scales and an FP32 global scale).
@@ -20,6 +23,33 @@ from .prepare import PREPARED
 
 REFERENCE = "reference.json"
 E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+CHUNKED = "crit_chunked"
+QUERY_BLOCK = 256
+
+
+def chunked_attention(module, query, key, value, attention_mask, scaling=None, dropout=0.0, sliding_window=None,
+                      **kwargs):
+    """Eager causal attention computed QUERY_BLOCK query rows at a time: FP32 scores, softmax over each whole
+    row, never a full length x length matrix. Registered with transformers' AttentionInterface as CHUNKED;
+    attention_mask is ignored (the layer gets none), causality and any sliding window come from positions."""
+    import torch
+    groups = query.shape[1] // key.shape[1]
+    key, value = key.repeat_interleave(groups, dim=1), value.repeat_interleave(groups, dim=1)  # transformers' repeat_kv
+    scaling = query.shape[-1] ** -0.5 if scaling is None else scaling
+    offset = key.shape[2] - query.shape[2]
+    columns = torch.arange(key.shape[2], device=query.device)
+    out = torch.empty_like(query)
+    for start in range(0, query.shape[2], QUERY_BLOCK):
+        stop = min(start + QUERY_BLOCK, query.shape[2])
+        rows = torch.arange(start + offset, stop + offset, device=query.device)[:, None]
+        width = stop + offset
+        scores = torch.matmul(query[:, :, start:stop], key[:, :, :width].transpose(2, 3)) * scaling
+        allowed = columns[None, :width] <= rows
+        if sliding_window:
+            allowed &= columns[None, :width] > rows - sliding_window
+        weights = torch.softmax(scores.masked_fill(~allowed, float("-inf")), dim=-1, dtype=torch.float32).to(query.dtype)
+        out[:, :, start:stop] = torch.matmul(weights, value[:, :, :width])
+    return out.transpose(1, 2).contiguous(), None
 
 
 class Checkpoint:
@@ -105,19 +135,30 @@ class StreamingReference:
         layer.load_state_dict(state, strict=True, assign=True)
         return layer
 
-    def score(self, sequences, top_k, valid_vocab=None, log=print):
+    def _attention(self, layer, implementation):
+        """Point every attention module of `layer` at `implementation` ("eager" or CHUNKED)."""
+        for module in layer.modules():
+            config = getattr(module, "config", None)
+            if config is not None and hasattr(config, "_attn_implementation"):
+                config._attn_implementation = implementation
+
+    def score(self, sequences, top_k, valid_vocab=None, log=print, long=()):
         """sequences: list of (ids, first_target). Returns, per sequence, a list of target records.
-        Head rows at or above valid_vocab (padding rows with no token) are excluded."""
+        Head rows at or above valid_vocab (padding rows with no token) are excluded. The sequences whose
+        indices are in `long` use chunked_attention (no mask or score matrix of the whole sequence in memory,
+        which at 32K tokens would not fit); the others eager attention with an explicit causal mask."""
         torch = self.torch
+        from transformers import AttentionInterface
+        AttentionInterface.register(CHUNKED, chunked_attention)
         embed = self.checkpoint.raw(self.prefix + "embed_tokens.weight")
         states, extras = [], []
-        for ids, _ in sequences:
+        for s, (ids, _) in enumerate(sequences):
             hidden = embed[torch.tensor(ids)].float().to(self.device)[None]
             positions = torch.arange(len(ids), device=self.device)[None]
             cos, sin = self.rotary(hidden, positions)
-            mask = torch.full((len(ids), len(ids)), float("-inf"), device=self.device).triu(1)[None, None]
+            mask = None if s in long else torch.full((len(ids), len(ids)), float("-inf"), device=self.device).triu(1)[None, None]
             states.append(hidden)
-            extras.append(((cos, sin), mask, positions))
+            extras.append(((cos, sin), mask, positions, s in long))
         del embed
         layer_types = getattr(self.config, "layer_types", None)
         with torch.no_grad():
@@ -125,9 +166,15 @@ class StreamingReference:
                 started = time.time()
                 layer = self.layer(index)
                 full = layer_types is None or layer_types[index] != "linear_attention"
-                for s, (embeddings, mask, positions) in enumerate(extras):
-                    states[s] = layer(states[s], position_embeddings=embeddings,
-                                      attention_mask=mask if full else None, position_ids=positions)
+                for s, (embeddings, mask, positions, causal) in enumerate(extras):
+                    if causal:
+                        self._attention(layer, CHUNKED)
+                        states[s] = layer(states[s], position_embeddings=embeddings, attention_mask=None,
+                                          position_ids=positions)
+                        self._attention(layer, "eager")
+                    else:
+                        states[s] = layer(states[s], position_embeddings=embeddings,
+                                          attention_mask=mask if full else None, position_ids=positions)
                 self.skeleton.layers[index] = torch.nn.Identity()
                 del layer
                 torch.cuda.empty_cache()
@@ -154,8 +201,11 @@ def build_reference(model, data, top_k, log=print):
     prepared = load_json(Path(data) / PREPARED)
     started = time.time()
     reference = StreamingReference(model)
-    sequences = [(c["ids"], c["first_target"]) for c in prepared["quality"]]
-    scored = reference.score(sequences, top_k, prepared["valid_vocab"], log=log)
+    # The suite's conversations and the long prefill_decode prompts go through the layers in one stream.
+    long, short = prepared.get("prefill_decode") or [], len(prepared["quality"])
+    sequences = [(c["ids"], c["first_target"]) for c in prepared["quality"] + long]
+    scored = reference.score(sequences, top_k, prepared["valid_vocab"], log=log, long=set(range(short, len(sequences))))
+    scored, long_scored = scored[:short], scored[short:]
     out = {
         "prepared_model_sha256": prepared["model"]["sha256"],
         "suite_sha256": prepared["suite_sha256"],
@@ -165,6 +215,8 @@ def build_reference(model, data, top_k, log=print):
         "valid_vocab": prepared["valid_vocab"],
         "seconds": time.time() - started,
         "conversations": [{"id": c["id"], "targets": t} for c, t in zip(prepared["quality"], scored)],
+        "prefill_decode": [{"id": c["id"], "prompt_tokens": c["prompt_tokens"], "targets": t}
+                           for c, t in zip(long, long_scored)],
     }
     nll = [-r["logprob"] for t in scored for r in t]
     out["perplexity"] = math.exp(sum(nll) / len(nll))

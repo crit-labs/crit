@@ -1,6 +1,9 @@
-"""Immutable resident model snapshots and generation-bound device allocation leases.
+"""Resident model files and generation-bound device allocation leases.
 
-The host implementation maps verified private files. Device allocation, actual
+By default the host maps the run's model files in place after checking each file's size against the frozen
+manifest; a source whose size or modification metadata changes later is refused, and on Windows the host's
+handle denies writes. With verify (crit serve --verify-model) it first reads and hashes every file against the
+manifest and serves engines without chat-model-file-v1 from a private read-only copy. Device allocation, actual
 byte accounting, synchronization and release are supplied by the engine backend.
 """
 from dataclasses import dataclass
@@ -78,7 +81,6 @@ class ModelPool:
         self.host_bytes = self.device_bytes = 0
         self.blocked = False
         self.sources = {}
-        self.source_hashes = {}
         self.paths = {}
 
     @staticmethod
@@ -87,15 +89,16 @@ class ModelPool:
         return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
 
     def verify_sources(self):
+        """Metadata only (device, inode, size and times), so it is cheap on every read."""
         if self.blocked:
             raise ValueError("Model residency is quarantined")
         for path, identity in self.sources.items():
-            if (self.fingerprint(path) != identity or
-                    (os.name == 'nt' and path in self.source_hashes and
-                     file_sha(path) != self.source_hashes[path])):
+            if self.fingerprint(path) != identity:
                 raise ValueError("Model source changed; unload before loading a new identity")
 
-    def load(self, model_path, manifest, native_files=False, progress=None):
+    def load(self, model_path, manifest, native_files=False, progress=None, verify=False):
+        """Hold every manifest file. By default each file's size is checked against the manifest and the file is
+        mapped in place; verify reads and hashes it first and copies it into a private snapshot unless native_files."""
         if self.blocked:
             raise ValueError("Model residency is quarantined")
         model_id = digest(manifest)
@@ -129,9 +132,21 @@ class ModelPool:
                 if not model_path.is_dir() and source != model_path:
                     raise ValueError("Model file manifest names a different source")
                 before = self.fingerprint(source)
+                report(index, row['path'], 0, force=True)
+                if not verify:
+                    size = before[2]
+                    if size != row['bytes']:
+                        raise ValueError('Model file %s has %d bytes, its frozen manifest %d' % (row['path'], size, row['bytes']))
+                    stream = locked_read(source)
+                    self.paths[row['path']] = source
+                    mapping = mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) if size else None
+                    self.files[row["path"]] = (stream, mapping)
+                    self.sources[source] = before
+                    report(index, row['path'], size, force=True)
+                    completed += size
+                    continue
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 hasher, size = hashlib.sha256(), 0
-                report(index, row['path'], size, force=True)
                 input_file = locked_read(source) if native_files else source.open('rb')
                 try:
                     output = None if native_files else destination.open('xb')
@@ -161,11 +176,9 @@ class ModelPool:
                         input_file.close()
                 mapping = mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) if size else None
                 self.files[row["path"]] = (stream, mapping)
+                # A copied snapshot keeps its verified bytes whatever happens to the source; the source's metadata
+                # still decides whether a later load may reuse it.
                 self.sources[source] = before
-                if not native_files:
-                    # Native Windows sources have a retained deny-write handle;
-                    # copied sources need byte verification despite stale metadata.
-                    self.source_hashes[source] = row['sha256']
                 report(index, row['path'], size, force=True)
                 completed += size
             self.model_id, self.host_bytes = model_id, total
@@ -262,7 +275,6 @@ class ModelPool:
         self.model_id = None
         self.host_bytes = 0
         self.sources.clear()
-        self.source_hashes.clear()
         self.paths.clear()
         self.generation = uuid.uuid4().hex
 

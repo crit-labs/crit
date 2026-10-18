@@ -41,7 +41,7 @@ def main(argv=None):
     evaluation.add_argument("--out", required=True, help="Eval result JSON")
     evaluation.add_argument("--evaluation", required=True, help="New models_evaluation JSON")
     evaluation.add_argument("--config", default="{}", help="JSON configuration passed to the adapter")
-    evaluation.add_argument("--only", action="append", choices=["speed", "quality", "exactness", "context", "heldout"],
+    evaluation.add_argument("--only", action="append", choices=["speed", "quality", "exactness", "context", "heldout", "history"],
                             help="Run only these Eval parts (repeatable); default all")
     evaluation.add_argument("--device", metavar="JSON", help="Device file from crit eval probe")
     evaluation.add_argument("--baseline", metavar="RESULT", help="Eval result of the engine on the source checkpoint")

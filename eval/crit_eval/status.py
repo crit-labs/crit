@@ -3,12 +3,15 @@
 Reads one result file and reports facts. It does not classify or rank; the agent reasons from
 the numbers about how to build.
 
-1. Gates, the only pass/fail: speed coverage, repeatable outputs, quality against the reference's
-   drift budget, capacity (the engine serves a request at the required context), lower context (no
-   speed case is slower on an engine opened at a lower context), generality (against a baseline, no
-   held-out prompt and not the held-out score slows down) and, when the run requires it,
+1. Gates, the only pass/fail: speed coverage, repeatable outputs, request history (the same greedy
+   requests give the same tokens on the fresh engine and after everything else it served), quality
+   against the reference's drift budget on every path (prefill_decode, decode after long prompts,
+   required), capacity (the engine serves a request at the required context), retrieval (facts at the
+   start, middle and end of long prompts up to the required context are answered verbatim), lower
+   context (no speed case is slower on an engine opened at a lower context), generality (against a
+   baseline, no held-out prompt and not the held-out score slows down) and, when the run requires it,
    speculative exactness. Exactness in its default `reported` mode is a note: the quality budget
-   judges output.
+   judges output; request history is a gate in every mode.
 2. Goals for the next candidate: each of decode, prefill and time to first token, and decode and
    time to first token over the long-context curve, from its current score to its physical limit.
    All of them hold at once; none is ranked or optional.
@@ -43,6 +46,7 @@ def _gates(result):
                                  else f"{len(measured)}/{len(measured)} cases repeat their output")})
     else:
         gates.append({"name": "coverage", "state": "unmeasured", "detail": "speed not run"})
+    gates += _history_gate(result)
     if quality is None:
         gates.append({"name": "quality", "state": "unmeasured", "detail": "quality not run"})
     elif not quality["paths"]:
@@ -50,7 +54,14 @@ def _gates(result):
                       "detail": "the adapter declares no score paths (score_paths)"})
     else:
         failures = [f"{p}: {', '.join(q['failures'])}" for p, q in quality["paths"].items() if not q["passed"]]
+        # A required path (protocol quality.required_paths) that was not scored fails: every engine prefills and decodes.
+        failures += [f"{p}: not scored ({(quality.get('missing') or {}).get(p) or 'the adapter does not declare it in score_paths'})"
+                     for p in quality.get("required", []) if p not in quality["paths"]]
         detail = ("paths " + ", ".join(quality["paths"]) if not failures else "; ".join(failures))
+        skipped = [f"{int(length):,}" for q in quality["paths"].values()
+                   for length, row in (q.get("lengths") or {}).items() if row.get("status") == "skipped"]
+        if skipped:
+            detail += f" (prefill_decode skipped at {', '.join(skipped)} prompt tokens: above max_context)"
         if quality.get("unsupported"):
             detail += f" (unscored: {', '.join(quality['unsupported'])})"
         gates.append({"name": "quality", "state": "fail" if failures else "pass", "detail": detail})
@@ -66,8 +77,55 @@ def _gates(result):
     return gates
 
 
+LEGACY_PROTOCOLS = ("crit-eval-v1", "crit-eval-v2", "crit-eval-v3")
+
+
+def _since_v4(result):
+    """Results of crit-eval-v4 and later have the request-history and retrieval gates; earlier ones are shown as
+    they were judged."""
+    return result.get("protocol") is not None and result["protocol"] not in LEGACY_PROTOCOLS
+
+
+def _history_gate(result):
+    """The same greedy requests on the freshly opened engine and after everything else it served. A gate in
+    every exactness mode: a deterministic engine repeats a request whatever came before."""
+    history = result.get("history")
+    if history is None:
+        return [{"name": "request_history", "state": "unmeasured", "detail": "history not run"}] if _since_v4(result) else []
+    cases = history.get("cases") or {}
+    if not cases:
+        return [{"name": "request_history", "state": "unmeasured", "detail": "no history case fits the engine"}]
+    differ = {cid: c["first_difference"] for cid, c in cases.items() if not c["identical"]}
+    served = ", ".join(history.get("served_between") or []) or "nothing else"
+    return [{"name": "request_history", "state": "fail" if differ else "pass",
+             "detail": (f"{len(cases) - len(differ)}/{len(cases)} cases repeat their fresh-engine output after {served}"
+                        + "".join(f"; {cid} differs at token {i}" for cid, i in differ.items()))}]
+
+
+def _retrieval_gate(result, required):
+    context = result.get("context") or {}
+    retrieval = context.get("retrieval")
+    if retrieval is None:
+        return [{"name": "retrieval", "state": "unmeasured", "detail": "context checks not run"}] if _since_v4(result) else []
+    if retrieval.get("status") != "measured":
+        return [{"name": "retrieval", "state": "unmeasured", "detail": retrieval.get("reason") or "retrieval not run"}]
+    problems = []
+    for key, point in retrieval["points"].items():
+        if point["status"] == "failed":
+            problems.append(f"{int(key):,}: {point['error']}")
+        elif point["status"] == "measured" and not point["passed"]:
+            missing = [fact for fact, found in point["found"].items() if not found]
+            problems.append(f"{int(key):,}: {', '.join(missing)} fact not found in {point['text'][:200]!r}")
+    judged = [k for k, p in retrieval["points"].items() if p["status"] != "skipped"]
+    if not judged:
+        return [{"name": "retrieval", "state": "unmeasured", "detail": "no point holds the facts"}]
+    return [{"name": "retrieval", "state": "fail" if problems else "pass",
+             "detail": ("; ".join(problems) if problems else
+                        f"every fact found at {', '.join(f'{int(k):,}' for k in judged)} tokens (up to the required {required:,})")}]
+
+
 def _context_gates(result):
-    """Capacity and lower context; results from before the context checks have neither."""
+    """Capacity, retrieval and lower context; results from before the context checks have none of them."""
     context = result.get("context")
     if context is None:
         return []
@@ -75,8 +133,9 @@ def _context_gates(result):
     if not required:
         why = context.get("reason") or "; ".join(context.get("missing") or []) or "no required context"
         detail = f"max context unknown: {why} (pass --context, or --device with a crit eval probe result)"
-        return [{"name": "capacity", "state": "unmeasured", "detail": detail},
-                {"name": "lower_context", "state": "unmeasured", "detail": detail}]
+        return [{"name": "capacity", "state": "unmeasured", "detail": detail}] + (
+            [{"name": "retrieval", "state": "unmeasured", "detail": detail}] if _since_v4(result) else []) + [
+            {"name": "lower_context", "state": "unmeasured", "detail": detail}]
     points, lower = context.get("points"), context.get("lower")
     if points is None:
         capacity = {"name": "capacity", "state": "unmeasured", "detail": "context checks not run"}
@@ -107,7 +166,7 @@ def _context_gates(result):
         parts += [f"{cid} not measured" for cid in lower.get("unmeasured", [])]
         lowered = {"name": "lower_context", "state": "fail",
                    "detail": f"slower at {lower['context']:,} tokens than at {required:,}: " + "; ".join(parts)}
-    return [capacity, lowered]
+    return [capacity] + _retrieval_gate(result, required) + [lowered]
 
 
 def _generality_gate(result, protocol, baseline):
@@ -168,6 +227,23 @@ def _exactness_note(result):
     return (f"exactness reported: {len(cases) - len(differ)}/{len(cases)} cases equal plain greedy"
             + "".join(f"; {cid} differs at token {i}" for cid, i in differ.items())
             + ("; the quality budget judges the output" if differ else ""))
+
+
+def _exactness_drop(result, baseline):
+    """Fewer cases equal plain greedy than in the baseline: a bug until a root cause is shown (AGENTS.md), never
+    put down to rounding without evidence."""
+    now, before = (result.get("exactness") or {}).get("cases"), ((baseline or {}).get("exactness") or {}).get("cases")
+    if not now or not before:
+        return None
+    shared = [cid for cid in now if cid in before]
+    equal_now = sum(now[cid]["identical"] for cid in shared)
+    equal_before = sum(before[cid]["identical"] for cid in shared)
+    if equal_now >= equal_before:
+        return None
+    lost = [cid for cid in shared if before[cid]["identical"] and not now[cid]["identical"]]
+    label = baseline.get("label") or (baseline.get("engine") or {}).get("name") or "the baseline"
+    return (f"plain-greedy equality fell from {equal_before}/{len(shared)} ({label}) to {equal_now}/{len(shared)}"
+            f" ({', '.join(lost)} now differ): treat it as a bug until a root cause is demonstrated, not as rounding")
 
 
 def _quality_kpi(quality, thresholds):
@@ -261,6 +337,9 @@ def build(result, protocol, baseline=None):
     exactness_note = _exactness_note(result)
     if exactness_note:
         notes.append(exactness_note)
+    drop = _exactness_drop(result, baseline)
+    if drop:
+        notes.append(drop)
     if ((result.get("context") or {}).get("points") or {}):
         ctext = (result.get("context") or {}).get("decode_text") or {"source": "generated"}
         notes.append(f"long-context points replay {ctext.get('case')}'s pinned continuation {ctext['sha256'][:12]}, after copies "

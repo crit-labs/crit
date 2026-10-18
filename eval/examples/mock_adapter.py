@@ -24,10 +24,12 @@ class MockEngine:
                 self.reference = json.load(handle)
         self.noise = float(self.config.get("noise", 0.0))
         self.calls = 0
+        self.longest = 0  # the longest prompt served so far
 
     def info(self):
         return {"name": "mock", "configuration": self.config, "max_context": self.capacity,
-                "speculative": self.config["draft_tokens"] > 0, "score_paths": ["prefill", "decode"],
+                "speculative": self.config["draft_tokens"] > 0,
+                "score_paths": ["prefill", "decode"] + (["prefill_decode"] if self.config.get("prefill_decode", True) else []),
                 # Optional headroom inputs: draft width and bytes one full model pass reads.
                 "draft_width": self.config["draft_tokens"], "bytes_per_pass": self.config.get("bytes_per_pass"),
                 "draft_bytes_per_step": self.config.get("draft_bytes_per_step"),
@@ -63,8 +65,18 @@ class MockEngine:
             raise RuntimeError("out of device memory")
         # Test knob: an engine whose greedy text changes from one request to the next.
         shift = self.calls if self.config.get("unrepeatable") else 0
+        # Test knob: an engine that keeps stale state once it has served a prompt this long.
+        if self.longest >= int(self.config.get("drifts_after_prompt", 1 << 62)):
+            shift += 1
         self.calls += 1
-        return self._rounds([(sum(prompt) + i + shift) % 1000 for i in range(max_new_tokens)], on_tokens)
+        self.longest = max(self.longest, len(prompt))
+        tokens = [(sum(prompt) + i + shift) % 1000 for i in range(max_new_tokens)]
+        # Test knob: ids at or above facts_from are facts; the reply repeats them, unless the prompt is longer
+        # than forgets_above.
+        if "facts_from" in self.config and len(prompt) <= int(self.config.get("forgets_above", 1 << 62)):
+            facts = [t for t in prompt if t >= int(self.config["facts_from"])]
+            tokens = (facts + tokens)[:max_new_tokens]
+        return self._rounds(tokens, on_tokens)
 
     def generate_plain(self, prompt, max_new_tokens, on_tokens):
         """One token per target pass, no drafting: the same greedy text."""
@@ -76,7 +88,8 @@ class MockEngine:
         return self._rounds(list(continuation), on_tokens)
 
     def score(self, ids, first_target, path, queries):
-        rows = [t for c in self.reference["conversations"] for t in c["targets"]]
+        """prefill_decode: prefill ids[:first_target], then decode the rest one token per step."""
+        rows = [t for c in self.reference["conversations"] + self.reference.get("prefill_decode", []) for t in c["targets"]]
         lookup = {}
         for t in rows:
             lookup.setdefault((t["target"], tuple(t["top_ids"])), t)
@@ -84,6 +97,9 @@ class MockEngine:
         for position, query in zip(range(first_target, len(ids)), queries):
             ref = lookup[(ids[position], tuple(query))]
             shift = self.noise if path == "decode" else 0.0
+            # Test knob: decode after a prompt this long reads stale state (say, uninitialized expert scales).
+            if path == "prefill_decode" and first_target >= int(self.config.get("stale_after_prompt", 1 << 62)):
+                shift = 0.3
             target_lp.append(ref["logprob"] - shift)
             query_lp.append([v - shift if i == 0 else v for i, v in enumerate(ref["top_logprobs"])])
         return {"target_logprobs": target_lp, "query_logprobs": query_lp}

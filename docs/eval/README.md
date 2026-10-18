@@ -2,7 +2,9 @@
 
 [Overview](README.md) · [Measurements](MEASUREMENTS.md) · [Context](CONTEXT.md) · [Adapter](ADAPTER.md)
 
-Eval is crit's common speed and quality suite. [Core](../../core/README.md) provides the
+Eval combines physics-based performance targets with common speed and quality tests.
+Measured bandwidth and compute throughput set the limits each engine aims to approach.
+[Core](../../core/README.md) provides the
 runtime, [Inference](../../inference/README.md) supplies techniques,
 [Kernels](../../kernels/README.md) helps select kernels, and Eval measures the resulting engine.
 Every engine runs it the same way: `crit eval` fixes the prompts, output lengths, stop handling
@@ -21,11 +23,14 @@ crit eval kernels --adapter my_adapter.py --model MODEL_DIR --data EVAL_DATA_DIR
 
 Results report facts; Eval does not classify or rank. The builder reasons from them:
 
-- **Gates**, the only pass/fail checks: every speed case ran and repeated its output; quality
-  stays within the drift budget on every scoring path; the engine serves a request at the
-  required context and is not slower at a lower context; with `--exactness required`,
-  speculative output equals plain greedy; against a baseline, the held-out prompts keep up
-  (generality). A failing gate blocks qualification whatever the speed.
+- **Gates**, the only pass/fail checks: every speed case ran and repeated its output; the same
+  greedy requests give the same tokens on the fresh engine and after everything else it served
+  (request history); quality stays within the drift budget on every scoring path, including
+  decode after 1K-, 4K- and 32K-token prompts (`prefill_decode`, required of every engine); the
+  engine serves a request at the required context, answers facts placed at the start, middle
+  and end of long prompts up to it verbatim (retrieval) and is not slower at a lower context;
+  with `--exactness required`, speculative output equals plain greedy; against a baseline, the
+  held-out prompts keep up (generality). A failing gate blocks qualification whatever the speed.
 - **Goals and KPIs:** decode, prefill, time to first token and the long-context scores, each
   against its physical [limit](MEASUREMENTS.md#limits); quality as the share of the drift budget
   the worst path uses. All goals hold at once for the next candidate.
@@ -49,22 +54,28 @@ the steps can also run separately:
 | `run` | Evaluate an engine | Python standard library and the engine's dependencies |
 | `kernels` | Rank kernels by GPU time per phase | Linux, a CUDA toolkit with CUPTI |
 
-Use one data directory per model so every engine gets the same token ids and reference. Keep
+Use one data directory per model so every engine gets the same token ids and reference. Data
+prepared for an earlier protocol (before `crit-eval-v4`) has no long prompts: prepare it again
+into a new directory, then build its reference and pin it again. Keep
 data, references and results outside product folders, for example in the run's workspace.
 Reference generation needs a compatible CUDA GPU; the engine under test can be CPU or GPU.
 
 ## Results and status
 
 `--only speed`, `--only quality` and repeated `--only` options help during development;
-exactness needs speed output (`--only speed --only exactness`). `--warmups` and
+exactness needs speed output (`--only speed --only exactness`); `--only history` repeats its
+two requests around whatever else runs. `--warmups` and
 `--repetitions` override the protocol defaults; report them when comparing. Read coverage
 with each score:
 
 - `speed.complete` records whether every case ran; a partial decode score is not the full one.
 - `context` records the required context and its source (`given` or `computed`), `max_context`,
   the curve and the lower-context comparison.
-- Quality covers only the declared scoring paths.
-- Exactness covers measured speed cases and is a gate only with `--exactness required`.
+- Quality covers the declared scoring paths; `prefill_decode` is required, so an adapter without
+  it fails the quality gate.
+- Exactness covers measured speed cases and is a gate only with `--exactness required`. A drop
+  in plain-greedy equality against `--baseline` (status notes it) and any difference between
+  repeated identical requests are bugs until a root cause is shown ([AGENTS.md](../../AGENTS.md)).
   `requirements` records the drift budget and exactness mode used.
 - Physical RAM/VRAM use, cancellation and lifecycle need separate engine measurements.
 

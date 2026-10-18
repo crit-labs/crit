@@ -110,6 +110,22 @@ def windows_job_settled(name):
 RETIREMENT_SECONDS = 60
 
 
+def read_ownership(path):
+    """Read fresh ownership after bounded sharing-denial retries; never infer ownership from cached data.
+
+    Both supervisor and guardian need this: Windows atomic replacement can briefly deny an open even while
+    the owner remains alive. Missing/malformed records and an expired retry still fail closed.
+    """
+    deadline = time.monotonic() + .25
+    while True:
+        try:
+            return read_json(path)
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(.005)
+
+
 def default_directory():
     user = str(os.getuid()) if hasattr(os, "getuid") else hashlib.sha256(getpass.getuser().encode()).hexdigest()[:16]
     return Path(os.environ.get("CRIT_RUNTIME_DIRECTORY", str(Path(tempfile.gettempdir()) / ("crit-runtime-" + user))))
@@ -169,18 +185,7 @@ class RuntimeOwnership:
         self.token = token
 
     def read_owned(self):
-        # Atomic replacement can briefly deny an open on Windows. Retry only
-        # that access failure, within a fixed deadline; never use stale data or
-        # infer idle/unowned state from an unreadable ownership record.
-        deadline = time.monotonic() + .25
-        while True:
-            try:
-                value = read_json(self.path)
-                break
-            except PermissionError:
-                if time.monotonic() >= deadline:
-                    raise
-                time.sleep(.005)
+        value = read_ownership(self.path)
         if not self.token or value.get("token") != self.token:
             raise ValueError("Runtime ownership changed")
         return value

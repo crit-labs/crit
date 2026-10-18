@@ -69,7 +69,11 @@ accounting. Core waits for the whole group before publication.
 ## Request options
 
 `submit(prompt, output_tokens, options)` takes a value-owned `RequestOptions`.
-Unset sampling fields use the adapter's defaults. `ModelInfo.sampling` declares
+Unset sampling fields use the adapter's defaults. `crit serve` forwards explicit
+per-request overrides from packages declaring the corresponding
+[sampling capabilities](../../../docs/SERVING.md#per-request-sampling-for-adapters),
+including penalties and logit bias through the native engine ABI.
+`ModelInfo.sampling` declares
 support per field (`penalties` covers all three). Unsupported or invalid options
 throw `std::invalid_argument` naming the field before any memory or model call,
 for example `model does not support a requested sampling option: min_tokens`.
@@ -148,7 +152,8 @@ top-k), optionally its argmax and, with `top_k`, its own ranked alternatives
 (`QueryScores::top`, needs `ModelInfo.max_top_logprobs >= top_k`). Targets must
 be below the valid vocabulary, else submission fails with "scoring target outside
 the valid vocabulary". `path` names one of `ModelInfo.score_paths` and is
-forwarded unchanged; empty selects the default.
+forwarded unchanged; empty selects the default. Eval scores `prefill`, `decode`,
+`verify` and the required `prefill_decode` ([Eval adapter](../../../docs/eval/ADAPTER.md)).
 
 Core checks values under the [generation rules](#log-probabilities) and returns
 them in `Result::scores`, `query_scores`, `argmax` and `top_logprobs`

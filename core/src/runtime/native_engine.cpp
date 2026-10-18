@@ -1,6 +1,7 @@
 #include "crit/native_engine.h"
 #include "crit/json.h"
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -113,6 +114,20 @@ RequestOptions request_options(const char* options_json) {
     if(const auto* v = root.find("top_k"); v && !v->is_null()) sampling.top_k = std::uint32_t(v->u64());
     if(const auto* v = root.find("min_p"); v && !v->is_null()) sampling.min_p = v->real();
     if(const auto* v = root.find("seed"); v && !v->is_null()) sampling.seed = v->u64();
+    if(const auto* v = root.find("repetition_penalty"); v && !v->is_null()) sampling.repetition_penalty = v->real();
+    if(const auto* v = root.find("frequency_penalty"); v && !v->is_null()) sampling.frequency_penalty = v->real();
+    if(const auto* v = root.find("presence_penalty"); v && !v->is_null()) sampling.presence_penalty = v->real();
+    if(const auto* v = root.find("logit_bias"); v && !v->is_null()) {
+        for(const auto& entry:v->object()) {
+            Token token = 0;
+            const auto parsed = std::from_chars(entry.key.data(), entry.key.data() + entry.key.size(), token);
+            if(parsed.ec != std::errc{} || parsed.ptr != entry.key.data() + entry.key.size() || token < 0)
+                throw std::invalid_argument("logit_bias keys must be nonnegative token ids");
+            const double bias = entry.value.real();
+            if(bias < -100 || bias > 100) throw std::invalid_argument("logit_bias must be in [-100, 100]");
+            sampling.logit_bias.push_back({token, float(bias)});
+        }
+    }
     if(const auto* v = root.find("replay"); v && !v->is_null()) {
         auto replay = std::make_shared<ReplayContinuation>();
         replay->tokens = token_array(*v, "replay");
@@ -165,7 +180,9 @@ int info(void* handle, char* out, int capacity) noexcept {
         const auto& s = i.sampling;
         text += std::string("],\"sampling\":{\"temperature\":") + (s.temperature ? "true" : "false") + ",\"top_p\":" + (s.top_p ? "true" : "false") +
                 ",\"top_k\":" + (s.top_k ? "true" : "false") + ",\"seed\":" + (s.seed ? "true" : "false") +
-                ",\"min_p\":" + (s.min_p ? "true" : "false") + "}}";
+                ",\"min_p\":" + (s.min_p ? "true" : "false") +
+                ",\"penalties\":" + (s.penalties ? "true" : "false") +
+                ",\"logit_bias\":" + (s.logit_bias ? "true" : "false") + "}}";
         return copy(merged(std::move(text), native.info), out, capacity);
     } catch(const std::exception& error) {
         fail(error.what());

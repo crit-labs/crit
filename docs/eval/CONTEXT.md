@@ -50,6 +50,13 @@ unmeasured.
   text, so every engine decodes the same tokens (as in the speed cases); otherwise it decodes its
   own output, and `context_decode` compares only between results decoded on the same text.
   Prefilling the longest points can take minutes.
+- **Retrieval gate:** after the curve, on the same engine, one greedy request (64 output tokens)
+  at each of 4,096, 32,768 and 131,072 tokens below the requirement and one at the requirement,
+  prompt plus output filling it. The prompt is suite text with three facts
+  ([long.json](../../eval/suite/long.json)) at 2%, 50% and 97% of it, then a question asking for
+  all of them. The output up to its first stop token, decoded with the token strings `prepare`
+  records, must contain every answer verbatim. Capacity shows the engine holds the context;
+  retrieval that it still reads all of it correctly. A point it cannot serve fails.
 - **Long-context goals:** `context_decode` is the geometric mean of decode tok/s over the points
   against their floors (pass floor with the KV read at that context, plus draft steps at their
   floor, at the measured tokens per round). `context_ttft` is the geometric mean TTFT against
@@ -59,7 +66,7 @@ unmeasured.
   it decodes slower, or reaches its first token later, than on the full build by more than 5% or
   its own run-to-run spread, whichever is larger. Failing to open or run there fails too.
 
-`--only context` runs the curve; `--only speed` also runs the lower-context gate.
+`--only context` runs the curve and retrieval; `--only speed` also runs the lower-context gate.
 
 ## What this asks of an engine
 

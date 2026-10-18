@@ -82,10 +82,23 @@ score. Results carry this under `headroom`, the summary under `status`.
 
 [suite/quality.json](../../eval/suite/quality.json) holds six fixed conversations (prose, code,
 math, German, JSON, story; 1,434 scored tokens for Qwen3.8). The final assistant turn is scored
-with teacher forcing on every path the engine has: `prefill`, `decode` (one token at a time) and
-`verify`. Each path reports, against the reference, the perplexity ratio, KL(reference ‖ engine)
+with teacher forcing on every path the engine has: `prefill`, `decode` (one token at a time from
+the start), `verify` and `prefill_decode`. Each path reports, against the reference, the perplexity ratio, KL(reference ‖ engine)
 mean / p99 / max over the reference's top-16 tokens plus a lumped tail (a lower bound of the
 full-vocabulary KL), and top-1 agreement.
+
+**Decode after a long prompt.** The first three paths put the scored turn inside one prefill or
+run the whole sequence as 1- or 4-token passes, so each pass reads only state it has just set up
+itself. A real request prefills a long prompt and then decodes, and decode reads what the prefill
+left: prefetched experts and their scales, KV written by a different kernel, sparse-attention
+indices. `prefill_decode` scores that. Three conversations (`quality.prefill_decode` in
+[protocol.json](../../eval/protocol.json)) get suite text ([long.json](../../eval/suite/long.json))
+before their first user message, so their prompts are exactly 1,024, 4,096 and 32,768 tokens,
+past typical prefetch, prefill-kernel and sparse-attention thresholds. The engine prefills the
+prompt as it prefills any request, then feeds the reference continuation through ordinary
+one-token decode steps, each scored against the reference. Every prompt length is judged by the
+drift budget on its own (`lengths` in the path's result); a length above `max_context` is
+skipped. Every engine must provide it: without `prefill_decode` the quality gate fails.
 
 The **drift budget** defaults to PPL ratio ≤ 1.05, mean KLD ≤ 0.05, p99 KLD ≤ 0.5.
 `--quality-budget '{"ppl_ratio_max": 1.02}'` sets any subset;
@@ -95,7 +108,8 @@ lower drift than needed is not a gain.
 
 The **reference** runs the model's official `transformers` code with FP32 activations, no TF32,
 and stored weights dequantized exactly (unquantized, FP8 E4M3 with channel or tensor scales,
-NVFP4), streaming layers onto the GPU one at a time.
+NVFP4), streaming layers onto the GPU one at a time. The long prompts use the same arithmetic in
+blocks of 256 query rows, since a mask and score matrix over 32K tokens would not fit.
 
 ## Exactness
 
@@ -108,6 +122,21 @@ information, since verify and decode may sum in different orders and the drift b
 `--exactness required` makes any difference fail. Teacher-forced scoring cannot see a lossy
 acceptance rule (accepting drafts that are not the target's argmax), so such an engine records
 the rule in its configuration and needs criteria that allow it.
+
+A difference is information, not evidence of rounding. A drop in plain-greedy equality against an
+earlier candidate (status notes it when given `--baseline`) or any difference between identical
+requests is a bug until a root cause is demonstrated ([AGENTS.md](../../AGENTS.md)): stale or
+uninitialized state shows up exactly this way, and teacher-forced scoring can miss it.
+
+## Request history
+
+Right after the engine built for the required context opens, before any other request, Eval
+generates the speed cases with the shortest and the longest prompt (`agent-long`, 14,336 tokens),
+and again after everything else that engine served: speed, held-out prompts, quality, the
+long-context curve up to the requirement and retrieval. The tokens must be identical. A
+deterministic engine's greedy output does not depend on earlier requests, so this gate holds in
+every exactness mode and constrains no speed; `repeatable` cannot see state that changed before
+the first measured repetition. `history.served_between` lists what ran in between.
 
 ## Held-out prompts and generality
 

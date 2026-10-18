@@ -1,5 +1,6 @@
 """crit eval harness: metrics, runner and comparison with the mock adapter (no GPU)."""
 import hashlib
+import importlib.util
 import json
 import math
 from pathlib import Path
@@ -21,21 +22,39 @@ def softmax_logprobs(logits):
     return [v - top - math.log(total) for v in logits]
 
 
+FACTS = 2000  # retrieval fact ids in the fixture start here; the mock's facts_from knob repeats them
+
+
+def reference_targets(ids, first):
+    targets = []
+    for position in range(first, len(ids)):
+        lp = softmax_logprobs([3.0, 1.0, 0.5, 0.0] + [-4.0] * 20)
+        top = [ids[position], 100 + position, 200 + position, 300 + position]
+        targets.append({"target": top[0], "logprob": lp[0], "top_ids": top, "top_logprobs": lp[:4]})
+    return targets
+
+
 def fixture(directory):
     prepared = {
-        "protocol": "crit-eval-v3", "suite_sha256": "suite", "model": {"sha256": "model"}, "stop_ids": [999],
+        "protocol": "crit-eval-v4", "suite_sha256": "suite", "model": {"sha256": "model"}, "stop_ids": [999],
         "valid_vocab": 1000,
         "speed": [{"id": "short", "kind": "prose", "prompt_ids": [1, 2, 3], "output_tokens": 12},
                   {"id": "long", "kind": "long-context", "prompt_ids": list(range(60)), "output_tokens": 12}],
         "quality": [{"id": "c", "ids": [5, 6, 7, 8, 9], "first_target": 2}],
+        # Two prompt lengths of filler before scored tokens 5..9 (prefill_decode).
+        "prefill_decode": [{"id": f"c@{n}", "conversation": "c", "prompt_tokens": n,
+                            "ids": [1] * n + [5, 6, 7, 8, 9], "first_target": n} for n in (16, 40)],
+        "retrieval": {"head_ids": [1, 2], "tail_ids": [3, 4], "filler_ids": list(range(10, 50)),
+                      "facts": [{"id": "start", "answer": "ab", "ids": [FACTS, FACTS + 1]},
+                                {"id": "middle", "answer": "cd", "ids": [FACTS + 2, FACTS + 3]},
+                                {"id": "end", "answer": "ef", "ids": [FACTS + 4, FACTS + 5]}],
+                      "token_text": [None] * FACTS + list("abcdef")},
     }
-    targets = []
-    for position in range(2, 5):
-        lp = softmax_logprobs([3.0, 1.0, 0.5, 0.0] + [-4.0] * 20)
-        ids = [prepared["quality"][0]["ids"][position], 100 + position, 200 + position, 300 + position]
-        targets.append({"target": ids[0], "logprob": lp[0], "top_ids": ids, "top_logprobs": lp[:4]})
     reference = {"prepared_model_sha256": "model", "suite_sha256": "suite", "top_k": 4,
-                 "conversations": [{"id": "c", "targets": targets}]}
+                 "conversations": [{"id": "c", "targets": reference_targets([5, 6, 7, 8, 9], 2)}],
+                 "prefill_decode": [{"id": s["id"], "prompt_tokens": s["prompt_tokens"],
+                                     "targets": reference_targets(s["ids"], s["first_target"])}
+                                    for s in prepared["prefill_decode"]]}
     (directory / "prepared.json").write_text(json.dumps(prepared))
     (directory / "reference.json").write_text(json.dumps(reference))
     return prepared, reference
@@ -503,8 +522,9 @@ class StatusTests(unittest.TestCase):
             gates = {g["name"]: g["state"] for g in current["gates"]}
             # Exactness is reported by default, so it is a note rather than a gate.
             # The fixture's prepared data predates the held-out prompts: generality is unmeasured, not failed.
-            self.assertEqual(gates, {"coverage": "pass", "repeatable": "pass", "quality": "fail",
-                                 "capacity": "unmeasured", "lower_context": "unmeasured", "generality": "unmeasured"})
+            self.assertEqual(gates, {"coverage": "pass", "repeatable": "pass", "request_history": "pass", "quality": "fail",
+                                 "capacity": "unmeasured", "retrieval": "unmeasured", "lower_context": "unmeasured",
+                                 "generality": "unmeasured"})
             self.assertIn("exactness reported: 2/2 cases equal plain greedy", current["notes"])
             self.assertIn("scoring on paths verify (adapter score_paths)", current["missing"])
             self.assertIsNotNone(current["kpis"]["decode"]["speed_of_light"])
@@ -951,6 +971,227 @@ class ContextTextTests(unittest.TestCase):
         own = {"context": {"tokens": 32}}
         self.assertEqual(status.context_text_identity(pinned), "ab" * 32)
         self.assertEqual(status.context_text_identity(own), "generated")
+
+
+class LongPromptTests(unittest.TestCase):
+    """Decode after long prompts (prefill_decode), retrieval up to the required context and request history."""
+
+    def run_mock(self, directory, context_tokens=None, parts=runner.PARTS, edit=None, **config):
+        data = Path(directory)
+        prepared, reference = fixture(data)
+        if edit:
+            edit(prepared, reference)
+            (data / "prepared.json").write_text(json.dumps(prepared))
+            (data / "reference.json").write_text(json.dumps(reference))
+        config = {"reference": str(data / "reference.json"), "facts_from": FACTS, **config}
+        return runner.run(MOCK, "unused-model", data, data / "result.json", config, parts=parts, warmups=0,
+                          repetitions=2, log=lambda message: None, context_tokens=context_tokens)
+
+    def gates(self, result):
+        return {g["name"]: g for g in result["status"]["gates"]}
+
+    def test_prefill_decode_scores_each_prompt_length_against_the_reference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_mock(directory, parts=("quality",), max_context=128)
+        path = result["quality"]["paths"]["prefill_decode"]
+        self.assertEqual(path["targets"], 10)  # five scored tokens after each of the two prompt lengths
+        self.assertEqual({k: (row["status"], row["passed"]) for k, row in path["lengths"].items()},
+                         {"16": ("measured", True), "40": ("measured", True)})
+        self.assertAlmostEqual(path["kld_mean"], 0.0, places=12)
+        self.assertEqual(self.gates(result)["quality"]["state"], "pass")
+
+    def test_decode_that_reads_stale_state_after_a_long_prompt_fails_only_this_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_mock(directory, parts=("quality",), max_context=128, stale_after_prompt=40)
+        quality = result["quality"]
+        path = quality["paths"]["prefill_decode"]
+        self.assertTrue(path["lengths"]["16"]["passed"])
+        self.assertFalse(path["lengths"]["40"]["passed"])
+        self.assertFalse(path["passed"])
+        self.assertTrue(quality["paths"]["prefill"]["passed"])  # teacher forcing in one prefill cannot see it
+        gate = self.gates(result)["quality"]
+        self.assertEqual(gate["state"], "fail")
+        self.assertIn("at 40 prompt tokens: kld_mean", gate["detail"])
+
+    def test_lengths_beyond_the_engine_are_skipped_and_an_unscored_path_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            short = self.run_mock(directory, parts=("quality",), max_context=30)
+        lengths = short["quality"]["paths"]["prefill_decode"]["lengths"]
+        self.assertEqual((lengths["16"]["status"], lengths["40"]["status"]), ("measured", "skipped"))
+        gate = self.gates(short)["quality"]
+        self.assertEqual(gate["state"], "pass")
+        self.assertIn("prefill_decode skipped at 40 prompt tokens", gate["detail"])
+        with tempfile.TemporaryDirectory() as directory:
+            undeclared = self.run_mock(directory, parts=("quality",), max_context=128, prefill_decode=False)
+        gate = self.gates(undeclared)["quality"]
+        self.assertEqual(gate["state"], "fail")
+        self.assertIn("prefill_decode: not scored (the adapter does not declare it in score_paths)", gate["detail"])
+        self.assertFalse(undeclared["quality"]["passed"])
+        with tempfile.TemporaryDirectory() as directory:
+            unreferenced = self.run_mock(directory, parts=("quality",), max_context=128,
+                                         edit=lambda prepared, reference: reference.pop("prefill_decode"))
+        self.assertIn("the reference has no prefill_decode targets", self.gates(unreferenced)["quality"]["detail"])
+
+    def test_retrieval_prompts_hold_every_fact_at_its_position(self):
+        prepared, _ = fixture(Path(tempfile.mkdtemp()))
+        pieces = prepared["retrieval"]
+        rule = runner.load_json(runner.EVAL_DIR / "protocol.json")["context"]["retrieval"]
+        prompt = context.retrieval_prompt(pieces, 1000, rule["positions"])
+        self.assertEqual(len(prompt), 1000)
+        self.assertEqual((prompt[:2], prompt[-2:]), ([1, 2], [3, 4]))
+        where = [prompt.index(fact["ids"][0]) for fact in pieces["facts"]]
+        self.assertEqual(where, sorted(where))
+        self.assertLess(where[0], 50)
+        self.assertTrue(450 < where[1] < 550)
+        self.assertGreater(where[2], 940)
+        self.assertIsNone(context.retrieval_prompt(pieces, 12, rule["positions"]))
+        self.assertEqual(context.retrieval_points(262144, rule), [4096, 32768, 131072, 262144])
+        self.assertEqual(context.retrieval_points(8192, rule), [4096, 8192])
+        text = context.token_text([FACTS, FACTS + 1, 5, FACTS + 2, 999, FACTS + 3], pieces["token_text"], [999])
+        self.assertEqual(text, "ab�c")  # an id without text cannot complete an answer; output stops at 999
+
+    def test_retrieval_finds_every_fact_up_to_the_required_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_mock(directory, 8192, parts=("context",))
+        retrieval = result["context"]["retrieval"]
+        self.assertEqual(list(retrieval["points"]), ["4096", "8192"])
+        point = retrieval["points"]["8192"]
+        self.assertEqual((point["prompt_tokens"], point["found"]), (8192 - 64, {"start": True, "middle": True, "end": True}))
+        self.assertTrue(retrieval["passed"])
+        self.assertEqual(self.gates(result)["retrieval"]["state"], "pass")
+
+    def test_retrieval_fails_when_a_long_prompt_loses_its_facts_or_is_not_served(self):
+        with tempfile.TemporaryDirectory() as directory:
+            forgetful = self.run_mock(directory, 8192, parts=("context",), forgets_above=6000)
+        points = forgetful["context"]["retrieval"]["points"]
+        self.assertTrue(points["4096"]["passed"])
+        self.assertFalse(points["8192"]["passed"])
+        gate = self.gates(forgetful)["retrieval"]
+        self.assertEqual(gate["state"], "fail")
+        self.assertIn("8,192: start, middle, end fact not found", gate["detail"])
+        # Capacity alone passes: the engine served the request, it just answered wrongly.
+        self.assertEqual(self.gates(forgetful)["capacity"]["state"], "pass")
+        with tempfile.TemporaryDirectory() as directory:
+            failing = self.run_mock(directory, 8192, parts=("context",), fails_above_context=6000)
+        self.assertEqual(failing["context"]["retrieval"]["points"]["8192"]["status"], "failed")
+        self.assertIn("8,192: RuntimeError: out of device memory", self.gates(failing)["retrieval"]["detail"])
+
+    def test_request_history_catches_state_left_by_a_long_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            clean = self.run_mock(directory, parts=("speed", "history"), max_context=128)
+        history = clean["history"]
+        self.assertEqual(set(history["cases"]), {"short", "long"})  # the shortest and the longest prompt
+        self.assertEqual(history["served_between"], ["speed"])
+        self.assertEqual(self.gates(clean)["request_history"]["state"], "pass")
+        with tempfile.TemporaryDirectory() as directory:
+            # Outputs change once a 50-token prompt has been served: every speed repetition already sees the
+            # changed state, so only the fresh engine's output tells.
+            drifting = self.run_mock(directory, parts=("speed", "history"), max_context=128, drifts_after_prompt=50)
+        gates = self.gates(drifting)
+        self.assertEqual(gates["repeatable"]["state"], "pass")
+        self.assertEqual(gates["request_history"]["state"], "fail")
+        self.assertIn("short differs at token 0", gates["request_history"]["detail"])
+        # A gate in every exactness mode.
+        self.assertEqual(drifting["requirements"]["exactness"], "reported")
+
+    def test_new_gates_apply_from_crit_eval_v4_and_legacy_results_keep_theirs(self):
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        base = {"engine": {"speculative": False}, "speed": {"cases": {"a": {"status": "measured", "repeatable": True}}},
+                "context": {"tokens": 8192, "points": {"8192": {"status": "measured"}}}}
+        legacy = {g["name"] for g in status.build({**base, "protocol": "crit-eval-v3"}, protocol)["gates"]}
+        self.assertFalse({"request_history", "retrieval"} & legacy)
+        current = {g["name"]: g["state"] for g in status.build({**base, "protocol": "crit-eval-v4"}, protocol)["gates"]}
+        self.assertEqual((current["request_history"], current["retrieval"]), ("unmeasured", "unmeasured"))
+
+    def test_a_drop_in_plain_greedy_equality_is_flagged_against_the_baseline(self):
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+
+        def result(*identical):
+            return {"engine": {"speculative": True}, "label": "parent",
+                    "exactness": {"mode": "reported", "cases": {cid: {"identical": same, "first_difference": None if same else 3}
+                                                                for cid, same in zip("abc", identical)}}}
+        notes = status.build(result(True, False, False), protocol, result(True, True, True))["notes"]
+        self.assertTrue(any("plain-greedy equality fell from 3/3 (parent) to 1/3 (b, c now differ)" in n
+                            and "bug until a root cause is demonstrated" in n for n in notes))
+        same = status.build(result(True, False, False), protocol, result(True, False, False))["notes"]
+        self.assertFalse(any("equality fell" in n for n in same))
+
+    def test_cli_parts_are_the_runners(self):
+        from crit_eval import cli
+        self.assertEqual(cli.PARTS, runner.PARTS)
+
+
+class LongPrepareTests(unittest.TestCase):
+    class Model(CharacterText):
+        class tokenizer(CharacterText.tokenizer):
+            vocab_size = 128
+
+            @staticmethod
+            def decode(ids):
+                return "".join(chr(i) for i in ids)
+
+        def render(self, messages, tools=None, add_generation_prompt=False, **variables):
+            return "".join(f"<{m['role']}>{m['content']}" for m in messages) + ("<assistant>" if add_generation_prompt else "")
+
+    def test_prefill_decode_prompts_have_the_exact_length_before_the_scored_turn(self):
+        long = json.loads((ROOT / "eval/suite/long.json").read_text(encoding="utf-8"))
+        conversation = {"id": "c", "messages": [{"role": "user", "content": "Question?"},
+                                                {"role": "assistant", "content": "Answer."}]}
+        filler = prepare.filler_ids(self.Model(), long)
+        ids, first = prepare.prefill_decode_sequence(self.Model(), conversation, long, filler, 3000)
+        self.assertEqual(first, 3000)
+        text = "".join(chr(i) for i in ids)
+        self.assertTrue(text.startswith("<user>The following background material"))
+        self.assertTrue(text[:first].endswith("Question?<assistant>"))
+        self.assertEqual(text[first:], "Answer.")
+
+    def test_retrieval_pieces_spell_every_answer(self):
+        long = json.loads((ROOT / "eval/suite/long.json").read_text(encoding="utf-8"))
+        model = self.Model()
+        pieces = prepare.retrieval_pieces(model, long, prepare.filler_ids(model, long))
+        prompt = context.retrieval_prompt(pieces, 20000, [0.02, 0.5, 0.97])
+        self.assertEqual(len(prompt), 20000)
+        text = context.token_text(prompt, pieces["token_text"])
+        for fact in pieces["facts"]:
+            self.assertEqual(text.count(fact["answer"]), 1)
+        self.assertTrue(text.endswith("as STATION: identifier.<assistant>"))
+
+    def test_suite_long_prompts_agree_with_the_protocol(self):
+        protocol = json.loads((ROOT / "eval/protocol.json").read_text(encoding="utf-8"))
+        long = json.loads((ROOT / "eval/suite/long.json").read_text(encoding="utf-8"))
+        quality = json.loads((ROOT / "eval/suite/quality.json").read_text(encoding="utf-8"))
+        self.assertTrue(set(protocol["quality"]["prefill_decode"]["conversations"]) <= {c["id"] for c in quality["conversations"]})
+        self.assertIn("prefill_decode", protocol["quality"]["paths"])
+        filler = "".join((ROOT / "eval/suite" / name).read_text(encoding="utf-8") for name in long["filler"])
+        for fact in long["retrieval"]["facts"]:
+            self.assertIn(fact["answer"], fact["text"])
+            self.assertTrue(fact["answer"].isascii())
+            self.assertNotIn(fact["answer"], filler)
+        self.assertEqual(len(long["retrieval"]["facts"]), len(protocol["context"]["retrieval"]["positions"]))
+
+
+HAS_REFERENCE = all(importlib.util.find_spec(name) for name in ("torch", "transformers", "safetensors"))
+
+
+@unittest.skipUnless(HAS_REFERENCE, "needs torch, transformers and safetensors")
+class ReferenceTests(unittest.TestCase):
+    def test_long_prompts_score_like_eager_attention_without_its_mask(self):
+        import torch
+        from transformers import Qwen3Config, Qwen3ForCausalLM
+        from crit_eval import reference
+        torch.manual_seed(0)
+        config = Qwen3Config(vocab_size=128, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+                             num_attention_heads=4, num_key_value_heads=2, head_dim=16, max_position_embeddings=4096,
+                             tie_word_embeddings=False)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        with tempfile.TemporaryDirectory() as folder:
+            Qwen3ForCausalLM(config).save_pretrained(folder)
+            ids = torch.randint(0, 128, (2 * reference.QUERY_BLOCK + 100,)).tolist()
+            eager = reference.StreamingReference(folder, device).score([(ids, 500)], 4, 128, log=lambda m: None)[0]
+            chunked = reference.StreamingReference(folder, device).score([(ids, 500)], 4, 128, log=lambda m: None,
+                                                                         long={0})[0]
+        self.assertEqual([r["top_ids"] for r in eager], [r["top_ids"] for r in chunked])
+        self.assertLess(max(abs(a["logprob"] - b["logprob"]) for a, b in zip(eager, chunked)), 1e-5)
 
 
 if __name__ == "__main__":

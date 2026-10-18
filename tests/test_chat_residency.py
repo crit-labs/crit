@@ -1,4 +1,5 @@
 """Resident lifetimes use synthetic model bytes and a fake device allocator only."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -43,6 +44,13 @@ class Engine:
     def generate(self, request, cancellation):
         self.mode = request['messages'][-1]['content']
         self.calls += 1
+        if self.mode.startswith('tool:'):
+            response = self.response(request, '')
+            response['tool_calls'] = json.loads(self.mode[5:])
+            return response
+        if self.mode == 'echo-request':
+            return self.response(request, json.dumps({k: request.get(k) for k in
+                ('sampling', 'tools', 'tool_choice', 'parallel_tool_calls', 'messages', 'tool_grammars')}))
         if self.mode == 'crash':
             os._exit(17)
         if self.mode.startswith('reply:'):
@@ -71,7 +79,8 @@ class Engine:
         message = request['messages'][-1]['content']
         if not message.startswith('words:'):
             response = self.generate(request, cancellation)
-            emit(response['assistant'])
+            if response['assistant']:
+                emit(response['assistant'])
             return response
         self.mode = message
         pieces = []
@@ -103,6 +112,10 @@ class ServeFixture(RunFixture):
     reported = None  # chat-config-v1 fixture: configuration the adapter reports as applied
     stream = False   # declare chat-stream-v1
     constraints = False  # declare chat-constraints-v1
+    request_options = False  # sampling and tool fixtures
+    strict_tools = False
+    tool_stream = False
+    adapter_suffix = ''
 
     def package(self, candidate):
         package = self.root / ('resident-package-' + candidate['candidate_id'])
@@ -113,10 +126,17 @@ class ServeFixture(RunFixture):
             capabilities.append('chat-stream-v1')
         if self.constraints:
             capabilities.append('chat-constraints-v1')
+        if self.request_options:
+            from crit_api.options import SAMPLING, sampling_capability
+            capabilities += ['chat-tools-v1', *map(sampling_capability, sorted(SAMPLING))]
+        if self.strict_tools:
+            capabilities.append('chat-tools-strict-v1')
+        if self.tool_stream:
+            capabilities.append('chat-tool-stream-v1')
         if self.reported is not None:
             capabilities.append('chat-config-v1')
             adapter += '\nEngine.effective_configuration = lambda self: %r\n' % (self.reported,)
-        (package / 'engine.py').write_text(adapter)
+        (package / 'engine.py').write_text(adapter + self.adapter_suffix)
         return self.store.package(self.run_id, candidate['candidate_id'], package,
             {'build': {'toolchain': {'fixture': 'host-python'}, 'dependencies': [], 'command': ['fixture']},
              'launch': ['engine.py'], 'capabilities': capabilities})
@@ -285,7 +305,8 @@ class ResidentTests(ServeFixture, unittest.TestCase):
         self.ask(self.engine())
 
     def test_resident_budget_and_source_mutation_do_not_publish_reply(self):
-        engine = self.engine(open=False)
+        # --verify-model serves a private copy and leaves the source writable; a change is still detected.
+        engine = self.engine(open=False, verify_model=True)
         engine.runtime.host_limit = 1
         with self.assertRaisesRegex(ValueError, 'RAM budget'):
             engine.open()
@@ -354,7 +375,9 @@ class LoadBoundTests(ServeFixture, unittest.TestCase):
         engine = self.engine(open=False)
         spec = engine.spec(self.a)
         size = sum(row['bytes'] for row in spec['model_manifest'])
-        self.assertAlmostEqual(engine.load_seconds(spec), 600 + size / 50e6)
+        self.assertAlmostEqual(engine.load_seconds(spec), 600 + size / 200e6)
+        verifying = self.engine(open=False, verify_model=True)
+        self.assertAlmostEqual(verifying.load_seconds(verifying.spec(self.a)), 600 + size / 50e6)
         self.assertEqual(self.engine(open=False, load_timeout=1234).load_seconds(spec), 1234)
 
 
@@ -449,7 +472,7 @@ class ModelPoolTests(unittest.TestCase):
                 try:
                     clock = {'side_effect': (i * .3 for i in range(100))} if native else {'return_value': 1}
                     with patch('crit_api.models.time.monotonic', **clock):
-                        pool.load(folder, manifest, native_files=native, progress=updates.append)
+                        pool.load(folder, manifest, native_files=native, progress=updates.append, verify=True)
                     amounts = [p['completed_bytes'] for p in updates]
                     self.assertEqual(amounts, sorted(amounts))
                     self.assertEqual((amounts[0], amounts[-1]), (0, total))
@@ -461,7 +484,8 @@ class ModelPoolTests(unittest.TestCase):
                         self.assertEqual([p['file_index'] for p in updates], [1, 1, 2, 2])
                     self.assertTrue(all(p['file_count'] == 2 and p['total_bytes'] == total for p in updates))
                     with patch('crit_api.models.time.monotonic', side_effect=AssertionError('No reread on reuse')):
-                        self.assertFalse(pool.load(folder, manifest, native_files=native, progress=updates.append))
+                        self.assertFalse(pool.load(folder, manifest, native_files=native, progress=updates.append,
+                                                   verify=True))
                 finally:
                     pool.close()
         self.pool.close()
@@ -474,7 +498,7 @@ class ModelPoolTests(unittest.TestCase):
         self.source.write_bytes(b'four')
         self.manifest = [{'path': 'weights', 'bytes': 4, 'sha256': file_sha(self.source)}]
         self.pool = ModelPool(self.root / 'pool', 4, 8)
-        self.pool.load(self.source, self.manifest)
+        self.pool.load(self.source, self.manifest, verify=True)  # a hashed private copy
         self.key = dict(device='fake:0', representation='all-weights', dtype='bytes', quantization='none',
                         layout='flat', shape=[4], abi='v1')
         self.events = []
@@ -495,6 +519,35 @@ class ModelPoolTests(unittest.TestCase):
                 self.source.write_bytes(b'new!')
         context.close(); pool.close()
         self.source.write_bytes(b'new!')
+        self.pool.close()
+
+    def test_default_load_checks_sizes_and_maps_in_place_without_reading(self):
+        pool = ModelPool(self.root / 'fast', 4, 8)
+        with patch('crit_api.models.hashlib') as hashing:
+            self.assertTrue(pool.load(self.source, self.manifest))
+        hashing.sha256.assert_not_called()  # no model file is read or hashed by default
+        context = ModelContext(pool, {}, [])
+        self.assertEqual(bytes(context.host('weights')), b'four')
+        self.assertEqual(context.model_file('weights'), self.source)
+        self.assertFalse(any(p.is_file() for p in pool.root.rglob('*')))  # no private copy
+        with patch('crit_api.models.file_sha', side_effect=AssertionError('no re-hash per read')):
+            context.host('weights'); pool.verify_sources()
+        if os.name == 'nt':
+            with self.assertRaises(PermissionError):
+                self.source.write_bytes(b'new!')  # the held handle denies writes while serving
+        context.close(); pool.close()
+        self.pool.close()
+
+    def test_default_load_refuses_wrong_sizes_and_accepts_same_size_bytes_that_only_verify_catches(self):
+        wrong_size = [{**self.manifest[0], 'bytes': 5}]
+        pool = ModelPool(self.root / 'sizes', 8, 8)
+        with self.assertRaisesRegex(ValueError, 'frozen manifest'):
+            pool.load(self.source, wrong_size)
+        other_bytes = [{**self.manifest[0], 'sha256': hashlib.sha256(b'five').hexdigest()}]
+        self.assertTrue(pool.load(self.source, other_bytes))  # the documented cost of skipping the hash
+        pool.close()
+        with self.assertRaisesRegex(ValueError, 'frozen manifest'):
+            pool.load(self.source, other_bytes, verify=True)
         self.pool.close()
 
     def test_backend_measured_allocation_is_charged_and_reused(self):
@@ -554,12 +607,15 @@ class ModelPoolTests(unittest.TestCase):
         with self.assertRaises(BufferError):
             self.pool.close()
         context.close()
+        stamp = self.source.stat().st_mtime_ns
         self.source.write_bytes(b'new!')
+        # Windows file times follow a coarse clock tick, so a rewrite right after setUp can keep the same time.
+        os.utime(self.source, ns=(stamp + 10 ** 9, stamp + 10 ** 9))
         with self.assertRaisesRegex(ValueError, 'source changed'):
             self.pool.verify_sources()
         self.pool.close()
         with self.assertRaisesRegex(ValueError, 'frozen manifest'):
-            self.pool.load(self.source, self.manifest)
+            self.pool.load(self.source, self.manifest, verify=True)
         too_small = ModelPool(self.root / 'small', 3, 0)
         with self.assertRaisesRegex(ValueError, 'RAM budget'):
             too_small.load(self.source, self.manifest)
@@ -642,15 +698,17 @@ class ModelPoolTests(unittest.TestCase):
         self.assertEqual(len(count), 4 if os.name == 'nt' else 3)
         self.pool.close()
 
-    @unittest.skipUnless(os.name == 'nt', 'Windows timestamp cache behavior')
-    def test_windows_copied_source_rechecks_bytes_with_unchanged_metadata(self):
+    def test_a_verified_copy_keeps_serving_its_bytes_without_rehashing_the_source(self):
         frozen = self.pool.fingerprint(self.source)
+        context = ModelContext(self.pool, {}, [])
         try:
-            with patch.object(self.pool, 'fingerprint', return_value=frozen):
-                self.source.write_bytes(b'next')
-                with self.assertRaisesRegex(ValueError, 'source changed'):
-                    self.pool.verify_sources()
+            with patch.object(self.pool, 'fingerprint', return_value=frozen), \
+                    patch('crit_api.models.file_sha', side_effect=AssertionError('no re-hash per read')):
+                self.source.write_bytes(b'next')  # metadata that looks unchanged, as Windows can report
+                self.pool.verify_sources()
+                self.assertEqual(bytes(context.host('weights')), b'four')  # the private copy, verified at load
         finally:
+            context.close()
             self.pool.close()
 
     @unittest.skipUnless(os.name == 'nt', 'Windows timestamp cache behavior')

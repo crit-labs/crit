@@ -4,6 +4,10 @@ Engines never see text. Every engine evaluated against the same data directory r
 exactly the same prompt and corpus token ids, rendered once with the model's own chat
 template. Tokenizer, chat template, stop ids and vocabulary come from Core's text layer
 (crit_core.text), which needs the `tokenizers` and `jinja2` packages (preparation only).
+
+Long prompts (suite/long.json) are frozen the same way: the prefill_decode quality sequences at each of the
+protocol's prompt lengths, and the pieces a run assembles retrieval prompts from once it knows the required
+context (head, filler and fact token ids, and the text of every token for matching the answers).
 """
 import hashlib
 import json
@@ -13,6 +17,8 @@ from . import SUITE_DIR, write_json
 from .ceiling import model_ceiling
 
 PREPARED = "prepared.json"
+LONG = "long.json"
+SENTINEL = "\u0000DOCUMENT\u0000"
 
 
 def file_sha256(path):
@@ -88,10 +94,9 @@ def speed_case(model, case):
         return prompt_ids(model, messages, tools)
     # Exact-length long-context prompt: template head + document tokens cut to fit + template tail.
     # The document goes where an inline message content holds {document}.
-    sentinel = "\u0000DOCUMENT\u0000"
-    messages, tools = speed_messages(case, sentinel)
+    messages, tools = speed_messages(case, SENTINEL)
     rendered = chat_text(model, messages, True, tools)
-    head, tail = rendered.split(sentinel)
+    head, tail = rendered.split(SENTINEL)
     head_ids, tail_ids = token_ids(model, head), token_ids(model, tail)
     document = (SUITE_DIR / case["document"]).read_text(encoding="utf-8")
     need = case["prompt_tokens"] - len(head_ids) - len(tail_ids)
@@ -110,6 +115,63 @@ def quality_conversation(model, conversation):
     if full[:len(prefix)] != prefix:
         raise ValueError(f"{conversation['id']}: the generation prompt is not a token prefix of the conversation")
     return full, len(prefix)
+
+
+def filler_ids(model, long):
+    """The long-prompt filler: the suite files long.json names, joined by blank lines, as token ids."""
+    return token_ids(model, "\n\n".join((SUITE_DIR / name).read_text(encoding="utf-8") for name in long["filler"]))
+
+
+def repeated(ids, length):
+    """The first `length` tokens of `ids` repeated as often as needed."""
+    copies = -(-length // len(ids))
+    return (list(ids) * copies)[:length]
+
+
+def prefill_decode_sequence(model, conversation, long, filler, prompt_tokens):
+    """A quality conversation whose prompt (everything before the scored assistant turn) is exactly
+    `prompt_tokens` long: long.json's preamble, holding filler cut to fit, goes before its first user message.
+    Returns (ids, first_target); first_target is prompt_tokens."""
+    messages = [dict(m) for m in conversation["messages"]]
+    first = next(i for i, m in enumerate(messages) if m["role"] == "user")
+    messages[first]["content"] = long["prefill_decode"]["preamble"].replace("{document}", SENTINEL) + messages[first]["content"]
+    head, tail = chat_text(model, messages[:-1], True).split(SENTINEL)
+    full_head, rest = chat_text(model, messages, False).rstrip("\n").split(SENTINEL)
+    if head != full_head:
+        raise ValueError(f"{conversation['id']}: the generation prompt and the conversation render differently before the filler")
+    head_ids, tail_ids, rest_ids = token_ids(model, head), token_ids(model, tail), token_ids(model, rest)
+    if rest_ids[:len(tail_ids)] != tail_ids:
+        raise ValueError(f"{conversation['id']}: the generation prompt is not a token prefix of the conversation")
+    need = prompt_tokens - len(head_ids) - len(tail_ids)
+    if need <= 0:
+        raise ValueError(f"{conversation['id']}: {prompt_tokens} prompt tokens leave no room for the filler")
+    return head_ids + repeated(filler, need) + rest_ids, prompt_tokens
+
+
+def token_strings(model, count):
+    """The text of each token id below `count` decoded on its own; None where it is not ASCII (part of a
+    character, or non-Latin text). The retrieval answers are ASCII, so joining these spells them exactly."""
+    out = []
+    for token in range(count):
+        try:
+            text = model.tokenizer.decode([token])
+        except Exception:  # an id the tokenizer cannot decode
+            text = None
+        out.append(text if isinstance(text, str) and text.isascii() else None)
+    return out
+
+
+def retrieval_pieces(model, long, filler):
+    """What a run assembles retrieval prompts from (context.retrieval_prompt): the rendered prompt's token ids
+    before and after the filler, the filler, each fact's token ids with its answer, and token_strings."""
+    rule = long["retrieval"]
+    messages = [{"role": "system", "content": rule["system"]},
+                {"role": "user", "content": rule["user"].replace("{document}", SENTINEL)}]
+    head, tail = chat_text(model, messages, True).split(SENTINEL)
+    return {"head_ids": token_ids(model, head), "tail_ids": token_ids(model, tail), "filler_ids": list(filler),
+            "facts": [{"id": f["id"], "answer": f["answer"], "ids": token_ids(model, "\n\n" + f["text"] + "\n\n")}
+                      for f in rule["facts"]],
+            "token_text": token_strings(model, model.tokenizer.vocab_size)}
 
 
 def prepare(model, data, speed_tokens=None):
@@ -142,6 +204,18 @@ def prepare(model, data, speed_tokens=None):
     prepared["heldout"] = [{"id": p["id"], "language": p["language"], "kind": p["kind"],
                             "prompt_ids": prompt_ids(text, [{"role": "user", "content": p["content"]}]),
                             "output_tokens": protocol["heldout"]["output_tokens"]} for p in heldout["prompts"]]
+    # Long prompts (protocol quality.prefill_decode and context.retrieval).
+    long = json.loads((SUITE_DIR / LONG).read_text(encoding="utf-8"))
+    filler = filler_ids(text, long)
+    by_id = {c["id"]: c for c in quality["conversations"]}
+    rule = protocol["quality"]["prefill_decode"]
+    prepared["prefill_decode"] = []
+    for length in rule["prompt_tokens"]:
+        for conversation_id in rule["conversations"]:
+            ids, first = prefill_decode_sequence(text, by_id[conversation_id], long, filler, length)
+            prepared["prefill_decode"].append({"id": f"{conversation_id}@{length}", "conversation": conversation_id,
+                                               "prompt_tokens": length, "ids": ids, "first_target": first})
+    prepared["retrieval"] = retrieval_pieces(text, long, filler)
     Path(data).mkdir(parents=True, exist_ok=True)
     write_json(Path(data) / PREPARED, prepared)
     return prepared

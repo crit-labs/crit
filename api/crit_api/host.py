@@ -6,13 +6,15 @@ import time
 import types
 
 if __package__ in {None, ""}:
-    # Launched by path: make crit_api and, in a checkout, crit importable.
-    for folder in (Path(__file__).resolve().parents[1], Path(__file__).resolve().parents[2] / "cli"):
-        if (folder / "crit_api").is_dir() or (folder / "crit").is_dir():
+    # Launched by path: make crit_api and, in a checkout, crit and crit_core importable.
+    root = Path(__file__).resolve().parents[2]
+    for folder in (Path(__file__).resolve().parents[1], root / "cli", root / "core" / "python"):
+        if any((folder / name).is_dir() for name in ("crit_api", "crit", "crit_core")):
             sys.path.insert(0, str(folder))
 from crit.run.records import digest, read_json, safe_path, write_json
 from crit_api.models import ModelContext, ModelPool
 from crit_api.stream import CAPABILITY as STREAM_CAPABILITY, StreamWriter
+from crit_api.options import TOOLS_CAPABILITY, STRICT_TOOLS_CAPABILITY, TOOL_STREAM_CAPABILITY
 
 CONFIG_CAPABILITY = "chat-config-v1"
 
@@ -97,6 +99,7 @@ class Host:
         self.status("loading_model")
         loaded = self.pool.load(spec["model_path"], spec["model_manifest"],
                        native_files='chat-model-file-v1' in spec.get('capabilities', []),
+                       verify=bool(spec.get('verify_model')),
                        progress=lambda value: self.status("loading_model", progress=value))
         def loading(state):
             self.status(state, model_reused=not loaded, model_bytes=self.pool.host_bytes,
@@ -119,6 +122,11 @@ class Host:
         self.context = ModelContext(self.pool, spec["configuration"], spec["launch"][1:], progress=loading)
         self.context.limits = spec.get('limits', {})
         try:
+            capabilities = spec.get("capabilities", [])
+            if (STRICT_TOOLS_CAPABILITY in capabilities or TOOL_STREAM_CAPABILITY in capabilities) and TOOLS_CAPABILITY not in capabilities:
+                raise ValueError("Strict or streaming tools require chat-tools-v1")
+            if TOOL_STREAM_CAPABILITY in capabilities and STREAM_CAPABILITY not in capabilities:
+                raise ValueError("chat-tool-stream-v1 requires chat-stream-v1")
             self.engine = module.create_engine(self.context)
             if not all(callable(getattr(self.engine, name, None)) for name in ("generate", "reset", "close")):
                 raise ValueError("Resident engine must implement generate, reset and close")
@@ -158,7 +166,8 @@ class Host:
         if any(request[key] != self.identity[key] for key in self.identity):
             raise ValueError("Resident request engine identity mismatch")
         cancellation = Cancellation(self.root / "cancel" / (command["command_id"] + ".json"))
-        stream = (StreamWriter(self.root / "stream.json", command, request, cancellation)
+        stream = (StreamWriter(self.root / "stream.json", command, request, cancellation,
+                               tools=TOOL_STREAM_CAPABILITY in payload["spec"].get("capabilities", []))
                   if STREAM_CAPABILITY in payload["spec"].get("capabilities", []) else None)
         self.status("generating")
         try:

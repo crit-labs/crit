@@ -13,11 +13,11 @@ object provides:
 
 | Method | Returns |
 | --- | --- |
-| `info()` | `name`, `configuration` (settings actually applied), `max_context`, `speculative`, `score_paths`; optional `draft_width`, `bytes_per_pass`, `draft_bytes_per_step`, `draft_ms`, `kv_bytes_per_token` (KV bytes per token at the stored precision) for headroom; `replay: true` when `replay()` exists; `plain: true` when `generate_plain()` exists; `native_libraries` (paths of loaded native libraries; Eval records sha256 and size); `kernel_work` (for `crit eval kernels`) |
+| `info()` | `name`, `configuration` (settings actually applied), `max_context`, `speculative`, `score_paths` (`prefill_decode` is required); optional `draft_width`, `bytes_per_pass`, `draft_bytes_per_step`, `draft_ms`, `kv_bytes_per_token` (KV bytes per token at the stored precision) for headroom; `replay: true` when `replay()` exists; `plain: true` when `generate_plain()` exists; `native_libraries` (paths of loaded native libraries; Eval records sha256 and size); `kernel_work` (for `crit eval kernels`) |
 | `generate(prompt_ids, max_new_tokens, on_tokens)` | Greedy, stop tokens disabled, exactly `max_new_tokens` tokens. Call `on_tokens(list)` as soon as tokens reach the host. Return `{"tokens": [...], "rounds": int or None}` (target passes after prefill); optional `accepted` (drafts accepted per round), `verify_ms` and `draft_ms` (device time in verify passes and draft steps) |
 | `replay(prompt_ids, continuation, on_tokens)` | Optional. The speculative loop on a fixed continuation: drafts accepted while they equal its next tokens, each correction or bonus token taken from it, exactly its tokens emitted. Same return fields |
 | `generate_plain(prompt_ids, max_new_tokens, on_tokens)` | Optional, speculative engines. Plain greedy on the loaded engine: one token per target pass, no drafting. Same contract as `generate`. Eval then runs the exactness check on this engine instead of opening a second one with `speculative` false |
-| `score(ids, first_target, path, queries)` | For each target `ids[i]`, `i >= first_target`, on that path: `target_logprobs`, `query_logprobs` (for the ids in `queries[i - first_target]`) and optionally `argmax`. Run the whole sequence through the scored path (`decode` steps every position from the start) |
+| `score(ids, first_target, path, queries)` | For each target `ids[i]`, `i >= first_target`, on that path: `target_logprobs`, `query_logprobs` (for the ids in `queries[i - first_target]`) and optionally `argmax`. Run the whole sequence through the scored path: `decode` steps every position from the start; `prefill_decode` prefills `ids[:first_target]` as it prefills any request prompt, then feeds each later id through an ordinary one-token decode step (the target at `first_target` comes from the prefill's last position, each later one from the step fed the id before it) |
 | `close()` | Release the engine |
 
 Log-probabilities are natural-log softmax over the token ids that exist. A Core engine can serve
@@ -33,6 +33,11 @@ adapter may keep host-side weights (for example pinned expert records) in the pr
 to the next engine it opens for the same model. Build everything on the device fresh for each engine:
 KV cache, expert or weight caches, workspaces and graphs. Device state carried over from an earlier
 engine would bias the lower-context comparison.
+
+Within one engine, nothing a request or score call leaves behind may change a later result. Caches
+may stay warm, but their contents must be complete and correct whenever they are read: Eval's
+request-history gate compares outputs on the freshly opened engine with outputs after every
+other part, long-context requests included.
 
 A Core engine built as a shared library with `CRIT_EXPORT_ENGINE`
 ([engine libraries](../../core/src/runtime/README.md#engine-libraries)) needs no adapter code of

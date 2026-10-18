@@ -5,15 +5,15 @@
   <br />
 </p>
 
-### What if building a tailored, high-performance inference engine took hours instead of weeks?
+### Why wait for someone to optimize an LLM for your GPU when an AI agent can build a specialized inference engine in a few hours?
 
-[![Version 0.2.0](docs/assets/badge-version.svg)](CHANGELOG.md)
+[![Version 0.2.1](docs/assets/badge-version.svg)](CHANGELOG.md)
 [![License Apache-2.0](docs/assets/badge-license.svg)](LICENSE)
 [![crit-hub engines](docs/assets/badge-crit-hub.svg)](https://github.com/crit-labs/crit-hub)
 [![CI](https://github.com/crit-labs/crit/actions/workflows/ci.yml/badge.svg)](https://github.com/crit-labs/crit/actions/workflows/ci.yml)
 
-[Summary](#summary) • [Case studies](#case-study) • [General vs. tailored](#inference-engines) •
-[Methodology](#methodology) • [Limitations](#limitations) • [Documentation](#documentation)
+[Summary](#summary) • [Quick start](#quick-start) • [What crit solves](#what-crit-solves) • [Case studies](#case-study) •
+[Methodology](#methodology) • [Serving](#serving) • [Limitations](#limitations) • [Documentation](#documentation)
 
 </div>
 
@@ -23,16 +23,51 @@
 
 ## Summary
 
-**A toolkit for developers and coding agents to quickly build inference engines
+**`crit` is a toolkit for developers and coding agents to quickly build inference engines
 tailored to your model and hardware.**
 > [!IMPORTANT]
-> `crit` combines a runtime foundation, reusable techniques, kernel discovery
-> and evaluation. In our first case study, a coding agent built an engine for
+> Combines a runtime foundation, reusable techniques, kernel discovery
+> and physics-based evaluation. In our first case study, a coding agent built an engine for
 > Qwen3.8-27B on one RTX 5090 in about 3.5 hours and five candidates,
 > reaching 216 tok/s decode with the model's full 262,144-token context.
 > You get runnable source, measured candidate comparisons and an OpenAI-compatible API.
 > Follow the [building guide](docs/BUILDING_ENGINES.md) yourself, or give your coding
 > agent the [agent instructions](AGENTS.md), target model and hardware.
+
+---
+
+<a id="quick-start"></a>
+
+## Quick start
+
+Give this prompt to your coding agent and specify your target LLM:
+```bash
+Use github.com/crit-labs/crit to build an optimized inference engine.
+```
+
+
+---
+
+<a id="what-crit-solves"></a>
+
+## What `crit` solves
+
+Less time building an engine. More performance from your hardware.
+
+**The boring stuff has already been built ⏱️** 
+> Requests, memory management and cleanup
+> eat up development time before optimization even starts. `crit` supplies a clean
+> foundation so you can get to the work that makes your engine fast.
+
+**Curated high-impact inference strategies 📊** 
+> Don't rebuild inference strategies from scratch. We studied established tailored
+> engines and distilled their core speedup strategies into reusable code, so you can
+> apply what works to your model and hardware.
+
+**Physics-based evaluation suite 🔬** 
+> A benchmark score alone doesn't tell
+> you what's still left on the table. `crit` measures your hardware's limits and shows
+> how close your engine gets, with quality and correctness checks along the way.
 
 ---
 
@@ -44,14 +79,18 @@ tailored to your model and hardware.**
 > Find the referenced engines in our [`crit-hub`](https://github.com/crit-labs/crit-hub) repository.
 
 We gave `Claude Opus 5.5` a target LLM along with the `crit` repository and let it cook autonomously. 
-Here are the results.
+The scenarios below explore two priorities: building a fast engine quickly within a
+candidate budget, and pushing engine quality until the agreed targets are met.
 
 ---
 
 <details>
-<summary><strong>📋 Case study 01: RTX5090, 96GB RAM, Qwen3.8-27b@NVFP4</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/qwen3.8-27b@NVFP4/mtp7-fp8attn">Inspect engine</a></summary>
+<summary><strong>📋 Build a fast dense-model engine quickly</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/qwen3.8-27b@NVFP4/mtp7-fp8attn">Inspect engine</a></summary>
 
 <br />
+
+**Goal:** Get to a fast, working engine for a dense model as quickly as possible.
+**Limit:** A fixed candidate budget.
 
 <div align="center">
 <table>
@@ -132,9 +171,12 @@ six prompts, from a chat question to a 14K-token agent session.
 ---
 
 <details>
-<summary><strong>📋 Case study 02: RTX5090, 96GB RAM, Qwen3.8-Flash-Next@FP4-Local</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/qwen3.8-flash-next@FP4-Local/mtp3-expert-cache">Inspect engine</a></summary>
+<summary><strong>📋 Build a fast MoE engine beyond VRAM capacity quickly</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/qwen3.8-flash-next@FP4-Local/mtp3-expert-cache">Inspect engine</a></summary>
 
 <br />
+
+**Goal:** Quickly build a fast engine for an MoE model whose weights don't fit in VRAM.
+**Limit:** A fixed candidate budget.
 
 <div align="center">
 <table>
@@ -149,14 +191,14 @@ Development to selection
     <td align="center" width="16%">
       <strong>
 
-88 tok/s</strong>
+84.5 tok/s</strong>
 
 Decode
     </td>
     <td align="center" width="16%">
       <strong>
 
-1,818 tok/s</strong>
+1,801 tok/s</strong>
 
 Prefill
     </td>
@@ -201,35 +243,40 @@ as a reference, and drafts 3 tokens ahead with the model's own MTP block, used a
 | 2 | Drafts 3 tokens ahead, decode in CUDA graphs, unused KV space lent to the expert cache | 82 tok/s | 1,916 tok/s | 1.63 s |
 | 3 | Weights decoded once per pass, CPU share of short prompts' experts | 81 tok/s | 1,744 tok/s | 1.43 s |
 | 4 | Second run, from candidate 2 with candidate 3's exact changes | 80 tok/s | 1,737 tok/s | 1.79 s |
-| **5** | **Faster decode GEMVs and expert sums, 8-bit KV cache** | **88 tok/s** | **1,818 tok/s** | **1.60 s** |
+| 5 | Faster decode GEMVs and expert sums, 8-bit KV cache (superseded: incorrect after prompts of 512+ tokens: prefetched experts used before their scales were set) | 88 tok/s | 1,818 tok/s | 1.60 s |
+| **6** | **Prefetched experts' scales initialized before cache use; 2 GiB VRAM margin** | **84.5 tok/s** | **1,801 tok/s** | **1.61 s** |
 
 Measured with crit Eval at the full 262,144-token context. The work took two `crit run`s back to
 back, from 14:37 to 04:34. The first run's request asked for 1 GiB of free VRAM instead of the
 machine's 0.3 GiB, so none of its candidates qualified, and the second continued from its
-candidate 2. The selected record is candidate 5 recorded again with the same source, because
-its first benchmarks were published before their checks.
+candidate 2. Candidate 5 was selected first, but an audit found it reused prefetched experts
+before their scales were initialized, so generation after prompts of 512 or more tokens was
+wrong; Eval's prompts and scoring paths never decoded after such a prompt. Candidate 6 fixes it
+and replaces candidate 5 in crit-hub.
 
 - **Bottleneck:** decode is bound by expert misses over the host link (about 27 GB/s): each
   round reads 88 to 280 missed experts. A prompt that fills all 262,144 tokens gets its first
-  token after 99 s, then decodes at 65 tok/s.
-- **Quality:** perplexity stays within 0.03% of the reference. With the 8-bit KV cache,
-  drafted output equals plain decoding on 3 of 6 cases; this run reported exactness rather
-  than requiring it.
+  token after about 100 s, then decodes at 63 tok/s.
+- **Quality:** perplexity stays within 0.03% of the reference. Drafted output equals plain
+  decoding on 3 of 6 cases; the cause is not yet established, and this run reported
+  exactness rather than requiring it.
 
 </details>
 
 ---
 
-<a id="inference-engines"></a>
+<details>
+<summary><strong>📋 Push a dense-model engine as far as possible</strong></summary>
 
-## Inference engines: general vs. tailored
+<br />
 
-| | General-purpose engine | Tailored engine |
-| --- | --- | --- |
-| Target | Many models, machines, workloads | One model, machine, workload |
-| Design | Shared paths, broad compatibility | Layouts, kernels and memory chosen for the target |
-| Effort | Configure an existing engine | Build and test it; crit supplies the parts |
-| Best fit | Broad support, ready to use | Maximum performance on a known target |
+**Goal:** Build the best engine possible for a dense model, pursuing speed alongside
+output quality and correctness.
+**Stopping criterion:** Meet the agreed engine quality targets across those measures.
+
+*Results pending.*
+
+</details>
 
 ---
 
@@ -321,7 +368,7 @@ model, and records the recipe, calibration data, seed, file hashes and cost.
 <a id="eval"></a>
 
 <details>
-<summary><strong>📚 Eval — speed and quality</strong> → <a href="docs/eval/README.md">Full guide</a></summary>
+<summary><strong>📚 Eval — physics-based evaluation</strong> → <a href="docs/eval/README.md">Full guide</a></summary>
 
 <br />
 
@@ -350,7 +397,7 @@ Results keep samples, settings and skipped cases visible.
 <a id="serving"></a>
 
 <details>
-<summary><strong>🔌 Serving — OpenAI-compatible API</strong> → <a href="docs/SERVING.md">Full guide</a></summary>
+<summary><strong>🔌 Serving</strong> → <a href="docs/SERVING.md">Full guide</a></summary>
 
 <br />
 

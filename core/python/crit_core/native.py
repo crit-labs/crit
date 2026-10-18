@@ -81,7 +81,8 @@ class NativeEngine:
                  on_tokens=None, cancelled=None):
         """Returns (tokens, result) with result's "finish", "timing" (ms, decode_steps) and the engine's request
         facts, or (None, {"cancelled": True}) when cancelled() turned true. stop_tokens None keeps the model's;
-        [] disables them. sampling: temperature, top_p, top_k, min_p, seed. plain: decode without drafting (engines
+        [] disables them. sampling: temperature, top_p, top_k, min_p, seed, penalties and logit_bias.
+        plain: decode without drafting (engines
         that declare "plain")."""
         options = dict(sampling or {})
         if stop_tokens is not None:
@@ -239,7 +240,9 @@ class ResidentEngine:
         return dict(self.configuration)
 
     def _run(self, request, cancellation, emit=None):
-        messages = [{"role": m["role"], "content": m["content"]} for m in request["messages"]]
+        if request.get("tools") or any(m.get("tool_calls") or m["role"] == "tool" for m in request["messages"]):
+            raise ValueError("Native tool calling needs a model-specific resident adapter and output parser")
+        messages = request["messages"]
         ids = self.text.encode_chat(messages, add_generation_prompt=True,
                                     **(self.configuration.get("chat_template_kwargs") or {}))
         limits = request.get("limits", {})
@@ -255,7 +258,13 @@ class ResidentEngine:
                 if emit:
                     emit(delta.text)
 
-        tokens, result = self.native.generate(ids, output_tokens, on_tokens=on_tokens,
+        sampling = dict(request.get("sampling") or {})
+        support = self.facts.get("sampling") or {}
+        for key in sampling:
+            flag = "penalties" if key in {"repetition_penalty", "presence_penalty", "frequency_penalty"} else key
+            if not support.get(flag):
+                raise ValueError("Native engine does not support requested sampling option: " + key)
+        tokens, result = self.native.generate(ids, output_tokens, on_tokens=on_tokens, sampling=sampling,
                                               cancelled=lambda: cancellation.is_set())
         if tokens is None:
             cancellation.check()

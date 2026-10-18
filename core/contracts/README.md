@@ -1,7 +1,7 @@
 # Native core contracts
 
 The authoritative native interface is [crit/core.h](../include/crit/core.h);
-the current source version is 0.2.0. [CONTRACTS.json](CONTRACTS.json) records
+the current source version is 0.2.1. [CONTRACTS.json](CONTRACTS.json) records
 its ownership responsibilities and those of the
 [component libraries](#component-libraries); it is documentation, not a wire ABI.
 

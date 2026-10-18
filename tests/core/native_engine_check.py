@@ -20,6 +20,15 @@ def abi(library):
     expect(facts["implementation"] == "toy native engine" and facts["context"] == 256, facts)
     expect(facts["stop_tokens"] == [5] and facts["score_paths"] == ["prefill", "decode"], facts)
     expect(facts["speculative"] is True and facts["replay"] is True and facts["draft_width"] == 1, facts)
+    expect(facts["sampling"]["penalties"] is False and facts["sampling"]["logit_bias"] is False, facts)
+    # The bridge must forward these options to Core, which rejects them for this greedy-only model.
+    for options in ({"frequency_penalty": .5}, {"presence_penalty": .5}, {"repetition_penalty": 1.1},
+                    {"logit_bias": {"12": -2}}):
+        try:
+            engine.generate([1, 2], 3, sampling=options)
+            raise AssertionError("sampling options must never disappear in the ABI: " + str(options))
+        except NativeError as error:
+            expect("does not support a requested sampling option" in str(error), error)
 
     streamed = []
     tokens, result = engine.generate([1, 2, 3], 7, on_tokens=streamed.extend)

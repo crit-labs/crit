@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 import sys
 
+# runner.PARTS, kept here so parsing imports nothing else.
+PARTS = ("speed", "quality", "exactness", "context", "heldout", "history")
+
 
 def main(argv=None):
     if hasattr(sys.stdout, "reconfigure"):
@@ -17,9 +20,10 @@ def main(argv=None):
     run.add_argument("--data", required=True, help="Prepared suite and reference directory for this model")
     run.add_argument("--out", required=True, help="Result JSON path")
     run.add_argument("--config", default="{}", help="JSON configuration overrides passed to the adapter")
-    run.add_argument("--only", choices=["speed", "quality", "exactness", "context", "heldout"], action="append",
-                     help="Run only these parts (repeatable); default is all. context: the long-context curve up to "
-                          "the required context and the speed cases again at a lower context")
+    run.add_argument("--only", choices=list(PARTS), action="append",
+                     help="Run only these parts (repeatable); default is all. context: the long-context curve and "
+                          "retrieval up to the required context and the speed cases again at a lower context; "
+                          "history: the same requests on the fresh engine and after every other part")
     run.add_argument("--repetitions", type=int, help="Override the protocol's measured repetitions")
     run.add_argument("--warmups", type=int, help="Override the protocol's warmup runs")
     run.add_argument("--label", help="Name shown in comparisons")
@@ -178,7 +182,7 @@ def main(argv=None):
     from .prepare import PREPARED
     from .reference import REFERENCE
     from .runner import run as do_run
-    parts = tuple(args.only or ("speed", "quality", "exactness", "context", "heldout"))
+    parts = tuple(args.only or PARTS)
     data = Path(args.data)
     if not (data / PREPARED).is_file():
         from .prepare import prepare as do_prepare

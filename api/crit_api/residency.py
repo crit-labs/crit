@@ -56,11 +56,12 @@ class ResidentRuntime:
                     raise
                 time.sleep(.005)
 
-    def call(self, action, payload, stop, timeout, progress=None, request=None):
+    def call(self, action, payload, stop, timeout, progress=None, request=None, progress_tools=None):
         self.start()
         cid = uuid.uuid4().hex
         stream_path = self.root / "stream.json"
-        stream = StreamReader(stream_path, cid, self.ownership.token, request, progress) if progress else None
+        stream = (StreamReader(stream_path, cid, self.ownership.token, request, progress or (lambda text: None),
+                               progress_tools) if progress or progress_tools else None)
         result = self._call(cid, action, payload, stop, timeout, stream)
         # Completion proves producer settlement. On an exception the owner
         # retires the host, then close()/recovery removes this private snapshot.
@@ -101,7 +102,9 @@ class ResidentRuntime:
                     stream.poll()
                 return result
             if self.tree.process.poll() is not None:
-                raise ValueError("Resident host exited before completing the request")
+                # Identify retained diagnostics without exposing arbitrary adapter log contents to API clients.
+                raise ValueError("Resident host exited before completing the request (exit %s); diagnostics: %s" %
+                                 (self.tree.process.returncode, self.root / "runtime.log"))
             time.sleep(.02)
 
     def close(self):

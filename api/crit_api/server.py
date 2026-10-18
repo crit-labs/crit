@@ -12,26 +12,20 @@ from crit_core.constraints import UnsupportedConstraint, compile_language, json_
 from crit_core.text import StopMatcher, TextError
 
 from .engine import CONSTRAINTS_CAPABILITY, EngineError
+from .options import (RequestError, SAMPLING, TOOLS_CAPABILITY, TOOL_STREAM_CAPABILITY, require, sampling_capability,
+                      sampling_options, tool_calls, tool_options)
 
 MAX_BODY = 8 * 1024 * 1024
 MAX_STOPS = 4
 DEFAULT_MAX_TOKENS = 1024
-# Accepted for client compatibility. The engine applies the sampling frozen in its candidate configuration until
-# the adapter contract carries per-request sampling; responses name the parameters that were ignored.
-IGNORED = {"temperature", "top_p", "top_k", "min_p", "seed", "presence_penalty", "frequency_penalty",
-           "repetition_penalty", "logit_bias", "user", "metadata", "store", "service_tier", "parallel_tool_calls",
-           "reasoning_effort", "prediction", "modalities"}
-UNSUPPORTED = {"tools": "tool calls", "tool_choice": "tool calls", "functions": "function calls",
+# Only non-generation metadata is accepted without applying it.
+IGNORED = {"user", "metadata", "store", "service_tier"}
+UNSUPPORTED = {"functions": "legacy function calls (use tools)",
                "function_call": "function calls",
-               "logprobs": "logprobs", "top_logprobs": "logprobs", "audio": "audio output"}
+               "logprobs": "logprobs", "top_logprobs": "logprobs", "audio": "audio output",
+               "reasoning_effort": "reasoning effort", "prediction": "predicted output", "modalities": "modalities"}
 KNOWN = {"model", "messages", "stream", "stream_options", "max_tokens", "max_completion_tokens", "stop", "n",
-         "response_format"}
-
-
-class RequestError(Exception):
-    def __init__(self, message, status=400, param=None, code=None):
-        super().__init__(message)
-        self.status, self.param, self.code = status, param, code
+         "response_format", "tools", "tool_choice", "parallel_tool_calls"} | SAMPLING
 
 
 def content_text(content, index):
@@ -45,16 +39,20 @@ def content_text(content, index):
     raise RequestError("Message content must be a string or a list of text parts", param=f"messages[{index}].content")
 
 
-def conversation(messages):
+def conversation(messages, capabilities=()):
     """An optional leading system message, then user/assistant turns ending with the user.
 
     Consecutive messages from the same role are joined with a blank line, since the adapter contract alternates.
     """
     if not isinstance(messages, list) or not messages:
         raise RequestError("messages must be a non-empty list", param="messages")
+    if any(isinstance(m, dict) and (m.get("role") == "tool" or m.get("tool_calls")) for m in messages):
+        require(capabilities, TOOLS_CAPABILITY, "messages")
+        return tool_conversation(messages)
     result = []
     for index, message in enumerate(messages):
-        if not isinstance(message, dict) or message.get("role") not in {"system", "developer", "user", "assistant"}:
+        if (not isinstance(message, dict) or not isinstance(message.get("role"), str)
+                or message["role"] not in {"system", "developer", "user", "assistant"}):
             raise RequestError("Each message needs a role of system, user or assistant", param=f"messages[{index}].role")
         role = "system" if message["role"] == "developer" else message["role"]
         content = content_text(message.get("content"), index)
@@ -67,6 +65,53 @@ def conversation(messages):
     turns = result[1:] if result[0]["role"] == "system" else result
     if not turns or turns[0]["role"] != "user" or turns[-1]["role"] != "user":
         raise RequestError("The conversation must start and end with a user message", param="messages")
+    return result
+
+
+def tool_conversation(messages):
+    """Preserve call ids and message boundaries; every call must have exactly one result."""
+    result, pending, seen = [], set(), set()
+    for index, message in enumerate(messages):
+        param = f"messages[{index}]"
+        if not isinstance(message, dict):
+            raise RequestError("Each message must be an object", param=param)
+        role = message.get("role")
+        role = "system" if role == "developer" else role
+        if not isinstance(role, str) or role not in {"system", "user", "assistant", "tool"}:
+            raise RequestError("Invalid message role", param=param + ".role")
+        if role == "system" and any(m["role"] != "system" for m in result):
+            raise RequestError("System messages must come first", param=param)
+        if pending and role != "tool":
+            raise RequestError("Supply results for all pending tool calls before the next turn", param=param)
+        calls = message.get("tool_calls")
+        if calls and role != "assistant":
+            raise RequestError("Only assistant messages may contain tool_calls", param=param)
+        content = message.get("content")
+        row = {"role": role, "content": "" if content is None and calls else content_text(content, index)}
+        if calls:
+            try:
+                row["tool_calls"] = tool_calls(calls)
+            except (ValueError, TypeError) as exc:
+                raise RequestError(str(exc), param=param + ".tool_calls") from None
+            pending = {c["id"] for c in calls}
+            if pending & seen:
+                raise RequestError("Tool call ids must be unique across the conversation", param=param)
+            seen.update(pending)
+        if role == "tool":
+            ident = message.get("tool_call_id")
+            if not isinstance(ident, str) or ident not in pending:
+                raise RequestError("tool_call_id must reference an unanswered assistant call", param=param)
+            pending.remove(ident)
+            row["tool_call_id"] = ident
+        for key in ("name", "reasoning_content"):
+            if key in message:
+                if not isinstance(message[key], str):
+                    raise RequestError(key + " must be a string", param=param)
+                row[key] = message[key]
+        result.append(row)
+    turns = [m for m in result if m["role"] != "system"]
+    if pending or not turns or turns[0]["role"] != "user" or turns[-1]["role"] not in {"user", "tool"}:
+        raise RequestError("Conversation must start with user and end with user or completed tool results", param="messages")
     return result
 
 
@@ -139,17 +184,25 @@ class Api:
         if not isinstance(body, dict):
             raise RequestError("The request body must be a JSON object")
         for key, feature in UNSUPPORTED.items():
-            if key in body and body[key] not in (None, False, [], "auto", "none") and not (
-                    key == "response_format" and isinstance(body[key], dict) and body[key].get("type") == "text"):
+            if key in body and body[key] is not None and not (
+                    (key == "logprobs" and body[key] is False) or (key == "top_logprobs" and body[key] == 0)):
                 raise RequestError(f"This engine does not support {feature} yet", param=key, code="unsupported_parameter")
-        if body.get("n", 1) != 1:
+        if type(body.get("n", 1)) is not int or body.get("n", 1) != 1:
             raise RequestError("This engine returns one choice per request", param="n")
+        if "stream" in body and type(body["stream"]) is not bool:
+            raise RequestError("stream must be a boolean", param="stream")
         candidate = self.candidate(body.get("model"))
+        capabilities = self.engine.spec(candidate)["capabilities"]
+        sampling = sampling_options(body, capabilities)
+        tools = tool_options(body, capabilities)
         constraint = response_format(body.get("response_format"))
         if constraint and CONSTRAINTS_CAPABILITY not in self.engine.spec(candidate)["capabilities"]:
             raise RequestError(f"This engine cannot apply response_format {constraint['type']}: its package does not "
                                f"declare {CONSTRAINTS_CAPABILITY}", param="response_format", code="unsupported_parameter")
-        messages = conversation(body.get("messages"))
+        messages = conversation(body.get("messages"), capabilities)
+        if tools and (constraint or body.get("stop")):
+            raise RequestError("Tool requests cannot combine stop strings or response_format",
+                               param="response_format" if constraint else "stop")
         limit = body.get("max_completion_tokens", body.get("max_tokens"))
         if limit is None:
             limit = min(DEFAULT_MAX_TOKENS, self.engine.kv_tokens - 1)
@@ -160,10 +213,12 @@ class Api:
             raise RequestError("stream_options must be an object", param="stream_options")
         ignored = sorted(k for k in body if k in IGNORED)
         unknown = sorted(k for k in body if k not in IGNORED | set(UNSUPPORTED) | KNOWN)
+        if unknown:
+            raise RequestError("Unknown request parameter: " + unknown[0], param=unknown[0], code="unsupported_parameter")
         return {"candidate": candidate, "model": self.model if candidate == self.engine.default else self.engine.model_id(candidate),
                 "messages": messages, "max_tokens": limit, "stream": bool(body.get("stream")),
                 "include_usage": bool(options.get("include_usage")), "stop": stops(body.get("stop")),
-                "response_format": constraint, "ignored": ignored + unknown}
+                "response_format": constraint, "sampling": sampling, "tool_options": tools, "ignored": ignored}
 
     def candidate(self, model):
         """The candidate a request's model names: RUN_ID/CANDIDATE_ID or a bare candidate ID. Any other name (clients
@@ -189,9 +244,13 @@ class Api:
         cards = []
         for candidate in self.engine.candidates():
             default = candidate["candidate_id"] == self.engine.default
+            spec = self.engine.spec(candidate["candidate_id"])
             cards.append({"id": self.model if default else self.engine.model_id(candidate["candidate_id"]),
                           "object": "model", "created": self.created, "owned_by": "crit", "label": candidate["label"],
-                          "context_length": self.engine.kv_tokens, "default": default})
+                          "context_length": spec["limits"]["kv_tokens"], "default": default,
+                          "capabilities": spec["capabilities"],
+                          "supported_sampling_parameters": sorted(k for k in SAMPLING if sampling_capability(k)
+                                                                  in spec["capabilities"])})
         return cards
 
     def usage(self, measured):
@@ -205,8 +264,9 @@ class Api:
             return "stop"
         return "length" if measured and measured["output_tokens"] >= limit else "stop"
 
-    def run(self, request, emit, cancel):
-        """Generate; `emit(piece)` gets released text. Returns (finish_reason, measured or None). Stop strings follow
+    def run(self, request, emit, cancel, emit_tools=None):
+        """Generate; emit receives text, emit_tools indexed deltas. Returns (finish_reason, measured, calls).
+        Stop strings follow
         Core's rule (crit_core.text.StopMatcher): the first stop to complete wins, and only text that could still
         begin a stop is held back."""
         scanner = StopMatcher(request["stop"])
@@ -217,13 +277,20 @@ class Api:
             if scanner.stopped is not None:
                 cancel.set()  # Stop sequence reached: end the engine's turn early.
         try:
+            tool_incremental = (request["stream"] and request["tool_options"] and
+                                TOOL_STREAM_CAPABILITY in self.engine.spec(request["candidate"])["capabilities"])
+            incremental = (request["stream"] or request["stop"]) and (not request["tool_options"] or tool_incremental)
             status, assistant, measured = self.engine.generate(request["messages"], request["max_tokens"], cancel,
-                                                               on_text=progress if request["stream"] or request["stop"] else None,
+                                                               on_text=progress if incremental else None,
                                                                candidate_id=request["candidate"],
-                                                               response_format=request.get("response_format"))
+                                                               response_format=request.get("response_format"),
+                                                               sampling=request["sampling"], tool_options=request["tool_options"],
+                                                               on_tools=emit_tools if tool_incremental else None)
         except (ValueError, OSError) as exc:
             raise EngineError(str(exc)) from exc
         if status == "completed":
+            calls = assistant.get("tool_calls") if isinstance(assistant, dict) else None
+            assistant = assistant["content"] if isinstance(assistant, dict) else assistant
             try:
                 piece = scanner.advance(assistant, final=True)
             except TextError as exc:
@@ -236,9 +303,13 @@ class Api:
                 raise EngineError("The engine's reply does not match response_format " + constraint["type"])
             if piece:
                 emit(piece)
-            return finish, measured
+            if calls:
+                if emit_tools and not tool_incremental:
+                    emit_tools([dict(call, index=i) for i, call in enumerate(calls)])
+                return "tool_calls", measured, calls
+            return finish, measured, []
         if scanner.stopped is not None:
-            return "stop", None
+            return "stop", None, []
         if status == "timed_out":
             raise EngineError("The engine did not finish within the request timeout", 504)
         raise EngineError("Request cancelled", 499)
@@ -344,13 +415,15 @@ class Handler(BaseHTTPRequestHandler):
     def complete(self, request):
         pieces = []
         try:
-            finish, measured = self.api.run(request, pieces.append, threading.Event())
+            finish, measured, calls = self.api.run(request, pieces.append, threading.Event())
         except EngineError as exc:
             return self.error(exc.status, str(exc), "server_error" if exc.status >= 500 else "invalid_request_error")
         value = {"id": "chatcmpl-" + uuid.uuid4().hex, "object": "chat.completion", "created": int(time.time()),
                  "model": request["model"], "system_fingerprint": self.api.engine.spec(request["candidate"])["package_sha256"][:16],
                  "choices": [{"index": 0, "message": {"role": "assistant", "content": "".join(pieces)},
                               "logprobs": None, "finish_reason": finish}]}
+        if calls:
+            value["choices"][0]["message"].update(content="".join(pieces) or None, tool_calls=calls)
         usage = self.api.usage(measured)
         if usage:
             value["usage"] = usage
@@ -389,7 +462,8 @@ class Handler(BaseHTTPRequestHandler):
 
         event(chunk({"role": "assistant", "content": ""}))
         try:
-            finish, measured = self.api.run(request, lambda piece: event(chunk({"content": piece})), cancel)
+            finish, measured, _ = self.api.run(request, lambda piece: event(chunk({"content": piece})), cancel,
+                lambda deltas: event(chunk({"tool_calls": deltas})))
         except EngineError as exc:
             event({"error": {"message": str(exc), "type": "server_error", "param": None, "code": None}})
         else:

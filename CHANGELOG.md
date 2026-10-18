@@ -9,6 +9,65 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-18
+
+### Overview
+
+crit 0.2.1 makes Eval catch engines that go wrong only after a long prompt: decode after
+1K to 32K prompt tokens is now scored against the reference, long-context retrieval and
+repeated requests are gates, and AGENTS.md treats unexplained output differences as bugs.
+Serving accepts per-request sampling and tool calls, and `crit serve` loads the model
+right away instead of hashing the whole checkpoint first. Eval data prepared for 0.2.0
+(`crit-eval-v3`) must be prepared again, and Eval adapters need the new `prefill_decode`
+score path. The Python distribution and the Core SDK share version 0.2.1.
+
+### Added
+
+- Serving passes validated per-request sampling overrides to opt-in resident adapters,
+  including native Core penalties and logit bias. Model cards list supported sampling
+  parameters and package capabilities.
+- `chat-tools-v1` carries function definitions, choice policies, correlated tool-result
+  history and validated calls in JSON and SSE responses. `chat-tools-strict-v1` compiles
+  argument schemas with Core and verifies replies; `chat-tool-stream-v1` carries live,
+  indexed argument fragments with append-only and strict-prefix validation.
+  Model-specific adapters supply prompting, parsing and constrained decoding.
+- Eval protocol `crit-eval-v4` adds three gates. The required `prefill_decode` quality
+  path prefills 1,024-, 4,096- and 32,768-token prompts and scores the reference
+  continuation through ordinary decode steps against the drift budget, per prompt length.
+  The retrieval gate asks for facts placed at the start, middle and end of prompts up to
+  the required context and checks the answers verbatim. The request-history gate requires
+  the same greedy tokens on a fresh engine and after every other request it served, in
+  every exactness mode. With `--baseline`, status notes a drop in plain-greedy equality.
+- `crit serve --verify-model` reads and SHA-256s every model file against the run's frozen
+  manifest before loading, and gives engines without `chat-model-file-v1` a private copy.
+
+### Changed
+
+- `crit serve` checks each model file's size against the frozen manifest and maps it in
+  place by default, so the engine starts loading at once instead of after a full read and
+  hash of the checkpoint. A checkpoint with the same sizes but other bytes is served
+  unnoticed unless `--verify-model` is given. The default load timeout assumes 200 MB/s
+  (50 MB/s with `--verify-model`), and Windows no longer re-hashes copied model files on
+  every read.
+- AGENTS.md lays out the build loop (recon, plan, build, evaluate, revisit recon, repeat)
+  with its commands and stop conditions, and treats a drop in plain-greedy equality or a
+  difference between repeated identical requests as a bug until a root cause is shown.
+- README case study 02 shows the corrected Flash-Next candidate 6; candidate 5 is marked
+  superseded (it used prefetched experts before their scales were set).
+- Data prepared for `crit-eval-v3` must be prepared again, with a new reference and pin:
+  `prepared.json` now holds the long prompts and the token strings retrieval matches with.
+  An Eval adapter must declare and implement the `prefill_decode` score path.
+- Unsupported sampling controls and unknown request parameters now return HTTP 400
+  instead of being ignored. Existing sealed packages continue to serve plain chat;
+  clients must omit unsupported overrides or use a newly built capable adapter.
+
+### Fixed
+
+- Windows resident startup no longer treats a transient permission denial during
+  ownership-record replacement as owner death: the guardian uses the supervisor's
+  bounded retry. Changed ownership and persistent failures still stop execution.
+  Unexpected resident exits report their exit code and diagnostic log location.
+
 ## [0.2.0] - 2026-10-17
 
 ### Overview
@@ -172,6 +231,7 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/crit-labs/crit/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/crit-labs/crit/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/crit-labs/crit/releases/tag/v0.1.0

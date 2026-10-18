@@ -5,6 +5,8 @@ import threading
 import time
 
 from crit.run.records import keys, number, read_json, write_json
+from .options import validate_tool_reply
+from .tool_stream import ToolCallStream
 
 CAPABILITY = "chat-stream-v1"
 MAX_TEXT = 65536
@@ -22,13 +24,15 @@ def stream_text(value):
 
 class StreamWriter:
     """Synchronous adapter callback; keep one coalesced snapshot, never a queue."""
-    def __init__(self, path, command, request, cancellation):
+    def __init__(self, path, command, request, cancellation, tools=False):
         self.path, self.cancellation = path, cancellation
         self.identity = {key: request[key] for key in IDENTITY}
         self.identity.update(command_id=command["command_id"], token=command["token"])
         self.thread = threading.get_ident()
         self.text, self.sequence, self.published = "", 0, 0
         self.next_write, self.closed, self.error = 0, False, None
+        self.tools = ToolCallStream(request) if tools else None
+        self.request = self.tools.request if self.tools is not None else request
 
     def emit(self, chunk):
         try:
@@ -37,10 +41,13 @@ class StreamWriter:
             if self.error:
                 raise ValueError(self.error)
             self.cancellation.check()
-            chunk = stream_text(chunk)
-            if len(self.text) + len(chunk) > MAX_TEXT:
+            if isinstance(chunk, dict) and self.tools is not None:
+                keys(chunk, {"tool_calls"})
+                self.tools.update(chunk["tool_calls"])
+            else:
+                self.text += stream_text(chunk)
+            if len(self.text) + (self.tools.size if self.tools else 0) > MAX_TEXT:
                 raise ValueError("Stream text exceeds 65536 characters")
-            self.text += chunk
             self.sequence += 1
             if time.monotonic() >= self.next_write:
                 self.flush()
@@ -51,7 +58,8 @@ class StreamWriter:
     def flush(self):
         if self.sequence != self.published:
             write_json(self.path, {"schema_version": 1, "record_kind": "chat_progress",
-                **self.identity, "sequence": self.sequence, "assistant": self.text})
+                **self.identity, "sequence": self.sequence, "assistant": self.text,
+                **({"tool_calls": self.tools.calls} if self.tools else {})})
             self.published = self.sequence
             self.next_write = time.monotonic() + .05
 
@@ -60,6 +68,10 @@ class StreamWriter:
             raise ValueError(self.error)
         if not isinstance(response, dict) or response.get("assistant") != self.text:
             raise ValueError("Final reply differs from emitted stream text")
+        if self.tools is not None:
+            calls = validate_tool_reply(response.get("tool_calls"), self.request)
+            if calls != self.tools.calls:
+                raise ValueError("Final tool calls differ from emitted tool calls")
         self.flush()
 
     def close(self):
@@ -68,11 +80,12 @@ class StreamWriter:
 
 class StreamReader:
     """Reject stale identities and rewrites; dropped intermediate snapshots are OK."""
-    def __init__(self, path, command_id, token, request, publish):
+    def __init__(self, path, command_id, token, request, publish, publish_tools=None):
         self.path, self.publish = path, publish
         self.identity = {key: request[key] for key in IDENTITY}
         self.identity.update(command_id=command_id, token=token)
         self.sequence, self.text = 0, ""
+        self.tools, self.publish_tools = ToolCallStream(request), publish_tools
 
     def poll(self):
         if not self.path.exists():
@@ -88,16 +101,26 @@ class StreamReader:
                 if sys.platform != "win32" or not retryable or time.monotonic() >= deadline:
                     raise
                 time.sleep(.005)
-        keys(value, {"schema_version", "record_kind", "sequence", "assistant", *self.identity})
+        keys(value, {"schema_version", "record_kind", "sequence", "assistant", *self.identity}, {"tool_calls"})
         if type(value["schema_version"]) is not int or value["schema_version"] != 1 or value["record_kind"] != "chat_progress":
             raise ValueError("Invalid resident stream record")
         if any(value[key] != expected for key, expected in self.identity.items()):
             raise ValueError("Resident stream identity mismatch")
         sequence = number(value["sequence"], "Stream sequence", 1, MAX_TEXT, integer=True)
-        text = stream_text(value["assistant"])
-        if sequence == self.sequence and text == self.text:
+        text = value["assistant"]
+        if text != "" or not value.get("tool_calls"):
+            text = stream_text(text)
+        calls = value.get("tool_calls", [])
+        if sequence == self.sequence and text == self.text and calls == self.tools.calls:
             return
-        if sequence <= self.sequence or not text.startswith(self.text) or len(text) - len(self.text) < sequence - self.sequence:
+        old_size = self.tools.size
+        deltas = self.tools.snapshot(calls)
+        size = len(text) + self.tools.size
+        if (size > MAX_TEXT or sequence <= self.sequence or not text.startswith(self.text)
+                or size - len(self.text) - old_size < sequence - self.sequence):
             raise ValueError("Resident stream text or sequence moved backwards")
         self.sequence, self.text = sequence, text
-        self.publish(text)
+        if text:
+            self.publish(text)
+        if deltas and self.publish_tools:
+            self.publish_tools(deltas)

@@ -143,6 +143,42 @@ def filled_prompt(base, length):
     return (base * copies)[len(base) * copies - length:]
 
 
+def retrieval_points(required, rule):
+    """Context lengths the retrieval check fills: its fixed points below the requirement, then the requirement
+    itself (near capacity: prompt plus output equal it). rule: protocol.json's context.retrieval."""
+    return sorted({int(p) for p in rule["points"] if int(p) < required} | {int(required)})
+
+
+def retrieval_prompt(pieces, length, positions):
+    """A retrieval prompt of exactly `length` tokens: the prepared head, the filler (repeated as needed) with
+    one fact at each of `positions` (fractions of the filler), and the tail with the question. None when
+    `length` cannot hold the head, tail and facts with filler between them. pieces: prepared["retrieval"]."""
+    head, tail, facts = pieces["head_ids"], pieces["tail_ids"], pieces["facts"]
+    plain = length - len(head) - len(tail) - sum(len(f["ids"]) for f in facts)
+    if plain < len(facts) + 1:
+        return None
+    filler = pieces["filler_ids"]
+    filler = (list(filler) * -(-plain // len(filler)))[:plain]
+    out, last = list(head), 0
+    for fraction, fact in zip(positions, facts):
+        cut = max(last, min(plain, int(plain * float(fraction))))
+        out += filler[last:cut] + list(fact["ids"])
+        last = cut
+    return out + filler[last:] + list(tail)
+
+
+def token_text(tokens, strings, stop_ids=()):
+    """The text of `tokens` up to the first stop id, joined from the prepared per-token strings; a token with
+    no ASCII string (or outside the table) becomes U+FFFD, so it can never complete an ASCII answer."""
+    stops, out = set(stop_ids), []
+    for token in tokens:
+        if token in stops:
+            break
+        text = strings[token] if 0 <= token < len(strings) else None
+        out.append(text if text is not None else "�")
+    return "".join(out)
+
+
 def render(value):
     lines = []
     if value["tokens"]:

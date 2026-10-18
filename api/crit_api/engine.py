@@ -1,5 +1,6 @@
 """One sealed candidate, loaded once and kept resident; requests run one at a time."""
 from pathlib import Path
+import json
 import shutil
 import threading
 import uuid
@@ -11,13 +12,16 @@ from crit.run.store import ROOT, RunStore
 
 from .residency import CAPABILITY as RESIDENT_CAPABILITY, ResidentRuntime
 from .stream import CAPABILITY as STREAM_CAPABILITY
+from .options import (RequestError, TOOL_STREAM_CAPABILITY, sampling_options,
+                      tool_options as validate_tool_options, validate_tool_reply)
 
 CAPABILITY = "chat-json-v1"
 # The adapter applies a request's response_format (crit_core.constraints / crit/constraints.h); see docs/SERVING.md.
 CONSTRAINTS_CAPABILITY = "chat-constraints-v1"
 MAX_REPLY = 65536
 MAX_CONVERSATION = 1_000_000
-LOAD_BYTES_PER_SECOND = 50e6  # model bytes per second assumed by the default load bound (copy, hash, engine load)
+LOAD_BYTES_PER_SECOND = 200e6  # model bytes per second assumed by the default load bound (the engine's own load)
+VERIFY_BYTES_PER_SECOND = 50e6  # with --verify-model: read, hash and copy every model file, then the engine load
 
 
 class EngineError(Exception):
@@ -62,12 +66,24 @@ def telemetry(value, request):
 
 
 def reply(value, request):
-    keys(value, {"schema_version", "record_kind", "request_id", "candidate_id", "package_sha256", "assistant", "telemetry"})
+    keys(value, {"schema_version", "record_kind", "request_id", "candidate_id", "package_sha256", "assistant", "telemetry"},
+         {"tool_calls"})
     if type(value["schema_version"]) is not int or value["schema_version"] != 1 or value["record_kind"] != "chat_response":
         raise ValueError("Invalid engine chat response")
     if any(value[key] != request[key] for key in ("request_id", "candidate_id", "package_sha256")):
         raise ValueError("Reply belongs to a different request or engine")
-    return text(value["assistant"], "Reply", MAX_REPLY), telemetry(value["telemetry"], request)
+    calls = validate_tool_reply(value.get("tool_calls"), request)
+    assistant = value["assistant"]
+    if calls:
+        if not isinstance(assistant, str) or "\0" in assistant:
+            raise ValueError("Tool reply assistant must be text without NUL")
+        assistant.encode("utf-8")
+        if len(json.dumps(calls, ensure_ascii=False)) + len(assistant) > MAX_REPLY:
+            raise ValueError("Tool reply exceeds the reply size limit")
+        assistant = {"content": assistant, "tool_calls": calls}
+    else:
+        text(assistant, "Reply", MAX_REPLY)
+    return assistant, telemetry(value["telemetry"], request)
 
 
 def package_signature(folder):
@@ -92,13 +108,14 @@ class ServedEngine:
     The server owns the machine's crit runtime while it runs: no other crit process can load an engine.
     """
     def __init__(self, workspace, run_id=None, candidate_id=None, project=ROOT, runtime_directory=None,
-                 host_limit=None, device_limit=None, timeout=600, load_timeout=None):
+                 host_limit=None, device_limit=None, timeout=600, load_timeout=None, verify_model=False):
         self.store = RunStore(workspace, project)
         self.run_id = run_id or single_run(self.store)
         self.requested_candidate = candidate_id
         self.default = None
         self.timeout = number(timeout, "request timeout", .01, 86400)
         self.load_timeout = None if load_timeout is None else number(load_timeout, "load timeout", .01, 7 * 86400)
+        self.verify_model = bool(verify_model)
         self.ownership = RuntimeOwnership(runtime_directory)
         self.runtime = ResidentRuntime(self.ownership, host_limit, device_limit)
         self.lock = threading.Lock()
@@ -137,7 +154,7 @@ class ServedEngine:
                     model_manifest=read_json(safe_path(root, "inputs.json"))["model_manifest"],
                     configuration=candidate["configuration"], launch=manifest["launch"],
                     capabilities=manifest["capabilities"], limits=view["run"]["spec"]["hardware_constraints"],
-                    label=candidate["label"], signature=package_signature(package))
+                    label=candidate["label"], signature=package_signature(package), verify_model=self.verify_model)
 
     def candidates(self, refresh=False):
         """Sealed candidates of the run whose packages declare a resident chat adapter (listed once, then on refresh)."""
@@ -193,12 +210,14 @@ class ServedEngine:
                 raise
 
     def load_seconds(self, spec):
-        """Bound on loading a candidate: --load-timeout, else 600 s plus the model's bytes at 50 MB/s. The host
-        copies and hashes every model file into its private snapshot before the engine reads them, so loading
-        grows with the checkpoint; a fixed bound fails large models on ordinary disks."""
+        """Bound on loading a candidate: --load-timeout, else 600 s plus the model's bytes at 200 MB/s, which the
+        engine's own load reads. With --verify-model the host first reads and hashes every model file (copying it
+        for engines without chat-model-file-v1), so the bound assumes 50 MB/s. Loading grows with the checkpoint;
+        a fixed bound fails large models on ordinary disks."""
         if self.load_timeout is not None:
             return self.load_timeout
-        return 600 + sum(row["bytes"] for row in spec["model_manifest"]) / LOAD_BYTES_PER_SECOND
+        rate = VERIFY_BYTES_PER_SECOND if spec.get("verify_model") else LOAD_BYTES_PER_SECOND
+        return 600 + sum(row["bytes"] for row in spec["model_manifest"]) / rate
 
     def _release(self):
         try:
@@ -216,15 +235,17 @@ class ServedEngine:
             return {"state": "blocked", "error": self.ownership.blocked}
         return self.runtime.status()
 
-    def generate(self, messages, max_tokens, stop, on_text=None, candidate_id=None, response_format=None):
+    def generate(self, messages, max_tokens, stop, on_text=None, candidate_id=None, response_format=None,
+                 sampling=None, tool_options=None, on_tools=None):
         """Run one request. `on_text(text)` receives the cumulative accepted text when the adapter streams.
         `response_format` (from crit_api.server.response_format) goes into the request record for adapters that
-        declare chat-constraints-v1.
+        declare chat-constraints-v1. Sampling and tool options are capability-gated request overrides.
 
         Returns (status, assistant, telemetry): status is "completed", "cancelled" or "timed_out"; a cancelled
-        or timed-out request has no reply or telemetry. Raises EngineError when the engine fails.
+        or timed-out request has no reply or telemetry. Assistant is text, or {content, tool_calls} for a tool
+        reply. Raises EngineError when the engine fails.
         """
-        if sum(len(m["content"]) for m in messages) > MAX_CONVERSATION:
+        if len(json.dumps(messages, ensure_ascii=False)) > MAX_CONVERSATION:
             raise EngineError("Conversation exceeds 1,000,000 characters", 400)
         with self.lock:
             if self.closed:
@@ -238,6 +259,13 @@ class ServedEngine:
             if response_format is not None and CONSTRAINTS_CAPABILITY not in spec["capabilities"]:
                 raise EngineError("This engine package does not declare " + CONSTRAINTS_CAPABILITY, 400)
             extra = {} if response_format is None else {"response_format": response_format}
+            try:
+                applied = sampling_options(sampling or {}, spec["capabilities"])
+                extra.update(validate_tool_options(tool_options or {}, spec["capabilities"]))
+            except RequestError as exc:
+                raise EngineError(str(exc), 400) from exc
+            if applied:
+                extra["sampling"] = applied
             self.runtime.start()
             folder = self.runtime.root / "requests" / uuid.uuid4().hex
             folder.mkdir(parents=True)
@@ -252,7 +280,8 @@ class ServedEngine:
             try:
                 result = self.runtime.call("generate", {"spec": spec, "request_path": str(folder / "request.json"),
                     "response_path": str(folder / "response.json")}, stop, self.timeout,
-                    progress=on_text if streams and on_text else None, request=request)
+                    progress=on_text if streams and on_text else None, request=request,
+                    progress_tools=on_tools if TOOL_STREAM_CAPABILITY in spec["capabilities"] else None)
             except (ValueError, OSError) as exc:
                 self._retire(exc)
                 raise EngineError("Engine host failed: " + str(exc)) from exc

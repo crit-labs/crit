@@ -31,7 +31,8 @@ reply = client.chat.completions.create(model="default", messages=[{"role": "user
 | `--cors-origin ORIGIN` | Allow browser requests from this origin, or `*` |
 | `--model-name NAME` | Model ID reported for the default candidate |
 | `--timeout SECONDS` | Limit per request; default 600 |
-| `--load-timeout SECONDS` | Limit on loading the starting candidate; default 600 plus the model's bytes at 50 MB/s, since the host copies and hashes every model file before the engine loads |
+| `--load-timeout SECONDS` | Limit on loading the starting candidate; default 600 plus the model's bytes at 200 MB/s (50 MB/s with `--verify-model`) |
+| `--verify-model` | Before loading, read and SHA-256 every model file against the run's frozen manifest, and give engines without `chat-model-file-v1` a private read-only copy. By default the host only checks each file's size against the manifest and maps it in place, so the engine starts loading at once; a checkpoint with the same sizes but other bytes (another revision, corruption) is then served unnoticed |
 | `--resident-ram-gib N`, `--resident-vram-gib N` | Optional caps on pool-owned model bytes, not total process/device memory |
 | `--project PATH` | crit checkout used to verify packages; default this checkout |
 | `--write-launchers` | Write `serve.cmd` (Windows, double-click) and `serve.sh` with the same options into the run folder, then exit. Under WSL, `serve.cmd` starts `serve.sh` in the same distribution. They never contain the API key; set `CRIT_API_KEY` |
@@ -44,7 +45,7 @@ Ctrl+C stops accepting requests, unloads the engine and releases model memory.
 | Endpoint | Behavior |
 | --- | --- |
 | `GET /health` | `{"status": "ok", "engine": ...}`; 503 when the runtime is blocked. No key needed |
-| `GET /v1/models`, `GET /v1/models/{id}` | The run's sealed resident candidates, with `label`, `context_length` (the candidate's `kv_tokens`) and `default` |
+| `GET /v1/models`, `GET /v1/models/{id}` | The run's sealed resident candidates, with `label`, `context_length` (the candidate's `kv_tokens`), `default`, package `capabilities` and `supported_sampling_parameters` |
 | `POST /v1/chat/completions` | Chat completion, JSON or server-sent events |
 
 `model` selects a candidate by `RUN_ID/CANDIDATE_ID` or `CANDIDATE_ID`; any other name
@@ -60,13 +61,56 @@ compatible model allocations. Requests run one at a time.
 | `stop` | Up to 4 strings of at most 256 UTF-8 bytes. Text before the first completed stop returns with `finish_reason: "stop"` (`crit_core.text.StopMatcher`); the turn is cancelled, the engine stays loaded |
 | `n` | Must be 1 |
 | `response_format` | `text`, `json_object` or `json_schema` ([structured output](#structured-output)) |
+| `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias` | Per-request overrides when the package declares support for that field; otherwise 400. Omitted or null fields keep engine defaults |
+| `tools`, `tool_choice`, `parallel_tool_calls` | Function calls for packages declaring `chat-tools-v1`; `auto`, `none`, `required` or a named function. Tool-result history is preserved |
 
 Responses carry `usage` when measured and `crit_telemetry` (phase tokens, ms, rates).
-Sampling follows the frozen configuration: `temperature`, `top_p`, `seed`, penalties and
-similar are ignored and listed in the `X-Crit-Ignored-Parameters` header. Tools,
-`logprobs`, audio and an unsupported `response_format` return 400. Errors use the
+Sampling overrides are validated before generation, including for streaming requests.
+Unknown parameters and unsupported generation controls return 400 rather than being
+silently ignored. Only client metadata (`user`, `metadata`, `store`, `service_tier`)
+is ignored and listed in `X-Crit-Ignored-Parameters`; no storage or service tier is applied.
+`logprobs`, audio, legacy `functions`/`function_call`, and an unsupported `response_format` return 400. Errors use the
 OpenAI shape; timeout is 504, engine failure 500 (the next request reloads). A
 disconnecting client cancels its turn.
+
+This changes clients that previously sent ignored sampling values to old packages:
+omit those fields to retain the frozen defaults, or build a new package with an
+adapter that applies and declares them. Never edit a sealed package's manifest.
+
+### Tool calls
+
+`chat-tools-v1` supports up to 128 function definitions with unique names and up to
+128 calls per reply. Assistant history carries `tool_calls` with JSON-string
+`function.arguments`; subsequent `role: "tool"` messages carry the matching
+`tool_call_id`. All calls need exactly one result before the next turn. A request
+may end with the last tool result. The API never executes tools itself.
+
+Responses contain `message.tool_calls` and `finish_reason: "tool_calls"`; a tool-only
+message has `content: null`. With `chat-tool-stream-v1`, SSE returns each call's
+`index`, id, type and complete name once, followed by incremental argument fragments.
+Multiple calls may interleave by index. Without that capability, tool requests are
+buffered until the adapter finishes, then emitted as a single tool-call delta.
+`parallel_tool_calls: false` permits at most one call. Unknown functions, invalid JSON arguments and replies
+violating `tool_choice` fail rather than being exposed as usable calls.
+
+`strict: true` requires `chat-tools-strict-v1`. The function's `parameters` must be
+an object schema in Core's [supported subset](#structured-output), including
+`additionalProperties: false`. The server compiles it before generation and checks
+completed arguments against that grammar. Strict arguments use compact JSON in the
+schema's declaration order, as with `response_format`. Unsupported schemas return
+400 with `param: "tools"`, `code: "unsupported_schema"`; there is no unconstrained
+fallback. Non-strict tools require JSON-object arguments but do not promise schema
+conformance. A request may mix strict and non-strict functions.
+
+Streaming deltas are provisional until `finish_reason: "tool_calls"`. The host
+validates strict argument prefixes before publishing them and requires the final
+calls to match the stream exactly. An incomplete or invalid final call produces an
+SSE error and `[DONE]`, without a successful finish chunk. Clients should assemble
+calls by index and only act on a successfully completed turn.
+
+Tool requests cannot combine `stop` or a structured `response_format`.
+Tool syntax and prompting differ by model; the stock native adapter has no tool
+parser and must not declare `chat-tools-v1`. A model-specific adapter implements it.
 
 ## Structured output
 
@@ -115,7 +159,7 @@ namespace. Load weights in the factory. The returned engine implements:
 
 Calls are serialized; no concurrent generation. The client owns the conversation (each
 request carries all of it); the engine owns tokenizer, private KV/recurrent state,
-scratch and graphs until switch or failure; the model pool owns verified host bytes and
+scratch and graphs until switch or failure; the model pool owns the mapped model files and
 device weights until the server stops, one entry per identity/representation, no
 eviction. A → B → A closes each engine before the next.
 
@@ -128,8 +172,8 @@ retire the runtime; a stuck adapter is killed after a one-second cancellation gr
 
 | API | Behavior |
 | --- | --- |
-| `context.host("relative/model/file")` | Read-only memoryview of a verified private snapshot (pageable; first use copies and hashes, needs temporary disk) |
-| `context.model_file(name)` | Verified native-loader path when `chat-model-file-v1` is declared; no second copy |
+| `context.host("relative/model/file")` | Read-only memoryview of the model file, mapped in place after a size check (pageable). With `--verify-model`, of a hashed private copy (needs temporary disk) |
+| `context.model_file(name)` | Native-loader path of the model file when `chat-model-file-v1` is declared; no copy |
 | `context.limits` | Context and RAM/VRAM headroom; `kv_tokens` is the built context, `context` (when present) Eval's [basis](eval/CONTEXT.md) |
 | `context.device(compatibility, nbytes, allocate, inputs=())` | Generation-bound lease; `lease.buffer` valid for the engine lifetime. `inputs` lists non-model files whose bytes enter the allocation |
 
@@ -163,6 +207,19 @@ run/chat/request/candidate IDs, canonical `package_sha256`, UTC creation time, m
 locator and frozen manifest, package path, configuration, `limits`, and
 `messages: [{role, content}, ...]` (optional first `system`, then alternating
 user/assistant ending with user).
+
+With `chat-tools-v1`, messages also preserve assistant `tool_calls`, tool messages
+with `tool_call_id`, and optional `name`/`reasoning_content`; tool message boundaries
+are not merged. The request also carries `tools`, resolved `tool_choice` and
+`parallel_tool_calls` when tools were supplied. Use the model's tool-aware chat
+template, apply the requested choice, and parse generated calls in the adapter.
+Return them as an optional top-level `tool_calls` list in the response record,
+using OpenAI's `{id, type: "function", function: {name, arguments}}` shape with
+JSON-string arguments. `assistant` stays a string and may be empty for tool-only
+replies. Without `chat-tool-stream-v1`, a streaming adapter emits only assistant
+text through `emit`, never raw tool syntax; return complete calls in the final record.
+Tool arguments and text
+share the 65,536-character reply budget, and telemetry counts all generated tokens.
 
 - Apply the system message through the chat template. Use the exact model, tokenizer,
   template and sampling; verify the manifest, never substitute.
@@ -248,6 +305,66 @@ or template text. When `allowed()` throws, fail the request; never generate
 unconstrained text. Budget completion room within `max_output_tokens` and the matcher's
 limits. Full-vocabulary per-token masks need the native matchers or an equivalent device mask.
 
+### Strict and streaming tools for adapters
+
+Declare **`chat-tools-strict-v1`** alongside `chat-tools-v1` only when the adapter
+constrains each strict function's arguments during decoding. The request's
+`tool_grammars` maps function names to compiled `crit-byte-grammar-v1` artifacts.
+Use a fresh `GrammarMatcher` (or equivalent device constraint) for each call's
+arguments, exactly as for structured output. Non-strict functions have no entry.
+The server checks the complete arguments too; checking after unconstrained
+generation alone does not satisfy this adapter contract.
+
+For live tool deltas, additionally declare **`chat-tool-stream-v1`** and
+`chat-stream-v1`. `generate_stream(request, cancellation, emit)` may emit text as
+before or an object containing only `tool_calls`, a list of OpenAI-style deltas:
+
+```python
+emit({"tool_calls": [{"index": 0, "id": "call_unique_id", "type": "function",
+                      "function": {"name": "read_file", "arguments": ""}}]})
+emit({"tool_calls": [{"index": 0, "function": {"arguments": '{"path":'}}]})
+emit({"tool_calls": [{"index": 0, "function": {"arguments": '"a.py"}'}}]})
+```
+
+Introduce indices consecutively from zero, with a new id and complete function
+name. Subsequent deltas for that index contain only a nonempty `arguments` suffix;
+names and ids cannot be rewritten or emitted again. Use the model-specific parser
+to separate text, tool syntax and arguments before emitting. Return the assembled
+calls as the final response's `tool_calls` and concatenate only text emits into
+`assistant`. Every emitted call must appear unchanged in the final response.
+If no tool is selected, text-only output remains valid under `tool_choice: "auto"`.
+
+The same synchronous-thread, cancellation and callback-error rules as text
+streaming apply. One bounded cumulative snapshot holds text and calls, so a slow
+reader may receive coalesced fragments. Calls are checked for choice policy,
+unique ids, append-only arguments, strict-schema prefix membership and the shared
+65,536-character limit. A callback failure invalidates the turn even if swallowed
+by the adapter. Cancelled or failed partial calls are never committed to a later
+request. Sampling, constraints and parser state must remain private to the turn.
+
+### Per-request sampling for adapters
+
+Declare individual capabilities only for fields the engine actually applies:
+`chat-sampling-temperature-v1`, `chat-sampling-top-p-v1`, `chat-sampling-top-k-v1`,
+`chat-sampling-min-p-v1`, `chat-sampling-seed-v1`, `chat-sampling-presence-penalty-v1`,
+`chat-sampling-frequency-penalty-v1`, `chat-sampling-repetition-penalty-v1`, and
+`chat-sampling-logit-bias-v1`. The request's optional `sampling` object contains
+only explicit, non-null overrides, using the original API field names.
+
+Apply overrides to fresh request options; never mutate the candidate configuration
+or resident defaults. Temperature is in `[0, 2]`, top-p in `(0, 1]`, min-p in `[0, 1]`, top-k is
+an unsigned 32-bit integer, seed an unsigned 64-bit integer, presence/frequency
+penalties in `[-2, 2]`, and repetition penalty strictly positive. All floats must
+be finite. `logit_bias` maps canonical nonnegative decimal token-id strings to
+biases in `[-100, 100]`, at most 1024 entries; the engine must also validate ids
+against its vocabulary.
+
+`crit_core.native.ResidentEngine` forwards these overrides through the native ABI
+to Core's `RequestOptions.sampling` and checks `ModelInfo.sampling` support. Its
+native library must be rebuilt to forward penalties and logit bias. Only declare
+capabilities implemented by that model, including speculative decoding paths.
+No request override changes Eval's greedy protocol or the sealed configuration.
+
 ### Effective configuration
 
 Declare **`chat-config-v1`** and implement `effective_configuration()`, returning what
@@ -268,5 +385,11 @@ timeout, shutdown or client death. After a crash, `crit serve --recover-runtime`
 verifies retirement before releasing admission; never delete the guard. Request
 records live in the runtime directory while running (kept after failure for
 diagnosis); nothing is written to the run folder.
+
+The guardian and supervisor both retry a transient permission denial when reading
+the atomically replaced ownership record, for at most 250 ms. They always read
+fresh data; missing/malformed records, changed identities and persistent access
+failures still stop the engine. Unexpected resident exits include the exit code
+and the retained diagnostic log's location.
 
 The [residency fixtures](../tests/test_chat_residency.py) contain executable example adapters.

@@ -111,7 +111,7 @@ shell expansion.
 | Strategy | Measured bottleneck; alternatives with estimated ceilings; Inference code used and the hooks your engine supplies |
 | Headroom | `crit eval status`: each KPI and the long-context curve against its floor or ceiling. Re-measure every candidate and on resume |
 | Correctness | Separate arithmetic, functional and resource gates with fixed criteria; failures stay failed |
-| Repeatability | Same output in a fresh process ([recorded selection](../inference/recorded-selection/README.md)) |
+| Repeatability | Same output in a fresh process and after other requests, long ones included (Eval's request-history gate; [recorded selection](../inference/recorded-selection/README.md)) |
 | Quality | When arithmetic changes, perplexity and KL divergence from a reference ([full-vocabulary comparison](eval/MEASUREMENTS.md#full-vocabulary-comparison)). Under `weights_policy: as_stored`, requantized or pruned weights don't qualify and each candidate declares `weights` ([run records](RUN_RECORDS.md)) |
 | Performance | Matched inputs/protocol, warmups, every repetition, prefill/decode/request/load costs, physical memory, plus [`crit eval`](eval/README.md); tune text-dependent settings such as draft width on its mixed cases |
 | Coverage | Representative contexts and request shapes; operator tests alone don't qualify a model |

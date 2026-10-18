@@ -1,5 +1,5 @@
 {
-  "protocol": "crit-eval-v3",
+  "protocol": "crit-eval-v4",
   "speed": {
     "warmup_runs": 1,
     "repetitions": 3,
@@ -16,7 +16,14 @@
   },
   "quality": {
     "top_k": 16,
-    "paths": ["prefill", "decode", "verify"],
+    "paths": ["prefill", "decode", "verify", "prefill_decode"],
+    "required_paths": ["prefill_decode"],
+    "prefill_decode": {
+      "prompt_tokens": [1024, 4096, 32768],
+      "conversations": ["explain-tides", "python-merge-intervals", "german-letter"],
+      "rule": "the engine prefills only the prompt (suite filler text, then the conversation up to its scored turn) as it prefills any request, then feeds the reference continuation through ordinary one-token decode steps; each step's log-probabilities are scored against the reference. Every prompt length is judged by the drift budget on its own; a length above the engine's max_context is skipped",
+      "purpose": "the other paths put the scored text inside one prefill or run the whole sequence as 1- or 4-token passes; this one decodes after prompts long enough to cross the thresholds where engines switch prefetching, prefill kernels or sparse attention"
+    },
     "kl": "KL(reference || engine) over the reference top-k plus one lumped tail bucket",
     "thresholds": {
       "ppl_ratio_max": 1.05,
@@ -30,6 +37,11 @@
     "default": "reported",
     "engine": "the plain greedy output comes from the speculative engine itself when its adapter declares plain decoding (info plain, generate_plain), else from a second engine opened with speculative false",
     "modes": "reported: agreement is shown and every emitted path is judged by the quality budget; required: any difference fails the gate"
+  },
+  "history": {
+    "cases": "the speed cases with the shortest and the longest prompt the engine holds",
+    "rule": "each case's greedy output right after the engine built for the required context opens, before any other request, equals token for token its output after everything else that engine served (speed, held-out, quality, the long-context curve and retrieval)",
+    "gate": "a gate whatever the exactness mode: a deterministic engine repeats a request whatever it served before, so it constrains no speed"
   },
   "headroom": {
     "pass_floor": "bytes read per model pass (adapter bytes_per_pass plus KV bytes at the case's context) / achievable device bandwidth",
@@ -53,7 +65,14 @@
     "lower_context": "the speed cases on an engine opened at lower_fraction of the requirement (never below the longest speed case), measured just before the engine built for the requirement; no case may decode slower or reach its first token later than at the requirement by more than its tolerance",
     "lower_fraction": 0.25,
     "tolerance": 0.05,
-    "tolerance_rule": "per case and KPI, the larger of tolerance and the run-to-run spread of that case in either measurement"
+    "tolerance_rule": "per case and KPI, the larger of tolerance and the run-to-run spread of that case in either measurement",
+    "retrieval": {
+      "points": [4096, 32768, 131072],
+      "output_tokens": 64,
+      "positions": [0.02, 0.5, 0.97],
+      "rule": "on the engine built for the required context, after the curve: one greedy request per point below the requirement and one at the requirement (prompt plus output equal the point). The prompt is suite filler text with one fact (suite/long.json) at each of positions (fractions of the filler) and a question asking for all of them; the output up to its first stop token, decoded with the prepared token strings, must contain every fact's answer verbatim",
+      "gate": "every point served and every answer found, on every candidate"
+    }
   },
   "heldout": {
     "purpose": "speed gains must generalize: the held-out prompts (suite/heldout.json, several languages and domains) are outside the speed suite, and no engine choice may be tuned or selected on them",

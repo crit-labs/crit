@@ -11,7 +11,8 @@ from pathlib import Path
 from . import CONTRACT, EVAL_DIR, load_json, write_json
 from . import headroom, metrics, status
 from .ceiling import model_ceiling
-from .context import GIB, curve_points, filled_prompt, lower_context, max_context
+from .context import (GIB, curve_points, filled_prompt, lower_context, max_context, retrieval_points, retrieval_prompt,
+                      token_text)
 from .pin import CONTINUATIONS, load_continuations
 from .prepare import PREPARED
 from .reference import REFERENCE
@@ -251,31 +252,88 @@ def quality_thresholds(protocol, budget=None):
     return {**protocol["quality"]["thresholds"], **{k: float(v) for k, v in budget.items()}}
 
 
+def score_rows(engine, sequences, by_id, path):
+    """Reference and engine rows of every target of `sequences` (prepared {id, ids, first_target}) on `path`."""
+    reference_rows, engine_rows = [], []
+    for sequence in sequences:
+        targets = by_id[sequence["id"]]
+        scored = engine.score(sequence["ids"], sequence["first_target"], path, [t["top_ids"] for t in targets])
+        argmax = scored.get("argmax") or [None] * len(targets)
+        for target, lp, query, best in zip(targets, scored["target_logprobs"], scored["query_logprobs"], argmax):
+            engine_rows.append({"target_logprob": lp, "top_logprobs": query, "argmax": best})
+        reference_rows += targets
+    return reference_rows, engine_rows
+
+
+def judged(reference_rows, engine_rows, thresholds):
+    result = metrics.quality_path(reference_rows, engine_rows)
+    failures = metrics.judge(result, thresholds)
+    result.update(passed=not failures, failures=failures, budget_used=metrics.budget_used(result, thresholds))
+    return result
+
+
+def prefill_decode_quality(engine, info, prepared, reference, thresholds, log):
+    """The prefill_decode path (protocol quality.prefill_decode): every prepared long sequence is prefilled up to
+    its scored turn and the reference continuation fed through decode steps. Each prompt length is judged on
+    its own and the path passes only when all of them and the pooled targets do. Returns (result, reason):
+    reason says why nothing could be scored."""
+    sequences = prepared.get("prefill_decode")
+    rows = {c["id"]: c["targets"] for c in (reference or {}).get("prefill_decode") or []}
+    if not sequences:
+        return None, "the prepared data has no prefill_decode prompts; prepare it again"
+    if any(s["id"] not in rows for s in sequences):
+        return None, "the reference has no prefill_decode targets; build it again (crit eval reference)"
+    started, lengths, pooled = time.time(), {}, ([], [])
+    for length in sorted({s["prompt_tokens"] for s in sequences}):
+        group = [s for s in sequences if s["prompt_tokens"] == length]
+        if max(len(s["ids"]) for s in group) > info["max_context"]:
+            lengths[str(length)] = {"status": "skipped",
+                                    "reason": f"needs {max(len(s['ids']) for s in group):,} tokens of context"}
+            log(f"quality prefill_decode at {length:,} tokens: skipped (context)")
+            continue
+        reference_rows, engine_rows = score_rows(engine, group, rows, "prefill_decode")
+        pooled[0].extend(reference_rows)
+        pooled[1].extend(engine_rows)
+        lengths[str(length)] = {"status": "measured", "conversations": [s["conversation"] for s in group],
+                                **judged(reference_rows, engine_rows, thresholds)}
+        row = lengths[str(length)]
+        log(f"quality prefill_decode at {length:,} tokens: KLD mean {row['kld_mean']:.2e}, p99 {row['kld_p99']:.2e}, "
+            f"top-1 {row['top1_agreement']:.3f} ({'pass' if row['passed'] else 'FAIL'})")
+    if not pooled[0]:
+        return None, "every prompt length is above the engine's max_context"
+    result = judged(*pooled, thresholds)
+    result["failures"] += [f"at {int(length):,} prompt tokens: {failure}" for length, row in lengths.items()
+                           for failure in row.get("failures", [])]
+    result.update(passed=not result["failures"], lengths=lengths, seconds=time.time() - started,
+                  budget_used=max([result["budget_used"]] + [row["budget_used"] for row in lengths.values()
+                                                             if row.get("budget_used") is not None]))
+    return result, None
+
+
 def run_quality(engine, info, prepared, reference, protocol, log, thresholds=None):
     paths = [p for p in protocol["quality"]["paths"] if p in info.get("score_paths", [])]
     by_id = {c["id"]: c["targets"] for c in reference["conversations"]}
-    out = {"paths": {}, "unsupported": [p for p in protocol["quality"]["paths"] if p not in paths]}
+    out = {"paths": {}, "unsupported": [p for p in protocol["quality"]["paths"] if p not in paths],
+           "required": list(protocol["quality"].get("required_paths", [])), "missing": {}}
     thresholds = thresholds or protocol["quality"]["thresholds"]
     out["thresholds"] = thresholds
     for path in paths:
         started = time.time()
-        reference_rows, engine_rows = [], []
-        for conversation in prepared["quality"]:
-            targets = by_id[conversation["id"]]
-            scored = engine.score(conversation["ids"], conversation["first_target"], path, [t["top_ids"] for t in targets])
-            argmax = scored.get("argmax") or [None] * len(targets)
-            for target, lp, query, best in zip(targets, scored["target_logprobs"], scored["query_logprobs"], argmax):
-                engine_rows.append({"target_logprob": lp, "top_logprobs": query, "argmax": best})
-            reference_rows += targets
-        result = metrics.quality_path(reference_rows, engine_rows)
-        failures = metrics.judge(result, thresholds)
-        result.update(seconds=time.time() - started, passed=not failures, failures=failures,
-                      budget_used=metrics.budget_used(result, thresholds))
+        if path == "prefill_decode":
+            result, reason = prefill_decode_quality(engine, info, prepared, reference, thresholds, log)
+            if result is None:
+                out["missing"][path] = reason
+                log(f"quality {path}: not scored ({reason})")
+                continue
+        else:
+            result = judged(*score_rows(engine, prepared["quality"], by_id, path), thresholds)
+            result["seconds"] = time.time() - started
         out["paths"][path] = result
         log(f"quality {path}: ppl ratio {result['ppl_ratio']:.5f}, KLD mean {result['kld_mean']:.2e}, "
             f"p99 {result['kld_p99']:.2e}, top-1 {result['top1_agreement']:.3f}, {result['budget_used']:.1%} of the drift budget "
-            f"({'pass' if not failures else 'FAIL'})")
-    out["passed"] = bool(out["paths"]) and all(p["passed"] for p in out["paths"].values())
+            f"({'pass' if result['passed'] else 'FAIL'})")
+    out["passed"] = (bool(out["paths"]) and all(p["passed"] for p in out["paths"].values())
+                     and all(p in out["paths"] for p in out["required"]))
     return out
 
 
@@ -381,6 +439,69 @@ def run_context(engine, info, prepared, settings, required, log, continuations=N
     return points, text
 
 
+def run_retrieval(engine, info, prepared, settings, required, log):
+    """Facts near the start, middle and end of filler text, asked for at the end (protocol context.retrieval):
+    one greedy request per point, the last filling the required context. A point passes when the output up to
+    its first stop token contains every fact's answer verbatim; one the engine cannot serve fails."""
+    pieces, rule = prepared.get("retrieval"), settings["retrieval"]
+    if not pieces:
+        log("retrieval: not in the prepared data (prepare it again with crit eval prepare into a new data directory)")
+        return {"status": "missing", "reason": "the prepared data has no retrieval prompts; prepare it again"}
+    n, stops, points = int(rule["output_tokens"]), prepared["stop_ids"], {}
+    for point in retrieval_points(required, rule):
+        prompt = retrieval_prompt(pieces, point - n, rule["positions"])
+        if prompt is None:
+            points[str(point)] = {"status": "skipped", "context": point, "reason": "too short to hold the facts"}
+            continue
+        if point > info["max_context"]:
+            points[str(point)] = {"status": "failed", "context": point,
+                                  "error": f"the engine's max_context {info['max_context']:,} is below {point:,}"}
+            log(f"retrieval {point:,}: not served (max_context {info['max_context']:,})")
+            continue
+        try:
+            tokens, sample = timed_generate(engine, prompt, n)
+        except Exception as error:  # an engine that cannot hold the context fails here, however it fails
+            points[str(point)] = {"status": "failed", "context": point, "error": f"{type(error).__name__}: {error}"[:2000]}
+            log(f"retrieval {point:,}: failed ({type(error).__name__}: {error})")
+            continue
+        text = token_text(tokens, pieces["token_text"], stops)
+        found = {fact["id"]: fact["answer"] in text for fact in pieces["facts"]}
+        points[str(point)] = {"status": "measured", "context": point, "prompt_tokens": len(prompt), "found": found,
+                              "passed": all(found.values()), "text": text[:2000], "tokens": tokens,
+                              "ttft_ms": sample["ttft_ms"]}
+        log(f"retrieval {point:,}: " + ", ".join(f"{k} {'found' if v else 'MISSING'}" for k, v in found.items()))
+    judged_points = [p for p in points.values() if p["status"] != "skipped"]
+    return {"status": "measured", "points": points,
+            "passed": bool(judged_points) and all(p.get("passed") for p in judged_points)}
+
+
+def history_cases(prepared, info):
+    """The speed cases the request-history check repeats (protocol history): those with the shortest and the
+    longest prompt the engine holds."""
+    held = [c for c in prepared["speed"] if len(c["prompt_ids"]) + c["output_tokens"] <= info["max_context"]]
+    if not held:
+        return []
+    ends = (min(held, key=lambda c: len(c["prompt_ids"])), max(held, key=lambda c: len(c["prompt_ids"])))
+    return [c for c in held if any(c is end for end in ends)]
+
+
+def history_outputs(engine, cases):
+    return {case["id"]: timed_generate(engine, case["prompt_ids"], case["output_tokens"])[0] for case in cases}
+
+
+def compare_history(fresh, after, served):
+    """Each case's output on the freshly opened engine against its output after everything `served` names."""
+    cases = {}
+    for case_id, first in fresh.items():
+        later = after.get(case_id) or []
+        diverge = next((i for i, (a, b) in enumerate(zip(first, later)) if a != b), None)
+        if diverge is None and len(first) != len(later):
+            diverge = min(len(first), len(later))
+        cases[case_id] = {"identical": diverge is None, "first_difference": diverge, "fresh": first, "after": later}
+    return {"cases": cases, "served_between": served,
+            "passed": bool(cases) and all(c["identical"] for c in cases.values())}
+
+
 def _spread(case, key):
     return headroom.spread([s[key] for s in case.get("samples", []) if not s.get("warmup") and s.get(key)]) or 0.0
 
@@ -444,7 +565,7 @@ def run_lower_context(module, model, config, prepared, protocol, required, warmu
     return {"context": lower, "engine_max_context": info["max_context"], "speed": measured}
 
 
-PARTS = ("speed", "quality", "exactness", "context", "heldout")
+PARTS = ("speed", "quality", "exactness", "context", "heldout", "history")
 
 
 def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
@@ -457,8 +578,10 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
     exactness: "reported" (default) or "required" (any difference from plain greedy fails the gate).
     context_tokens: the context every engine is built for (a run's kv_tokens); without it, Eval's max context
     for the model on the device, with vram_headroom_bytes (default 1 GiB) left free. The `context` part
-    measures the long-context curve up to it and the speed cases again at a lower context. The `heldout` part
-    decodes the held-out prompts; with a baseline that measured them, the generality gate judges them.
+    measures the long-context curve and the retrieval check up to it and the speed cases again at a lower context.
+    The `heldout` part decodes the held-out prompts; with a baseline that measured them, the generality gate judges
+    them. The `history` part repeats protocol history's cases right after the engine opens and after every other
+    part ran on it.
     abort_disturbed: stop the round when a speed case's repetitions show a disturbed device (protocol
     speed.disturbed_spread); the result then holds what was measured and `aborted`, and no status."""
     protocol = load_json(EVAL_DIR / "protocol.json")
@@ -538,6 +661,12 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
         result["native_libraries"] = native_identity(info)
     log(f"loaded {info['name']} in {result['load_ms'] / 1000:.1f} s")
     try:
+        fresh = None
+        if "history" in parts:
+            # Before any other request: what this engine answers fresh, repeated once everything else has run.
+            cases = history_cases(prepared, info)
+            fresh = history_outputs(engine, cases)
+            log("history: fresh outputs of " + (", ".join(fresh) or "no case (none fits the engine)"))
         if "speed" in parts:
             result["speed"] = run_speed(engine, info, prepared, protocol, warmups, repetitions, log, continuations,
                                         disturbed)
@@ -548,10 +677,20 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
         if "context" in parts and required:
             result["context"]["points"], result["context"]["decode_text"] = run_context(
                 engine, info, prepared, settings, required, log, continuations)
+            result["context"]["retrieval"] = run_retrieval(engine, info, prepared, settings, required, log)
         if "exactness" in parts and "speed" in result and plain_on_engine(engine, info):
             # The engine decodes plain greedy itself: no second engine to load.
             result["exactness"] = run_exactness(module, model, config, prepared, result["speed"], log, exactness,
                                                 engine=engine, info=info)
+        if fresh is not None:
+            served = [part for part in ("speed", "heldout", "quality", "context", "exactness") if part in result
+                      and (part != "context" or "points" in result["context"])
+                      and (part != "exactness" or result["exactness"].get("engine") == "shared")]
+            result["history"] = compare_history(fresh, history_outputs(engine, cases), served)
+            between = ", ".join(served) or "nothing else"
+            for case_id, row in result["history"]["cases"].items():
+                log(f"history {case_id}: " + (f"identical after {between}" if row["identical"] else
+                                              f"differs at token {row['first_difference']} after {between}"))
     finally:
         engine.close()
     if "exactness" in parts and "speed" in result and info.get("speculative") and "exactness" not in result:

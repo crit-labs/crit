@@ -72,9 +72,9 @@ class ApiTests(ServeFixture, unittest.TestCase):
         self.assertEqual(json.loads(self.call("GET", "/health")[1])["status"], "ok")
 
     def test_completion_returns_the_reply_usage_and_measured_telemetry(self):
-        response, value = self.chat(max_tokens=50, temperature=0.2)
+        response, value = self.chat(max_tokens=50, user="fixture")
         self.assertEqual(response.status, 200, value)
-        self.assertEqual(response.getheader("X-Crit-Ignored-Parameters"), "temperature")
+        self.assertEqual(response.getheader("X-Crit-Ignored-Parameters"), "user")
         self.assertEqual(response.getheader("Access-Control-Allow-Origin"), "*")
         reply = json.loads(value["choices"][0]["message"]["content"])
         self.assertEqual(reply["limit"], 50)

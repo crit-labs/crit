@@ -28,7 +28,11 @@ def parser():
     result.add_argument("--model-name", help="Model ID reported to clients (default: RUN_ID/CANDIDATE_ID)")
     result.add_argument("--timeout", type=float, default=600, help="Seconds one request may run (default: 600)")
     result.add_argument("--load-timeout", type=float,
-                        help="Seconds loading the candidate at startup may take (default: 600 plus the model's size at 50 MB/s)")
+                        help="Seconds loading the candidate at startup may take (default: 600 plus the model's size at "
+                             "200 MB/s, or at 50 MB/s with --verify-model)")
+    result.add_argument("--verify-model", action="store_true",
+                        help="Read and SHA-256 every model file against the run's frozen manifest before loading "
+                             "(default: check file sizes only and load right away)")
     result.add_argument("--resident-ram-gib", type=float, help="Optional cap on retained model bytes in host memory")
     result.add_argument("--resident-vram-gib", type=float, help="Optional cap on retained model bytes in device memory")
     result.add_argument("--project", type=Path, default=ROOT if (ROOT / "core/include/crit/core.h").is_file() else Path.cwd(),
@@ -89,7 +93,7 @@ def main(argv=None):
     try:
         engine = ServedEngine(args.workspace, args.run, args.candidate, project=args.project,
                               host_limit=gib(args.resident_ram_gib), device_limit=gib(args.resident_vram_gib),
-                              timeout=args.timeout, load_timeout=args.load_timeout)
+                              timeout=args.timeout, load_timeout=args.load_timeout, verify_model=args.verify_model)
         print("Loading %s ..." % (args.candidate or "the selected candidate"), file=sys.stderr, flush=True)
         engine.open()
     except ValueError as exc:

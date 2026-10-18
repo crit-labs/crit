@@ -63,6 +63,26 @@ candidate source. Keep model-specific changes in the engine; record toolkit gaps
 ## 3. Build and compare candidates
 
 Follow [Building engines](docs/BUILDING_ENGINES.md) and [Run records](docs/RUN_RECORDS.md).
+Work in rounds, one candidate per round:
+
+1. **Recon** (`crit run ... recon`, section 1) before the first candidate. Cite the
+   findings that bear on the design (attention layout, draft heads, rope, length
+   thresholds, known issues) in each proposal's `strategy` and `rationale`.
+2. **Plan** each candidate as an ambitious one-shot from the physical limits and the
+   last round: `crit eval status` goals, gaps and failed gates, the profile's heaviest
+   kernels, the parent's result. Include everything expected to reach every goal;
+   effort is never a reason to leave something out.
+3. **Build** it (`crit run ... candidate`); fix or prune what is slow or fails a gate
+   (prune only after measuring) until the plan is implemented.
+4. **Evaluate:** `crit eval run --baseline FIRST_RESULT`, `crit eval kernels`, then
+   `crit eval status RESULT --baseline PARENT_RESULT`. A failed gate, an exactness drop
+   or a repeat difference is a bug and the next candidate's first item.
+5. **Revisit recon** when a result contradicts it, or when the engine switches behaviour
+   at a threshold (prefetch, sparse attention, chunk sizes) Eval does not cross: update
+   `recon.md` (and the frozen block if needed) and add a run case that crosses it
+   before the next candidate.
+6. **Repeat** from step 2 until the targets are met, the candidate budget (a number of
+   candidates, not time) is used or the run is blocked. On resume, re-measure first.
 
 - **Strategy first.** Working baseline, measured bottlenecks, then compare strategies,
   not only settings. Reach the highest-ceiling strategy in working form before tuning
@@ -88,26 +108,27 @@ Follow [Building engines](docs/BUILDING_ENGINES.md) and [Run records](docs/RUN_R
   check each candidate against its parent (`crit eval status RESULT --baseline PARENT_RESULT`).
 - **Never train or fine-tune a drafter.** Use the checkpoint's drafter or a published
   companion draft model as released.
-- **Each candidate is an ambitious one-shot**, planned from the physical limits and
-  including everything expected to reach every goal. Effort is never a reason to leave
-  something out. Build, run Eval and a profile, fix or prune what is slow or fails a
-  gate (prune only after measuring), and continue until the plan is implemented.
 - **Ceilings, in milliseconds.** Decode = tokens per round ÷ round time. A model pass
   cannot beat bytes read ÷ bandwidth (weights read plus KV and recurrent state). A draft
   step has its own bytes floor; acceptance at a generous width projects every smaller
   width, and draft width, head size, vocabulary and encoding must be tested together.
   Prefill is bound by FLOPs at the GEMM rate per weight format, plus attention. Time
   to first token is at least the larger of the compute floor and one weight read.
-  `crit eval probe` measures bandwidth and GEMM rates; `crit eval` reports each term
-  against its floor, the best draft width, the decode ceiling and the gaps.
+  `crit eval probe` measures bandwidth and GEMM rates; status reports each term's floor.
 - **Profile** each candidate with `crit eval kernels`; for the heaviest kernels per
   phase far from their floor, check Kernels before replacing them, and fix kernels
   that leave SMs idle.
-- **Measure** with [`crit eval`](docs/eval/README.md) plus the run's cases and read
-  `crit eval status` (gates, goals, gaps, missing inputs; `stop_record_headroom` with
-  `--baseline` seeds the stop record). Sweep settings on the mixed suite, not one prompt.
+- **Measure** with [`crit eval`](docs/eval/README.md) plus the run's cases
+  (`stop_record_headroom` with `--baseline` seeds the stop record). Sweep settings on
+  the mixed suite, not one prompt.
   Retain adapter, applied configuration, data, reference and results; report skipped
   cases. Eval results neither publish records nor qualify a candidate.
+- **Output differences are bugs until explained.** A drop in plain-greedy equality versus
+  an earlier candidate, or any output difference between repeated identical requests
+  (Eval's `repeatable` and `request_history` gates), is a bug until a root cause is
+  demonstrated: the differing kernel or state located and the difference reproduced.
+  Never attribute it to rounding, FP8 KV or accumulation order without that evidence,
+  even when exactness is only reported.
 - **Record through `crit run`:** freeze inputs, create candidates, retain source and
   packages, publish each case's checks, then benchmark with `crit run measure`, which
   replays one pinned text per case for every candidate and binds the checks; seal
@@ -136,9 +157,7 @@ requests, streaming, a stop string, candidate switching and Ctrl+C. Report anyth
 ## 5. Critique and hand off
 
 Review the engine against the physical limits; a working engine or a speedup alone is
-not enough. On resume, re-measure and plan from fresh bottlenecks. The budget is a
-number of candidates, not time; a segment ends when they are built, targets are met
-or it is blocked.
+not enough. A segment ends when the loop in section 3 stops.
 
 Publish reason, critique, opportunities and cleanup with `crit run ... stop`. Its
 `headroom` covers decode, prefill, ttft (and context_decode, context_ttft when
