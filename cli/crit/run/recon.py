@@ -12,7 +12,8 @@ from .records import file_sha, keys, now, read_json, record, safe_path, text, wr
 RECON_JSON = "work/recon.json"
 RECON_MD = "work/recon.md"
 FROZEN = ("sampling", "chat_template", "template_variables", "stop_token_ids", "stop_strings")
-# config.json fields that shape the engine, read at the top level and in text_config.
+# config.json fields that shape the engine, read at the top level and in the text section (crit_core.model's
+# TEXT_SECTION_KEYS: text_config, else llm_config).
 ARCHITECTURE_KEYS = (
     "architectures", "model_type", "torch_dtype", "dtype", "vocab_size", "hidden_size", "intermediate_size",
     "moe_intermediate_size", "num_hidden_layers", "num_attention_heads", "num_key_value_heads", "head_dim",
@@ -20,7 +21,10 @@ ARCHITECTURE_KEYS = (
     "rms_norm_eps", "layer_norm_eps", "sliding_window", "layer_types", "full_attention_interval",
     "attention_bias", "tie_word_embeddings", "num_experts", "num_local_experts", "n_routed_experts",
     "num_experts_per_tok", "n_shared_experts", "kv_lora_rank", "q_lora_rank", "num_nextn_predict_layers",
-    "mtp_num_hidden_layers", "quantization_config")
+    "mtp_num_hidden_layers", "quantization_config", "layers_block_type", "mtp_layers_block_type",
+    "mamba_num_heads", "mamba_head_dim", "ssm_state_size", "n_groups", "conv_kernel", "chunk_size",
+    "moe_latent_size", "moe_shared_expert_intermediate_size", "routed_scaling_factor", "norm_topk_prob",
+    "layer_norm_epsilon")
 # Variables every chat template receives; the rest are the model's own switches (enable_thinking, ...).
 STANDARD_VARIABLES = {"messages", "tools", "documents", "add_generation_prompt", "continue_final_message",
                       "raise_exception", "strftime_now", "bos_token", "eos_token", "unk_token", "sep_token",
@@ -28,12 +32,35 @@ STANDARD_VARIABLES = {"messages", "tools", "documents", "add_generation_prompt",
 MODEL_CARD = "README.md"
 
 
+# Per-module lists in quantization_config (ModelOpt lists every quantized and ignored module) are summarized by
+# their length and first entries so recon.json stays small; the rest of the block is kept as written.
+QUANT_LISTS_KEPT = 8
+
+
+def _quantization(value):
+    if not isinstance(value, dict):
+        return value
+    out = {}
+    for key, item in value.items():
+        if isinstance(item, list) and len(item) > QUANT_LISTS_KEPT:
+            out[key] = {"count": len(item), "first": item[:QUANT_LISTS_KEPT]}
+        elif isinstance(item, dict) and len(item) > 4 * QUANT_LISTS_KEPT:
+            out[key] = {"count": len(item), "first": dict(list(item.items())[:QUANT_LISTS_KEPT])}
+        elif isinstance(item, dict):
+            out[key] = _quantization(item)
+        else:
+            out[key] = item
+    return out
+
+
 def _architecture(config):
     found = {}
-    for section in (config, config.get("text_config") if isinstance(config.get("text_config"), dict) else {}):
+    from crit_core.model.config import TEXT_SECTION_KEYS
+    text = next((config.get(key) for key in TEXT_SECTION_KEYS if key in config), None)
+    for section in (config, text if isinstance(text, dict) else {}):
         for key in ARCHITECTURE_KEYS:
             if key in section and section[key] is not None and key not in found:
-                found[key] = section[key]
+                found[key] = _quantization(section[key]) if key == "quantization_config" else section[key]
     return found
 
 

@@ -122,6 +122,21 @@ neither may silently change the representation or apply a routing weight twice. 
 [normalization](../rmsnorm-bf16/README.md) and projection must make intermediate
 rounding explicit.
 
+**Calibrated activations (W4A4 prompts).** ModelOpt NVFP4 checkpoints carry a static
+`input_scale` per linear layer. For prompt GEMMs, quantizing activations to NVFP4 with that
+global scale (`gs = 1 / input_scale`; per 16 values a UE4M3 scale `e4m3(amax / 6 * gs)` and
+E2M1 codes, round to nearest even, saturating) runs both operands on block-scaled FP4 tensor
+cores, as NVIDIA's serving stacks run such checkpoints. Quantize each row on its own so a
+token's result never depends on the other tokens of a chunk, and check that the scale really
+is shared before folding it into one quantization per layer (MoE checkpoints often give all
+experts of a layer one `input_scale`). Grouped block-scaled GEMMs reach their rate only with
+enough rows per expert, so measure the rate by rows per expert on the target device before
+choosing the prompt chunk size, and keep weight-only GEMVs for decode. Check the prompt's
+drift against the reference, since activations are quantized too. (For scale only: CUTLASS
+v4.7.1 SM120 ptr-array grouped GEMMs on an RTX 5090 ran at 260 TFLOPS at about 90 rows per
+expert and 720-940 at 352-1,408; on one 120B MoE the routed experts took a 64K-token prompt
+from 15.3 s to 9.4 s at a prompt KLD mean of 4e-3.)
+
 ## Costs and validation
 
 Storage is `ceil(R * W * bits / 8) + 4 * R * W / G` bytes with FP32 scales; smaller

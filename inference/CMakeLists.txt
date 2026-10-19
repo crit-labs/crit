@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_inference VERSION 0.2.1 LANGUAGES CXX)
+project(crit_inference VERSION 0.2.2 LANGUAGES CXX)
 # Inference's native examples and fixtures. Inference uses Core only through its public SDK
 # (crit::core, crit::cuda); Core never builds or includes Inference code.
 find_package(Threads REQUIRED)
@@ -8,7 +8,7 @@ option(CRIT_INFERENCE_CUDA "Build Inference's CUDA reference kernels and their f
 option(CRIT_INFERENCE_INSTALLED_CORE "Use an installed Core SDK (CMAKE_PREFIX_PATH) instead of this checkout's core/" OFF)
 if(NOT TARGET crit::core)
   if(CRIT_INFERENCE_INSTALLED_CORE)
-    find_package(critCore 0.2.1 CONFIG REQUIRED)
+    find_package(critCore 0.2.2 CONFIG REQUIRED)
   else()
     if(CRIT_INFERENCE_CUDA)
       set(CRIT_CORE_CUDA ON CACHE BOOL "Build the explicit CUDA backend services" FORCE)
@@ -104,6 +104,32 @@ crit_inference_test(crit_inference_io_codec 30 crit_inference_io_codec_tests "${
 
 crit_inference_executable(crit_nvfp4_tests SOURCES ${FIXTURES}/nvfp4_tests.cpp INCLUDES ${INFERENCE}/quantized-projections/code)
 crit_inference_test(crit_nvfp4 30 crit_nvfp4_tests)
+# Host NVFP4 rows in a declared order: the ISA files get their own flags, chosen at run time; no file may contract
+# a multiply and an add into an FMA the order does not declare.
+set(_host_nvfp4 ${INFERENCE}/host-expert-arithmetic/code)
+add_library(crit_host_nvfp4 STATIC ${_host_nvfp4}/host_nvfp4.cpp)
+target_include_directories(crit_host_nvfp4 PUBLIC ${_host_nvfp4} ${INFERENCE}/quantized-projections/code)
+target_compile_features(crit_host_nvfp4 PUBLIC cxx_std_20)
+crit_inference_warnings(crit_host_nvfp4)
+if(MSVC)
+  target_compile_options(crit_host_nvfp4 PRIVATE /fp:precise)
+else()
+  target_compile_options(crit_host_nvfp4 PRIVATE -ffp-contract=off)
+endif()
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+  target_sources(crit_host_nvfp4 PRIVATE ${_host_nvfp4}/host_nvfp4_avx2.cpp ${_host_nvfp4}/host_nvfp4_avx512.cpp)
+  target_compile_definitions(crit_host_nvfp4 PRIVATE CRIT_HOST_NVFP4_AVX2=1 CRIT_HOST_NVFP4_AVX512=1)
+  if(MSVC)
+    set_source_files_properties(${_host_nvfp4}/host_nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX2)
+    set_source_files_properties(${_host_nvfp4}/host_nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX512)
+  else()
+    set_source_files_properties(${_host_nvfp4}/host_nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+    set_source_files_properties(${_host_nvfp4}/host_nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mfma")
+  endif()
+endif()
+crit_inference_executable(crit_host_nvfp4_tests SOURCES ${FIXTURES}/host_nvfp4_tests.cpp LINK crit_host_nvfp4 Threads::Threads)
+crit_inference_test(crit_host_nvfp4 60 crit_host_nvfp4_tests)
+
 crit_inference_executable(crit_selection_tests SOURCES ${FIXTURES}/selection_tests.cpp INCLUDES ${INFERENCE}/recorded-selection/code)
 crit_inference_test(crit_selection 30 crit_selection_tests)
 
@@ -204,6 +230,17 @@ crit_inference_kernels(crit_token_sampling ${INFERENCE}/token-sampling/code samp
 target_link_libraries(crit_token_sampling PUBLIC crit::core)
 crit_inference_executable(crit_token_sampling_tests SOURCES ${FIXTURES}/token_sampling_tests.cpp LINK crit_token_sampling)
 crit_inference_test(crit_token_sampling 120 crit_token_sampling_tests)
+
+crit_inference_kernels(crit_host_mailbox ${INFERENCE}/host-work-mailbox/code mailbox.cu)
+add_library(crit_host_mailbox_fixture STATIC ${FIXTURES}/host_mailbox_fixture.cu)
+target_link_libraries(crit_host_mailbox_fixture PUBLIC crit_host_mailbox)
+crit_inference_executable(crit_host_mailbox_tests SOURCES ${FIXTURES}/host_mailbox_tests.cpp LINK crit_host_mailbox_fixture)
+crit_inference_test(crit_host_mailbox 300 crit_host_mailbox_tests)
+
+add_executable(crit_host_nvfp4_cuda_tests ${FIXTURES}/host_nvfp4_cuda_tests.cu)
+target_compile_features(crit_host_nvfp4_cuda_tests PRIVATE cxx_std_20 cuda_std_20)
+target_link_libraries(crit_host_nvfp4_cuda_tests PRIVATE crit_host_nvfp4 CUDA::cudart)
+crit_inference_test(crit_host_nvfp4_cuda 120 crit_host_nvfp4_cuda_tests)
 
 add_library(crit_device_round_toy STATIC ${_round_code}/toy_model.cu)
 target_link_libraries(crit_device_round_toy PUBLIC crit_device_round_kernels crit_recurrent_cuda)

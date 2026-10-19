@@ -1,6 +1,7 @@
 """Serving options travel across the actual resident process boundary and back over HTTP."""
 import json
 import unittest
+from unittest.mock import patch
 
 import test_api
 from crit_api.options import SAMPLING, RequestError, sampling_capability, sampling_options
@@ -120,6 +121,15 @@ class RequestOptionsTests(test_api.ApiTests):
 
 
 class LegacyOptionsTests(test_api.ApiTests):
+    """A package sealed before crit run package required temperature."""
+    temperature = False
+
+    def setUp(self):
+        legacy = patch("crit.run.store.serving_gaps", return_value=[])
+        legacy.start()
+        self.addCleanup(legacy.stop)
+        super().setUp()
+
     def test_legacy_adapter_rejects_generation_options_instead_of_ignoring_them(self):
         for options in ({"temperature": 0}, {"seed": 0}, {"tools": TOOLS}, {"frequency_penalty": 0}):
             response, value = self.chat(**options)

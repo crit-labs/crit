@@ -108,9 +108,10 @@ def eval_adapter(library):
 
 class FakeText:
     """Stands in for crit_core.text's model text: one token per character, stop token filtered by the adapter."""
+    generation = types.SimpleNamespace(stop_token_ids=())
 
     def encode_chat(self, messages, **variables):
-        expect(variables == {"add_generation_prompt": True, "enable_thinking": False}, variables)
+        expect(variables == {"tools": None, "add_generation_prompt": True, "enable_thinking": False}, variables)
         return [ord(c) % 40 + 1 for m in messages for c in m["content"]]
 
     def text_stream(self, ids):
@@ -137,6 +138,7 @@ class Cancellation:
 def resident_adapter(library):
     module = types.ModuleType("crit_core.text")
     module.load_model_text = lambda model, clock=None: FakeText()
+    module.openai_messages = lambda messages: messages
     sys.modules["crit_core.text"] = module
     context = types.SimpleNamespace(configuration={"chat_template_kwargs": {"enable_thinking": False}},
                                     model_file=lambda name: "/models/toy/" + name, limits={"kv_tokens": 200})

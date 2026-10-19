@@ -51,12 +51,27 @@ void mapping() {
     require(host[127] == 0 && host[128] == 9 && host[383] == 9 && host[384] == 0, "device writes through the alias");
     require(quarantined_cuda_mappings() == 0, "settled registration was retained");
 }
+void host_block() {
+    Fixture f;
+    auto block = std::make_shared<HostBlock>(2 * 4096);
+    std::memset(block->data(), 0, block->size());
+    const auto span = cuda_pin_host_block(f.backend, *block, 2);
+    require(block->attached() && span.bytes == block->size(), "pinned block");
+    check(cudaMemsetAsync(reinterpret_cast<void*>(span.device_address + 4096), 5, 16, f.backend->stream()));
+    f.backend->drain();
+    require(std::to_integer<int>(block->data()[4096]) == 5 && std::to_integer<int>(block->data()[4095]) == 0,
+            "device writes through the pinned block");
+    bool rejected = false;
+    try { cuda_pin_host_block(f.backend, *block, 0); } catch(const std::invalid_argument&) { rejected = true; }
+    require(rejected, "a block is pinned once");
+}
 }
 int main(int argc, char** argv) {
     try {
         const std::string test = argc > 1 ? argv[1] : "leases";
         if(test == "leases") leases();
         else if(test == "mapping") mapping();
+        else if(test == "host_block") host_block();
         else throw std::runtime_error("unknown test");
         std::cout << "crit core CUDA memory passed: " << test << '\n';
     } catch(const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

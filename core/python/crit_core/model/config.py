@@ -10,6 +10,7 @@ keys and YaRN included, refuses an integer outside [-2^63, 2^64), as the native 
 """
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
+import json
 import math
 import numbers
 import os
@@ -27,10 +28,15 @@ MAX_PATH_SHOWN = 200   # characters of a nested key path named in an error
 U32_MAX = (1 << 32) - 1
 TOKEN_MIN, TOKEN_MAX = -(1 << 31), (1 << 31) - 1
 INT64_MIN, UINT64_END = -(1 << 63), 1 << 64   # the integers the native reader can type
-LENGTH_KEYS = ("max_position_embeddings", "n_positions", "max_seq_len", "seq_length", "max_sequence_length",
-               "model_max_length")
-EXPERT_KEYS = ("num_experts", "num_local_experts", "n_routed_experts")
-NORM_EPS_KEYS = ("rms_norm_eps", "layer_norm_eps", "layer_norm_epsilon")
+# Which keys spell each field, in order: config_keys.json, the one table this reader and the C++ reader share.
+_KEYS = json.loads((Path(__file__).with_name("config_keys.json")).read_text(encoding="utf-8"))
+TEXT_SECTION_KEYS = tuple(_KEYS["text_sections"])
+LENGTH_KEYS = tuple(_KEYS["position_lengths"])
+EXPERT_KEYS = tuple(_KEYS["experts"])
+NORM_EPS_KEYS = tuple(_KEYS["norm_eps"])
+DTYPE_KEYS = tuple(_KEYS["dtype"])
+LAYER_TYPE_KEYS = tuple(_KEYS["layer_types"])
+LAYER_COUNT_KEYS = tuple(_KEYS["layer_count_from"])
 
 FULL_ATTENTION = "full_attention"
 SLIDING_ATTENTION = "sliding_attention"
@@ -153,8 +159,8 @@ class QuantizationConfig(_Picklable):
 
 @dataclass(frozen=True)
 class ModelConfig(_Picklable):
-    """Typed view of one config.json. `section` is the text section (text_config keys over the root) that every
-    typed field and rule reads; `raw` is the root and `text` the text_config object (the root when absent). All
+    """Typed view of one config.json. `section` is the text section (text_config, else llm_config, keys over the
+    root) that every typed field and rule reads; `raw` is the root and `text` that object (the root when absent). All
     mappings are read-only all the way down (arrays become tuples); to_dict() returns a plain copy of the root.
     intermediate_size is the integer form; a per-layer array (Gemma 3n) leaves it None and fills
     intermediate_sizes. rope_by_layer_type holds one RopeLayer per entry of a rope_parameters (or rope_scaling)
@@ -458,11 +464,35 @@ def _thawed(value):
 
 # Rules shared with crit eval. Each value is read in eval's order and only where eval evaluates it.
 
+def _text_object(config, source):
+    # The first TEXT_SECTION_KEYS entry the config has (llm_config: multimodal wrappers such as NemotronH_Omni and
+    # InternVL); null reads as absent.
+    key = next((key for key in TEXT_SECTION_KEYS if key in config), None)
+    return _object(config, key, source) if key else None
+
+
 def text_section(config, source=CONFIG_NAME):
-    """The config with text_config's keys over the root's (a missing or null text_config leaves the root)."""
+    """The config with the text section's keys over the root's: the first of TEXT_SECTION_KEYS it has (text_config,
+    else llm_config; a missing or null section leaves the root)."""
     config = _mapping_of(config, source)
-    text = _object(config, "text_config", source)
+    text = _text_object(config, source)
     return {**config, **(text or {})}
+
+
+def _layer_types(config, source):
+    # The first LAYER_TYPE_KEYS entry the config has (layers_block_type: "mamba", "moe", "mlp", "attention").
+    key = next((key for key in LAYER_TYPE_KEYS if key in config), None)
+    return _strings(config, key, source) if key else None
+
+
+def _layer_count(config, source):
+    # num_hidden_layers, else the length of the first LAYER_COUNT_KEYS list (configs that derive the count from it).
+    layers = _integer(config, "num_hidden_layers", source)
+    if layers is None and "num_hidden_layers" not in config:
+        key = next((key for key in LAYER_COUNT_KEYS if key in config), None)
+        kinds = _strings(config, key, source) if key else None
+        return len(kinds) if kinds else None
+    return layers
 
 
 def position_limit(config, source=CONFIG_NAME):
@@ -515,10 +545,10 @@ def attention_shape(config, source=CONFIG_NAME):
     else every layer. Head dim: head_dim, else hidden_size // heads. KV heads: num_key_value_heads, else heads.
     """
     config = _mapping_of(config, source)
-    layers = _integer(config, "num_hidden_layers", source)
+    layers = _layer_count(config, source)
     if not layers:
         return None
-    types = _strings(config, "layer_types", source)
+    types = _layer_types(config, source)
     if types:
         full = sum(1 for kind in types if kind in ("full_attention", "attention"))
     else:
@@ -560,15 +590,25 @@ def kv_elements_per_token(config, source=CONFIG_NAME):
 
 def fixed_state_bytes(config, kv_bytes_per_element, source=CONFIG_NAME):
     """Bytes of state that does not grow with the context: the linear-attention recurrence (FP32 state, BF16
-    convolution window of linear_conv_kernel_dim - 1, default kernel 4) and the KV cache of sliding_attention layers
+    convolution window of linear_conv_kernel_dim - 1, default kernel 4), the Mamba-2 recurrence of "mamba" layers
+    (FP32 state, BF16 convolution window of conv_kernel - 1) and the KV cache of sliding_attention layers
     at kv_bytes_per_element. Layer kinds come from layer_types only; the linear_* sizes are read only for
     linear_attention layers and sliding_window only for sliding_attention layers."""
     element = kv_bytes_per_element
     if _finite_real(element) is None or element < 0:
         raise ValueError(f"kv_bytes_per_element must be a finite non-negative number, not {_describe(element)}")
     config = _mapping_of(config, source)
-    types = _strings(config, "layer_types", source) or ()
+    types = _layer_types(config, source) or ()
     total = 0
+    mamba = types.count("mamba")
+    m_heads = _integer(config, "mamba_num_heads", source) if mamba else None
+    m_dim = _integer(config, "mamba_head_dim", source) if m_heads else None
+    m_state = _integer(config, "ssm_state_size", source) if m_dim else None
+    if m_state:
+        # Mamba-2: FP32 state [heads][head_dim][state], BF16 window of conv_kernel - 1 over x, B and C.
+        channels = m_heads * m_dim + 2 * (_integer(config, "n_groups", source) or 1) * m_state
+        conv = max(0, (_integer(config, "conv_kernel", source) or 4) - 1) * channels
+        total += mamba * (m_heads * m_dim * m_state * 4 + conv * 2)
     linear = types.count("linear_attention")
     hv = _integer(config, "linear_num_value_heads", source) if linear else None
     dk = _integer(config, "linear_key_head_dim", source) if hv else None
@@ -601,10 +641,12 @@ def layer_kinds(config, source=CONFIG_NAME):
     (the layer_types Hugging Face derives from that key); else all full. The FULL_ATTENTION count always equals
     attention_shape's full layers."""
     config = _mapping_of(config, source)
-    layers = _positive(config, "num_hidden_layers", source)
+    layers = _layer_count(config, source) if "num_hidden_layers" not in config else None
+    if not layers:
+        layers = _positive(config, "num_hidden_layers", source)
     if layers > MAX_LAYERS:
         _fail(source, "num_hidden_layers", f"{layers} layers exceed the {MAX_LAYERS}-layer limit")
-    types = _strings(config, "layer_types", source)
+    types = _layer_types(config, source)
     if types:
         if len(types) != layers:
             _fail(source, "layer_types", f"{len(types)} entries for {layers} layers")
@@ -747,11 +789,11 @@ def parse_model_config(config, source=CONFIG_NAME):
     """A ModelConfig from an already parsed config object; `source` names the file in error messages. The object is
     copied read-only and held to strict JSON: string keys, UTF-8 strings, finite numbers, MAX_CONFIG_DEPTH levels."""
     root = _frozen(_mapping_of(config, source), source)
-    text = _object(root, "text_config", source)
+    text = _text_object(root, source)
     section = MappingProxyType(text_section(root, source))
     max_positions, max_positions_key = _declared_positions(section, source)
     norm_eps, norm_eps_key = _first(section, NORM_EPS_KEYS, _real, source)
-    dtype, _ = _first(section, ("dtype", "torch_dtype"), _string, source)
+    dtype, _ = _first(section, DTYPE_KEYS, _string, source)
     intermediate_size, intermediate_sizes = _sizes(section, "intermediate_size", source)
     rope, rope_by_layer_type = _rope(section, source)
     return ModelConfig(
@@ -762,7 +804,7 @@ def parse_model_config(config, source=CONFIG_NAME):
         vocab_size=_integer(section, "vocab_size", source),
         hidden_size=_integer(section, "hidden_size", source),
         intermediate_size=intermediate_size,
-        num_hidden_layers=_integer(section, "num_hidden_layers", source),
+        num_hidden_layers=_layer_count(section, source),
         num_attention_heads=_integer(section, "num_attention_heads", source),
         num_key_value_heads=_integer(section, "num_key_value_heads", source),
         head_dim=_integer(section, "head_dim", source),
@@ -773,7 +815,7 @@ def parse_model_config(config, source=CONFIG_NAME):
         rope=rope,
         sliding_window=_integer(section, "sliding_window", source),
         full_attention_interval=_integer(section, "full_attention_interval", source),
-        layer_types=_strings(section, "layer_types", source) or (),
+        layer_types=_layer_types(section, source) or (),
         moe=_moe(section, source), mla=_mla(section, source), linear=_linear(section, source),
         num_nextn_predict_layers=_integer(section, "num_nextn_predict_layers", source),
         eos_token_ids=_token_ids(section, "eos_token_id", source),

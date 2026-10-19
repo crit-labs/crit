@@ -1,0 +1,11 @@
+{
+  "about": "Which config.json keys spell each field, in the order they are tried. The one copy both config readers use: crit_core.model.config loads it, core/CMakeLists.txt generates the C++ reader's arrays from it. A model family that spells a field its own way adds its key here, never a branch in a reader. layer_count_from: per-layer lists whose length is the layer count when num_hidden_layers is absent (configs that derive the count from them).",
+  "text_sections": ["text_config", "llm_config"],
+  "position_lengths": ["max_position_embeddings", "n_positions", "max_seq_len", "seq_length", "max_sequence_length",
+                       "model_max_length"],
+  "norm_eps": ["rms_norm_eps", "layer_norm_eps", "layer_norm_epsilon"],
+  "dtype": ["dtype", "torch_dtype"],
+  "experts": ["num_experts", "num_local_experts", "n_routed_experts"],
+  "layer_types": ["layer_types", "layers_block_type"],
+  "layer_count_from": ["layers_block_type"]
+}

@@ -90,7 +90,9 @@ def measure(store, run_id, candidate_id, adapter, model=None, config=None, secon
     write_json(scratch / "job.json", job)
     log_path = folder / "logs" / f"measure-{attempt}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    outcome, code, failure = _run_child(scratch / "job.json", log_path, reservation["deadline_at"])
+    from crit_core.machine import engine_lock
+    with engine_lock(f"crit run measure {run_id} {candidate_id}"):
+        outcome, code, failure = _run_child(scratch / "job.json", log_path, reservation["deadline_at"])
     result = read_json(scratch / "result.json") if outcome == "completed" and (scratch / "result.json").is_file() else None
     if outcome == "completed" and result is None:
         outcome, failure = "failed", "The measurement wrote no result"
@@ -263,37 +265,62 @@ def process_rss():
     return None
 
 
-def worker(job_path):
-    """Child process: pin missing cases with plain greedy decoding, then measure every case."""
+def _no_core_files():
     if os.name != "nt":
         import resource
         # No core file: a crash of a process holding tens of GB would write one that large (a soft limit of 1
         # byte also stops pipe-based core handlers, which ignore 0).
         resource.setrlimit(resource.RLIMIT_CORE, (1, resource.getrlimit(resource.RLIMIT_CORE)[1]))
-    from crit_eval.runner import load_adapter, open_engine, timed_generate, timed_replay
+
+
+def pin_worker(job_path):
+    """Grandchild process: pin missing cases with plain greedy decoding on a non-speculative engine. It runs in its
+    own process so everything that engine holds (host-resident weights, pinned memory, caches an adapter keeps for
+    the next engine of the process) is gone before the speculative engine loads: two engines of a model whose
+    weights live in host memory do not fit side by side."""
+    _no_core_files()
+    from crit_eval.runner import load_adapter, open_engine, timed_generate
     job = json.loads(Path(job_path).read_text(encoding="utf-8"))
     module = load_adapter(job["adapter"])
+    new_pins, unpinned = {}, {}
+    engine, _ = open_engine(module, job["model"], job["config"], speculative=False, context_tokens=job["context_tokens"])
+    try:
+        for case in job["cases"]:
+            if case["pin"] is not None:
+                continue
+            first, _ = timed_generate(engine, case["prompt"], case["output_tokens"])
+            second, _ = timed_generate(engine, case["prompt"], case["output_tokens"])
+            if first != second:
+                # Like crit eval pin, only a repeatable text becomes the run's pin; the case is still measured
+                # on the text the candidate generates.
+                at = next((i for i, (a, b) in enumerate(zip(first, second)) if a != b), min(len(first), len(second)))
+                unpinned[case["case_id"]] = f"plain greedy output changed between two runs (from token {at}), so no text was pinned"
+                print(f"{case['case_id']}: {unpinned[case['case_id']]}", flush=True)
+                continue
+            new_pins[case["case_id"]] = first
+            print(f"pinned {case['case_id']}: {len(first)} tokens", flush=True)
+    finally:
+        engine.close()
+    Path(job["out"] + ".pins.json").write_text(json.dumps({"pins": new_pins, "unpinned": unpinned}), encoding="utf-8")
+
+
+def worker(job_path):
+    """Child process: pin missing cases (in a grandchild process, pin_worker), then measure every case."""
+    _no_core_files()
+    from crit_eval.runner import load_adapter, open_engine, timed_generate, timed_replay
+    job = json.loads(Path(job_path).read_text(encoding="utf-8"))
     pins = {c["case_id"]: c["pin"] for c in job["cases"] if c["pin"] is not None}
     new_pins, unpinned = {}, {}
     if len(pins) < len(job["cases"]):
-        engine, _ = open_engine(module, job["model"], job["config"], speculative=False, context_tokens=job["context_tokens"])
-        try:
-            for case in job["cases"]:
-                if case["case_id"] in pins:
-                    continue
-                first, _ = timed_generate(engine, case["prompt"], case["output_tokens"])
-                second, _ = timed_generate(engine, case["prompt"], case["output_tokens"])
-                if first != second:
-                    # Like crit eval pin, only a repeatable text becomes the run's pin; the case is still measured
-                    # on the text the candidate generates.
-                    at = next((i for i, (a, b) in enumerate(zip(first, second)) if a != b), min(len(first), len(second)))
-                    unpinned[case["case_id"]] = f"plain greedy output changed between two runs (from token {at}), so no text was pinned"
-                    print(f"{case['case_id']}: {unpinned[case['case_id']]}", flush=True)
-                    continue
-                pins[case["case_id"]] = new_pins[case["case_id"]] = first
-                print(f"pinned {case['case_id']}: {len(first)} tokens", flush=True)
-        finally:
-            engine.close()
+        sys.stdout.flush()
+        done = subprocess.run([sys.executable, "-B", "-m", "crit.run.measure", str(job_path), "--pin"])
+        pinned = Path(job["out"] + ".pins.json")
+        if done.returncode or not pinned.is_file():
+            raise SystemExit(f"pinning failed (exit code {done.returncode})")
+        result = json.loads(pinned.read_text(encoding="utf-8"))
+        new_pins, unpinned = result["pins"], result["unpinned"]
+        pins.update(new_pins)
+    module = load_adapter(job["adapter"])
     sampler = Sampler()
     started = time.perf_counter()
     engine, info = open_engine(module, job["model"], job["config"], speculative=True, context_tokens=job["context_tokens"])
@@ -340,4 +367,4 @@ def worker(job_path):
 
 
 if __name__ == "__main__":
-    worker(sys.argv[1])
+    pin_worker(sys.argv[1]) if sys.argv[2:] == ["--pin"] else worker(sys.argv[1])

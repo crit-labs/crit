@@ -115,6 +115,7 @@ class ServeFixture(RunFixture):
     request_options = False  # sampling and tool fixtures
     strict_tools = False
     tool_stream = False
+    temperature = True  # declare chat-sampling-temperature-v1, which crit run package requires
     adapter_suffix = ''
 
     def package(self, candidate):
@@ -129,6 +130,8 @@ class ServeFixture(RunFixture):
         if self.request_options:
             from crit_api.options import SAMPLING, sampling_capability
             capabilities += ['chat-tools-v1', *map(sampling_capability, sorted(SAMPLING))]
+        elif self.temperature:
+            capabilities.append('chat-sampling-temperature-v1')
         if self.strict_tools:
             capabilities.append('chat-tools-strict-v1')
         if self.tool_stream:

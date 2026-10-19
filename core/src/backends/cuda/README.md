@@ -120,6 +120,8 @@ adds the CUDA hooks: `cuda_lease_backend(backend, memory)` allocates with
 `cudaMalloc` or `cudaMallocHost`, settles both streams and frees;
 `cuda_map_host(backend, host, bytes)` registers caller-owned host bytes and
 reports the actual device alias, unregistering at the last release (a failure
-retains it, `quarantined_cuda_mappings()`). Fixtures:
+retains it, `quarantined_cuda_mappings()`); `cuda_pin_host_block(backend, block, touch_threads)` registers a filled
+[HostBlock](../../memory/README.md#large-host-blocks-and-the-process-pool) once, attaches the registration to it and
+touches its pages. Fixtures:
 [device_memory_tests.cpp](../../../../tests/core/device_memory_tests.cpp) (host) and
 [cuda_memory_tests.cpp](../../../../tests/core/cuda_memory_tests.cpp) (device).

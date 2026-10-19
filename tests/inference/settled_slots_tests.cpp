@@ -256,7 +256,69 @@ void bytes_and_repeated_recovery() {
     cache.close();
   }
 }
+// Reverse loans: slots 4..7 alias memory an owner lent to the cache (KV positions
+// a request cannot reach). Before a request writes positions behind slots 5 and 7
+// the owner reclaims them with a slot loan; a live reader blocks slot 6 until it
+// settles; a survivor moves to a free own slot; returned slots come back EMPTY.
+void reverse_loans() {
+  Slots cache(8); // address-agnostic: the owner's memory needs no backing owner here
+  for (auto key : {"a", "b", "c", "d", "e", "f", "g", "h"}) load(cache, key);
+  const std::array<std::size_t, 2> scattered{7, 5};
+  auto binding = cache.binding();
+  auto request = cache.begin_slot_loan(scattered);
+  assert(!cache.valid(binding));
+  assert(!cache.acquire("f") && !cache.acquire("h") && cache.resident() == 6);
+  assert(cache.available_capacity() == 6);
+  assert(cache.on_loan(5) && cache.on_loan(7) && !cache.on_loan(6));
+  rejects([&] { (void)cache.on_loan(8); });
+  cache.activate_loan(request);
+  auto writer = cache.acquire_loan(request, storage()); // the request's KV writes
+  rejects([&] { cache.extent(writer); });                 // the owner addresses its own memory
+
+  auto reader = *cache.acquire("g"); // a pass still reads slot 6
+  const std::size_t six = 6;
+  rejects([&] { cache.begin_slot_loan(std::span(&six, 1)); });
+  cache.settle(reader);
+  rejects([&] { cache.begin_slot_loan(scattered); });           // already on loan
+  const std::array<std::size_t, 2> duplicate{6, 6}, outside{6, 8};
+  rejects([&] { cache.begin_slot_loan(duplicate); });
+  rejects([&] { cache.begin_slot_loan(outside); });
+  rejects([&] { cache.begin_slot_loan(std::span<const std::size_t>{}); });
+
+  // A longer request also reaches slot 4: its expert survives in a free own slot.
+  auto evicted = cache.begin_upload("spare"); // empties own slot 0's victim for the move
+  cache.finish_upload(evicted, false);
+  const std::size_t four = 4;
+  const Slots::Relocation survive{4, evicted.slot};
+  auto grow = cache.begin_slot_loan(std::span(&four, 1), std::span(&survive, 1));
+  auto copy = cache.begin_relocation(grow, 0, storage());
+  cache.settle_relocation(copy, true);
+  cache.activate_loan(grow);
+  auto moved = cache.acquire("e");
+  assert(moved && moved->slot == evicted.slot);
+  cache.settle(*moved);
+
+  // The request ends: its writers settle, then the slots return to the cache empty.
+  cache.begin_return(request);
+  rejects([&] { cache.reclaim_loan(request); }); // the writer has not settled
+  cache.settle_loan_use(writer);
+  cache.reclaim_loan(request);
+  returned(cache, grow);
+  assert(!cache.acquire("f") && !cache.acquire("h")); // never resurrected
+  assert(cache.available_capacity() == 8 && cache.resident() == 5 && !cache.on_loan(5));
+  auto refill = cache.begin_upload("f"); // an empty returned slot is the first victim
+  assert(!refill.evicted && (refill.slot == 4 || refill.slot == 5 || refill.slot == 7));
+  cache.finish_upload(refill, true);
+  for (int cycle = 0; cycle < 500; ++cycle) { // repeated requests keep exact accounting
+    auto again = cache.begin_slot_loan(scattered);
+    cache.activate_loan(again);
+    returned(cache, again);
+  }
+  assert(cache.available_capacity() == 8);
+  cache.close();
+}
 int main() {
+  reverse_loans();
   loan_admission();
   relocation_failure();
   independent_loans_and_owners();

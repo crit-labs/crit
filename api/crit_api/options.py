@@ -9,6 +9,11 @@ from crit_core.constraints import UnsupportedConstraint, compile_language, match
 TOOLS_CAPABILITY = "chat-tools-v1"
 STRICT_TOOLS_CAPABILITY = "chat-tools-strict-v1"
 TOOL_STREAM_CAPABILITY = "chat-tool-stream-v1"
+# Declared by packages sealed before crit 0.2.2 with the interim template tools. Their adapters are ResidentChats, which
+# now parse calls themselves, so it reads as chat-tools-v1 (and chat-tool-stream-v1 when the package streams), with
+# tool_choice auto or none.
+TOOL_TEMPLATE_CAPABILITY = "chat-tool-template-v1"
+STREAM_CAPABILITY = "chat-stream-v1"
 SAMPLING = {"temperature", "top_p", "top_k", "min_p", "seed", "presence_penalty",
             "frequency_penalty", "repetition_penalty", "logit_bias"}
 
@@ -17,6 +22,17 @@ class RequestError(Exception):
     def __init__(self, message, status=400, param=None, code=None):
         super().__init__(message)
         self.status, self.param, self.code = status, param, code
+
+
+def serving_capabilities(declared):
+    """The capabilities crit serve offers for a package's declared ones: the earlier chat-tool-template-v1 adds
+    chat-tools-v1, and chat-tool-stream-v1 when the package streams."""
+    result = list(declared)
+    if TOOL_TEMPLATE_CAPABILITY in result:
+        for capability in (TOOLS_CAPABILITY, *((TOOL_STREAM_CAPABILITY,) if STREAM_CAPABILITY in result else ())):
+            if capability not in result:
+                result.append(capability)
+    return result
 
 
 def sampling_capability(name):
@@ -114,6 +130,9 @@ def tool_options(body, capabilities):
         raise RequestError("parallel_tool_calls must be a boolean", param="parallel_tool_calls")
     if tools:
         require(capabilities, TOOLS_CAPABILITY, "tools")
+        if TOOL_TEMPLATE_CAPABILITY in capabilities and choice not in ("auto", "none"):
+            raise RequestError("This engine parses tool calls from free generation; tool_choice must be auto or none",
+                               param="tool_choice", code="unsupported_parameter")
     options = {"tools": tools, "tool_choice": choice, "parallel_tool_calls": parallel} if tools else {}
     if grammars:
         options["tool_grammars"] = grammars

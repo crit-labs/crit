@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import sys
 
@@ -75,6 +76,10 @@ def write_launchers(args, argv):
     return windows, posix
 
 
+def _interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
 def main(argv=None):
     args = parser().parse_args(argv)
     if args.recover_runtime:
@@ -89,6 +94,12 @@ def main(argv=None):
         for path in write_launchers(args, argv if argv is not None else sys.argv[1:]):
             print(path)
         return 0
+    from crit_core.machine import engine_lock
+    with engine_lock(f"crit serve {args.run or ''} {args.candidate or ''}".strip()):
+        return _serve(args)
+
+
+def _serve(args):
     gib = lambda value: None if value is None else round(value * GIB)
     try:
         engine = ServedEngine(args.workspace, args.run, args.candidate, project=args.project,
@@ -104,6 +115,11 @@ def main(argv=None):
                   log=lambda line: print(line, file=sys.stderr, flush=True))
         server = Server((args.host, args.port), api)
         host, port = server.server_address[:2]
+        # Ctrl+C, and SIGTERM from a supervisor, unload the engine and release ownership. A shell's background job
+        # starts with SIGINT ignored, so restore Python's handler for it too.
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, _interrupt)
         print("Serving %s at http://%s:%d/v1 (Ctrl+C to stop)" % (api.model, host, port), file=sys.stderr, flush=True)
         try:
             server.serve_forever()

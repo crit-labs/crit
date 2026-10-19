@@ -12,7 +12,7 @@ from crit.run.store import ROOT, RunStore
 
 from .residency import CAPABILITY as RESIDENT_CAPABILITY, ResidentRuntime
 from .stream import CAPABILITY as STREAM_CAPABILITY
-from .options import (RequestError, TOOL_STREAM_CAPABILITY, sampling_options,
+from .options import (RequestError, TOOL_STREAM_CAPABILITY, sampling_options, serving_capabilities,
                       tool_options as validate_tool_options, validate_tool_reply)
 
 CAPABILITY = "chat-json-v1"
@@ -67,7 +67,7 @@ def telemetry(value, request):
 
 def reply(value, request):
     keys(value, {"schema_version", "record_kind", "request_id", "candidate_id", "package_sha256", "assistant", "telemetry"},
-         {"tool_calls"})
+         {"tool_calls", "reasoning"})
     if type(value["schema_version"]) is not int or value["schema_version"] != 1 or value["record_kind"] != "chat_response":
         raise ValueError("Invalid engine chat response")
     if any(value[key] != request[key] for key in ("request_id", "candidate_id", "package_sha256")):
@@ -83,6 +83,15 @@ def reply(value, request):
         assistant = {"content": assistant, "tool_calls": calls}
     else:
         text(assistant, "Reply", MAX_REPLY)
+    if "reasoning" in value:
+        # Reasoning the model wrote apart from its reply (crit_core.text.reasoning); clients get reasoning_content.
+        reasoning = value["reasoning"]
+        if not isinstance(reasoning, str) or not reasoning or "\0" in reasoning:
+            raise ValueError("Reply reasoning must be non-empty text without NUL")
+        reasoning.encode("utf-8")
+        if len(reasoning) > MAX_REPLY:
+            raise ValueError("Reply reasoning exceeds the reply size limit")
+        assistant = dict(assistant if isinstance(assistant, dict) else {"content": assistant}, reasoning=reasoning)
     return assistant, telemetry(value["telemetry"], request)
 
 
@@ -153,7 +162,7 @@ class ServedEngine:
                     package_path=str(package), model_path=view["run"]["spec"]["model_path"],
                     model_manifest=read_json(safe_path(root, "inputs.json"))["model_manifest"],
                     configuration=candidate["configuration"], launch=manifest["launch"],
-                    capabilities=manifest["capabilities"], limits=view["run"]["spec"]["hardware_constraints"],
+                    capabilities=serving_capabilities(manifest["capabilities"]), limits=view["run"]["spec"]["hardware_constraints"],
                     label=candidate["label"], signature=package_signature(package), verify_model=self.verify_model)
 
     def candidates(self, refresh=False):
@@ -236,7 +245,7 @@ class ServedEngine:
         return self.runtime.status()
 
     def generate(self, messages, max_tokens, stop, on_text=None, candidate_id=None, response_format=None,
-                 sampling=None, tool_options=None, on_tools=None):
+                 sampling=None, tool_options=None, on_tools=None, on_reasoning=None):
         """Run one request. `on_text(text)` receives the cumulative accepted text when the adapter streams.
         `response_format` (from crit_api.server.response_format) goes into the request record for adapters that
         declare chat-constraints-v1. Sampling and tool options are capability-gated request overrides.
@@ -281,7 +290,8 @@ class ServedEngine:
                 result = self.runtime.call("generate", {"spec": spec, "request_path": str(folder / "request.json"),
                     "response_path": str(folder / "response.json")}, stop, self.timeout,
                     progress=on_text if streams and on_text else None, request=request,
-                    progress_tools=on_tools if TOOL_STREAM_CAPABILITY in spec["capabilities"] else None)
+                    progress_tools=on_tools if TOOL_STREAM_CAPABILITY in spec["capabilities"] else None,
+                    progress_reasoning=on_reasoning if streams else None)
             except (ValueError, OSError) as exc:
                 self._retire(exc)
                 raise EngineError("Engine host failed: " + str(exc)) from exc

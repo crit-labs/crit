@@ -35,10 +35,12 @@ leaves to the engine.
 | Attend over long prompts without a score matrix | [flash-prefill-attention](flash-prefill-attention/README.md) | Causal GQA BF16 flash kernel, head dims 64/128/256 |
 | Fit a long context in an FP8 KV cache | [fp8-kv-attention](fp8-kv-attention/README.md) | E4M3 cache with per-head-vector scales; prompt and decode attention |
 | Normalize and fuse a row epilogue | [rmsnorm-bf16](rmsnorm-bf16/README.md) | CUDA source, borrowed-view interface, host formula |
-| Reuse expert weights or lend cache memory | [expert-residency](expert-residency/README.md) | Byte-cache leases, complete bundles, C++ region loans |
+| Reuse expert weights, lend cache memory or borrow idle KV and workspace memory | [expert-residency](expert-residency/README.md) | Byte-cache leases, complete bundles, C++ region loans and owner slot loans |
 | Plan expert residency inside decode graphs | [device-expert-cache](device-expert-cache/README.md) | CUDA directory, miss copies, prefetch, offline policy replay |
 | Choose expert execution sources | [heterogeneous-expert-dispatch](heterogeneous-expert-dispatch/README.md) | Placement plans, measured CPU/device splits, router/shared fusion |
+| Compute NVFP4 experts on the CPU with the device's bits | [host-expert-arithmetic](host-expert-arithmetic/README.md) | Declared row order, scalar oracle, AVX2/AVX-512 paths, matching CUDA function, scale hook |
 | Join asynchronous contributions | [async-expert-contributions](async-expert-contributions/README.md) | Receipt-based join, source retention, ordered reduction |
+| Run device-decided host work inside a captured graph | [host-work-mailbox](host-work-mailbox/README.md) | Device-reset doorbells, measured stream-wait or poll join, release and failure answering |
 | Fetch file-backed experts | [ssd-expert-materialization](ssd-expert-materialization/README.md) | Checked reads, bounded gather, read-ahead, upload handoff |
 | Bound prefill, physical batches and scratch | [session-scheduling](session-scheduling/README.md) | Transactional cursor, latency chunk policy, physical caps and workspace sizing |
 | Batch independent requests | [concurrent-request-execution](concurrent-request-execution/README.md) | Ready-row compaction, metadata patches, retirement barrier |

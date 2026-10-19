@@ -10,7 +10,8 @@ Use it when one logical routed operation launches independent work and must
 produce one result. The unit is a **route occurrence**: two positions can select
 the same expert and still owe two contributions. A single fused projection may
 need no host-side group, but the ownership and completion rules still apply if the
-join moves into a device stream.
+join moves into a device stream; the [host-work mailbox](../host-work-mailbox/README.md)
+supplies that join for host producers.
 
 ## How it works
 

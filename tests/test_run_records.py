@@ -18,12 +18,19 @@ from crit.run.store import RunStore, lease
 
 
 class RunFixture:
+    model_files = None  # {name: text} makes the model a recon'd fixture folder (core_text_fixtures.llama_files)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
-        self.model = self.root / "model.fixture"
-        self.model.write_text("synthetic input, not a model", encoding="utf-8")
+        if self.model_files:
+            from core_text_fixtures import llama_files, write_files
+            self.model = write_files(self.root / "model", llama_files(
+                **{"model.fixture": "synthetic input, not a model", **self.model_files}))
+        else:
+            self.model = self.root / "model.fixture"
+            self.model.write_text("synthetic input, not a model", encoding="utf-8")
         self.data = {"model_path": str(self.model), "correctness_criteria": "Fixed fixture gates", "budget_minutes": 1,
                      "kv_tokens": 8192, "targets": {"decode_tps": 15}, "workload": {"repetitions": 3}}
         self.store = RunStore(self.root / "runs")
@@ -31,6 +38,8 @@ class RunFixture:
         self.run = self.view["run"]
         self.run_id = self.run["run_id"]
         self.directory = self.store.directory(self.run_id)
+        if self.model_files:
+            self.store.recon(self.run_id)
 
     def resolve(self):
         path = self.directory / "captured/input.fixture"
@@ -99,6 +108,11 @@ class RunRecordTests(RunFixture, unittest.TestCase):
             self.candidate(label="x" * 500)
         self.assertEqual(list((self.directory / "candidates").glob("candidate-*")), [])
         self.assertEqual(self.candidate()["candidate_id"], "candidate-0001")
+
+    def test_a_prepared_work_folder_does_not_break_candidate_creation(self):
+        (self.directory / "work" / "candidate-0001").mkdir(parents=True)
+        self.assertEqual(self.candidate()["candidate_id"], "candidate-0001")
+        self.assertEqual(self.store.get(self.run_id)["errors"], [])
 
     def test_start_identity_and_input_freezing_precede_construction(self):
         self.assertEqual(self.run["request_sha256"], digest(self.run["spec"]))
@@ -270,6 +284,18 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         self.assertFalse(result["eligible"])
         with self.assertRaises(ValueError):
             self.store.select(self.run_id, candidate["candidate_id"])
+
+    def test_measure_warning_reads_the_unsealed_candidates_own_qualification(self):
+        import contextlib, io
+        from crit.run.cli import warn_exploratory
+        good, *_ = self.measured()
+        bad, *_ = self.measured(arithmetic="failed")
+        for candidate, expected in ((good, ""), (bad, "gate arithmetic failed")):
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                warn_exploratory(self.store, self.run_id, candidate["candidate_id"], "benchmark-0001")
+            self.assertIn(expected, stderr.getvalue())
+            self.assertEqual(stderr.getvalue() == "", expected == "")
 
     def test_benchmark_without_bound_checks_names_why_the_candidate_is_ineligible(self):
         candidate = self.candidate()

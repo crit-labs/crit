@@ -133,7 +133,22 @@ class StreamingReference:
             state[name] = self.checkpoint.dense(key, self.device) if leaf == "weight" else \
                 self.checkpoint.raw(f"{key}.{leaf}").to(self.device).float()
         layer.load_state_dict(state, strict=True, assign=True)
+        self._config_dt_limit(layer)
         return layer
+
+    def _config_dt_limit(self, layer):
+        """Mamba-2 mixers take the model's own dt limit. transformers sets some mixers' limit to
+        (time_step_min, inf) although config.json declares time_step_limit (usually [0, inf]) and the model's own
+        kernels (mamba_chunk_scan_combined) apply that; the clamp makes long-memory heads forget, which shows
+        as retrieval failing beyond ~64K tokens and as drift against engines that follow the config."""
+        limit = getattr(self.config, "time_step_limit", None)
+        if not isinstance(limit, (list, tuple)) or len(limit) != 2:
+            return
+        lo, hi = (float(v) for v in limit)
+        for module in layer.modules():
+            current = getattr(module, "time_step_limit", None)
+            if isinstance(current, tuple) and len(current) == 2 and tuple(map(float, current)) != (lo, hi):
+                module.time_step_limit = (lo, hi)
 
     def _attention(self, layer, implementation):
         """Point every attention module of `layer` at `implementation` ("eager" or CHUNKED)."""
@@ -210,7 +225,8 @@ def build_reference(model, data, top_k, log=print):
         "prepared_model_sha256": prepared["model"]["sha256"],
         "suite_sha256": prepared["suite_sha256"],
         "implementation": f"transformers {transformers.__version__} official modeling, layer-streamed; "
-                          "FP32 activations, stored weights dequantized to FP32, no TF32",
+                          "FP32 activations, stored weights dequantized to FP32, no TF32; Mamba-2 dt limit from "
+                          "config.json time_step_limit",
         "top_k": top_k,
         "valid_vocab": prepared["valid_vocab"],
         "seconds": time.time() - started,

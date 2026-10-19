@@ -37,3 +37,24 @@ Observe right before a large host allocation, charge anonymous and pinned bytes
 through `Resources::reserve(Memory::host, ...)`, and keep allocation failure
 authoritative: admission is evidence, not a guarantee. Device memory is outside
 this check.
+
+## Large host blocks and the process pool
+
+Engines whose weights live in host memory (routed experts, embeddings) allocate tens of GB that the device reads
+through a mapping. [host_block.h](../../include/crit/host_block.h) ([host_block.cpp](host_block.cpp)) provides:
+
+- `HostBlock(bytes)`: page-aligned anonymous pages (mmap / VirtualAlloc), not pinned. Fill it with the loader's
+  threads, then pin it once with `cuda_pin_host_block(backend, block, touch_threads)` from
+  [cuda_memory.h](../../include/crit/cuda_memory.h): page faults run in parallel during the fill and the
+  registration is one call. Under WSL2 `cudaMallocHost` of 60 GB took about 90 s; fill-then-register took 35 s.
+  `touch(threads)` reads every page once; after a registration under WSL2 the first CPU read of each page was slow
+  (about 10 s over 60 GB on an engine's first request), so pin it with touch threads when the CPU reads the block.
+  The registration is attached to the block and ends before the pages are freed; spans must not outlive the block.
+- `HostBlockPool::process()`: blocks kept between engines opened one after another in one process (Eval rounds,
+  `crit run measure`, serve switches). `acquire(key, bytes, keep, &reused, identity)` returns the cached block when key, size
+  and identity match (pass what the bytes were filled from, such as the weight files' hashes, so another checkpoint
+  of the same size never reuses them); otherwise it drops the cached block for that key before returning a new one, so an engine with a different
+  layout (for example opened without its draft head) never holds a second copy. A block a live engine still holds
+  is freed only when that engine releases it.
+
+Charge the block through `Resources::reserve(Memory::host, ...)` and check it with `admit_host` first, as above.

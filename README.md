@@ -7,13 +7,13 @@
 
 ### Why wait for someone to optimize an LLM for your GPU when an AI agent can build a specialized inference engine in a few hours?
 
-[![Version 0.2.1](docs/assets/badge-version.svg)](CHANGELOG.md)
+[![Version 0.2.2](docs/assets/badge-version.svg)](CHANGELOG.md)
 [![License Apache-2.0](docs/assets/badge-license.svg)](LICENSE)
 [![crit-hub engines](docs/assets/badge-crit-hub.svg)](https://github.com/crit-labs/crit-hub)
 [![CI](https://github.com/crit-labs/crit/actions/workflows/ci.yml/badge.svg)](https://github.com/crit-labs/crit/actions/workflows/ci.yml)
 
 [Summary](#summary) • [Quick start](#quick-start) • [What crit solves](#what-crit-solves) • [Case studies](#case-study) •
-[Methodology](#methodology) • [Serving](#serving) • [Limitations](#limitations) • [Documentation](#documentation)
+[Methodology](#methodology) • [crit-hub](#crit-hub) • [Serving](#serving) • [Limitations](#limitations) • [Documentation](#documentation)
 
 </div>
 
@@ -78,14 +78,19 @@ Less time building an engine. More performance from your hardware.
 > [!NOTE]
 > Find the referenced engines in our [`crit-hub`](https://github.com/crit-labs/crit-hub) repository.
 
-We gave `Claude Opus 5.5` a target LLM along with the `crit` repository and let it cook autonomously. 
-The scenarios below explore two priorities: building a fast engine quickly within a
-candidate budget, and pushing engine quality until the agreed targets are met.
+We gave `Claude Opus 5.5` a target LLM along with the `crit` repository and let it cook autonomously.
+
+| What it shows               | Evidence |
+|-----------------------------| --- |
+| **`crit` engines are fast** | Qwen3.8-27B decodes at 216 tok/s and prefills at 8,917 tok/s |
+| **Dense and MoE models**    | Dense: Qwen3.8-27B and Gemma 4 31B. Mixture-of-experts larger than VRAM: Qwen3.8-Flash-Next (102 GB) and Nemotron 3.5 Super 120B (75 GB) |
+| **Different architectures** | Qwen (gated DeltaNet and attention), Gemma (sliding-window and full attention), Nemotron (Mamba-2 and latent MoE) |
+| **Hours, not weeks**        | Qwen3.8-27B in 3h 33m, Gemma 4 31B in 5h 24m, from the first command to the selected engine |
 
 ---
 
 <details>
-<summary><strong>📋 Build a fast dense-model engine quickly</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/qwen3.8-27b@NVFP4/mtp7-fp8attn">Inspect engine</a></summary>
+<summary><strong>📋 Dense LLM, Qwen architecture</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/qwen3.8-27b@NVFP4/mtp7-fp8attn">Inspect engine</a></summary>
 
 <br />
 
@@ -171,7 +176,95 @@ six prompts, from a chat question to a 14K-token agent session.
 ---
 
 <details>
-<summary><strong>📋 Build a fast MoE engine beyond VRAM capacity quickly</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/qwen3.8-flash-next@FP4-Local/mtp3-expert-cache">Inspect engine</a></summary>
+<summary><strong>📋 Dense LLM, Gemma architecture</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/gemma-4-31b-it@NVFP4/assistant6-fp8qk">Inspect engine</a></summary>
+
+<br />
+
+**Goal:** Get to a fast, working engine for a dense model of a different architecture.
+**Limit:** A fixed candidate budget.
+
+<div align="center">
+<table>
+  <tr>
+    <td align="center" width="16%">
+      <strong>
+
+5h 24m</strong>
+
+Development to selection
+    </td>
+    <td align="center" width="16%">
+      <strong>
+
+261 tok/s</strong>
+
+Decode
+    </td>
+    <td align="center" width="16%">
+      <strong>
+
+8,326 tok/s</strong>
+
+Prefill
+    </td>
+    <td align="center" width="16%">
+      <strong>
+
+262,144 tok</strong>
+
+Context
+    </td>
+    <td align="center" width="16%">
+      <strong>
+
++4.6%</strong>
+
+Perplexity vs reference
+    </td>
+    <td align="center" width="16%">
+      <strong>
+
+0.025</strong>
+
+Mean KL divergence
+    </td>
+  </tr>
+</table>
+</div>
+
+<br />
+
+[`assistant6-fp8qk`](https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/gemma-4-31b-it@NVFP4/assistant6-fp8qk)
+runs Gemma 4 31B-IT on one RTX 5090 with the model's full 262,144 tokens of context. Gemma mixes 50
+sliding-window layers with 10 full-attention layers whose keys equal their values, and its hidden
+states overflow FP16, so little carries over from the Qwen engines. The NVFP4 MLPs are used as
+stored; the BF16 attention projections and output head are re-encoded to FP8 at load, because as
+stored they don't fit next to a 262K KV cache. It drafts 6 tokens ahead with Google's own assistant
+model, used as released.
+
+| Candidate | What changed | Decode | Prefill | First token |
+| --- | --- | ---: | ---: | ---: |
+| 1 | Working engine: FP8 attention and head, NVFP4 MLPs as stored, drafts 6 tokens ahead | 253 tok/s | 7,428 tok/s | 123 ms |
+| 2 | Long prompts scored, full attention reads one shared key/value cache | 252 tok/s | 7,779 tok/s | 120 ms |
+| 3 | 4-bit prompt activations scaled per row (candidate 2's shared scales missed the quality budget) | 261 tok/s | 7,609 tok/s | 119 ms |
+| 4 | 8-bit query-key products for full-attention prompts, two-stage argmax over the head | 267 tok/s | 8,471 tok/s | 114 ms |
+| **5** | **Candidate 4's engine, with Gemma's tool-call syntax carried by the package** | **261 tok/s** | **8,326 tok/s** | **116 ms** |
+
+Measured with crit Eval at the full 262,144-token context. Candidates 4 and 5 run the same code;
+their difference is run-to-run variation.
+
+- **Bandwidth:** the verify pass reads the weights at their bandwidth floor (14.6 ms against 15.0 ms),
+  so decode speed is set by how many drafts are accepted: 3.1 tokens per round on chat, up to 6.4 on
+  the agent case. A prompt that fills all 262,144 tokens gets its first token after 148 s.
+- **Quality:** decoding stays within 0.2% perplexity of the reference. The 4-bit prompt path spends
+  most of the drift budget (+4.6% perplexity, 91% of the budget), inside it on every path.
+
+</details>
+
+---
+
+<details>
+<summary><strong>📋 MoE LLM, VRAM overload, Qwen architecture</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/qwen3.8-flash-next@FP4-Local/mtp3-expert-cache">Inspect engine</a></summary>
 
 <br />
 
@@ -266,15 +359,91 @@ and replaces candidate 5 in crit-hub.
 ---
 
 <details>
-<summary><strong>📋 Push a dense-model engine as far as possible</strong></summary>
+<summary><strong>📋 MoE LLM, VRAM overload, Nemotron architecture</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/nemotron-3.5-super-vl-120b-a12b@NVFP4/mtp3-cpu-experts">Inspect engine</a></summary>
 
 <br />
 
-**Goal:** Build the best engine possible for a dense model, pursuing speed alongside
-output quality and correctness.
-**Stopping criterion:** Meet the agreed engine quality targets across those measures.
+**Goal:** Build a fast engine for a 120B hybrid Mamba and mixture-of-experts model whose weights don't fit in VRAM.
+**Limit:** A fixed candidate budget.
 
-*Results pending.*
+<div align="center">
+<table>
+  <tr>
+    <td align="center" width="16%">
+      <strong>
+
+10h 46m</strong>
+
+Development to selection
+    </td>
+    <td align="center" width="16%">
+      <strong>
+
+42.5 tok/s</strong>
+
+Decode
+    </td>
+    <td align="center" width="16%">
+      <strong>
+
+3,035 tok/s</strong>
+
+Prefill
+    </td>
+    <td align="center" width="16%">
+      <strong>
+
+262,144 tok</strong>
+
+Context
+    </td>
+    <td align="center" width="16%">
+      <strong>
+
++0.7%</strong>
+
+Perplexity vs reference
+    </td>
+    <td align="center" width="16%">
+      <strong>
+
+0.0051</strong>
+
+Mean KL divergence
+    </td>
+  </tr>
+</table>
+</div>
+
+<br />
+
+[`mtp3-cpu-experts`](https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/nemotron-3.5-super-vl-120b-a12b@NVFP4/mtp3-cpu-experts)
+runs Nemotron 3.5 Super VL 120B-A12B (text path) on one RTX 5090 with 262,144 tokens of context. Its
+layers are 40 Mamba-2 mixers, 40 latent mixture-of-experts layers with 512 NVFP4 experts each (22
+per token) and 8 attention layers. The checkpoint is 75 GB, 63 GB of it routed experts, used as
+stored: they sit in pinned host memory behind a GPU cache of about 7,150 slots, and 6 CPU cores
+compute 60% of each pass's cache misses with the GPU's exact operation order, so the output does not
+depend on where a miss runs. It drafts 3 tokens ahead with the model's own MTP block, used as released.
+
+| Candidate | What changed | Decode | Prefill | First token |
+| --- | --- | ---: | ---: | ---: |
+| 1 | Working engine without drafting, experts in host memory (superseded: forgot content beyond 64K tokens) | 28.8 tok/s | 1,605 tok/s | 2.47 s |
+| 2 | Drafts 3 tokens ahead, CPU share of expert misses, the model's own Mamba time-step limit | 40.8 tok/s | 2,373 tok/s | 2.22 s |
+| 3 | 4-bit prompt experts on CUTLASS grouped GEMMs, 8-bit prompt GEMMs | 44.2 tok/s | 3,149 tok/s | 1.88 s |
+| **4** | **8-bit prompt attention, CPU share of short prompts' experts, one copy of the experts in RAM** | **42.5 tok/s** | **3,035 tok/s** | **1.83 s** |
+
+Measured with crit Eval. Candidates 1 and 2 were built for a 1,048,576-token context; the work then
+moved to a second `crit run` at 262,144 tokens, which re-measured candidate 3 and built candidate 4.
+Candidates 3 and 4 differ only in the prompt path, so their decode difference is run-to-run
+variation. The development time leaves out about 5h 25m with no work in progress: an idle stretch
+in the night, and a PC restart (an engine and the FP32 reference together had exhausted host
+memory) followed by a pause until the work was resumed.
+
+- **Bottleneck:** decode is bound by expert misses, over the host link and on the CPU, so other heavy
+  programs on the PC slow it. Sampled requests decode one token per pass, about 22 tok/s.
+- **Quality:** perplexity stays within 0.7% of the reference on every path. Candidate 1 lost track of
+  content beyond 64K tokens because transformers clamps Mamba's time step; the engine and Eval's
+  reference now follow the model's config, and retrieval passes up to 262,144 tokens.
 
 </details>
 
@@ -293,7 +462,7 @@ hardware became Inference entries, with their assumptions made explicit.
 <a id="core"></a>
 
 <details>
-<summary><strong>📗 Core — the foundation</strong> → <a href="core/README.md">Full guide</a></summary>
+<summary><strong>📗 Core</strong> → <a href="core/README.md">Full guide</a></summary>
 
 <br />
 
@@ -310,7 +479,7 @@ Try the [Core + Inference walkthrough](inference/examples/core-projection/README
 <a id="inference"></a>
 
 <details>
-<summary><strong>📕 Inference — curated techniques</strong> → <a href="inference/README.md">Full guide</a></summary>
+<summary><strong>📕 Inference</strong> → <a href="inference/README.md">Full guide</a></summary>
 
 <br />
 
@@ -335,7 +504,7 @@ Each technique says when it helps, what is tested and what your engine supplies.
 <a id="kernels"></a>
 
 <details>
-<summary><strong>📘 Kernels — kernel discovery</strong> → <a href="kernels/README.md">Full guide</a></summary>
+<summary><strong>📘 Kernels</strong> → <a href="kernels/README.md">Full guide</a></summary>
 
 <br />
 
@@ -352,7 +521,7 @@ whether the kernel helps.
 <a id="models"></a>
 
 <details>
-<summary><strong>📙 Models — weight transforms</strong> → <a href="models/README.md">Full guide</a></summary>
+<summary><strong>📙 Models</strong> → <a href="models/README.md">Full guide</a></summary>
 
 <br />
 
@@ -368,7 +537,7 @@ model, and records the recipe, calibration data, seed, file hashes and cost.
 <a id="eval"></a>
 
 <details>
-<summary><strong>📚 Eval — physics-based evaluation</strong> → <a href="docs/eval/README.md">Full guide</a></summary>
+<summary><strong>📚 Eval</strong> → <a href="docs/eval/README.md">Full guide</a></summary>
 
 <br />
 
@@ -391,6 +560,21 @@ Results keep samples, settings and skipped cases visible.
 ---
 
 ## Miscellaneous
+
+---
+
+<a id="crit-hub"></a>
+
+<details>
+<summary><strong>🔭 crit-hub</strong> → <a href="https://github.com/crit-labs/crit-hub">Repository</a></summary>
+
+<br />
+
+[`crit-hub`](https://github.com/crit-labs/crit-hub) collects `crit`-based inference engines in one repository 
+to make discovery super easy. Each engine ships runnable source, the exact checkpoint it was built on, what 
+was measured, its known limits and a link to the repository of whoever contributed it.
+
+</details>
 
 ---
 
@@ -439,5 +623,5 @@ implement the [adapter contract](docs/SERVING.md#adapter-contract).
 | Quantize weights and record the transform | [Models](models/README.md) |
 | Compare speed, quality and speculative output | [Eval](docs/eval/README.md) |
 | Serve an engine as an OpenAI-compatible API | [Serving](docs/SERVING.md) · [Adapter contract](docs/SERVING.md#adapter-contract) |
-| Change `crit` or run its tests | [Contributing](docs/CONTRIBUTING.md) · [Licensing](docs/LICENSES.md) |
+| Change `crit` or run its tests | [What belongs in crit](docs/CONTRIBUTION_CRITERIA.md) · [Contributing](docs/CONTRIBUTING.md) · [Licensing](docs/LICENSES.md) |
 | See release history | [Changelog](CHANGELOG.md) |

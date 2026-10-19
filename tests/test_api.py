@@ -213,11 +213,22 @@ if __name__ == "__main__":
 class CommandTests(ServeFixture, unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "Ctrl+C reaches the whole Windows console group, including the test runner")
     def test_crit_serve_loads_answers_and_releases_the_runtime_on_interrupt(self):
-        import re, signal, subprocess, sys, time
+        import signal
+        self.serve_and_stop(signal.SIGINT)
+
+    @unittest.skipIf(os.name == "nt", "POSIX signals")
+    def test_sigterm_and_a_background_jobs_ignored_sigint_also_release_the_runtime(self):
+        import signal
+        self.serve_and_stop(signal.SIGTERM)
+        # A shell's background job (`crit serve &`) starts with SIGINT ignored.
+        self.serve_and_stop(signal.SIGINT, preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN))
+
+    def serve_and_stop(self, stop, **options):
+        import re, subprocess, sys, time
         from pathlib import Path
         root = Path(__file__).resolve().parents[1]
         process = subprocess.Popen([sys.executable, "-B", str(root / "tests/run_crit.py"), "serve", "--workspace", str(self.store.root),
-                                    "--port", "0"], stderr=subprocess.PIPE, text=True, env=os.environ.copy())
+                                    "--port", "0"], stderr=subprocess.PIPE, text=True, env=os.environ.copy(), **options)
         try:
             port = None
             deadline = time.monotonic() + 30
@@ -232,7 +243,7 @@ class CommandTests(ServeFixture, unittest.TestCase):
             value = json.loads(connection.getresponse().read())
             connection.close()
             self.assertEqual(json.loads(value["choices"][0]["message"]["content"])["calls"], 1)
-            process.send_signal(signal.SIGINT)
+            process.send_signal(stop)
             self.assertEqual(process.wait(30), 0)
             self.assertFalse((self.root / "runtime-owner" / "owner.json").exists())
         finally:

@@ -320,6 +320,26 @@ class ConfigRuleParityTests(unittest.TestCase):
                 self.assertEqual(value, actual[key], (case, key, config))
         self.assertGreater(loaded, 1500)
 
+    def test_nemotron_h_llm_config(self):
+        # Multimodal wrapper: the text section is llm_config; layers_block_type stands in for layer_types.
+        types = ["mamba", "moe", "mamba", "attention"]
+        text = {"layers_block_type": types, "num_attention_heads": 32,
+                "num_key_value_heads": 2, "head_dim": 128, "max_position_embeddings": 1048576, "mamba_num_heads": 8,
+                "mamba_head_dim": 4, "ssm_state_size": 16, "n_groups": 2, "conv_kernel": 4}
+        config = {"model_type": "nemotron_h_omni", "llm_config": text}
+        section = mc.text_section(config)
+        self.assertEqual(mc.attention_shape(section), (1, 32, 128, 2))
+        self.assertEqual(mc.position_limit(section), (1048576, "max_position_embeddings"))
+        state = 8 * 4 * 16 * 4 + 3 * (8 * 4 + 2 * 2 * 16) * 2
+        self.assertEqual(mc.fixed_state_bytes(section, 1), 2 * state)
+        parsed = mc.parse_model_config(config)
+        self.assertEqual(parsed.layer_types, tuple(types))
+        self.assertEqual(parsed.num_hidden_layers, 4)   # derived from layers_block_type, as NemotronHConfig does
+        self.assertEqual(parsed.num_attention_heads, 32)
+        self.assertEqual(mc.layer_kinds(section), (mc.OTHER, mc.OTHER, mc.OTHER, mc.FULL_ATTENTION))
+        # An explicit text_config (even null) wins over llm_config.
+        self.assertEqual(mc.text_section({"llm_config": text, "text_config": None}).get("layers_block_type"), None)
+
     def test_crit_eval_fixture_values_hold(self):
         self.assertEqual(mc.position_limit({"max_position_embeddings": 262144}), (262144, "max_position_embeddings"))
         yarn = {"max_position_embeddings": 32768,

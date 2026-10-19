@@ -162,11 +162,19 @@ def _context_gates(result):
     else:
         rows = lower.get("cases", {})
         parts = [f"{cid} {kind} {rows[cid][kind + '_change']:+.1%} (tolerance {rows[cid][kind + '_tolerance']:.1%})"
-                 for cid, kinds in lower.get("slower", {}).items() for kind in kinds]
+                 + _host_load(rows[cid]) for cid, kinds in lower.get("slower", {}).items() for kind in kinds]
         parts += [f"{cid} not measured" for cid in lower.get("unmeasured", [])]
         lowered = {"name": "lower_context", "state": "fail",
                    "detail": f"slower at {lower['context']:,} tokens than at {required:,}: " + "; ".join(parts)}
     return [capacity] + _retrieval_gate(result, required) + [lowered]
+
+
+def _host_load(row):
+    """Other processes' CPU load during a slower case's two measurements, when one of them was busy."""
+    low, high = row.get("host_other_cpu_cores"), row.get("host_other_cpu_cores_at_required")
+    if low is None or high is None or max(low, high) < 0.5:
+        return ""
+    return f", other processes {low:.1f} vs {high:.1f} CPU cores"
 
 
 def _generality_gate(result, protocol, baseline):

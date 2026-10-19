@@ -14,10 +14,18 @@ namespace fs = std::filesystem;
 constexpr std::uint64_t u32_max = std::numeric_limits<std::uint32_t>::max();
 constexpr std::uint64_t u64_max = std::numeric_limits<std::uint64_t>::max();
 constexpr std::uint32_t max_layers = 1u << 16;
-constexpr const char* length_keys[] = {"max_position_embeddings", "n_positions", "max_seq_len", "seq_length",
-                                       "max_sequence_length", "model_max_length"};
-constexpr const char* norm_eps_keys[] = {"rms_norm_eps", "layer_norm_eps", "layer_norm_epsilon"};
-constexpr const char* expert_keys[] = {"num_experts", "num_local_experts", "n_routed_experts"};
+// Which keys spell each field, in order: text_sections_keys, position_lengths_keys, norm_eps_keys, dtype_keys,
+// experts_keys, layer_types_keys and layer_count_from_keys, generated from the table crit_core.model.config also
+// reads (python/crit_core/model/config_keys.json).
+#include "crit_config_keys.inc"
+
+// The first key of `keys` the object has, or nullptr.
+template<std::size_t N>
+const char* first_present(const json::Value& object, const char* const (&keys)[N]) {
+    for(const char* key:keys)
+        if(object.find(key)) return key;
+    return nullptr;
+}
 
 std::string str(std::uint64_t value) { return std::to_string(value); }
 // Short printable rendering of a string for diagnostics; never splits a UTF-8 sequence.
@@ -240,7 +248,10 @@ ModelConfig parse_model_config(json::Document document) {
     const auto& root = c.document.root();
     const Reader r{c.document.source()};
     if(root.kind() != json::Kind::object) throw FormatError(r.source, "root", "the config must be a JSON object, not " + describe(root));
-    const auto* text = r.object(root.find("text_config"), "text_config");
+    // The text section: the first text_sections_keys entry present (llm_config: multimodal wrappers such as
+    // NemotronH_Omni); null reads as absent.
+    const char* section = first_present(root, text_sections_keys);
+    const auto* text = section ? r.object(root.find(section), section) : nullptr;
     c.text = text ? text : &root;
     const auto get = [&](std::string_view key) { return c.get(key); };
     const auto u32 = [&](const char* key) { return r.u32(get(key), key); };
@@ -258,7 +269,7 @@ ModelConfig parse_model_config(json::Document document) {
     c.num_attention_heads = u32("num_attention_heads");
     c.num_key_value_heads = u32("num_key_value_heads");
     c.head_dim = u32("head_dim");
-    for(const char* key:length_keys) {   // eval's rule: the first positive integer; other values are skipped
+    for(const char* key:position_lengths_keys) {   // eval's rule: the first positive integer; other values are skipped
         const auto* value = get(key);
         r.within_64_bits(value, key);     // except an integer beyond 64 bits, which is an error
         const auto number = value && value->kind() == json::Kind::integer ? non_negative(*value) : std::nullopt;
@@ -275,7 +286,7 @@ ModelConfig parse_model_config(json::Document document) {
             break;
         }
     c.tie_word_embeddings = r.boolean(get("tie_word_embeddings"), "tie_word_embeddings");
-    for(const char* key:{"dtype", "torch_dtype"})
+    for(const char* key:dtype_keys)
         if(auto dtype = r.string(get(key), key)) {
             c.dtype = *dtype;
             break;
@@ -283,8 +294,20 @@ ModelConfig parse_model_config(json::Document document) {
     parse_rope(r, c);
     c.sliding_window = u32("sliding_window");
     c.full_attention_interval = u32("full_attention_interval");
-    c.layer_types = r.strings(get("layer_types"), "layer_types");
-    for(const char* key:expert_keys)
+    for(const char* key:layer_types_keys)
+        if(get(key)) {
+            c.layer_types = r.strings(get(key), key);
+            break;
+        }
+    // Without num_hidden_layers, configs that derive it from a per-layer list (layer_count_from_keys) give its length.
+    if(!c.num_hidden_layers && !get("num_hidden_layers"))
+        for(const char* key:layer_count_from_keys)
+            if(get(key)) {
+                const auto kinds = r.strings(get(key), key);
+                if(!kinds.empty()) c.num_hidden_layers = std::uint32_t(kinds.size());
+                break;
+            }
+    for(const char* key:experts_keys)
         if(auto experts = u32(key)) {
             if(*experts == 0) break;
             MoeConfig moe;
@@ -345,7 +368,8 @@ fs::path config_file(const fs::path& path, const char* file_name) {
     std::error_code ignored;
     return fs::is_directory(path, ignored) ? path / file_name : path;
 }
-// Every eos_token_id of a root object and its text_config, appended to ids (non-negative ids only).
+// Every eos_token_id of a root object and its text_config, appended to ids (non-negative ids only; Eval's
+// stop_ids rule, crit_core.text.legacy_eos_ids).
 void append_eos(const json::Document& document, std::vector<Token>& ids) {
     const auto& root = document.root();
     if(root.kind() != json::Kind::object) return;

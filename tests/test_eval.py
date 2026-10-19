@@ -1194,5 +1194,44 @@ class ReferenceTests(unittest.TestCase):
         self.assertLess(max(abs(a["logprob"] - b["logprob"]) for a, b in zip(eager, chunked)), 1e-5)
 
 
+class ReferenceDtLimitTest(unittest.TestCase):
+    """Mamba-2 mixers in the reference take config.json's time_step_limit, not transformers' (time_step_min, inf)."""
+
+    def test_config_limit_replaces_the_mixer_clamp(self):
+        from types import SimpleNamespace
+        from crit_eval.reference import StreamingReference
+        mixer = SimpleNamespace(time_step_limit=(0.001, float("inf")))
+        attention = SimpleNamespace()
+        layer = SimpleNamespace(modules=lambda: [layer, mixer, attention])
+        owner = SimpleNamespace(config=SimpleNamespace(time_step_limit=[0.0, float("inf")]))
+        StreamingReference._config_dt_limit(owner, layer)
+        self.assertEqual(mixer.time_step_limit, (0.0, float("inf")))
+        self.assertFalse(hasattr(attention, "time_step_limit"))
+        mixer.time_step_limit = (0.001, float("inf"))
+        StreamingReference._config_dt_limit(SimpleNamespace(config=SimpleNamespace()), layer)
+        self.assertEqual(mixer.time_step_limit, (0.001, float("inf")), "no config limit: unchanged")
+
+
+class HostLoadTest(unittest.TestCase):
+    """Other processes' CPU cores over an interval: a busy child counts, this process's own work does not."""
+
+    def test_counts_other_processes_not_this_one(self):
+        import subprocess
+        import time as _time
+        from crit_eval.hostload import HostLoad
+        load = HostLoad().start()
+        end = _time.perf_counter() + 0.4
+        while _time.perf_counter() < end:
+            pass
+        own = load.cores()
+        if own is None:
+            self.skipTest("no host CPU totals on this platform")
+        child = subprocess.Popen([sys.executable, "-c", "import time; end = time.time() + 1.5\nwhile time.time() < end: pass"])
+        load = HostLoad().start()
+        child.wait()
+        busy = load.cores()
+        self.assertGreater(busy, own + 0.3, (own, busy))
+
+
 if __name__ == "__main__":
     unittest.main()

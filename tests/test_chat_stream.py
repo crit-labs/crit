@@ -151,7 +151,8 @@ class StreamingFixture(ServeFixture):
         return self.store.package(self.run_id, candidate["candidate_id"], package,
             {"build": {"toolchain": {"fixture": "host-python"}, "dependencies": [], "command": ["fixture"]},
              "launch": ["engine.py", str(self.control)],
-             "capabilities": ["prefill", "decode", "chat-json-v1", "chat-resident-v1", "chat-stream-v1"]})
+             "capabilities": ["prefill", "decode", "chat-json-v1", "chat-resident-v1", "chat-stream-v1",
+                              "chat-sampling-temperature-v1"]})
 
     def streaming(self, engine, message, stop=None, candidate=None):
         """Generate in a thread, collecting the cumulative text the engine streams."""

@@ -197,6 +197,23 @@ fallback still executable. [Residency](../expert-residency/README.md) supplies
 lifetime rules; [asynchronous contributions](../async-expert-contributions/README.md)
 supplies a join protocol when splitting pays.
 
+**Exact split.** When host workers compute missed experts, give them the device
+kernel's exact per-row operation order, so an expert's contribution is bitwise the
+same on either processor and output does not depend on the split, the cache state or
+host load. [Host expert arithmetic](../host-expert-arithmetic/README.md) supplies that
+for NVFP4: a declared order, host paths matching it bit for bit and the device
+function that declares the same one.
+For prompt chunks, choose host experts by a fixed function of (layer, expert), never
+by what happens to be resident: a cache-dependent split changes a token's arithmetic
+between two identical requests. A miss the host computes is not admitted to the
+device cache, so the miss rate rises with the host share; weigh that against the
+transfer it saves.
+
+**Host work inside a captured decode.** To run the host share mid-graph, post it
+through the [host-work mailbox](../host-work-mailbox/README.md), which supplies the
+doorbell protocol, measured join choice, release and failure answering, and the
+rules for host worker pools fed from the device.
+
 ## Costs and validation
 
 Placement feasibility is not a throughput model. Splitting can gain from overlap
@@ -205,7 +222,20 @@ or slower fallback reads. Measure miss bytes and complete operation time. Host
 execution of missed experts reads the same DRAM as concurrent host-to-device
 copies, so measure host latency while those copies run. Spin barriers across host
 workers stall when one thread is descheduled; leave cores for the launching
-thread. Measured prefix planning is quadratic in route count and prices one
+thread. Choose the host share of each pass's misses from measurements on the target
+machine, never a fixed fraction: host workers add per-expert compute time until they
+saturate host DRAM bandwidth, the device pays each miss's transfer at the measured
+host-to-device rate (`crit eval probe`), and past the share where host time exceeds
+the transfer it replaces, decode slows down. Sweep the share on the mixed suite. Where
+the first CPU read of host memory registered with the device is slow (seen under
+WSL2), touch every page once at load (Core's `HostBlock::touch`). (For scale only: on
+one machine with 6 Ryzen 5 9600 cores, an engine with 3.1 MB NVFP4 experts reached
+about 36 GB/s with six threads, near the host's DRAM rate, and gained most with about
+60% of its misses on the CPU, while a second engine on the same machine measured its
+CPU path slower than the transfer. The same CPU can be worth a large share for one
+model and none for another.)
+
+Measured prefix planning is quadratic in route count and prices one
 operation, not future cache warmth. Common errors: treating occurrence capacity as
 cache capacity, applying weights twice, remapping IDs modulo cache size, and
 aliasing scratch with live content.

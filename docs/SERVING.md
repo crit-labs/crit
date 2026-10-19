@@ -40,6 +40,13 @@ reply = client.chat.completions.create(model="default", messages=[{"role": "user
 
 Ctrl+C stops accepting requests, unloads the engine and releases model memory.
 
+The server holds the machine's engine lock while it runs (`crit_core.machine`): `crit eval run`, `pin`, `ab`,
+`kernels`, `reference` and `crit run measure` wait for it, and it waits for them, printing who holds the lock. Two
+engines side by side can exhaust host RAM when weights live there. `CRIT_ENGINE_LOCK` names the lock file (default
+`crit-engine.lock` in the system temp directory), `CRIT_ENGINE_LOCK=off` disables it. Since file locks do not
+cross OS instances, the holder also keeps a lease that Windows and its WSL distributions both read
+(`CRIT_ENGINE_LEASE`, default `C:\ProgramData\crit\engine.lease`, `/mnt/c/ProgramData/crit/engine.lease` under WSL).
+
 ## Endpoints
 
 | Endpoint | Behavior |
@@ -62,7 +69,7 @@ compatible model allocations. Requests run one at a time.
 | `n` | Must be 1 |
 | `response_format` | `text`, `json_object` or `json_schema` ([structured output](#structured-output)) |
 | `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias` | Per-request overrides when the package declares support for that field; otherwise 400. Omitted or null fields keep engine defaults |
-| `tools`, `tool_choice`, `parallel_tool_calls` | Function calls for packages declaring `chat-tools-v1`; `auto`, `none`, `required` or a named function. Tool-result history is preserved |
+| `tools`, `tool_choice`, `parallel_tool_calls` | Function calls for packages declaring `chat-tools-v1`; `auto`, `none`, `required` or a named function (adapters that parse free generation, such as [ResidentChat](#tool-calls-from-the-chat-template): `auto` or `none`). Tool-result history is preserved |
 
 Responses carry `usage` when measured and `crit_telemetry` (phase tokens, ms, rates).
 Sampling overrides are validated before generation, including for streaming requests.
@@ -109,8 +116,42 @@ SSE error and `[DONE]`, without a successful finish chunk. Clients should assemb
 calls by index and only act on a successfully completed turn.
 
 Tool requests cannot combine `stop` or a structured `response_format`.
-Tool syntax and prompting differ by model; the stock native adapter has no tool
-parser and must not declare `chat-tools-v1`. A model-specific adapter implements it.
+
+### Tool calls from the chat template
+
+Adapters built on `crit_core.serving.ResidentChat` (and Core's `resident_engine`) offer
+tool calls without model-specific code in crit. ResidentChat renders the request's
+`tools` (unless `tool_choice` is `none`) and the tool history with the model's own chat
+template, splits the reply into content and calls with `crit_core.text.ToolCallParser`,
+gives each call an id and returns them as `tool_calls`; with streaming each call arrives
+as one delta when its block closes. `capabilities(text, sampling)` then declares
+`chat-tools-v1`, plus `chat-tool-stream-v1` when the package streams. A block that does
+not parse, names an unknown function or exceeds `parallel_tool_calls: false` stays in
+the content as written. `tool_choice` must be `auto` or `none`, since the model is not
+constrained to call; strict tools need an adapter with `chat-tools-strict-v1`.
+
+The call syntax is the one the template teaches when crit registers it
+(`crit_core.text.templates_tool_format`; crit registers only syntaxes several model
+families share, such as Qwen3-Coder style `<function=...>` blocks and Hermes-style JSON
+in `<tool_call>`). When a model writes another one, the engine package carries the
+parser, never crit: set `ResidentChat.tool_format` to a `crit_core.text.ToolFormat`
+(the parse function and markers) and declare `capabilities(text, sampling,
+tool_format=...)`. Packages sealed with the earlier `chat-tool-template-v1` keep working:
+crit serve reads it as `chat-tools-v1`.
+
+### Reasoning
+
+Reasoning models write their thinking between markers before the reply. crit serve
+returns it apart from the reply, as OpenAI-compatible clients expect: the message's
+`reasoning_content` in JSON replies, and `delta.reasoning_content` chunks, before the
+content, when streaming. Adapters built on `crit_core.serving.ResidentChat` split it in
+the markers the model's chat template uses (`crit_core.text.reasoning`; crit registers
+the `<think>...</think>` syntax several model families share). Reasoning starts where the
+reply starts, either because the generation prompt ends with the opening marker or
+because the reply opens with it; a marker later in the reply is reply text, and a reply
+cut before the closing marker is all reasoning. Tool calls are parsed from the reply
+only. A package whose model writes other markers sets `ResidentChat.reasoning_format`
+to a `crit_core.text.ReasoningFormat`, and `False` leaves the reasoning in the reply.
 
 ## Structured output
 
@@ -136,11 +177,21 @@ failed final check becomes an error event.
 ## Adapter contract
 
 A package is servable when it declares **`chat-json-v1` and `chat-resident-v1`** and
-`launch[0]` is a retained Python module exporting `create_engine(context)` (native
-engines can use a Python wrapper; a Core engine library exported with
+`launch[0]` is a retained Python module exporting `create_engine(context)`. Build the
+adapter on **`crit_core.serving.ResidentChat`**: it renders the conversation, tools and
+tool history with the model's chat template, forwards the request's sampling fields that
+the engine lists in `sampling`, streams text without stop tokens, honors cancellation and
+reports Core's phase telemetry, so the engine supplies only `generate_tokens(ids,
+max_new_tokens, sampling, on_tokens, cancelled)`. Declare
+`crit_core.serving.capabilities(text, sampling)`. A Core engine library exported with
 `CRIT_EXPORT_ENGINE` can return `crit_core.native.resident_engine(context, library,
-defaults)`, which applies the model's chat template and stop tokens, streams text and
-reports Core's timing, see [engine libraries](../core/src/runtime/README.md#engine-libraries)).
+defaults)`, a ResidentChat over the library (see
+[engine libraries](../core/src/runtime/README.md#engine-libraries)).
+
+`crit run package` refuses a resident package that does not declare
+`chat-sampling-temperature-v1`, or that does not declare `chat-tools-v1` while the
+model's chat template teaches a tool-call format crit parses: agent clients send both on
+every turn.
 Serving works with failed or missing checks and
 never changes benchmark evidence or passes a gate. [Eval](eval/ADAPTER.md) uses a
 separate `eval-v1` adapter (`create_eval_engine(context)`); both can wrap one engine.
@@ -212,7 +263,8 @@ With `chat-tools-v1`, messages also preserve assistant `tool_calls`, tool messag
 with `tool_call_id`, and optional `name`/`reasoning_content`; tool message boundaries
 are not merged. The request also carries `tools`, resolved `tool_choice` and
 `parallel_tool_calls` when tools were supplied. Use the model's tool-aware chat
-template, apply the requested choice, and parse generated calls in the adapter.
+template, apply the requested choice, and parse generated calls in the adapter
+(ResidentChat does all three).
 Return them as an optional top-level `tool_calls` list in the response record,
 using OpenAI's `{id, type: "function", function: {name, arguments}}` shape with
 JSON-string arguments. `assistant` stays a string and may be empty for tool-only
@@ -242,6 +294,7 @@ record. Replies are at most 65,536 characters, responses UTF-8 JSON under 1 MiB.
   "candidate_id": "COPY_FROM_REQUEST",
   "package_sha256": "COPY_FROM_REQUEST",
   "assistant": "Reply text",
+  "reasoning": "Optional thinking apart from the reply",
   "telemetry": {
     "prompt_tokens": 512, "output_tokens": 128,
     "prefill_tokens": 512, "prefill_ms": 256,
@@ -251,7 +304,10 @@ record. Replies are at most 65,536 characters, responses UTF-8 JSON under 1 MiB.
 }
 ```
 
-`prompt_tokens` is the full templated input, `output_tokens` all generated tokens;
+`reasoning` (optional, nonempty, at most 65,536 characters) is the model's thinking
+apart from `assistant`, which then holds only the reply; crit serve returns it as
+`reasoning_content`. `prompt_tokens` is the full templated input, `output_tokens` all
+generated tokens;
 `prefill_*`/`decode_*` count tokens actually timed per phase (excluding a reused prefix
 or the first token from prefill); `ttft_ms` runs from admission to first emitted token.
 Synchronize device work at phase boundaries, exclude startup and loading, and never
@@ -285,6 +341,8 @@ concatenated exactly, with no retraction; the final `assistant` must equal them 
 for byte. Callback errors fail the turn even if caught. `reset` and `close` must stop
 every producer that could call `emit`. Token timing still comes from the final
 response. Packages without `chat-stream-v1` stream their reply as one chunk.
+`emit({"reasoning": text})` streams reasoning apart from the reply in the same way; the
+final `reasoning` must equal those chunks.
 
 ### Structured output for adapters
 

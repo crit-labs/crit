@@ -21,9 +21,12 @@ import ctypes
 import json
 from pathlib import Path
 
+from crit_core.serving import SAMPLING, ResidentChat, chat_prompt  # noqa: F401  (chat_prompt is re-exported)
+
 ABI = 1
 RESULT_BYTES = 1 << 20  # a generation's result JSON: finish, timing and the engine's request facts
 TOKEN_CALLBACK = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_int)
+PENALTY, PENALTIES = "penalties", {"repetition_penalty", "presence_penalty", "frequency_penalty"}
 FACTS = ("draft_width", "bytes_per_pass", "draft_bytes_per_step", "draft_ms", "kv_bytes_per_token", "kernel_work")
 
 
@@ -217,86 +220,35 @@ class EvalEngine:
         self.native.close()
 
 
-class ResidentEngine:
-    """chat-resident-v1 (docs/SERVING.md) over a native engine: the model's chat template and tokenizer from
-    crit_core.text, the model's stop tokens and sampling defaults, streamed text and Core's phase timing.
-    Configuration "chat_template_kwargs" passes variables to the chat template (for example enable_thinking)."""
+class ResidentEngine(ResidentChat):
+    """chat-resident-v1 (docs/SERVING.md) over a native engine: crit_core.serving.ResidentChat with the engine's
+    stop tokens, context and the sampling fields its info declares ("sampling": {temperature, top_p, top_k, min_p,
+    seed, penalties, logit_bias}). Configuration "chat_template_kwargs" passes variables to the chat template."""
 
     def __init__(self, context, library, defaults=None):
-        from crit_core.text import load_model_text
-        self.configuration = {**(defaults or {}), **(context.configuration or {})}
+        configuration = {**(defaults or {}), **(context.configuration or {})}
         model = Path(context.model_file("config.json")).parent
+        super().__init__(context, model, configuration=configuration)
         limits = getattr(context, "limits", {}) or {}
         native = dict(self.configuration, model=str(model))
         if limits.get("kv_tokens"):
             native["context_tokens"] = int(limits["kv_tokens"])
-        self.text = load_model_text(str(model), clock=None)
         self.native = NativeEngine(library, native)
         self.facts = self.native.info()
         self.capacity = min(int(self.facts["context"]), int(limits.get("kv_tokens") or self.facts["context"]))
         self.stop_ids = set(self.facts.get("stop_tokens") or [])
-
-    def effective_configuration(self):
-        return dict(self.configuration)
-
-    def _run(self, request, cancellation, emit=None):
-        if request.get("tools") or any(m.get("tool_calls") or m["role"] == "tool" for m in request["messages"]):
-            raise ValueError("Native tool calling needs a model-specific resident adapter and output parser")
-        messages = request["messages"]
-        ids = self.text.encode_chat(messages, add_generation_prompt=True,
-                                    **(self.configuration.get("chat_template_kwargs") or {}))
-        limits = request.get("limits", {})
-        output_tokens = int(limits.get("max_output_tokens") or 1024)
-        if len(ids) + output_tokens > min(int(limits.get("kv_tokens") or self.capacity), self.capacity):
-            raise ValueError(f"prompt of {len(ids)} tokens plus {output_tokens} output tokens exceeds the context")
-        stream, pieces = self.text.text_stream(ids), []
-
-        def on_tokens(tokens):
-            delta = stream.push([t for t in tokens if t not in self.stop_ids])
-            if delta.text:
-                pieces.append(delta.text)
-                if emit:
-                    emit(delta.text)
-
-        sampling = dict(request.get("sampling") or {})
         support = self.facts.get("sampling") or {}
-        for key in sampling:
-            flag = "penalties" if key in {"repetition_penalty", "presence_penalty", "frequency_penalty"} else key
-            if not support.get(flag):
-                raise ValueError("Native engine does not support requested sampling option: " + key)
-        tokens, result = self.native.generate(ids, output_tokens, on_tokens=on_tokens, sampling=sampling,
-                                              cancelled=lambda: cancellation.is_set())
+        self.sampling = tuple(key for key in SAMPLING if support.get(PENALTY if key in PENALTIES else key))
+
+    def generate_tokens(self, ids, max_new_tokens, sampling, on_tokens, cancelled):
+        tokens, result = self.native.generate(ids, max_new_tokens, on_tokens=on_tokens, sampling=sampling,
+                                              cancelled=cancelled)
         if tokens is None:
-            cancellation.check()
-            raise RuntimeError("generation cancelled")
-        tail = stream.finish()
-        if tail.text:
-            pieces.append(tail.text)
-            if emit:
-                emit(tail.text)
-        timing, n = result["timing"], len(tokens)
-        telemetry = {"prompt_tokens": len(ids), "output_tokens": n,
-                     "prefill_tokens": timing["prefill_tokens"] - timing["reused_prompt_tokens"],
-                     "prefill_ms": timing["prefill_ms"],
-                     "decode_tokens": n - 1 if n > 1 else None, "decode_ms": timing["decode_ms"] if n > 1 else None,
-                     "ttft_ms": timing["first_token_ms"], "missing": {}}
-        if n <= 1:
-            telemetry["missing"]["decode"] = "the reply has a single token"
-        return "".join(pieces), telemetry
-
-    def _response(self, request, text, telemetry):
-        return {"schema_version": 1, "record_kind": "chat_response", "request_id": request["request_id"],
-                "candidate_id": request["candidate_id"], "package_sha256": request["package_sha256"],
-                "assistant": text, "telemetry": telemetry}
-
-    def generate(self, request, cancellation):
-        return self._response(request, *self._run(request, cancellation))
-
-    def generate_stream(self, request, cancellation, emit):
-        return self._response(request, *self._run(request, cancellation, emit))
-
-    def reset(self):
-        pass
+            return None, {}
+        timing = result["timing"]
+        return tokens, {"prefill_tokens": timing["prefill_tokens"] - timing["reused_prompt_tokens"],
+                        "prefill_ms": timing["prefill_ms"], "decode_ms": timing["decode_ms"],
+                        "first_token_ms": timing["first_token_ms"]}
 
     def close(self):
         self.native.close()
@@ -310,4 +262,5 @@ def resident_engine(context, library, defaults=None):
     return ResidentEngine(context, library, defaults)
 
 
-__all__ = ["NativeEngine", "NativeError", "EvalEngine", "ResidentEngine", "eval_engine", "resident_engine"]
+__all__ = ["NativeEngine", "NativeError", "EvalEngine", "ResidentEngine", "chat_prompt", "eval_engine",
+           "resident_engine"]

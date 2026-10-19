@@ -56,12 +56,14 @@ class ResidentRuntime:
                     raise
                 time.sleep(.005)
 
-    def call(self, action, payload, stop, timeout, progress=None, request=None, progress_tools=None):
+    def call(self, action, payload, stop, timeout, progress=None, request=None, progress_tools=None,
+             progress_reasoning=None):
         self.start()
         cid = uuid.uuid4().hex
         stream_path = self.root / "stream.json"
         stream = (StreamReader(stream_path, cid, self.ownership.token, request, progress or (lambda text: None),
-                               progress_tools) if progress or progress_tools else None)
+                               progress_tools, progress_reasoning)
+                  if progress or progress_tools or progress_reasoning else None)
         result = self._call(cid, action, payload, stop, timeout, stream)
         # Completion proves producer settlement. On an exception the owner
         # retires the host, then close()/recovery removes this private snapshot.

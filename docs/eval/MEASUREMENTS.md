@@ -109,7 +109,11 @@ lower drift than needed is not a gain.
 The **reference** runs the model's official `transformers` code with FP32 activations, no TF32,
 and stored weights dequantized exactly (unquantized, FP8 E4M3 with channel or tensor scales,
 NVFP4), streaming layers onto the GPU one at a time. The long prompts use the same arithmetic in
-blocks of 256 query rows, since a mask and score matrix over 32K tokens would not fit.
+blocks of 256 query rows, since a mask and score matrix over 32K tokens would not fit. Mamba-2
+mixers take the dt limit config.json declares (`time_step_limit`, usually [0, inf]) as the
+model's own kernels do; some transformers mixers clamp dt at `time_step_min` instead,
+which makes long-memory heads forget (retrieval fails beyond about 64K tokens) and reads as
+drift against an engine that follows the config.
 
 ## Exactness
 

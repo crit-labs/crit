@@ -67,4 +67,11 @@ MappedSpan cuda_map_host(std::shared_ptr<CudaBackend> backend, void* host, std::
     return {reinterpret_cast<std::uintptr_t>(host), reinterpret_cast<std::uintptr_t>(device), bytes, owner};
 }
 std::size_t quarantined_cuda_mappings() noexcept { return mapping_quarantine.load(std::memory_order_relaxed); }
+MappedSpan cuda_pin_host_block(std::shared_ptr<CudaBackend> backend, HostBlock& block, int touch_threads) {
+    if(block.attached()) throw std::invalid_argument("cuda_pin_host_block: block already pinned");
+    MappedSpan span = cuda_map_host(std::move(backend), block.data(), block.size());
+    block.attach(span.owner);
+    if(touch_threads > 0) block.touch(touch_threads);
+    return span;
+}
 }

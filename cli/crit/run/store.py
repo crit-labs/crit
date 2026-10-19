@@ -87,6 +87,26 @@ def copy_package(source, destination, rows, retained_source, source_rows):
     shutil.copytree(source, destination, copy_function=copy)
 
 
+def serving_gaps(capabilities, model_path):
+    """What a chat-resident-v1 package leaves out that crit serve clients rely on: per-request temperature, and
+    tool calls when the model's chat template teaches a call format crit parses."""
+    if not isinstance(capabilities, list) or "chat-resident-v1" not in capabilities:
+        return []
+    gaps = []
+    if "chat-sampling-temperature-v1" not in capabilities:
+        gaps.append("it must apply a request's temperature and declare chat-sampling-temperature-v1")
+    if not {"chat-tools-v1", "chat-tool-template-v1"} & set(capabilities) and Path(model_path).is_dir():
+        from crit_core.text import template_sources, templates_tool_format
+        try:
+            taught = templates_tool_format(template_sources(Path(model_path)).values())
+        except Exception:
+            taught = None
+        if taught:
+            gaps.append("the model's chat template teaches tool calls, so it must render tools, parse the calls and "
+                        "declare chat-tools-v1")
+    return gaps
+
+
 class RunStore:
     def __init__(self, root, project=ROOT):
         self.project = Path(project).resolve()
@@ -443,7 +463,8 @@ class RunStore:
                 raise
             write_json(folder / "source.manifest.json", source_manifest, immutable=True)
             write_json(folder / "candidate.json", value, immutable=True)
-            (root / "work" / candidate_id).mkdir()
+            # The agent may have prepared the candidate's work folder before creating it.
+            (root / "work" / candidate_id).mkdir(exist_ok=True)
             self._refresh(root, candidate_id)
             self._state(root)
             self._event(root, "candidate_created", candidate_id, detail={"parent_candidate_id": value["parent_candidate_id"], "rationale": value["rationale"]})
@@ -471,6 +492,10 @@ class RunStore:
             rows = inventory(source)
             if any(r["path"] == "manifest.json" for r in rows):
                 raise ValueError("Package input must not contain coordinator manifest.json")
+            gaps = serving_gaps(recipe.get("capabilities"), run["spec"]["model_path"])
+            if gaps:
+                raise ValueError("The resident chat adapter is incomplete: " + "; ".join(gaps)
+                                 + ". crit_core.serving.ResidentChat provides all of it (docs/SERVING.md)")
             # The package carries the candidate's configuration so exports and launches
             # can read it; a supplied copy must be exactly that configuration.
             supplied = source / "configuration.json"

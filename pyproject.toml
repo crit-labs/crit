@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crit"
-version = "0.2.1"
+version = "0.2.2"
 description = "crit: inference runtime, reusable techniques, kernel discovery, evaluation and an OpenAI-compatible serving API"
 readme = "README.md"
 license = "Apache-2.0"
@@ -21,3 +21,6 @@ crit = "crit.cli:main"
 [tool.setuptools.packages.find]
 where = ["cli", "api", "eval", "kernels", "models", "core/python"]
 include = ["crit*", "crit_api*", "crit_eval*", "crit_kernels*", "crit_models*", "crit_core*"]
+
+[tool.setuptools.package-data]
+crit_core = ["model/config_keys.json"]

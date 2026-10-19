@@ -8,6 +8,7 @@
 #include <crit/device_graph.h>
 #include <crit/device_memory.h>
 #include <crit/file.h>
+#include <crit/host_block.h>
 #include <crit/host_memory.h>
 #include <crit/json.h>
 #include <crit/model_config.h>
@@ -174,6 +175,14 @@ void check_host_memory() {
     require(admission.admitted, "host_memory.h: zero demand is admitted");
 }
 
+// crit/host_block.h
+void check_host_block() {
+    cc::HostBlockPool pool;
+    bool reused = true;
+    const auto block = pool.acquire("weights", 4096, true, &reused, "checkpoint");
+    require(!reused && block->size() == 4096 && pool.cached_bytes() == 4096, "host_block.h: pool allocates and caches");
+}
+
 // crit/safetensors.h
 void check_safetensors(const std::filesystem::path& directory) {
     const std::string header = R"({"w":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}})";
@@ -237,6 +246,7 @@ int main() {
         check_state();
         check_json();
         check_host_memory();
+        check_host_block();
         check_trace();
         check_device_graph();
         check_device_memory();

@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from . import CONTRACT, EVAL_DIR, load_json, write_json
+from .hostload import HostLoad
 from . import headroom, metrics, status
 from .ceiling import model_ceiling
 from .context import (GIB, curve_points, filled_prompt, lower_context, max_context, retrieval_points, retrieval_prompt,
@@ -100,15 +101,17 @@ class Disturbed(Exception):
 DISTURBED_MIN_REQUEST_MS = 100  # shorter requests vary with timer and scheduler jitter, not with the device
 
 
-def check_disturbed(case_id, samples, limit):
+def check_disturbed(case_id, samples, limit, other_cores=None):
     """Raise Disturbed when the measured decode speeds of one case spread (max - min over the median) by more
-    than `limit`. Quiet rounds recorded at most about 10%; a disturbed one 37%."""
+    than `limit`. Quiet rounds recorded at most about 10%; a disturbed one 37%. other_cores: CPU cores other
+    processes kept busy during the case (HostLoad), named in the message."""
     measured = [s for s in samples if not s.get("warmup")]
     if not limit or not measured or metrics.median([s["request_ms"] for s in measured]) < DISTURBED_MIN_REQUEST_MS:
         return
     spread = headroom.spread([s["decode_tps"] for s in measured if s.get("decode_tps")])
     if spread is not None and spread > limit:
-        raise Disturbed(f"speed {case_id}: decode varied {spread:.0%} between repetitions (limit {limit:.0%}); "
+        load = f"; other processes kept {other_cores:.1f} CPU cores busy" if other_cores is not None else ""
+        raise Disturbed(f"speed {case_id}: decode varied {spread:.0%} between repetitions (limit {limit:.0%}){load}; "
                         "the device was disturbed. Measure again when nothing else uses it")
 
 
@@ -145,6 +148,7 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
             log(f"speed {case['id']}: skipped (context)")
             continue
         samples, outputs = [], []
+        load = HostLoad().start()
         continuation = pinned.get(case["id"])
         if pinned and (continuation is None or len(continuation) != n):
             raise SystemExit(f"{CONTINUATIONS} has no {n}-token continuation for speed case {case['id']}")
@@ -163,7 +167,8 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
                 samples.append(sample)
                 if i >= warmups:
                     outputs.append(tokens)
-        check_disturbed(case["id"], samples, disturbed_spread)
+        other = load.cores()
+        check_disturbed(case["id"], samples, disturbed_spread, other)
         summary = _summary([s for s in samples if not s["warmup"]])
         crossed = [i for i, t in enumerate(outputs[0]) if t in stop_ids]
         cases[case["id"]] = {
@@ -171,11 +176,14 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
             "repeatable": all(o == outputs[0] for o in outputs),
             "stop_crossed": bool(crossed), "first_stop_index": crossed[0] if crossed else None,
             "tokens": outputs[0], "samples": samples,
+            # CPU cores other processes kept busy during the case: engines computing on the host slow down with them.
+            "host_other_cpu_cores": None if other is None else round(other, 2),
         }
         log(f"speed {case['id']}: decode {summary['decode_tps']:.1f} tok/s"
             + (" (pinned continuation)" if continuation is not None else "")
             + f", prefill {summary['prefill_tps']:.0f} tok/s, tokens/round {summary['tokens_per_round'] or 0:.2f}, "
-            f"round {summary['round_ms'] or 0:.2f} ms")
+            f"round {summary['round_ms'] or 0:.2f} ms"
+            + (f", other processes {other:.1f} CPU cores" if other is not None and other >= 0.5 else ""))
     measured = [c for c in cases.values() if c["status"] == "measured"]
     prefill = [cases[i]["prefill_tps"] for i in protocol["speed"].get("prefill_cases", [])
                if cases.get(i, {}).get("status") == "measured" and cases[i].get("prefill_tps")]
@@ -518,7 +526,9 @@ def compare_lower(at_max, at_lower, lower, settings):
         row = {"decode_tps": low["decode_tps"], "decode_tps_at_required": high["decode_tps"],
                "ttft_ms": low["ttft_ms"], "ttft_ms_at_required": high["ttft_ms"],
                "decode_tolerance": max(float(settings["tolerance"]), _spread(high, "decode_tps"), _spread(low, "decode_tps")),
-               "ttft_tolerance": max(float(settings["tolerance"]), _spread(high, "ttft_ms"), _spread(low, "ttft_ms"))}
+               "ttft_tolerance": max(float(settings["tolerance"]), _spread(high, "ttft_ms"), _spread(low, "ttft_ms")),
+               "host_other_cpu_cores": low.get("host_other_cpu_cores"),
+               "host_other_cpu_cores_at_required": high.get("host_other_cpu_cores")}
         row["decode_change"] = (low["decode_tps"] / high["decode_tps"] - 1
                                 if low.get("decode_tps") and high.get("decode_tps") else None)
         row["ttft_change"] = low["ttft_ms"] / high["ttft_ms"] - 1 if low.get("ttft_ms") and high.get("ttft_ms") else None

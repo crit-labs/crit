@@ -11,6 +11,7 @@ context (head, filler and fact token ids, and the text of every token for matchi
 """
 import hashlib
 import json
+import os
 from pathlib import Path
 
 from . import SUITE_DIR, write_json
@@ -19,6 +20,7 @@ from .ceiling import model_ceiling
 PREPARED = "prepared.json"
 LONG = "long.json"
 SENTINEL = "\u0000DOCUMENT\u0000"
+REPLY = "\u0000REPLY\u0000"
 
 
 def file_sha256(path):
@@ -106,15 +108,40 @@ def speed_case(model, case):
     return head_ids + document_ids[:need] + tail_ids
 
 
+def reply_opening(model, messages):
+    """The conversation rendered up to where its scored (final assistant) turn's content begins: rendered with that
+    turn's content replaced by a marker, cut at the marker. None when the template does not render the marker
+    exactly once."""
+    rendered = chat_text(model, [*messages[:-1], {"role": "assistant", "content": REPLY}], False)
+    return rendered.split(REPLY)[0] if rendered.count(REPLY) == 1 else None
+
+
+def generated_part(rendered, prompt, opening=None):
+    """The text a model generates after the generation prompt `prompt` to produce the scored turn that ends
+    `rendered` (the conversation with that turn), when `rendered` does not start with `prompt`: some templates open
+    the generation prompt with more than a rendered history turn holds (Gemma 4 adds an empty thought channel that
+    history turns strip). That is the part of `rendered` after `opening` (reply_opening) when both texts start with
+    it, so a reply that begins like the prompt's extra text keeps those characters; otherwise the part after the
+    text both share. None when they share none."""
+    if opening and rendered.startswith(opening) and prompt.startswith(opening):
+        return rendered[len(opening):]
+    common = os.path.commonprefix([rendered, prompt])
+    return rendered[len(common):] if common else None
+
+
 def quality_conversation(model, conversation):
     messages = conversation["messages"]
     if messages[-1]["role"] != "assistant":
         raise ValueError(f"{conversation['id']}: the scored turn must be the final assistant message")
     prefix = prompt_ids(model, messages[:-1])
-    full = token_ids(model, chat_text(model, messages, False).rstrip("\n"))
-    if full[:len(prefix)] != prefix:
+    text = chat_text(model, messages, False).rstrip("\n")
+    full = token_ids(model, text)
+    if full[:len(prefix)] == prefix:
+        return full, len(prefix)
+    rest = generated_part(text, chat_text(model, messages[:-1], True), reply_opening(model, messages))
+    if rest is None:
         raise ValueError(f"{conversation['id']}: the generation prompt is not a token prefix of the conversation")
-    return full, len(prefix)
+    return prefix + token_ids(model, rest), len(prefix)
 
 
 def filler_ids(model, long):
@@ -141,7 +168,11 @@ def prefill_decode_sequence(model, conversation, long, filler, prompt_tokens):
         raise ValueError(f"{conversation['id']}: the generation prompt and the conversation render differently before the filler")
     head_ids, tail_ids, rest_ids = token_ids(model, head), token_ids(model, tail), token_ids(model, rest)
     if rest_ids[:len(tail_ids)] != tail_ids:
-        raise ValueError(f"{conversation['id']}: the generation prompt is not a token prefix of the conversation")
+        opening = reply_opening(model, messages)
+        generated = generated_part(rest, tail, opening.split(SENTINEL)[1] if opening and SENTINEL in opening else None)
+        if generated is None:
+            raise ValueError(f"{conversation['id']}: the generation prompt is not a token prefix of the conversation")
+        rest_ids = tail_ids + token_ids(model, generated)
     need = prompt_tokens - len(head_ids) - len(tail_ids)
     if need <= 0:
         raise ValueError(f"{conversation['id']}: {prompt_tokens} prompt tokens leave no room for the filler")

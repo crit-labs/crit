@@ -130,7 +130,12 @@ naming the file on any mismatch.
 `load_model_config(dir_or_file, limits)` reads `config.json` as strict JSON except
 that `NaN`/`Infinity` load, as transformers writes them. Fields read the text
 section: a `text_config` key wins over the root's, and `null` hides the root
-value. Known keys with the wrong type throw `FormatError` "key 'x': ...";
+value. Without `text_config`, an `llm_config` object (multimodal wrappers such as
+NemotronH_Omni) is the text section. Which keys spell a field, in the order they are
+tried, comes from one table both readers share,
+[config_keys.json](../../python/crit_core/model/config_keys.json): CMake generates the C++
+arrays from it and `crit_core.model.config` loads it. A model family that spells a field
+its own way gets a key there, not a branch in either reader. Known keys with the wrong type throw `FormatError` "key 'x': ...";
 booleans never count as numbers and reals never as integers. Typed fields refuse
 non-finite numbers and integers beyond 64 bits; unread keys may hold anything.
 
@@ -142,7 +147,8 @@ non-finite numbers and integers beyond 64 bits; unread keys may hold anything.
 | `rms_norm_eps` | first of `rms_norm_eps`, `layer_norm_eps`, `layer_norm_epsilon` |
 | `dtype` | `dtype`, else `torch_dtype` |
 | `rope` | `rope_scaling`, else `rope_parameters`; `rope_theta`; per-layer-type entries in `rope_by_layer_type` |
-| `sliding_window`, `full_attention_interval`, `layer_types`, `tie_word_embeddings`, `num_nextn_predict_layers` | same names |
+| `sliding_window`, `full_attention_interval`, `tie_word_embeddings`, `num_nextn_predict_layers` | same names |
+| `layer_types` | `layer_types`, else `layers_block_type` (`mamba` and `moe` layers read as other kinds; without `num_hidden_layers` its length is the layer count, `layer_count_from`) |
 | `moe` | `num_experts`/`num_local_experts`/`n_routed_experts` and the routing keys |
 | `mla` | positive `kv_lora_rank` with its head dims |
 | `linear` | `linear_*` head and kernel keys |

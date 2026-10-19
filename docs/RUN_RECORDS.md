@@ -108,7 +108,7 @@ generates it); crit writes `configuration.json` when absent, and a supplied one 
 equal the configuration. On POSIX, files identical to retained source are hard-linked,
 so changing either fails verification. Keep dependencies, notices and build inputs in
 the package. Serving capabilities (`chat-json-v1`, `chat-resident-v1`, optional
-`chat-stream-v1`, `chat-config-v1`, `chat-constraints-v1`) are in
+`chat-stream-v1`, `chat-tools-v1`, `chat-config-v1`, `chat-constraints-v1`) are in
 [Serving](SERVING.md#adapter-contract).
 
 ### Attempt result
@@ -175,7 +175,9 @@ required cases, not the fastest series. Served request timing never enters proje
 `{"ids": [token ids]}` in its manifest (the workload's `prompt_tokens` long). The first
 candidate measured pins its plain greedy output of every case as `pins/CASE.json`, when
 two runs give the same text (otherwise the case stays unpinned until a later candidate
-repeats). Every later measurement of any candidate decodes that text through the
+repeats). Pinning runs a non-speculative engine in its own process, which exits before the
+measured engine loads, so an engine whose weights live in host memory never holds two copies.
+Every later measurement of any candidate decodes that text through the
 adapter's `replay` when it declares one, so speculative candidates are compared on the
 same tokens and drafts. Without `replay` or a pin, a candidate decodes its own text, and
 `extensions.decode_text` records which and why. Times are host-observed from token delivery, as

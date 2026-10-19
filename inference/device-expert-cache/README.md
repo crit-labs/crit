@@ -28,6 +28,18 @@ same victims as a serial scan). The victim is remapped and pinned and a copy job
 Because hits are pinned first, a miss never evicts a bundle the same layer reads. A
 copy kernel moves the bundles and the expert arithmetic reads `uses[i].bundle`.
 
+**Lent capacity.** Device memory a request cannot use can hold slots: KV-cache
+positions beyond the request's length (revalidated when a request begins) and the
+prompt workspace between prompts (invalidated while a prompt chunk runs). The gain
+grows with the context the engine is built for and shrinks as requests fill it, so
+size it from the engine's own KV capacity and workspace, not a fixed slot count. Keep
+both kinds out of a prompt's plans while the memory is in use, and never let a lent
+slot back a key the current pass reads. Expert residency's
+[slot loans](../expert-residency/README.md#lending-owner-memory-to-the-cache) give the owner
+that reclaim lifecycle on the host. (For scale only: one engine on a 32 GB GPU
+with a 1M-token FP8 KV cache gained about 1,500 and 2,300-2,900 slots next to
+3,000-5,000 owned ones.)
+
 **Lookahead prefetch.** The next group's router applied to the current input predicts
 many of its experts. A prefetch plan tags a pool half (by group parity, so the half
 being filled is never the one consumed) with nonresident predictions and writes

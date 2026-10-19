@@ -117,6 +117,18 @@ def main(argv=None):
     kernels.add_argument("--context", type=int, metavar="TOKENS", help="Context the engine is built for (the run's kv_tokens)")
 
     args = parser.parse_args(argv)
+    if args.command in ENGINE_COMMANDS:
+        from crit_core.machine import engine_lock
+        with engine_lock(f"crit eval {args.command}"):
+            return _command(args)
+    return _command(args)
+
+
+# Commands that load an engine or the reference model: one at a time per machine (crit_core.machine).
+ENGINE_COMMANDS = {"run", "pin", "ab", "kernels", "reference"}
+
+
+def _command(args):
     if args.command == "kernels":
         from . import load_json as load
         from .kernels import render as render_kernels, trace

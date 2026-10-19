@@ -1,6 +1,7 @@
 // Core shared device allocation protocol on the host: leases charged once through Resources, settled final
 // release with failure retention, and mapped-source resolution. Backend hooks are host fakes; no device call.
 #include <crit/device_memory.h>
+#include <crit/host_block.h>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -188,6 +189,54 @@ void mapped_generations() {
 }
 }
 
+// HostBlock: page-aligned, writable, touched; the pool reuses a matching block and drops a mismatched one before
+// the caller allocates, never freeing a block a live holder still uses.
+void host_block_pool() {
+    HostBlock block(3 * 4096 + 17);
+    require(block.size() == 3 * 4096 + 17 && reinterpret_cast<std::uintptr_t>(block.data()) % 4096 == 0, "page aligned");
+    block.data()[block.size() - 1] = std::byte{7};
+    block.touch(3);
+    require(!block.attached(), "fresh block attached");
+    bool destroyed = false;
+    block.attach(std::shared_ptr<const void>(&destroyed, [](const void* p) { *static_cast<bool*>(const_cast<void*>(p)) = true; }));
+    require(block.attached(), "attachment");
+    {
+        HostBlock scoped(4096);
+        scoped.attach(std::shared_ptr<const void>(&destroyed, [](const void* p) { *static_cast<bool*>(const_cast<void*>(p)) = true; }));
+    }
+    require(destroyed, "attachment released with the block");
+    rejects<std::invalid_argument>([] { HostBlock empty(0); }, "needs a size");
+
+    HostBlockPool pool;
+    bool reused = true;
+    auto a = pool.acquire("model/experts", 8192, true, &reused);
+    require(!reused && pool.cached_bytes() == 8192, "first acquire allocates and caches");
+    a->data()[0] = std::byte{42};
+    auto b = pool.acquire("model/experts", 8192, true, &reused);
+    require(reused && b == a && b->data()[0] == std::byte{42}, "matching size reuses the block");
+    std::weak_ptr<HostBlock> old = a;
+    a.reset();
+    b.reset();
+    auto c = pool.acquire("model/experts", 12288, true, &reused);
+    require(!reused && old.expired() && c->size() == 12288 && pool.cached_bytes() == 12288,
+            "a size mismatch frees the cached block before the new one");
+    auto same = pool.acquire("model/experts", 12288, true, &reused, "");
+    require(reused && same == c, "the default identity matches itself");
+    same.reset();
+    std::weak_ptr<HostBlock> stale = c;
+    c.reset();
+    c = pool.acquire("model/experts", 12288, true, &reused, "other-checkpoint");
+    require(!reused && stale.expired() && pool.cached_bytes() == 12288,
+            "another identity of the same size never reuses the cached bytes");
+    auto held = pool.acquire("model/embed", 4096, false, &reused);
+    require(!reused && pool.cached_bytes() == 12288, "keep=false does not cache");
+    pool.release("model/experts");
+    require(pool.cached_bytes() == 0 && c->size() == 12288, "release keeps bytes a holder still uses");
+    auto d = pool.acquire("k", 4096, true);
+    pool.clear();
+    require(pool.cached_bytes() == 0 && d->size() == 4096, "clear");
+}
+
 int main(int argc, char** argv) {
     try {
         const std::string test = argc > 1 ? argv[1] : "all";
@@ -196,7 +245,7 @@ int main(int argc, char** argv) {
             {"memory_settle_failure", memory_settle_failure}, {"memory_release_failure", memory_release_failure},
             {"memory_threads", memory_threads}, {"mapped_contiguous", mapped_contiguous},
             {"mapped_discontinuous", mapped_discontinuous}, {"mapped_rejects", mapped_rejects},
-            {"mapped_generations", mapped_generations}};
+            {"mapped_generations", mapped_generations}, {"host_block_pool", host_block_pool}};
         bool found = false;
         for(const auto& [name, run] : tests) if(test == "all" || test == name) {
             run();

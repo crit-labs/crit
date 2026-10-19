@@ -264,12 +264,20 @@ class Api:
             return "stop"
         return "length" if measured and measured["output_tokens"] >= limit else "stop"
 
-    def run(self, request, emit, cancel, emit_tools=None):
-        """Generate; emit receives text, emit_tools indexed deltas. Returns (finish_reason, measured, calls).
+    def run(self, request, emit, cancel, emit_tools=None, emit_reasoning=None):
+        """Generate; emit receives text, emit_tools indexed deltas, emit_reasoning reasoning text (apart from the
+        reply). Returns (finish_reason, measured, calls, reasoning).
         Stop strings follow
         Core's rule (crit_core.text.StopMatcher): the first stop to complete wins, and only text that could still
         begin a stop is held back."""
         scanner = StopMatcher(request["stop"])
+        streamed = []
+
+        def reasoned(text):
+            streamed.append(text)
+            if emit_reasoning:
+                emit_reasoning(text)
+
         def progress(text):
             piece = scanner.advance(text)
             if piece:
@@ -285,12 +293,19 @@ class Api:
                                                                candidate_id=request["candidate"],
                                                                response_format=request.get("response_format"),
                                                                sampling=request["sampling"], tool_options=request["tool_options"],
-                                                               on_tools=emit_tools if tool_incremental else None)
+                                                               on_tools=emit_tools if tool_incremental else None,
+                                                               on_reasoning=reasoned if request["stream"] else None)
         except (ValueError, OSError) as exc:
             raise EngineError(str(exc)) from exc
         if status == "completed":
             calls = assistant.get("tool_calls") if isinstance(assistant, dict) else None
+            reasoning = assistant.get("reasoning", "") if isinstance(assistant, dict) else ""
             assistant = assistant["content"] if isinstance(assistant, dict) else assistant
+            sent = "".join(streamed)
+            if not reasoning.startswith(sent):
+                raise EngineError("The engine's reasoning does not extend its streamed reasoning")
+            if emit_reasoning and reasoning != sent:
+                emit_reasoning(reasoning[len(sent):])
             try:
                 piece = scanner.advance(assistant, final=True)
             except TextError as exc:
@@ -306,10 +321,10 @@ class Api:
             if calls:
                 if emit_tools and not tool_incremental:
                     emit_tools([dict(call, index=i) for i, call in enumerate(calls)])
-                return "tool_calls", measured, calls
-            return finish, measured, []
+                return "tool_calls", measured, calls, reasoning
+            return finish, measured, [], reasoning
         if scanner.stopped is not None:
-            return "stop", None, []
+            return "stop", None, [], "".join(streamed)
         if status == "timed_out":
             raise EngineError("The engine did not finish within the request timeout", 504)
         raise EngineError("Request cancelled", 499)
@@ -415,7 +430,7 @@ class Handler(BaseHTTPRequestHandler):
     def complete(self, request):
         pieces = []
         try:
-            finish, measured, calls = self.api.run(request, pieces.append, threading.Event())
+            finish, measured, calls, reasoning = self.api.run(request, pieces.append, threading.Event())
         except EngineError as exc:
             return self.error(exc.status, str(exc), "server_error" if exc.status >= 500 else "invalid_request_error")
         value = {"id": "chatcmpl-" + uuid.uuid4().hex, "object": "chat.completion", "created": int(time.time()),
@@ -424,6 +439,8 @@ class Handler(BaseHTTPRequestHandler):
                               "logprobs": None, "finish_reason": finish}]}
         if calls:
             value["choices"][0]["message"].update(content="".join(pieces) or None, tool_calls=calls)
+        if reasoning:
+            value["choices"][0]["message"]["reasoning_content"] = reasoning
         usage = self.api.usage(measured)
         if usage:
             value["usage"] = usage
@@ -462,8 +479,9 @@ class Handler(BaseHTTPRequestHandler):
 
         event(chunk({"role": "assistant", "content": ""}))
         try:
-            finish, measured, _ = self.api.run(request, lambda piece: event(chunk({"content": piece})), cancel,
-                lambda deltas: event(chunk({"tool_calls": deltas})))
+            finish, measured, _, _ = self.api.run(request, lambda piece: event(chunk({"content": piece})), cancel,
+                lambda deltas: event(chunk({"tool_calls": deltas})),
+                lambda piece: event(chunk({"reasoning_content": piece})))
         except EngineError as exc:
             event({"error": {"message": str(exc), "type": "server_error", "param": None, "code": None}})
         else:

@@ -9,6 +9,78 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-19
+
+### Overview
+
+crit 0.2.2 makes serving one shared path for every engine. `crit_core.serving.ResidentChat`
+renders the chat template, parses tool calls in the syntax the template teaches (or one the
+engine package supplies), returns reasoning apart from the reply as `reasoning_content`, forwards
+per-request sampling and streams, so an engine supplies only its token generator and gets every
+serving fix without changes. Engines whose weights live in host memory get Core's `HostBlock`
+and a machine-wide engine lock that also covers Windows and WSL together, and Inference gains
+entries for host work inside captured graphs and bit-exact NVFP4 experts on the CPU. Config
+readers take their key spellings from one shared table, Eval classifies tensors in one place, and
+[What belongs in crit](docs/CONTRIBUTION_CRITERIA.md) states the criteria every change must meet.
+Eval data prepared for 0.2.1 stays valid; references for Mamba-2 models must be built again (they now
+follow the model's own time-step limit). The Python distribution and the Core SDK share version
+0.2.2.
+
+### Added
+
+- `crit_core.serving.ResidentChat`: the shared body of a resident chat adapter (chat template,
+  tools, per-request sampling, streaming, cancellation, telemetry); an engine supplies only
+  its token generator. `crit_core.native.resident_engine` is built on it.
+- Tool calls without model-specific code in crit: ResidentChat renders tools and tool history
+  with the model's chat template and parses the calls (`crit_core.text.ToolCallParser`) in the
+  syntax the template teaches when crit registers it (Qwen3-Coder `<function=...>` and Hermes
+  JSON blocks), or in the package's own `ResidentChat.tool_format`. It declares
+  `chat-tools-v1` and streams each call as one delta. Packages that declared the interim
+  `chat-tool-template-v1` are served as `chat-tools-v1`.
+- Core `HostBlock` and `HostBlockPool` (`crit/host_block.h`) with `cuda_pin_host_block`: large host weight
+  blocks filled by the loader's threads, then pinned once and touched, and a process-wide pool that reuses a
+  block only for the same key, size and identity and frees a mismatched one before the next engine
+  allocates, so engines opened one after another never hold two copies.
+- A machine-wide engine lock (`crit_core.machine`, `CRIT_ENGINE_LOCK`): `crit eval run/pin/ab/kernels/reference`,
+  `crit run measure` and `crit serve` load one model at a time and say who holds the lock while waiting. A
+  lease in a location every OS instance reads (`CRIT_ENGINE_LEASE`) makes Windows and WSL wait for each other.
+- Eval records the CPU cores other processes kept busy during each speed case and names them in disturbed
+  and `lower_context` failures.
+- [What belongs in crit](docs/CONTRIBUTION_CRITERIA.md): the criteria every change to crit must meet.
+- Reasoning apart from the reply: ResidentChat splits a reasoning model's thinking in the markers its chat
+  template uses (`crit_core.text.reasoning`, `<think>...</think>`; a package can set its own
+  `ResidentChat.reasoning_format`), and crit serve returns it as `reasoning_content`, streamed before the
+  content. Adapters return it as the response record's optional `reasoning` and stream it as
+  `emit({"reasoning": text})`.
+- Inference entry [host-work-mailbox](inference/host-work-mailbox/README.md): host work the device posts and a
+  stream joins inside a captured graph (device-reset doorbells, release, terminal failure answering), with the
+  stream-front-end and poll-kernel waits chosen by a measured probe and an eager fallback.
+- Inference entry [host-expert-arithmetic](inference/host-expert-arithmetic/README.md): NVFP4 expert rows on the
+  CPU in a declared operation order (element-scaled or block-dot products; scalar oracle, AVX2 and AVX-512
+  paths chosen at run time) that a matching CUDA function reproduces bit for bit, with a scale-decode hook for
+  checkpoint-specific scale encodings.
+- Reverse loans in expert-residency: `SettledSlots::begin_slot_loan` lets an owner that lent its memory to the
+  expert cache (KV positions a request cannot reach, an idle prompt workspace) reclaim any set of slots with the
+  existing loan lifecycle (protected-reader refusal, survivor relocation, binding invalidation, empty return).
+
+### Changed
+
+- Both config readers take the keys that spell each field from one table,
+  `crit_core/model/config_keys.json` (CMake generates the C++ arrays), which also reads `llm_config`
+  wrappers and `layers_block_type`. Eval's ceiling and context limit classify tensors in one place
+  (`crit_eval.tensors`); results are unchanged on the checkpoints checked.
+- `crit run package` refuses a resident chat package that does not accept `temperature`, or
+  that offers no tool calls although the model's chat template teaches them.
+- `crit run measure` pins cases in a separate process that exits before the measured engine loads.
+- Eval prepare scores the turn of a template whose generation prompt holds more than a history turn (Gemma 4's
+  empty thought channel) from where that turn's content begins, so a reply that starts like the prompt's extra
+  text keeps those characters. Prepared data is unchanged for the checkpoints checked.
+- Eval's reference gives Mamba-2 mixers config.json's `time_step_limit` instead of transformers'
+  `time_step_min` clamp, which broke retrieval beyond about 64K tokens and read as drift.
+- Inference entries: exact host/device expert splits and the worker-generation race
+  (heterogeneous-expert-dispatch), lent cache capacity (device-expert-cache), W4A4 prompt GEMMs from
+  calibrated input scales (quantized-projections), each stated as a rule to measure on the target machine.
+
 ## [0.2.1] - 2026-10-18
 
 ### Overview
@@ -231,7 +303,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/crit-labs/crit/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/crit-labs/crit/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/crit-labs/crit/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/crit-labs/crit/releases/tag/v0.1.0

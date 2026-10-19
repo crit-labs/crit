@@ -23,7 +23,7 @@ from pathlib import Path
 
 from crit_core.model import CONFIG_NAME, inspect_model, inspect_safetensors, load_model_config, parse_model_config
 
-SKIP = ("embed_tokens", "visual", "vision", "lm_head", "mtp")
+from .tensors import DRAFT, tensor_role
 
 
 def model_config(model):
@@ -43,31 +43,37 @@ def weight_shards(model, drafts=False):
         return []
     shards = list(inspect_model(model).shards)
     if not drafts:
-        return [shard for shard in shards if "mtp" not in shard.path.name]
+        return [shard for shard in shards if DRAFT not in shard.path.name]
     named = {shard.path.name for shard in shards}
     # Draft layers sometimes ship beside the index in their own file.
     return shards + [inspect_safetensors(path) for path in sorted(model.glob("*mtp*.safetensors"))
                      if path.name not in named]
 
 
-def weight_bytes(tensors):
-    """Bytes of the tensors one forward pass reads (embedding rows are gathered, so excluded).
-    tensors: {name: crit_core.model.TensorInfo} of one file."""
-    return sum(t.nbytes for name, t in tensors.items()
-               if not any(s in name for s in ("embed_tokens", "visual", "vision", "mtp")))
+def _read(role):
+    # A pass of the language model reads its layers, experts and head; embedding rows are gathered.
+    return role.kind in ("layer", "expert", "head") and not role.draft
 
 
-def matmul_flops(tensors):
+def weight_bytes(tensors, file_name=""):
+    """Bytes of the tensors one forward pass reads (crit_eval.tensors: layers, experts and the output head, not
+    embeddings, other modalities or draft layers). tensors: {name: crit_core.model.TensorInfo} of one file."""
+    return sum(t.nbytes for name, t in tensors.items() if _read(tensor_role(name, file_name)))
+
+
+def matmul_flops(tensors, file_name=""):
     """FLOPs per token by stored weight format, and how many matrices each format has, over one file's
-    {name: TensorInfo}."""
+    {name: TensorInfo}. The output head is left out (one row of logits per prompt)."""
     flops, matrices = {}, {}
     for name, tensor in tensors.items():
-        if any(s in name for s in SKIP) or len(tensor.shape) != 2:
+        role = tensor_role(name, file_name)
+        if not _read(role) or role.kind == "head" or len(tensor.shape) != 2:
             continue
         rows, cols = tensor.shape
         fmt = None
-        if name.endswith(".weight_packed") and tensor.dtype == "U8":
-            scale = tensors.get(name[:-len("weight_packed")] + "weight_scale")
+        if (name.endswith(".weight_packed") or name.endswith(".weight")) and tensor.dtype == "U8":
+            # compressed-tensors (weight_packed) or ModelOpt (weight) NVFP4: packed E2M1 with E4M3 group-16 scales
+            scale = tensors.get(name[:-len("weight_packed" if name.endswith("_packed") else "weight")] + "weight_scale")
             if scale and scale.dtype == "F8_E4M3" and scale.shape[-1] * 16 == cols * 2:
                 fmt, cols = "nvfp4", cols * 2
         elif name.endswith(".weight"):
@@ -86,8 +92,8 @@ def model_ceiling(model):
     flops, matrices, read = {}, {}, 0
     for shard in shards:
         tensors = {tensor.name: tensor for tensor in shard.tensors}
-        read += weight_bytes(tensors)
-        f, m = matmul_flops(tensors)
+        read += weight_bytes(tensors, shard.path.name)
+        f, m = matmul_flops(tensors, shard.path.name)
         for key in f:
             flops[key] = flops.get(key, 0) + f[key]
             matrices[key] = matrices.get(key, 0) + m[key]

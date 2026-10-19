@@ -38,7 +38,7 @@ current generation.
 | --- | --- | --- |
 | [`ExpertCache`](code/implementation.py) | Byte-bounded ready-object cache, acquisition-order eviction, leases and deferred-use receipts | `load(key, nbytes)` returning a ready owner; safe physical release; teardown |
 | [`BundleDirectory`](code/implementation.py) | Fixed-slot complete-bundle metadata, pinned uses, upload tickets, component validation, source retention and ordered publication | Reserved backing buffers, copies, completion receipts, native visibility and recovery |
-| [`crit::techniques::SettledSlots`](code/settled_slots.h) | C++ fixed-slot directory, content generations, protected uses and temporary region loans with transactional relocation | Slot geometry, reserved backing, physical completion, transfers and loan policy |
+| [`crit::techniques::SettledSlots`](code/settled_slots.h) | C++ fixed-slot directory, content generations, protected uses, temporary region loans with transactional relocation, and slot loans by which owners reclaim memory lent to the cache | Slot geometry, reserved backing, physical completion, transfers and loan policy |
 | [`planning.py`](code/planning.py) | Phase-aware admission, compatible-layout bank sizing, dual-contiguous copy runs and demand/cost observations | Allocation, directory integration, exact fallback, native copies/projections and measured costs |
 
 `ExpertCache` capacity is in bytes; the two directories use slot counts. Neither
@@ -113,6 +113,28 @@ cmake -S inference -B build/inference
 cmake --build build/inference --config Release --target crit_cache_loan_example
 ctest --test-dir build/inference -C Release -R crit_cache_loan_example --output-on-failure
 ```
+
+### Lending owner memory to the cache
+
+The reverse direction uses the same lifecycle. Memory another owner reserved but cannot use right now can
+hold cache slots, and the owner reclaims it before writing. Examples are KV positions beyond the longest
+request in flight and a prompt workspace between prompts. Build the directory over all slots, its own and
+the lent ones. The directory is address-agnostic, and the engine keeps each slot's address. The owner holds a
+loan while it uses its memory:
+
+1. Before the owner writes, for example when a request begins and reaches those positions or a prompt pass
+   starts, it calls `begin_slot_loan(slots, relocations)`. The slots can be any set and need not be adjacent.
+   Their contents are evicted, and protected readers or uploads reject the whole loan, so settle them and
+   retry. Optional survivors move to free slots with the same relocation protocol.
+2. `activate_loan`. The owner's writers register with `acquire_loan`. A slot loan has no `extent`, because
+   the owner addresses its own memory.
+3. When the owner is done (the request ends, the prompt pass finishes), call `begin_return`, settle the
+   writers, then `reclaim_loan`. The slots come back EMPTY, never with old contents.
+
+Every transition invalidates `binding()`. A device directory that reads a per-slot valid flag on each replay,
+as [device-expert-cache](../device-expert-cache/README.md) does, mirrors `on_loan(slot)` into it: it clears the flag and settles
+its readers before the owner's first write is enqueued. It sets the flag again only after `reclaim_loan`. The
+owner keeps the memory charged once; the cache gains logical capacity, not memory.
 
 ### Bundle publication
 
@@ -215,7 +237,11 @@ protected hits, pending reads, failed enqueue/copy and abandoned replacements.
 The [settled-slot fixture](../../tests/inference/settled_slots_tests.cpp) checks
 slot metadata, receipt identity, fragmented and protected regions, overlapping
 loans, stale identities, partial relocation failure, cancellation and binding
-invalidation over 1,250 loan/return cycles. Planner fixtures check admission
+invalidation over 1,250 loan/return cycles, and reverse loans: scattered slot loans, a live reader blocking a
+reclaim until it settles, a survivor relocated out of reclaimed owner memory, empty return and 500 repeated
+requests. In one MoE engine that lends unreachable KV positions and its prompt workspace, holding those as slot
+loans (one per request, one per prompt pass) and mirroring `on_loan` into its device valid flags gave
+token-identical output at unchanged speed. Planner fixtures check admission
 boundaries, bank grouping, guards, alignment and copy-range parity; run the bank
 example with `python -B code/example.py` from this entry's directory. Validate a
 combined engine on all-hit, all-miss, mixed and repeated routes, slot pressure with

@@ -35,8 +35,10 @@ def _candidate(store, run_id, candidate_id):
 
 
 def warn_exploratory(store, run_id, candidate_id, benchmark_id):
-    """A benchmark that does not qualify keeps the candidate ineligible; say so when it is recorded."""
-    candidate = _candidate(store, run_id, candidate_id)
+    """A benchmark that does not qualify keeps the candidate ineligible; say so when it is recorded. The run view
+    shows every series of an unsealed candidate as exploratory, so read the candidate's own projection."""
+    path = safe_path(store.directory(run_id), f"candidates/{candidate_id}/telemetry.json")
+    candidate = read_json(path) if path.is_file() else _candidate(store, run_id, candidate_id)
     series = next((s for s in (candidate or {}).get("series", []) if s["benchmark_id"] == benchmark_id), None)
     if series and series["qualification"] != "qualified":
         print(f"warning: {benchmark_id} is exploratory and cannot make {candidate_id} eligible: {exploratory_reason(series)}",

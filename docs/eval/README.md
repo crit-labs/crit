@@ -59,6 +59,9 @@ prepared for an earlier protocol (before `crit-eval-v4`) has no long prompts: pr
 into a new directory, then build its reference and pin it again. Keep
 data, references and results outside product folders, for example in the run's workspace.
 Reference generation needs a compatible CUDA GPU; the engine under test can be CPU or GPU.
+`reference`, `pin`, `run`, `ab` and `kernels` take the machine's engine lock, shared with `crit run measure` and
+`crit serve`: one model-loading process at a time, the others wait and say who holds it
+([SERVING.md](../SERVING.md#start-the-server)).
 
 ## Results and status
 
@@ -83,7 +86,10 @@ A round stops early when a speed case's measured decode speeds spread by more th
 `disturbed_spread` (25%; quiet engines stay near 10% at most): something else was using the device.
 The result keeps what was measured, with `aborted` and no status, and `run` exits with code 3.
 Measure again when the device is quiet; `--keep-disturbed` finishes the round anyway. Requests
-shorter than 100 ms are not judged, since timer jitter dominates them.
+shorter than 100 ms are not judged, since timer jitter dominates them. Each speed case records
+`host_other_cpu_cores`, the CPU cores other processes kept busy while it ran (host busy time minus
+Eval's own process); the disturbed message and a failed `lower_context` gate name it, since engines
+that compute on the host slow down with other programs.
 
 `crit eval status result.json` (also printed by `run`, stored as `status`) reports the gates,
 goals, each KPI against its limit, the gaps and missing inputs, with no verdict or ranking.

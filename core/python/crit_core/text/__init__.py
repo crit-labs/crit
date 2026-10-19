@@ -1,4 +1,4 @@
-"""Text layer: tokenizer, chat templates, generation config, streaming detokenization and stop strings.
+"""Text layer: tokenizer, chat templates, generation config, streaming detokenization, stop strings and tool calls.
 
 Names are re-exported lazily (PEP 562): `import crit_core.text` and `from crit_core.text import StopMatcher` load
 only the standard library; `tokenizers` and `jinja2` are imported when a name that needs them is first used.
@@ -9,6 +9,9 @@ _EXPORTS = {
     "TextError": "errors", "ModelTextError": "errors", "TemplateError": "errors", "TokenError": "errors",
     "StopMatcher": "stops",
     "openai_messages": "messages",
+    "ToolCallParser": "tools", "ToolFormat": "tools", "ToolReply": "tools", "tool_call_format": "tools",
+    "templates_tool_format": "tools",
+    "ReasoningFormat": "reasoning", "ReasoningSplitter": "reasoning", "template_reasoning_format": "reasoning",
     "GenerationConfig": "generation", "legacy_eos_ids": "generation",
     "AddedToken": "tokenizer", "Tokenizer": "tokenizer", "SPECIAL_TOKEN_NAMES": "tokenizer",
     "ChatTemplate": "template", "ChatTemplates": "template", "environment": "template",

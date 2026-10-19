@@ -2,7 +2,9 @@
 
 Build a complete engine for the user's LLM and hardware, with recorded candidate
 comparisons and a working OpenAI-compatible API (`crit serve`). You own the work from
-investigation to delivery. Changes to crit itself follow [Contributing](docs/CONTRIBUTING.md).
+investigation to delivery. Changes to crit itself must meet [what belongs in crit](docs/CONTRIBUTION_CRITERIA.md)
+(general interfaces for any model and any CUDA hardware, never one model's or machine's code) and follow
+[Contributing](docs/CONTRIBUTING.md).
 Install from the repo root with `python -m pip install -e .`, then run `crit ...`.
 
 ## 1. Set up the project
@@ -58,7 +60,8 @@ Install from the repo root with `python -m pip install -e .`, then run `crit ...
   Eval and serve adapters from `crit_core.native`.
 
 Retain Core revision/build inputs, dependency identities/notices and adaptations with
-candidate source. Keep model-specific changes in the engine; record toolkit gaps in the summary.
+candidate source. Keep model-specific changes in the engine; record toolkit gaps in the summary. Salvage
+from a run reaches crit only as a general mechanism that meets [the criteria](docs/CONTRIBUTION_CRITERIA.md).
 
 ## 3. Build and compare candidates
 
@@ -151,8 +154,11 @@ Include serving unless the user asked for less. Before sealing, implement the
 and `chat-resident-v1`, export `create_engine(context)`, retain the adapter (native
 engines can use a Python wrapper). Load weights once; keep model allocations across
 requests and switches; accept an optional leading system message; keep request state
-private; honor cancellation and cleanup. Verify with `crit serve`: consecutive
-requests, streaming, a stop string, candidate switching and Ctrl+C. Report anything unverified.
+private; honor cancellation and cleanup. Build the adapter on `crit_core.serving.ResidentChat`
+so the chat template, tools, per-request sampling and streaming come from Core, and list every
+sampling field the decoder applies; `crit run package` refuses an adapter without temperature
+or, when the model's template renders tools, without tool calls. Verify with `crit serve`: consecutive requests, streaming, a stop
+string, a tool call and its result, candidate switching and Ctrl+C. Report anything unverified.
 
 ## 5. Critique and hand off
 

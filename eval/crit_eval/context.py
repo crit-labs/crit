@@ -22,13 +22,10 @@ of it on every pass, so a context beyond the device limit is a cliff, not a slop
 Below the maximum, an engine sized for it must be at least as fast: Eval measures the engine built for
 the maximum, a curve of long-context points up to it, and the speed cases again at a lower context.
 """
-import re
-
 from .ceiling import model_config, weight_shards
+from .tensors import tensor_role
 
 GIB = 1 << 30
-EXPERT = re.compile(r"\.experts\.")
-NOT_LOADED = ("visual", "vision")
 
 
 def weight_split(model, config):
@@ -44,17 +41,17 @@ def weight_split(model, config):
     heads = 0
     for shard in shards:
         for tensor in shard.tensors:
-            name, size = tensor.name, tensor.nbytes
-            if any(part in name for part in NOT_LOADED):
+            role, size = tensor_role(tensor.name, shard.path.name), tensor.nbytes
+            if role.kind == "other_modality":
                 split["vision"] += size
-            elif "embed_tokens" in name:
+            elif role.kind == "embedding":
                 split["embedding"] += size
-            elif EXPERT.search(name):
+            elif role.kind == "expert":
                 split["experts"] += size
             else:
                 split["resident"] += size
-                heads += "lm_head" in name
-                if "mtp" in name or "mtp" in shard.path.name:
+                heads += role.kind == "head"
+                if role.draft:
                     split["draft"] += size
     if tied and not heads:
         # The output head is the embedding table: every pass reads all of it.

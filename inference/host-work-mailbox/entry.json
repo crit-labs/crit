@@ -1,0 +1,103 @@
+{
+  "id": "host-work-mailbox",
+  "category": "execution",
+  "summary": "Host work posted by the device and joined inside a CUDA stream or captured graph, with a measured choice of wait",
+  "implementation_status": "native_source",
+  "implementation_scope": "C++/CUDA mailbox over caller-owned mapped pinned memory: device-reset doorbells (done = 0 before ready = 1, survive graph replay), device-answered skips, host service thread, stream-front-end and poll-kernel joins plus an eager host join, release with a sweeper for stuck windows, rearm, terminal failure answering, functional support probe and replayed-graph join cost measurement; Python host reference of the protocol. Payload layout, handler arithmetic and worker pools remain engine supplied.",
+  "agent_guidance": {
+    "use_when": "A graph-captured step needs host computation or host-issued work that the device decides on at run time (host-computed experts, host lookups, copies), and splitting the graph with a host synchronization per decision costs too much",
+    "avoid_when": "The host work is known before launch, fits on the device, or the measured join cost exceeds the work moved; never assume the stream wait is free on a platform without measuring it",
+    "provides": [
+      "Per-slot ready/done/status words and payload laid over a caller-owned mapped region",
+      "Device-side post and skip helpers that reset done before raising ready, so captured joins wait for a constant",
+      "Stream-front-end join (cuStreamWaitValue32 resolved through the runtime) and one-thread poll-kernel join on the same word",
+      "Eager host join for platforms without a capturable join, rejecting capture",
+      "Service thread answering doorbells in any order; release() with a sweeper that drains stuck windows; rearm() after drained streams",
+      "Terminal failure: every later doorbell answered at once with status failed and the handler never called again",
+      "Functional probe of stream-wait support, eagerly and captured, and per-join cost measured in a replayed graph"
+    ],
+    "engine_supplies": [
+      "Mapped pinned bytes allocated and accounted through Core (CudaBackend host buffers or cuda_map_host)",
+      "Payload layout, system-fenced payload writes before each post, and volatile reads of results after the join",
+      "The handler and any worker pool it uses; handlers must return",
+      "Join choice from measure_joins on the target machine, ideally re-checked within the engine's own step",
+      "Watchdog or cancellation calling release(), and discarding outputs of windows whose status is released or failed"
+    ],
+    "preserve": [
+      "The device resets done before raising ready, after a system fence over the payload",
+      "The host writes status before done; done >= 1 is the only completion signal",
+      "One outstanding job per slot until the stream has joined it",
+      "Slots without host work are answered by the device (skip) so every captured join completes",
+      "Failure is terminal and answers every later doorbell; rearm only after every joining stream is drained"
+    ],
+    "adapt": [
+      "Slot count, payload layout and posting from a kernel or a stream operation",
+      "Join kind by measured cost; polling and back-off policy of the service",
+      "Handler threading and how results are reduced on the device"
+    ]
+  },
+  "path": "inference/host-work-mailbox/README.md",
+  "code_path": "inference/host-work-mailbox/code",
+  "code_files": [
+    {
+      "path": "inference/host-work-mailbox/code/mailbox.h",
+      "purpose": "Mailbox, slot views, join kinds, release/rearm/failure contract, probe and cost measurement"
+    },
+    {
+      "path": "inference/host-work-mailbox/code/mailbox.cu",
+      "purpose": "Post/skip/poll kernels, stream wait through a runtime-resolved driver entry point, service and sweeper threads, probe and measurement"
+    },
+    {
+      "path": "inference/host-work-mailbox/code/mailbox_device.cuh",
+      "purpose": "Device-side post, skip and result reads for engine kernels"
+    },
+    {
+      "path": "inference/host-work-mailbox/code/implementation.py",
+      "purpose": "Host reference of the protocol with captured programs replayed in order"
+    }
+  ],
+  "requires": {
+    "hardware": "A CUDA device that maps pinned host memory; the stream-wait join additionally needs driver support for 32-bit stream memory operations on mapped memory, probed at run time. Python 3.11+ for the host reference",
+    "model": "Any model; the payload and handler are engine defined",
+    "workload": "Graph-captured or eager steps with host work decided on the device"
+  },
+  "contract": {
+    "input": "Caller-owned mapped region of region_bytes(slots, payload), slot count, payload bytes, join kind and handler; device posts with system-fenced payloads",
+    "output": "Per slot a status (served, skipped, failed, released) and the handler's payload outputs, visible to the stream after its join",
+    "ownership": "The caller keeps the mapped region and its accounting alive past the mailbox; the stream reads results only after the join; one outstanding job per slot",
+    "failure": "A throwing handler fails the mailbox for good and answers every later doorbell with status failed; release() answers pending and later doorbells with status released; rearm() refuses while a job runs or after failure; the eager join rejects capture and reports a join of an unposted slot",
+    "core_boundary": "Engines allocate the region through Core resources and include release() in drain and cancellation; Core is not changed"
+  },
+  "dependencies": [
+    "CUDA runtime 12.0+ (driver entry points), C++20",
+    "Python standard library for the host reference"
+  ],
+  "symbols": [
+    "crit::techniques::host_mailbox::Mailbox",
+    "crit::techniques::host_mailbox::MappedRegion",
+    "crit::techniques::host_mailbox::region_bytes",
+    "crit::techniques::host_mailbox::Join",
+    "crit::techniques::host_mailbox::probe_joins",
+    "crit::techniques::host_mailbox::measure_joins",
+    "crit::techniques::host_mailbox::JoinCosts",
+    "crit::techniques::host_mailbox::post_job",
+    "crit::techniques::host_mailbox::skip_job",
+    "Mailbox",
+    "Stream"
+  ],
+  "interactions": [
+    "heterogeneous-expert-dispatch",
+    "async-expert-contributions",
+    "host-expert-arithmetic"
+  ],
+  "techniques": [
+    "host-work-mailbox",
+    "heterogeneous-expert-dispatch",
+    "async-expert-contributions"
+  ],
+  "validation": {
+    "host": "Worked example covers replayed captured programs, the stale answer without a device reset, release, rearm and terminal failure",
+    "native": "CUDA fixture (RTX 5090; native Windows and WSL2) replays an eight-slot window 200 times with both capturable joins and a skipped slot, releases a window held by a stuck job, fails the handler on the fifth job, serves an aborted window's doorbells, posts in reverse order, and checks the eager join and its capture rejection",
+    "performance": "Post plus join on one RTX 5090 (driver 596.49) was 37-41 us with stream_wait and 2.7-2.8 us with device_poll on native Windows and WSL2. In one MoE engine on that machine (WSL2, about 40 joins per pass) device_poll matched the engine's own spin handshake (33.8 vs 33.0 tok/s speculative decode, identical output) and stream_wait cost about 8% of plain decode"
+  }
+}

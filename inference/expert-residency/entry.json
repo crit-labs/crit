@@ -12,6 +12,7 @@
       "Fixed-slot complete-component upload/publication and protected uses",
       "C++ slot generations, upload/use identities and sequence exhaustion guards",
       "Temporary contiguous cache-region loans, transactional survivor relocation, private operation owners, settled return and graph-binding invalidation",
+      "Slot loans over any set of slots so an owner that lent memory to the cache (unreachable KV positions, an idle workspace) reclaims it with the same lifecycle and gets it back empty",
       "Phase-aware population/read-only reuse with protected reads that preserve replacement ages",
       "Compatible-layout bank budgets including guards/alignment and dual-contiguous component copy runs",
       "Original-demand occurrence/unique counts with caller-measured phase/mode transfer and synchronization costs"
@@ -82,6 +83,8 @@
     "ExpertLease",
     "crit::techniques::SettledSlots",
     "begin_loan",
+    "begin_slot_loan",
+    "on_loan",
     "begin_relocation",
     "activate_loan",
     "acquire_loan",
@@ -116,7 +119,7 @@
     "heterogeneous-expert-dispatch"
   ],
   "validation": {
-    "host": "Python fixtures cover bundle publication, phase/bank/copy planning and failures. Native CPU fixtures cover loan admission, overlap/fragmentation, protected regions, partial relocation failure, independent sessions, retained owners, binding invalidation and 1,250 real byte-copy loan/return cycles; the example checks Core reservation lifetime.",
+    "host": "Python fixtures cover bundle publication, phase/bank/copy planning and failures. Native CPU fixtures cover loan admission, overlap/fragmentation, protected regions, partial relocation failure, independent sessions, retained owners, binding invalidation and 1,250 real byte-copy loan/return cycles, and reverse slot loans (scattered slots, a live reader blocking a reclaim, survivor relocation, empty return, 500 repeated requests); the example checks Core reservation lifetime.",
     "native": "Native cache transfers, device publication, encoded projections and model behavior remain unqualified by host fixtures",
     "performance": "Unmeasured for a native engine; host fixture success is not a speed claim"
   },

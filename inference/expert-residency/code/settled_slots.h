@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +32,8 @@ public:
   };
   // A loan reserves whole adjacent slots in one contiguous physical bank.
   // Copies move complete slots (including scales, padding and guards).
+  // A slot loan (begin_slot_loan) reserves any set of slots, for example slots
+  // whose bytes alias memory another owner lent to the cache and now reclaims.
   struct Region { std::size_t first, count; };
   struct Relocation { std::size_t source, destination; };
   struct Loan { std::uint64_t id, owner; };
@@ -56,7 +59,8 @@ private:
     std::shared_ptr<void> work_owner;
   };
   struct LoanState {
-    Region region;
+    std::vector<std::size_t> members; // every reserved slot, ascending
+    std::optional<Region> region;     // contiguous loans only (extent())
     std::vector<Move> moves;
     Phase phase = Phase::preparing;
     bool published = false;
@@ -102,8 +106,8 @@ private:
       throw std::logic_error("foreign or retired cache loan");
     return it->second;
   }
-  static bool contains(Region region, std::size_t slot) {
-    return slot >= region.first && slot - region.first < region.count;
+  static bool contains(const std::vector<std::size_t> &members, std::size_t slot) {
+    return std::binary_search(members.begin(), members.end(), slot);
   }
   void invalidate(std::size_t index) {
     auto &s = slots_[index];
@@ -205,22 +209,43 @@ public:
   // contents in the region and at destinations. No automatic victim scoring.
   // Validate and allocate all loan metadata before changing the directory.
   Loan begin_loan(Region region, std::span<const Relocation> relocations = {}) {
-    static_assert(std::is_nothrow_move_constructible_v<Key> && std::is_nothrow_move_assignable_v<Key>);
     open();
     if (!backing_owner_ || !region.count || region.first >= slots_.size() ||
         region.count > slots_.size() - region.first || relocations.size() > region.count)
       throw std::invalid_argument("loan requires a nonempty in-bank slot region and owner");
+    std::vector<std::size_t> members(region.count);
+    for (std::size_t i = 0; i < region.count; ++i) members[i] = region.first + i;
+    return lend(std::move(members), region, relocations);
+  }
+  // The reverse direction: an owner that lent its own memory to the cache (KV
+  // positions a request cannot reach, an idle workspace) reclaims those slots
+  // before it writes them. Same lifecycle, checks and binding invalidation as
+  // begin_loan; the slots need not be adjacent and the owner addresses its own
+  // memory, so there is no extent(). Protected readers or uploads reject the
+  // whole loan: settle them, then retry.
+  Loan begin_slot_loan(std::span<const std::size_t> slots, std::span<const Relocation> relocations = {}) {
+    open();
+    std::vector<std::size_t> members(slots.begin(), slots.end());
+    std::sort(members.begin(), members.end());
+    if (members.empty() || std::adjacent_find(members.begin(), members.end()) != members.end() ||
+        members.back() >= slots_.size() || relocations.size() > members.size())
+      throw std::invalid_argument("slot loan requires distinct in-range slots");
+    return lend(std::move(members), std::nullopt, relocations);
+  }
+private:
+  Loan lend(std::vector<std::size_t> members, std::optional<Region> region, std::span<const Relocation> relocations) {
+    static_assert(std::is_nothrow_move_constructible_v<Key> && std::is_nothrow_move_assignable_v<Key>);
     auto eligible = [&](std::size_t index) {
       if (index >= slots_.size()) throw std::out_of_range("loan slot outside bank");
       const auto &s = slots_[index];
       if (s.uses || s.pending || s.loan) throw std::runtime_error("loan intersects protected storage");
       available(s.generation);
     };
-    for (std::size_t i = region.first; i < region.first + region.count; ++i) eligible(i);
-    LoanState state{region, {}};
+    for (auto i : members) eligible(i);
+    LoanState state{std::move(members), region, {}};
     state.moves.reserve(relocations.size());
     for (auto move : relocations) {
-      if (!contains(region, move.source) || contains(region, move.destination))
+      if (!contains(state.members, move.source) || contains(state.members, move.destination))
         throw std::invalid_argument("relocations must leave the borrowed region");
       eligible(move.destination);
       if (!slots_[move.source].ready) throw std::invalid_argument("relocation source is empty");
@@ -236,7 +261,7 @@ public:
     (void)inserted;
     ++next_loan_;
     ++binding_generation_;
-    for (std::size_t i = region.first; i < region.first + region.count; ++i) {
+    for (auto i : it->second.members) {
       auto &s = slots_[i];
       s.loan = loan.id;
       ++s.generation;
@@ -252,6 +277,7 @@ public:
     }
     return loan;
   }
+public:
   // Register BEFORE enqueue; a throwing/partial launch remains pending. The
   // private work owner retains any extra events, streams, staging or producers.
   Copy begin_relocation(Loan loan, std::size_t index, std::shared_ptr<void> work_owner) {
@@ -313,7 +339,8 @@ public:
     auto it = borrowers_.find(use.id);
     if (it == borrowers_.end() || it->second.loan.id != use.loan.id)
       throw std::logic_error("unowned scratch use");
-    return {state.region.first * slot_bytes_, state.region.count * slot_bytes_};
+    if (!state.region) throw std::logic_error("a slot loan has no single extent");
+    return {state.region->first * slot_bytes_, state.region->count * slot_bytes_};
   }
   void settle_loan_use(Borrow use) {
     auto &state = checked(use.loan);
@@ -346,7 +373,7 @@ public:
         slots_[move.slots.destination].loan = 0;
       }
     }
-    for (std::size_t i = state.region.first; i < state.region.first + state.region.count; ++i)
+    for (auto i : state.members)
       slots_[i].loan = 0; // Bytes are EMPTY, never resurrect old scratch contents.
     loans_.erase(loan.id);
     ++binding_generation_;
@@ -354,6 +381,12 @@ public:
   Binding binding() const { open(); return {owner_, binding_generation_}; }
   bool valid(Binding value) const { return !closed_ && value == Binding{owner_, binding_generation_}; }
   std::size_t capacity() const { return slots_.size(); }
+  // Whether a loan holds the slot: what a device directory's per-slot valid flag mirrors.
+  bool on_loan(std::size_t slot) const {
+    open();
+    if (slot >= slots_.size()) throw std::out_of_range("slot outside bank");
+    return slots_[slot].loan != 0;
+  }
   std::size_t available_capacity() const {
     std::size_t count = 0;
     for (const auto &s : slots_) count += s.loan == 0;
