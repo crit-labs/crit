@@ -14,6 +14,7 @@ TOOL_STREAM_CAPABILITY = "chat-tool-stream-v1"
 # tool_choice auto or none.
 TOOL_TEMPLATE_CAPABILITY = "chat-tool-template-v1"
 STREAM_CAPABILITY = "chat-stream-v1"
+MAX_CHAT_RECORD = 16 * 1024 * 1024  # bounded image data plus retained request metadata
 SAMPLING = {"temperature", "top_p", "top_k", "min_p", "seed", "presence_penalty",
             "frequency_penalty", "repetition_penalty", "logit_bias"}
 

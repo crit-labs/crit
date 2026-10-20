@@ -22,7 +22,7 @@ from crit_api.stream import StreamReader, StreamWriter  # noqa: E402
 from crit.run.records import write_json  # noqa: E402
 import test_api  # noqa: E402,F401  (puts the checkout's packages on sys.path)
 from test_chat_residency import ServeFixture  # noqa: E402
-from crit_api.engine import ServedEngine  # noqa: E402
+from crit_api.engine import ServedEngine, reply  # noqa: E402
 from crit_api.server import Api, Server  # noqa: E402
 
 # A template that strips thinking from history and opens the generation prompt inside it (Qwen3 style).
@@ -116,6 +116,17 @@ class ResidentChatReasoningTests(unittest.TestCase):
         self.assertEqual(off["assistant"], Decoder.reply)
         self.assertNotIn("reasoning", off)
 
+    def test_unfinished_reasoning_from_resident_chat_is_a_valid_response(self):
+        engine = Decoder(self.context, self.model)
+        engine.reply = "still thinking"
+        current = request(limits={"max_output_tokens": 64, "kv_tokens": 4096, "timeout_seconds": 10})
+        emitted = []
+        response = engine.generate_stream(current, threading.Event(), emitted.append)
+        self.assertEqual(response["assistant"], "")
+        self.assertEqual(response["reasoning"], "still thinking")
+        self.assertEqual("".join(e["reasoning"] for e in emitted), "still thinking")
+        self.assertEqual(reply(response, current)[0], {"content": "", "reasoning": "still thinking"})
+
 
 class StreamReasoningTests(unittest.TestCase):
     def test_reasoning_snapshots_publish_deltas_and_final_reply_must_match(self):
@@ -155,7 +166,12 @@ class ReasoningEngine(Engine):
         if parts is None:
             return super().generate_stream(request, cancellation, emit)
         emit({'reasoning': parts[0]})
-        emit(parts[1])
+        if parts[0] == 'hold':
+            while True:
+                cancellation.check()
+                time.sleep(.01)
+        if parts[1]:
+            emit(parts[1])
         return dict(self.response(request, parts[1]), reasoning=parts[0])
 def create_engine(context):
     return ReasoningEngine(context)
@@ -200,6 +216,65 @@ class ServeReasoningTests(ServeFixture, unittest.TestCase):
         self.assertEqual("".join(d.get("reasoning_content") or "" for d in deltas), "why")
         self.assertEqual("".join(d.get("content") or "" for d in deltas), "Because.")
         self.assertEqual(kinds[0], "reasoning_content")
+
+    def test_reasoning_only_completes_and_reuses_the_resident_host(self):
+        served = self.server.api.engine
+        # Establish the resident engine, then ensure every reasoning-only turn keeps it.
+        self.assertEqual(self.chat()[0], 200)
+        root, tree = served.runtime.root, served.runtime.tree
+        loads = served.status()["engine_loads"]
+        for maximum, finish in ((4, "length"), (128, "stop")):
+            for streaming in (False, True):
+                with self.subTest(maximum=maximum, stream=streaming):
+                    status, body = self.chat(messages=[{"role": "user", "content": "think:still thinking|"}],
+                                             max_tokens=maximum, stream=streaming)
+                    self.assertEqual(status, 200, body)
+                    if streaming:
+                        events = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: {")]
+                        self.assertFalse(any("error" in e for e in events), body)
+                        choices = [e["choices"][0] for e in events if e.get("choices")]
+                        self.assertEqual("".join(c["delta"].get("reasoning_content", "") for c in choices), "still thinking")
+                        self.assertEqual("".join(c["delta"].get("content", "") for c in choices), "")
+                        self.assertEqual(choices[-1]["finish_reason"], finish)
+                        self.assertTrue(body.endswith("data: [DONE]\n\n"))
+                    else:
+                        result = json.loads(body)
+                        self.assertEqual(result["choices"][0]["message"],
+                                         {"role": "assistant", "content": "", "reasoning_content": "still thinking"})
+                        self.assertEqual(result["choices"][0]["finish_reason"], finish)
+                        self.assertEqual(result["usage"]["completion_tokens"], 4)
+                    self.assertEqual(served.runtime.root, root)
+                    self.assertIs(served.runtime.tree, tree)
+                    self.assertIsNone(tree.process.poll())
+                    self.assertEqual(served.status()["engine_loads"], loads)
+        status, body = self.chat()
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["choices"][0]["message"]["content"], "Because.")
+        self.assertIs(served.runtime.tree, tree)
+
+    def test_reasoning_consumer_exception_retires_producer_before_next_request(self):
+        served = self.server.api.engine
+        self.addCleanup(served._retire, "reasoning consumer regression cleanup")
+        root, tree = served.runtime.root, served.runtime.tree
+        error, seen = TypeError("reasoning consumer failed"), []
+
+        def reasoning(text):
+            seen.append(text)
+            raise error
+
+        with self.assertRaises(TypeError) as caught:
+            served.generate([{"role": "user", "content": "think:hold|Because."}], 128,
+                            threading.Event(), on_reasoning=reasoning)
+        self.assertIs(caught.exception, error)
+        self.assertEqual(seen, ["hold"])
+        self.assertIsNone(served.runtime.tree)
+        self.assertIsNotNone(tree.process.poll())
+        self.assertFalse((root / "stream.json").exists())
+        status, body = self.chat()
+        self.assertEqual(status, 200, body)
+        message = json.loads(body)["choices"][0]["message"]
+        self.assertEqual((message["content"], message["reasoning_content"]), ("Because.", "why"))
+        self.assertNotEqual(served.runtime.root, root)
 
 
 if __name__ == "__main__":

@@ -75,10 +75,10 @@ cmake --build build/consumer
 ctest --test-dir build/consumer --output-on-failure
 ```
 
-The SDK is version 0.2.2. Include `<crit/core.h>` and link the installed target:
+The SDK is version 0.2.3. Include `<crit/core.h>` and link the installed target:
 
 ```cmake
-find_package(critCore 0.2.2 EXACT CONFIG REQUIRED)
+find_package(critCore 0.2.3 EXACT CONFIG REQUIRED)
 target_link_libraries(your_engine PRIVATE crit::core)
 ```
 

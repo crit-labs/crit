@@ -173,9 +173,19 @@ def holder(path=None):
 
 
 @contextmanager
-def engine_lock(label, wait=True, poll_s=2.0, log=None):
+def engine_lock(label, wait=True, poll_s=2.0, log=None, deadline=None):
     """Hold the machine's engine lock for the block. Waits (printing the holder once) unless wait is False, in which
-    case a busy lock raises RuntimeError."""
+    case a busy lock raises RuntimeError. An optional time.monotonic() deadline bounds acquisition, raising
+    TimeoutError before admission when expired; it does not limit work inside the block."""
+    def remaining():
+        if deadline is None:
+            return poll_s
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("Engine lock acquisition passed its deadline")
+        return min(poll_s, left)
+
+    remaining()
     path = lock_path()
     if path is None or os.environ.get(HELD_ENV):
         yield
@@ -190,7 +200,7 @@ def engine_lock(label, wait=True, poll_s=2.0, log=None):
                 raise RuntimeError(f"another engine is loaded on this machine ({who}); {LOCK_ENV}={path}")
             log(f"waiting for the engine lock held by {who} ({path}); one engine-loading process at a time")
             while not _try_lock(handle):
-                time.sleep(poll_s)
+                time.sleep(remaining())
         shared = lease_path()
         lease = _Lease(shared, label) if shared else None
         try:
@@ -201,16 +211,15 @@ def engine_lock(label, wait=True, poll_s=2.0, log=None):
                 log(f"waiting for the engine lease held by {_describe(lease.other())} ({shared}); "
                     "one engine-loading process per machine")
                 while not lease.take():
-                    time.sleep(poll_s)
-        except BaseException:
-            _unlock(handle)
-            raise
-        Path(str(path) + ".holder").write_text(f"{os.getpid()} {label}\n", encoding="utf-8")
-        os.environ[HELD_ENV] = "1"
-        try:
-            yield
+                    time.sleep(remaining())
+            remaining()
+            Path(str(path) + ".holder").write_text(f"{os.getpid()} {label}\n", encoding="utf-8")
+            os.environ[HELD_ENV] = "1"
+            try:
+                yield
+            finally:
+                os.environ.pop(HELD_ENV, None)
         finally:
-            os.environ.pop(HELD_ENV, None)
             if lease:
                 lease.release()
             try:

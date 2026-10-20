@@ -1,4 +1,4 @@
-#include "crit/core.h"
+#include "crit/native_engine.h"
 #include "crit/text.h"
 #include "trace.h"
 #include <algorithm>
@@ -115,6 +115,25 @@ void validate_tokens(std::span<const Token> tokens, std::uint32_t vocabulary,
                      const char* message = "token outside declared vocabulary") {
     for(auto token:tokens) if(token < 0 || std::uint32_t(token) >= vocabulary)
         throw std::invalid_argument(message);
+}
+// Shape only, before materialization; the caller owns readiness ordering.
+void validate_deferred_progress(const Progress& p, const char* message) {
+    if(p.deferred_tokens && (!p.readiness || !p.tokens.empty() || !p.prefill_complete))
+        throw std::runtime_error(message);
+}
+// Shared serial/batched contract after readiness and deferred materialization.
+// This only validates: frontier changes, mixed work accounting and publication stay with the caller.
+void validate_progress(const Progress& p, const WorkBudget& budget, std::uint32_t frontier,
+                       const Request& request, const char* message) {
+    const auto next_frontier = frontier + std::uint64_t(p.prompt_tokens);
+    if(p.reused_prompt_tokens > p.prompt_tokens || p.prompt_tokens - p.reused_prompt_tokens > budget.prefill_tokens ||
+       (p.reused_prompt_tokens && !request.phases.reuse_allowed()) ||
+       next_frontier > request.prompt.size() || (budget.prefill_complete && p.prompt_tokens) ||
+       (budget.prefill_complete && !p.prefill_complete) ||
+       p.prefill_complete != (next_frontier == request.prompt.size()) ||
+       (!p.prefill_complete && !p.tokens.empty()) || p.tokens.size() > budget.output_tokens ||
+       (!p.prompt_tokens && p.tokens.empty()))
+        throw std::runtime_error(message);
 }
 bool has_sampling(const SamplingOptions& s) {
     return s.temperature || s.top_p || s.top_k || s.seed || s.min_p || s.repetition_penalty || s.frequency_penalty ||
@@ -380,6 +399,8 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
         }
     };
     Profile profile;
+    // Native wrapper resources must outlive backend/model destruction, including quarantine.
+    std::shared_ptr<void> native_owner;
     Resources resources;
     Reservation trace_storage;
     detail::TraceBuffer trace_buffer;
@@ -760,8 +781,7 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
             }
         }
         for(auto& row:rows) if(row.progress.deferred_tokens) {
-            if(!row.progress.readiness || !row.progress.tokens.empty() || !row.progress.prefill_complete)
-                throw std::runtime_error("invalid deferred concurrent progress");
+            validate_deferred_progress(row.progress,"invalid deferred concurrent progress");
             row.progress.tokens = execution ? execution->ready_tokens(row.key) : concurrent->ready_tokens(row.key);
         }
         if(trace_buffer.enabled()) {
@@ -782,13 +802,7 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
                 p.prompt_tokens - p.reused_prompt_tokens > p.token_work ||
                 (lane.prefilled && !p.token_work)))
                 throw std::runtime_error("mixed token work exceeds grant or omits computation");
-            if(p.reused_prompt_tokens > p.prompt_tokens || p.prompt_tokens - p.reused_prompt_tokens > item.budget.prefill_tokens ||
-               (p.reused_prompt_tokens && !lane.request->phases.reuse_allowed()) ||
-               lane.frontier + std::uint64_t(p.prompt_tokens) > lane.request->prompt.size() || (lane.prefilled && p.prompt_tokens) ||
-               (lane.prefilled && !p.prefill_complete) ||
-               p.prefill_complete != (lane.frontier+p.prompt_tokens==lane.request->prompt.size()) ||
-               (!p.prefill_complete && !p.tokens.empty()) || p.tokens.size()>item.budget.output_tokens ||
-               (!p.prompt_tokens && p.tokens.empty())) throw std::runtime_error("invalid or stalled concurrent progress");
+            validate_progress(p,item.budget,lane.frontier,*lane.request,"invalid or stalled concurrent progress");
             validate_tokens(p.tokens,valid_vocabulary(declaration),"generated token outside the valid vocabulary");
             logprobs.push_back(logprob_rows(lane.request->options,p,valid_vocabulary(declaration)));
         }
@@ -1162,12 +1176,12 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
                         if(advised>chunk)throw std::runtime_error("prefill advice exceeds granted work");
                         if(advised)chunk=advised;
                     }
+                    const WorkBudget budget{chunk,remaining,prefill_complete};
                     auto progress = [&]{
                         detail::TraceScope span(trace_buffer,prefill_complete ? TracePhase::decode : TracePhase::prefill,key);
-                        return session->advance({chunk,remaining,prefill_complete});
+                        return session->advance(budget);
                     }();
-                    if(progress.deferred_tokens && (!progress.readiness || !progress.tokens.empty() || !progress.prefill_complete))
-                        throw std::runtime_error("invalid deferred model progress");
+                    validate_deferred_progress(progress,"invalid deferred model progress");
                     if(progress.readiness) {
                         detail::TraceScope span(trace_buffer,TracePhase::readiness,key);
                         progress.readiness->wait();
@@ -1178,15 +1192,7 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
                         catch(...) { trace_buffer.drop(); }
                     }
                     if(*request->cancelled) {finish = Finish::cancelled; break;}
-                    if(progress.reused_prompt_tokens > progress.prompt_tokens || progress.prompt_tokens - progress.reused_prompt_tokens > chunk ||
-                       (progress.reused_prompt_tokens && !request->phases.reuse_allowed()) ||
-                       frontier + std::uint64_t(progress.prompt_tokens) > request->prompt.size() || (prefill_complete && progress.prompt_tokens) ||
-                       (prefill_complete && !progress.prefill_complete) ||
-                       progress.prefill_complete != (frontier+progress.prompt_tokens == request->prompt.size()) ||
-                       (!progress.prefill_complete && !progress.tokens.empty()) ||
-                       progress.tokens.size() > remaining ||
-                       (!progress.prompt_tokens && progress.tokens.empty()))
-                        throw std::runtime_error("invalid or stalled model progress");
+                    validate_progress(progress,budget,frontier,*request,"invalid or stalled model progress");
                     frontier += progress.prompt_tokens;
                     const bool was_prefilled = prefill_complete;
                     prefill_complete = progress.prefill_complete;
@@ -1370,6 +1376,9 @@ Engine::Engine(Profile p,std::shared_ptr<Backend> b,Factory f) {
     impl_->initialize(std::move(f));
 }
 Engine::~Engine() = default;
+void NativeEngine::retain_owner() const noexcept {
+    if(engine && engine->impl_) engine->impl_->native_owner = owner;
+}
 Engine::Engine(Engine&&) noexcept = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
 Handle Engine::submit(std::vector<Token> prompt,std::uint32_t output,RequestOptions options) {

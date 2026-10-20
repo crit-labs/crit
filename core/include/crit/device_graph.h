@@ -43,13 +43,20 @@ using GraphOwner = std::shared_ptr<const void>;
 
 // Bounded cache of captured graphs. An identical key must name the identical physical owners. Replay requires
 // settled successful prerequisites and keeps only in-flight receipts plus the latest. A failed capture quarantines
-// its owners; a failed or receiptless launch blocks replay and eviction until backend recovery. Not thread-safe.
+// its owners; a failed/receiptless launch or ambiguous destruction blocks replay and eviction. Not thread-safe.
+// Destruction releases settled entries; unproved work retains the cache's owners, executables and receipts
+// for process recovery. Capture reserves ownership bookkeeping before invoking the backend hook.
 class GraphCache {
 public:
     using Capture = std::function<GraphHandle(const GraphKey&)>;
     using Launch = std::function<std::shared_ptr<GraphReceipt>(const GraphHandle&)>;
     using Destroy = std::function<void(const GraphHandle&)>;
     explicit GraphCache(std::size_t capacity);
+    ~GraphCache();
+    GraphCache(const GraphCache&);
+    GraphCache& operator=(const GraphCache&);
+    GraphCache(GraphCache&&) noexcept;
+    GraphCache& operator=(GraphCache&&) noexcept;
     GraphHandle capture(const GraphKey&, std::vector<GraphOwner> owners, const Capture&);
     std::shared_ptr<GraphReceipt> replay(const GraphKey&, const Launch&,
                                          std::span<const std::shared_ptr<GraphReceipt>> prerequisites = {});
@@ -66,13 +73,16 @@ private:
         GraphHandle graph;
         std::vector<GraphOwner> owners;
         std::vector<std::shared_ptr<GraphReceipt>> completions;
-        bool failed_launch = false;
+        bool failed_operation = false;
         bool settled();
     };
     const Entry& at(const GraphKey&) const;
     std::size_t capacity_;
     std::map<GraphKey, Entry> entries_;
     std::vector<std::vector<GraphOwner>> quarantined_;
+    struct Retention;
+    std::unique_ptr<Retention> retention_;
+    void swap(GraphCache&) noexcept;
 };
 
 // Staged matrix geometry. Stride is in elements, including row padding.

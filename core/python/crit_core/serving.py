@@ -32,6 +32,8 @@ chat-tool-stream-v1). Reasoning in the template's markers (<think>...</think>) i
 the same way, as `reasoning`, which crit serve gives clients as reasoning_content.
 """
 from pathlib import Path
+from contextlib import contextmanager
+from dataclasses import dataclass
 
 SAMPLING = ("temperature", "top_p", "top_k", "min_p", "seed", "presence_penalty", "frequency_penalty",
             "repetition_penalty", "logit_bias")
@@ -66,7 +68,7 @@ def kept_special_ids(text, tool_format=None):
     return special_marker_ids(text, format_markers(format)) if format is not None else frozenset()
 
 
-def capabilities(text, sampling=(), *, stream=True, config=True, tool_format=None):
+def capabilities(text, sampling=(), *, stream=True, config=True, tool_format=None, images=False, concurrent=False):
     """The serving capabilities a package built on ResidentChat declares, for a model's ModelText and the package's
     own `tool_format` (ResidentChat.tool_format), if any."""
     unknown = sorted(set(sampling) - set(SAMPLING))
@@ -75,17 +77,31 @@ def capabilities(text, sampling=(), *, stream=True, config=True, tool_format=Non
     result = ["chat-json-v1", "chat-resident-v1"]
     result += ["chat-stream-v1"] if stream else []
     result += ["chat-config-v1"] if config else []
+    result += ["chat-images-v1"] if images else []
+    result += ["chat-concurrent-v1"] if concurrent else []
     if tool_format is not None or template_tool_format(text):
         result += ["chat-tools-v1"] + (["chat-tool-stream-v1"] if stream else [])
     return result + [sampling_capability(name) for name in SAMPLING if name in sampling]
 
 
-def chat_prompt(request):
+def chat_prompt(request, *, images=False):
     """(messages, tools) for ModelText.encode_chat: tool history keeps its calls and results, and the request's
     tools are rendered unless tool_choice is "none"; ResidentChat parses the calls."""
     from crit_core.text import openai_messages
     tools = request.get("tools") if request.get("tool_choice", "auto") != "none" else None
-    return openai_messages(request["messages"]), (tools or None)
+    return openai_messages(request["messages"], images=images), (tools or None)
+
+
+@dataclass(frozen=True)
+class PreparedPrompt:
+    """Request-local token ids, optional engine inputs, and actual context positions.
+
+    Image expansion may occupy more positions than the template's placeholder ids.
+    The engine supplies that count; Crit never guesses it from an image's size.
+    """
+    ids: object
+    inputs: object = None
+    token_count: int | None = None
 
 
 class ResidentChat:
@@ -100,6 +116,16 @@ class ResidentChat:
     sampling = ()
     tool_format = None
     reasoning_format = None
+    images = False
+    max_concurrent_requests = 1
+
+    def create_request(self, request):
+        """Return an independent ResidentChat sharing only safe model resources.
+
+        Concurrent packages implement this factory. The host resets and closes
+        its result after generation settles; the parent keeps shared weights.
+        """
+        raise NotImplementedError("Concurrent adapters must provide create_request(request)")
 
     def __init__(self, context, model, *, configuration=None, stop_ids=None, capacity=None, template_variables=None):
         from crit_core.text import load_model_text
@@ -130,16 +156,41 @@ class ResidentChat:
         return dict(self.configuration)
 
     def prompt_ids(self, request):
-        messages, tools = chat_prompt(request)
+        messages, tools = chat_prompt(request, images=self.images)
         return self.text.encode_chat(messages, tools=tools, add_generation_prompt=True, **self.template_variables)
 
+    @contextmanager
+    def prepare_prompt(self, request, cancellation):
+        """Override for images; yield PreparedPrompt and release private inputs in finally.
+
+        Use prompt_ids() to render ordered image/text parts through the checkpoint's
+        template. The engine supplies image decoding, vision arithmetic and layout.
+        """
+        if any(isinstance(m.get("content"), list) and any(p.get("type") == "image_url" for p in m["content"])
+               for m in request["messages"]):
+            raise ValueError("Image input requires the engine's prepare_prompt implementation")
+        yield PreparedPrompt(self.prompt_ids(request))
+
+    def generate_prepared(self, prompt, max_new_tokens, sampling, on_tokens, cancelled):
+        """Override to consume prepared image inputs with the engine's token generator."""
+        if prompt.inputs is not None:
+            raise NotImplementedError("Prepared image inputs require generate_prepared")
+        return self.generate_tokens(prompt.ids, max_new_tokens, sampling, on_tokens, cancelled)
+
     def _run(self, request, cancellation, emit=None):
-        ids = self.prompt_ids(request)
+        with self.prepare_prompt(request, cancellation) as prompt:
+            return self._generate(request, cancellation, prompt, emit)
+
+    def _generate(self, request, cancellation, prompt, emit):
+        ids = prompt.ids
+        prompt_tokens = len(ids) if prompt.token_count is None else prompt.token_count
+        if type(prompt_tokens) is not int or prompt_tokens < 1:
+            raise ValueError("Prepared prompt token_count must be a positive integer")
         limits = request.get("limits", {})
         output_tokens = int(limits.get("max_output_tokens") or 1024)
         bounds = [c for c in (int(limits.get("kv_tokens") or 0), self.capacity or 0) if c]
-        if bounds and len(ids) + output_tokens > min(bounds):
-            raise ValueError(f"prompt of {len(ids)} tokens plus {output_tokens} output tokens exceeds the context")
+        if bounds and prompt_tokens + output_tokens > min(bounds):
+            raise ValueError(f"prompt of {prompt_tokens} tokens plus {output_tokens} output tokens exceeds the context")
         sampling = dict(request.get("sampling") or {})
         unsupported = sorted(set(sampling) - set(self.sampling))
         if unsupported:
@@ -191,7 +242,7 @@ class ResidentChat:
             if delta.text:
                 route(delta.text)
 
-        tokens, timing = self.generate_tokens(ids, output_tokens, sampling, on_tokens, cancellation.is_set)
+        tokens, timing = self.generate_prepared(prompt, output_tokens, sampling, on_tokens, cancellation.is_set)
         if tokens is None:
             cancellation.check()
             raise RuntimeError("generation cancelled")
@@ -206,8 +257,8 @@ class ResidentChat:
             pieces = [content]
         n = len(tokens)
         decode = timing.get("decode_tokens", n - 1)
-        telemetry = {"prompt_tokens": len(ids), "output_tokens": n,
-                     "prefill_tokens": int(timing.get("prefill_tokens", len(ids))), "prefill_ms": timing["prefill_ms"],
+        telemetry = {"prompt_tokens": prompt_tokens, "output_tokens": n,
+                     "prefill_tokens": int(timing.get("prefill_tokens", prompt_tokens)), "prefill_ms": timing["prefill_ms"],
                      "decode_tokens": min(int(decode), n - 1) if n > 1 else None,
                      "decode_ms": timing["decode_ms"] if n > 1 else None,
                      "ttft_ms": timing["first_token_ms"], "missing": {}}
@@ -264,5 +315,5 @@ class ResidentChat:
         pass
 
 
-__all__ = ["ResidentChat", "SAMPLING", "capabilities", "chat_prompt", "kept_special_ids", "special_marker_ids",
+__all__ = ["ResidentChat", "PreparedPrompt", "SAMPLING", "capabilities", "chat_prompt", "kept_special_ids", "special_marker_ids",
            "sampling_capability", "template_tool_format"]

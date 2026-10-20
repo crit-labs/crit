@@ -117,11 +117,13 @@ class ServeFixture(RunFixture):
     tool_stream = False
     temperature = True  # declare chat-sampling-temperature-v1, which crit run package requires
     adapter_suffix = ''
+    extra_capabilities = ()
 
     def package(self, candidate):
         package = self.root / ('resident-package-' + candidate['candidate_id'])
         package.mkdir(exist_ok=True)
         capabilities = ['prefill', 'decode', 'chat-json-v1', 'chat-resident-v1']
+        capabilities.extend(self.extra_capabilities)
         adapter = ADAPTER
         if self.stream:
             capabilities.append('chat-stream-v1')
@@ -197,6 +199,20 @@ class ServeFixture(RunFixture):
 
 
 class ResidentTests(ServeFixture, unittest.TestCase):
+    def test_already_cancelled_generation_does_not_dispatch_or_switch_candidates(self):
+        engine = self.engine()
+        before = self.ask(engine)
+        stop = threading.Event()
+        stop.set()
+        commands = set((engine.runtime.root / 'accepted').iterdir())
+        self.assertEqual(engine.generate([{'role': 'user', 'content': 'hello'}], 128, stop,
+                                         candidate_id=self.b), ('cancelled', None, None))
+        self.assertEqual(set((engine.runtime.root / 'accepted').iterdir()), commands)
+        self.assertEqual(engine.status()['engine_loads'], 1)
+        after = self.ask(engine)
+        self.assertEqual(after['calls'], before['calls'] + 1)
+        self.assertEqual(after['device'], before['device'])
+
     def test_load_progress_reports_actual_reads_and_allocation_then_reuse(self):
         engine = self.engine(open=False)
         engine.default = self.a

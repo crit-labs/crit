@@ -1,5 +1,7 @@
 """OpenAI chat messages normalized for Hugging Face chat templates (standard library only)."""
 from collections.abc import Mapping
+import base64
+from urllib.parse import urlsplit
 
 from crit_core import jsonfile
 
@@ -8,18 +10,45 @@ from .errors import TextError
 KEPT = ("tool_call_id", "name", "reasoning_content")
 
 
-def _content(content, where):
+def message_content(content, where="content", *, images=False):
+    """Validate OpenAI text/image parts without fetching URLs or opening files.
+
+    Text-only lists retain the earlier joined-string form. Image lists preserve
+    order and use the OpenAI image_url shape in request records.
+    """
     if content is None:
         return ""
     if isinstance(content, str):
         return content
     if isinstance(content, (list, tuple)):
-        texts = []
+        parts, has_images = [], False
         for index, part in enumerate(content):
-            if not isinstance(part, Mapping) or part.get("type") != "text" or not isinstance(part.get("text"), str):
+            if isinstance(part, Mapping) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                parts.append({"type": "text", "text": part["text"]})
+                continue
+            image = part.get("image_url") if isinstance(part, Mapping) else None
+            if not images:
                 raise TextError(f"{where}[{index}] must be a text part; only text content is supported")
-            texts.append(part["text"])
-        return "".join(texts)
+            if not images or not isinstance(part, Mapping) or part.get("type") != "image_url" or not isinstance(image, Mapping):
+                raise TextError(f"{where}[{index}] must be a supported text or image_url part")
+            url, detail = image.get("url"), image.get("detail", "auto")
+            if not isinstance(url, str) or not url or detail not in ("auto", "low", "high"):
+                raise TextError(f"{where}[{index}] needs an image URL and detail auto, low or high")
+            if url.startswith("data:image/"):
+                header, separator, data = url.partition(",")
+                if not separator or not header.endswith(";base64") or not data:
+                    raise TextError("Image data URLs require base64 image data")
+                try:
+                    base64.b64decode(data, validate=True)
+                except ValueError as exc:
+                    raise TextError("Invalid base64 image data") from exc
+            else:
+                parsed = urlsplit(url)
+                if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+                    raise TextError("Image URLs must use http, https or base64 data:image/")
+            parts.append({"type": "image_url", "image_url": {"url": url, "detail": detail}})
+            has_images = True
+        return parts if has_images else "".join(p["text"] for p in parts)
     raise TextError(f"{where} must be a string, a list of text parts or null")
 
 
@@ -44,11 +73,13 @@ def _tool_call(call, where):
     return call
 
 
-def openai_messages(messages):
+def openai_messages(messages, *, images=False):
     """Return new message dicts for a chat template: "developer" becomes "system"; content that is null becomes ""
     and a list of text parts is joined into one string; tool_calls[*].function.arguments given as a JSON string
     becomes a dict (TextError if it is not a JSON object); tool_call_id, name and reasoning_content are kept and
-    other keys dropped. Role order is left to the template, which rejects what it cannot render."""
+    other keys dropped. With images=True, all content becomes ordered parts, with image_url sources represented
+    as {"type": "image", "image": URL, "detail": ...} for the checkpoint template. No URLs are fetched.
+    Role order is left to the template, which rejects what it cannot render."""
     if isinstance(messages, (str, bytes, Mapping)) or not isinstance(messages, (list, tuple)):
         raise TextError("messages must be a list of message objects")
     result = []
@@ -59,8 +90,12 @@ def openai_messages(messages):
         role = message.get("role")
         if not isinstance(role, str) or not role:
             raise TextError(f"{where}.role must be a non-empty string")
-        normalized = {"role": "system" if role == "developer" else role,
-                      "content": _content(message.get("content"), f"{where}.content")}
+        content = message_content(message.get("content"), f"{where}.content", images=images)
+        if images:
+            parts = [{"type": "text", "text": content}] if isinstance(content, str) else content
+            content = [({"type": "image", "image": p["image_url"]["url"], "detail": p["image_url"]["detail"]}
+                        if p["type"] == "image_url" else dict(p)) for p in parts]
+        normalized = {"role": "system" if role == "developer" else role, "content": content}
         calls = message.get("tool_calls")
         if calls is not None:
             if isinstance(calls, (str, bytes, Mapping)) or not isinstance(calls, (list, tuple)):

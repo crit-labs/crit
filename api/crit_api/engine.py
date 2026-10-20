@@ -1,6 +1,7 @@
-"""One sealed candidate, loaded once and kept resident; requests run one at a time."""
+"""Verified sealed candidates, bounded request admission and resident lifetimes."""
 from pathlib import Path
 import json
+import re
 import shutil
 import threading
 import uuid
@@ -11,14 +12,15 @@ from crit.run.records import (digest, keys, now, number, read_json, record, safe
 from crit.run.store import ROOT, RunStore
 
 from .residency import CAPABILITY as RESIDENT_CAPABILITY, ResidentRuntime
+from .admission import Admission
+from .content import response_content, tool_size
 from .stream import CAPABILITY as STREAM_CAPABILITY
-from .options import (RequestError, TOOL_STREAM_CAPABILITY, sampling_options, serving_capabilities,
+from .options import (MAX_CHAT_RECORD, RequestError, TOOL_STREAM_CAPABILITY, sampling_options, serving_capabilities,
                       tool_options as validate_tool_options, validate_tool_reply)
 
 CAPABILITY = "chat-json-v1"
 # The adapter applies a request's response_format (crit_core.constraints / crit/constraints.h); see docs/SERVING.md.
 CONSTRAINTS_CAPABILITY = "chat-constraints-v1"
-MAX_REPLY = 65536
 MAX_CONVERSATION = 1_000_000
 LOAD_BYTES_PER_SECOND = 200e6  # model bytes per second assumed by the default load bound (the engine's own load)
 VERIFY_BYTES_PER_SECOND = 50e6  # with --verify-model: read, hash and copy every model file, then the engine load
@@ -29,6 +31,15 @@ class EngineError(Exception):
     def __init__(self, message, status=500):
         super().__init__(message)
         self.status = status
+
+
+class _CommandStop:
+    """Observe client cancellation and engine shutdown without changing either event."""
+    def __init__(self, client, shutdown):
+        self.client, self.shutdown = client, shutdown
+
+    def is_set(self):
+        return self.client.is_set() or self.shutdown.is_set()
 
 
 def telemetry(value, request):
@@ -73,24 +84,11 @@ def reply(value, request):
     if any(value[key] != request[key] for key in ("request_id", "candidate_id", "package_sha256")):
         raise ValueError("Reply belongs to a different request or engine")
     calls = validate_tool_reply(value.get("tool_calls"), request)
-    assistant = value["assistant"]
+    assistant, reasoning = response_content(value, tool_size(calls))
     if calls:
-        if not isinstance(assistant, str) or "\0" in assistant:
-            raise ValueError("Tool reply assistant must be text without NUL")
-        assistant.encode("utf-8")
-        if len(json.dumps(calls, ensure_ascii=False)) + len(assistant) > MAX_REPLY:
-            raise ValueError("Tool reply exceeds the reply size limit")
         assistant = {"content": assistant, "tool_calls": calls}
-    else:
-        text(assistant, "Reply", MAX_REPLY)
-    if "reasoning" in value:
+    if reasoning:
         # Reasoning the model wrote apart from its reply (crit_core.text.reasoning); clients get reasoning_content.
-        reasoning = value["reasoning"]
-        if not isinstance(reasoning, str) or not reasoning or "\0" in reasoning:
-            raise ValueError("Reply reasoning must be non-empty text without NUL")
-        reasoning.encode("utf-8")
-        if len(reasoning) > MAX_REPLY:
-            raise ValueError("Reply reasoning exceeds the reply size limit")
         assistant = dict(assistant if isinstance(assistant, dict) else {"content": assistant}, reasoning=reasoning)
     return assistant, telemetry(value["telemetry"], request)
 
@@ -112,7 +110,7 @@ def single_run(store):
 
 class ServedEngine:
     """Verifies sealed candidates of one run, keeps the requested one loaded in the resident host and runs requests
-    one at a time. Switching candidates reuses model bytes and compatible device allocations.
+    within its declared capacity. Switching candidates reuses compatible model allocations.
 
     The server owns the machine's crit runtime while it runs: no other crit process can load an engine.
     """
@@ -127,14 +125,17 @@ class ServedEngine:
         self.verify_model = bool(verify_model)
         self.ownership = RuntimeOwnership(runtime_directory)
         self.runtime = ResidentRuntime(self.ownership, host_limit, device_limit)
-        self.lock = threading.Lock()
+        self.lock = Admission()
+        self.runtime.on_retire = self.lock.invalidate
+        self._stopping = threading.Event()
         self.specs = {}
         self.listed = None
         self.closed = False
 
-    def _verify(self, candidate_id):
+    def _verify(self, candidate_id, *, store=None, run_id=None):
         """The candidate's retained bytes, seal, chat interface, model file and settled attempts."""
-        view = self.store.get(self.run_id)
+        store, run_id = store or self.store, run_id or self.run_id
+        view = store.get(run_id)
         if view["errors"]:
             raise ValueError("Retained project verification failed: " + str(view["errors"]))
         candidate = next((c for c in view["candidates"] if c["candidate_id"] == candidate_id), None)
@@ -152,13 +153,13 @@ class ServedEngine:
         if not Path(view["run"]["spec"]["model_path"]).exists():
             raise ValueError("Model file is unavailable at its recorded path: " + view["run"]["spec"]["model_path"])
         # External agents cannot be stopped from here. Their recorded attempts must have settled cleanup.
-        for reservation in self.store._attempts(root):
+        for reservation in store._attempts(root):
             owner = ("candidates/" + reservation["candidate_id"] if reservation["candidate_id"]
                      else "segments/" + reservation["segment_id"])
             result = safe_path(root, owner + "/attempts/" + reservation["attempt_id"] + "/result.json")
             if not result.is_file() or not read_json(result)["cleanup_settled"]:
                 raise ValueError("Settle the external agent/build attempt and its cleanup before serving")
-        return dict(run_id=self.run_id, candidate_id=candidate_id, package_sha256=digest(manifest),
+        return dict(run_id=run_id, candidate_id=candidate_id, selector=candidate_id, package_sha256=digest(manifest),
                     package_path=str(package), model_path=view["run"]["spec"]["model_path"],
                     model_manifest=read_json(safe_path(root, "inputs.json"))["model_manifest"],
                     configuration=candidate["configuration"], launch=manifest["launch"],
@@ -190,6 +191,18 @@ class ServedEngine:
     def model_id(self, candidate_id=None):
         return self.run_id + "/" + (candidate_id or self.default)
 
+    def resolve_model(self, model):
+        """Legacy single-run names permit arbitrary client aliases for the default."""
+        if model is None:
+            return self.default
+        candidate = model.removeprefix(self.run_id + "/")
+        if candidate == model and not re.fullmatch(r"candidate-\d+", model):
+            return self.default
+        known = lambda refresh=False: candidate in {c["candidate_id"] for c in self.candidates(refresh)}
+        if not known() and not known(refresh=True):
+            raise EngineError("Unknown model " + model + "; GET /v1/models lists the served candidates", 404)
+        return candidate
+
     @property
     def kv_tokens(self):
         return self.spec()["limits"]["kv_tokens"]
@@ -201,7 +214,7 @@ class ServedEngine:
     def open(self, stop=None):
         """Verify the default candidate, take runtime ownership and load the engine."""
         with self.lock:
-            if self.closed:
+            if self.closed or self._stopping.is_set():
                 raise ValueError("Engine is closed")
             view = self.store.get(self.run_id)
             self.default = self.requested_candidate or view["state"]["selected_candidate_id"]
@@ -211,9 +224,11 @@ class ServedEngine:
             self.candidates(refresh=True)
             self.ownership.acquire()
             try:
-                result = self.runtime.call("load", {"spec": spec}, stop or threading.Event(), self.load_seconds(spec))
+                result = self.runtime.call("load", {"spec": spec},
+                                           _CommandStop(stop or threading.Event(), self._stopping), self.load_seconds(spec))
                 if result["status"] != "completed":
                     raise ValueError(result["error"] or "Engine loading failed")
+                self.lock.configure(self.default, result.get("max_concurrent_requests", 1))
             except BaseException:
                 self._release()
                 raise
@@ -245,23 +260,42 @@ class ServedEngine:
         return self.runtime.status()
 
     def generate(self, messages, max_tokens, stop, on_text=None, candidate_id=None, response_format=None,
-                 sampling=None, tool_options=None, on_tools=None, on_reasoning=None):
+                 sampling=None, tool_options=None, on_tools=None, on_reasoning=None, on_started=None):
         """Run one request. `on_text(text)` receives the cumulative accepted text when the adapter streams.
         `response_format` (from crit_api.server.response_format) goes into the request record for adapters that
         declare chat-constraints-v1. Sampling and tool options are capability-gated request overrides.
+        `on_started(deadline)` receives the command's absolute monotonic deadline
+        after dispatch, so response delivery can honor the same execution budget.
 
         Returns (status, assistant, telemetry): status is "completed", "cancelled" or "timed_out"; a cancelled
         or timed-out request has no reply or telemetry. Assistant is text, or {content, tool_calls} for a tool
         reply. Raises EngineError when the engine fails.
         """
-        if len(json.dumps(messages, ensure_ascii=False)) > MAX_CONVERSATION:
+        image_input = any(isinstance(m.get("content"), list) and any(p.get("type") == "image_url" for p in m["content"])
+                          for m in messages)
+        encoded = json.dumps(messages, ensure_ascii=False)
+        if image_input and len(encoded.encode("utf-8")) > 8 * 1024 * 1024:
+            raise EngineError("Image conversation exceeds 8 MiB", 400)
+        if not image_input and len(encoded) > MAX_CONVERSATION:
             raise EngineError("Conversation exceeds 1,000,000 characters", 400)
-        with self.lock:
-            if self.closed:
-                raise EngineError("Engine is closed", 503)
+        # A disconnected waiter must leave promptly without taking ownership of
+        # the active turn or eventually loading/switching an engine for dead work.
+        candidate_id = candidate_id or self.default
+        needs_load = self.lock.admit(candidate_id, _CommandStop(stop, self._stopping))
+        if needs_load is None:
+            if self._stopping.is_set():
+                raise EngineError("Engine is stopping", 503)
+            return "cancelled", None, None
+        try:
+            if stop.is_set():
+                return "cancelled", None, None
+            if self._stopping.is_set():
+                raise EngineError("Engine is stopping", 503)
             if self.ownership.blocked:
                 raise EngineError("Runtime cleanup is unresolved: " + self.ownership.blocked, 503)
             spec = self.spec(candidate_id)
+            if image_input and "chat-images-v1" not in spec["capabilities"]:
+                raise EngineError("This engine package does not declare chat-images-v1", 400)
             limits = spec["limits"]
             if not 1 <= max_tokens < limits["kv_tokens"]:
                 raise EngineError("max_tokens must be between 1 and %d" % (limits["kv_tokens"] - 1), 400)
@@ -275,29 +309,57 @@ class ServedEngine:
                 raise EngineError(str(exc), 400) from exc
             if applied:
                 extra["sampling"] = applied
-            self.runtime.start()
+            if stop.is_set():
+                return "cancelled", None, None
+            if self._stopping.is_set():
+                raise EngineError("Engine is stopping", 503)
+            if needs_load:
+                try:
+                    loaded = self.runtime.call("load", {"spec": spec}, _CommandStop(stop, self._stopping),
+                                               self.load_seconds(spec))
+                    if loaded["status"] in {"cancelled", "timed_out"}:
+                        self.lock.invalidate()
+                        if self._stopping.is_set():
+                            raise EngineError("Engine is stopping", 503)
+                        return loaded["status"], None, None
+                    if loaded["status"] != "completed":
+                        raise EngineError(loaded.get("error") or "Engine loading failed")
+                    self.lock.configure(candidate_id, loaded.get("max_concurrent_requests", 1))
+                except BaseException as exc:
+                    if not self._stopping.is_set():
+                        self._retire(exc)
+                    raise
             folder = self.runtime.root / "requests" / uuid.uuid4().hex
             folder.mkdir(parents=True)
-            request = record("chat_request", self.run_id, chat_id="chat-" + uuid.uuid4().hex, request_id=uuid.uuid4().hex,
+            request = record("chat_request", spec["run_id"], chat_id="chat-" + uuid.uuid4().hex, request_id=uuid.uuid4().hex,
                 candidate_id=spec["candidate_id"], package_sha256=spec["package_sha256"], created_at=now(),
                 model_path=spec["model_path"], package_path=spec["package_path"],
                 model_manifest=spec["model_manifest"], configuration=spec["configuration"], messages=messages,
                 limits={"max_output_tokens": max_tokens, "kv_tokens": limits["kv_tokens"], "timeout_seconds": self.timeout,
                         **{k: v for k, v in limits.items() if k.endswith("headroom_bytes")}}, **extra)
-            write_json(folder / "request.json", request, immutable=True)
+            write_json(folder / "request.json", request, immutable=True, max_bytes=MAX_CHAT_RECORD)
             streams = STREAM_CAPABILITY in spec["capabilities"]
             try:
                 result = self.runtime.call("generate", {"spec": spec, "request_path": str(folder / "request.json"),
-                    "response_path": str(folder / "response.json")}, stop, self.timeout,
+                    "response_path": str(folder / "response.json")}, _CommandStop(stop, self._stopping), self.timeout,
                     progress=on_text if streams and on_text else None, request=request,
                     progress_tools=on_tools if TOOL_STREAM_CAPABILITY in spec["capabilities"] else None,
-                    progress_reasoning=on_reasoning if streams else None)
-            except (ValueError, OSError) as exc:
+                    progress_reasoning=on_reasoning if streams else None, on_started=on_started)
+            except BaseException as exc:
+                # Once the supervisor unwinds, no observer remains to forward
+                # cancellation. Retire even for consumer failures/interrupts,
+                # while the request lock still excludes another command.
                 self._retire(exc)
-                raise EngineError("Engine host failed: " + str(exc)) from exc
+                if isinstance(exc, (ValueError, OSError)):
+                    if self._stopping.is_set():
+                        raise EngineError("Engine is stopping", 503) from exc
+                    raise EngineError("Engine host failed: " + str(exc)) from exc
+                raise
             if result["status"] in {"cancelled", "timed_out"}:
                 # Settled cooperative cancellation keeps the weights resident.
                 shutil.rmtree(folder, ignore_errors=True)
+                if self._stopping.is_set():
+                    raise EngineError("Engine is stopping", 503)
                 return result["status"], None, None
             if result["status"] != "completed":
                 self._retire(result["error"])
@@ -311,14 +373,17 @@ class ServedEngine:
             # A long-running server would otherwise keep every conversation on disk; failed requests stay for diagnosis.
             shutil.rmtree(folder, ignore_errors=True)
             return "completed", assistant, measured
+        finally:
+            self.lock.release()
 
     def _check_sealed(self, spec):
         """The package must still be the sealed one after the engine ran. Unchanged file metadata skips rehashing;
         any change verifies the candidate's retained bytes again."""
         if package_signature(spec["package_path"]) == spec["signature"]:
             return
-        self.specs.pop(spec["candidate_id"], None)
-        if self.spec(spec["candidate_id"])["package_sha256"] != spec["package_sha256"]:
+        selector = spec["selector"]
+        self.specs.pop(selector, None)
+        if self.spec(selector)["package_sha256"] != spec["package_sha256"]:
             raise ValueError("Engine artifacts changed during the request")
 
     def _retire(self, error):
@@ -329,15 +394,21 @@ class ServedEngine:
             self.ownership.block("Engine cleanup failed after an error (%s): %s" % (error, exc))
 
     def close(self):
+        # Publish before waiting for the request lock: its owner must be able to
+        # cancel and settle, and queued requests must not dispatch behind it.
+        self._stopping.set()
         with self.lock:
             if self.closed:
                 return
-            self.closed = True
-            if not self.ownership.token:
-                return
-            if self.runtime.tree:
+            if self.ownership.token:
                 try:
-                    self.runtime.call("unload", {}, threading.Event(), 5)
-                except (ValueError, OSError):
-                    pass  # Retiring the whole process below also proves release.
-            self._release()
+                    if self.runtime.tree and not self.ownership.blocked:
+                        try:
+                            self.runtime.call("unload", {}, threading.Event(), 5)
+                        except (ValueError, OSError):
+                            pass  # Retiring the whole process below also proves release.
+                finally:
+                    self._release()
+            # A failed release leaves shutdown requested and ownership blocked,
+            # but allows a later close to retry physical retirement.
+            self.closed = True

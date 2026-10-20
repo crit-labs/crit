@@ -195,6 +195,30 @@ class AdvancedToolTests(test_api.ApiTests):
         self.assertEqual(response.status, 200, value)
         self.assertEqual(self.served.status()['engine_loads'], 1)
 
+    def test_tool_consumer_exception_retires_producer_before_next_request(self):
+        root, tree = self.served.runtime.root, self.served.runtime.tree
+        self.addCleanup(self.served._retire, "tool consumer regression cleanup")
+        error, seen = RuntimeError("tool consumer failed"), []
+
+        def tools(delta):
+            seen.extend(delta)
+            raise error
+
+        options = tool_options({'tools': TOOLS}, self.served.spec()['capabilities'])
+        with self.assertRaises(RuntimeError) as caught:
+            self.served.generate(
+                [{'role': 'user', 'content': 'stream-tools:' + json.dumps({'calls': [CALL], 'hold': True})}],
+                30, threading.Event(), tool_options=options, on_tools=tools)
+        self.assertIs(caught.exception, error)
+        self.assertTrue(seen)
+        self.assertIsNone(self.served.runtime.tree)
+        self.assertIsNotNone(tree.process.poll())
+        self.assertFalse((root / 'stream.json').exists())
+        response, value = self.chat('stream-tools:' + json.dumps({'calls': [CALL]}), tools=TOOLS)
+        self.assertEqual(response.status, 200, value)
+        self.assertEqual(value['choices'][0]['message']['tool_calls'], [CALL])
+        self.assertNotEqual(self.served.runtime.root, root)
+
     def test_invalid_strict_prefix_is_sse_error_without_invalid_argument_delta(self):
         call = dict(CALL, function={'name': 'read_file', 'arguments': '{"wrong":1}'})
         response, data = self.chat('stream-tools:' + json.dumps({'calls': [call]}), tools=TOOLS, stream=True)

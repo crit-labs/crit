@@ -71,6 +71,7 @@ class EngineLockTest(unittest.TestCase):
             self.assertGreater(waited, 0.5)
         finally:
             proc.wait(timeout=30)
+            proc.stdout.close()
 
     def foreign_lease(self, age_s):
         self.lease.write_text(json.dumps({"id": "other", "pid": 7, "label": "crit serve (WSL test)", "system": "wsl",
@@ -102,6 +103,40 @@ class EngineLockTest(unittest.TestCase):
         os.environ[machine.LOCK_ENV] = "off"
         with machine.engine_lock("anything"):
             self.assertIsNone(os.environ.get(machine.HELD_ENV))
+
+    def test_deadline_bounds_wait_for_file_lock(self):
+        proc = self.holder_process(10)
+        try:
+            started = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                with machine.engine_lock("bounded waiter", deadline=started + .15, poll_s=5):
+                    self.fail("busy lock admitted a waiter")
+            self.assertLess(time.monotonic() - started, 2)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10)
+            proc.stdout.close()
+
+    def test_deadline_bounds_wait_for_shared_lease(self):
+        self.foreign_lease(age_s=1)
+        started = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            with machine.engine_lock("bounded waiter", deadline=started + .15, poll_s=5):
+                self.fail("busy lease admitted a waiter")
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(json.loads(self.lease.read_text())["id"], "other")
+        os.environ[machine.LEASE_ENV] = "off"
+        with machine.engine_lock("next caller", wait=False):
+            pass
+
+    def test_expiry_during_lease_acquisition_releases_both_locks(self):
+        with self.assertRaises(TimeoutError):
+            with machine.engine_lock("expires during handshake", deadline=time.monotonic() + .05):
+                self.fail("expired caller admitted")
+        self.assertFalse(self.lease.exists())
+        self.assertNotIn(machine.HELD_ENV, os.environ)
+        with machine.engine_lock("next caller", wait=False):
+            pass
 
 
 if __name__ == "__main__":

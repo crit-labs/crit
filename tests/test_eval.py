@@ -3,15 +3,18 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock, mock_open, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("core/python", "eval"): sys.path.insert(0, str(ROOT / _folder))
 from crit_core.model import inspect_safetensors  # noqa: E402
-from crit_eval import ab, ceiling, context, headroom, metrics, pin, prepare, probe, report, runner, status  # noqa: E402
+from crit_eval import ab, ceiling, context, headroom, hostload, metrics, pin, prepare, probe, report, runner, status  # noqa: E402
 
 MOCK = ROOT / "eval/examples/mock_adapter.py"
 
@@ -1213,24 +1216,114 @@ class ReferenceDtLimitTest(unittest.TestCase):
 
 
 class HostLoadTest(unittest.TestCase):
-    """Other processes' CPU cores over an interval: a busy child counts, this process's own work does not."""
+    """Exact CPU accounting, independent of unrelated programs running on the test host."""
+
+    def measure(self, host, process, wall):
+        # Control the counter inputs, keeping HostLoad and its own-process reader real.
+        with patch.object(hostload, "_host_busy_seconds", side_effect=host), \
+                patch.object(hostload.os, "times", side_effect=[os.times_result(t) for t in process]), \
+                patch.object(hostload.time, "perf_counter", side_effect=wall):
+            return hostload.HostLoad().start().cores()
 
     def test_counts_other_processes_not_this_one(self):
-        import subprocess
-        import time as _time
-        from crit_eval.hostload import HostLoad
-        load = HostLoad().start()
-        end = _time.perf_counter() + 0.4
-        while _time.perf_counter() < end:
-            pass
-        own = load.cores()
-        if own is None:
-            self.skipTest("no host CPU totals on this platform")
-        child = subprocess.Popen([sys.executable, "-c", "import time; end = time.time() + 1.5\nwhile time.time() < end: pass"])
-        load = HostLoad().start()
-        child.wait()
-        busy = load.cores()
-        self.assertGreater(busy, own + 0.3, (own, busy))
+        # os.times fields: own user/system, reaped children's user/system, elapsed.
+        start = (10, 4, 7, 3, 1000)
+        cases = [
+            # Two CPU seconds of our own work over two wall seconds: no other load.
+            ("own work", 102, (11.5, 4.5, 7, 3, 1002), 0.0),
+            # A waited-for child's two CPU seconds must still count as other work.
+            ("child work", 102, (10, 4, 8.5, 3.5, 1002), 1.0),
+            # Two own, three child and four unrelated CPU seconds: 3.5 other cores.
+            ("mixed work", 109, (11.5, 4.5, 9, 4, 1002), 3.5),
+        ]
+        # The old live test compared different windows and assumed background load
+        # stayed constant. Each scenario now has its own exact accounting oracle.
+        for name, host_end, process_end, expected in cases:
+            with self.subTest(work=name):
+                self.assertEqual(self.measure((100, host_end), (start, process_end), (20, 22)), expected)
+
+    def test_normalizes_by_elapsed_wall_time(self):
+        process = ((10, 4, 7, 3, 1000), (11.5, 4.5, 7, 3, 1004))
+        for elapsed, expected in ((0.5, 8.0), (2, 2.0), (4, 1.0)):
+            with self.subTest(elapsed=elapsed):
+                self.assertEqual(self.measure((100, 106), process, (20, 20 + elapsed)), expected)
+
+    def test_unavailable_host_totals_are_not_reported_as_zero(self):
+        process = ((10, 4, 7, 3, 1000), (10, 4, 7, 3, 1002))
+        for host in ((None, 102), (100, None), (None, None)):
+            with self.subTest(host=host):
+                self.assertIsNone(self.measure(host, process, (20, 22)))
+
+    def test_nonpositive_wall_interval_is_unavailable(self):
+        process = ((10, 4, 7, 3, 1000), (10, 4, 7, 3, 1002))
+        for wall in ((20, 20), (20, 19)):
+            with self.subTest(wall=wall):
+                self.assertIsNone(self.measure((100, 102), process, wall))
+
+    def test_counter_sampling_skew_cannot_report_negative_load(self):
+        process = ((10, 4, 7, 3, 1000), (10.25, 4, 7, 3, 1002))
+        self.assertEqual(self.measure((100, 100.125), process, (20, 22)), 0.0)
+
+
+class HostLoadCountersTest(unittest.TestCase):
+    """Exercise both platform readers on either OS, plus the real local counter APIs."""
+
+    def test_windows_excludes_idle_and_converts_filetime(self):
+        import ctypes
+
+        def system_times(idle, kernel, user):
+            # 1000 idle seconds, 1600 kernel seconds (including idle), 250.25 user
+            # seconds. Totals exceed 32 bits; FILETIME ticks are 100 ns.
+            for pointer, ticks in ((idle, 10_000_000_000), (kernel, 16_000_000_000), (user, 2_502_500_000)):
+                ctypes.cast(pointer, ctypes.POINTER(ctypes.c_ulonglong)).contents.value = ticks
+            return success
+
+        for success, expected in ((1, 850.25), (0, None)):
+            with self.subTest(api_success=success):
+                windows = SimpleNamespace(kernel32=SimpleNamespace(GetSystemTimes=system_times))
+                with patch.object(hostload, "os", SimpleNamespace(name="nt")), \
+                        patch.object(ctypes, "windll", windows, create=True):
+                    self.assertEqual(hostload._host_busy_seconds(), expected)
+
+    def test_linux_excludes_idle_iowait_and_duplicate_guest_time(self):
+        # Busy ticks: 1000 user + 200 nice + 300 system + 60 irq + 70 softirq
+        # + 80 steal = 1710. Guest and guest_nice are already in user and nice.
+        stat = "cpu 1000 200 300 4000 500 60 70 80 900 150\ncpu0 1 2 3 4 5 6 7 8 9 10\n"
+        for ticks_per_second, expected in ((100, 17.1), (250, 6.84)):
+            with self.subTest(ticks_per_second=ticks_per_second):
+                platform = SimpleNamespace(name="posix", sysconf=Mock(return_value=ticks_per_second))
+                with patch.object(hostload, "os", platform), \
+                        patch.object(hostload, "open", mock_open(read_data=stat), create=True):
+                    self.assertEqual(hostload._host_busy_seconds(), expected)
+                platform.sysconf.assert_called_once_with("SC_CLK_TCK")
+
+    def test_linux_accepts_totals_without_optional_fields(self):
+        platform = SimpleNamespace(name="posix", sysconf=lambda name: 100)
+        with patch.object(hostload, "os", platform), \
+                patch.object(hostload, "open", mock_open(read_data="cpu 1000 200 300 4000\n"), create=True):
+            self.assertEqual(hostload._host_busy_seconds(), 15.0)
+
+    def test_linux_unreadable_or_invalid_totals_are_unavailable(self):
+        platform = SimpleNamespace(name="posix", sysconf=lambda name: 100)
+        for data in ("", "cpu0 1 2 3 4\n", "cpu 1 2\n", "cpu 1 two 3 4\n", OSError("unreadable")):
+            with self.subTest(data=data):
+                source = Mock(side_effect=data) if isinstance(data, OSError) else mock_open(read_data=data)
+                with patch.object(hostload, "os", platform), \
+                        patch.object(hostload, "open", source, create=True):
+                    self.assertIsNone(hostload._host_busy_seconds())
+
+    @unittest.skipUnless(os.name == "nt" or sys.platform.startswith("linux"), "Windows/Linux counter APIs")
+    def test_native_counters_are_available_and_monotonic(self):
+        # A supported platform losing its reader must fail, not silently skip the
+        # accounting test. No assumption about how much background work occurs.
+        for name, read in (("host", hostload._host_busy_seconds), ("own", hostload._own_seconds)):
+            with self.subTest(counter=name):
+                before, after = read(), read()
+                self.assertIsNotNone(before)
+                self.assertIsNotNone(after)
+                self.assertTrue(math.isfinite(before) and math.isfinite(after))
+                self.assertGreaterEqual(before, 0.0)
+                self.assertGreaterEqual(after, before)
 
 
 if __name__ == "__main__":

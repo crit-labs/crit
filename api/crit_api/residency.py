@@ -2,6 +2,7 @@
 from pathlib import Path
 import errno
 import sys
+import threading
 import time
 import uuid
 
@@ -19,12 +20,18 @@ class ResidentRuntime:
         self.ownership = ownership
         self.host_limit, self.device_limit = host_limit, device_limit
         self.tree = self.log = self.root = None
+        self.lifecycle = threading.RLock()
+        self.on_retire = lambda: None
 
     def start(self):
+        with self.lifecycle:
+            self._start()
+
+    def _start(self):
         if self.tree:
             return
         self.root = self.ownership.directory / "runtimes" / uuid.uuid4().hex
-        for name in ("commands", "accepted", "results", "cancel"):
+        for name in ("commands", "accepted", "results", "cancel", "streams"):
             (self.root / name).mkdir(parents=True)
         self.ownership.update(runtime_id=self.root.name)
         config = self.root / "host.json"
@@ -35,12 +42,14 @@ class ResidentRuntime:
                                  self.root, self.log, self.ownership, self.root)
 
     def status(self):
-        if not self.tree:
+        with self.lifecycle:
+            tree, root = self.tree, self.root
+        if not tree:
             return {"state": "unloaded", "host_bytes": 0, "device_bytes": 0}
-        if self.tree.process.poll() is not None:
+        if tree.process.poll() is not None:
             return {"state": "interrupted", "host_bytes": 0, "device_bytes": 0,
                     "error": "Resident host exited; Unload verifies remaining process cleanup"}
-        path = self.root / "status.json"
+        path = root / "status.json"
         deadline = time.monotonic() + .25
         while True:
             try:
@@ -57,35 +66,48 @@ class ResidentRuntime:
                 time.sleep(.005)
 
     def call(self, action, payload, stop, timeout, progress=None, request=None, progress_tools=None,
-             progress_reasoning=None):
-        self.start()
+             progress_reasoning=None, on_started=None):
+        if stop.is_set():
+            return {"status": "cancelled", "error": "Stopped", "cleanup_settled": True}
+        with self.lifecycle:
+            if action != "generate":
+                self.start()
+            if self.tree is None:
+                raise ValueError("Resident host was retired")
+            root, tree = self.root, self.tree
         cid = uuid.uuid4().hex
-        stream_path = self.root / "stream.json"
+        concurrent = "chat-concurrent-v1" in payload.get("spec", {}).get("capabilities", [])
+        stream_path = root / "streams" / (cid + ".json") if concurrent else root / "stream.json"
         stream = (StreamReader(stream_path, cid, self.ownership.token, request, progress or (lambda text: None),
                                progress_tools, progress_reasoning)
                   if progress or progress_tools or progress_reasoning else None)
-        result = self._call(cid, action, payload, stop, timeout, stream)
+        result = self._call(cid, action, payload, stop, timeout, stream, on_started, root, tree)
         # Completion proves producer settlement. On an exception the owner
         # retires the host, then close()/recovery removes this private snapshot.
         stream_path.unlink(missing_ok=True)
         return result
 
-    def _call(self, cid, action, payload, stop, timeout, stream):
-        write_json(self.root / "commands" / (cid + ".json"), {"command_id": cid, "token": self.ownership.token,
+    def _call(self, cid, action, payload, stop, timeout, stream, on_started=None, root=None, tree=None):
+        root, tree = root or self.root, tree or self.tree
+        if stop.is_set():
+            return {"status": "cancelled", "error": "Stopped", "cleanup_settled": True}
+        write_json(root / "commands" / (cid + ".json"), {"command_id": cid, "token": self.ownership.token,
                    "action": action, "payload": payload}, immutable=True)
         deadline, cancelled_at, timed_out = time.monotonic() + timeout, None, False
-        result_path = self.root / "results" / (cid + ".json")
+        if on_started:
+            on_started(deadline)
+        result_path = root / "results" / (cid + ".json")
         while True:
             stamp = time.monotonic()
             if stop.is_set() or stamp >= deadline:
                 if cancelled_at is None:
                     timed_out = not stop.is_set()
                     cancelled_at = stamp
-                    write_json(self.root / "cancel" / (cid + ".json"), {"command_id": cid}, immutable=True)
+                    write_json(root / "cancel" / (cid + ".json"), {"command_id": cid}, immutable=True)
                 if stamp - cancelled_at >= 1:
                     self.close()
                     return {"status": "timed_out" if timed_out else "cancelled", "error": "Reply timed out" if timed_out else "Stopped", "cleanup_settled": True}
-            if (self.root / "runtime.log").stat().st_size > 4 * 1024 * 1024:
+            if (root / "runtime.log").stat().st_size > 4 * 1024 * 1024:
                 raise ValueError("Resident diagnostic output limit exceeded")
             if stream and cancelled_at is None:
                 stream.poll()
@@ -103,13 +125,18 @@ class ResidentRuntime:
                     # once more in case it appeared after this loop's read.
                     stream.poll()
                 return result
-            if self.tree.process.poll() is not None:
+            if tree.process.poll() is not None:
                 # Identify retained diagnostics without exposing arbitrary adapter log contents to API clients.
                 raise ValueError("Resident host exited before completing the request (exit %s); diagnostics: %s" %
-                                 (self.tree.process.returncode, self.root / "runtime.log"))
+                                 (tree.process.returncode, root / "runtime.log"))
             time.sleep(.02)
 
     def close(self):
+        self.on_retire()
+        with self.lifecycle:
+            self._close()
+
+    def _close(self):
         if self.tree:
             self.tree.close()
             self.tree = None

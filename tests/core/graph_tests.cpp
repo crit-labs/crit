@@ -1,6 +1,7 @@
 // Core device graph protocol on the host: graph identity and settled lifetime, staged matrix geometry and the
 // staged replay/failure state machine. No device or CUDA call is made.
 #include <crit/device_graph.h>
+#include "allocation_failure.h"
 #include <functional>
 #include <iostream>
 #include <stdexcept>
@@ -171,6 +172,128 @@ void graph_receipts() {
     require(launches == 0 && cache.in_flight(key()) == 1 && cache.owners(key())[0] == kept,
             "a failed completion probe dropped receipts or launched");
 }
+void graph_owner_lifetime() {
+    // Leaving scope must not bypass evict's settlement checks. Weak owners make a premature
+    // destruction observable without letting a fake device read freed memory.
+    for(const int failure:{0,1,2,3,4}) {
+        std::weak_ptr<const void> observed_owner;
+        std::weak_ptr<void> observed_graph;
+        {
+            const allocation_failure::Reset reset;
+            GraphCache cache(1);
+            auto kept = owner();
+            observed_owner = kept;
+            if(failure == 4) {
+                rejects<std::runtime_error>([&] {
+                    cache.capture(key(),{kept},[](const GraphKey&) -> GraphHandle {
+                        throw std::runtime_error("capture submitted before failure");
+                    });
+                },"capture submitted");
+            } else {
+                auto executable = cache.capture(key(),{kept},[](const GraphKey&){return graph();});
+                observed_graph = executable;
+                if(failure == 3) {
+                    rejects<std::runtime_error>([&] {
+                        cache.replay(key(),[](const GraphHandle&) -> std::shared_ptr<GraphReceipt> {
+                            throw std::runtime_error("launch submitted before failure");
+                        });
+                    },"launch submitted");
+                } else {
+                    auto completion = receipt(failure == 0);
+                    completion->uncertain = failure == 2;
+                    cache.replay(key(),[&](const GraphHandle&){return completion;});
+                }
+            }
+            allocation_failure::enabled = true;
+        }
+        require(observed_owner.expired() == (failure == 0),
+                "graph cache destruction released an owner without settlement proof");
+        if(failure != 4) require(observed_graph.expired() == (failure == 0),
+                                "graph cache destruction released an unsettled executable");
+    }
+}
+void graph_capture_allocation_failure() {
+    struct CaptureFailure {};
+    GraphCache cache(1);
+    auto kept = owner();
+    const std::weak_ptr<const void> observed = kept;
+    bool original = false, allocation_error = false;
+    {
+        const allocation_failure::Reset reset;
+        try {
+            cache.capture(key(),{std::move(kept)},[](const GraphKey&) -> GraphHandle {
+                allocation_failure::enabled = true;
+                throw CaptureFailure{};
+            });
+        } catch(const CaptureFailure&) { original = true; }
+        catch(const std::bad_alloc&) { allocation_error = true; }
+    }
+    require(original && !allocation_error && !observed.expired() && cache.quarantined().size() == 1,
+            "failed capture allocated recovery bookkeeping and lost its owner or original exception");
+    auto executable = graph();
+    bool captured = false;
+    {
+        const allocation_failure::Reset reset;
+        try {
+            captured = cache.capture(key(),{owner()},[&](const GraphKey&) {
+                allocation_failure::enabled = true;
+                return executable;
+            }) == executable;
+        } catch(const std::bad_alloc&) {}
+    }
+    require(captured,"successful capture allocated ownership bookkeeping after the backend hook");
+}
+void graph_owner_moves() {
+    auto kept = owner();
+    const std::weak_ptr<const void> observed = kept;
+    auto completion = receipt();
+    GraphCache original(1);
+    original.capture(key(),{std::move(kept)},[](const GraphKey&){return graph();});
+    original.replay(key(),[&](const GraphHandle&){return completion;});
+    GraphCache copy(original);
+    GraphCache moved(std::move(original));
+    require(original.size() == 0 && moved.size() == 1 && copy.size() == 1 && !observed.expired(),
+            "moving/copying a cache lost its pending owners");
+    original.capture(key(),{owner()},[](const GraphKey&){return graph();});
+    completion->finished = true;
+    moved.evict(key(),[](const GraphHandle&){});
+    require(!observed.expired(),"copy did not retain its graph owners");
+    copy.evict(key(),[](const GraphHandle&){});
+    require(observed.expired(),"settled copies kept their graph owners");
+    // Assignment also retires its old contents. It cannot silently drop a pending destination.
+    for(const bool move:{false,true}) {
+        auto old = owner();
+        const std::weak_ptr<const void> pending = old;
+        GraphCache destination(1);
+        destination.capture(key(),{std::move(old)},[](const GraphKey&){return graph();});
+        destination.replay(key(),[](const GraphHandle&){return receipt();});
+        GraphCache source(1);
+        source.capture(key(),{owner()},[](const GraphKey&){return graph();});
+        if(move) destination = std::move(source); else destination = source;
+        require(!pending.expired() && destination.size() == 1,
+                "cache assignment dropped an unsettled destination");
+    }
+}
+void graph_destroy_failure() {
+    GraphCache cache(1);
+    cache.capture(key(),{owner()},[](const GraphKey&){return graph();});
+    unsigned destroys = 0, launches = 0;
+    rejects<std::runtime_error>([&] {
+        cache.evict(key(),[&](const GraphHandle&) {
+            ++destroys;
+            throw std::runtime_error("destroy outcome unknown");
+        });
+    },"destroy outcome unknown");
+    require(cache.failed(key()),"failed graph destruction left the executable reusable");
+    rejects<std::logic_error>([&] {
+        cache.replay(key(),[&](const GraphHandle&) { ++launches; return receipt(true); });
+    },"backend recovery");
+    rejects<std::logic_error>([&] {
+        cache.evict(key(),[&](const GraphHandle&){++destroys;});
+    },"retained owners");
+    require(launches == 0 && destroys == 1 && cache.owners(key()).size() == 1,
+            "ambiguous graph destruction retried or released its owners");
+}
 void graph_plan() {
     const MatrixLayout layout{2, 3, 4, MatrixElement::f32};
     StagedGraphPlan plan(layout, layout, 4, 2, 1);
@@ -260,6 +383,10 @@ int main(int argc, char** argv) {
         const std::string test = argc > 1 ? argv[1] : "all";
         const std::vector<std::pair<std::string, std::function<void()>>> tests{
             {"graph_key", graph_key}, {"graph_identity", graph_identity}, {"graph_generations", graph_generations},
+            {"graph_owner_lifetime", graph_owner_lifetime},
+            {"graph_capture_allocation_failure", graph_capture_allocation_failure},
+            {"graph_owner_moves", graph_owner_moves},
+            {"graph_destroy_failure", graph_destroy_failure},
             {"graph_prerequisites", graph_prerequisites}, {"graph_failures", graph_failures},
             {"graph_receipts", graph_receipts}, {"graph_plan", graph_plan}, {"graph_state", graph_state},
             {"graph_state_failures", graph_state_failures}};
