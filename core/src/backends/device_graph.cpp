@@ -1,5 +1,6 @@
 #include "crit/device_graph.h"
 #include <algorithm>
+#include <atomic>
 #include <limits>
 #include <set>
 
@@ -26,7 +27,7 @@ void GraphKey::validate() const {
 }
 
 bool GraphCache::Entry::settled() {
-    if(failed_launch) return false;
+    if(failed_operation) return false;
     // A probe that throws leaves every receipt retained.
     std::vector<std::shared_ptr<GraphReceipt>> live;
     for(const auto& completion : completions)
@@ -34,8 +35,53 @@ bool GraphCache::Entry::settled() {
     completions = std::move(live);
     return completions.empty();
 }
-GraphCache::GraphCache(std::size_t capacity):capacity_(capacity) {
+// Allocated before any backend hook. Teardown can transfer ownership without allocating,
+// even if a failed completion probe coincides with host memory exhaustion.
+struct GraphCache::Retention {
+    std::map<GraphKey,Entry> entries;
+    std::vector<std::vector<GraphOwner>> captures;
+    Retention* next = nullptr;
+};
+GraphCache::GraphCache(std::size_t capacity):capacity_(capacity),retention_(std::make_unique<Retention>()) {
     if(!capacity) throw std::invalid_argument("positive graph capacity required");
+}
+GraphCache::~GraphCache() {
+    bool settled = quarantined_.empty();
+    if(settled) try {
+        for(auto& [key,entry]:entries_) {
+            static_cast<void>(key);
+            if(!entry.settled()) { settled = false; break; }
+        }
+    } catch(...) { settled = false; }
+    if(settled) return;
+    retention_->entries.swap(entries_);
+    retention_->captures.swap(quarantined_);
+    auto* kept = retention_.release();
+    static std::atomic<Retention*> head{nullptr};
+    auto previous = head.load(std::memory_order_relaxed);
+    do { kept->next = previous; }
+    while(!head.compare_exchange_weak(previous,kept,std::memory_order_release,std::memory_order_relaxed));
+}
+GraphCache::GraphCache(const GraphCache& other):GraphCache(other.capacity_) {
+    entries_ = other.entries_;
+    quarantined_ = other.quarantined_;
+}
+GraphCache::GraphCache(GraphCache&& other) noexcept
+    :capacity_(other.capacity_),entries_(std::move(other.entries_)),quarantined_(std::move(other.quarantined_)),
+     retention_(std::move(other.retention_)) {}
+void GraphCache::swap(GraphCache& other) noexcept {
+    std::swap(capacity_,other.capacity_);
+    entries_.swap(other.entries_);
+    quarantined_.swap(other.quarantined_);
+    retention_.swap(other.retention_);
+}
+GraphCache& GraphCache::operator=(const GraphCache& other) {
+    if(this != &other) { GraphCache replacement(other); swap(replacement); }
+    return *this;
+}
+GraphCache& GraphCache::operator=(GraphCache&& other) noexcept {
+    if(this != &other) { GraphCache replacement(std::move(other)); swap(replacement); }
+    return *this;
 }
 GraphHandle GraphCache::capture(const GraphKey& key, std::vector<GraphOwner> owners, const Capture& capture_graph) {
     key.validate();
@@ -48,17 +94,20 @@ GraphHandle GraphCache::capture(const GraphKey& key, std::vector<GraphOwner> own
     if(owners.empty() || std::find(owners.begin(), owners.end(), nullptr) != owners.end())
         throw std::invalid_argument("capture must retain its physical owners");
     if(!capture_graph) throw std::invalid_argument("capture hook required");
-    GraphHandle graph;
+    // A moved-from cache may be reused. Replenish its guard before any backend operation.
+    if(!retention_) retention_ = std::make_unique<Retention>();
+    quarantined_.reserve(quarantined_.size()+1);
+    auto entry = entries_.emplace(key,Entry{{},std::move(owners),{},false}).first;
     try {
-        graph = capture_graph(key);
-        if(!graph) throw std::logic_error("capture returned no graph");
+        entry->second.graph = capture_graph(key);
+        if(!entry->second.graph) throw std::logic_error("capture returned no graph");
     } catch(...) {
         // Captured work may exist: release the owners only after backend abort or quiescence proof.
-        quarantined_.push_back(std::move(owners));
+        quarantined_.push_back(std::move(entry->second.owners));
+        entries_.erase(entry);
         throw;
     }
-    entries_.emplace(key, Entry{graph, std::move(owners), {}, false});
-    return graph;
+    return entry->second.graph;
 }
 std::shared_ptr<GraphReceipt> GraphCache::replay(const GraphKey& key, const Launch& launch,
                                                  std::span<const std::shared_ptr<GraphReceipt>> prerequisites) {
@@ -66,7 +115,7 @@ std::shared_ptr<GraphReceipt> GraphCache::replay(const GraphKey& key, const Laun
     const auto found = entries_.find(key);
     if(found == entries_.end()) throw std::out_of_range("graph identity is not cached");
     auto& entry = found->second;
-    if(entry.failed_launch) throw std::logic_error("failed launch requires backend recovery before reuse");
+    if(entry.failed_operation) throw std::logic_error("failed graph operation requires backend recovery before reuse");
     if(!launch) throw std::invalid_argument("launch hook required");
     for(const auto& receipt : prerequisites)
         if(!receipt) throw std::invalid_argument("prerequisites require settlement and success receipts");
@@ -81,7 +130,7 @@ std::shared_ptr<GraphReceipt> GraphCache::replay(const GraphKey& key, const Laun
         if(!completion) throw std::logic_error("launch must return a physical completion receipt");
         entry.completions.reserve(entry.completions.size() + 1);
     } catch(...) {
-        entry.failed_launch = true; // Submitted work may exist without a receipt.
+        entry.failed_operation = true; // Submitted work may exist without a receipt.
         throw;
     }
     entry.completions.push_back(completion);
@@ -92,7 +141,13 @@ void GraphCache::evict(const GraphKey& key, const Destroy& destroy) {
     if(found == entries_.end()) throw std::out_of_range("graph identity is not cached");
     if(!destroy) throw std::invalid_argument("destroy hook required");
     if(!found->second.settled()) throw std::logic_error("graph still accesses retained owners");
-    destroy(found->second.graph);
+    try { destroy(found->second.graph); }
+    catch(...) {
+        // Destruction may have taken effect before the hook threw. Neither replay nor a second
+        // destruction is safe without backend recovery; preserve the graph and its owners.
+        found->second.failed_operation = true;
+        throw;
+    }
     entries_.erase(found);
 }
 std::size_t GraphCache::size() const noexcept { return entries_.size(); }
@@ -104,7 +159,7 @@ const GraphCache::Entry& GraphCache::at(const GraphKey& key) const {
 }
 std::span<const GraphOwner> GraphCache::owners(const GraphKey& key) const { return at(key).owners; }
 std::size_t GraphCache::in_flight(const GraphKey& key) const { return at(key).completions.size(); }
-bool GraphCache::failed(const GraphKey& key) const { return at(key).failed_launch; }
+bool GraphCache::failed(const GraphKey& key) const { return at(key).failed_operation; }
 std::span<const std::vector<GraphOwner>> GraphCache::quarantined() const noexcept { return quarantined_; }
 
 namespace {

@@ -212,6 +212,138 @@ class StreamingTests(StreamingFixture, unittest.TestCase):
         self.assertEqual(status, "completed")
         self.assertEqual(json.loads(assistant.split("\n", 1)[1])["history"], 1)
 
+    def check_consumer_failure(self, error):
+        engine = self.engine()
+        self.addCleanup(engine._retire, "stream consumer regression cleanup")
+        root, tree = engine.runtime.root, engine.runtime.tree
+        held, observed = [], []
+        close = engine.runtime.close
+
+        def retire():
+            held.append(engine.lock.locked())
+            close()
+
+        def consume(text):
+            observed.append(text)
+            raise error
+
+        with patch.object(engine.runtime, "close", side_effect=retire):
+            with self.assertRaises(type(error)) as caught:
+                engine.generate([{"role": "user", "content": "hold"}], 128,
+                                threading.Event(), on_text=consume)
+        self.assertIs(caught.exception, error)
+        self.assertTrue(observed)
+        self.assertIsNone(engine.runtime.tree)
+        self.assertIsNotNone(tree.process.poll())
+        self.assertEqual(held, [True])
+        self.assertFalse(engine.lock.locked())
+        self.assertFalse((root / "stream.json").exists())
+        self.assertFalse((root / "models").exists())
+        (status, assistant, _), failure = self.streaming(engine, "hello")[2]()
+        self.assertEqual(status, "completed", failure)
+        self.assertNotEqual(engine.runtime.root, root)
+        data = json.loads(assistant.split("\n", 1)[1])
+        self.assertEqual((data["calls"], data["private"], data["history"]), (1, 1, 1))
+
+    def test_consumer_exception_retires_before_unlock_and_preserves_original_error(self):
+        self.check_consumer_failure(RuntimeError("consumer failed"))
+
+    def test_consumer_interrupt_retires_before_unlock_and_preserves_interrupt(self):
+        self.check_consumer_failure(KeyboardInterrupt("consumer interrupted"))
+
+    def test_consumer_failure_with_failed_retirement_blocks_reuse(self):
+        engine = self.engine()
+        self.addCleanup(engine._retire, "failed retirement regression cleanup")
+        root, tree = engine.runtime.root, engine.runtime.tree
+        error = RuntimeError("consumer failed")
+
+        def consume(text):
+            raise error
+
+        with patch.object(engine.runtime, "close", side_effect=RuntimeError("retirement failed")):
+            with self.assertRaises(RuntimeError) as caught:
+                engine.generate([{"role": "user", "content": "hold"}], 128,
+                                threading.Event(), on_text=consume)
+            self.assertIs(caught.exception, error)
+            self.assertEqual(engine.status()["state"], "blocked")
+            self.assertIn("retirement failed", engine.ownership.blocked)
+            self.assertIs(engine.runtime.tree, tree)
+            self.assertIsNone(tree.process.poll())
+            self.assertTrue((root / "stream.json").exists())
+            with self.assertRaisesRegex(EngineError, "cleanup is unresolved") as blocked:
+                self.ask(engine)
+            self.assertEqual(blocked.exception.status, 503)
+            with self.assertRaisesRegex(ValueError, "Another CRIT runtime"):
+                self.engine(open=False).open()
+        engine._retire("retry after synthetic cleanup failure")
+        self.assertIsNotNone(tree.process.poll())
+        engine.close()
+        self.assertFalse(engine.ownership.path.exists())
+        self.assertEqual(self.streaming(self.engine(), "hello")[2]()[0][0], "completed")
+
+    def test_queued_request_waits_for_consumer_failure_retirement(self):
+        engine = self.engine()
+        self.addCleanup(engine._retire, "queued retirement regression cleanup")
+        root, tree = engine.runtime.root, engine.runtime.tree
+        retiring, release = threading.Event(), threading.Event()
+        attempted, finished = threading.Event(), threading.Event()
+        outcome = {}
+        error = RuntimeError("consumer failed")
+        close = engine.runtime.close
+
+        def retire():
+            retiring.set()
+            if not release.wait(10):
+                raise RuntimeError("test did not release retirement")
+            close()
+
+        def consume(text):
+            raise error
+
+        def first_request():
+            try:
+                engine.generate([{"role": "user", "content": "hold"}], 128,
+                                threading.Event(), on_text=consume)
+            except BaseException as exc:
+                outcome["first_error"] = exc
+
+        def queued_request():
+            attempted.set()
+            try:
+                outcome["second"] = engine.generate([{"role": "user", "content": "hello"}],
+                                                    128, threading.Event())
+            except BaseException as exc:
+                outcome["second_error"] = exc
+            finally:
+                finished.set()
+
+        first, second = threading.Thread(target=first_request), threading.Thread(target=queued_request)
+        with patch.object(engine.runtime, "close", side_effect=retire):
+            try:
+                first.start()
+                self.assertTrue(retiring.wait(5), "consumer failure did not begin retirement")
+                second.start()
+                self.assertTrue(attempted.wait(5))
+                self.assertFalse(finished.wait(.1), "queued request passed unfinished retirement")
+                self.assertTrue(engine.lock.locked())
+                self.assertIsNone(tree.process.poll())
+                self.assertEqual(list((root / "commands").glob("*.json")), [])
+            finally:
+                release.set()
+                first.join(10)
+                if second.ident is not None:
+                    second.join(10)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertIs(outcome.get("first_error"), error)
+        self.assertNotIn("second_error", outcome)
+        self.assertIsNotNone(tree.process.poll())
+        self.assertNotEqual(engine.runtime.root, root)
+        status, assistant, _ = outcome["second"]
+        self.assertEqual(status, "completed")
+        data = json.loads(assistant.split("\n", 1)[1])
+        self.assertEqual((data["calls"], data["private"], data["history"]), (1, 1, 1))
+
     def test_failed_final_telemetry_reset_or_swallowed_emit_fails_the_request(self):
         engine = self.engine()
         for message, error in (("badfinal", "differs"), ("badtelemetry", "output tokens"),

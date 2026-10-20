@@ -30,6 +30,7 @@ reply = client.chat.completions.create(model="default", messages=[{"role": "user
 | `--api-key KEY` | Require `Authorization: Bearer KEY`; default `CRIT_API_KEY`. A non-local `--host` without a key prints a warning |
 | `--cors-origin ORIGIN` | Allow browser requests from this origin, or `*` |
 | `--model-name NAME` | Model ID reported for the default candidate |
+| `--models PATH` | JSON catalog of named models from several runs; replaces `--workspace`, `--run`, `--candidate` and `--model-name` |
 | `--timeout SECONDS` | Limit per request; default 600 |
 | `--load-timeout SECONDS` | Limit on loading the starting candidate; default 600 plus the model's bytes at 200 MB/s (50 MB/s with `--verify-model`) |
 | `--verify-model` | Before loading, read and SHA-256 every model file against the run's frozen manifest, and give engines without `chat-model-file-v1` a private read-only copy. By default the host only checks each file's size against the manifest and maps it in place, so the engine starts loading at once; a checkpoint with the same sizes but other bytes (another revision, corruption) is then served unnoticed |
@@ -38,7 +39,11 @@ reply = client.chat.completions.create(model="default", messages=[{"role": "user
 | `--write-launchers` | Write `serve.cmd` (Windows, double-click) and `serve.sh` with the same options into the run folder, then exit. Under WSL, `serve.cmd` starts `serve.sh` in the same distribution. They never contain the API key; set `CRIT_API_KEY` |
 | `--recover-runtime` | Verify retirement of a crashed runtime, release ownership, exit |
 
-Ctrl+C stops accepting requests, unloads the engine and releases model memory.
+Ctrl+C (or SIGTERM on Linux) stops accepting requests, cancels active generation
+and rejects queued requests before unloading the engine and releasing model
+memory. Shutdown uses the same cancellation grace and process retirement as
+client cancellation; ownership is released only after cleanup settles. If
+retirement fails, ownership stays blocked and cleanup can be retried.
 
 The server holds the machine's engine lock while it runs (`crit_core.machine`): `crit eval run`, `pin`, `ab`,
 `kernels`, `reference` and `crit run measure` wait for it, and it waits for them, printing who holds the lock. Two
@@ -47,22 +52,56 @@ engines side by side can exhaust host RAM when weights live there. `CRIT_ENGINE_
 cross OS instances, the holder also keeps a lease that Windows and its WSL distributions both read
 (`CRIT_ENGINE_LEASE`, default `C:\ProgramData\crit\engine.lease`, `/mnt/c/ProgramData/crit/engine.lease` under WSL).
 
+### Several models on one server
+
+Create a catalog, for example `models.json`:
+
+```json
+{
+  "default": "text",
+  "models": [
+    {"name": "text", "workspace": "runs", "run": "run-0001", "candidate": "candidate-0002"},
+    {"name": "vision", "workspace": "runs", "run": "run-0002"}
+  ]
+}
+```
+
+Use actual retained run/candidate IDs. Workspace paths are relative to the catalog
+file (absolute paths also work). Omitting `candidate` selects that run's selected
+candidate at server startup. Names must be unique; `default` defaults to the first
+entry. Start with `crit serve --models models.json`. `--write-launchers` writes
+the scripts beside the catalog.
+
+`GET /v1/models` lists the configured names. The request's `model` selects that
+name; omitting it chooses the default. An unknown name returns 404, rather than
+silently generating with another model. Each binding uses its own capabilities,
+context limit, sealed configuration and model identity.
+
+Only one model's weights are resident. Switching drains active requests, closes
+the old engine, releases its leases and frees its model pool before loading the
+next model. Failed cleanup retires the host before another model can enter.
+Switching back reloads those weights. Candidates using the same model identity
+still reuse compatible allocations. This supports one-model memory budgets;
+alternating model requests pay loading latency. It does not run different models
+simultaneously.
+
 ## Endpoints
 
 | Endpoint | Behavior |
 | --- | --- |
 | `GET /health` | `{"status": "ok", "engine": ...}`; 503 when the runtime is blocked. No key needed |
-| `GET /v1/models`, `GET /v1/models/{id}` | The run's sealed resident candidates, with `label`, `context_length` (the candidate's `kv_tokens`), `default`, package `capabilities` and `supported_sampling_parameters` |
+| `GET /v1/models`, `GET /v1/models/{id}` | The run's sealed resident candidates, or catalog names, with `label`, `context_length` (the candidate's `kv_tokens`), `default`, package `capabilities` and `supported_sampling_parameters` |
 | `POST /v1/chat/completions` | Chat completion, JSON or server-sent events |
 
 `model` selects a candidate by `RUN_ID/CANDIDATE_ID` or `CANDIDATE_ID`; any other name
 (`"default"`, `"gpt-4o"`) uses the default. An unknown candidate returns 404, one that
 fails verification 409. Switching closes the old engine and loads the new one, reusing
-compatible model allocations. Requests run one at a time.
+compatible model allocations. Requests run one at a time unless the adapter
+declares the concurrent request contract below.
 
 | Field | Behavior |
 | --- | --- |
-| `messages` | Optional leading `system`/`developer` messages (merged into one `system`), then user/assistant turns ending with user. Consecutive same-role turns are joined with a blank line. Content is a string or a list of `text` parts |
+| `messages` | Optional leading `system`/`developer` messages (merged into one `system`), then user/assistant turns ending with user. Consecutive same-role turns are joined with a blank line. Content is a string or ordered `text`/`image_url` parts; images require `chat-images-v1` |
 | `max_tokens`, `max_completion_tokens` | Output cap, 1 to `context_length - 1`; default 1024 or less to fit |
 | `stream`, `stream_options.include_usage` | SSE: role chunk, text chunks, finish chunk, optional usage chunk, `[DONE]` |
 | `stop` | Up to 4 strings of at most 256 UTF-8 bytes. Text before the first completed stop returns with `finish_reason: "stop"` (`crit_core.text.StopMatcher`); the turn is cancelled, the engine stays loaded |
@@ -77,12 +116,81 @@ Unknown parameters and unsupported generation controls return 400 rather than be
 silently ignored. Only client metadata (`user`, `metadata`, `store`, `service_tier`)
 is ignored and listed in `X-Crit-Ignored-Parameters`; no storage or service tier is applied.
 `logprobs`, audio, legacy `functions`/`function_call`, and an unsupported `response_format` return 400. Errors use the
-OpenAI shape; timeout is 504, engine failure 500 (the next request reloads). A
-disconnecting client cancels its turn.
+OpenAI shape; timeout is 504, engine failure 500 (the next request reloads).
+Closing the request connection cancels the turn, including ordinary graceful TCP
+closes, connection resets and other detected socket failures. This also applies to
+non-streaming requests and streaming requests that have not emitted text yet.
+Cooperative cancellation resets request state and keeps weights loaded; an adapter
+that does not settle within the cancellation grace period is retired before another
+turn can run.
+Streaming writes also honor the command's deadline and shutdown while a connected
+client is not reading. If delivery cannot continue, the connection is closed and
+the existing cancellation path settles the request. A partially sent SSE event
+is not followed by an error event or `[DONE]`. A responsive client can still
+receive the ordinary terminal error when generation times out.
+Cancellation also removes a request waiting for the engine without interrupting
+the active turn or dispatching the cancelled request later.
+
+If a streaming consumer raises or a supervised command is interrupted, the server
+retires the resident host before releasing the request lock. Failed retirement
+blocks reuse until cleanup is proved. Unexpected consumer exceptions and interrupts
+propagate unchanged after cleanup; existing host/protocol errors keep their
+`EngineError` translation. The next request after successful retirement loads a
+fresh engine.
+The streaming, tool and reasoning regressions exercise these failures through
+real resident processes with synthetic adapters, including a queued request
+waiting for retirement and cleanup failure blocking further requests.
+
+Clients must keep both sides of the connection open until the response completes.
+`crit serve` treats a clean TCP EOF as request abandonment, so explicitly
+half-closing the client's sending side also cancels the turn. This is a serving
+policy: a graceful full close and a write-half-close look the same to the server.
+The connection watcher never consumes bytes of a pipelined request and stops before
+the next request uses the connection.
+
+Cancellation must reach the server: the client must abort the HTTP request, and
+any proxy in between must propagate the disconnect. A UI that only stops displaying
+text while leaving its HTTP request open has not cancelled the server request.
+The cancellation regressions in `tests/test_api_cancellation.py` exercise ordinary
+Python HTTP client closes and curl request timeouts in both response modes. They
+also check that cancelled queue entries never run, cooperative adapters retain
+their weights, and uncooperative adapters retire before the next turn.
 
 This changes clients that previously sent ignored sampling values to old packages:
 omit those fields to retain the frozen defaults, or build a new package with an
 adapter that applies and declares them. Never edit a sealed package's manifest.
+
+### Images
+
+Packages declaring `chat-images-v1` accept ordered text and image parts:
+
+```json
+{"role":"user","content":[{"type":"text","text":"Describe this image."},
+ {"type":"image_url","image_url":{"url":"data:image/png;base64,...","detail":"auto"}}]}
+```
+
+`url` accepts HTTP(S) URLs or base64 `data:image/...` URLs; `detail` is `auto`,
+`low` or `high`. Crit validates and carries the source through the private
+request record; it does not fetch URLs or open client-supplied file paths.
+The HTTP body remains bounded at 8 MiB. Request records containing images allow
+16 MiB including metadata; ordinary run records retain their 1 MiB bound.
+Unsupported engines return 400. Tool history and image order are preserved.
+
+A `ResidentChat` engine sets `images = True` and declares
+`capabilities(text, sampling, images=True)`. Its `prepare_prompt(request,
+cancellation)` context manager uses `self.prompt_ids(request)` to render the
+checkpoint template, supplies vision processing, and yields
+`PreparedPrompt(ids, inputs, token_count)`. Templates receive content lists
+with `{"type":"text","text":...}` and `{"type":"image","image":URL,"detail":...}`.
+`token_count` is the actual context positions after image expansion; it controls
+context checks and prompt telemetry. It must include the text and image positions.
+`generate_prepared(prompt, max_new_tokens, sampling, on_tokens, cancelled)`
+consumes the engine's prepared inputs and returns the usual tokens/timing pair.
+Release request-private vision inputs in the context manager's `finally`, including
+on cancellation or context rejection. Image decoding, URL access policy, download
+bounds, vision arithmetic and embedding layout belong to the engine; preprocessing
+must observe the supplied cancellation object. Text-only adapters keep their
+existing `generate_tokens` path.
 
 ### Tool calls
 
@@ -149,7 +257,9 @@ the markers the model's chat template uses (`crit_core.text.reasoning`; crit reg
 the `<think>...</think>` syntax several model families share). Reasoning starts where the
 reply starts, either because the generation prompt ends with the opening marker or
 because the reply opens with it; a marker later in the reply is reply text, and a reply
-cut before the closing marker is all reasoning. Tool calls are parsed from the reply
+cut before the closing marker is all reasoning. That is a valid completion with empty
+assistant content, including when the output cap is reached; it keeps the resident
+engine available for the next request. Tool calls are parsed from the reply
 only. A package whose model writes other markers sets `ResidentChat.reasoning_format`
 to a `crit_core.text.ReasoningFormat`, and `False` leaves the reasoning in the reply.
 
@@ -208,16 +318,46 @@ namespace. Load weights in the factory. The returned engine implements:
 | `reset()` | After every generation, including failure/cancellation: drain queues, graphs, borrowed pointers, writes and producers; reset turn state; keep weights |
 | `close()` | Drain and release engine-private resources before switch/unload; crit releases model leases/views afterwards |
 
-Calls are serialized; no concurrent generation. The client owns the conversation (each
+Calls are serialized by default. The client owns the conversation (each
 request carries all of it); the engine owns tokenizer, private KV/recurrent state,
 scratch and graphs until switch or failure; the model pool owns the mapped model files and
-device weights until the server stops, one entry per identity/representation, no
-eviction. A → B → A closes each engine before the next.
+device weights until that model unloads, one entry per representation. A → B → A
+closes each engine before the next; different model identities also free the old
+pool before loading.
 
 Packages share one process: release views, mutable globals and workers on close. Link
 the CUDA runtime dynamically (shared `libcudart`); a static one failed with "invalid
 argument" after another engine's had loaded. Construction, reset or close failure can
 retire the runtime; a stuck adapter is killed after a one-second cancellation grace.
+
+### Concurrent requests
+
+A package opts in with `chat-concurrent-v1` (or
+`capabilities(text, sampling, concurrent=True)`). Its loaded parent engine exposes
+`max_concurrent_requests`, an integer from 1 to 1024, and
+`create_request(request)`. Capacity is the adapter's safe bound for the sealed
+configuration and memory limits; the host does not infer it from GPU or model names.
+
+The factory returns a distinct object implementing the same generation,
+streaming, `reset()` and `close()` methods. It may be a `ResidentChat` sharing
+immutable tokenizer/model resources with the parent. KV/recurrent state, scratch,
+random sampling state, prepared images and other mutable turn data must be private.
+The factory and shared decoder resources must support concurrent calls. Returning
+the parent or another live request object is rejected. The parent remains loaded;
+each request object is reset and closed after its generation settles.
+
+The host admits at most the declared number for the same resident candidate.
+Every command has its own cancellation record, deadline, stream snapshot and
+response. Queued candidate/model switches drain active requests first and prevent
+later requests from continually overtaking them. Cancelled waiters leave without
+dispatch. Shutdown cancels all active requests and waits for cleanup.
+
+Cooperative cancellation preserves peers and shared weights. A failed cleanup,
+adapter failure or request that ignores cancellation requires retiring the shared
+host process; other active requests fail too, and no new work enters until they
+have unwound. This is the existing ownership guarantee applied to concurrent work.
+The contract permits an engine's scheduler to batch requests; it does not itself
+promise batched device arithmetic or a throughput gain.
 
 ### Model access and allocation
 
@@ -306,7 +446,11 @@ record. Replies are at most 65,536 characters, responses UTF-8 JSON under 1 MiB.
 
 `reasoning` (optional, nonempty, at most 65,536 characters) is the model's thinking
 apart from `assistant`, which then holds only the reply; crit serve returns it as
-`reasoning_content`. `prompt_tokens` is the full templated input, `output_tokens` all
+`reasoning_content`. `assistant` may be empty when nonempty reasoning or valid tool
+calls are present. Otherwise it must contain nonblank text. Every text channel must
+be UTF-8 encodable without NUL; reasoning has its own character budget, separate
+from the combined assistant/tool-call budget.
+`prompt_tokens` is the full templated input, `output_tokens` all
 generated tokens;
 `prefill_*`/`decode_*` count tokens actually timed per phase (excluding a reused prefix
 or the first token from prefill); `ttft_ms` runs from admission to first emitted token.
@@ -342,7 +486,11 @@ for byte. Callback errors fail the turn even if caught. `reset` and `close` must
 every producer that could call `emit`. Token timing still comes from the final
 response. Packages without `chat-stream-v1` stream their reply as one chunk.
 `emit({"reasoning": text})` streams reasoning apart from the reply in the same way; the
-final `reasoning` must equal those chunks.
+final `reasoning` must equal those chunks. A reasoning-only completion emits reasoning
+chunks and returns an empty `assistant`; it does not emit an empty text chunk.
+Whitespace is valid incremental text, but completed output must satisfy the response
+content rules above. Complete tool calls are validated at completion even when the
+adapter returns them only in the final record.
 
 ### Structured output for adapters
 

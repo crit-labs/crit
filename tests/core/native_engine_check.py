@@ -136,9 +136,13 @@ class Cancellation:
 
 
 def resident_adapter(library):
+    def text_messages(messages, *, images=False):
+        expect(not images, "the native text fixture must not request image processing")
+        return messages
+
     module = types.ModuleType("crit_core.text")
     module.load_model_text = lambda model, clock=None: FakeText()
-    module.openai_messages = lambda messages: messages
+    module.openai_messages = text_messages
     sys.modules["crit_core.text"] = module
     context = types.SimpleNamespace(configuration={"chat_template_kwargs": {"enable_thinking": False}},
                                     model_file=lambda name: "/models/toy/" + name, limits={"kv_tokens": 200})

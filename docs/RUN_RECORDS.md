@@ -101,6 +101,11 @@ and activation precision, judged by the quality gates).
 `store_decisions` maps Inference technique names to `{status, reason}`, status one of
 `implemented`, `inherited`, `rejected`, `untested`. IDs are coordinator-assigned and
 never recycled; labels don't determine paths or ordering.
+Candidate creation stages its source, source manifest and identity together in a
+scratch directory at the run root before publishing the candidate directory. An interruption before publication
+leaves no candidate ID; after publication, `recover` rebuilds its telemetry from the
+retained identity. Inspect the recovered candidates before issuing another `candidate`
+command. Abandoned `.candidate-*` scratch directories are unpublished copies.
 
 Package dependencies give `name`, `version`, package-relative `path` and exact-byte
 `sha256`; `launch[0]` names a retained relative file. Omit `manifest.json` (crit
@@ -111,6 +116,16 @@ the package. Serving capabilities (`chat-json-v1`, `chat-resident-v1`, optional
 `chat-stream-v1`, `chat-tools-v1`, `chat-config-v1`, `chat-constraints-v1`) are in
 [Serving](SERVING.md#adapter-contract).
 
+Packaging copies and validates the input inventory and recipe in a scratch directory
+at the run root, then renames the complete package into the candidate. A copy or validation
+failure can be retried. If publication succeeded but updating projections failed,
+`recover` rebuilds them; repeating `package` with identical contents and recipe also
+finishes publication without replacing retained bytes. Different contents require a new
+candidate. An abrupt exit can leave unpublished `.package-*` scratch directories at
+the run root; these are outside candidate inventories and are not runnable packages.
+Staging stays outside `work/`, so that whole directory can be used as an input without
+copying staged output back into itself.
+
 ### Attempt result
 
 Required: `outcome`, `ended_at`, `exit_code`, `cleanup_settled` (boolean), `logs`
@@ -120,6 +135,18 @@ settled cleanup and an end within the reservation. Every attempt counts against 
 limit; the candidate's lifecycle follows its latest attempt, and earlier failures stay
 recorded. Reservations only record deadlines; the caller supervises processes and
 descendant cleanup. A published reservation must be settled before `seal` or `resume`.
+
+Settlement, candidate projections and recovery apply the same result validation,
+including retained log hashes. `logs` must be a list, even when empty. A supplied
+failure message must be nonempty text (at most 8000 characters); unsuccessful
+candidate attempts require it, while agent/discovery results may use null.
+Invalid results are rejected before publication; recovery never repairs retained
+result bytes by silently normalizing them.
+
+Reservations likewise share validation of their owner/operation, segment window,
+process cap and one-attempt cost before publication, settlement or recovery.
+Candidate projections additionally bind reservations to the candidate's creation
+time, resolved inputs and package; build attempts may precede a package.
 
 ### Check
 
@@ -185,6 +212,31 @@ in Eval. Memory is sampled during each request: host `MemAvailable` (Linux) or
 `GlobalMemoryStatusEx` (Windows), the process's resident memory, and free device memory
 from `nvidia-smi` for GPU 0. Device memory is the driver's whole-GPU view, and metrics a
 host cannot measure go to `missing_metrics`.
+
+Measurement workers and their descendants run in an owned Windows job or Linux
+process group. Cleanup terminates and waits for that tree on completion, failure,
+timeout and interruption, including any remaining pinning or adapter helpers.
+Engine load and close failures also stop the memory sampler.
+
+Workers use the same launch guardian and persistent runtime ownership as serving.
+A dead coordinator triggers retirement, and unresolved ownership blocks further
+measurement or serving. Once the coordinator has exited, use
+`crit serve --recover-runtime` from the same OS/user environment to verify
+retirement and release that guard. This does not settle the run's attempt:
+an abrupt kill can leave its reservation pending, requiring an explicit
+`crit run ... settle` record with the verified cleanup evidence. Existing
+unsettled attempt results remain retained; runtime recovery does not rewrite them.
+
+The reservation includes time waiting for the machine's engine lock. Expiry
+before admission starts no worker; completion after the deadline records `timed_out`
+and publishes no benchmarks. Setup errors, interruptions and unreadable worker
+results also settle the attempt, retaining available logs and failed-work scratch
+files. A launch or retirement failure whose cleanup cannot be proven records
+`cleanup_settled: false`; it does not qualify the candidate for sealing. If the
+coordinator cannot write the attempt result itself, the reservation stays pending.
+Logs are hashed as retained evidence only after cleanup is proven. Unretired
+workers' raw logs remain in the candidate's `logs/` directory without freezing
+bytes that those workers may still append to.
 
 ### Eval evidence
 
@@ -256,16 +308,29 @@ benchmark claim; `completed` requires measurements; other lifecycles are
 source, flag, configuration, dependency or representation change, or later
 evaluation, needs a new candidate.
 
+If sealing is interrupted after writing the outcome, repeat `seal` with the same
+lifecycle and failure. It preserves the original outcome and completes the seal.
+If the seal was already published, the retry verifies its inventory and updates only
+run state and history. A different outcome or damaged sealed artifact is rejected.
+
 ## Recovery and Resume
 
 A per-operation coordinator lease serializes writers. Immutable records publish
 atomically and exclusively, projections by atomic replacement, with no cross-file
 transaction; readers wait for consistent revisions. The lease names the owner's PID,
-host and OS. A terminated `crit run` (SIGTERM) releases it; a killed one leaves it for
+host and OS. A persistent `.coordinator.guard` file carries a kernel lock around
+lease acquisition, dead-owner recovery and writes. The OS releases that lock when
+its process exits; the guard file must not be removed or replaced. It prevents two
+recoverers from removing each other's replacement lease. The owner lease still
+excludes writers across OS instances.
+
+A terminated `crit run` (SIGTERM) releases its lease; a killed one leaves it for
 `recover`, which verifies a dead owner, keeps valid orphaned evidence and rebuilds
 **active** projections, never rewriting seals, inventing records, resetting counters or
 starting processes. Live or unproven owners and corrupt identities block it, and it
 must run on the owner's host and OS (WSL and Windows process IDs differ).
+Seal publication uses temporary files under `work/`, so an abrupt exit cannot leave
+an extra file inside a newly sealed candidate and invalidate its inventory.
 
 Before sealing or resuming, settle every reservation and external process tree; a
 vanished coordinator does not prove an agent stopped. `resume` keeps the request and

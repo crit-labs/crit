@@ -1,25 +1,16 @@
-"""Bounded provisional text for an opt-in, serialized resident request."""
+"""Bounded provisional text for one isolated resident request."""
 import errno
 import sys
 import threading
 import time
 
 from crit.run.records import keys, number, read_json, write_json
+from .content import MAX_CONTENT, content_size, content_text, response_content, tool_size
 from .options import validate_tool_reply
 from .tool_stream import ToolCallStream
 
 CAPABILITY = "chat-stream-v1"
-MAX_TEXT = 65536
 IDENTITY = ("request_id", "candidate_id", "package_sha256")
-
-
-def stream_text(value):
-    # Whitespace and grapheme fragments are valid incremental text. A caller
-    # must concatenate them without trimming or decoding them independently.
-    if not isinstance(value, str) or not value or len(value) > MAX_TEXT or "\0" in value:
-        raise ValueError("Stream text must contain 1–65536 characters without NUL")
-    value.encode("utf-8")  # Reject unpaired surrogates before publication.
-    return value
 
 
 class StreamWriter:
@@ -44,16 +35,13 @@ class StreamWriter:
             if isinstance(chunk, dict) and "reasoning" in chunk:
                 # Reasoning apart from the reply (crit_core.text.reasoning), with its own size budget.
                 keys(chunk, {"reasoning"})
-                self.reasoning += stream_text(chunk["reasoning"])
-                if len(self.reasoning) > MAX_TEXT:
-                    raise ValueError("Stream reasoning exceeds 65536 characters")
+                self.reasoning += content_text(chunk["reasoning"], "Stream reasoning")
             elif isinstance(chunk, dict) and self.tools is not None:
                 keys(chunk, {"tool_calls"})
                 self.tools.update(chunk["tool_calls"])
             else:
-                self.text += stream_text(chunk)
-            if len(self.text) + (self.tools.size if self.tools else 0) > MAX_TEXT:
-                raise ValueError("Stream text exceeds 65536 characters")
+                self.text += content_text(chunk, "Stream text")
+            content_size(self.text, self.tools.size if self.tools else 0, self.reasoning)
             self.sequence += 1
             if time.monotonic() >= self.next_write:
                 self.flush()
@@ -77,10 +65,10 @@ class StreamWriter:
             raise ValueError("Final reply differs from emitted stream text")
         if response.get("reasoning", "") != self.reasoning:
             raise ValueError("Final reasoning differs from emitted stream reasoning")
-        if self.tools is not None:
-            calls = validate_tool_reply(response.get("tool_calls"), self.request)
-            if calls != self.tools.calls:
-                raise ValueError("Final tool calls differ from emitted tool calls")
+        calls = validate_tool_reply(response.get("tool_calls"), self.request)
+        if self.tools is not None and calls != self.tools.calls:
+            raise ValueError("Final tool calls differ from emitted tool calls")
+        response_content(response, tool_size(calls))
         self.flush()
 
     def close(self):
@@ -116,22 +104,19 @@ class StreamReader:
             raise ValueError("Invalid resident stream record")
         if any(value[key] != expected for key, expected in self.identity.items()):
             raise ValueError("Resident stream identity mismatch")
-        sequence = number(value["sequence"], "Stream sequence", 1, MAX_TEXT, integer=True)
-        text = value["assistant"]
-        reasoning = stream_text(value["reasoning"]) if "reasoning" in value else ""
-        if text != "" or not (value.get("tool_calls") or reasoning):
-            text = stream_text(text)
+        sequence = number(value["sequence"], "Stream sequence", 1, MAX_CONTENT, integer=True)
         calls = value.get("tool_calls", [])
+        text, reasoning = response_content(value, tool_size(calls), final=False)
         if (sequence == self.sequence and text == self.text and calls == self.tools.calls
                 and reasoning == self.reasoning):
             return
-        if len(reasoning) > MAX_TEXT or not reasoning.startswith(self.reasoning):
+        if not reasoning.startswith(self.reasoning):
             raise ValueError("Resident stream reasoning moved backwards")
         grown = len(reasoning) - len(self.reasoning)
         old_size = self.tools.size
         deltas = self.tools.snapshot(calls)
         size = len(text) + self.tools.size
-        if (size > MAX_TEXT or sequence <= self.sequence or not text.startswith(self.text)
+        if (sequence <= self.sequence or not text.startswith(self.text)
                 or size - len(self.text) - old_size + grown < sequence - self.sequence):
             raise ValueError("Resident stream text or sequence moved backwards")
         added = reasoning[len(self.reasoning):]

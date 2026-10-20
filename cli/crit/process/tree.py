@@ -239,37 +239,43 @@ class ProcessTree:
         self.closed = True
 
 
-def guarded_tree(command, cwd, log, ownership, folder):
+def guarded_tree(command, cwd, log, ownership, folder, env=None, deadline=None):
+    ownership.launch_settled = True
     folder.mkdir(parents=True, exist_ok=True)
     launch = folder / ("launch-" + uuid.uuid4().hex + ".json")
     write_json(launch, {"owner_path": str(ownership.path), "token": ownership.token,
                "command": command, "cwd": str(cwd)}, immutable=True)
-    interpreter, environment = sys.executable, None
+    interpreter, environment = sys.executable, env
     if os.name == "nt" and getattr(sys, "_base_executable", sys.executable) != sys.executable:
         # A venv's python.exe is a launcher that starts the base interpreter, and Windows activates a Microsoft
         # Store base outside the launcher's job. Start the base directly, naming the venv as the launcher does.
-        interpreter, environment = sys._base_executable, dict(os.environ, __PYVENV_LAUNCHER__=sys.executable)
+        interpreter = sys._base_executable
+        environment = dict(os.environ if env is None else env, __PYVENV_LAUNCHER__=sys.executable)
+    ownership.launch_settled = False
     tree = ProcessTree([interpreter, "-B", str(Path(__file__).with_name("guardian.py")), str(launch)], cwd, log,
                        job_name="Local\\crit-runtime-" + ownership.token, env=environment)
     tree.launch_error_path = launch.with_suffix(".error.json")
     try:
         ready_path = launch.with_suffix(".ready.json")
-        deadline = time.monotonic() + 10
+        deadline = min(time.monotonic() + 10, deadline) if deadline is not None else time.monotonic() + 10
         while not ready_path.exists():
             if tree.process.poll() is not None:
                 raise ValueError("Launch guardian exited before reporting its identity")
             if time.monotonic() >= deadline:
-                raise ValueError("Launch guardian did not report its identity before the deadline")
+                raise TimeoutError("Launch guardian did not report its identity before the deadline")
             time.sleep(.01)
         ready = read_json(ready_path)
         keys(ready, {"token", "pid", "identity"})
         if ready["token"] != ownership.token:
             raise ValueError("Launch guardian ownership token changed")
         tree.identify_guardian(ready["pid"], ready["identity"])
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Launch guardian passed its deadline before engine admission")
         ownership.bind(tree)
     except BaseException:
         try:
             tree.close()
+            ownership.launch_settled = True
         except BaseException:
             ownership.failed_tree = tree
             ownership.block("Launch ownership could not be published or settled")

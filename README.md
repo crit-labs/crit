@@ -7,7 +7,7 @@
 
 ### Why wait for someone to optimize an LLM for your GPU when an AI agent can build a specialized inference engine in a few hours?
 
-[![Version 0.2.2](docs/assets/badge-version.svg)](CHANGELOG.md)
+[![Version 0.2.3](docs/assets/badge-version.svg)](CHANGELOG.md)
 [![License Apache-2.0](docs/assets/badge-license.svg)](LICENSE)
 [![crit-hub engines](docs/assets/badge-crit-hub.svg)](https://github.com/crit-labs/crit-hub)
 [![CI](https://github.com/crit-labs/crit/actions/workflows/ci.yml/badge.svg)](https://github.com/crit-labs/crit/actions/workflows/ci.yml)
@@ -176,7 +176,7 @@ six prompts, from a chat question to a 14K-token agent session.
 ---
 
 <details>
-<summary><strong>📋 Dense LLM, Gemma architecture</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/gemma-4-31b-it@NVFP4/assistant6-fp8qk">Inspect engine</a></summary>
+<summary><strong>📋 Dense LLM, Gemma architecture</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/gemma-4-31b@NVFP4/assistant6-fp8qk">Inspect engine</a></summary>
 
 <br />
 
@@ -234,8 +234,8 @@ Mean KL divergence
 
 <br />
 
-[`assistant6-fp8qk`](https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/gemma-4-31b-it@NVFP4/assistant6-fp8qk)
-runs Gemma 4 31B-IT on one RTX 5090 with the model's full 262,144 tokens of context. Gemma mixes 50
+[`assistant6-fp8qk`](https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/gemma-4-31b@NVFP4/assistant6-fp8qk)
+runs Gemma 4 31B on one RTX 5090 with the model's full 262,144 tokens of context. Gemma mixes 50
 sliding-window layers with 10 full-attention layers whose keys equal their values, and its hidden
 states overflow FP16, so little carries over from the Qwen engines. The NVFP4 MLPs are used as
 stored; the BF16 attention projections and output head are re-encoded to FP8 at load, because as
@@ -359,7 +359,7 @@ and replaces candidate 5 in crit-hub.
 ---
 
 <details>
-<summary><strong>📋 MoE LLM, VRAM overload, Nemotron architecture</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/nemotron-3.5-super-vl-120b-a12b@NVFP4/mtp3-cpu-experts">Inspect engine</a></summary>
+<summary><strong>📋 MoE LLM, VRAM overload, Nemotron architecture</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/nemotron-3.5-super-120b-a12b@NVFP4/mtp3-cpu-experts">Inspect engine</a></summary>
 
 <br />
 
@@ -417,8 +417,8 @@ Mean KL divergence
 
 <br />
 
-[`mtp3-cpu-experts`](https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/nemotron-3.5-super-vl-120b-a12b@NVFP4/mtp3-cpu-experts)
-runs Nemotron 3.5 Super VL 120B-A12B (text path) on one RTX 5090 with 262,144 tokens of context. Its
+[`mtp3-cpu-experts`](https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/nemotron-3.5-super-120b-a12b@NVFP4/mtp3-cpu-experts)
+runs Nemotron 3.5 Super 120B-A12B (text path) on one RTX 5090 with 262,144 tokens of context. Its
 layers are 40 Mamba-2 mixers, 40 latent mixture-of-experts layers with 512 NVFP4 experts each (22
 per token) and 8 attention layers. The checkpoint is 75 GB, 63 GB of it routed experts, used as
 stored: they sit in pinned host memory behind a GPU cache of about 7,150 slots, and 6 CPU cores

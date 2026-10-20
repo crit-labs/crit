@@ -25,6 +25,20 @@ Concurrent requests reserve their maximum accepted-token staging buffer at
 submission, alongside prompt and result storage. Insufficient Core buffer
 capacity rejects the new submission without failing accepted work.
 
+## Model progress
+
+Serial sessions and concurrent rows use the same internal checks for prompt
+progress, prefix reuse, prefill completion and output grants. Reuse must precede
+any computed prompt token; newly computed tokens must fit the prefill grant.
+Output requires complete prefill, and every step must consume prompt tokens or
+produce output. Deferred reports require a readiness fence, complete prefill and
+an initially empty token span; the final span is read after readiness.
+
+The checks do not advance request state. Each execution path retains its own
+readiness, cancellation, commit and cleanup ordering. Concurrent execution also
+checks row membership and mixed token-work accounting, and validates every row
+before decoding text or staging output for the group.
+
 ## Request release
 
 When `Handle::wait()` or `wait_output()` returns (with a result, a cancellation
@@ -384,6 +398,12 @@ crit::core::NativeEngine open_engine(std::string_view configuration_json) {
 }
 CRIT_EXPORT_ENGINE(open_engine)
 ```
+
+After the factory returns successfully, the native bridge pins `owner` to the
+runtime. It survives outstanding request handles and a failed final drain that
+quarantines the runtime; ordinary cleanup releases it after the model and backend.
+Work launched during construction must already have its owners in the backend or
+model, as described in the [construction contract](../../contracts/README.md#construction-and-borrowed-backend-handles).
 
 The configuration is the adapter's configuration plus `model` (the model
 directory) and `context_tokens` (the context to serve); Eval also passes

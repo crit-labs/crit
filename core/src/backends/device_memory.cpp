@@ -17,6 +17,7 @@ struct BufferService::State {
 namespace {
 // Retained allocations of a destroyed service, reachable from a static list for the life of the process.
 struct Quarantine {
+    std::shared_ptr<LeaseBackend> backend;
     std::vector<std::shared_ptr<BufferService::State>> states;
     Quarantine* next = nullptr;
 };
@@ -30,11 +31,13 @@ struct BufferService::Shared {
     mutable std::mutex mutex;
     std::unique_ptr<Quarantine> quarantine = std::make_unique<Quarantine>();
     std::vector<std::shared_ptr<State>>* retained = &quarantine->states;
+    std::size_t allocations = 0;
     Shared(std::shared_ptr<LeaseBackend> b, Resources r, Memory m):backend(std::move(b)), resources(std::move(r)), memory(m) {}
     ~Shared() {
         // Never release unproven allocations or their charges.
         if(retained->empty()) return;
         auto* kept = quarantine.release();
+        kept->backend = std::move(backend);
         auto previous = quarantine_head.load(std::memory_order_relaxed);
         do { kept->next = previous; }
         while(!quarantine_head.compare_exchange_weak(previous, kept, std::memory_order_release, std::memory_order_relaxed));
@@ -47,7 +50,8 @@ struct BufferService::Shared {
     void retire(const std::shared_ptr<State>& state) {
         if(state->leases || state->freed) return;
         if(state->uncertain) throw std::logic_error("failed physical release requires recovery; cannot retry blindly");
-        retained->reserve(retained->size() + 1);
+        // allocate() reserved a retention slot for every outstanding physical allocation.
+        // Final close must not lose its last owner to a bookkeeping allocation failure.
         try { backend->settle(); }
         catch(...) { keep(state); throw; }
         try { backend->release(state->physical, state->bytes); }
@@ -55,6 +59,7 @@ struct BufferService::Shared {
         state->freed = true;
         state->reservation = {};
         std::erase(*retained, state);
+        --allocations;
     }
 };
 BufferService::BufferService(std::shared_ptr<LeaseBackend> backend, Resources resources, Memory memory) {
@@ -67,7 +72,11 @@ BufferLease BufferService::allocate(std::size_t bytes) {
     auto state = std::make_shared<State>();
     state->bytes = bytes;
     state->reservation = shared_->resources.reserve(shared_->memory, bytes);
+    if(shared_->allocations == std::numeric_limits<std::size_t>::max())
+        throw std::overflow_error("buffer allocation count exhausted");
+    shared_->retained->reserve(shared_->allocations + 1);
     state->physical = shared_->backend->allocate(bytes); // A failure drops the reservation with the state.
+    ++shared_->allocations;
     return BufferLease(shared_, std::move(state));
 }
 void BufferService::retry_retained() {

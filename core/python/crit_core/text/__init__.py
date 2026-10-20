@@ -9,6 +9,7 @@ _EXPORTS = {
     "TextError": "errors", "ModelTextError": "errors", "TemplateError": "errors", "TokenError": "errors",
     "StopMatcher": "stops",
     "openai_messages": "messages",
+    "message_content": "messages",
     "ToolCallParser": "tools", "ToolFormat": "tools", "ToolReply": "tools", "tool_call_format": "tools",
     "templates_tool_format": "tools",
     "ReasoningFormat": "reasoning", "ReasoningSplitter": "reasoning", "template_reasoning_format": "reasoning",

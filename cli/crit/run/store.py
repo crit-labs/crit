@@ -7,11 +7,17 @@ from pathlib import Path
 import platform
 import shutil
 import socket
+import tempfile
+import time
 import uuid
 
-from .records import (LIFECYCLES, MAX_CANDIDATES, SAFETY_WINDOW_MINUTES, STOP_REASONS, WEIGHTS, amendment, candidate_projection, quality_terms, digest, evidence,
-    file_sha, header, headroom_record, ident, ineligibility, inputs, inventory, keys, load_run, now, number, read_candidates,
-    read_json, record, request_spec, safe_path, segment, text, timestamp, write_json)
+from .records import (
+    LIFECYCLES, MAX_CANDIDATES, SAFETY_WINDOW_MINUTES, STOP_REASONS, WEIGHTS, amendment, attempt_process_cap,
+    candidate_projection, quality_terms, digest, evidence, file_sha, header, headroom_record, ident,
+    ineligibility, inputs, inventory, keys, load_run, now, number, read_candidates, read_json, record,
+    request_spec, safe_path, segment, text, timestamp, validate_attempt_reservation, validate_attempt_result,
+    verify_inventory, write_json,
+)
 from . import recon
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -34,7 +40,25 @@ def read_lease_owner(path):
 
 
 @contextmanager
-def lease(root):
+def lease(root, *, recover=False):
+    """Pin ownership while checking/removing a dead lease and throughout every write."""
+    from crit_core.machine import _try_lock, _unlock
+    # Never unlink this guard: replacing its inode would split the kernel lock.
+    # The separate owner lease still excludes writers across Windows/WSL.
+    with safe_path(root, ".coordinator.guard").open("a+b") as guard:
+        if not _try_lock(guard):
+            raise ValueError("Run coordinator is busy; another writer or recoverer holds its guard")
+        try:
+            if recover:
+                release_dead_lease(root)
+            with exclusive_lease(root):
+                yield
+        finally:
+            _unlock(guard)
+
+
+@contextmanager
+def exclusive_lease(root):
     """An abandoned exclusive lease blocks writers until explicit dead-owner recovery."""
     path = safe_path(root, ".coordinator.lock")
     try:
@@ -54,6 +78,46 @@ def lease(root):
         yield
     finally:
         path.unlink()
+
+
+def release_dead_lease(root):
+    """Called only while holding the persistent coordinator guard."""
+    lock_path = safe_path(root, ".coordinator.lock")
+    if not lock_path.exists():
+        return
+    owner = read_lease_owner(lock_path)
+    if owner["host"] is not None and (owner["host"], owner["system"]) != (socket.gethostname(), platform.system()):
+        # Another OS (for example WSL versus Windows) has its own PID space:
+        # a missing PID here proves nothing about the owner.
+        raise ValueError(f"Lease owner ran on {owner['host']} ({owner['system']}); recover from that host and OS")
+    pid = owner["pid"]
+    if os.name == "nt":
+        import ctypes
+        api = ctypes.WinDLL("kernel32", use_last_error=True)
+        api.OpenProcess.restype = ctypes.c_void_p
+        api.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        handle = api.OpenProcess(0x100000, False, pid)  # SYNCHRONIZE
+        if handle:
+            api.CloseHandle.argtypes = [ctypes.c_void_p]
+            api.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            api.WaitForSingleObject.restype = ctypes.c_ulong
+            try:
+                # An exited process can still be opened while another process
+                # retains its handle. Signalled state proves it has terminated.
+                if api.WaitForSingleObject(handle, 0) != 0:
+                    raise ValueError("Coordinator owner may still be alive; recovery blocked")
+            finally:
+                api.CloseHandle(handle)
+        elif ctypes.get_last_error() != 87:
+            raise ValueError("Cannot prove coordinator owner exited")
+    else:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise ValueError("Coordinator owner is still alive")
+    lock_path.unlink()
 
 
 def next_id(directory, kind, suffix=""):
@@ -85,6 +149,34 @@ def copy_package(source, destination, rows, retained_source, source_rows):
                 pass
         return shutil.copy2(src, dst)
     shutil.copytree(source, destination, copy_function=copy)
+
+
+@contextmanager
+def staging(root, kind):
+    """Unpublished bytes live outside candidate inventories, even after abrupt exit."""
+    # A source may be the entire work/ directory. Stage beside it, never inside
+    # it; callers already reject a source containing the run root itself.
+    scratch = Path(tempfile.mkdtemp(dir=root, prefix=f".{kind}-"))
+    try:
+        yield scratch / kind
+    finally:
+        # Revalidate the exact scratch path before recursive cleanup.
+        path = safe_path(root, scratch.name)
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def publish_directory(source, destination):
+    """The coordinator lease serializes publication; Windows readers may hold a handle."""
+    deadline = time.monotonic() + .25
+    while True:
+        try:
+            source.rename(destination)
+            return
+        except PermissionError as exc:
+            if getattr(exc, "winerror", None) not in {5, 32, 33} or time.monotonic() >= deadline:
+                raise
+            time.sleep(.005)
 
 
 def serving_gaps(capabilities, model_path):
@@ -280,41 +372,14 @@ class RunStore:
         result = []
         for path in paths:
             safe_path(root, path.relative_to(root).as_posix())
-            value = read_json(path)
             run = load_run(root)
-            header(value, "attempt_reservation", run["run_id"], {"segment_id", "candidate_id", "attempt_id", "operation", "reserved_at", "deadline_at", "inputs_manifest_sha256", "package_sha256", "cost"})
-            ident(value["attempt_id"], "attempt")
-            bounds = segment(root, run, value["segment_id"])
-            if value["candidate_id"] is not None:
-                ident(value["candidate_id"], "candidate")
+            value = validate_attempt_reservation(root, run, read_json(path))
             owner = f"candidates/{value['candidate_id']}" if value["candidate_id"] else f"segments/{value['segment_id']}"
             if path.relative_to(root).as_posix() != f"{owner}/attempts/{value['attempt_id']}/reservation.json":
                 raise ValueError("Reservation owner/path mismatch")
-            operation = value["operation"]
-            if operation not in bounds["limits"]["process_seconds"] or (value["candidate_id"] is None) != (operation in {"agent", "discovery"}):
-                raise ValueError("Invalid reservation operation/owner")
-            start, deadline = timestamp(value["reserved_at"], "reservation"), timestamp(value["deadline_at"], "deadline")
-            if not timestamp(bounds["started_at"], "start") <= start <= deadline <= timestamp(bounds["deadline_at"], "segment deadline") or (deadline-start).total_seconds() > bounds["limits"]["process_seconds"][operation]:
-                raise ValueError("Reservation exceeds fixed segment/process bounds")
-            if digest(value["cost"]) != digest({"unit": "attempt", "amount": 1}):
-                raise ValueError("Invalid attempt counter reservation")
             outcome_path = safe_path(root, f"{owner}/attempts/{value['attempt_id']}/result.json")
             if outcome_path.exists():
-                outcome = read_json(outcome_path)
-                header(outcome, "attempt_result", run["run_id"], {"segment_id", "candidate_id", "attempt_id", "outcome", "ended_at", "exit_code", "cleanup_settled", "logs", "failure"})
-                if any(outcome[key] != value[key] for key in ("segment_id", "candidate_id", "attempt_id")) or type(outcome["cleanup_settled"]) is not bool:
-                    raise ValueError("Invalid attempt result binding/cleanup")
-                if outcome["outcome"] not in {"completed", "failed", "cancelled", "timed_out", "interrupted", "launch_failed"}:
-                    raise ValueError("Invalid process outcome")
-                ended = timestamp(outcome["ended_at"], "process end")
-                if ended < start or (outcome["outcome"] == "completed" and (ended > deadline or outcome["exit_code"] != 0 or not outcome["cleanup_settled"])):
-                    raise ValueError("Process result violates its reserved bounds")
-                if outcome["exit_code"] is not None:
-                    number(outcome["exit_code"], "exit code", -(2 ** 31), 2 ** 32, integer=True)
-                if not isinstance(outcome["logs"], list):
-                    raise ValueError("Logs require retained evidence references")
-                for reference in outcome["logs"]:
-                    evidence(root, reference)
+                validate_attempt_result(root, run["run_id"], value, read_json(outcome_path))
             result.append(value)
         for segment_id in {value["segment_id"] for value in result}:
             if sum(value["segment_id"] == segment_id for value in result) > segment(root, load_run(root), segment_id)["limits"]["attempt_limit"]:
@@ -400,10 +465,13 @@ class RunStore:
         path = safe_path(root, f"candidates/{candidate_id}/{relative}")
         candidate_projection(root, load_run(root), candidate_id, {path.relative_to(root).as_posix(): value})
         write_json(path, value, immutable=True)
+        self._published(root, candidate_id, path, value)
+        return value
+
+    def _published(self, root, candidate_id, path, value):
         self._refresh(root, candidate_id)
         self._state(root)
         self._event(root, value["record_kind"], candidate_id, reference={"path": path.relative_to(root).as_posix(), "sha256": file_sha(path)})
-        return value
 
     @staticmethod
     def _segment_candidates(root, run, bounds):
@@ -445,24 +513,20 @@ class RunStore:
                 configuration, extensions = {**configuration, "recon": frozen}, {**extensions, "recon": recon_ref}
             candidate_id = next_id(root / "candidates", "candidate")
             folder = root / "candidates" / candidate_id
-            # Validate every record before the folder exists: a rejected proposal leaves nothing behind and
-            # does not consume a candidate ID.
+            # Validate complete staged records and source before publishing the candidate ID.
             source_manifest = record("source_manifest", run_id, candidate_id=candidate_id, files=rows)
             value = record("candidate", run_id, candidate_id=candidate_id, segment_id=bounds["segment_id"], ordinal=int(candidate_id.split("-")[1]),
                 parent_candidate_id=proposal.get("parent_candidate_id"), origin_candidate_id=proposal.get("origin_candidate_id"), created_at=now(),
                 **{k: proposal[k] for k in ("label", "rationale", "strategy", "store_decisions")}, configuration=configuration,
                 **({"weights": proposal["weights"]} if "weights" in proposal else {}),
                 extensions=extensions, source_manifest_sha256=digest(source_manifest), inputs_manifest_sha256=resolved["manifest_sha256"], request_sha256=run["request_sha256"])
-            overlays = {f"candidates/{candidate_id}/candidate.json": value, f"candidates/{candidate_id}/source.manifest.json": source_manifest}
-            folder.mkdir()
-            try:
-                shutil.copytree(source, folder / "source")
-                candidate_projection(root, run, candidate_id, overlays)
-            except BaseException:
-                shutil.rmtree(folder, ignore_errors=True)
-                raise
-            write_json(folder / "source.manifest.json", source_manifest, immutable=True)
-            write_json(folder / "candidate.json", value, immutable=True)
+            with staging(root, "candidate") as staged:
+                staged.mkdir()
+                shutil.copytree(source, staged / "source")
+                write_json(staged / "source.manifest.json", source_manifest, immutable=True)
+                write_json(staged / "candidate.json", value, immutable=True)
+                candidate_projection(root, run, candidate_id, candidate_root=staged)
+                publish_directory(staged, folder)
             # The agent may have prepared the candidate's work folder before creating it.
             (root / "work" / candidate_id).mkdir(exist_ok=True)
             self._refresh(root, candidate_id)
@@ -501,14 +565,28 @@ class RunStore:
             supplied = source / "configuration.json"
             if supplied.is_file() and read_json(supplied) != candidate["configuration"]:
                 raise ValueError("Package configuration.json differs from the candidate configuration")
-            copy_package(source, folder / "package", rows, folder / "source", read_json(folder / "source.manifest.json")["files"])
-            if not supplied.is_file():
-                (folder / "package" / "configuration.json").write_text(
-                    json.dumps(candidate["configuration"], indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
-                rows = inventory(folder / "package")
-            value = record("package_manifest", run_id, candidate_id=candidate_id, source_manifest_sha256=candidate["source_manifest_sha256"],
-                configuration_sha256=digest(candidate["configuration"]), files=rows, **recipe)
-            self._publish(root, candidate_id, "package/manifest.json", value)
+            destination = safe_path(folder, "package")
+            manifest_path = safe_path(folder, "package/manifest.json")
+            with staging(root, "package") as staged:
+                copy_package(source, staged, rows, folder / "source", read_json(folder / "source.manifest.json")["files"])
+                verify_inventory(staged, rows)
+                if not supplied.is_file():
+                    (staged / "configuration.json").write_text(
+                        json.dumps(candidate["configuration"], indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+                    rows = inventory(staged)
+                value = record("package_manifest", run_id, candidate_id=candidate_id, source_manifest_sha256=candidate["source_manifest_sha256"],
+                    configuration_sha256=digest(candidate["configuration"]), files=rows, **recipe)
+                candidate_projection(root, run, candidate_id,
+                    {manifest_path.relative_to(root).as_posix(): value}, package_root=staged)
+                if destination.exists():
+                    if not manifest_path.exists() or read_json(manifest_path) != value:
+                        raise ValueError("Package already exists with different or incomplete contents; retain it and use a new candidate")
+                    # An identical retry finishes projections without replacing published bytes.
+                    candidate_projection(root, run, candidate_id)
+                else:
+                    write_json(staged / "manifest.json", value, immutable=True)
+                    publish_directory(staged, destination)
+            self._published(root, candidate_id, manifest_path, value)
         return value
 
     def append(self, run_id, candidate_id, kind, data):
@@ -540,11 +618,9 @@ class RunStore:
         root = self.directory(run_id)
         with lease(root):
             run, _, bounds = self._active(root)
-            if operation not in bounds["limits"]["process_seconds"] or (candidate_id is None) != (operation in {"agent", "discovery"}):
-                raise ValueError("Invalid reservation owner/operation")
+            cap = attempt_process_cap(bounds, candidate_id, operation)
             if sum(a["segment_id"] == bounds["segment_id"] for a in self._attempts(root)) >= bounds["limits"]["attempt_limit"]:
                 raise ValueError("Segment attempt limit exhausted")
-            cap = bounds["limits"]["process_seconds"][operation]
             seconds = cap if seconds is None else number(seconds, "Process deadline", .001, cap)
             owner = f"candidates/{ident(candidate_id, 'candidate')}" if candidate_id else f"segments/{bounds['segment_id']}"
             directory = safe_path(root, owner + "/attempts")
@@ -560,6 +636,7 @@ class RunStore:
                 if candidate_id:
                     self._publish(root, candidate_id, f"attempts/{attempt_id}/reservation.json", value)
                 else:
+                    validate_attempt_reservation(root, run, value, bounds=bounds)
                     write_json(written, value, immutable=True)
                     self._state(root, phase="running" if operation == "agent" else "discovering", **({"cleanup": "owned"} if operation == "agent" else {}))
                     self._event(root, "agent_reserved", reference={"path": f"{owner}/attempts/{attempt_id}/reservation.json", "sha256": file_sha(written)})
@@ -606,17 +683,8 @@ class RunStore:
             if candidate_id:
                 self._publish(root, candidate_id, f"attempts/{reservation['attempt_id']}/result.json", value)
             else:
-                if value["outcome"] not in {"completed", "failed", "cancelled", "timed_out", "interrupted", "launch_failed"} or type(value["cleanup_settled"]) is not bool:
-                    raise ValueError("Invalid agent outcome")
-                ended = timestamp(value["ended_at"], "process end")
-                if ended < timestamp(reservation["reserved_at"], "reserved") or (value["outcome"] == "completed" and (ended > timestamp(reservation["deadline_at"], "deadline") or value["exit_code"] != 0 or not value["cleanup_settled"])):
-                    raise ValueError("Agent outcome violates its reserved bounds")
-                if value["exit_code"] is not None:
-                    number(value["exit_code"], "exit code", -(2 ** 31), 2 ** 32, integer=True)
-                if not isinstance(value["logs"], list):
-                    raise ValueError("Logs require retained references")
-                for ref in value["logs"]:
-                    evidence(root, ref)
+                validate_attempt_reservation(root, load_run(root), reservation)
+                validate_attempt_result(root, run_id, reservation, value)
                 write_json(path.with_name("result.json"), value, immutable=True)
                 phase = ("finished" if reservation["operation"] == "agent" else "building") if value["outcome"] == "completed" else value["outcome"]
                 cleanup = ("settled" if reservation["operation"] == "agent" else "external") if value["cleanup_settled"] else "unresolved"
@@ -627,12 +695,32 @@ class RunStore:
     def seal(self, run_id, candidate_id, lifecycle, failure=None):
         root = self.directory(run_id)
         with lease(root):
-            outcome = record("candidate_outcome", run_id, candidate_id=candidate_id, lifecycle=lifecycle, failure=failure, closed_at=now())
-            self._publish(root, candidate_id, "outcome.json", outcome)
-            folder = safe_path(root, f"candidates/{candidate_id}")
-            revision = read_json(folder / "telemetry.json")["revision"]
-            value = record("candidate_seal", run_id, candidate_id=candidate_id, sealed_at=now(), telemetry_revision=revision, files=inventory(folder))
-            write_json(folder / "seal.json", value, immutable=True)
+            folder = safe_path(root, f"candidates/{ident(candidate_id, 'candidate')}")
+            outcome_path = safe_path(folder, "outcome.json")
+            seal_path = safe_path(folder, "seal.json")
+            if outcome_path.exists():
+                outcome = read_json(outcome_path)
+                if digest({key: outcome[key] for key in ("lifecycle", "failure")}) != digest({"lifecycle": lifecycle, "failure": failure}):
+                    raise ValueError("Candidate outcome already exists with different lifecycle/failure")
+            else:
+                outcome = record("candidate_outcome", run_id, candidate_id=candidate_id, lifecycle=lifecycle, failure=failure, closed_at=now())
+            if seal_path.exists():
+                # A retry repairs only run projections/history, never a sealed inventory.
+                candidates, errors = read_candidates(root, load_run(root))
+                if not any(c["candidate_id"] == candidate_id for c in candidates):
+                    error = next((e["error"] for e in errors if e["file"] == f"candidates/{candidate_id}"), "invalid candidate")
+                    raise ValueError("Cannot retry an invalid seal: " + error)
+                value = read_json(seal_path)
+            else:
+                if outcome_path.exists():
+                    self._published(root, candidate_id, outcome_path, outcome)
+                else:
+                    self._publish(root, candidate_id, "outcome.json", outcome)
+                revision = read_json(folder / "telemetry.json")["revision"]
+                value = record("candidate_seal", run_id, candidate_id=candidate_id, sealed_at=now(), telemetry_revision=revision, files=inventory(folder))
+                # A killed writer can leave its temporary hard link behind. Keep it
+                # outside the inventory that this very record seals.
+                write_json(seal_path, value, immutable=True, temporary_directory=safe_path(root, "work"))
             self._state(root)
             self._event(root, "candidate_sealed", candidate_id)
         return value
@@ -679,35 +767,7 @@ class RunStore:
 
     def recover(self, run_id):
         root = self.directory(run_id)
-        lock_path = safe_path(root, ".coordinator.lock")
-        if lock_path.exists():
-            owner = read_lease_owner(lock_path)
-            if owner["host"] is not None and (owner["host"], owner["system"]) != (socket.gethostname(), platform.system()):
-                # Another OS (for example WSL versus Windows) has its own PID space:
-                # a missing PID here proves nothing about the owner.
-                raise ValueError(f"Lease owner ran on {owner['host']} ({owner['system']}); recover from that host and OS")
-            pid = owner["pid"]
-            if os.name == "nt":
-                import ctypes
-                api = ctypes.WinDLL("kernel32", use_last_error=True)
-                api.OpenProcess.restype = ctypes.c_void_p
-                api.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
-                handle = api.OpenProcess(0x1000, False, pid)
-                if handle:
-                    api.CloseHandle.argtypes = [ctypes.c_void_p]
-                    api.CloseHandle(handle)
-                    raise ValueError("Coordinator owner may still be alive; recovery blocked")
-                if ctypes.get_last_error() != 87:
-                    raise ValueError("Cannot prove coordinator owner exited")
-            else:
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    pass
-                else:
-                    raise ValueError("Coordinator owner is still alive")
-            lock_path.unlink()
-        with lease(root):
+        with lease(root, recover=True):
             for folder in sorted((root / "candidates").glob("candidate-*")):
                 if not safe_path(folder, "seal.json").exists():
                     self._refresh(root, folder.name)

@@ -12,13 +12,15 @@ from crit.process.ownership import RuntimeOwnership
 from crit.run.records import GIB
 from crit.run.store import ROOT, RunStore
 
-from .engine import ServedEngine, single_run
+from .engine import EngineError, ServedEngine, single_run
+from .catalog import ModelCatalog
 from .server import Api, Server
 
 
 def parser():
     result = argparse.ArgumentParser(prog="crit serve", description=__doc__)
     result.add_argument("--workspace", type=Path, help="Folder containing the run-* project directories")
+    result.add_argument("--models", type=Path, help="JSON catalog of named models from sealed runs (docs/SERVING.md)")
     result.add_argument("--run", help="Run ID (default: the workspace's only run)")
     result.add_argument("--candidate", help="Candidate ID (default: the run's selected candidate)")
     result.add_argument("--host", default="127.0.0.1", help="Address to listen on (default: 127.0.0.1, this machine only)")
@@ -47,8 +49,11 @@ def parser():
 
 def write_launchers(args, argv):
     """Double-clickable scripts in the run folder that start the server with the same options."""
-    store = RunStore(args.workspace, args.project)
-    folder = store.directory(args.run or single_run(store))
+    if args.models:
+        folder = args.models.resolve().parent
+    else:
+        store = RunStore(args.workspace, args.project)
+        folder = store.directory(args.run or single_run(store))
     options, skip = [], False
     for argument in argv:
         # A key in a script file would be readable by anyone who can read the run folder; use CRIT_API_KEY.
@@ -59,12 +64,17 @@ def write_launchers(args, argv):
             skip = True
             continue
         options.append(argument)
-    if not args.run:
+    if not args.models and not args.run:
         options += ["--run", folder.name]
-    if "--workspace" not in options:
+    if not args.models and "--workspace" not in options:
         options += ["--workspace", str(args.workspace)]
     command = [sys.executable, "-m", "crit.cli"]
-    command += ["serve", *[str(Path(a).absolute()) if a == str(args.workspace) else a for a in options]]
+    def absolute_option(argument):
+        for prefix in ("--models=", "--workspace="):
+            if argument.startswith(prefix):
+                return prefix + str(Path(argument[len(prefix):]).absolute())
+        return str(Path(argument).absolute()) if argument in {str(args.workspace), str(args.models)} else argument
+    command += ["serve", *map(absolute_option, options)]
     windows = folder / "serve.cmd"
     posix = folder / "serve.sh"
     # Under WSL the command holds Linux paths, so the Windows launcher starts serve.sh in the same distribution.
@@ -85,8 +95,11 @@ def main(argv=None):
     if args.recover_runtime:
         print(json.dumps(RuntimeOwnership().recover()))
         return 0
-    if args.workspace is None:
-        parser().error("--workspace is required")
+    if args.models:
+        if any((args.workspace, args.run, args.candidate, args.model_name)):
+            parser().error("--models replaces --workspace, --run, --candidate and --model-name")
+    elif args.workspace is None:
+        parser().error("--workspace or --models is required")
     if args.host not in {"127.0.0.1", "localhost", "::1"} and not args.api_key:
         print("warning: listening on %s without an API key; anyone who can reach this port can use the engine" % args.host,
               file=sys.stderr)
@@ -102,12 +115,14 @@ def main(argv=None):
 def _serve(args):
     gib = lambda value: None if value is None else round(value * GIB)
     try:
-        engine = ServedEngine(args.workspace, args.run, args.candidate, project=args.project,
-                              host_limit=gib(args.resident_ram_gib), device_limit=gib(args.resident_vram_gib),
-                              timeout=args.timeout, load_timeout=args.load_timeout, verify_model=args.verify_model)
+        options = dict(project=args.project, host_limit=gib(args.resident_ram_gib),
+                       device_limit=gib(args.resident_vram_gib), timeout=args.timeout,
+                       load_timeout=args.load_timeout, verify_model=args.verify_model)
+        engine = (ModelCatalog(args.models, **options) if args.models else
+                  ServedEngine(args.workspace, args.run, args.candidate, **options))
         print("Loading %s ..." % (args.candidate or "the selected candidate"), file=sys.stderr, flush=True)
         engine.open()
-    except ValueError as exc:
+    except (ValueError, EngineError) as exc:
         print("error: " + str(exc), file=sys.stderr)
         return 2
     try:

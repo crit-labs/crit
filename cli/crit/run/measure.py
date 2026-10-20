@@ -7,12 +7,12 @@ replay, so a candidate's decode speed does not depend on the text its own arithm
 Host and device memory are sampled during every request. The parent settles the attempt and records one
 benchmark per case, bound to the case's checks.
 """
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import shutil
-import signal
 import subprocess
 import sys
 import threading
@@ -24,6 +24,14 @@ from .records import (ALL_METRICS, METRICS, digest, file_sha, ident, inputs, loa
 PINS = "pins"
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE_FOLDERS = ("cli", "eval", "core/python", "api", "kernels")
+
+
+@dataclass
+class _Execution:
+    outcome: str = "launch_failed"
+    code: int | None = None
+    failure: str | None = None
+    cleanup_settled: bool = True  # No process has been attempted yet.
 
 
 def case_prompt(root, rows):
@@ -82,24 +90,52 @@ def measure(store, run_id, candidate_id, adapter, model=None, config=None, secon
                       "pin": pin["tokens"] if pin else None})
     reservation = store.reserve(run_id, candidate_id, "benchmark", seconds)
     attempt = reservation["attempt_id"]
-    scratch = safe_path(root, f"work/measure/{candidate_id}-{attempt}")
-    scratch.mkdir(parents=True, exist_ok=True)
-    job = {"adapter": str(folder / "package" / adapter), "model": str(model or run["spec"]["model_path"]),
-           "config": dict(config or {}), "context_tokens": run["spec"]["hardware_constraints"]["kv_tokens"],
-           "cases": cases, "out": str(scratch / "result.json")}
-    write_json(scratch / "job.json", job)
     log_path = folder / "logs" / f"measure-{attempt}.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    from crit_core.machine import engine_lock
-    with engine_lock(f"crit run measure {run_id} {candidate_id}"):
-        outcome, code, failure = _run_child(scratch / "job.json", log_path, reservation["deadline_at"])
-    result = read_json(scratch / "result.json") if outcome == "completed" and (scratch / "result.json").is_file() else None
-    if outcome == "completed" and result is None:
-        outcome, failure = "failed", "The measurement wrote no result"
-    store.settle(run_id, reservation, {"outcome": outcome, "ended_at": now(), "exit_code": code, "cleanup_settled": True,
-        "logs": [{"path": log_path.relative_to(root).as_posix(), "sha256": file_sha(log_path)}], "failure": failure})
-    if result is None:
-        raise ValueError(f"Measurement {outcome}: {failure} (log {log_path.relative_to(root).as_posix()})")
+    execution, result = _Execution(), None
+    try:
+        scratch = safe_path(root, f"work/measure/{candidate_id}-{attempt}")
+        scratch.mkdir(parents=True, exist_ok=True)
+        job = {"adapter": str(folder / "package" / adapter), "model": str(model or run["spec"]["model_path"]),
+               "config": dict(config or {}), "context_tokens": run["spec"]["hardware_constraints"]["kv_tokens"],
+               "cases": cases, "out": str(scratch / "result.json")}
+        write_json(scratch / "job.json", job)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        from crit_core.machine import engine_lock
+        deadline = time.monotonic() + _remaining(reservation["deadline_at"])
+        with engine_lock(f"crit run measure {run_id} {candidate_id}", deadline=deadline):
+            execution.outcome, execution.code, execution.failure = _run_child(
+                scratch / "job.json", log_path, reservation["deadline_at"], execution)
+        if execution.outcome == "completed":
+            if not (scratch / "result.json").is_file():
+                raise ValueError("The measurement wrote no result")
+            result = read_json(scratch / "result.json")
+    except BaseException as exc:
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            execution.outcome = "interrupted"
+        elif isinstance(exc, TimeoutError) and execution.outcome == "launch_failed":
+            execution.outcome = "timed_out"
+        elif execution.outcome == "completed":
+            execution.outcome = "failed"
+        execution.failure = (type(exc).__name__ + ": " + str(exc))[:8000]
+        raise
+    finally:
+        ended = now()
+        if execution.outcome == "completed" and timestamp(ended, "ended") > timestamp(reservation["deadline_at"], "deadline"):
+            execution.outcome, execution.failure = "timed_out", "The measurement passed its reserved deadline"
+        logs = []
+        try:
+            # Unretired descendants may still append to this file. Keep their
+            # raw output, but never freeze a mutable log as retained evidence.
+            if execution.cleanup_settled and log_path.is_file():
+                logs.append({"path": log_path.relative_to(root).as_posix(), "sha256": file_sha(log_path)})
+        except OSError as exc:
+            if execution.outcome == "completed":
+                execution.outcome = "failed"
+            execution.failure = ((execution.failure or "") + f"; could not retain log: {exc}")[:8000]
+        store.settle(run_id, reservation, {"outcome": execution.outcome, "ended_at": ended, "exit_code": execution.code,
+            "cleanup_settled": execution.cleanup_settled, "logs": logs, "failure": execution.failure})
+    if execution.outcome != "completed":
+        raise ValueError(f"Measurement {execution.outcome}: {execution.failure} (log {log_path.relative_to(root).as_posix()})")
     for case_id, tokens in result["pins"].items():
         path = safe_path(root, f"{PINS}/{ident(case_id, 'case')}.json")
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -133,25 +169,62 @@ def measure(store, run_id, candidate_id, adapter, model=None, config=None, secon
     return recorded
 
 
-def _run_child(job, log_path, deadline_at):
+def _remaining(deadline_at):
+    return (timestamp(deadline_at, "deadline") - datetime.now(timezone.utc)).total_seconds()
+
+
+def _run_child(job, log_path, deadline_at, execution=None):
+    from crit.process.ownership import RuntimeOwnership
+    from crit.process.tree import guarded_tree
+
+    execution = execution if execution is not None else _Execution()
     command = [sys.executable, "-B", "-m", "crit.run.measure", str(job)]
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     env["PYTHONPATH"] = os.pathsep.join([str(ROOT / f) for f in SOURCE_FOLDERS] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
-    remaining = (timestamp(deadline_at, "deadline") - datetime.now(timezone.utc)).total_seconds()
-    with open(log_path, "wb") as log:
-        options = {"start_new_session": True} if os.name != "nt" else {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env, **options)
-        try:
-            code = process.wait(timeout=max(1.0, remaining))
-        except subprocess.TimeoutExpired:
-            if os.name != "nt":
-                os.killpg(process.pid, signal.SIGKILL)
-            else:
-                process.kill()
-            process.wait()
-            return "timed_out", None, "The measurement passed its reserved deadline"
+    remaining = _remaining(deadline_at)
+    if remaining <= 0:
+        return "timed_out", None, "The measurement passed its reserved deadline before launch"
+    deadline = time.monotonic() + remaining
+    ownership = RuntimeOwnership()
+    ownership.acquire()
+    try:
+        with open(log_path, "wb") as log:
+            # Admission and filesystem work can consume the remaining budget.
+            if _remaining(deadline_at) <= 0:
+                return "timed_out", None, "The measurement passed its reserved deadline before launch"
+            execution.cleanup_settled = False
+            try:
+                tree = guarded_tree(command, Path.cwd(), log, ownership, Path(job).parent, env=env, deadline=deadline)
+            except BaseException:
+                execution.cleanup_settled = ownership.launch_settled
+                raise
+            execution.outcome = "failed"
+            try:
+                while True:
+                    left = _remaining(deadline_at)
+                    if left <= 0:
+                        return "timed_out", None, "The measurement passed its reserved deadline"
+                    try:
+                        # Windows' native process wait can defer Python's Ctrl+C
+                        # handler until it returns. Keep each wait bounded.
+                        code = execution.code = tree.process.wait(timeout=min(.1, left))
+                        break
+                    except subprocess.TimeoutExpired:
+                        pass
+            finally:
+                # Includes the pinning process and adapter/sampler helpers, even
+                # after normal exit. The guardian also handles coordinator death.
+                tree.close()
+                execution.cleanup_settled = True
+    finally:
+        if execution.cleanup_settled:
+            ownership.release(settled=True)
+        else:
+            ownership.block("Measurement launch or tree retirement could not be proven settled")
     if code != 0:
-        tail = log_path.read_bytes()[-2000:].decode("utf-8", "replace").strip().splitlines()
+        with log_path.open("rb") as log:
+            log.seek(max(0, log.seek(0, os.SEEK_END) - 2000))
+            tail = log.read().decode("utf-8", "replace").strip().splitlines()
         return "failed", code, "Measurement process exited with %d: %s" % (code, tail[-1] if tail else "no output")
     return "completed", 0, None
 
@@ -322,14 +395,15 @@ def worker(job_path):
         pins.update(new_pins)
     module = load_adapter(job["adapter"])
     sampler = Sampler()
-    started = time.perf_counter()
-    engine, info = open_engine(module, job["model"], job["config"], speculative=True, context_tokens=job["context_tokens"])
-    load_ms = (time.perf_counter() - started) * 1000
-    print(f"loaded {info['name']} in {load_ms / 1000:.1f} s", flush=True)
-    replay = bool(info.get("replay")) and bool(info.get("speculative")) and callable(getattr(engine, "replay", None))
-    reason = ("" if replay else "the adapter does not declare replay" if info.get("speculative") else "ordinary decoding")
-    cases = {}
+    engine = None
     try:
+        started = time.perf_counter()
+        engine, info = open_engine(module, job["model"], job["config"], speculative=True, context_tokens=job["context_tokens"])
+        load_ms = (time.perf_counter() - started) * 1000
+        print(f"loaded {info['name']} in {load_ms / 1000:.1f} s", flush=True)
+        replay = bool(info.get("replay")) and bool(info.get("speculative")) and callable(getattr(engine, "replay", None))
+        reason = ("" if replay else "the adapter does not declare replay" if info.get("speculative") else "ordinary decoding")
+        cases = {}
         for case in job["cases"]:
             names = ("prefill_tps", "decode_tps", "request_ms", "ttft_ms", "load_ms", "peak_ram_bytes", "peak_vram_bytes",
                      "minimum_free_ram_bytes", "minimum_free_vram_bytes", "accepted_tokens_per_round")
@@ -361,8 +435,11 @@ def worker(job_path):
                                       "missing": missing, "replayed": replayed, "text_reason": text_reason,
                                       "started_at": begun, "ended_at": now()}
     finally:
-        engine.close()
-        sampler.stop()
+        try:
+            if engine is not None:
+                engine.close()
+        finally:
+            sampler.stop()
     Path(job["out"]).write_text(json.dumps({"load_ms": load_ms, "cases": cases, "pins": new_pins}), encoding="utf-8")
 
 

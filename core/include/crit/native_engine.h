@@ -11,10 +11,17 @@
 #include <vector>
 
 namespace crit::core {
+struct NativeEngine;
+using NativeFactory = NativeEngine (*)(std::string_view configuration_json);
+namespace native_api {
+void* open(NativeFactory, const char* configuration_json) noexcept;
+}
 // What an engine library builds from its configuration (a JSON object: the adapter's configuration plus "model",
 // the model directory, and "context_tokens", the context the engine must serve).
 struct NativeEngine {
-    // Kept alive until after the engine is destroyed (for example a backend or model files the engine borrows).
+    // The native bridge retains this with the runtime, including quarantine after a failed final drain.
+    // For example, model files or allocations the engine borrows. Construction work must already be owned
+    // by the backend/model: the bridge can attach this owner only after the factory returns successfully.
     std::shared_ptr<void> owner;
     std::unique_ptr<Engine> engine;
     // Optional: a JSON object merged into crit_engine_info, for engine facts such as "speculative",
@@ -24,8 +31,11 @@ struct NativeEngine {
     // finished on the calling thread (for example "accepted" drafts per round, "verify_ms", "draft_ms", and
     // "rounds", the target passes after prefill, when it differs from the length of "accepted").
     std::function<std::string()> request;
+private:
+    // Called by the bridge once after a successful factory return, before exposing the handle.
+    void retain_owner() const noexcept;
+    friend void* native_api::open(NativeFactory, const char*) noexcept;
 };
-using NativeFactory = NativeEngine (*)(std::string_view configuration_json);
 
 // A generation whose drafts are verified against a fixed continuation (Eval's replay): the session accepts a
 // draft while it equals the continuation's next token and takes each correction or bonus token from it, so

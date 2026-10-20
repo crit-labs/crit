@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_core VERSION 0.2.2 LANGUAGES CXX)
+project(crit_core VERSION 0.2.3 LANGUAGES CXX)
 find_package(Threads REQUIRED)
 function(crit_strict_warnings target)
   if(MSVC)
@@ -100,7 +100,7 @@ if(BUILD_TESTING AND PROJECT_IS_TOP_LEVEL)
   add_executable(crit_core_tests ../tests/core/runtime_tests.cpp)
   target_link_libraries(crit_core_tests PRIVATE crit_core)
   crit_strict_warnings(crit_core_tests)
-  foreach(_test resources generation readiness cancel retained_owner retained_cancel errors score_ownership abandoned startup borrowed_startup cancel_wait drain_retry drain_fatal tracing deferred timing reuse query_scoring
+  foreach(_test resources generation readiness cancel retained_owner retained_cancel errors score_ownership abandoned startup borrowed_startup native_owner cancel_wait drain_retry drain_fatal tracing deferred timing reuse query_scoring
     declarations logprobs logprob_rows deferred_logprobs wait_output text_storage logprob_scoring release_race sink_unwind)
     add_test(NAME crit_core_${_test} COMMAND crit_core_tests ${_test})
     set_tests_properties(crit_core_${_test} PROPERTIES TIMEOUT 30)
@@ -130,6 +130,8 @@ if(BUILD_TESTING AND PROJECT_IS_TOP_LEVEL)
       set_tests_properties(crit_core_${_case} PROPERTIES TIMEOUT ${timeout})
     endforeach()
   endfunction()
+
+  crit_core_cases(progress_tests 30 progress_serial progress_concurrent progress_mixed progress_async)
 
   crit_core_cases(text_tests 30 text_stop_rules text_stop_oracle text_stop_linear text_stream text_offset_rules
     text_offset_bytes text_offset_sentencepiece text_offset_bounds text_stream_offsets text_utf8)
@@ -175,9 +177,11 @@ if(BUILD_TESTING AND PROJECT_IS_TOP_LEVEL)
   set_tests_properties(crit_core_trace_disabled PROPERTIES TIMEOUT 30)
 
   crit_core_cases(graph_tests 30 graph_key graph_identity graph_generations graph_prerequisites graph_failures graph_receipts
+    graph_owner_lifetime graph_capture_allocation_failure graph_owner_moves graph_destroy_failure
     graph_plan graph_state graph_state_failures)
 
   crit_core_cases(device_memory_tests 30 memory_leases memory_lifetime memory_settle_failure memory_release_failure
+    memory_backend_lifetime memory_close_allocation_failure
     memory_threads mapped_contiguous mapped_discontinuous mapped_rejects mapped_generations host_block_pool)
 
   if(CRIT_CORE_CUDA)

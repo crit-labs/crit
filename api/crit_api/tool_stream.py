@@ -1,10 +1,10 @@
 """Append-only tool-call assembly and strict argument-prefix checks."""
 import copy
-import json
 import re
 
 from crit_core.constraints import ByteGrammar, GrammarState
 
+from .content import content_size, content_text, tool_size
 from .options import function_name
 
 
@@ -16,7 +16,7 @@ class ToolCallStream:
 
     @property
     def size(self):
-        return len(json.dumps(self.calls, ensure_ascii=False)) if self.calls else 0
+        return tool_size(self.calls)
 
     def update(self, deltas):
         """Apply a nonempty list of indexed OpenAI deltas atomically, returning normalized deltas."""
@@ -34,10 +34,7 @@ class ToolCallStream:
                 raise ValueError("Tool-call indices must be contiguous and between 0 and 127")
             if not isinstance(function, dict) or set(function) - {"name", "arguments"}:
                 raise ValueError("Invalid streamed function")
-            arguments = function.get("arguments", "")
-            if not isinstance(arguments, str) or "\0" in arguments:
-                raise ValueError("Tool arguments must be text without NUL")
-            arguments.encode("utf-8")
+            arguments = content_text(function.get("arguments", ""), "Tool arguments", allow_empty=True)
             if index == len(calls):
                 ident, name = delta.get("id"), function.get("name")
                 if (not isinstance(ident, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", ident)
@@ -57,8 +54,7 @@ class ToolCallStream:
                     raise ValueError("Later tool deltas may only append nonempty arguments")
                 out = {"index": index, "function": {"arguments": arguments}}
             calls[index]["function"]["arguments"] += arguments
-            if len(json.dumps(calls, ensure_ascii=False)) > 65536:
-                raise ValueError("Tool stream exceeds 65536 characters")
+            content_size("", tool_size(calls))
             if states[index] is not None:
                 states[index] = states[index].advance(arguments.encode("utf-8"))
                 if states[index] is None:

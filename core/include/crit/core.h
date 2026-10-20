@@ -542,5 +542,6 @@ private:
     struct Impl;
     std::shared_ptr<Impl> impl_;
     friend class Handle;
+    friend struct NativeEngine;
 };
 }

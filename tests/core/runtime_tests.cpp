@@ -1,4 +1,5 @@
 #include "crit/core.h"
+#include "crit/native_engine.h"
 #include <array>
 #include <algorithm>
 #include <atomic>
@@ -532,6 +533,64 @@ void failed_drain(bool permanent) {
         require(s->closed == 1 && s->models_destroyed == 1 && !s->pending,"successful cleanup retry failed");
     }
     require(s->unsafe == 0,"failed drain permitted premature storage release");
+}
+struct NativeOwner {
+    std::shared_ptr<State> state;
+    std::shared_ptr<std::atomic<int>> destroyed;
+    NativeOwner(std::shared_ptr<State> s,std::shared_ptr<std::atomic<int>> d):state(std::move(s)),destroyed(std::move(d)) {}
+    ~NativeOwner() {
+        if(state->pending) ++state->unsafe;
+        ++*destroyed;
+    }
+};
+std::shared_ptr<State> native_owner_state;
+std::shared_ptr<std::atomic<int>> native_owner_destroyed;
+Handle native_owner_request;
+bool native_owner_submit = false;
+NativeEngine borrowed_native_factory(std::string_view) {
+    NativeEngine native;
+    native.owner = std::make_shared<NativeOwner>(native_owner_state,native_owner_destroyed);
+    native.engine = engine(native_owner_state);
+    if(native_owner_submit) native_owner_request = native.engine->submit({1},1);
+    return native;
+}
+void native_owner_lifetime() {
+    for(const bool permanent:{false,true}) {
+        native_owner_state = std::make_shared<State>();
+        native_owner_destroyed = std::make_shared<std::atomic<int>>(0);
+        auto* native = native_api::open(borrowed_native_factory,"{}");
+        require(native != nullptr,"native fixture failed to open");
+        native_owner_state->drain_failures = permanent ? -1 : 1;
+        Token prompt = 1, output = 0;
+        const auto before = quarantined_engines();
+        require(native_api::generate(native,&prompt,1,1,nullptr,nullptr,nullptr,&output,nullptr,0) == -1,
+                "native drain failure was not reported");
+        require(native_owner_state->pending && *native_owner_destroyed == 0,"native owner released before close");
+        native_api::close(native);
+        require(native_owner_state->unsafe == 0,"native wrapper released an owner still borrowed by quarantined work");
+        require(*native_owner_destroyed == (permanent ? 0 : 1),"native owner lifetime did not follow physical settlement");
+        require(quarantined_engines() == before+(permanent ? 1u : 0u),"native quarantine state");
+    }
+    // Core handles retain their runtime even after the exported wrapper closes. The wrapper's owner
+    // must follow the handle too; use a gate to keep a real request unsettled at wrapper destruction.
+    native_owner_state = std::make_shared<State>();
+    native_owner_destroyed = std::make_shared<std::atomic<int>>(0);
+    native_owner_state->gate = std::make_shared<Gate>();
+    native_owner_submit = true;
+    auto* native = native_api::open(borrowed_native_factory,"{}");
+    native_owner_submit = false;
+    require(native != nullptr,"native active fixture failed to open");
+    native_owner_state->gate->observed();
+    native_api::close(native);
+    const bool alive = *native_owner_destroyed == 0 && native_owner_state->unsafe == 0;
+    native_owner_request.cancel();
+    native_owner_state->gate->release();
+    native_owner_request.wait();
+    require(alive,"closing the native wrapper released an active handle's borrowed owner");
+    require(*native_owner_destroyed == 1 && native_owner_state->unsafe == 0,
+            "last native handle failed to release its settled owner");
+    native_owner_state.reset();
+    native_owner_destroyed.reset();
 }
 void tracing() {
     auto make=[](const std::shared_ptr<State>& s,Profile p) {
@@ -1172,7 +1231,7 @@ int main(int argc,char** argv) {
             {"resources",resources},{"generation",ordinary},{"readiness",[]{asynchronous(false,false);}},
             {"cancel",[]{asynchronous(true,false);}},{"retained_owner",[]{asynchronous(false,true);}},
             {"retained_cancel",[]{asynchronous(true,true);}},{"errors",errors},{"score_ownership",score_ownership},{"abandoned",abandoned},
-            {"startup",startup},{"borrowed_startup",borrowed_startup},{"cancel_wait",cancel_while_waiting},
+            {"startup",startup},{"borrowed_startup",borrowed_startup},{"native_owner",native_owner_lifetime},{"cancel_wait",cancel_while_waiting},
             {"drain_retry",[]{failed_drain(false);}},{"drain_fatal",[]{failed_drain(true);}},{"tracing",tracing},{"deferred",deferred},{"timing",timing},{"reuse",reuse},{"query_scoring",query_scoring},
             {"declarations",declarations},{"logprobs",logprobs},{"logprob_rows",logprob_rows},{"deferred_logprobs",deferred_logprobs},
             {"wait_output",wait_output},{"text_storage",text_storage},{"logprob_scoring",logprob_scoring},

@@ -27,6 +27,8 @@ class BufferLease;
 // The last lease settles the backend, releases the allocation and drops the charge. A failed settle retains the
 // allocation and charge for retry_retained(); a failed release is never retried, since double release is unsafe,
 // and keeps its charge. Operations are serialized internally; backend hooks run under that lock.
+// Retention bookkeeping is reserved before allocation, so final close needs no Core heap allocation.
+// Destroying an unsettled service quarantines its backend as well as the allocations and charges.
 class BufferService {
 public:
     BufferService(std::shared_ptr<LeaseBackend>, Resources, Memory);

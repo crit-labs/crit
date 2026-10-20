@@ -9,6 +9,77 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-10-20
+
+### Overview
+
+crit 0.2.3 makes `crit serve` hold up under real clients: a closed connection, a stalled reader, a
+failing consumer or Ctrl+C now cancels the turn and settles the engine instead of leaving it running
+or wedged. One server can serve a named catalog of models from several runs, admit bounded concurrent
+requests for adapters that declare a capacity, and take image input for vision packages. `crit run`
+publishes candidates, seals and packages atomically and recovers cleanly after a crash, `crit run
+measure` retires its whole worker tree on every exit, and Core keeps native resources owned until the
+work borrowing them has settled. Serving clients must keep their connection open until the reply
+completes, since closing or half-closing it now cancels the request. The Python distribution and the
+Core SDK share version 0.2.3.
+
+### Added
+
+- `crit serve --models catalog.json` serves named sealed candidates from several runs, each with its
+  own capabilities and context limits ([Serving](docs/SERVING.md)). Switching models releases the old
+  weights before the new ones load, so one server fits a one-model memory budget; an unknown model
+  name returns 404.
+- Concurrent serving: an adapter that declares `chat-concurrent-v1` and a request capacity gets that
+  many requests at once, each with its own stream, cancellation and cleanup. A model switch queues
+  fairly behind active work, and an unrecoverable failure retires the shared host before the next
+  request is admitted. Other adapters stay serial.
+- Image input: `crit serve` passes ordered image and text parts to `chat-images-v1` packages through
+  the chat template, tool history included. `ResidentChat` gives engines request-scoped prepared
+  prompts for their vision inputs; text-only adapters are unchanged.
+
+### Changed
+
+- `crit serve` cancels a turn when its client goes away: a closed or reset connection, also during
+  non-streaming replies and quiet stretches of a stream. A client that half-closes its sending side
+  while waiting cancels too. Cancelled requests leave the wait for the engine at once without
+  touching the active turn.
+- Final replies, stream snapshots and tool deltas go through one content check. Streams still accept
+  whitespace and incomplete tool arguments as prefixes; the completed reply meets the same rules as a
+  JSON reply.
+- Core validates model progress the same way on serial and batched execution, and run records share
+  reservation and attempt-result validation between publication and recovery. Malformed retained
+  records are now rejected before anything is published; valid records are read as before.
+
+### Fixed
+
+- `crit serve` accepts a reply that is only reasoning, including one cut off while reasoning, instead
+  of rejecting it and retiring the resident host. Empty replies, malformed text, tool-policy
+  violations and exceeded budgets still fail.
+- A stalled streaming client no longer holds the engine: writes observe the request's deadline,
+  cancellation and shutdown, the connection is dropped, and a partial frame is never followed by an
+  error or `[DONE]`.
+- `crit serve` shutdown (Ctrl+C, SIGINT, SIGTERM) cancels active requests before waiting and answers
+  queued ones with 503. An exception escaping a streaming consumer retires the resident host before the
+  next request, so it gets a fresh engine. In both cases a failed cleanup stays blocked until a retry
+  succeeds instead of passing for a completed close.
+- `crit run measure` retires its whole worker tree, pinning process and adapter helpers included, on
+  success, failure, timeout and interruption, and when the coordinator dies, on Linux as on Windows.
+  Ctrl+C on Windows takes effect promptly. Reservations count the time spent waiting for the engine
+  lock, so an expired attempt can neither launch nor publish a benchmark, and every setup error or
+  interruption records an outcome.
+- `crit run` publishes atomically: a candidate's source and identity together, a package only after its
+  bytes and launch recipe check out, a seal with its temporary files outside the candidate. An
+  interrupted create, seal or package no longer leaves a half-written directory that blocks recovery,
+  and a retry keeps the original outcome. Staging stays outside `work/`, so the whole work directory can
+  be an input.
+- Run recovery and ordinary writers take one lock on the coordinator lease, so two writers can no
+  longer own the same run. Windows recovery recognizes a dead coordinator whose process handle another
+  process still holds.
+- Core keeps native resources owned until the work using them has settled: graph caches keep
+  unsettled executables through cleanup failures, final buffer release no longer loses an allocation's
+  ownership when host memory runs out, and native engine libraries keep their resource owner alive
+  while request handles are outstanding.
+
 ## [0.2.2] - 2026-10-19
 
 ### Overview
@@ -303,7 +374,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/crit-labs/crit/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/crit-labs/crit/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/crit-labs/crit/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/crit-labs/crit/compare/v0.1.0...v0.2.0

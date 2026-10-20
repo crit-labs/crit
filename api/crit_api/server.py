@@ -4,13 +4,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
 import json
 import re
-import threading
 import time
 import uuid
 
 from crit_core.constraints import UnsupportedConstraint, compile_language, json_object_matches, matches
-from crit_core.text import StopMatcher, TextError
+from crit_core.text import StopMatcher, TextError, message_content
 
+from .disconnect import ClientDisconnect
+from .delivery import StreamDelivery
 from .engine import CONSTRAINTS_CAPABILITY, EngineError
 from .options import (RequestError, SAMPLING, TOOLS_CAPABILITY, TOOL_STREAM_CAPABILITY, require, sampling_capability,
                       sampling_options, tool_calls, tool_options)
@@ -28,15 +29,14 @@ KNOWN = {"model", "messages", "stream", "stream_options", "max_tokens", "max_com
          "response_format", "tools", "tool_choice", "parallel_tool_calls"} | SAMPLING
 
 
-def content_text(content, index):
-    """Message content as text: a string, or a list of text parts."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list) and all(isinstance(p, dict) for p in content):
-        if any(p.get("type") != "text" or not isinstance(p.get("text"), str) for p in content):
-            raise RequestError("This engine accepts text content only", param=f"messages[{index}].content")
-        return "".join(p["text"] for p in content)
-    raise RequestError("Message content must be a string or a list of text parts", param=f"messages[{index}].content")
+def content_text(content, index, capabilities=()):
+    param = f"messages[{index}].content"
+    if content is None:
+        raise RequestError("Message content must be a string or a list of parts", param=param)
+    try:
+        return message_content(content, param, images="chat-images-v1" in capabilities)
+    except (TextError, ValueError) as exc:
+        raise RequestError(str(exc), param=param) from None
 
 
 def conversation(messages, capabilities=()):
@@ -48,18 +48,23 @@ def conversation(messages, capabilities=()):
         raise RequestError("messages must be a non-empty list", param="messages")
     if any(isinstance(m, dict) and (m.get("role") == "tool" or m.get("tool_calls")) for m in messages):
         require(capabilities, TOOLS_CAPABILITY, "messages")
-        return tool_conversation(messages)
+        return tool_conversation(messages, capabilities)
     result = []
     for index, message in enumerate(messages):
         if (not isinstance(message, dict) or not isinstance(message.get("role"), str)
                 or message["role"] not in {"system", "developer", "user", "assistant"}):
             raise RequestError("Each message needs a role of system, user or assistant", param=f"messages[{index}].role")
         role = "system" if message["role"] == "developer" else message["role"]
-        content = content_text(message.get("content"), index)
+        content = content_text(message.get("content"), index, capabilities)
         if role == "system" and any(m["role"] != "system" for m in result):
             raise RequestError("System messages must come before the conversation", param=f"messages[{index}]")
         if result and result[-1]["role"] == role:
-            result[-1]["content"] += "\n\n" + content
+            previous = result[-1]["content"]
+            if isinstance(previous, str) and isinstance(content, str):
+                result[-1]["content"] += "\n\n" + content
+            else:
+                parts = lambda value: [{"type": "text", "text": value}] if isinstance(value, str) else value
+                result[-1]["content"] = parts(previous) + [{"type": "text", "text": "\n\n"}] + parts(content)
         else:
             result.append({"role": role, "content": content})
     turns = result[1:] if result[0]["role"] == "system" else result
@@ -68,7 +73,7 @@ def conversation(messages, capabilities=()):
     return result
 
 
-def tool_conversation(messages):
+def tool_conversation(messages, capabilities=()):
     """Preserve call ids and message boundaries; every call must have exactly one result."""
     result, pending, seen = [], set(), set()
     for index, message in enumerate(messages):
@@ -87,7 +92,7 @@ def tool_conversation(messages):
         if calls and role != "assistant":
             raise RequestError("Only assistant messages may contain tool_calls", param=param)
         content = message.get("content")
-        row = {"role": role, "content": "" if content is None and calls else content_text(content, index)}
+        row = {"role": role, "content": "" if content is None and calls else content_text(content, index, capabilities)}
         if calls:
             try:
                 row["tool_calls"] = tool_calls(calls)
@@ -192,7 +197,8 @@ class Api:
         if "stream" in body and type(body["stream"]) is not bool:
             raise RequestError("stream must be a boolean", param="stream")
         candidate = self.candidate(body.get("model"))
-        capabilities = self.engine.spec(candidate)["capabilities"]
+        spec = self.engine.spec(candidate)
+        capabilities = spec["capabilities"]
         sampling = sampling_options(body, capabilities)
         tools = tool_options(body, capabilities)
         constraint = response_format(body.get("response_format"))
@@ -205,9 +211,9 @@ class Api:
                                param="response_format" if constraint else "stop")
         limit = body.get("max_completion_tokens", body.get("max_tokens"))
         if limit is None:
-            limit = min(DEFAULT_MAX_TOKENS, self.engine.kv_tokens - 1)
-        if type(limit) is not int or not 1 <= limit < self.engine.kv_tokens:
-            raise RequestError(f"max_tokens must be between 1 and {self.engine.kv_tokens - 1}", param="max_tokens")
+            limit = min(DEFAULT_MAX_TOKENS, spec["limits"]["kv_tokens"] - 1)
+        if type(limit) is not int or not 1 <= limit < spec["limits"]["kv_tokens"]:
+            raise RequestError(f"max_tokens must be between 1 and {spec['limits']['kv_tokens'] - 1}", param="max_tokens")
         options = body.get("stream_options") or {}
         if not isinstance(options, dict):
             raise RequestError("stream_options must be an object", param="stream_options")
@@ -227,13 +233,10 @@ class Api:
             return self.engine.default
         if not isinstance(model, str):
             raise RequestError("model must be a string", param="model")
-        candidate = model.removeprefix(self.engine.run_id + "/")
-        if candidate == model and not re.fullmatch(r"candidate-\d+", model):
-            return self.engine.default
-        known = lambda refresh=False: candidate in {c["candidate_id"] for c in self.engine.candidates(refresh)}
-        if not known() and not known(refresh=True):
-            raise RequestError("Unknown model " + model + "; GET /v1/models lists the served candidates", 404,
-                               param="model", code="model_not_found")
+        try:
+            candidate = self.engine.resolve_model(model)
+        except EngineError as exc:
+            raise RequestError(str(exc), exc.status, param="model", code="model_not_found") from exc
         try:
             self.engine.spec(candidate)
         except (ValueError, EngineError) as exc:
@@ -264,7 +267,7 @@ class Api:
             return "stop"
         return "length" if measured and measured["output_tokens"] >= limit else "stop"
 
-    def run(self, request, emit, cancel, emit_tools=None, emit_reasoning=None):
+    def run(self, request, emit, cancel, emit_tools=None, emit_reasoning=None, on_started=None):
         """Generate; emit receives text, emit_tools indexed deltas, emit_reasoning reasoning text (apart from the
         reply). Returns (finish_reason, measured, calls, reasoning).
         Stop strings follow
@@ -294,7 +297,8 @@ class Api:
                                                                response_format=request.get("response_format"),
                                                                sampling=request["sampling"], tool_options=request["tool_options"],
                                                                on_tools=emit_tools if tool_incremental else None,
-                                                               on_reasoning=reasoned if request["stream"] else None)
+                                                               on_reasoning=reasoned if request["stream"] else None,
+                                                               on_started=on_started)
         except (ValueError, OSError) as exc:
             raise EngineError(str(exc)) from exc
         if status == "completed":
@@ -422,15 +426,23 @@ class Handler(BaseHTTPRequestHandler):
             return self.error(400, "Invalid JSON body: " + str(exc))
         except RequestError as exc:
             return self.error(exc.status, str(exc), param=exc.param, code=exc.code)
-        (self.stream if request["stream"] else self.complete)(request)
+        with ClientDisconnect(self.connection) as client:
+            try:
+                (self.stream if request["stream"] else self.complete)(request, client.cancel)
+            except OSError:
+                # A response write can fail between transport polls.
+                client.cancel.set()
+                self.close_connection = True
+        if client.disconnected.is_set():
+            self.close_connection = True
 
     def headers_for(self, request):
         return [("X-Crit-Ignored-Parameters", ",".join(request["ignored"]))] if request["ignored"] else []
 
-    def complete(self, request):
+    def complete(self, request, cancel):
         pieces = []
         try:
-            finish, measured, calls, reasoning = self.api.run(request, pieces.append, threading.Event())
+            finish, measured, calls, reasoning = self.api.run(request, pieces.append, cancel)
         except EngineError as exc:
             return self.error(exc.status, str(exc), "server_error" if exc.status >= 500 else "invalid_request_error")
         value = {"id": "chatcmpl-" + uuid.uuid4().hex, "object": "chat.completion", "created": int(time.time()),
@@ -448,8 +460,15 @@ class Handler(BaseHTTPRequestHandler):
             value["crit_telemetry"] = self.api.telemetry(measured)
         self.send_json(200, value, self.headers_for(request))
 
-    def stream(self, request):
-        cancel = threading.Event()
+    def stream(self, request, cancel):
+        with StreamDelivery(self.connection, cancel, self.api.engine._stopping, self.api.engine.timeout) as delivery:
+            previous, self.wfile = self.wfile, delivery
+            try:
+                self._stream(request, cancel, delivery.set_deadline)
+            finally:
+                self.wfile = previous
+
+    def _stream(self, request, cancel, on_started):
         ident, created = "chatcmpl-" + uuid.uuid4().hex, int(time.time())
         fingerprint = self.api.engine.spec(request["candidate"])["package_sha256"][:16]
         self.send_response(200)
@@ -481,7 +500,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             finish, measured, _, _ = self.api.run(request, lambda piece: event(chunk({"content": piece})), cancel,
                 lambda deltas: event(chunk({"tool_calls": deltas})),
-                lambda piece: event(chunk({"reasoning_content": piece})))
+                lambda piece: event(chunk({"reasoning_content": piece})), on_started=on_started)
         except EngineError as exc:
             event({"error": {"message": str(exc), "type": "server_error", "param": None, "code": None}})
         else:

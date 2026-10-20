@@ -81,6 +81,12 @@ The host protocol is [device_graph.h](../../../include/crit/device_graph.h)
 | `StagedGraphPlan` | Validates staged geometry (f16/bf16/f32, at most 64 phases). `UnsupportedLayout` is a pre-submission rejection: use another slot or an eager path. |
 | `StagedGraphState` | Replay state machine: prepare, launch/bridge/launch in phase order, finish; one replay in flight; any failure poisons replay; only a successful drain closes. |
 
+`GraphCache` destruction checks the same settlement receipts as eviction. Pending,
+failed or uncertain work retains the cache's executables, receipts and owners for
+process recovery. Capture reserves its ownership bookkeeping before calling the
+backend, so a later allocation failure cannot undo retention.
+An ambiguous destruction failure also blocks further replay and destruction.
+
 [cuda_graph.h](../../../include/crit/cuda_graph.h) ([cuda_graph.cpp](cuda_graph.cpp))
 adds `CudaStagedGraph` in `crit::cuda`: it binds row geometry to one slot,
 allocates padded device staging and captures each phase. Replay zero-fills
@@ -108,6 +114,9 @@ charge. A failed settle retains both for `retry_retained()`; a failed release is
 never retried. `LeaseBackend` settlement must cover every reader and writer,
 including other streams and CPU workers. Never charge one allocation both here
 and through `CudaBuffer`.
+Retention bookkeeping is reserved before physical allocation, so final lease
+cleanup can retain failures without allocating. If the service is destroyed with
+unsettled or uncertain allocations, it retains their backend and charges too.
 
 `MappedSource` is an immutable address map of one generation: host spans with
 their actual device aliases and owners. `resolve` returns one device pointer only

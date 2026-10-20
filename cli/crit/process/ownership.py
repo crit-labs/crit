@@ -157,6 +157,10 @@ def clean_snapshots(directory, runtime_id):
                 time.sleep(.005)
     stream = safe_path(directory, "runtimes/" + runtime_id + "/stream.json")
     stream.unlink(missing_ok=True)
+    streams = safe_path(directory, "runtimes/" + runtime_id + "/streams")
+    if streams.exists():
+        for path in streams.glob("*.json"):
+            safe_path(streams, path.name).unlink(missing_ok=True)
 
 
 class RuntimeOwnership:
@@ -165,6 +169,7 @@ class RuntimeOwnership:
         self.path = safe_path(self.directory, "owner.json")
         self.token = None
         self.failed_tree = None
+        self.launch_settled = True  # In-process proof for failed guarded launches.
         self.blocked = ""
 
     def acquire(self):

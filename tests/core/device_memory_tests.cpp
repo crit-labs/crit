@@ -2,6 +2,7 @@
 // release with failure retention, and mapped-source resolution. Backend hooks are host fakes; no device call.
 #include <crit/device_memory.h>
 #include <crit/host_block.h>
+#include "allocation_failure.h"
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -130,6 +131,65 @@ void memory_release_failure() {
     require(quarantined_buffer_services() == before + 1 && resources.usage(Memory::device).live == 4,
             "a destroyed service released an uncertain allocation or its charge");
 }
+void memory_backend_lifetime() {
+    for(const int failure:{0,1,2}) {
+        Resources resources(0,8);
+        std::weak_ptr<FakeBackend> observed;
+        const auto before = quarantined_buffer_services();
+        {
+            auto backend = std::make_shared<FakeBackend>();
+            observed = backend;
+            BufferService service(backend,resources,Memory::device);
+            auto lease = service.allocate(4);
+            backend->fail_settle = failure == 1;
+            backend->fail_release = failure == 2;
+            backend.reset(); // The service is now the sole owner of the actual backing storage.
+            if(failure) rejects<std::runtime_error>([&]{lease.close();},"");
+            else lease.close();
+        }
+        require(observed.expired() == (failure == 0),
+                "quarantine lost the backend that owns its physical allocation");
+        require(resources.usage(Memory::device).live == (failure ? 4u : 0u) &&
+                quarantined_buffer_services() == before+(failure ? 1u : 0u),
+                "backend lifetime and retained allocation accounting disagree");
+    }
+}
+void memory_close_allocation_failure() {
+    struct BackendWithoutAllocations final : LeaseBackend {
+        std::byte storage[8]{};
+        unsigned settled = 0, released = 0;
+        bool reject_settle = false;
+        void* allocate(std::size_t) override { return storage; }
+        void settle() override {
+            ++settled;
+            if(reject_settle) throw std::bad_alloc();
+        }
+        void release(void*,std::size_t) override { ++released; }
+    };
+    for(const bool failed_settle:{false,true}) {
+        auto backend = std::make_shared<BackendWithoutAllocations>();
+        Resources resources(0,8);
+        BufferService service(backend,resources,Memory::device);
+        auto first = service.allocate(4), second = service.allocate(4);
+        backend->reject_settle = failed_settle;
+        unsigned failures = 0;
+        {
+            const allocation_failure::Reset reset;
+            allocation_failure::enabled = true;
+            try { first.close(); } catch(const std::bad_alloc&) { ++failures; }
+            try { second.close(); } catch(const std::bad_alloc&) { ++failures; }
+        }
+        require(backend->settled == 2 && failures == (failed_settle ? 2u : 0u),
+                "final lease close allocated bookkeeping before settling the backend");
+        require(service.retained() == (failed_settle ? 2u : 0u) &&
+                resources.usage(Memory::device).live == (failed_settle ? 8u : 0u),
+                "allocation failure lost physical ownership or its charge");
+        backend->reject_settle = false;
+        service.retry_retained();
+        require(!service.retained() && resources.usage(Memory::device).live == 0 && backend->released == 2,
+                "retained allocations did not release exactly once after recovery");
+    }
+}
 void memory_threads() {
     Fixture f;
     auto root = f.service.allocate(8);
@@ -243,6 +303,7 @@ int main(int argc, char** argv) {
         const std::vector<std::pair<std::string, std::function<void()>>> tests{
             {"memory_leases", memory_leases}, {"memory_lifetime", memory_lifetime},
             {"memory_settle_failure", memory_settle_failure}, {"memory_release_failure", memory_release_failure},
+            {"memory_backend_lifetime", memory_backend_lifetime}, {"memory_close_allocation_failure", memory_close_allocation_failure},
             {"memory_threads", memory_threads}, {"mapped_contiguous", mapped_contiguous},
             {"mapped_discontinuous", mapped_discontinuous}, {"mapped_rejects", mapped_rejects},
             {"mapped_generations", mapped_generations}, {"host_block_pool", host_block_pool}};

@@ -248,23 +248,24 @@ def unique_object(pairs):
     return value
 
 
-def read_json(path):
-    if not path.is_file() or path.is_symlink() or path.stat().st_size > MAX_JSON_BYTES:
-        raise ValueError("JSON must be a regular file under 1 MiB")
+def read_json(path, *, max_bytes=MAX_JSON_BYTES):
+    limit = "1 MiB" if max_bytes == MAX_JSON_BYTES else str(max_bytes) + " bytes"
+    if not path.is_file() or path.is_symlink() or path.stat().st_size > max_bytes:
+        raise ValueError("JSON must be a regular file under " + limit)
     data = path.read_bytes()
-    if len(data) > MAX_JSON_BYTES:
-        raise ValueError("JSON must be under 1 MiB")
+    if len(data) > max_bytes:
+        raise ValueError("JSON must be under " + limit)
     return json.loads(data.decode("utf-8"), object_pairs_hook=unique_object, parse_constant=lambda value: (_ for _ in ()).throw(ValueError("Nonfinite JSON")))
 
 
-def write_json(path, value, immutable=False):
+def write_json(path, value, immutable=False, *, max_bytes=MAX_JSON_BYTES, temporary_directory=None):
     data = (json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
-    if len(data) > MAX_JSON_BYTES:
-        raise ValueError("JSON projection exceeds 1 MiB")
+    if len(data) > max_bytes:
+        raise ValueError("JSON projection exceeds " + ("1 MiB" if max_bytes == MAX_JSON_BYTES else str(max_bytes) + " bytes"))
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:
-        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + ".", suffix=".tmp", delete=False) as stream:
+        with tempfile.NamedTemporaryFile(dir=temporary_directory or path.parent, prefix=path.name + ".", suffix=".tmp", delete=False) as stream:
             temporary = Path(stream.name)
             stream.write(data)
             stream.flush()
@@ -560,7 +561,68 @@ def evidence(root, ref):
     return path
 
 
-def candidate_projection(root, run, candidate_id, overlay=None):
+def attempt_process_cap(bounds, candidate_id, operation):
+    """Check the operation's owner and return its fixed process cap."""
+    if candidate_id is not None:
+        ident(candidate_id, "candidate")
+    if (not isinstance(operation, str) or operation not in bounds["limits"]["process_seconds"]
+            or (candidate_id is None) != (operation in {"agent", "discovery"})):
+        raise ValueError("Invalid reservation operation/owner")
+    return bounds["limits"]["process_seconds"][operation]
+
+
+def validate_attempt_reservation(root, run, value, *, bounds=None):
+    """Common authority; callers may reuse a validated segment and additionally bind paths/artifacts."""
+    header(value, "attempt_reservation", run["run_id"], {"segment_id", "candidate_id", "attempt_id",
+           "operation", "reserved_at", "deadline_at", "inputs_manifest_sha256", "package_sha256", "cost"})
+    ident(value["attempt_id"], "attempt")
+    if bounds is None:
+        bounds = segment(root, run, value["segment_id"])
+    if value["segment_id"] != bounds["segment_id"]:
+        raise ValueError("Reservation segment mismatch")
+    cap = attempt_process_cap(bounds, value["candidate_id"], value["operation"])
+    start = timestamp(value["reserved_at"], "reservation")
+    deadline = timestamp(value["deadline_at"], "attempt deadline")
+    if not (timestamp(bounds["started_at"], "segment start") <= start <= deadline
+            <= timestamp(bounds["deadline_at"], "segment deadline")):
+        raise ValueError("Reservation exceeds fixed segment bounds")
+    if (deadline - start).total_seconds() > cap:
+        raise ValueError("Attempt exceeds its process cap")
+    if digest(value["cost"]) != digest({"unit": "attempt", "amount": 1}):
+        raise ValueError("Invalid attempt counter reservation")
+    return value
+
+
+def validate_attempt_result(root, run_id, reservation, value):
+    """Validate a result against its reservation before publication or when rebuilding state."""
+    header(value, "attempt_result", run_id, {"segment_id", "candidate_id", "attempt_id", "outcome",
+           "ended_at", "exit_code", "cleanup_settled", "logs", "failure"})
+    if any(value[key] != reservation[key] for key in ("segment_id", "candidate_id", "attempt_id")):
+        raise ValueError("Attempt result owner mismatch")
+    if (not isinstance(value["outcome"], str) or
+            value["outcome"] not in {"completed", "failed", "cancelled", "timed_out", "interrupted", "launch_failed"}
+            or type(value["cleanup_settled"]) is not bool):
+        raise ValueError("Invalid attempt outcome/settlement")
+    ended = timestamp(value["ended_at"], "ended_at")
+    if ended < timestamp(reservation["reserved_at"], "reserved_at"):
+        raise ValueError("Attempt ended before reservation")
+    if value["outcome"] == "completed" and ended > timestamp(reservation["deadline_at"], "deadline_at"):
+        raise ValueError("Completed attempt exceeded deadline")
+    if value["exit_code"] is not None:
+        number(value["exit_code"], "exit_code", -(2 ** 31), 2 ** 32, integer=True)
+    if value["outcome"] == "completed" and (value["exit_code"] != 0 or not value["cleanup_settled"]):
+        raise ValueError("Completed attempt requires zero exit and settled cleanup")
+    if not isinstance(value["logs"], list):
+        raise ValueError("Logs require retained evidence references")
+    for ref in value["logs"]:
+        evidence(root, ref)
+    # Candidate failures feed the lifecycle's failure message. Agent/discovery results may omit it.
+    if value["failure"] is not None or (reservation["candidate_id"] is not None and value["outcome"] != "completed"):
+        text(value["failure"], "failure", 8000)
+    return value
+
+
+def candidate_projection(root, run, candidate_id, overlay=None, *, candidate_root=None, package_root=None):
     """Recompute from immutable retained artifacts/checks/benchmarks, never fastest samples."""
     overlay = overlay or {}
     def read(path):
@@ -584,6 +646,8 @@ def candidate_projection(root, run, candidate_id, overlay=None):
                 found.add(path)
         return sorted(found)
     folder = safe_path(root, "candidates/" + ident(candidate_id, "candidate"))
+    if candidate_root is not None:
+        folder = candidate_root
     candidate = read(safe_path(folder, "candidate.json"))
     required = {"candidate_id", "segment_id", "ordinal", "parent_candidate_id", "origin_candidate_id", "created_at", "label", "rationale", "strategy", "configuration", "store_decisions", "source_manifest_sha256", "inputs_manifest_sha256", "request_sha256"}
     header(candidate, "candidate", run["run_id"], required, {"weights"})
@@ -623,6 +687,7 @@ def candidate_projection(root, run, candidate_id, overlay=None):
     verify_inventory(folder / "source", source["files"])
     artifacts = {"source": f"candidates/{candidate_id}/source", "source_manifest": f"candidates/{candidate_id}/source.manifest.json"}
     package_sha = None
+    package_root = package_root if package_root is not None else folder / "package"
     package_path = safe_path(folder, "package/manifest.json")
     if exists(package_path):
         package = read(package_path)
@@ -630,11 +695,11 @@ def candidate_projection(root, run, candidate_id, overlay=None):
         if (package["candidate_id"] != candidate_id or package["source_manifest_sha256"] != candidate["source_manifest_sha256"] or
                 package["configuration_sha256"] != digest(candidate["configuration"])):
             raise ValueError("Package identity differs from frozen source/configuration")
-        verify_inventory(folder / "package", package["files"], {"manifest.json"})
+        verify_inventory(package_root, package["files"], {"manifest.json"})
         keys(package["build"], {"toolchain", "dependencies", "command"})
         if not isinstance(package["launch"], list) or not package["launch"] or not all(isinstance(s, str) for s in package["launch"]):
             raise ValueError("Package launch recipe requires literal arguments")
-        executable = safe_path(folder / "package", package["launch"][0])
+        executable = safe_path(package_root, package["launch"][0])
         if not executable.is_file():
             raise ValueError("Package launch entry must be a retained file")
         if not isinstance(package["build"]["toolchain"], dict) or not package["build"]["toolchain"] or not isinstance(package["build"]["dependencies"], list):
@@ -647,7 +712,7 @@ def candidate_projection(root, run, candidate_id, overlay=None):
             keys(dependency, {"name", "version", "path", "sha256"})
             text(dependency["name"], "dependency name", 200)
             text(dependency["version"], "dependency version", 200)
-            dependency_path = safe_path(folder / "package", dependency["path"])
+            dependency_path = safe_path(package_root, dependency["path"])
             if not dependency_path.is_file() or file_sha(dependency_path) != dependency["sha256"]:
                 raise ValueError("Package dependency must bind retained bytes")
         package_sha = digest(package)
@@ -660,23 +725,15 @@ def candidate_projection(root, run, candidate_id, overlay=None):
     attempts = []
     for attempt in paths(folder / "attempts", "attempt-*"):
         ident(attempt.name, "attempt")
-        reservation = read(safe_path(attempt, "reservation.json"))
-        header(reservation, "attempt_reservation", run["run_id"], {"segment_id", "candidate_id", "attempt_id", "operation", "reserved_at", "deadline_at", "inputs_manifest_sha256", "package_sha256", "cost"})
+        reservation = validate_attempt_reservation(root, run, read(safe_path(attempt, "reservation.json")), bounds=bounds)
         if reservation["candidate_id"] != candidate_id or reservation["segment_id"] != candidate["segment_id"] or reservation["attempt_id"] != attempt.name:
             raise ValueError("Attempt owner mismatch")
         if reservation["inputs_manifest_sha256"] != resolved["manifest_sha256"]:
             raise ValueError("Attempt input identity mismatch")
-        if reservation["operation"] not in {"build", "check", "benchmark"}:
-            raise ValueError("Unknown candidate operation")
         if reservation["operation"] != "build" and reservation["package_sha256"] != package_sha:
             raise ValueError("Attempt package identity mismatch")
-        if not created <= timestamp(reservation["reserved_at"], "reservation") <= timestamp(reservation["deadline_at"], "attempt deadline") <= timestamp(bounds["deadline_at"], "segment deadline"):
-            raise ValueError("Attempt deadline outside segment")
-        cap = bounds["limits"]["process_seconds"][reservation["operation"]]
-        if (timestamp(reservation["deadline_at"], "deadline") - timestamp(reservation["reserved_at"], "reserved")).total_seconds() > cap:
-            raise ValueError("Attempt exceeds its process cap")
-        if digest(reservation["cost"]) != digest({"unit": "attempt", "amount": 1}):
-            raise ValueError("Attempt counter reservation invalid")
+        if timestamp(reservation["reserved_at"], "reservation") < created:
+            raise ValueError("Attempt precedes candidate creation")
         attempt_count += 1
         attempt_view = {"attempt_id": attempt.name, "operation": reservation["operation"], "deadline_at": reservation["deadline_at"],
                         "reservation": f"candidates/{candidate_id}/attempts/{attempt.name}/reservation.json", "outcome": None}
@@ -686,27 +743,12 @@ def candidate_projection(root, run, candidate_id, overlay=None):
             unresolved = True
             lifecycle = {"build": "building", "check": "checking", "benchmark": "benchmarking"}[reservation["operation"]]
             continue
-        result = read(result_path)
-        header(result, "attempt_result", run["run_id"], {"segment_id", "candidate_id", "attempt_id", "outcome", "ended_at", "exit_code", "cleanup_settled", "logs", "failure"})
-        if any(result[k] != reservation[k] for k in ("segment_id", "candidate_id", "attempt_id")):
-            raise ValueError("Attempt result owner mismatch")
-        if result["outcome"] not in {"completed", "failed", "cancelled", "timed_out", "interrupted", "launch_failed"} or type(result["cleanup_settled"]) is not bool:
-            raise ValueError("Invalid attempt outcome/settlement")
-        if timestamp(result["ended_at"], "ended_at") < timestamp(reservation["reserved_at"], "reserved_at"):
-            raise ValueError("Attempt ended before reservation")
-        if result["outcome"] == "completed" and timestamp(result["ended_at"], "ended_at") > timestamp(reservation["deadline_at"], "deadline_at"):
-            raise ValueError("Completed attempt exceeded deadline")
-        if result["exit_code"] is not None:
-            number(result["exit_code"], "exit_code", -(2 ** 31), 2 ** 32, integer=True)
-        if result["outcome"] == "completed" and (result["exit_code"] != 0 or result["cleanup_settled"] is not True):
-            raise ValueError("Completed attempt requires zero exit and settled cleanup")
+        result = validate_attempt_result(root, run["run_id"], reservation, read(result_path))
         attempt_view.update(outcome=result["outcome"], cleanup_settled=result["cleanup_settled"], ended_at=result["ended_at"], logs=result["logs"])
         unresolved |= not result["cleanup_settled"]
-        for ref in result["logs"]:
-            evidence(root, ref)
         if result["outcome"] != "completed":
             lifecycle = result["outcome"] if result["outcome"] in LIFECYCLES else reservation["operation"] + "_failed"
-            failure = {"operation": reservation["operation"], "message": text(result["failure"], "failure", 8000)}
+            failure = {"operation": reservation["operation"], "message": result["failure"]}
         else:
             # The latest attempt decides: a completed retry supersedes an earlier failed attempt.
             lifecycle, failure = ("queued" if package_sha is None else "checking"), None

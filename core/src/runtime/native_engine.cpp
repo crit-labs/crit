@@ -145,6 +145,7 @@ void* open(NativeFactory factory, const char* configuration_json) noexcept {
     try {
         auto native = std::make_unique<NativeEngine>(factory(configuration_json ? configuration_json : "{}"));
         if(!native->engine) throw std::runtime_error("the engine factory returned no engine");
+        native->retain_owner();
         return native.release();
     } catch(const std::exception& error) {
         fail(error.what());
