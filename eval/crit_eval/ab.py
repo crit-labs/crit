@@ -13,7 +13,7 @@ from pathlib import Path
 
 from . import EVAL_DIR, load_json, metrics, write_json
 from .pin import load_continuations
-from .prepare import PREPARED
+from .prepare import PREPARED, check_prepared
 from .runner import load_adapter, open_engine, run_speed
 
 KPIS = ("decode_score", "prefill_score", "ttft_score_ms")
@@ -23,8 +23,7 @@ def run_ab(adapter_a, config_a, adapter_b, config_b, model, data, out, rounds=2,
            log=print, context_tokens=None):
     protocol = load_json(EVAL_DIR / "protocol.json")
     prepared = load_json(Path(data) / PREPARED)
-    if prepared.get("protocol") != protocol["protocol"]:
-        raise SystemExit(f"{data} was prepared for {prepared.get('protocol')}, not {protocol['protocol']}")
+    check_prepared(prepared, protocol, data)
     if rounds < 1:
         raise SystemExit("--rounds must be at least 1")
     continuations = load_continuations(data, prepared)

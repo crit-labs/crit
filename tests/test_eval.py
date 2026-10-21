@@ -15,8 +15,10 @@ ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("core/python", "eval"): sys.path.insert(0, str(ROOT / _folder))
 from crit_core.model import inspect_safetensors  # noqa: E402
 from crit_eval import ab, ceiling, context, headroom, hostload, metrics, pin, prepare, probe, report, runner, status  # noqa: E402
+from crit_eval import protocol_version  # noqa: E402
 
 MOCK = ROOT / "eval/examples/mock_adapter.py"
+SUITE = prepare.suite_identity()  # prepared data must come from the suite Eval runs
 
 
 def softmax_logprobs(logits):
@@ -28,60 +30,63 @@ def softmax_logprobs(logits):
 FACTS = 2000  # retrieval fact ids in the fixture start here; the mock's facts_from knob repeats them
 
 
-def reference_targets(ids, first):
-    targets = []
-    for position in range(first, len(ids)):
-        lp = softmax_logprobs([3.0, 1.0, 0.5, 0.0] + [-4.0] * 20)
-        top = [ids[position], 100 + position, 200 + position, 300 + position]
-        targets.append({"target": top[0], "logprob": lp[0], "top_ids": top, "top_logprobs": lp[:4]})
-    return targets
-
-
 def fixture(directory):
     prepared = {
-        "protocol": "crit-eval-v4", "suite_sha256": "suite", "model": {"sha256": "model"}, "stop_ids": [999],
+        "protocol": "crit-eval-v5", "suite_sha256": SUITE, "model": {"sha256": "model"}, "stop_ids": [999],
         "valid_vocab": 1000,
         "speed": [{"id": "short", "kind": "prose", "prompt_ids": [1, 2, 3], "output_tokens": 12},
                   {"id": "long", "kind": "long-context", "prompt_ids": list(range(60)), "output_tokens": 12}],
-        "quality": [{"id": "c", "ids": [5, 6, 7, 8, 9], "first_target": 2}],
-        # Two prompt lengths of filler before scored tokens 5..9 (prefill_decode).
-        "prefill_decode": [{"id": f"c@{n}", "conversation": "c", "prompt_tokens": n,
-                            "ids": [1] * n + [5, 6, 7, 8, 9], "first_target": n} for n in (16, 40)],
+        "quality": [{"id": "c", "set": "conversations", "prompt_ids": [5, 6],
+                     "messages": [{"role": "user", "content": "c"}]}],
         "retrieval": {"head_ids": [1, 2], "tail_ids": [3, 4], "filler_ids": list(range(10, 50)),
                       "facts": [{"id": "start", "answer": "ab", "ids": [FACTS, FACTS + 1]},
                                 {"id": "middle", "answer": "cd", "ids": [FACTS + 2, FACTS + 3]},
                                 {"id": "end", "answer": "ef", "ids": [FACTS + 4, FACTS + 5]}],
                       "token_text": [None] * FACTS + list("abcdef")},
+        # The long-context curve extends "long": its 60 ids are a frame around a document.
+        "context": {"case": "long", "head_ids": [0, 1], "tail_ids": [58, 59], "document_ids": list(range(2, 58))},
     }
-    reference = {"prepared_model_sha256": "model", "suite_sha256": "suite", "top_k": 4,
-                 "conversations": [{"id": "c", "targets": reference_targets([5, 6, 7, 8, 9], 2)}],
-                 "prefill_decode": [{"id": s["id"], "prompt_tokens": s["prompt_tokens"],
-                                     "targets": reference_targets(s["ids"], s["first_target"])}
-                                    for s in prepared["prefill_decode"]]}
     (directory / "prepared.json").write_text(json.dumps(prepared))
-    (directory / "reference.json").write_text(json.dumps(reference))
-    return prepared, reference
+    return prepared
 
 
 class MetricTests(unittest.TestCase):
-    def test_lumped_kl_is_zero_for_equal_and_a_lower_bound_of_full_kl(self):
+    def test_partial_kl_is_zero_for_equal_and_a_lower_bound_of_full_kl(self):
         p = softmax_logprobs([2.0, 1.0, 0.0, -1.0, -2.0])
         q = softmax_logprobs([1.5, 1.2, 0.1, -0.5, -3.0])
-        self.assertAlmostEqual(metrics.lumped_kl(p[:3], p[:3]), 0.0, places=12)
+        self.assertAlmostEqual(metrics.partial_kl([0, 1, 2], p[:3], dict(enumerate(p[:3]))), 0.0, places=12)
         full = sum(math.exp(a) * (a - b) for a, b in zip(p, q))
-        lumped = metrics.lumped_kl(p[:3], q[:3])
-        self.assertGreater(lumped, 0.0)
-        self.assertLessEqual(lumped, full + 1e-12)
+        both = metrics.partial_kl([0, 1, 2], p[:3], dict(enumerate(q[:3])))
+        self.assertGreater(both, 0.0)
+        self.assertLessEqual(both, full + 1e-12)
+        # A reference token outside the engine's top-k goes into the lumped rest: still a lower bound, and lower.
+        missing = metrics.partial_kl([0, 1, 2], p[:3], {0: q[0], 2: q[2], 4: q[4]})
+        self.assertLessEqual(missing, both + 1e-12)
+
+    def test_reply_quality_scores_the_engines_tokens_against_the_reference(self):
+        lp = softmax_logprobs([3.0, 1.0, 0.5, 0.0])
+        reference = [{"target": 7, "logprob": lp[0], "top_ids": [7, 8, 9], "top_logprobs": lp[:3]},
+                     {"target": 8, "logprob": lp[1], "top_ids": [7, 8, 9], "top_logprobs": lp[:3]}]
+        same = [{"logprob": lp[0], "top": [[7, lp[0]], [8, lp[1]], [9, lp[2]]]},
+                {"logprob": lp[1], "top": [[7, lp[0]], [8, lp[1]], [9, lp[2]]]}]
+        row = metrics.reply_quality(reference, same)
+        self.assertEqual((row["targets"], row["ppl_ratio"], row["kld_max"]), (2, 1.0, 0.0))
+        self.assertEqual(row["top1_agreement"], 0.5)  # the engine chose 8 where the reference ranks 7 first
+        flat = [{"logprob": lp[0] - 0.2, "top": [[7, lp[0] - 0.2], [8, lp[1]], [9, lp[2]]]},
+                {"logprob": lp[1] - 0.2, "top": [[7, lp[0]], [8, lp[1] - 0.2], [9, lp[2]]]}]
+        self.assertGreater(metrics.reply_quality(reference, flat)["ppl_ratio"], 1.0)
+        with self.assertRaises(ValueError):
+            metrics.reply_quality(reference, same[:1])
 
     def test_speed_sample_counts_decode_after_the_first_token(self):
-        sample = metrics.speed_sample(100, list(range(11)), 0.0, 0.5, 1.5, 4)
+        sample = metrics.speed_sample(100, 11, 0.0, 0.5, 1.5, 4)
         self.assertAlmostEqual(sample["decode_tps"], 10.0)
         self.assertAlmostEqual(sample["prefill_tps"], 200.0)
         self.assertAlmostEqual(sample["tokens_per_round"], 11 / 4)
 
     def test_round_ms_covers_decode_time_per_target_pass(self):
-        self.assertAlmostEqual(metrics.speed_sample(100, list(range(11)), 0.0, 0.5, 1.5, 4)["round_ms"], 250.0)
-        self.assertAlmostEqual(metrics.speed_sample(100, list(range(11)), 0.0, 0.5, 1.5, None)["round_ms"], 100.0)
+        self.assertAlmostEqual(metrics.speed_sample(100, 11, 0.0, 0.5, 1.5, 4)["round_ms"], 250.0)
+        self.assertAlmostEqual(metrics.speed_sample(100, 11, 0.0, 0.5, 1.5, None)["round_ms"], 100.0)
 
     def test_headroom_reports_pass_efficiency_and_draft_saturation(self):
         thresholds = {}
@@ -148,8 +153,7 @@ class RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)
             fixture(data)
-            config = {"reference": str(data / "reference.json"), "noise": 0.2, "max_context": 64, "bytes_per_pass": 1e6,
-                      "draft_bytes_per_step": 1e5}
+            config = {"max_context": 64, "bytes_per_pass": 1e6, "draft_bytes_per_step": 1e5}
             result = runner.run(MOCK, "unused-model", data, data / "result.json", config,
                                 warmups=0, repetitions=2, log=lambda message: None, bandwidth_gbs=1.0)
             speed = result["speed"]
@@ -158,11 +162,8 @@ class RunnerTests(unittest.TestCase):
             self.assertAlmostEqual(speed["cases"]["short"]["tokens_per_round"], 12 / 3)
             self.assertTrue(speed["cases"]["short"]["repeatable"])
             self.assertFalse(speed["complete"])
-            prefill, decode = result["quality"]["paths"]["prefill"], result["quality"]["paths"]["decode"]
-            self.assertAlmostEqual(prefill["kld_mean"], 0.0, places=12)
-            self.assertTrue(prefill["passed"])
-            self.assertFalse(decode["passed"])  # every target shifted by 0.2 nats
-            self.assertEqual(result["quality"]["unsupported"], ["verify"])
+            # An adapter's engine replies with no log-probabilities: quality is measured over the chat API.
+            self.assertEqual(result["quality"]["status"], "unsupported")
             self.assertTrue(result["exactness"]["passed"])
             room = result["headroom"]
             self.assertEqual(room["draft_width"], 4)
@@ -173,9 +174,14 @@ class RunnerTests(unittest.TestCase):
             self.assertIsNotNone(room["projection"]["speed_of_light_score"])
             table = report.compare([data / "result.json", data / "result.json"])
             self.assertIn("Decode tok/s: short", table)
-            self.assertIn("Quality: decode", table)
+            self.assertNotIn("Quality:", table)
             self.assertIn("Model pass vs bandwidth floor", table)
             self.assertIn("Decode ceiling", table)
+            minor = {**json.loads((data / "result.json").read_text()), "protocol": "crit-eval-v5.1"}
+            (data / "minor.json").write_text(json.dumps(minor))
+            (data / "v4.json").write_text(json.dumps({**minor, "protocol": "crit-eval-v4"}))
+            self.assertNotIn("major versions", report.compare([data / "result.json", data / "minor.json"]))
+            self.assertIn("major versions", report.compare([data / "result.json", data / "v4.json"]))
 
     def test_loading_an_adapter_writes_no_bytecode_into_its_package(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -209,6 +215,10 @@ class CharacterText:
         def encode(text, *, add_special_tokens, split_special_tokens=None):
             return [ord(c) for c in text]
 
+        @staticmethod
+        def decode(ids):
+            return "".join(map(chr, ids))
+
 
 class PrepareTests(unittest.TestCase):
     def test_model_identity_counts_index_shards_in_a_subfolder(self):
@@ -231,6 +241,16 @@ class PrepareTests(unittest.TestCase):
         ids = prepare.speed_case(Model(), case)
         self.assertEqual(len(ids), 400)
         self.assertEqual(ids[-7:], [ord(c) for c in "</u><a>"])
+
+    def test_a_speed_prompts_messages_render_to_its_token_ids(self):
+        class Model(CharacterText):
+            def render(self, messages, tools=None, **variables):
+                return "".join(f"<{m['role']}>{m['content']}" for m in messages) + "<a>"
+        case = {"id": "long", "prompt_tokens": 400, "document": "long_document.txt",
+                "messages": [{"role": "user", "content": "Summarize.\n\n{document}"}]}
+        ids, messages, tools = prepare.speed_prompt(Model(), case)
+        self.assertEqual(len(ids), 400)
+        self.assertEqual(prepare.token_ids(Model(), Model().render(messages, tools)), ids)  # the document cut to fit
 
     def test_agent_case_renders_tools_and_file_contents_and_fills_the_inline_document(self):
         seen = {}
@@ -260,6 +280,62 @@ class PrepareTests(unittest.TestCase):
             for message in case["messages"]:
                 if "content_file" in message:
                     self.assertTrue((ROOT / "eval/suite" / message["content_file"]).is_file())
+
+
+# Every protocol id with the protocol and suite it names. Append only: a change to eval/protocol.json or eval/suite
+# gets a new id, the next major if it can move a score and the next minor otherwise (docs/eval/README.md).
+PROTOCOLS = {
+    "crit-eval-v4": "345143e9b1a3c33f08efd20512d66afe438b2e30a07b6c4e67cf7ad3a58bc461",
+    "crit-eval-v4.1": "90b938a9641178a19c14e3b505491757c844a442bcbcb86ccad1d7415a5cc0af",  # served engines
+    "crit-eval-v5": "24a1ca7b64b191246c7e4a964bd3a6d413207a6c2cddf9d8ba4a747493822bd1",  # chat messages, reply quality
+}
+
+
+def protocol_fingerprint():
+    protocol = json.loads((ROOT / "eval/protocol.json").read_text(encoding="utf-8"))
+    protocol.pop("protocol")
+    return hashlib.sha256((json.dumps(protocol, sort_keys=True) + prepare.suite_identity()).encode()).hexdigest()
+
+
+class ProtocolVersionTests(unittest.TestCase):
+    def test_the_protocol_id_names_one_protocol_and_suite(self):
+        current = json.loads((ROOT / "eval/protocol.json").read_text(encoding="utf-8"))["protocol"]
+        fingerprint = protocol_fingerprint()
+        self.assertEqual(PROTOCOLS.get(current), fingerprint,
+                         f"eval/protocol.json or eval/suite changed under {current}: give the protocol a new id "
+                         f"(the next major if a score can move, else the next minor) and add it to PROTOCOLS "
+                         f"with {fingerprint}")
+        self.assertEqual(max(PROTOCOLS, key=protocol_version), current)  # versions only go up
+
+    def test_the_suite_has_one_identity_on_every_platform(self):
+        class WindowsOrder(type(Path())):  # sorts as a Windows path does, without case
+            def __lt__(self, other):
+                return [part.lower() for part in self.parts] < [part.lower() for part in other.parts]
+        names = ["agent/README.md.txt", "agent/cli.py.txt", "long.json", "long_document.txt"]
+        with tempfile.TemporaryDirectory() as temp:
+            for name in names:
+                (Path(temp) / name).parent.mkdir(exist_ok=True)
+                (Path(temp) / name).write_bytes(name.encode())
+            with patch.object(prepare, "SUITE_DIR", WindowsOrder(temp)):
+                found = prepare.suite_identity()
+        self.assertEqual(found, hashlib.sha256(b"".join(n.encode() + b"\0" + n.encode() for n in names)).hexdigest())
+
+        self.assertEqual(protocol_version("crit-eval-v4"), (4, 0))
+        self.assertEqual(protocol_version("crit-eval-v4.1"), (4, 1))
+        self.assertEqual(protocol_version("crit-eval-v12.3"), (12, 3))
+        for wrong in ("crit-eval-v", "crit-eval-4", "crit-eval-v4.1.2", "eval-v1", None):
+            with self.assertRaises(ValueError):
+                protocol_version(wrong)
+
+    def test_prepared_data_runs_under_every_minor_version_of_its_suite(self):
+        prepared = {"protocol": "crit-eval-v4", "suite_sha256": SUITE}
+        prepare.check_prepared(prepared, {"protocol": "crit-eval-v4"}, "data")
+        prepare.check_prepared(prepared, {"protocol": "crit-eval-v4.2"}, "data")
+        for other in ({"protocol": "crit-eval-v3", "suite_sha256": SUITE},
+                      {"protocol": "crit-eval-v4", "suite_sha256": "another suite"},
+                      {"suite_sha256": SUITE}):
+            with self.assertRaises(SystemExit):
+                prepare.check_prepared(other, {"protocol": "crit-eval-v4"}, "data")
 
 
 def header_fixture():
@@ -470,12 +546,12 @@ class HeldoutTests(unittest.TestCase):
     def test_mock_engine_decodes_the_held_out_prompts(self):
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)
-            prepared, _ = fixture(data)
+            prepared = fixture(data)
             prepared["heldout"] = [{"id": "zh", "language": "Chinese", "kind": "prose", "prompt_ids": [7, 8, 9],
                                     "output_tokens": 12}]
             (data / "prepared.json").write_text(json.dumps(prepared))
             result = runner.run(MOCK, "unused-model", data, data / "result.json",
-                                {"reference": str(data / "reference.json"), "max_context": 128},
+                                {"max_context": 128},
                                 parts=("speed", "heldout"), warmups=0, repetitions=1, log=lambda message: None)
             held = result["heldout"]
             self.assertEqual(held["status"], "measured")
@@ -508,34 +584,33 @@ class HeldoutTests(unittest.TestCase):
 class StatusTests(unittest.TestCase):
     def run_mock(self, directory, device, **config):
         data = Path(directory)
-        prepared, _ = fixture(data)
+        prepared = fixture(data)
         prepared["ceiling"] = {"matmul_flops_per_token": {"fp8": 1e8}, "attention_flops_per_pair": 0,
                                "recurrent_flops_per_token": 0, "kv_bytes_per_token": 0}
         (data / "prepared.json").write_text(json.dumps(prepared))
-        config = {"reference": str(data / "reference.json"), "max_context": 128, "bytes_per_pass": 1e6,
+        config = {"max_context": 128, "bytes_per_pass": 1e6,
                   "draft_bytes_per_step": 1e5, **config}
         return runner.run(MOCK, "unused-model", data, data / "result.json", config, warmups=0, repetitions=2,
                           log=lambda message: None, device=device)
 
     def test_status_reports_gates_kpis_and_missing_inputs_without_a_verdict(self):
         with tempfile.TemporaryDirectory() as directory:
-            result = self.run_mock(directory, {"bandwidth_gbs": 1.0, "tflops": {"fp8": 1.0, "bf16": 1.0}}, noise=0.2)
+            result = self.run_mock(directory, {"bandwidth_gbs": 1.0, "tflops": {"fp8": 1.0, "bf16": 1.0}})
             current = result["status"]
             self.assertFalse({"verdict", "next"} & set(current))
             gates = {g["name"]: g["state"] for g in current["gates"]}
             # Exactness is reported by default, so it is a note rather than a gate.
             # The fixture's prepared data predates the held-out prompts: generality is unmeasured, not failed.
-            self.assertEqual(gates, {"coverage": "pass", "repeatable": "pass", "request_history": "pass", "quality": "fail",
+            self.assertEqual(gates, {"coverage": "pass", "repeatable": "pass", "request_history": "pass", "quality": "unmeasured",
                                  "capacity": "unmeasured", "retrieval": "unmeasured", "lower_context": "unmeasured",
                                  "generality": "unmeasured"})
             self.assertIn("exactness reported: 2/2 cases equal plain greedy", current["notes"])
-            self.assertIn("scoring on paths verify (adapter score_paths)", current["missing"])
             self.assertIsNotNone(current["kpis"]["decode"]["speed_of_light"])
             self.assertIsNotNone(current["kpis"]["ttft"]["fraction_of_floor"])
             self.assertIn("ttft", status.render(current))
-            self.assertEqual(current["kpis"]["quality"]["worst_kld_mean_path"], "decode")
+            self.assertIsNone(current["kpis"]["quality"])
             text = status.render(current)
-            self.assertIn("quality ✗", text)  # decode-path quality fails with 0.2 nats noise
+            self.assertIn("quality: quality is measured over the chat API", text)
             self.assertNotIn("polished", text)
             # The stop-record shape is what `crit run ... stop` validates.
             for _folder in ("core/python", "api", "eval", "kernels", "cli"): sys.path.insert(0, str(ROOT / _folder))
@@ -558,17 +633,14 @@ class StatusTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)
             fixture(data)
-            config = {"reference": str(data / "reference.json"), "noise": 0.2, "max_context": 128}
+            config = {"max_context": 128}
             budget = {"ppl_ratio_max": 1.5, "kld_mean_max": 1.0, "kld_p99_max": 10.0}
             result = runner.run(MOCK, "unused-model", data, data / "result.json", config, warmups=0, repetitions=2,
                                 log=lambda message: None, quality_budget=budget, exactness="required")
+            # crit eval reference judges the quality sets by the run's budget (QualityTests).
             self.assertEqual(result["requirements"], {"quality_budget": budget, "exactness": "required"})
-            decode = result["quality"]["paths"]["decode"]
-            self.assertTrue(decode["passed"])  # 0.2 nats of drift fits this run's budget
-            self.assertAlmostEqual(decode["budget_used"], (decode["ppl_ratio"] - 1) / 0.5)
             gates = {g["name"]: g["state"] for g in result["status"]["gates"]}
             self.assertEqual(gates["exactness"], "pass")
-            self.assertIn("of the drift budget used (decode)", status.render(result["status"]))
             with self.assertRaises(SystemExit):
                 runner.run(MOCK, "unused-model", data, data / "bad.json", config, warmups=0, repetitions=1,
                            log=lambda message: None, quality_budget={"kld_max": 1.0})
@@ -602,7 +674,7 @@ class StatusTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)
             fixture(data)
-            config = {"reference": str(data / "reference.json"), "max_context": 128, "disturbed": True}
+            config = {"max_context": 128, "disturbed": True}
             result = runner.run(MOCK, "unused-model", data, data / "result.json", config, warmups=0, repetitions=2,
                                 log=lambda message: None)
             self.assertEqual(result["aborted"]["reason"], "disturbed")
@@ -665,7 +737,7 @@ class StatusTests(unittest.TestCase):
                 "prefill": {"score": 800.0, "ceiling_score": 1000.0, "fraction_of_ceiling": 0.8, "cases": {}},
                 "ttft": {"score_ms": 100.0, "floor_ms": 80.0, "fraction_of_floor": 0.8, "cases": {}},
                 "levers": [{"kpi": "decode", "name": "old", "projected_gain": 0.1, "polished_kpi": True}], "missing": []}
-        quality = {"passed": True, "unsupported": [], "paths": {"prefill": {
+        quality = {"status": "scored", "passed": True, "sets": {"conversations": {
             "passed": True, "failures": [], "kld_mean": 1e-5, "kld_p99": 1e-4, "ppl_ratio": 1.0, "top1_agreement": 1.0}}}
         result = {"engine": {"speculative": False}, "headroom": room, "quality": quality,
                   "speed": {"decode_score": 90.0, "complete": True, "cases": {"a": {"status": "measured", "repeatable": True}}}}
@@ -691,8 +763,8 @@ class StatusTests(unittest.TestCase):
     def test_pinned_continuation_makes_every_engine_decode_the_same_text(self):
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)
-            prepared, _ = fixture(data)
-            config = {"reference": str(data / "reference.json"), "max_context": 128}
+            prepared = fixture(data)
+            config = {"max_context": 128}
             pinned = pin.pin(MOCK, "unused-model", data, config, log=lambda message: None)
             self.assertEqual(set(pinned["cases"]), {"short", "long"})
             self.assertEqual(pinned["sha256"], pin.continuation_sha256(pinned["cases"]))
@@ -733,7 +805,7 @@ class StatusTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)
             fixture(data)
-            config = {"reference": str(data / "reference.json"), "max_context": 128}
+            config = {"max_context": 128}
             result = ab.run_ab(MOCK, config, MOCK, {**config, "draft_tokens": 2}, "unused-model", data, data / "ab.json",
                                rounds=2, warmups=0, repetitions=1, log=lambda message: None)
             self.assertEqual([row["order"] for row in result["rounds"]], [["a", "b"], ["b", "a"]])
@@ -819,15 +891,17 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(split["resident"], 64 * 64 * 2 + 1000 * 64 * 2)
         self.assertEqual(split["vision"], 256 * 64 * 2)
 
-    def test_curve_points_lower_context_and_filled_prompts(self):
+    def test_curve_points_lower_context_and_curve_prompts(self):
         self.assertEqual(context.curve_points(262144, self.settings), [32768, 65536, 131072, 262144])
         self.assertEqual(context.curve_points(200000, self.settings), [32768, 65536, 131072, 200000])
         self.assertEqual(context.curve_points(8192, self.settings), [8192])
         self.assertEqual(context.lower_context(262144, 14000, self.settings), 65536)
         self.assertEqual(context.lower_context(8192, 72, self.settings), 2048)
         self.assertIsNone(context.lower_context(4096, 3500, self.settings))  # the longest case needs all of it
-        self.assertEqual(context.filled_prompt([1, 2, 3], 7), [3, 1, 2, 3, 1, 2, 3])
-        self.assertEqual(context.filled_prompt([1, 2, 3], 3), [1, 2, 3])
+        pieces = {"case": "c", "head_ids": [1], "tail_ids": [9], "document_ids": [2, 3]}
+        self.assertEqual(context.curve_prompt(pieces, [5, 6], 9), [1, 2, 3, 5, 6, 5, 6, 5, 9])
+        self.assertEqual(context.curve_prompt(pieces, [5, 6], 3), [1, 2, 9])
+        self.assertIsNone(context.curve_prompt(pieces, [5, 6], 2))  # no room inside the frame
 
     def test_a_case_is_slower_at_a_lower_context_beyond_its_own_spread(self):
         def case(decode, ttft, decodes=None):
@@ -851,7 +925,7 @@ class ContextTests(unittest.TestCase):
     def run_mock(self, directory, context_tokens, model="unused-model", device=None, **config):
         data = Path(directory)
         fixture(data)
-        config = {"reference": str(data / "reference.json"), "bytes_per_pass": 1e6, "draft_bytes_per_step": 1e5, **config}
+        config = {"bytes_per_pass": 1e6, "draft_bytes_per_step": 1e5, **config}
         device = {"bandwidth_gbs": 1.0, "tflops": {"fp8": 1.0, "bf16": 1.0}, **(device or {})}
         return runner.run(MOCK, model, data, data / "result.json", config, warmups=0, repetitions=2,
                           log=lambda message: None, device=device, context_tokens=context_tokens)
@@ -926,7 +1000,7 @@ class ContextTests(unittest.TestCase):
 
 
 class ContextTextTests(unittest.TestCase):
-    """Long-context points replay the longest speed case's pinned continuation, like the speed cases."""
+    """Long-context points replay the curve case's pinned continuation, like the speed cases."""
 
     class Engine:
         def __init__(self):
@@ -943,7 +1017,9 @@ class ContextTextTests(unittest.TestCase):
             on_tokens(list(continuation))
             return {"tokens": list(continuation), "rounds": 2}
 
-    prepared = {"speed": [{"id": "short", "prompt_ids": [1, 2]}, {"id": "long", "prompt_ids": [3, 4, 5, 6]}]}
+    prepared = {"speed": [{"id": "short", "prompt_ids": [1, 2]}, {"id": "long", "prompt_ids": [3, 4, 5, 6]}],
+                "context": {"case": "long", "head_ids": [3], "tail_ids": [6], "document_ids": [4, 5]},
+                "retrieval": {"filler_ids": [8, 9]}}
     settings = {"output_tokens": 4, "curve_from": 16, "repetitions": 1}
     pinned = {"sha256": "ab" * 32, "engine": "fixture", "cases": {"short": [9] * 6, "long": [5, 6, 7, 8, 9, 10]}}
 
@@ -953,7 +1029,7 @@ class ContextTextTests(unittest.TestCase):
                                           lambda message: None, continuations)
         return engine, points, text
 
-    def test_points_replay_the_longest_cases_pinned_text(self):
+    def test_points_replay_the_curve_cases_pinned_text(self):
         engine, points, text = self.run_points({"replay": True, "speculative": True}, self.pinned)
         self.assertEqual(text["source"], "pinned")
         self.assertEqual(text["case"], "long")
@@ -976,67 +1052,110 @@ class ContextTextTests(unittest.TestCase):
         self.assertEqual(status.context_text_identity(own), "generated")
 
 
-class LongPromptTests(unittest.TestCase):
-    """Decode after long prompts (prefill_decode), retrieval up to the required context and request history."""
+class QualityTests(unittest.TestCase):
+    """The engine's replies against the reference's scores of them (protocol quality), judged set by set."""
 
-    def run_mock(self, directory, context_tokens=None, parts=runner.PARTS, edit=None, **config):
+    LP = softmax_logprobs([3.0, 1.0, 0.5, 0.0])
+
+    def reply(self, reply_id, set_name, tokens, shift=0.0):
+        """A reply whose reported log-probabilities are the reference's, its top token lowered by `shift` nats."""
+        top = [[7, self.LP[0] - shift], [8, self.LP[1]], [9, self.LP[2]]]
+        return {"id": reply_id, "set": set_name, "tokens": tokens,
+                "logprobs": [self.LP[0] - shift if t == 7 else self.LP[1] for t in tokens], "top": [top] * len(tokens)}
+
+    def scored(self, reply):
+        return [{"target": t, "logprob": self.LP[0] if t == 7 else self.LP[1], "top_ids": [7, 8, 9],
+                 "top_logprobs": self.LP[:3]} for t in reply["tokens"]]
+
+    def judged(self, replies, thresholds=None):
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        thresholds = thresholds or protocol["quality"]["thresholds"]
+        from crit_eval.reference import judge_sets
+        quality = {"status": "scored", "thresholds": thresholds, "replies": replies, "skipped": {"long-32768": "needs 33,024 tokens of context"},
+                   **judge_sets(replies, [self.scored(r) for r in replies], thresholds)}
+        result = {"engine": {"speculative": False}, "quality": quality, "model_sha256": "m", "suite_sha256": "s",
+                  "speed": {"cases": {"a": {"status": "measured", "repeatable": True}}}}
+        return result, status.build(result, protocol)
+
+    def gate(self, current):
+        return next(g for g in current["gates"] if g["name"] == "quality")
+
+    def test_every_set_is_judged_on_its_own(self):
+        replies = [self.reply("a", "conversations", [7, 7, 8]), self.reply("b", "conversations", [7, 8]),
+                   self.reply("a@4096", "long-4096", [7, 7, 7], shift=0.3)]
+        result, current = self.judged(replies)
+        sets = result["quality"]["sets"]
+        self.assertEqual(sets["conversations"]["replies"], ["a", "b"])
+        self.assertEqual(sets["conversations"]["targets"], 5)
+        self.assertAlmostEqual(sets["conversations"]["kld_mean"], 0.0, places=12)
+        self.assertTrue(sets["conversations"]["passed"])
+        self.assertFalse(sets["long-4096"]["passed"])  # 0.3 nats off after the long prompt
+        self.assertFalse(result["quality"]["passed"])
+        gate = self.gate(current)
+        self.assertEqual(gate["state"], "fail")
+        self.assertIn("long-4096: ppl_ratio", gate["detail"])
+        self.assertIn("kld_mean", gate["detail"])
+        self.assertIn("skipped: long-32768, needs 33,024 tokens of context", gate["detail"])
+        kpi = current["kpis"]["quality"]
+        self.assertEqual((kpi["worst_kld_mean_set"], kpi["budget_used_set"]), ("long-4096", "long-4096"))
+        self.assertIn("of the drift budget used (long-4096)", status.render(current))
+
+    def test_the_runs_budget_judges_the_sets(self):
+        replies = [self.reply("a@4096", "long-4096", [7, 7, 7], shift=0.3)]
+        budget = {"ppl_ratio_max": 1.5, "kld_mean_max": 1.0, "kld_p99_max": 10.0}
+        result, current = self.judged(replies, budget)
+        row = result["quality"]["sets"]["long-4096"]
+        self.assertTrue(row["passed"])
+        self.assertAlmostEqual(row["budget_used"], (row["ppl_ratio"] - 1) / 0.5)
+        self.assertEqual(self.gate(current)["state"], "pass")
+
+    def test_the_reference_must_score_the_replys_tokens(self):
+        from crit_eval.reference import judge_sets
+        reply = self.reply("a", "conversations", [7, 8])
+        with self.assertRaises(ValueError):
+            judge_sets([reply], [self.scored(self.reply("a", "conversations", [8, 7]))], {})
+
+    def test_quality_before_the_reference_and_without_a_chat_api_is_unmeasured(self):
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        base = {"engine": {"speculative": False}}
+        replied = status.build({**base, "quality": {"status": "replied", "replies": [{}, {}]}}, protocol)
+        self.assertEqual((self.gate(replied)["state"], self.gate(replied)["detail"]),
+                         ("unmeasured", "2 replies await the reference: crit eval reference --result"))
+        self.assertIsNone(replied["kpis"]["quality"])
+        adapter = status.build({**base, "quality": {"status": "unsupported", "reason": "chat API"}}, protocol)
+        self.assertEqual(self.gate(adapter)["state"], "unmeasured")
+        tiny = status.build({**base, "quality": {"status": "skipped", "reason": "no quality prompt fits"}}, protocol)
+        self.assertEqual(self.gate(tiny)["state"], "fail")
+        older = status.build({**base, "protocol": "crit-eval-v4", "quality": {"paths": {}}}, protocol)
+        self.assertIn("crit-eval-v4", self.gate(older)["detail"])
+
+    def test_compare_shows_every_set(self):
+        result, current = self.judged([self.reply("a", "conversations", [7, 8]), self.reply("a@1024", "long-1024", [7])])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "result.json"
+            row = {**result, "status": current, "engine": {"name": "e", "speculative": False}, "host": {"platform": "p"},
+                   "protocol": "crit-eval-v5"}
+            path.write_text(json.dumps({k: v for k, v in row.items() if k != "speed"}))
+            table = report.compare([path, path])
+        self.assertIn("Quality: conversations", table)
+        self.assertIn("Quality: long-1024", table)
+
+
+class LongPromptTests(unittest.TestCase):
+    """Retrieval up to the required context and request history."""
+
+    def run_mock(self, directory, context_tokens=None, parts=runner.PARTS, **config):
         data = Path(directory)
-        prepared, reference = fixture(data)
-        if edit:
-            edit(prepared, reference)
-            (data / "prepared.json").write_text(json.dumps(prepared))
-            (data / "reference.json").write_text(json.dumps(reference))
-        config = {"reference": str(data / "reference.json"), "facts_from": FACTS, **config}
+        fixture(data)
+        config = {"facts_from": FACTS, **config}
         return runner.run(MOCK, "unused-model", data, data / "result.json", config, parts=parts, warmups=0,
                           repetitions=2, log=lambda message: None, context_tokens=context_tokens)
 
     def gates(self, result):
         return {g["name"]: g for g in result["status"]["gates"]}
 
-    def test_prefill_decode_scores_each_prompt_length_against_the_reference(self):
-        with tempfile.TemporaryDirectory() as directory:
-            result = self.run_mock(directory, parts=("quality",), max_context=128)
-        path = result["quality"]["paths"]["prefill_decode"]
-        self.assertEqual(path["targets"], 10)  # five scored tokens after each of the two prompt lengths
-        self.assertEqual({k: (row["status"], row["passed"]) for k, row in path["lengths"].items()},
-                         {"16": ("measured", True), "40": ("measured", True)})
-        self.assertAlmostEqual(path["kld_mean"], 0.0, places=12)
-        self.assertEqual(self.gates(result)["quality"]["state"], "pass")
-
-    def test_decode_that_reads_stale_state_after_a_long_prompt_fails_only_this_path(self):
-        with tempfile.TemporaryDirectory() as directory:
-            result = self.run_mock(directory, parts=("quality",), max_context=128, stale_after_prompt=40)
-        quality = result["quality"]
-        path = quality["paths"]["prefill_decode"]
-        self.assertTrue(path["lengths"]["16"]["passed"])
-        self.assertFalse(path["lengths"]["40"]["passed"])
-        self.assertFalse(path["passed"])
-        self.assertTrue(quality["paths"]["prefill"]["passed"])  # teacher forcing in one prefill cannot see it
-        gate = self.gates(result)["quality"]
-        self.assertEqual(gate["state"], "fail")
-        self.assertIn("at 40 prompt tokens: kld_mean", gate["detail"])
-
-    def test_lengths_beyond_the_engine_are_skipped_and_an_unscored_path_fails(self):
-        with tempfile.TemporaryDirectory() as directory:
-            short = self.run_mock(directory, parts=("quality",), max_context=30)
-        lengths = short["quality"]["paths"]["prefill_decode"]["lengths"]
-        self.assertEqual((lengths["16"]["status"], lengths["40"]["status"]), ("measured", "skipped"))
-        gate = self.gates(short)["quality"]
-        self.assertEqual(gate["state"], "pass")
-        self.assertIn("prefill_decode skipped at 40 prompt tokens", gate["detail"])
-        with tempfile.TemporaryDirectory() as directory:
-            undeclared = self.run_mock(directory, parts=("quality",), max_context=128, prefill_decode=False)
-        gate = self.gates(undeclared)["quality"]
-        self.assertEqual(gate["state"], "fail")
-        self.assertIn("prefill_decode: not scored (the adapter does not declare it in score_paths)", gate["detail"])
-        self.assertFalse(undeclared["quality"]["passed"])
-        with tempfile.TemporaryDirectory() as directory:
-            unreferenced = self.run_mock(directory, parts=("quality",), max_context=128,
-                                         edit=lambda prepared, reference: reference.pop("prefill_decode"))
-        self.assertIn("the reference has no prefill_decode targets", self.gates(unreferenced)["quality"]["detail"])
-
     def test_retrieval_prompts_hold_every_fact_at_its_position(self):
-        prepared, _ = fixture(Path(tempfile.mkdtemp()))
+        prepared = fixture(Path(tempfile.mkdtemp()))
         pieces = prepared["retrieval"]
         rule = runner.load_json(runner.EVAL_DIR / "protocol.json")["context"]["retrieval"]
         prompt = context.retrieval_prompt(pieces, 1000, rule["positions"])
@@ -1105,6 +1224,8 @@ class LongPromptTests(unittest.TestCase):
         self.assertFalse({"request_history", "retrieval"} & legacy)
         current = {g["name"]: g["state"] for g in status.build({**base, "protocol": "crit-eval-v4"}, protocol)["gates"]}
         self.assertEqual((current["request_history"], current["retrieval"]), ("unmeasured", "unmeasured"))
+        minor = {g["name"] for g in status.build({**base, "protocol": "crit-eval-v4.1"}, protocol)["gates"]}
+        self.assertTrue({"request_history", "retrieval"} <= minor)
 
     def test_a_drop_in_plain_greedy_equality_is_flagged_against_the_baseline(self):
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
@@ -1136,17 +1257,31 @@ class LongPrepareTests(unittest.TestCase):
         def render(self, messages, tools=None, add_generation_prompt=False, **variables):
             return "".join(f"<{m['role']}>{m['content']}" for m in messages) + ("<assistant>" if add_generation_prompt else "")
 
-    def test_prefill_decode_prompts_have_the_exact_length_before_the_scored_turn(self):
+        def encode_chat(self, messages, tools=None, add_generation_prompt=False, **variables):
+            return [ord(c) for c in self.render(messages, tools, add_generation_prompt)]
+
+    def test_long_quality_prompts_render_to_their_length_from_their_messages(self):
         long = json.loads((ROOT / "eval/suite/long.json").read_text(encoding="utf-8"))
-        conversation = {"id": "c", "messages": [{"role": "user", "content": "Question?"},
-                                                {"role": "assistant", "content": "Answer."}]}
-        filler = prepare.filler_ids(self.Model(), long)
-        ids, first = prepare.prefill_decode_sequence(self.Model(), conversation, long, filler, 3000)
-        self.assertEqual(first, 3000)
-        text = "".join(chr(i) for i in ids)
+        conversation = {"id": "c", "messages": [{"role": "user", "content": "Question?"}]}
+        model = self.Model()
+        messages = prepare.long_quality_messages(model, conversation, long["quality"]["preamble"],
+                                                 prepare.filler_ids(model, long), 3000)
+        prompt = prepare.quality_prompt(model, "c@3000", "long-3000", messages)
+        self.assertEqual(len(prompt["prompt_ids"]), 3000)
+        self.assertEqual(prompt["prompt_ids"], prepare.prompt_ids(model, prompt["messages"]))
+        text = "".join(chr(i) for i in prompt["prompt_ids"])
         self.assertTrue(text.startswith("<user>The following background material"))
-        self.assertTrue(text[:first].endswith("Question?<assistant>"))
-        self.assertEqual(text[first:], "Answer.")
+        self.assertTrue(text.endswith("---\n\nQuestion?<assistant>"))
+
+    def test_quality_sets_are_the_conversations_and_each_long_length(self):
+        long = json.loads((ROOT / "eval/suite/long.json").read_text(encoding="utf-8"))
+        quality = {"conversations": [{"id": c, "messages": [{"role": "user", "content": c}]} for c in "ab"]}
+        rule = {"long": {"prompt_tokens": [1000, 2000], "conversations": ["b"]}}
+        model = self.Model()
+        prompts = prepare.quality_prompts(model, quality, long, prepare.filler_ids(model, long), rule)
+        self.assertEqual([(p["id"], p["set"]) for p in prompts],
+                         [("a", "conversations"), ("b", "conversations"), ("b@1000", "long-1000"), ("b@2000", "long-2000")])
+        self.assertEqual(prompts[0]["messages"], [{"role": "user", "content": "a"}])
 
     def test_retrieval_pieces_spell_every_answer(self):
         long = json.loads((ROOT / "eval/suite/long.json").read_text(encoding="utf-8"))
@@ -1163,8 +1298,10 @@ class LongPrepareTests(unittest.TestCase):
         protocol = json.loads((ROOT / "eval/protocol.json").read_text(encoding="utf-8"))
         long = json.loads((ROOT / "eval/suite/long.json").read_text(encoding="utf-8"))
         quality = json.loads((ROOT / "eval/suite/quality.json").read_text(encoding="utf-8"))
-        self.assertTrue(set(protocol["quality"]["prefill_decode"]["conversations"]) <= {c["id"] for c in quality["conversations"]})
-        self.assertIn("prefill_decode", protocol["quality"]["paths"])
+        self.assertTrue(set(protocol["quality"]["long"]["conversations"]) <= {c["id"] for c in quality["conversations"]})
+        # Every quality prompt is the engine's to answer: no conversation ends with a reply of its own.
+        self.assertTrue(all(c["messages"][-1]["role"] == "user" for c in quality["conversations"]))
+        self.assertIn("{document}", long["quality"]["preamble"])
         filler = "".join((ROOT / "eval/suite" / name).read_text(encoding="utf-8") for name in long["filler"])
         for fact in long["retrieval"]["facts"]:
             self.assertIn(fact["answer"], fact["text"])
@@ -1195,6 +1332,65 @@ class ReferenceTests(unittest.TestCase):
                                                                          long={0})[0]
         self.assertEqual([r["top_ids"] for r in eager], [r["top_ids"] for r in chunked])
         self.assertLess(max(abs(a["logprob"] - b["logprob"]) for a, b in zip(eager, chunked)), 1e-5)
+
+    def test_nvfp4_layouts_dequantize_alike(self):
+        # compressed-tensors divides the group scales by weight_global_scale; ModelOpt multiplies by weight_scale_2.
+        import torch
+        from types import SimpleNamespace
+        from crit_eval import reference
+        torch.manual_seed(0)
+        packed = torch.randint(0, 256, (4, 16), dtype=torch.uint8)
+        scale = (torch.rand(4, 2) * 4 + .5).to(torch.float8_e4m3fn)
+
+        def checkpoint(tensors):
+            ckpt = object.__new__(reference.Checkpoint)
+            ckpt.where = {k: SimpleNamespace(get_tensor=lambda key, t=tensors: t[key]) for k in tensors}
+            return ckpt
+        ct = checkpoint({"w.weight_packed": packed, "w.weight_scale": scale, "w.weight_global_scale": torch.tensor(4.0)})
+        mo = checkpoint({"w.weight": packed, "w.weight_scale": scale, "w.weight_scale_2": torch.tensor(0.25)})
+        a, b = ct.dense("w", "cpu"), mo.dense("w", "cpu")
+        self.assertEqual(a.shape, (4, 32))
+        self.assertTrue(torch.equal(a, b))
+        first = float(reference.E2M1[int(packed[0, 0]) & 7] * (-1 if int(packed[0, 0]) & 8 else 1))
+        self.assertEqual(float(a[0, 0]), first * float(scale[0, 0].float()) / 4)
+
+    def assert_scores_like_the_model(self, model, folder, ids, first, top_k=4):
+        """The layer-streamed reference, eager and chunked, scores like the model's own FP32 forward."""
+        import torch
+        from crit_eval import reference
+        model.save_pretrained(folder)
+        with torch.no_grad():
+            expected = torch.log_softmax(model.float()(torch.tensor([ids])).logits[0].double(), dim=-1)
+        expected = expected[first - 1:len(ids) - 1]
+        for long in ((), {0}):
+            rows = reference.StreamingReference(folder, "cpu").score([(ids, first)], top_k, None,
+                                                                      log=lambda m: None, long=long)[0]
+            got = torch.tensor([r["logprob"] for r in rows], dtype=torch.float64)
+            want = expected.gather(1, torch.tensor(ids[first:])[:, None])[:, 0]
+            self.assertLess(float((got - want).abs().max()), 1e-4, long)
+            self.assertEqual([r["top_ids"] for r in rows], expected.topk(top_k, dim=-1).indices.tolist(), long)
+
+    def test_gemma4_layer_kinds_score_like_the_model(self):
+        # Per-layer-type RoPE, a sliding window shorter than the prompt, keys equal to values on full layers, a
+        # scaled tied embedding, a stored layer scalar and final logit soft-capping.
+        import torch
+        from transformers import Gemma4TextConfig, Gemma4ForCausalLM
+        torch.manual_seed(0)
+        config = Gemma4TextConfig(vocab_size=128, hidden_size=64, intermediate_size=128, num_hidden_layers=4,
+                                  num_attention_heads=4, num_key_value_heads=2, num_global_key_value_heads=1,
+                                  head_dim=16, global_head_dim=32, sliding_window=8, max_position_embeddings=256,
+                                  layer_types=["sliding_attention", "sliding_attention", "sliding_attention",
+                                               "full_attention"], attention_k_eq_v=True,
+                                  final_logit_softcapping=3.0, hidden_size_per_layer_input=0,
+                                  tie_word_embeddings=True)
+        model = Gemma4ForCausalLM(config)
+        with torch.no_grad():
+            for i, layer in enumerate(model.model.layers):
+                layer.layer_scalar.fill_(0.5 + 0.25 * i)
+        from crit_eval import reference
+        ids = torch.randint(0, 128, (2 * reference.QUERY_BLOCK + 40,)).tolist()   # chunked blocks past the window
+        with tempfile.TemporaryDirectory() as folder:
+            self.assert_scores_like_the_model(model, folder, ids, reference.QUERY_BLOCK - 20)
 
 
 class ReferenceDtLimitTest(unittest.TestCase):

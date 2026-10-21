@@ -33,22 +33,14 @@ def main(argv=None):
     ptq.add_argument("--record", required=True, help="New models_transform JSON outside the source and output")
     ptq.add_argument("--calibration", help="JSONL of {\"text\": ...} documents unrelated to Eval (gptq only)")
     ptq.add_argument("--device", help="torch device (default: cuda when available, else cpu)")
-    evaluation = subs.add_parser("eval", help="Run the output in an engine through Eval against the source "
-                                              "model's prepared data and reference")
+    evaluation = subs.add_parser("eval", help="Bind the Eval result of an engine serving the output to its record, "
+                                              "with its quality replies scored on the source checkpoint")
     evaluation.add_argument("--record", required=True, help="models_transform JSON")
-    evaluation.add_argument("--adapter", required=True, help="Eval adapter of the engine that runs the output")
     evaluation.add_argument("--data", required=True, help="Eval data directory prepared from the source checkpoint")
-    evaluation.add_argument("--out", required=True, help="Eval result JSON")
+    evaluation.add_argument("--result", required=True, help="crit eval run --url result of the engine serving the "
+                                                            "output; stop the server first")
     evaluation.add_argument("--evaluation", required=True, help="New models_evaluation JSON")
-    evaluation.add_argument("--config", default="{}", help="JSON configuration passed to the adapter")
-    evaluation.add_argument("--only", action="append", choices=["speed", "quality", "exactness", "context", "heldout", "history"],
-                            help="Run only these Eval parts (repeatable); default all")
-    evaluation.add_argument("--device", metavar="JSON", help="Device file from crit eval probe")
     evaluation.add_argument("--baseline", metavar="RESULT", help="Eval result of the engine on the source checkpoint")
-    evaluation.add_argument("--quality-budget", metavar="JSON", help="Drift limits, as for crit eval run")
-    evaluation.add_argument("--exactness", choices=["reported", "required"])
-    evaluation.add_argument("--context", type=int, metavar="TOKENS", help="Required context, as for crit eval run")
-    evaluation.add_argument("--label")
     check = subs.add_parser("verify", help="Re-hash a transform's output and source against its record")
     check.add_argument("--record", required=True)
     args = parser.parse_args(argv)
@@ -78,12 +70,9 @@ def main(argv=None):
                 raise ValueError("crit models eval runs Eval from a crit checkout")
             from crit_eval.status import render
             from .evaluate import evaluate
-            result = evaluate(args.record, args.adapter, args.data, args.out, args.evaluation, json.loads(args.config),
-                              args.only, load_json(args.device) if args.device else None,
-                              load_json(args.baseline) if args.baseline else None,
-                              json.loads(args.quality_budget) if args.quality_budget else None, args.exactness,
-                              args.context, args.label)
-            print(render(load_json(args.out)["status"]))
+            result = evaluate(args.record, args.data, args.result, args.evaluation,
+                              load_json(args.baseline) if args.baseline else None)
+            print(render(load_json(args.result)["status"]))
             print(f"wrote {args.evaluation} (gates: " + ", ".join(f"{k} {v}" for k, v in result["summary"]["gates"].items()) + ")")
             return 0
         from .evaluate import load_record

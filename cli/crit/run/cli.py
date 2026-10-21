@@ -81,11 +81,17 @@ def main(argv=None):
     sub = subs.add_parser("settle")
     sub.add_argument("--reservation", required=True, help="Reservation path relative to run")
     sub.add_argument("--record", type=Path, required=True)
-    sub = subs.add_parser("measure", help="Benchmark the run's cases on a candidate package through its Eval adapter")
+    sub = subs.add_parser("measure", help="Benchmark the run's cases on a packaged candidate through crit serve")
     sub.add_argument("--candidate", required=True)
-    sub.add_argument("--adapter", required=True, help="The package's eval-v1 adapter, relative to the package")
-    sub.add_argument("--model", type=Path, help="Model directory for the adapter (default: the run's model)")
-    sub.add_argument("--config", metavar="JSON", help="Configuration overrides passed to the adapter")
+    sub.add_argument("--seconds", type=float, help="Reservation length (default: the benchmark process cap)")
+    sub = subs.add_parser("eval", help="Run Eval on a packaged candidate through crit serve and score its quality "
+                                       "replies on the run's model")
+    sub.add_argument("--candidate", required=True)
+    sub.add_argument("--data", type=Path, required=True, help="Eval data directory prepared from the run's model")
+    sub.add_argument("--only", action="append", choices=["speed", "quality", "exactness", "context", "heldout", "history"],
+                     help="Run only these Eval parts (repeatable); default all")
+    sub.add_argument("--baseline", type=Path, metavar="RESULT", help="Earlier Eval result to show KPI changes against")
+    sub.add_argument("--label")
     sub.add_argument("--seconds", type=float, help="Reservation length (default: the benchmark process cap)")
     sub = subs.add_parser("seal")
     sub.add_argument("--candidate", required=True)
@@ -143,10 +149,15 @@ def main(argv=None):
             result = store.settle(args.id, reservation, payload)
         elif args.action == "measure":
             from .measure import measure
-            result = measure(store, args.id, args.candidate, args.adapter, args.model,
-                             json.loads(args.config) if args.config else None, args.seconds)
+            result = measure(store, args.id, args.candidate, args.seconds)
             for record in result:
                 warn_exploratory(store, args.id, args.candidate, record["benchmark_id"])
+        elif args.action == "eval":
+            from .evaluation import evaluate
+            result = evaluate(store, args.id, args.candidate, args.data, args.only,
+                              read_json(args.baseline) if args.baseline else None, args.seconds, args.label)
+            from crit_eval.status import render
+            print(render(result.pop("status")), file=sys.stderr)
         elif args.action == "seal":
             failure = {"message": args.failure} if args.failure else None
             result = store.seal(args.id, args.candidate, args.lifecycle, failure)

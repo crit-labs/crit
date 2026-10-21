@@ -1,8 +1,9 @@
 """Speed and quality metrics. Pure Python so results can be computed on any host.
 
-Quality has two forms: `quality_path` compares the suite's compact reference (top-k log-probabilities
-plus a lumped tail, a lower bound on KL), and `log_softmax`, `kl_divergence`, `Summary` and `compare` compare
-full logit rows when an engine can supply them (FP64; probe/logprob_compare.cu is the device reference).
+Quality has two forms: `reply_quality` compares an engine's replies, with the top-k log-probabilities it
+reported, with the reference's scores of the same tokens (top-k on both sides plus a lumped tail, a lower bound
+on KL), and `log_softmax`, `kl_divergence`, `Summary` and `compare` compare full logit rows when an engine can
+supply them (FP64; probe/logprob_compare.cu is the device reference).
 """
 import math
 
@@ -28,10 +29,9 @@ def percentile(values, fraction):
     return values[min(len(values) - 1, max(0, math.ceil(fraction * len(values)) - 1))]
 
 
-def speed_sample(prompt_tokens, tokens, started, first, last, rounds):
-    """One timed request. Times are host seconds observed by the harness when the
+def speed_sample(prompt_tokens, n, started, first, last, rounds):
+    """One timed request of n output tokens. Times are host seconds observed by the harness when the
     engine delivered tokens: started = call, first = first token, last = last token."""
-    n = len(tokens)
     decode_seconds = last - first
     return {
         "output_tokens": n,
@@ -48,16 +48,20 @@ def speed_sample(prompt_tokens, tokens, started, first, last, rounds):
     }
 
 
-def lumped_kl(reference_logprobs, engine_logprobs):
-    """KL(reference || engine) over the reference's top-k tokens plus one lumped tail bucket.
+def partial_kl(reference_ids, reference_logprobs, engine):
+    """KL(reference || engine) over the tokens in both top-k lists plus one lumped bucket for the rest.
 
-    reference_logprobs and engine_logprobs are log-probabilities of the same k token ids.
-    The tail bucket holds each distribution's remaining mass. By the log-sum inequality this
-    is a lower bound on the full-vocabulary KL, and it is exact when the tail is negligible.
+    reference_ids and reference_logprobs: the reference's top-k; engine: {token id: log-probability} of the
+    engine's top-k. Each token in both is its own bucket and everything else one more, holding each
+    distribution's remaining mass. By the log-sum inequality this is a lower bound on the full-vocabulary KL,
+    and it is exact when the rest is negligible.
     """
     kl = 0.0
     p_sum = q_sum = 0.0
-    for lp, lq in zip(reference_logprobs, engine_logprobs):
+    for token, lp in zip(reference_ids, reference_logprobs):
+        lq = engine.get(token)
+        if lq is None:
+            continue
         p = math.exp(lp)
         p_sum += p
         q_sum += math.exp(lq)
@@ -144,24 +148,19 @@ def compare(reference_rows, candidate_rows, targets, valid=None):
     return ref, cand
 
 
-def quality_path(reference_targets, engine_rows):
-    """Compare one scoring path with the reference.
+def reply_quality(reference_rows, engine_rows):
+    """Compare an engine's replies with the reference's scores of the same tokens.
 
-    reference_targets: list of {"target": id, "logprob": float, "top_ids": [...], "top_logprobs": [...]}
-    engine_rows: list of {"target_logprob": float, "top_logprobs": [...], "argmax": id or None}
-    with top_logprobs aligned to the reference's top_ids.
+    reference_rows: per reply token {"target": id, "logprob": float, "top_ids": [...], "top_logprobs": [...]}
+    (reference.StreamingReference.score); engine_rows: per reply token {"logprob": the engine's log-probability of
+    the token, "top": [[id, logprob], ...] of its top-k}. The engine chose each token, so top-1 agreement is the
+    share of them that are also the reference's most likely token.
     """
-    if len(reference_targets) != len(engine_rows):
-        raise ValueError(f"engine scored {len(engine_rows)} targets, reference has {len(reference_targets)}")
-    ref_nll = [-r["logprob"] for r in reference_targets]
-    eng_nll = [-e["target_logprob"] for e in engine_rows]
-    kls = [lumped_kl(r["top_logprobs"], e["top_logprobs"]) for r, e in zip(reference_targets, engine_rows)]
-    agree = 0
-    for r, e in zip(reference_targets, engine_rows):
-        best = e.get("argmax")
-        if best is None:  # best of the reference's top-k under the engine's distribution
-            best = r["top_ids"][max(range(len(r["top_ids"])), key=lambda i: e["top_logprobs"][i])]
-        agree += int(best == r["top_ids"][0])
+    if len(reference_rows) != len(engine_rows) or not engine_rows:
+        raise ValueError(f"the reference scored {len(reference_rows)} reply tokens, the engine reported {len(engine_rows)}")
+    ref_nll = [-r["logprob"] for r in reference_rows]
+    eng_nll = [-e["logprob"] for e in engine_rows]
+    kls = [partial_kl(r["top_ids"], r["top_logprobs"], dict(e["top"])) for r, e in zip(reference_rows, engine_rows)]
     ref_ppl = math.exp(sum(ref_nll) / len(ref_nll))
     ppl = math.exp(sum(eng_nll) / len(eng_nll))
     return {
@@ -172,17 +171,17 @@ def quality_path(reference_targets, engine_rows):
         "kld_mean": sum(kls) / len(kls),
         "kld_p99": percentile(kls, 0.99),
         "kld_max": max(kls),
-        "top1_agreement": agree / len(kls),
+        "top1_agreement": sum(r["top_ids"][0] == r["target"] for r in reference_rows) / len(kls),
         "max_abs_target_logprob_diff": max(abs(a - b) for a, b in zip(ref_nll, eng_nll)),
     }
 
 
-def budget_used(path_metrics, thresholds):
-    """Largest fraction of the drift budget a path uses (1.0 at a limit); None when nothing is limited."""
+def budget_used(quality, thresholds):
+    """Largest fraction of the drift budget a set uses (1.0 at a limit); None when nothing is limited."""
     used = []
     for key, limit in thresholds.items():
         name = key[:-4] if key.endswith("_max") else key
-        value = path_metrics.get(name)
+        value = quality.get(name)
         if value is None:
             continue
         # A perplexity ratio drifts from 1, so its budget is the distance from 1.
@@ -192,11 +191,11 @@ def budget_used(path_metrics, thresholds):
     return max(used) if used else None
 
 
-def judge(path_metrics, thresholds):
+def judge(quality, thresholds):
     failures = []
     for key, limit in thresholds.items():
         name = key[:-4] if key.endswith("_max") else key
-        value = path_metrics.get(name)
+        value = quality.get(name)
         if value is None or value > limit:
             failures.append(f"{name} {value} > {limit}")
     return failures

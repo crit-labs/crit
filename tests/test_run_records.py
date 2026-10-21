@@ -128,7 +128,8 @@ class RunRecordTests(RunFixture, unittest.TestCase):
             self.assertIn(resource, handoff)
         self.assertIn("eval-v1 adapter", handoff)
         self.assertIn("Eval result JSON is separate evidence", handoff)
-        self.assertIn("chat-json-v1 and chat-resident-v1", handoff)
+        self.assertIn("chat-json-v1 and chat-resident-v1 with chat-stream-v1 and chat-logprobs-v1", handoff)
+        self.assertIn("Measure every candidate with crit run ... eval", handoff)
         self.assertIn("create_engine(context)", handoff)
         self.assertNotIn("--crit-chat-request", handoff)
         self.assertIn("summary.md", handoff)
@@ -780,63 +781,6 @@ class RunRecordTests(RunFixture, unittest.TestCase):
 
 def timestamp_for_test(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
-class MeasureTests(RunFixture, unittest.TestCase):
-    """crit run measure on the Eval mock adapter: one pinned text per case, replayed by every candidate."""
-
-    def resolve(self):
-        workload = self.run["spec"]["cases"][0]["workload"]
-        path = self.directory / "captured/case-0001/prompt.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"ids": list(range(1, workload["prompt_tokens"] + 1))}), encoding="utf-8")
-        self.resolved = self.store.freeze_inputs(self.run_id, {"hardware_manifest": {"device": "host fixture"},
-            "environment_manifest": {"benchmark": "synthetic"}, "case_manifests": {"case-0001": [
-                {"path": "captured/case-0001/prompt.json", "bytes": path.stat().st_size, "sha256": file_sha(path)}]}})
-
-    def package(self, candidate):
-        import shutil
-        package = self.root / ("package-" + candidate["candidate_id"])
-        package.mkdir()
-        shutil.copyfile(ROOT / "eval/examples/mock_adapter.py", package / "mock_adapter.py")
-        return self.store.package(self.run_id, candidate["candidate_id"], package,
-            {"build": {"toolchain": {"identity": "host fixture"}, "dependencies": [], "command": ["fixture"]},
-             "launch": ["mock_adapter.py"], "capabilities": ["prefill", "decode"]})
-
-    def test_measure_pins_once_and_every_candidate_replays_the_pin(self):
-        from crit.run.measure import measure
-        first = self.candidate()
-        self.package(first)
-        with self.assertRaisesRegex(ValueError, "not a file of the candidate's package"):
-            measure(self.store, self.run_id, first["candidate_id"], "missing.py")
-        (record,) = measure(self.store, self.run_id, first["candidate_id"], "mock_adapter.py")
-        workload = self.run["spec"]["cases"][0]["workload"]
-        pin = read_json(self.directory / "pins/case-0001.json")
-        self.assertEqual((len(pin["tokens"]), pin["pinned_by"]), (workload["output_tokens"], first["candidate_id"]))
-        text = record["extensions"]["decode_text"]
-        self.assertEqual((text["source"], text["sha256"]), ("pinned", pin["sha256"]))
-        for key in ("prefill_tps", "decode_tps", "request_ms", "ttft_ms", "load_ms", "accepted_tokens_per_round"):
-            self.assertEqual(len(record["metrics"][key]["samples"]), workload["repetitions"], key)
-        self.assertTrue(all(key in record["metrics"] or key in record["missing_metrics"] for key in
-                            ("peak_vram_bytes", "minimum_free_vram_bytes", "peak_ram_bytes", "minimum_free_ram_bytes")))
-        second = self.candidate(label="Second engine")
-        self.package(second)
-        (again,) = measure(self.store, self.run_id, second["candidate_id"], "mock_adapter.py")
-        self.assertEqual(again["extensions"]["decode_text"]["sha256"], pin["sha256"])
-        self.assertEqual(again["extensions"]["decode_text"]["pinned_by"], first["candidate_id"])
-        attempts = self.store.get(self.run_id)["candidates"][1]["attempts"]
-        self.assertEqual([(a["operation"], a["outcome"]) for a in attempts], [("benchmark", "completed")])
-
-    def test_a_text_that_does_not_repeat_is_not_pinned_but_still_measured(self):
-        from crit.run.measure import measure
-        candidate = self.candidate()
-        self.package(candidate)
-        (record,) = measure(self.store, self.run_id, candidate["candidate_id"], "mock_adapter.py", config={"unrepeatable": True})
-        self.assertFalse((self.directory / "pins/case-0001.json").exists())
-        text = record["extensions"]["decode_text"]
-        self.assertEqual(text["source"], "generated")
-        self.assertIn("changed between two runs (from token 0)", text["reason"])
-        self.assertEqual(len(record["metrics"]["decode_tps"]["samples"]), self.run["spec"]["cases"][0]["workload"]["repetitions"])
 
 
 if __name__ == "__main__":

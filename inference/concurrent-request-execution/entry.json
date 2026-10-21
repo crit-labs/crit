@@ -1,19 +1,21 @@
 {
   "id": "concurrent-request-execution",
   "category": "execution",
-  "summary": "Compact request rows, produce host metadata deltas and execute bounded independent CPU batches with completion notification",
+  "summary": "Compact request rows, produce host metadata deltas and execute bounded independent or dependent request steps with owned continuations",
   "implementation_status": "native_source",
-  "implementation_scope": "Ready-row compaction, immutable stable-slot metadata snapshots and bounded incremental patches, owned candidate copies, single-use commit handoff and retirement barrier; native uploads and model batching are external; C++20 HostBatch executes independent CPU tasks through Core async batch lifecycle",
+  "implementation_scope": "Ready-row compaction, stable-slot metadata snapshots and patches, owned candidates and retirement barriers; HostBatch executes independent CPU tasks; a portable recurrent reference integrates dependent steps and complete-state memory recovery, and a CUDA recurrence example carries device state across steps before host readback; production model arithmetic and native metadata uploads are external",
   "agent_guidance": {
-    "use_when": "Several requests produce variable candidate rows with independent readiness and lifetime",
-    "avoid_when": "Only one request runs, or existing core/engine staging already supplies the same handoff",
+    "use_when": "Several requests produce variable candidate rows, or an engine can carry accepted state into a dependent step before host publication",
+    "avoid_when": "Existing staging already supplies the same handoff, or dependent execution requires a host decision that cannot be carried privately",
     "provides": [
       "Ordered ready-row selection with admitted row limit",
       "Copied and reserved candidate groups consumed once at commit",
       "Receipt-based independent owner retirement",
       "Stable request/generation slots with immutable retained snapshots and changed-row byte patches",
       "Exact-base delta validation, atomic host apply and independently ordered row gathers",
-      "Real asynchronous host batch execution with private result storage and retained owners"
+      "Real asynchronous host batch execution with private result storage and retained owners",
+      "Portable recurrent execution with private sampling histories, bounded dependent steps and complete-state snapshots under memory pressure",
+      "CUDA recurrence example with retained device state and events, private readback slots and demonstrated successor computation before predecessor readback"
     ],
     "engine_supplies": [
       "Active request/generation mapping and model execution",
@@ -47,10 +49,18 @@
     {
       "path": "inference/concurrent-request-execution/code/host_batch.h",
       "purpose": "Owned CPU batch execution, nonblocking future readiness, single-use commit and joining lifetime for Core pipeline"
+    },
+    {
+      "path": "inference/concurrent-request-execution/code/recurrent_pipeline.h",
+      "purpose": "Synthetic asynchronous recurrent model with private accepted state and sampling history, dependent continuations, bounded physical state pools and snapshot recovery"
+    },
+    {
+      "path": "inference/concurrent-request-execution/code/cuda_ahead_example.cu",
+      "purpose": "Runnable synthetic CUDA recurrence with device-carried accepted tokens, event dependencies, retained operation slots, ordered publication and cancellation"
     }
   ],
   "requires": {
-    "hardware": "Python 3.11+ and standard library for the host reference; backend hardware is an engine choice; C++20 host threads for native helper",
+    "hardware": "Python 3.11+ for host references; C++20 host threads for native helpers; the optional device example additionally requires a C++20-capable CUDA toolkit and device",
     "model": "Engine with independent request state and variable nonempty candidate rows",
     "workload": "Concurrent requests with declared per-request output budgets and physical receipts"
   },
@@ -63,7 +73,8 @@
   },
   "dependencies": [
     "Python standard library",
-    "C++20 standard library and Core SDK for HostBatch"
+    "C++20 standard library and Core SDK for native host helpers",
+    "Optional CUDA toolkit and Core CUDA backend for the device recurrence example"
   ],
   "symbols": [
     "Row",
@@ -89,7 +100,7 @@
   ],
   "validation": {
     "host": "Host fixtures and worked example cover row compaction, copies, budgets, failed commit and independent retirement; 500 metadata mutation/gather comparisons, stale deltas, slot rebinding, immutable old readers and invalid-patch non-publication",
-    "native": "C++ CPU integration tests exercise independent overlap, ordered output, cancellation, refill, prepare/submit/producer/commit failure, stale membership, deadline cleanup and quarantine; immediate/racing completion notification, no idle batch polling, retained trace spans and slow/failure classification; device arithmetic remains unqualified",
+    "native": "C++ CPU fixtures cover independent overlap, ordered output, cancellation, refill, failures, stale membership, cleanup, quarantine, notifications and tracing. Dependent-step fixtures compare seeded output with depth one, cover variable accepted widths, stops, limits, eligibility, private-state recovery and nonrecoverable pressure. Native HTTP fixtures cover concurrent streaming/buffered clients and cancellation during prefill. The optional CUDA recurrence fixture checks device-carried dependencies against a host oracle and cancellation while predecessor readback is gated; full-model device behavior remains unqualified",
     "performance": "Unmeasured for a native engine; host fixture success is not a speed claim"
   }
 }

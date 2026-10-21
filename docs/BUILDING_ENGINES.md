@@ -68,8 +68,13 @@ configured separately.
 
 Retain workload files under `RUN_ROOT/RUN_ID/captured/` with nonempty hardware and
 environment manifests and path/size/SHA-256 manifests for every case. The coordinator
-verifies them and hashes the model. Keep each case's prompt as a JSON file
-`{"ids": [token ids]}` so `crit run measure` can benchmark it.
+verifies them and hashes the model. Keep each case's request as a JSON file
+`{"messages": [...], "tools": [...]}` (`tools` optional) so `crit run measure` can
+benchmark it through `crit serve`. Its messages must render to the workload's
+`prompt_tokens` as the candidate renders them:
+`crit_core.text.load_model_text(MODEL_DIR, clock=None).encode_chat(messages, tools=tools,
+add_generation_prompt=True, **chat_template_kwargs)`, with the candidate's configured
+`chat_template_kwargs`, counts them as `ResidentChat` does.
 
 ```text
 crit run --project CRIT_ROOT --root RUN_ROOT --id RUN_ID resolve --record inputs.json
@@ -93,14 +98,17 @@ crit run --root RUN_ROOT --id RUN_ID reserve --candidate CANDIDATE_ID --operatio
 crit run --root RUN_ROOT --id RUN_ID settle --reservation RESERVATION_PATH --record result.json
 crit run --root RUN_ROOT --id RUN_ID package --candidate CANDIDATE_ID --source PACKAGE_DIR --record recipe.json
 crit run --root RUN_ROOT --id RUN_ID check --candidate CANDIDATE_ID --record check.json
-crit run --root RUN_ROOT --id RUN_ID measure --candidate CANDIDATE_ID --adapter EVAL_ADAPTER.py
+crit run --root RUN_ROOT --id RUN_ID measure --candidate CANDIDATE_ID
+crit run --root RUN_ROOT --id RUN_ID eval --candidate CANDIDATE_ID --data EVAL_DATA_DIR
 ```
 
 Run these from the checkout or add `--project CRIT_ROOT`; use the exact reservation
-path returned. `measure` reserves, runs and settles its own benchmark attempt and
-records one benchmark per case after the case's checks. Every candidate decodes the
-same pinned text, so their decode speeds compare. A `benchmark --record` payload
-remains for workloads `measure` does not cover (cold mode, concurrency above 1).
+path returned. `measure` and `eval` reserve, run and settle their own benchmark attempt.
+`measure` serves the packaged candidate through `crit serve`, as `eval` does, and
+records one benchmark per case from what a chat client receives: each candidate's own
+greedy reply, memory of the resident host process and `crit serve`'s tokens per round.
+A `benchmark --record` payload remains for workloads `measure` does not cover (cold
+mode, concurrency above 1).
 The package holds runnable files, dependencies and notices, without
 `manifest.json` (crit creates it). Build/launch recipes are literal arguments, without
 shell expansion.
@@ -130,19 +138,28 @@ process and can change outputs. For speculative decoding, record
 
 ### Run the common Eval suite
 
-Retain an [Eval adapter](eval/ADAPTER.md) for the candidate's engine with its source.
-An engine built as a Core [engine library](../core/src/runtime/README.md#engine-libraries)
-uses the stock adapters in `crit_core.native` for Eval and for serving.
-Every candidate of a model uses the same prepared data, reference and pinned
-continuation (`crit eval pin`, with the adapter's `replay`). Keep data and results in
-the run workspace and run evaluation under the same reservation and settlement.
+Eval measures a candidate as a chat client gets it. `crit run ... eval --candidate ID
+--data EVAL_DATA_DIR` reserves a benchmark attempt, serves the packaged candidate through
+`crit serve` before it is sealed, runs every Eval part over the chat API
+([Engines behind a server](eval/README.md#engines-behind-a-server)), stops the server and
+scores the quality replies on the run's model (`crit eval reference`). It applies the run's
+`quality_budget`, `exactness` and `kv_tokens` and retains the result as
+`candidates/ID/eval/ATTEMPT.json` for checks to reference. The package therefore needs its
+[resident adapter](#4-make-the-package-servable-and-seal) with `chat-stream-v1` and
+`chat-logprobs-v1` from its first Eval on; `crit_core.serving.ResidentChat` provides both.
+Every candidate of a model uses the same prepared data, kept in the run workspace. `--only`
+runs some parts, `--baseline` shows KPI changes against an earlier result.
 
-Pass the run's `quality_budget`, `exactness` and `kv_tokens` to `crit eval run` as
-`--quality-budget`, `--exactness` and `--context` (`--context` also to `pin`, `ab` and
-`kernels`). Run the full suite for the final comparison; retain raw results, settings,
-inputs and the Eval revision; report skipped cases and overrides. Confirm small
-differences with `crit eval ab`. Start kernel work from `crit eval kernels`, checking
-[Kernels](../kernels/README.md) first.
+Hardware telemetry stays in process, through an [Eval adapter](eval/ADAPTER.md) retained
+with the candidate's source: tokens per round and acceptance on the pinned continuation
+(`crit eval pin`, with the adapter's `replay`), `crit eval ab` to confirm small
+differences and `crit eval kernels` to start kernel work, checking
+[Kernels](../kernels/README.md) first. Pass the run's `kv_tokens` to `pin`, `ab` and
+`kernels` as `--context`. An engine built as a Core
+[engine library](../core/src/runtime/README.md#engine-libraries) uses the stock adapters in
+`crit_core.native` for Eval and for serving. Run the full suite for the final comparison;
+retain raw results, settings, inputs and the Eval revision; report skipped cases and
+overrides.
 
 Eval results are evidence, not run records, and Eval's drift budget does not replace
 the agreed gates. See [Eval results](eval/README.md#results-and-status) and
@@ -150,9 +167,9 @@ the agreed gates. See [Eval results](eval/README.md#results-and-status) and
 
 ## 4. Make the package servable and seal
 
-Before sealing, implement the [resident adapter](SERVING.md#adapter-contract)
-(`chat-json-v1`, `chat-resident-v1`, `create_engine(context)`, model allocations reused
-across requests). Verify with `crit serve`: consecutive requests, a leading system
+Before the candidate's first Eval, implement the [resident adapter](SERVING.md#adapter-contract)
+(`chat-json-v1`, `chat-resident-v1`, `chat-stream-v1`, `chat-logprobs-v1`,
+`create_engine(context)`, model allocations reused across requests). Verify with `crit serve`: consecutive requests, a leading system
 message, streaming, a stop string, A → B → A switching, cancellation and Ctrl+C, with
 real tokenizer counts and synchronized phase times. Declare `chat-config-v1` so the host
 rejects an adapter that drops or changes a configuration key. For `response_format`,

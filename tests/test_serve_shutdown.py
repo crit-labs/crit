@@ -85,8 +85,7 @@ class EngineShutdownTests(ShutdownFixture, unittest.TestCase):
         for method in ("call", "_call"):
             with self.subTest(method=method):
                 engine = self.engine(timeout=60)
-                root = engine.runtime.root
-                accepted = set((root / "accepted").iterdir())
+                root, link = engine.runtime.root, engine.runtime.link
                 preparing, release = threading.Event(), threading.Event()
                 call = getattr(engine.runtime, method)
                 producer = closer = None
@@ -100,7 +99,8 @@ class EngineShutdownTests(ShutdownFixture, unittest.TestCase):
                     return call(*args, **kwargs)
 
                 try:
-                    with patch.object(engine.runtime, method, side_effect=held_call):
+                    with patch.object(engine.runtime, method, side_effect=held_call), \
+                            patch.object(link, "send", wraps=link.send) as send:
                         producer = self.launch(lambda: engine.generate(
                             [{"role": "user", "content": "hello"}], 128, threading.Event(), candidate_id=self.b))
                         self.assertTrue(preparing.wait(5))
@@ -109,11 +109,9 @@ class EngineShutdownTests(ShutdownFixture, unittest.TestCase):
                         release.set()
                         self.assert_stopping(producer)
                         self.assertNotIn("error", self.finish(closer))
-                    added = set((root / "accepted").iterdir()) - accepted
-                    self.assertEqual([read_json(path)["action"] for path in added], ["unload"])
-                    self.assertEqual(list((root / "commands").iterdir()), [])
+                    self.assertEqual([call.args[0].get("action") for call in send.call_args_list], ["unload"])
                     # Cancellation may now precede even the request directory.
-                    self.assertEqual(list((root / "requests").glob("*")), [])
+                    self.assertFalse((root / "requests").exists())
                     self.assertFalse(engine.ownership.path.exists())
                 finally:
                     release.set()
@@ -181,12 +179,12 @@ class EngineShutdownTests(ShutdownFixture, unittest.TestCase):
 
         try:
             self.generating(engine)
-            tree, root = engine.runtime.tree, engine.runtime.root
-            accepted = set((root / "accepted").iterdir())
+            tree, link = engine.runtime.tree, engine.runtime.link
             queued = self.launch(queued_request)
             self.assertTrue(attempted.wait(5))
             self.assertFalse(queued[1].wait(.1))
-            with patch.object(engine.runtime, "close", side_effect=held_retirement):
+            with patch.object(engine.runtime, "close", side_effect=held_retirement), \
+                    patch.object(link, "send", wraps=link.send) as send:
                 try:
                     closer = self.launch(engine.close)
                     self.assertTrue(retiring.wait(5), "unresponsive producer was not retired")
@@ -199,8 +197,8 @@ class EngineShutdownTests(ShutdownFixture, unittest.TestCase):
                     self.assertTrue(engine.lock.locked())
                     self.assertTrue(engine.ownership.path.exists())
                     self.assertIsNone(tree.process.poll())
-                    self.assertEqual(set((root / "accepted").iterdir()), accepted)
-                    self.assertEqual(list((root / "commands").iterdir()), [])
+                    # The producer's cancellation only: no command was sent while the host retired.
+                    self.assertEqual([call.args[0]["kind"] for call in send.call_args_list], ["cancel"])
                 finally:
                     release.set()
                     self.assert_stopping(producer)
@@ -224,9 +222,9 @@ class EngineShutdownTests(ShutdownFixture, unittest.TestCase):
         closer = None
         try:
             self.generating(engine)
-            tree, root = engine.runtime.tree, engine.runtime.root
-            accepted = set((root / "accepted").iterdir())
-            with patch.object(ProcessTree, "close", side_effect=OSError("synthetic shutdown retirement failure")):
+            tree, link = engine.runtime.tree, engine.runtime.link
+            with patch.object(ProcessTree, "close", side_effect=OSError("synthetic shutdown retirement failure")), \
+                    patch.object(link, "send", wraps=link.send) as send:
                 closer = self.launch(engine.close)
                 self.assertIsInstance(self.finish(producer).get("error"), EngineError)
                 self.assertIsInstance(self.finish(closer).get("error"), OSError)
@@ -238,7 +236,7 @@ class EngineShutdownTests(ShutdownFixture, unittest.TestCase):
                     self.ask(engine)
                 with self.assertRaisesRegex(ValueError, "Another CRIT runtime"):
                     self.engine(open=False).open()
-                self.assertEqual(set((root / "accepted").iterdir()), accepted)
+                self.assertEqual([call.args[0]["kind"] for call in send.call_args_list], ["cancel"])
             engine.close()
             self.assertTrue(engine.closed)
             self.assertIsNone(engine.runtime.tree)

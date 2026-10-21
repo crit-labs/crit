@@ -13,7 +13,8 @@
       "Single-query scalar paged attention, tiled MHA/GQA/MQA prefill/decode, causal/window/keep/bias masks and partial RoPE",
       "Private bounded scratch with retained KV image, synchronous GEMM contract, cancellation and optional OpenBLAS integration",
       "Physically compressed G32 int8 page storage behind Core's StateCache with bounded head-range decoding into attention scratch",
-      "Keyed ragged batches with retained private plans, aggregate resource limits and all-or-nothing result return; synthetic Core mixed-scheduling integration"
+      "Keyed ragged batches with retained private plans, aggregate resource limits and all-or-nothing result return; synthetic Core mixed-scheduling integration",
+      "Integrated Core memory-pressure recovery with real page reclamation and replay of accepted history for the supplied attention reference"
     ],
     "engine_supplies": [
       "Model projections, head geometry, RoPE frequencies/layout/position IDs, attention scale and allowed causal prefixes",
@@ -72,6 +73,14 @@
     {
       "path": "inference/attention-state/code/batch_example.cpp",
       "purpose": "Runnable Core mixed prefill/decode integration with 16 active lanes, refill and 24 synthetic requests on Core's StateCache, checked against independent dense generation, plus a fork copy-on-write check"
+    },
+    {
+      "path": "inference/attention-state/code/batch_engine.h",
+      "purpose": "Shared synthetic attention model, session and batch operations used by the continuous-batching example and recovery integration"
+    },
+    {
+      "path": "inference/attention-state/code/recoverable_engine.h",
+      "purpose": "Core memory-pressure adapter with transactional page reservation, physical page release and complete continuation replay for the supplied attention model"
     }
   ],
   "requires": {

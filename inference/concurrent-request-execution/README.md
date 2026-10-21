@@ -137,7 +137,32 @@ owns admission, completion, publication and quarantine.
 Workers need independent session and result storage, must not call Core callbacks
 recursively, and reserve task memory through the engine's budget. Stop callbacks must be
 idempotent; a timeout alone cannot release storage. Device execution implements the same
-contract with native events. Same-request speculative pipelining is not implemented.
+contract with native events.
+
+## Dependent steps and recovery
+
+The [recurrent reference](code/recurrent_pipeline.h) integrates Core's
+[dependent execution contract](../../core/src/runtime/README.md#dependent-execution).
+Each asynchronous producer owns its recurrent state, accepted tokens and sampling
+history. A successor consumes that state through an established future before host
+publication, while Core bounds unresolved output grants and publishes steps in order.
+The example supports variable accepted widths and seeded sampling; requests requiring
+host-side context decisions explicitly fall back to depth one. Terminal predecessors
+discard descendant output, and retirement waits for physical settlement.
+
+Its bounded state pool also integrates memory preemption. A settled victim snapshots
+the complete approved state before returning its pool slot; restoration reserves the
+old state and a useful next step. The [fixtures](../../tests/inference/dependent_steps_tests.cpp)
+compare output against depth one and exercise stops, limits, cancellation, stale
+steps, failed commit, quarantine and recovery with a constrained physical pool.
+
+The optional [CUDA recurrence example](code/cuda_ahead_example.cu) uses device-carried
+state and accepted tokens, event dependencies and private readback slots. Its test
+blocks predecessor readback while a successor computes, then verifies ordered output
+against a host oracle and cancellation cleanup. Build Inference with
+`CRIT_INFERENCE_CUDA=ON` and run `crit_cuda_ahead` through CTest. Arithmetic is synthetic;
+real engines supply their own kernels, layouts, complete recovery images and private
+execution state. These examples establish integrated capabilities, not speedups.
 
 ## Costs and validation
 
@@ -155,4 +180,5 @@ snapshots, malformed patches and stale deltas. The
 [native integration fixture](../../tests/inference/pipeline_tests.cpp) runs a full model
 adapter: a blocked producer stays alive while an independent request finishes, plus
 cancellation, refill, stale completions, failures, timeout and notification races. None
-of these establish throughput or qualify a device implementation.
+of these establish throughput. The CUDA example qualifies only its own synthetic
+device arithmetic and dependency/readback lifetime.

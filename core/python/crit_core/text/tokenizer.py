@@ -6,6 +6,7 @@ raise TokenError instead of decoding to "" or None; truncation and padding store
 off at load, before the backend is shared, so text is never cut silently.
 """
 from dataclasses import dataclass
+import json
 import operator
 from pathlib import Path
 import threading
@@ -54,6 +55,19 @@ def special_tokens_from(config, files):
                 else:
                     values[name] = token
     return values
+
+
+def byte_alphabet():
+    """The characters byte-level BPE vocabularies spell bytes with (GPT-2's bytes_to_unicode): {character: byte}."""
+    printable = {*range(ord("!"), ord("~") + 1), *range(ord("\u00a1"), ord("\u00ac") + 1), *range(ord("\u00ae"), 256)}
+    extra = iter(range(256, 512))
+    return {chr(byte) if byte in printable else chr(next(extra)): byte for byte in range(256)}
+
+
+def _byte_level(backend):
+    """Whether tokenizer.json decodes with a ByteLevel decoder, on its own or inside a Sequence."""
+    decoder = json.loads(backend.to_str()).get("decoder") or {}
+    return decoder.get("type") == "ByteLevel" or any(d.get("type") == "ByteLevel" for d in decoder.get("decoders") or [])
 
 
 def _backend(text):
@@ -117,6 +131,7 @@ class Tokenizer:
         self.eos_token_id = backend.token_to_id(special["eos_token"]) if "eos_token" in special else None
         self.split_special_tokens = split_special_tokens
         self._split = None
+        self._bytes = None
         self._lock = threading.Lock()
 
     @classmethod
@@ -208,3 +223,26 @@ class Tokenizer:
     def get_vocab(self):
         """A new {token: id} dict of the whole vocabulary, added tokens included."""
         return dict(self.backend.get_vocab(with_added_tokens=True))
+
+    def token_bytes(self):
+        """The bytes every id stands for in text, read from the vocabulary, as a tuple indexed by id: byte-level
+        pieces through the byte alphabet, SentencePiece <0xNN> pieces as that byte, other pieces as UTF-8 with
+        "\u2581" as a space, added tokens as their content. Servers name tokens by these bytes (logprobs)."""
+        with self._lock:
+            if self._bytes is None:
+                alphabet = byte_alphabet() if _byte_level(self.backend) else None
+                out = []
+                for token in range(self.vocab_size):
+                    added = self.added_tokens.get(token)
+                    piece = added.content if added is not None else self.backend.id_to_token(token)
+                    if added is not None:
+                        out.append(piece.encode())
+                    elif alphabet is not None:
+                        out.append(bytes(alphabet[c] for c in piece) if all(c in alphabet for c in piece)
+                                   else piece.encode())
+                    elif len(piece) == 6 and piece.startswith("<0x") and piece.endswith(">"):
+                        out.append(bytes([int(piece[3:5], 16)]))
+                    else:
+                        out.append(piece.replace("\u2581", " ").encode())
+                self._bytes = tuple(out)
+            return self._bytes

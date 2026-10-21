@@ -132,12 +132,19 @@ def curve_points(required, settings):
     return points + [required]
 
 
-def filled_prompt(base, length):
-    """A prompt of exactly `length` tokens that ends with the whole of `base` (a complete speed-case prompt,
-    so the model answers it) after as many earlier copies of it as the length needs."""
-    base = list(base)
-    copies = -(-length // len(base))
-    return (base * copies)[len(base) * copies - length:]
+def curve_prompt(pieces, filler, length):
+    """A long-context prompt of exactly `length` tokens: the curve's speed case with its document followed by the
+    filler (repeated as needed), cut to fit, so the engine answers that case's request. None when `length` cannot
+    hold the case's frame. pieces: prepared["context"]; filler: the retrieval filler ids."""
+    head, tail = list(pieces["head_ids"]), list(pieces["tail_ids"])
+    need = length - len(head) - len(tail)
+    if need < 1:
+        return None
+    middle = list(pieces["document_ids"])
+    if len(middle) < need:
+        rest = need - len(middle)
+        middle += (list(filler) * -(-rest // len(filler)))[:rest]
+    return head + middle[:need] + tail
 
 
 def retrieval_points(required, rule):

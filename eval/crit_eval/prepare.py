@@ -1,26 +1,25 @@
 """Freeze the suite as token ids for one model: `crit eval prepare --model DIR --data DIR`.
 
-Engines never see text. Every engine evaluated against the same data directory receives
-exactly the same prompt and corpus token ids, rendered once with the model's own chat
-template. Tokenizer, chat template, stop ids and vocabulary come from Core's text layer
-(crit_core.text), which needs the `tokenizers` and `jinja2` packages (preparation only).
+Every engine evaluated against the same data directory gets exactly the same prompts, rendered once with the
+model's own chat template: an adapter's engine their token ids, an engine behind a server the chat messages
+frozen next to them (crit_eval.chat). Tokenizer, chat template, stop ids and vocabulary come from Core's text
+layer (crit_core.text), which needs the `tokenizers` and `jinja2` packages (preparation only).
 
-Long prompts (suite/long.json) are frozen the same way: the prefill_decode quality sequences at each of the
-protocol's prompt lengths, and the pieces a run assembles retrieval prompts from once it knows the required
-context (head, filler and fact token ids, and the text of every token for matching the answers).
+Long prompts (suite/long.json) are frozen the same way: the long quality prompts at each of the protocol's
+prompt lengths, and the pieces a run assembles long-context and retrieval prompts from once it knows the
+required context (head, filler and fact token ids, and the text of every token for matching the answers).
 """
 import hashlib
+from itertools import count
 import json
-import os
 from pathlib import Path
 
-from . import SUITE_DIR, write_json
+from . import SUITE_DIR, protocol_version, write_json
 from .ceiling import model_ceiling
 
 PREPARED = "prepared.json"
 LONG = "long.json"
 SENTINEL = "\u0000DOCUMENT\u0000"
-REPLY = "\u0000REPLY\u0000"
 
 
 def file_sha256(path):
@@ -53,10 +52,26 @@ def model_identity(model):
 
 def suite_identity():
     digest = hashlib.sha256()
-    for path in sorted(SUITE_DIR.rglob("*")):
+    # By name parts, case and all: Windows paths sort without case, which would give the suite another identity there.
+    for path in sorted(SUITE_DIR.rglob("*"), key=lambda path: path.relative_to(SUITE_DIR).parts):
         if path.is_file():
             digest.update(path.relative_to(SUITE_DIR).as_posix().encode() + b"\0" + path.read_bytes())
     return digest.hexdigest()
+
+
+def check_prepared(prepared, protocol, data):
+    """Data prepared under the same major protocol version from the current suite runs under any minor version."""
+    found, current = prepared.get("protocol"), protocol["protocol"]
+    try:
+        same_major = protocol_version(found)[0] == protocol_version(current)[0]
+    except ValueError:
+        same_major = False
+    if not same_major:
+        raise SystemExit(f"{data} was prepared for {found}, not {current}: "
+                         "prepare it again (crit eval prepare) into a new data directory")
+    if prepared.get("suite_sha256") != suite_identity():
+        raise SystemExit(f"{data} was prepared from another suite than {current}'s: "
+                         "prepare it again (crit eval prepare) into a new data directory")
 
 
 # `model` below is a crit_core.text.ModelText. Templates render in non-thinking mode where they support it.
@@ -90,58 +105,85 @@ def speed_messages(case, document=None):
     return messages, tools
 
 
-def speed_case(model, case):
+def document_frame(model, messages, tools=None):
+    """A generation prompt around a document: the token ids before and after SENTINEL in the messages' render."""
+    head, tail = chat_text(model, messages, True, tools).split(SENTINEL)
+    return token_ids(model, head), token_ids(model, tail)
+
+
+def with_document(messages, document):
+    return [{**m, "content": m["content"].replace(SENTINEL, document)} if SENTINEL in (m.get("content") or "") else m
+            for m in messages]
+
+
+def speed_prompt(model, case):
+    """A speed case's prompt as (token ids, messages, tools): the messages and tools hold the text the ids render
+    from, a long-context document cut to fit."""
     if "document" not in case:
         messages, tools = speed_messages(case)
-        return prompt_ids(model, messages, tools)
+        return prompt_ids(model, messages, tools), messages, tools
     # Exact-length long-context prompt: template head + document tokens cut to fit + template tail.
     # The document goes where an inline message content holds {document}.
     messages, tools = speed_messages(case, SENTINEL)
-    rendered = chat_text(model, messages, True, tools)
-    head, tail = rendered.split(SENTINEL)
-    head_ids, tail_ids = token_ids(model, head), token_ids(model, tail)
+    head_ids, tail_ids = document_frame(model, messages, tools)
     document = (SUITE_DIR / case["document"]).read_text(encoding="utf-8")
     need = case["prompt_tokens"] - len(head_ids) - len(tail_ids)
     document_ids = token_ids(model, document)
     if need <= 0 or len(document_ids) < need:
         raise ValueError(f"{case['id']}: document has {len(document_ids)} tokens, needs {need}")
-    return head_ids + document_ids[:need] + tail_ids
+    return (head_ids + document_ids[:need] + tail_ids, with_document(messages, model.tokenizer.decode(document_ids[:need])),
+            tools)
 
 
-def reply_opening(model, messages):
-    """The conversation rendered up to where its scored (final assistant) turn's content begins: rendered with that
-    turn's content replaced by a marker, cut at the marker. None when the template does not render the marker
-    exactly once."""
-    rendered = chat_text(model, [*messages[:-1], {"role": "assistant", "content": REPLY}], False)
-    return rendered.split(REPLY)[0] if rendered.count(REPLY) == 1 else None
+def curve_case(speed):
+    """The speed case the long-context curve extends: the longest, which holds a document."""
+    case = max(speed["cases"], key=lambda c: c.get("prompt_tokens", 0))
+    if "document" not in case:
+        raise ValueError(f"{case['id']}: the longest speed case has no document for the long-context curve to extend")
+    return case
 
 
-def generated_part(rendered, prompt, opening=None):
-    """The text a model generates after the generation prompt `prompt` to produce the scored turn that ends
-    `rendered` (the conversation with that turn), when `rendered` does not start with `prompt`: some templates open
-    the generation prompt with more than a rendered history turn holds (Gemma 4 adds an empty thought channel that
-    history turns strip). That is the part of `rendered` after `opening` (reply_opening) when both texts start with
-    it, so a reply that begins like the prompt's extra text keeps those characters; otherwise the part after the
-    text both share. None when they share none."""
-    if opening and rendered.startswith(opening) and prompt.startswith(opening):
-        return rendered[len(opening):]
-    common = os.path.commonprefix([rendered, prompt])
-    return rendered[len(common):] if common else None
+def curve_pieces(model, case):
+    """What a run assembles long-context curve prompts from (context.curve_prompt): the case's token ids before
+    and after its document, and the document followed by a paragraph break."""
+    messages, tools = speed_messages(case, SENTINEL)
+    head_ids, tail_ids = document_frame(model, messages, tools)
+    document = (SUITE_DIR / case["document"]).read_text(encoding="utf-8")
+    return {"case": case["id"], "head_ids": head_ids, "tail_ids": tail_ids,
+            "document_ids": token_ids(model, document) + token_ids(model, "\n\n"),
+            "messages": api_messages(messages), "tools": tools}
 
 
-def quality_conversation(model, conversation):
-    messages = conversation["messages"]
-    if messages[-1]["role"] != "assistant":
-        raise ValueError(f"{conversation['id']}: the scored turn must be the final assistant message")
-    prefix = prompt_ids(model, messages[:-1])
-    text = chat_text(model, messages, False).rstrip("\n")
-    full = token_ids(model, text)
-    if full[:len(prefix)] == prefix:
-        return full, len(prefix)
-    rest = generated_part(text, chat_text(model, messages[:-1], True), reply_opening(model, messages))
-    if rest is None:
-        raise ValueError(f"{conversation['id']}: the generation prompt is not a token prefix of the conversation")
-    return prefix + token_ids(model, rest), len(prefix)
+def speed_case(model, case):
+    return speed_prompt(model, case)[0]
+
+
+def heldout_messages(prompt):
+    return [{"role": "user", "content": prompt["content"]}]
+
+
+def api_messages(messages):
+    """Suite messages in the chat API's form, as an engine behind a server is sent them (crit_eval.chat): tool-call
+    arguments as JSON text, each tool result paired with its call by id."""
+    out, ids, pending = [], count(), []
+    for message in messages:
+        message = dict(message)
+        if message.get("tool_calls"):
+            message["tool_calls"] = [{"id": f"call_{next(ids)}", "type": "function",
+                                      "function": {"name": call["function"]["name"],
+                                                   "arguments": json.dumps(call["function"]["arguments"])}}
+                                     for call in message["tool_calls"]]
+            pending += [call["id"] for call in message["tool_calls"]]
+        elif message["role"] == "tool":
+            message["tool_call_id"] = pending.pop(0)
+        out.append(message)
+    return out
+
+
+def speed_entry(model, case, output_tokens):
+    ids, messages, tools = speed_prompt(model, case)
+    return {"id": case["id"], "kind": case["kind"], "prompt_ids": ids, "messages": api_messages(messages),
+            "tools": tools, "output_tokens": output_tokens}
 
 
 def filler_ids(model, long):
@@ -155,28 +197,22 @@ def repeated(ids, length):
     return (list(ids) * copies)[:length]
 
 
-def prefill_decode_sequence(model, conversation, long, filler, prompt_tokens):
-    """A quality conversation whose prompt (everything before the scored assistant turn) is exactly
-    `prompt_tokens` long: long.json's preamble, holding filler cut to fit, goes before its first user message.
-    Returns (ids, first_target); first_target is prompt_tokens."""
+def quality_prompt(model, prompt_id, set_name, messages):
+    return {"id": prompt_id, "set": set_name, "prompt_ids": prompt_ids(model, messages), "messages": api_messages(messages)}
+
+
+def long_quality_messages(model, conversation, preamble, filler, prompt_tokens):
+    """A quality conversation whose generation prompt renders to about `prompt_tokens` tokens: long.json's preamble,
+    holding filler cut to fit, goes before its first user message. The filler goes in as text, so the prompt's ids
+    are its render's (prompt_ids), as a server renders it; the text can re-encode a token or two off the cut."""
     messages = [dict(m) for m in conversation["messages"]]
     first = next(i for i, m in enumerate(messages) if m["role"] == "user")
-    messages[first]["content"] = long["prefill_decode"]["preamble"].replace("{document}", SENTINEL) + messages[first]["content"]
-    head, tail = chat_text(model, messages[:-1], True).split(SENTINEL)
-    full_head, rest = chat_text(model, messages, False).rstrip("\n").split(SENTINEL)
-    if head != full_head:
-        raise ValueError(f"{conversation['id']}: the generation prompt and the conversation render differently before the filler")
-    head_ids, tail_ids, rest_ids = token_ids(model, head), token_ids(model, tail), token_ids(model, rest)
-    if rest_ids[:len(tail_ids)] != tail_ids:
-        opening = reply_opening(model, messages)
-        generated = generated_part(rest, tail, opening.split(SENTINEL)[1] if opening and SENTINEL in opening else None)
-        if generated is None:
-            raise ValueError(f"{conversation['id']}: the generation prompt is not a token prefix of the conversation")
-        rest_ids = tail_ids + token_ids(model, generated)
+    messages[first]["content"] = preamble.replace("{document}", SENTINEL) + messages[first]["content"]
+    head_ids, tail_ids = document_frame(model, messages)
     need = prompt_tokens - len(head_ids) - len(tail_ids)
     if need <= 0:
         raise ValueError(f"{conversation['id']}: {prompt_tokens} prompt tokens leave no room for the filler")
-    return head_ids + repeated(filler, need) + rest_ids, prompt_tokens
+    return with_document(messages, model.tokenizer.decode(repeated(filler, need)))
 
 
 def token_strings(model, count):
@@ -192,17 +228,31 @@ def token_strings(model, count):
     return out
 
 
+def retrieval_messages(rule):
+    return [{"role": "system", "content": rule["system"]},
+            {"role": "user", "content": rule["user"].replace("{document}", SENTINEL)}]
+
+
 def retrieval_pieces(model, long, filler):
     """What a run assembles retrieval prompts from (context.retrieval_prompt): the rendered prompt's token ids
     before and after the filler, the filler, each fact's token ids with its answer, and token_strings."""
     rule = long["retrieval"]
-    messages = [{"role": "system", "content": rule["system"]},
-                {"role": "user", "content": rule["user"].replace("{document}", SENTINEL)}]
-    head, tail = chat_text(model, messages, True).split(SENTINEL)
-    return {"head_ids": token_ids(model, head), "tail_ids": token_ids(model, tail), "filler_ids": list(filler),
+    head_ids, tail_ids = document_frame(model, retrieval_messages(rule))
+    return {"head_ids": head_ids, "tail_ids": tail_ids, "messages": retrieval_messages(rule), "filler_ids": list(filler),
             "facts": [{"id": f["id"], "answer": f["answer"], "ids": token_ids(model, "\n\n" + f["text"] + "\n\n")}
                       for f in rule["facts"]],
             "token_text": token_strings(model, model.tokenizer.vocab_size)}
+
+
+def quality_prompts(model, quality, long, filler, rule):
+    """protocol quality: the suite's conversations as one set, then the long ones at each prompt length, a set each."""
+    prompts = [quality_prompt(model, c["id"], "conversations", c["messages"]) for c in quality["conversations"]]
+    by_id = {c["id"]: c for c in quality["conversations"]}
+    for length in rule["long"]["prompt_tokens"]:
+        for conversation_id in rule["long"]["conversations"]:
+            messages = long_quality_messages(model, by_id[conversation_id], long["quality"]["preamble"], filler, length)
+            prompts.append(quality_prompt(model, f"{conversation_id}@{length}", f"long-{length}", messages))
+    return prompts
 
 
 def prepare(model, data, speed_tokens=None):
@@ -214,6 +264,8 @@ def prepare(model, data, speed_tokens=None):
     text = load_model_text(files, clock=None)
     speed = json.loads((SUITE_DIR / "speed.json").read_text(encoding="utf-8"))
     quality = json.loads((SUITE_DIR / "quality.json").read_text(encoding="utf-8"))
+    long = json.loads((SUITE_DIR / LONG).read_text(encoding="utf-8"))
+    filler = filler_ids(text, long)
     prepared = {
         "protocol": protocol["protocol"],
         "suite_sha256": suite_identity(),
@@ -221,32 +273,18 @@ def prepare(model, data, speed_tokens=None):
         "stop_ids": legacy_eos_ids(files),
         # Token ids that exist; head rows beyond this are padding and excluded from scoring.
         "valid_vocab": text.tokenizer.vocab_size,
-        "speed": [{"id": c["id"], "kind": c["kind"], "prompt_ids": speed_case(text, c),
-                   "output_tokens": speed_tokens or protocol["speed"]["output_tokens"]} for c in speed["cases"]],
-        "quality": [],
+        "speed": [speed_entry(text, c, speed_tokens or protocol["speed"]["output_tokens"]) for c in speed["cases"]],
+        "quality": quality_prompts(text, quality, long, filler, protocol["quality"]),
         # Arithmetic and KV bytes per token for the prefill and long-context decode floors.
         "ceiling": model_ceiling(model),
     }
-    for conversation in quality["conversations"]:
-        ids, first = quality_conversation(text, conversation)
-        prepared["quality"].append({"id": conversation["id"], "ids": ids, "first_target": first})
     # Held-out prompts: outside the speed suite, never a tuning target (protocol "heldout").
     heldout = json.loads((SUITE_DIR / "heldout.json").read_text(encoding="utf-8"))
     prepared["heldout"] = [{"id": p["id"], "language": p["language"], "kind": p["kind"],
-                            "prompt_ids": prompt_ids(text, [{"role": "user", "content": p["content"]}]),
+                            "prompt_ids": prompt_ids(text, heldout_messages(p)), "messages": heldout_messages(p),
                             "output_tokens": protocol["heldout"]["output_tokens"]} for p in heldout["prompts"]]
-    # Long prompts (protocol quality.prefill_decode and context.retrieval).
-    long = json.loads((SUITE_DIR / LONG).read_text(encoding="utf-8"))
-    filler = filler_ids(text, long)
-    by_id = {c["id"]: c for c in quality["conversations"]}
-    rule = protocol["quality"]["prefill_decode"]
-    prepared["prefill_decode"] = []
-    for length in rule["prompt_tokens"]:
-        for conversation_id in rule["conversations"]:
-            ids, first = prefill_decode_sequence(text, by_id[conversation_id], long, filler, length)
-            prepared["prefill_decode"].append({"id": f"{conversation_id}@{length}", "conversation": conversation_id,
-                                               "prompt_tokens": length, "ids": ids, "first_target": first})
     prepared["retrieval"] = retrieval_pieces(text, long, filler)
+    prepared["context"] = curve_pieces(text, curve_case(speed))
     Path(data).mkdir(parents=True, exist_ok=True)
     write_json(Path(data) / PREPARED, prepared)
     return prepared

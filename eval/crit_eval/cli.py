@@ -14,10 +14,14 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="crit eval", description="Run the common crit speed, quality and speculative-exactness suite and report the engine against its ceilings")
     subs = parser.add_subparsers(dest="command", required=True)
 
-    run = subs.add_parser("run", help="Evaluate one engine (prepares data and reference first when missing)")
-    run.add_argument("--adapter", required=True, help="Python file exporting create_eval_engine(context)")
+    run = subs.add_parser("run", help="Evaluate one engine (prepares the data first when missing)")
+    engine = run.add_mutually_exclusive_group(required=True)
+    engine.add_argument("--adapter", help="Python file exporting create_eval_engine(context)")
+    engine.add_argument("--url", help="Base URL of an OpenAI-compatible server the engine runs behind, for example "
+                                      "http://127.0.0.1:8000/v1 (needs --context: the context the server was started with)")
+    run.add_argument("--served-model", help="With --url: the model to request (default: the one the server lists)")
     run.add_argument("--model", required=True, help="Model directory passed to the adapter")
-    run.add_argument("--data", required=True, help="Prepared suite and reference directory for this model")
+    run.add_argument("--data", required=True, help="Prepared suite directory for this model")
     run.add_argument("--out", required=True, help="Result JSON path")
     run.add_argument("--config", default="{}", help="JSON configuration overrides passed to the adapter")
     run.add_argument("--only", choices=list(PARTS), action="append",
@@ -75,9 +79,12 @@ def main(argv=None):
     prepare.add_argument("--model", required=True)
     prepare.add_argument("--data", required=True)
 
-    reference = subs.add_parser("reference", help="Build reference log-probabilities (torch + transformers, GPU)")
-    reference.add_argument("--model", required=True)
-    reference.add_argument("--data", required=True)
+    reference = subs.add_parser("reference", help="Score a run's quality replies on the prepared model's checkpoint "
+                                                  "and judge them (torch + transformers, GPU; stop the engine first)")
+    reference.add_argument("--model", required=True, help="The checkpoint the data was prepared from")
+    reference.add_argument("--data", required=True, help="Prepared suite directory the run measured")
+    reference.add_argument("--result", required=True, help="Result JSON of the run; its quality and status are updated")
+    reference.add_argument("--baseline", metavar="RESULT", help="Earlier result to show KPI changes against")
 
     compare = subs.add_parser("compare", help="Print a side-by-side table of result files")
     compare.add_argument("results", nargs="+")
@@ -117,14 +124,16 @@ def main(argv=None):
     kernels.add_argument("--context", type=int, metavar="TOKENS", help="Context the engine is built for (the run's kv_tokens)")
 
     args = parser.parse_args(argv)
-    if args.command in ENGINE_COMMANDS:
+    # An engine behind a server is the server's to load (crit serve holds the lock while it serves).
+    if args.command in ENGINE_COMMANDS and not getattr(args, "url", None):
         from crit_core.machine import engine_lock
         with engine_lock(f"crit eval {args.command}"):
             return _command(args)
     return _command(args)
 
 
-# Commands that load an engine or the reference model: one at a time per machine (crit_core.machine).
+# Commands that load an engine or the reference model: one at a time per machine (crit_core.machine); run only
+# with --adapter.
 ENGINE_COMMANDS = {"run", "pin", "ab", "kernels", "reference"}
 
 
@@ -144,10 +153,16 @@ def _command(args):
     if args.command == "prepare":
         from .prepare import prepare as do_prepare
         prepared = do_prepare(args.model, args.data)
-        print(f"prepared {len(prepared['speed'])} speed cases and {len(prepared['quality'])} quality conversations in {args.data}")
+        print(f"prepared {len(prepared['speed'])} speed cases and {len(prepared['quality'])} quality prompts in {args.data}")
         return 0
     if args.command == "reference":
-        return _reference(args.model, args.data)
+        from . import load_json as load
+        from .reference import score_result
+        from .status import render
+        result = score_result(args.model, args.data, args.result, load(args.baseline) if args.baseline else None)
+        print(f"wrote {args.result}")
+        print(render(result["status"]))
+        return 0
     if args.command == "context":
         from . import load_json as load
         from .context import GIB, max_context, render as render_context
@@ -192,15 +207,12 @@ def _command(args):
         print(json.dumps(current, indent=1) if args.json else render(current))
         return 0
     from .prepare import PREPARED
-    from .reference import REFERENCE
     from .runner import run as do_run
     parts = tuple(args.only or PARTS)
     data = Path(args.data)
     if not (data / PREPARED).is_file():
         from .prepare import prepare as do_prepare
         do_prepare(args.model, data)
-    if "quality" in parts and not (data / REFERENCE).is_file():
-        _reference(args.model, data)
     from . import load_json as load
     from .status import render
     device = load(args.device) if args.device else None
@@ -211,12 +223,15 @@ def _command(args):
                     exactness=args.exactness, context_tokens=args.context,
                     vram_headroom_bytes=round(headroom_gib(args) * (1 << 30)),
                     context_reserve_bytes=round(reserve_gib(args) * (1 << 30)) if reserve_gib(args) is not None else None,
-                    abort_disturbed=not args.keep_disturbed)
+                    abort_disturbed=not args.keep_disturbed, url=args.url, served_model=args.served_model)
     print(f"wrote {args.out}")
     if result.get("aborted"):
         print(f"aborted: {result['aborted']['detail']}")
         return 3
     print(render(result["status"]))
+    if (result.get("quality") or {}).get("status") == "replied":
+        print(f"quality: stop the engine, then score its replies: crit eval reference --model {args.model} --data {args.data} "
+              f"--result {args.out}" + (f" --baseline {args.baseline}" if args.baseline else ""))
     return 0
 
 
@@ -235,12 +250,3 @@ def reserve_gib(args):
 def context_settings(settings, args):
     reserve = reserve_gib(args)
     return settings if reserve is None else {**settings, "reserve_gib": reserve}
-
-
-def _reference(model, data):
-    from . import load_json
-    from .reference import build_reference
-    protocol = load_json(Path(__file__).resolve().parents[1] / "protocol.json")
-    out = build_reference(model, data, protocol["quality"]["top_k"])
-    print(f"reference perplexity {out['perplexity']:.4f} over {sum(len(c['targets']) for c in out['conversations'])} targets")
-    return 0

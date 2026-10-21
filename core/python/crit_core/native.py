@@ -18,14 +18,19 @@ The factory receives a JSON object: the adapter's configuration plus "model" (th
 Eval asks for plain one-token decoding on a second engine; an engine declaring "plain" decodes it per request).
 """
 import ctypes
+import copy
+import threading
+from contextlib import contextmanager, nullcontext
 import json
 from pathlib import Path
 
-from crit_core.serving import SAMPLING, ResidentChat, chat_prompt  # noqa: F401  (chat_prompt is re-exported)
+from crit_core.serving import SAMPLING, TOP_LOGPROBS, ResidentChat, chat_prompt  # noqa: F401  (chat_prompt is re-exported)
 
 ABI = 1
 RESULT_BYTES = 1 << 20  # a generation's result JSON: finish, timing and the engine's request facts
 TOKEN_CALLBACK = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_int)
+OUTPUT_CALLBACK = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int32, ctypes.c_float,
+                                   ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float), ctypes.c_int)
 PENALTY, PENALTIES = "penalties", {"repetition_penalty", "presence_penalty", "frequency_penalty"}
 FACTS = ("draft_width", "bytes_per_pass", "draft_bytes_per_step", "draft_ms", "kv_bytes_per_token", "kernel_work")
 
@@ -59,6 +64,29 @@ class NativeEngine:
                                           ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
                                           ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int)]
         lib.crit_engine_last_error.restype = ctypes.c_char_p
+        self._condition = threading.Condition()
+        self._serial = threading.RLock()
+        self._active = 0
+        self._closing = False
+        self._requests = hasattr(lib, "crit_engine_request_open")
+        if self._requests:
+            lib.crit_engine_request_open.restype = ctypes.c_void_p
+            lib.crit_engine_request_open.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                                                    ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
+            for name in ("cancel", "close"):
+                function = getattr(lib, "crit_engine_request_" + name)
+                function.restype = None
+                function.argtypes = [ctypes.c_void_p]
+            lib.crit_engine_request_wait.restype = ctypes.c_int
+            lib.crit_engine_request_wait.argtypes = [ctypes.c_void_p, TOKEN_CALLBACK, ctypes.c_void_p,
+                                                    ctypes.POINTER(ctypes.c_int32), ctypes.c_char_p, ctypes.c_int]
+        # Per-token log-probabilities (libraries built against a header that exports request_wait_output).
+        self.outputs = self._requests and hasattr(lib, "crit_engine_request_wait_output")
+        if self.outputs:
+            lib.crit_engine_request_wait_output.restype = ctypes.c_int
+            lib.crit_engine_request_wait_output.argtypes = [ctypes.c_void_p, OUTPUT_CALLBACK, ctypes.c_void_p,
+                                                           ctypes.POINTER(ctypes.c_int32), ctypes.c_char_p,
+                                                           ctypes.c_int]
         self.lib = lib
         self.handle = lib.crit_engine_open(json.dumps(configuration).encode("utf-8"))
         if not self.handle:
@@ -80,13 +108,35 @@ class NativeEngine:
         """ModelInfo fields (implementation, context, stop_tokens, score_paths, ...) plus the factory's facts."""
         return dict(self.facts)
 
-    def generate(self, prompt, output_tokens, *, stop_tokens=None, sampling=None, replay=None, plain=False,
-                 on_tokens=None, cancelled=None):
+    @contextmanager
+    def _lease(self):
+        with self._condition:
+            if self._closing or not self.handle:
+                raise NativeError("engine is closed")
+            self._active += 1
+        try:
+            concurrent = self._requests and self.facts.get("max_concurrent_requests", 1) > 1
+            with nullcontext() if concurrent else self._serial:
+                yield
+        finally:
+            with self._condition:
+                self._active -= 1
+                self._condition.notify_all()
+
+    def generate(self, prompt, output_tokens, **options):
+        with self._lease():
+            return self._generate(prompt, output_tokens, **options)
+
+    def _generate(self, prompt, output_tokens, *, stop_tokens=None, sampling=None, replay=None, plain=False,
+                 logprobs=None, on_tokens=None, cancelled=None):
         """Returns (tokens, result) with result's "finish", "timing" (ms, decode_steps) and the engine's request
         facts, or (None, {"cancelled": True}) when cancelled() turned true. stop_tokens None keeps the model's;
         [] disables them. sampling: temperature, top_p, top_k, min_p, seed, penalties and logit_bias.
-        plain: decode without drafting (engines
-        that declare "plain")."""
+        plain: decode without drafting (engines that declare "plain"). logprobs n: on_tokens(tokens, rows) gets one
+        (logprob, [(token, logprob), ...n alternatives]) row per token (engines whose info reports token_logprobs
+        and max_top_logprobs >= n)."""
+        if cancelled and cancelled():
+            return None, {"cancelled": True}
         options = dict(sampling or {})
         if stop_tokens is not None:
             options["stop_tokens"] = [int(t) for t in stop_tokens]
@@ -94,33 +144,84 @@ class NativeEngine:
             options["replay"] = [int(t) for t in replay]
         if plain:
             options["plain"] = True
+        if logprobs is not None:
+            if not self.outputs:
+                raise NativeError(f"{self.path} has no per-token log-probabilities: rebuild it against this crit's "
+                                  "crit/native_engine.h")
+            options["logprobs"] = int(logprobs)
         failure = []
 
-        def deliver(_user, tokens, count):
+        def guarded(publish):
             try:
+                if cancelled and cancelled():
+                    return 1
                 if on_tokens:
-                    on_tokens([tokens[i] for i in range(count)])
+                    publish()
                 return 1 if cancelled and cancelled() else 0
             except BaseException as error:  # never unwind through C; re-raised below
                 failure.append(error)
                 return 1
 
-        callback = TOKEN_CALLBACK(deliver)
+        def deliver(_user, tokens, count):
+            return guarded(lambda: on_tokens([tokens[i] for i in range(count)]))
+
+        def deliver_output(_user, token, logprob, top_tokens, top_logprobs, count):
+            return guarded(lambda: on_tokens([token], [(logprob, [(top_tokens[i], top_logprobs[i])
+                                                                  for i in range(count)])]))
+
+        callback = TOKEN_CALLBACK(deliver) if logprobs is None else OUTPUT_CALLBACK(deliver_output)
         ids = (ctypes.c_int32 * len(prompt))(*prompt)
         out = (ctypes.c_int32 * max(1, output_tokens))()
         result = ctypes.create_string_buffer(RESULT_BYTES)
-        count = self.lib.crit_engine_generate(self.handle, ids, len(prompt), int(output_tokens),
-                                              json.dumps(options).encode("utf-8"), callback, None, out, result,
-                                              RESULT_BYTES)
+        encoded = json.dumps(options).encode("utf-8")
+        if self._requests:
+            request = self.lib.crit_engine_request_open(self.handle, ids, len(prompt), int(output_tokens), encoded)
+            if not request:
+                raise NativeError("generation failed: " + self._error())
+            done = threading.Event()
+            monitor = None
+
+            def watch():
+                while not done.is_set():
+                    try:
+                        stop = cancelled()
+                    except BaseException as error:
+                        failure.append(error)
+                        stop = True
+                    if stop:
+                        self.lib.crit_engine_request_cancel(request)
+                        return
+                    done.wait(0.01)
+
+            try:
+                if cancelled:
+                    monitor = threading.Thread(target=watch, name="crit-native-cancel", daemon=True)
+                    monitor.start()
+                wait = self.lib.crit_engine_request_wait if logprobs is None else self.lib.crit_engine_request_wait_output
+                count = wait(request, callback, None, out, result, RESULT_BYTES)
+                error = self._error() if count < 0 else ""
+            finally:
+                done.set()
+                if monitor is not None and monitor.ident is not None:
+                    monitor.join()
+                self.lib.crit_engine_request_close(request)
+        else:
+            count = self.lib.crit_engine_generate(self.handle, ids, len(prompt), int(output_tokens),
+                                                 encoded, callback, None, out, result, RESULT_BYTES)
+            error = self._error() if count < 0 else ""
         if failure:
             raise failure[0]
         if count == -2:
             return None, {"cancelled": True}
         if count < 0:
-            raise NativeError("generation failed: " + self._error())
+            raise NativeError("generation failed: " + error)
         return [out[i] for i in range(count)], json.loads(result.value.decode("utf-8"))
 
     def score(self, ids, first_target, path="", queries=None):
+        with self._lease():
+            return self._score(ids, first_target, path, queries)
+
+    def _score(self, ids, first_target, path="", queries=None):
         """(target log-probabilities, query log-probability rows or None, argmax or None) for every target
         ids[i], i >= first_target. queries: one row of token ids per target, all the same length."""
         targets = len(ids) - first_target
@@ -142,14 +243,29 @@ class NativeEngine:
         return list(target), rows, (list(argmax) if has_argmax.value else None)
 
     def close(self):
-        if self.handle:
-            self.lib.crit_engine_close(self.handle)
-            self.handle = None
+        with self._condition:
+            self._closing = True
+            while self._active:
+                self._condition.wait()
+            if self.handle:
+                self.lib.crit_engine_close(self.handle)
+                self.handle = None
+
+
+def decode_rounds(tokens, result, speculative):
+    """Target passes after prefill: the engine's own count, else one per accepted entry, else Core's decode steps
+    (which also count steps that run no target pass, such as seeding a drafter); one per token after the first
+    without drafting."""
+    if "rounds" in result:
+        return result["rounds"]
+    if "accepted" in result:
+        return len(result["accepted"])
+    return result["timing"]["decode_steps"] if speculative else max(0, len(tokens) - 1)
 
 
 class EvalEngine:
-    """eval-v1 (docs/eval/ADAPTER.md) over a native engine: greedy generation with stop tokens disabled, the
-    engine's scoring paths, replay when the engine declares it, and its headroom facts."""
+    """eval-v1 (docs/eval/ADAPTER.md) over a native engine: greedy generation with stop tokens disabled, replay
+    and plain decoding when the engine declares them, and its headroom facts."""
 
     def __init__(self, context, library, defaults=None):
         configuration = {**(defaults or {}), **(context.get("config") or {})}
@@ -172,22 +288,13 @@ class EvalEngine:
     def info(self):
         info = {"name": self.facts.get("name") or self.facts["implementation"], "configuration": self.configuration,
                 "max_context": self.facts["context"], "speculative": self.speculative,
-                "score_paths": self.facts.get("score_paths") or ["prefill"],
                 "native_libraries": [str(self.native.path)], "replay": bool(self.facts.get("replay")),
                 "plain": bool(self.speculative and self.facts.get("plain"))}
         info.update({key: self.facts[key] for key in FACTS if key in self.facts})
         return info
 
     def _result(self, tokens, result):
-        # Rounds are target passes after prefill: the engine's own count, else one per accepted entry, else Core's
-        # decode steps (which also count steps that run no target pass, such as seeding a drafter).
-        if "rounds" in result:
-            rounds = result["rounds"]
-        elif "accepted" in result:
-            rounds = len(result["accepted"])
-        else:
-            rounds = result["timing"]["decode_steps"] if self.speculative else max(0, len(tokens) - 1)
-        out = {"tokens": tokens, "rounds": rounds}
+        out = {"tokens": tokens, "rounds": decode_rounds(tokens, result, self.speculative)}
         out.update({key: result[key] for key in ("accepted", "verify_ms", "draft_ms") if key in result})
         return out
 
@@ -208,14 +315,6 @@ class EvalEngine:
                                               on_tokens=on_tokens)
         return self._result(tokens, result)
 
-    def score(self, ids, first_target, path, queries):
-        named = self.facts.get("score_paths") or []
-        target, rows, argmax = self.native.score(list(ids), int(first_target), path if named else "", queries)
-        out = {"target_logprobs": target, "query_logprobs": rows or [[] for _ in target]}
-        if argmax is not None:
-            out["argmax"] = argmax
-        return out
-
     def close(self):
         self.native.close()
 
@@ -223,7 +322,9 @@ class EvalEngine:
 class ResidentEngine(ResidentChat):
     """chat-resident-v1 (docs/SERVING.md) over a native engine: crit_core.serving.ResidentChat with the engine's
     stop tokens, context and the sampling fields its info declares ("sampling": {temperature, top_p, top_k, min_p,
-    seed, penalties, logit_bias}). Configuration "chat_template_kwargs" passes variables to the chat template."""
+    seed, penalties, logit_bias}), and token log-probabilities (chat-logprobs-v1) when its info reports
+    token_logprobs with max_top_logprobs of at least 20. Configuration "chat_template_kwargs" passes variables to the
+    chat template."""
 
     def __init__(self, context, library, defaults=None):
         configuration = {**(defaults or {}), **(context.configuration or {})}
@@ -235,23 +336,43 @@ class ResidentEngine(ResidentChat):
             native["context_tokens"] = int(limits["kv_tokens"])
         self.native = NativeEngine(library, native)
         self.facts = self.native.info()
+        self.max_concurrent_requests = (int(self.facts.get("max_concurrent_requests", 1))
+                                        if self.native._requests else 1)
+        self._owns_native = True
         self.capacity = min(int(self.facts["context"]), int(limits.get("kv_tokens") or self.facts["context"]))
         self.stop_ids = set(self.facts.get("stop_tokens") or [])
         support = self.facts.get("sampling") or {}
         self.sampling = tuple(key for key in SAMPLING if support.get(PENALTY if key in PENALTIES else key))
+        self.logprobs = bool(self.native.outputs and self.facts.get("token_logprobs")
+                             and int(self.facts.get("max_top_logprobs", 0)) >= TOP_LOGPROBS)
 
-    def generate_tokens(self, ids, max_new_tokens, sampling, on_tokens, cancelled):
+    def create_request(self, request):
+        # Share only the immutable tokenizer/configuration and the synchronized native
+        # engine. ResidentChat's parser discovery caches belong to this wrapper.
+        child = copy.copy(self)
+        child._owns_native = False
+        child.configuration = dict(self.configuration)
+        child.template_variables = dict(self.template_variables)
+        child.stop_ids = set(self.stop_ids)
+        child.kept_special = child.calls_format = None
+        child.__dict__.pop("_kept_cache", None)
+        child.__dict__.pop("_thinking", None)
+        return child
+
+    def generate_tokens(self, ids, max_new_tokens, sampling, on_tokens, cancelled, logprobs=None):
         tokens, result = self.native.generate(ids, max_new_tokens, on_tokens=on_tokens, sampling=sampling,
-                                              cancelled=cancelled)
+                                              logprobs=logprobs, cancelled=cancelled)
         if tokens is None:
             return None, {}
         timing = result["timing"]
         return tokens, {"prefill_tokens": timing["prefill_tokens"] - timing["reused_prompt_tokens"],
                         "prefill_ms": timing["prefill_ms"], "decode_ms": timing["decode_ms"],
-                        "first_token_ms": timing["first_token_ms"]}
+                        "first_token_ms": timing["first_token_ms"],
+                        "rounds": decode_rounds(tokens, result, bool(self.facts.get("speculative")))}
 
     def close(self):
-        self.native.close()
+        if self._owns_native:
+            self.native.close()
 
 
 def eval_engine(context, library, defaults=None):

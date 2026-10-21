@@ -1,10 +1,11 @@
 """Request sampling overrides reach the native call without changing resident defaults."""
 import threading
-import types
 import unittest
 from unittest.mock import Mock
 
+from core_text_fixtures import byte_level_json
 from crit_core.native import ResidentEngine
+from crit_core.text import TextStream, Tokenizer
 
 
 class NativeServingOptionsTests(unittest.TestCase):
@@ -20,11 +21,12 @@ class NativeServingOptionsTests(unittest.TestCase):
         engine.text = Mock()
         engine.text.templates = {}   # a template that teaches no registered tool-call format
         engine.text.encode_chat.return_value = [1, 2]
-        engine.text.text_stream.return_value = types.SimpleNamespace(
-            push=lambda tokens: types.SimpleNamespace(text="ok"), finish=lambda: types.SimpleNamespace(text=""))
+        engine.text.tokenizer = Tokenizer.from_bytes(byte_level_json())
+        engine.text.text_stream.side_effect = lambda ids, **options: TextStream(engine.text.tokenizer, ids, **options)
+        output = engine.text.tokenizer.encode("ok", add_special_tokens=False)
         def generate(ids, limit, **options):
-            options["on_tokens"]([3, 4])
-            return [3, 4], {"timing": {"prefill_tokens": 2, "reused_prompt_tokens": 0,
+            options["on_tokens"](output)
+            return output, {"timing": {"prefill_tokens": 2, "reused_prompt_tokens": 0,
                 "prefill_ms": 1, "decode_ms": 1, "first_token_ms": 1}}
         engine.native = Mock()
         engine.native.generate.side_effect = generate
@@ -34,11 +36,27 @@ class NativeServingOptionsTests(unittest.TestCase):
         engine = self.engine()
         request = {"messages": [{"role": "user", "content": "hi"}], "sampling": {
             "temperature": 0, "seed": 123, "frequency_penalty": .5, "logit_bias": {"12": -2}}}
-        engine._run(request, threading.Event())
+        self.assertEqual(engine._run(request, threading.Event())[0], "ok")
         self.assertEqual(engine.native.generate.call_args.kwargs["sampling"], request["sampling"])
         engine._run({"messages": request["messages"]}, threading.Event())
         self.assertEqual(engine.native.generate.call_args.kwargs["sampling"], {})
         self.assertEqual(engine.configuration, {"temperature": .8})
+
+    def test_decode_rounds_reach_the_reply_telemetry(self):
+        engine = self.engine()
+        output = engine.text.tokenizer.encode("okay then", add_special_tokens=False)
+        timing = {"prefill_tokens": 2, "reused_prompt_tokens": 0, "prefill_ms": 1, "decode_ms": 1,
+                  "first_token_ms": 1, "decode_steps": 7}
+        message = {"messages": [{"role": "user", "content": "hi"}]}
+        for speculative, facts, rounds in ((True, {"accepted": [3, 2]}, 2), (True, {"rounds": 4}, 4),
+                                           (True, {}, 7), (False, {}, len(output) - 1)):
+            with self.subTest(speculative=speculative, facts=facts):
+                def generate(ids, limit, **options):
+                    options["on_tokens"](output)
+                    return output, {"timing": timing, **facts}
+                engine.native.generate.side_effect = generate
+                engine.facts["speculative"] = speculative
+                self.assertEqual(engine._run(message, threading.Event())[1]["decode_rounds"], rounds)
 
     def test_unsupported_native_sampling_is_not_ignored(self):
         engine = self.engine()

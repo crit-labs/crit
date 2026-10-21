@@ -81,8 +81,9 @@ class ApiTests(ServeFixture, unittest.TestCase):
         self.assertEqual(value["choices"][0]["finish_reason"], "stop")
         self.assertEqual(value["usage"], {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14})
         self.assertEqual(value["crit_telemetry"]["decode_tps"], 300)
+        self.assertNotIn("tokens_per_round", value["crit_telemetry"])  # the engine reported no decode rounds
         self.assertEqual(value["model"], self.run_id + "/" + self.a)
-        self.assertEqual(list((self.served.runtime.root / "requests").iterdir()), [])
+        self.assertFalse((self.served.runtime.root / "requests").exists())
         response, value = self.chat(model=self.b)
         self.assertEqual(value["model"], self.run_id + "/" + self.b)
         self.assertEqual(json.loads(value["choices"][0]["message"]["content"])["calls"], 1)
@@ -104,6 +105,8 @@ class ApiTests(ServeFixture, unittest.TestCase):
         self.assertEqual(chunks[-2]["choices"][0]["finish_reason"], "stop")
         self.assertEqual(chunks[-1]["choices"], [])
         self.assertEqual(chunks[-1]["usage"]["completion_tokens"], 3)
+        self.assertEqual(chunks[-1]["crit_telemetry"]["tokens_per_round"], 3)  # 3 tokens over one decode round
+        self.assertNotIn("crit_telemetry", chunks[-2])
 
     def test_stop_sequences_end_the_engine_turn_early_and_keep_the_model_loaded(self):
         response, value = self.chat("words:alpha beta STOP gamma delta epsilon", stop=["STOP"])

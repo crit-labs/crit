@@ -134,7 +134,7 @@ class CalibrationTests(unittest.TestCase):
         texts = calibration.suite_texts()
         self.assertTrue(texts)
         quality = json.loads((ROOT / "eval/suite/quality.json").read_text(encoding="utf-8"))
-        quoted = quality["conversations"][0]["messages"][-1]["content"]
+        quoted = max((m["content"] for c in quality["conversations"] for m in c["messages"]), key=len)
         found = calibration.suite_overlap(["An unrelated document about rivers and maps.",
                                            "Notes:\n" + quoted + "\nend"], texts)
         self.assertEqual(found, [1])
@@ -376,6 +376,10 @@ class PtqTests(unittest.TestCase):
 
 @unittest.skipUnless(HAS_TORCH, "needs torch and safetensors")
 class EvaluationTests(unittest.TestCase):
+    status = {"gates": [{"name": "quality", "state": "pass"}],
+              "kpis": {"quality": {"passed": True, "worst_ppl_ratio": 1.01}, "decode": {"score": 90.0},
+                       "prefill": {"score": 900.0}, "ttft": {"score_ms": 12.0}}}
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -387,44 +391,37 @@ class EvaluationTests(unittest.TestCase):
                 device="cpu", log=lambda m: None)
         self.data = self.root / "data"
         self.data.mkdir()
-        (self.root / "adapter.py").write_text("def create_eval_engine(context):\n    raise RuntimeError\n")
 
     def prepared(self, model):
         from crit_eval.prepare import model_identity
-        write_json(self.data / "prepared.json", {"model": model_identity(model)})
+        self.model_sha256 = model_identity(model)["sha256"]
+        write_json(self.data / "prepared.json", {"model": model_identity(model), "suite_sha256": "suite"})
 
-    def evaluate(self, **options):
+    def result(self, **fields):
+        value = {"model_sha256": self.model_sha256, "suite_sha256": "suite", "adapter": None,
+                 "server": "http://127.0.0.1:8000/v1", "engine": {"name": "out"}, "status": self.status,
+                 "ended_at": "2026-10-21T00:00:00+00:00", **fields}
+        write_json(self.root / "result.json", {k: v for k, v in value.items() if v is not ...})
+
+    def evaluate(self):
         from crit_models.evaluate import evaluate
-        return evaluate(self.root / "transform.json", self.root / "adapter.py", self.data, self.root / "result.json",
-                        self.root / "evaluation.json", log=lambda m: None, **options)
+        return evaluate(self.root / "transform.json", self.data, self.root / "result.json",
+                        self.root / "evaluation.json", log=lambda m: None)
 
-    def test_eval_requires_the_source_models_data_and_reference(self):
+    def test_eval_requires_data_prepared_from_the_source_model(self):
         with self.assertRaisesRegex(ValueError, "prepare it from the source"):
             self.evaluate()
         self.prepared(self.root / "out")
         with self.assertRaisesRegex(ValueError, "another model than the source"):
             self.evaluate()
-        self.prepared(self.source)
-        with self.assertRaisesRegex(ValueError, "build it from the source"):
-            self.evaluate()
 
-    def test_eval_runs_the_output_and_records_the_result(self):
+    def test_eval_binds_the_served_result_to_the_transform(self):
         self.prepared(self.source)
-        (self.data / "reference.json").write_text("{}")
-        status = {"gates": [{"name": "quality", "state": "pass"}],
-                  "kpis": {"quality": {"passed": True, "worst_ppl_ratio": 1.01}, "decode": {"score": 90.0},
-                           "prefill": {"score": 900.0}, "ttft": {"score_ms": 12.0}}}
-
-        def fake_run(adapter, model, data, out, config, parts, **options):
-            self.assertEqual(Path(model), self.root / "out")
-            write_json(Path(out), {"status": status})
-            return {"status": status, "engine": {"configuration": {"applied": True}}}
-        with patch("crit_eval.runner.run", fake_run):
-            evaluation = self.evaluate(parts=["quality"])
+        self.result()
+        evaluation = self.evaluate()
+        self.assertEqual(evaluation["server"], {"url": "http://127.0.0.1:8000/v1", "model": "out"})
         self.assertEqual(evaluation["summary"]["gates"], {"quality": "pass"})
         self.assertEqual(evaluation["summary"]["decode_score"], 90.0)
-        self.assertEqual(evaluation["parts"], ["quality"])
-        self.assertEqual(evaluation["configuration"], {"applied": True})
         self.assertEqual(json.loads((self.root / "evaluation.json").read_text(encoding="utf-8")), evaluation)
         with self.assertRaisesRegex(ValueError, "already exists"):
             self.evaluate()
@@ -433,6 +430,31 @@ class EvaluationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "output differs"):
             self.evaluate()
 
+    def test_eval_refuses_other_data_adapter_and_unfinished_results(self):
+        self.prepared(self.source)
+        for fields, message in (({"suite_sha256": "other"}, "other prepared data"),
+                                ({"adapter": "adapter.py", "server": None}, "adapter's engine"),
+                                ({"aborted": {"reason": "disturbed"}}, "no finished Eval round"),
+                                ({"status": ...}, "no finished Eval round")):
+            with self.subTest(fields=fields):
+                self.result(**fields)
+                with self.assertRaisesRegex(ValueError, message):
+                    self.evaluate()
+        self.assertFalse((self.root / "evaluation.json").exists())
+
+    def test_eval_scores_the_outputs_quality_replies_on_the_source(self):
+        self.prepared(self.source)
+        self.result(quality={"status": "replied"}, status={"gates": [], "kpis": {}})
+        scored = []
+
+        def fake_score(model, data, path, baseline, log):
+            scored.append((Path(model).resolve(), Path(path)))
+            return {"server": "http://127.0.0.1:8000/v1", "engine": {"name": "out"},
+                    "quality": {"status": "scored"}, "status": self.status}
+        with patch("crit_eval.reference.score_result", fake_score):
+            evaluation = self.evaluate()
+        self.assertEqual(scored, [(self.source.resolve(), self.root / "result.json")])
+        self.assertEqual(evaluation["summary"]["gates"], {"quality": "pass"})
 
 if __name__ == "__main__":
     unittest.main()

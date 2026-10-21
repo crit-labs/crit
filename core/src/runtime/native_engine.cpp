@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -13,6 +14,12 @@ namespace {
 thread_local std::string last;
 
 struct Cancelled {};
+struct NativeRequest {
+    NativeEngine* native;
+    int output;
+    std::optional<std::uint32_t> logprobs;
+    Handle handle;
+};
 
 void fail(const char* what) noexcept {
     try {
@@ -137,7 +144,53 @@ RequestOptions request_options(const char* options_json) {
         if(options.context) throw std::invalid_argument("plain and replay exclude each other");
         options.context = std::make_shared<PlainDecoding>();
     }
+    if(const auto* v = root.find("logprobs"); v && !v->is_null()) {
+        const auto alternatives = v->u64();
+        if(alternatives > top_logprobs_limit) throw std::invalid_argument("logprobs exceeds top_logprobs_limit");
+        options.logprobs = std::uint32_t(alternatives);
+    }
     return options;
+}
+
+// One waiter's result: tokens into `out` (up to the request's output count), the result JSON (finish, Core's timing
+// and the factory's facts) into `result`. `wait(request, keep)` waits on the handle, passing each token to keep().
+template<class Wait>
+int settle(void* handle, std::int32_t* out, char* result, int capacity, Wait&& wait) noexcept {
+    try {
+        if(!handle || !out) throw std::invalid_argument("wait needs a request and output buffer");
+        auto& pending = *static_cast<NativeRequest*>(handle);
+        auto& native = *pending.native;
+        int written = 0;
+        Result r;
+        try {
+            r = wait(pending, [&](Token token) {
+                if(written < pending.output) out[written++] = token;
+            });
+        } catch(const Cancelled&) {
+            return -2;
+        }
+        const auto ms = [](std::uint64_t ns) { return number(double(ns) / 1e6); };
+        const auto& t = r.timing;
+        std::string text = std::string("{\"finish\":\"") + finish_name(r.finish) + "\",\"timing\":{\"queued_ms\":" + ms(t.queued_ns) +
+                           ",\"prefill_ms\":" + ms(t.prefill_ns) + ",\"first_token_ms\":" + ms(t.first_token_ns) +
+                           ",\"decode_ms\":" + ms(t.decode_ns) + ",\"total_ms\":" + ms(t.total_ns) +
+                           ",\"prefill_tokens\":" + std::to_string(t.prefill_tokens) +
+                           ",\"reused_prompt_tokens\":" + std::to_string(t.reused_prompt_tokens) +
+                           ",\"decode_steps\":" + std::to_string(t.decode_steps) +
+                           ",\"preemptions\":" + std::to_string(t.preemptions) +
+                           ",\"recovery_ms\":" + ms(t.recovery_ns) +
+                           ",\"recomputed_tokens\":" + std::to_string(t.recomputed_tokens) + "}}";
+        if(r.finish == Finish::cancelled) return -2;
+        text = merged(std::move(text), native.request);
+        if(native.result) text = merged(std::move(text), [&] { return native.result(r); });
+        copy(text, result, capacity);
+        return written;
+    } catch(const std::exception& error) {
+        fail(error.what());
+    } catch(...) {
+        fail("unknown generation failure");
+    }
+    return -1;
 }
 }  // namespace
 
@@ -145,6 +198,8 @@ void* open(NativeFactory factory, const char* configuration_json) noexcept {
     try {
         auto native = std::make_unique<NativeEngine>(factory(configuration_json ? configuration_json : "{}"));
         if(!native->engine) throw std::runtime_error("the engine factory returned no engine");
+        if(native->concurrent_requests && native->request)
+            throw std::invalid_argument("concurrent native engines require request-owned result facts");
         native->retain_owner();
         return native.release();
     } catch(const std::exception& error) {
@@ -176,6 +231,8 @@ int info(void* handle, char* out, int capacity) noexcept {
                            ",\"stop_tokens\":" + tokens(i.stop_tokens) + ",\"generation\":" + (i.generation ? "true" : "false") +
                            ",\"scoring\":" + (i.scoring ? "true" : "false") + ",\"query_scoring\":" + (i.query_scoring ? "true" : "false") +
                            ",\"request_context\":" + (i.request_context ? "true" : "false") +
+                           ",\"token_logprobs\":" + (i.token_logprobs ? "true" : "false") +
+                           ",\"max_top_logprobs\":" + std::to_string(i.max_top_logprobs) +
                            ",\"max_concurrency\":" + std::to_string(i.max_concurrency) + ",\"score_paths\":[";
         for(std::size_t p = 0; p < i.score_paths.size(); ++p) text += (p ? "," : "") + json_string(i.score_paths[p]);
         const auto& s = i.sampling;
@@ -184,7 +241,12 @@ int info(void* handle, char* out, int capacity) noexcept {
                 ",\"min_p\":" + (s.min_p ? "true" : "false") +
                 ",\"penalties\":" + (s.penalties ? "true" : "false") +
                 ",\"logit_bias\":" + (s.logit_bias ? "true" : "false") + "}}";
-        return copy(merged(std::move(text), native.info), out, capacity);
+        text = merged(std::move(text), native.info);
+        const auto profile = native.engine->profile();
+        text.pop_back();
+        text += ",\"request_handles\":true,\"max_concurrent_requests\":" +
+                std::to_string(native.concurrent_requests ? profile.max_concurrency + profile.max_pending : 1) + "}";
+        return copy(text, out, capacity);
     } catch(const std::exception& error) {
         fail(error.what());
     } catch(...) {
@@ -193,39 +255,70 @@ int info(void* handle, char* out, int capacity) noexcept {
     return -1;
 }
 
-int generate(void* handle, const std::int32_t* prompt, int count, int output_tokens, const char* options_json,
-             TokenCallback callback, void* user, std::int32_t* out, char* result, int capacity) noexcept {
+void* request_open(void* handle, const std::int32_t* prompt, int count, int output_tokens,
+                   const char* options_json) noexcept {
     try {
         auto& native = engine_of(handle);
-        if(!prompt || count <= 0 || output_tokens <= 0 || !out) throw std::invalid_argument("generate needs a prompt, an output count and an output buffer");
-        auto request = native.engine->submit(std::vector<Token>(prompt, prompt + count), std::uint32_t(output_tokens),
-                                             request_options(options_json));
-        int written = 0;
-        Result r;
-        try {
-            r = request.wait([&](Token token) {
-                if(written < output_tokens) out[written++] = token;
-                if(callback && callback(user, &token, 1)) throw Cancelled{};
-            });
-        } catch(const Cancelled&) {
-            return -2;
-        }
-        const auto ms = [](std::uint64_t ns) { return number(double(ns) / 1e6); };
-        const auto& t = r.timing;
-        std::string text = std::string("{\"finish\":\"") + finish_name(r.finish) + "\",\"timing\":{\"queued_ms\":" + ms(t.queued_ns) +
-                           ",\"prefill_ms\":" + ms(t.prefill_ns) + ",\"first_token_ms\":" + ms(t.first_token_ns) +
-                           ",\"decode_ms\":" + ms(t.decode_ns) + ",\"total_ms\":" + ms(t.total_ns) +
-                           ",\"prefill_tokens\":" + std::to_string(t.prefill_tokens) +
-                           ",\"reused_prompt_tokens\":" + std::to_string(t.reused_prompt_tokens) +
-                           ",\"decode_steps\":" + std::to_string(t.decode_steps) + "}}";
-        copy(merged(std::move(text), native.request), result, capacity);
-        return written;
-    } catch(const std::exception& error) {
-        fail(error.what());
-    } catch(...) {
-        fail("unknown generation failure");
-    }
-    return -1;
+        if(!prompt || count <= 0 || output_tokens <= 0)
+            throw std::invalid_argument("generate needs a prompt and an output count");
+        auto request = std::make_unique<NativeRequest>();
+        request->native = &native;
+        request->output = output_tokens;
+        auto options = request_options(options_json);
+        request->logprobs = options.logprobs;
+        request->handle = native.engine->submit(std::vector<Token>(prompt, prompt + count),
+                                                std::uint32_t(output_tokens), std::move(options));
+        return request.release();
+    } catch(const std::exception& error) { fail(error.what()); }
+    catch(...) { fail("unknown request submission failure"); }
+    return nullptr;
+}
+void request_cancel(void* request) noexcept {
+    if(request) static_cast<NativeRequest*>(request)->handle.cancel();
+}
+void request_close(void* request) noexcept { delete static_cast<NativeRequest*>(request); }
+
+int request_wait(void* handle, TokenCallback callback, void* user, std::int32_t* out,
+                 char* result, int capacity) noexcept {
+    return settle(handle, out, result, capacity, [&](NativeRequest& request, auto&& keep) {
+        return request.handle.wait([&](Token token) {
+            keep(token);
+            if(callback && callback(user, &token, 1)) throw Cancelled{};
+        });
+    });
+}
+
+int request_wait_output(void* handle, OutputCallback callback, void* user, std::int32_t* out,
+                        char* result, int capacity) noexcept {
+    return settle(handle, out, result, capacity, [&](NativeRequest& request, auto&& keep) {
+        if(!request.logprobs) throw std::invalid_argument("request_wait_output needs a request opened with logprobs");
+        // The alternatives as two arrays, so the callback needs no struct layout.
+        std::vector<std::int32_t> top_ids;
+        std::vector<float> top_values;
+        top_ids.reserve(*request.logprobs);
+        top_values.reserve(*request.logprobs);
+        return request.handle.wait_output([&](const OutputEvent& event) {
+            keep(event.token);
+            top_ids.clear();
+            top_values.clear();
+            for(const auto& alternative:event.top_logprobs) {
+                top_ids.push_back(alternative.token);
+                top_values.push_back(alternative.logprob);
+            }
+            if(callback && callback(user, event.token, event.logprob.value_or(0.F), top_ids.data(), top_values.data(),
+                                    int(top_ids.size())))
+                throw Cancelled{};
+        });
+    });
+}
+
+int generate(void* engine, const std::int32_t* prompt, int count, int output_tokens, const char* options_json,
+             TokenCallback callback, void* user, std::int32_t* out, char* result, int capacity) noexcept {
+    auto* request = request_open(engine, prompt, count, output_tokens, options_json);
+    if(!request) return -1;
+    const int code = request_wait(request, callback, user, out, result, capacity);
+    request_close(request);
+    return code;
 }
 
 int score(void* handle, const std::int32_t* ids, int count, int first_target, const char* path,

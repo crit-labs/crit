@@ -13,8 +13,9 @@ from crit_core.text import StopMatcher, TextError, message_content
 from .disconnect import ClientDisconnect
 from .delivery import StreamDelivery
 from .engine import CONSTRAINTS_CAPABILITY, EngineError
-from .options import (RequestError, SAMPLING, TOOLS_CAPABILITY, TOOL_STREAM_CAPABILITY, require, sampling_capability,
-                      sampling_options, tool_calls, tool_options)
+from .logprobs import logprob_options
+from .options import (RequestError, SAMPLING, TOOLS_CAPABILITY, TOOL_STREAM_CAPABILITY, complete_arguments, require,
+                      sampling_capability, sampling_options, tool_calls, tool_options)
 
 MAX_BODY = 8 * 1024 * 1024
 MAX_STOPS = 4
@@ -22,11 +23,10 @@ DEFAULT_MAX_TOKENS = 1024
 # Only non-generation metadata is accepted without applying it.
 IGNORED = {"user", "metadata", "store", "service_tier"}
 UNSUPPORTED = {"functions": "legacy function calls (use tools)",
-               "function_call": "function calls",
-               "logprobs": "logprobs", "top_logprobs": "logprobs", "audio": "audio output",
+               "function_call": "function calls", "audio": "audio output",
                "reasoning_effort": "reasoning effort", "prediction": "predicted output", "modalities": "modalities"}
 KNOWN = {"model", "messages", "stream", "stream_options", "max_tokens", "max_completion_tokens", "stop", "n",
-         "response_format", "tools", "tool_choice", "parallel_tool_calls"} | SAMPLING
+         "response_format", "tools", "tool_choice", "parallel_tool_calls", "logprobs", "top_logprobs"} | SAMPLING
 
 
 def content_text(content, index, capabilities=()):
@@ -189,8 +189,7 @@ class Api:
         if not isinstance(body, dict):
             raise RequestError("The request body must be a JSON object")
         for key, feature in UNSUPPORTED.items():
-            if key in body and body[key] is not None and not (
-                    (key == "logprobs" and body[key] is False) or (key == "top_logprobs" and body[key] == 0)):
+            if key in body and body[key] is not None:
                 raise RequestError(f"This engine does not support {feature} yet", param=key, code="unsupported_parameter")
         if type(body.get("n", 1)) is not int or body.get("n", 1) != 1:
             raise RequestError("This engine returns one choice per request", param="n")
@@ -200,6 +199,10 @@ class Api:
         spec = self.engine.spec(candidate)
         capabilities = spec["capabilities"]
         sampling = sampling_options(body, capabilities)
+        logprobs = logprob_options(body, capabilities)
+        if logprobs is not None and body.get("stop"):
+            # The turn is cancelled where a stop string completes, before the engine reports its tokens.
+            raise RequestError("Stop strings cannot be combined with logprobs", param="stop")
         tools = tool_options(body, capabilities)
         constraint = response_format(body.get("response_format"))
         if constraint and CONSTRAINTS_CAPABILITY not in self.engine.spec(candidate)["capabilities"]:
@@ -224,7 +227,8 @@ class Api:
         return {"candidate": candidate, "model": self.model if candidate == self.engine.default else self.engine.model_id(candidate),
                 "messages": messages, "max_tokens": limit, "stream": bool(body.get("stream")),
                 "include_usage": bool(options.get("include_usage")), "stop": stops(body.get("stop")),
-                "response_format": constraint, "sampling": sampling, "tool_options": tools, "ignored": ignored}
+                "response_format": constraint, "sampling": sampling, "tool_options": tools, "logprobs": logprobs,
+                "ignored": ignored}
 
     def candidate(self, model):
         """The candidate a request's model names: RUN_ID/CANDIDATE_ID or a bare candidate ID. Any other name (clients
@@ -269,7 +273,8 @@ class Api:
 
     def run(self, request, emit, cancel, emit_tools=None, emit_reasoning=None, on_started=None):
         """Generate; emit receives text, emit_tools indexed deltas, emit_reasoning reasoning text (apart from the
-        reply). Returns (finish_reason, measured, calls, reasoning).
+        reply). Returns (finish_reason, measured, calls, reasoning, logprobs), logprobs being OpenAI's logprobs
+        content when the request asked for it.
         Stop strings follow
         Core's rule (crit_core.text.StopMatcher): the first stop to complete wins, and only text that could still
         begin a stop is held back."""
@@ -282,7 +287,7 @@ class Api:
                 emit_reasoning(text)
 
         def progress(text):
-            piece = scanner.advance(text)
+            piece = scanner.push(text)
             if piece:
                 emit(piece)
             if scanner.stopped is not None:
@@ -298,12 +303,13 @@ class Api:
                                                                sampling=request["sampling"], tool_options=request["tool_options"],
                                                                on_tools=emit_tools if tool_incremental else None,
                                                                on_reasoning=reasoned if request["stream"] else None,
-                                                               on_started=on_started)
+                                                               on_started=on_started, logprobs=request.get("logprobs"))
         except (ValueError, OSError) as exc:
             raise EngineError(str(exc)) from exc
         if status == "completed":
             calls = assistant.get("tool_calls") if isinstance(assistant, dict) else None
             reasoning = assistant.get("reasoning", "") if isinstance(assistant, dict) else ""
+            logprobs = assistant.get("logprobs") if isinstance(assistant, dict) else None
             assistant = assistant["content"] if isinstance(assistant, dict) else assistant
             sent = "".join(streamed)
             if not reasoning.startswith(sent):
@@ -325,10 +331,11 @@ class Api:
             if calls:
                 if emit_tools and not tool_incremental:
                     emit_tools([dict(call, index=i) for i, call in enumerate(calls)])
-                return "tool_calls", measured, calls, reasoning
-            return finish, measured, [], reasoning
+                # A call the output limit cut keeps the arguments written so far, and the reply finishes as cut.
+                return ("tool_calls" if complete_arguments(calls[-1]) else "length"), measured, calls, reasoning, logprobs
+            return finish, measured, [], reasoning, logprobs
         if scanner.stopped is not None:
-            return "stop", None, [], "".join(streamed)
+            return "stop", None, [], "".join(streamed), None
         if status == "timed_out":
             raise EngineError("The engine did not finish within the request timeout", 504)
         raise EngineError("Request cancelled", 499)
@@ -336,12 +343,14 @@ class Api:
     def telemetry(self, measured):
         if measured is None:
             return None
-        return {key: measured[key] for key in ("prompt_tokens", "output_tokens", "prefill_tps", "decode_tps", "ttft_ms")}
+        return {key: measured[key] for key in ("prompt_tokens", "output_tokens", "prefill_tps", "decode_tps", "ttft_ms",
+                                               "tokens_per_round") if key in measured}
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "crit-serve"
     protocol_version = "HTTP/1.1"
+    disable_nagle_algorithm = True  # each streamed chunk leaves at once, not after the client's delayed ACK
 
     @property
     def api(self):
@@ -442,13 +451,13 @@ class Handler(BaseHTTPRequestHandler):
     def complete(self, request, cancel):
         pieces = []
         try:
-            finish, measured, calls, reasoning = self.api.run(request, pieces.append, cancel)
+            finish, measured, calls, reasoning, logprobs = self.api.run(request, pieces.append, cancel)
         except EngineError as exc:
             return self.error(exc.status, str(exc), "server_error" if exc.status >= 500 else "invalid_request_error")
         value = {"id": "chatcmpl-" + uuid.uuid4().hex, "object": "chat.completion", "created": int(time.time()),
                  "model": request["model"], "system_fingerprint": self.api.engine.spec(request["candidate"])["package_sha256"][:16],
                  "choices": [{"index": 0, "message": {"role": "assistant", "content": "".join(pieces)},
-                              "logprobs": None, "finish_reason": finish}]}
+                              "logprobs": None if logprobs is None else {"content": logprobs}, "finish_reason": finish}]}
         if calls:
             value["choices"][0]["message"].update(content="".join(pieces) or None, tool_calls=calls)
         if reasoning:
@@ -488,25 +497,29 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 cancel.set()  # The client went away: stop the engine.
 
-        def chunk(delta, finish=None, usage=None, choices=True):
+        def chunk(delta, finish=None, usage=None, choices=True, logprobs=None, telemetry=None):
             value = {"id": ident, "object": "chat.completion.chunk", "created": created, "model": request["model"],
                      "system_fingerprint": fingerprint,
-                     "choices": [{"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish}] if choices else []}
+                     "choices": [{"index": 0, "delta": delta, "logprobs": None if logprobs is None else {"content": logprobs},
+                                  "finish_reason": finish}] if choices else []}
             if usage is not None or (request["include_usage"] and not choices):
                 value["usage"] = usage
+            if telemetry is not None:
+                value["crit_telemetry"] = telemetry
             return value
 
         event(chunk({"role": "assistant", "content": ""}))
         try:
-            finish, measured, _, _ = self.api.run(request, lambda piece: event(chunk({"content": piece})), cancel,
-                lambda deltas: event(chunk({"tool_calls": deltas})),
+            finish, measured, _, _, logprobs = self.api.run(request, lambda piece: event(chunk({"content": piece})),
+                cancel, lambda deltas: event(chunk({"tool_calls": deltas})),
                 lambda piece: event(chunk({"reasoning_content": piece})), on_started=on_started)
         except EngineError as exc:
             event({"error": {"message": str(exc), "type": "server_error", "param": None, "code": None}})
         else:
-            event(chunk({}, finish))
+            # Text streams as the engine emits it; the reply's logprobs come from its final record, with the finish chunk.
+            event(chunk({}, finish, logprobs=logprobs))
             if request["include_usage"]:
-                event(chunk({}, usage=self.api.usage(measured), choices=False))
+                event(chunk({}, usage=self.api.usage(measured), choices=False, telemetry=self.api.telemetry(measured)))
         try:
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()

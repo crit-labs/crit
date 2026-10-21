@@ -17,13 +17,16 @@ closing marker is all reasoning. Whitespace around the markers belongs to the fo
 from typing import NamedTuple
 
 from .errors import TextError
+from .markers import MarkerBuffer, marker_ids
 
 
 class ReasoningFormat(NamedTuple):
     """A reasoning syntax: the literal markers around the thinking. A tokenizer may hold them as special tokens, which
-    the reply text then has to keep (ResidentChat does)."""
+    the reply text then has to keep (ResidentChat does). `delimiters="auto"` uses token identity for single special
+    tokens when a tokenizer is supplied; `delimiters="text"` always matches their spelling."""
     opening: str
     closing: str
+    delimiters: str = "auto"
 
 
 REASONING_FORMATS = {
@@ -53,24 +56,19 @@ def template_reasoning_format(sources):
     return found.pop() if found else None
 
 
-def _held(buffer, marker):
-    """Length of the buffer's suffix that could still start `marker`."""
-    for size in range(min(len(buffer), len(marker) - 1), 0, -1):
-        if marker.startswith(buffer[-size:]):
-            return size
-    return 0
-
-
 class ReasoningSplitter:
     """Incremental split of reply text into ("reasoning", str) and ("text", str) events.
 
     `opened`: the generation prompt already ends with the opening marker, so the reply starts inside the reasoning.
-    Text that could still be a marker is held back, and so is whitespace that may turn out to sit next to one."""
+    Text that could still be a marker is held back, and so is whitespace that may turn out to sit next to one.
+    With `tokenizer`, special delimiters require TokenText events from MarkerDecoder. Text events preserve these
+    events for a downstream tool parser; reasoning events contain plain strings."""
 
-    def __init__(self, format, *, opened=False):
+    def __init__(self, format, *, opened=False, tokenizer=None):
         self.format = reasoning_format(format)
+        self.token_ids = marker_ids(tokenizer, (self.format.opening, self.format.closing), self.format.delimiters)
         self.state = "reasoning" if opened else "start"   # start -> reasoning -> text, or start -> text
-        self.buffer, self.finished, self._leading = "", False, True
+        self.buffer, self.finished, self._leading = MarkerBuffer(), False, True
 
     def _reasoning(self, text, events):
         if self._leading:
@@ -80,43 +78,43 @@ class ReasoningSplitter:
             self._leading = False
 
     def _text(self, text, events):
-        if text:
-            events.append(("text", text))
+        events.extend(("text", part) for part in text.parts())
 
     def push(self, text):
         if self.finished:
             raise TextError("the reasoning splitter has finished")
-        self.buffer += text
+        self.buffer.append(text)
         events = []
-        opening, closing = self.format
+        opening, closing = self.format.opening, self.format.closing
         if self.state == "start":
             stripped = self.buffer.lstrip()
-            if stripped.startswith(opening):
-                self.state, self.buffer = "reasoning", stripped[len(opening):]
-            elif not stripped or opening.startswith(stripped):
+            if stripped.find(opening, self.token_ids) == 0:
+                self.state, self.buffer = "reasoning", stripped.slice(len(opening))
+            elif not stripped.text or (opening not in self.token_ids and opening.startswith(stripped.text)):
                 return events   # still whitespace or a partial opening marker
             else:
                 self.state = "text"
         if self.state == "reasoning":
-            end = self.buffer.find(closing)
+            end = self.buffer.find(closing, self.token_ids)
             if end < 0:
-                keep = _held(self.buffer, closing)
-                ready = self.buffer[:len(self.buffer) - keep]
+                keep = self.buffer.held(closing, self.token_ids)
+                ready = self.buffer.text[:len(self.buffer.text) - keep]
                 keep += len(ready) - len(ready.rstrip())   # whitespace that may precede the closing marker
-                self._reasoning(self.buffer[:len(self.buffer) - keep], events)
-                self.buffer = self.buffer[len(self.buffer) - keep:]
+                end = len(self.buffer.text) - keep
+                self._reasoning(self.buffer.text[:end], events)
+                self.buffer = self.buffer.slice(end)
                 return events
-            self._reasoning(self.buffer[:end].rstrip(), events)
-            self.state, self.buffer = "after", self.buffer[end + len(closing):]
+            self._reasoning(self.buffer.text[:end].rstrip(), events)
+            self.state, self.buffer = "after", self.buffer.slice(end + len(closing))
         if self.state == "after":
             stripped = self.buffer.lstrip()
-            if not stripped:
-                self.buffer = ""
+            if not stripped.text:
+                self.buffer = MarkerBuffer()
                 return events
             self.state, self.buffer = "text", stripped
         if self.state == "text":
             self._text(self.buffer, events)
-            self.buffer = ""
+            self.buffer = MarkerBuffer()
         return events
 
     def finish(self):
@@ -124,10 +122,10 @@ class ReasoningSplitter:
         events = self.push("")
         self.finished = True
         if self.state == "reasoning":
-            self._reasoning(self.buffer.rstrip(), events)
+            self._reasoning(self.buffer.text.rstrip(), events)
         elif self.state == "start":
             self._text(self.buffer, events)
-        self.buffer = ""
+        self.buffer = MarkerBuffer()
         return events
 
 

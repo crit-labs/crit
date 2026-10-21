@@ -22,6 +22,17 @@
 #include <utility>
 
 namespace crit::core {
+namespace detail {
+struct RequestWakeup {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool changed=false;
+    void notify() {
+        { std::lock_guard lock(mutex); changed=true; }
+        cv.notify_one();
+    }
+};
+}
 namespace {
 using Clock = std::chrono::steady_clock;
 // Worker-private phase observations; folded into Result::timing at completion.
@@ -388,16 +399,17 @@ std::vector<RowProgress> ConcurrentModel::execute(std::span<const WorkItem>) {
 std::unique_ptr<BatchExecution> ConcurrentModel::prepare_batch(std::span<const WorkItem>) {
     throw std::logic_error("async_batches model must implement prepare_batch");
 }
+BatchPreparation ConcurrentModel::prepare_incremental(std::span<const WorkItem>) {
+    throw std::logic_error("memory_preemption model must implement prepare_incremental");
+}
+std::unique_ptr<Suspension> ConcurrentModel::suspend(const ContinuationView&, ConcurrentSession&) {
+    throw std::logic_error("memory_preemption model must implement suspend");
+}
+std::unique_ptr<Restoration> ConcurrentModel::restore(const ContinuationView&, const ResumeImage&) {
+    throw std::logic_error("memory_preemption model must implement restore");
+}
 struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
-    struct Wakeup {
-        std::mutex mutex;
-        std::condition_variable cv;
-        bool changed = false;
-        void notify() {
-            { std::lock_guard lock(mutex); changed = true; }
-            cv.notify_one();
-        }
-    };
+    using Wakeup = detail::RequestWakeup;
     Profile profile;
     // Native wrapper resources must outlive backend/model destruction, including quarantine.
     std::shared_ptr<void> native_owner;
@@ -416,15 +428,25 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
         std::shared_ptr<Request> request;
         std::unique_ptr<ConcurrentSession> session;
         std::unique_ptr<Retirement> receipt;
+        std::unique_ptr<Suspension> suspension;
+        std::unique_ptr<Restoration> restoration;
+        std::unique_ptr<ResumeImage> image;
+        Clock::time_point recovery_started;
+        std::uint64_t blocked_epoch = std::numeric_limits<std::uint64_t>::max();
         std::uint32_t frontier = 0;
         std::uint32_t prefill_wait_steps = 0;
         std::uint64_t prefix_affinity = 0;
-        bool prefilled = false, retiring = false, executing = false;
+        bool prefilled = false, retiring = false, terminal = false, frozen = false;
+        std::uint32_t executing = 0, reserved_output = 0, step_limit = 1;
+        std::uint64_t next_step = 1, publish_step = 1;
+        std::shared_ptr<StepContinuation> tail;
         Finish finish = Finish::length;
         std::chrono::steady_clock::time_point retirement_started;
         std::uint64_t trace_retirement = 0, trace_started = 0;
     };
     std::vector<Lane> lanes;
+    std::list<Lane> suspended;
+    std::uint64_t capacity_epoch = 0, pressure_owner = 0;
     std::vector<std::uint64_t> generations;
     std::vector<RowProgress*> row_lookup;
     struct PendingBatch {
@@ -460,6 +482,7 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
         if(!p.context || !p.prefill_chunk || p.prefill_chunk > p.context || !p.host_limit || !p.device_limit || !backend ||
            !p.max_concurrency || p.max_concurrency > max_request_concurrency || p.max_pending > 1024 ||
            !p.pending_timeout_ms || !p.retirement_timeout_ms || !p.prefill_starvation_steps ||
+           !p.max_request_steps || p.max_request_steps>64 || !p.max_step_output_tokens ||
            !p.max_admission_bypasses || !p.admission_starvation_ms || !p.batch_timeout_ms || p.max_inflight_batches>64 ||
            (p.max_inflight_batches && !p.max_batch_tokens) || p.admission_lookahead > max_request_concurrency + 1024 ||
            (p.admission_policy != AdmissionPolicy::fifo && p.admission_policy != AdmissionPolicy::reuse_aware) ||
@@ -484,6 +507,10 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
             detail::TraceScope span(trace_buffer,TracePhase::quiesce);
             std::exception_ptr failure;
             for(auto& batch:batches) if(batch.execution)try { batch.execution->quiesce(); } catch(...) { if(!failure)failure=std::current_exception(); }
+            for(auto& lane:lanes) {
+                try { if(lane.suspension) lane.suspension->quiesce(); } catch(...) { if(!failure) failure=std::current_exception(); }
+                try { if(lane.restoration) lane.restoration->quiesce(); } catch(...) { if(!failure) failure=std::current_exception(); }
+            }
             try { concurrent->quiesce(); } catch(...) { if(!failure)failure=std::current_exception(); }
             if(failure)std::rethrow_exception(failure);
         }
@@ -518,6 +545,9 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
         if((declaration.mixed_batches && (!concurrent || !declaration.decode_token_work)) ||
            (profile.max_batch_tokens && !declaration.mixed_batches))
             throw std::invalid_argument("mixed token work requires a capable concurrent model");
+        if(!declaration.prefill_work_quantum ||
+           (profile.max_batch_tokens && declaration.prefill_work_quantum>profile.max_batch_tokens))
+            throw std::invalid_argument("prefill work quantum must fit the mixed batch budget");
         validate_tokens(declaration.stop_tokens,declaration.vocabulary);
         if(profile.admission_policy == AdmissionPolicy::reuse_aware && (!concurrent || !declaration.scheduling_hints))
             throw std::invalid_argument("reuse-aware admission requires scheduling hints");
@@ -525,6 +555,11 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
             throw std::invalid_argument("latency chunk sizing requires prefill advice");
         if(profile.max_inflight_batches && (!concurrent || !declaration.async_batches || !declaration.mixed_batches))
             throw std::invalid_argument("execution pipeline requires async mixed batches");
+        if(profile.memory_preemption && (!profile.max_inflight_batches || !declaration.memory_preemption))
+            throw std::invalid_argument("memory preemption requires incremental async execution");
+        if(!declaration.max_request_steps || profile.max_request_steps>declaration.max_request_steps ||
+           (profile.max_request_steps>1 && !profile.max_inflight_batches))
+            throw std::invalid_argument("dependent steps require a capable async model");
         frontend = model->text_frontend();
         if(!declaration.max_concurrency || declaration.max_concurrency > max_request_concurrency || declaration.max_concurrency < profile.max_concurrency ||
            (!concurrent && (profile.max_concurrency != 1 || profile.max_pending)))
@@ -548,11 +583,12 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
         try { backend->bind_thread(); quiesce_model(); drain_backend(); } catch(...) {return false;}
         batches.clear(); // Release operation owners before their borrowed sessions.
         for(auto& lane:lanes) {
-            lane.receipt.reset();
+            lane.suspension.reset(); lane.restoration.reset(); lane.receipt.reset();
             if(lane.session) lane.session->close(Finish::failed);
             lane.session.reset();
             lane = Lane{};
         }
+        suspended.clear();
         waiting.clear();
         active_score.reset();
         if(retained_session) {retained_session->close(Finish::failed); retained_session.reset();}
@@ -598,7 +634,9 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
         r->cv.notify_all();
     }
     void begin_retirement(Lane& lane, Finish finish) {
-        lane.finish = finish;
+        lane.finish = finish; lane.terminal = true;
+        if(lane.executing) return; // Every submitted descendant must settle first.
+        lane.tail.reset();
         lane.retirement_started = std::chrono::steady_clock::now();
         if(trace_buffer.enabled()) {
             lane.trace_retirement=trace_buffer.operation(); lane.trace_started=trace_buffer.now();
@@ -610,7 +648,8 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
     }
     void poll_retirements() {
         for(auto& lane:lanes) if(lane.request) {
-            if(!lane.retiring && !lane.executing && *lane.request->cancelled) begin_retirement(lane,Finish::cancelled);
+            if(!lane.retiring && !lane.executing && !lane.suspension && !lane.restoration && (lane.terminal || *lane.request->cancelled))
+                begin_retirement(lane,lane.terminal ? lane.finish : Finish::cancelled);
             if(!lane.retiring) continue;
             if(lane.receipt->ready()) {
                 // Receipt destruction can reference the session; release it first.
@@ -620,15 +659,111 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
                     trace_buffer.write({0,lane.trace_retirement,now,lane.key,TracePhase::retirement,TraceMark::end,now-lane.trace_started});
                 }
                 const auto request=lane.request; const auto finish=lane.finish;
+                if(pressure_owner == request->id) pressure_owner = 0;
+                ++capacity_epoch;
                 lane = Lane{};
                 {
                     std::lock_guard lock(wakeup->mutex);
-                    busy=!waiting.empty() || std::any_of(lanes.begin(),lanes.end(),[](const auto& value){return bool(value.request);});
+                    busy=!waiting.empty() || !suspended.empty() || std::any_of(lanes.begin(),lanes.end(),[](const auto& value){return bool(value.request);});
                 }
                 complete(request,finish,std::move(request->failure));
             } else if(std::chrono::steady_clock::now()-lane.retirement_started >= std::chrono::milliseconds(profile.retirement_timeout_ms))
                 throw std::runtime_error("retirement deadline expired without settlement");
         }
+    }
+    ContinuationView continuation(const Lane& lane) const {
+        return {{lane.key,lane.request->prompt,lane.request->output,&lane.request->options},
+                lane.request->result.tokens,lane.frontier,lane.prefilled};
+    }
+    void poll_recovery() {
+        for(auto& lane:lanes) if(lane.request) {
+            if(lane.suspension && lane.suspension->ready()) {
+                lane.image = lane.suspension->take();
+                if(!lane.image) throw std::runtime_error("suspension returned no recovery image");
+                lane.suspension.reset(); lane.session.reset();
+                ++lane.request->result.timing.preemptions;
+                // Allocate the destination before transferring ownership.
+                suspended.emplace_back();
+                suspended.back() = std::move(lane); lane = Lane{};
+                ++capacity_epoch;
+            } else if(lane.restoration && lane.restoration->ready()) {
+                lane.session = lane.restoration->take();
+                if(!lane.session) throw std::runtime_error("restoration returned no session");
+                auto& timing = lane.request->result.timing;
+                timing.recomputed_tokens += lane.restoration->recomputed_tokens();
+                timing.recovery_ns += elapsed_ns(lane.recovery_started,Clock::now());
+                lane.restoration.reset(); lane.image.reset();
+                ++capacity_epoch;
+            } else if((lane.suspension || lane.restoration) &&
+                      Clock::now()-lane.recovery_started >= std::chrono::milliseconds(profile.batch_timeout_ms))
+                throw std::runtime_error("recovery deadline expired without settlement");
+        }
+        for(auto it=suspended.begin();it!=suspended.end();) {
+            if(*it->request->cancelled) {
+                const auto request=it->request;
+                it=suspended.erase(it); ++capacity_epoch;
+                complete(request,Finish::cancelled);
+            } else ++it;
+        }
+        // A resumed request owns the solo recovery route through its first new
+        // step; younger admissions cannot consume that route or cause thrashing.
+        if(suspended.empty() || std::any_of(lanes.begin(),lanes.end(),[](const auto& l){return bool(l.request);})) return;
+        auto oldest=std::min_element(suspended.begin(),suspended.end(),[](const auto& a,const auto& b){return a.request->id<b.request->id;});
+        auto& lane=lanes.front();
+        if(generations.front()==std::numeric_limits<std::uint64_t>::max()) throw std::overflow_error("lane generation exhausted");
+        lane=std::move(*oldest); suspended.erase(oldest);
+        lane.key={lane.request->id,++generations.front(),0}; lane.frozen=false;
+        lane.request->trace_key=lane.key; lane.blocked_epoch=std::numeric_limits<std::uint64_t>::max();
+        pressure_owner=lane.request->id; lane.recovery_started=Clock::now();
+        lane.restoration=concurrent->restore(continuation(lane),*lane.image);
+        if(!lane.restoration) throw std::runtime_error("null restoration operation");
+        lane.restoration->submit([signal=wakeup]{signal->notify();});
+    }
+    void memory_blocked(const BatchPreparation& preparation) {
+        if(preparation.execution || preparation.blocked.lane>=lanes.size() ||
+           lanes[preparation.blocked.lane].key!=preparation.blocked)
+            throw std::runtime_error("invalid incremental preparation");
+        auto& blocked=lanes[preparation.blocked.lane];
+        if(preparation.status==Admission::infeasible) {
+            blocked.request->failure=runtime_failure("request cannot fit execution resources alone");
+            begin_retirement(blocked,Finish::failed); return;
+        }
+        if(preparation.status!=Admission::deferred || !preparation.pressure)
+            throw std::runtime_error("blocked preparation omitted memory pressure");
+        blocked.blocked_epoch=capacity_epoch;
+        pressure_owner=blocked.request->id;
+        for(const auto& lane:lanes) if(lane.request && !lane.retiring)
+            pressure_owner=std::min(pressure_owner,lane.request->id);
+        Lane* victim=nullptr;
+        for(auto& lane:lanes) if(lane.request && lane.request->id>pressure_owner)
+            lane.frozen=bool(lane.executing);
+        for(auto& lane:lanes) if(lane.request && lane.request->id>pressure_owner && !lane.retiring && !lane.terminal &&
+            !lane.executing && !lane.suspension && !lane.restoration &&
+            concurrent->reclaimable(*preparation.pressure,continuation(lane),*lane.session) &&
+            (!victim || lane.request->id>victim->request->id)) victim=&lane;
+        if(victim) {
+            victim->recovery_started=Clock::now();
+            victim->suspension=concurrent->suspend(continuation(*victim),*victim->session);
+            if(!victim->suspension) throw std::runtime_error("null suspension operation");
+            victim->suspension->submit([signal=wakeup]{signal->notify();});
+        } else if(std::count_if(lanes.begin(),lanes.end(),[](const auto& l){return bool(l.request);})==1 && !blocked.executing) {
+            blocked.request->failure=runtime_failure("memory pressure cannot make progress with a solo request");
+            begin_retirement(blocked,Finish::failed);
+        } else if(std::all_of(lanes.begin(),lanes.end(),[&](const auto& lane) {
+            return !lane.request || (!lane.executing && !lane.suspension && !lane.restoration &&
+                !lane.retiring && lane.blocked_epoch==capacity_epoch);
+        })) {
+            // Non-recoverable requests may hold mutually needed pools. With no
+            // runnable work or pending settlement, another retry cannot free them.
+            blocked.request->failure=runtime_failure("memory pressure has no reclaimable progress route");
+            begin_retirement(blocked,Finish::failed);
+        }
+    }
+    void set_step_limit(Lane& lane) {
+        if(profile.max_request_steps==1) return;
+        const auto depth=concurrent->execution_depth(continuation(lane).request);
+        if(!depth || depth>declaration.max_request_steps) throw std::runtime_error("invalid request execution depth");
+        lane.step_limit=std::min(depth,profile.max_request_steps);
     }
     bool admit_reuse(std::size_t lane_index, Clock::time_point now) {
         auto& lane=lanes[lane_index];
@@ -673,6 +808,7 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
         r->phases.admit(); detail::TraceScope span(trace_buffer,TracePhase::open,key);
         lane.session=concurrent->open({key,r->prompt,r->output,&r->options});
         if(!lane.session) throw std::runtime_error("model opened null concurrent session");
+        set_step_limit(lane);
         return true;
     }
     void admit() {
@@ -687,6 +823,7 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
                 it = waiting.erase(it);
             } else ++it;
         }
+        if(pressure_owner || !suspended.empty()) return;
         for(std::size_t i=0;i<lanes.size() && !waiting.empty();++i) {
             auto& lane = lanes[i];
             if(lane.request) continue;
@@ -725,6 +862,7 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
                 detail::TraceScope span(trace_buffer,TracePhase::open,key);
                 r->phases.admit(); lane.session=concurrent->open(view);
                 if(!lane.session) throw std::runtime_error("model opened null concurrent session");
+                set_step_limit(lane);
                 break;
             }
             // A deferred head/barrier applies equally to all free lanes. Retry
@@ -733,9 +871,12 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
         }
     }
     WorkItem work(const Lane& lane) const {
-        return {lane.key,lane.session.get(),{
-            std::min(profile.prefill_chunk,std::uint32_t(lane.request->prompt.size())-lane.frontier),
-            lane.request->output-std::uint32_t(lane.request->result.tokens.size()),lane.prefilled}};
+        auto output=lane.request->output-std::uint32_t(lane.request->result.tokens.size())-lane.reserved_output;
+        if(profile.max_request_steps>1) output=std::min(output,profile.max_step_output_tokens);
+        WorkItem item{lane.key,lane.session.get(),{
+            std::min(profile.prefill_chunk,std::uint32_t(lane.request->prompt.size())-lane.frontier),output,lane.prefilled}};
+        if(profile.max_request_steps>1) { item.step=lane.next_step; item.predecessor=lane.tail; }
+        return item;
     }
     void advise_prefill(WorkItem& item, std::uint32_t decode_work=0) {
         if(!profile.prefill_target_ns || item.budget.prefill_complete || !item.budget.prefill_tokens)return;
@@ -745,7 +886,10 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
         if(limit>item.budget.prefill_tokens)throw std::runtime_error("prefill advice exceeds granted work");
         if(limit) {
             item.budget.prefill_tokens=limit;
-            if(item.budget.token_work)item.budget.token_work=limit;
+            if(item.budget.token_work) {
+                const auto quantum=declaration.prefill_work_quantum;
+                item.budget.token_work=std::uint32_t((std::uint64_t(limit)+quantum-1)/quantum*quantum);
+            }
         }
     }
     void publish_group(std::span<const WorkItem> items, std::vector<RowProgress> rows, std::uint64_t operation, BatchExecution* execution=nullptr) {
@@ -771,7 +915,7 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
             if(slot) throw std::runtime_error("duplicate row identity");
             slot=&row;
         }
-        for(const auto& item:items) if(!row_lookup[item.key.lane] || row_lookup[item.key.lane]->key!=item.key)
+        for(const auto& item:items) if(!row_lookup[item.key.lane] || row_lookup[item.key.lane]->key!=item.key || row_lookup[item.key.lane]->step!=item.step)
             throw std::runtime_error("missing row identity");
         for(const auto& item:items) {
             const auto* row=row_lookup[item.key.lane];
@@ -796,6 +940,7 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
         for(const auto& item:items) {
             const auto& p = row_lookup[item.key.lane]->progress;
             auto& lane = lanes[item.key.lane];
+            if(lane.terminal) { logprobs.emplace_back(); continue; }
             if(item.budget.token_work &&
                (p.token_work > item.budget.token_work ||
                 p.reused_prompt_tokens > p.prompt_tokens ||
@@ -823,9 +968,9 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
             }
             // A text decoding or text storage failure ends only this row: it commits like a cancellation and
             // retires with Finish::failed, reporting the error from wait().
-            if(!cancelled) try {
+            if(!cancelled && !lane.terminal) try {
                 StepText text;
-                d = decide(p.tokens,stops(request),item.budget.output_tokens,request.text_stream.get(),text);
+                d = decide(p.tokens,stops(request),request.output-std::uint32_t(request.result.tokens.size()),request.text_stream.get(),text);
                 std::lock_guard lock(request.mutex);
                 try { stage_output(request,resources,logprobs[i],d.accepted,text); }
                 catch(...) { restore(request.result,before); throw; }
@@ -836,7 +981,7 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
             copied.clear();
             if(d.accepted) copied.assign(p.tokens.begin(),p.tokens.begin()+d.accepted);
             staged.push_back({&lane,copied,lane.frontier+p.prompt_tokens,p.reused_prompt_tokens,p.prefill_complete,d.finish,before,failure});
-            decisions.push_back({item.key,item.session,d.accepted,d.terminal,cancelled || failure});
+            decisions.push_back({item.key,item.session,d.accepted,d.terminal,cancelled || bool(failure) || lane.terminal,item.step,lane.terminal});
         }
         try {
             detail::TraceScope span(trace_buffer,TracePhase::commit,items);
@@ -850,6 +995,7 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
         }
         for(std::size_t i=0;i<staged.size();++i) {
             auto& value = staged[i]; auto& lane = *value.lane;
+            if(decisions[i].discard) continue;
             lane.request->phases.step(value.frontier-lane.frontier,value.reused,lane.prefilled,value.prefilled,value.tokens.size());
             lane.frontier=value.frontier; lane.prefilled=value.prefilled;
             if(value.failure) lane.request->failure = value.failure;
@@ -860,7 +1006,7 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
             trace_buffer.point(TracePhase::publication,lane.key);
             lane.request->cv.notify_all();
         }
-        for(std::size_t i=0;i<staged.size();++i) if(decisions[i].terminal) begin_retirement(*staged[i].lane,staged[i].finish);
+        for(std::size_t i=0;i<staged.size();++i) if(decisions[i].terminal && !decisions[i].discard) begin_retirement(*staged[i].lane,staged[i].finish);
     }
     bool step_concurrent() {
         if(profile.max_inflight_batches && batches.size()>=profile.max_inflight_batches)return false;
@@ -896,14 +1042,22 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
     bool step_mixed() {
         std::vector<WorkItem> items;
         auto remaining=profile.max_batch_tokens;
-        const auto eligible=[](const Lane& lane){return lane.request && !lane.retiring && !lane.executing;};
+        const auto eligible=[&](const Lane& lane){return lane.request && !lane.retiring && !lane.terminal && !lane.frozen &&
+            !*lane.request->cancelled && !lane.suspension && !lane.restoration && lane.blocked_epoch!=capacity_epoch &&
+            lane.executing<(lane.prefilled ? lane.step_limit : 1) &&
+            lane.request->result.tokens.size()+lane.reserved_output<lane.request->output;};
         const auto add=[&](std::size_t i) {
-            auto item=work(lanes[i]); item.budget.token_work=1;
-            items.push_back(item); --remaining;
+            auto item=work(lanes[i]);
+            const auto minimum=item.budget.prefill_complete ? 1u : declaration.prefill_work_quantum;
+            if(remaining<minimum)return;
+            item.budget.token_work=minimum;
+            items.push_back(item); remaining-=minimum;
         };
         const auto expand=[&](WorkItem& item) {
-            const auto desired=item.budget.prefill_complete ? declaration.decode_token_work : item.budget.prefill_tokens;
-            const auto extra=std::min(remaining,desired-item.budget.token_work);
+            const auto quantum=item.budget.prefill_complete ? 1u : declaration.prefill_work_quantum;
+            const auto tokens=item.budget.prefill_complete ? declaration.decode_token_work : item.budget.prefill_tokens;
+            const auto desired=(std::uint64_t(tokens)+quantum-1)/quantum*quantum;
+            const auto extra=std::uint32_t(std::min<std::uint64_t>(remaining,desired-item.budget.token_work)/quantum*quantum);
             item.budget.token_work+=extra; remaining-=extra;
         };
         if(profile.batch_policy==BatchPolicy::fair) {
@@ -923,9 +1077,9 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
                 if(eligible(lane) && !lane.prefilled && lane.prefill_wait_steps>=profile.prefill_starvation_steps &&
                    (urgent==lanes.size() || lane.prefill_wait_steps>lanes[urgent].prefill_wait_steps)) urgent=i;
             }
-            // With only one unit, a sustained queue of aged prefills must not
+            // When one prefill consumes the whole budget, aged prefills must not
             // starve decoders in turn. Alternate forced prefill and decode.
-            if(remaining==1 && reserved_prefill_last && std::any_of(lanes.begin(),lanes.end(),[&](const auto& lane) {
+            if(remaining<=declaration.prefill_work_quantum && reserved_prefill_last && std::any_of(lanes.begin(),lanes.end(),[&](const auto& lane) {
                 return eligible(lane) && lane.prefilled;
             })) urgent=lanes.size();
             reserved_prefill_last=urgent!=lanes.size();
@@ -953,7 +1107,7 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
         std::uint32_t decode_work=0;
         for(const auto& item:items) if(item.budget.prefill_complete)decode_work+=item.budget.token_work;
         for(auto& item:items) if(!item.budget.prefill_complete) {
-            item.budget.prefill_tokens=item.budget.token_work;
+            item.budget.prefill_tokens=std::min(item.budget.prefill_tokens,item.budget.token_work);
             advise_prefill(item,decode_work);
             lanes[item.key.lane].prefill_wait_steps=0;
         }
@@ -962,10 +1116,33 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
             // nor a lost completion can release its sessions or storage early.
             batches.emplace_back(std::move(items),trace_buffer);
             auto& batch=batches.back();
-            batch.execution=concurrent->prepare_batch(batch.items);
+            if(profile.memory_preemption) {
+                auto preparation=concurrent->prepare_incremental(batch.items);
+                if(preparation.status!=Admission::ready) {
+                    // No operation was submitted; partial reservations must be gone.
+                    const bool member=std::any_of(batch.items.begin(),batch.items.end(),[&](const auto& item){return item.key==preparation.blocked;});
+                    if(!member) throw std::runtime_error("blocked preparation identifies a nonmember");
+                    batches.pop_back(); memory_blocked(preparation); return true;
+                }
+                batch.execution=std::move(preparation.execution);
+            } else batch.execution=concurrent->prepare_batch(batch.items);
             if(!batch.execution)throw std::runtime_error("null batch execution");
-            for(const auto& item:batch.items)lanes[item.key.lane].executing=true;
+            for(const auto& item:batch.items) {
+                auto& lane=lanes[item.key.lane]; ++lane.executing;
+                lane.reserved_output+=item.budget.output_tokens;
+                if(item.step) {
+                    if(lane.next_step==std::numeric_limits<std::uint64_t>::max()) throw std::overflow_error("step sequence exhausted");
+                    ++lane.next_step;
+                }
+            }
             batch.execution->submit([signal=wakeup]{signal->notify();});
+            if(profile.max_request_steps>1) for(const auto& item:batch.items) {
+                auto& lane=lanes[item.key.lane];
+                if(lane.step_limit>1) {
+                    lane.tail=batch.execution->continuation({item.key,item.step});
+                    if(!lane.tail) throw std::runtime_error("dependent execution omitted continuation");
+                }
+            }
             return true;
         }
         detail::TraceScope step(trace_buffer,TracePhase::step,std::span<const WorkItem>(items));
@@ -979,11 +1156,19 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
     bool poll_batches() {
         bool progress=false;
         for(auto it=batches.begin();it!=batches.end();) {
-            if(it->execution->ready()) {
+            const bool ordered=std::all_of(it->items.begin(),it->items.end(),[&](const auto& item) {
+                return !item.step || item.step==lanes[item.key.lane].publish_step;
+            });
+            if(it->execution->ready() && ordered) {
                 auto rows=it->execution->progress();
                 publish_group(it->items,std::move(rows),it->step.operation(),it->execution.get());
-                for(const auto& item:it->items)lanes[item.key.lane].executing=false;
-                it=batches.erase(it); progress=true;
+                for(const auto& item:it->items) {
+                    auto& lane=lanes[item.key.lane]; --lane.executing;
+                    lane.reserved_output-=item.budget.output_tokens;
+                    if(item.step) ++lane.publish_step;
+                    if(!lane.executing) { lane.tail.reset(); lane.frozen=false; }
+                }
+                it=batches.erase(it); ++capacity_epoch; progress=true;
             } else {
                 if(Clock::now()-it->started>=std::chrono::milliseconds(profile.batch_timeout_ms))
                     throw std::runtime_error("batch execution deadline expired without settlement");
@@ -1050,7 +1235,7 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
     bool score_concurrent() {
         {
             std::lock_guard lock(wakeup->mutex);
-            if(waiting.empty() || !waiting.front()->scoring ||
+            if(waiting.empty() || !waiting.front()->scoring || !suspended.empty() ||
                std::any_of(lanes.begin(),lanes.end(),[](const auto& lane){return bool(lane.request);}))
                 return false;
             // Retain before invoking the model: failure may leave live readers.
@@ -1072,7 +1257,7 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
         // stops with the poison, so the queue cannot grow after it is counted.
         std::size_t failing=0;
         { std::lock_guard lock(wakeup->mutex); poisoned=true; failing=waiting.size(); }
-        failing+=std::size_t(bool(active_score))+std::size_t(std::count_if(lanes.begin(),lanes.end(),[](const auto& lane){return bool(lane.request);}));
+        failing+=suspended.size()+std::size_t(bool(active_score))+std::size_t(std::count_if(lanes.begin(),lanes.end(),[](const auto& lane){return bool(lane.request);}));
         const auto fail=[&](const std::shared_ptr<Request>& request, bool retained) {
             if(--failing) complete(request,Finish::failed,error,retained);
             else complete(request,Finish::failed,std::move(error),retained);
@@ -1095,7 +1280,7 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
         for(auto& lane:lanes) if(lane.request) {
             const auto request=lane.request;
             if(settled) {
-                lane.receipt.reset(); if(lane.session) lane.session->close(Finish::failed);
+                lane.suspension.reset(); lane.restoration.reset(); lane.receipt.reset(); if(lane.session) lane.session->close(Finish::failed);
                 lane = Lane{};
             }
             // Match normal retirement: a completed handle must not race
@@ -1103,6 +1288,8 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
             // Unknown work still retains the complete lane for quarantine.
             fail(request,!settled);
         }
+        for(auto& lane:suspended) fail(lane.request,!settled);
+        if(settled)suspended.clear();
         std::lock_guard lock(wakeup->mutex);
         for(auto& r:waiting) fail(r,!settled);
         if(settled) waiting.clear();
@@ -1115,15 +1302,20 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
             for(;;) {
                 // Clear before inspection, not before sleeping: a completion
                 // arriving during inspection must prevent the subsequent wait.
-                { std::lock_guard lock(wakeup->mutex); wakeup->changed=false; }
+                { std::lock_guard lock(wakeup->mutex); wakeup->changed=false;
+                    if(stopping) {
+                        for(auto& lane:lanes) if(lane.request) *lane.request->cancelled=true;
+                        for(auto& lane:suspended) *lane.request->cancelled=true;
+                    }
+                }
                 const bool advanced=poll_batches();
-                poll_retirements(); admit();
+                poll_retirements(); poll_recovery(); admit();
                 if(score_concurrent()) continue;
                 if(step_concurrent()) continue;
                 if(advanced)continue;
                 std::unique_lock lock(wakeup->mutex);
                 const bool occupied=std::any_of(lanes.begin(),lanes.end(),[](const auto& lane){return bool(lane.request);});
-                busy=occupied || !waiting.empty();
+                busy=occupied || !waiting.empty() || !suspended.empty();
                 if(stopping && !busy) return;
                 if(!busy) wakeup->cv.wait(lock,[&]{return stopping || !waiting.empty();});
                 else {
@@ -1132,7 +1324,7 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
                         deadline=std::min(deadline,batch.started+std::chrono::milliseconds(profile.batch_timeout_ms));
                     // Admission and retirement still expose polling interfaces.
                     // Pending batches instead wake us on completion or deadline.
-                    if(batches.empty() || !waiting.empty() || std::any_of(lanes.begin(),lanes.end(),
+                    if(batches.empty() || !waiting.empty() || !suspended.empty() || std::any_of(lanes.begin(),lanes.end(),
                        [](const auto& lane){return lane.request && !lane.executing;}))
                         deadline=std::min(deadline,Clock::now()+std::chrono::milliseconds(1));
                     wakeup->cv.wait_until(lock,deadline,[&]{return wakeup->changed;});
@@ -1268,6 +1460,7 @@ struct Handle::Impl {
         if(request) {
             const auto held = request; // Outlives the lock on its mutex.
             *held->cancelled = true;
+            try { engine->wakeup->notify(); } catch(...) {}
             std::unique_lock lock(held->mutex);
             held->cv.wait(lock,[&]{return held->done;});
             settle(lock);
@@ -1303,6 +1496,7 @@ struct Handle::Impl {
                     // Rethrown from this handler: std::current_exception() is empty for a foreign exception, and
                     // forced unwinding (pthread_exit, thread cancellation) must not end inside a handler.
                     *held->cancelled = true;
+                    try { engine->wakeup->notify(); } catch(...) {}
                     lock.lock();
                     held->cv.wait(lock,[&]{return held->done;});
                     settle(lock);
@@ -1321,11 +1515,16 @@ struct Handle::Impl {
     }
 };
 Handle::Handle() noexcept = default;
-Handle::Handle(std::unique_ptr<Impl> p):impl_(std::move(p)),cancellation_(impl_ ? impl_->request->cancelled : nullptr),id_(impl_ ? impl_->request->id : 0) {}
+Handle::Handle(std::unique_ptr<Impl> p):impl_(std::move(p)),cancellation_(impl_ ? impl_->request->cancelled : nullptr),
+    wake_cancel_(impl_ ? impl_->engine->wakeup : nullptr),
+    id_(impl_ ? impl_->request->id : 0) {}
 Handle::~Handle() = default;
 Handle::Handle(Handle&&) noexcept = default;
 Handle& Handle::operator=(Handle&&) noexcept = default;
-void Handle::cancel() noexcept { if(cancellation_) *cancellation_ = true; }
+void Handle::cancel() noexcept {
+    if(cancellation_) *cancellation_ = true;
+    try { if(wake_cancel_) wake_cancel_->notify(); } catch(...) {}
+}
 std::uint64_t Handle::id() const noexcept { return cancellation_ ? id_ : 0; }
 Result Handle::wait(TokenSink sink) {
     if(!impl_ || !impl_->request) throw std::logic_error("request handle is empty/consumed");

@@ -65,15 +65,20 @@ construction.
 
 | `BatchPolicy` | Grant order |
 | --- | --- |
-| `fair` (default) | From a rotating cursor, one token-work unit per eligible row, then remaining units up to each prefill chunk or `ModelInfo.decode_token_work`. Prefill and decode can mix in one call. |
-| `decode_first` | One unit per decoder, then decoders up to their preference, then prefill chunks; separate rotating cursors. A prefill that waited `prefill_starvation_steps` groups (default 8) reserves one unit before decoders. Requires positive `max_batch_tokens`. |
+| `fair` (default) | From a rotating cursor, the minimum work grant per eligible row (one for decode, the prefill quantum for prefill), then remaining units up to each prefill chunk or `ModelInfo.decode_token_work`. Prefill and decode can mix in one call. |
+| `decode_first` | One unit per decoder, then decoders up to their preference, then prefill chunks; separate rotating cursors. A prefill that waited `prefill_starvation_steps` groups (default 8) reserves its minimum work grant before decoders. Requires positive `max_batch_tokens`. |
 
 `WorkBudget.token_work` bounds computation for a row; `prefill_tokens` bounds
 newly computed prompt tokens; `output_tokens` is the remaining output allowance.
 A verify pass can compute several columns and publish fewer tokens. The adapter
 reports actual `Progress.token_work`, counting every target, draft and padded
 column it executes, and must accept grants down to one (falling back to an
-ordinary step). Reused prompt state costs no units. Core checks every row before
+ordinary step). Engines whose prefill kernels pad columns can declare
+`ModelInfo.prefill_work_quantum`; Core grants prefill work in multiples of that
+quantum while keeping prompt consumption within the real input and chunk limit.
+The quantum must fit `max_batch_tokens`. It defaults to one, and decode grants
+remain as small as one. Latency advice preserves the rounded work charge.
+Reused prompt state costs no units. Core checks every row before
 commit.
 
 Token work is an admission quota, not equal time; budgets need measurement per
@@ -166,8 +171,7 @@ top-k), optionally its argmax and, with `top_k`, its own ranked alternatives
 (`QueryScores::top`, needs `ModelInfo.max_top_logprobs >= top_k`). Targets must
 be below the valid vocabulary, else submission fails with "scoring target outside
 the valid vocabulary". `path` names one of `ModelInfo.score_paths` and is
-forwarded unchanged; empty selects the default. Eval scores `prefill`, `decode`,
-`verify` and the required `prefill_decode` ([Eval adapter](../../../docs/eval/ADAPTER.md)).
+forwarded unchanged; empty selects the default.
 
 Core checks values under the [generation rules](#log-probabilities) and returns
 them in `Result::scores`, `query_scores`, `argmax` and `top_logprobs`
@@ -373,14 +377,128 @@ failure; it is safe on any thread, repeatable, and only wakes Core. Publish
 readiness before notifying and join notifications in `quiesce`/destruction.
 
 While operations run, Core admits requests and submits other eligible lanes up to
-the bound, at most one operation per lane; shared model inspection must be safe
+the bound, by default at most one operation per lane; shared model inspection must be safe
 alongside execution. `batch_timeout_ms` (default 30000) bounds a pending
 operation: expiry fails the engine. Failure or shutdown calls every operation's
 idempotent `quiesce`, then model quiescence and backend drain. Commit must hand
 newly launched state work to the sessions before the operation is destroyed. The
 bound limits operation count, not bytes; adapters reserve all workspace.
 
+## Dependent execution
+
+`Profile.max_request_steps` defaults to one. Larger values require async mixed
+execution and a matching `ModelInfo.max_request_steps` declaration. The model's
+`execution_depth(RequestView)` further limits each request (default one); use one
+for a host sampler or grammar whose decision cannot be made by a private executor.
+`max_step_output_tokens` caps each unresolved output grant. Core reserves their
+sum against the true remaining request length; filling a step grant does not end
+the request. Prompt work stays depth one until prefix reuse and prefill resolve.
+
+Each opted-in WorkItem carries a monotonic `step` and an owned `predecessor`.
+After successful submission, `BatchExecution.continuation(StepKey)` must return
+an already-established dependency and private accepted state. Successors execute
+after it, using real accepted tokens, counts and positions. RowProgress and
+CommitDecision echo the step identity. Each operation owns its scratch, output,
+readback and any graph slots. Public commit must not overwrite state a successor
+uses or index unapproved output in shared caches. Existing single-pending-round
+StateCache/TokenHistory contracts remain unchanged.
+
+Publication waits for earlier steps of every row in a group; unrelated groups
+may complete independently. Stops/cancellation mark descendants discard-only.
+Core still reads their operation status and detects errors, but does not decode
+or publish their tokens. Retirement waits for every descendant to settle. Failure
+quiesces all operation owners, or retains them together in quarantine. Memory
+preemption freezes younger chains until settlement, then captures the approved
+boundary through the same recovery contract below.
+
+The [portable recurrent reference](../../../inference/concurrent-request-execution/code/recurrent_pipeline.h)
+uses asynchronous producer tasks and owned futures. A successor can compute from
+the predecessor's actual recurrent state while host publication is gated. Private
+sampling histories and complete recurrent snapshots preserve seeded output under
+preemption. This is functional integration evidence, not a throughput measurement
+or automatic acceleration of existing engine packages.
+
+The [CUDA recurrence example](../../../inference/concurrent-request-execution/code/cuda_ahead_example.cu)
+uses device-carried state and tokens, producer events and separate retained
+readback slots. Its test gates predecessor readback while a successor computes,
+then checks ordered output against a host oracle and cancellation cleanup. It
+qualifies that synthetic device path, not full-model arithmetic or performance.
+
+## Incremental memory and recovery
+
+`Profile.memory_preemption` requires async mixed batches and the matching model
+declaration. `prepare_incremental` returns an owned prepared operation, a deferred
+row with engine-defined `MemoryPressure`, or a solo-infeasible row. Deferred
+preparation must launch nothing and undo partial reservations; exceptions still
+fail the engine. Pressure describes actual pools, not interchangeable byte totals.
+`reclaimable` inspects settled victims and must count only capacity really freed,
+including shared pages and copy-on-write, all recurrent/draft state and scratch.
+
+Core favors the oldest resident request and considers younger settled victims.
+It holds new admissions during pressure, retries blocked rows after capacity or
+work changes, and restores suspended requests oldest first with no other resident
+requests. This conservative recovery policy reserves a solo route through replay
+and useful new work; it does not optimize the cost of preemption. A request that
+cannot progress alone fails individually. If all residents are blocked with no
+reclaimable victim or pending work, one blocked request fails to release capacity
+for its peers. Suspended requests still count toward
+the outstanding limit and scoring barriers, and keep their original queue age,
+options, accepted output and text decoder. Restored bindings get fresh generations.
+
+`suspend` and `restore` prepare operations without submitting. Core retains each
+before `submit`, through readiness, or through quiescence/drain on failure. A
+suspension's readiness certifies a complete `ResumeImage` and source release.
+After `take`, the old session is destroyed without retirement or completion.
+Failure cleanup must tolerate partially completed suspension. Restoration reserves
+the old frontier plus at least one new useful step before submitting. Its `take`
+returns a settled session. Recovery operations must join all producers in
+`quiesce`; uncertain cleanup retains the whole runtime in quarantine.
+
+Images are engine-owned and charged to Core Resources. Replay is opt-in: preserve
+conditioning, pending token, positions, sampling/penalty/grammar and recurrent or
+draft state, not just KV. Feed accepted tokens without sampling or publishing them.
+An engine whose arithmetic cannot reconstruct the same continuation needs a complete
+snapshot. `RequestTiming.preemptions`, `recovery_ns` and `recomputed_tokens` report
+recovery separately from public prompt/output usage. `recovery_ns` measures each
+successful restoration from preparation to observed readiness, excluding time
+suspended. Cancellation of a suspended
+request drops its image; cancellation during restore settles the operation first.
+
+The [attention recovery reference](../../../inference/attention-state/code/recoverable_engine.h)
+uses actual StateCache pages and the existing attention arithmetic. Its portable
+CPU operations settle synchronously; it establishes reclamation and replay
+correctness, not device overlap or a throughput gain.
+
 ## Engine libraries
+
+For concurrent serving, set `NativeEngine.concurrent_requests = true` and declare
+`chat-concurrent-v1` in the package. The stock resident adapter exposes the configured
+`Profile.max_concurrency + max_pending`, creates a private parser wrapper per request,
+and shares the native engine and immutable tokenizer. All engine state must obey the
+ConcurrentModel ownership contract. The legacy zero-argument `request` facts callback
+is rejected with this flag; use `result(const Result&)` for request-owned facts.
+
+Rebuilt libraries also export `crit_engine_request_open`, `request_wait`,
+`request_cancel` and `request_close` (each with the `crit_engine_` prefix). A request
+has one waiter; cancel may run concurrently. Close it after waiting, before closing
+the engine. The Python bridge polls cancellation independently of token delivery,
+so cancellation during prefill reaches Core. Physical work still settles before
+release. ABI-1 libraries without these additive exports retain the original token
+callback cancellation path and serial capacity.
+
+Token log-probabilities take one more additive export, `crit_engine_request_wait_output`.
+A request opened with `"logprobs": n` (the model declaring `token_logprobs` and
+`max_top_logprobs` of at least `n`, both in `crit_engine_info`) is waited on with it: its
+callback receives each published token with its log-probability and its `n` most likely
+alternatives as two ranked arrays of ids and log-probabilities, the
+[TokenLogprob](#log-probabilities) rows of `Handle::wait_output`.
+`crit_core.native.ResidentEngine` serves them as `chat-logprobs-v1` when `n` can be 20.
+
+Cancellation predicates passed to the Python bridge must be thread-safe and
+nonblocking: an independent monitor may call them while token delivery runs.
+The native serving integration fixtures exercise real HTTP clients through the
+stock resident adapter, including simultaneous streaming and buffered replies,
+memory recovery and a connection closed during prefill.
 
 `crit/native_engine.h` exports an engine as a shared library with a small C ABI,
 so crit's Python tools reach it without engine-specific glue. Write a factory

@@ -179,6 +179,12 @@ def publish_directory(source, destination):
             time.sleep(.005)
 
 
+def amendments(root, segment_id):
+    """The quality-term amendments of the run's segments up to segment_id, in order."""
+    return [s["amendment"] for s in (read_json(p) for p in sorted((root / "segments").glob("segment-*.json")))
+            if "amendment" in s and s["segment_id"] <= segment_id]
+
+
 def serving_gaps(capabilities, model_path):
     """What a chat-resident-v1 package leaves out that crit serve clients rely on: per-request temperature, and
     tool calls when the model's chat template teaches a call format crit parses."""
@@ -781,17 +787,16 @@ class RunStore:
                         " transformed candidates are never eligible. Draft-only weights (a speculative drafter whose"
                         " tokens the stored weights verify) and KV-cache precision are not covered; see"
                         " docs/RUN_RECORDS.md.") if policy == "as_stored" else ""
-        amendments = [s["amendment"] for s in (read_json(p) for p in sorted((root / "segments").glob("segment-*.json")))
-                      if "amendment" in s and s["segment_id"] <= bounds["segment_id"]]
-        quality_budget, exactness = quality_terms(run["spec"]["correctness"], amendments)
+        amended = amendments(root, bounds["segment_id"])
+        quality_budget, exactness = quality_terms(run["spec"]["correctness"], amended)
         quality_line = (f"Quality budget: PPL ratio ≤ {quality_budget['ppl_ratio_max']}, mean KLD ≤ "
                         f"{quality_budget['kld_mean_max']}, p99 KLD ≤ {quality_budget['kld_p99_max']} against Eval's reference; "
-                        f"speculative exactness {exactness}. Pass both to crit eval run as --quality-budget "
-                        f"'{json.dumps(quality_budget)}' --exactness {exactness}. The budget is a resource to spend on speed: a "
+                        f"speculative exactness {exactness}. crit run ... eval applies both; pass them to crit eval run as "
+                        f"--quality-budget '{json.dumps(quality_budget)}' --exactness {exactness} when you run it yourself. The budget is a resource to spend on speed: a "
                         "lever inside it counts in full, being close to a limit is no reason to reject it, and lower drift "
                         "than the budget is not a gain."
-                        + (f" These terms amend the original request (approved by {amendments[-1]['approved_by']}) and"
-                           " replace any stricter limits in its correctness criteria." if amendments else ""))
+                        + (f" These terms amend the original request (approved by {amended[-1]['approved_by']}) and"
+                           " replace any stricter limits in its correctness criteria." if amended else ""))
         capacity = run["spec"]["hardware_constraints"]["kv_tokens"]
         basis = run["spec"]["hardware_constraints"].get("context")
         if basis:
@@ -803,7 +808,8 @@ class RunStore:
         else:
             origin = "set by the request"
         context_line = (f"Context: every candidate serves {capacity:,} tokens of prompt plus output, {origin}. It is a "
-                        f"requirement, not a lever: pass --context {capacity} to crit eval run, pin, ab and kernels, and plan "
+                        f"requirement, not a lever: crit run ... eval applies it; pass --context {capacity} to crit eval run, pin, ab "
+                        "and kernels, and plan "
                         "KV precision, tables and buffers for it, not for the longest Eval case. Speed must depend on the tokens "
                         "a request holds, never on the capacity: Eval measures the speed cases again on an engine opened at a "
                         "lower context and fails a candidate that is slower there. Device memory a lower context frees goes "
@@ -844,9 +850,11 @@ keep going until everything you reasoned out is implemented. Plan the next candi
 At stop, account for each goal (decode, prefill, ttft, and context_decode and context_ttft when Eval measured the
 required context): the score at the start, the score reached and the limit, what you built for it, and the
 physical cause of any distance left. Effort, time or the candidate count are not causes.
-Measure candidates with Eval alongside this run's frozen cases. Retain the eval-v1 adapter,
-applied settings, prepared data, reference and result JSON; report skipped cases and unsupported paths.
-Use the same prepared data and reference for comparisons, and include Eval results in the handoff.
+Measure every candidate with crit run ... eval: it serves the package through crit serve, runs Eval over the chat
+API and scores the quality replies on the model's checkpoint. Measure this run's frozen cases with crit run ...
+measure, which serves the package through crit serve too, and take in-process hardware telemetry (acceptance on a
+pinned text, kernels) through the eval-v1 adapter. Retain the adapter, prepared data and result JSON; report skipped
+cases and unsupported paths. Use the same prepared data for comparisons, and include Eval results in the handoff.
 Eval result JSON is separate evidence; it does not automatically publish run checks or benchmarks.
 Use the record coordinator: crit run --project "{self.project}" --root "{self.root}" --id {run['run_id']} --help
 Before the first candidate, run recon (required for a model folder; crit run ... --id {run['run_id']} recon): it writes work/recon.json from the
@@ -854,14 +862,15 @@ model's generation_config.json, tokenizer files, chat templates and config.json,
 recon.md from the model card and the transformers reference code; every candidate freezes recon.json's frozen
 block (sampling, chat template, stop tokens) into configuration["recon"] instead of defaulting to greedy.
 Develop source and builds under this run's work/; keep candidates and failures visible with decision reasoning.
-Capture fixed benchmark inputs under captured/. Freeze inputs before construction with resolve.
+Capture fixed benchmark inputs under captured/: each case's chat request as JSON {{"messages": [...]}} that renders
+to its prompt_tokens (docs/BUILDING_ENGINES.md). Freeze inputs before construction with resolve.
 Create each candidate through candidate --source DIR --record proposal.json; it retains a complete source copy.
 Reserve every build/check/benchmark process with reserve BEFORE launch and settle after owned cleanup.
 Use package to retain a runnable package and its literal launch recipe. Submit checks and benchmark raw samples
 through check and benchmark; publish seal last. The coordinator writes telemetry.json and state.json.
-Include serving through crit serve unless the user explicitly requested a narrower deliverable. Before sealing,
-declare chat-json-v1 and chat-resident-v1, export create_engine(context) from the retained entry,
-and follow docs/SERVING.md. Native code can use a factory wrapper.
+Every candidate serves through crit serve, where Eval measures it. Before its first Eval,
+declare chat-json-v1 and chat-resident-v1 with chat-stream-v1 and chat-logprobs-v1, export create_engine(context)
+from the retained entry, and follow docs/SERVING.md. Native code can use a factory wrapper.
 Include the adapter in source/package inventories. Load once when the server starts, accept an optional leading
 system message, retain compatible model allocations across requests and switches until the server stops, and
 verify consecutive, streamed and stopped requests and cleanup with crit serve.

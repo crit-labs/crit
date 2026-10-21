@@ -112,7 +112,7 @@ class DisconnectTests(ServeFixture, unittest.TestCase):
                          (before['pid'], before['device'], before['generation']))
         self.assertEqual(after['private'], 1)
         self.assertEqual(self.served.status()['engine_loads'], 1)
-        self.assertEqual(list((self.served.runtime.root / 'requests').iterdir()), [])
+        self.assertFalse((self.served.runtime.root / 'requests').exists())
         self.until(lambda: not any(t.name == 'crit-client-disconnect' for t in threading.enumerate()),
                    'Disconnect watcher outlived the request')
 

@@ -1,5 +1,5 @@
 {
-  "protocol": "crit-eval-v4",
+  "protocol": "crit-eval-v5",
   "speed": {
     "warmup_runs": 1,
     "repetitions": 3,
@@ -12,24 +12,29 @@
     "ttft_aggregate": "the TTFT score is the geometric mean of the case medians of time to first token in ms, over every case",
     "disturbed_spread": 0.25,
     "disturbed": "a speed case whose measured decode speeds spread (max - min over the median) by more than disturbed_spread stops the round: the device was disturbed (quiet rounds recorded at most about 10%); the result keeps what was measured, marked aborted, and has no status",
-    "decode_text": "with a pinned continuation (crit eval pin) and a replaying adapter, speed is measured by replaying that text; otherwise on each engine's own greedy output. Decode scores on different texts are not compared"
+    "decode_text": "with a pinned continuation (crit eval pin) and a replaying adapter, speed is measured by replaying that text; otherwise on each engine's own greedy output. Decode scores on different texts are not compared",
+    "served": "an engine behind an OpenAI-compatible server (crit eval run --url) gets every prompt as the chat messages and tools prepare froze next to its ids, under the server's own chat template; prompt and output lengths are the usage counts the server must stream, and a reply that ends before output_tokens (no standard field turns end tokens off) is measured on the tokens it has. The server prefills every request: a reply with cached prompt tokens fails. Prefill and time to first token include the server's HTTP and templating. lower_context needs the engine started again at the lower context: crit run eval, which serves the candidate itself, does that; a server Eval did not start cannot be, so there lower_context is not measured"
   },
   "quality": {
+    "reply_tokens": 256,
     "top_k": 16,
-    "paths": ["prefill", "decode", "verify", "prefill_decode"],
-    "required_paths": ["prefill_decode"],
-    "prefill_decode": {
+    "rule": "every quality prompt goes to the engine as chat messages with logprobs and top_logprobs top_k; its greedy reply of at most reply_tokens tokens, with the log-probabilities the server reports for every token, is the scored text. crit eval reference then scores the same tokens teacher-forced on the prepared model's own checkpoint, after the same prompt token ids. The server must render each prompt to the token count the model's chat template renders (usage prompt_tokens), prefill it without a prompt cache, and report every reply token's bytes, log-probability and top_k alternatives from the model's distribution",
+    "conversations": "the suite's quality conversations (suite/quality.json): one set",
+    "long": {
       "prompt_tokens": [1024, 4096, 32768],
       "conversations": ["explain-tides", "python-merge-intervals", "german-letter"],
-      "rule": "the engine prefills only the prompt (suite filler text, then the conversation up to its scored turn) as it prefills any request, then feeds the reference continuation through ordinary one-token decode steps; each step's log-probabilities are scored against the reference. Every prompt length is judged by the drift budget on its own; a length above the engine's max_context is skipped",
-      "purpose": "the other paths put the scored text inside one prefill or run the whole sequence as 1- or 4-token passes; this one decodes after prompts long enough to cross the thresholds where engines switch prefetching, prefill kernels or sparse attention"
+      "rule": "long.json's preamble, holding suite filler cut to fit, goes before the conversation's first user message so the prompt renders to about prompt_tokens tokens; each length is its own set, skipped when the prompt and reply_tokens exceed the engine's max_context",
+      "purpose": "the engine decodes after prompts long enough to cross the thresholds where engines switch prefetching, prefill kernels or sparse attention"
     },
-    "kl": "KL(reference || engine) over the reference top-k plus one lumped tail bucket",
+    "kl": "KL(reference || engine) at every reply token over the tokens in both the reference's and the engine's top_k, plus one bucket for the rest of each distribution: a lower bound on the full-vocabulary KL",
+    "perplexity": "ppl_ratio: the engine's perplexity of its reply over the reference's perplexity of the same tokens",
+    "top1": "the share of reply tokens that are also the reference's most likely token",
     "thresholds": {
       "ppl_ratio_max": 1.05,
       "kld_mean_max": 0.05,
       "kld_p99_max": 0.5
     },
+    "judged": "every set by the drift budget on its own; quality passes when every set scored passes",
     "budget": "the thresholds are a drift budget to spend on speed, not a score to minimise; a run sets its own with --quality-budget"
   },
   "exactness": {
@@ -57,7 +62,7 @@
     "reserve_gib": 3,
     "granularity": 1024,
     "engine": "every engine is opened with context_tokens = the required context; the speed cases, quality and exactness all run on that build",
-    "curve": "after the speed cases and quality, on the same engine, one greedy request per point fills the context exactly (prompt + output = point): powers of two from curve_from below the requirement, then the requirement itself; the prompt is copies of the longest speed case's prompt ending with a whole one",
+    "curve": "after the speed cases and quality, on the same engine, one greedy request per point fills the context exactly (prompt + output = point): powers of two from curve_from below the requirement, then the requirement itself; the prompt is the longest speed case with its document followed by suite filler text (long.json), cut to fit, so the engine answers that case's request and every prompt is chat messages",
     "curve_from": 32768,
     "output_tokens": 256,
     "repetitions": 1,

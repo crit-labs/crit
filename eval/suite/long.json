@@ -1,6 +1,6 @@
 {
-  "suite": "crit-eval-long-v1",
-  "notes": "Long prompts for the prefill_decode quality path and the retrieval check (protocol quality.prefill_decode, context.retrieval). The filler is these suite files joined by blank lines, tokenized once and repeated as far as a prompt needs. {document} in a message marks where the filler goes; prepare cuts it to the exact prompt length.",
+  "suite": "crit-eval-long-v2",
+  "notes": "Long prompts for the long quality sets and the retrieval check (protocol quality.long, context.retrieval). The filler is these suite files joined by blank lines, tokenized once and repeated as far as a prompt needs. {document} in a message marks where the filler goes; prepare cuts it to fit the prompt length.",
   "filler": [
     "long_document.txt",
     "agent/README.md.txt",
@@ -12,7 +12,7 @@
     "agent/metrics.py.txt",
     "agent/report.py.txt"
   ],
-  "prefill_decode": {
+  "quality": {
     "preamble": "The following background material is unrelated to my question; you do not need it.\n\n{document}\n\n---\n\n"
   },
   "retrieval": {

@@ -45,8 +45,10 @@ unmeasured.
 - **Capacity gate:** `max_context` is at least the requirement and a request filling it completes.
 - **Long-context curve:** after speed and quality, one greedy request per point fills the context
   exactly, prompt plus 256 output tokens, at powers of two from 32,768 below the requirement and
-  at the requirement. Prompts are copies of the longest speed case's prompt, ending with a whole
-  one. With a pinned continuation and a replaying adapter, each point replays that case's pinned
+  at the requirement. Each prompt is the longest speed case with its document followed by suite
+  filler text ([long.json](../../eval/suite/long.json)) cut to fit, so the engine answers that
+  case's request and every prompt is chat messages that an engine behind a server is sent too.
+  With a pinned continuation and a replaying adapter, each point replays that case's pinned
   text, so every engine decodes the same tokens (as in the speed cases); otherwise it decodes its
   own output, and `context_decode` compares only between results decoded on the same text.
   Prefilling the longest points can take minutes.

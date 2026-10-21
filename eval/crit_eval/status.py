@@ -5,20 +5,21 @@ the numbers about how to build.
 
 1. Gates, the only pass/fail: speed coverage, repeatable outputs, request history (the same greedy
    requests give the same tokens on the fresh engine and after everything else it served), quality
-   against the reference's drift budget on every path (prefill_decode, decode after long prompts,
-   required), capacity (the engine serves a request at the required context), retrieval (facts at the
-   start, middle and end of long prompts up to the required context are answered verbatim), lower
-   context (no speed case is slower on an engine opened at a lower context), generality (against a
-   baseline, no held-out prompt and not the held-out score slows down) and, when the run requires it,
-   speculative exactness. Exactness in its default `reported` mode is a note: the quality budget
-   judges output; request history is a gate in every mode.
+   (the engine's replies, scored by the reference, within the drift budget in every set: the
+   conversations and the replies after long prompts), capacity (the engine serves a request at the
+   required context), retrieval (facts at the start, middle and end of long prompts up to the
+   required context are answered verbatim), lower context (no speed case is slower on an engine
+   opened at a lower context), generality (against a baseline, no held-out prompt and not the
+   held-out score slows down) and, when the run requires it, speculative exactness. Exactness in
+   its default `reported` mode is a note: the quality budget judges output; request history is a
+   gate in every mode.
 2. Goals for the next candidate: each of decode, prefill and time to first token, and decode and
    time to first token over the long-context curve, from its current score to its physical limit.
    All of them hold at once; none is ranked or optional.
 3. KPIs, each next to its physical limit: the decode score against its ceiling (the larger of
    this drafter's speed of light and a drafter accepting later drafts as often as the first),
    the model pass against its bandwidth floor, the prefill score against its compute ceiling,
-   time to first token against its floor, the share of the drift budget the worst path uses,
+   time to first token against its floor, the share of the drift budget the worst set uses,
    and the end-to-end score as a fact.
 4. Gaps: what each term would give its own KPI at its floor, in a fixed order.
 5. Missing inputs that hide a limit, and notes.
@@ -26,7 +27,7 @@ the numbers about how to build.
 `run` writes the same status into the result and prints it. With --baseline, the KPIs also
 show the change from an earlier result of the same model and suite.
 """
-from . import load_json, metrics
+from . import load_json, metrics, protocol_version
 
 
 def _gates(result):
@@ -47,24 +48,7 @@ def _gates(result):
     else:
         gates.append({"name": "coverage", "state": "unmeasured", "detail": "speed not run"})
     gates += _history_gate(result)
-    if quality is None:
-        gates.append({"name": "quality", "state": "unmeasured", "detail": "quality not run"})
-    elif not quality["paths"]:
-        gates.append({"name": "quality", "state": "unmeasured",
-                      "detail": "the adapter declares no score paths (score_paths)"})
-    else:
-        failures = [f"{p}: {', '.join(q['failures'])}" for p, q in quality["paths"].items() if not q["passed"]]
-        # A required path (protocol quality.required_paths) that was not scored fails: every engine prefills and decodes.
-        failures += [f"{p}: not scored ({(quality.get('missing') or {}).get(p) or 'the adapter does not declare it in score_paths'})"
-                     for p in quality.get("required", []) if p not in quality["paths"]]
-        detail = ("paths " + ", ".join(quality["paths"]) if not failures else "; ".join(failures))
-        skipped = [f"{int(length):,}" for q in quality["paths"].values()
-                   for length, row in (q.get("lengths") or {}).items() if row.get("status") == "skipped"]
-        if skipped:
-            detail += f" (prefill_decode skipped at {', '.join(skipped)} prompt tokens: above max_context)"
-        if quality.get("unsupported"):
-            detail += f" (unscored: {', '.join(quality['unsupported'])})"
-        gates.append({"name": "quality", "state": "fail" if failures else "pass", "detail": detail})
+    gates.append(_quality_gate(result))
     gates += _context_gates(result)
     if speculative and _exactness_mode(result) == "required":
         if exact is None:
@@ -77,13 +61,36 @@ def _gates(result):
     return gates
 
 
-LEGACY_PROTOCOLS = ("crit-eval-v1", "crit-eval-v2", "crit-eval-v3")
+def _quality_gate(result):
+    """The engine's replies scored by the reference (protocol quality): every set within the drift budget."""
+    quality = result.get("quality")
+    state = (quality or {}).get("status")
+    if quality is None:
+        return {"name": "quality", "state": "unmeasured", "detail": "quality not run"}
+    if state == "unsupported":
+        return {"name": "quality", "state": "unmeasured", "detail": quality["reason"]}
+    if state == "skipped":
+        return {"name": "quality", "state": "fail", "detail": quality["reason"]}
+    if state == "replied":
+        return {"name": "quality", "state": "unmeasured",
+                "detail": f"{len(quality['replies'])} replies await the reference: crit eval reference --result"}
+    if state != "scored":
+        return {"name": "quality", "state": "unmeasured",
+                "detail": f"measured with {result.get('protocol')}, whose quality this Eval does not read"}
+    failures = [f"{name}: {', '.join(s['failures'])}" for name, s in quality["sets"].items() if not s["passed"]]
+    detail = "sets " + ", ".join(quality["sets"]) if not failures else "; ".join(failures)
+    if quality.get("skipped"):
+        detail += " (skipped: " + "; ".join(f"{name}, {why}" for name, why in quality["skipped"].items()) + ")"
+    return {"name": "quality", "state": "fail" if failures else "pass", "detail": detail}
 
 
 def _since_v4(result):
     """Results of crit-eval-v4 and later have the request-history and retrieval gates; earlier ones are shown as
     they were judged."""
-    return result.get("protocol") is not None and result["protocol"] not in LEGACY_PROTOCOLS
+    try:
+        return protocol_version(result.get("protocol"))[0] >= 4
+    except ValueError:
+        return False
 
 
 def _history_gate(result):
@@ -255,21 +262,21 @@ def _exactness_drop(result, baseline):
 
 
 def _quality_kpi(quality, thresholds):
-    if not quality or not quality.get("paths"):
+    if not quality or quality.get("status") != "scored" or not quality["sets"]:
         return None
     thresholds = quality.get("thresholds") or thresholds
-    paths = quality["paths"]
-    used = max(((metrics.budget_used(p, thresholds), name) for name, p in paths.items()),
+    sets = quality["sets"]
+    used = max(((metrics.budget_used(s, thresholds), name) for name, s in sets.items()),
                key=lambda v: -1 if v[0] is None else v[0])
-    worst = {key: max(((p[key], name) for name, p in paths.items()), key=lambda v: v[0])
+    worst = {key: max(((s[key], name) for name, s in sets.items()), key=lambda v: v[0])
              for key in ("kld_mean", "kld_p99", "ppl_ratio")}
-    lowest_top1 = min(((p["top1_agreement"], name) for name, p in paths.items()), key=lambda v: v[0])
-    return {"passed": quality["passed"], "paths": list(paths), "unsupported": quality.get("unsupported", []),
-            "worst_kld_mean": worst["kld_mean"][0], "worst_kld_mean_path": worst["kld_mean"][1],
-            "worst_kld_p99": worst["kld_p99"][0], "worst_kld_p99_path": worst["kld_p99"][1],
-            "worst_ppl_ratio": worst["ppl_ratio"][0], "worst_ppl_ratio_path": worst["ppl_ratio"][1],
-            "lowest_top1": lowest_top1[0], "lowest_top1_path": lowest_top1[1],
-            "budget_used": used[0], "budget_used_path": used[1],
+    lowest_top1 = min(((s["top1_agreement"], name) for name, s in sets.items()), key=lambda v: v[0])
+    return {"passed": quality["passed"], "sets": list(sets),
+            "worst_kld_mean": worst["kld_mean"][0], "worst_kld_mean_set": worst["kld_mean"][1],
+            "worst_kld_p99": worst["kld_p99"][0], "worst_kld_p99_set": worst["kld_p99"][1],
+            "worst_ppl_ratio": worst["ppl_ratio"][0], "worst_ppl_ratio_set": worst["ppl_ratio"][1],
+            "lowest_top1": lowest_top1[0], "lowest_top1_set": lowest_top1[1],
+            "budget_used": used[0], "budget_used_set": used[1],
             "limits": {"kld_mean": thresholds.get("kld_mean_max"), "kld_p99": thresholds.get("kld_p99_max"),
                        "ppl_ratio": thresholds.get("ppl_ratio_max")}}
 
@@ -334,9 +341,6 @@ def build(result, protocol, baseline=None):
             "context": _context_kpi(result), "heldout": heldout_kpi,
             "quality": _quality_kpi(result.get("quality"), protocol["quality"]["thresholds"])}
     missing = list(room.get("missing", []))
-    quality = result.get("quality")
-    if quality and quality.get("unsupported"):
-        missing.append("scoring on paths " + ", ".join(quality["unsupported"]) + " (adapter score_paths)")
     # Older results call the gaps levers, tag them and add end-to-end gains; none of that is shown.
     gaps = [{k: v for k, v in gap.items() if k not in ("polished_kpi", "below_noise", "end_to_end_gain")}
             for gap in room.get("gaps", room.get("levers", []))]
@@ -422,7 +426,7 @@ def changes(result, baseline):
     def ratio(now, before):
         return now / before - 1 if now and before else None
     q_now, q_before = result.get("quality") or {}, baseline.get("quality") or {}
-    worst = lambda q: max((p["kld_mean"] for p in q.get("paths", {}).values()), default=None)  # noqa: E731
+    worst = lambda q: max((s["kld_mean"] for s in (q.get("sets") or {}).values()), default=None)  # noqa: E731
     same_text = decode_text_identity(result) == decode_text_identity(baseline)
     same_context = (result.get("context") or {}).get("tokens") == (baseline.get("context") or {}).get("tokens")
     same_context_text = same_context and context_text_identity(result) == context_text_identity(baseline)
@@ -548,9 +552,9 @@ def render(status):
                      f"{_num(h['tokens_per_round'], '.2f')} tokens/round (geometric means): "
                      + ", ".join(f"{pid} {_num(row['decode_tps'], '.0f')}" for pid, row in h["prompts"].items()))
     if q:
-        used = "" if q.get("budget_used") is None else f"{q['budget_used']:.1%} of the drift budget used ({q['budget_used_path']}); "
+        used = "" if q.get("budget_used") is None else f"{q['budget_used']:.1%} of the drift budget used ({q['budget_used_set']}); "
         lines.append(f"  quality  {'pass' if q['passed'] else 'FAIL'}: {used}worst KLD mean {q['worst_kld_mean']:.1e} "
-                     f"({q['worst_kld_mean_path']}, limit {q['limits']['kld_mean']}), p99 {q['worst_kld_p99']:.1e} "
+                     f"({q['worst_kld_mean_set']}, limit {q['limits']['kld_mean']}), p99 {q['worst_kld_p99']:.1e} "
                      f"(limit {q['limits']['kld_p99']}), PPL ×{q['worst_ppl_ratio']:.4f} (limit {q['limits']['ppl_ratio']}), "
                      f"top-1 {q['lowest_top1']:.3f}")
     else:

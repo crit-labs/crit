@@ -1,8 +1,8 @@
 """Resident host with bounded request isolation and exclusive model lifecycle work."""
 from pathlib import Path
 import importlib.util
+import os
 import sys
-import time
 import types
 import threading
 
@@ -12,10 +12,12 @@ if __package__ in {None, ""}:
     for folder in (Path(__file__).resolve().parents[1], root / "cli", root / "core" / "python"):
         if any((folder / name).is_dir() for name in ("crit_api", "crit", "crit_core")):
             sys.path.insert(0, str(folder))
-from crit.run.records import digest, read_json, safe_path, write_json
+from crit.run.records import MAX_JSON_BYTES, digest, read_json, safe_path
+from crit_api import channel
 from crit_api.models import ModelContext, ModelPool
 from crit_api.stream import CAPABILITY as STREAM_CAPABILITY, StreamWriter
 from crit_api.options import MAX_CHAT_RECORD, TOOLS_CAPABILITY, STRICT_TOOLS_CAPABILITY, TOOL_STREAM_CAPABILITY
+from crit_core.serving import LOGPROBS_CAPABILITY
 
 CONFIG_CAPABILITY = "chat-config-v1"
 
@@ -44,11 +46,12 @@ class Cancelled(Exception):
 
 
 class Cancellation:
-    def __init__(self, path):
-        self.path = path
+    """Set when crit serve cancels the command."""
+    def __init__(self, event=None):
+        self.event = event or threading.Event()
 
     def is_set(self):
-        return self.path.exists()
+        return self.event.is_set()
 
     def check(self):
         if self.is_set():
@@ -56,8 +59,8 @@ class Cancellation:
 
 
 class Host:
-    def __init__(self, root, host_limit, device_limit):
-        self.root = root
+    def __init__(self, root, host_limit, device_limit, send):
+        self.root, self.send = root, send
         self.pool = ModelPool(root / "models", host_limit, device_limit)
         self.pools = {}
         self.host_limit, self.device_limit = self.pool.host_limit, self.pool.device_limit
@@ -74,12 +77,12 @@ class Host:
         with self.state_lock:
             if self.active and state in {"ready", "draining"}:
                 state = "generating"
-            write_json(self.root / "status.json", {"schema_version": 1, "state": state,
+            self.send({"kind": "status", "status": {"schema_version": 1, "state": state,
                 "engine": self.identity, "model_id": self.pool.model_id, "model_generation": self.pool.generation,
                 "host_bytes": sum(p.host_bytes for p in self.pools.values()),
                 "device_bytes": sum(p.device_bytes for p in self.pools.values()),
                 "engine_loads": self.loads, "active_requests": self.active,
-                "max_concurrent_requests": self.capacity, **extra})
+                "max_concurrent_requests": self.capacity, **extra}})
 
     def detach(self):
         if self.engine is not None:
@@ -135,6 +138,9 @@ class Host:
             module.__path__ = [str(package)]
             sys.modules[namespace] = module
         name = namespace + ".entry"
+        # A sealed package keeps its bytes: importing it must not write a __pycache__ into it. crit serve launches
+        # the host with -B; a host run in-process (a test, an embedding) may not have been.
+        sys.dont_write_bytecode = True
         module_spec = importlib.util.spec_from_file_location(name, entry)
         module = importlib.util.module_from_spec(module_spec)
         sys.modules[name] = module
@@ -158,6 +164,9 @@ class Host:
                 raise ValueError("max_concurrent_requests must be an integer in [1, 1024]")
             if self.concurrent and not callable(getattr(self.engine, "create_request", None)):
                 raise ValueError("chat-concurrent-v1 requires create_request(request)")
+            if LOGPROBS_CAPABILITY in capabilities and getattr(self.engine, "logprobs", False) is not True:
+                raise ValueError(LOGPROBS_CAPABILITY + " requires an engine that reports log-probabilities (logprobs "
+                                 "True)")
         except BaseException:
             self.blocked = True  # Partial construction may own native work.
             raise
@@ -172,7 +181,8 @@ class Host:
         self.loads += 1
         self.status("ready")
 
-    def handle(self, command):
+    def handle(self, command, cancellation):
+        """Run one command; a generation returns its response."""
         if self.blocked:
             raise ValueError("Resident host is quarantined")
         action, payload = command["action"], command["payload"]
@@ -188,13 +198,10 @@ class Host:
             return None
         if action != "generate":
             raise ValueError("Unknown resident command")
-        request = read_json(Path(payload["request_path"]), max_bytes=MAX_CHAT_RECORD)
+        request = payload["request"]
         if any(request[key] != self.identity[key] for key in self.identity):
             raise ValueError("Resident request engine identity mismatch")
-        cancellation = Cancellation(self.root / "cancel" / (command["command_id"] + ".json"))
-        stream_path = (self.root / "streams" / (command["command_id"] + ".json")
-                       if self.concurrent else self.root / "stream.json")
-        stream = (StreamWriter(stream_path, command, request, cancellation,
+        stream = (StreamWriter(self.send, command["command_id"], request, cancellation,
                                tools=TOOL_STREAM_CAPABILITY in payload["spec"].get("capabilities", []))
                   if STREAM_CAPABILITY in payload["spec"].get("capabilities", []) else None)
         target = self.engine
@@ -248,21 +255,49 @@ class Host:
             finally:
                 with self.state_lock:
                     self.active -= 1
-        write_json(Path(payload["response_path"]), response, immutable=True)
         self.status("ready")
+        return response
 
 
 def main():
+    if os.name != "nt":
+        import resource
+        # No core file: a crash of a host holding tens of GB would write one that large (a soft limit of 1 byte also
+        # stops pipe-based core handlers, which ignore 0).
+        hard = resource.getrlimit(resource.RLIMIT_CORE)[1]
+        if hard == resource.RLIM_INFINITY or hard >= 1:
+            resource.setrlimit(resource.RLIMIT_CORE, (1, hard))
     config = read_json(Path(sys.argv[1]))
-    root = Path(config["root"])
-    host = Host(root, config["host_limit"], config["device_limit"])
+    link = channel.connect(config["port"], config["token"])
+    host = Host(Path(config["root"]), config["host_limit"], config["device_limit"], link.send)
     host.status("unloaded")
-    workers = []
+    lock, wake = threading.Lock(), threading.Event()
+    pending, running, cancels, closed = [], set(), {}, []
 
-    def execute(path, command):
-        status, error = "completed", None
+    def receive():
+        """Queue commands and set cancellations as crit serve sends them; any failure ends the host."""
         try:
-            host.handle(command)
+            while True:
+                message = link.receive(MAX_CHAT_RECORD + MAX_JSON_BYTES)
+                with lock:
+                    if message["kind"] == "command":
+                        pending.append(message)
+                    elif message["kind"] == "cancel":
+                        cancels.setdefault(message["command_id"], Cancellation()).event.set()
+                    else:
+                        raise ValueError("Unknown resident message")
+                wake.set()
+        except BaseException as exc:
+            closed.append(exc)
+            wake.set()
+
+    def execute(command):
+        cid = command["command_id"]
+        with lock:
+            cancellation = cancels.setdefault(cid, Cancellation())
+        status, error, response = "completed", None, None
+        try:
+            response = host.handle(command, cancellation)
         except Cancelled as exc:
             status, error = "cancelled", str(exc)
         except BaseException as exc:
@@ -270,30 +305,38 @@ def main():
             host.blocked = True
         host.blocked = host.blocked or host.pool.blocked
         host.status("blocked" if host.blocked else ("ready" if host.engine else "unloaded"), error=error)
-        write_json(root / "results" / path.name, {"schema_version": 1, "command_id": command["command_id"],
-            "token": config["token"], "status": status, "error": error,
-            "max_concurrent_requests": host.capacity, "cleanup_settled": not host.blocked}, immutable=True)
+        link.send({"kind": "result", "command_id": cid, "status": status, "error": error,
+                   "max_concurrent_requests": host.capacity, "cleanup_settled": not host.blocked,
+                   **({"response": response} if command["action"] == "generate" and status == "completed" else {})})
+        with lock:
+            cancels.pop(cid, None)
+            running.discard(cid)
+        wake.set()
 
-    while True:
-        workers = [worker for worker in workers if worker.is_alive()]
-        paths = sorted((root / "commands").glob("*.json"))
-        for path in paths:
-            command = read_json(path)
-            if command["command_id"] != path.stem or command["token"] != config["token"]:
-                raise ValueError("Resident command identity mismatch")
+    threading.Thread(target=receive, name="crit-host-receive", daemon=True).start()
+    while not closed:
+        wake.clear()
+        with lock:
+            queued = list(pending)
+        for command in queued:
             parallel = command["action"] == "generate" and host.concurrent
             identity = {k: command["payload"].get("spec", {}).get(k)
                         for k in ("run_id", "candidate_id", "package_sha256")}
-            if workers and (not parallel or identity != host.identity or len(workers) >= host.capacity):
-                continue
-            path.rename(root / "accepted" / path.name)
+            with lock:
+                if running and (not parallel or identity != host.identity or len(running) >= host.capacity):
+                    continue
+                pending.remove(command)
+                if parallel:
+                    running.add(command["command_id"])
             if parallel:
-                worker = threading.Thread(target=execute, args=(path, command), daemon=True)
-                workers.append(worker)
-                worker.start()
+                threading.Thread(target=execute, args=(command,), daemon=True).start()
             else:
-                execute(path, command)
-        time.sleep(.02)
+                execute(command)
+        wake.wait()
+    # crit serve closed the channel: it is retiring this host.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":
