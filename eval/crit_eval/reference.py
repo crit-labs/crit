@@ -8,20 +8,29 @@ token's log-probability and the reference's top-k. The conversations use eager a
 mask; the long prompts the same FP32 arithmetic in blocks of query rows (chunked_attention), since a 32K-token mask
 and score matrix would not fit. It needs the device to itself: stop the engine's server first.
 
-Supported stored formats (compressed-tensors): unquantized tensors, FP8 E4M3 with per-channel
-or per-tensor scales, and NVFP4 (E2M1 values, E4M3 group-16 scales and an FP32 global scale).
-Requires torch, transformers and safetensors. This is the slow, trusted path, run once per
-evaluation; the engine's replies are judged against its scores.
+Supported stored formats: safetensors, PyTorch state dicts and ONNX graphs (crit_core.model.open_model), their
+weights unquantized or in any scheme of crit_eval.schemes (FP8, NVFP4, compressed-tensors int, AWQ, GPTQ, MLX,
+bitsandbytes, ONNX Runtime's MatMulNBits), each decoded to exactly the FP32 values its own library produces.
+A GGUF (a lone .gguf, a split set or a folder holding one) is read through crit_eval.gguf_layout:
+every block type gguf-py decodes, with GGUF's reference converter layout undone per architecture, and the
+config.json its metadata derives (crit_core.model.gguf_files) unless its folder has the base model's.
+Requires torch, transformers and safetensors, gguf for a GGUF and numpy for ONNX. This is the slow, trusted path,
+run once per evaluation; the engine's replies are judged against its scores.
 """
 import inspect
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 from . import EVAL_DIR, load_json, metrics, write_json
 from .prepare import PREPARED, model_identity
+from .schemes import quantization_of, refuse_unread
 
-E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+# torch dtype names -> safetensors dtype names
+TORCH_DTYPES = {"bfloat16": "BF16", "float16": "F16", "float32": "F32", "float64": "F64", "float8_e4m3fn": "F8_E4M3",
+                "float8_e5m2": "F8_E5M2", "float8_e8m0fnu": "F8_E8M0", "uint8": "U8", "int8": "I8", "int16": "I16",
+                "int32": "I32", "uint32": "U32", "int64": "I64", "bool": "BOOL"}
 CHUNKED = "crit_chunked"
 QUERY_BLOCK = 256
 
@@ -57,25 +66,19 @@ def chunked_attention(module, query, key, value, attention_mask, scaling=None, d
     return out.view(batch, heads, length, -1).transpose(1, 2).contiguous(), None
 
 
-class Checkpoint:
-    def __init__(self, model):
-        from crit_core.model import inspect_model
-        from safetensors import safe_open
-        self.model = Path(model)
-        self.files = {}
-        self.where = {}
-        # The files and headers Core validates (crit_core.model.inspect_model) before torch reads any tensor.
-        for shard in inspect_model(self.model).shards:
-            handle = safe_open(str(shard.path), "pt", device="cpu")
-            self.files[shard.path.name] = handle
-            for key in handle.keys():
-                self.where[key] = handle
+class TensorCheckpoint:
+    """A checkpoint keyed by Hugging Face tensor names (has, raw), which dense() decodes to FP32 with the scheme its
+    tensors are stored in (crit_eval.schemes). quantization: the config's quantization_config (or MLX's
+    quantization) as a dict."""
+    where = {}
+    quantization = {}
 
     def has(self, key):
         return key in self.where
 
-    def raw(self, key):
-        return self.where[key].get_tensor(key)
+    def fit(self, key, tensor, shape):
+        """The tensor as the module stores it: Hugging Face checkpoints keep the modeling code's shapes."""
+        return tensor
 
     def prefix(self):
         for key in self.where:
@@ -85,40 +88,123 @@ class Checkpoint:
 
     def dense(self, base, device):
         """FP32 weight for module path `base` (without the .weight suffix)."""
+        from .schemes import dense
+        return dense(self, base, device)
+
+    def embedding(self, base):
+        """The embedding table for gathering rows: as stored when it is plain, else decoded to FP32 on the CPU."""
+        from .schemes import scheme
+        if scheme(self, base) is None:
+            return self.raw(base + ".weight")
+        return self.dense(base, "cpu")
+
+
+class Checkpoint(TensorCheckpoint):
+    """A safetensors checkpoint."""
+
+    def __init__(self, model, quantization=None):
+        from crit_core.model import inspect_model
+        from safetensors import safe_open
+        self.model = Path(model)
+        self.quantization = dict(quantization or {})
+        self.files = {}
+        self.where = {}
+        # The files and headers Core validates (crit_core.model.inspect_model) before torch reads any tensor.
+        for shard in inspect_model(self.model).shards:
+            handle = safe_open(str(shard.path), "pt", device="cpu")
+            self.files[shard.path.name] = handle
+            for key in handle.keys():
+                self.where[key] = handle
+
+    def raw(self, key):
+        return self.where[key].get_tensor(key)
+
+    def header(self, key):
+        part = self.where[key].get_slice(key)
+        return SimpleNamespace(dtype=part.get_dtype(), shape=tuple(part.get_shape()))
+
+
+class StateDictCheckpoint(TensorCheckpoint):
+    """PyTorch state dicts (crit_core.model.TorchCheckpoint), memory-mapped by torch.load once Core has read
+    their pickles without running them; weights_only keeps torch's own loader to tensors as well."""
+
+    def __init__(self, weights, quantization=None):
         import torch
-        # NVFP4: E2M1 pairs (low nibble first) with E4M3 group-16 scales and an FP32 global factor, which
-        # compressed-tensors stores as a divisor (weight_packed, weight_global_scale) and ModelOpt as a
-        # multiplier (weight, weight_scale_2).
-        packed = None
-        if self.has(base + ".weight_packed"):
-            packed = self.raw(base + ".weight_packed").to(device)
-            scale = self.raw(base + ".weight_scale").to(device).float()
-            scale = scale / self.raw(base + ".weight_global_scale").to(device).float()
-        elif self.has(base + ".weight_scale_2") and self.raw(base + ".weight").dtype == torch.uint8:
-            packed = self.raw(base + ".weight").to(device)
-            scale = self.raw(base + ".weight_scale").to(device).float()
-            scale = scale * self.raw(base + ".weight_scale_2").to(device).float()
-        if packed is not None:
-            table = torch.tensor(E2M1, dtype=torch.float32, device=device)
-            low, high = packed & 0x0F, packed >> 4
-            nibbles = torch.stack((low, high), dim=-1).reshape(packed.shape[0], -1).long()
-            values = table[nibbles & 7] * torch.where(nibbles & 8 > 0, -1.0, 1.0)
-            values = values.reshape(values.shape[0], scale.shape[1], -1) * scale[..., None]
-            return values.reshape(packed.shape[0], -1)
-        weight = self.raw(base + ".weight").to(device)
-        if weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            scale = self.raw(base + ".weight_scale").to(device).float()
-            return weight.float() * (scale if scale.ndim == 2 else scale.reshape(-1)[0])
-        return weight.float()
+        self.quantization = dict(quantization or {})
+        self.where = {}
+        for shard in weights.shards:
+            state = torch.load(shard.path, map_location="cpu", weights_only=True, mmap=True)
+            for tensor in shard.tensors:
+                self.where[tensor.name] = state[tensor.name]
+
+    def raw(self, key):
+        return self.where[key]
+
+    def header(self, key):
+        tensor = self.where[key]
+        return SimpleNamespace(dtype=TORCH_DTYPES[str(tensor.dtype).removeprefix("torch.")], shape=tuple(tensor.shape))
+
+
+class OnnxCheckpoint(TensorCheckpoint):
+    """An ONNX graph's weights (crit_core.model.OnnxModel) under Hugging Face names, read from the bytes Core
+    located; a weight stored as its transpose (a MatMul's [in, out] operand) is transposed back."""
+
+    def __init__(self, weights, quantization=None):
+        self.quantization = dict(quantization or {})
+        self.where = {tensor.name: tensor for tensor in weights.tensors}
+
+    def raw(self, key):
+        import numpy as np
+        import torch
+        tensor = self.where[key]
+        values = np.fromfile(tensor.shard, dtype=np.uint8, count=tensor.nbytes, offset=tensor.data_begin)
+        dtype = getattr(torch, next(name for name, short in TORCH_DTYPES.items() if short == tensor.dtype))
+        out = torch.from_numpy(values.copy()).view(dtype).reshape(tensor.shape)
+        return out.T.contiguous() if tensor.transposed else out
+
+    def header(self, key):
+        tensor = self.where[key]
+        shape = tuple(reversed(tensor.shape)) if tensor.transposed else tuple(tensor.shape)
+        return SimpleNamespace(dtype=tensor.dtype, shape=shape, attributes=tensor.attributes)
+
+
+def open_checkpoint(model, config):
+    """The reference's checkpoint for the model (crit_core.model.open_model): its safetensors (Checkpoint), its
+    PyTorch state dicts (StateDictCheckpoint) or its GGUF (GgufCheckpoint). config: transformers' text config."""
+    from crit_core.model import open_model
+    source = open_model(model)
+    if source.format == "gguf":
+        from .gguf_layout import GgufCheckpoint
+        return GgufCheckpoint(source.weights, config)
+    quantization = quantization_of(source.config())
+    refuse_unread(quantization)
+    if source.format == "torch":
+        return StateDictCheckpoint(source.weights, quantization)
+    if source.format == "onnx":
+        return OnnxCheckpoint(source.weights, quantization)
+    if source.format != "safetensors":
+        raise SystemExit(f"{model}: no weight files the reference reads (safetensors, GGUF, PyTorch or ONNX)")
+    return Checkpoint(source.path, quantization)
 
 
 def _text_config(model):
-    """transformers' own config object, which its modeling classes need; config.json must first pass Core's
-    rules (crit_core.model.load_model_config), as it did when the suite was prepared."""
-    from crit_core.model import load_model_config
-    from transformers import AutoConfig
-    load_model_config(model)
-    config = AutoConfig.from_pretrained(str(model))
+    """transformers' own config object, which its modeling classes need, from the model's config.json (the
+    folder's own, or the one a GGUF derives); it must first pass Core's rules (crit_core.model.ModelSource.config),
+    as it did when the suite was prepared."""
+    import json
+    from crit_core.model import CONFIG_NAME, open_model
+    from transformers import AutoConfig, CONFIG_MAPPING
+    source = open_model(model)
+    source.config()
+    if CONFIG_NAME in source.derived:
+        data = json.loads(source.files.read(CONFIG_NAME))
+        if data.get("model_type") not in CONFIG_MAPPING:
+            raise SystemExit(f"{model}: the config derived from the GGUF names no transformers model type "
+                             f"({data.get('model_type')!r}); the reference needs config rules for its architecture "
+                             "(crit_core.model.gguf_files) or the base model's config.json beside it")
+        config = CONFIG_MAPPING[data["model_type"]].from_dict(data)
+    else:
+        config = AutoConfig.from_pretrained(str(source.folder or model))
     text = getattr(config, "text_config", None) or config
     text._attn_implementation = "eager"
     return text
@@ -148,9 +234,9 @@ class StreamingReference:
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         self.torch, self.device = torch, device
-        self.checkpoint = Checkpoint(model)
-        self.prefix = self.checkpoint.prefix()
         self.config = _text_config(model)
+        self.checkpoint = open_checkpoint(model, self.config)
+        self.prefix = self.checkpoint.prefix()
         with _meta_parameters():
             self.skeleton = AutoModel.from_config(self.config)
         self.rotary = self.skeleton.rotary_emb.to(device)  # buffers only: its frequencies, computed at build
@@ -170,6 +256,8 @@ class StreamingReference:
                 state[name] = self.checkpoint.raw(key).to(self.device).float()
             else:
                 state[name] = value
+                continue
+            state[name] = self.checkpoint.fit(key, state[name], value.shape)
         layer.load_state_dict(state, strict=True, assign=True)
         layer.to(self.device)
         self._config_dt_limit(layer)
@@ -221,7 +309,7 @@ class StreamingReference:
         torch = self.torch
         from transformers import AttentionInterface
         AttentionInterface.register(CHUNKED, chunked_attention)
-        embed = self.checkpoint.raw(self.prefix + "embed_tokens.weight")
+        embed = self.checkpoint.embedding(self.prefix + "embed_tokens")
         # A scaled embedding (for example Gemma's) multiplies its rows by its own embed_scale buffer.
         scale = getattr(self.skeleton.embed_tokens, "embed_scale", None)
         layer_types = getattr(self.config, "layer_types", None) or [None] * self.config.num_hidden_layers
@@ -317,11 +405,13 @@ def score_result(model, data, path, baseline=None, log=print):
     started = time.time()
     sequences = [(prompts[r["id"]] + r["tokens"], len(prompts[r["id"]])) for r in replies]
     long = {i for i, r in enumerate(replies) if r["set"] != "conversations"}
-    scored = StreamingReference(model).score(sequences, quality["top_k"], prepared["valid_vocab"], log=log, long=long)
+    reference = StreamingReference(model)
+    scored = reference.score(sequences, quality["top_k"], prepared["valid_vocab"], log=log, long=long)
     thresholds = result["requirements"]["quality_budget"]
     quality.update(judge_sets(replies, scored, thresholds), status="scored", thresholds=thresholds, reference={
         "implementation": f"transformers {transformers.__version__} official modeling, layer-streamed; "
-                          "FP32 activations, stored weights dequantized to FP32, no TF32; Mamba-2 dt limit from "
+                          + getattr(getattr(reference, "checkpoint", None), "description", "")
+                          + "FP32 activations, stored weights dequantized to FP32, no TF32; Mamba-2 dt limit from "
                           "config.json time_step_limit; per-layer-type RoPE and sliding-window masks, embedding "
                           "scale and final logit soft-capping as the modeling code applies them",
         "seconds": time.time() - started})

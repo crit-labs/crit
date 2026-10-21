@@ -185,6 +185,17 @@ def amendments(root, segment_id):
             if "amendment" in s and s["segment_id"] <= segment_id]
 
 
+def described(model_path):
+    """Whether the model has description files (tokenizer, templates, config): a folder, or a weight file whose
+    metadata derives them (a GGUF, crit_core.model.open_model)."""
+    try:
+        from crit_core.model import open_model
+        source = open_model(model_path)
+    except Exception:
+        return Path(model_path).is_dir()
+    return source.folder is not None or bool(source.derived)
+
+
 def serving_gaps(capabilities, model_path):
     """What a chat-resident-v1 package leaves out that crit serve clients rely on: per-request temperature, and
     tool calls when the model's chat template teaches a call format crit parses."""
@@ -193,10 +204,11 @@ def serving_gaps(capabilities, model_path):
     gaps = []
     if "chat-sampling-temperature-v1" not in capabilities:
         gaps.append("it must apply a request's temperature and declare chat-sampling-temperature-v1")
-    if not {"chat-tools-v1", "chat-tool-template-v1"} & set(capabilities) and Path(model_path).is_dir():
+    if not {"chat-tools-v1", "chat-tool-template-v1"} & set(capabilities) and described(model_path):
+        from crit_core.model import open_model
         from crit_core.text import template_sources, templates_tool_format
         try:
-            taught = templates_tool_format(template_sources(Path(model_path)).values())
+            taught = templates_tool_format(template_sources(open_model(model_path).files).values())
         except Exception:
             taught = None
         if taught:
@@ -508,7 +520,7 @@ class RunStore:
                 raise ValueError("Candidate needs complete retained source")
             # The model recon's sampling, chat template and stop tokens are frozen into every candidate.
             frozen, recon_ref = recon.load(root, run)
-            if frozen is None and Path(run["spec"]["model_path"]).is_dir():
+            if frozen is None and described(run["spec"]["model_path"]):
                 raise ValueError(f"Run recon before the first candidate: crit run --id {run_id} recon writes "
                                  f"{recon.RECON_JSON}, then finish {recon.RECON_MD}")
             configuration, extensions = proposal["configuration"], proposal.get("extensions", {})

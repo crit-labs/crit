@@ -186,7 +186,9 @@ def resident_adapter(library):
         expect(not images, "the native text fixture must not request image processing")
         return messages
 
+    import crit_core.model
     import crit_core.text as module
+    crit_core.model.open_model = lambda path: types.SimpleNamespace(files=path)   # no model folder behind it
     module.load_model_text = lambda model, clock=None: FakeText()
     module.openai_messages = text_messages
     context = types.SimpleNamespace(configuration={"chat_template_kwargs": {"enable_thinking": False}},

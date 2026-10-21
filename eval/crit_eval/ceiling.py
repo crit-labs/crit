@@ -1,5 +1,5 @@
 """The model's arithmetic per token, for the prefill floor, its weight bytes, for the memory
-floor of a short prompt, and its KV bytes per token, for the decode floor at long context. Counted once from the safetensors headers and config when the
+floor of a short prompt, and its KV bytes per token, for the decode floor at long context. Counted once from the weight headers and config when the
 suite is prepared, so every engine evaluated against one data directory gets the same ceiling.
 
 Prefill is compute bound. Its floor for a prompt of N tokens is
@@ -8,9 +8,13 @@ Prefill is compute bound. Its floor for a prompt of N tokens is
     attention   N(N+1)/2 query-key pairs x FLOPs per pair / the BF16 rate
     recurrent   N x linear-attention FLOPs per token / the BF16 rate (chunked form, approximate)
 
-A projection weight of R x K elements costs 2RK FLOPs per token in the format it is stored in:
-BF16/F16/F32 `weight` (bf16), F8_E4M3 `weight` (fp8) or a U8 `weight_packed` with an F8_E4M3
-`weight_scale` of one scale per 16 elements (nvfp4, K = 2 x packed columns). Embedding tables
+A projection weight of R x K elements costs 2RK FLOPs per token at the rate of the format it is stored in
+(crit_eval.schemes): BF16/F16/F32 (bf16), FP8 (fp8), NVFP4 (nvfp4), weight-only integer codes (AWQ, GPTQ,
+MLX, bitsandbytes NF4, compressed-tensors pack-quantized: bf16, as engines widen them for the GEMM) and 8-bit
+integer weights with per-row scales (bitsandbytes LLM.int8, compressed-tensors int-quantized: fp8, the int8 rate).
+A GGUF's ggml block types
+count at the fp8 rate (engines multiply their integer codes on 8-bit tensor cores, which run int8 and FP8 at
+the same rate), its MXFP4 and NVFP4 at the nvfp4 rate and its F32/F16/BF16 at bf16. Embedding tables
 (gathered), vision towers, norms, convolutions and the output head (one row of logits per
 prompt) are left out. Engines may compute in other formats; the floor uses the stored ones.
 
@@ -18,36 +22,42 @@ Time to first token cannot beat either floor: the prompt's arithmetic, or readin
 once (language-model tensors and the output head, not embeddings, vision or draft layers)
 plus writing the prompt's KV, at the device bandwidth.
 """
+import math
 import os
-from pathlib import Path
 
-from crit_core.model import CONFIG_NAME, inspect_model, inspect_safetensors, load_model_config, parse_model_config
+from crit_core.model import open_model, parse_model_config
+from crit_core.model.gguf import TYPE_BY_NAME, TensorInfo as GgufTensor
 
-from .tensors import DRAFT, tensor_role
+from .schemes import PRIMARY, quantization_of, refuse_unread, stored
+from .tensors import tensor_role
+
+
+def _source(model):
+    # A model path that does not exist reads as a model without files, as a folder without them does.
+    return open_model(model) if os.path.lexists(model) else None
 
 
 def model_config(model):
-    """MODEL_DIR's config.json read with Core's rules (crit_core.model.load_model_config); an empty config when
-    the model has none. Rules read the text section (`text_config` over the root)."""
-    path = Path(model) / CONFIG_NAME
-    return load_model_config(path) if os.path.lexists(path) else parse_model_config({})
+    """The model's config.json read with Core's rules (crit_core.model.ModelSource.config): the folder's own, or
+    the one a GGUF's metadata derives; an empty config when the model has none. Rules read the text section
+    (`text_config` over the root)."""
+    source = _source(model)
+    return source.config() if source else parse_model_config({})
+
+
+def weight_files(model, drafts=False):
+    """The weight files of the model (a folder or a weight file, crit_core.model.open_model) with the draft blocks
+    their tensors' roles need: (files, draft_blocks). Without `drafts`, draft-layer files are left out; with it,
+    those beside the checkpoint join it. ([], no blocks) for a folder without weights."""
+    source = _source(model)
+    return (list(source.weight_files(drafts)), source.draft_blocks) if source else ([], frozenset())
 
 
 def weight_shards(model, drafts=False):
-    """The safetensors files of MODEL_DIR, validated by crit_core.model: the checkpoint inspect_model resolves
-    (model.safetensors.index.json, else model.safetensors, else the only .safetensors file). Without `drafts`,
-    files with `mtp` in their name are left out; with it, draft files beside the checkpoint join it. [] when the
-    directory holds no safetensors file."""
-    model = Path(model)
-    if not model.is_dir() or not any(model.glob("*.safetensors*")):
-        return []
-    shards = list(inspect_model(model).shards)
-    if not drafts:
-        return [shard for shard in shards if DRAFT not in shard.path.name]
-    named = {shard.path.name for shard in shards}
-    # Draft layers sometimes ship beside the index in their own file.
-    return shards + [inspect_safetensors(path) for path in sorted(model.glob("*mtp*.safetensors"))
-                     if path.name not in named]
+    """The safetensors files of the model, validated by crit_core.model (weight_files of a safetensors model);
+    [] for any other model."""
+    source = _source(model)
+    return list(source.weight_files(drafts)) if source and source.format == "safetensors" else []
 
 
 def _read(role):
@@ -55,49 +65,69 @@ def _read(role):
     return role.kind in ("layer", "expert", "head") and not role.draft
 
 
-def weight_bytes(tensors, file_name=""):
+def weight_bytes(tensors, file_name="", draft_blocks=()):
     """Bytes of the tensors one forward pass reads (crit_eval.tensors: layers, experts and the output head, not
     embeddings, other modalities or draft layers). tensors: {name: crit_core.model.TensorInfo} of one file."""
-    return sum(t.nbytes for name, t in tensors.items() if _read(tensor_role(name, file_name)))
+    return sum(t.nbytes for name, t in tensors.items() if _read(tensor_role(name, file_name, draft_blocks)))
 
 
-def matmul_flops(tensors, file_name=""):
+def _ggml_format(dtype):
+    """A GGUF tensor's GEMM rate key (see the module docstring); None for the integer types."""
+    if dtype in ("F32", "F16", "BF16"):
+        return "bf16"
+    if dtype in ("MXFP4", "NVFP4"):
+        return "nvfp4"
+    return "fp8" if TYPE_BY_NAME[dtype].quantized else None
+
+
+def matmul_flops(tensors, file_name="", draft_blocks=(), quantization=None):
     """FLOPs per token by stored weight format, and how many matrices each format has, over one file's
-    {name: TensorInfo}. The output head is left out (one row of logits per prompt)."""
-    flops, matrices = {}, {}
+    {name: TensorInfo}. The output head is left out (one row of logits per prompt). A 3-D expert tensor counts as
+    one matrix per expert, as the per-expert matrices of a checkpoint that stores them apart do. quantization: the
+    config's quantization_config (or MLX's quantization), which names the scheme of packed integer weights
+    (crit_eval.schemes)."""
+    flops, matrices, seen = {}, {}, set()
     for name, tensor in tensors.items():
-        role = tensor_role(name, file_name)
-        if not _read(role) or role.kind == "head" or len(tensor.shape) != 2:
+        role = tensor_role(name, file_name, draft_blocks)
+        stacked = len(tensor.shape) == 3 and role.kind == "expert"
+        if not _read(role) or role.kind == "head":
             continue
-        rows, cols = tensor.shape
-        fmt = None
-        if (name.endswith(".weight_packed") or name.endswith(".weight")) and tensor.dtype == "U8":
-            # compressed-tensors (weight_packed) or ModelOpt (weight) NVFP4: packed E2M1 with E4M3 group-16 scales
-            scale = tensors.get(name[:-len("weight_packed" if name.endswith("_packed") else "weight")] + "weight_scale")
-            if scale and scale.dtype == "F8_E4M3" and scale.shape[-1] * 16 == cols * 2:
-                fmt, cols = "nvfp4", cols * 2
-        elif name.endswith(".weight"):
-            fmt = {"F8_E4M3": "fp8", "BF16": "bf16", "F16": "bf16", "F32": "bf16"}.get(tensor.dtype)
+        count = tensor.shape[0] if stacked else 1
+        if isinstance(tensor, GgufTensor):
+            if "conv" in name or (len(tensor.shape) != 2 and not stacked):   # GGUF squeezes conv kernels to 2-D
+                continue
+            fmt = _ggml_format(tensor.dtype) if name.endswith(".weight") else None
+            elements = math.prod(tensor.shape)
+        else:
+            base = next((name[:-len(suffix)] for suffix in PRIMARY if name.endswith(suffix)), None)
+            found = None if base is None or base in seen else stored(tensors, base, quantization)
+            # Plain and FP8 weights of other ranks are norms, biases and convolution kernels, not matrices.
+            if found is None or (found[0] in ("plain", "fp8") and len(tensor.shape) != 2 and not stacked):
+                continue
+            seen.add(base)
+            _, fmt, elements = found
         if fmt:
-            flops[fmt] = flops.get(fmt, 0) + 2 * rows * cols
-            matrices[fmt] = matrices.get(fmt, 0) + 1
+            flops[fmt] = flops.get(fmt, 0) + 2 * elements
+            matrices[fmt] = matrices.get(fmt, 0) + count
     return flops, matrices
 
 
 def model_ceiling(model):
-    """Per-token arithmetic and KV bytes of the model in MODEL_DIR, or None without safetensors."""
-    shards = weight_shards(model)
+    """Per-token arithmetic and KV bytes of the model, or None for a model without weight files."""
+    shards, drafts = weight_files(model)
     if not shards:
         return None
+    config = model_config(model)
+    quantization = quantization_of(config)
     flops, matrices, read = {}, {}, 0
     for shard in shards:
         tensors = {tensor.name: tensor for tensor in shard.tensors}
-        read += weight_bytes(tensors, shard.path.name)
-        f, m = matmul_flops(tensors, shard.path.name)
+        refuse_unread(quantization, tensors)
+        read += weight_bytes(tensors, shard.path.name, drafts)
+        f, m = matmul_flops(tensors, shard.path.name, drafts, quantization)
         for key in f:
             flops[key] = flops.get(key, 0) + f[key]
             matrices[key] = matrices.get(key, 0) + m[key]
-    config = model_config(model)
     shape = config.attention_shape()
     out = {"matmul_flops_per_token": flops, "matrices": matrices, "weight_bytes": read,
            "attention_layers": None, "attention_flops_per_pair": None, "kv_bytes_per_token": None,

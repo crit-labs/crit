@@ -9,6 +9,62 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-21
+
+### Overview
+
+crit 0.4.0 reads models in the formats they are published in. Eval, `crit run recon`, `crit serve`
+and calibration open a Hugging Face folder or a single weight file through one model source:
+safetensors, GGUF (a lone `.gguf` included, with its config and tokenizer derived from its own
+metadata), PyTorch state dicts and ONNX graphs. The reference and the decode ceiling read the
+common quantization schemes as stored (compressed-tensors, FP8 blocks, AWQ, GPTQ, MLX, bitsandbytes
+and ONNX MatMulNBits), each decoded to exactly the FP32 weights its own library gives. EXL2 and
+EXL3 are refused by name. crit ships no GGUF runtime; gguf-py is needed only to score a GGUF with
+`crit eval reference`. Eval data prepared with 0.3.0 for a safetensors model stays valid. The
+Python distribution and the Core SDK share version 0.4.0.
+
+### Added
+
+- GGUF models, pointed at as they come: a lone `.gguf`, the first part of a `gguf-split` set, or a
+  folder holding one. `crit_core.model` gets a strict, standard-library GGUF reader (`inspect_gguf`,
+  `inspect_gguf_model`) and derives the description files from the GGUF's own metadata
+  (`crit_core.model.gguf_files`): `config.json` for the `llama`, `qwen2`, `qwen3`, `qwen3moe`,
+  `qwen35` and `qwen35moe` architectures, `tokenizer.json` for byte-level BPE vocabularies with
+  the `qwen2`, `qwen35`, `llama-bpe` and `gpt-2` pre-tokenizers, `tokenizer_config.json`, the
+  chat templates and `generation_config.json`. The base model's files beside the GGUF are used
+  instead where present, and `check_gguf_folder` refuses them when their shapes, norm epsilon,
+  RoPE base, tokens or merges disagree with the GGUF. The context, ceiling and model identity count
+  the GGUF's stored bytes per block type. The reference decodes blocks with gguf-py and undoes
+  the reference converter's layout for the same six architectures (`crit_eval.gguf_layout`); a lone
+  GGUF from that converter gives back every tensor, the original config.json and
+  tokenizer, and the same reference scores. The derived tokenizers match Hugging Face's on
+  the reference converter's vocabulary test sets. crit runs no GGUF runtime.
+- Model sources. `crit_core.model.open_model(path)` reads any model folder or weight file as one
+  `ModelSource` (weight headers, weight files, description files real or derived), and Eval,
+  `crit run recon`, `crit serve` and calibration read models only through it. A weight format is
+  one `ModelFormat` (safetensors, GGUF, PyTorch and ONNX today).
+- PyTorch state dicts: `pytorch_model.bin` (sharded with its index too), `.pt` and `.pth`.
+  `crit_core.model.inspect_torch` reads torch.save's zip format with an unpickler that resolves
+  only what a state dict uses and refuses any other global, so the pickle never runs; tied
+  weights, float8 and storage offsets are kept, transposed views and the pre-1.6 format refused.
+  A safetensors checkpoint beside it wins, as in transformers.
+- ONNX graphs exported from a Hugging Face checkpoint (Optimum, torch.onnx), with external data.
+  `crit_core.model.inspect_onnx` walks the protobuf with the standard library and names every
+  weight as the checkpoint it came from, through the consuming node's module scope (a linear
+  layer's transposed MatMul operand becomes `<module>.weight`); MatMulNBits weights keep their
+  node's attributes. onnxruntime-genai builder graphs and other quantized ops are refused.
+- Quantization schemes, decided in one place for the ceiling and the reference
+  (`crit_eval.schemes`): compressed-tensors int (pack-quantized W4A16/W8A16 with or without zero
+  points, int-quantized W8A8), FP8 per block (compressed-tensors and `weight_scale_inv`), AWQ GEMM,
+  GPTQ (2/3/4/8 bits, `gptq` and `gptq_v2`), MLX (affine, mixed, mxfp4, nvfp4, mxfp8),
+  bitsandbytes NF4/FP4/LLM.int8 and ONNX MatMulNBits, beside the FP8 and NVFP4 already read. The
+  reference decodes each to exactly the FP32 weights the format's own library gives (tested against
+  GPTQModel, AutoAWQ, mlx, bitsandbytes, compressed-tensors and onnxruntime on models those tools
+  wrote), and the ceiling counts each scheme's matrices at its GEMM rate.
+- EXL2 and EXL3 checkpoints are refused by name, by their config or their tensors, rather than
+  counted and read without their matrices: exllama decodes them only in CUDA kernels, so there is
+  no CPU dequantization to check a reference decoder against.
+
 ## [0.3.0] - 2026-10-21
 
 ### Overview
@@ -528,7 +584,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/crit-labs/crit/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/crit-labs/crit/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/crit-labs/crit/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/crit-labs/crit/compare/v0.2.1...v0.2.2

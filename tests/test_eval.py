@@ -398,6 +398,24 @@ class CeilingTests(unittest.TestCase):
         self.assertEqual(out["weight_bytes"], read)
         self.assertIsNone(ceiling.model_ceiling(Path(directory) / "missing"))
 
+    def test_exllama_checkpoints_are_refused_not_counted_without_their_matrices(self):
+        trellis = {"model.layers.0.mlp.up_proj.trellis": {"dtype": "I16", "shape": [4, 4, 256],
+                                                          "data_offsets": [0, 8192]},
+                   "model.norm.weight": {"dtype": "BF16", "shape": [64], "data_offsets": [8192, 8320]}}
+        q_weight = {"model.layers.0.mlp.up_proj.q_weight": {"dtype": "I32", "shape": [16, 64],
+                                                            "data_offsets": [0, 4096]}}
+        cases = {"exl3 by its config": ({"quant_method": "exl3", "bits": 4}, trellis, "EXL3"),
+                 "exl3 by its tensors": (None, trellis, "EXL3"),
+                 "exl2 by its tensors": (None, q_weight, "EXL2")}
+        for label, (quantization, tensors, method) in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as directory:
+                model = Path(directory)
+                write_safetensors(model / "model.safetensors", tensors)
+                config = {"num_hidden_layers": 1, **({"quantization_config": quantization} if quantization else {})}
+                (model / "config.json").write_text(json.dumps(config))
+                with self.assertRaisesRegex(ValueError, f"{method} weights are not read: exllama decodes them only"):
+                    ceiling.model_ceiling(model)
+
     def test_prefill_floor_adds_matmul_attention_and_recurrent_time(self):
         model = {"matmul_flops_per_token": {"nvfp4": 4e9, "fp8": 2e9}, "attention_flops_per_pair": 1e5,
                  "recurrent_flops_per_token": 1e6}
@@ -1336,22 +1354,21 @@ class ReferenceTests(unittest.TestCase):
     def test_nvfp4_layouts_dequantize_alike(self):
         # compressed-tensors divides the group scales by weight_global_scale; ModelOpt multiplies by weight_scale_2.
         import torch
-        from types import SimpleNamespace
-        from crit_eval import reference
+        from crit_eval import reference, schemes
         torch.manual_seed(0)
         packed = torch.randint(0, 256, (4, 16), dtype=torch.uint8)
         scale = (torch.rand(4, 2) * 4 + .5).to(torch.float8_e4m3fn)
 
         def checkpoint(tensors):
-            ckpt = object.__new__(reference.Checkpoint)
-            ckpt.where = {k: SimpleNamespace(get_tensor=lambda key, t=tensors: t[key]) for k in tensors}
+            ckpt = object.__new__(reference.StateDictCheckpoint)
+            ckpt.where, ckpt.quantization = tensors, {}
             return ckpt
         ct = checkpoint({"w.weight_packed": packed, "w.weight_scale": scale, "w.weight_global_scale": torch.tensor(4.0)})
         mo = checkpoint({"w.weight": packed, "w.weight_scale": scale, "w.weight_scale_2": torch.tensor(0.25)})
         a, b = ct.dense("w", "cpu"), mo.dense("w", "cpu")
         self.assertEqual(a.shape, (4, 32))
         self.assertTrue(torch.equal(a, b))
-        first = float(reference.E2M1[int(packed[0, 0]) & 7] * (-1 if int(packed[0, 0]) & 8 else 1))
+        first = float(schemes.E2M1[int(packed[0, 0]) & 7] * (-1 if int(packed[0, 0]) & 8 else 1))
         self.assertEqual(float(a[0, 0]), first * float(scale[0, 0].float()) / 4)
 
     def assert_scores_like_the_model(self, model, folder, ids, first, top_k=4):

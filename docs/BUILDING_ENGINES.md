@@ -52,6 +52,9 @@ only when the user asks.
 ```
 
 These values are a template, not acceptance criteria; use `cases` for multiple workloads.
+`model_path` is the model as the user has it: a Hugging Face model folder, or a GGUF file (or a
+folder holding one), whose config, tokenizer and chat template crit derives from its metadata
+([GGUF models](eval/README.md#gguf-models)).
 Free-memory headroom comes from `settings.toml` (`vram_headroom_gib`,
 `ram_headroom_gib`; defaults 1 and 2 GiB), and `create` freezes it. A value in the
 request replaces the machine's setting, so add one only when the user asks for it.

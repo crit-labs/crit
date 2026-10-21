@@ -7,7 +7,7 @@
 
 ### Why wait for someone to optimize an LLM for your GPU when an AI agent can build a specialized inference engine in a few hours?
 
-[![Version 0.3.0](docs/assets/badge-version.svg)](CHANGELOG.md)
+[![Version 0.4.0](docs/assets/badge-version.svg)](CHANGELOG.md)
 [![License Apache-2.0](docs/assets/badge-license.svg)](LICENSE)
 [![crit-hub engines](docs/assets/badge-crit-hub.svg)](https://github.com/crit-labs/crit-hub)
 [![CI](https://github.com/crit-labs/crit/actions/workflows/ci.yml/badge.svg)](https://github.com/crit-labs/crit/actions/workflows/ci.yml)
@@ -609,6 +609,7 @@ implement the [adapter contract](docs/SERVING.md#adapter-contract).
 | Multi-GPU setups | Expected to work with engine-specific partitioning and communication; not yet tested end to end. |
 | macOS | Not yet tested. Current CI covers Windows and Linux. |
 | AMD and Apple GPUs | No bundled ROCm or Metal backend. The current GPU backend uses CUDA. |
+| Model formats | Hugging Face safetensors, PyTorch state dicts (`.bin`, `.pt`) and Optimum ONNX exports, unquantized or [quantized](docs/eval/README.md#other-weight-formats-and-quantization-schemes) as FP8, NVFP4, compressed-tensors int, AWQ, GPTQ, MLX, bitsandbytes or MatMulNBits, and [GGUF](docs/eval/README.md#gguf-models), a lone `.gguf` included: its config, tokenizer and chat template are derived from its metadata for the `llama`, `qwen2`, `qwen3`, `qwen3moe`, `qwen35` and `qwen35moe` architectures and byte-level BPE tokenizers (others need the base model's files beside it), and Eval's reference reads those architectures. A new format is one `ModelFormat` in `crit_core.model`. Core's C++ model library reads safetensors only; engines read a GGUF's tensors through `crit_core.model`'s offsets. |
 
 </details>
 
