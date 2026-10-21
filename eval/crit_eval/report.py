@@ -1,12 +1,19 @@
 """Side-by-side comparison of result files: `crit eval compare A.json B.json ...`."""
 from pathlib import Path
 
-from . import load_json
+from . import load_json, protocol_version
 from .status import decode_text_identity
 
 
 def _fmt(value, spec):
     return "–" if value is None else format(value, spec)
+
+
+def _major(result):
+    try:
+        return protocol_version(result.get("protocol"))[0]
+    except ValueError:
+        return None
 
 
 def compare(paths):
@@ -18,6 +25,8 @@ def compare(paths):
     warn = []
     if len({r["model_sha256"] for r in results}) > 1 or len({r["suite_sha256"] for r in results}) > 1:
         warn.append("Results use different prepared data or suites; they are not comparable.")
+    if len({_major(r) for r in results}) > 1:
+        warn.append("Results use different Eval protocol major versions; their scores are not comparable.")
     texts = [decode_text_identity(r) for r in results]
     rows.append(("Decode text", [("pinned " + t[:12]) if t != "generated" else "own output" for t in texts]))
     if len(set(texts)) > 1:
@@ -90,19 +99,19 @@ def compare(paths):
             fraction = p.get("fraction_of_ceiling") or p.get("fraction_of_speed_of_light")
             cells.append("–" if not ceiling else f"{ceiling:.1f}" + (f" (at {fraction:.0%})" if fraction else ""))
         rows.append(("Decode ceiling", cells))
-    paths_seen = []
+    sets_seen = []
     for r in results:
-        for path in r.get("quality", {}).get("paths", {}):
-            if path not in paths_seen:
-                paths_seen.append(path)
-    for path in paths_seen:
+        for name in (r.get("quality") or {}).get("sets") or {}:
+            if name not in sets_seen:
+                sets_seen.append(name)
+    for name in sets_seen:
         cells = []
         for r in results:
-            q = r.get("quality", {}).get("paths", {}).get(path)
-            cells.append("unsupported" if q is None else
+            q = ((r.get("quality") or {}).get("sets") or {}).get(name)
+            cells.append("–" if q is None else
                          f"PPL ×{q['ppl_ratio']:.4f}, KLD {q['kld_mean']:.1e} (p99 {q['kld_p99']:.1e}), "
                          f"top-1 {q['top1_agreement']:.3f} {'✓' if q['passed'] else '✗'}")
-        rows.append((f"Quality: {path}", cells))
+        rows.append((f"Quality: {name}", cells))
     if any("exactness" in r for r in results):
         cells = []
         for r in results:

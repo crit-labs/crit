@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_inference VERSION 0.2.3 LANGUAGES CXX)
+project(crit_inference VERSION 0.3.0 LANGUAGES CXX)
 # Inference's native examples and fixtures. Inference uses Core only through its public SDK
 # (crit::core, crit::cuda); Core never builds or includes Inference code.
 find_package(Threads REQUIRED)
@@ -8,7 +8,7 @@ option(CRIT_INFERENCE_CUDA "Build Inference's CUDA reference kernels and their f
 option(CRIT_INFERENCE_INSTALLED_CORE "Use an installed Core SDK (CMAKE_PREFIX_PATH) instead of this checkout's core/" OFF)
 if(NOT TARGET crit::core)
   if(CRIT_INFERENCE_INSTALLED_CORE)
-    find_package(critCore 0.2.3 CONFIG REQUIRED)
+    find_package(critCore 0.3.0 CONFIG REQUIRED)
   else()
     if(CRIT_INFERENCE_CUDA)
       set(CRIT_CORE_CUDA ON CACHE BOOL "Build the explicit CUDA backend services" FORCE)
@@ -143,6 +143,24 @@ crit_inference_executable(crit_attention_example SOURCES ${INFERENCE}/attention-
 crit_inference_test(crit_attention_example 30 crit_attention_example)
 crit_inference_executable(crit_paged_batch_example SOURCES ${INFERENCE}/attention-state/code/batch_example.cpp LINK crit::core)
 crit_inference_test(crit_paged_batch_example 30 crit_paged_batch_example)
+crit_inference_executable(crit_recovery_scheduler_tests SOURCES ${FIXTURES}/recovery_scheduler_tests.cpp
+  INCLUDES ${INFERENCE}/attention-state/code LINK crit::core)
+crit_inference_test(crit_recovery_scheduler 30 crit_recovery_scheduler_tests)
+crit_inference_tests(crit_recovery_scheduler_tests crit_recovery_scheduler 30
+  cancel_suspended cancel_restore suspend_failure restore_failure quarantine)
+crit_inference_executable(crit_dependent_steps_tests SOURCES ${FIXTURES}/dependent_steps_tests.cpp
+  INCLUDES ${INFERENCE}/concurrent-request-execution/code LINK crit::core)
+crit_inference_tests(crit_dependent_steps_tests crit_dependent_steps 30 compare ahead cancel recovery stale commit quarantine immovable)
+add_library(crit_native_scheduler_fixture SHARED ${FIXTURES}/native_scheduler_fixture.cpp)
+target_include_directories(crit_native_scheduler_fixture PRIVATE ${INFERENCE}/concurrent-request-execution/code ${INFERENCE}/attention-state/code)
+target_link_libraries(crit_native_scheduler_fixture PRIVATE crit::core)
+crit_inference_warnings(crit_native_scheduler_fixture)
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME crit_native_scheduler_serving COMMAND "${Python3_EXECUTABLE}" -B
+    "${FIXTURES}/native_serving_check.py" $<TARGET_FILE:crit_native_scheduler_fixture>)
+  set_tests_properties(crit_native_scheduler_serving PROPERTIES TIMEOUT 90)
+endif()
 crit_inference_executable(crit_attention_tests SOURCES ${FIXTURES}/attention_tests.cpp
   INCLUDES ${INFERENCE}/attention-state/code ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/examples/openblas
   LINK crit::core ${CMAKE_DL_LIBS})
@@ -187,6 +205,10 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES native)
 endif()
 enable_language(CUDA)
+add_executable(crit_cuda_ahead_example ${INFERENCE}/concurrent-request-execution/code/cuda_ahead_example.cu)
+target_compile_features(crit_cuda_ahead_example PRIVATE cxx_std_20 cuda_std_20)
+target_link_libraries(crit_cuda_ahead_example PRIVATE crit::cuda)
+crit_inference_test(crit_cuda_ahead 60 crit_cuda_ahead_example)
 include(CheckLinkerFlag)
 check_linker_flag(CXX "LINKER:--wrap=crit_link_probe" CRIT_INFERENCE_HAS_LINKER_WRAP)
 

@@ -54,7 +54,7 @@ a clean snapshot:
 mkdir -p build/package-source
 git archive HEAD | tar -x -C build/package-source
 python -B -c "import os; from setuptools.build_meta import build_sdist, build_wheel; os.chdir('build/package-source'); build_sdist('../dist'); build_wheel('../dist')"
-python -m pip install build/dist/crit-0.2.3-py3-none-any.whl
+python -m pip install build/dist/crit-0.3.0-py3-none-any.whl
 ```
 
 The wheel holds `crit`, `crit_api`, `crit_eval`, `crit_kernels`, `crit_models` and `crit_core` and

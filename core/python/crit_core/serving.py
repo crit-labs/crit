@@ -29,7 +29,10 @@ temperature. ResidentChat is the one place calls are parsed: in the format the m
 crit_core.text.tools registers it, else in the package's own `tool_format` (a crit_core.text.ToolFormat; crit
 carries no model-specific syntax). Either way the adapter returns parsed calls (chat-tools-v1, streamed with
 chat-tool-stream-v1). Reasoning in the template's markers (<think>...</think>) is returned apart from the reply in
-the same way, as `reasoning`, which crit serve gives clients as reasoning_content.
+the same way, as `reasoning`, which crit serve gives clients as reasoning_content. An engine that reports token
+log-probabilities sets `logprobs = True` and declares capabilities(..., logprobs=True) (chat-logprobs-v1): a request
+then carries "logprobs": n, ResidentChat passes logprobs=n to generate_tokens, and the decoder calls
+on_tokens(tokens, rows) with one (logprob, [(token, logprob), ...n alternatives]) row per token.
 """
 from pathlib import Path
 from contextlib import contextmanager
@@ -37,6 +40,9 @@ from dataclasses import dataclass
 
 SAMPLING = ("temperature", "top_p", "top_k", "min_p", "seed", "presence_penalty", "frequency_penalty",
             "repetition_penalty", "logit_bias")
+LOGPROBS_CAPABILITY = "chat-logprobs-v1"
+TOP_LOGPROBS = 20  # the most alternatives per token a request asks for (OpenAI's top_logprobs range)
+MIN_LOGPROB = -9999.0  # what a zero probability reads as, as OpenAI reports it (JSON has no infinity)
 
 
 def sampling_capability(name):
@@ -52,12 +58,8 @@ def template_tool_format(text):
 
 def special_marker_ids(text, markers):
     """The ids of the markers the tokenizer holds as single special tokens."""
-    kept = set()
-    for marker in markers:
-        ids = text.tokenizer.encode(marker, add_special_tokens=False, split_special_tokens=False)
-        if len(ids) == 1 and ids[0] in text.tokenizer.special_ids:
-            kept.add(ids[0])
-    return frozenset(kept)
+    from crit_core.text.markers import marker_ids
+    return frozenset(marker_ids(text.tokenizer, markers).values())
 
 
 def kept_special_ids(text, tool_format=None):
@@ -68,9 +70,10 @@ def kept_special_ids(text, tool_format=None):
     return special_marker_ids(text, format_markers(format)) if format is not None else frozenset()
 
 
-def capabilities(text, sampling=(), *, stream=True, config=True, tool_format=None, images=False, concurrent=False):
+def capabilities(text, sampling=(), *, stream=True, config=True, tool_format=None, images=False, concurrent=False,
+                 logprobs=False):
     """The serving capabilities a package built on ResidentChat declares, for a model's ModelText and the package's
-    own `tool_format` (ResidentChat.tool_format), if any."""
+    own `tool_format` (ResidentChat.tool_format), if any. logprobs: the engine sets ResidentChat.logprobs."""
     unknown = sorted(set(sampling) - set(SAMPLING))
     if unknown:
         raise ValueError("Unknown sampling fields: " + ", ".join(unknown))
@@ -79,9 +82,20 @@ def capabilities(text, sampling=(), *, stream=True, config=True, tool_format=Non
     result += ["chat-config-v1"] if config else []
     result += ["chat-images-v1"] if images else []
     result += ["chat-concurrent-v1"] if concurrent else []
+    result += [LOGPROBS_CAPABILITY] if logprobs else []
     if tool_format is not None or template_tool_format(text):
         result += ["chat-tools-v1"] + (["chat-tool-stream-v1"] if stream else [])
     return result + [sampling_capability(name) for name in SAMPLING if name in sampling]
+
+
+def logprob_row(token, row, alternatives):
+    """[token, logprob, [[token, logprob], ...]] for a response's "logprobs": exactly `alternatives` ranked
+    alternatives, log-probabilities clamped into [MIN_LOGPROB, 0] (Core allows -inf and a rounding tolerance)."""
+    logprob, top = row
+    if len(top) != alternatives:
+        raise ValueError(f"The engine returned {len(top)} alternatives for a token, not {alternatives}")
+    clamp = lambda value: min(0.0, max(MIN_LOGPROB, float(value)))
+    return [int(token), clamp(logprob), [[int(other), clamp(value)] for other, value in top]]
 
 
 def chat_prompt(request, *, images=False):
@@ -112,8 +126,11 @@ class ResidentChat:
     package sets for a syntax crit does not register; replies carry them as tool_calls (chat-tools-v1). Reasoning is
     split from the reply in the markers the chat template uses (crit_core.text.reasoning) and returned as
     `reasoning`, streamed as {"reasoning": text}; `reasoning_format` sets a crit_core.text.ReasoningFormat for
-    markers crit does not register, or False to leave reasoning in the reply."""
+    markers crit does not register, or False to leave reasoning in the reply. `logprobs` True: the decoder reports
+    each token's log-probability and up to TOP_LOGPROBS alternatives (chat-logprobs-v1); the response then carries
+    them for every generated token but stop tokens, reasoning and tool calls included."""
     sampling = ()
+    logprobs = False
     tool_format = None
     reasoning_format = None
     images = False
@@ -148,8 +165,12 @@ class ResidentChat:
         """Decode up to max_new_tokens after prompt `ids`, calling on_tokens(list of ids) as tokens are accepted.
         `sampling` holds only request fields from `self.sampling`; absent fields keep the engine's defaults.
         Return (tokens, timing), with tokens None when cancelled() turned true. timing: prefill_ms, decode_ms,
-        first_token_ms, and optionally prefill_tokens (prompt tokens actually computed) and decode_tokens (output
-        tokens the decode phase produced, never drafting rounds; default: all but the first)."""
+        first_token_ms, and optionally prefill_tokens (prompt tokens actually computed), decode_tokens (output
+        tokens the decode phase produced, never drafting rounds; default: all but the first) and rounds (target
+        passes after prefill, a speculative engine's verify rounds; crit serve reports output tokens per round).
+        An engine with `logprobs` also takes logprobs=n when the request asks for them and then calls
+        on_tokens(tokens, rows): per token (logprob, [(token, logprob), ...]) with its n most likely alternatives,
+        ranked, natural-log probabilities of the raw logits (crit::core::TokenLogprob)."""
         raise NotImplementedError
 
     def effective_configuration(self):
@@ -171,17 +192,21 @@ class ResidentChat:
             raise ValueError("Image input requires the engine's prepare_prompt implementation")
         yield PreparedPrompt(self.prompt_ids(request))
 
-    def generate_prepared(self, prompt, max_new_tokens, sampling, on_tokens, cancelled):
-        """Override to consume prepared image inputs with the engine's token generator."""
+    def generate_prepared(self, prompt, max_new_tokens, sampling, on_tokens, cancelled, **options):
+        """Override to consume prepared image inputs with the engine's token generator; `options` (logprobs) go
+        to generate_tokens."""
         if prompt.inputs is not None:
             raise NotImplementedError("Prepared image inputs require generate_prepared")
-        return self.generate_tokens(prompt.ids, max_new_tokens, sampling, on_tokens, cancelled)
+        return self.generate_tokens(prompt.ids, max_new_tokens, sampling, on_tokens, cancelled, **options)
 
     def _run(self, request, cancellation, emit=None):
         with self.prepare_prompt(request, cancellation) as prompt:
             return self._generate(request, cancellation, prompt, emit)
 
     def _generate(self, request, cancellation, prompt, emit):
+        from crit_core.text import MarkerDecoder, ReasoningSplitter, TokenText, ToolReply
+        from crit_core.text.markers import prompt_ends_with
+
         ids = prompt.ids
         prompt_tokens = len(ids) if prompt.token_count is None else prompt.token_count
         if type(prompt_tokens) is not int or prompt_tokens < 1:
@@ -195,6 +220,11 @@ class ResidentChat:
         unsupported = sorted(set(sampling) - set(self.sampling))
         if unsupported:
             raise ValueError("This engine does not apply sampling field(s): " + ", ".join(unsupported))
+        alternatives = request.get("logprobs")
+        if alternatives is not None and not self.logprobs:
+            raise ValueError("This engine does not report log-probabilities")
+        if alternatives is not None and not (type(alternatives) is int and 0 <= alternatives <= TOP_LOGPROBS):
+            raise ValueError(f"logprobs must be an integer in [0, {TOP_LOGPROBS}]")
         calls_format, reply = None, None
         if request.get("tools"):   # calls only come when tools are offered
             if getattr(self, "calls_format", None) is None:   # also subclasses that set up self.text themselves
@@ -205,21 +235,21 @@ class ResidentChat:
                 if request.get("tool_choice", "auto") != "auto":
                     raise ValueError("This engine parses tool calls from free generation: tool_choice must be auto "
                                      "or none")
-                from crit_core.text import ToolReply
-                reply = ToolReply(calls_format, request, emit)
+                reply = ToolReply(calls_format, request, emit, tokenizer=self.text.tokenizer)
         thinking = self._reasoning_format()
         kept = self._kept_markers(calls_format, thinking)
-        if kept:
-            stream = self.text.text_stream(ids, skip_special_tokens=False)
-            dropped = (set(self.text.tokenizer.special_ids) - kept) | self.stop_ids
-        else:
-            stream, dropped = self.text.text_stream(ids), self.stop_ids
+        dropped = ((set(self.text.tokenizer.special_ids) - kept) | self.stop_ids) if kept else self.stop_ids
         splitter = None
+        boundaries = dict(reply.parser.token_ids) if reply else {}
         if thinking is not None:
-            from crit_core.text import ReasoningSplitter
-            prompt_end = self.text.tokenizer.decode(list(ids[-16:])).rstrip()
-            splitter = ReasoningSplitter(thinking, opened=prompt_end.endswith(thinking.opening))
+            splitter = ReasoningSplitter(thinking, tokenizer=self.text.tokenizer)
+            if prompt_ends_with(self.text.tokenizer, ids, thinking.opening, splitter.token_ids):
+                splitter.state = "reasoning"
+            boundaries.update(splitter.token_ids)
+        stream = MarkerDecoder(self.text.tokenizer, markers={v: k for k, v in boundaries.items()},
+                               stream=self.text.text_stream(ids, skip_special_tokens=not kept))
         pieces, reasoning = [], []
+        rows = None if alternatives is None else []
 
         def deliver(events):
             for kind, value in events:
@@ -228,32 +258,38 @@ class ResidentChat:
                     if emit:
                         emit({"reasoning": value})
                     continue
-                pieces.append(value)
+                text = value.text if isinstance(value, TokenText) else value
+                pieces.append(text)
                 if reply:
                     reply.push(value)
                 elif emit:
-                    emit(value)
+                    emit(text)
 
         def route(text):
             deliver(splitter.push(text) if splitter else [("text", text)])
 
-        def on_tokens(tokens):
-            delta = stream.push([t for t in tokens if t not in dropped])
-            if delta.text:
-                route(delta.text)
+        def on_tokens(tokens, logprobs=None):
+            if rows is not None:
+                if logprobs is None or len(logprobs) != len(tokens):
+                    raise ValueError("The engine returned tokens without their log-probabilities")
+                rows.extend(logprob_row(token, row, alternatives) for token, row in zip(tokens, logprobs)
+                            if token not in self.stop_ids)
+            for part in stream.push([t for t in tokens if t not in dropped]):
+                route(part)
 
-        tokens, timing = self.generate_prepared(prompt, output_tokens, sampling, on_tokens, cancellation.is_set)
+        options = {} if alternatives is None else {"logprobs": alternatives}
+        tokens, timing = self.generate_prepared(prompt, output_tokens, sampling, on_tokens, cancellation.is_set,
+                                                **options)
         if tokens is None:
             cancellation.check()
             raise RuntimeError("generation cancelled")
-        tail = stream.finish()
-        if tail.text:
-            route(tail.text)
+        for part in stream.finish():
+            route(part)
         if splitter:
             deliver(splitter.finish())
         calls = None
         if reply:
-            content, calls = reply.finish()
+            content, calls = reply.finish(cut=len(tokens) >= output_tokens)
             pieces = [content]
         n = len(tokens)
         decode = timing.get("decode_tokens", n - 1)
@@ -264,7 +300,17 @@ class ResidentChat:
                      "ttft_ms": timing["first_token_ms"], "missing": {}}
         if n <= 1:
             telemetry["missing"]["decode"] = "the reply has a single token"
-        return "".join(pieces), telemetry, calls, "".join(reasoning)
+        elif timing.get("rounds"):
+            telemetry["decode_rounds"] = min(int(timing["rounds"]), n)
+        logprobs = None
+        if rows is not None:
+            # Each token named once by its bytes, so the server can give clients token text and bytes.
+            data = self.text.tokenizer.token_bytes()
+            ids = {row[0] for row in rows} | {other for row in rows for other, _ in row[2]}
+            if ids and not 0 <= min(ids) <= max(ids) < len(data):
+                raise ValueError("The engine reported log-probabilities for ids outside the tokenizer's vocabulary")
+            logprobs = {"tokens": rows, "bytes": {str(token): data[token].hex() for token in sorted(ids)}}
+        return "".join(pieces), telemetry, calls, "".join(reasoning), logprobs
 
     def _reasoning_format(self):
         """reasoning_format, else the reasoning format the chat templates use (None: no split; False disables it)."""
@@ -288,11 +334,11 @@ class ResidentChat:
         if key not in cache:
             kept = set(kept_special_ids(self.text, calls_format)) if calls_format is not None else set()
             if thinking is not None:
-                kept |= special_marker_ids(self.text, thinking)
+                kept |= special_marker_ids(self.text, (thinking.opening, thinking.closing))
             cache[key] = frozenset(kept)
         return cache[key]
 
-    def _response(self, request, text, telemetry, calls=None, reasoning=""):
+    def _response(self, request, text, telemetry, calls=None, reasoning="", logprobs=None):
         response = {"schema_version": 1, "record_kind": "chat_response", "request_id": request["request_id"],
                     "candidate_id": request["candidate_id"], "package_sha256": request["package_sha256"],
                     "assistant": text, "telemetry": telemetry}
@@ -300,6 +346,8 @@ class ResidentChat:
             response["tool_calls"] = calls
         if reasoning:
             response["reasoning"] = reasoning
+        if logprobs is not None:
+            response["logprobs"] = logprobs
         return response
 
     def generate(self, request, cancellation):
@@ -315,5 +363,6 @@ class ResidentChat:
         pass
 
 
-__all__ = ["ResidentChat", "PreparedPrompt", "SAMPLING", "capabilities", "chat_prompt", "kept_special_ids", "special_marker_ids",
-           "sampling_capability", "template_tool_format"]
+__all__ = ["ResidentChat", "PreparedPrompt", "SAMPLING", "LOGPROBS_CAPABILITY", "TOP_LOGPROBS", "capabilities",
+           "chat_prompt", "kept_special_ids", "logprob_row", "special_marker_ids", "sampling_capability",
+           "template_tool_format"]

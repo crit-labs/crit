@@ -4,7 +4,7 @@ import math
 import re
 from functools import lru_cache
 
-from crit_core.constraints import UnsupportedConstraint, compile_language, matches
+from crit_core.constraints import ByteGrammar, GrammarState, UnsupportedConstraint, compile_language, matches
 
 TOOLS_CAPABILITY = "chat-tools-v1"
 STRICT_TOOLS_CAPABILITY = "chat-tools-strict-v1"
@@ -144,12 +144,13 @@ def _reject_constant(value):
     raise ValueError("Non-finite JSON number: " + value)
 
 
-def tool_calls(value):
-    """Validate the OpenAI wire representation; never interpret or execute a call."""
+def tool_calls(value, truncated=False):
+    """Validate the OpenAI wire representation; never interpret or execute a call. With `truncated`, a reply cut by
+    its output limit, the last call's arguments may be the start of a JSON object, as the model wrote them."""
     if not isinstance(value, list) or not 1 <= len(value) <= 128:
         raise ValueError("tool_calls must be a non-empty list of at most 128 calls")
     ids = set()
-    for call in value:
+    for index, call in enumerate(value):
         if not isinstance(call, dict):
             raise ValueError("Each tool call must be an object")
         ident, function = call.get("id"), call.get("function")
@@ -158,6 +159,10 @@ def tool_calls(value):
                 or not function_name(function.get("name")) or not isinstance(function.get("arguments"), str)):
             raise ValueError("Tool calls need unique ids, type function, a name and JSON-string arguments")
         ids.add(ident)
+        if truncated and index == len(value) - 1 and not complete_arguments(call):
+            if not function["arguments"].startswith("{"):
+                raise ValueError("A cut tool call's arguments must start a JSON object")
+            continue
         arguments = json.loads(function["arguments"], parse_constant=_reject_constant)
         if not isinstance(arguments, dict):
             raise ValueError("Tool call arguments must encode a JSON object")
@@ -165,8 +170,19 @@ def tool_calls(value):
     return value
 
 
-def validate_tool_reply(calls, options):
-    calls = [] if calls is None or calls == [] else tool_calls(calls)
+def complete_arguments(call):
+    """Whether a call's arguments are a whole JSON value, not the start of one a cut reply left."""
+    try:
+        json.loads(call["function"]["arguments"], parse_constant=_reject_constant)
+    except ValueError:
+        return False
+    return True
+
+
+def validate_tool_reply(calls, options, truncated=False):
+    """A reply's calls against the request's tool policy; `truncated`: the reply reached its output limit, so its last
+    call may be cut (tool_calls)."""
+    calls = [] if calls is None or calls == [] else tool_calls(calls, truncated)
     choice = options.get("tool_choice", "none")
     names = {t["function"]["name"] for t in options.get("tools", [])}
     if calls and (choice == "none" or any(c["function"]["name"] not in names for c in calls)):
@@ -182,6 +198,8 @@ def validate_tool_reply(calls, options):
         raise ValueError("Engine reused a tool call id from the conversation")
     for call in calls:
         grammar = options.get("tool_grammars", {}).get(call["function"]["name"])
-        if grammar and not matches(grammar, call["function"]["arguments"].encode("utf-8")):
+        arguments = call["function"]["arguments"].encode("utf-8")
+        if grammar and not (matches(grammar, arguments) if complete_arguments(call)
+                            else GrammarState(ByteGrammar.load(grammar)).advance(arguments) is not None):
             raise ValueError("Tool arguments do not match the strict schema: " + call["function"]["name"])
     return calls

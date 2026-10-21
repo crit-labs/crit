@@ -7,7 +7,7 @@ says who holds it while it waits.
 
 CRIT_ENGINE_LOCK names the lock file (default: crit-engine.lock in the system temp directory, one per OS instance;
 under WSL that is the distribution); "off" disables the lock. A process holding it exports CRIT_ENGINE_LOCK_HELD,
-so the processes it starts (an Eval adapter's engine, crit run measure's children) never wait for their parent.
+so the processes it starts (an Eval adapter's engine, crit serve's resident host) never wait for their parent.
 
 File locks do not cross OS instances, but Windows and its WSL distributions share one GPU and one RAM. The holder
 therefore also keeps a lease file every OS instance of the machine can read and refreshes it while it holds the lock;

@@ -12,6 +12,7 @@
 #include <vector>
 
 namespace crit::core {
+namespace detail { struct RequestWakeup; }
 using Token = std::int32_t;
 enum class Memory { host, device };
 struct Usage { std::size_t live = 0, peak = 0, limit = 0; };
@@ -87,8 +88,13 @@ struct Profile {
     std::uint32_t admission_starvation_ms = 1000;
     // Zero keeps fixed chunks. Advice may shrink grants, never enlarge them.
     std::uint64_t prefill_target_ns = 0;
-    // Opt-in mixed execution pipeline. Each lane belongs to at most one batch.
+    // Opt-in mixed execution pipeline. Depth one per lane unless configured below.
     std::uint32_t max_inflight_batches = 0, batch_timeout_ms = 30000;
+    // Optional incremental allocation and recoverable suspension (async mixed batches).
+    bool memory_preemption = false;
+    // Dependent execution per request, opt-in. Output ceilings reserve unresolved
+    // steps without confusing a step's grant with the request's remaining length.
+    std::uint32_t max_request_steps = 1, max_step_output_tokens = 1;
 };
 // Most alternatives any log-probability row may carry.
 inline constexpr std::uint32_t top_logprobs_limit = 64;
@@ -165,6 +171,12 @@ struct ModelInfo {
     std::uint32_t max_top_logprobs = 0;
     // Named scoring paths (for example prefill and decode); empty means one default path.
     std::vector<std::string> score_paths = {};
+    bool memory_preemption = false;
+    std::uint32_t max_request_steps = 1;
+    // Mixed prefill work is granted in multiples of this quantum, including
+    // padded columns. Prompt consumption remains bounded by actual input.
+    // One preserves single-token grants; decode always supports them.
+    std::uint32_t prefill_work_quantum = 1;
 };
 // A token and its natural-log probability under the raw logits of the pass that
 // produced or scored the position: before temperature, penalties, bias and filters,
@@ -369,17 +381,31 @@ struct SchedulingHint {
     std::uint64_t prefix_affinity = 0;
     bool prefix_pending = false;
 };
+struct StepKey {
+    RequestKey request;
+    std::uint64_t sequence = 0;
+    bool operator==(const StepKey&) const = default;
+};
+// An owned, already-established dependency and private engine-accepted carry.
+// It is not host-readable progress. A successor uses actual accepted tokens and
+// positions, never guessed tokens or unverified speculative candidates.
+class StepContinuation { public: virtual ~StepContinuation() = default; };
 struct WorkItem {
     RequestKey key;
     ConcurrentSession* session;
     WorkBudget budget;
+    std::uint64_t step = 0;
+    std::shared_ptr<StepContinuation> predecessor = {};
 };
-struct RowProgress { RequestKey key; Progress progress; };
+struct RowProgress { RequestKey key; Progress progress; std::uint64_t step = 0; };
 struct CommitDecision {
     RequestKey key;
     ConcurrentSession* session;
     std::uint32_t accepted;
     bool terminal, cancelled;
+    std::uint64_t step = 0;
+    // A terminal predecessor makes this descendant private suffix discard-only.
+    bool discard = false;
 };
 class Retirement {
 public:
@@ -399,6 +425,9 @@ public:
     // Core; it neither publishes output nor certifies readiness. Quiesce and
     // destruction must join producers, including any outstanding notification.
     virtual void submit(Notify notify) = 0;
+    // Called after successful submit, before host readiness. Required for opted-in
+    // dependent steps. The dependency and storage outlive this operation as needed.
+    virtual std::shared_ptr<StepContinuation> continuation(StepKey) { return {}; }
     // Nonblocking; true proves all submitted operation readers/producers settled.
     virtual bool ready() = 0;
     virtual std::vector<RowProgress> progress() = 0;
@@ -409,16 +438,55 @@ public:
     virtual void commit(std::span<const CommitDecision>) = 0;
     virtual void quiesce() = 0; // Idempotently stop/join its host producers.
 };
+// Engine-defined pool pressure. A blocked preparation has launched nothing and
+// released every provisional reservation. Allocation/launch exceptions are failures.
+class MemoryPressure { public: virtual ~MemoryPressure() = default; };
+struct BatchPreparation {
+    Admission status = Admission::ready;
+    std::unique_ptr<BatchExecution> execution;
+    RequestKey blocked;
+    std::shared_ptr<const MemoryPressure> pressure;
+};
+struct ContinuationView {
+    RequestView request;
+    std::span<const Token> accepted;
+    std::uint32_t prompt_tokens;
+    bool prefill_complete;
+};
+// Complete engine-owned conditioning/state or a lossless replay recipe. The
+// engine charges retained storage to Resources before releasing source state.
+class ResumeImage { public: virtual ~ResumeImage() = default; };
+class Suspension {
+public:
+    virtual ~Suspension() = default;
+    virtual void submit(BatchExecution::Notify) = 0;
+    // True certifies a recoverable image AND release of all source readers/state.
+    virtual bool ready() = 0;
+    virtual std::unique_ptr<ResumeImage> take() = 0;
+    virtual void quiesce() = 0;
+};
+class Restoration {
+public:
+    virtual ~Restoration() = default;
+    virtual void submit(BatchExecution::Notify) = 0;
+    virtual bool ready() = 0;
+    virtual std::unique_ptr<ConcurrentSession> take() = 0;
+    virtual std::uint64_t recomputed_tokens() const noexcept = 0;
+    virtual void quiesce() = 0;
+};
 class ConcurrentModel : public Model {
 public:
     std::unique_ptr<Session> open(std::span<const Token>) final;
-    // Inspection only; no submissions or provisional allocations. Full request
-    // memory entitlement is extension policy, reserved by open before execution.
+    // Inspection only; no submissions or provisional allocations. Request memory
+    // entitlement is extension policy: reserve in open, or opt into the incremental
+    // preparation/recovery contract below before allocating per-step state.
     virtual Admission admission(const RequestView&) { return Admission::ready; }
     // Bounded, host-only inspection; no work submission, waits or retained views.
     virtual SchedulingHint scheduling_hint(const RequestView&) { return {}; }
     virtual std::uint32_t prefill_limit(const WorkItem&, const PrefillWindow&) { return 0; }
     virtual std::unique_ptr<ConcurrentSession> open(const RequestView&) = 0;
+    // Request-specific eligibility: host-dependent sampling/grammar uses one.
+    virtual std::uint32_t execution_depth(const RequestView&) { return 1; }
     virtual RowProgress prefill(const WorkItem&) = 0;
     // Exactly one row per compact WorkItem, in any order; variable candidates per
     // row allow ordinary, batched speculative, or solo-specific strategies.
@@ -427,9 +495,24 @@ public:
     // all grants are ceilings. One-token grants must make progress. Returned
     // storage/readiness/commit obey the same group contract as decode().
     virtual std::vector<RowProgress> execute(std::span<const WorkItem>);
-    // Prepare ownership only, without launching work. Different in-flight
-    // operations use disjoint lanes and private metadata/output/scratch.
+    // Prepare ownership only, without launching work. Operations own private
+    // metadata/output/scratch. Lanes are disjoint at depth one; larger depths
+    // require the explicit predecessor/step protocol and private acceptance.
     virtual std::unique_ptr<BatchExecution> prepare_batch(std::span<const WorkItem>);
+    // Optional incremental path. Infeasible identifies a request that cannot fit
+    // alone. Deferred identifies the exact blocked row and noninterchangeable pools.
+    virtual BatchPreparation prepare_incremental(std::span<const WorkItem>);
+    // Pure bounded inspection of a settled victim: true only if its suspension
+    // actually helps this pressure (shared pages must not be counted twice).
+    virtual bool reclaimable(const MemoryPressure&, const ContinuationView&, const ConcurrentSession&) { return false; }
+    // Preparation launches nothing. Core retains operation and session before submit.
+    // take() is called once after ready; the old session is then destroyed, without
+    // retire/close: suspension itself releases it, and never completes the request.
+    virtual std::unique_ptr<Suspension> suspend(const ContinuationView&, ConcurrentSession&);
+    // Core restores with other resident requests retired. Reserve through the old
+    // frontier PLUS one useful new step before submission. Never resample/re-emit
+    // accepted tokens. Preserve all state, including recurrent/draft/conditioning.
+    virtual std::unique_ptr<Restoration> restore(const ContinuationView&, const ResumeImage&);
     // Timings for the last decode()/prefill()/execute() group, for every row key.
     // Same calling and lifetime rules as Session::device_timings().
     virtual std::span<const DeviceTiming> device_timings() { return {}; }
@@ -460,6 +543,9 @@ struct RequestTiming {
     std::uint32_t prefill_tokens = 0; // prompt tokens the model reported consuming
     std::uint32_t reused_prompt_tokens = 0; // of prefill_tokens, restored without computation
     std::uint32_t decode_steps = 0;   // generation steps after prefill completed
+    std::uint32_t preemptions = 0;
+    // Successful restoration prepare -> readiness; excludes time suspended.
+    std::uint64_t recovery_ns = 0, recomputed_tokens = 0;
 };
 struct Result {
     std::vector<Token> tokens;
@@ -511,6 +597,7 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     std::shared_ptr<std::atomic<bool>> cancellation_;
+    std::shared_ptr<detail::RequestWakeup> wake_cancel_;
     std::uint64_t id_ = 0;
     explicit Handle(std::unique_ptr<Impl>);
     friend class Engine;

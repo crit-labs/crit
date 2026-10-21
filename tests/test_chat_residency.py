@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from test_run_records import RunFixture
 from crit_api.engine import EngineError, ServedEngine
-from crit_api.host import Host
+from crit_api.host import Cancellation, Host
 from crit_api.models import DeviceAllocation, ModelContext, ModelPool
 from crit.process.ownership import RuntimeOwnership, group_alive, process_identity
 from crit_api.residency import ResidentRuntime
@@ -69,11 +69,12 @@ class Engine:
                     format=(request.get('response_format') or {}).get('type'))
         return self.response(request, json.dumps(data))
 
-    def response(self, request, assistant, output_tokens=4):
+    def response(self, request, assistant, output_tokens=4, rounds=None):
         return dict(schema_version=1, record_kind='chat_response',
                     **{k: request[k] for k in ('request_id', 'candidate_id', 'package_sha256')},
                     assistant=assistant, telemetry=dict(prompt_tokens=10, output_tokens=output_tokens,
-                    prefill_tokens=10, prefill_ms=5, decode_tokens=output_tokens - 1, decode_ms=10, ttft_ms=6, missing={}))
+                    prefill_tokens=10, prefill_ms=5, decode_tokens=output_tokens - 1, decode_ms=10, ttft_ms=6, missing={},
+                    **({'decode_rounds': rounds} if rounds else {})))
 
     def generate_stream(self, request, cancellation, emit):
         message = request['messages'][-1]['content']
@@ -90,7 +91,9 @@ class Engine:
             emit(piece)
             pieces.append(piece)
             time.sleep(.05)
-        return self.response(request, ''.join(pieces), min(len(pieces), request['limits']['max_output_tokens']))
+        # Words decode as one verify round of up to three tokens after the first (a speculative engine's telemetry).
+        output = min(len(pieces), request['limits']['max_output_tokens'])
+        return self.response(request, ''.join(pieces), output, -(-(output - 1) // 3) if output > 1 else None)
 
     def reset(self):
         if self.mode == 'badreset':
@@ -204,10 +207,10 @@ class ResidentTests(ServeFixture, unittest.TestCase):
         before = self.ask(engine)
         stop = threading.Event()
         stop.set()
-        commands = set((engine.runtime.root / 'accepted').iterdir())
-        self.assertEqual(engine.generate([{'role': 'user', 'content': 'hello'}], 128, stop,
-                                         candidate_id=self.b), ('cancelled', None, None))
-        self.assertEqual(set((engine.runtime.root / 'accepted').iterdir()), commands)
+        with patch.object(engine.runtime.link, 'send', wraps=engine.runtime.link.send) as send:
+            self.assertEqual(engine.generate([{'role': 'user', 'content': 'hello'}], 128, stop,
+                                             candidate_id=self.b), ('cancelled', None, None))
+        send.assert_not_called()
         self.assertEqual(engine.status()['engine_loads'], 1)
         after = self.ask(engine)
         self.assertEqual(after['calls'], before['calls'] + 1)
@@ -216,7 +219,7 @@ class ResidentTests(ServeFixture, unittest.TestCase):
     def test_load_progress_reports_actual_reads_and_allocation_then_reuse(self):
         engine = self.engine(open=False)
         engine.default = self.a
-        host = Host(self.root / 'progress-host', 1024, 1024)
+        host = Host(self.root / 'progress-host', 1024, 1024, lambda message: None)
         try:
             with patch.object(host, 'status', wraps=host.status) as status:
                 host.attach(engine.spec(self.a))
@@ -237,7 +240,7 @@ class ResidentTests(ServeFixture, unittest.TestCase):
                 self.assertTrue(all(row['model_reused'] for row in setup))
                 self.assertEqual(setup[-1]['model_device_bytes'], self.model.stat().st_size)
         finally:
-            host.handle({'action': 'unload', 'payload': {}})
+            host.handle({'action': 'unload', 'payload': {}}, Cancellation())
 
     def test_a_a_b_a_reuses_model_and_device_but_resets_private_state(self):
         engine = self.engine()
@@ -271,6 +274,16 @@ class ResidentTests(ServeFixture, unittest.TestCase):
         self.assertEqual(self.ask(engine)['history'], 1)
         with self.assertRaisesRegex(EngineError, 'max_tokens'):
             engine.generate(messages, 8192, threading.Event())
+
+    def test_conversation_size_is_bounded_by_bytes_not_a_character_count(self):
+        # A full-context prompt of a 262,144-token model is over a million characters; the bound is the
+        # request body's, so it reaches the adapter, and only a larger conversation is refused.
+        engine = self.engine()
+        long = [{'role': 'user', 'content': 'word ' * 300_000}]
+        status, assistant, _ = engine.generate(long, 8, threading.Event())
+        self.assertEqual((status, json.loads(assistant)['history']), ('completed', 1))
+        with self.assertRaisesRegex(EngineError, 'exceeds 8 MiB'):
+            engine.generate([{'role': 'user', 'content': 'x' * (8 << 20)}], 8, threading.Event())
 
     def test_cooperative_stop_and_switch_keep_the_resident_model(self):
         engine = self.engine()
@@ -750,50 +763,22 @@ class RuntimeStatusTests(unittest.TestCase):
         from unittest.mock import Mock
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        write_json(self.root / 'status.json', {'state': 'ready', 'host_bytes': 8, 'device_bytes': 4})
-        self.runtime = ResidentRuntime(RuntimeOwnership(self.root), 16, 16)
-        self.runtime.root = self.root
+        self.runtime = ResidentRuntime(RuntimeOwnership(self.temp.name), 16, 16)
         self.runtime.tree = Mock()
         self.runtime.tree.process.poll.return_value = None
+        self.runtime.link = Mock(status=None)
 
-    def denied(self, code=32):
-        error = PermissionError(13, 'status sharing denied')
-        error.winerror = code
-        return error
-
-    def test_transient_windows_sharing_denial_returns_only_new_valid_status(self):
-        expected = read_json(self.root / 'status.json')
-        with patch('crit_api.residency.sys.platform', 'win32'), \
-             patch('crit_api.residency.read_json', side_effect=[self.denied(), self.denied(5), self.denied(None), expected]) as reader, \
-             patch('crit_api.residency.time.sleep') as sleep:
-            self.assertEqual(self.runtime.status(), expected)
-            self.assertEqual(reader.call_count, 4)
-            self.assertEqual(sleep.call_count, 3)
-
-    def test_persistent_windows_sharing_denial_is_bounded_and_propagated(self):
-        denied = self.denied()
-        with patch('crit_api.residency.sys.platform', 'win32'), \
-             patch('crit_api.residency.read_json', side_effect=denied) as reader, \
-             patch('crit_api.residency.time.monotonic', side_effect=[0, .3]), \
-             patch('crit_api.residency.time.sleep') as sleep:
-            with self.assertRaises(PermissionError) as raised:
-                self.runtime.status()
-            self.assertIs(raised.exception, denied)
-            self.assertEqual(reader.call_count, 1)
-            sleep.assert_not_called()
-
-    def test_other_platform_permissions_and_invalid_status_never_retry(self):
-        for platform, error in [('linux', self.denied()), ('win32', self.denied(13)),
-                                ('win32', ValueError('invalid status'))]:
-            with self.subTest(platform=platform, error=error), \
-                 patch('crit_api.residency.sys.platform', platform), \
-                 patch('crit_api.residency.read_json', side_effect=error) as reader, \
-                 patch('crit_api.residency.time.sleep') as sleep:
-                with self.assertRaises(type(error)):
-                    self.runtime.status()
-                self.assertEqual(reader.call_count, 1)
-                sleep.assert_not_called()
+    def test_status_is_a_copy_of_the_hosts_latest_report(self):
+        self.assertEqual(self.runtime.status(), {'state': 'starting', 'host_bytes': 0, 'device_bytes': 0})
+        self.runtime.link.status = {'state': 'ready', 'host_bytes': 8, 'device_bytes': 4}
+        status = self.runtime.status()
+        self.assertEqual(status, {'state': 'ready', 'host_bytes': 8, 'device_bytes': 4})
+        status['state'] = 'changed'
+        self.assertEqual(self.runtime.link.status['state'], 'ready')
+        self.runtime.tree.process.poll.return_value = 3
+        self.assertEqual(self.runtime.status()['state'], 'interrupted')
+        self.runtime.tree = None
+        self.assertEqual(self.runtime.status(), {'state': 'unloaded', 'host_bytes': 0, 'device_bytes': 0})
 
 
 class OwnershipReadTests(unittest.TestCase):

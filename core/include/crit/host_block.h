@@ -31,8 +31,8 @@ private:
     std::shared_ptr<const void> attachment_;
 };
 
-// Process-wide blocks kept between engines opened one after another in one process (crit Eval, crit run measure
-// and crit serve switches), so the next engine on the same weights reuses them instead of reading and pinning
+// Process-wide blocks kept between engines opened one after another in one process (crit Eval and crit serve
+// switches), so the next engine on the same weights reuses them instead of reading and pinning
 // tens of GB again. acquire() returns the cached block when the key, the size and the identity match; otherwise it
 // drops the cached block for that key BEFORE the caller allocates, so a mismatched layout (an engine opened without a
 // draft head, then one with it) never holds two copies. `identity` names what the bytes were filled from (for example

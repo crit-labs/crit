@@ -3,7 +3,9 @@
 `crit serve` loads one sealed candidate, keeps it resident and answers
 OpenAI-compatible chat requests until stopped, so any OpenAI client (the `openai`
 SDKs, LangChain, Open WebUI, curl) can use the engine. Packages implement the
-[adapter contract](#adapter-contract).
+[adapter contract](#adapter-contract). `crit run ... eval` serves a packaged candidate
+the same way before it is sealed, for Eval over the chat API
+([Building engines](BUILDING_ENGINES.md#run-the-common-eval-suite)).
 
 ## Start the server
 
@@ -45,8 +47,9 @@ memory. Shutdown uses the same cancellation grace and process retirement as
 client cancellation; ownership is released only after cleanup settles. If
 retirement fails, ownership stays blocked and cleanup can be retried.
 
-The server holds the machine's engine lock while it runs (`crit_core.machine`): `crit eval run`, `pin`, `ab`,
-`kernels`, `reference` and `crit run measure` wait for it, and it waits for them, printing who holds the lock. Two
+The server holds the machine's engine lock while it runs (`crit_core.machine`): `crit eval run --adapter`, `pin`,
+`ab`, `kernels`, `reference` and `crit run measure` wait for it, and it waits for them, printing who holds the lock
+(`crit eval run --url` measures the server itself and takes no lock). Two
 engines side by side can exhaust host RAM when weights live there. `CRIT_ENGINE_LOCK` names the lock file (default
 `crit-engine.lock` in the system temp directory), `CRIT_ENGINE_LOCK=off` disables it. Since file locks do not
 cross OS instances, the holder also keeps a lease that Windows and its WSL distributions both read
@@ -109,13 +112,16 @@ declares the concurrent request contract below.
 | `response_format` | `text`, `json_object` or `json_schema` ([structured output](#structured-output)) |
 | `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias` | Per-request overrides when the package declares support for that field; otherwise 400. Omitted or null fields keep engine defaults |
 | `tools`, `tool_choice`, `parallel_tool_calls` | Function calls for packages declaring `chat-tools-v1`; `auto`, `none`, `required` or a named function (adapters that parse free generation, such as [ResidentChat](#tool-calls-from-the-chat-template): `auto` or `none`). Tool-result history is preserved |
+| `logprobs`, `top_logprobs` | [Token log-probabilities](#token-log-probabilities) for packages declaring `chat-logprobs-v1`: every token's own and up to 20 alternatives. Not with `stop` |
 
-Responses carry `usage` when measured and `crit_telemetry` (phase tokens, ms, rates).
+Responses carry `usage` when measured and `crit_telemetry`: prompt and output tokens, the
+engine's prefill and decode rates, TTFT, and `tokens_per_round` (output tokens per target
+pass) when the engine reports its decode rounds. A stream's usage chunk carries both.
 Sampling overrides are validated before generation, including for streaming requests.
 Unknown parameters and unsupported generation controls return 400 rather than being
 silently ignored. Only client metadata (`user`, `metadata`, `store`, `service_tier`)
 is ignored and listed in `X-Crit-Ignored-Parameters`; no storage or service tier is applied.
-`logprobs`, audio, legacy `functions`/`function_call`, and an unsupported `response_format` return 400. Errors use the
+Audio, legacy `functions`/`function_call`, and an unsupported `response_format` return 400. Errors use the
 OpenAI shape; timeout is 504, engine failure 500 (the next request reloads).
 Closing the request connection cancels the turn, including ordinary graceful TCP
 closes, connection resets and other detected socket failures. This also applies to
@@ -201,7 +207,9 @@ existing `generate_tokens` path.
 may end with the last tool result. The API never executes tools itself.
 
 Responses contain `message.tool_calls` and `finish_reason: "tool_calls"`; a tool-only
-message has `content: null`. With `chat-tool-stream-v1`, SSE returns each call's
+message has `content: null`. A reply `max_tokens` cuts inside a call returns that call with the
+arguments written so far and `finish_reason: "length"`, as OpenAI's API does: act only on the
+calls of a `"tool_calls"` finish. With `chat-tool-stream-v1`, SSE returns each call's
 `index`, id, type and complete name once, followed by incremental argument fragments.
 Multiple calls may interleave by index. Without that capability, tool requests are
 buffered until the adapter finishes, then emitted as a single tool-call delta.
@@ -211,7 +219,7 @@ violating `tool_choice` fail rather than being exposed as usable calls.
 `strict: true` requires `chat-tools-strict-v1`. The function's `parameters` must be
 an object schema in Core's [supported subset](#structured-output), including
 `additionalProperties: false`. The server compiles it before generation and checks
-completed arguments against that grammar. Strict arguments use compact JSON in the
+completed arguments against that grammar, and a cut call's arguments as a prefix it accepts. Strict arguments use compact JSON in the
 schema's declaration order, as with `response_format`. Unsupported schemas return
 400 with `param: "tools"`, `code: "unsupported_schema"`; there is no unconstrained
 fallback. Non-strict tools require JSON-object arguments but do not promise schema
@@ -219,8 +227,8 @@ conformance. A request may mix strict and non-strict functions.
 
 Streaming deltas are provisional until `finish_reason: "tool_calls"`. The host
 validates strict argument prefixes before publishing them and requires the final
-calls to match the stream exactly. An incomplete or invalid final call produces an
-SSE error and `[DONE]`, without a successful finish chunk. Clients should assemble
+calls to match the stream exactly. An invalid final call, or an incomplete one in a reply
+`max_tokens` did not cut, produces an SSE error and `[DONE]`, without a successful finish chunk. Clients should assemble
 calls by index and only act on a successfully completed turn.
 
 Tool requests cannot combine `stop` or a structured `response_format`.
@@ -231,11 +239,14 @@ Adapters built on `crit_core.serving.ResidentChat` (and Core's `resident_engine`
 tool calls without model-specific code in crit. ResidentChat renders the request's
 `tools` (unless `tool_choice` is `none`) and the tool history with the model's own chat
 template, splits the reply into content and calls with `crit_core.text.ToolCallParser`,
-gives each call an id and returns them as `tool_calls`; with streaming each call arrives
-as one delta when its block closes. `capabilities(text, sampling)` then declares
-`chat-tools-v1`, plus `chat-tool-stream-v1` when the package streams. A block that does
-not parse, names an unknown function or exceeds `parallel_tool_calls: false` stays in
-the content as written. `tool_choice` must be `auto` or `none`, since the model is not
+gives each call an id and returns them as `tool_calls`. With streaming a call goes out as
+the model writes it: its id and name once the name is written, then its arguments as they
+become certain, so a client sees the call from its first tokens. `capabilities(text,
+sampling)` then declares `chat-tools-v1`, plus `chat-tool-stream-v1` when the package
+streams. A block that names no offered function or exceeds `parallel_tool_calls: false`
+stays in the content as written. One that has begun streaming as a call is that call: if it
+closes without parsing, or the model ends its reply inside it, the reply fails; if
+`max_tokens` cuts the reply inside it, the call keeps the arguments written so far. `tool_choice` must be `auto` or `none`, since the model is not
 constrained to call; strict tools need an adapter with `chat-tools-strict-v1`.
 
 The call syntax is the one the template teaches when crit registers it
@@ -244,8 +255,19 @@ families share, such as Qwen3-Coder style `<function=...>` blocks and Hermes-sty
 in `<tool_call>`). When a model writes another one, the engine package carries the
 parser, never crit: set `ResidentChat.tool_format` to a `crit_core.text.ToolFormat`
 (the parse function and markers) and declare `capabilities(text, sampling,
-tool_format=...)`. Packages sealed with the earlier `chat-tool-template-v1` keep working:
+tool_format=...)`. Give it a `stream` function too, which reads the function name and the
+start of the arguments from an unfinished block, and its calls stream as they are written;
+without one, each call arrives as one delta when its block closes, and a block that does
+not parse stays in the content. Packages sealed with the earlier `chat-tool-template-v1` keep working:
 crit serve reads it as `chat-tools-v1`.
+
+Reasoning and tool boundaries use token identity when a marker is a single special
+token in the loaded tokenizer. Ordinary tokens spelling that marker remain literal
+content, including a closing marker inside tool arguments. Markers made from ordinary
+or multiple tokens keep text matching. A package can explicitly choose spelling-based
+matching with `ToolFormat(..., delimiters="text")` or
+`ReasoningFormat(..., delimiters="text")`; the default is `"auto"`. Tool body parsers
+still receive text and define their own syntax and escaping rules.
 
 ### Reasoning
 
@@ -262,6 +284,20 @@ assistant content, including when the output cap is reached; it keeps the reside
 engine available for the next request. Tool calls are parsed from the reply
 only. A package whose model writes other markers sets `ResidentChat.reasoning_format`
 to a `crit_core.text.ReasoningFormat`, and `False` leaves the reasoning in the reply.
+
+### Token log-probabilities
+
+With `logprobs: true` a reply's `choices[0].logprobs.content` lists every token the
+model generated, in order: reasoning and tool-call tokens included, the stop token that
+ended the reply left out. Each entry is OpenAI's `{token, logprob, bytes,
+top_logprobs}`, where `top_logprobs` holds the `top_logprobs` (0 to 20) most likely
+tokens at that position, ranked, in the same shape. `bytes` are the token's UTF-8 bytes;
+`token` is their text, with U+FFFD where a token ends inside a character. A
+log-probability is natural-log, of the raw logits before temperature, penalties, bias
+and constraints; a zero probability reads as -9999. When streaming, the entries arrive
+with the finish chunk, since the engine reports them in its final response. A request
+with `stop` strings is refused, since its turn is cancelled where a stop completes,
+before the engine reports its tokens.
 
 ## Structured output
 
@@ -347,8 +383,7 @@ the parent or another live request object is rejected. The parent remains loaded
 each request object is reset and closed after its generation settles.
 
 The host admits at most the declared number for the same resident candidate.
-Every command has its own cancellation record, deadline, stream snapshot and
-response. Queued candidate/model switches drain active requests first and prevent
+Every command has its own cancellation, deadline, stream and response. Queued candidate/model switches drain active requests first and prevent
 later requests from continually overtaking them. Cancelled waiters leave without
 dispatch. Shutdown cancels all active requests and waits for cleanup.
 
@@ -424,7 +459,8 @@ share the 65,536-character reply budget, and telemetry counts all generated toke
 ### Response and telemetry
 
 Return real identities and measured values (numbers illustrative); the host writes the
-record. Replies are at most 65,536 characters, responses UTF-8 JSON under 1 MiB.
+record. Replies are at most 65,536 characters, responses UTF-8 JSON under 1 MiB, plus
+1 KiB per output token and alternative with [log-probabilities](#token-log-probabilities-for-adapters).
 
 ```json
 {
@@ -438,7 +474,7 @@ record. Replies are at most 65,536 characters, responses UTF-8 JSON under 1 MiB.
   "telemetry": {
     "prompt_tokens": 512, "output_tokens": 128,
     "prefill_tokens": 512, "prefill_ms": 256,
-    "decode_tokens": 127, "decode_ms": 3175,
+    "decode_tokens": 127, "decode_ms": 3175, "decode_rounds": 40,
     "ttft_ms": 290, "missing": {}
   }
 }
@@ -454,6 +490,9 @@ from the combined assistant/tool-call budget.
 generated tokens;
 `prefill_*`/`decode_*` count tokens actually timed per phase (excluding a reused prefix
 or the first token from prefill); `ttft_ms` runs from admission to first emitted token.
+Optional `decode_rounds` counts target passes after prefill (a speculative engine's verify
+rounds, at most `output_tokens`); ResidentChat reports it from `generate_tokens`' timing
+`rounds`, and Core engine libraries report theirs.
 Synchronize device work at phase boundaries, exclude startup and loading, and never
 estimate tokens from characters.
 
@@ -491,6 +530,12 @@ chunks and returns an empty `assistant`; it does not emit an empty text chunk.
 Whitespace is valid incremental text, but completed output must satisfy the response
 content rules above. Complete tool calls are validated at completion even when the
 adapter returns them only in the final record.
+
+Each `emit` reaches the client as one chunk the moment it is made. The resident host
+and `crit serve` talk over one loopback connection that the host opens with the
+runtime's ownership token and its process id; it carries commands, cancellations, status, stream pieces
+and results as messages, so serving adds no polling delay to the first token or
+between tokens (about a millisecond of dispatch and delivery in all).
 
 ### Structured output for adapters
 
@@ -537,12 +582,14 @@ name. Subsequent deltas for that index contain only a nonempty `arguments` suffi
 names and ids cannot be rewritten or emitted again. Use the model-specific parser
 to separate text, tool syntax and arguments before emitting. Return the assembled
 calls as the final response's `tool_calls` and concatenate only text emits into
-`assistant`. Every emitted call must appear unchanged in the final response.
+`assistant`. Every emitted call must appear unchanged in the final response. A reply that
+reaches `max_output_tokens` inside a call returns it with the arguments emitted so far, the
+start of a JSON object; crit serve finishes it as `length`.
 If no tool is selected, text-only output remains valid under `tool_choice: "auto"`.
 
 The same synchronous-thread, cancellation and callback-error rules as text
-streaming apply. One bounded cumulative snapshot holds text and calls, so a slow
-reader may receive coalesced fragments. Calls are checked for choice policy,
+streaming apply. Each emitted delta reaches the client as its own chunk, and crit serve
+checks it again on arrival. Calls are checked for choice policy,
 unique ids, append-only arguments, strict-schema prefix membership and the shared
 65,536-character limit. A callback failure invalidates the turn even if swallowed
 by the adapter. Cancelled or failed partial calls are never committed to a later
@@ -571,6 +618,34 @@ native library must be rebuilt to forward penalties and logit bias. Only declare
 capabilities implemented by that model, including speculative decoding paths.
 No request override changes Eval's greedy protocol or the sealed configuration.
 
+### Token log-probabilities for adapters
+
+Declare **`chat-logprobs-v1`** (`capabilities(text, sampling, logprobs=True)`) when the
+engine reports, for every generated token, its log-probability and its 20 most likely
+alternatives, and set `logprobs = True` on the engine object; the host refuses to load
+the package otherwise. A request that asks for them carries `"logprobs": n`, the
+alternatives per token (0 to 20). The response then carries one row per generated
+token but stop tokens, and every row's token and alternatives named by their bytes
+(lowercase hex), so crit serve needs no tokenizer:
+
+```json
+"logprobs": {
+  "tokens": [[9906, -0.0123, [[9906, -0.0123], [13347, -4.875]]]],
+  "bytes": {"9906": "48656c6c6f", "13347": "4869"}
+}
+```
+
+Rows are `[token, logprob, [[token, logprob], ...]]` with exactly `n` distinct
+alternatives, ranked; log-probabilities are in [-9999, 0]. ResidentChat builds this:
+with `logprobs = True` it passes `logprobs=n` to `generate_tokens` (and
+`generate_prepared`), and the decoder calls `on_tokens(tokens, rows)` with one
+`(logprob, [(token, logprob), ...])` row per token. It drops stop tokens, clamps -inf
+and Core's rounding tolerance into the range and reads the bytes from the tokenizer.
+`crit_core.native.ResidentEngine` sets `logprobs` when the library exports
+`crit_engine_request_wait_output` and its `ModelInfo` declares `token_logprobs` with
+`max_top_logprobs` of at least 20 (see
+[engine libraries](../core/src/runtime/README.md#engine-libraries)).
+
 ### Effective configuration
 
 Declare **`chat-config-v1`** and implement `effective_configuration()`, returning what
@@ -588,9 +663,9 @@ A per-user guard (`crit-runtime-USER` in the OS temp folder, or
 `CRIT_RUNTIME_DIRECTORY`, never to bypass an owner) lets one runtime own the machine.
 The engine runs in a Windows Job Object or POSIX process group retired on stop,
 timeout, shutdown or client death. After a crash, `crit serve --recover-runtime`
-verifies retirement before releasing admission; never delete the guard. Request
-records live in the runtime directory while running (kept after failure for
-diagnosis); nothing is written to the run folder.
+verifies retirement before releasing admission; never delete the guard. A failed
+request's records (`requests/<request_id>/` in the runtime directory) stay for
+diagnosis; nothing is written to the run folder.
 
 The guardian and supervisor both retry a transient permission denial when reading
 the atomically replaced ownership record, for at most 250 ms. They always read

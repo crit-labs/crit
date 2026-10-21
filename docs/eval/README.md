@@ -15,6 +15,8 @@ crit eval probe --out device.json
 crit eval context --model MODEL_DIR --device device.json
 crit eval pin --adapter my_adapter.py --model MODEL_DIR --data EVAL_DATA_DIR [--context TOKENS]
 crit eval run --adapter my_adapter.py --model MODEL_DIR --data EVAL_DATA_DIR --device device.json [--context TOKENS] --out result.json
+crit eval run --url http://127.0.0.1:8000/v1 --model MODEL_DIR --data EVAL_DATA_DIR --context TOKENS --out result.json
+crit eval reference --model MODEL_DIR --data EVAL_DATA_DIR --result result.json
 crit eval status result.json [--baseline earlier.json]
 crit eval compare a.json b.json
 crit eval ab --adapter my_adapter.py --config A.json --config-b B.json --model MODEL_DIR --data EVAL_DATA_DIR --out ab.json
@@ -25,15 +27,15 @@ Results report facts; Eval does not classify or rank. The builder reasons from t
 
 - **Gates**, the only pass/fail checks: every speed case ran and repeated its output; the same
   greedy requests give the same tokens on the fresh engine and after everything else it served
-  (request history); quality stays within the drift budget on every scoring path, including
-  decode after 1K-, 4K- and 32K-token prompts (`prefill_decode`, required of every engine); the
+  (request history); the engine's own replies, scored on the model's checkpoint, stay within the
+  drift budget in every quality set, including replies after 1K-, 4K- and 32K-token prompts; the
   engine serves a request at the required context, answers facts placed at the start, middle
   and end of long prompts up to it verbatim (retrieval) and is not slower at a lower context;
   with `--exactness required`, speculative output equals plain greedy; against a baseline, the
   held-out prompts keep up (generality). A failing gate blocks qualification whatever the speed.
 - **Goals and KPIs:** decode, prefill, time to first token and the long-context scores, each
   against its physical [limit](MEASUREMENTS.md#limits); quality as the share of the drift budget
-  the worst path uses. All goals hold at once for the next candidate.
+  the worst set uses. All goals hold at once for the next candidate.
 - **Gaps:** what each term (model pass, draft steps, draft width, drafter acceptance, prefill,
   TTFT) would give at its floor, plus missing inputs that hide a limit.
 
@@ -41,27 +43,69 @@ Results report facts; Eval does not classify or rank. The builder reasons from t
 
 Eval ships in the source checkout, not the CLI wheel: `python -m pip install -e .`, or run
 `python -B eval/crit_eval ...` on another host (for example WSL) with the complete `eval/`
-directory, the project license and the adapter. `run` prepares missing data and, when quality is requested, builds a missing reference;
-the steps can also run separately:
+directory, the project license and the adapter. `run` prepares missing data; the steps can also run
+separately:
 
 | Command | Does | Needs |
 | --- | --- | --- |
 | `probe` | Device ceilings: free memory, copy bandwidth, GEMM TFLOPS per weight format | CUDA toolkit (`nvcc`, cuBLASLt) on the target machine |
 | `context` | The max context the engine must serve | the probe result, `config.json`, safetensors headers |
 | `prepare --model M --data D` | Freeze the suite as token ids, with arithmetic per token | `tokenizers`, `jinja2` |
-| `reference --model M --data D` | Reference log-probabilities | `torch`, `transformers`, `safetensors`, a GPU |
+| `reference --model M --data D --result R` | Score a run's quality replies on the checkpoint `D` was prepared from and judge them | `torch`, `transformers`, `safetensors`, a GPU |
 | `pin` | Pin the decode text (once per data directory) | the engine's dependencies |
 | `run` | Evaluate an engine | Python standard library and the engine's dependencies |
 | `kernels` | Rank kernels by GPU time per phase | Linux, a CUDA toolkit with CUPTI |
 
-Use one data directory per model so every engine gets the same token ids and reference. Data
-prepared for an earlier protocol (before `crit-eval-v4`) has no long prompts: prepare it again
-into a new directory, then build its reference and pin it again. Keep
-data, references and results outside product folders, for example in the run's workspace.
-Reference generation needs a compatible CUDA GPU; the engine under test can be CPU or GPU.
-`reference`, `pin`, `run`, `ab` and `kernels` take the machine's engine lock, shared with `crit run measure` and
-`crit serve`: one model-loading process at a time, the others wait and say who holds it
-([SERVING.md](../SERVING.md#start-the-server)).
+Use one data directory per model so every engine gets the same prompts. Data prepared for an
+earlier major protocol version does not run: prepare it again into a new directory and pin it
+again. Keep data and results outside product folders, for example in the run's workspace. The
+reference needs a compatible CUDA GPU to itself; the engine under test can be CPU or GPU.
+`reference`, `pin`, `run --adapter`, `ab` and `kernels` take the machine's engine lock, shared with
+`crit run measure` and `crit serve`: one model-loading process at a time, the others wait and say who
+holds it ([SERVING.md](../SERVING.md#start-the-server)). `run --url` takes none: the server loaded its engine.
+
+## Engines behind a server
+
+`--url` measures an engine behind any OpenAI-compatible server through its streaming
+`/chat/completions`, with no adapter: `crit serve` and other servers alike. `--context` is the
+context the server was started with, `--model` the model directory the data was prepared from
+(its tokenizer encodes the replies), and `--served-model` names the model when the server lists
+several. A key for the server goes in `CRIT_SERVER_KEY`.
+
+Every prompt goes as the chat messages and tools `prepare` froze next to its token ids, and the
+server applies its own chat template: the speed cases, held-out prompts, request history, the
+long-context curve and retrieval. Prompt and output lengths are the server's `usage` counts,
+which it must stream (`stream_options.include_usage`), and every sample records them as `served`
+with the finish reason. No standard field turns end tokens off, so a reply that ends early,
+typically at a tool call, is measured on the tokens it has. The server must prefill every
+request: a reply whose usage reports cached prompt tokens fails, so turn its prompt cache off.
+Prefill and first-token times include the server's HTTP and templating. A running server cannot
+be opened at a lower context, so the lower-context gate stays unmeasured, except under
+`crit run ... eval`: it serves a run's candidate itself and starts it again at the lower context
+([Building engines](../BUILDING_ENGINES.md#run-the-common-eval-suite)).
+
+Quality prompts go the same way, with `logprobs` and 16 `top_logprobs`
+([Measurements](MEASUREMENTS.md#quality)). The server must render each to the token count the
+model's chat template does (its own template, thinking off), report every reply token's bytes
+with its log-probability and alternatives (`crit serve` does for packages declaring
+`chat-logprobs-v1`, [Serving](../SERVING.md#token-log-probabilities)), and the result records the
+replies. Stop the server, then `crit eval reference --result result.json` scores them on the
+checkpoint the data was prepared from and writes the quality sets and the status into the result.
+An adapter's engine gets no quality figures: quality is measured over the chat API.
+
+## Protocol versions
+
+Every prepared data directory and result records the protocol it ran under, `protocol` in
+[protocol.json](../../eval/protocol.json): `crit-eval-v4` is version 4.0 and `crit-eval-v4.1`
+is 4.1. Scores compare within one major version. A change that can move a score starts
+the next major version: the speed, held-out, quality or long-context cases and their prompts,
+output lengths, warmups and repetitions, aggregation, the quality thresholds or scoring rules,
+and any harness change that measures differently. Any other change to the protocol (wording,
+a reported-only field, a diagnostic) takes the next minor version. `compare` warns when results
+come from different major versions. Data prepared under one major version runs under each of its
+minor versions as long as it froze the suite Eval ships; otherwise `run` and `ab` ask to prepare
+it again. A test pins every version to its protocol and suite, so an edit to either fails until
+it has a new version.
 
 ## Results and status
 
@@ -74,8 +118,8 @@ with each score:
 - `speed.complete` records whether every case ran; a partial decode score is not the full one.
 - `context` records the required context and its source (`given` or `computed`), `max_context`,
   the curve and the lower-context comparison.
-- Quality covers the declared scoring paths; `prefill_decode` is required, so an adapter without
-  it fails the quality gate.
+- Quality covers the sets whose prompts and replies fit the engine's context (`quality.skipped`
+  names the others); it is unmeasured until `crit eval reference` has scored the replies.
 - Exactness covers measured speed cases and is a gate only with `--exactness required`. A drop
   in plain-greedy equality against `--baseline` (status notes it) and any difference between
   repeated identical requests are bugs until a root cause is shown ([AGENTS.md](../../AGENTS.md)).
@@ -101,8 +145,8 @@ whole requests) mixes KPIs by the suite's case mix: a fact, not a weighting.
 Absolute scores drift a few percent over a day. Compare candidates with `crit eval ab`, which
 runs both engines (two adapters, or one with two configurations) in one session in alternating
 order (A B, then B A) and reports the paired ratio per round, its median and spread. Compare
-only results with the same data, reference, device file and Eval revision. `compare` warns when
-model or suite identities differ but does not enforce matching references or hardware, and the
+only results with the same data, device file and Eval revision. `compare` warns when
+model or suite identities differ but does not enforce matching hardware, and the
 model identity does not hash every weight byte, so keep the exact identity in the run records.
 
 A successful exit does not mean quality or exactness passed: inspect the fields. Follow

@@ -1,67 +1,53 @@
-"""crit run measure: the run's benchmark cases measured by crit on a candidate's package.
+"""crit run measure: the run's benchmark cases measured on a candidate's package, through crit serve.
 
-The candidate's Eval adapter (eval-v1, docs/eval/ADAPTER.md) runs in a child process under a benchmark
-reservation. Every case decodes a text pinned once per run (the first measured candidate's plain greedy
-output, stored under pins/), replayed through each candidate's speculative loop when the adapter declares
-replay, so a candidate's decode speed does not depend on the text its own arithmetic happened to produce.
-Host and device memory are sampled during every request. The parent settles the attempt and records one
-benchmark per case, bound to the case's checks.
+Under a benchmark reservation crit serve serves the candidate (its resident chat adapter, packaged and not yet
+sealed) at the run's context, and each case's chat request streams to it over the chat API with greedy decoding, as
+a client of the server gets it. crit serve's usage must count the workload's prompt tokens. Every candidate decodes
+its own reply; one that ends before the workload's output length is measured on the tokens it has. Host and device
+memory are sampled on the resident host process during every request, and tokens per round comes from crit serve's
+telemetry. The attempt settles once the server has stopped, then one benchmark is recorded per case.
 """
-from dataclasses import dataclass
-from datetime import datetime, timezone
+import functools
+import http.client
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import threading
 import time
 
-from .records import (ALL_METRICS, METRICS, digest, file_sha, ident, inputs, load_run, now, read_json, safe_path, timestamp,
-                      write_json)
+from .records import ALL_METRICS, digest, file_sha, ident, inputs, load_run, now, read_json, safe_path, timestamp
+from .served import Expired, SERVED, Served, remaining
 
-PINS = "pins"
-ROOT = Path(__file__).resolve().parents[3]
-SOURCE_FOLDERS = ("cli", "eval", "core/python", "api", "kernels")
-
-
-@dataclass
-class _Execution:
-    outcome: str = "launch_failed"
-    code: int | None = None
-    failure: str | None = None
-    cleanup_settled: bool = True  # No process has been attempted yet.
+TIMED = ("prefill_tps", "decode_tps", "request_ms", "ttft_ms")
+MEMORY = ("peak_ram_bytes", "minimum_free_ram_bytes", "peak_vram_bytes", "minimum_free_vram_bytes")
 
 
-def case_prompt(root, rows):
-    """A case's prompt token ids: its first retained JSON file holding {"ids": [token ids]}."""
+def case_request(root, rows):
+    """A case's chat request: its first retained JSON file holding {"messages": [...]}, with optional "tools"."""
+    from crit_api.server import MAX_BODY
     for row in rows:
         path = safe_path(root, row["path"])
         if path.suffix.lower() != ".json":
             continue
         try:
-            value = read_json(path)
+            value = read_json(path, max_bytes=MAX_BODY)
         except (ValueError, OSError):
             continue
-        ids = value.get("ids") if isinstance(value, dict) else None
-        if isinstance(ids, list) and ids and all(isinstance(t, int) and not isinstance(t, bool) and t >= 0 for t in ids):
-            return ids
-    raise ValueError('No retained prompt for the case; keep a captured JSON file {"ids": [token ids]} in its manifest')
+        messages = value.get("messages") if isinstance(value, dict) else None
+        if isinstance(messages, list) and messages and all(isinstance(m, dict) for m in messages):
+            tools = value.get("tools")
+            if tools is not None and not isinstance(tools, list):
+                raise ValueError(f"{row['path']}: tools must be a list")
+            return {"messages": messages, **({"tools": tools} if tools else {})}
+    raise ValueError('No retained chat request for the case; keep a captured JSON file {"messages": [...]} in its '
+                     'manifest')
 
 
-def read_pin(root, case_id):
-    path = safe_path(root, f"{PINS}/{ident(case_id, 'case')}.json")
-    if not path.is_file():
-        return None
-    pin = read_json(path)
-    if pin.get("case_id") != case_id or pin.get("sha256") != digest(pin.get("tokens")):
-        raise ValueError(f"{path}: pinned text does not match its sha256")
-    return pin
-
-
-def measure(store, run_id, candidate_id, adapter, model=None, config=None, seconds=None):
-    """Reserve, measure every case in a child process, settle, then record one benchmark per case."""
+def measure(store, run_id, candidate_id, seconds=None):
+    """Reserve, serve the candidate, measure every case through crit serve, stop the server and settle, then record
+    one benchmark per case."""
     root = store.directory(run_id)
     run = load_run(root)
     resolved = inputs(root, run)
@@ -72,169 +58,171 @@ def measure(store, run_id, candidate_id, adapter, model=None, config=None, secon
     if not manifest_path.is_file():
         raise ValueError("Package the candidate before measuring it")
     manifest = read_json(manifest_path)
-    if not any(row["path"] == adapter for row in manifest["files"]):
-        raise ValueError(f"{adapter} is not a file of the candidate's package")
+    missing = [c for c in SERVED if c not in manifest["capabilities"]]
+    if missing:
+        raise ValueError("crit run measure measures the candidate through crit serve: its package must declare "
+                         + ", ".join(missing) + " (docs/SERVING.md)")
     cases = []
     for case in run["spec"]["cases"]:
         workload = case["workload"]
         if workload["mode"] != "resident" or workload["concurrency"] != 1:
             raise ValueError(f"{case['case_id']}: crit run measure supports resident cases of concurrency 1")
-        prompt = case_prompt(root, resolved["case_manifests"][case["case_id"]])
-        if len(prompt) != workload["prompt_tokens"]:
-            raise ValueError(f"{case['case_id']}: retained prompt has {len(prompt)} tokens, the workload {workload['prompt_tokens']}")
-        pin = read_pin(root, case["case_id"])
-        if pin and len(pin["tokens"]) != workload["output_tokens"]:
-            raise ValueError(f"{case['case_id']}: pinned text has {len(pin['tokens'])} tokens, the workload {workload['output_tokens']}")
-        cases.append({"case_id": case["case_id"], "prompt": prompt, "output_tokens": workload["output_tokens"],
-                      "warmup_runs": workload["warmup_runs"], "repetitions": workload["repetitions"],
-                      "pin": pin["tokens"] if pin else None})
+        cases.append({"case_id": case["case_id"], "request": case_request(root, resolved["case_manifests"][case["case_id"]]),
+                      **{key: workload[key] for key in ("prompt_tokens", "output_tokens", "warmup_runs", "repetitions")}})
     reservation = store.reserve(run_id, candidate_id, "benchmark", seconds)
     attempt = reservation["attempt_id"]
     log_path = folder / "logs" / f"measure-{attempt}.log"
-    execution, result = _Execution(), None
+    outcome, failure, settled, interrupted = "completed", None, True, None
     try:
-        scratch = safe_path(root, f"work/measure/{candidate_id}-{attempt}")
-        scratch.mkdir(parents=True, exist_ok=True)
-        job = {"adapter": str(folder / "package" / adapter), "model": str(model or run["spec"]["model_path"]),
-               "config": dict(config or {}), "context_tokens": run["spec"]["hardware_constraints"]["kv_tokens"],
-               "cases": cases, "out": str(scratch / "result.json")}
-        write_json(scratch / "job.json", job)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        from crit_core.machine import engine_lock
-        deadline = time.monotonic() + _remaining(reservation["deadline_at"])
-        with engine_lock(f"crit run measure {run_id} {candidate_id}", deadline=deadline):
-            execution.outcome, execution.code, execution.failure = _run_child(
-                scratch / "job.json", log_path, reservation["deadline_at"], execution)
-        if execution.outcome == "completed":
-            if not (scratch / "result.json").is_file():
-                raise ValueError("The measurement wrote no result")
-            result = read_json(scratch / "result.json")
+        with log_path.open("a", encoding="utf-8") as stream:
+            def log(message):
+                print(message, file=sys.stderr, flush=True)
+                stream.write(message + "\n")
+                stream.flush()
+            measured = _measure(store, run_id, candidate_id, attempt, reservation["deadline_at"],
+                                run["spec"]["hardware_constraints"]["kv_tokens"], cases, log)
     except BaseException as exc:
-        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-            execution.outcome = "interrupted"
-        elif isinstance(exc, TimeoutError) and execution.outcome == "launch_failed":
-            execution.outcome = "timed_out"
-        elif execution.outcome == "completed":
-            execution.outcome = "failed"
-        execution.failure = (type(exc).__name__ + ": " + str(exc))[:8000]
-        raise
-    finally:
-        ended = now()
-        if execution.outcome == "completed" and timestamp(ended, "ended") > timestamp(reservation["deadline_at"], "deadline"):
-            execution.outcome, execution.failure = "timed_out", "The measurement passed its reserved deadline"
-        logs = []
-        try:
-            # Unretired descendants may still append to this file. Keep their
-            # raw output, but never freeze a mutable log as retained evidence.
-            if execution.cleanup_settled and log_path.is_file():
-                logs.append({"path": log_path.relative_to(root).as_posix(), "sha256": file_sha(log_path)})
-        except OSError as exc:
-            if execution.outcome == "completed":
-                execution.outcome = "failed"
-            execution.failure = ((execution.failure or "") + f"; could not retain log: {exc}")[:8000]
-        store.settle(run_id, reservation, {"outcome": execution.outcome, "ended_at": ended, "exit_code": execution.code,
-            "cleanup_settled": execution.cleanup_settled, "logs": logs, "failure": execution.failure})
-    if execution.outcome != "completed":
-        raise ValueError(f"Measurement {execution.outcome}: {execution.failure} (log {log_path.relative_to(root).as_posix()})")
-    for case_id, tokens in result["pins"].items():
-        path = safe_path(root, f"{PINS}/{ident(case_id, 'case')}.json")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            write_json(path, {"case_id": case_id, "tokens": tokens, "sha256": digest(tokens), "pinned_by": candidate_id,
-                              "package_sha256": digest(manifest), "created_at": now()}, immutable=True)
-        except FileExistsError:
-            # Another candidate pinned this case meanwhile; this measurement replayed a different text.
-            raise ValueError(f"{case_id} was pinned concurrently; measure this candidate again") from None
+        settled = getattr(exc, "settled", True)
+        if isinstance(exc, (Expired, TimeoutError)):
+            outcome, failure = "timed_out", str(exc) or "The measurement passed its reserved deadline"
+        elif isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            outcome, failure, interrupted = "interrupted", "Interrupted", exc
+        else:
+            outcome, failure = "failed", (type(exc).__name__ + ": " + str(exc))[:8000]
+    ended = now()
+    if outcome == "completed" and timestamp(ended, "ended") > timestamp(reservation["deadline_at"], "deadline"):
+        outcome, failure = "timed_out", "The measurement passed its reserved deadline"
+    # As for every attempt, the log is retained as evidence only once cleanup is proven.
+    logs = ([{"path": log_path.relative_to(root).as_posix(), "sha256": file_sha(log_path)}]
+            if settled and log_path.is_file() else [])
+    # The server ran in this process; the resident host's exit is part of the cleanup.
+    store.settle(run_id, reservation, {"outcome": outcome, "ended_at": ended,
+                                       "exit_code": 0 if outcome == "completed" else None,
+                                       "cleanup_settled": settled, "logs": logs, "failure": failure})
+    if interrupted is not None:
+        raise interrupted
+    if outcome != "completed":
+        raise ValueError(f"Measurement {outcome}: {failure} (log {log_path.relative_to(root).as_posix()})")
     recorded = []
     for case in run["spec"]["cases"]:
-        measured = result["cases"][case["case_id"]]
-        pin = read_pin(root, case["case_id"])
-        metrics = {key: {"unit": ALL_METRICS[key], "samples": samples} for key, samples in measured["samples"].items()
-                   if samples is not None}
-        missing = {key: measured["missing"].get(key, "Not measured on this host") for key in METRICS if key not in metrics}
-        text = ({"source": "pinned", "path": f"{PINS}/{case['case_id']}.json", "sha256": pin["sha256"], "pinned_by": pin["pinned_by"]}
-                if measured["replayed"] else {"source": "generated", "reason": measured["text_reason"]})
+        result = measured[case["case_id"]]
         payload = {"case_id": case["case_id"], "package_sha256": digest(manifest), "case_sha256": digest(case),
                    "protocol_sha256": digest(run["spec"]["benchmark_protocol"]),
                    "identities": {"model_sha256": digest(resolved["model_manifest"]),
                                   "input_sha256": digest(resolved["case_manifests"][case["case_id"]]),
                                   "hardware_sha256": digest(resolved["hardware_manifest"]),
                                   "environment_sha256": digest(resolved["environment_manifest"])},
-                   "workload": case["workload"], "metrics": metrics, "missing_metrics": missing, "checks": [],
-                   "outcome": "completed", "started_at": measured["started_at"], "ended_at": measured["ended_at"],
-                   "extensions": {"measured_by": "crit run measure", "adapter": adapter, "decode_text": text,
-                                  "attempt_id": attempt}}
+                   "workload": case["workload"], "metrics": result["metrics"], "missing_metrics": result["missing"],
+                   "checks": [], "outcome": "completed", "started_at": result["started_at"],
+                   "ended_at": result["ended_at"],
+                   "extensions": {"measured_by": "crit run measure", "served_by": "crit serve", "attempt_id": attempt,
+                                  "output_tokens": result["output_tokens"]}}
         recorded.append(store.append(run_id, candidate_id, "benchmark", payload))
-    shutil.rmtree(scratch, ignore_errors=True)
     return recorded
 
 
-def _remaining(deadline_at):
-    return (timestamp(deadline_at, "deadline") - datetime.now(timezone.utc)).total_seconds()
-
-
-def _run_child(job, log_path, deadline_at, execution=None):
-    from crit.process.ownership import RuntimeOwnership
-    from crit.process.tree import guarded_tree
-
-    execution = execution if execution is not None else _Execution()
-    command = [sys.executable, "-B", "-m", "crit.run.measure", str(job)]
-    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-    env["PYTHONPATH"] = os.pathsep.join([str(ROOT / f) for f in SOURCE_FOLDERS] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
-    remaining = _remaining(deadline_at)
-    if remaining <= 0:
-        return "timed_out", None, "The measurement passed its reserved deadline before launch"
-    deadline = time.monotonic() + remaining
-    ownership = RuntimeOwnership()
-    ownership.acquire()
-    try:
-        with open(log_path, "wb") as log:
-            # Admission and filesystem work can consume the remaining budget.
-            if _remaining(deadline_at) <= 0:
-                return "timed_out", None, "The measurement passed its reserved deadline before launch"
-            execution.cleanup_settled = False
+def _measure(store, run_id, candidate_id, attempt, deadline_at, kv_tokens, cases, log):
+    """Serve the candidate and measure every case; a failed engine cleanup raises with `settled` False."""
+    from crit_core.machine import engine_lock
+    # A request may take what is left of the reservation, whose deadline stops the server.
+    served = Served(store, run_id, candidate_id, attempt, kv_tokens, log, "The measurement",
+                    timeout=min(86400, max(1.0, remaining(deadline_at))))
+    with engine_lock(f"crit run measure {run_id} {candidate_id}", deadline=time.monotonic() + remaining(deadline_at)):
+        with served.until(deadline_at):
+            started = time.perf_counter()
+            engine, _, port = served.open()
+            load_ms = (time.perf_counter() - started) * 1000
+            sampler = Sampler(engine.host_pid())
             try:
-                tree = guarded_tree(command, Path.cwd(), log, ownership, Path(job).parent, env=env, deadline=deadline)
-            except BaseException:
-                execution.cleanup_settled = ownership.launch_settled
-                raise
-            execution.outcome = "failed"
-            try:
-                while True:
-                    left = _remaining(deadline_at)
-                    if left <= 0:
-                        return "timed_out", None, "The measurement passed its reserved deadline"
-                    try:
-                        # Windows' native process wait can defer Python's Ctrl+C
-                        # handler until it returns. Keep each wait bounded.
-                        code = execution.code = tree.process.wait(timeout=min(.1, left))
-                        break
-                    except subprocess.TimeoutExpired:
-                        pass
+                return {case["case_id"]: _case(port, case, load_ms, sampler, served.timeout, log) for case in cases}
             finally:
-                # Includes the pinning process and adapter/sampler helpers, even
-                # after normal exit. The guardian also handles coordinator death.
-                tree.close()
-                execution.cleanup_settled = True
+                sampler.stop()
+
+
+def _case(port, case, load_ms, sampler, timeout, log):
+    """A case's warmups and repetitions: its metrics and missing metrics as a benchmark records them."""
+    from crit_eval.metrics import speed_sample
+    body = {**case["request"], "max_tokens": case["output_tokens"], "temperature": 0, "stream": True,
+            "stream_options": {"include_usage": True}}
+    samples = {name: [] for name in TIMED + MEMORY + ("accepted_tokens_per_round",)}
+    outputs, begun = [], now()
+    for i in range(case["warmup_runs"] + case["repetitions"]):
+        sampler.reset()
+        started, first, last, usage, telemetry = _request(port, body, timeout)
+        memory = sampler.window()
+        if usage["prompt_tokens"] != case["prompt_tokens"]:
+            raise ValueError(f"{case['case_id']}: crit serve rendered the case's messages as {usage['prompt_tokens']} "
+                             f"prompt tokens, the workload has {case['prompt_tokens']}")
+        if i < case["warmup_runs"]:
+            continue
+        n = usage["completion_tokens"]
+        sample = speed_sample(usage["prompt_tokens"], n, started, first, last, None)
+        for name in TIMED:
+            samples[name].append(sample[name])
+        for name in MEMORY:
+            samples[name].append(memory[name])
+        samples["accepted_tokens_per_round"].append(telemetry.get("tokens_per_round"))
+        outputs.append(n)
+        log(f"{case['case_id']} rep {len(outputs)}: ttft {sample['ttft_ms']:.0f} ms, decode "
+            f"{sample['decode_tps'] or 0:.1f} tok/s" + ("" if n == case["output_tokens"] else
+                                                       f", the reply ended after {n} of {case['output_tokens']} tokens"))
+    reasons = {"decode_tps": "A reply arrived in one piece, so its decode was not timed",
+               "accepted_tokens_per_round": "crit serve reports no tokens per round: the engine reports no decode rounds"}
+    metrics = {name: {"unit": ALL_METRICS[name], "samples": values} for name, values in samples.items()
+               if all(value is not None for value in values)}
+    metrics["load_ms"] = {"unit": ALL_METRICS["load_ms"], "samples": [load_ms] * case["repetitions"]}
+    missing = {name: reasons.get(name, "Not measurable on this host") for name in samples if name not in metrics}
+    return {"metrics": metrics, "missing": missing, "output_tokens": outputs, "started_at": begun, "ended_at": now()}
+
+
+def _request(port, body, timeout):
+    """Stream one chat request to crit serve. Returns when it was sent and when its first and last reply pieces
+    arrived (time.perf_counter()), its usage and crit serve's telemetry."""
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        started = time.perf_counter()
+        connection.request("POST", "/v1/chat/completions", json.dumps(body), {"Content-Type": "application/json"})
+        response = connection.getresponse()
+        if response.status != 200:
+            data = response.read()
+            try:
+                data = json.loads(data)["error"]["message"]
+            except (ValueError, KeyError, TypeError):
+                pass
+            raise ValueError(f"crit serve answered {response.status}: {data}")
+        first = last = usage = None
+        telemetry = {}
+        for line in response:
+            arrived = time.perf_counter()
+            if not line.startswith(b"data: "):
+                continue
+            data = line[6:].strip()
+            if data == b"[DONE]":
+                break
+            event = json.loads(data)
+            if "error" in event:
+                raise ValueError("crit serve failed the request: " + str(event["error"].get("message")))
+            for choice in event.get("choices") or []:
+                delta = choice.get("delta") or {}
+                if delta.get("content") or delta.get("reasoning_content") or delta.get("tool_calls"):
+                    first, last = first or arrived, arrived
+            usage = event.get("usage") or usage
+            telemetry = event.get("crit_telemetry") or telemetry
     finally:
-        if execution.cleanup_settled:
-            ownership.release(settled=True)
-        else:
-            ownership.block("Measurement launch or tree retirement could not be proven settled")
-    if code != 0:
-        with log_path.open("rb") as log:
-            log.seek(max(0, log.seek(0, os.SEEK_END) - 2000))
-            tail = log.read().decode("utf-8", "replace").strip().splitlines()
-        return "failed", code, "Measurement process exited with %d: %s" % (code, tail[-1] if tail else "no output")
-    return "completed", 0, None
+        connection.close()
+    if first is None or not usage:
+        raise ValueError("crit serve streamed " + ("no reply" if first is None else "no usage"))
+    return started, first, last, usage, telemetry
 
 
 class Sampler:
-    """Free host memory, this process's resident memory and free device memory, sampled during requests.
-    Device memory is the driver's whole-GPU view (nvidia-smi, GPU 0), which counts other processes too; inside
-    WSL2 the process's own cudaMemGetInfo disagrees with it."""
+    """Free host memory, the resident memory of process `pid` (crit serve's resident host, where the engine runs) and
+    free device memory, sampled during requests. Device memory is the driver's whole-GPU view (nvidia-smi, GPU 0),
+    which counts other processes too; inside WSL2 the process's own cudaMemGetInfo disagrees with it."""
 
-    def __init__(self):
+    def __init__(self, pid):
+        self.pid = pid
         self.lock = threading.Lock()
         self.running = True
         self.min_free_ram = self.peak_rss = self.min_free_vram = self.total_vram = None
@@ -264,7 +252,7 @@ class Sampler:
             time.sleep(.02)
 
     def sample(self):
-        available, rss = host_available(), process_rss()
+        available, rss = host_available(), process_rss(self.pid) if self.pid else None
         with self.lock:
             if available is not None:
                 self.min_free_ram = available if self.min_free_ram is None else min(self.min_free_ram, available)
@@ -314,134 +302,53 @@ def host_available():
     return None
 
 
-def process_rss():
+def process_rss(pid):
+    """Process `pid`'s resident memory (its working set on Windows), or None once it has exited."""
     if sys.platform.startswith("linux"):
-        with open("/proc/self/status", encoding="ascii") as handle:
-            for line in handle:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1]) * 1024
+        try:
+            with open(f"/proc/{pid}/status", encoding="ascii") as handle:
+                for line in handle:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1]) * 1024
+        except OSError:
+            pass
         return None
     if os.name == "nt":
         import ctypes
-        from ctypes import wintypes
-
-        class Counters(ctypes.Structure):
-            _fields_ = [("cb", wintypes.DWORD), ("faults", wintypes.DWORD), ("peak_working_set", ctypes.c_size_t),
-                        ("working_set", ctypes.c_size_t), ("quota_peak_paged", ctypes.c_size_t),
-                        ("quota_paged", ctypes.c_size_t), ("quota_peak_nonpaged", ctypes.c_size_t),
-                        ("quota_nonpaged", ctypes.c_size_t), ("pagefile", ctypes.c_size_t), ("peak_pagefile", ctypes.c_size_t)]
-        counters = Counters()
-        counters.cb = ctypes.sizeof(Counters)
-        process = ctypes.windll.kernel32.GetCurrentProcess()
-        ok = ctypes.windll.psapi.GetProcessMemoryInfo(process, ctypes.byref(counters), counters.cb)
-        return counters.working_set if ok else None
+        kernel32, psapi, Counters = _windows_memory()
+        # SYNCHRONIZE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ
+        handle = kernel32.OpenProcess(0x100000 | 0x1000 | 0x0010, False, pid)
+        if not handle:
+            return None
+        try:
+            # An exited process stays open while anyone holds a handle to it, as subprocess.Popen does to its child.
+            if kernel32.WaitForSingleObject(handle, 0) == 0:  # WAIT_OBJECT_0: it has exited
+                return None
+            counters = Counters()
+            counters.cb = ctypes.sizeof(Counters)
+            ok = psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
+            return counters.working_set if ok else None
+        finally:
+            kernel32.CloseHandle(handle)
     return None
 
 
-def _no_core_files():
-    if os.name != "nt":
-        import resource
-        # No core file: a crash of a process holding tens of GB would write one that large (a soft limit of 1
-        # byte also stops pipe-based core handlers, which ignore 0).
-        resource.setrlimit(resource.RLIMIT_CORE, (1, resource.getrlimit(resource.RLIMIT_CORE)[1]))
+@functools.cache
+def _windows_memory():
+    """kernel32 and psapi with the prototypes process_rss calls, and PROCESS_MEMORY_COUNTERS."""
+    import ctypes
+    from ctypes import wintypes
 
-
-def pin_worker(job_path):
-    """Grandchild process: pin missing cases with plain greedy decoding on a non-speculative engine. It runs in its
-    own process so everything that engine holds (host-resident weights, pinned memory, caches an adapter keeps for
-    the next engine of the process) is gone before the speculative engine loads: two engines of a model whose
-    weights live in host memory do not fit side by side."""
-    _no_core_files()
-    from crit_eval.runner import load_adapter, open_engine, timed_generate
-    job = json.loads(Path(job_path).read_text(encoding="utf-8"))
-    module = load_adapter(job["adapter"])
-    new_pins, unpinned = {}, {}
-    engine, _ = open_engine(module, job["model"], job["config"], speculative=False, context_tokens=job["context_tokens"])
-    try:
-        for case in job["cases"]:
-            if case["pin"] is not None:
-                continue
-            first, _ = timed_generate(engine, case["prompt"], case["output_tokens"])
-            second, _ = timed_generate(engine, case["prompt"], case["output_tokens"])
-            if first != second:
-                # Like crit eval pin, only a repeatable text becomes the run's pin; the case is still measured
-                # on the text the candidate generates.
-                at = next((i for i, (a, b) in enumerate(zip(first, second)) if a != b), min(len(first), len(second)))
-                unpinned[case["case_id"]] = f"plain greedy output changed between two runs (from token {at}), so no text was pinned"
-                print(f"{case['case_id']}: {unpinned[case['case_id']]}", flush=True)
-                continue
-            new_pins[case["case_id"]] = first
-            print(f"pinned {case['case_id']}: {len(first)} tokens", flush=True)
-    finally:
-        engine.close()
-    Path(job["out"] + ".pins.json").write_text(json.dumps({"pins": new_pins, "unpinned": unpinned}), encoding="utf-8")
-
-
-def worker(job_path):
-    """Child process: pin missing cases (in a grandchild process, pin_worker), then measure every case."""
-    _no_core_files()
-    from crit_eval.runner import load_adapter, open_engine, timed_generate, timed_replay
-    job = json.loads(Path(job_path).read_text(encoding="utf-8"))
-    pins = {c["case_id"]: c["pin"] for c in job["cases"] if c["pin"] is not None}
-    new_pins, unpinned = {}, {}
-    if len(pins) < len(job["cases"]):
-        sys.stdout.flush()
-        done = subprocess.run([sys.executable, "-B", "-m", "crit.run.measure", str(job_path), "--pin"])
-        pinned = Path(job["out"] + ".pins.json")
-        if done.returncode or not pinned.is_file():
-            raise SystemExit(f"pinning failed (exit code {done.returncode})")
-        result = json.loads(pinned.read_text(encoding="utf-8"))
-        new_pins, unpinned = result["pins"], result["unpinned"]
-        pins.update(new_pins)
-    module = load_adapter(job["adapter"])
-    sampler = Sampler()
-    engine = None
-    try:
-        started = time.perf_counter()
-        engine, info = open_engine(module, job["model"], job["config"], speculative=True, context_tokens=job["context_tokens"])
-        load_ms = (time.perf_counter() - started) * 1000
-        print(f"loaded {info['name']} in {load_ms / 1000:.1f} s", flush=True)
-        replay = bool(info.get("replay")) and bool(info.get("speculative")) and callable(getattr(engine, "replay", None))
-        reason = ("" if replay else "the adapter does not declare replay" if info.get("speculative") else "ordinary decoding")
-        cases = {}
-        for case in job["cases"]:
-            names = ("prefill_tps", "decode_tps", "request_ms", "ttft_ms", "load_ms", "peak_ram_bytes", "peak_vram_bytes",
-                     "minimum_free_ram_bytes", "minimum_free_vram_bytes", "accepted_tokens_per_round")
-            samples = {name: [] for name in names}
-            begun = now()
-            replayed = replay and case["case_id"] in pins
-            text_reason = "" if replayed else unpinned.get(case["case_id"]) or reason
-            for i in range(case["warmup_runs"] + case["repetitions"]):
-                sampler.reset()
-                if replayed:
-                    _, sample = timed_replay(engine, case["prompt"], pins[case["case_id"]])
-                else:
-                    _, sample = timed_generate(engine, case["prompt"], case["output_tokens"])
-                memory = sampler.window()
-                if i < case["warmup_runs"]:
-                    continue
-                for name in ("prefill_tps", "decode_tps", "request_ms", "ttft_ms"):
-                    samples[name].append(sample[name])
-                samples["load_ms"].append(load_ms)
-                samples["accepted_tokens_per_round"].append(sample["tokens_per_round"])
-                for name, value in memory.items():
-                    samples[name].append(value)
-                print(f"{case['case_id']} rep {i - case['warmup_runs'] + 1}: ttft {sample['ttft_ms']:.0f} ms, decode "
-                      f"{sample['decode_tps'] or 0:.1f} tok/s" + (" (pinned text)" if replayed else ""), flush=True)
-            missing = {name: "not measurable on this host" for name, values in samples.items() if any(v is None for v in values)}
-            missing.pop("accepted_tokens_per_round", None)
-            cases[case["case_id"]] = {"samples": {name: (None if any(v is None for v in values) else values)
-                                                  for name, values in samples.items()},
-                                      "missing": missing, "replayed": replayed, "text_reason": text_reason,
-                                      "started_at": begun, "ended_at": now()}
-    finally:
-        try:
-            if engine is not None:
-                engine.close()
-        finally:
-            sampler.stop()
-    Path(job["out"]).write_text(json.dumps({"load_ms": load_ms, "cases": cases, "pins": new_pins}), encoding="utf-8")
-
-
-if __name__ == "__main__":
-    pin_worker(sys.argv[1]) if sys.argv[2:] == ["--pin"] else worker(sys.argv[1])
+    class Counters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("faults", wintypes.DWORD), ("peak_working_set", ctypes.c_size_t),
+                    ("working_set", ctypes.c_size_t), ("quota_peak_paged", ctypes.c_size_t),
+                    ("quota_paged", ctypes.c_size_t), ("quota_peak_nonpaged", ctypes.c_size_t),
+                    ("quota_nonpaged", ctypes.c_size_t), ("pagefile", ctypes.c_size_t), ("peak_pagefile", ctypes.c_size_t)]
+    kernel32, psapi = ctypes.WinDLL("kernel32"), ctypes.WinDLL("psapi")
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    psapi.GetProcessMemoryInfo.argtypes = (wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD)
+    return kernel32, psapi, Counters

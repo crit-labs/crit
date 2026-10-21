@@ -24,11 +24,11 @@ def tool_size(calls):
 
 
 def content_size(assistant, tool_characters=0, reasoning=""):
-    """Assistant text and tools share one budget; reasoning has its own."""
-    size = len(assistant) + tool_characters
+    """Assistant text and tools share one budget; reasoning has its own. Text may be given by its length."""
+    size = (assistant if type(assistant) is int else len(assistant)) + tool_characters
     if size > MAX_CONTENT:
         raise ValueError(f"Reply content exceeds {MAX_CONTENT} characters")
-    if len(reasoning) > MAX_CONTENT:
+    if (reasoning if type(reasoning) is int else len(reasoning)) > MAX_CONTENT:
         raise ValueError(f"Reply reasoning exceeds {MAX_CONTENT} characters")
     return size
 

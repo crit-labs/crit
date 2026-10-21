@@ -18,6 +18,7 @@ _EXPORTS = {
     "ChatTemplate": "template", "ChatTemplates": "template", "environment": "template",
     "template_sources": "template",
     "IncrementalDetokenizer": "detokenize",
+    "MarkerDecoder": "markers", "TokenText": "markers",
     "TextDelta": "stream", "TextStream": "stream",
     "ModelText": "model", "TextIdentity": "model", "load_model_text": "model",
 }

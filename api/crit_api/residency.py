@@ -1,6 +1,6 @@
-"""Process supervisor for the opt-in resident host; immutable per-command IPC."""
+"""Process supervisor for the opt-in resident host; commands, streams and results over its channel."""
 from pathlib import Path
-import errno
+import subprocess
 import sys
 import threading
 import time
@@ -8,18 +8,22 @@ import uuid
 
 from crit.process.ownership import clean_snapshots
 from crit.process.tree import guarded_tree
-from crit.run.records import read_json, write_json
+from crit.run.records import MAX_JSON_BYTES, write_json
 
+from .channel import Supervisor
+from .logprobs import response_bytes
+from .options import MAX_CHAT_RECORD
 from .stream import StreamReader
 
 CAPABILITY = "chat-resident-v1"
+RESULT = {"kind", "command_id", "status", "error", "max_concurrent_requests", "cleanup_settled"}
 
 
 class ResidentRuntime:
     def __init__(self, ownership, host_limit, device_limit):
         self.ownership = ownership
         self.host_limit, self.device_limit = host_limit, device_limit
-        self.tree = self.log = self.root = None
+        self.tree = self.log = self.root = self.link = None
         self.lifecycle = threading.RLock()
         self.on_retire = lambda: None
 
@@ -31,11 +35,11 @@ class ResidentRuntime:
         if self.tree:
             return
         self.root = self.ownership.directory / "runtimes" / uuid.uuid4().hex
-        for name in ("commands", "accepted", "results", "cancel", "streams"):
-            (self.root / name).mkdir(parents=True)
+        self.root.mkdir(parents=True)
         self.ownership.update(runtime_id=self.root.name)
+        self.link = Supervisor(self.ownership.token)
         config = self.root / "host.json"
-        write_json(config, {"root": str(self.root), "token": self.ownership.token,
+        write_json(config, {"root": str(self.root), "token": self.ownership.token, "port": self.link.port,
                    "host_limit": self.host_limit, "device_limit": self.device_limit}, immutable=True)
         self.log = (self.root / "runtime.log").open("xb")
         self.tree = guarded_tree([sys.executable, "-B", str(Path(__file__).with_name("host.py")), str(config)],
@@ -43,30 +47,25 @@ class ResidentRuntime:
 
     def status(self):
         with self.lifecycle:
-            tree, root = self.tree, self.root
+            tree, link = self.tree, self.link
         if not tree:
             return {"state": "unloaded", "host_bytes": 0, "device_bytes": 0}
         if tree.process.poll() is not None:
             return {"state": "interrupted", "host_bytes": 0, "device_bytes": 0,
                     "error": "Resident host exited; Unload verifies remaining process cleanup"}
-        path = root / "status.json"
-        deadline = time.monotonic() + .25
-        while True:
-            try:
-                return read_json(path) if path.exists() else {"state": "starting", "host_bytes": 0, "device_bytes": 0}
-            except PermissionError as exc:
-                # Atomic replacement can briefly deny a Windows reader's open.
-                # Retrying never supplies a cached or fabricated ready status.
-                code = getattr(exc, "winerror", None)
-                # Python's Windows file open can expose only EACCES, omitting
-                # the native sharing code. Persistent access denial still fails.
-                retryable = code in {5, 32, 33} or (code is None and exc.errno == errno.EACCES)
-                if sys.platform != "win32" or not retryable or time.monotonic() >= deadline:
-                    raise
-                time.sleep(.005)
+        status = link.status
+        return dict(status) if status is not None else {"state": "starting", "host_bytes": 0, "device_bytes": 0}
+
+    def host_pid(self):
+        """The resident host's process id once it has connected, else None."""
+        with self.lifecycle:
+            link = self.link
+        return link.pid if link else None
 
     def call(self, action, payload, stop, timeout, progress=None, request=None, progress_tools=None,
              progress_reasoning=None, on_started=None):
+        """Run one command on the host. A generation's payload carries its request record; its result carries the
+        engine's response, and progress, progress_tools and progress_reasoning receive each streamed piece."""
         if stop.is_set():
             return {"status": "cancelled", "error": "Stopped", "cleanup_settled": True}
         with self.lifecycle:
@@ -74,62 +73,68 @@ class ResidentRuntime:
                 self.start()
             if self.tree is None:
                 raise ValueError("Resident host was retired")
-            root, tree = self.root, self.tree
-        cid = uuid.uuid4().hex
-        concurrent = "chat-concurrent-v1" in payload.get("spec", {}).get("capabilities", [])
-        stream_path = root / "streams" / (cid + ".json") if concurrent else root / "stream.json"
-        stream = (StreamReader(stream_path, cid, self.ownership.token, request, progress or (lambda text: None),
-                               progress_tools, progress_reasoning)
+            root, tree, link = self.root, self.tree, self.link
+        stream = (StreamReader(request, progress or (lambda text: None), progress_tools, progress_reasoning)
                   if progress or progress_tools or progress_reasoning else None)
-        result = self._call(cid, action, payload, stop, timeout, stream, on_started, root, tree)
-        # Completion proves producer settlement. On an exception the owner
-        # retires the host, then close()/recovery removes this private snapshot.
-        stream_path.unlink(missing_ok=True)
-        return result
+        limit = response_bytes(request) + MAX_JSON_BYTES if action == "generate" else MAX_JSON_BYTES
+        return self._call(uuid.uuid4().hex, action, payload, stop, timeout, stream, on_started, root, tree, link,
+                          limit)
 
-    def _call(self, cid, action, payload, stop, timeout, stream, on_started=None, root=None, tree=None):
-        root, tree = root or self.root, tree or self.tree
+    def _call(self, cid, action, payload, stop, timeout, stream, on_started=None, root=None, tree=None, link=None,
+              limit=MAX_JSON_BYTES):
+        root, tree, link = root or self.root, tree or self.tree, link or self.link
         if stop.is_set():
             return {"status": "cancelled", "error": "Stopped", "cleanup_settled": True}
-        write_json(root / "commands" / (cid + ".json"), {"command_id": cid, "token": self.ownership.token,
-                   "action": action, "payload": payload}, immutable=True)
-        deadline, cancelled_at, timed_out = time.monotonic() + timeout, None, False
-        if on_started:
-            on_started(deadline)
-        result_path = root / "results" / (cid + ".json")
-        while True:
-            stamp = time.monotonic()
-            if stop.is_set() or stamp >= deadline:
-                if cancelled_at is None:
-                    timed_out = not stop.is_set()
-                    cancelled_at = stamp
-                    write_json(root / "cancel" / (cid + ".json"), {"command_id": cid}, immutable=True)
-                if stamp - cancelled_at >= 1:
-                    self.close()
-                    return {"status": "timed_out" if timed_out else "cancelled", "error": "Reply timed out" if timed_out else "Stopped", "cleanup_settled": True}
-            if (root / "runtime.log").stat().st_size > 4 * 1024 * 1024:
-                raise ValueError("Resident diagnostic output limit exceeded")
-            if stream and cancelled_at is None:
-                stream.poll()
-            if result_path.exists():
-                result = read_json(result_path)
-                if result.get("schema_version") != 1 or result.get("command_id") != cid or result.get("token") != self.ownership.token or type(result.get("cleanup_settled")) is not bool or result.get("status") not in {"completed", "cancelled", "failed"}:
-                    raise ValueError("Resident completion identity/cleanup mismatch")
-                if not result["cleanup_settled"]:
-                    self.close()  # Retire the entire owner before admitting again.
-                    result["cleanup_settled"] = True
-                if cancelled_at is not None and result["status"] != "failed":
-                    result.update(status="timed_out" if timed_out else "cancelled", error="Reply timed out" if timed_out else "Stopped")
-                if stream and result["status"] == "completed":
-                    # The final snapshot precedes completion publication. Poll
-                    # once more in case it appeared after this loop's read.
-                    stream.poll()
-                return result
-            if tree.process.poll() is not None:
-                # Identify retained diagnostics without exposing arbitrary adapter log contents to API clients.
-                raise ValueError("Resident host exited before completing the request (exit %s); diagnostics: %s" %
-                                 (tree.process.returncode, root / "runtime.log"))
-            time.sleep(.02)
+        box = link.register(cid, limit)
+        try:
+            link.send({"kind": "command", "command_id": cid, "action": action, "payload": payload},
+                      MAX_CHAT_RECORD + MAX_JSON_BYTES)
+            deadline, cancelled_at, timed_out = time.monotonic() + timeout, None, False
+            if on_started:
+                on_started(deadline)
+            while True:
+                stamp = time.monotonic()
+                if stop.is_set() or stamp >= deadline:
+                    if cancelled_at is None:
+                        timed_out = not stop.is_set()
+                        cancelled_at = stamp
+                        try:
+                            link.send({"kind": "cancel", "command_id": cid})
+                        except ValueError:
+                            pass  # a broken channel is reported below
+                    if stamp - cancelled_at >= 1:
+                        self.close()
+                        return {"status": "timed_out" if timed_out else "cancelled", "error": "Reply timed out" if timed_out else "Stopped", "cleanup_settled": True}
+                if (root / "runtime.log").stat().st_size > 4 * 1024 * 1024:
+                    raise ValueError("Resident diagnostic output limit exceeded")
+                pieces, result = link.take(box)
+                if stream and cancelled_at is None:
+                    for piece in pieces:  # every piece the host sent before its result
+                        stream.apply(piece)
+                if result is not None:
+                    if (set(result) - {"response"} != RESULT or type(result["cleanup_settled"]) is not bool
+                            or result["status"] not in {"completed", "cancelled", "failed"}
+                            or ("response" in result) != (action == "generate" and result["status"] == "completed")):
+                        raise ValueError("Resident completion identity/cleanup mismatch")
+                    result = {k: v for k, v in result.items() if k not in {"kind", "command_id"}}
+                    if not result["cleanup_settled"]:
+                        self.close()  # Retire the entire owner before admitting again.
+                        result["cleanup_settled"] = True
+                    if cancelled_at is not None and result["status"] != "failed":
+                        result.update(status="timed_out" if timed_out else "cancelled", error="Reply timed out" if timed_out else "Stopped")
+                        result.pop("response", None)
+                    return result
+                if tree.process.poll() is not None or link.failure:
+                    try:
+                        tree.process.wait(1)  # a host that crashed also broke its channel
+                    except subprocess.TimeoutExpired:
+                        raise ValueError("Resident host channel failed: " + link.failure) from None
+                    # Identify retained diagnostics without exposing arbitrary adapter log contents to API clients.
+                    raise ValueError("Resident host exited before completing the request (exit %s); diagnostics: %s" %
+                                     (tree.process.returncode, root / "runtime.log"))
+                box.ready.wait(.02)
+        finally:
+            link.unregister(cid)
 
     def close(self):
         self.on_retire()
@@ -140,6 +145,9 @@ class ResidentRuntime:
         if self.tree:
             self.tree.close()
             self.tree = None
+        if self.link:
+            self.link.close()
+            self.link = None
         if self.log:
             self.log.close()
             self.log = None

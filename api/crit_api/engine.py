@@ -2,7 +2,6 @@
 from pathlib import Path
 import json
 import re
-import shutil
 import threading
 import uuid
 
@@ -14,6 +13,7 @@ from crit.run.store import ROOT, RunStore
 from .residency import CAPABILITY as RESIDENT_CAPABILITY, ResidentRuntime
 from .admission import Admission
 from .content import response_content, tool_size
+from .logprobs import logprob_entries, logprob_options, response_bytes
 from .stream import CAPABILITY as STREAM_CAPABILITY
 from .options import (MAX_CHAT_RECORD, RequestError, TOOL_STREAM_CAPABILITY, sampling_options, serving_capabilities,
                       tool_options as validate_tool_options, validate_tool_reply)
@@ -21,7 +21,7 @@ from .options import (MAX_CHAT_RECORD, RequestError, TOOL_STREAM_CAPABILITY, sam
 CAPABILITY = "chat-json-v1"
 # The adapter applies a request's response_format (crit_core.constraints / crit/constraints.h); see docs/SERVING.md.
 CONSTRAINTS_CAPABILITY = "chat-constraints-v1"
-MAX_CONVERSATION = 1_000_000
+MAX_CONVERSATION = 8 * 1024 * 1024
 LOAD_BYTES_PER_SECOND = 200e6  # model bytes per second assumed by the default load bound (the engine's own load)
 VERIFY_BYTES_PER_SECOND = 50e6  # with --verify-model: read, hash and copy every model file, then the engine load
 
@@ -43,9 +43,10 @@ class _CommandStop:
 
 
 def telemetry(value, request):
-    """Rates use the engine's timed phase token counts, never string lengths."""
+    """Rates use the engine's timed phase token counts, never string lengths. Optional decode_rounds, the target
+    passes after prefill (a speculative engine's verify rounds), gives tokens_per_round: output tokens per round."""
     keys(value, {"prompt_tokens", "output_tokens", "prefill_tokens", "prefill_ms",
-                 "decode_tokens", "decode_ms", "ttft_ms", "missing"})
+                 "decode_tokens", "decode_ms", "ttft_ms", "missing"}, {"decode_rounds"})
     prompt = number(value["prompt_tokens"], "prompt tokens", 1, request["limits"]["kv_tokens"], integer=True)
     output = number(value["output_tokens"], "output tokens", 1, request["limits"]["max_output_tokens"], integer=True)
     if prompt + output > request["limits"]["kv_tokens"]:
@@ -73,24 +74,37 @@ def telemetry(value, request):
         number(value["ttft_ms"], "first token milliseconds", 0, request["limits"]["timeout_seconds"] * 1000)
         if "ttft" in value["missing"]:
             raise ValueError("A measured TTFT cannot also be missing")
+    if "decode_rounds" in value:
+        if value["decode_tokens"] is None:
+            raise ValueError("Decode rounds need a measured decode phase")
+        rates["tokens_per_round"] = output / number(value["decode_rounds"], "decode rounds", 1, output, integer=True)
     return value | rates
 
 
 def reply(value, request):
     keys(value, {"schema_version", "record_kind", "request_id", "candidate_id", "package_sha256", "assistant", "telemetry"},
-         {"tool_calls", "reasoning"})
+         {"tool_calls", "reasoning", "logprobs"})
     if type(value["schema_version"]) is not int or value["schema_version"] != 1 or value["record_kind"] != "chat_response":
         raise ValueError("Invalid engine chat response")
     if any(value[key] != request[key] for key in ("request_id", "candidate_id", "package_sha256")):
         raise ValueError("Reply belongs to a different request or engine")
-    calls = validate_tool_reply(value.get("tool_calls"), request)
+    measured = telemetry(value["telemetry"], request)
+    calls = validate_tool_reply(value.get("tool_calls"), request,
+                                measured["output_tokens"] == request["limits"]["max_output_tokens"])
     assistant, reasoning = response_content(value, tool_size(calls))
     if calls:
         assistant = {"content": assistant, "tool_calls": calls}
     if reasoning:
         # Reasoning the model wrote apart from its reply (crit_core.text.reasoning); clients get reasoning_content.
         assistant = dict(assistant if isinstance(assistant, dict) else {"content": assistant}, reasoning=reasoning)
-    return assistant, telemetry(value["telemetry"], request)
+    if ("logprobs" in value) != (request.get("logprobs") is not None):
+        raise ValueError("Reply logprobs do not match the request")
+    if "logprobs" in value:
+        entries = logprob_entries(value["logprobs"], request)
+        if len(entries) > measured["output_tokens"]:
+            raise ValueError("Reply logprobs exceed its output tokens")
+        assistant = dict(assistant if isinstance(assistant, dict) else {"content": assistant}, logprobs=entries)
+    return assistant, measured
 
 
 def package_signature(folder):
@@ -112,13 +126,23 @@ class ServedEngine:
     """Verifies sealed candidates of one run, keeps the requested one loaded in the resident host and runs requests
     within its declared capacity. Switching candidates reuses compatible model allocations.
 
+    With `attempt` (crit run eval), it serves only `candidate_id`, packaged but not yet sealed, for Eval under that
+    benchmark attempt of the candidate, whose reservation settles after the server stops; `kv_tokens` then serves it
+    at a lower context than the run's (Eval's lower-context gate).
+
     The server owns the machine's crit runtime while it runs: no other crit process can load an engine.
     """
     def __init__(self, workspace, run_id=None, candidate_id=None, project=ROOT, runtime_directory=None,
-                 host_limit=None, device_limit=None, timeout=600, load_timeout=None, verify_model=False):
+                 host_limit=None, device_limit=None, timeout=600, load_timeout=None, verify_model=False, attempt=None,
+                 kv_tokens=None):
         self.store = RunStore(workspace, project)
         self.run_id = run_id or single_run(self.store)
         self.requested_candidate = candidate_id
+        if attempt is not None and candidate_id is None:
+            raise ValueError("Measuring under an attempt needs its candidate")
+        if kv_tokens is not None and attempt is None:
+            raise ValueError("Only a measurement serves a candidate at another context")
+        self.attempt, self.context_tokens = attempt, kv_tokens
         self.default = None
         self.timeout = number(timeout, "request timeout", .01, 86400)
         self.load_timeout = None if load_timeout is None else number(load_timeout, "load timeout", .01, 7 * 86400)
@@ -139,9 +163,11 @@ class ServedEngine:
         if view["errors"]:
             raise ValueError("Retained project verification failed: " + str(view["errors"]))
         candidate = next((c for c in view["candidates"] if c["candidate_id"] == candidate_id), None)
-        if candidate is None:
+        if candidate is None or (self.attempt is not None and candidate_id != self.requested_candidate):
             raise EngineError("Unknown candidate: " + str(candidate_id), 404)
-        if not candidate["sealed"] or not candidate["artifacts"].get("package"):
+        if self.attempt is not None and candidate["sealed"]:
+            raise ValueError("A sealed candidate is not measured again; allocate a new candidate")
+        if not candidate["artifacts"].get("package") or not (candidate["sealed"] or self.attempt is not None):
             raise ValueError("Serving requires a sealed candidate with a runnable package")
         root = Path(view["folder"])
         package = safe_path(root, candidate["artifacts"]["package"])
@@ -154,27 +180,41 @@ class ServedEngine:
             raise ValueError("Model file is unavailable at its recorded path: " + view["run"]["spec"]["model_path"])
         # External agents cannot be stopped from here. Their recorded attempts must have settled cleanup.
         for reservation in store._attempts(root):
+            if (reservation["candidate_id"], reservation["attempt_id"]) == (candidate_id, self.attempt):
+                continue  # the attempt this engine is measured under settles after it stops
             owner = ("candidates/" + reservation["candidate_id"] if reservation["candidate_id"]
                      else "segments/" + reservation["segment_id"])
             result = safe_path(root, owner + "/attempts/" + reservation["attempt_id"] + "/result.json")
             if not result.is_file() or not read_json(result)["cleanup_settled"]:
                 raise ValueError("Settle the external agent/build attempt and its cleanup before serving")
+        limits = view["run"]["spec"]["hardware_constraints"]
+        if self.context_tokens is not None:
+            if type(self.context_tokens) is not int or not 1 < self.context_tokens <= limits["kv_tokens"]:
+                raise ValueError("A measurement serves at most the run's context of %d tokens" % limits["kv_tokens"])
+            limits = dict(limits, kv_tokens=self.context_tokens)
         return dict(run_id=run_id, candidate_id=candidate_id, selector=candidate_id, package_sha256=digest(manifest),
                     package_path=str(package), model_path=view["run"]["spec"]["model_path"],
                     model_manifest=read_json(safe_path(root, "inputs.json"))["model_manifest"],
                     configuration=candidate["configuration"], launch=manifest["launch"],
-                    capabilities=serving_capabilities(manifest["capabilities"]), limits=view["run"]["spec"]["hardware_constraints"],
+                    capabilities=serving_capabilities(manifest["capabilities"]), limits=limits,
                     label=candidate["label"], signature=package_signature(package), verify_model=self.verify_model)
 
+    def serves(self, candidate):
+        """Sealed candidates; under an attempt only its packaged candidate."""
+        if self.attempt is not None:
+            return candidate["candidate_id"] == self.requested_candidate and not candidate["sealed"]
+        return candidate["sealed"]
+
     def candidates(self, refresh=False):
-        """Sealed candidates of the run whose packages declare a resident chat adapter (listed once, then on refresh)."""
+        """Served candidates of the run whose packages declare a resident chat adapter (listed once, then on
+        refresh)."""
         if self.listed is not None and not refresh:
             return self.listed
         with verification_scope():
             view = self.store.get(self.run_id)
         result = []
         for candidate in view["candidates"]:
-            if candidate["sealed"] and candidate["artifacts"].get("package"):
+            if self.serves(candidate) and candidate["artifacts"].get("package"):
                 manifest = read_json(safe_path(Path(view["folder"]), candidate["artifacts"]["package"] + "/manifest.json"))
                 if {CAPABILITY, RESIDENT_CAPABILITY} <= set(manifest["capabilities"]):
                     result.append({"candidate_id": candidate["candidate_id"], "label": candidate["label"]})
@@ -254,30 +294,33 @@ class ServedEngine:
             raise
         self.ownership.release(settled=True)
 
+    def host_pid(self):
+        """The process the engine runs in, crit serve's resident host, once it has connected."""
+        return self.runtime.host_pid()
+
     def status(self):
         if self.ownership.blocked:
             return {"state": "blocked", "error": self.ownership.blocked}
         return self.runtime.status()
 
     def generate(self, messages, max_tokens, stop, on_text=None, candidate_id=None, response_format=None,
-                 sampling=None, tool_options=None, on_tools=None, on_reasoning=None, on_started=None):
-        """Run one request. `on_text(text)` receives the cumulative accepted text when the adapter streams.
+                 sampling=None, tool_options=None, on_tools=None, on_reasoning=None, on_started=None, logprobs=None):
+        """Run one request. `on_text(text)` receives each piece of accepted text as the adapter streams it.
         `response_format` (from crit_api.server.response_format) goes into the request record for adapters that
-        declare chat-constraints-v1. Sampling and tool options are capability-gated request overrides.
+        declare chat-constraints-v1. Sampling and tool options are capability-gated request overrides; logprobs n
+        asks a chat-logprobs-v1 adapter for every token's log-probability with n alternatives.
         `on_started(deadline)` receives the command's absolute monotonic deadline
         after dispatch, so response delivery can honor the same execution budget.
 
         Returns (status, assistant, telemetry): status is "completed", "cancelled" or "timed_out"; a cancelled
-        or timed-out request has no reply or telemetry. Assistant is text, or {content, tool_calls} for a tool
-        reply. Raises EngineError when the engine fails.
+        or timed-out request has no reply or telemetry. Assistant is text, or {content, tool_calls, reasoning,
+        logprobs (OpenAI's logprobs content)} with the parts the reply has. Raises EngineError when the engine fails.
         """
         image_input = any(isinstance(m.get("content"), list) and any(p.get("type") == "image_url" for p in m["content"])
                           for m in messages)
-        encoded = json.dumps(messages, ensure_ascii=False)
-        if image_input and len(encoded.encode("utf-8")) > 8 * 1024 * 1024:
-            raise EngineError("Image conversation exceeds 8 MiB", 400)
-        if not image_input and len(encoded) > MAX_CONVERSATION:
-            raise EngineError("Conversation exceeds 1,000,000 characters", 400)
+        # The HTTP body's bound, in bytes: a character count would refuse a prompt that fits the model's context.
+        if len(json.dumps(messages, ensure_ascii=False).encode("utf-8")) > MAX_CONVERSATION:
+            raise EngineError("Conversation exceeds 8 MiB", 400)
         # A disconnected waiter must leave promptly without taking ownership of
         # the active turn or eventually loading/switching an engine for dead work.
         candidate_id = candidate_id or self.default
@@ -305,6 +348,9 @@ class ServedEngine:
             try:
                 applied = sampling_options(sampling or {}, spec["capabilities"])
                 extra.update(validate_tool_options(tool_options or {}, spec["capabilities"]))
+                if logprobs is not None:
+                    extra["logprobs"] = logprob_options({"logprobs": True, "top_logprobs": logprobs},
+                                                        spec["capabilities"])
             except RequestError as exc:
                 raise EngineError(str(exc), 400) from exc
             if applied:
@@ -329,19 +375,16 @@ class ServedEngine:
                     if not self._stopping.is_set():
                         self._retire(exc)
                     raise
-            folder = self.runtime.root / "requests" / uuid.uuid4().hex
-            folder.mkdir(parents=True)
             request = record("chat_request", spec["run_id"], chat_id="chat-" + uuid.uuid4().hex, request_id=uuid.uuid4().hex,
                 candidate_id=spec["candidate_id"], package_sha256=spec["package_sha256"], created_at=now(),
                 model_path=spec["model_path"], package_path=spec["package_path"],
                 model_manifest=spec["model_manifest"], configuration=spec["configuration"], messages=messages,
                 limits={"max_output_tokens": max_tokens, "kv_tokens": limits["kv_tokens"], "timeout_seconds": self.timeout,
                         **{k: v for k, v in limits.items() if k.endswith("headroom_bytes")}}, **extra)
-            write_json(folder / "request.json", request, immutable=True, max_bytes=MAX_CHAT_RECORD)
             streams = STREAM_CAPABILITY in spec["capabilities"]
             try:
-                result = self.runtime.call("generate", {"spec": spec, "request_path": str(folder / "request.json"),
-                    "response_path": str(folder / "response.json")}, _CommandStop(stop, self._stopping), self.timeout,
+                result = self.runtime.call("generate", {"spec": spec, "request": request},
+                    _CommandStop(stop, self._stopping), self.timeout,
                     progress=on_text if streams and on_text else None, request=request,
                     progress_tools=on_tools if TOOL_STREAM_CAPABILITY in spec["capabilities"] else None,
                     progress_reasoning=on_reasoning if streams else None, on_started=on_started)
@@ -349,6 +392,7 @@ class ServedEngine:
                 # Once the supervisor unwinds, no observer remains to forward
                 # cancellation. Retire even for consumer failures/interrupts,
                 # while the request lock still excludes another command.
+                self._keep(request)
                 self._retire(exc)
                 if isinstance(exc, (ValueError, OSError)):
                     if self._stopping.is_set():
@@ -357,21 +401,20 @@ class ServedEngine:
                 raise
             if result["status"] in {"cancelled", "timed_out"}:
                 # Settled cooperative cancellation keeps the weights resident.
-                shutil.rmtree(folder, ignore_errors=True)
                 if self._stopping.is_set():
                     raise EngineError("Engine is stopping", 503)
                 return result["status"], None, None
             if result["status"] != "completed":
+                self._keep(request)
                 self._retire(result["error"])
                 raise EngineError(result["error"] or "Engine failed the request")
             try:
-                assistant, measured = reply(read_json(folder / "response.json"), request)
+                assistant, measured = reply(result["response"], request)
                 self._check_sealed(spec)
             except (ValueError, OSError, KeyError, TypeError) as exc:
+                self._keep(request, result["response"])
                 self._retire(exc)
                 raise EngineError("Engine returned an invalid response: " + str(exc)) from exc
-            # A long-running server would otherwise keep every conversation on disk; failed requests stay for diagnosis.
-            shutil.rmtree(folder, ignore_errors=True)
             return "completed", assistant, measured
         finally:
             self.lock.release()
@@ -385,6 +428,16 @@ class ServedEngine:
         self.specs.pop(selector, None)
         if self.spec(selector)["package_sha256"] != spec["package_sha256"]:
             raise ValueError("Engine artifacts changed during the request")
+
+    def _keep(self, request, response=None):
+        """A failed request's records stay in the runtime directory for diagnosis."""
+        try:
+            folder = self.runtime.root / "requests" / request["request_id"]
+            write_json(folder / "request.json", request, immutable=True, max_bytes=MAX_CHAT_RECORD)
+            if response is not None:
+                write_json(folder / "response.json", response, immutable=True, max_bytes=response_bytes(request))
+        except (OSError, ValueError, TypeError):
+            pass  # diagnostics never mask the failure
 
     def _retire(self, error):
         """A failed request retires the host process; the next request loads the engine again."""

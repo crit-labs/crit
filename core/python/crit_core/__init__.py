@@ -1,2 +1,2 @@
 """crit Core for Python: model files, model config and the text layer (tokenizer, chat templates, stops)."""
-__version__ = "0.2.3"
+__version__ = "0.3.0"

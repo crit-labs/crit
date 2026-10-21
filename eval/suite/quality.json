@@ -1,47 +1,41 @@
 {
-  "suite": "crit-eval-quality-v1",
-  "notes": "Fixed conversations written for crit eval. Only the final assistant turn is scored, with teacher forcing.",
+  "suite": "crit-eval-quality-v2",
+  "notes": "Fixed prompts written for crit eval. The engine replies to each; its own reply is the scored text (protocol quality).",
   "conversations": [
     {
       "id": "explain-tides",
       "messages": [
-        {"role": "user", "content": "Why are there usually two high tides a day instead of one?"},
-        {"role": "assistant", "content": "Tides come from the difference in the Moon's pull across the Earth, not from the pull itself.\n\nThe side of the Earth facing the Moon is about 6,400 km closer to it than the Earth's centre, so the water there is pulled slightly harder than the planet as a whole. That water bulges towards the Moon. On the far side the opposite happens: the solid Earth is pulled towards the Moon a little more than the distant ocean, so the water there is effectively left behind and forms a second bulge.\n\nAs the Earth rotates once a day, a given coastline passes through both bulges, which is why most places see two high tides and two low tides. Because the Moon also moves along its orbit, the cycle takes about 24 hours and 50 minutes, so high tide arrives roughly 50 minutes later each day.\n\nThe Sun produces the same effect at about half the strength. When the Sun and Moon line up at new and full moon, their bulges add and we get large spring tides; at the quarter moons they partly cancel and we get smaller neap tides. Coastline shape, ocean depth and resonance in bays then modify all of this, which is why some places see only one tide a day and others see tides over ten metres high."}
+        {"role": "user", "content": "Why are there usually two high tides a day instead of one?"}
       ]
     },
     {
       "id": "python-merge-intervals",
       "messages": [
-        {"role": "user", "content": "Write a Python function that merges overlapping intervals, with a short explanation."},
-        {"role": "assistant", "content": "```python\nfrom typing import List, Tuple\n\n\ndef merge_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:\n    \"\"\"Merge overlapping or touching closed intervals.\n\n    >>> merge_intervals([(1, 3), (2, 6), (8, 10), (15, 18)])\n    [(1, 6), (8, 10), (15, 18)]\n    \"\"\"\n    if not intervals:\n        return []\n    ordered = sorted(intervals, key=lambda pair: pair[0])\n    merged = [ordered[0]]\n    for start, end in ordered[1:]:\n        last_start, last_end = merged[-1]\n        if start <= last_end:\n            merged[-1] = (last_start, max(last_end, end))\n        else:\n            merged.append((start, end))\n    return merged\n```\n\nThe function sorts the intervals by their start, which takes O(n log n) time. After sorting, any interval that overlaps the previous merged interval must start no later than that interval's end, so a single left-to-right pass is enough: either extend the last merged interval or start a new one. The input list is not modified, and an empty input returns an empty list."}
+        {"role": "user", "content": "Write a Python function that merges overlapping intervals, with a short explanation."}
       ]
     },
     {
       "id": "math-word-problem",
       "messages": [
-        {"role": "user", "content": "A tank is filled by pipe A in 6 hours and by pipe B in 9 hours. A drain empties the full tank in 12 hours. With all three open, how long does it take to fill the empty tank?"},
-        {"role": "assistant", "content": "Work with rates in tanks per hour.\n\n- Pipe A fills 1/6 of the tank per hour.\n- Pipe B fills 1/9 of the tank per hour.\n- The drain removes 1/12 of the tank per hour.\n\nThe combined rate is 1/6 + 1/9 - 1/12. Using the common denominator 36:\n\n1/6 = 6/36, 1/9 = 4/36 and 1/12 = 3/36, so the net rate is (6 + 4 - 3)/36 = 7/36 of the tank per hour.\n\nThe time to fill one tank is the reciprocal of the rate: 36/7 hours, which is about 5.14 hours, or 5 hours and about 8.6 minutes.\n\nCheck: in 36/7 hours pipe A adds 6/7 of a tank, pipe B adds 4/7 and the drain removes 3/7, giving 6/7 + 4/7 - 3/7 = 7/7 = 1 full tank. The answer is 36/7 hours."}
+        {"role": "user", "content": "A tank is filled by pipe A in 6 hours and by pipe B in 9 hours. A drain empties the full tank in 12 hours. With all three open, how long does it take to fill the empty tank?"}
       ]
     },
     {
       "id": "german-letter",
       "messages": [
-        {"role": "user", "content": "Schreib eine kurze, höfliche Absage an einen Bewerber."},
-        {"role": "assistant", "content": "Sehr geehrter Herr Becker,\n\nvielen Dank für Ihre Bewerbung als Projektleiter in unserem Unternehmen und für das freundliche Gespräch in der vergangenen Woche. Wir haben uns über Ihr Interesse an unserer Arbeit sehr gefreut.\n\nNach sorgfältiger Prüfung aller Unterlagen haben wir uns entschieden, die Stelle mit einer anderen Bewerberin zu besetzen, deren Erfahrung noch etwas genauer zu den aktuellen Anforderungen des Teams passt. Diese Entscheidung ist uns nicht leichtgefallen, denn Ihr Profil hat uns in vielen Punkten überzeugt.\n\nGerne würden wir Ihre Unterlagen mit Ihrem Einverständnis für zukünftige Ausschreibungen aufbewahren. Bitte teilen Sie uns kurz mit, ob Sie damit einverstanden sind.\n\nWir wünschen Ihnen für Ihre berufliche Zukunft alles Gute und viel Erfolg.\n\nMit freundlichen Grüßen\n\nAnna Schulz\nPersonalabteilung"}
+        {"role": "user", "content": "Schreib eine kurze, höfliche Absage an einen Bewerber."}
       ]
     },
     {
       "id": "json-extraction",
       "messages": [
-        {"role": "user", "content": "Extract the orders from this note as JSON with fields customer, item, quantity and due_date (ISO format): \"Mia wants 3 oak chairs by March 4th 2027. Tom ordered one walnut table, needed 2027-03-10. Also 12 pine shelves for Lena, due on the 15th of March 2027.\""},
-        {"role": "assistant", "content": "```json\n[\n  {\n    \"customer\": \"Mia\",\n    \"item\": \"oak chair\",\n    \"quantity\": 3,\n    \"due_date\": \"2027-03-04\"\n  },\n  {\n    \"customer\": \"Tom\",\n    \"item\": \"walnut table\",\n    \"quantity\": 1,\n    \"due_date\": \"2027-03-10\"\n  },\n  {\n    \"customer\": \"Lena\",\n    \"item\": \"pine shelf\",\n    \"quantity\": 12,\n    \"due_date\": \"2027-03-15\"\n  }\n]\n```\n\nI used singular item names so the quantity field carries the count, and converted every date to the ISO 8601 format YYYY-MM-DD."}
+        {"role": "user", "content": "Extract the orders from this note as JSON with fields customer, item, quantity and due_date (ISO format): \"Mia wants 3 oak chairs by March 4th 2027. Tom ordered one walnut table, needed 2027-03-10. Also 12 pine shelves for Lena, due on the 15th of March 2027.\""}
       ]
     },
     {
       "id": "short-story",
       "messages": [
-        {"role": "user", "content": "Write a short story about a lighthouse keeper who finds a message in a bottle."},
-        {"role": "assistant", "content": "Every morning Ilse walked the shingle below the lighthouse before she trimmed the wick, and every morning the sea gave her the same things: kelp, driftwood, the occasional lost glove.\n\nOn the first day of November it gave her a bottle.\n\nIt was green, thick at the base, sealed with wax that had gone grey with salt. Inside was a single folded page. She carried it up the hundred and twelve steps without opening it, the way you carry a letter you are afraid of.\n\nBy lamplight she read it. The handwriting was careful and young. \"If you find this,\" it said, \"please tell me what your sea looks like. Mine is grey today, and the ferry did not come.\" There was a name, Tomas, and an island she had never heard of, and a date forty-one years old.\n\nIlse sat for a long time while the great lens turned above her. Then she took out paper of her own. She described the morning light on the water, the gulls arguing over the harbour, the way the beam swept the fog like a slow hand.\n\nAt dawn she sealed her letter in the same green bottle and threw it as far as she could into the outgoing tide."}
+        {"role": "user", "content": "Write a short story about a lighthouse keeper who finds a message in a bottle."}
       ]
     }
   ]

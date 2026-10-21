@@ -8,11 +8,8 @@ import unittest
 
 import test_api
 import test_chat_stream
-from crit_api.host import Cancellation
 from crit_api.options import (RequestError, STRICT_TOOLS_CAPABILITY, TOOLS_CAPABILITY, tool_options,
                               validate_tool_reply)
-from crit_api.stream import StreamReader, StreamWriter
-from crit.run.records import read_json, write_json
 
 TOOLS = [{"type": "function", "function": {"name": "read_file", "strict": True, "parameters": {
     "type": "object", "properties": {"path": {"type": "string", "maxLength": 32}},
@@ -28,6 +25,18 @@ class StrictSchemaTests(unittest.TestCase):
         for arguments in ('{}', '{"path":2}', '{"path":"x","extra":1}', '{"path":"' + 'x' * 33 + '"}'):
             with self.subTest(arguments=arguments), self.assertRaises(ValueError):
                 validate_tool_reply([dict(CALL, function={"name": "read_file", "arguments": arguments})], options)
+        # A call a cut reply ends with: its arguments so far must begin arguments the schema accepts.
+        for arguments, valid in (('{"path":"a', True), ('{', True), ('{"pa', True), ('{"path":2', False),
+                                 ('{"wrong"', False)):
+            with self.subTest(arguments=arguments):
+                call = dict(CALL, function={"name": "read_file", "arguments": arguments})
+                if valid:
+                    self.assertEqual(validate_tool_reply([call], options, truncated=True), [call])
+                else:
+                    with self.assertRaisesRegex(ValueError, "strict schema"):
+                        validate_tool_reply([call], options, truncated=True)
+                with self.assertRaises(ValueError):
+                    validate_tool_reply([call], options)
         with self.assertRaises(RequestError):
             tool_options({"tools": TOOLS}, [TOOLS_CAPABILITY])
         for schema in ({"type": "object", "additionalProperties": True},
@@ -45,22 +54,17 @@ class ToolStreamContractTests(test_chat_stream.StreamContractTests):
         super().setUp()
         self.request.update(tool_options({"tools": TOOLS}, [TOOLS_CAPABILITY, STRICT_TOOLS_CAPABILITY]))
 
-    def tool_writer(self):
-        return StreamWriter(self.path, self.command, self.request, Cancellation(self.root / "cancel"), tools=True)
-
-    def test_interleaved_calls_and_coalescing_preserve_exact_arguments(self):
-        writer, text, deltas = self.tool_writer(), [], []
-        reader = StreamReader(self.path, "command", "owner", self.request, text.append, deltas.extend)
+    def test_interleaved_calls_preserve_exact_arguments(self):
+        writer, text, deltas = self.writer(tools=True), [], []
+        reader = self.reader(text, deltas.extend)
         calls = [CALL, dict(CALL, id="call_2")]
         for i, call in enumerate(calls):
             writer.emit({"tool_calls": [dict(call, index=i, function={"name": "read_file", "arguments": "{"})]})
-        writer.flush()
-        reader.poll()
         for i in (1, 0):
             writer.emit({"tool_calls": [{"index": i, "function": {"arguments": CALL["function"]["arguments"][1:]}}]})
         writer.finish({"assistant": "", "tool_calls": calls})
-        reader.poll()
-        reader.poll()
+        for piece in self.sent:
+            reader.apply(piece)
         rebuilt = {}
         for delta in deltas:
             index = delta["index"]
@@ -71,15 +75,15 @@ class ToolStreamContractTests(test_chat_stream.StreamContractTests):
         self.assertEqual(text, [])
 
     def test_bad_prefix_and_swallowed_callback_errors_fail_the_turn(self):
-        writer = self.tool_writer()
+        writer = self.writer(tools=True)
         with self.assertRaisesRegex(ValueError, "strict tool schema"):
             writer.emit({"tool_calls": [dict(CALL, index=0, function={"name": "read_file", "arguments": '{"wrong"'})]})
-        self.assertFalse(self.path.exists())
+        self.assertEqual(self.sent, [])
         with self.assertRaises(ValueError):
             writer.finish({"assistant": "", "tool_calls": [CALL]})
 
     def test_adapter_request_edits_cannot_disable_admitted_constraints(self):
-        writer = self.tool_writer()
+        writer = self.writer(tools=True)
         self.request['tool_grammars'].clear()
         with self.assertRaisesRegex(ValueError, 'strict tool schema'):
             writer.emit({'tool_calls': [dict(CALL, index=0, function={'name': 'read_file', 'arguments': '{}'})]})
@@ -88,19 +92,16 @@ class ToolStreamContractTests(test_chat_stream.StreamContractTests):
         for delta in ({"index": True, "function": {}}, dict(CALL, index=1),
                       dict(CALL, index=0, function={"name": "unknown", "arguments": ""})):
             with self.subTest(delta=delta), self.assertRaises(ValueError):
-                self.tool_writer().emit({"tool_calls": [delta]})
-        writer = self.tool_writer()
+                self.writer(tools=True).emit({"tool_calls": [delta]})
+        writer = self.writer(tools=True)
         writer.emit({"tool_calls": [dict(CALL, index=0, function={"name": "read_file", "arguments": "{"})]})
         with self.assertRaisesRegex(ValueError, "differ"):
             writer.finish({"assistant": "", "tool_calls": [CALL]})
-        reader = StreamReader(self.path, "command", "owner", self.request, lambda t: None)
-        reader.poll()
-        snapshot = read_json(self.path)
-        snapshot["tool_calls"][0]["id"] = "rewritten"
-        snapshot["sequence"] += 1
-        write_json(self.path, snapshot)
-        with self.assertRaisesRegex(ValueError, "rewritten"):
-            reader.poll()
+        reader = self.reader([])
+        reader.apply(self.sent[0])
+        for delta in (dict(CALL, index=0, id="rewritten"), {"index": 0, "function": {"arguments": '"x"}'}}):
+            with self.subTest(delta=delta), self.assertRaisesRegex(ValueError, "Later tool deltas|strict"):
+                reader.apply(self.piece(tool_calls=[delta]))
 
 
 ADAPTER = r'''
@@ -180,6 +181,22 @@ class AdvancedToolTests(test_api.ApiTests):
         self.assertEqual(events[-1]['usage']['completion_tokens'], 4)
         self.assertTrue(tail.endswith('data: [DONE]\n\n'))
 
+    def test_a_call_the_output_limit_cuts_comes_back_as_written_and_finishes_as_length(self):
+        cut = dict(CALL, function={'name': 'read_file', 'arguments': '{"path":"a'})
+        message = 'stream-tools:' + json.dumps({'calls': [cut]})
+        response, value = self.chat(message, tools=TOOLS, max_tokens=4)  # the fixture's replies are 4 tokens
+        self.assertEqual(response.status, 200, value)
+        self.assertEqual((value['choices'][0]['finish_reason'], value['choices'][0]['message']['tool_calls']),
+                         ('length', [cut]))
+        response, data = self.chat(message, tools=TOOLS, max_tokens=4, stream=True)
+        events = [json.loads(e[6:]) for e in data.decode().splitlines() if e.startswith('data: {')]
+        self.assertEqual([e['choices'][0]['finish_reason'] for e in events if e.get('choices')][-1], 'length')
+        deltas = [d for e in events if e.get('choices') for d in e['choices'][0]['delta'].get('tool_calls', [])]
+        self.assertEqual(''.join(d['function'].get('arguments', '') for d in deltas), cut['function']['arguments'])
+        # A reply that was not cut and ends inside a call wrote a malformed call.
+        response, value = self.chat(message, tools=TOOLS, max_tokens=30)
+        self.assertEqual(response.status, 500, value)
+
     def test_cancelling_tool_stream_keeps_resident_model_and_private_state_is_reset(self):
         cancel, seen = threading.Event(), []
         def tools(delta):
@@ -213,7 +230,6 @@ class AdvancedToolTests(test_api.ApiTests):
         self.assertTrue(seen)
         self.assertIsNone(self.served.runtime.tree)
         self.assertIsNotNone(tree.process.poll())
-        self.assertFalse((root / 'stream.json').exists())
         response, value = self.chat('stream-tools:' + json.dumps({'calls': [CALL]}), tools=TOOLS)
         self.assertEqual(response.status, 200, value)
         self.assertEqual(value['choices'][0]['message']['tool_calls'], [CALL])

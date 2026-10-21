@@ -311,6 +311,15 @@ class TokenizerTests(unittest.TestCase):
             with self.subTest(message=message), self.assertRaisesRegex(ModelTextError, message):
                 Tokenizer.from_files(mapping(files))
 
+    def test_token_bytes_read_the_vocabulary_of_byte_level_and_sentencepiece_models(self):
+        for data in (fx.byte_level_json(), fx.sentencepiece_json()):
+            tokenizer = Tokenizer(data)
+            expected = fx.token_bytes(tokenizer, range(tokenizer.vocab_size), False)
+            self.assertEqual(list(tokenizer.token_bytes()), expected)
+            self.assertIs(tokenizer.token_bytes(), tokenizer.token_bytes())
+            ids = tokenizer.encode("Grüße 😀 tides", add_special_tokens=False)
+            self.assertIn("Grüße 😀 tides".encode(), b"".join(tokenizer.token_bytes()[t] for t in ids))
+
 
 class TemplateTests(unittest.TestCase):
     def test_tojson_keeps_key_order_and_non_ascii_and_passes_indent_and_separators(self):

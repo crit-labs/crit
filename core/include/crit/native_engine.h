@@ -31,6 +31,11 @@ struct NativeEngine {
     // finished on the calling thread (for example "accepted" drafts per round, "verify_ms", "draft_ms", and
     // "rounds", the target passes after prefill, when it differs from the length of "accepted").
     std::function<std::string()> request;
+    // Explicit opt-in: all factory callbacks and engine state permit concurrent callers.
+    // The legacy request callback is incompatible with this flag. Use result facts
+    // derived from the completed, request-owned Result instead of shared model counters.
+    bool concurrent_requests = false;
+    std::function<std::string(const Result&)> result;
 private:
     // Called by the bridge once after a successful factory return, before exposing the handle.
     void retain_owner() const noexcept;
@@ -58,11 +63,26 @@ namespace native_api {
 inline constexpr int abi_version = 1;
 // Called with each published token; nonzero cancels the request.
 using TokenCallback = int (*)(void* user, const std::int32_t* tokens, int count);
+// Called with each published token of a request opened with "logprobs": n, with its log-probability and its n most
+// likely alternatives (tokens and log-probabilities, ranked as TokenLogprob rows are); nonzero cancels the request.
+using OutputCallback = int (*)(void* user, std::int32_t token, float logprob, const std::int32_t* top_tokens,
+                               const float* top_logprobs, int alternatives);
 void* open(NativeFactory, const char* configuration_json) noexcept;
 void close(void* engine) noexcept;
 int info(void* engine, char* out, int capacity) noexcept;
 int generate(void* engine, const std::int32_t* prompt, int count, int output_tokens, const char* options_json,
              TokenCallback callback, void* user, std::int32_t* out, char* result, int capacity) noexcept;
+// Additive ABI-1 extension. One waiter per request; cancel may run concurrently.
+// Close the request after wait (or to cancel and settle it), before closing engine.
+void* request_open(void* engine, const std::int32_t* prompt, int count, int output_tokens,
+                   const char* options_json) noexcept;
+void request_cancel(void* request) noexcept;
+void request_close(void* request) noexcept;
+int request_wait(void* request, TokenCallback, void* user, std::int32_t* out, char* result, int capacity) noexcept;
+// Additive ABI-1 extension: request_wait for a request opened with "logprobs", delivering each token's
+// log-probabilities.
+int request_wait_output(void* request, OutputCallback, void* user, std::int32_t* out, char* result,
+                        int capacity) noexcept;
 int score(void* engine, const std::int32_t* ids, int count, int first_target, const char* path,
           const std::int32_t* queries, int per_target, float* target, float* query, std::int32_t* argmax,
           int* has_argmax) noexcept;
@@ -80,18 +100,32 @@ const char* last_error() noexcept;
 //   int   crit_engine_abi()                     ABI version (1)
 //   void* crit_engine_open(config_json)         engine handle, or null (crit_engine_last_error)
 //   void  crit_engine_close(handle)
-//   int   crit_engine_info(handle, out, cap)    JSON length: ModelInfo fields plus the factory's info
+//   int   crit_engine_info(handle, out, cap)    JSON length: ModelInfo fields (token_logprobs, max_top_logprobs,
+//                                               ...) plus the factory's info
 //   int   crit_engine_generate(handle, prompt, count, output_tokens, options_json, callback, user, out, result,
 //                              cap)             tokens written; -1 error, -2 cancelled. options_json: optional
 //                                               "stop_tokens" (array; [] disables), "temperature", "top_p",
 //                                               "top_k", "min_p", "seed", "replay" (token array), "plain"
-//                                               (true: no drafting). result: JSON
+//                                               (true: no drafting), "logprobs" (alternatives per token;
+//                                               requires token_logprobs, at most max_top_logprobs; wait with
+//                                               crit_engine_request_wait_output). result: JSON
 //                                               with "finish", "timing" (ms, prefill_tokens, decode_steps) and
 //                                               the factory's request facts
 //   int   crit_engine_score(handle, ids, count, first_target, path, queries, per_target, target, query, argmax,
 //                           has_argmax)         0, or -1 error
 //   const char* crit_engine_last_error()        the calling thread's last error
 #define CRIT_EXPORT_ENGINE(factory)                                                                                \
+    CRIT_ENGINE_EXPORT void* crit_engine_request_open(void* engine, const std::int32_t* prompt, int count, int output, const char* options) { \
+        return ::crit::core::native_api::request_open(engine, prompt, count, output, options);                       \
+    }                                                                                                              \
+    CRIT_ENGINE_EXPORT void crit_engine_request_cancel(void* request) { ::crit::core::native_api::request_cancel(request); } \
+    CRIT_ENGINE_EXPORT void crit_engine_request_close(void* request) { ::crit::core::native_api::request_close(request); } \
+    CRIT_ENGINE_EXPORT int crit_engine_request_wait(void* request, ::crit::core::native_api::TokenCallback callback, void* user, std::int32_t* out, char* result, int capacity) { \
+        return ::crit::core::native_api::request_wait(request, callback, user, out, result, capacity);                \
+    }                                                                                                              \
+    CRIT_ENGINE_EXPORT int crit_engine_request_wait_output(void* request, ::crit::core::native_api::OutputCallback callback, void* user, std::int32_t* out, char* result, int capacity) { \
+        return ::crit::core::native_api::request_wait_output(request, callback, user, out, result, capacity);         \
+    }                                                                                                              \
     CRIT_ENGINE_EXPORT int crit_engine_abi() { return ::crit::core::native_api::abi_version; }                     \
     CRIT_ENGINE_EXPORT void* crit_engine_open(const char* configuration) {                                         \
         return ::crit::core::native_api::open(&(factory), configuration);                                          \

@@ -7,7 +7,7 @@
 
 ### Why wait for someone to optimize an LLM for your GPU when an AI agent can build a specialized inference engine in a few hours?
 
-[![Version 0.2.3](docs/assets/badge-version.svg)](CHANGELOG.md)
+[![Version 0.3.0](docs/assets/badge-version.svg)](CHANGELOG.md)
 [![License Apache-2.0](docs/assets/badge-license.svg)](LICENSE)
 [![crit-hub engines](docs/assets/badge-crit-hub.svg)](https://github.com/crit-labs/crit-hub)
 [![CI](https://github.com/crit-labs/crit/actions/workflows/ci.yml/badge.svg)](https://github.com/crit-labs/crit/actions/workflows/ci.yml)
@@ -23,8 +23,8 @@
 
 ## Summary
 
-**`crit` is a toolkit for developers and coding agents to quickly build inference engines
-tailored to your model and hardware.**
+**`crit` is a toolkit for quickly building a new inference engine
+tailored to your model and hardware or optimizing a pre-existing one.**
 > [!IMPORTANT]
 > Combines a runtime foundation, reusable techniques, kernel discovery
 > and physics-based evaluation. In our first case study, a coding agent built an engine for
@@ -40,11 +40,14 @@ tailored to your model and hardware.**
 
 ## Quick start
 
-Give this prompt to your coding agent and specify your target LLM:
+Give this prompt to your coding agent and specify your target LLM or target engine:
 ```bash
-Use github.com/crit-labs/crit to build an optimized inference engine.
+Use github.com/crit-labs/crit to build an optimized inference engine for <url_to_llm_on_huggingface>.
 ```
 
+```bash
+Use github.com/crit-labs/crit to optimize my own inference engine in <path_to_your_engine> / <url_to_engine_on_crit-hub>.
+```
 
 ---
 
@@ -60,9 +63,9 @@ Less time building an engine. More performance from your hardware.
 > foundation so you can get to the work that makes your engine fast.
 
 **Curated high-impact inference strategies 📊** 
-> Don't rebuild inference strategies from scratch. We studied established tailored
-> engines and distilled their core speedup strategies into reusable code, so you can
-> apply what works to your model and hardware.
+> Don't rebuild inference strategies from scratch. We studied established
+> inference engines and distilled their core speedup strategies into reusable code, so you can
+> apply what works to your model and hardware quickly.
 
 **Physics-based evaluation suite 🔬** 
 > A benchmark score alone doesn't tell
@@ -90,7 +93,7 @@ We gave `Claude Opus 5.5` a target LLM along with the `crit` repository and let 
 ---
 
 <details>
-<summary><strong>📋 Dense LLM, Qwen architecture</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/qwen3.8-27b@NVFP4/mtp7-fp8attn">Inspect engine</a></summary>
+<summary><strong>📋 Dense LLM, Qwen architecture</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/crit-labs/mtp7-fp8attn">Inspect engine</a></summary>
 
 <br />
 
@@ -148,7 +151,7 @@ Mean KL divergence
 
 <br />
 
-[`mtp7-fp8attn`](https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/qwen3.8-27b@NVFP4/mtp7-fp8attn)
+[`mtp7-fp8attn`](https://github.com/crit-labs/crit-hub/tree/main/engines/crit-labs/mtp7-fp8attn)
 runs Qwen3.8-27B in its original NVFP4 weights on one RTX 5090, with the model's full 262,144
 tokens of context. One coding agent built it from scratch in a single `crit run`, writing its
 own kernels on Core without using another inference engine as a reference. It speeds up
@@ -176,7 +179,7 @@ six prompts, from a chat question to a 14K-token agent session.
 ---
 
 <details>
-<summary><strong>📋 Dense LLM, Gemma architecture</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/gemma-4-31b@NVFP4/assistant6-fp8qk">Inspect engine</a></summary>
+<summary><strong>📋 Dense LLM, Gemma architecture</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/crit-labs/assistant6-fp8qk">Inspect engine</a></summary>
 
 <br />
 
@@ -234,7 +237,7 @@ Mean KL divergence
 
 <br />
 
-[`assistant6-fp8qk`](https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/gemma-4-31b@NVFP4/assistant6-fp8qk)
+[`assistant6-fp8qk`](https://github.com/crit-labs/crit-hub/tree/main/engines/crit-labs/assistant6-fp8qk)
 runs Gemma 4 31B on one RTX 5090 with the model's full 262,144 tokens of context. Gemma mixes 50
 sliding-window layers with 10 full-attention layers whose keys equal their values, and its hidden
 states overflow FP16, so little carries over from the Qwen engines. The NVFP4 MLPs are used as
@@ -264,7 +267,7 @@ their difference is run-to-run variation.
 ---
 
 <details>
-<summary><strong>📋 MoE LLM, VRAM overload, Qwen architecture</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/qwen3.8-flash-next@FP4-Local/mtp3-expert-cache">Inspect engine</a></summary>
+<summary><strong>📋 MoE LLM, VRAM overload, Qwen architecture</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/crit-labs/mtp3-expert-cache">Inspect engine</a></summary>
 
 <br />
 
@@ -322,7 +325,7 @@ Mean KL divergence
 
 <br />
 
-[`mtp3-expert-cache`](https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/qwen3.8-flash-next@FP4-Local/mtp3-expert-cache)
+[`mtp3-expert-cache`](https://github.com/crit-labs/crit-hub/tree/main/engines/crit-labs/mtp3-expert-cache)
 runs Qwen3.8-Flash-Next, a 102 GB mixture-of-experts checkpoint with 512 NVFP4 experts per
 layer, on one 32 GB RTX 5090 with the model's full 262,144 tokens of context. The weights are
 used as stored: attention, the shared expert and the KV cache stay on the GPU, the routed
@@ -359,7 +362,7 @@ and replaces candidate 5 in crit-hub.
 ---
 
 <details>
-<summary><strong>📋 MoE LLM, VRAM overload, Nemotron architecture</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/nemotron-3.5-super-120b-a12b@NVFP4/mtp3-cpu-experts">Inspect engine</a></summary>
+<summary><strong>📋 MoE LLM, VRAM overload, Nemotron architecture</strong> → <a href="https://github.com/crit-labs/crit-hub/tree/main/engines/crit-labs/mtp3-cpu-experts">Inspect engine</a></summary>
 
 <br />
 
@@ -417,7 +420,7 @@ Mean KL divergence
 
 <br />
 
-[`mtp3-cpu-experts`](https://github.com/crit-labs/crit-hub/tree/main/engines/rtx5090/nemotron-3.5-super-120b-a12b@NVFP4/mtp3-cpu-experts)
+[`mtp3-cpu-experts`](https://github.com/crit-labs/crit-hub/tree/main/engines/crit-labs/mtp3-cpu-experts)
 runs Nemotron 3.5 Super 120B-A12B (text path) on one RTX 5090 with 262,144 tokens of context. Its
 layers are 40 Mamba-2 mixers, 40 latent mixture-of-experts layers with 512 NVFP4 experts each (22
 per token) and 8 attention layers. The checkpoint is 75 GB, 63 GB of it routed experts, used as
@@ -570,9 +573,10 @@ Results keep samples, settings and skipped cases visible.
 
 <br />
 
-[`crit-hub`](https://github.com/crit-labs/crit-hub) collects `crit`-based inference engines in one repository 
+[`crit-hub`](https://github.com/crit-labs/crit-hub) collects bespoke inference engines in one repository 
 to make discovery super easy. Each engine ships runnable source, the exact checkpoint it was built on, what 
-was measured, its known limits and a link to the repository of whoever contributed it.
+was measured, its known limits and a link to the repository of whoever contributed it. 
+Use them as jump-off point for further optimization.
 
 </details>
 

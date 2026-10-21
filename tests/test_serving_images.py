@@ -135,4 +135,4 @@ class ImageHttpTests(ServeFixture, unittest.TestCase):
                 else:
                     text = json.loads(wire)["choices"][0]["message"]["content"]
                 self.assertEqual(json.loads(text), {"types": ["text", "image_url"], "urls": [len(url)]})
-        self.assertEqual(list((served.runtime.root / "requests").iterdir()), [])
+        self.assertFalse((served.runtime.root / "requests").exists())

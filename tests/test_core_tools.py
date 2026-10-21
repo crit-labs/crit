@@ -137,6 +137,134 @@ class JsonObjectTests(unittest.TestCase):
             text = "<tool_call>" + body + "</tool_call>"
             self.assertEqual(joined(events(ToolCallParser("json-object", TOOLS), text)), (text, []))
 
+def streamed(text, format="xml-function", chunks=None, cut=False, **request):
+    """ToolReply over text pushed in chunks (one character each by default): (content, calls, the deltas emitted
+    after each push, the last after finish)."""
+    emitted, steps = [], []
+    reply = ToolReply(format, {"tools": TOOLS, **request}, emitted.append)
+    position = 0
+    for size in chunks or [1] * len(text):
+        reply.push(text[position:position + size])
+        position += size
+        steps.append([e["tool_calls"][0] for e in emitted if isinstance(e, dict)])
+    reply.push(text[position:])
+    content, calls = reply.finish(cut)
+    return content, calls, steps + [[e["tool_calls"][0] for e in emitted if isinstance(e, dict)]]
+
+
+def rebuilt(deltas):
+    """Calls as a client assembles them from deltas: {index: (id, name, arguments)}."""
+    calls = {}
+    for delta in deltas:
+        ident, name, arguments = calls.get(delta["index"], (delta.get("id"), delta["function"].get("name"), ""))
+        calls[delta["index"]] = ident, name, arguments + delta["function"].get("arguments", "")
+    return calls
+
+
+class StreamingTests(unittest.TestCase):
+    def check(self, calls, deltas):
+        """Each call's first delta names it and the rest only add arguments, which add up to the final call's."""
+        for index, call in enumerate(calls):
+            mine = [d for d in deltas if d["index"] == index]
+            self.assertEqual((mine[0]["id"], mine[0]["type"], mine[0]["function"]["name"]),
+                             (call["id"], "function", call["function"]["name"]))
+            self.assertTrue(all(set(d) == {"index", "function"} and set(d["function"]) == {"arguments"}
+                                and d["function"]["arguments"] for d in mine[1:]))
+        self.assertEqual(rebuilt(deltas), {i: (c["id"], c["function"]["name"], c["function"]["arguments"])
+                                           for i, c in enumerate(calls)})
+
+    def test_xml_calls_stream_from_their_name_in_any_chunking(self):
+        calls = [("read_file", {"path": "src/a b.py", "lines": 20, "options": {"x": [1, 2]}, "note": "two\nlines\n"}),
+                 ("list", {})]
+        text = XmlFunctionTests.render(None, "I'll look.", calls)
+        rng = random.Random(11)
+        for chunks in [None] + [[rng.randint(1, 9) for _ in range(len(text) // 3)] for _ in range(30)]:
+            content, final, steps = streamed(text, chunks=chunks)
+            self.assertEqual(content, "I'll look.")
+            self.assertEqual([(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in final], calls)
+            self.check(final, steps[-1])
+        _, _, steps = streamed(text)
+        header = text.index("<function=read_file>") + len("<function=read_file>")
+        self.assertEqual(rebuilt(steps[header - 1])[0][1:], ("read_file", "{"))  # named before its block closes
+        self.assertEqual(rebuilt(steps[text.index("a b.py") + 1])[0][2], '{"path": "src/a ')
+        # A non-string value goes out once its parameter closes; text that may end a string value is held.
+        self.assertEqual(rebuilt(steps[text.index("20") + 1])[0][2], '{"path": "src/a b.py", "lines": ')
+        self.assertEqual(rebuilt(steps[text.index("two\n") + 3])[0][2].rsplit(" ", 1)[1], '"two')
+
+    def test_json_object_calls_stream_member_by_member(self):
+        call = {"name": "read_file", "arguments": {"path": "a.py", "lines": 20, "options": {"x": [1, 2]}}}
+        text = "Sure.\n<tool_call>\n" + json.dumps(call) + "\n</tool_call>"
+        for chunks in (None, [3] * 40, [17] * 10):
+            content, final, steps = streamed(text, "json-object", chunks)
+            self.assertEqual((content, json.loads(final[0]["function"]["arguments"])), ("Sure.", call["arguments"]))
+            self.check(final, steps[-1])
+        _, _, steps = streamed(text, "json-object")
+        self.assertEqual(steps[text.index('read_file"') + 8], [])
+        self.assertEqual(rebuilt(steps[text.index('read_file"') + 9])[0][1:], ("read_file", "{"))
+        self.assertEqual(rebuilt(steps[text.index('a.py"') + 1])[0][2], '{"path": "a.')
+        self.assertEqual(rebuilt(steps[text.index("20,") + 1])[0][2], '{"path": "a.py", "lines": ')  # 20 may go on
+        self.assertEqual(rebuilt(steps[text.index("20,") + 2])[0][2], '{"path": "a.py", "lines": 20')
+        # A string streams as it decodes, never half an escape: "\u00e9" goes out as "é" once whole.
+        text = '<tool_call>{"name": "read_file", "arguments": {"path": "caf\\u00e9 \\ud83d\\ude00\\n"}}</tool_call>'
+        content, final, steps = streamed(text, "json-object")
+        self.assertEqual(json.loads(final[0]["function"]["arguments"]), {"path": "café 😀\n"})
+        self.check(final, steps[-1])
+        self.assertEqual(rebuilt(steps[text.index("u00e9") + 3])[0][2], '{"path": "caf')
+        self.assertEqual(rebuilt(steps[text.index("u00e9") + 4])[0][2], '{"path": "café')
+        self.assertEqual(rebuilt(steps[text.index("ude00") + 3])[0][2], '{"path": "café ')
+        self.assertEqual(rebuilt(steps[text.index("ude00") + 4])[0][2], '{"path": "café 😀')
+        # Arguments written as a JSON string decode when the block closes.
+        text = '<tool_call>{"name": "list", "arguments": "{\\"a\\": 1}"}</tool_call>'
+        _, final, steps = streamed(text, "json-object")
+        self.assertEqual(final[0]["function"]["arguments"], '{"a": 1}')
+        self.check(final, steps[-1])
+
+    def test_a_named_block_that_does_not_parse_fails_the_reply(self):
+        for format, text in (("xml-function", "<tool_call>\n<function=read_file>\nstray\n</function>\n</tool_call>"),
+                             ("xml-function", "<tool_call>\n<function=list>\n<parameter=a>\n1\n</parameter>\n"
+                                              "<parameter=a>\n2\n</parameter>\n</function>\n</tool_call>"),
+                             ("json-object", '<tool_call>{"name": "list", "arguments": {}, "id": 1}</tool_call>'),
+                             ("json-object", '<tool_call>{"name": "list", "arguments": {"a": 1, "a": 2}}</tool_call>')):
+            with self.subTest(text=text), self.assertRaisesRegex(TextError, "malformed call to (read_file|list)"):
+                streamed(text, format)
+
+    def test_unnamed_unknown_and_disallowed_blocks_stay_text(self):
+        good = "<tool_call>\n<function=list>\n</function>\n</tool_call>"
+        for text in ("<tool_call>\n<function=delete_all>\n</function>\n</tool_call>",
+                     "<tool_call>\n{\"name\": \"list\"}\n</tool_call>"):
+            self.assertEqual(streamed(text)[:2], (text, []))
+        content, calls, steps = streamed(good + "\n" + good, parallel_tool_calls=False)
+        self.assertEqual((content, len(calls), {d["index"] for d in steps[-1]}), (good, 1, {0}))
+        # A repeated key is no call in either format.
+        text = '<tool_call>{"name": "list", "arguments": {"a": 1, "a": 2}}</tool_call>'
+        self.assertEqual(joined(events(ToolCallParser("json-object", TOOLS), text)), (text, []))
+
+    def test_a_reply_cut_inside_a_streamed_call_keeps_the_call_so_far(self):
+        text = "Checking.\n\n<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/a"
+        content, calls, steps = streamed(text, cut=True)
+        self.assertEqual(content, "Checking.")
+        self.assertEqual([c["function"] for c in calls], [{"name": "read_file", "arguments": '{"path": "src/a'}])
+        self.check(calls, steps[-1])
+        with self.assertRaisesRegex(TextError, "ended its reply inside its call to read_file"):
+            streamed(text)  # not cut: the model ended its reply there
+        # Ended before the name is written: no call, the text stays.
+        for cut in (True, False):
+            self.assertEqual(streamed("Checking.<tool_call>\n<funct", cut=cut)[:2], ("Checking.<tool_call>\n<funct", []))
+
+    def test_a_package_format_streams_when_it_reads_unfinished_blocks(self):
+        def stream(body, tools):
+            name, space, _ = body.lstrip().partition(" ")
+            return (name, "{") if space and name in tools else None
+        streaming = BRACKET._replace(stream=stream)
+        text = 'Looking. [[call read_file {"path": "a.py"}]]'
+        _, calls, steps = streamed(text, streaming)
+        self.check(calls, steps[-1])
+        self.assertEqual((steps[text.index("{") - 2], len(steps[text.index("{") - 1])), ([], 1))
+        _, calls, steps = streamed(text, BRACKET)
+        self.assertEqual(steps[-3], [])  # without stream: whole, once its block closes
+        self.assertEqual(steps[-1], [dict(calls[0], index=0)])
+
+
 # The tool-call rendering of the Gemma 4 chat template (format_argument with bare keys), reduced to the call syntax.
 def _bracket_call(body, tools):
     """A package's own syntax for the tests: [[call NAME JSON]]."""

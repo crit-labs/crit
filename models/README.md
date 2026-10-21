@@ -15,8 +15,8 @@ the transform and the engine may spend together.
 crit models plan --recipe recipe.json --source SOURCE_DIR
 crit models ptq  --recipe recipe.json --source SOURCE_DIR --out OUT_DIR --record transform.json [--calibration data.jsonl]
 crit eval prepare   --model SOURCE_DIR --data DATA_DIR
-crit eval reference --model SOURCE_DIR --data DATA_DIR
-crit models eval --record transform.json --adapter engine_adapter.py --data DATA_DIR --out result.json --evaluation evaluation.json
+crit eval run --url URL --model OUT_DIR --data DATA_DIR --context TOKENS --out result.json
+crit models eval --record transform.json --data DATA_DIR --result result.json --evaluation evaluation.json
 crit models verify --record transform.json
 ```
 
@@ -29,11 +29,14 @@ crit models verify --record transform.json
    `quantization_config`. It writes the `models_transform` record. It needs `torch`
    and `safetensors`, and `transformers` for GPTQ; with `--device cuda` the GPU must
    be free of other measurements.
-3. **Eval** runs the output in your engine through its [Eval adapter](../docs/eval/ADAPTER.md),
-   against data prepared from the **source** checkpoint and a reference built from it.
-   It refuses data prepared from another model, so quality is always measured against
-   the original. Pass `--baseline` with the same engine's result on the source to see
-   the speed change. It writes the `models_evaluation` record.
+3. **Eval** measures the output in your engine: serve `OUT_DIR` with it on any
+   OpenAI-compatible server and run `crit eval run --url` against data prepared from the
+   **source** checkpoint ([Engines behind a server](../docs/eval/README.md#engines-behind-a-server)).
+   Stop the server, then `crit models eval` verifies the output, scores the engine's quality
+   replies on the source checkpoint (`crit eval reference`) and writes the `models_evaluation`
+   record. It refuses data prepared from another model and a result measured on other data or
+   through an adapter, so quality is always the engine's own replies against the original.
+   Pass `--baseline` with the same engine's result on the source to see the speed change.
 4. **Verify** re-hashes the output and source against the record.
 
 The source must be unquantized (BF16, F16 or F32 projections, no `quantization_config`).
@@ -115,8 +118,8 @@ general corpus in several languages and domains.
 | `environment`, `crit_version`, `started_at`, `ended_at` | Python, platform, torch, CUDA, safetensors, transformers |
 
 `models_evaluation` binds an Eval result to a transform: the transform record's sha256 and
-output manifest, the adapter's sha256 and applied configuration, the prepared data and
-reference hashes, the result's sha256, and a summary of gates, quality and speed KPIs.
+output manifest, the server's URL and served model name, the prepared data's hash, the
+result's sha256, and a summary of gates, quality and speed KPIs.
 
 ## Use in a run
 

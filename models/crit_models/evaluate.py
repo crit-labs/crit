@@ -1,4 +1,5 @@
-"""Run a transformed checkpoint in an engine through Eval, against the source model's prepared data and reference."""
+"""Bind an Eval result of an engine serving a transformed checkpoint to its transform record, with its quality replies
+scored on the source checkpoint."""
 from pathlib import Path
 
 from crit.run.records import file_sha, now, read_json, write_json
@@ -17,22 +18,22 @@ def load_record(path):
     return record
 
 
-def evaluate(record_path, adapter, data, out, evaluation_path, config=None, parts=None, device=None, baseline=None,
-             quality_budget=None, exactness=None, context_tokens=None, label=None, log=print):
+def evaluate(record_path, data, result_path, evaluation_path, baseline=None, log=print):
     """Verify the output against its record, check that `data` was prepared from the source checkpoint (so Eval's
-    quality reference is the original model), run Eval on the output and write a models_evaluation record."""
-    from crit_eval import load_json, machine_settings
+    quality reference is the original model) and that the result at `result_path` (crit eval run --url on the engine
+    serving the output, stopped since) was measured on it, score its quality replies on the source checkpoint unless
+    they are scored, and write a models_evaluation record."""
+    from crit_eval import load_json
     from crit_eval.prepare import PREPARED
-    from crit_eval.reference import REFERENCE
-    from crit_eval.runner import PARTS, run
-    record_path, data, evaluation_path = Path(record_path), Path(data), Path(evaluation_path).absolute()
+    from crit_eval.reference import score_result
+    record_path, data, result_path = Path(record_path), Path(data), Path(result_path)
+    evaluation_path = Path(evaluation_path).absolute()
     record = load_record(record_path)
     if evaluation_path.exists():
         raise ValueError(f"{evaluation_path} already exists")
     findings = [f for f in verify(record) if not f.startswith("source")]
     if findings:
         raise ValueError("; ".join(findings))
-    parts = tuple(parts or PARTS)
     if not (data / PREPARED).is_file():
         raise ValueError(f"{data} holds no {PREPARED}: prepare it from the source checkpoint first "
                          f"(crit eval prepare --model {record['source']['path']} --data {data})")
@@ -40,27 +41,26 @@ def evaluate(record_path, adapter, data, out, evaluation_path, config=None, part
     if prepared["model"]["sha256"] != record["source"]["eval_model_sha256"]:
         raise ValueError(f"{data} was prepared from another model than the source checkpoint; Eval must compare "
                          "the output with the original model's prepared data and reference")
-    if "quality" in parts and not (data / REFERENCE).is_file():
-        raise ValueError(f"{data} holds no {REFERENCE}: build it from the source checkpoint first "
-                         f"(crit eval reference --model {record['source']['path']} --data {data})")
-    settings = machine_settings()
-    reserve = settings.get("context_reserve_gib")
-    result = run(str(adapter), record["output"]["path"], data, out, config or {}, parts, label=label, log=log,
-                 device=device, baseline=baseline, quality_budget=quality_budget, exactness=exactness,
-                 context_tokens=context_tokens, vram_headroom_bytes=round(settings.get("vram_headroom_gib", 1.0) * (1 << 30)),
-                 context_reserve_bytes=round(reserve * (1 << 30)) if reserve is not None else None)
+    result = load_json(result_path)
+    if (result.get("model_sha256"), result.get("suite_sha256")) != (prepared["model"]["sha256"], prepared["suite_sha256"]):
+        raise ValueError(f"{result_path} was measured on other prepared data than {data}")
+    if not result.get("server"):
+        raise ValueError(f"{result_path} measured an adapter's engine: measure the engine serving the output with "
+                         f"crit eval run --url ... --model {record['output']['path']} --data {data}")
+    if result.get("aborted") or "status" not in result:
+        raise ValueError(f"{result_path} is no finished Eval round")
+    if (result.get("quality") or {}).get("status") == "replied":
+        result = score_result(record["source"]["path"], data, result_path, baseline, log)
     status = result["status"]
     kpis = status["kpis"]
     evaluation = {
         "schema_version": 1, "record_kind": "models_evaluation",
         "transform": {"path": str(record_path.absolute()), "sha256": file_sha(record_path),
                       "output_manifest_sha256": record["output"]["manifest_sha256"]},
-        "adapter": {"path": str(Path(adapter).absolute()), "sha256": file_sha(Path(adapter))},
-        "configuration": result["engine"]["configuration"], "parts": list(parts),
+        "server": {"url": result["server"], "model": result["engine"]["name"]},
         "data": {"path": str(data.absolute()), "prepared_sha256": file_sha(data / PREPARED),
-                 "reference_sha256": file_sha(data / REFERENCE) if (data / REFERENCE).is_file() else None,
                  "model_sha256": prepared["model"]["sha256"]},
-        "result": {"path": str(Path(out).absolute()), "sha256": file_sha(Path(out))},
+        "result": {"path": str(result_path.absolute()), "sha256": file_sha(result_path)},
         "summary": {"gates": {g["name"]: g["state"] for g in status["gates"]}, "quality": kpis.get("quality"),
                     "decode_score": kpis["decode"]["score"], "prefill_score": kpis["prefill"]["score"],
                     "ttft_ms": kpis["ttft"]["score_ms"]},

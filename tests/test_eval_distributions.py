@@ -51,7 +51,7 @@ class HostComparisonTests(unittest.TestCase):
         self.assertEqual(cand.kld_quantile(0.99), cand.kld_max())
         # The suite's compact top-k-plus-tail KL is a lower bound on the full-vocabulary value.
         r, c = metrics.log_softmax(reference[0], 3), metrics.log_softmax(candidate[0], 3)
-        self.assertLessEqual(metrics.lumped_kl(r[:2], c[:2]), metrics.kl_divergence(r, c) + 1e-15)
+        self.assertLessEqual(metrics.partial_kl([0, 1], r[:2], {0: c[0], 1: c[1]}), metrics.kl_divergence(r, c) + 1e-15)
 
 
 class DeviceReferenceTests(unittest.TestCase):

@@ -132,7 +132,7 @@ def default_directory():
 
 
 def clean_snapshots(directory, runtime_id):
-    """Remove a settled owner's private model and provisional-text snapshots."""
+    """Remove a settled owner's private model snapshots."""
     if runtime_id is None:
         return
     if not isinstance(runtime_id, str) or not re.fullmatch(r"[0-9a-f]{32}", runtime_id):
@@ -155,12 +155,6 @@ def clean_snapshots(directory, runtime_id):
                 if getattr(exc, "winerror", None) not in {5, 32, 33} or time.monotonic() >= deadline:
                     raise
                 time.sleep(.005)
-    stream = safe_path(directory, "runtimes/" + runtime_id + "/stream.json")
-    stream.unlink(missing_ok=True)
-    streams = safe_path(directory, "runtimes/" + runtime_id + "/streams")
-    if streams.exists():
-        for path in streams.glob("*.json"):
-            safe_path(streams, path.name).unlink(missing_ok=True)
 
 
 class RuntimeOwnership:

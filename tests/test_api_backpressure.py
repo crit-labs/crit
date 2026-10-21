@@ -121,7 +121,7 @@ class BackpressureTests(ShutdownFixture, unittest.TestCase):
         self.assertEqual((after["pid"], after["device"], after["generation"]),
                          (before["pid"], before["device"], before["generation"]))
         self.assertEqual(after["private"], 1)
-        self.assertEqual(list((self.served.runtime.root / "requests").iterdir()), [])
+        self.assertFalse((self.served.runtime.root / "requests").exists())
         # No client read/close/release above could have allowed cancellation.
         self.assertFalse(self.gate.with_suffix(".release").exists())
         wire = self.wire(client)

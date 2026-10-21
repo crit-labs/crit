@@ -52,12 +52,17 @@ Install from the repo root with `python -m pip install -e .`, then run `crit ...
   Check operations, formats, shapes, OS/device, licenses, dependencies and the three
   checks Kernels lists.
 - **[Models](models/README.md):** only when the run's `weights_policy` is `transformable`:
-  quantize the source with `crit models ptq`, run the output through `crit models eval`
-  against the source's Eval data, and keep both records with the candidate.
-- **[Eval](docs/eval/README.md):** connect the engine through an eval adapter; use the
-  same prepared data and reference for every engine of one model. A Core engine built
-  as a shared [engine library](core/src/runtime/README.md#engine-libraries) gets the
-  Eval and serve adapters from `crit_core.native`.
+  quantize the source with `crit models ptq`, measure the served output with
+  `crit eval run --url` against the source's Eval data, bind the result with
+  `crit models eval`, and keep both records with the candidate.
+- **[Eval](docs/eval/README.md):** measure each candidate with `crit run ... eval`: it
+  serves the packaged candidate through `crit serve`, runs Eval over the chat API and
+  scores the quality replies on the model's checkpoint. Use the same prepared data for
+  every engine of one model. Hardware telemetry (tokens per round, acceptance, memory,
+  kernels) comes from `crit run ... measure` and Eval's adapter commands through an eval
+  adapter. A Core engine built as a shared
+  [engine library](core/src/runtime/README.md#engine-libraries) gets the Eval and serve
+  adapters from `crit_core.native`.
 
 Retain Core revision/build inputs, dependency identities/notices and adaptations with
 candidate source. Keep model-specific changes in the engine; record toolkit gaps in the summary. Salvage
@@ -124,7 +129,7 @@ Work in rounds, one candidate per round:
 - **Measure** with [`crit eval`](docs/eval/README.md) plus the run's cases
   (`stop_record_headroom` with `--baseline` seeds the stop record). Sweep settings on
   the mixed suite, not one prompt.
-  Retain adapter, applied configuration, data, reference and results; report skipped
+  Retain adapter, applied configuration, data and results; report skipped
   cases. Eval results neither publish records nor qualify a candidate.
 - **Output differences are bugs until explained.** A drop in plain-greedy equality versus
   an earlier candidate, or any output difference between repeated identical requests
@@ -134,7 +139,7 @@ Work in rounds, one candidate per round:
   even when exactness is only reported.
 - **Record through `crit run`:** freeze inputs, create candidates, retain source and
   packages, publish each case's checks, then benchmark with `crit run measure`, which
-  replays one pinned text per case for every candidate and binds the checks; seal
+  streams each case's chat request to the candidate served through `crit serve`; seal
   (check telemetry's eligibility first: sealed candidates are immutable). Reserve
   before launch; settle results and cleanup.
   Record parent, changes, rationale, build, results, selection reasoning

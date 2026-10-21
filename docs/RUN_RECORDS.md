@@ -40,7 +40,8 @@ and speed techniques; a larger one trades context for that room.
 | `settle` | `--reservation RUN_RELATIVE_PATH --record result.json`; exit, logs, cleanup |
 | `package` | `--candidate ID --source DIR --record recipe.json`; runnable files and manifest |
 | `check`, `benchmark` | `--candidate ID --record payload.json`; appends evidence |
-| `measure` | `--candidate ID --adapter EVAL_ADAPTER [--model DIR] [--config JSON] [--seconds N]`; reserves a benchmark attempt, measures every resident case through the package's eval-v1 adapter in a child process, settles it and records one benchmark per case bound to the case's checks |
+| `measure` | `--candidate ID [--seconds N]`; reserves a benchmark attempt, serves the packaged candidate through `crit serve`, streams every resident case's chat request to it, settles it and records one benchmark per case ([measured benchmarks](#measured-benchmarks)) |
+| `eval` | `--candidate ID --data EVAL_DATA_DIR [--only PART] [--baseline RESULT] [--label TEXT] [--seconds N]`; reserves a benchmark attempt, serves the packaged candidate through `crit serve`, runs Eval over the chat API with the run's quality terms and `kv_tokens`, scores the quality replies on the run's model, settles it and retains the result as `candidates/ID/eval/ATTEMPT.json` ([Eval evidence](#eval-evidence)) |
 | `seal` | `--candidate ID --lifecycle STATE [--failure TEXT]`; closes the candidate |
 | `select` | `--candidate ID`; selects a sealed eligible candidate |
 | `stop` | `--record stop.json` |
@@ -198,52 +199,52 @@ required cases, not the fastest series. Served request timing never enters proje
 
 ### Measured benchmarks
 
-`crit run measure` reads each case's prompt from a retained JSON file
-`{"ids": [token ids]}` in its manifest (the workload's `prompt_tokens` long). The first
-candidate measured pins its plain greedy output of every case as `pins/CASE.json`, when
-two runs give the same text (otherwise the case stays unpinned until a later candidate
-repeats). Pinning runs a non-speculative engine in its own process, which exits before the
-measured engine loads, so an engine whose weights live in host memory never holds two copies.
-Every later measurement of any candidate decodes that text through the
-adapter's `replay` when it declares one, so speculative candidates are compared on the
-same tokens and drafts. Without `replay` or a pin, a candidate decodes its own text, and
-`extensions.decode_text` records which and why. Times are host-observed from token delivery, as
-in Eval. Memory is sampled during each request: host `MemAvailable` (Linux) or
-`GlobalMemoryStatusEx` (Windows), the process's resident memory, and free device memory
-from `nvidia-smi` for GPU 0. Device memory is the driver's whole-GPU view, and metrics a
-host cannot measure go to `missing_metrics`.
+`crit run measure` measures the run's cases on a candidate as a client of `crit serve`
+gets it. Each case keeps its chat request as a retained JSON file
+`{"messages": [...], "tools": [...]}` (`tools` optional) in its manifest. Under one
+benchmark reservation `crit serve` serves the packaged candidate at the run's
+`kv_tokens`, and every warmup and repetition streams the request to
+`/v1/chat/completions` with `temperature` 0, `max_tokens` the workload's
+`output_tokens` and usage. `crit serve`'s usage must count the workload's
+`prompt_tokens`: a case whose messages render to another length fails the measurement,
+naming both counts. Every candidate decodes its own greedy reply, and one that ends
+before `output_tokens` is measured on the tokens it has; `extensions.output_tokens`
+records each repetition's length. Times are client-observed from the streamed chunks, as
+in Eval: time to first token, prefill (the prompt over the time to first token), decode
+(the tokens after the first over the time to the last) and the request to its last
+token. `load_ms` is the time `crit serve` took to load the engine, and
+`accepted_tokens_per_round` is `crit_telemetry.tokens_per_round` when the engine
+reports its decode rounds ([SERVING.md](SERVING.md)). Memory is sampled during each
+request: host `MemAvailable` (Linux) or `GlobalMemoryStatusEx` (Windows), the resident
+memory of `crit serve`'s resident host process, where the engine runs, and free device
+memory from `nvidia-smi` for GPU 0. Device memory is the driver's whole-GPU view, and
+metrics a host cannot measure go to `missing_metrics`.
 
-Measurement workers and their descendants run in an owned Windows job or Linux
-process group. Cleanup terminates and waits for that tree on completion, failure,
-timeout and interruption, including any remaining pinning or adapter helpers.
-Engine load and close failures also stop the memory sampler.
-
-Workers use the same launch guardian and persistent runtime ownership as serving.
-A dead coordinator triggers retirement, and unresolved ownership blocks further
-measurement or serving. Once the coordinator has exited, use
-`crit serve --recover-runtime` from the same OS/user environment to verify
-retirement and release that guard. This does not settle the run's attempt:
-an abrupt kill can leave its reservation pending, requiring an explicit
-`crit run ... settle` record with the verified cleanup evidence. Existing
+The resident host runs under `crit serve`'s launch guardian and runtime ownership,
+which retire its process tree on completion, failure, the reservation's deadline and
+interruption. The attempt settles once the server has stopped; a failed engine cleanup
+settles it with `cleanup_settled` false and blocks further measurement or serving.
+Once the coordinator has exited, use `crit serve --recover-runtime` from the same
+OS/user environment to verify retirement and release that guard. This does not settle
+the run's attempt: an abrupt kill can leave its reservation pending, requiring an
+explicit `crit run ... settle` record with the verified cleanup evidence. Existing
 unsettled attempt results remain retained; runtime recovery does not rewrite them.
 
 The reservation includes time waiting for the machine's engine lock. Expiry
-before admission starts no worker; completion after the deadline records `timed_out`
-and publishes no benchmarks. Setup errors, interruptions and unreadable worker
-results also settle the attempt, retaining available logs and failed-work scratch
-files. A launch or retirement failure whose cleanup cannot be proven records
-`cleanup_settled: false`; it does not qualify the candidate for sealing. If the
-coordinator cannot write the attempt result itself, the reservation stays pending.
-Logs are hashed as retained evidence only after cleanup is proven. Unretired
-workers' raw logs remain in the candidate's `logs/` directory without freezing
-bytes that those workers may still append to.
+before admission serves nothing; completion after the deadline records `timed_out`
+and publishes no benchmarks. Failures and interruptions also settle the attempt,
+with the measurement's log (`logs/measure-ATTEMPT.log`). An engine cleanup that
+cannot be proven records `cleanup_settled: false`; it does not qualify the candidate
+for sealing. If the coordinator cannot write the attempt result itself, the
+reservation stays pending. Logs are hashed as retained evidence only after cleanup
+is proven; otherwise the log stays in the candidate's `logs/` directory unhashed.
 
 ### Eval evidence
 
 [Eval](eval/README.md) result JSON is not a `check` or `benchmark` payload and is
-never imported automatically. Keep the adapter and inputs with the candidate, retain
-the result JSON under it before sealing and reference its bytes from a check's
-`evidence`. Publish benchmark samples only under cases and a protocol frozen for them;
+never imported automatically. `eval` retains it under the candidate before sealing;
+reference its bytes from a check's `evidence`. Keep any Eval adapter and inputs with the
+candidate. Publish benchmark samples only under cases and a protocol frozen for them;
 an Eval case cannot be relabelled as a run workload, and Eval's model identity differs
 from the run's manifest hash. Report skipped cases and overrides. Eval does not measure
 physical memory, and an Eval pass passes no run gate.
@@ -285,6 +286,7 @@ run-ID/
     package/manifest.json       runnable files, build and launch identities
     attempts/attempt-NNNN/      reservation.json and result.json
     checks/, benchmarks/, logs/
+    eval/ATTEMPT.json           Eval results of crit run eval
     telemetry.json             active projection
     outcome.json, seal.json     final outcome and complete inventory
   chats/                       separate requests, replies and conversations
@@ -293,7 +295,7 @@ run-ID/
 Records are UTF-8 JSON with unique keys, finite numbers, integer `schema_version: 1`,
 the correct `record_kind`, owner IDs and timezone-aware UTC timestamps. Projections
 have increasing integer revisions. Optional extensions go in `extensions`; invalid
-versions/fields are rejected. Limits: **1 MiB per JSON file, 512 candidates per run,
+versions/fields are rejected. Limits: **1 MiB per JSON record, 512 candidates per run,
 100,000 files per inventory**; link larger evidence.
 
 Paths are canonical forward-slash paths relative to the owning run (or source/package

@@ -9,6 +9,160 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-21
+
+### Overview
+
+crit 0.3.0 measures engines the way a chat client uses them. Eval protocol `crit-eval-v5` sends
+every prompt as chat messages to an OpenAI-compatible `/chat/completions`, so `crit eval run --url`
+measures any served engine, built with crit or not, and `crit eval reference` scores quality on the
+engine's own greedy replies against the checkpoint the data was prepared from. `crit run measure`
+and `crit run eval` measure a packaged candidate through `crit serve`. `crit serve` talks to its
+resident host over one loopback connection instead of polled files, streams tool calls as they are
+written, returns token log-probabilities and reports tokens per round. Core serves concurrent native
+engines, preempts and restores requests under memory pressure and schedules dependent request
+steps. Nothing measured before carries over: prepare Eval data again for v5, capture run cases kept
+as token ids again as chat messages, and expect no quality figures from an Eval adapter. The Python
+distribution and the Core SDK share version 0.3.0.
+
+### Added
+
+- `crit eval run --url` measures any engine behind an OpenAI-compatible chat API, no adapter
+  needed: the speed cases, held-out prompts, request history, long-context curve and retrieval
+  go to `/chat/completions` as the chat messages `prepare` freezes next to their token ids, with
+  lengths from the usage counts the server must stream, and quality from the engine's own replies.
+  It takes no engine lock, so it measures an engine `crit serve` is serving.
+- `crit serve` returns token log-probabilities (`logprobs`, `top_logprobs` up to 20) for packages
+  declaring `chat-logprobs-v1`: every generated token with its bytes and ranked alternatives, in
+  the finish chunk when streaming. ResidentChat adapters set `logprobs = True` and receive
+  `logprobs=n`; native libraries rebuilt against this `crit/native_engine.h` export
+  `crit_engine_request_wait_output` and pass `"logprobs": n` through to Core, so
+  `crit_core.native.ResidentEngine` serves them when the model declares 20 alternatives.
+- `crit serve` reports `tokens_per_round` (output tokens per target pass) in `crit_telemetry`, and
+  a stream's usage chunk now carries `crit_telemetry` too, when the engine reports its decode
+  rounds: response telemetry takes an optional `decode_rounds`, ResidentChat passes
+  `generate_tokens`' timing `rounds`, and Core engine libraries report theirs as Eval counts them.
+- `crit run ... eval --candidate ID --data DIR` measures a packaged candidate the way a chat client
+  gets it: under one benchmark reservation it serves the candidate through `crit serve` before
+  sealing, runs Eval over the chat API with the run's quality terms and context, stops the server,
+  scores the quality replies on the run's model and retains the result as
+  `candidates/ID/eval/ATTEMPT.json`. Every engine Eval opens is the candidate served at the context
+  it asks for, so the lower-context gate is measured too. Packages need `chat-stream-v1` and
+  `chat-logprobs-v1` from their first Eval.
+- Core accepts an optional prefill work quantum for engines that pad prompt
+  computation. Mixed scheduling reserves those padded columns without consuming
+  nonexistent input, exceeding the batch budget or rounding decode grants up.
+  This closes a concrete integration gap exposed by a retained engine's kernels.
+
+- Native HTTP integration fixtures exercise concurrent streaming and buffered clients,
+  both supplied recovery adapters, and client cancellation during prefill. An optional
+  CUDA recurrence example verifies device-carried dependent steps while predecessor
+  readback is blocked, with ordered publication and cancellation cleanup.
+- Core can schedule bounded dependent steps for one request before host publication,
+  using engine-owned continuations and per-request eligibility. It reserves unresolved
+  output grants, publishes in order, and settles discarded descendants before retirement.
+  A portable asynchronous recurrent reference covers real dependent computation, seeded
+  sampling, stops, failure ownership and full-state recovery under memory pressure.
+- Core's optional memory preemption path accepts typed pre-submission pressure,
+  suspends reclaimable settled requests, and restores their original streams and
+  identities after other resident work finishes. Recovery has separate telemetry,
+  cancellation and failure ownership. A paged-attention reference reuses physical
+  pages and replays accepted history without resampling or duplicate output.
+- Native serving supports explicitly concurrent engine libraries through private resident
+  request wrappers and the configured Core admission capacity. Additive ABI request handles
+  allow cancellation during prefill, before any output; request-owned result facts avoid
+  shared mutable statistics. Older libraries retain serial serving.
+- Core's reasoning and tool parsers accept tokenizer-bound delimiters and retain token identity
+  through incremental decoding and reasoning-to-tool routing. Single special-token boundaries
+  distinguish control ids from ordinary tokens with the same spelling; multi-token text
+  delimiters and explicit `delimiters="text"` formats retain text matching.
+
+### Changed
+
+- `crit run measure --candidate ID [--seconds N]` measures the run's cases through `crit serve`, as a
+  chat client gets them, instead of through the package's Eval adapter in a child process. Each case
+  keeps its chat request as a captured `{"messages": [...]}` JSON file, and `crit serve`'s usage must
+  count the workload's prompt tokens for it. Every candidate decodes its own greedy reply, so no text
+  is pinned any more, and a reply that ends early is measured on the tokens it has. Memory is sampled
+  on the resident host process, which now names itself to `crit serve`, and tokens per round comes
+  from `crit serve`'s telemetry. `--adapter`, `--model` and `--config` are gone; capture cases kept
+  as `{"ids": [...]}` again as messages. The resident host, like the worker before it, writes no
+  core file the size of the model when it crashes.
+- ResidentChat streams a tool call as the model writes it instead of as one delta
+  when its block closes: the call's id and name as soon as the name is written, then its arguments
+  as they become certain, for both registered call syntaxes and for a package `ToolFormat` that
+  gives the new `stream` function. Eval over `crit serve` therefore times a reply that ends in a
+  call by when its tokens were written. A block that has begun streaming is that call: one that
+  closes without parsing, or that the model ends its reply inside, fails the reply instead of
+  staying content, and one `max_tokens` cuts comes back with the arguments written so far and
+  `finish_reason: "length"`, as OpenAI's API returns it. A Hermes-style JSON call that repeats a
+  key stays content.
+- `crit serve` talks to its resident host over one loopback connection the host opens with the
+  runtime's ownership token, instead of command, result and stream-snapshot files polled every
+  20 ms. A streamed reply's first token arrives about 30 ms sooner, and each delta the engine
+  emits reaches the client as its own chunk instead of one coalesced update per 50 ms; the HTTP
+  server sends chunks without Nagle's delay. Only failed requests leave records in the runtime
+  directory, and `ServedEngine.generate`'s `on_text` receives each piece instead of the
+  cumulative text.
+- Eval protocol `crit-eval-v5`: the long-context curve's prompts are the longest speed case
+  with its document followed by suite filler text, cut to fit, instead of copies of its whole
+  prompt, so every prompt Eval sends is chat messages and served engines run the curve and
+  retrieval too. Curve scores move: prepare data again for v5.
+- Eval protocol `crit-eval-v5` measures quality on the engine's own replies, as a chat API user
+  gets them. Each quality prompt goes as chat messages with `logprobs` and 16 `top_logprobs`;
+  `crit eval reference --model --data --result` then scores the greedy reply teacher-forced on the
+  checkpoint the data was prepared from: KL over both top-16 lists plus the rest, the perplexity
+  ratio and top-1 agreement over every reply token. The conversations and the replies after 1K-,
+  4K- and 32K-token prompts are each a set judged by the drift budget. The server must render each
+  prompt to the token count the model's chat template does and name reply tokens by their bytes.
+  Adapter scoring (`score()`, `score_paths`, `prefill_decode`, and the stock
+  `crit_core.native.EvalEngine`'s) and `reference.json` are gone, so an adapter's engine gets no
+  quality figures; Core's scoring and `crit_engine_score` stay for engines.
+- `crit models eval --record --data --result --evaluation` binds a `crit eval run --url` result of
+  the engine serving a transform's output to its record and scores its quality replies on the
+  source checkpoint, instead of running an adapter; `models_evaluation` records the server's URL
+  and model name in place of the adapter and its configuration.
+- Eval protocol ids have a major and an optional minor version: `crit-eval-v4` is 4.0 and
+  `crit-eval-v4.1` is 4.1. A change that can move a score takes the next major version,
+  any other the next minor; scores compare within a major version and `compare` warns across
+  majors. Prepared data runs under every minor version of its major when it froze the current
+  suite, and a test pins each version to its protocol and suite, so an edit to either needs a
+  new version.
+
+### Fixed
+
+- A resident host run in-process no longer writes a `__pycache__` into the sealed package it loads,
+  which failed the package's verification on the next request; the test suite run without `-B` hit it.
+- Core fails an individually blocked request when all resident requests hold
+  nonreclaimable memory and no work can free capacity, allowing its peers to progress
+  instead of waiting indefinitely.
+- Resident chat parsing now keeps delimiter token identity through reasoning and tool-call
+  handling, including reasoning opened by the prompt. Ordinary tokens spelling a special
+  delimiter stay literal content instead of changing channels or creating a tool call.
+  Buffered replies and streaming use the same path; text-delimited package formats remain supported.
+- `crit eval run --url` no longer stops on a server that streams a reply in one piece: that
+  reply's decode speed is unmeasured.
+- `crit serve` bounds a conversation by the request body's 8 MiB, in bytes, instead of
+  1,000,000 characters, which refused prompts that fit a long-context model (a full
+  262,144-token prompt is over a million characters) and failed Eval's capacity and retrieval
+  gates at the required context.
+- `crit eval run --url` reports an error a server streams as that error, instead of
+  "streamed no usage".
+- `crit eval reference` scores models the way their transformers modeling code runs them, which
+  it could not for Gemma 4 and failed on Qwen3 under current transformers: rotary embeddings per
+  layer type, sliding-window masks on sliding-attention layers, the embedding's own scale, stored
+  layer buffers (a layer scalar), per-sequence shared keys and values, final logit soft-capping
+  and a tied output head. It reads ModelOpt NVFP4 (`weight`, `weight_scale_2`) as well as
+  compressed-tensors NVFP4. A tiny Gemma 4 scores within 1e-4 of the model's own FP32 forward.
+- `crit eval reference` scores long prompts without copying keys and values per query head, and
+  a sliding-window layer reads only the columns its window covers: a 31B model's 32,768-token
+  quality prompts no longer exhaust a 32 GB GPU, which failed the scoring there.
+- The Eval suite has one identity on every platform. Windows sorted the suite's files without case
+  (`agent/README.md.txt` after `agent/cli.py.txt`), so `crit eval prepare` recorded another
+  `suite_sha256` there and the test pinning `crit-eval-v5` to its suite failed on Windows; data
+  prepared on Linux now runs on Windows and back. Data prepared on Windows before this fix needs
+  preparing again.
+
 ## [0.2.3] - 2026-10-20
 
 ### Overview
@@ -374,7 +528,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/crit-labs/crit/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/crit-labs/crit/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/crit-labs/crit/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/crit-labs/crit/compare/v0.2.0...v0.2.1

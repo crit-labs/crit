@@ -12,11 +12,11 @@ from . import CONTRACT, EVAL_DIR, load_json, write_json
 from .hostload import HostLoad
 from . import headroom, metrics, status
 from .ceiling import model_ceiling
-from .context import (GIB, curve_points, filled_prompt, lower_context, max_context, retrieval_points, retrieval_prompt,
+from .chat import Server
+from .context import (GIB, curve_points, curve_prompt, lower_context, max_context, retrieval_points, retrieval_prompt,
                       token_text)
 from .pin import CONTINUATIONS, load_continuations
-from .prepare import PREPARED
-from .reference import REFERENCE
+from .prepare import PREPARED, check_prepared
 
 
 def load_adapter(path):
@@ -57,16 +57,22 @@ def _timed(call, prompt, output_tokens, expected=None):
     started = time.perf_counter()
     result = call(on_tokens)
     tokens = list(result["tokens"])
+    # An engine behind a chat API streams text: the server counts its tokens, and its reply may end early.
+    served = result.get("served")
     streamed = [t for _, chunk in deliveries for t in chunk]
-    if streamed != tokens:
+    if served is None and streamed != tokens:
         raise RuntimeError("tokens passed to on_tokens differ from the returned tokens")
-    if len(tokens) != output_tokens:
-        raise RuntimeError(f"engine returned {len(tokens)} tokens, expected {output_tokens} (stop tokens must be disabled)")
+    count = len(tokens) if served is None else int(served["output_tokens"])
+    if count > output_tokens or count < output_tokens and served is None:
+        raise RuntimeError(f"engine returned {count} tokens, expected {output_tokens} (stop tokens must be disabled)")
     if expected is not None and tokens != list(expected):
         diverge = next(i for i, (a, b) in enumerate(zip(tokens, expected)) if a != b)
         raise RuntimeError(f"replay emitted a token different from the pinned continuation at position {diverge}")
     first = next(t for t, chunk in deliveries if chunk)
-    sample = metrics.speed_sample(len(prompt), tokens, started, first, deliveries[-1][0], result.get("rounds"))
+    prompt_tokens = len(prompt) if served is None else int(served["prompt_tokens"])
+    sample = metrics.speed_sample(prompt_tokens, count, started, first, deliveries[-1][0], result.get("rounds"))
+    if served is not None:
+        sample["served"] = served
     sample["engine_timing"] = result.get("timing")
     sample["accepted"] = result.get("accepted")
     # Optional engine-measured parts of the decode: time in verify passes and in draft steps (ms, whole request).
@@ -120,6 +126,11 @@ SUMMARY_KEYS = ("decode_tps", "prefill_tps", "ttft_ms", "request_ms", "tokens_pe
 
 def _summary(samples):
     return {key: metrics.median([s[key] for s in samples if s[key] is not None]) for key in SUMMARY_KEYS}
+
+
+def rate(value, digits):
+    """A speed for the log; a reply streamed in one piece has no decode time, and one before any time no prefill."""
+    return "unmeasured" if value is None else f"{value:.{digits}f} tok/s"
 
 
 def decode_text(info, continuations):
@@ -179,9 +190,9 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
             # CPU cores other processes kept busy during the case: engines computing on the host slow down with them.
             "host_other_cpu_cores": None if other is None else round(other, 2),
         }
-        log(f"speed {case['id']}: decode {summary['decode_tps']:.1f} tok/s"
+        log(f"speed {case['id']}: decode {rate(summary['decode_tps'], 1)}"
             + (" (pinned continuation)" if continuation is not None else "")
-            + f", prefill {summary['prefill_tps']:.0f} tok/s, tokens/round {summary['tokens_per_round'] or 0:.2f}, "
+            + f", prefill {rate(summary['prefill_tps'], 0)}, tokens/round {summary['tokens_per_round'] or 0:.2f}, "
             f"round {summary['round_ms'] or 0:.2f} ms"
             + (f", other processes {other:.1f} CPU cores" if other is not None and other >= 0.5 else ""))
     measured = [c for c in cases.values() if c["status"] == "measured"]
@@ -218,7 +229,7 @@ def run_heldout(engine, info, prepared, protocol, log):
         summary = _summary(samples)
         prompts[prompt["id"]] = {"status": "measured", "language": prompt["language"], "kind": prompt["kind"],
                                  "prompt_tokens": len(ids), "output_tokens": n, **summary, "samples": samples}
-        log(f"held-out {prompt['id']} ({prompt['language']}): decode {summary['decode_tps']:.1f} tok/s, "
+        log(f"held-out {prompt['id']} ({prompt['language']}): decode {rate(summary['decode_tps'], 1)}, "
             f"tokens/round {summary['tokens_per_round'] or 0:.2f}")
     measured = [p for p in prompts.values() if p["status"] == "measured"]
     return {"status": "measured", "prompts": prompts,
@@ -260,89 +271,32 @@ def quality_thresholds(protocol, budget=None):
     return {**protocol["quality"]["thresholds"], **{k: float(v) for k, v in budget.items()}}
 
 
-def score_rows(engine, sequences, by_id, path):
-    """Reference and engine rows of every target of `sequences` (prepared {id, ids, first_target}) on `path`."""
-    reference_rows, engine_rows = [], []
-    for sequence in sequences:
-        targets = by_id[sequence["id"]]
-        scored = engine.score(sequence["ids"], sequence["first_target"], path, [t["top_ids"] for t in targets])
-        argmax = scored.get("argmax") or [None] * len(targets)
-        for target, lp, query, best in zip(targets, scored["target_logprobs"], scored["query_logprobs"], argmax):
-            engine_rows.append({"target_logprob": lp, "top_logprobs": query, "argmax": best})
-        reference_rows += targets
-    return reference_rows, engine_rows
-
-
-def judged(reference_rows, engine_rows, thresholds):
-    result = metrics.quality_path(reference_rows, engine_rows)
-    failures = metrics.judge(result, thresholds)
-    result.update(passed=not failures, failures=failures, budget_used=metrics.budget_used(result, thresholds))
-    return result
-
-
-def prefill_decode_quality(engine, info, prepared, reference, thresholds, log):
-    """The prefill_decode path (protocol quality.prefill_decode): every prepared long sequence is prefilled up to
-    its scored turn and the reference continuation fed through decode steps. Each prompt length is judged on
-    its own and the path passes only when all of them and the pooled targets do. Returns (result, reason):
-    reason says why nothing could be scored."""
-    sequences = prepared.get("prefill_decode")
-    rows = {c["id"]: c["targets"] for c in (reference or {}).get("prefill_decode") or []}
-    if not sequences:
-        return None, "the prepared data has no prefill_decode prompts; prepare it again"
-    if any(s["id"] not in rows for s in sequences):
-        return None, "the reference has no prefill_decode targets; build it again (crit eval reference)"
-    started, lengths, pooled = time.time(), {}, ([], [])
-    for length in sorted({s["prompt_tokens"] for s in sequences}):
-        group = [s for s in sequences if s["prompt_tokens"] == length]
-        if max(len(s["ids"]) for s in group) > info["max_context"]:
-            lengths[str(length)] = {"status": "skipped",
-                                    "reason": f"needs {max(len(s['ids']) for s in group):,} tokens of context"}
-            log(f"quality prefill_decode at {length:,} tokens: skipped (context)")
+def run_quality(engine, info, prepared, protocol, log):
+    """protocol quality: the engine's greedy reply to every quality prompt, with the log-probabilities it reports
+    (an engine's reply(prompt, max_new_tokens, top_k): an engine behind a server, crit_eval.chat). `crit eval
+    reference` scores them on the prepared model's checkpoint (reference.score_result). A set with a prompt that
+    does not fit the engine's max_context with reply_tokens is skipped."""
+    rule = protocol["quality"]
+    out = {"top_k": rule["top_k"], "reply_tokens": rule["reply_tokens"]}
+    if not callable(getattr(engine, "reply", None)):
+        log("quality: not measured (an adapter's engine; quality is measured over the chat API)")
+        return {**out, "status": "unsupported",
+                "reason": "quality is measured over the chat API: serve the engine and run crit eval run --url"}
+    started, replies, skipped = time.time(), [], {}
+    for prompt in prepared["quality"]:
+        need = max(len(p["prompt_ids"]) for p in prepared["quality"] if p["set"] == prompt["set"]) + rule["reply_tokens"]
+        if need > info["max_context"]:
+            skipped[prompt["set"]] = f"needs {need:,} tokens of context"
             continue
-        reference_rows, engine_rows = score_rows(engine, group, rows, "prefill_decode")
-        pooled[0].extend(reference_rows)
-        pooled[1].extend(engine_rows)
-        lengths[str(length)] = {"status": "measured", "conversations": [s["conversation"] for s in group],
-                                **judged(reference_rows, engine_rows, thresholds)}
-        row = lengths[str(length)]
-        log(f"quality prefill_decode at {length:,} tokens: KLD mean {row['kld_mean']:.2e}, p99 {row['kld_p99']:.2e}, "
-            f"top-1 {row['top1_agreement']:.3f} ({'pass' if row['passed'] else 'FAIL'})")
-    if not pooled[0]:
-        return None, "every prompt length is above the engine's max_context"
-    result = judged(*pooled, thresholds)
-    result["failures"] += [f"at {int(length):,} prompt tokens: {failure}" for length, row in lengths.items()
-                           for failure in row.get("failures", [])]
-    result.update(passed=not result["failures"], lengths=lengths, seconds=time.time() - started,
-                  budget_used=max([result["budget_used"]] + [row["budget_used"] for row in lengths.values()
-                                                             if row.get("budget_used") is not None]))
-    return result, None
-
-
-def run_quality(engine, info, prepared, reference, protocol, log, thresholds=None):
-    paths = [p for p in protocol["quality"]["paths"] if p in info.get("score_paths", [])]
-    by_id = {c["id"]: c["targets"] for c in reference["conversations"]}
-    out = {"paths": {}, "unsupported": [p for p in protocol["quality"]["paths"] if p not in paths],
-           "required": list(protocol["quality"].get("required_paths", [])), "missing": {}}
-    thresholds = thresholds or protocol["quality"]["thresholds"]
-    out["thresholds"] = thresholds
-    for path in paths:
-        started = time.time()
-        if path == "prefill_decode":
-            result, reason = prefill_decode_quality(engine, info, prepared, reference, thresholds, log)
-            if result is None:
-                out["missing"][path] = reason
-                log(f"quality {path}: not scored ({reason})")
-                continue
-        else:
-            result = judged(*score_rows(engine, prepared["quality"], by_id, path), thresholds)
-            result["seconds"] = time.time() - started
-        out["paths"][path] = result
-        log(f"quality {path}: ppl ratio {result['ppl_ratio']:.5f}, KLD mean {result['kld_mean']:.2e}, "
-            f"p99 {result['kld_p99']:.2e}, top-1 {result['top1_agreement']:.3f}, {result['budget_used']:.1%} of the drift budget "
-            f"({'pass' if result['passed'] else 'FAIL'})")
-    out["passed"] = (bool(out["paths"]) and all(p["passed"] for p in out["paths"].values())
-                     and all(p in out["paths"] for p in out["required"]))
-    return out
+        replies.append({"id": prompt["id"], "set": prompt["set"],
+                        **engine.reply(prompt["prompt_ids"], rule["reply_tokens"], rule["top_k"])})
+    for name, reason in skipped.items():
+        log(f"quality {name}: skipped ({reason})")
+    if not replies:
+        return {**out, "status": "skipped", "skipped": skipped,
+                "reason": f"no quality prompt fits the engine's {info['max_context']:,}-token context"}
+    log(f"quality: {len(replies)} replies, {sum(len(r['tokens']) for r in replies):,} tokens, await the reference")
+    return {**out, "status": "replied", "replies": replies, "skipped": skipped, "seconds": time.time() - started}
 
 
 def plain_on_engine(engine, info):
@@ -393,27 +347,27 @@ def context_requirement(model, device, context_tokens, vram_headroom_bytes, sett
 
 
 def context_text(info, continuations, prepared, output_tokens):
-    """The text the long-context points decode, and the replayed tokens: the longest speed case's pinned
-    continuation (its first output_tokens), since every point's prompt ends with that case's whole prompt,
-    when the data has one and the adapter replays; else each engine's own greedy output."""
+    """The text the long-context points decode, and the replayed tokens: the curve case's pinned continuation
+    (its first output_tokens), since every point's prompt ends with that case's request, when the data has one
+    and the adapter replays; else each engine's own greedy output."""
     text = decode_text(info, continuations)
     if text["source"] != "pinned":
         return text, None
-    longest = max(prepared["speed"], key=lambda case: len(case["prompt_ids"]))
-    pinned = continuations["cases"].get(longest["id"]) or []
+    case = prepared["context"]["case"]
+    pinned = continuations["cases"].get(case) or []
     if len(pinned) < output_tokens:
-        return {"source": "generated", "reason": f"the pinned continuation of {longest['id']} has {len(pinned)} tokens, "
+        return {"source": "generated", "reason": f"the pinned continuation of {case} has {len(pinned)} tokens, "
                 f"fewer than the {output_tokens} each point decodes"}, None
-    return {**text, "case": longest["id"]}, list(pinned[:output_tokens])
+    return {**text, "case": case}, list(pinned[:output_tokens])
 
 
 def run_context(engine, info, prepared, settings, required, log, continuations=None):
     """One greedy request per curve point, each filling the context exactly (prompt plus output equal
-    the point). The prompt is copies of the longest speed case's prompt ending with a whole one, so the
-    engine decodes an answer to it: a replay of that case's pinned continuation when there is one (the
-    same text for every engine, as in the speed cases), else the engine's own output. A request the
-    engine cannot serve is recorded as failed. Returns (points, decode text)."""
-    base = max((case["prompt_ids"] for case in prepared["speed"]), key=len)
+    the point). The prompt is the longest speed case with its document and filler text after it
+    (curve_prompt), so the engine decodes an answer to that case: a replay of its pinned continuation when
+    there is one (the same text for every engine, as in the speed cases), else the engine's own output. A
+    request the engine cannot serve is recorded as failed. Returns (points, decode text)."""
+    pieces, filler = prepared["context"], prepared["retrieval"]["filler_ids"]
     n = int(settings["output_tokens"])
     text, continuation = context_text(info, continuations, prepared, n)
     points = {}
@@ -423,10 +377,11 @@ def run_context(engine, info, prepared, settings, required, log, continuations=N
                                   "reason": f"the engine's max_context {info['max_context']:,} is below {point:,}"}
             log(f"context {point:,}: skipped (max_context {info['max_context']:,})")
             continue
-        if point <= n:
-            points[str(point)] = {"status": "skipped", "context": point, "reason": f"no room for a prompt before {n} output tokens"}
+        prompt = curve_prompt(pieces, filler, point - n)
+        if prompt is None:
+            points[str(point)] = {"status": "skipped", "context": point,
+                                  "reason": f"no room for the {pieces['case']} prompt before {n} output tokens"}
             continue
-        prompt = filled_prompt(base, point - n)
         samples = []
         try:
             for _ in range(int(settings.get("repetitions", 1))):
@@ -581,10 +536,15 @@ PARTS = ("speed", "quality", "exactness", "context", "heldout", "history")
 def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
         repetitions=None, label=None, log=print, bandwidth_gbs=None, device=None, baseline=None,
         quality_budget=None, exactness=None, context_tokens=None, vram_headroom_bytes=None, context_reserve_bytes=None,
-        abort_disturbed=True):
-    """device: `crit eval probe` result (bandwidth_gbs, tflops, free memory); bandwidth_gbs overrides its bandwidth.
+        abort_disturbed=True, url=None, served_model=None):
+    """adapter: the eval-v1 adapter file, or an object that opens engines as an adapter module does
+    (create_eval_engine), its `server` naming them in the result (crit run eval serves a candidate per engine); with
+    url instead, the engine behind that OpenAI-compatible server (crit_eval.chat), served_model naming its model.
+    device: `crit eval probe` result (bandwidth_gbs, tflops, free memory); bandwidth_gbs overrides its bandwidth.
     baseline: an earlier result to show KPI changes against.
-    quality_budget: the run's drift limits over the protocol's (ppl_ratio_max, kld_mean_max, kld_p99_max).
+    quality_budget: the run's drift limits over the protocol's (ppl_ratio_max, kld_mean_max, kld_p99_max). The
+    `quality` part records the engine's replies to the quality prompts; `crit eval reference` scores them and judges
+    every set by these limits.
     exactness: "reported" (default) or "required" (any difference from plain greedy fails the gate).
     context_tokens: the context every engine is built for (a run's kv_tokens); without it, Eval's max context
     for the model on the device, with vram_headroom_bytes (default 1 GiB) left free. The `context` part
@@ -600,9 +560,7 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
     if exactness not in EXACTNESS_MODES:
         raise SystemExit(f"exactness must be one of {', '.join(EXACTNESS_MODES)}")
     prepared = load_json(Path(data) / PREPARED)
-    if prepared.get("protocol") != protocol["protocol"]:
-        raise SystemExit(f"{data} was prepared for {prepared.get('protocol')}, not {protocol['protocol']}: "
-                         "prepare it again (crit eval prepare) into a new data directory")
+    check_prepared(prepared, protocol, data)
     device = device or {}
     bandwidth_gbs = bandwidth_gbs or device.get("bandwidth_gbs")
     settings = protocol["context"]
@@ -617,17 +575,15 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
             ceiling = model_ceiling(model)
         except (OSError, ValueError, KeyError):
             ceiling = None
-    reference = load_json(Path(data) / REFERENCE) if "quality" in parts else None
-    if reference and reference["prepared_model_sha256"] != prepared["model"]["sha256"]:
-        raise SystemExit("reference.json was built from different prepared data")
     continuations = load_continuations(data, prepared)
-    module = load_adapter(adapter)
+    opener = None if url or isinstance(adapter, (str, Path)) else adapter
+    module = Server(url, prepared, served_model) if url else opener or load_adapter(adapter)
     result = {
         "contract": CONTRACT, "protocol": protocol["protocol"], "label": label,
         "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "model_sha256": prepared["model"]["sha256"], "suite_sha256": prepared["suite_sha256"],
         "host": {"platform": platform.platform(), "python": platform.python_version()},
-        "adapter": str(Path(adapter).resolve()),
+        "adapter": None if url or opener else str(Path(adapter).resolve()), "server": url or getattr(opener, "server", None),
         "device": {k: device.get(k) for k in ("device", "bandwidth_gbs", "tflops", "memory_total_bytes",
                                                "memory_free_bytes", "measured_at")} if device else None,
         "bandwidth_gbs": bandwidth_gbs,
@@ -645,7 +601,7 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
     disturbed = protocol["speed"].get("disturbed_spread") if abort_disturbed else None
     try:
         return _measure(result, module, model, config or {}, prepared, protocol, parts, warmups, repetitions, log,
-                        continuations, required, settings, reference, thresholds, exactness, disturbed, bandwidth_gbs,
+                        continuations, required, settings, exactness, disturbed, bandwidth_gbs,
                         device, ceiling, baseline, out)
     except Disturbed as error:
         log(f"aborted: {error}")
@@ -656,10 +612,12 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
 
 
 def _measure(result, module, model, config, prepared, protocol, parts, warmups, repetitions, log, continuations,
-             required, settings, reference, thresholds, exactness, disturbed, bandwidth_gbs, device, ceiling, baseline,
+             required, settings, exactness, disturbed, bandwidth_gbs, device, ceiling, baseline,
              out):
     lower = None
-    if "context" in parts and "speed" in parts and required:
+    if "context" in parts and "speed" in parts and required and isinstance(module, Server):
+        lower = {"context": None, "passed": None, "reason": "a served engine cannot be opened at a lower context"}
+    elif "context" in parts and "speed" in parts and required:
         lower = run_lower_context(module, model, config, prepared, protocol, required, warmups, repetitions, log,
                                   continuations, disturbed)
     started = time.perf_counter()
@@ -683,7 +641,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
         if "heldout" in parts:
             result["heldout"] = run_heldout(engine, info, prepared, protocol, log)
         if "quality" in parts:
-            result["quality"] = run_quality(engine, info, prepared, reference, protocol, log, thresholds)
+            result["quality"] = run_quality(engine, info, prepared, protocol, log)
         if "context" in parts and required:
             result["context"]["points"], result["context"]["decode_text"] = run_context(
                 engine, info, prepared, settings, required, log, continuations)
@@ -695,6 +653,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
         if fresh is not None:
             served = [part for part in ("speed", "heldout", "quality", "context", "exactness") if part in result
                       and (part != "context" or "points" in result["context"])
+                      and (part != "quality" or result["quality"].get("replies"))
                       and (part != "exactness" or result["exactness"].get("engine") == "shared")]
             result["history"] = compare_history(fresh, history_outputs(engine, cases), served)
             between = ", ".join(served) or "nothing else"

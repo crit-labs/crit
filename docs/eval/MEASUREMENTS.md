@@ -80,36 +80,43 @@ score. Results carry this under `headroom`, the summary under `status`.
 
 ## Quality
 
-[suite/quality.json](../../eval/suite/quality.json) holds six fixed conversations (prose, code,
-math, German, JSON, story; 1,434 scored tokens for Qwen3.8). The final assistant turn is scored
-with teacher forcing on every path the engine has: `prefill`, `decode` (one token at a time from
-the start), `verify` and `prefill_decode`. Each path reports, against the reference, the perplexity ratio, KL(reference ‖ engine)
-mean / p99 / max over the reference's top-16 tokens plus a lumped tail (a lower bound of the
-full-vocabulary KL), and top-1 agreement.
+Quality is the engine's own output, as a user of its chat API gets it, scored by the checkpoint
+the user chose: Eval measures what the engine loses on top of that checkpoint's quantization,
+nothing else. [suite/quality.json](../../eval/suite/quality.json) holds six fixed prompts (prose,
+code, math, German, JSON, story). Each goes to the engine as chat messages with `logprobs` and 16
+`top_logprobs`, and its greedy reply of up to 256 tokens (`quality.reply_tokens`) is the scored
+text, with the log-probabilities the engine reports for every token. The server must render each
+prompt to the token count the model's chat template renders, so the reference sees the prompt the
+engine saw, and name each reply token by its bytes, which Eval maps to the model's ids through its
+vocabulary.
 
-**Decode after a long prompt.** The first three paths put the scored turn inside one prefill or
-run the whole sequence as 1- or 4-token passes, so each pass reads only state it has just set up
-itself. A real request prefills a long prompt and then decodes, and decode reads what the prefill
-left: prefetched experts and their scales, KV written by a different kernel, sparse-attention
-indices. `prefill_decode` scores that. Three conversations (`quality.prefill_decode` in
-[protocol.json](../../eval/protocol.json)) get suite text ([long.json](../../eval/suite/long.json))
-before their first user message, so their prompts are exactly 1,024, 4,096 and 32,768 tokens,
-past typical prefetch, prefill-kernel and sparse-attention thresholds. The engine prefills the
-prompt as it prefills any request, then feeds the reference continuation through ordinary
-one-token decode steps, each scored against the reference. Every prompt length is judged by the
-drift budget on its own (`lengths` in the path's result); a length above `max_context` is
-skipped. Every engine must provide it: without `prefill_decode` the quality gate fails.
+`crit eval reference --result` then feeds every prompt and reply through the reference, teacher
+forced, and compares each reply token: the perplexity ratio (the engine's perplexity of its reply
+over the reference's of the same tokens), KL(reference ‖ engine) mean / p99 / max over the tokens
+in both top-16 lists plus one bucket for the rest (a lower bound of the full-vocabulary KL), and
+top-1 agreement (the share of reply tokens that are also the reference's first choice).
+
+**Replies after long prompts.** A real request prefills a long prompt and then decodes, and decode
+reads what the prefill left: prefetched experts and their scales, KV written by a different kernel,
+sparse-attention indices. Three of the prompts (`quality.long` in
+[protocol.json](../../eval/protocol.json)) also go with suite text ([long.json](../../eval/suite/long.json))
+before their first user message, so they render to about 1,024, 4,096 and 32,768 tokens, past
+typical prefetch, prefill-kernel and sparse-attention thresholds. The conversations are one set and
+each length another (`conversations`, `long-1024`, `long-4096`, `long-32768`); every set is judged
+by the drift budget on its own, and a set whose prompts and replies do not fit `max_context` is
+skipped.
 
 The **drift budget** defaults to PPL ratio ≤ 1.05, mean KLD ≤ 0.05, p99 KLD ≤ 0.5.
 `--quality-budget '{"ppl_ratio_max": 1.02}'` sets any subset;
-`{"ppl_ratio_max": 1.0, "kld_mean_max": 0, "kld_p99_max": 0}` asks for no drift. Each path
+`{"ppl_ratio_max": 1.0, "kld_mean_max": 0, "kld_p99_max": 0}` asks for no drift. Each set
 reports `budget_used`, its largest share of any limit. The budget is there to be spent on speed:
 lower drift than needed is not a gain.
 
-The **reference** runs the model's official `transformers` code with FP32 activations, no TF32,
-and stored weights dequantized exactly (unquantized, FP8 E4M3 with channel or tensor scales,
-NVFP4), streaming layers onto the GPU one at a time. The long prompts use the same arithmetic in
-blocks of 256 query rows, since a mask and score matrix over 32K tokens would not fit. Mamba-2
+The **reference** is the checkpoint the data was prepared from. It runs the model's official
+`transformers` code with FP32 activations, no TF32, and stored weights dequantized exactly
+(unquantized, FP8 E4M3 with channel or tensor scales, NVFP4), streaming layers onto the GPU one at
+a time, so a model larger than device memory still runs; it needs the GPU to itself, so stop the
+engine first. The long prompts use the same arithmetic in blocks of 256 query rows, since a mask and score matrix over 32K tokens would not fit. Mamba-2
 mixers take the dt limit config.json declares (`time_step_limit`, usually [0, inf]) as the
 model's own kernels do; some transformers mixers clamp dt at `time_step_min` instead,
 which makes long-memory heads forget (retrieval fails beyond about 64K tokens) and reads as
@@ -122,15 +129,16 @@ engine's non-speculative output and reports whether they are identical, the firs
 token and the agreeing prefix. An engine declaring `plain` decodes the non-speculative output
 itself before it closes; otherwise Eval opens a second engine with `speculative` false
 (`exactness.engine` is `shared` or `separate`). By default (`--exactness reported`) this is
-information, since verify and decode may sum in different orders and the drift budget judges both;
-`--exactness required` makes any difference fail. Teacher-forced scoring cannot see a lossy
-acceptance rule (accepting drafts that are not the target's argmax), so such an engine records
-the rule in its configuration and needs criteria that allow it.
+information, since verify and decode may sum in different orders and the drift budget judges the
+output; `--exactness required` makes any difference fail. The drift budget compares distributions,
+so it does not judge a lossy acceptance rule (accepting drafts that are not the target's argmax);
+top-1 agreement shows one, and such an engine records the rule in its configuration and needs
+criteria that allow it.
 
 A difference is information, not evidence of rounding. A drop in plain-greedy equality against an
 earlier candidate (status notes it when given `--baseline`) or any difference between identical
 requests is a bug until a root cause is demonstrated ([AGENTS.md](../../AGENTS.md)): stale or
-uninitialized state shows up exactly this way, and teacher-forced scoring can miss it.
+uninitialized state shows up exactly this way, and quality scores over a few prompts can miss it.
 
 ## Request history
 

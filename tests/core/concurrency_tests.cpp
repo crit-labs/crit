@@ -40,6 +40,7 @@ struct State {
     std::atomic<bool> release_score{false};
     bool hold_work=false, hold_retirement=false, hold_score=false, scoring=true, hold_close=false;
     bool mixed=false;
+    std::uint32_t prefill_quantum=1;
     bool hints=false;
     bool advice=false;
     std::vector<PrefillWindow> windows;
@@ -145,6 +146,7 @@ struct FixtureModel final:ConcurrentModel {
         result.scheduling_hints=state->hints;
         result.prefill_advice=state->advice;
         result.decode_token_work=3;
+        result.prefill_work_quantum=state->prefill_quantum;
         return result;
     }
     SchedulingHint scheduling_hint(const RequestView& v) override {
@@ -218,6 +220,8 @@ struct FixtureModel final:ConcurrentModel {
             bounded.budget.output_tokens=std::min(item.budget.output_tokens,item.budget.token_work);
             auto row=item.budget.prefill_complete ? decode(std::span<const WorkItem>(&bounded,1)).front() : prefill(item);
             row.progress.token_work=item.budget.prefill_complete ? std::uint32_t(row.progress.tokens.size()) : row.progress.prompt_tokens;
+            if(!item.budget.prefill_complete && state->prefill_quantum>1)
+                row.progress.token_work=(row.progress.prompt_tokens+state->prefill_quantum-1)/state->prefill_quantum*state->prefill_quantum;
             if(state->fault=="mixed_work") row.progress.token_work=item.budget.token_work+1;
             if(state->fault=="mixed_zero") row.progress.token_work=0;
             rows.push_back(row);
@@ -646,6 +650,39 @@ void scaled_batches() {
         traced[event.operation].insert(event.key.lane);
     require(std::any_of(traced.begin(),traced.end(),[](const auto& group){return group.second.size()==32;}),"trace truncated large batch");
     require(trace.overwritten==0 && trace.dropped==0 && s->unsafe==0,"large batch lifetime/trace failure");
+}
+void padded_prefill() {
+    for(auto policy:{BatchPolicy::fair,BatchPolicy::decode_first})
+    for(auto budget:{4u,5u,9u}) for(bool advice:{false,true}) {
+        auto s=std::make_shared<State>();s->mixed=true;s->prefill_quantum=4;s->advice=advice;
+        auto p=profile(3,0);p.prefill_chunk=5;p.max_batch_tokens=budget;p.batch_policy=policy;
+        p.prefill_starvation_steps=1;if(advice)p.prefill_target_ns=5000;
+        auto e=engine(s,p);
+        auto a=e->submit({1},20),b=e->submit(std::vector<Token>(9,10),4),c=e->submit({20,21,22},3);
+        s->admit_enabled=true;
+        require(a.wait().tokens==expected(1,20) && b.wait().tokens==expected(10,4) &&
+                c.wait().tokens==expected(20,3),"padded prefill changed results");
+        bool padded=false,small_decode=false;
+        for(const auto& group:s->mixed_groups) {
+            unsigned used=0;
+            for(const auto& row:group) {
+                used+=row.token_work;
+                if(!row.prefill_complete) {
+                    require(row.token_work%4==0 && row.prefill_tokens<=5 && row.prefill_tokens<=row.token_work,
+                            "prefill padding was not granted separately from input");
+                    padded|=row.token_work>row.prefill_tokens;
+                } else small_decode|=row.token_work<4;
+            }
+            require(used<=budget,"padded prefill exceeded total work budget");
+        }
+        require(padded && small_decode,"fixture missed padded prefill or small decode grants");
+        e.reset();require(!s->unsafe,"padded prefill released live state");
+    }
+    for(auto quantum:{0u,5u,std::numeric_limits<std::uint32_t>::max()}) {
+        auto s=std::make_shared<State>();s->mixed=true;s->prefill_quantum=quantum;
+        auto p=profile();p.max_batch_tokens=4;
+        rejects([&]{engine(s,p);},"prefill work quantum");
+    }
 }
 void decode_priority() {
     auto s=std::make_shared<State>(); s->mixed=true;
@@ -1289,6 +1326,7 @@ int main(int argc,char** argv) {
             {"latency_advice",latency_advice}, {"reuse_admission",reuse_admission}, {"scaled_batches",scaled_batches}, {"decode_priority",decode_priority}, {"admission_backfill",admission_backfill},
             {"many_aged_prefills",many_aged_prefills},
             {"mixed_batches",mixed_batches},
+            {"padded_prefill",padded_prefill},
             {"identities_fairness_variable_rows",identities_and_fairness}, {"prefill_decode_interleave",prefill_decode_interleave},
             {"queued_cancel_overload",queued_cancel_and_limits}, {"pending_timeout",pending_timeout}, {"retained_handles",retained_handles},
             {"independent_retirement_reuse",isolated_retirement}, {"active_cancel_abandon",cancel_active_and_abandon},

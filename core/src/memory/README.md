@@ -51,7 +51,7 @@ through a mapping. [host_block.h](../../include/crit/host_block.h) ([host_block.
   (about 10 s over 60 GB on an engine's first request), so pin it with touch threads when the CPU reads the block.
   The registration is attached to the block and ends before the pages are freed; spans must not outlive the block.
 - `HostBlockPool::process()`: blocks kept between engines opened one after another in one process (Eval rounds,
-  `crit run measure`, serve switches). `acquire(key, bytes, keep, &reused, identity)` returns the cached block when key, size
+  serve switches). `acquire(key, bytes, keep, &reused, identity)` returns the cached block when key, size
   and identity match (pass what the bytes were filled from, such as the weight files' hashes, so another checkpoint
   of the same size never reuses them); otherwise it drops the cached block for that key before returning a new one, so an engine with a different
   layout (for example opened without its draft head) never holds a second copy. A block a live engine still holds

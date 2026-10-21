@@ -182,6 +182,18 @@ once its reads settle.
 
 ## Costs and validation
 
+The shared [batch engine](code/batch_engine.h) also has a
+[memory recovery adapter](code/recoverable_engine.h) for Core's optional preemption
+contract. It reserves page rounds transactionally, reports typed pressure before
+submission, releases a settled victim's physical pages, and restores its continuation
+by replaying accepted history without resampling or publishing it again. This is a
+complete recovery recipe for the supplied synthetic attention model; an engine with
+recurrent, draft, grammar or other state must include that state in its own image.
+The [recovery fixtures](../../tests/inference/recovery_scheduler_tests.cpp) check
+physical page reuse and dense-reference output, suspended/restoring cancellation,
+failure ownership and quarantine. Native HTTP fixtures exercise this adapter through
+the stock resident serving path. These CPU operations settle synchronously.
+
 Host work is `O(N * (K + V))` for `N` visible rows. `StatePages` payload is
 `pages * page_rows * (K + V) * 4` bytes. A fork extending a shared tail needs an
 extra page even for one row; if none is free, `begin` throws `CapacityExhausted`

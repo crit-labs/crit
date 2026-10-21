@@ -1,6 +1,9 @@
 """Drive the toy engine library (native_engine_fixture.cpp) through crit_core.native: the C ABI, the eval-v1
 adapter and the chat-resident-v1 adapter."""
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 import types
 from pathlib import Path
 
@@ -44,6 +47,26 @@ def abi(library):
     tokens, result = engine.generate([1, 2, 3], 6, stop_tokens=[], replay=[12, 13, 5, 14, 15, 16])
     expect(tokens == [12, 13, 5, 14, 15, 16] and result["finish"] == "length", (tokens, result))
 
+    # Per-token log-probabilities: the token's own and its n most likely alternatives, ranked.
+    expect(facts["token_logprobs"] is True and facts["max_top_logprobs"] == 20, facts)
+    rows = []
+    tokens, result = engine.generate([1, 2, 3], 5, logprobs=3, on_tokens=lambda ts, lps: rows.extend(zip(ts, lps)))
+    expect([t for t, _ in rows] == tokens and len(tokens) == 5 and result["finish"] == "length", (tokens, rows))
+    for token, (logprob, top) in rows:
+        expect(logprob == -0.5 and top == [(token, -0.5), ((token + 1) % 64, -0.75), ((token + 2) % 64, -1.0)], rows)
+    expect(engine.generate([1, 2, 3], 5)[0] == tokens, "log-probabilities leave the tokens as they are")
+    tokens, _ = engine.generate([1, 2, 3], 2, logprobs=0, on_tokens=lambda ts, lps: rows.extend(lps))
+    expect(rows[-2:] == [(-0.5, []), (-0.5, [])], rows)
+    seen = []
+    tokens, result = engine.generate([1, 2, 3], 20, logprobs=1, on_tokens=lambda ts, lps: seen.extend(ts),
+                                     cancelled=lambda: len(seen) >= 3)
+    expect(tokens is None and result == {"cancelled": True} and len(seen) == 3, (tokens, result, seen))
+    try:
+        engine.generate([1, 2, 3], 2, logprobs=21)
+        raise AssertionError("more alternatives than the model reports must fail")
+    except NativeError as error:
+        expect("max_top_logprobs" in str(error), error)
+
     seen = []
     tokens, result = engine.generate([1, 2, 3], 20, on_tokens=seen.extend, cancelled=lambda: len(seen) >= 3)
     expect(tokens is None and result == {"cancelled": True} and len(seen) == 3, (tokens, result, seen))
@@ -77,6 +100,31 @@ def abi(library):
         expect("toy engine refused to open" in str(error), error)
 
 
+def concurrent_adapter(library):
+    engine = NativeEngine(library, {"concurrent": True})
+    expect(engine.info()["max_concurrent_requests"] == 3, engine.info())
+    cancelled = threading.Event()
+    seen = []
+    with ThreadPoolExecutor(2) as pool:
+        slow = pool.submit(engine.generate, [1] * 200, 20, on_tokens=seen.extend, cancelled=cancelled.is_set)
+        time.sleep(.02)
+        fast = pool.submit(engine.generate, [4], 4)
+        tokens, result = fast.result(timeout=5)
+        expect(len(tokens) == 4 and result["identity"] > 0, (tokens, result))
+        expect(not slow.done(), "a short peer must finish while the long prefill is still running")
+        cancelled.set()
+        expect(slow.result(timeout=5) == (None, {"cancelled": True}), "independent pre-token cancellation")
+    expect(not seen, ("cancelled prefill emitted tokens", seen))
+    expect(len(engine.generate([2], 4)[0]) == 4, "peer engine survives cancellation")
+    expect(engine.generate([1], 4, cancelled=lambda: True) == (None, {"cancelled": True}), "early cancellation")
+    try:
+        engine.generate([1], 4, logprobs=1)
+        raise AssertionError("a model without token log-probabilities must refuse them")
+    except NativeError as error:
+        expect("does not support generation logprobs" in str(error), error)
+    engine.close()
+
+
 def eval_adapter(library):
     engine = EvalEngine({"model": "/models/toy", "config": {"mode": "x"}, "speculative": True, "context_tokens": 128},
                         library)
@@ -84,8 +132,7 @@ def eval_adapter(library):
     expect(info["configuration"] == {"mode": "x", "model": "/models/toy", "speculative": True, "context_tokens": 128},
            info)
     expect(info["max_context"] == 256 and info["speculative"] and info["replay"] and info["draft_width"] == 1, info)
-    expect(info["score_paths"] == ["prefill", "decode"] and info["native_libraries"] == [str(Path(library).resolve())],
-           info)
+    expect(info["native_libraries"] == [str(Path(library).resolve())] and "score_paths" not in info, info)
     out = engine.generate([1, 2, 3], 6, lambda tokens: None)
     # Rounds follow the engine's accepted list (one entry per target pass), not Core's decode steps.
     expect(len(out["tokens"]) == 6 and out["rounds"] == 2 and out["accepted"] == [1, 1], out)
@@ -95,9 +142,7 @@ def eval_adapter(library):
     expect(info["plain"] is True, info)
     plain_out = engine.generate_plain([1, 2, 3], 6, lambda tokens: None)
     expect(plain_out["tokens"] == out["tokens"] and plain_out["rounds"] == 5 and "accepted" not in plain_out, plain_out)
-    scored = engine.score([1, 2, 3, 4], 2, "decode", [[7], [8]])
-    expect(scored == {"target_logprobs": [-0.75, -0.75], "query_logprobs": [[-1.0], [-1.125]], "argmax": [3, 4]},
-           scored)
+    expect(not hasattr(engine, "score"), "Eval measures quality over the chat API, not through the adapter")
     engine.close()
     # Eval's speculative=False turns drafting off; it never turns on drafting the configuration turned off.
     for config, harness, expected in (({"speculative": False}, True, False), ({}, False, False), ({}, True, True)):
@@ -109,12 +154,13 @@ def eval_adapter(library):
 class FakeText:
     """Stands in for crit_core.text's model text: one token per character, stop token filtered by the adapter."""
     generation = types.SimpleNamespace(stop_token_ids=())
+    tokenizer = types.SimpleNamespace(special_ids=(), token_bytes=lambda: tuple(bytes([97 + t % 26]) for t in range(64)))
 
     def encode_chat(self, messages, **variables):
         expect(variables == {"tools": None, "add_generation_prompt": True, "enable_thinking": False}, variables)
         return [ord(c) % 40 + 1 for m in messages for c in m["content"]]
 
-    def text_stream(self, ids):
+    def text_stream(self, ids, **_kwargs):
         def delta(text):
             return types.SimpleNamespace(text=text)
 
@@ -140,10 +186,9 @@ def resident_adapter(library):
         expect(not images, "the native text fixture must not request image processing")
         return messages
 
-    module = types.ModuleType("crit_core.text")
+    import crit_core.text as module
     module.load_model_text = lambda model, clock=None: FakeText()
     module.openai_messages = text_messages
-    sys.modules["crit_core.text"] = module
     context = types.SimpleNamespace(configuration={"chat_template_kwargs": {"enable_thinking": False}},
                                     model_file=lambda name: "/models/toy/" + name, limits={"kv_tokens": 200})
     engine = ResidentEngine(context, library)
@@ -161,6 +206,12 @@ def resident_adapter(library):
         raise AssertionError("a cancelled request must not return a response")
     except RuntimeError as error:
         expect("cancelled" in str(error), error)
+    expect(engine.logprobs is True and "logprobs" not in response, response)
+    response = engine.generate(dict(request, logprobs=2), Cancellation())
+    rows, named = response["logprobs"]["tokens"], response["logprobs"]["bytes"]
+    expect(len(rows) == 6 and all(row[1] == -0.5 and [t for t, _ in row[2]] == [row[0], (row[0] + 1) % 64]
+                                  for row in rows), rows)
+    expect(response["assistant"] == "".join(bytes.fromhex(named[str(row[0])]).decode() for row in rows), response)
     too_long = dict(request, limits={"max_output_tokens": 196})
     try:
         engine.generate(too_long, Cancellation())
@@ -168,10 +219,22 @@ def resident_adapter(library):
     except ValueError:
         pass
     engine.close()
+    context.configuration["concurrent"] = True
+    engine = ResidentEngine(context, library)
+    expect(engine.logprobs is False, "a model without token log-probabilities declares none")
+    first, second = engine.create_request(request), engine.create_request(request)
+    expect(engine.max_concurrent_requests == 3 and first is not second, "private request wrappers")
+    first.calls_format = object()
+    expect(second.calls_format is None, "parser discovery is request-local")
+    first.close()
+    expect(len(second.generate_tokens([1], 4, {}, None, lambda: False)[0]) == 4, "closing a wrapper keeps weights")
+    second.close()
+    engine.close()
 
 
 def main(library):
     abi(library)
+    concurrent_adapter(library)
     eval_adapter(library)
     resident_adapter(library)
     print("native engine checks passed")

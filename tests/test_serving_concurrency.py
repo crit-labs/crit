@@ -107,11 +107,10 @@ class ConcurrentTests(ShutdownFixture, unittest.TestCase):
         values = [json.loads(reply) for reply in replies]
         self.assertEqual(values[0], values[1])
         self.assertEqual(values[0]["private"], 1)
-        self.assertEqual(second[3][-1], replies[0])
-        self.assertEqual(third[3][-1], replies[1])
+        self.assertEqual("".join(second[3]), replies[0])
+        self.assertEqual("".join(third[3]), replies[1])
         self.assertTrue(first[0].with_suffix(".closed").exists())
-        self.assertEqual(list((engine.runtime.root / "streams").iterdir()), [])
-        self.assertEqual(list((engine.runtime.root / "requests").iterdir()), [])
+        self.assertFalse((engine.runtime.root / "requests").exists())
 
     def test_forced_retirement_fails_peer_before_new_admission(self):
         engine = self.engine()
@@ -121,12 +120,10 @@ class ConcurrentTests(ShutdownFixture, unittest.TestCase):
         self.started(first)
         self.started(second)
         pid = engine.runtime.tree.process.pid
-        root = engine.runtime.root
         first[1].set()
         self.assertEqual(self.finish(first[2])["result"][0], "cancelled")
         self.assertIn("error", self.finish(second[2]))
         self.assertIsNone(process_identity(pid))
-        self.assertEqual(list((root / "streams").glob("*.json")), [])
         after = self.ask(engine)
         self.assertNotEqual(after["pid"], pid)
         self.assertEqual(after["private"], 1)

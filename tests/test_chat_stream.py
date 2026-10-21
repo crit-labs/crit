@@ -2,7 +2,6 @@
 import json
 from pathlib import Path
 import sys
-import tempfile
 import threading
 import time
 import unittest
@@ -12,44 +11,37 @@ ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("core/python", "api", "eval", "kernels", "cli"): sys.path.insert(0, str(ROOT / _folder))
 from crit_api.host import Cancellation
 from crit_api.stream import StreamReader, StreamWriter
-from crit.run.records import read_json, write_json
 from crit_api.engine import EngineError
 from test_chat_residency import ADAPTER, ServeFixture
 
 
 class StreamContractTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        self.path = self.root / "stream.json"
-        self.request = dict(request_id="request", candidate_id="candidate", package_sha256="package")
-        self.command = dict(command_id="command", token="owner")
+        self.request = dict(request_id="request", candidate_id="candidate", package_sha256="package",
+                            limits={"kv_tokens": 64, "max_output_tokens": 16, "timeout_seconds": 60})
+        self.sent = []
 
-    def writer(self):
-        return StreamWriter(self.path, self.command, self.request, Cancellation(self.root / "cancel"))
+    def writer(self, tools=False):
+        return StreamWriter(self.sent.append, "command", self.request, Cancellation(), tools=tools)
 
-    def reader(self, updates):
-        return StreamReader(self.path, "command", "owner", self.request, updates.append)
+    def reader(self, updates, tools=None, reasoning=None):
+        return StreamReader(self.request, updates.append, tools, reasoning)
 
-    def test_coalesced_snapshots_preserve_whitespace_and_split_graphemes(self):
+    def piece(self, **part):
+        return {"kind": "progress", "command_id": "command", **part}
+
+    def test_each_chunk_is_sent_at_once_and_published_exactly(self):
         updates, writer = [], self.writer()
         reader = self.reader(updates)
         chunks = ["界 e", "\u0301 ", "👩", "🏽\u200d", "💻\n"]
-        with patch("crit_api.stream.time.monotonic", return_value=10), patch("crit_api.stream.write_json", wraps=write_json) as writes:
-            for chunk in chunks:
-                writer.emit(chunk)
-                reader.poll()
-            self.assertEqual(updates, [chunks[0]])
-            self.assertEqual(writes.call_count, 1)
-            writer.finish({"assistant": "".join(chunks)})
-            writer.close()
-            reader.poll()
-            reader.poll()
-            self.assertEqual(writes.call_count, 2)
-        self.assertEqual(updates, [chunks[0], "".join(chunks)])
-        self.assertEqual(read_json(self.path)["sequence"], len(chunks))
-        self.assertEqual(list(self.root.iterdir()), [self.path])
+        for chunk in chunks:
+            writer.emit(chunk)
+            reader.apply(self.sent[-1])
+            self.assertEqual(updates[-1], chunk)
+        writer.finish({"assistant": "".join(chunks)})
+        writer.close()
+        self.assertEqual(self.sent, [self.piece(text=chunk) for chunk in chunks])
+        self.assertEqual(updates, chunks)
 
     def test_invalid_chunks_cannot_be_swallowed_or_exceed_the_reply_bound(self):
         for chunk in ("", None, "x\0y", "\ud800", "x" * 65537):
@@ -87,23 +79,23 @@ class StreamContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "generation thread"):
             writer.emit("late")
 
-    def test_reader_rejects_stale_identity_rewrites_and_invalid_sequences(self):
-        writer = self.writer()
-        writer.emit("first")
-        original = read_json(self.path)
-        for change in ({"command_id": "stale"}, {"request_id": "stale"}, {"candidate_id": "other"},
-                       {"package_sha256": "other"}, {"token": "other"}, {"schema_version": True},
-                       {"sequence": True}, {"sequence": 0}, {"sequence": 65537},
-                       {"sequence": 1, "assistant": "rewrite"}, {"sequence": 2, "assistant": "first"}):
-            with self.subTest(change=change):
-                write_json(self.path, original)
+    def test_reader_rejects_malformed_or_oversized_pieces(self):
+        for piece in (self.piece(), self.piece(text="a", reasoning="b"), self.piece(text=""), self.piece(text=3),
+                      self.piece(text="x\0y"), self.piece(text="\ud800"), self.piece(reasoning=None),
+                      self.piece(other="x"), {"kind": "progress", "text": "a"},
+                      self.piece(tool_calls=[{"index": 0, "id": "call_1", "type": "function",
+                                              "function": {"name": "lookup", "arguments": "{}"}}])):
+            with self.subTest(piece=piece):
                 updates = []
-                reader = self.reader(updates)
-                reader.poll()
-                write_json(self.path, original | change)
                 with self.assertRaises(ValueError):
-                    reader.poll()
-                self.assertEqual(updates, ["first"])
+                    self.reader(updates).apply(piece)
+                self.assertEqual(updates, [])
+        updates = []
+        reader = self.reader(updates)
+        reader.apply(self.piece(text=" " * 65536))
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            reader.apply(self.piece(text="x"))
+        self.assertEqual(len(updates), 1)
 
 
 STREAM_ADAPTER = ADAPTER + r'''
@@ -128,6 +120,13 @@ class StreamingEngine(Engine):
             response['telemetry']['output_tokens'] = 10000
         if self.mode == 'streamcrash':
             os._exit(19)
+        if self.mode == 'malformed':
+            # A piece that bypasses the writer's checks: crit serve checks every piece again.
+            writer = emit.__self__
+            writer.send({'kind': 'progress', 'command_id': writer.command_id, 'text': ''})
+            while True:
+                cancellation.check()
+                time.sleep(.01)
         if self.mode == 'swallowed':
             try:
                 emit('')
@@ -155,7 +154,7 @@ class StreamingFixture(ServeFixture):
                               "chat-sampling-temperature-v1"]})
 
     def streaming(self, engine, message, stop=None, candidate=None):
-        """Generate in a thread, collecting the cumulative text the engine streams."""
+        """Generate in a thread, collecting the pieces of text the engine streams."""
         seen, outcome, stop = [], {}, stop or threading.Event()
         def run():
             try:
@@ -175,7 +174,7 @@ class StreamingFixture(ServeFixture):
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline:
             if seen:
-                return seen[-1]
+                return "".join(seen)
             time.sleep(.01)
         self.fail("No provisional text appeared")
 
@@ -190,8 +189,8 @@ class StreamingTests(StreamingFixture, unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(status, "completed")
         self.assertTrue(assistant.startswith("界 e\u0301 👩🏽\u200d💻\n"))
-        self.assertEqual(seen[-1], assistant)
-        self.assertTrue(all(b.startswith(a) for a, b in zip(seen, seen[1:])))
+        self.assertEqual(seen[:5], ["界 e", "\u0301 ", "👩", "🏽\u200d", "💻\n"])  # each chunk as emitted
+        self.assertEqual("".join(seen), assistant)
         data = json.loads(assistant.split("\n", 1)[1])
         for candidate in (self.a, self.b, self.a):
             (status, assistant, _), error = self.streaming(engine, "hello", candidate=candidate)[2]()
@@ -199,7 +198,6 @@ class StreamingTests(StreamingFixture, unittest.TestCase):
             next_data = json.loads(assistant.split("\n", 1)[1])
             self.assertEqual((next_data["pid"], next_data["device"]), (data["pid"], data["device"]))
             self.assertEqual(next_data["private"], 1)
-        self.assertFalse((engine.runtime.root / "stream.json").exists())
 
     def test_cancelled_partial_is_discarded_and_next_request_is_isolated(self):
         engine = self.engine()
@@ -237,7 +235,6 @@ class StreamingTests(StreamingFixture, unittest.TestCase):
         self.assertIsNotNone(tree.process.poll())
         self.assertEqual(held, [True])
         self.assertFalse(engine.lock.locked())
-        self.assertFalse((root / "stream.json").exists())
         self.assertFalse((root / "models").exists())
         (status, assistant, _), failure = self.streaming(engine, "hello")[2]()
         self.assertEqual(status, "completed", failure)
@@ -269,7 +266,6 @@ class StreamingTests(StreamingFixture, unittest.TestCase):
             self.assertIn("retirement failed", engine.ownership.blocked)
             self.assertIs(engine.runtime.tree, tree)
             self.assertIsNone(tree.process.poll())
-            self.assertTrue((root / "stream.json").exists())
             with self.assertRaisesRegex(EngineError, "cleanup is unresolved") as blocked:
                 self.ask(engine)
             self.assertEqual(blocked.exception.status, 503)
@@ -318,7 +314,9 @@ class StreamingTests(StreamingFixture, unittest.TestCase):
                 finished.set()
 
         first, second = threading.Thread(target=first_request), threading.Thread(target=queued_request)
-        with patch.object(engine.runtime, "close", side_effect=retire):
+        link = engine.runtime.link
+        with patch.object(engine.runtime, "close", side_effect=retire), \
+                patch.object(link, "send", wraps=link.send) as send:
             try:
                 first.start()
                 self.assertTrue(retiring.wait(5), "consumer failure did not begin retirement")
@@ -327,7 +325,8 @@ class StreamingTests(StreamingFixture, unittest.TestCase):
                 self.assertFalse(finished.wait(.1), "queued request passed unfinished retirement")
                 self.assertTrue(engine.lock.locked())
                 self.assertIsNone(tree.process.poll())
-                self.assertEqual(list((root / "commands").glob("*.json")), [])
+                self.assertEqual([call.args[0]["action"] for call in send.call_args_list
+                                  if call.args[0]["kind"] == "command"], ["generate"])
             finally:
                 release.set()
                 first.join(10)
@@ -353,26 +352,15 @@ class StreamingTests(StreamingFixture, unittest.TestCase):
                 self.assertIsNone(result)
                 self.assertIn(error, str(failure))
                 self.assertIsNone(engine.runtime.tree)
-                self.assertFalse((engine.runtime.root / "stream.json").exists())
 
     def test_malformed_progress_retires_the_producer_before_another_request(self):
         engine = self.engine()
-        seen, _, wait = self.streaming(engine, "hold")
-        self.partial(seen)
-        path = engine.runtime.root / "stream.json"
-        # Coalescing need not publish each chunk. Wait for a producer barrier,
-        # then corrupt the latest snapshot while no more emits can replace it.
-        deadline = time.monotonic() + 5
-        while not (self.control / "holding").exists() and time.monotonic() < deadline:
-            time.sleep(.01)
-        self.assertTrue((self.control / "holding").exists())
-        value = read_json(path)
-        write_json(path, value | {"request_id": "stale-request"})
+        seen, _, wait = self.streaming(engine, "malformed")
         result, failure = wait()
         self.assertIsNone(result)
-        self.assertIn("stream identity", str(failure))
+        self.assertIn("Stream text must be nonempty", str(failure))
+        self.assertEqual(seen[:5], ["界 e", "\u0301 ", "👩", "🏽\u200d", "💻\n"])
         self.assertIsNone(engine.runtime.tree)
-        self.assertFalse(path.exists())
         self.assertEqual(self.streaming(engine, "hello")[2]()[0][0], "completed")
 
     def test_timeout_and_host_crash_discard_observed_text(self):
@@ -387,7 +375,6 @@ class StreamingTests(StreamingFixture, unittest.TestCase):
                     self.assertIsNotNone(failure)
                 else:
                     self.assertEqual(result, ("timed_out", None, None))
-                self.assertFalse((engine.runtime.root / "stream.json").exists())
 
     def test_declared_streaming_requires_the_method_and_retires_failed_factory(self):
         engine = self.engine()

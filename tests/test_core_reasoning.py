@@ -8,7 +8,6 @@ import tempfile
 import threading
 import types
 import unittest
-from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("core/python", "api", "cli", "eval", "tests"): sys.path.insert(0, str(ROOT / _folder))
@@ -19,7 +18,6 @@ from crit_core.text import TextError  # noqa: E402
 from crit_core.text.reasoning import ReasoningFormat, ReasoningSplitter, template_reasoning_format  # noqa: E402
 from crit_api.host import Cancellation  # noqa: E402
 from crit_api.stream import StreamReader, StreamWriter  # noqa: E402
-from crit.run.records import write_json  # noqa: E402
 import test_api  # noqa: E402,F401  (puts the checkout's packages on sys.path)
 from test_chat_residency import ServeFixture  # noqa: E402
 from crit_api.engine import ServedEngine, reply  # noqa: E402
@@ -129,23 +127,18 @@ class ResidentChatReasoningTests(unittest.TestCase):
 
 
 class StreamReasoningTests(unittest.TestCase):
-    def test_reasoning_snapshots_publish_deltas_and_final_reply_must_match(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            request_ids = dict(request_id="request", candidate_id="candidate", package_sha256="package")
-            writer = StreamWriter(root / "stream.json", dict(command_id="command", token="owner"), request_ids,
-                                  Cancellation(root / "cancel"))
-            texts, thoughts = [], []
-            reader = StreamReader(root / "stream.json", "command", "owner", request_ids, texts.append,
-                                  publish_reasoning=thoughts.append)
-            with patch("crit_api.stream.time.monotonic", side_effect=range(10, 1000)), \
-                    patch("crit_api.stream.write_json", wraps=write_json):
-                for chunk in ({"reasoning": "first "}, {"reasoning": "thought"}, "Answer"):
-                    writer.emit(chunk)
-                    reader.poll()
-            self.assertEqual(("".join(thoughts), texts[-1]), ("first thought", "Answer"))
-            with self.assertRaisesRegex(ValueError, "reasoning differs"):
-                writer.finish({"assistant": "Answer", "reasoning": "other"})
+    def test_reasoning_pieces_publish_apart_and_final_reply_must_match(self):
+        request_ids = dict(request_id="request", candidate_id="candidate", package_sha256="package")
+        sent = []
+        writer = StreamWriter(sent.append, "command", request_ids, Cancellation())
+        texts, thoughts = [], []
+        reader = StreamReader(request_ids, texts.append, publish_reasoning=thoughts.append)
+        for chunk in ({"reasoning": "first "}, {"reasoning": "thought"}, "Answer"):
+            writer.emit(chunk)
+            reader.apply(sent[-1])
+        self.assertEqual((thoughts, texts), (["first ", "thought"], ["Answer"]))
+        with self.assertRaisesRegex(ValueError, "reasoning differs"):
+            writer.finish({"assistant": "Answer", "reasoning": "other"})
 
 
 # Replies "think:REASONING|REPLY" with the reasoning apart, streaming it before the reply.
@@ -269,7 +262,6 @@ class ServeReasoningTests(ServeFixture, unittest.TestCase):
         self.assertEqual(seen, ["hold"])
         self.assertIsNone(served.runtime.tree)
         self.assertIsNotNone(tree.process.poll())
-        self.assertFalse((root / "stream.json").exists())
         status, body = self.chat()
         self.assertEqual(status, 200, body)
         message = json.loads(body)["choices"][0]["message"]

@@ -50,6 +50,14 @@ class ResidentChatTests(unittest.TestCase):
         self.plain = write_files(Path(temp.name) / "plain", llama_files())
         self.context = types.SimpleNamespace(configuration={"batch": 1}, limits={"kv_tokens": 4096})
 
+    def test_decode_rounds_from_the_engine_timing_reach_the_telemetry(self):
+        engine = Decoder(self.context, self.model)
+        decode = engine.generate_tokens
+        engine.generate_tokens = lambda *args: (lambda tokens, timing: (tokens, dict(timing, rounds=2)))(*decode(*args))
+        self.assertEqual(engine.generate(request(), threading.Event())["telemetry"]["decode_rounds"], 2)
+        engine.generate_tokens = decode
+        self.assertNotIn("decode_rounds", engine.generate(request(), threading.Event())["telemetry"])
+
     def test_capabilities_follow_the_template_and_the_decoder(self):
         engine = Decoder(self.context, self.model)
         self.assertEqual(capabilities(engine.text, Decoder.sampling),
@@ -111,13 +119,60 @@ class TemplateToolFormatTests(unittest.TestCase):
         self.assertEqual([c["function"] for c in response["tool_calls"]],
                          [{"name": "read_file", "arguments": '{"path": "a.py"}'}])
         self.assertEqual("".join(e for e in emitted if isinstance(e, str)), "Let me read it.")
-        self.assertEqual([e["tool_calls"][0]["index"] for e in emitted if isinstance(e, dict)], [0])
+        # The call streams from its name on: a header, then its arguments as the model writes them.
+        deltas = [e["tool_calls"][0] for e in emitted if isinstance(e, dict)]
+        self.assertGreater(len(deltas), 1)
+        self.assertEqual({d["index"] for d in deltas}, {0})
+        self.assertEqual((deltas[0]["type"], deltas[0]["function"]["name"]), ("function", "read_file"))
+        self.assertTrue(all(set(d) == {"index", "function"} and set(d["function"]) == {"arguments"} for d in deltas[1:]))
+        self.assertEqual("".join(d["function"]["arguments"] for d in deltas), '{"path": "a.py"}')
         for kept in (engine.generate(request(tools=TOOLS, tool_choice="none"), threading.Event()),
                      engine.generate(request(), threading.Event())):
             self.assertEqual(kept["assistant"], XmlDecoder.reply)
             self.assertNotIn("tool_calls", kept)
         with self.assertRaisesRegex(ValueError, "tool_choice must be auto or none"):
             engine.generate(request(tools=TOOLS, tool_choice="required"), threading.Event())
+
+
+class CutDecoder(XmlDecoder):
+    """Writes its reply up to max_new_tokens, or with `end` its first `end` tokens and its end token: a reply cut
+    inside its call, or ended there."""
+    end = None
+
+    def generate_tokens(self, ids, max_new_tokens, sampling, on_tokens, cancelled):
+        reply = self.text.tokenizer.encode(self.reply, add_special_tokens=False)
+        reply = reply[:max_new_tokens] if self.end is None else reply[:self.end] + [1]
+        for token in reply:
+            on_tokens([token])
+        return reply, {"prefill_ms": 2.0, "decode_ms": 3.0, "first_token_ms": 2.5}
+
+
+class CutCallTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.model = write_files(Path(temp.name) / "model", llama_files(**{"chat_template.jinja": TEMPLATE}))
+        self.context = types.SimpleNamespace(configuration={}, limits={"kv_tokens": 4096})
+
+    def test_a_reply_cut_inside_a_call_keeps_it_and_one_ended_there_fails(self):
+        engine = CutDecoder(self.context, self.model)
+        tokens = engine.text.tokenizer.encode(XmlDecoder.reply, add_special_tokens=False)
+        named = next(n for n in range(len(tokens)) if "<function=read_file>" in engine.text.tokenizer.decode(tokens[:n]))
+        for limit in (named, len(tokens) - 1):
+            with self.subTest(limit=limit):
+                emitted = []
+                response = engine.generate_stream(request(tools=TOOLS, limits={"max_output_tokens": limit}),
+                                                  threading.Event(), emitted.append)
+                self.assertEqual(response["assistant"], "Let me read it.")
+                [call] = response["tool_calls"]
+                self.assertEqual(call["function"]["name"], "read_file")
+                self.assertTrue(call["function"]["arguments"].startswith("{"))
+                self.assertFalse(call["function"]["arguments"].endswith("}"))
+                self.assertEqual("".join(e["tool_calls"][0]["function"]["arguments"] for e in emitted
+                                         if isinstance(e, dict)), call["function"]["arguments"])
+        engine.end = named
+        with self.assertRaisesRegex(ValueError, "ended its reply inside its call to read_file"):
+            engine.generate(request(tools=TOOLS, limits={"max_output_tokens": len(tokens)}), threading.Event())
 
 
 class BracketDecoder(Decoder):
@@ -149,12 +204,66 @@ class PackageToolFormatTests(unittest.TestCase):
         response = engine.generate_stream(request(tools=TOOLS, tool_choice="auto"), threading.Event(), emitted.append)
         self.assertEqual(response["assistant"], "Sure.")
         self.assertEqual([c["function"]["name"] for c in response["tool_calls"]], ["read_file"])
-        self.assertEqual(emitted[-1]["tool_calls"][0]["function"]["arguments"], '{"path": "a.py"}')
+        # Its format reads no name before the call closes, so the call arrives whole.
+        self.assertEqual([e["tool_calls"][0]["function"] for e in emitted if isinstance(e, dict)],
+                         [{"name": "read_file", "arguments": '{"path": "a.py"}'}])
         plain = engine.generate(request(tools=TOOLS, tool_choice="none"), threading.Event())
         self.assertEqual((plain["assistant"], "tool_calls" in plain), (BracketDecoder.reply, False))
         self.assertNotIn("tool_calls", engine.generate(request(), threading.Event()))
         with self.assertRaisesRegex(ValueError, "tool_choice must be auto or none"):
             engine.generate(request(tools=TOOLS, tool_choice="required"), threading.Event())
+
+
+class LogprobDecoder(Decoder):
+    """Reports every token's log-probability and its alternatives: ids t, t+1, ... one nat apart."""
+    logprobs = True
+
+    def generate_tokens(self, ids, max_new_tokens, sampling, on_tokens, cancelled, logprobs=None):
+        reply = self.text.tokenizer.encode("Hi there", add_special_tokens=False)
+        for token in reply + [1]:
+            if logprobs is None:
+                on_tokens([token])
+            else:
+                own = float("-inf") if token == reply[0] else 1e-7   # Core allows both: no probability, rounding
+                on_tokens([token], [(own, [(token + k, -1.0 * k) for k in range(logprobs)])])
+        return reply + [1], {"prefill_ms": 2.0, "decode_ms": 3.0, "first_token_ms": 2.5}
+
+
+class LogprobTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.model = write_files(Path(temp.name) / "plain", llama_files())
+        self.context = types.SimpleNamespace(configuration={}, limits={"kv_tokens": 4096})
+
+    def test_each_generated_token_but_the_stop_token_comes_with_its_alternatives_and_bytes(self):
+        engine = LogprobDecoder(self.context, self.model)
+        self.assertIn("chat-logprobs-v1", capabilities(engine.text, LogprobDecoder.sampling, logprobs=True))
+        self.assertNotIn("chat-logprobs-v1", capabilities(engine.text, LogprobDecoder.sampling))
+        emitted = []
+        response = engine.generate_stream(request(logprobs=2), threading.Event(), emitted.append)
+        reply = engine.text.tokenizer.encode("Hi there", add_special_tokens=False)
+        rows, named = response["logprobs"]["tokens"], response["logprobs"]["bytes"]
+        self.assertEqual([row[0] for row in rows], reply)
+        self.assertEqual([row[1] for row in rows], [-9999.0] + [0.0] * (len(reply) - 1))
+        self.assertEqual(rows[0][2], [[reply[0], 0.0], [reply[0] + 1, -1.0]])
+        self.assertEqual(b"".join(bytes.fromhex(named[str(row[0])]) for row in rows).decode().strip(), "Hi there")
+        self.assertEqual(set(named), {str(t) for row in rows for t in (row[0], *(o for o, _ in row[2]))})
+        self.assertEqual("".join(emitted), "Hi there")
+        self.assertNotIn("logprobs", engine.generate(request(), threading.Event()))
+        self.assertEqual(engine.generate(request(logprobs=0), threading.Event())["logprobs"]["tokens"][1][2], [])
+
+    def test_missing_rows_and_engines_without_logprobs_fail(self):
+        class Bare(LogprobDecoder):
+            def generate_tokens(self, ids, max_new_tokens, sampling, on_tokens, cancelled, logprobs=None):
+                on_tokens([5])
+                return [5], {"prefill_ms": 2.0, "decode_ms": 3.0, "first_token_ms": 2.5}
+        with self.assertRaisesRegex(ValueError, "without their log-probabilities"):
+            Bare(self.context, self.model).generate(request(logprobs=1), threading.Event())
+        with self.assertRaisesRegex(ValueError, "does not report log-probabilities"):
+            Decoder(self.context, self.model).generate(request(logprobs=1), threading.Event())
+        with self.assertRaisesRegex(ValueError, r"integer in \[0, 20\]"):
+            LogprobDecoder(self.context, self.model).generate(request(logprobs=21), threading.Event())
 
 
 class PackageGapTests(unittest.TestCase):

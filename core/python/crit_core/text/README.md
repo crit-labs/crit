@@ -32,6 +32,7 @@ else:
 | [messages.py](messages.py) | `openai_messages` (OpenAI chat messages to template messages) |
 | [generation.py](generation.py) | `GenerationConfig`, `legacy_eos_ids`, `model_generation_view` |
 | [detokenize.py](detokenize.py) | `IncrementalDetokenizer` |
+| [markers.py](markers.py) | `MarkerDecoder`, `TokenText`; delimiter provenance for reasoning and tool parsing |
 | [stops.py](stops.py) | `StopMatcher` (standard library only) |
 | [stream.py](stream.py) | `TextStream`, `TextDelta` |
 | [model.py](model.py) | `load_model_text`, `ModelText`, `TextIdentity` |
@@ -174,6 +175,33 @@ it is the last consumed token. `TextDelta.consumed` counts the ids of that
 `push` belonging to the reply, `finish_reason` is `"stop"` or, from `finish()`,
 `"length"`, and `stop` is the matched string or id. `include_stop_str` appends a
 matched stop string to the text.
+
+## Reasoning and tool delimiters
+
+`ReasoningSplitter(format, tokenizer=...)`, `ToolCallParser(format, tools,
+tokenizer=...)` and `ToolReply(format, request, tokenizer=...)` resolve the format's
+opening and closing markers independently. With the default `delimiters="auto"`,
+a marker encoded as one special token requires that token id; ordinary tokens
+spelling the same text cannot open or close a block. Other markers keep text
+matching across chunks. `ReasoningFormat` and `ToolFormat` accept
+`delimiters="text"` for formats that explicitly use spelling regardless of ids.
+Without a tokenizer, standalone parsers retain their existing text API.
+
+Feed token-aware parsers from `MarkerDecoder(tokenizer, prompt_ids,
+markers={id: spelling}, skip_special_tokens=False)`. Its `push(ids)` and `finish()`
+return strings and `TokenText(text, token_id)` events. Use the parsers' `token_ids`
+maps (`{spelling: id}`) to select the delimiters. One incremental decoder retains
+UTF-8 and whitespace context across those events. A decoder that does not release
+a selected marker's spelling at its token raises `TextError`. Optional
+`stop_token_ids` use `TextStream`'s stop handling. Alternatively, `stream=...` wraps
+an existing text stream; its configured stop and decoding options stay in force.
+With no selected token delimiters, chunks pass directly through that stream.
+`ResidentChat` wraps its model's text stream for both buffered and streaming replies
+and checks prompt-opened reasoning by the same token identity rule.
+
+Reasoning text events preserve `TokenText` values for downstream tool parsing;
+reasoning content, parsed call bodies and final tool text are plain strings.
+Tool body parsers still define their own text syntax and escaping rules.
 
 ## Limits
 

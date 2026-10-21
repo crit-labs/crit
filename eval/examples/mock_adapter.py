@@ -1,9 +1,7 @@
 """Minimal eval-v1 adapter without a GPU, used by tests and as a template for real engines.
 
-It "generates" a fixed token pattern and scores by echoing a reference file, optionally
-perturbed, so every harness path can be exercised on any host.
+It "generates" a fixed token pattern, so every harness path can be exercised on any host.
 """
-import json
 import time
 
 
@@ -18,18 +16,12 @@ class MockEngine:
         # Test knob: an engine that cannot be built below a context.
         if self.capacity < int(self.config.get("fails_below_context", 0)):
             raise RuntimeError("cannot be built below the context it was tuned for")
-        self.reference = None
-        if "reference" in self.config:
-            with open(self.config["reference"], encoding="utf-8") as handle:
-                self.reference = json.load(handle)
-        self.noise = float(self.config.get("noise", 0.0))
         self.calls = 0
         self.longest = 0  # the longest prompt served so far
 
     def info(self):
         return {"name": "mock", "configuration": self.config, "max_context": self.capacity,
                 "speculative": self.config["draft_tokens"] > 0,
-                "score_paths": ["prefill", "decode"] + (["prefill_decode"] if self.config.get("prefill_decode", True) else []),
                 # Optional headroom inputs: draft width and bytes one full model pass reads.
                 "draft_width": self.config["draft_tokens"], "bytes_per_pass": self.config.get("bytes_per_pass"),
                 "draft_bytes_per_step": self.config.get("draft_bytes_per_step"),
@@ -86,23 +78,6 @@ class MockEngine:
         """Decode `continuation` as if it were the engine's own greedy output (drafts accepted while
         they match it, corrections taken from it)."""
         return self._rounds(list(continuation), on_tokens)
-
-    def score(self, ids, first_target, path, queries):
-        """prefill_decode: prefill ids[:first_target], then decode the rest one token per step."""
-        rows = [t for c in self.reference["conversations"] + self.reference.get("prefill_decode", []) for t in c["targets"]]
-        lookup = {}
-        for t in rows:
-            lookup.setdefault((t["target"], tuple(t["top_ids"])), t)
-        target_lp, query_lp = [], []
-        for position, query in zip(range(first_target, len(ids)), queries):
-            ref = lookup[(ids[position], tuple(query))]
-            shift = self.noise if path == "decode" else 0.0
-            # Test knob: decode after a prompt this long reads stale state (say, uninitialized expert scales).
-            if path == "prefill_decode" and first_target >= int(self.config.get("stale_after_prompt", 1 << 62)):
-                shift = 0.3
-            target_lp.append(ref["logprob"] - shift)
-            query_lp.append([v - shift if i == 0 else v for i, v in enumerate(ref["top_logprobs"])])
-        return {"target_logprobs": target_lp, "query_logprobs": query_lp}
 
     def close(self):
         pass
