@@ -66,9 +66,9 @@ class Server:
 
 def load_text(model):
     """The model's tokenizer and chat template, loaded as prepare loads them."""
-    from crit_core.files import DirectoryFiles
+    from crit_core.model import open_model
     from crit_core.text import load_model_text
-    return load_model_text(DirectoryFiles(model), clock=None)
+    return load_model_text(open_model(model).files, clock=None)
 
 
 def ids_by_bytes(tokenizer):

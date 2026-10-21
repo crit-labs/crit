@@ -14,6 +14,9 @@ from itertools import count
 import json
 from pathlib import Path
 
+from crit_core.model import open_model
+from crit_core.model.gguf import PROJECTOR
+
 from . import SUITE_DIR, protocol_version, write_json
 from .ceiling import model_ceiling
 
@@ -22,30 +25,37 @@ LONG = "long.json"
 SENTINEL = "\u0000DOCUMENT\u0000"
 
 
-def file_sha256(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for block in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def model_identity(model):
-    """Hash of the files that define tokens and shapes, plus weight file sizes.
+    """Hash of the files that define tokens and shapes, plus weight file sizes. The files are the model's own or,
+    for a GGUF without them, the ones its metadata derives (crit_core.model.open_model).
     Weight bytes are not hashed here: engines and crit run records already do that."""
-    model = Path(model)
+    source = open_model(model)
+    files = source.files
     parts = {}
     for name in ("config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
-                 "generation_config.json", "model.safetensors.index.json"):
-        if (model / name).is_file():
-            parts[name] = file_sha256(model / name)
-    # The weight files beside the config and those the index lists, which may sit in a subfolder (tensors/...).
-    names = {p.name for p in model.glob("*.safetensors")}
-    index = model / "model.safetensors.index.json"
-    if index.is_file():
-        names |= {name for name in json.loads(index.read_text(encoding="utf-8")).get("weight_map", {}).values()
-                  if isinstance(name, str) and (model / name).is_file()}
-    parts["weight_files"] = {name: (model / name).stat().st_size for name in sorted(names)}
+                 "generation_config.json", "model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        if name in source.derived or (source.folder is not None and (source.folder / name).is_file()):
+            parts[name] = hashlib.sha256(files.read(name)).hexdigest()
+    folder = source.folder
+    if source.format in ("torch", "onnx"):
+        # The files the weights are in: the state dicts, or the graph and its external data files.
+        names = {}
+        for shard in source.weight_files(drafts=True):
+            for path in {shard.path, *(tensor.shard for tensor in shard.tensors)}:
+                names[path.name] = path.stat().st_size
+    elif folder is None:   # a lone weight file (and the other parts of its split set)
+        names = {shard.path.name: shard.size for shard in source.weight_files(drafts=True)}
+    else:
+        # The weight files beside the config and those the index lists, which may sit in a subfolder
+        # (tensors/...), or the GGUF parts (not a multimodal projector beside them).
+        found = {p.name for p in folder.glob("*.safetensors")}
+        found |= {p.name for p in folder.glob("*.gguf") if not PROJECTOR.search(p.stem)}
+        index = folder / "model.safetensors.index.json"
+        if index.is_file():
+            found |= {name for name in json.loads(index.read_text(encoding="utf-8")).get("weight_map", {}).values()
+                      if isinstance(name, str) and (folder / name).is_file()}
+        names = {name: (folder / name).stat().st_size for name in found}
+    parts["weight_files"] = dict(sorted(names.items()))
     blob = json.dumps(parts, sort_keys=True).encode()
     return {"sha256": hashlib.sha256(blob).hexdigest(), "files": parts}
 
@@ -256,10 +266,9 @@ def quality_prompts(model, quality, long, filler, rule):
 
 
 def prepare(model, data, speed_tokens=None):
-    from crit_core.files import DirectoryFiles
     from crit_core.text import legacy_eos_ids, load_model_text
     protocol = json.loads((SUITE_DIR.parent / "protocol.json").read_text(encoding="utf-8"))
-    files = DirectoryFiles(model)
+    files = open_model(model).files
     # No clock: templates use their own fallback date, so renders are reproducible.
     text = load_model_text(files, clock=None)
     speed = json.loads((SUITE_DIR / "speed.json").read_text(encoding="utf-8"))

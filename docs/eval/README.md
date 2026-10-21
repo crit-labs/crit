@@ -49,9 +49,9 @@ separately:
 | Command | Does | Needs |
 | --- | --- | --- |
 | `probe` | Device ceilings: free memory, copy bandwidth, GEMM TFLOPS per weight format | CUDA toolkit (`nvcc`, cuBLASLt) on the target machine |
-| `context` | The max context the engine must serve | the probe result, `config.json`, safetensors headers |
+| `context` | The max context the engine must serve | the probe result, `config.json`, safetensors or GGUF headers |
 | `prepare --model M --data D` | Freeze the suite as token ids, with arithmetic per token | `tokenizers`, `jinja2` |
-| `reference --model M --data D --result R` | Score a run's quality replies on the checkpoint `D` was prepared from and judge them | `torch`, `transformers`, `safetensors`, a GPU |
+| `reference --model M --data D --result R` | Score a run's quality replies on the checkpoint `D` was prepared from and judge them | `torch`, `transformers`, `safetensors` (`gguf` for a GGUF), a GPU |
 | `pin` | Pin the decode text (once per data directory) | the engine's dependencies |
 | `run` | Evaluate an engine | Python standard library and the engine's dependencies |
 | `kernels` | Rank kernels by GPU time per phase | Linux, a CUDA toolkit with CUPTI |
@@ -63,6 +63,71 @@ reference needs a compatible CUDA GPU to itself; the engine under test can be CP
 `reference`, `pin`, `run --adapter`, `ab` and `kernels` take the machine's engine lock, shared with
 `crit run measure` and `crit serve`: one model-loading process at a time, the others wait and say who
 holds it ([SERVING.md](../SERVING.md#start-the-server)). `run --url` takes none: the server loaded its engine.
+
+## GGUF models
+
+`--model` takes a GGUF as it comes: one `.gguf` file, the first part of a `gguf-split` set, or a
+folder holding one of them. Nothing else is needed. GGUF's converter writes the model's
+description into the GGUF's metadata, and Core derives the files the rest of crit reads from it
+([crit_core.model](../../core/python/crit_core/model/README.md#gguf)): `config.json` from the
+architecture's shape and RoPE keys, `tokenizer.json` and `tokenizer_config.json` from the
+vocabulary, merges and special tokens, the chat templates from `tokenizer.chat_template`, and
+`generation_config.json` from the end-of-generation tokens and any `general.sampling.*` defaults.
+crit runs no GGUF runtime for any of it; `reference` needs the `gguf` Python package to decode
+the tensors.
+
+```text
+crit eval prepare --model ~/models/Qwen3.5-27B-IQ3_S.gguf --data DATA
+```
+
+From a Hugging Face GGUF repository, download the one quantization you want and point at that
+file: a folder with several quantizations holds several models and is refused.
+
+Configs are derived for the `llama`, `qwen2`, `qwen3`, `qwen3moe`, `qwen35` and `qwen35moe`
+architectures (another architecture gets the generic shape keys when its metadata needs nothing
+more, and is refused by name otherwise), tokenizers for byte-level BPE vocabularies with the
+`qwen2`, `qwen35`, `llama-bpe` and `gpt-2` pre-tokenizers. For anything else, put the base model's
+own files beside the GGUF in its folder. A folder's own files are used by group (the config; the
+tokenizer with its templates; the generation config) and only the groups it lacks are derived.
+The files it has must agree with the GGUF: layers, width, heads, head size, MLP and expert widths,
+vocabulary, norm epsilon, RoPE base, every token string and BPE merge, so files from another model
+are an error rather than a silent drift.
+
+The context, the ceiling and the model identity count the GGUF's stored bytes per block type
+(the identity also hashes the derived files). `reference` decodes every block type gguf-py
+decodes (bit for bit as ggml's own dequantization) and undoes the converter's layout per
+architecture before the official modeling code runs
+([gguf_layout.py](../../eval/crit_eval/gguf_layout.py)), for the same six architectures; others
+are refused by name. The GGUF is the reference: an engine that serves it is judged against the
+quantized model as stored. A multimodal projector (`mmproj-*.gguf`) beside it is ignored.
+
+## Other weight formats and quantization schemes
+
+`--model` also takes PyTorch state dicts (`pytorch_model.bin`, sharded with its
+`pytorch_model.bin.index.json`, or a `.pt`/`.pth` file) and ONNX graphs exported from a Hugging
+Face checkpoint (Optimum, `torch.onnx`), with the model's description files beside them as
+usual. Core reads a state dict's pickle without running it, so a file that would run code under
+`torch.load` is refused
+([crit_core.model](../../core/python/crit_core/model/README.md#pytorch-state-dicts)), and names an
+ONNX graph's weights as the checkpoint it came from
+([ONNX](../../core/python/crit_core/model/README.md#onnx)). Where a repository ships safetensors
+beside either, the safetensors are the weights.
+
+Quantized checkpoints are read as stored, whatever writes them
+([schemes.py](../../eval/crit_eval/schemes.py)): FP8 (per tensor, per row or per block, compressed-
+tensors or DeepSeek/Qwen `weight_scale_inv`), NVFP4 (compressed-tensors, ModelOpt), compressed-tensors
+int (pack-quantized W4A16/W8A16, symmetric or with zero points, and int-quantized W8A8), AWQ GEMM,
+GPTQ (2, 3, 4 and 8 bits, `gptq` and `gptq_v2`), MLX (affine of any width, mixed per-module widths,
+`mxfp4`, `nvfp4`, `mxfp8`), bitsandbytes (NF4 and FP4, double-quantized or not, and LLM.int8) and
+ONNX Runtime's MatMulNBits. `reference` decodes each to exactly the FP32 values the format's own
+library produces (the tests check this against GPTQModel, AutoAWQ, mlx, bitsandbytes,
+compressed-tensors and onnxruntime on models those tools wrote, and that the reference scores such
+a model exactly as transformers scores its dequantized twin). The ceiling counts each matrix once
+at its stored format's rate: weight-only integer codes at bf16 (engines widen them for the GEMM),
+8-bit integer weights with per-row scales at fp8 (int8 tensor cores run at the FP8 rate), MXFP4 at
+nvfp4. Refused by name: AWQ GEMV layouts, GPTQModel's planar 5/6/7-bit layout, ONNX graphs from
+onnxruntime-genai's builder, ONNX quantized ops other than MatMulNBits, and EXL2 and EXL3,
+which exllama decodes only in CUDA kernels, so there is no CPU dequantization to check against.
 
 ## Engines behind a server
 

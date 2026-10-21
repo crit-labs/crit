@@ -22,7 +22,7 @@ of it on every pass, so a context beyond the device limit is a cliff, not a slop
 Below the maximum, an engine sized for it must be at least as fast: Eval measures the engine built for
 the maximum, a curve of long-context points up to it, and the speed cases again at a lower context.
 """
-from .ceiling import model_config, weight_shards
+from .ceiling import model_config, weight_files
 from .tensors import tensor_role
 
 GIB = 1 << 30
@@ -32,8 +32,8 @@ def weight_split(model, config):
     """Stored bytes by where they have to live: `resident` (read on every pass, kept in device memory),
     `experts` (read sparsely, may move to host memory or disk), `draft` (part of resident), `embedding`
     (gathered rows, host memory is enough) and `vision` (not loaded by a text engine). None without
-    safetensors files. config: the model's crit_core.model.ModelConfig."""
-    shards = weight_shards(model, drafts=True)
+    safetensors files or a GGUF. config: the model's crit_core.model.ModelConfig."""
+    shards, drafts = weight_files(model, drafts=True)
     if not shards:
         return None
     split = {"resident": 0, "experts": 0, "draft": 0, "embedding": 0, "vision": 0}
@@ -41,7 +41,7 @@ def weight_split(model, config):
     heads = 0
     for shard in shards:
         for tensor in shard.tensors:
-            role, size = tensor_role(tensor.name, shard.path.name), tensor.nbytes
+            role, size = tensor_role(tensor.name, shard.path.name, drafts), tensor.nbytes
             if role.kind == "other_modality":
                 split["vision"] += size
             elif role.kind == "embedding":
@@ -77,12 +77,13 @@ def max_context(model, device, vram_headroom_bytes, settings):
     if elements is None:
         out["missing"].append("the model's attention layers (config.json)")
     try:
-        split = weight_split(model, config)
-    except (OSError, ValueError, KeyError):
-        split = None
+        split, problem = weight_split(model, config), None
+    except (OSError, ValueError, KeyError) as error:
+        split, problem = None, str(error)
     free = (device or {}).get("memory_free_bytes")
     if split is None:
-        out["missing"].append("the model's safetensors headers")
+        out["missing"].append(f"the model's weight headers ({problem})" if problem else
+                              "the model's weight headers (safetensors files or a GGUF)")
     if not free:
         out["missing"].append("free device memory (re-run crit eval probe)")
     if out["missing"]:

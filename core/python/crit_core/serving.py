@@ -145,10 +145,12 @@ class ResidentChat:
         raise NotImplementedError("Concurrent adapters must provide create_request(request)")
 
     def __init__(self, context, model, *, configuration=None, stop_ids=None, capacity=None, template_variables=None):
+        from crit_core.model import open_model
         from crit_core.text import load_model_text
         self.context = context
         self.configuration = dict(configuration if configuration is not None else (context.configuration or {}))
-        self.text = load_model_text(str(Path(model)), clock=None)
+        # A folder's files, or those a lone GGUF's metadata derives.
+        self.text = load_model_text(open_model(model).files, clock=None)
         limits = getattr(context, "limits", {}) or {}
         self.capacity = int(capacity or limits.get("kv_tokens") or 0) or None
         self.stop_ids = set(self.text.generation.stop_token_ids if stop_ids is None else stop_ids)

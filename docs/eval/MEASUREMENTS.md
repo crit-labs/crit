@@ -43,9 +43,10 @@ read plus written) and dense cuBLASLt GEMM rates with FP32 accumulation at prefi
 for BF16, FP8 E4M3 and NVFP4 (16-element E4M3 block scales), plus total and least free device
 memory and host memory. Pass it with `run --device`; `--bandwidth GBS` overrides the bandwidth.
 
-**Prefill ceiling.** `prepare` counts arithmetic per token from safetensors headers and config
+**Prefill ceiling.** `prepare` counts arithmetic per token from safetensors or GGUF headers and config
 ([crit_eval/ceiling.py](../../eval/crit_eval/ceiling.py)): 2 × rows × columns for every
-projection in its stored format (BF16, FP8 or NVFP4), excluding gathered embeddings, the vision
+projection in its stored format (BF16, FP8 or NVFP4; a GGUF's block types at the FP8 rate, the
+rate int8 tensor cores share, and its MXFP4/NVFP4 at the NVFP4 rate), excluding gathered embeddings, the vision
 tower, draft layers and the output head; 4 × heads × head dim per query-key pair in each
 full-attention layer; and the chunked linear-attention recurrence. The floor is matmul FLOPs at
 each format's GEMM rate, attention at the faster of the BF16 and FP8 rates (FP8 Q·Kᵀ and P·V fit

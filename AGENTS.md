@@ -22,7 +22,7 @@ Install from the repo root with `python -m pip install -e .`, then run `crit ...
   `crit run --id RUN_ID recon` (`candidate` refuses a model folder without it): it reads `generation_config.json` (sampling defaults),
   the tokenizer files and chat templates (BOS/EOS and stop tokens, template switches
   such as `enable_thinking`) and `config.json` (rope scaling, MTP or draft heads,
-  attention layout), writes the facts with file hashes to `work/recon.json` and
+  attention layout; for a lone GGUF, the files its metadata derives), writes the facts with file hashes to `work/recon.json` and
   scaffolds `work/recon.md`. Finish `recon.md` from the model card (recommended
   sampling per mode, e.g. thinking vs non-thinking, known issues, context limits) and
   the reference implementation in transformers (norm and attention quirks),

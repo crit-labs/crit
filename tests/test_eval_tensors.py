@@ -27,6 +27,23 @@ class TensorRoleTests(unittest.TestCase):
         for (name, file_name), expected in cases.items():
             self.assertEqual(tuple(tensor_role(name, file_name)), expected, name)
 
+    def test_gguf_names_and_draft_blocks(self):
+        cases = {
+            "token_embd.weight": ("embedding", False),
+            "per_layer_token_embd.weight": ("embedding", False),
+            "output.weight": ("head", False),
+            "output_norm.weight": ("layer", False),
+            "blk.0.attn_output.weight": ("layer", False),
+            "blk.1.ffn_gate_exps.weight": ("expert", False),
+            "blk.1.ffn_gate_up_exps.weight": ("expert", False),
+            "blk.1.ffn_up_shexp.weight": ("layer", False),
+            "blk.2.attn_q.weight": ("layer", True),
+            "blk.2.nextn.eh_proj.weight": ("layer", True),
+            "blk.12.attn_q.weight": ("layer", False),
+        }
+        for name, expected in cases.items():
+            self.assertEqual(tuple(tensor_role(name, "model.gguf", frozenset({2}))), expected, name)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -110,12 +110,24 @@ class ReconTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "stop_token_ids"):
             self.candidate({"batch": 1})
 
+    def test_a_lone_gguf_gathers_the_files_its_metadata_derives(self):
+        from test_eval_gguf import gguf_folder
+        (self.root / "gguf").mkdir()
+        model = gguf_folder(self.root / "gguf", config=None) / "model-IQ3_S.gguf"
+        rows, gathered, frozen = recon.gather(model)
+        self.assertEqual(gathered["derived_files"], ["chat_template.jinja", "config.json", "generation_config.json",
+                                                     "tokenizer.json", "tokenizer_config.json"])
+        self.assertEqual((gathered["architecture"]["model_type"], gathered["eos_token_ids"]), ("qwen3_5_text", [2, 0]))
+        self.assertEqual((frozen["chat_template"]["name"], frozen["stop_token_ids"]), ("default", [2, 0]))
+        self.assertIn("came from the weights' own metadata", recon.scaffold(
+            {"model_path": str(model), "created_at": "now", "sources": rows, "gathered": gathered, "frozen": frozen}))
+
     def test_cli_and_single_file_models(self):
         self.assertEqual(main(["--project", str(ROOT), "--root", str(self.root / "runs"), "--id", self.run_id, "recon"]), 0)
         self.assertTrue((self.directory / recon.RECON_JSON).is_file())
         single = self.root / "model.bin"
         single.write_bytes(b"not a model folder")
-        with self.assertRaisesRegex(ValueError, "model folder"):
+        with self.assertRaisesRegex(ValueError, "description files; .* has none"):
             recon.gather(single)
         # A single-file model needs no recon; its candidates are unchanged.
         store = RunStore(self.root / "single-runs")

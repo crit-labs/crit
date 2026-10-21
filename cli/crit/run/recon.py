@@ -1,11 +1,11 @@
 """Model reconnaissance: the machine-readable facts a candidate freezes, gathered with their sources.
 
-`crit run --id RUN recon` reads the run's model folder through Core's text layer and writes work/recon.json (the
+`crit run --id RUN recon` reads the run's model (crit_core.model.open_model: a folder, or a weight file such as a
+lone .gguf whose metadata derives the description files) through Core's text layer and writes work/recon.json (the
 facts, the files they came from and the `frozen` block every later candidate takes into configuration["recon"])
 and scaffolds work/recon.md, whose model-card and reference-code sections the agent writes.
 """
 import hashlib
-from pathlib import Path
 
 from .records import file_sha, keys, now, read_json, record, safe_path, text, write_json
 
@@ -75,16 +75,17 @@ def _template_variables(source):
 
 
 def gather(model):
-    """Facts from a model folder: sampling defaults, stop tokens, chat templates and config.json fields, plus
-    {path, bytes, sha256} for every file read. A model given as a single file yields no facts."""
-    from crit_core.files import model_files
+    """Facts from a model's description files: sampling defaults, stop tokens, chat templates and config.json
+    fields, plus {path, bytes, sha256} for every file read. A weight file without description files (a lone
+    .safetensors) yields no facts."""
     from crit_core.jsonfile import MAX_CONFIG_BYTES
+    from crit_core.model import open_model
     from crit_core.text import GenerationConfig, Tokenizer, template_sources
     from crit_core.text.errors import read_json_object
-    model = Path(model)
-    if not model.is_dir():
-        raise ValueError(f"Recon reads a model folder; {model} is not one")
-    files = model_files(model)
+    source = open_model(model)
+    if source.folder is None and not source.derived:
+        raise ValueError(f"Recon reads a model's description files; {model} has none")
+    files = source.files
     tokenizer_config = read_json_object(files, "tokenizer_config.json") or {}
     tokenizer = (Tokenizer.from_files(files, tokenizer_config=tokenizer_config)
                  if files.read("tokenizer.json") is not None else None)
@@ -112,6 +113,8 @@ def gather(model):
         "chat_templates": chat,
         "architecture": _architecture(config),
         "model_card": MODEL_CARD if card is not None else None,
+        # Files the weights' own metadata supplied (a GGUF without the base model's files beside it).
+        "derived_files": list(source.derived_names),
     }
     frozen = {
         "sampling": generation.sampling_defaults(),
@@ -191,6 +194,9 @@ def scaffold(value):
                         f"{', '.join(t['variables']) or 'none'}\n" for name, t in g["chat_templates"].items()) or "- none\n"
     card = (f"Read `{g['model_card']}` in the model folder (or the model's Hugging Face page)"
             if g["model_card"] else "No README.md in the model folder: read the model's Hugging Face page")
+    if g.get("derived_files"):
+        card += (f". {', '.join(f'`{n}`' for n in g['derived_files'])} came from the weights' own metadata (crit "
+                 "derives them from a GGUF); check them against the base model's repository")
     return f"""# Model recon
 
 Model: `{value['model_path']}`, gathered {value['created_at']} by `crit run ... recon`.

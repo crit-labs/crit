@@ -94,7 +94,7 @@ def windows(documents, encode, separator, samples, sequence_tokens, seed):
 
 def load_calibration(path, model, recipe):
     """Token windows for a gptq recipe and the facts its record keeps (file hash, windows hash, overlap check)."""
-    from crit_core.files import DirectoryFiles
+    from crit_core.model import open_model
     from crit_core.text import legacy_eos_ids, load_model_text
     documents = read_documents(path)
     texts = suite_texts()
@@ -103,7 +103,7 @@ def load_calibration(path, model, recipe):
         if overlap:
             raise ValueError(f"{path}: {len(overlap)} documents contain Eval suite text (first: document "
                              f"{overlap[0] + 1}); calibrate on data unrelated to Eval")
-    files = DirectoryFiles(model)
+    files = open_model(model).files
     text = load_model_text(files, clock=None)
     stops = legacy_eos_ids(files)
     settings = recipe["calibration"]
