@@ -20,7 +20,8 @@ Agent cases render [tools.json](../../eval/suite/agent/tools.json) and frozen to
 14,592 tokens of context; an engine with less skips it and its decode score is incomplete.
 
 Stop tokens are disabled; output past the model's end token is flagged `stop_crossed`.
-Defaults: 1 warmup, 3 repetitions ([protocol.json](../../eval/protocol.json)). Time to first token
+Defaults: 1 warmup, 2 repetitions and a third only when the two disagree: their decode speed or time to
+first token spread by more than 5%, or their outputs differ ([protocol.json](../../eval/protocol.json)). Time to first token
 gives prefill, the remaining tokens decode. The **decode score** is the geometric mean of the six
 case medians; each case also reports tokens per round. The **prefill score** is the geometric mean of prompt tokens ÷ TTFT over `long-summary`
 and `agent-long` (`prefill_cases`). The **TTFT score** is the geometric mean of TTFT in ms over
@@ -81,31 +82,53 @@ score. Results carry this under `headroom`, the summary under `status`.
 
 ## Quality
 
-Quality is the engine's own output, as a user of its chat API gets it, scored by the checkpoint
-the user chose: Eval measures what the engine loses on top of that checkpoint's quantization,
-nothing else. [suite/quality.json](../../eval/suite/quality.json) holds six fixed prompts (prose,
-code, math, German, JSON, story). Each goes to the engine as chat messages with `logprobs` and 16
-`top_logprobs`, and its greedy reply of up to 256 tokens (`quality.reply_tokens`) is the scored
-text, with the log-probabilities the engine reports for every token. The server must render each
-prompt to the token count the model's chat template renders, so the reference sees the prompt the
-engine saw, and name each reply token by its bytes, which Eval maps to the model's ids through its
-vocabulary.
+Quality is what the engine loses on top of the checkpoint the user chose, nothing else, measured
+on fixed text through the paths the engine serves with.
+[suite/quality.json](../../eval/suite/quality.json) holds six conversations (prose, code, math,
+German, JSON, story), each with a written answer. Each quality text is a conversation rendered by
+the model's chat template with its generation prompt, followed by its answer cut to 256 tokens
+(`quality.continuation_tokens`); `prepare` freezes both as token ids.
 
-`crit eval reference --result` then feeds every prompt and reply through the reference, teacher
-forced, and compares each reply token: the perplexity ratio (the engine's perplexity of its reply
-over the reference's of the same tokens), KL(reference ‖ engine) mean / p99 / max over the tokens
-in both top-16 lists plus one bucket for the rest (a lower bound of the full-vocabulary KL), and
-top-1 agreement (the share of reply tokens that are also the reference's first choice).
+`crit eval reference` scores every position of every text once, teacher forced on the checkpoint,
+and stores each position's log-probability and the reference's top 16 under the data. The engine
+scores the same ids through crit serve's score call (`chat-score-v1`): every prompt position and the
+first answer token from one prefill of the prompt, as it prefills any request, and every later
+answer token from its decode, each step forced to the answer (a speculative engine accepts drafts
+only while they equal it and takes every correction and bonus token from it). Eval compares each
+position: the perplexity ratio (the engine's perplexity of the scored tokens over the reference's),
+KL(reference ‖ engine) mean / p99 / max over the tokens in both top-16 lists plus one bucket for the
+rest (a lower bound of the full-vocabulary KL), and top-1 agreement (the share of positions where
+both rank the same token first). Each set is judged on the positions the engine serves (`SET/served`):
+the answer, its first token from the prefill's last position and the rest from decode. The prompt
+positions are reported (`quality.prompt`) and never judged: no request returns their prefill logits,
+and what the prefill leaves in the cache reaches the served tokens, which are judged. Both are also
+reported by position: absolute position in log2 buckets (1-511, 512-1023, 1024-2047, ...) for the
+prompt and offset in the answer (1-31, 32-63, 64-127, 128-255) for the served positions, so a
+threshold where the engine switches kernels shows as a step (reported, not judged).
 
-**Replies after long prompts.** A real request prefills a long prompt and then decodes, and decode
-reads what the prefill left: prefetched experts and their scales, KV written by a different kernel,
-sparse-attention indices. Three of the prompts (`quality.long` in
-[protocol.json](../../eval/protocol.json)) also go with suite text ([long.json](../../eval/suite/long.json))
-before their first user message, so they render to about 1,024, 4,096 and 32,768 tokens, past
-typical prefetch, prefill-kernel and sparse-attention thresholds. The conversations are one set and
-each length another (`conversations`, `long-1024`, `long-4096`, `long-32768`); every set is judged
-by the drift budget on its own, and a set whose prompts and replies do not fit `max_context` is
-skipped.
+**Long prompts.** A real request prefills a long prompt and then decodes, and decode reads what the
+prefill left: prefetched experts and their scales, KV written by a different kernel, sparse-attention
+indices. Three of the conversations (`quality.long` in [protocol.json](../../eval/protocol.json))
+also go with suite text ([long.json](../../eval/suite/long.json)) before their first user message, so
+they render to about 1,024, 4,096 and 32,768 tokens, past typical prefetch, prefill-kernel and
+sparse-attention thresholds. The conversations are one set and each length another
+(`conversations`, `long-1024`, `long-4096`, `long-32768`); a set whose texts do not fit
+`max_context` is skipped.
+
+**Honesty.** The scores must come from the paths the engine serves with. Eval also takes the
+engine's greedy replies to the conversations and the 32K-token prompts over its chat API, with
+`logprobs` and 16 `top_logprobs` (the server renders each prompt to the token count the model's chat
+template renders and names each reply token by its bytes), and scores the same reply tokens through
+the score call, without the prompt's rows, which the fixed texts already score: every token's
+log-probability and every alternative in both lists must agree within `quality.honesty.tolerance`
+(1e-3 nats), and the lists hold the same tokens but those within it of the 16th. `quality.honesty`
+records the largest difference; a failure fails the quality gate.
+
+`quality.timing` shows where the phase's time goes: for the fixed texts' score requests, the honesty
+replies and the honesty rescores, the requests' seconds, the engine's own prefill and decode
+seconds (`crit_telemetry`), the rest of each request's time (transfer and the server's own work),
+the response bytes and the client's parse seconds, with each text's own row in `timing.texts`;
+`timing.metrics_seconds` is the time the comparison with the reference took.
 
 The **drift budget** defaults to PPL ratio ≤ 1.05, mean KLD ≤ 0.05, p99 KLD ≤ 0.5.
 `--quality-budget '{"ppl_ratio_max": 1.02}'` sets any subset;
@@ -150,6 +173,22 @@ long-context curve up to the requirement and retrieval. The tokens must be ident
 deterministic engine's greedy output does not depend on earlier requests, so this gate holds in
 every exactness mode and constrains no speed; `repeatable` cannot see state that changed before
 the first measured repetition. `history.served_between` lists what ran in between.
+
+## Follow-up turns and the prompt cache
+
+A conversation's follow-up turns resend its history. Right after the request history's first
+requests, Eval sends each turn of [followup.json](../../eval/suite/followup.json) in order: the first
+its user message after a document making the prompt about `followup.prompt_tokens` (8,192)
+tokens, each later one the conversation so far with the suite's fixed assistant replies and the
+next user message, `output_tokens` (64) each. Each turn may be served from a prompt cache, so an
+engine that keeps the earlier turns prefills only the rest. Every turn reports its time to first
+token, the prompt tokens the engine reports as cached
+(`usage.prompt_tokens_details.cached_tokens`) and the prefill rate of the tokens it computed;
+`followup.ttft_ms` and `followup.prefill_tps` are the geometric means over the turns after the
+first. After every other part the turns run again, and every turn must answer as it did first
+(the **prompt_cache** gate): a cached path must give the tokens the fresh one gave. An engine
+without a prompt cache reports its fresh prefill and passes. The part is skipped when its last
+turn does not fit the engine's context.
 
 ## Held-out prompts and generality
 

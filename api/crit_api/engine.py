@@ -10,6 +10,8 @@ from crit.run.records import (digest, keys, now, number, read_json, record, safe
                               verification_scope, write_json)
 from crit.run.store import ROOT, RunStore
 
+from crit_core.serving import MIN_LOGPROB, SCORE_CAPABILITY
+
 from .residency import CAPABILITY as RESIDENT_CAPABILITY, ResidentRuntime
 from .admission import Admission
 from .content import response_content, tool_size
@@ -105,6 +107,47 @@ def reply(value, request):
             raise ValueError("Reply logprobs exceed its output tokens")
         assistant = dict(assistant if isinstance(assistant, dict) else {"content": assistant}, logprobs=entries)
     return assistant, measured
+
+
+def score_reply(value, request):
+    """A score response record (chat-score-v1) checked against its request: one row per prompt position after the
+    first and per continuation token, each naming its own token, with exactly the requested ranked, distinct
+    alternatives and log-probabilities in [MIN_LOGPROB, 0]."""
+    keys(value, {"schema_version", "record_kind", "request_id", "candidate_id", "package_sha256", "prompt",
+                 "continuation", "telemetry"})
+    if type(value["schema_version"]) is not int or value["schema_version"] != 1 or value["record_kind"] != "score_response":
+        raise ValueError("Invalid engine score response")
+    if any(value[key] != request[key] for key in ("request_id", "candidate_id", "package_sha256")):
+        raise ValueError("Score belongs to a different request or engine")
+
+    def checked(logprob):
+        if type(logprob) not in (int, float) or not MIN_LOGPROB <= logprob <= 0:
+            raise ValueError(f"Score log-probabilities must be numbers in [{MIN_LOGPROB}, 0]")
+        return float(logprob)
+
+    def rows(found, tokens, part):
+        if part == "prompt" and not request["prompt_rows"]:
+            tokens = []
+        if not isinstance(found, list) or len(found) != len(tokens):
+            raise ValueError(f"Score {part} rows must number {len(tokens)}")
+        out = []
+        for row, token in zip(found, tokens):
+            if not isinstance(row, list) or len(row) != 3 or row[0] != token or not isinstance(row[2], list):
+                raise ValueError(f"Score {part} rows are [token, logprob, alternatives] for the scored tokens")
+            top = [[pair[0], checked(pair[1])] for pair in row[2]
+                   if isinstance(pair, list) and len(pair) == 2 and type(pair[0]) is int and pair[0] >= 0]
+            if (len(top) != len(row[2]) or len(top) != request["top_logprobs"] or len({p[0] for p in top}) != len(top)
+                    or any(a[1] < b[1] for a, b in zip(top, top[1:]))):
+                raise ValueError(f"Score {part} rows need {request['top_logprobs']} distinct, ranked alternatives")
+            out.append([token, checked(row[1]), top])
+        return out
+    telemetry = value["telemetry"]
+    if not isinstance(telemetry, dict) or set(telemetry) != {"prefill_ms", "decode_ms"} or not all(
+            v is None or (type(v) in (int, float) and v >= 0) for v in telemetry.values()):
+        raise ValueError("Score telemetry holds prefill_ms and decode_ms")
+    return {"prompt": rows(value["prompt"], request["prompt_ids"][1:], "prompt"),
+            "continuation": rows(value["continuation"], request["continuation_ids"], "continuation"),
+            "telemetry": telemetry}
 
 
 def package_signature(folder):
@@ -360,21 +403,9 @@ class ServedEngine:
             if self._stopping.is_set():
                 raise EngineError("Engine is stopping", 503)
             if needs_load:
-                try:
-                    loaded = self.runtime.call("load", {"spec": spec}, _CommandStop(stop, self._stopping),
-                                               self.load_seconds(spec))
-                    if loaded["status"] in {"cancelled", "timed_out"}:
-                        self.lock.invalidate()
-                        if self._stopping.is_set():
-                            raise EngineError("Engine is stopping", 503)
-                        return loaded["status"], None, None
-                    if loaded["status"] != "completed":
-                        raise EngineError(loaded.get("error") or "Engine loading failed")
-                    self.lock.configure(candidate_id, loaded.get("max_concurrent_requests", 1))
-                except BaseException as exc:
-                    if not self._stopping.is_set():
-                        self._retire(exc)
-                    raise
+                loaded = self._load(spec, candidate_id, stop)
+                if loaded is not None:
+                    return loaded, None, None
             request = record("chat_request", spec["run_id"], chat_id="chat-" + uuid.uuid4().hex, request_id=uuid.uuid4().hex,
                 candidate_id=spec["candidate_id"], package_sha256=spec["package_sha256"], created_at=now(),
                 model_path=spec["model_path"], package_path=spec["package_path"],
@@ -416,6 +447,86 @@ class ServedEngine:
                 self._retire(exc)
                 raise EngineError("Engine returned an invalid response: " + str(exc)) from exc
             return "completed", assistant, measured
+        finally:
+            self.lock.release()
+
+    def _load(self, spec, candidate_id, stop):
+        """Load the candidate's engine on the host: None once loaded, else "cancelled" or "timed_out"."""
+        try:
+            loaded = self.runtime.call("load", {"spec": spec}, _CommandStop(stop, self._stopping),
+                                       self.load_seconds(spec))
+            if loaded["status"] in {"cancelled", "timed_out"}:
+                self.lock.invalidate()
+                if self._stopping.is_set():
+                    raise EngineError("Engine is stopping", 503)
+                return loaded["status"]
+            if loaded["status"] != "completed":
+                raise EngineError(loaded.get("error") or "Engine loading failed")
+            self.lock.configure(candidate_id, loaded.get("max_concurrent_requests", 1))
+        except BaseException as exc:
+            if not self._stopping.is_set():
+                self._retire(exc)
+            raise
+        return None
+
+    def score(self, prompt_ids, continuation_ids, top_logprobs, stop, candidate_id=None, prompt_rows=True):
+        """Score fixed text through the engine's serving paths (chat-score-v1): every prompt position from its
+        prefill (none with prompt_rows false) and every continuation token from its decode, forced to the
+        continuation, each with the token's log-probability and top_logprobs ranked alternatives. Returns (status,
+        scored, telemetry) as generate() does, scored {"prompt": rows, "continuation": rows} with rows
+        [token, logprob, [[token, logprob], ...]]."""
+        candidate_id = candidate_id or self.default
+        needs_load = self.lock.admit(candidate_id, _CommandStop(stop, self._stopping))
+        if needs_load is None:
+            if self._stopping.is_set():
+                raise EngineError("Engine is stopping", 503)
+            return "cancelled", None, None
+        try:
+            if stop.is_set():
+                return "cancelled", None, None
+            if self._stopping.is_set():
+                raise EngineError("Engine is stopping", 503)
+            if self.ownership.blocked:
+                raise EngineError("Runtime cleanup is unresolved: " + self.ownership.blocked, 503)
+            spec = self.spec(candidate_id)
+            if SCORE_CAPABILITY not in spec["capabilities"]:
+                raise EngineError("This engine package does not declare " + SCORE_CAPABILITY, 400)
+            limits = spec["limits"]
+            if len(prompt_ids) < 1 or len(prompt_ids) + len(continuation_ids) > limits["kv_tokens"]:
+                raise EngineError("prompt_ids and continuation_ids must hold 1 to %d tokens" % limits["kv_tokens"], 400)
+            if needs_load:
+                loaded = self._load(spec, candidate_id, stop)
+                if loaded is not None:
+                    return loaded, None, None
+            request = record("score_request", spec["run_id"], request_id=uuid.uuid4().hex,
+                             candidate_id=spec["candidate_id"], package_sha256=spec["package_sha256"], created_at=now(),
+                             prompt_ids=list(prompt_ids), continuation_ids=list(continuation_ids),
+                             top_logprobs=top_logprobs, prompt_rows=bool(prompt_rows),
+                             limits={"kv_tokens": limits["kv_tokens"], "timeout_seconds": self.timeout})
+            try:
+                result = self.runtime.call("score", {"spec": spec, "request": request},
+                                           _CommandStop(stop, self._stopping), self.timeout, request=request)
+            except BaseException as exc:
+                self._retire(exc)
+                if isinstance(exc, (ValueError, OSError)):
+                    if self._stopping.is_set():
+                        raise EngineError("Engine is stopping", 503) from exc
+                    raise EngineError("Engine host failed: " + str(exc)) from exc
+                raise
+            if result["status"] in {"cancelled", "timed_out"}:
+                if self._stopping.is_set():
+                    raise EngineError("Engine is stopping", 503)
+                return result["status"], None, None
+            if result["status"] != "completed":
+                self._retire(result["error"])
+                raise EngineError(result["error"] or "Engine failed the request")
+            try:
+                scored = score_reply(result["response"], request)
+                self._check_sealed(spec)
+            except (ValueError, OSError, KeyError, TypeError) as exc:
+                self._retire(exc)
+                raise EngineError("Engine returned an invalid response: " + str(exc)) from exc
+            return "completed", {"prompt": scored["prompt"], "continuation": scored["continuation"]}, scored["telemetry"]
         finally:
             self.lock.release()
 

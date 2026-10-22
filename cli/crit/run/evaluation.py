@@ -1,11 +1,17 @@
-"""crit run eval: Eval of a packaged candidate through crit serve, under a benchmark reservation.
+"""crit run eval: Eval of a packaged candidate through crit serve, under one eval reservation.
 
 crit serve's resident host loads the candidate's resident chat adapter, packaged and not yet sealed, and Eval
 measures it over the chat API like any served engine (docs/eval/README.md#engines-behind-a-server): speed, request
-history, held-out prompts, the long-context curve, retrieval and the quality replies. The server then stops and the
-run's model scores the replies (crit eval reference), so the quality gate judges the engine's own replies against
-the model's checkpoint. The result is retained under the candidate's eval/ folder for checks to reference; it
+history, held-out prompts, the long-context curve, retrieval and quality, the engine's scores of the fixed quality
+texts through its serving paths (chat-score-v1) against the reference scores of the run's model stored under the
+data. When the data holds none yet, the run's model scores the texts first (crit eval reference), once, before the
+candidate is served. The result is retained under the candidate's eval/ folder for checks to reference; it
 publishes no check or benchmark.
+
+Every part runs in one attempt on one loaded engine (the lower-context gate opens its own, at its context). The
+attempt has no fixed process cap, since Eval's work scales with the model and the device: it may run to the
+segment's deadline, and each request is bounded by the rates the engine measured in it (crit_eval.deadline), so a
+hung engine stops the attempt.
 """
 from pathlib import Path
 import sys
@@ -15,12 +21,14 @@ from .records import file_sha, ident, load_run, now, quality_terms, read_json, s
 from .served import Expired, SERVED, Served, remaining
 from .store import amendments
 
-LOGPROBS = "chat-logprobs-v1"  # the quality replies need every token's log-probability
+# Quality needs the score call and, for its honesty check, every served token's log-probability.
+QUALITY = ("chat-score-v1", "chat-logprobs-v1")
 
 
 def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, seconds=None, label=None):
-    """Reserve, serve the candidate, run Eval on it over the chat API, stop the server, score its quality replies on
-    the run's model and settle. Returns the retained result (path relative to the run, sha256) and its status."""
+    """Reserve, score the data's quality texts on the run's model unless stored, serve the candidate, run Eval on it
+    over the chat API, stop the server and settle. Returns the retained result (path relative to the run, sha256)
+    and its status."""
     from crit_eval import load_json, machine_settings
     from crit_eval.prepare import PREPARED, model_identity
     from crit_eval.runner import PARTS
@@ -34,7 +42,7 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
         raise ValueError("Package the candidate before measuring it")
     parts = tuple(parts or PARTS)
     declared = set(read_json(manifest_path)["capabilities"])
-    missing = [c for c in SERVED + ((LOGPROBS,) if "quality" in parts else ()) if c not in declared]
+    missing = [c for c in SERVED + (QUALITY if "quality" in parts else ()) if c not in declared]
     if missing:
         raise ValueError("Eval measures the candidate through crit serve: its package must declare "
                          + ", ".join(missing) + " (docs/SERVING.md)")
@@ -51,7 +59,7 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
     device = read_json(probe) if probe and probe.is_file() and file_sha(probe) == basis["device_sha256"] else None
     settings = machine_settings()
     reserve = settings.get("context_reserve_gib")
-    reservation = store.reserve(run_id, candidate_id, "benchmark", seconds)
+    reservation = store.reserve(run_id, candidate_id, "eval", seconds)
     attempt = reservation["attempt_id"]
     budget, exactness = quality_terms(run["spec"]["correctness"], amendments(root, reservation["segment_id"]))
     options = dict(label=label, device=device, baseline=baseline, quality_budget=budget, exactness=exactness,
@@ -100,8 +108,10 @@ class EvalEngines(Served):
     is the candidate served through crit serve at the context Eval asks for, the run's or the lower-context gate's,
     and stops when Eval closes it."""
 
-    def __init__(self, store, run_id, candidate_id, attempt, kv_tokens, prepared, log):
-        super().__init__(store, run_id, candidate_id, attempt, kv_tokens, log, "Eval")
+    def __init__(self, store, run_id, candidate_id, attempt, kv_tokens, prepared, log, deadline_at):
+        # crit serve's own bound on a request is the attempt's deadline: Eval bounds each request by what it measured.
+        super().__init__(store, run_id, candidate_id, attempt, kv_tokens, log, "Eval",
+                         timeout=min(86400, max(1.0, remaining(deadline_at))))
         self.prepared = prepared
 
     def create_eval_engine(self, context):
@@ -113,22 +123,27 @@ class EvalEngines(Served):
 
 
 def _measure(store, run_id, candidate_id, attempt, deadline_at, model, data, out, parts, options, log):
-    """Measure through crit serve, then score; a failed engine cleanup raises with `settled` False."""
+    """Score the data's quality texts unless stored, then measure through crit serve; a failed engine cleanup raises
+    with `settled` False."""
     from crit_core.machine import engine_lock
     from crit_eval import load_json
     from crit_eval.prepare import PREPARED
-    from crit_eval.reference import score_result
+    from crit_eval.reference import score_data
     from crit_eval.runner import run as run_eval
     served = EvalEngines(store, run_id, candidate_id, attempt, options["context_tokens"], load_json(data / PREPARED),
-                         log)
+                         log, deadline_at)
     with engine_lock(f"crit run eval {run_id} {candidate_id}", deadline=time.monotonic() + remaining(deadline_at)):
+        if "quality" in parts:
+            def check():
+                # Between the reference's layers and texts: scoring stops at the reservation's deadline.
+                if remaining(deadline_at) <= 0:
+                    raise Expired("Eval passed its reserved deadline while the reference scored the quality texts")
+            how = score_data(model, data, log, check)
+            log(f"quality: reference scores of {how['positions']:,} positions {how['method']}"
+                + (f" in {how['seconds']:.0f} s" if how["method"] == "scored" else ""))
         with served.until(deadline_at):
             # Eval closes every engine it opens, also when a part fails.
             result = run_eval(served, model, data, out, {}, parts, log=log, **options)
         if result.get("aborted"):
             raise ValueError("Eval aborted the round: " + result["aborted"]["detail"])
-        if (result.get("quality") or {}).get("status") == "replied":
-            if remaining(deadline_at) <= 0:
-                raise Expired("Eval passed its reserved deadline before scoring")
-            result = score_result(model, data, out, options["baseline"], log)
     return result

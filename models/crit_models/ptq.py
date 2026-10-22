@@ -116,7 +116,8 @@ def calibrate(source, plan, recipe, windows, device, staging, log):
     del embed
     length = len(windows[0])
     positions = torch.arange(length, device=device)[None]
-    embeddings = reference.rotary(states[0].to(device), positions)
+    # The rotary module keeps its computed frequency buffers on the reference's skeleton.
+    embeddings = reference.skeleton.rotary_emb.to(device)(states[0].to(device), positions)
     mask = torch.full((length, length), float("-inf"), device=device).triu(1)[None, None]
     layer_types = getattr(config, "layer_types", None)
     errors, last = {}, max(by_layer)
@@ -131,7 +132,7 @@ def calibrate(source, plan, recipe, windows, device, staging, log):
     with torch.no_grad():
         for index in range(last + 1):
             started = time.time()
-            layer = reference.layer(index)
+            layer = reference.layer(index, index + 1 if index < last else None)
             targets = by_layer.get(index, [])
             if targets:
                 hessians, counts, hooks = {}, defaultdict(int), []

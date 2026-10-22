@@ -16,6 +16,8 @@
 // nibble = even element, one 8-bit block scale per 16 values. Block scales go through a decode hook, so
 // checkpoint-specific scale encodings stay in the engine; the standard hook reads E4M3 bytes.
 #pragma once
+#include "host_isa.h"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -51,10 +53,11 @@ struct ScaleDecoder {
 // The standard decoder: E4M3FN bytes of `matrix.scales` through crit::nvfp4::e4m3. `matrix` must outlive it.
 ScaleDecoder e4m3_scales(const MatrixView& matrix);
 
-enum class Isa { scalar, avx2, avx512 };
-const char* isa_name(Isa) noexcept;
-bool supported(Isa) noexcept;  // compiled in and reported by the CPU and the OS (cpuid, xgetbv)
-Isa best_isa() noexcept;
+// The ISA files this build compiled in and the CPU and the OS report (host_isa.h).
+using Isa = host_isa::Isa;
+using host_isa::best_isa;
+using host_isa::isa_name;
+using host_isa::supported;
 
 // out[t * ldo + r] for every token t < tokens whose bit is set in `mask` and rows r in [row0, row1): the declared
 // dot of row r with x[t * ldx ...], times post. Other tokens' outputs are left unwritten. Rows are independent,

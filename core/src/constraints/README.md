@@ -12,8 +12,10 @@ Python: [`crit_core.constraints`](../../python/crit_core/constraints). Tests:
 
 | API | Purpose |
 | --- | --- |
-| `ByteVocabulary` | Exact decoded bytes per token id; one EOS with an empty piece; other empty pieces are never allowed |
-| `TokenMatcher` | Request-private language state: `allowed()`, `append`, `rewind`, `fork`, `ended` |
+| `ByteVocabulary` | Exact decoded bytes per token id; one EOS with an empty piece; other empty pieces are never allowed; a byte trie of the pieces |
+| `TokenMatcher` | Request-private language state: `allowed()`, `allowed_bits` (a bitmask for device masks), `append`, `rewind`, `fork`, `ended` |
+| `AllowedCache` | Bounded, thread-safe LRU of allowed sets keyed by exact matcher state, shared by the matchers of one language |
+| `allowed_by_scan` | The full-vocabulary definition of `allowed()` (every token a fork accepts), for tests and measurements |
 | `ChoiceGrammar`, `ChoiceMatcher` | A finite set of byte strings, whatever the token segmentation |
 | `JsonObjectMatcher`, `JsonLimits` | One JSON object of any shape (JSON mode) |
 | `ByteGrammar`, `GrammarMatcher`, `GrammarLimits` | A compiled byte grammar (JSON schema, regex, EBNF) through a bounded Earley recognizer |
@@ -50,7 +52,9 @@ output budget, since a valid prefix does not guarantee the rest can finish it.
 
 Pieces are the bytes the detokenizer appends for each token, not the stored
 spellings, and may end inside a UTF-8 character. Special and control tokens get
-empty pieces and are never allowed. `byte_vocabulary(tokenizer, eos=None)` builds
+empty pieces and are never allowed. The constructor also builds a byte trie of the
+nonempty pieces (tens of milliseconds for a vocabulary of a few hundred thousand
+tokens), which every matcher walks. `byte_vocabulary(tokenizer, eos=None)` builds
 the table from a `crit_core.text.Tokenizer` for byte-level, Metaspace and
 SentencePiece byte-fallback decoders; others raise `TextError`. Limits: 1,048,576
 entries and 64 MiB of piece bytes.
@@ -65,7 +69,42 @@ entries and 64 MiB of piece bytes.
 
 Grammar exhaustion throws `length_error` without changing the matcher.
 
+## Computing allowed sets
+
+`allowed()` walks the vocabulary's piece trie depth first and advances the
+matcher's own state one byte per edge (a choice-trie node, a JSON cursor, an Earley
+chart), pruning a subtree as soon as its prefix is rejected and pieces longer than
+the remaining byte room. A prefix that many tokens share is processed once, and a
+rejected prefix rejects all of them; the set is collected as a bitmask and returned
+sorted. The result equals the full-vocabulary scan (`allowed_by_scan`), including
+grammar chart exhaustion: a token's path visits exactly the charts its scan would.
+
+Allowed sets are cached by exact state: the choice-trie node; the whole JSON cursor
+(lexical state, container stack) with the byte room up to the longest piece; for
+grammars, whether a sentence ended and the items still waiting for a symbol in the
+last chart and in every chart their origins reach (completed items have acted
+already), renumbered so equal structures at other offsets share a key. A grammar
+entry records the chart states its walk used and serves only states whose remaining
+budget covers them, so a hit never hides a `length_error`; states with more than
+4,096 waiting items are not cached. A matcher gets a private 4 MiB cache
+(`allowed_cache_private_bytes`) unless one is passed in; pass one `AllowedCache`
+to every matcher of a language (same vocabulary, grammar or choices, and limits)
+to share it across requests, since states such as "inside a string" recur. The
+cache throws `invalid_argument` when used with another language.
+
+A grammar rule whose productions are all single bytes is a byte class: recognizers
+scan it as one terminal instead of predicting its productions (character classes
+otherwise add one item per byte to every chart), and the Python recognizer does the
+same so both count the same chart states. The compiler builds unbounded repetition
+left recursive, which an Earley recognizer extends in constant work per item, where
+right recursion leaves a completion chain as long as the repetition.
+
 ## Sampling with a mask
+
+On the device, `allowed_bits` fills a bitmask (bit `t % 32` of word `t / 32`) that
+[token-sampling](../../../inference/token-sampling/README.md)'s `enqueue_mask` applies
+to logits before selection.
+
 
 `Sampler::sample(logits, AllowedTokens{ids}, params, history, column, top)` and
 the matching `distribution` overload mask every id outside `ids` to -inf before
@@ -84,11 +123,30 @@ silently relaxed. Offline: `python -m crit_core.constraints.compiler schema repl
 
 The [JSON Schema 2020-12](https://json-schema.org/draft/2020-12/json-schema-validation)
 subset: closed objects (`additionalProperties: false`, at most 128 properties,
-output as compact JSON in declaration order), arrays with `items`/`minItems`/`maxItems`,
-strings with `minLength`/`maxLength`, `boolean`, `null`, `number`, `integer`
-(bounded integers need both bounds spanning at most 4,096 values), `enum` and
-`const`. `$ref`, unions (`anyOf`, `oneOf`, type lists), `pattern`, `format` and
-open objects are rejected.
+required and optional ones, output as compact JSON in declaration order), arrays with
+`items`/`minItems`/`maxItems`, strings with `minLength`/`maxLength` or `pattern`,
+`boolean`, `null`, `number`, `integer` (bounded integers need both bounds spanning at
+most 4,096 values), `enum`, `const`, and:
+
+- `anyOf` (1 to 64 schemas, no sibling keywords) and type lists (each listed type
+  takes the keywords that apply to it; a keyword no listed type takes is rejected);
+- `oneOf` only when its branches are provably disjoint: different JSON kinds,
+  disjoint `enum`/`const` values, or a property every branch requires with disjoint
+  `enum`/`const` values (a tagged union). Anything else is rejected, never compiled
+  as `anyOf`;
+- `$defs` at the root and local `$ref` (`#` or `#/$defs/<name>`, no sibling
+  keywords), one grammar rule per target, so recursive schemas work; a reference
+  cycle that produces no value is rejected;
+- `pattern` with ECMA-262 search semantics on the decoded string: unanchored ends
+  take any characters, `.` excludes line terminators, `\d` and `\w` are ASCII and
+  `\s` includes the Unicode spaces. Classes take ASCII characters only (a negated
+  class admits every other character). The matched part is written in one canonical
+  encoding (`"` and `\` escaped, control characters as `\n`, `\r`, `\t`, `\b`,
+  `\f` or `\u00XX`, everything else raw UTF-8), the encoding
+  `json.dumps(..., ensure_ascii=False)` writes; `pattern` with length bounds is rejected.
+
+`format`, `allOf`, `not`, conditionals, nested `$defs`, remote references and open
+objects are rejected.
 
 `regex` matches the whole byte string (no lookaround, backreferences or flags).
 `ebnf` takes one `name ::= expression` per line with a required `root`. Neither
@@ -113,7 +171,25 @@ budgets.
 
 ## Costs
 
-The reference matchers scan the whole vocabulary at every position and copy
-history per fork; grammar charts grow with ambiguity. Compile ahead of admission
-and profile mask cost within the decode step before using it in a
-latency-sensitive path; device masks or transition caches are engine work.
+A state's first `allowed()` walks the trie; later visits of an equal state are
+cache hits that copy the stored set. Forks copy the matcher's history; grammar
+charts grow with ambiguity. Compile ahead of admission, share one `AllowedCache`
+per language and profile mask cost within the decode step.
+
+Measured on one thread of an AMD Ryzen 5 9600, before (full-vocabulary scan) and
+after, per position, on the byte vocabularies of Nemotron 3.5 Super (131,072
+tokens) and Qwen3.8 (248,077 tokens):
+
+| State | Before | After, first visit | After, repeat |
+| --- | --- | --- | --- |
+| JSON mode, object start / value / number | 2.2-5.0 ms | 0.01-0.06 ms | < 0.01 ms |
+| JSON mode, inside a string (127K / 245K tokens allowed) | 5.9 / 10.7 ms | 7.0 / 13.8 ms | 0.13 / 0.19 ms |
+| JSON schema grammar, start / integer | 1.3-6.3 ms | 0.004-0.03 ms | < 0.01 ms |
+| JSON schema grammar, inside a string | 9.4 / 17.9 s | 0.20 / 0.40 s | 0.13 / 0.21 ms |
+| 64 choices | 0.8-2.5 ms | 0.004-0.006 ms | < 0.01 ms |
+
+Writing a 24-character string, the JSON matcher's later positions averaged 0.011
+and 0.026 ms and the schema grammar's 8.7 and 17.6 ms (two first visits, then cache
+hits). Large allowed sets cost a little more on a first visit than the scan did
+(the walk carries a cursor per trie node), so the cache, not the walk, is what
+makes them cheap. These numbers illustrate one CPU and two vocabularies.

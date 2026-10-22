@@ -9,9 +9,9 @@ tokens as BF16 and halves cache reads at long context.
 When the KV cache decides how much context fits. Decode launch shape does not
 depend on capacity, so an engine built for a huge context (`crit eval run
 --context`) is as fast on short requests, and one CUDA graph serves every length.
-Not for a cache that is small next to the weights, a paged or shared cache (adapt
-the loads or use [attention-state](../attention-state/README.md)), or models
-needing finer scales.
+Not for a cache that is small next to the weights, a paged or shared cache (use
+[paged-attention](../paged-attention/README.md), which reads the same E4M3
+representation through block tables), or models needing finer scales.
 
 ## How it works
 

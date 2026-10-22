@@ -103,6 +103,10 @@ struct ToyModel final : Model {
         out.target.assign(ids.size() - first, -0.5F + shift);
         for(std::size_t i = 0; i < queries.ids.size(); ++i) out.queries.push_back(-1.F - 0.125F * float(i % 8));
         for(std::size_t t = first; t < ids.size(); ++t) out.argmax.push_back(ids[t]);
+        // Its own top_k: the target first, then the ids after it, each 0.25 less likely.
+        for(std::size_t t = first; t < ids.size(); ++t)
+            for(std::uint32_t k = 0; k < queries.top_k; ++k)
+                out.top.push_back({Token((ids[t] + Token(k)) % 64), -0.5F + shift - 0.25F * float(k)});
         return out;
     }
 };

@@ -98,12 +98,22 @@ struct Fake final : StateStorage {
     std::uint32_t page_tokens = 1;
     std::vector<Value> rows;                 // pages x page_tokens
     std::vector<std::vector<Value>> slots;   // components x slots
+    std::vector<std::vector<Value>> windows; // window groups x pages x page_tokens
     std::vector<std::array<std::uint32_t,3>> row_copies, slot_copies;
+    std::vector<std::array<std::uint32_t,4>> window_copies;
     long calls = 0, fail_at = -1;
     explicit Fake(const StateCacheConfig& c)
         : page_tokens(c.page_tokens ? c.page_tokens : 1), rows(std::size_t(c.pages)*page_tokens,0) {
         for(const auto& component:c.components) slots.emplace_back(component.slots,0);
-        row_copies.reserve(1 << 14); slot_copies.reserve(1 << 14);
+        for(const auto& group:c.windows) windows.emplace_back(std::size_t(group.pages)*page_tokens,0);
+        row_copies.reserve(1 << 14); slot_copies.reserve(1 << 14); window_copies.reserve(1 << 12);
+    }
+    void copy_window_rows(std::uint32_t window, PageId from, PageId to, std::uint32_t count) override {
+        hook();
+        require(from != to && count && count < page_tokens,"copy_window_rows needs a partial tail and a distinct page");
+        auto& values = windows[window];
+        for(std::uint32_t i = 0; i < count; ++i) values[std::size_t(to)*page_tokens+i] = values[std::size_t(from)*page_tokens+i];
+        if(window_copies.size() < window_copies.capacity()) window_copies.push_back({window,from,to,count});
     }
     void hook() { if(calls++ == fail_at) throw std::runtime_error("injected storage failure"); }
     void copy_rows(PageId from, PageId to, std::uint32_t count) override {
@@ -140,7 +150,7 @@ struct Sim {
     };
     struct Snapshot {
         StateCacheStats stats;
-        std::vector<std::vector<PageId>> tables;
+        std::vector<std::vector<PageId>> tables, windows;
         std::vector<std::vector<SlotId>> lives;
         std::vector<std::uint32_t> counts;
         std::vector<std::uint64_t> layouts;
@@ -156,10 +166,25 @@ struct Sim {
     std::vector<std::map<SlotId,std::uint64_t>> slot_retiring;
     std::set<PageId> last_pages;
     std::vector<std::set<SlotId>> last_slots;
+    // The same for window pages, per group.
+    std::uint32_t W = 0;
+    std::vector<std::map<PageId,std::uint64_t>> window_retiring;
+    std::vector<std::set<PageId>> last_windows;
 
     explicit Sim(const StateCacheConfig& c)
         : config(c), resources(std::size_t(1) << 30,0), storage(c), cache(c,storage,resources),
-          pt(c.page_tokens), C(std::uint32_t(c.components.size())), slot_retiring(C), last_slots(C) {}
+          pt(c.page_tokens), C(std::uint32_t(c.components.size())), slot_retiring(C), last_slots(C),
+          W(std::uint32_t(c.windows.size())), window_retiring(W), last_windows(W) {}
+    // First row the sequence's next row reads in window group w.
+    std::size_t window_first(std::uint32_t w, std::size_t next) const {
+        const std::size_t window = config.windows[w].window;
+        return next+1 > window ? next+1-window : 0;
+    }
+    std::size_t window_holders(std::uint32_t w, PageId page) const {
+        std::size_t count = 0;
+        for(const auto& s:seqs) for(auto held:cache.window_table(s.id,w)) count += held == page;
+        return count;
+    }
     static Value last(const Seq& s) { return s.values.empty() ? 0 : s.values.back(); }
     RecurrentCommit mode(std::uint32_t c) const { return config.components[c].commit; }
     std::size_t rows_of(PageId page, std::uint32_t offset) const { return std::size_t(page)*pt+offset; }
@@ -192,7 +217,13 @@ struct Sim {
     }
     std::uint32_t attach(Seq& s, const Tokens& prompt, std::uint32_t max_reuse) {
         const auto expected = cache.reusable(prompt,max_reuse);
-        const auto n = cache.attach(s.id,prompt,max_reuse);
+        std::uint32_t n = 0;
+        try { n = cache.attach(s.id,prompt,max_reuse); }
+        catch(...) {
+            // A failed snapshot restore may have written the live slots: the engine initializes them again.
+            for(std::uint32_t c = 0; c < C; ++c) storage.slots[c][cache.live_slot(s.id,c)] = 0;
+            throw;
+        }
         require(n == expected,"attach differs from reusable");
         require(n%pt == 0 && n <= max_reuse && n <= prompt.size(),"attach exceeded its cap or page granularity");
         s.tokens.assign(prompt.begin(),prompt.begin()+n);
@@ -234,7 +265,17 @@ struct Sim {
                 fresh_slot(c,slot);
                 storage.slots[c][slot] = value;
             }
+            for(std::uint32_t w = 0; w < W; ++w) {
+                const auto slot = r.window_kv[std::size_t(w)*rows+i];
+                const auto window = cache.window_table(s.id,w);
+                require(window.size() == table.size() && slot.page == window[(first+i)/pt] && slot.offset == (first+i)%pt,
+                        "window row slot differs from the window table");
+                require(window_holders(w,slot.page) == 1,"a window page with another owner was handed out for writing");
+                require(!window_retiring[w].count(slot.page),"window page written before its epoch retired");
+                storage.windows[w][rows_of(slot.page,slot.offset)] = value;
+            }
         }
+        require(r.window_kv.size() == std::size_t(W)*rows,"window row span size differs");
         for(std::uint32_t c = 0; c < C; ++c) {
             require(r.start[c] == cache.live_slot(s.id,c),"round start is not the live slot");
             const auto entries = r.scratch.subspan(std::size_t(c)*rows,rows);
@@ -251,11 +292,21 @@ struct Sim {
         const auto& r = *s.round;
         Value value = last(s);
         for(std::size_t i = 0; i < n; ++i) value = digest(value,s.staged[i]);
+        std::vector<Value> kept(C);
         for(std::uint32_t c = 0; c < C && n; ++c) {
             if(mode(c) == RecurrentCommit::recompute) storage.slots[c][r.scratch[std::size_t(c)*r.rows]] = value;
-            if(mode(c) == RecurrentCommit::in_place) storage.slots[c][cache.live_slot(s.id,c)] = value;
+            if(mode(c) == RecurrentCommit::in_place) {
+                kept[c] = storage.slots[c][cache.live_slot(s.id,c)];
+                storage.slots[c][cache.live_slot(s.id,c)] = value;
+            }
         }
-        cache.commit(s.id,r.id,std::span<const Token>(s.staged).first(n));
+        try { cache.commit(s.id,r.id,std::span<const Token>(s.staged).first(n)); }
+        catch(...) {
+            // A failed snapshot copy leaves the round pending: the in-place update is the engine's to undo.
+            for(std::uint32_t c = 0; c < C && n; ++c)
+                if(mode(c) == RecurrentCommit::in_place) storage.slots[c][cache.live_slot(s.id,c)] = kept[c];
+            throw;
+        }
         for(std::size_t i = 0; i < n; ++i) { s.values.push_back(digest(last(s),s.staged[i])); s.tokens.push_back(s.staged[i]); }
         s.round.reset(); s.staged.clear();
     }
@@ -273,6 +324,7 @@ struct Sim {
         const auto closed = completed >= cache.epoch() ? cache.epoch() : completed;
         cache.retire(completed);
         std::erase_if(page_retiring,[&](const auto& entry) { return entry.second <= closed; });
+        for(auto& pages:window_retiring) std::erase_if(pages,[&](const auto& entry) { return entry.second <= closed; });
         for(auto& slots:slot_retiring) std::erase_if(slots,[&](const auto& entry) { return entry.second <= closed; });
     }
     Snapshot snapshot() const {
@@ -281,6 +333,10 @@ struct Sim {
         for(const auto& s:seqs) {
             const auto table = cache.block_table(s.id);
             shot.tables.emplace_back(table.begin(),table.end());
+            for(std::uint32_t w = 0; w < W; ++w) {
+                const auto window = cache.window_table(s.id,w);
+                shot.windows.emplace_back(window.begin(),window.end());
+            }
             std::vector<SlotId> lives;
             for(std::uint32_t c = 0; c < C; ++c) lives.push_back(cache.live_slot(s.id,c));
             shot.lives.push_back(lives);
@@ -291,7 +347,7 @@ struct Sim {
     }
     // Exact equality, except that a failed copy-on-write which had to evict may cost that one cached page.
     static bool unchanged(const Snapshot& a, const Snapshot& b) {
-        if(a.tables != b.tables || a.lives != b.lives || a.counts != b.counts || a.layouts != b.layouts) return false;
+        if(a.tables != b.tables || a.windows != b.windows || a.lives != b.lives || a.counts != b.counts || a.layouts != b.layouts) return false;
         if(same_stats(a.stats,b.stats)) return true;
         auto evicted = a.stats;
         evicted.cached_pages -= 1; evicted.free_pages += 1; evicted.indexed_pages -= 1; evicted.evictions += 1;
@@ -316,6 +372,13 @@ struct Sim {
         held(pages,slots);
         for(auto page:last_pages) if(!pages.count(page)) page_retiring[page] = cache.epoch();
         for(auto page:pages) page_retiring.erase(page);   // a re-attached page is read-only
+        for(std::uint32_t w = 0; w < W; ++w) {
+            std::set<PageId> windows;
+            for(const auto& s:seqs) for(auto page:cache.window_table(s.id,w)) if(page != no_page) windows.insert(page);
+            for(auto page:last_windows[w]) if(!windows.count(page)) window_retiring[w][page] = cache.epoch();
+            for(auto page:windows) window_retiring[w].erase(page);
+            last_windows[w] = windows;
+        }
         for(std::uint32_t c = 0; c < C; ++c) {
             for(auto slot:last_slots[c]) if(!slots[c].count(slot)) slot_retiring[c][slot] = cache.epoch();
             last_slots[c] = slots[c];
@@ -345,6 +408,27 @@ struct Sim {
                     if(slot != no_slot) require(slots[c].insert(slot).second,"a scratch slot is shared");
             }
         }
+        for(std::uint32_t w = 0; w < W; ++w) {
+            std::set<PageId> windows;
+            for(const auto& s:seqs) {
+                const auto table = cache.window_table(s.id,w);
+                const auto block = cache.block_table(s.id);
+                require(table.size() == block.size(),"window table size differs from the block table");
+                std::size_t present = 0;
+                for(auto page:table) if(page != no_page) { windows.insert(page); ++present; }
+                require(std::set<PageId>(table.begin(),table.end()).size() == present+(present < table.size()),
+                        "a window table holds a page twice");
+                const auto values = s.values;
+                for(auto r = window_first(w,s.tokens.size()); r < s.tokens.size(); ++r)
+                    require(table[r/pt] != no_page && storage.windows[w][rows_of(table[r/pt],std::uint32_t(r%pt))] == values[r],
+                            "window rows the next row reads differ");
+            }
+            const auto ws = cache.window_stats(w);
+            require(ws.live_pages == windows.size(),"live window pages differ from the union of window tables");
+            require(std::uint64_t(ws.free_pages)+ws.cached_pages+ws.retiring_pages+ws.live_pages == config.windows[w].pages,
+                    "window page accounting");
+            require(ws.cached_pages <= ws.indexed_pages,"cached window pages must be linked");
+        }
         const auto st = cache.stats();
         require(st.live_pages == pages.size(),"live pages differ from the union of block tables");
         require(std::uint64_t(st.free_pages)+st.cached_pages+st.retiring_pages+st.live_pages == config.pages,"page accounting");
@@ -352,7 +436,7 @@ struct Sim {
         require(st.sequences == seqs.size(),"open sequence count differs");
         std::uint64_t live_slots = 0, total = 0;
         for(std::uint32_t c = 0; c < C; ++c) { live_slots += slots[c].size(); total += config.components[c].slots; }
-        require(st.live_slots == live_slots && st.free_slots+st.retiring_slots+st.live_slots == total,"slot accounting");
+        require(st.live_slots == live_slots+st.snapshots && st.free_slots+st.retiring_slots+st.live_slots == total,"slot accounting");
         track();
     }
     // Every committed full page of s is reusable now (default hash, no eviction since its chain began).
@@ -401,6 +485,14 @@ void config_rules() {
     rejects_as<std::invalid_argument>([&] { build([](auto& c) { c.pages = 3; }); },"max_tokens exceeds pages");
     rejects_as<std::invalid_argument>([&] { build([](auto& c) {
         c.prefix_cache = true; c.identity = 1; c.components = {component(RecurrentCommit::in_place,1)}; }); },"recurrent components");
+    rejects_as<std::invalid_argument>([&] { build([](auto& c) {
+        c.prefix_cache = true; c.identity = 1; c.components = {component(RecurrentCommit::in_place,2)}; c.components[0].snapshots = 2; }); },
+        "snapshots");
+    rejects_as<std::invalid_argument>([&] { build([](auto& c) { c.pages = 0; c.components = {component(RecurrentCommit::in_place,1)};
+        c.windows = {{4,2}}; }); },"windows require pages");
+    rejects_as<std::invalid_argument>([&] { build([](auto& c) { c.windows = {{4,0}}; }); },"window must be positive");
+    rejects_as<std::invalid_argument>([&] { build([](auto& c) { c.windows = {{2,2}}; }); },"window pages");
+    rejects_as<std::invalid_argument>([&] { build([](auto& c) { c.windows = {{no_page,2}}; }); },"page id range");
     rejects_as<std::invalid_argument>([&] { build([](auto& c) { c.prefix_cache = true; }); },"identity");
     rejects_as<std::invalid_argument>([&] { build([](auto& c) {
         c.components = {component(RecurrentCommit::column_checkpoints,2)}; }); },"cover every sequence");
@@ -419,6 +511,8 @@ void config_rules() {
     build([](auto& c) { c.components = {component(RecurrentCommit::column_checkpoints,3),component(RecurrentCommit::recompute,2),
                                          component(RecurrentCommit::in_place,1)}; });
     build([](auto& c) { c.pages = 0; c.components = {component(RecurrentCommit::in_place,1)}; });
+    build([](auto& c) { c.prefix_cache = true; c.identity = 1; c.components = {component(RecurrentCommit::in_place,3)};
+                        c.components[0].snapshots = 1; c.windows = {{4,3}}; });
     StateCache cache(base,storage,resources);
     require(cache.config().pages == 4 && cache.config().page_tokens == 2,"config differs");
     require(cache.epoch() == 1,"epochs start at one");
@@ -1397,9 +1491,10 @@ void walk(StateCacheConfig config, int steps, std::uint32_t seed, bool roomy = f
         return s.doc >= 0 && std::equal(s.tokens.begin(),s.tokens.end(),docs[std::size_t(s.doc)].begin());
     };
     int failures = 0, exhausted = 0, starved = 0, reused = 0, commits = 0, complete = 0;
-    const bool oracle = config.prefix_cache && !config.hash;
+    // Snapshots and windows end reuse early, so the completeness oracle covers attention-only caches.
+    const bool oracle = config.prefix_cache && !config.hash && config.components.empty() && config.windows.empty();
     for(int step = 0; step < steps; ++step) {
-        const auto before = sim.snapshot();
+        auto before = sim.snapshot();
         const bool inject = rng()%6 == 0;
         if(inject) sim.storage.fail_at = sim.storage.calls;
         try {
@@ -1409,6 +1504,7 @@ void walk(StateCacheConfig config, int steps, std::uint32_t seed, bool roomy = f
             case 4: case 18: if(auto* s = pick(true)) sim.fork(*s); break;
             case 5: case 6: {
                 auto& s = sim.open();
+                before = sim.snapshot();   // a failed attach (snapshot restore) leaves the opened sequence empty
                 const auto d = rng()%docs.size();
                 Tokens prompt(docs[d].begin(),docs[d].begin()+1+std::ptrdiff_t(rng()%config.max_tokens));
                 if(rng()%3 == 0) prompt.back() = Token(3+rng()%2);
@@ -1448,8 +1544,19 @@ void walk(StateCacheConfig config, int steps, std::uint32_t seed, bool roomy = f
                 if(auto* s = pending(); s && rng()%2) sim.discard(*s);
                 else if(auto* q = pick(true); q && !q->tokens.empty()) {
                     const auto keep = std::uint32_t(rng()%(q->tokens.size()+1));
+                    // Dropped window pages are a window table's leading no_page entries.
+                    bool dropped = false;
+                    for(std::uint32_t w = 0; w < sim.W; ++w) {
+                        const auto table = cache.window_table(q->id,w);
+                        std::size_t lead = 0;
+                        while(lead < table.size() && table[lead] == no_page) ++lead;
+                        dropped = dropped || sim.window_first(w,keep)/sim.pt < lead;
+                    }
                     if(recurrent && keep != q->tokens.size()) {
                         rejects_as<std::logic_error>([&] { cache.rewind(q->id,keep); },"cannot rewind");
+                        require(Sim::unchanged(before,sim.snapshot()),"rejected rewind changed state");
+                    } else if(dropped && keep != q->tokens.size()) {
+                        rejects_as<std::logic_error>([&] { cache.rewind(q->id,keep); },"dropped window pages");
                         require(Sim::unchanged(before,sim.snapshot()),"rejected rewind changed state");
                     } else sim.rewind(*q,keep);
                 }
@@ -1485,13 +1592,15 @@ void walk(StateCacheConfig config, int steps, std::uint32_t seed, bool roomy = f
     }
     require(failures > 0 && (roomy || starved > 0) && exhausted > starved && commits > steps/10,
             "the walk did not reach storage failures, every kind of exhaustion and commits");
-    require(recurrent || !config.prefix_cache || reused > 0,"the walk never reused a prefix");
+    require((recurrent && !config.prefix_cache) || !config.prefix_cache || reused > 0,"the walk never reused a prefix");
     require(!oracle || complete > steps,"the completeness oracle rarely applied");
     while(!sim.seqs.empty()) sim.close(sim.seqs.front());
     sim.retire(cache.epoch());
     sim.check();
     const auto st = cache.stats();
-    require(st.live_pages == 0 && st.retiring_pages == 0 && st.live_slots == 0 && st.retiring_slots == 0,"walk teardown leaked");
+    require(st.live_pages == 0 && st.retiring_pages == 0 && st.live_slots == st.snapshots && st.retiring_slots == 0,"walk teardown leaked");
+    for(std::uint32_t w = 0; w < config.windows.size(); ++w)
+        require(cache.window_stats(w).live_pages == 0 && cache.window_stats(w).retiring_pages == 0,"walk teardown leaked window pages");
 }
 void randomized() {
     walk(attention(14,3,8,24,5,true),5000,715982);
@@ -1505,6 +1614,19 @@ void randomized() {
     mixed.components = {component(RecurrentCommit::column_checkpoints,30),component(RecurrentCommit::recompute,14),
                         component(RecurrentCommit::in_place,8)};
     walk(mixed,3000,4242);
+    // Sliding-window groups, with and without the prefix cache.
+    auto windowed = attention(20,3,6,24,4,true);
+    windowed.windows = {{12,7},{9,4}};
+    walk(windowed,4000,5150);
+    windowed.prefix_cache = false; windowed.identity = 0;
+    walk(windowed,2000,6161);
+    // Hybrid prefix reuse through snapshots, beside a window group.
+    auto hybrid = attention(16,2,5,20,3,true);
+    hybrid.components = {component(RecurrentCommit::column_checkpoints,16),component(RecurrentCommit::recompute,12),
+                         component(RecurrentCommit::in_place,9)};
+    hybrid.components[0].snapshots = 3; hybrid.components[1].snapshots = 2; hybrid.components[2].snapshots = 2;
+    hybrid.windows = {{12,5}};
+    walk(hybrid,4000,7272);
 }
 
 void capacity() {
@@ -1725,6 +1847,194 @@ void hot_path() {
     require(allocations.load() == before,"the state cache allocated after construction");
 }
 
+// Hybrid prefix reuse: the recurrent state after a full page is snapshotted at commit when every component has it,
+// attach restores it with the pages, a FIFO quota bounds snapshots per component, a failing snapshot copy leaves the
+// round pending, and evicted pages take their snapshots along.
+void snapshots() {
+    auto c = attention(16,4,3,64,6,true);
+    c.components = {component(RecurrentCommit::column_checkpoints,3+6+4),component(RecurrentCommit::recompute,3+1+4),
+                    component(RecurrentCommit::in_place,3+4)};
+    for(auto& k:c.components) k.snapshots = 4;
+    Sim sim(c);
+    auto& cache = sim.cache;
+    auto& a = sim.open();
+    sim.begin(a,range(1,6)); sim.commit(a,6);   // page 0 fills inside the round: only column checkpoints hold that state
+    require(cache.stats().snapshots == 0,"a boundary without every component's state took a snapshot");
+    sim.begin(a,range(7,2)); sim.commit(a,2);   // the round ends on page 1's boundary: every component has the state
+    require(cache.stats().snapshots == 3,"each component snapshots page 1");
+    sim.check();
+    Tokens prompt = a.tokens;
+    prompt.push_back(40); prompt.push_back(41);
+    require(cache.reusable(prompt,std::uint32_t(prompt.size()-1)) == 8,"reuse ends at the page with snapshots");
+    sim.retire(cache.epoch());
+    auto& b = sim.open();
+    require(sim.attach(b,prompt,std::uint32_t(prompt.size()-1)) == 8,"attach reuses two pages");
+    require(cache.stats().prefix_hits == 2,"reused pages counted");
+    sim.check();   // b's live slots hold the state after the 8 reused tokens
+    sim.begin(b,{40,41}); sim.commit(b,2);
+    sim.check();
+    Tokens early = range(1,4);
+    early.push_back(99); early.push_back(98);
+    require(cache.reusable(early,5) == 0,"page 0 has no snapshot to end at");
+    sim.close(a); sim.close(b);
+    sim.retire(cache.epoch());
+    cache.evict(16);
+    require(cache.stats().snapshots == 3 && cache.reusable(prompt,9) == 0,"evicted pages took their snapshots; the slots stay pooled");
+    sim.retire(cache.epoch());
+    sim.check();
+
+    // One round fills three pages; a quota of two keeps the two newest.
+    auto q = attention(16,2,2,32,6,true);
+    q.components = {component(RecurrentCommit::column_checkpoints,2+6+2)};
+    q.components[0].snapshots = 2;
+    Sim fifo(q);
+    auto& d = fifo.open();
+    fifo.begin(d,range(1,6)); fifo.commit(d,6);
+    require(fifo.cache.stats().snapshots == 2,"the oldest snapshot is dropped at the quota");
+    Tokens p6 = range(1,6), p4 = range(1,4), p2 = range(1,2);
+    p6.push_back(50); p4.push_back(60); p4.push_back(61); p2.push_back(70); p2.push_back(71);
+    require(fifo.cache.reusable(p6,6) == 6 && fifo.cache.reusable(p4,5) == 4 && fifo.cache.reusable(p2,3) == 0,
+            "reuse ends at the newest snapshot each prompt reaches");
+    fifo.check();
+    // A failing snapshot copy publishes nothing and leaves the round pending; the retry commits.
+    fifo.retire(fifo.cache.epoch());
+    auto& e = fifo.open();
+    fifo.begin(e,range(100,4));
+    const auto before = fifo.cache.stats();
+    fifo.storage.fail_at = fifo.storage.calls;
+    rejects([&] { fifo.commit(e,4); },"injected storage failure");
+    require(fifo.cache.staged(e.id) == 4 && fifo.cache.committed(e.id) == 0 && same_stats(before,fifo.cache.stats()),
+            "a failed snapshot copy changed the cache");
+    fifo.storage.fail_at = -1;
+    fifo.commit(e,4);
+    fifo.check();
+    require(fifo.cache.stats().snapshots == 2,"the retry snapshots within the quota");
+}
+
+// Sliding-window groups: pages wholly older than the window leave the window table while full pages stay linked for
+// reuse; attach needs the pages its window reads; shared window tails are copied before writing; rewind cannot reach
+// dropped pages; window capacity is checked before anything changes, and nothing allocates after construction.
+void windows() {
+    auto c = attention(32,4,4,64,4,true);
+    c.windows = {{8,6}};
+    Fake storage(c);
+    Resources resources(std::size_t(1) << 24,0);
+    StateCache cache(c,storage,resources);
+    const auto write = [&](const Round& r, const Tokens& all) {
+        const auto values = digests(all);
+        require(r.window_kv.size() == r.rows,"one window row per staged row");
+        for(std::uint32_t i = 0; i < r.rows; ++i) {
+            const auto row = r.first_row+i;
+            storage.rows[std::size_t(r.kv[i].page)*4+r.kv[i].offset] = values[row];
+            storage.windows[0][std::size_t(r.window_kv[i].page)*4+r.window_kv[i].offset] = values[row];
+        }
+    };
+    // The rows the next row reads are present with their values; pages wholly before them are dropped.
+    const auto expect_window = [&](SequenceId id, const Tokens& tokens, bool dropped = true) {
+        const auto table = cache.window_table(id,0);
+        const auto n = std::uint32_t(tokens.size());
+        require(table.size() == (n+3)/4,"window table size differs from the block table");
+        const auto values = digests(tokens);
+        const auto first = n+1 > 6 ? n+1-6 : 0u;
+        for(std::uint32_t i = 0; dropped && i < first/4; ++i) require(table[i] == no_page,"a page older than the window stayed");
+        for(auto r = first; r < n; ++r)
+            require(table[r/4] != no_page && storage.windows[0][std::size_t(table[r/4])*4+r%4] == values[r],"window rows differ");
+    };
+    const auto step = [&](SequenceId id, Tokens& tokens, const Tokens& more) {
+        const auto r = cache.begin(id,std::uint32_t(more.size()));
+        auto all = tokens;
+        all.insert(all.end(),more.begin(),more.end());
+        write(r,all);
+        cache.commit(id,r.id,more);
+        tokens = all;
+        cache.retire(cache.epoch());
+        expect_window(id,tokens);
+    };
+    const auto a = cache.open();
+    Tokens ta;
+    for(Token t = 1; t <= 24; t += 4) step(a,ta,range(t,4));
+    require(cache.window_stats(0).live_pages == 2 && cache.window_stats(0).indexed_pages == 6 && cache.window_stats(0).cached_pages == 4,
+            "the window holds two pages; every full page stays linked");
+    cache.close(a);
+    cache.retire(cache.epoch());
+    // A new sequence reuses the 24 tokens with the two window pages row 24 reads.
+    const auto b = cache.open();
+    Tokens prompt = ta;
+    prompt.push_back(90);
+    require(cache.reusable(prompt,24) == 24 && cache.attach(b,prompt,24) == 24,"reuse with the window's pages");
+    expect_window(b,ta);
+    Tokens tb = ta;
+    step(b,tb,{90,91});
+    // A fork shares b's partial window tail: the first write copies it.
+    const auto copies = storage.window_copies.size();
+    const auto f = cache.fork(b);
+    Tokens tf = tb;
+    storage.fail_at = storage.calls;   // the copy fails once: nothing changes
+    const auto stats = cache.window_stats(0);
+    rejects([&] { cache.begin(f,1); },"injected storage failure");
+    require(same_stats(stats,cache.window_stats(0)) && cache.staged(f) == 0,"a failed window copy changed the cache");
+    storage.fail_at = -1;
+    step(f,tf,{92});
+    require(storage.window_copies.size() == copies+1,"a shared window tail is copied before writing");
+    expect_window(b,tb);
+    rejects_as<std::logic_error>([&] { cache.rewind(f,20); },"dropped window pages");
+    cache.rewind(f,26);
+    tf.resize(26);
+    expect_window(f,tf);
+    // Other prompts take the window pool: once a page row 24 reads is evicted, reuse stops short of it.
+    const auto g = cache.open();
+    Tokens tg;
+    for(Token t = 500; cache.reusable(prompt,24) == 24 && t < 600; t += 4) step(g,tg,range(t,4));
+    const auto reuse = cache.reusable(prompt,24);
+    require(reuse < 24 && cache.stats().prefix_misses == 0,"evicted window pages cap reuse");
+    const auto h = cache.open();
+    require(cache.attach(h,prompt,24) == reuse,"attach agrees with reusable");
+    expect_window(h,Tokens(prompt.begin(),prompt.begin()+reuse));
+    for(const auto id:{b,f,g,h}) cache.close(id);
+    cache.retire(cache.epoch());
+    require(cache.window_stats(0).live_pages == 0 && cache.stats().live_pages == 0,"every page returned");
+
+    // Window capacity is checked before anything changes.
+    auto small = attention(32,4,2,64,4);
+    small.windows = {{4,6}};
+    Fake tight_storage(small);
+    StateCache tight(small,tight_storage,resources);
+    const auto x = tight.open(), y = tight.open();
+    for(const auto id:{x,y}) { const auto r = tight.begin(id,4); tight.commit(id,r.id,range(1,4)); const auto r2 = tight.begin(id,4); tight.commit(id,r2.id,range(5,4)); }
+    const auto full = tight.window_stats(0);
+    require(full.free_pages == 0 && !tight.try_begin(x,4) && same_stats(full,tight.window_stats(0)),"window pages exhausted");
+    rejects_as<CapacityExhausted>([&] { tight.begin(x,4); },"window pages exhausted");
+
+    // Window groups and snapshots together allocate nothing after construction.
+    auto hybrid = attention(32,4,2,64,4,true);
+    hybrid.components = {component(RecurrentCommit::recompute,2+1+4)};
+    hybrid.components[0].snapshots = 4;
+    hybrid.windows = {{12,6}};
+    Fake hooks(hybrid);
+    StateCache mixed(hybrid,hooks,resources);
+    const Tokens doc = range(1,16), inputs = range(1,4);
+    const auto before = allocations.load();
+    for(int i = 0; i < 100; ++i) {
+        hooks.slot_copies.clear(); hooks.window_copies.clear(); hooks.row_copies.clear();
+        const auto s = mixed.open();
+        mixed.attach(s,doc,15);
+        while(mixed.committed(s) < 16) {
+            const auto start = mixed.committed(s);
+            const auto r = mixed.begin(s,4-start%4);
+            mixed.commit(s,r.id,std::span<const Token>(doc).subspan(start,4-start%4));
+            mixed.retire(mixed.epoch());   // one step at a time, as a single-stream engine retires
+        }
+        const auto t = mixed.fork(s);
+        const auto r = mixed.begin(t,2);
+        mixed.commit(t,r.id,std::span<const Token>(inputs).first(2));
+        static_cast<void>(mixed.window_table(t,0)); static_cast<void>(mixed.window_stats(0)); static_cast<void>(mixed.reusable(doc,15));
+        mixed.close(s); mixed.close(t);
+        mixed.retire(mixed.epoch());
+        if(i % 10 == 9) mixed.evict(32);
+    }
+    require(allocations.load() == before,"window groups or snapshots allocated after construction");
+}
+
 void checkpoints() {
     const std::array<std::size_t,3> accepted{0,2,5};   // physical nodes; rejected siblings are skipped
     require(!checkpoint_node(64,accepted,64),"the round start has no verify node");
@@ -1739,13 +2049,13 @@ void checkpoints() {
 }
 
 int main(int argc, char** argv) {
-    const std::array<std::pair<std::string_view,void(*)()>,20> cases{{
+    const std::array<std::pair<std::string_view,void(*)()>,22> cases{{
         {"state_config",config_rules},{"state_transactions",transactions},{"state_ownership",ownership},
         {"state_prefixes",prefixes},{"state_collisions",collisions},{"state_reuse",reuse},
         {"state_completeness",completeness},{"state_index",index_probing},{"state_lru",lru},{"state_epochs",epochs},
         {"state_forks",forks},{"state_recurrent",recurrent},{"state_hybrid",hybrid},{"state_failures",failures},
         {"state_randomized",randomized},{"state_capacity",capacity},{"state_layout",layout},{"state_metadata",metadata},
-        {"state_hot_path",hot_path},{"state_checkpoints",checkpoints}}};
+        {"state_hot_path",hot_path},{"state_checkpoints",checkpoints},{"state_snapshots",snapshots},{"state_windows",windows}}};
     try {
         const std::string_view name = argc > 1 ? argv[1] : "";
         bool found = false;

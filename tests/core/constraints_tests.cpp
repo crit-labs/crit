@@ -9,6 +9,8 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <memory>
+#include <typeinfo>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -209,6 +211,121 @@ void grammar_matcher() {
         require(c.ended(), "EOS agrees with the choice oracle");
     }
 }
+// The trie walk and the allowed-set cache against the full scan (allowed_by_scan: every token a fork accepts) along
+// seeded generations with forks and rewinds, over a vocabulary of single bytes, multi-byte and duplicate pieces,
+// split UTF-8, control tokens and EOS; the bitmask readout; cache binding; and a grammar whose chart budget runs out,
+// where a cached set must never hide the scan's length_error.
+void trie_walks() {
+    std::uint64_t state = 0x5eed;
+    const auto next = [&] { state = state*6364136223846793005ULL + 1442695040888963407ULL; return state >> 33; };
+    std::vector<std::string> pieces;
+    for(unsigned int byte = 0; byte < 256; ++byte) pieces.emplace_back(1, static_cast<char>(byte));
+    const std::string alphabet = "{}[],:\" 0123456789.eE-+truefalsnabcxyz\\\xc3\xa9\xe2\x82\xac\n";
+    for(int i = 0; i < 1200; ++i) {
+        std::string piece;
+        const auto length = 2 + next() % 7;
+        for(std::size_t j = 0; j < length; ++j) piece.push_back(alphabet[next() % alphabet.size()]);
+        pieces.push_back(piece);
+    }
+    pieces.push_back("{\"");
+    pieces.push_back("{\"");                                     // a duplicate piece: both ids are allowed together
+    pieces.emplace_back();                                       // a control token: never allowed
+    const Token eos = Token(pieces.size());
+    pieces.emplace_back();
+    const auto v = vocabulary(pieces, eos);
+    int length_errors = 0;   // steps where both the walk and the scan ran out of chart budget
+    require(v->longest_piece() == 8 && v->trie_nodes() < v->size() * 8, "the trie shares prefixes");
+    const auto compare = [&](const TokenMatcher& m) -> Ids {
+        Ids walked, scanned;
+        bool walk_threw = false, scan_threw = false;
+        std::string walk_error, scan_error;
+        try { walked = m.allowed(); } catch(const std::exception& e) { walk_threw = true; walk_error = typeid(e).name(); }
+        try { scanned = allowed_by_scan(m); } catch(const std::exception& e) { scan_threw = true; scan_error = typeid(e).name(); }
+        require(walk_threw == scan_threw && walk_error == scan_error, "the trie walk and the scan throw differently");
+        length_errors += walk_threw && walk_error == typeid(std::length_error).name();
+        require(walked == scanned, "the trie walk differs from the full scan");
+        if(!walk_threw) {
+            std::vector<std::uint32_t> bits((m.vocabulary() + 31) / 32);
+            m.allowed_bits(bits);
+            Ids from_bits;
+            for(std::size_t t = 0; t < m.vocabulary(); ++t) if(bits[t / 32] >> (t % 32) & 1u) from_bits.push_back(Token(t));
+            require(from_bits == walked, "the bitmask differs from allowed()");
+        }
+        return walked;
+    };
+    const auto generate = [&](TokenMatcher& m, int steps) {
+        std::vector<std::unique_ptr<TokenMatcher>> forks;
+        for(int i = 0; i < steps && !m.ended(); ++i) {
+            Ids allowed;
+            try { allowed = compare(m); } catch(...) { throw; }
+            if(allowed.empty()) return;
+            m.append(allowed[next() % allowed.size()]);
+            if(next() % 5 == 0 && m.size() > 1) m.rewind(m.size() - 1 - next() % std::min<std::size_t>(m.size() - 1, 3));
+            if(next() % 7 == 0) { forks.push_back(m.fork()); compare(*forks.back()); }
+        }
+    };
+    // JSON objects: every walk shares one cache, which must report hits for repeated cursors.
+    const auto shared = std::make_shared<AllowedCache>();
+    for(int walk = 0; walk < 12; ++walk) {
+        JsonObjectMatcher json(v, JsonLimits{6, 300, 80}, shared);
+        try { generate(json, 60); } catch(const std::domain_error&) {}
+    }
+    require(shared->stats().hits > 0 && shared->stats().entries > 0, "repeated JSON cursors hit the cache");
+    rejects([&] { JsonObjectMatcher(v, JsonLimits{7, 300, 80}, shared); });   // other limits: another language
+    // Choices sharing prefixes, split across pieces.
+    std::vector<std::string> words;
+    for(int i = 0; i < 200; ++i) {
+        std::string word;
+        const auto length = 1 + next() % 12;
+        for(std::size_t j = 0; j < length; ++j) word.push_back(alphabet[next() % 20]);
+        words.push_back(word);
+    }
+    const auto choice_grammar = choices(words);
+    for(int walk = 0; walk < 20; ++walk) {
+        ChoiceMatcher choice(choice_grammar, v);
+        generate(choice, 20);
+    }
+    // A recursive grammar: nested arrays of digit runs with optional spaces.
+    const auto nested = std::make_shared<const ByteGrammar>(4, 0, std::vector<ByteGrammar::Production>{
+        {0, {91, 257, 93}},                    // S -> [ L ]
+        {1, {}}, {1, {258}}, {1, {258, 44, 257}}, {1, {32, 257}},   // L -> | E | E , L | ' ' L
+        {2, {259}}, {2, {259, 258}}, {2, {256}},                    // E -> D | D E | S
+        {3, {48}}, {3, {49}}, {3, {50}}, {3, {55}}});               // D -> 0 | 1 | 2 | 7
+    for(int walk = 0; walk < 12; ++walk) {
+        GrammarMatcher grammar(nested, v);
+        generate(grammar, 40);
+    }
+    // A chart budget that runs out mid-generation: the walk and the scan raise the same length_error at the same
+    // step, before and after the cache holds sets of equal structure.
+    const auto tight = std::make_shared<AllowedCache>();
+    length_errors = 0;
+    for(int walk = 0; walk < 12; ++walk) {
+        GrammarMatcher grammar(nested, v, GrammarLimits{4096, 4096, 4096, 48}, tight);
+        generate(grammar, 200);
+    }
+    require(length_errors > 0 && tight->stats().hits > 0, "the budget ran out and the cache was used");
+}
+
+// The allowed-set cache keeps the most recently used entries within its byte bound and evicts the least recently
+// used one first, in constant time however many entries it holds.
+void allowed_cache() {
+    AllowedCache cache(3 * (8 + 4 + 64));   // three entries of one id and an 8-byte key
+    const auto ids = std::make_shared<const std::vector<Token>>(Ids{1});
+    const auto key = [](int i) { return std::string(8, char('a' + i)); };
+    for(int i = 0; i < 3; ++i) cache.insert(key(i), ids, 0);
+    require(cache.find(key(0), 0) != nullptr, "an entry within the bound is found");
+    cache.insert(key(3), ids, 0);   // evicts key 1, the least recently used
+    require(!cache.find(key(1), 0) && cache.find(key(0), 0) && cache.find(key(2), 0) && cache.find(key(3), 0), "LRU eviction order");
+    require(cache.stats().entries == 3, "three entries kept");
+    AllowedCache many(std::size_t{1} << 22);
+    for(int i = 0; i < 200000; ++i) many.insert(std::to_string(i), ids, 0);   // fills and evicts: constant time each
+    require(many.stats().entries < 200000 && many.find("199999", 0) && !many.find("0", 0), "a full cache keeps the newest entries");
+    const auto budget = std::make_shared<const std::vector<Token>>(Ids{2});
+    AllowedCache grammar;
+    grammar.insert("g", budget, 50);
+    require(!grammar.find("g", 49) && grammar.find("g", 50), "an entry stands only where the remaining budget covers it");
+}
+
 void grammar_corpus(const char* path) {
     std::ifstream input(path, std::ios::binary);
     std::string text((std::size_t{4} << 20) + 1, '\0');
@@ -295,7 +412,8 @@ int main(int argc, char** argv) {
         const std::vector<std::pair<std::string_view, std::function<void()>>> cases{
             {"constraint_vocabulary", vocabularies}, {"constraint_choices", choice_matcher},
             {"constraint_json", json_matcher}, {"constraint_grammar", grammar_matcher},
-            {"constraint_readout", readout}, {"constraint_sampling", sampling}};
+            {"constraint_readout", readout}, {"constraint_sampling", sampling}, {"constraint_trie", trie_walks},
+            {"constraint_cache", allowed_cache}};
         bool found = false;
         for(const auto& [case_name, run]:cases) if(name == "all" || name == case_name) {
             run();

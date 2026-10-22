@@ -1,7 +1,7 @@
 // Device token selection against Core's host sampler: greedy ties, top-k 1 and tiny
 // top-p reduce to greedy, seeded draws repeat and advance the position, chosen tokens
-// equal crit::core::Sampler's away from FP32 rounding of a boundary, and frequencies
-// follow the tempered distribution.
+// equal crit::core::Sampler's away from FP32 rounding of a boundary, frequencies
+// follow the tempered distribution, and constraint bitmasks mask logits as the host does.
 #include "sampling.h"
 
 #include <crit/sampling.h>
@@ -158,6 +158,53 @@ int main() {
         for(int i = 0; i < 4; ++i) {
             const double pr = std::exp(double(lg[i])) / z, got = double(hist[i]) / N;
             require(std::abs(got - pr) < 4 * std::sqrt(pr * (1 - pr) / N) + 1e-3, "frequency differs from the distribution");
+        }
+
+        // Device masks from a constraint's bitmask: exactly the host's -inf pattern on strided rows, and selection on
+        // the masked row equal to Core's constrained Sampler (AllowedTokens), ties to the lowest allowed id.
+        {
+            constexpr int rows = 3, stride = V + 7, words = (V + 31) / 32, mask_stride = words + 3;
+            std::vector<float> block(static_cast<std::size_t>(rows) * stride);
+            for(auto& x : block) x = std::round(n(rng) * 4.f) / 4.f;
+            std::vector<std::uint32_t> mask(static_cast<std::size_t>(rows) * mask_stride);
+            std::uniform_int_distribution<std::uint32_t> bits;
+            for(auto& w : mask) w = bits(rng) & bits(rng);   // about a quarter of the tokens allowed
+            float* d_block = nullptr;
+            std::uint32_t* d_mask = nullptr;
+            ok(cudaMalloc(&d_block, sizeof(float) * block.size()), "malloc");
+            ok(cudaMalloc(&d_mask, sizeof(std::uint32_t) * mask.size()), "malloc");
+            ok(cudaMemcpy(d_block, block.data(), sizeof(float) * block.size(), cudaMemcpyHostToDevice), "upload");
+            ok(cudaMemcpy(d_mask, mask.data(), sizeof(std::uint32_t) * mask.size(), cudaMemcpyHostToDevice), "upload");
+            ok(ts::enqueue_mask(d_block, V, stride, d_mask, mask_stride, rows, nullptr), "mask");
+            std::vector<float> masked(block.size());
+            ok(cudaMemcpy(masked.data(), d_block, sizeof(float) * masked.size(), cudaMemcpyDeviceToHost), "download");
+            for(int r = 0; r < rows; ++r)
+                for(int t = 0; t < stride; ++t) {
+                    const std::size_t i = static_cast<std::size_t>(r) * stride + t;
+                    const bool allowed = t >= V || ((mask[static_cast<std::size_t>(r) * mask_stride + t / 32] >> (t % 32)) & 1u);
+                    require(allowed ? masked[i] == block[i] : std::isinf(masked[i]) && masked[i] < 0, "device mask differs from the host's");
+                }
+            for(int r = 0; r < rows; ++r) {
+                std::vector<float> raw(block.begin() + static_cast<std::ptrdiff_t>(r) * stride, block.begin() + static_cast<std::ptrdiff_t>(r) * stride + V);
+                std::vector<cc::Token> ids;
+                for(int t = 0; t < V; ++t) if((mask[static_cast<std::size_t>(r) * mask_stride + t / 32] >> (t % 32)) & 1u) ids.push_back(t);
+                s.load(std::vector<float>(masked.begin() + static_cast<std::ptrdiff_t>(r) * stride, masked.begin() + static_cast<std::ptrdiff_t>(r) * stride + V));
+                s.set(ts::Params{});
+                cc::SamplingParams greedy;
+                greedy.temperature = 0.0;
+                require(s.draw() == host.sample(raw, cc::AllowedTokens{ids}, greedy, empty).token, "masked greedy differs from Core's constrained choice");
+                ts::Params q;
+                q.temperature = 0.8f;
+                q.top_k = 30;
+                q.seed = 77 + static_cast<std::uint64_t>(r);
+                s.set(q);
+                const int got = s.draw();
+                require(std::binary_search(ids.begin(), ids.end(), got), "a masked draw left the allowed set");
+            }
+            require(ts::enqueue_mask(d_block, V, V - 1, d_mask, words, 1, nullptr) == cudaErrorInvalidValue, "short logit stride");
+            require(ts::enqueue_mask(d_block, V, V, d_mask, words - 1, 1, nullptr) == cudaErrorInvalidValue, "short mask stride");
+            cudaFree(d_block);
+            cudaFree(d_mask);
         }
 
         require(ts::enqueue_select(nullptr, V, s.params, s.cand_v, s.cand_i, s.out, nullptr) == cudaErrorInvalidValue, "null logits");

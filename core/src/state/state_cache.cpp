@@ -45,17 +45,28 @@ void validate(const StateCacheConfig& c) {
     if(c.pages && c.max_tokens > std::uint64_t(c.pages)*c.page_tokens)
         throw std::invalid_argument("max_tokens exceeds pages x page_tokens");
     if(!c.pages && c.components.empty()) throw std::invalid_argument("state cache requires pages or components");
-    // Pages are implied: an attention-free cache has components, which the prefix cache rejects.
-    if(c.prefix_cache && !c.components.empty())
-        throw std::invalid_argument("prefix cache does not support recurrent components");
+    if(c.prefix_cache && !c.pages) throw std::invalid_argument("prefix cache requires pages");
     if(c.prefix_cache && !c.identity) throw std::invalid_argument("prefix cache requires a nonzero identity");
     for(const auto& component:c.components) {
         if(component.commit != RecurrentCommit::column_checkpoints && component.commit != RecurrentCommit::recompute &&
            component.commit != RecurrentCommit::in_place)
             throw std::invalid_argument("unknown recurrent commit mode");
         if(component.slots == no_slot) throw std::invalid_argument("component slots exceed the slot id range");
-        if(component.slots < std::uint64_t(c.sequences)+scratch_for(component.commit,c.max_round_rows))
-            throw std::invalid_argument("component slots must cover every sequence and one round");
+        // Reuse of a recurrent prefix needs its state after the reused pages.
+        if(c.prefix_cache && !component.snapshots)
+            throw std::invalid_argument("prefix cache with recurrent components requires snapshots for each");
+        const auto snapshots = c.prefix_cache ? std::uint64_t(component.snapshots) : 0u;
+        if(component.slots < std::uint64_t(c.sequences)+scratch_for(component.commit,c.max_round_rows)+snapshots)
+            throw std::invalid_argument("component slots must cover every sequence, one round and the snapshots");
+    }
+    if(!c.windows.empty() && !c.pages) throw std::invalid_argument("windows require pages");
+    const auto table = c.pages ? pages_for(c.max_tokens,c.page_tokens) : 0u;
+    for(const auto& group:c.windows) {
+        if(!group.window) throw std::invalid_argument("window must be positive");
+        if(group.pages == no_page) throw std::invalid_argument("window pages exceed the page id range");
+        // One sequence's window, a round and a copied tail must fit, as must a sequence's whole table.
+        const auto span = std::min<std::uint64_t>(table,pages_for(std::uint64_t(group.window)+c.max_round_rows,c.page_tokens));
+        if(group.pages < span+1) throw std::invalid_argument("window pages must hold one sequence's window and round");
     }
 }
 // Throwing mutations reject reentry from a storage hook; noexcept ones ignore it.
@@ -121,13 +132,42 @@ struct StateCache::Impl {
     std::uint32_t seq_free_count = 0, open_count = 0;
     std::uint64_t epoch = 1, next_round = 1, layout_counter = 0, hits = 0, misses = 0, evictions = 0;
     bool busy = false;
+    // Recurrent snapshots (prefix cache with components): snaps[page x C + c] is the slot holding component c's state
+    // after the page's last row, or no_slot; per component the snapshotted pages form a list, oldest first. Snapshot
+    // slots form a private pool of at most `snapshots` slots per component, filled from the free slots and recycled:
+    // only copy_slot reads or writes them, so the engine's ordered queue puts every read of an old snapshot before the
+    // copy that reuses its slot.
+    std::vector<SlotId> snaps, snap_spare;
+    std::vector<PageId> snap_prev, snap_next, snap_head, snap_tail;
+    std::vector<std::uint32_t> snap_base, snap_spares, snap_pool;
+    // Snapshots one commit copies before publication: the boundary row, one slot per component and where it came from.
+    std::vector<std::uint32_t> snap_rows;
+    std::vector<SlotId> snap_taken;
+    std::vector<std::uint8_t> snap_origin;
+    std::uint32_t snap_count = 0, B = 0;
+    // Window groups, flattened per group from wbase[w]: refcounts, list state, and the full-attention page whose rows a
+    // reusable window page holds (wlink, no_page when unlinked); window_of[page x W + w] is the reverse link.
+    std::uint32_t W = 0;
+    std::vector<std::uint32_t> wbase, wrefs, wfree_count, wlinked;
+    std::vector<std::uint8_t> wstate, wcopy;
+    std::vector<PageId> wprev, wnext, wfree, wlink, window_of, wpending;
+    std::vector<std::uint64_t> wreleased;
+    std::vector<List> wretiring, wcached;
+    // Per sequence and group: the window table (no_page below the window), its size and how many leading entries
+    // were dropped; one round's rows per group.
+    std::vector<PageId> wtables;
+    std::vector<std::uint32_t> wsize, wdropped;
+    std::vector<RowSlot> wkv;
+    // Pages a prompt matched, for the reuse caps of snapshots and windows.
+    mutable std::vector<PageId> found;
 
     Impl(StateCacheConfig value, StateStorage& hooks): config(std::move(value)), storage(hooks) {
         // An exact-size copy: spare capacity moved in with the caller's vector would be retained uncharged.
         config.components = std::vector<StateComponent>(config.components.begin(),config.components.end());
+        config.windows = std::vector<WindowGroup>(config.windows.begin(),config.windows.end());
         if(config.hash) hash = config.hash;
         P = config.pages; pt = config.page_tokens; S = config.sequences; R = config.max_round_rows;
-        C = std::uint32_t(config.components.size());
+        C = std::uint32_t(config.components.size()); W = std::uint32_t(config.windows.size());
         // Validation keeps ceil(max_tokens / page_tokens) <= pages.
         T = P ? pages_for(config.max_tokens,pt) : 0;
         for(const auto& component:config.components) slot_total = sum(slot_total,component.slots);
@@ -141,7 +181,22 @@ struct StateCache::Impl {
     }
     // Every array with its element count; measured before reserving, then allocated with the same counts.
     template<class F> void arrays(F&& f) {
-        const std::size_t p = P, s = S, c = C;
+        const std::size_t p = P, s = S, c = C, w = W;
+        const bool snapshots = config.prefix_cache && C;
+        std::size_t snapshot_total_slots = 0, window_pages = 0;
+        for(const auto& component:config.components) snapshot_total_slots = sum(snapshot_total_slots,snapshots ? component.snapshots : 0u);
+        for(const auto& group:config.windows) window_pages = sum(window_pages,group.pages);
+        const std::size_t boundaries = snapshots ? R/pt+2 : 0;
+        f(snaps,snapshots ? product(p,c) : 0); f(snap_prev,snapshots ? product(p,c) : 0); f(snap_next,snapshots ? product(p,c) : 0);
+        f(snap_spare,snapshot_total_slots); f(snap_base,snapshots ? c+1 : 0); f(snap_head,snapshots ? c : 0);
+        f(snap_tail,snapshots ? c : 0); f(snap_spares,snapshots ? c : 0); f(snap_pool,snapshots ? c : 0);
+        f(snap_rows,boundaries); f(snap_taken,product(boundaries,c)); f(snap_origin,product(boundaries,c));
+        f(wbase,w ? w+1 : 0); f(wrefs,window_pages); f(wfree_count,w); f(wlinked,w); f(wstate,window_pages); f(wcopy,w);
+        f(wprev,window_pages); f(wnext,window_pages); f(wfree,window_pages); f(wlink,window_pages); f(window_of,product(p,w));
+        f(wpending,w); f(wreleased,window_pages); f(wretiring,w); f(wcached,w);
+        f(wtables,product(product(s,w),P ? pages_for(config.max_tokens,pt) : 0)); f(wsize,product(s,w)); f(wdropped,product(s,w));
+        f(wkv,product(product(s,w),R));
+        f(found,snapshots || (w && config.prefix_cache) ? std::size_t(P ? pages_for(config.max_tokens,pt) : 0) : 0);
         f(refs,p); f(state,p); f(flags,p); f(generation,p); f(hashes,p); f(parent_generation,p); f(released,p);
         f(parent,p); f(prev,p); f(next,p); f(free_pages,p); f(index,index_capacity); f(tokens,product(p,pt));
         f(mode,c); f(base,c+1); f(slot_free_count,c); f(ring_head,c); f(ring_size,c);
@@ -152,7 +207,8 @@ struct StateCache::Impl {
         f(kv,P ? product(s,R) : 0);
     }
     std::size_t measure() {
-        std::size_t bytes = product(config.components.capacity(),sizeof(StateComponent));
+        std::size_t bytes = sum(product(config.components.capacity(),sizeof(StateComponent)),
+                                product(config.windows.capacity(),sizeof(WindowGroup)));
         arrays([&](auto& array, std::size_t count) {
             bytes = sum(bytes,product(count,sizeof(typename std::remove_reference_t<decltype(array)>::value_type)));
         });
@@ -180,6 +236,24 @@ struct StateCache::Impl {
         std::fill(live.begin(),live.end(),no_slot);
         std::fill(starts.begin(),starts.end(),no_slot);
         std::fill(scratch.begin(),scratch.end(),no_slot);
+        std::fill(snaps.begin(),snaps.end(),no_slot);
+        std::fill(snap_prev.begin(),snap_prev.end(),no_page);
+        std::fill(snap_next.begin(),snap_next.end(),no_page);
+        std::fill(snap_head.begin(),snap_head.end(),no_page);
+        std::fill(snap_tail.begin(),snap_tail.end(),no_page);
+        B = std::uint32_t(snap_rows.size());
+        for(std::uint32_t c = 0; !snap_base.empty() && c < C; ++c) snap_base[c+1] = snap_base[c]+config.components[c].snapshots;
+        for(std::uint32_t w = 0; w < W; ++w) {
+            const auto pages = config.windows[w].pages;
+            wbase[w+1] = wbase[w]+pages;
+            for(std::uint32_t i = 0; i < pages; ++i) wfree[wbase[w]+i] = pages-1-i;
+            wfree_count[w] = pages;
+        }
+        std::fill(wprev.begin(),wprev.end(),no_page);
+        std::fill(wnext.begin(),wnext.end(),no_page);
+        std::fill(wlink.begin(),wlink.end(),no_page);
+        std::fill(window_of.begin(),window_of.end(),no_page);
+        std::fill(wtables.begin(),wtables.end(),no_page);
     }
 
     RecurrentCommit commit_mode(std::uint32_t c) const noexcept { return RecurrentCommit(mode[c]); }
@@ -204,16 +278,18 @@ struct StateCache::Impl {
         return refs[page] > 1 || (flags[page] & page_hashed);
     }
 
-    void link(List& list, PageId page) noexcept {
-        prev[page] = list.tail; next[page] = no_page;
-        if(list.tail != no_page) next[list.tail] = page; else list.head = page;
+    static void link(List& list, PageId* before, PageId* after, PageId page) noexcept {
+        before[page] = list.tail; after[page] = no_page;
+        if(list.tail != no_page) after[list.tail] = page; else list.head = page;
         list.tail = page; ++list.size;
     }
-    void unlink(List& list, PageId page) noexcept {
-        if(prev[page] != no_page) next[prev[page]] = next[page]; else list.head = next[page];
-        if(next[page] != no_page) prev[next[page]] = prev[page]; else list.tail = prev[page];
-        prev[page] = next[page] = no_page; --list.size;
+    static void unlink(List& list, PageId* before, PageId* after, PageId page) noexcept {
+        if(before[page] != no_page) after[before[page]] = after[page]; else list.head = after[page];
+        if(after[page] != no_page) before[after[page]] = before[page]; else list.tail = before[page];
+        before[page] = after[page] = no_page; --list.size;
     }
+    void link(List& list, PageId page) noexcept { link(list,prev.data(),next.data(),page); }
+    void unlink(List& list, PageId page) noexcept { unlink(list,prev.data(),next.data(),page); }
     PageId find(std::uint64_t h) const noexcept {
         for(auto i = std::size_t(h)&mask;; i = (i+1)&mask) {
             const auto page = index[i];
@@ -243,6 +319,175 @@ struct StateCache::Impl {
         state[page] = page_free; flags[page] = 0;
         free_pages[free_count++] = page;
     }
+    // ---- recurrent snapshots
+    std::size_t sp(PageId page, std::uint32_t c) const noexcept { return std::size_t(page)*C+c; }
+    void snap_link(std::uint32_t c, PageId page, SlotId slot) noexcept {
+        snaps[sp(page,c)] = slot; snap_prev[sp(page,c)] = snap_tail[c]; snap_next[sp(page,c)] = no_page;
+        if(snap_tail[c] != no_page) snap_next[sp(snap_tail[c],c)] = page; else snap_head[c] = page;
+        snap_tail[c] = page;
+    }
+    SlotId snap_unlink(std::uint32_t c, PageId page) noexcept {
+        const auto before = snap_prev[sp(page,c)], after = snap_next[sp(page,c)];
+        if(before != no_page) snap_next[sp(before,c)] = after; else snap_head[c] = after;
+        if(after != no_page) snap_prev[sp(after,c)] = before; else snap_tail[c] = before;
+        snap_prev[sp(page,c)] = snap_next[sp(page,c)] = no_page;
+        const auto slot = snaps[sp(page,c)];
+        snaps[sp(page,c)] = no_slot;
+        return slot;
+    }
+    void snap_return(std::uint32_t c, SlotId slot) noexcept { snap_spare[snap_base[c]+snap_spares[c]++] = slot; }
+    // A page leaving the index drops its snapshots; their slots stay in the pool.
+    void drop_snapshots(PageId page) noexcept {
+        for(std::uint32_t c = 0; !snaps.empty() && c < C; ++c)
+            if(snaps[sp(page,c)] != no_slot) snap_return(c,snap_unlink(c,page));
+    }
+    bool snap_available(std::uint32_t c) const noexcept {
+        return snap_spares[c] || (snap_pool[c] < config.components[c].snapshots && slot_free_count[c]) || snap_head[c] != no_page;
+    }
+    // A snapshot slot: a spare, else a free slot while the pool is below the quota, else the oldest snapshot's slot.
+    SlotId snap_acquire(std::uint32_t c, std::uint8_t& origin) noexcept {
+        if(snap_spares[c]) { origin = 0; return snap_spare[snap_base[c]+ --snap_spares[c]]; }
+        if(snap_pool[c] < config.components[c].snapshots && slot_free_count[c]) { origin = 1; ++snap_pool[c]; return take_slot(c); }
+        origin = 2;
+        return snap_unlink(c,snap_head[c]);
+    }
+    // Undoes snap_acquire after a failed copy: free slots go back exactly, others to the spares (an evicted
+    // snapshot stays dropped).
+    void snap_release(std::uint32_t c, SlotId slot, std::uint8_t origin) noexcept {
+        if(origin == 1) { --snap_pool[c]; untake_slot(c,slot); }
+        else snap_return(c,slot);
+    }
+    // The slot holding component c's state after `boundary` rows in a round of `rows` rows from `first` that keeps n.
+    SlotId snapshot_source(std::uint32_t s, std::uint32_t c, std::uint32_t first, std::uint32_t rows, std::uint32_t n,
+                           std::uint32_t boundary) noexcept {
+        const auto* entries = scratch_of(s)+std::size_t(c)*rows;
+        if(commit_mode(c) == RecurrentCommit::column_checkpoints) return entries[boundary-first-1];
+        if(boundary != first+n) return no_slot;
+        return commit_mode(c) == RecurrentCommit::recompute ? entries[0] : live_of(s)[c];
+    }
+    // Before publication: copies each component's state after every page boundary the commit fills into fresh slots.
+    // Best effort: a boundary without an after-page state of every component, or without a free slot, is skipped. A
+    // throwing copy returns every slot taken here (in reverse, so free lists are restored exactly) and rethrows.
+    void take_snapshots(std::uint32_t s, std::uint32_t n) {
+        snap_count = 0;
+        if(snaps.empty() || !n) return;
+        const auto first = committed[s], rows = staged[s];
+        // Newest boundary first, so a short pool keeps the pages nearest the frontier.
+        for(auto boundary = (std::uint64_t(first)+n)/pt*pt; boundary > first; boundary -= pt) {
+            const auto b = std::uint32_t(boundary);
+            bool available = true;
+            for(std::uint32_t c = 0; c < C; ++c)
+                available = available && snap_available(c) && snapshot_source(s,c,first,rows,n,b) != no_slot;
+            if(!available) continue;
+            auto* taken = snap_taken.data()+std::size_t(snap_count)*C;
+            auto* origin = snap_origin.data()+std::size_t(snap_count)*C;
+            for(std::uint32_t c = 0; c < C; ++c) taken[c] = snap_acquire(c,origin[c]);
+            snap_rows[snap_count++] = b;
+            try {
+                for(std::uint32_t c = 0; c < C; ++c) storage.copy_slot(c,snapshot_source(s,c,first,rows,n,b),taken[c]);
+            } catch(...) {
+                for(auto k = snap_count; k-- > 0;)
+                    for(auto c = C; c-- > 0;) snap_release(c,snap_taken[std::size_t(k)*C+c],snap_origin[std::size_t(k)*C+c]);
+                snap_count = 0;
+                throw;
+            }
+        }
+    }
+    // After publication: each snapshot goes to the indexed copy of its page when that copy lacks one, else back to
+    // the pool. Oldest page first, so the list stays in page order.
+    void adopt_snapshots(std::uint32_t s) noexcept {
+        for(auto k = snap_count; k-- > 0;) {
+            const auto page = table(s)[snap_rows[k]/pt-1];
+            const auto target = (flags[page] & page_hashed) ? canonical(page) : page;
+            const bool reusable = flags[target] & page_indexed;
+            for(std::uint32_t c = 0; c < C; ++c) {
+                const auto slot = snap_taken[std::size_t(k)*C+c];
+                if(reusable && snaps[sp(target,c)] == no_slot) snap_link(c,target,slot);
+                else snap_return(c,slot);
+            }
+        }
+        snap_count = 0;
+    }
+    // ---- window groups
+    std::size_t wi(std::uint32_t w, PageId page) const noexcept { return std::size_t(wbase[w])+page; }
+    std::size_t wseq(std::uint32_t s, std::uint32_t w) const noexcept { return std::size_t(s)*W+w; }
+    PageId* wtable(std::uint32_t s, std::uint32_t w) noexcept { return wtables.data()+wseq(s,w)*T; }
+    const PageId* wtable(std::uint32_t s, std::uint32_t w) const noexcept { return wtables.data()+wseq(s,w)*T; }
+    void wlist_link(List& list, std::uint32_t w, PageId page) noexcept { link(list,wprev.data()+wbase[w],wnext.data()+wbase[w],page); }
+    void wlist_unlink(List& list, std::uint32_t w, PageId page) noexcept { unlink(list,wprev.data()+wbase[w],wnext.data()+wbase[w],page); }
+    // First page row `row` of a sequence reads in window group w: rows row - window + 1 .. row.
+    std::uint32_t window_start(std::uint32_t w, std::uint64_t row) const noexcept {
+        const std::uint64_t window = config.windows[w].window;
+        return row+1 > window ? std::uint32_t((row+1-window)/pt) : 0u;
+    }
+    void wunlink(std::uint32_t w, PageId page) noexcept {
+        auto& up = wlink[wi(w,page)];
+        if(up == no_page) return;
+        window_of[std::size_t(up)*W+w] = no_page; up = no_page; --wlinked[w];
+    }
+    void wfree_page(std::uint32_t w, PageId page) noexcept {
+        wstate[wi(w,page)] = page_free;
+        wfree[wbase[w]+wfree_count[w]++] = page;
+    }
+    // Callers check capacity first. Free pages go first, then the least recently released cached page.
+    PageId wtake(std::uint32_t w) noexcept {
+        PageId page;
+        if(wfree_count[w]) page = wfree[wbase[w]+ --wfree_count[w]];
+        else { page = wcached[w].head; wlist_unlink(wcached[w],w,page); wunlink(w,page); }
+        wrefs[wi(w,page)] = 1; wstate[wi(w,page)] = page_live;
+        return page;
+    }
+    void wgive_back(std::uint32_t w, PageId page) noexcept { wrefs[wi(w,page)] = 0; wfree_page(w,page); }
+    void whold(std::uint32_t w, PageId page) noexcept {
+        const auto i = wi(w,page);
+        if(!wrefs[i]) { wlist_unlink(wstate[i] == page_cached ? wcached[w] : wretiring[w],w,page); wstate[i] = page_live; }
+        ++wrefs[i];
+    }
+    void wrelease(std::uint32_t w, PageId page) noexcept {
+        const auto i = wi(w,page);
+        if(--wrefs[i]) return;
+        wstate[i] = page_retiring; wreleased[i] = epoch;
+        wlist_link(wretiring[w],w,page);
+    }
+    // A full-attention page leaving the index takes its window links along; a cached window page it linked is freed.
+    void drop_links(PageId page) noexcept {
+        for(std::uint32_t w = 0; w < W; ++w) {
+            const auto held = window_of[std::size_t(page)*W+w];
+            if(held == no_page) continue;
+            wunlink(w,held);
+            if(wstate[wi(w,held)] == page_cached) { wlist_unlink(wcached[w],w,held); wfree_page(w,held); }
+        }
+    }
+    // Links sequence s's window pages of logical page i to the indexed copy of its full-attention page, where free.
+    void link_windows(std::uint32_t s, std::uint32_t i) noexcept {
+        if(!W) return;
+        const auto target = canonical(table(s)[i]);
+        if(!(flags[target] & page_indexed)) return;
+        for(std::uint32_t w = 0; w < W; ++w) {
+            const auto page = i < wsize[wseq(s,w)] ? wtable(s,w)[i] : no_page;
+            if(page == no_page || window_of[std::size_t(target)*W+w] != no_page || wlink[wi(w,page)] != no_page) continue;
+            window_of[std::size_t(target)*W+w] = page; wlink[wi(w,page)] = target; ++wlinked[w];
+        }
+    }
+    // Releases window pages wholly older than the window of row `row`, the sequence's next row.
+    bool drop_window_pages(std::uint32_t s, std::uint32_t row) noexcept {
+        bool changed = false;
+        for(std::uint32_t w = 0; w < W; ++w) {
+            auto* pages_of = wtable(s,w);
+            auto& dropped = wdropped[wseq(s,w)];
+            const auto upto = std::min(window_start(w,row),wsize[wseq(s,w)]);
+            for(; dropped < upto; ++dropped)
+                if(pages_of[dropped] != no_page) { wrelease(w,pages_of[dropped]); pages_of[dropped] = no_page; changed = true; }
+        }
+        return changed;
+    }
+    // A window group's partial tail is copied when another owner holds it or it is linked for reuse.
+    bool wcopy_tail(std::uint32_t s, std::uint32_t w) const noexcept {
+        const auto size = wsize[wseq(s,w)];
+        if(!size || committed[s]%pt == 0) return false;
+        const auto page = wtable(s,w)[size-1];
+        return page != no_page && (wrefs[wi(w,page)] > 1 || wlink[wi(w,page)] != no_page);
+    }
     // Indexes a linked page. First writer wins while its own link checks out; an entry whose parent was evicted or
     // replaced can never match again, so a linked page takes its place (a cached loser goes to the free list).
     void index_page(PageId page) noexcept {
@@ -255,6 +500,7 @@ struct StateCache::Impl {
             else {
                 if(linked(entry)) return;
                 flags[entry] = std::uint8_t(flags[entry] & ~page_indexed);
+                drop_snapshots(entry); drop_links(entry);
                 if(state[entry] == page_cached) { unlink(cached,entry); free_page(entry); ++evictions; }
             }
             index[i] = page; flags[page] = std::uint8_t(flags[page] | page_indexed);
@@ -274,6 +520,7 @@ struct StateCache::Impl {
         }
         flags[page] = std::uint8_t(flags[page] & ~page_indexed);
         --indexed;
+        drop_snapshots(page); drop_links(page);
     }
     // Callers check capacity first. Free pages go first, then the least recently released cached page.
     PageId take_page() noexcept {
@@ -313,6 +560,15 @@ struct StateCache::Impl {
         auto* pages_of = table(s);
         if(config.prefix_cache) for(auto i = keep; i < table_size[s]; ++i) adopt(pages_of,i);
         while(table_size[s] > keep) release_page(pages_of[--table_size[s]]);
+        for(std::uint32_t w = 0; w < W; ++w) {
+            auto* window_pages = wtable(s,w);
+            auto& size = wsize[wseq(s,w)];
+            while(size > keep) {
+                --size;
+                if(window_pages[size] != no_page) { wrelease(w,window_pages[size]); window_pages[size] = no_page; }
+            }
+            wdropped[wseq(s,w)] = std::min(wdropped[wseq(s,w)],keep);
+        }
     }
     std::uint32_t slot_capacity(std::uint32_t c) const noexcept { return base[c+1]-base[c]; }
     SlotId take_slot(std::uint32_t c) noexcept { return slot_free[base[c]+ --slot_free_count[c]]; }
@@ -334,9 +590,19 @@ struct StateCache::Impl {
     }
     // Verified full pages of a prompt: each hit must hold exactly the page's tokens and link to exactly the page
     // matched before it (id and generation), so a hash collision never yields a false reuse.
+    // Whether reuse may end after j matched pages: the last has every component's snapshot and every window group
+    // holds the pages its window reads from row j x page_tokens.
+    bool usable(const PageId* pages_of, std::uint32_t j) const noexcept {
+        for(std::uint32_t c = 0; !snaps.empty() && c < C; ++c) if(snaps[std::size_t(pages_of[j-1])*C+c] == no_slot) return false;
+        for(std::uint32_t w = 0; w < W; ++w)
+            for(auto i = window_start(w,std::uint64_t(j)*pt); i < j; ++i)
+                if(window_of[std::size_t(pages_of[i])*W+w] == no_page) return false;
+        return true;
+    }
     Match match(std::span<const Token> prompt, std::uint32_t max_reuse, PageId* out) const noexcept {
         Match result;
         if(!config.prefix_cache) return result;
+        if(!out && !found.empty()) out = found.data();
         const auto limit = std::min<std::uint64_t>({std::uint64_t(prompt.size()),max_reuse,config.max_tokens});
         result.eligible = std::uint32_t(limit/pt);
         PageId previous = no_page;
@@ -351,6 +617,7 @@ struct StateCache::Impl {
             if(out) out[result.pages] = page;
             previous = page;
         }
+        if(!snaps.empty() || W) while(result.pages && !usable(out,result.pages)) --result.pages;
         return result;
     }
     // Ends the pending round keeping inputs.size() rows (zero discards). Publication only: never throws.
@@ -364,9 +631,10 @@ struct StateCache::Impl {
                 tokens[row_of(pages_of[row/pt])+row%pt] = inputs[i];
             }
             if(config.prefix_cache)
-                for(auto page = first/pt; (std::uint64_t(page)+1)*pt <= last; ++page) seal(s,page);
+                for(auto page = first/pt; (std::uint64_t(page)+1)*pt <= last; ++page) { seal(s,page); link_windows(s,page); }
             const auto keep = pages_for(last,pt);
             if(table_size[s] > keep) { truncate(s,keep); changed = true; }
+            if(drop_window_pages(s,last)) changed = true;
         }
         auto* lives = live_of(s);
         for(std::uint32_t c = 0; c < C; ++c) {
@@ -396,6 +664,13 @@ struct StateCache::Impl {
             if(throws) throw CapacityExhausted("state cache pages exhausted");
             return std::nullopt;
         }
+        for(std::uint32_t w = 0; w < W; ++w) {
+            wcopy[w] = rows && wcopy_tail(s,w);
+            if(target-wsize[wseq(s,w)]+wcopy[w] > wfree_count[w]+wcached[w].size) {
+                if(throws) throw CapacityExhausted("state cache window pages exhausted");
+                return std::nullopt;
+            }
+        }
         for(std::uint32_t c = 0; c < C; ++c) if(scratch_for(commit_mode(c),rows) > slot_free_count[c]) {
             if(throws) throw CapacityExhausted("state cache slots exhausted");
             return std::nullopt;
@@ -407,6 +682,17 @@ struct StateCache::Impl {
             replacement = take_page();
             try { storage.copy_rows(old_tail,replacement,first%pt); }
             catch(...) { give_back(replacement); throw; }
+        }
+        for(std::uint32_t w = 0; w < W; ++w) {
+            wpending[w] = no_page;
+            if(!wcopy[w]) continue;
+            wpending[w] = wtake(w);
+            try { storage.copy_window_rows(w,wtable(s,w)[wsize[wseq(s,w)]-1],wpending[w],first%pt); }
+            catch(...) {
+                for(auto v = w+1; v-- > 0;) if(wpending[v] != no_page) wgive_back(v,wpending[v]);
+                if(copy) give_back(replacement);
+                throw;
+            }
         }
         // Publication: nothing below allocates or throws.
         bool changed = false;
@@ -420,6 +706,19 @@ struct StateCache::Impl {
         while(table_size[s] < target) { pages_of[table_size[s]++] = take_page(); changed = true; }
         RowSlot* rows_of = P ? kv.data()+std::size_t(s)*R : nullptr;
         for(std::uint32_t i = 0; P && i < rows; ++i) rows_of[i] = {pages_of[(first+i)/pt],(first+i)%pt};
+        RowSlot* window_rows = W ? wkv.data()+std::size_t(s)*W*R : nullptr;
+        for(std::uint32_t w = 0; w < W; ++w) {
+            auto* window_pages = wtable(s,w);
+            auto& size = wsize[wseq(s,w)];
+            if(wcopy[w]) {
+                const auto old = window_pages[size-1];
+                window_pages[size-1] = wpending[w];
+                wrelease(w,old);
+                changed = true;
+            }
+            while(size < target) { window_pages[size++] = wtake(w); changed = true; }
+            for(std::uint32_t i = 0; i < rows; ++i) window_rows[std::size_t(w)*rows+i] = {window_pages[(first+i)/pt],(first+i)%pt};
+        }
         SlotId* start_of = C ? starts.data()+std::size_t(s)*C : nullptr;
         for(std::uint32_t c = 0; c < C; ++c) {
             start_of[c] = live_of(s)[c];
@@ -435,9 +734,14 @@ struct StateCache::Impl {
         round.kv = std::span<const RowSlot>(rows_of,P ? rows : 0);
         round.start = std::span<const SlotId>(start_of,C);
         round.scratch = std::span<const SlotId>(C ? scratch_of(s) : nullptr,std::size_t(C)*rows);
+        round.window_kv = std::span<const RowSlot>(window_rows,std::size_t(W)*rows);
         return round;
     }
 };
+
+void StateStorage::copy_window_rows(std::uint32_t, PageId, PageId, std::uint32_t) {
+    throw std::logic_error("state storage does not implement window groups");
+}
 
 StateCache::StateCache(StateCacheConfig config, StateStorage& storage, Resources& resources) {
     validate(config);
@@ -467,6 +771,7 @@ bool StateCache::close(SequenceId id) noexcept {
     const auto s = id.index;
     if(m.pending[s]) m.finish_round(s,{});
     m.truncate(s,0);
+    for(std::uint32_t w = 0; w < m.W; ++w) m.wdropped[m.wseq(s,w)] = 0;
     for(std::uint32_t c = 0; c < m.C; ++c) { m.release_slot(c,m.live_of(s)[c]); m.live_of(s)[c] = no_slot; }
     m.opened[s] = 0; m.committed[s] = 0; --m.open_count;
     m.seq_free[m.seq_free_count++] = s;
@@ -494,6 +799,15 @@ SequenceId StateCache::fork(SequenceId parent) {
         ++m.refs[m.table(s)[i]];
     }
     m.table_size[s] = m.table_size[p]; m.committed[s] = m.committed[p];
+    for(std::uint32_t w = 0; w < m.W; ++w) {
+        const auto size = m.wsize[m.wseq(p,w)];
+        for(std::uint32_t i = 0; i < size; ++i) {
+            const auto page = m.wtable(p,w)[i];
+            m.wtable(s,w)[i] = page;
+            if(page != no_page) ++m.wrefs[m.wi(w,page)];
+        }
+        m.wsize[m.wseq(s,w)] = size; m.wdropped[m.wseq(s,w)] = m.wdropped[m.wseq(p,w)];
+    }
     m.bump(s);
     return {s,m.seq_generation[s]};
 }
@@ -508,7 +822,21 @@ std::uint32_t StateCache::attach(SequenceId id, std::span<const Token> prompt, s
     if(m.pending[s] || m.committed[s] || m.table_size[s]) throw std::logic_error("attach requires an empty sequence");
     require_tokens(prompt);
     const auto found = m.match(prompt,max_reuse,m.table(s));
+    // Restoring the recurrent state is the only step that can fail; nothing is published before it.
+    if(found.pages && !m.snaps.empty()) {
+        const auto last = m.table(s)[found.pages-1];
+        for(std::uint32_t c = 0; c < m.C; ++c) m.storage.copy_slot(c,m.snaps[std::size_t(last)*m.C+c],m.live_of(s)[c]);
+    }
     for(std::uint32_t i = 0; i < found.pages; ++i) m.hold(m.table(s)[i]);
+    for(std::uint32_t w = 0; w < m.W; ++w) {
+        const auto start = std::min(m.window_start(w,std::uint64_t(found.pages)*m.pt),found.pages);
+        auto* window_pages = m.wtable(s,w);
+        for(std::uint32_t i = 0; i < found.pages; ++i) {
+            window_pages[i] = i < start ? no_page : m.window_of[std::size_t(m.table(s)[i])*m.W+w];
+            if(i >= start) m.whold(w,window_pages[i]);
+        }
+        m.wsize[m.wseq(s,w)] = found.pages; m.wdropped[m.wseq(s,w)] = start;
+    }
     m.hits += found.pages; m.misses += found.eligible-found.pages;
     m.table_size[s] = found.pages; m.committed[s] = found.pages*m.pt;
     if(found.pages) m.bump(s);
@@ -536,7 +864,9 @@ void StateCache::commit(SequenceId id, std::uint64_t round, std::span<const Toke
         m.finish_round(s,{});
         throw std::invalid_argument("state tokens must be nonnegative");
     }
+    m.take_snapshots(s,std::uint32_t(inputs.size()));   // a throwing copy leaves the round pending
     m.finish_round(s,inputs);
+    m.adopt_snapshots(s);
 }
 void StateCache::discard(SequenceId id, std::uint64_t round) {
     auto& m = *impl_;
@@ -553,6 +883,8 @@ void StateCache::rewind(SequenceId id, std::uint32_t tokens) {
     if(tokens > m.committed[s]) throw std::out_of_range("rewind exceeds committed rows");
     if(tokens == m.committed[s]) return;
     if(m.C) throw std::logic_error("recurrent state cannot rewind");
+    for(std::uint32_t w = 0; w < m.W; ++w)
+        if(m.window_start(w,tokens) < m.wdropped[m.wseq(s,w)]) throw std::logic_error("rewind would read dropped window pages");
     const auto keep = pages_for(tokens,m.pt);
     const bool changed = m.table_size[s] > keep;
     m.truncate(s,keep);
@@ -562,6 +894,11 @@ void StateCache::rewind(SequenceId id, std::uint32_t tokens) {
 std::span<const PageId> StateCache::block_table(SequenceId id) const {
     const auto s = impl_->check(id);
     return {impl_->table(s),impl_->table_size[s]};
+}
+std::span<const PageId> StateCache::window_table(SequenceId id, std::uint32_t window) const {
+    const auto s = impl_->check(id);
+    if(window >= impl_->W) throw std::out_of_range("state window group out of range");
+    return {impl_->wtable(s,window),impl_->wsize[impl_->wseq(s,window)]};
 }
 std::uint32_t StateCache::committed(SequenceId id) const { return impl_->committed[impl_->check(id)]; }
 std::uint32_t StateCache::staged(SequenceId id) const { return impl_->staged[impl_->check(id)]; }
@@ -589,6 +926,13 @@ void StateCache::retire(std::uint64_t completed) noexcept {
         if(m.flags[page] & page_indexed) { m.state[page] = page_cached; m.link(m.cached,page); }
         else m.free_page(page);
     }
+    for(std::uint32_t w = 0; w < m.W; ++w)
+        while(m.wretiring[w].head != no_page && m.wreleased[m.wi(w,m.wretiring[w].head)] <= completed) {
+            const auto page = m.wretiring[w].head;
+            m.wlist_unlink(m.wretiring[w],w,page);
+            if(m.wlink[m.wi(w,page)] != no_page) { m.wstate[m.wi(w,page)] = page_cached; m.wlist_link(m.wcached[w],w,page); }
+            else m.wfree_page(w,page);
+        }
     for(std::uint32_t c = 0; c < m.C; ++c) {
         while(m.ring_size[c]) {
             const auto slot = m.ring[m.base[c]+m.ring_head[c]];
@@ -621,6 +965,18 @@ StateCacheStats StateCache::stats() const noexcept {
     }
     result.sequences = m.open_count;
     result.prefix_hits = m.hits; result.prefix_misses = m.misses; result.evictions = m.evictions;
+    for(std::uint32_t c = 0; c < std::uint32_t(m.snap_pool.size()); ++c) result.snapshots += m.snap_pool[c];
+    return result;
+}
+StateCacheStats StateCache::window_stats(std::uint32_t window) const {
+    const auto& m = *impl_;
+    if(window >= m.W) throw std::out_of_range("state window group out of range");
+    auto result = stats();
+    const auto pages = m.wbase[window+1]-m.wbase[window];
+    result.free_pages = m.wfree_count[window]; result.cached_pages = m.wcached[window].size;
+    result.retiring_pages = m.wretiring[window].size;
+    result.live_pages = pages-result.free_pages-result.cached_pages-result.retiring_pages;
+    result.indexed_pages = m.wlinked[window];
     return result;
 }
 std::size_t StateCache::metadata_bytes() const noexcept { return impl_->reservation.bytes(); }

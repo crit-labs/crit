@@ -1,6 +1,6 @@
 {
   "suite": "crit-eval-long-v2",
-  "notes": "Long prompts for the long quality sets and the retrieval check (protocol quality.long, context.retrieval). The filler is these suite files joined by blank lines, tokenized once and repeated as far as a prompt needs. {document} in a message marks where the filler goes; prepare cuts it to fit the prompt length.",
+  "notes": "Long prompts for the long quality sets and the retrieval check (protocol quality.long, context.retrieval). The filler is these suite files joined by blank lines, tokenized once and repeated as far as a prompt needs. {document} in a message marks where the filler goes; prepare cuts it to fit the prompt length. retrieval.question asks for the facts at the required context, after the long-context curve's own document and filler, which then hold the facts, so that request shares its prefix with the curve's.",
   "filler": [
     "long_document.txt",
     "agent/README.md.txt",
@@ -18,6 +18,7 @@
   "retrieval": {
     "system": "Follow the user's request carefully. When asked for identifiers, copy them exactly.",
     "user": "Read this archive. It contains the secret identifiers of three stations; remember them.\n\n{document}\n\nList the exact secret identifiers of stations ALPHA, BETA and GAMMA, one per line, as STATION: identifier.",
+    "question": "The files above also contain the secret identifiers of three stations. Without calling a tool, list the exact secret identifiers of stations ALPHA, BETA and GAMMA, one per line, as STATION: identifier.",
     "facts": [
       {
         "id": "start",

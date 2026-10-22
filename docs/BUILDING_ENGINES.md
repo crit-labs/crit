@@ -143,13 +143,18 @@ process and can change outputs. For speculative decoding, record
 
 Eval measures a candidate as a chat client gets it. `crit run ... eval --candidate ID
 --data EVAL_DATA_DIR` reserves a benchmark attempt, serves the packaged candidate through
-`crit serve` before it is sealed, runs every Eval part over the chat API
-([Engines behind a server](eval/README.md#engines-behind-a-server)), stops the server and
-scores the quality replies on the run's model (`crit eval reference`). It applies the run's
+`crit serve` before it is sealed and runs every Eval part over the chat API
+([Engines behind a server](eval/README.md#engines-behind-a-server)), quality through the
+engine's score call against the run's model's scores of the same texts, which the
+reference stores in the data once (`crit eval reference`, before the first candidate is
+served). It applies the run's
 `quality_budget`, `exactness` and `kv_tokens` and retains the result as
 `candidates/ID/eval/ATTEMPT.json` for checks to reference. The package therefore needs its
-[resident adapter](#4-make-the-package-servable-and-seal) with `chat-stream-v1` and
-`chat-logprobs-v1` from its first Eval on; `crit_core.serving.ResidentChat` provides both.
+[resident adapter](#4-make-the-package-servable-and-seal) with `chat-stream-v1`,
+`chat-logprobs-v1` and `chat-score-v1` from its first Eval on; `crit_core.serving.ResidentChat`
+provides them (`score_tokens` runs the engine's prefill at every position and its decode forced
+to a continuation; `crit_core.native.ResidentEngine` implements it for Core engines with query
+scoring and replay).
 Every candidate of a model uses the same prepared data, kept in the run workspace. `--only`
 runs some parts, `--baseline` shows KPI changes against an earlier result.
 

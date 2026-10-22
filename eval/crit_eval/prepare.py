@@ -5,6 +5,9 @@ model's own chat template: an adapter's engine their token ids, an engine behind
 frozen next to them (crit_eval.chat). Tokenizer, chat template, stop ids and vocabulary come from Core's text
 layer (crit_core.text), which needs the `tokenizers` and `jinja2` packages (preparation only).
 
+Every quality text is a conversation's generation prompt followed by its written answer (continuation_ids, cut to
+the protocol's continuation_tokens), which the engine and the reference score at every position.
+
 Long prompts (suite/long.json) are frozen the same way: the long quality prompts at each of the protocol's
 prompt lengths, and the pieces a run assembles long-context and retrieval prompts from once it knows the
 required context (head, filler and fact token ids, and the text of every token for matching the answers).
@@ -153,15 +156,25 @@ def curve_case(speed):
     return case
 
 
-def curve_pieces(model, case):
+def curve_pieces(model, case, question):
     """What a run assembles long-context curve prompts from (context.curve_prompt): the case's token ids before
-    and after its document, and the document followed by a paragraph break."""
+    and after its document, and the document followed by a paragraph break. At the required context the retrieval
+    request shares the curve prompt up to the end of its document (context.required_prompts): the case's messages
+    through the one holding the document, then a user message asking `question` (retrieval_tail_ids,
+    retrieval_messages)."""
     messages, tools = speed_messages(case, SENTINEL)
     head_ids, tail_ids = document_frame(model, messages, tools)
+    held = next(i for i, m in enumerate(messages) if SENTINEL in (m.get("content") or ""))
+    asked = messages[:held + 1] + [{"role": "user", "content": question}]
+    shared, retrieval_tail = document_frame(model, asked, tools)
+    if shared != head_ids:
+        raise ValueError(f"{case['id']}: the chat template renders the retrieval question's prompt with another "
+                         "start than the case's, so the two cannot share their prefix")
     document = (SUITE_DIR / case["document"]).read_text(encoding="utf-8")
     return {"case": case["id"], "head_ids": head_ids, "tail_ids": tail_ids,
             "document_ids": token_ids(model, document) + token_ids(model, "\n\n"),
-            "messages": api_messages(messages), "tools": tools}
+            "messages": api_messages(messages), "tools": tools,
+            "retrieval_tail_ids": retrieval_tail, "retrieval_messages": api_messages(asked)}
 
 
 def speed_case(model, case):
@@ -207,8 +220,11 @@ def repeated(ids, length):
     return (list(ids) * copies)[:length]
 
 
-def quality_prompt(model, prompt_id, set_name, messages):
-    return {"id": prompt_id, "set": set_name, "prompt_ids": prompt_ids(model, messages), "messages": api_messages(messages)}
+def quality_prompt(model, prompt_id, set_name, messages, continuation, tokens):
+    """A quality text: the conversation's generation prompt (prompt_ids, and its messages for a server), followed by
+    its written answer encoded as the model's tokens, cut to `tokens` (continuation_ids)."""
+    return {"id": prompt_id, "set": set_name, "prompt_ids": prompt_ids(model, messages),
+            "continuation_ids": token_ids(model, continuation)[:tokens], "messages": api_messages(messages)}
 
 
 def long_quality_messages(model, conversation, preamble, filler, prompt_tokens):
@@ -238,6 +254,27 @@ def token_strings(model, count):
     return out
 
 
+def followup_prompts(model, followup, filler, prompt_tokens):
+    """protocol followup: every turn's prompt, the conversation so far with the suite's fixed assistant replies and
+    the turn's user message; the first user message holds the filler, cut so the first turn renders to about
+    prompt_tokens tokens."""
+    first = [{"role": "system", "content": followup["system"]},
+             {"role": "user", "content": followup["turns"][0]["user"].replace("{document}", SENTINEL)}]
+    head, tail = document_frame(model, first)
+    need = prompt_tokens - len(head) - len(tail)
+    if need < 1:
+        raise ValueError(f"followup: {prompt_tokens} prompt tokens cannot hold its first turn")
+    document = model.tokenizer.decode(repeated(filler, need))
+    messages = with_document(first, document)
+    prompts = []
+    for number, turn in enumerate(followup["turns"], 1):
+        if number > 1:
+            messages = messages + [{"role": "assistant", "content": turn["assistant"]},
+                                   {"role": "user", "content": turn["user"]}]
+        prompts.append({"turn": number, "prompt_ids": prompt_ids(model, messages), "messages": api_messages(messages)})
+    return prompts
+
+
 def retrieval_messages(rule):
     return [{"role": "system", "content": rule["system"]},
             {"role": "user", "content": rule["user"].replace("{document}", SENTINEL)}]
@@ -256,12 +293,15 @@ def retrieval_pieces(model, long, filler):
 
 def quality_prompts(model, quality, long, filler, rule):
     """protocol quality: the suite's conversations as one set, then the long ones at each prompt length, a set each."""
-    prompts = [quality_prompt(model, c["id"], "conversations", c["messages"]) for c in quality["conversations"]]
+    tokens = rule["continuation_tokens"]
+    prompts = [quality_prompt(model, c["id"], "conversations", c["messages"], c["continuation"], tokens)
+               for c in quality["conversations"]]
     by_id = {c["id"]: c for c in quality["conversations"]}
     for length in rule["long"]["prompt_tokens"]:
         for conversation_id in rule["long"]["conversations"]:
             messages = long_quality_messages(model, by_id[conversation_id], long["quality"]["preamble"], filler, length)
-            prompts.append(quality_prompt(model, f"{conversation_id}@{length}", f"long-{length}", messages))
+            prompts.append(quality_prompt(model, f"{conversation_id}@{length}", f"long-{length}", messages,
+                                          by_id[conversation_id]["continuation"], tokens))
     return prompts
 
 
@@ -293,7 +333,9 @@ def prepare(model, data, speed_tokens=None):
                             "prompt_ids": prompt_ids(text, heldout_messages(p)), "messages": heldout_messages(p),
                             "output_tokens": protocol["heldout"]["output_tokens"]} for p in heldout["prompts"]]
     prepared["retrieval"] = retrieval_pieces(text, long, filler)
-    prepared["context"] = curve_pieces(text, curve_case(speed))
+    followup = json.loads((SUITE_DIR / "followup.json").read_text(encoding="utf-8"))
+    prepared["followup"] = followup_prompts(text, followup, filler, protocol["followup"]["prompt_tokens"])
+    prepared["context"] = curve_pieces(text, curve_case(speed), long["retrieval"]["question"])
     Path(data).mkdir(parents=True, exist_ok=True)
     write_json(Path(data) / PREPARED, prepared)
     return prepared

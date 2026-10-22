@@ -83,6 +83,6 @@
   "validation": {
     "host": "Worked example checks the host constrained law (mask before filters, greedy ties), acceptance and in-language residual repair; Core's Python tests cover the compiler, preparation and byte tables",
     "native": "C++ fixtures cover constraint-first filters, ties, private forks, partial acceptance, RNG discard, failed repair, poisoned states, malformed model and matcher forks, independent constrained ordinary/speculative answer probabilities for choice and JSON languages, and seeded compiled-grammar/choice parity; no device/model qualification",
-    "performance": "No model speed or quality measurement; per-position vocabulary scans, matcher-history copies and dense law materialization require workload profiling"
+    "performance": "No model speed or quality measurement; per-position allowed sets (Core's trie walk or cache hit), matcher-history copies and dense law materialization require workload profiling"
   }
 }

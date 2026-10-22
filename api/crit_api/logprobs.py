@@ -10,6 +10,10 @@ from .options import RequestError, require
 # Response record bytes per token and alternative beyond the reply itself: one indented [id, logprob] pair and the
 # token's entry in the bytes table.
 ROW_BYTES = 1024
+# Resident commands whose result carries the engine's response record: a chat turn, and a score (chat-score-v1),
+# whose rows hold [id, logprob] pairs without a bytes table.
+RESPONDING = ("generate", "score")
+SCORE_PAIR_BYTES = 64
 
 
 def logprob_options(body, capabilities):
@@ -29,6 +33,9 @@ def logprob_options(body, capabilities):
 
 def response_bytes(request):
     """The largest response record a request may produce."""
+    if request.get("record_kind") == "score_request":
+        positions = len(request["prompt_ids"]) + len(request["continuation_ids"])
+        return MAX_JSON_BYTES + positions * (request["top_logprobs"] + 2) * SCORE_PAIR_BYTES
     if request.get("logprobs") is None:
         return MAX_JSON_BYTES
     return MAX_JSON_BYTES + request["limits"]["max_output_tokens"] * (request["logprobs"] + 1) * ROW_BYTES

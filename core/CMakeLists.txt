@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_core VERSION 0.4.0 LANGUAGES CXX)
+project(crit_core VERSION 0.5.0 LANGUAGES CXX)
 find_package(Threads REQUIRED)
 function(crit_strict_warnings target)
   if(MSVC)
@@ -139,7 +139,7 @@ if(BUILD_TESTING AND PROJECT_IS_TOP_LEVEL)
   crit_core_cases(sampling_tests 60 sampling_philox sampling_uniform sampling_validate sampling_history sampling_copy sampling_greedy sampling_law sampling_frequency sampling_redo sampling_penalties sampling_bias sampling_min_tokens sampling_logprobs sampling_infinity sampling_errors sampling_allocation sampling_scale sampling_score_rows sampling_accept sampling_suppress_padding sampling_magnitude sampling_constraint)
 
   crit_core_cases(constraints_tests 120 constraint_vocabulary constraint_choices constraint_json constraint_grammar
-    constraint_readout constraint_sampling)
+    constraint_readout constraint_sampling constraint_trie constraint_cache)
   # Independent standard-library oracles feed generated, mutated and truncated byte strings to the native matchers.
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_Interpreter_FOUND)
@@ -157,7 +157,7 @@ if(BUILD_TESTING AND PROJECT_IS_TOP_LEVEL)
     set_tests_properties(crit_core_native_engine PROPERTIES TIMEOUT 60)
   endif()
 
-  crit_core_cases(state_tests 120 state_config state_transactions state_ownership state_prefixes state_collisions state_reuse state_completeness state_index state_lru state_epochs state_forks state_recurrent state_hybrid state_failures state_randomized state_capacity state_layout state_metadata state_hot_path state_checkpoints)
+  crit_core_cases(state_tests 120 state_config state_transactions state_ownership state_prefixes state_collisions state_reuse state_completeness state_index state_lru state_epochs state_forks state_recurrent state_hybrid state_failures state_randomized state_capacity state_layout state_metadata state_hot_path state_checkpoints state_snapshots state_windows)
 
   crit_core_cases(io_tests 120 json_valid json_rejects json_utf8 json_strings json_numbers json_nonfinite json_limits json_access json_file json_random sha256_vectors sha256_chunked file_identity file_change file_read_exact file_read_chunks file_read_errors file_map file_open_errors host_memory_v2 host_memory_v1 host_memory_malformed host_memory_admission host_memory_live)
 

@@ -4,7 +4,8 @@
 
 kind is one of
 - other_modality: vision towers and their projectors, which a text engine does not load;
-- embedding: token embedding tables, of which a pass gathers one row per token instead of reading the table;
+- embedding: token and hashed n-gram embedding tables, of which a pass gathers rows per token instead of reading
+  the table;
 - expert: mixture-of-experts expert weights, read sparsely;
 - head: the output head;
 - layer: everything else, read on every pass.
@@ -22,7 +23,7 @@ import re
 # projectors of multimodal wrappers sit at the root as mlp1.*).
 OTHER_MODALITY = ("visual", "vision")
 OTHER_MODALITY_PREFIXES = ("mlp1.",)
-EMBEDDING = re.compile(r"embed_tokens|(^|\.)embeddings\.weight$|(^|_)token_embd\.")
+EMBEDDING = re.compile(r"embed_tokens|(^|\.)embeddings\.weight$|(^|_)token_embd\.|(^|\.)ngram_embedding\.")
 EXPERT = re.compile(r"\.experts\.|_exps\.")
 HEAD = re.compile(r"lm_head|^output\.weight$")
 DRAFT = "mtp"

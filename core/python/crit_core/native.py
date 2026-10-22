@@ -18,21 +18,26 @@ The factory receives a JSON object: the adapter's configuration plus "model" (th
 Eval asks for plain one-token decoding on a second engine; an engine declaring "plain" decodes it per request).
 """
 import ctypes
+from collections import namedtuple
 import copy
 import threading
+import time
 from contextlib import contextmanager, nullcontext
 import json
 from pathlib import Path
 
-from crit_core.serving import SAMPLING, TOP_LOGPROBS, ResidentChat, chat_prompt  # noqa: F401  (chat_prompt is re-exported)
+from crit_core.serving import SAMPLING, TOP_LOGPROBS, ResidentChat
 
-ABI = 1
+ABI = 2
 RESULT_BYTES = 1 << 20  # a generation's result JSON: finish, timing and the engine's request facts
 TOKEN_CALLBACK = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_int)
 OUTPUT_CALLBACK = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int32, ctypes.c_float,
                                    ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float), ctypes.c_int)
 PENALTY, PENALTIES = "penalties", {"repetition_penalty", "presence_penalty", "frequency_penalty"}
 FACTS = ("draft_width", "bytes_per_pass", "draft_bytes_per_step", "draft_ms", "kv_bytes_per_token", "kernel_work")
+# NativeEngine.score per target: its log-probability, the query rows, the argmax and the engine's own ranked top_k
+# [(token, logprob), ...] (None for parts not asked for or not returned).
+Scores = namedtuple("Scores", "target query argmax top")
 
 
 class NativeError(RuntimeError):
@@ -54,39 +59,29 @@ class NativeEngine:
         lib.crit_engine_close.argtypes = [ctypes.c_void_p]
         lib.crit_engine_info.restype = ctypes.c_int
         lib.crit_engine_info.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
-        lib.crit_engine_generate.restype = ctypes.c_int
-        lib.crit_engine_generate.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_int, ctypes.c_int,
-                                             ctypes.c_char_p, TOKEN_CALLBACK, ctypes.c_void_p,
-                                             ctypes.POINTER(ctypes.c_int32), ctypes.c_char_p, ctypes.c_int]
         lib.crit_engine_score.restype = ctypes.c_int
         lib.crit_engine_score.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_int, ctypes.c_int,
-                                          ctypes.c_char_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_int,
+                                          ctypes.c_char_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_int, ctypes.c_int,
                                           ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
-                                          ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int)]
+                                          ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int),
+                                          ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float)]
         lib.crit_engine_last_error.restype = ctypes.c_char_p
         self._condition = threading.Condition()
         self._serial = threading.RLock()
         self._active = 0
         self._closing = False
-        self._requests = hasattr(lib, "crit_engine_request_open")
-        if self._requests:
-            lib.crit_engine_request_open.restype = ctypes.c_void_p
-            lib.crit_engine_request_open.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
-                                                    ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
-            for name in ("cancel", "close"):
-                function = getattr(lib, "crit_engine_request_" + name)
-                function.restype = None
-                function.argtypes = [ctypes.c_void_p]
-            lib.crit_engine_request_wait.restype = ctypes.c_int
-            lib.crit_engine_request_wait.argtypes = [ctypes.c_void_p, TOKEN_CALLBACK, ctypes.c_void_p,
-                                                    ctypes.POINTER(ctypes.c_int32), ctypes.c_char_p, ctypes.c_int]
-        # Per-token log-probabilities (libraries built against a header that exports request_wait_output).
-        self.outputs = self._requests and hasattr(lib, "crit_engine_request_wait_output")
-        if self.outputs:
-            lib.crit_engine_request_wait_output.restype = ctypes.c_int
-            lib.crit_engine_request_wait_output.argtypes = [ctypes.c_void_p, OUTPUT_CALLBACK, ctypes.c_void_p,
-                                                           ctypes.POINTER(ctypes.c_int32), ctypes.c_char_p,
-                                                           ctypes.c_int]
+        lib.crit_engine_request_open.restype = ctypes.c_void_p
+        lib.crit_engine_request_open.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                                                ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
+        for name in ("cancel", "close"):
+            function = getattr(lib, "crit_engine_request_" + name)
+            function.restype = None
+            function.argtypes = [ctypes.c_void_p]
+        for name, callback in (("wait", TOKEN_CALLBACK), ("wait_output", OUTPUT_CALLBACK)):
+            function = getattr(lib, "crit_engine_request_" + name)
+            function.restype = ctypes.c_int
+            function.argtypes = [ctypes.c_void_p, callback, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                                 ctypes.c_char_p, ctypes.c_int]
         self.lib = lib
         self.handle = lib.crit_engine_open(json.dumps(configuration).encode("utf-8"))
         if not self.handle:
@@ -115,7 +110,7 @@ class NativeEngine:
                 raise NativeError("engine is closed")
             self._active += 1
         try:
-            concurrent = self._requests and self.facts.get("max_concurrent_requests", 1) > 1
+            concurrent = self.facts.get("max_concurrent_requests", 1) > 1
             with nullcontext() if concurrent else self._serial:
                 yield
         finally:
@@ -145,9 +140,6 @@ class NativeEngine:
         if plain:
             options["plain"] = True
         if logprobs is not None:
-            if not self.outputs:
-                raise NativeError(f"{self.path} has no per-token log-probabilities: rebuild it against this crit's "
-                                  "crit/native_engine.h")
             options["logprobs"] = int(logprobs)
         failure = []
 
@@ -174,41 +166,36 @@ class NativeEngine:
         out = (ctypes.c_int32 * max(1, output_tokens))()
         result = ctypes.create_string_buffer(RESULT_BYTES)
         encoded = json.dumps(options).encode("utf-8")
-        if self._requests:
-            request = self.lib.crit_engine_request_open(self.handle, ids, len(prompt), int(output_tokens), encoded)
-            if not request:
-                raise NativeError("generation failed: " + self._error())
-            done = threading.Event()
-            monitor = None
+        request = self.lib.crit_engine_request_open(self.handle, ids, len(prompt), int(output_tokens), encoded)
+        if not request:
+            raise NativeError("generation failed: " + self._error())
+        done = threading.Event()
+        monitor = None
 
-            def watch():
-                while not done.is_set():
-                    try:
-                        stop = cancelled()
-                    except BaseException as error:
-                        failure.append(error)
-                        stop = True
-                    if stop:
-                        self.lib.crit_engine_request_cancel(request)
-                        return
-                    done.wait(0.01)
+        def watch():
+            while not done.is_set():
+                try:
+                    stop = cancelled()
+                except BaseException as error:
+                    failure.append(error)
+                    stop = True
+                if stop:
+                    self.lib.crit_engine_request_cancel(request)
+                    return
+                done.wait(0.01)
 
-            try:
-                if cancelled:
-                    monitor = threading.Thread(target=watch, name="crit-native-cancel", daemon=True)
-                    monitor.start()
-                wait = self.lib.crit_engine_request_wait if logprobs is None else self.lib.crit_engine_request_wait_output
-                count = wait(request, callback, None, out, result, RESULT_BYTES)
-                error = self._error() if count < 0 else ""
-            finally:
-                done.set()
-                if monitor is not None and monitor.ident is not None:
-                    monitor.join()
-                self.lib.crit_engine_request_close(request)
-        else:
-            count = self.lib.crit_engine_generate(self.handle, ids, len(prompt), int(output_tokens),
-                                                 encoded, callback, None, out, result, RESULT_BYTES)
+        try:
+            if cancelled:
+                monitor = threading.Thread(target=watch, name="crit-native-cancel", daemon=True)
+                monitor.start()
+            wait = self.lib.crit_engine_request_wait if logprobs is None else self.lib.crit_engine_request_wait_output
+            count = wait(request, callback, None, out, result, RESULT_BYTES)
             error = self._error() if count < 0 else ""
+        finally:
+            done.set()
+            if monitor is not None and monitor.ident is not None:
+                monitor.join()
+            self.lib.crit_engine_request_close(request)
         if failure:
             raise failure[0]
         if count == -2:
@@ -217,30 +204,35 @@ class NativeEngine:
             raise NativeError("generation failed: " + error)
         return [out[i] for i in range(count)], json.loads(result.value.decode("utf-8"))
 
-    def score(self, ids, first_target, path="", queries=None):
+    def score(self, ids, first_target, path="", queries=None, top_k=0):
+        """Scores (crit_engine_score) of every target ids[i], i >= first_target: its log-probability, the
+        log-probabilities of its row of `queries` (one equally long row of token ids per target), the argmax when the
+        engine returns one, and with top_k the engine's own top_k ranked [(token, logprob), ...]. path: one of the
+        engine's score_paths ("": the default)."""
         with self._lease():
-            return self._score(ids, first_target, path, queries)
-
-    def _score(self, ids, first_target, path="", queries=None):
-        """(target log-probabilities, query log-probability rows or None, argmax or None) for every target
-        ids[i], i >= first_target. queries: one row of token ids per target, all the same length."""
-        targets = len(ids) - first_target
-        per = len(queries[0]) if queries else 0
-        flat = [int(t) for row in (queries or []) for t in row]
-        if len(flat) != targets * per:
-            raise NativeError("score queries need one equally long row per target")
-        target = (ctypes.c_float * targets)()
-        query = (ctypes.c_float * max(1, targets * per))()
-        argmax = (ctypes.c_int32 * targets)()
-        has_argmax = ctypes.c_int(0)
-        code = self.lib.crit_engine_score(self.handle, (ctypes.c_int32 * len(ids))(*ids), len(ids), int(first_target),
-                                          (path or "").encode("utf-8"),
-                                          (ctypes.c_int32 * max(1, len(flat)))(*flat) if flat else None, per,
-                                          target, query, argmax, ctypes.byref(has_argmax))
-        if code != 0:
-            raise NativeError("scoring failed: " + self._error())
-        rows = [[query[t * per + j] for j in range(per)] for t in range(targets)] if per else None
-        return list(target), rows, (list(argmax) if has_argmax.value else None)
+            targets = len(ids) - first_target
+            per = len(queries[0]) if queries else 0
+            flat = [int(t) for row in (queries or []) for t in row]
+            if len(flat) != targets * per:
+                raise NativeError("score queries need one equally long row per target")
+            target = (ctypes.c_float * max(1, targets))()
+            query = (ctypes.c_float * max(1, targets * per))()
+            argmax = (ctypes.c_int32 * max(1, targets))()
+            has_argmax = ctypes.c_int(0)
+            tokens = (ctypes.c_int32 * max(1, targets * top_k))()
+            values = (ctypes.c_float * max(1, targets * top_k))()
+            code = self.lib.crit_engine_score(self.handle, (ctypes.c_int32 * len(ids))(*ids), len(ids),
+                                              int(first_target), (path or "").encode("utf-8"),
+                                              (ctypes.c_int32 * max(1, len(flat)))(*flat) if flat else None, per,
+                                              int(top_k), target, query, argmax, ctypes.byref(has_argmax), tokens,
+                                              values)
+            if code != 0:
+                raise NativeError("scoring failed: " + self._error())
+            return Scores(list(target)[:targets],
+                          [[query[t * per + j] for j in range(per)] for t in range(targets)] if per else None,
+                          list(argmax)[:targets] if has_argmax.value else None,
+                          [[(tokens[t * top_k + k], values[t * top_k + k]) for k in range(top_k)]
+                           for t in range(targets)] if top_k else None)
 
     def close(self):
         with self._condition:
@@ -323,8 +315,10 @@ class ResidentEngine(ResidentChat):
     """chat-resident-v1 (docs/SERVING.md) over a native engine: crit_core.serving.ResidentChat with the engine's
     stop tokens, context and the sampling fields its info declares ("sampling": {temperature, top_p, top_k, min_p,
     seed, penalties, logit_bias}), and token log-probabilities (chat-logprobs-v1) when its info reports
-    token_logprobs with max_top_logprobs of at least 20. Configuration "chat_template_kwargs" passes variables to the
-    chat template."""
+    token_logprobs with max_top_logprobs of at least 20. It scores fixed text (chat-score-v1) when the engine also
+    declares query_scoring and replay: the prompt by query scoring with the engine's own top-k on its "prefill" score
+    path (the default path when it names none), the continuation by replay with log-probabilities.
+    Configuration "chat_template_kwargs" passes variables to the chat template."""
 
     def __init__(self, context, library, defaults=None):
         configuration = {**(defaults or {}), **(context.configuration or {})}
@@ -336,15 +330,15 @@ class ResidentEngine(ResidentChat):
             native["context_tokens"] = int(limits["kv_tokens"])
         self.native = NativeEngine(library, native)
         self.facts = self.native.info()
-        self.max_concurrent_requests = (int(self.facts.get("max_concurrent_requests", 1))
-                                        if self.native._requests else 1)
+        self.max_concurrent_requests = int(self.facts.get("max_concurrent_requests", 1))
         self._owns_native = True
         self.capacity = min(int(self.facts["context"]), int(limits.get("kv_tokens") or self.facts["context"]))
         self.stop_ids = set(self.facts.get("stop_tokens") or [])
         support = self.facts.get("sampling") or {}
         self.sampling = tuple(key for key in SAMPLING if support.get(PENALTY if key in PENALTIES else key))
-        self.logprobs = bool(self.native.outputs and self.facts.get("token_logprobs")
+        self.logprobs = bool(self.facts.get("token_logprobs")
                              and int(self.facts.get("max_top_logprobs", 0)) >= TOP_LOGPROBS)
+        self.scores = bool(self.logprobs and self.facts.get("query_scoring") and self.facts.get("replay"))
 
     def create_request(self, request):
         # Share only the immutable tokenizer/configuration and the synchronized native
@@ -370,6 +364,30 @@ class ResidentEngine(ResidentChat):
                         "first_token_ms": timing["first_token_ms"],
                         "rounds": decode_rounds(tokens, result, bool(self.facts.get("speculative")))}
 
+    def score_tokens(self, ids, continuation, top_k, cancelled, prompt_rows):
+        started = time.monotonic()
+        paths = self.facts.get("score_paths") or []
+        scored = (self.native.score(ids, 1, "prefill" if "prefill" in paths else "", top_k=top_k)
+                  if prompt_rows and len(ids) > 1 else None)
+        targets, tops = (scored.target, scored.top) if scored else ([], [])
+        prefill_ms = (time.monotonic() - started) * 1000
+        rows = []
+        if continuation:
+            # Greedy: a sampled replay would accept drafts by the sampling rule instead of by equality.
+            greedy = {"temperature": 0.0} if "temperature" in self.sampling else None
+            tokens, result = self.native.generate(list(ids), len(continuation), stop_tokens=[], replay=list(continuation),
+                                                  sampling=greedy, logprobs=top_k,
+                                                  on_tokens=lambda _tokens, found: rows.extend(found),
+                                                  cancelled=cancelled)
+            if tokens is None:
+                return None, None, {}
+            if list(tokens) != list(continuation):
+                raise NativeError("replay emitted other tokens than the continuation")
+            decode_ms = result["timing"]["decode_ms"]
+        else:
+            decode_ms = None
+        return list(zip(targets, tops)), rows, {"prefill_ms": prefill_ms, "decode_ms": decode_ms}
+
     def close(self):
         if self._owns_native:
             self.native.close()
@@ -383,5 +401,4 @@ def resident_engine(context, library, defaults=None):
     return ResidentEngine(context, library, defaults)
 
 
-__all__ = ["NativeEngine", "NativeError", "EvalEngine", "ResidentEngine", "chat_prompt", "eval_engine",
-           "resident_engine"]
+__all__ = ["NativeEngine", "NativeError", "EvalEngine", "ResidentEngine", "eval_engine", "resident_engine"]

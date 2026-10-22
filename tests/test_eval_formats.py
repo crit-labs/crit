@@ -66,6 +66,17 @@ def sequences():
     return [(torch.randint(0, 300, (40,)).tolist(), 5), (torch.randint(0, 300, (23,)).tolist(), 3)]
 
 
+def scored(folder, sequences, top_k=5):
+    """Per (ids, first target): the reference's (log-probabilities, top_k ids, their log-probabilities) of the targets
+    from the first on, as lists (score_texts scores every position)."""
+    import tempfile
+    from crit_eval.reference import StreamingReference
+    with tempfile.TemporaryDirectory() as scratch:
+        rows = StreamingReference(folder, device="cpu").score_texts([ids for ids, _ in sequences], top_k, None, scratch,
+                                                                    log=lambda *_: None)
+    return [tuple(part[first - 1:].tolist() for part in row) for (_, first), row in zip(sequences, rows)]
+
+
 @unittest.skipUnless(HAS_REFERENCE, "needs torch, transformers, safetensors and tokenizers")
 class FormatTests(unittest.TestCase):
     @classmethod
@@ -89,10 +100,9 @@ class FormatTests(unittest.TestCase):
         reference decodes, so the stored scheme reaches the modeling code intact."""
         import torch
         from transformers import AutoConfig, AutoModelForCausalLM
-        from crit_eval.reference import StreamingReference
         from crit_eval.schemes import scheme
         checkpoint = self.checkpoint(folder)
-        scores = StreamingReference(folder, device="cpu").score(sequences(), 5, None, log=lambda *_: None)
+        scores = scored(folder, sequences())
         config = json.loads((folder / "config.json").read_text())
         for key in ("quantization_config", "quantization"):
             config.pop(key, None)
@@ -105,10 +115,9 @@ class FormatTests(unittest.TestCase):
             state[key] = checkpoint.dense(base, "cpu") if stored else checkpoint.raw(key).float()
         model.load_state_dict(state, strict=True)
         with torch.no_grad():
-            for (ids, first), rows in zip(sequences(), scores):
+            for (ids, first), (got, _, _) in zip(sequences(), scores):
                 logprobs = torch.log_softmax(model(torch.tensor([ids])).logits[0].double(), -1)
-                self.assertEqual([row["logprob"] for row in rows],
-                                 [logprobs[i - 1, ids[i]].item() for i in range(first, len(ids))], folder.name)
+                self.assertEqual(got, [logprobs[i - 1, ids[i]].item() for i in range(first, len(ids))], folder.name)
 
     def assert_counted_like(self, folder, original, rate):
         """The ceiling counts the original's matrices and FLOPs, at `rate`."""
@@ -134,7 +143,6 @@ class FormatTests(unittest.TestCase):
         import torch
         from safetensors.torch import load_file
         from crit_core.model import open_model
-        from crit_eval.reference import StreamingReference
         tensors = load_file(self.small / "model.safetensors")
         whole, split = self.root / "torch", self.root / "torch-split"
         for folder in (whole, split):
@@ -146,11 +154,10 @@ class FormatTests(unittest.TestCase):
             torch.save({key: tensors[key] for key in keys}, split / file)
         (split / "pytorch_model.bin.index.json").write_text(json.dumps(
             {"weight_map": {key: file for file, keys in halves.items() for key in keys}}))
-        expected = StreamingReference(self.small, device="cpu").score(sequences(), 5, None, log=lambda *_: None)
+        expected = scored(self.small, sequences())
         for folder in (whole, split):
             self.assertEqual(open_model(folder).format, "torch")
-            self.assertEqual(StreamingReference(folder, device="cpu").score(sequences(), 5, None,
-                                                                           log=lambda *_: None), expected)
+            self.assertEqual(scored(folder, sequences()), expected)
             self.assertEqual(ceiling.model_ceiling(folder), ceiling.model_ceiling(self.small))
 
     def test_block_fp8_scales_decode_as_transformers_does(self):

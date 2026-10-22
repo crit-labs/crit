@@ -5,8 +5,9 @@ the numbers about how to build.
 
 1. Gates, the only pass/fail: speed coverage, repeatable outputs, request history (the same greedy
    requests give the same tokens on the fresh engine and after everything else it served), quality
-   (the engine's replies, scored by the reference, within the drift budget in every set: the
-   conversations and the replies after long prompts), capacity (the engine serves a request at the
+   (the engine's scores of the fixed quality texts against the reference's, within the drift budget
+   on every set's prefill and decode positions, and its served replies scored alike by its scoring
+   path: the honesty check), capacity (the engine serves a request at the
    required context), retrieval (facts at the start, middle and end of long prompts up to the
    required context are answered verbatim), lower context (no speed case is slower on an engine
    opened at a lower context), generality (against a baseline, no held-out prompt and not the
@@ -31,7 +32,7 @@ from . import load_json, metrics, protocol_version
 
 
 def _gates(result):
-    speed, quality, exact = result.get("speed"), result.get("quality"), result.get("exactness")
+    speed, exact = result.get("speed"), result.get("exactness")
     speculative = (result.get("engine") or {}).get("speculative")
     gates = []
     if speed:
@@ -48,6 +49,7 @@ def _gates(result):
     else:
         gates.append({"name": "coverage", "state": "unmeasured", "detail": "speed not run"})
     gates += _history_gate(result)
+    gates.append(_prompt_cache_gate(result))
     gates.append(_quality_gate(result))
     gates += _context_gates(result)
     if speculative and _exactness_mode(result) == "required":
@@ -62,7 +64,8 @@ def _gates(result):
 
 
 def _quality_gate(result):
-    """The engine's replies scored by the reference (protocol quality): every set within the drift budget."""
+    """The engine's scores of the fixed texts against the reference's (protocol quality): every set's prefill and
+    decode within the drift budget, and the honesty check holding."""
     quality = result.get("quality")
     state = (quality or {}).get("status")
     if quality is None:
@@ -71,26 +74,37 @@ def _quality_gate(result):
         return {"name": "quality", "state": "unmeasured", "detail": quality["reason"]}
     if state == "skipped":
         return {"name": "quality", "state": "fail", "detail": quality["reason"]}
-    if state == "replied":
-        return {"name": "quality", "state": "unmeasured",
-                "detail": f"{len(quality['replies'])} replies await the reference: crit eval reference --result"}
-    if state != "scored":
-        return {"name": "quality", "state": "unmeasured",
-                "detail": f"measured with {result.get('protocol')}, whose quality this Eval does not read"}
     failures = [f"{name}: {', '.join(s['failures'])}" for name, s in quality["sets"].items() if not s["passed"]]
+    honesty = quality.get("honesty") or {}
+    if honesty.get("passed") is False:
+        failures += honesty["failures"]
     detail = "sets " + ", ".join(quality["sets"]) if not failures else "; ".join(failures)
+    if honesty.get("passed") is not None:
+        detail += f"; served replies scored alike within {honesty['max_abs_logprob_diff']:.1e}"
+    elif honesty:
+        detail += f"; honesty not checked: {honesty.get('reason') or 'no honesty set fits the context'}"
     if quality.get("skipped"):
         detail += " (skipped: " + "; ".join(f"{name}, {why}" for name, why in quality["skipped"].items()) + ")"
     return {"name": "quality", "state": "fail" if failures else "pass", "detail": detail}
 
 
-def _since_v4(result):
-    """Results of crit-eval-v4 and later have the request-history and retrieval gates; earlier ones are shown as
-    they were judged."""
-    try:
-        return protocol_version(result.get("protocol"))[0] >= 4
-    except ValueError:
-        return False
+def _prompt_cache_gate(result):
+    """protocol followup: the follow-up turns, run again after every other part, answer as they did first, whatever
+    the engine served from a prompt cache either time."""
+    followup = result.get("followup")
+    if followup is None:
+        return {"name": "prompt_cache", "state": "unmeasured", "detail": "follow-up turns not run"}
+    if followup.get("status") != "measured":
+        return {"name": "prompt_cache", "state": "unmeasured", "detail": followup.get("reason") or "not measured"}
+    again = followup.get("again")
+    if again is None:
+        return {"name": "prompt_cache", "state": "unmeasured", "detail": "the follow-up turns did not run again"}
+    differ = {turn: row["first_difference"] for turn, row in again["turns"].items() if not row["identical"]}
+    cached = [str(row.get("cached_tokens")) for row in followup["turns"]]
+    return {"name": "prompt_cache", "state": "fail" if differ else "pass",
+            "detail": (f"{len(again['turns']) - len(differ)}/{len(again['turns'])} follow-up turns answer again as "
+                       f"first (cached prompt tokens {', '.join(cached)})"
+                       + "".join(f"; turn {turn} differs at token {i}" for turn, i in differ.items()))}
 
 
 def _history_gate(result):
@@ -98,7 +112,7 @@ def _history_gate(result):
     every exactness mode: a deterministic engine repeats a request whatever came before."""
     history = result.get("history")
     if history is None:
-        return [{"name": "request_history", "state": "unmeasured", "detail": "history not run"}] if _since_v4(result) else []
+        return [{"name": "request_history", "state": "unmeasured", "detail": "history not run"}]
     cases = history.get("cases") or {}
     if not cases:
         return [{"name": "request_history", "state": "unmeasured", "detail": "no history case fits the engine"}]
@@ -113,7 +127,7 @@ def _retrieval_gate(result, required):
     context = result.get("context") or {}
     retrieval = context.get("retrieval")
     if retrieval is None:
-        return [{"name": "retrieval", "state": "unmeasured", "detail": "context checks not run"}] if _since_v4(result) else []
+        return [{"name": "retrieval", "state": "unmeasured", "detail": "context checks not run"}]
     if retrieval.get("status") != "measured":
         return [{"name": "retrieval", "state": "unmeasured", "detail": retrieval.get("reason") or "retrieval not run"}]
     problems = []
@@ -132,17 +146,14 @@ def _retrieval_gate(result, required):
 
 
 def _context_gates(result):
-    """Capacity, retrieval and lower context; results from before the context checks have none of them."""
-    context = result.get("context")
-    if context is None:
-        return []
+    """Capacity, retrieval and lower context."""
+    context = result["context"]
     required = context.get("tokens")
     if not required:
         why = context.get("reason") or "; ".join(context.get("missing") or []) or "no required context"
         detail = f"max context unknown: {why} (pass --context, or --device with a crit eval probe result)"
-        return [{"name": "capacity", "state": "unmeasured", "detail": detail}] + (
-            [{"name": "retrieval", "state": "unmeasured", "detail": detail}] if _since_v4(result) else []) + [
-            {"name": "lower_context", "state": "unmeasured", "detail": detail}]
+        return [{"name": name, "state": "unmeasured", "detail": detail}
+                for name in ("capacity", "retrieval", "lower_context")]
     points, lower = context.get("points"), context.get("lower")
     if points is None:
         capacity = {"name": "capacity", "state": "unmeasured", "detail": "context checks not run"}
@@ -228,9 +239,7 @@ def _change(now, before):
 
 
 def _exactness_mode(result):
-    """Results from before exactness modes existed were judged as required."""
-    return ((result.get("exactness") or {}).get("mode")
-            or (result.get("requirements") or {}).get("exactness") or "required")
+    return result["requirements"]["exactness"]
 
 
 def _exactness_note(result):
@@ -337,8 +346,13 @@ def build(result, protocol, baseline=None):
                     "prompts": {pid: {k: row.get(k) for k in ("language", "decode_tps", "tokens_per_round")}
                                 for pid, row in held.get("prompts", {}).items() if row.get("status") == "measured"}}
                    if held.get("status") == "measured" else None)
+    follow = result.get("followup") or {}
+    followup_kpi = ({"ttft_ms": follow.get("ttft_ms"), "prefill_tps": follow.get("prefill_tps"),
+                     "turns": {str(t["turn"]): {k: t.get(k) for k in ("prompt_tokens", "cached_tokens", "ttft_ms",
+                                                                     "prefill_tps")} for t in follow["turns"]}}
+                    if follow.get("status") == "measured" else None)
     kpis = {"end_to_end": end_to_end, "decode": decode, "prefill": prefill_kpi, "ttft": ttft_kpi,
-            "context": _context_kpi(result), "heldout": heldout_kpi,
+            "context": _context_kpi(result), "heldout": heldout_kpi, "followup": followup_kpi,
             "quality": _quality_kpi(result.get("quality"), protocol["quality"]["thresholds"])}
     missing = list(room.get("missing", []))
     # Older results call the gaps levers, tag them and add end-to-end gains; none of that is shown.
@@ -419,9 +433,13 @@ def stop_record_headroom(result, baseline=None):
 
 
 def changes(result, baseline):
-    """Relative change of each headline KPI from a baseline result."""
-    if baseline.get("model_sha256") != result.get("model_sha256") or baseline.get("suite_sha256") != result.get("suite_sha256"):
+    """Relative change of each headline KPI from a baseline result of the same prepared data, suite and protocol
+    major version."""
+    if (baseline.get("model_sha256"), baseline.get("suite_sha256")) != (result.get("model_sha256"),
+                                                                        result.get("suite_sha256")):
         return {"comparable": False, "reason": "different prepared data or suite"}
+    if _major(baseline) != _major(result):
+        return {"comparable": False, "reason": f"measured with {baseline.get('protocol')}"}
 
     def ratio(now, before):
         return now / before - 1 if now and before else None
@@ -450,6 +468,13 @@ def changes(result, baseline):
             "worst_kld_mean": ratio(worst(q_now), worst(q_before)),
             "heldout_decode": ratio((result.get("heldout") or {}).get("decode_score"),
                                     (baseline.get("heldout") or {}).get("decode_score"))}
+
+
+def _major(result):
+    try:
+        return protocol_version(result.get("protocol"))[0]
+    except ValueError:
+        return None
 
 
 def context_text_identity(result):
@@ -594,8 +619,12 @@ def _signed(value):
 
 
 def status_of(path, protocol, baseline_path=None):
+    """The status of the result at `path` under this protocol. A result of another major version keeps the status
+    stored in it when it was measured."""
     result = load_json(path)
     if result.get("aborted"):
         raise SystemExit(f"{path} is an aborted round with no status: {result['aborted']['detail']}")
+    if _major(result) != _major(protocol):
+        raise SystemExit(f"{path} was measured with {result.get('protocol')}; its status is the one stored in it")
     baseline = load_json(baseline_path) if baseline_path else None
     return build(result, protocol, baseline)

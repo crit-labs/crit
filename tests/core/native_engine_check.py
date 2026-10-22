@@ -80,11 +80,19 @@ def abi(library):
     except KeyError:
         pass
 
-    target, rows, argmax = engine.score([1, 2, 3, 4], 2)
-    expect(target == [-0.5, -0.5] and rows is None and argmax == [3, 4], (target, rows, argmax))
-    target, rows, argmax = engine.score([1, 2, 3, 4], 2, "decode", [[7, 8], [9, 10]])
-    expect(target == [-0.75, -0.75] and rows == [[-1.0, -1.125], [-1.25, -1.375]] and argmax == [3, 4], rows)
-    for bad in (lambda: engine.score([1, 2], 2), lambda: engine.generate([], 3)):
+    scored = engine.score([1, 2, 3, 4], 2)
+    expect(scored == ([-0.5, -0.5], None, [3, 4], None), scored)
+    scored = engine.score([1, 2, 3, 4], 2, "decode", [[7, 8], [9, 10]])
+    expect(scored.target == [-0.75, -0.75] and scored.query == [[-1.0, -1.125], [-1.25, -1.375]]
+           and scored.argmax == [3, 4] and scored.top is None, scored)
+    # The engine's own top-k with the scores (the target first, then the ids after it), alone or with queries.
+    scored = engine.score([1, 2, 3, 4], 2, "decode", top_k=2)
+    expect(scored.target == [-0.75, -0.75] and scored.query is None
+           and scored.top == [[(3, -0.75), (4, -1.0)], [(4, -0.75), (5, -1.0)]], scored)
+    both = engine.score([1, 2, 3, 4], 2, "decode", [[7, 8], [9, 10]], top_k=2)
+    expect(both.query == [[-1.0, -1.125], [-1.25, -1.375]] and both.top == scored.top, both)
+    for bad in (lambda: engine.score([1, 2], 2), lambda: engine.generate([], 3),
+                lambda: engine.score([1, 2], 1, top_k=21)):
         try:
             bad()
             raise AssertionError("invalid requests must fail")
@@ -214,6 +222,14 @@ def resident_adapter(library):
     expect(len(rows) == 6 and all(row[1] == -0.5 and [t for t, _ in row[2]] == [row[0], (row[0] + 1) % 64]
                                   for row in rows), rows)
     expect(response["assistant"] == "".join(bytes.fromhex(named[str(row[0])]).decode() for row in rows), response)
+    # Fixed text (chat-score-v1): the prompt through the prefill score path, the continuation by replay.
+    expect(engine.scores is True, "query scoring, replay and log-probabilities score fixed text")
+    scored = engine.score(dict(request, prompt_ids=[1, 2, 3], continuation_ids=[11, 5, 12], top_logprobs=2,
+                               prompt_rows=True), Cancellation())
+    expect([row[0] for row in scored["prompt"]] == [2, 3] and [row[0] for row in scored["continuation"]] == [11, 5, 12],
+           scored)
+    expect(all(row[1] == -0.5 and [t for t, _ in row[2]] == [row[0], (row[0] + 1) % 64]
+               for row in scored["prompt"] + scored["continuation"]), scored)
     too_long = dict(request, limits={"max_output_tokens": 196})
     try:
         engine.generate(too_long, Cancellation())
@@ -223,7 +239,7 @@ def resident_adapter(library):
     engine.close()
     context.configuration["concurrent"] = True
     engine = ResidentEngine(context, library)
-    expect(engine.logprobs is False, "a model without token log-probabilities declares none")
+    expect(engine.logprobs is False and engine.scores is False, "a model without token log-probabilities declares none")
     first, second = engine.create_request(request), engine.create_request(request)
     expect(engine.max_concurrent_requests == 3 and first is not second, "private request wrappers")
     first.calls_format = object()

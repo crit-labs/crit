@@ -365,10 +365,11 @@ class PtqTests(unittest.TestCase):
         self.assertIn("output_error", record["errors"])
         self.assertFalse((self.root / "out/.crit-staging").exists())
         ids = list(range(1, 40))
-        original = StreamingReference(source, "cpu").score([(ids, 1)], 1, log=lambda m: None)[0]
-        transformed = StreamingReference(self.root / "out", "cpu").score([(ids, 1)], 1, log=lambda m: None)[0]
-        drift = [abs(a["logprob"] - b["logprob"]) for a, b in zip(original, transformed)]
-        self.assertLess(sum(drift) / len(drift), 0.5)
+        original = StreamingReference(source, "cpu").score_texts([ids], 1, None, self.root / "scratch-a",
+                                                                 log=lambda m: None)[0][0]
+        transformed = StreamingReference(self.root / "out", "cpu").score_texts([ids], 1, None, self.root / "scratch-b",
+                                                                              log=lambda m: None)[0][0]
+        self.assertLess(float((original - transformed).abs().mean()), 0.5)
         repeat = run_ptq(value, source, self.root / "again", self.root / "again.json",
                          calibration=self.root / "calibration.jsonl", device="cpu", log=lambda m: None)
         self.assertEqual(repeat["calibration"]["windows_sha256"], facts["windows_sha256"])
@@ -442,19 +443,15 @@ class EvaluationTests(unittest.TestCase):
                     self.evaluate()
         self.assertFalse((self.root / "evaluation.json").exists())
 
-    def test_eval_scores_the_outputs_quality_replies_on_the_source(self):
+    def test_eval_records_the_quality_its_round_judged_without_running_the_reference(self):
+        # The round judged quality against the source's reference scores stored under the data (crit eval reference
+        # --model SOURCE --data DATA): the record takes its gates as they are.
         self.prepared(self.source)
-        self.result(quality={"status": "replied"}, status={"gates": [], "kpis": {}})
-        scored = []
-
-        def fake_score(model, data, path, baseline, log):
-            scored.append((Path(model).resolve(), Path(path)))
-            return {"server": "http://127.0.0.1:8000/v1", "engine": {"name": "out"},
-                    "quality": {"status": "scored"}, "status": self.status}
-        with patch("crit_eval.reference.score_result", fake_score):
+        self.result(quality={"status": "scored", "passed": True})
+        with patch("crit_eval.reference.score_data", side_effect=AssertionError("ran the reference")):
             evaluation = self.evaluate()
-        self.assertEqual(scored, [(self.source.resolve(), self.root / "result.json")])
         self.assertEqual(evaluation["summary"]["gates"], {"quality": "pass"})
+
 
 if __name__ == "__main__":
     unittest.main()

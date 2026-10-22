@@ -322,32 +322,39 @@ int generate(void* engine, const std::int32_t* prompt, int count, int output_tok
 }
 
 int score(void* handle, const std::int32_t* ids, int count, int first_target, const char* path,
-          const std::int32_t* queries, int per_target, float* target, float* query, std::int32_t* argmax,
-          int* has_argmax) noexcept {
+          const std::int32_t* queries, int per_target, int top_k, float* target, float* query, std::int32_t* argmax,
+          int* has_argmax, std::int32_t* top_tokens, float* top_logprobs) noexcept {
     try {
         auto& native = engine_of(handle);
-        if(!ids || count <= 0 || first_target < 0 || first_target >= count || !target || per_target < 0)
-            throw std::invalid_argument("score needs ids, a first target inside them and a target buffer");
+        if(!ids || count <= 0 || first_target < 0 || first_target >= count || !target || per_target < 0 || top_k < 0 ||
+           (per_target && (!queries || !query)) || (top_k && (!top_tokens || !top_logprobs)))
+            throw std::invalid_argument("score needs ids, a first target inside them and the buffers it asks for");
         const auto targets = std::size_t(count - first_target);
         std::vector<Token> sequence(ids, ids + count);
         Handle request;
         // Query scoring also returns the argmax, so engines that support it take that path even without queries.
-        if(per_target > 0 || (path && *path) || native.engine->info().query_scoring) {
+        if(per_target > 0 || top_k > 0 || (path && *path) || native.engine->info().query_scoring) {
             ScoreQueries q;
             q.per_target = std::uint32_t(per_target);
             if(per_target) q.ids.assign(queries, queries + targets * std::size_t(per_target));
+            q.top_k = std::uint32_t(top_k);
             q.path = path ? path : "";
             request = native.engine->submit_score(std::move(sequence), std::uint32_t(first_target), std::move(q));
         } else {
             request = native.engine->submit_score(std::move(sequence), std::uint32_t(first_target));
         }
         const Result r = request.wait();
-        if(r.scores.size() != targets) throw std::runtime_error("engine returned the wrong number of target scores");
+        if(r.scores.size() != targets || r.top_logprobs.size() != targets * std::size_t(top_k))
+            throw std::runtime_error("engine returned the wrong number of target scores or alternatives");
         std::copy(r.scores.begin(), r.scores.end(), target);
-        if(per_target && query) std::copy(r.query_scores.begin(), r.query_scores.end(), query);
+        if(per_target) std::copy(r.query_scores.begin(), r.query_scores.end(), query);
         const bool argmaxed = r.argmax.size() == targets;
         if(argmaxed && argmax) std::copy(r.argmax.begin(), r.argmax.end(), argmax);
         if(has_argmax) *has_argmax = argmaxed ? 1 : 0;
+        for(std::size_t i = 0; i < r.top_logprobs.size(); ++i) {
+            top_tokens[i] = std::int32_t(r.top_logprobs[i].token);
+            top_logprobs[i] = r.top_logprobs[i].logprob;
+        }
         return 0;
     } catch(const std::exception& error) {
         fail(error.what());

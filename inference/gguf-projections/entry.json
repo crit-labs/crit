@@ -1,0 +1,74 @@
+{
+  "id": "gguf-projections",
+  "category": "projections",
+  "summary": "Projections over GGUF Q4_0, Q8_0, Q4_K, Q5_K and Q6_K blocks as stored in the file: a host reference equal bit for bit to gguf-py's dequantization and CUDA kernels that decode the same bits in registers for a GEMV over up to 8 rows or an FP32 copy",
+  "implementation_status": "native_source",
+  "implementation_scope": "A standard-library Python decoder of the five block formats following gguf-py's quants.dequantize operation by operation with FP32 rounding, plus a dense projection and deterministic test blocks; a header-only host/device decoder of eight values at a time with unfused FP32 multiply and subtract; CUDA dequantization and a warp-per-row GEMV for 1 to 8 FP32 activation rows reading the stored blocks directly. Codebook (IQ) formats, Q2_K/Q3_K, quantized activations and tensor-core prompt GEMMs over the blocks are engine work.",
+  "agent_guidance": {
+    "use_when": "An engine serves a GGUF checkpoint whose large matrices are Q4_0, Q8_0, Q4_K, Q5_K or Q6_K and decode should read the stored bits without re-encoding them",
+    "avoid_when": "The checkpoint uses IQ or other codebook formats, the engine re-encodes weights into its own layout, or a prompt GEMM needs tensor cores over the blocks",
+    "provides": [
+      "The five block layouts and value formulas in data and code, equal bit for bit to gguf-py's quants.dequantize",
+      "A host/device decoder of eight values per call with gguf-py's FP32 rounding order and no FMA contraction",
+      "A CUDA GEMV over rows of stored blocks for up to 8 activation rows, deterministic per row",
+      "A CUDA dequantization to FP32 for prompt GEMMs",
+      "Deterministic test blocks shared by the Python and native tests, with recorded digests of gguf-py's output"
+    ],
+    "engine_supplies": [
+      "The GGUF tensor offsets and shapes (Core's crit_core.model.gguf reads them) and device copies of the blocks",
+      "Activations in FP32 and the epilogue after the projection",
+      "Batched prompt GEMMs, or a choice to dequantize for them"
+    ],
+    "preserve": [
+      "One FP32 rounding per multiply and subtract in gguf-py's order",
+      "Each row's blocks read in the file's layout",
+      "A fixed reduction order per row"
+    ],
+    "adapt": [
+      "Rows per warp, split-K for short matrices and wider batches",
+      "BF16 or quantized activations",
+      "Fusing the dequantization into a tensor-core GEMM tile loader"
+    ]
+  },
+  "path": "inference/gguf-projections/README.md",
+  "code_path": "inference/gguf-projections/code",
+  "code_files": [
+    {"path": "inference/gguf-projections/code/gguf_blocks.py", "purpose": "Standard-library decoder equal to gguf-py, dense projection and deterministic test blocks"},
+    {"path": "inference/gguf-projections/code/gguf_blocks.h", "purpose": "Block formats and the host/device decoder of eight values with unfused FP32 arithmetic"},
+    {"path": "inference/gguf-projections/code/gguf_cuda.h", "purpose": "Dequantization and GEMV interfaces"},
+    {"path": "inference/gguf-projections/code/gguf_cuda.cu", "purpose": "Dequantization and warp-per-row GEMV kernels for the five formats"}
+  ],
+  "requires": {
+    "hardware": "CUDA C++20 on any GPU crit supports; Python 3.11+ standard library for the reference",
+    "model": "Matrices stored as GGUF Q4_0, Q8_0, Q4_K, Q5_K or Q6_K blocks",
+    "workload": "Decode or verify steps with 1 to 8 activation rows per projection"
+  },
+  "contract": {
+    "input": "Device blocks in the file's layout, rows, cols (a multiple of the block's values), FP32 activations [batch][cols] (16-byte aligned), batch 1 to 8",
+    "output": "FP32 projections [batch][rows], or FP32 values for dequantize",
+    "ownership": "The engine owns blocks, activations and outputs; launches borrow them on the caller stream",
+    "failure": "Null buffers, non-positive sizes, a partial block per row, batches outside 1 to 8, unaligned activations or an unknown format return cudaErrorInvalidValue; launch errors are returned. The Python reference raises ValueError for partial blocks",
+    "core_boundary": "No Core change; Core's GGUF reader supplies tensor offsets and types"
+  },
+  "dependencies": [
+    "CUDA runtime",
+    "Python standard library for the reference (gguf-py and numpy only to compare when installed)"
+  ],
+  "symbols": [
+    "Kind", "Format", "format", "decode8", "dequantize", "gemv", "FORMATS", "project", "test_blocks"
+  ],
+  "interactions": [
+    "quantized-projections",
+    "stored-tile-gemm",
+    "batched-reference-engine"
+  ],
+  "techniques": [
+    "gguf-projections",
+    "quantized-projections"
+  ],
+  "validation": {
+    "host": "The Python decoder equals SHA-256 digests of gguf 0.19.0's quants.dequantize on deterministic blocks of each format, and gguf-py itself when installed (checked bit for bit with gguf 0.19.0)",
+    "native": "The C++ host decoder equals the same digests; the CUDA decode equals the host bit for bit; the GEMV on 37 x 1024 matrices for 1, 3 and 8 rows is within 1e-5 of an FP64 product of the decoded weights",
+    "performance": "RTX 5090 (1,438 GB/s probed), weights cycling beyond the 96 MB L2, 14336 x 4096 matrix: one activation row 39 us (Q4_0, 841 GB/s of blocks), 45 us (Q8_0, 1,394 GB/s), 37 us (Q4_K, 885 GB/s), 47 us (Q5_K, 855 GB/s), 47 us (Q6_K, 1,023 GB/s); eight rows 97 to 126 us (265 to 645 GB/s), limited by the per-lane activation loop; no claim for other devices or shapes"
+  }
+}

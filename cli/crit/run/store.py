@@ -639,7 +639,9 @@ class RunStore:
             cap = attempt_process_cap(bounds, candidate_id, operation)
             if sum(a["segment_id"] == bounds["segment_id"] for a in self._attempts(root)) >= bounds["limits"]["attempt_limit"]:
                 raise ValueError("Segment attempt limit exhausted")
-            seconds = cap if seconds is None else number(seconds, "Process deadline", .001, cap)
+            window = (timestamp(bounds["deadline_at"], "deadline") - datetime.now(timezone.utc)).total_seconds()
+            limit = window if cap is None else cap
+            seconds = limit if seconds is None else number(seconds, "Process deadline", .001, max(.001, limit))
             owner = f"candidates/{ident(candidate_id, 'candidate')}" if candidate_id else f"segments/{bounds['segment_id']}"
             directory = safe_path(root, owner + "/attempts")
             attempt_id = next_id(directory, "attempt")

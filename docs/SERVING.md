@@ -95,6 +95,7 @@ simultaneously.
 | `GET /health` | `{"status": "ok", "engine": ...}`; 503 when the runtime is blocked. No key needed |
 | `GET /v1/models`, `GET /v1/models/{id}` | The run's sealed resident candidates, or catalog names, with `label`, `context_length` (the candidate's `kv_tokens`), `default`, package `capabilities` and `supported_sampling_parameters` |
 | `POST /v1/chat/completions` | Chat completion, JSON or server-sent events |
+| `POST /v1/crit/score` | [Fixed-text scores](#fixed-text-scores) for packages declaring `chat-score-v1` |
 
 `model` selects a candidate by `RUN_ID/CANDIDATE_ID` or `CANDIDATE_ID`; any other name
 (`"default"`, `"gpt-4o"`) uses the default. An unknown candidate returns 404, one that
@@ -115,6 +116,8 @@ declares the concurrent request contract below.
 | `logprobs`, `top_logprobs` | [Token log-probabilities](#token-log-probabilities) for packages declaring `chat-logprobs-v1`: every token's own and up to 20 alternatives. Not with `stop` |
 
 Responses carry `usage` when measured and `crit_telemetry`: prompt and output tokens, the
+prompt tokens the engine did not compute (`usage.prompt_tokens_details.cached_tokens`: its
+telemetry's prompt tokens minus `prefill_tokens`, 0 when it computed them all), the
 engine's prefill and decode rates, TTFT, and `tokens_per_round` (output tokens per target
 pass) when the engine reports its decode rounds. A stream's usage chunk carries both.
 Sampling overrides are validated before generation, including for streaming requests.
@@ -299,6 +302,23 @@ with the finish chunk, since the engine reports them in its final response. A re
 with `stop` strings is refused, since its turn is cancelled where a stop completes,
 before the engine reports its tokens.
 
+### Fixed-text scores
+
+`POST /v1/crit/score` with `{"model", "prompt_ids", "continuation_ids", "top_logprobs"}` and
+optionally `"prompt_rows": false` (token ids as the model's tokenizer numbers them;
+`top_logprobs` 0 to 20) scores fixed text
+through the engine's own serving paths, for packages declaring `chat-score-v1`: `prompt`
+holds one row per prompt position after the first, from one prefill of the prompt as the
+engine prefills a request, and `continuation` one row per continuation token, decoded after
+that prefill with every step forced to the continuation (a speculative engine accepts a
+draft only while it equals the continuation and takes every correction and bonus token from
+it). The first continuation row comes from the prefill's last position. With `prompt_rows`
+false, `prompt` is empty and the engine only prefills the prompt, as for a reply. Rows are `[token,
+logprob, [[token, logprob], ...]]` with exactly `top_logprobs` ranked alternatives,
+natural-log, of the raw logits; `crit_telemetry` holds `prefill_ms` and `decode_ms`. Eval's
+quality gate uses it ([docs/eval](eval/README.md)). A score runs alone on the engine, as Core
+runs scores, and is not streamed.
+
 ## Structured output
 
 `response_format` restricts the reply's bytes with Core's
@@ -309,9 +329,10 @@ declaring `chat-constraints-v1`; otherwise it returns 400.
 - `{"type": "json_schema", "json_schema": {"name": ..., "schema": {...}, "strict": ...}}`:
   compact JSON in the schema's declaration order, compiled with `crit_core.constraints`.
   The [supported subset](../core/src/constraints/README.md#compiling-languages-python):
-  closed objects (`additionalProperties: false`), typed arrays, strings with lengths,
-  booleans, null, numbers, integers with both bounds, `enum`, `const`. Anything else
-  (`$ref`, `anyOf`, `pattern`, `format`, open objects) returns 400 with
+  closed objects (`additionalProperties: false`), typed arrays, strings with lengths or a
+  `pattern`, booleans, null, numbers, integers with both bounds, `enum`, `const`, `anyOf`,
+  type lists, provably disjoint `oneOf` and local `$ref`/`$defs`. Anything else
+  (`format`, overlapping `oneOf`, `allOf`, open objects) returns 400 with
   `param: "response_format"`, `code: "unsupported_schema"` and the reason. Always strict.
 
 The engine applies the constraint while sampling (the adapter interface carries no
@@ -392,7 +413,9 @@ adapter failure or request that ignores cancellation requires retiring the share
 host process; other active requests fail too, and no new work enters until they
 have unwound. This is the existing ownership guarantee applied to concurrent work.
 The contract permits an engine's scheduler to batch requests; it does not itself
-promise batched device arithmetic or a throughput gain.
+promise batched device arithmetic or a throughput gain. The
+[batched reference engine](../inference/batched-reference-engine/README.md) is a native
+library that does both: its steps run every request's rows through one GEMM per weight.
 
 ### Model access and allocation
 
@@ -645,6 +668,23 @@ and Core's rounding tolerance into the range and reads the bytes from the tokeni
 `crit_engine_request_wait_output` and its `ModelInfo` declares `token_logprobs` with
 `max_top_logprobs` of at least 20 (see
 [engine libraries](../core/src/runtime/README.md#engine-libraries)).
+
+### Fixed-text scores for adapters
+
+Declare **`chat-score-v1`** (`capabilities(text, sampling, score=True)`) when the engine
+scores fixed text through its serving paths, set `scores = True` and implement
+`score_tokens(ids, continuation, top_k, cancelled, prompt_rows)`, returning `(prompt_rows,
+continuation_rows, timing)` with one `(logprob, [(token, logprob), ...top_k])` row per
+prompt position after the first (none when `prompt_rows` is false: the prompt is then only
+prefilled) and per continuation token (None for the rows when
+cancelled) and `timing` with `prefill_ms` and `decode_ms`; the host refuses to load the
+package otherwise. ResidentChat's `score(request, cancellation)` builds the response from
+it. `crit_core.native.ResidentEngine` sets `scores` when the engine's `ModelInfo` declares
+`query_scoring`, `token_logprobs` with `max_top_logprobs` of at least 20, and the info facts
+`replay`: the prompt is scored by
+Core's query scoring with the engine's own top-k on its `"prefill"` score path (the default
+path when it names none), which must run the engine's prefill kernels at every position, and
+the continuation by a replay generation with log-probabilities.
 
 ### Effective configuration
 

@@ -1,9 +1,9 @@
 """Speed and quality metrics. Pure Python so results can be computed on any host.
 
-Quality has two forms: `reply_quality` compares an engine's replies, with the top-k log-probabilities it
-reported, with the reference's scores of the same tokens (top-k on both sides plus a lumped tail, a lower bound
-on KL), and `log_softmax`, `kl_divergence`, `Summary` and `compare` compare full logit rows when an engine can
-supply them (FP64; probe/logprob_compare.cu is the device reference).
+Quality has two forms: `text_quality` compares an engine's scores of a fixed text with the reference's, position
+by position (top-k on both sides plus a lumped tail, a lower bound on KL), and `log_softmax`, `kl_divergence`,
+`Summary` and `compare` compare full logit rows when an engine can supply them (FP64; probe/logprob_compare.cu is
+the device reference).
 """
 import math
 
@@ -148,21 +148,22 @@ def compare(reference_rows, candidate_rows, targets, valid=None):
     return ref, cand
 
 
-def reply_quality(reference_rows, engine_rows):
-    """Compare an engine's replies with the reference's scores of the same tokens.
+def text_quality(reference_rows, engine_rows):
+    """Compare an engine's scores of a fixed text with the reference's, position by position.
 
-    reference_rows: per reply token {"target": id, "logprob": float, "top_ids": [...], "top_logprobs": [...]}
-    (reference.StreamingReference.score); engine_rows: per reply token {"logprob": the engine's log-probability of
-    the token, "top": [[id, logprob], ...] of its top-k}. The engine chose each token, so top-1 agreement is the
-    share of them that are also the reference's most likely token.
+    reference_rows: per position {"logprob": the reference's log-probability of the text's token, "top_ids",
+    "top_logprobs"}; engine_rows: per position {"logprob", "top": [[id, logprob], ...]}. Neither chose the token,
+    so top-1 agreement is the share of positions where both rank the same token first. KL is partial_kl's: the
+    top-k on both sides plus a lumped tail.
     """
     if len(reference_rows) != len(engine_rows) or not engine_rows:
-        raise ValueError(f"the reference scored {len(reference_rows)} reply tokens, the engine reported {len(engine_rows)}")
+        raise ValueError(f"the reference scored {len(reference_rows)} positions, the engine {len(engine_rows)}")
     ref_nll = [-r["logprob"] for r in reference_rows]
     eng_nll = [-e["logprob"] for e in engine_rows]
     kls = [partial_kl(r["top_ids"], r["top_logprobs"], dict(e["top"])) for r, e in zip(reference_rows, engine_rows)]
     ref_ppl = math.exp(sum(ref_nll) / len(ref_nll))
     ppl = math.exp(sum(eng_nll) / len(eng_nll))
+    first = [max(e["top"], key=lambda pair: pair[1])[0] if e["top"] else None for e in engine_rows]
     return {
         "targets": len(kls),
         "perplexity": ppl,
@@ -171,9 +172,27 @@ def reply_quality(reference_rows, engine_rows):
         "kld_mean": sum(kls) / len(kls),
         "kld_p99": percentile(kls, 0.99),
         "kld_max": max(kls),
-        "top1_agreement": sum(r["top_ids"][0] == r["target"] for r in reference_rows) / len(kls),
+        "top1_agreement": sum(r["top_ids"][0] == f for r, f in zip(reference_rows, first)) / len(kls),
         "max_abs_target_logprob_diff": max(abs(a - b) for a, b in zip(ref_nll, eng_nll)),
     }
+
+
+def log2_bucket(value, smallest):
+    """The bucket of a position or offset (>= 1): 1..smallest-1, then powers of two (512-1023, 1024-2047, ...)."""
+    if value < smallest:
+        return f"1-{smallest - 1}"
+    low = 1 << (int(value).bit_length() - 1)
+    return f"{low}-{2 * low - 1}"
+
+
+def bucketed(reference_rows, engine_rows, labels):
+    """text_quality of the positions in each bucket ({label: quality}, in the labels' order of appearance)."""
+    groups = {}
+    for reference, engine, label in zip(reference_rows, engine_rows, labels):
+        groups.setdefault(label, ([], []))
+        groups[label][0].append(reference)
+        groups[label][1].append(engine)
+    return {label: text_quality(*rows) for label, rows in groups.items()}
 
 
 def budget_used(quality, thresholds):

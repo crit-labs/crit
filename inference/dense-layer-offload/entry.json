@@ -1,0 +1,90 @@
+{
+  "id": "dense-layer-offload",
+  "category": "memory-and-loading",
+  "summary": "Layer-granular placement of dense models larger than device memory: a planner over measured device, upload and host rates choosing between host execution of layers (AVX2/AVX-512 BF16 GEMVs, host KV) and double-buffered weight streaming, with measured selection of the plan",
+  "implementation_status": "native_source",
+  "implementation_scope": "C++ and CUDA host code: a planner predicting each placement's decode step from measured rates and ranking resident, host and streaming plans, with selection by timing the leading candidates; a two-slot weight streamer on a copy stream ordered by events; an executor running a step's layers by placement through an engine-supplied LayerRunner; measurements of pinned upload bandwidth, host GEMV rate and activation round trips; host BF16 GEMV with scalar, AVX2 and AVX-512 paths chosen at run time over a persistent thread pool, and a host pre-norm block with host KV; a synthetic model runner composing them with the batched reference engine's kernels and paged attention, plus a measurement tool; a Python model of the planner. A real model's layers and partial-layer offload are engine work.",
+  "agent_guidance": {
+    "use_when": "A dense model's weights do not fit the device memory left after KV cache and activations but fit host memory, and decode runs a single sequence or a few rows per step",
+    "avoid_when": "The model is expert routed, its weights fit the device, or quantizing them to fit stays within the quality budget",
+    "provides": [
+      "A planner over measured rates (device bandwidth from crit eval probe, pinned upload, host GEMV, activation round trip) with predicted step times per placement",
+      "Measured selection among the leading candidate plans",
+      "A two-slot weight streamer: uploads of streamed layers two ahead on a copy stream, ordered by events",
+      "An executor for resident, streamed and host layers in one step, with one synchronization per run of host layers",
+      "Host BF16 GEMV on scalar, AVX2 or AVX-512 paths chosen through host-expert-arithmetic's host_isa.h over a thread pool, independent of the thread split",
+      "A host pre-norm block (RMSNorm, rotary, GQA attention over host KV, SiLU product) with the device's BF16 rounding points",
+      "Measurement helpers and a synthetic model runner with a measurement tool"
+    ],
+    "engine_supplies": [
+      "The model's layers as a LayerRunner (device and host forms of each layer over its own activations and KV)",
+      "Each layer's weights as one contiguous range in pinned host memory, and device copies of resident layers",
+      "The device budget for layer weights after KV cache, activations and other weights"
+    ],
+    "preserve": [
+      "A streamed layer is read only after its upload's event; its slot is reused only after release",
+      "Host layers read activations after the copy down completed; the device reads them after the copy back",
+      "A layer's KV cache lives where the layer runs",
+      "Plans ranked by prediction, chosen by measurement"
+    ],
+    "adapt": [
+      "Partial layers (only the MLP on the host), more staging slots, quantized host weights",
+      "Batched decode rows and prefill chunks on the host, NUMA-aware thread placement",
+      "Per-phase plans (prefill streaming, decode on the host)"
+    ]
+  },
+  "path": "inference/dense-layer-offload/README.md",
+  "code_path": "inference/dense-layer-offload/code",
+  "code_files": [
+    {"path": "inference/dense-layer-offload/code/offload_plan.h", "purpose": "Placements, measured rates, step prediction, candidate plans and measured selection"},
+    {"path": "inference/dense-layer-offload/code/offload_exec.h", "purpose": "Weight streamer, layer runner interface, executor and measurement interfaces"},
+    {"path": "inference/dense-layer-offload/code/offload_exec.cpp", "purpose": "Two-slot streaming, step execution by placement and rate measurements"},
+    {"path": "inference/dense-layer-offload/code/host_dense.h", "purpose": "Host GEMV ISAs, thread pool and the host pre-norm block"},
+    {"path": "inference/dense-layer-offload/code/host_dense.cpp", "purpose": "Scalar path, ISA dispatch, thread pool and host block operations"},
+    {"path": "inference/dense-layer-offload/code/host_dense_avx2.cpp", "purpose": "AVX2 + FMA BF16 GEMV rows"},
+    {"path": "inference/dense-layer-offload/code/host_dense_avx512.cpp", "purpose": "AVX-512F BF16 GEMV rows"},
+    {"path": "inference/dense-layer-offload/code/synthetic_offload.h", "purpose": "A complete LayerRunner: the synthetic transformer on device, streamed and host layers"},
+    {"path": "inference/dense-layer-offload/code/synthetic_offload.cpp", "purpose": "Synthetic model weights, device and host layer forms, steps"},
+    {"path": "inference/dense-layer-offload/code/offload_bench.cpp", "purpose": "Measures rates, predicts and times each candidate plan for a model above the budget"},
+    {"path": "inference/dense-layer-offload/code/planner.py", "purpose": "Python model of the prediction and candidate plans"}
+  ],
+  "requires": {
+    "hardware": "CUDA C++20; x86-64 with AVX2 or AVX-512F for the fast host paths (a scalar path runs elsewhere); pinned host memory for the weights; Python 3.11+ standard library for the planner model",
+    "model": "Dense decoder layers whose weights form one contiguous range each",
+    "workload": "Decode with one sequence or a few rows per step, weights above the device budget"
+  },
+  "contract": {
+    "input": "Layer byte sizes, the device budget and measured rates for planning; pinned host weights, device copies of resident layers and a LayerRunner for execution",
+    "output": "Ranked plans with predicted step times; each step's layers executed by placement",
+    "ownership": "The engine owns weights, activations, KV caches and streams; the weight streamer owns its two slots and events; the thread pool owns its workers",
+    "failure": "Planning without layers or with non-positive rates, a streamed layer larger than a slot, a store that disagrees with the plan, or host GEMV geometry the ISA cannot run throws invalid_argument; CUDA errors throw runtime_error",
+    "core_boundary": "No Core change; device rates come from crit eval probe"
+  },
+  "dependencies": [
+    "CUDA runtime",
+    "host-expert-arithmetic's host_isa (crit_host_isa) for run-time ISA detection",
+    "batched-reference-engine and paged-attention for the synthetic model runner",
+    "Python standard library for the planner model"
+  ],
+  "symbols": [
+    "Place", "Measurements", "Plan", "predict", "candidates", "select_measured", "WeightStream", "LayerRunner", "LayerStore", "run_layers",
+    "measure_upload_gbs", "measure_host_gemv_gbs", "measure_round_trip_ns", "Isa", "best_isa", "gemv", "ThreadPool", "host_block",
+    "SyntheticOffloadModel"
+  ],
+  "interactions": [
+    "batched-reference-engine",
+    "paged-attention",
+    "host-expert-arithmetic",
+    "heterogeneous-expert-dispatch",
+    "host-memory-admission"
+  ],
+  "techniques": [
+    "dense-layer-offload",
+    "host-expert-arithmetic"
+  ],
+  "validation": {
+    "host": "The README example and test_reusable_techniques.py: candidate order and predicted times of the planner model",
+    "native": "Planner candidates and predictions, measured selection overriding the predicted order; scalar, AVX2 and AVX-512 host GEMVs within 1e-5 of FP64 and bit for bit across thread splits; a six-layer synthetic model under resident, streamed (slots recycled), host and mixed placements: streamed logits equal resident ones bit for bit, host placements within 2% (at most 1.3% all on host, sm_120)",
+    "performance": "One machine (RTX 5090, 12 host threads with AVX-512), 16 layers of 436 MB, device budget set below the weights: rates device 1,131 GB/s, upload 28.8 GB/s, host GEMV 35 GB/s, round trip 21 us; 25% resident: host 12 layers predicted 147 ms / measured 171 ms per decode step, streaming 14 layers 214 / 212 ms; 60% resident: 91 / 94 ms and 139 / 137 ms; host execution selected; no claim for other machines"
+  }
+}

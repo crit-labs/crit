@@ -41,7 +41,7 @@ and speed techniques; a larger one trades context for that room.
 | `package` | `--candidate ID --source DIR --record recipe.json`; runnable files and manifest |
 | `check`, `benchmark` | `--candidate ID --record payload.json`; appends evidence |
 | `measure` | `--candidate ID [--seconds N]`; reserves a benchmark attempt, serves the packaged candidate through `crit serve`, streams every resident case's chat request to it, settles it and records one benchmark per case ([measured benchmarks](#measured-benchmarks)) |
-| `eval` | `--candidate ID --data EVAL_DATA_DIR [--only PART] [--baseline RESULT] [--label TEXT] [--seconds N]`; reserves a benchmark attempt, serves the packaged candidate through `crit serve`, runs Eval over the chat API with the run's quality terms and `kv_tokens`, scores the quality replies on the run's model, settles it and retains the result as `candidates/ID/eval/ATTEMPT.json` ([Eval evidence](#eval-evidence)) |
+| `eval` | `--candidate ID --data EVAL_DATA_DIR [--only PART] [--baseline RESULT] [--label TEXT] [--seconds N]`; reserves a benchmark attempt, serves the packaged candidate through `crit serve`, scores the data's quality texts on the run's model unless stored, runs Eval over the chat API with the run's quality terms and `kv_tokens`, settles it and retains the result as `candidates/ID/eval/ATTEMPT.json` ([Eval evidence](#eval-evidence)) |
 | `seal` | `--candidate ID --lifecycle STATE [--failure TEXT]`; closes the candidate |
 | `select` | `--candidate ID`; selects a sealed eligible candidate |
 | `stop` | `--record stop.json` |
@@ -77,8 +77,11 @@ Workload keys: `prompt_tokens`, `output_tokens` (1–1,000,000), `concurrency` (
 `repetitions` (1–100), `warmup_runs` (0–100), `mode` (`resident`/`cold`). KV capacity
 is 1–2,000,000 tokens and must cover every case. Per-process ceilings: discovery 180 s,
 build 1800 s, check 3600 s, benchmark 1800 s, configured agent 10800 s, all clipped to
-the remaining segment window and requested cap. Provider spend limits are the caller's
-responsibility.
+the remaining segment window and requested cap. An `eval` attempt (`crit run eval`) has
+no fixed cap: Eval's work scales with the model and the device, so it may run to the
+segment's deadline, and Eval bounds each request by the rates the engine measured in the
+same attempt (protocol `requests.timeout`), so a hung engine ends it (`eval_failed`).
+Provider spend limits are the caller's responsibility.
 
 ### Inputs, proposal and package
 

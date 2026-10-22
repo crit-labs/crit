@@ -11,7 +11,7 @@ from crit.process.tree import guarded_tree
 from crit.run.records import MAX_JSON_BYTES, write_json
 
 from .channel import Supervisor
-from .logprobs import response_bytes
+from .logprobs import RESPONDING, response_bytes
 from .options import MAX_CHAT_RECORD
 from .stream import StreamReader
 
@@ -69,14 +69,14 @@ class ResidentRuntime:
         if stop.is_set():
             return {"status": "cancelled", "error": "Stopped", "cleanup_settled": True}
         with self.lifecycle:
-            if action != "generate":
+            if action not in RESPONDING:
                 self.start()
             if self.tree is None:
                 raise ValueError("Resident host was retired")
             root, tree, link = self.root, self.tree, self.link
         stream = (StreamReader(request, progress or (lambda text: None), progress_tools, progress_reasoning)
                   if progress or progress_tools or progress_reasoning else None)
-        limit = response_bytes(request) + MAX_JSON_BYTES if action == "generate" else MAX_JSON_BYTES
+        limit = response_bytes(request) + MAX_JSON_BYTES if action in RESPONDING else MAX_JSON_BYTES
         return self._call(uuid.uuid4().hex, action, payload, stop, timeout, stream, on_started, root, tree, link,
                           limit)
 
@@ -114,7 +114,7 @@ class ResidentRuntime:
                 if result is not None:
                     if (set(result) - {"response"} != RESULT or type(result["cleanup_settled"]) is not bool
                             or result["status"] not in {"completed", "cancelled", "failed"}
-                            or ("response" in result) != (action == "generate" and result["status"] == "completed")):
+                            or ("response" in result) != (action in RESPONDING and result["status"] == "completed")):
                         raise ValueError("Resident completion identity/cleanup mismatch")
                     result = {k: v for k, v in result.items() if k not in {"kind", "command_id"}}
                     if not result["cleanup_settled"]:
