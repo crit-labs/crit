@@ -173,6 +173,9 @@ be below the valid vocabulary, else submission fails with "scoring target outsid
 the valid vocabulary". `path` names one of `ModelInfo.score_paths` and is
 forwarded unchanged; empty selects the default.
 
+`crit_engine_score` takes `top_k` with the query rows and returns the engine's own
+alternatives with the target scores, for crit serve's fixed-text scores (`chat-score-v1`).
+
 Core checks values under the [generation rules](#log-probabilities) and returns
 them in `Result::scores`, `query_scores`, `argmax` and `top_logprobs`
 (targets x top_k).
@@ -478,15 +481,14 @@ and shares the native engine and immutable tokenizer. All engine state must obey
 ConcurrentModel ownership contract. The legacy zero-argument `request` facts callback
 is rejected with this flag; use `result(const Result&)` for request-owned facts.
 
-Rebuilt libraries also export `crit_engine_request_open`, `request_wait`,
+Libraries also export `crit_engine_request_open`, `request_wait`,
 `request_cancel` and `request_close` (each with the `crit_engine_` prefix). A request
 has one waiter; cancel may run concurrently. Close it after waiting, before closing
 the engine. The Python bridge polls cancellation independently of token delivery,
 so cancellation during prefill reaches Core. Physical work still settles before
-release. ABI-1 libraries without these additive exports retain the original token
-callback cancellation path and serial capacity.
+release.
 
-Token log-probabilities take one more additive export, `crit_engine_request_wait_output`.
+Token log-probabilities are waited on with `crit_engine_request_wait_output`.
 A request opened with `"logprobs": n` (the model declaring `token_logprobs` and
 `max_top_logprobs` of at least `n`, both in `crit_engine_info`) is waited on with it: its
 callback receives each published token with its log-probability and its `n` most likely
@@ -526,10 +528,12 @@ model, as described in the [construction contract](../../contracts/README.md#con
 The configuration is the adapter's configuration plus `model` (the model
 directory) and `context_tokens` (the context to serve); Eval also passes
 `speculative`. Link the static `crit::core` into the library (it builds
-position-independent). The ABI (version 1) opens and closes engines, reports
+position-independent). The ABI (version 2) opens and closes engines, reports
 `ModelInfo` merged with `NativeEngine::info`, generates with stop tokens,
 sampling options and a replay continuation, streams tokens to a callback that
-can cancel, and scores with optional query rows and a named path. Each
+can cancel, and scores with optional query rows, the engine's own top-k and a named
+path. `crit_core.native` refuses a library of another ABI version: rebuild it against
+this crit's headers. Each
 generation's result carries Core's [request timing](#request-timing) in
 milliseconds, merged with `NativeEngine::request` (per-request facts such as
 `accepted`, `verify_ms` and `draft_ms`). Eval counts one round per `accepted`

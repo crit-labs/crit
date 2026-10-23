@@ -56,8 +56,9 @@ Install from the repo root with `python -m pip install -e .`, then run `crit ...
   `crit eval run --url` against the source's Eval data, bind the result with
   `crit models eval`, and keep both records with the candidate.
 - **[Eval](docs/eval/README.md):** measure each candidate with `crit run ... eval`: it
-  serves the packaged candidate through `crit serve`, runs Eval over the chat API and
-  scores the quality replies on the model's checkpoint. Use the same prepared data for
+  scores the data's fixed quality texts on the model's checkpoint once (`crit eval
+  reference`), serves the packaged candidate through `crit serve` and runs Eval over the
+  chat API, quality through the engine's own score call. Use the same prepared data for
   every engine of one model. Hardware telemetry (tokens per round, acceptance, memory,
   kernels) comes from `crit run ... measure` and Eval's adapter commands through an eval
   adapter. A Core engine built as a shared

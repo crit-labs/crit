@@ -14,10 +14,11 @@ if __package__ in {None, ""}:
             sys.path.insert(0, str(folder))
 from crit.run.records import MAX_JSON_BYTES, digest, read_json, safe_path
 from crit_api import channel
+from crit_api.logprobs import RESPONDING
 from crit_api.models import ModelContext, ModelPool
 from crit_api.stream import CAPABILITY as STREAM_CAPABILITY, StreamWriter
 from crit_api.options import MAX_CHAT_RECORD, TOOLS_CAPABILITY, STRICT_TOOLS_CAPABILITY, TOOL_STREAM_CAPABILITY
-from crit_core.serving import LOGPROBS_CAPABILITY
+from crit_core.serving import LOGPROBS_CAPABILITY, SCORE_CAPABILITY
 
 CONFIG_CAPABILITY = "chat-config-v1"
 
@@ -167,6 +168,10 @@ class Host:
             if LOGPROBS_CAPABILITY in capabilities and getattr(self.engine, "logprobs", False) is not True:
                 raise ValueError(LOGPROBS_CAPABILITY + " requires an engine that reports log-probabilities (logprobs "
                                  "True)")
+            if SCORE_CAPABILITY in capabilities and (getattr(self.engine, "scores", False) is not True
+                                                     or not callable(getattr(self.engine, "score", None))):
+                raise ValueError(SCORE_CAPABILITY + " requires an engine that scores fixed text (scores True, "
+                                 "score(request, cancellation))")
         except BaseException:
             self.blocked = True  # Partial construction may own native work.
             raise
@@ -180,6 +185,32 @@ class Host:
         self.identity = identity
         self.loads += 1
         self.status("ready")
+
+    def score(self, spec, request, cancellation):
+        """A score request (chat-score-v1): alone on the engine, as Core runs scores, then reset like a turn."""
+        if SCORE_CAPABILITY not in spec.get("capabilities", []):
+            raise ValueError("This engine package does not declare " + SCORE_CAPABILITY)
+        with self.state_lock:
+            self.active += 1
+        self.status("generating")
+        try:
+            cancellation.check()
+            response = self.engine.score(request, cancellation)
+            cancellation.check()
+            self.pool.verify_sources()
+        finally:
+            self.status("draining")
+            try:
+                self.engine.reset()
+                self.pool.verify_sources()
+            except BaseException:
+                self.blocked = True
+                raise
+            finally:
+                with self.state_lock:
+                    self.active -= 1
+        self.status("ready")
+        return response
 
     def handle(self, command, cancellation):
         """Run one command; a generation returns its response."""
@@ -196,11 +227,13 @@ class Host:
         self.attach(payload["spec"])
         if action == "load":
             return None
-        if action != "generate":
+        if action not in ("generate", "score"):
             raise ValueError("Unknown resident command")
         request = payload["request"]
         if any(request[key] != self.identity[key] for key in self.identity):
             raise ValueError("Resident request engine identity mismatch")
+        if action == "score":
+            return self.score(payload["spec"], request, cancellation)
         stream = (StreamWriter(self.send, command["command_id"], request, cancellation,
                                tools=TOOL_STREAM_CAPABILITY in payload["spec"].get("capabilities", []))
                   if STREAM_CAPABILITY in payload["spec"].get("capabilities", []) else None)
@@ -307,7 +340,7 @@ def main():
         host.status("blocked" if host.blocked else ("ready" if host.engine else "unloaded"), error=error)
         link.send({"kind": "result", "command_id": cid, "status": status, "error": error,
                    "max_concurrent_requests": host.capacity, "cleanup_settled": not host.blocked,
-                   **({"response": response} if command["action"] == "generate" and status == "completed" else {})})
+                   **({"response": response} if command["action"] in RESPONDING and status == "completed" else {})})
         with lock:
             cancels.pop(cid, None)
             running.discard(cid)

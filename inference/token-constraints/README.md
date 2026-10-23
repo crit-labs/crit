@@ -63,7 +63,7 @@ restore the matcher with accepted KV/recurrent state.
 
 ## Costs and validation
 
-Every `next()` scans the vocabulary and every append copies matcher history: conservative CPU choices. Empty
+Every `next()` reads the matcher's allowed set (Core walks the vocabulary's piece trie, or hits its allowed-set cache for a repeated state) and every append copies matcher history. Empty
 support throws; it never falls back to unconstrained generation. [Native fixtures](../../tests/inference/constraint_tests.cpp)
 check masking, branches, poisoned states and speculative answer frequencies against exact probabilities. No model
 or device speed qualification.

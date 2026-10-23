@@ -84,15 +84,16 @@ def main(argv=None):
     sub = subs.add_parser("measure", help="Benchmark the run's cases on a packaged candidate through crit serve")
     sub.add_argument("--candidate", required=True)
     sub.add_argument("--seconds", type=float, help="Reservation length (default: the benchmark process cap)")
-    sub = subs.add_parser("eval", help="Run Eval on a packaged candidate through crit serve and score its quality "
-                                       "replies on the run's model")
+    sub = subs.add_parser("eval", help="Run Eval on a packaged candidate through crit serve, quality against the "
+                                       "run's model's scores of the fixed texts (scored once into the data)")
     sub.add_argument("--candidate", required=True)
     sub.add_argument("--data", type=Path, required=True, help="Eval data directory prepared from the run's model")
-    sub.add_argument("--only", action="append", choices=["speed", "quality", "exactness", "context", "heldout", "history"],
+    sub.add_argument("--only", action="append", choices=["speed", "quality", "exactness", "context", "heldout", "history", "followup"],
                      help="Run only these Eval parts (repeatable); default all")
     sub.add_argument("--baseline", type=Path, metavar="RESULT", help="Earlier Eval result to show KPI changes against")
     sub.add_argument("--label")
-    sub.add_argument("--seconds", type=float, help="Reservation length (default: the benchmark process cap)")
+    sub.add_argument("--seconds", type=float, help="Reservation length (default: to the segment's deadline; each "
+                                                   "request is bounded by the rates the engine measured)")
     sub = subs.add_parser("seal")
     sub.add_argument("--candidate", required=True)
     sub.add_argument("--lifecycle", required=True)

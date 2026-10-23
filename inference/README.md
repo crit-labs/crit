@@ -31,8 +31,10 @@ leaves to the engine.
 | Evaluate rotation for low-bit KV | [rotated-kv-quantization](rotated-kv-quantization/README.md) | Walsh-Hadamard rotation before int8/int4 KV, host and CUDA |
 | Partition a long attention sequence | [partitioned-attention](partitioned-attention/README.md) | Interleaved ownership, stable partial reduction, head-major scatter |
 | Execute low-bit projections | [quantized-projections](quantized-projections/README.md) | G32 W4/W8, dynamic A8, row-scaled FP8, NVFP4 codec |
+| Read GGUF quantized blocks in projections | [gguf-projections](gguf-projections/README.md) | Q4_0/Q8_0/Q4_K/Q5_K/Q6_K decode equal to gguf-py, CUDA GEMV and dequantization over stored blocks |
 | Run FP8 / NVFP4 prompt GEMMs without re-layout | [stored-tile-gemm](stored-tile-gemm/README.md) | Tile layout shared with decode GEMV; W8A8 and W4A4 CUDA GEMMs |
 | Attend over long prompts without a score matrix | [flash-prefill-attention](flash-prefill-attention/README.md) | Causal GQA BF16 flash kernel, head dims 64/128/256 |
+| Batch attention over paged KV of many sequences | [paged-attention](paged-attention/README.md) | CUDA decode, verify and varlen prefill over StateCache block tables; BF16/E4M3 pages |
 | Fit a long context in an FP8 KV cache | [fp8-kv-attention](fp8-kv-attention/README.md) | E4M3 cache with per-head-vector scales; prompt and decode attention |
 | Normalize and fuse a row epilogue | [rmsnorm-bf16](rmsnorm-bf16/README.md) | CUDA source, borrowed-view interface, host formula |
 | Reuse expert weights, lend cache memory or borrow idle KV and workspace memory | [expert-residency](expert-residency/README.md) | Byte-cache leases, complete bundles, C++ region loans and owner slot loans |
@@ -41,9 +43,11 @@ leaves to the engine.
 | Compute NVFP4 experts on the CPU with the device's bits | [host-expert-arithmetic](host-expert-arithmetic/README.md) | Declared row order, scalar oracle, AVX2/AVX-512 paths, matching CUDA function, scale hook |
 | Join asynchronous contributions | [async-expert-contributions](async-expert-contributions/README.md) | Receipt-based join, source retention, ordered reduction |
 | Run device-decided host work inside a captured graph | [host-work-mailbox](host-work-mailbox/README.md) | Device-reset doorbells, measured stream-wait or poll join, release and failure answering |
+| Serve a dense model larger than device memory | [dense-layer-offload](dense-layer-offload/README.md) | Measured planner, host AVX2/AVX-512 layers, double-buffered weight streaming, measured plan selection |
 | Fetch file-backed experts | [ssd-expert-materialization](ssd-expert-materialization/README.md) | Checked reads, bounded gather, read-ahead, upload handoff |
 | Bound prefill, physical batches and scratch | [session-scheduling](session-scheduling/README.md) | Transactional cursor, latency chunk policy, physical caps and workspace sizing |
 | Batch independent requests | [concurrent-request-execution](concurrent-request-execution/README.md) | Ready-row compaction, metadata patches, retirement barrier |
+| Serve concurrent requests with batched steps end to end | [batched-reference-engine](batched-reference-engine/README.md) | Synthetic-model ConcurrentModel: one GEMM per weight per step, StateCache prefix reuse, paged attention, native library for crit serve |
 | Execute speculative rounds | [mtp-decode](mtp-decode/README.md) | Token-history proposals, greedy/sampled verification, repair, adaptive budgets |
 | Sample tokens on the device | [token-sampling](token-sampling/README.md) | CUDA top-k, temperature and top-p; Core's Sampler as oracle |
 | Keep structured output exact under speculation | [token-constraints](token-constraints/README.md) | [Core](../core/src/constraints/README.md) matchers in sampled speculation, private forks and rewinds |

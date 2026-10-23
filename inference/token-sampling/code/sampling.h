@@ -28,4 +28,11 @@ struct Params {
 cudaError_t enqueue_select(const float* logits, int vocab, Params* params, float* cand_values, std::int32_t* cand_ids,
                            std::int32_t* out, cudaStream_t stream);
 
+// Structured output on the device: sets logits[r * stride + t] to -inf wherever bit t % 32 of word
+// mask[r * mask_stride + t / 32] is clear (crit::core::TokenMatcher::allowed_bits), for `rows` rows of `vocab` logits.
+// Selection on the masked row then follows Core's constrained Sampler (AllowedTokens), ties to the lowest allowed id.
+// mask_stride >= (vocab + 31) / 32 words; stride >= vocab.
+cudaError_t enqueue_mask(float* logits, int vocab, int stride, const std::uint32_t* mask, int mask_stride, int rows,
+                         cudaStream_t stream);
+
 } // namespace crit::techniques::token_sampling

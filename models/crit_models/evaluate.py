@@ -20,12 +20,11 @@ def load_record(path):
 
 def evaluate(record_path, data, result_path, evaluation_path, baseline=None, log=print):
     """Verify the output against its record, check that `data` was prepared from the source checkpoint (so Eval's
-    quality reference is the original model) and that the result at `result_path` (crit eval run --url on the engine
-    serving the output, stopped since) was measured on it, score its quality replies on the source checkpoint unless
-    they are scored, and write a models_evaluation record."""
+    quality reference is the original model: crit eval reference --model SOURCE --data DATA before the round) and
+    that the result at `result_path` (crit eval run --url on the engine serving the output, stopped since) was
+    measured on it, and write a models_evaluation record."""
     from crit_eval import load_json
     from crit_eval.prepare import PREPARED
-    from crit_eval.reference import score_result
     record_path, data, result_path = Path(record_path), Path(data), Path(result_path)
     evaluation_path = Path(evaluation_path).absolute()
     record = load_record(record_path)
@@ -49,8 +48,6 @@ def evaluate(record_path, data, result_path, evaluation_path, baseline=None, log
                          f"crit eval run --url ... --model {record['output']['path']} --data {data}")
     if result.get("aborted") or "status" not in result:
         raise ValueError(f"{result_path} is no finished Eval round")
-    if (result.get("quality") or {}).get("status") == "replied":
-        result = score_result(record["source"]["path"], data, result_path, baseline, log)
     status = result["status"]
     kpis = status["kpis"]
     evaluation = {

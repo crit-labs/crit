@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_inference VERSION 0.4.0 LANGUAGES CXX)
+project(crit_inference VERSION 0.5.0 LANGUAGES CXX)
 # Inference's native examples and fixtures. Inference uses Core only through its public SDK
 # (crit::core, crit::cuda); Core never builds or includes Inference code.
 find_package(Threads REQUIRED)
@@ -8,7 +8,7 @@ option(CRIT_INFERENCE_CUDA "Build Inference's CUDA reference kernels and their f
 option(CRIT_INFERENCE_INSTALLED_CORE "Use an installed Core SDK (CMAKE_PREFIX_PATH) instead of this checkout's core/" OFF)
 if(NOT TARGET crit::core)
   if(CRIT_INFERENCE_INSTALLED_CORE)
-    find_package(critCore 0.4.0 CONFIG REQUIRED)
+    find_package(critCore 0.5.0 CONFIG REQUIRED)
   else()
     if(CRIT_INFERENCE_CUDA)
       set(CRIT_CORE_CUDA ON CACHE BOOL "Build the explicit CUDA backend services" FORCE)
@@ -104,9 +104,40 @@ crit_inference_test(crit_inference_io_codec 30 crit_inference_io_codec_tests "${
 
 crit_inference_executable(crit_nvfp4_tests SOURCES ${FIXTURES}/nvfp4_tests.cpp INCLUDES ${INFERENCE}/quantized-projections/code)
 crit_inference_test(crit_nvfp4 30 crit_nvfp4_tests)
-# Host NVFP4 rows in a declared order: the ISA files get their own flags, chosen at run time; no file may contract
-# a multiply and an add into an FMA the order does not declare.
+# Host ISA files: AVX2 and AVX-512 sources compiled with their own flags and chosen at run time through host_isa.h.
+# One condition builds them for every library, so host_isa's supported() answers for all of them.
 set(_host_nvfp4 ${INFERENCE}/host-expert-arithmetic/code)
+set(CRIT_INFERENCE_HOST_ISA OFF)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+  set(CRIT_INFERENCE_HOST_ISA ON)
+endif()
+add_library(crit_host_isa STATIC ${_host_nvfp4}/host_isa.cpp)
+target_include_directories(crit_host_isa PUBLIC ${_host_nvfp4})
+target_compile_features(crit_host_isa PUBLIC cxx_std_20)
+crit_inference_warnings(crit_host_isa)
+if(CRIT_INFERENCE_HOST_ISA)
+  target_compile_definitions(crit_host_isa PRIVATE CRIT_HOST_ISA_FILES=1)
+endif()
+# crit_inference_isa_sources(target avx2_source avx512_source): links host_isa and, where the ISA files are built,
+# adds them with their flags and defines CRIT_HOST_ISA_FILES for the target's dispatch.
+function(crit_inference_isa_sources target avx2 avx512)
+  target_link_libraries(${target} PUBLIC crit_host_isa)
+  if(NOT CRIT_INFERENCE_HOST_ISA)
+    return()
+  endif()
+  target_sources(${target} PRIVATE ${avx2} ${avx512})
+  target_compile_definitions(${target} PRIVATE CRIT_HOST_ISA_FILES=1)
+  if(MSVC)
+    set_source_files_properties(${avx2} PROPERTIES COMPILE_OPTIONS /arch:AVX2)
+    set_source_files_properties(${avx512} PROPERTIES COMPILE_OPTIONS /arch:AVX512)
+  else()
+    set_source_files_properties(${avx2} PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+    set_source_files_properties(${avx512} PROPERTIES COMPILE_OPTIONS "-mavx512f;-mfma")
+  endif()
+endfunction()
+
+# Host NVFP4 rows in a declared order: no file may contract a multiply and an add into an FMA the order does not
+# declare.
 add_library(crit_host_nvfp4 STATIC ${_host_nvfp4}/host_nvfp4.cpp)
 target_include_directories(crit_host_nvfp4 PUBLIC ${_host_nvfp4} ${INFERENCE}/quantized-projections/code)
 target_compile_features(crit_host_nvfp4 PUBLIC cxx_std_20)
@@ -116,17 +147,7 @@ if(MSVC)
 else()
   target_compile_options(crit_host_nvfp4 PRIVATE -ffp-contract=off)
 endif()
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
-  target_sources(crit_host_nvfp4 PRIVATE ${_host_nvfp4}/host_nvfp4_avx2.cpp ${_host_nvfp4}/host_nvfp4_avx512.cpp)
-  target_compile_definitions(crit_host_nvfp4 PRIVATE CRIT_HOST_NVFP4_AVX2=1 CRIT_HOST_NVFP4_AVX512=1)
-  if(MSVC)
-    set_source_files_properties(${_host_nvfp4}/host_nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX2)
-    set_source_files_properties(${_host_nvfp4}/host_nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX512)
-  else()
-    set_source_files_properties(${_host_nvfp4}/host_nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
-    set_source_files_properties(${_host_nvfp4}/host_nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mfma")
-  endif()
-endif()
+crit_inference_isa_sources(crit_host_nvfp4 ${_host_nvfp4}/host_nvfp4_avx2.cpp ${_host_nvfp4}/host_nvfp4_avx512.cpp)
 crit_inference_executable(crit_host_nvfp4_tests SOURCES ${FIXTURES}/host_nvfp4_tests.cpp LINK crit_host_nvfp4 Threads::Threads)
 crit_inference_test(crit_host_nvfp4 60 crit_host_nvfp4_tests)
 
@@ -258,6 +279,41 @@ add_library(crit_host_mailbox_fixture STATIC ${FIXTURES}/host_mailbox_fixture.cu
 target_link_libraries(crit_host_mailbox_fixture PUBLIC crit_host_mailbox)
 crit_inference_executable(crit_host_mailbox_tests SOURCES ${FIXTURES}/host_mailbox_tests.cpp LINK crit_host_mailbox_fixture)
 crit_inference_test(crit_host_mailbox 300 crit_host_mailbox_tests)
+
+crit_inference_kernels(crit_paged_attention ${INFERENCE}/paged-attention/code paged_attention.cu)
+target_link_libraries(crit_paged_attention PUBLIC crit::core)
+crit_inference_executable(crit_paged_attention_tests SOURCES ${FIXTURES}/paged_attention_tests.cpp
+  INCLUDES ${INFERENCE}/attention-state/code LINK crit_paged_attention)
+crit_inference_tests(crit_paged_attention_tests crit_paged_attention 300 decode invariance graph rejects)
+
+crit_inference_kernels(crit_batched_engine ${INFERENCE}/batched-reference-engine/code synthetic_model.cu)
+target_link_libraries(crit_batched_engine PUBLIC crit_paged_attention crit::cuda)
+crit_inference_executable(crit_batched_engine_tests SOURCES ${FIXTURES}/batched_engine_tests.cpp LINK crit_batched_engine)
+crit_inference_tests(crit_batched_engine_tests crit_batched_engine 300 kernels batched e4m3)
+crit_inference_executable(crit_batched_engine_throughput SOURCES ${INFERENCE}/batched-reference-engine/code/throughput.cpp LINK crit_batched_engine)
+add_library(crit_batched_engine_library SHARED ${INFERENCE}/batched-reference-engine/code/engine_library.cpp)
+target_link_libraries(crit_batched_engine_library PRIVATE crit_batched_engine)
+crit_inference_warnings(crit_batched_engine_library)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME crit_batched_engine_serving COMMAND "${Python3_EXECUTABLE}" -B
+    "${FIXTURES}/batched_engine_serving_check.py" $<TARGET_FILE:crit_batched_engine_library>)
+  set_tests_properties(crit_batched_engine_serving PROPERTIES TIMEOUT 300)
+endif()
+
+crit_inference_kernels(crit_gguf_projections ${INFERENCE}/gguf-projections/code gguf_cuda.cu)
+crit_inference_executable(crit_gguf_projections_tests SOURCES ${FIXTURES}/gguf_projections_tests.cpp LINK crit_gguf_projections crit::core)
+crit_inference_test(crit_gguf_projections 120 crit_gguf_projections_tests)
+
+set(_offload ${INFERENCE}/dense-layer-offload/code)
+add_library(crit_dense_offload STATIC ${_offload}/host_dense.cpp ${_offload}/offload_exec.cpp ${_offload}/synthetic_offload.cpp)
+target_include_directories(crit_dense_offload PUBLIC ${_offload})
+target_link_libraries(crit_dense_offload PUBLIC crit_batched_engine Threads::Threads)
+target_compile_features(crit_dense_offload PUBLIC cxx_std_20)
+crit_inference_warnings(crit_dense_offload)
+crit_inference_isa_sources(crit_dense_offload ${_offload}/host_dense_avx2.cpp ${_offload}/host_dense_avx512.cpp)
+crit_inference_executable(crit_dense_offload_tests SOURCES ${FIXTURES}/dense_offload_tests.cpp LINK crit_dense_offload)
+crit_inference_tests(crit_dense_offload_tests crit_dense_offload 300 plan host plans)
+crit_inference_executable(crit_dense_offload_bench SOURCES ${_offload}/offload_bench.cpp LINK crit_dense_offload)
 
 add_executable(crit_host_nvfp4_cuda_tests ${FIXTURES}/host_nvfp4_cuda_tests.cu)
 target_compile_features(crit_host_nvfp4_cuda_tests PRIVATE cxx_std_20 cuda_std_20)

@@ -21,7 +21,7 @@ object provides:
 
 The adapter calls the engine's code; the harness computes every metric and records the
 configuration, host, model and suite identities, every sample and the generated tokens. Quality is
-measured over the chat API, on the engine's own replies
+measured through crit serve, on the engine's scores of fixed text from the paths it serves with
 ([Engines behind a server](README.md#engines-behind-a-server)): an adapter's engine gets no quality
 figures.
 

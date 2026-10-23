@@ -40,7 +40,7 @@ class StrictSchemaTests(unittest.TestCase):
         with self.assertRaises(RequestError):
             tool_options({"tools": TOOLS}, [TOOLS_CAPABILITY])
         for schema in ({"type": "object", "additionalProperties": True},
-                       {"type": "object", "properties": {"path": {"type": "string", "pattern": "a+"}},
+                       {"type": "object", "properties": {"path": {"type": "string", "format": "email"}},
                         "additionalProperties": False}):
             tools = copy.deepcopy(TOOLS)
             tools[0]["function"]["parameters"] = schema

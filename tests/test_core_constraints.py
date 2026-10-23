@@ -38,10 +38,17 @@ class CompilerTests(unittest.TestCase):
                     self.assertTrue(all(0 <= s < 256 + int(rules) for s in rhs))
 
     def test_unknown_or_unsupported_schema_keywords_never_relax_constraints(self):
-        cases = [{"type": "string", "pattern": "a"}, {"type": "string", "format": "email"},
-                 {"$ref": "#/$defs/x"}, {"oneOf": [{"type": "string"}]},
+        cases = [{"type": "string", "pattern": "a", "maxLength": 3}, {"type": "string", "format": "email"},
+                 {"$ref": "#/$defs/x"}, {"oneOf": [{"type": "integer"}, {"type": "number"}]},
                  {"type": "number", "maximum": 1}, {"type": "object"},
-                 {"type": "array"}, {"type": ["string", "null"]},
+                 {"type": "array"}, {"type": ["string", "null"], "items": {"type": "null"}},
+                 {"type": ["string", "string"]}, {"anyOf": []}, {"anyOf": [{"type": "string"}], "type": "string"},
+                 {"$ref": "http://example.invalid/schema"}, {"$ref": "#/$defs/x", "type": "string", "$defs": {"x": {"type": "string"}}},
+                 {"type": "object", "properties": {"a": {"$defs": {}, "type": "null"}}, "additionalProperties": False},
+                 {"allOf": [{"type": "string"}]}, {"not": {"type": "string"}},
+                 {"type": "string", "pattern": "(?=a)"}, {"type": "string", "pattern": "a*?"},
+                 {"type": "string", "pattern": "\\bword"}, {"type": "string", "pattern": "[\u00e9]"},
+                 {"type": "string", "pattern": "\\xe9"},
                  {"type": "object", "properties": {}, "required": ["x"], "additionalProperties": False},
                  {"type": "string", "maxLength": True}, {"type": "string", "maxLength": None},
                  {"type": "array", "items": {"type": "null"}, "maxItems": None},
@@ -52,6 +59,70 @@ class CompilerTests(unittest.TestCase):
         for schema in cases:
             with self.subTest(schema=schema), self.assertRaises(ValueError):
                 self.compile(schema)
+
+    def test_unions_type_lists_references_and_optional_properties(self):
+        from crit_core.constraints import matches
+        union = self.compile({"type": "object", "properties": {
+            "v": {"anyOf": [{"type": "integer"}, {"type": ["string", "null"], "maxLength": 3}]},
+            "o": {"type": "boolean"}}, "required": ["v"], "additionalProperties": False})
+        for raw, ok in ((b'{"v":1}', True), (b'{"v":"abc"}', True), (b'{"v":"abcd"}', False), (b'{"v":null,"o":true}', True),
+                        (b'{"o":true}', False), (b'{"v":1.5}', False), (b'{"v":1,"o":false}', True)):
+            self.assertEqual(matches(union, raw), ok, raw)
+        tree = self.compile({"$defs": {"node": {"type": "object", "properties": {
+            "v": {"type": "integer"}, "kids": {"type": "array", "items": {"$ref": "#/$defs/node"}}},
+            "required": ["v", "kids"], "additionalProperties": False}}, "$ref": "#/$defs/node"})
+        self.assertTrue(matches(tree, b'{"v":1,"kids":[{"v":2,"kids":[]},{"v":3,"kids":[{"v":4,"kids":[]}]}]}'))
+        self.assertFalse(matches(tree, b'{"v":1,"kids":[{"v":2}]}'))
+        nested = self.compile({"type": "array", "items": {"$ref": "#"}, "maxItems": 2})
+        self.assertTrue(matches(nested, b"[[],[[]]]"))
+        self.assertFalse(matches(nested, b"[[],[],[]]"))
+        with self.assertRaises(ValueError):   # a reference cycle that never produces a value
+            self.compile({"$defs": {"a": {"$ref": "#/$defs/a"}}, "$ref": "#/$defs/a"})
+
+    def test_one_of_only_with_provably_disjoint_branches(self):
+        from crit_core.constraints import matches
+        tagged = self.compile({"oneOf": [
+            {"type": "object", "properties": {"kind": {"const": "a"}, "x": {"type": "integer"}}, "required": ["kind", "x"],
+             "additionalProperties": False},
+            {"type": "object", "properties": {"kind": {"const": "b"}, "y": {"type": "string"}}, "required": ["kind", "y"],
+             "additionalProperties": False}]})
+        self.assertTrue(matches(tagged, b'{"kind":"a","x":1}'))
+        self.assertFalse(matches(tagged, b'{"kind":"a","y":"s"}'))
+        for disjoint in ({"oneOf": [{"type": "string"}, {"type": "integer"}, {"type": "null"}]},
+                         {"oneOf": [{"const": "a"}, {"enum": ["b", 1]}]}, {"oneOf": [{"enum": [True]}, {"enum": [1]}]},
+                         {"oneOf": [{"type": "boolean"}, {"$ref": "#/$defs/s"}], "$defs": {"s": {"type": "string"}}}):
+            self.compile(disjoint)
+        for overlapping in ({"oneOf": [{"enum": [1, "a"]}, {"enum": [1.0]}]}, {"oneOf": [{"type": "string"}, {"type": "string", "maxLength": 2}]},
+                            {"oneOf": [{"$ref": "#/$defs/s"}, {"type": "string"}], "$defs": {"s": {"type": "string"}}},
+                            {"oneOf": [{"type": "object", "properties": {"k": {"const": "a"}}, "required": [], "additionalProperties": False},
+                                       {"type": "object", "properties": {"k": {"const": "b"}}, "required": [], "additionalProperties": False}]}):
+            with self.subTest(schema=overlapping), self.assertRaises(ValueError):
+                self.compile(overlapping)
+
+    def test_patterns_match_the_decoded_string_with_search_semantics(self):
+        import random
+        import re
+        from crit_core.constraints import matches
+        rng = random.Random(4)
+        e_acute, line_separator, no_break = chr(0xe9), chr(0x2028), chr(0xa0)
+        alphabet = ["a", "b", "c", "1", "2", '"', "\\", "\n", "\r", " ", e_acute, line_separator, no_break, "x", "-", ".", "\x01"]
+        # ECMA-262 (JSON Schema's dialect) as Python regexes: '.' excludes every line terminator, '$' anchors only at the
+        # end, \d and \w are ASCII, \s includes the Unicode spaces.
+        dot = "[^\n\r" + line_separator + chr(0x2029) + "]"
+        space = "[\t\n\x0b\x0c\r " + "".join(chr(c) for c in (0xa0, 0x1680, *range(0x2000, 0x200b), 0x2028, 0x2029, 0x202f,
+                                                               0x205f, 0x3000, 0xfeff)) + "]"
+        cases = ((r"^a(b|c)*[0-9]{1,3}$", r"\Aa(b|c)*[0-9]{1,3}\Z"), (r"b.c", "b" + dot + "c"), (r"^[^a-c]+$", r"\A[^a-c]+\Z"),
+                 (r"\d+", "[0-9]+"), (r"^.*$", r"\A" + dot + r"*\Z"), (r"a\.b", r"a\.b"), (r"^x?$", r"\Ax?\Z"), ('"', '"'),
+                 (r"^\w+\s\w+$", r"\A[A-Za-z0-9_]+" + space + r"[A-Za-z0-9_]+\Z"), (r"\\", r"\\"), (e_acute, e_acute),
+                 (r"^[\x00-\x1f]$", r"\A[\x00-\x1f]\Z"))
+        for pattern, ecma in cases:
+            artifact = self.compile({"type": "string", "pattern": pattern})
+            reference = re.compile(ecma)
+            for _ in range(250):
+                text = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 6)))
+                # json.dumps(..., ensure_ascii=False) writes the canonical encoding the compiled pattern generates.
+                encoded = json.dumps(text, ensure_ascii=False).encode("utf-8")
+                self.assertEqual(matches(artifact, encoded), reference.search(text) is not None, (pattern, text))
 
     def test_schema_dialect_duplicates_nonfinite_and_compiler_limits(self):
         for source in ('{"type":"string","type":"integer"}', '{"enum":[NaN]}',

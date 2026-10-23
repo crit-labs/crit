@@ -13,7 +13,7 @@ from itertools import islice
 import re
 import sys
 
-VERSION = "crit-language-compiler-1"
+VERSION = "crit-language-compiler-2"
 MAX_SOURCE = 1048576
 
 
@@ -88,7 +88,9 @@ class Builder:
                 raise UnsupportedConstraint("inverted repetition bounds")
         tail = self.new()
         if high is None:
-            self.define(tail, [(), (rule, tail)])
+            # Left recursion: an Earley recognizer extends it in constant work per repetition, where right recursion
+            # leaves a completion chain as long as the repetition (and a different chart state after every item).
+            self.define(tail, [(), (tail, rule)])
         else:
             self.define(tail, [()])
             for _ in range(high - low):
@@ -116,10 +118,82 @@ class Builder:
         return result
 
 
+class JsonText:
+    """Rules for decoded JSON string content in one canonical encoding: '"' and '\\' escaped, control characters as
+    \\n \\r \\t \\b \\f or \\u00XX, everything else raw UTF-8 (the encoding json.dumps(..., ensure_ascii=False)
+    writes). A schema pattern compiles through it, so the regex applies to the decoded string."""
+    ESCAPES = {8: b"\\b", 9: b"\\t", 10: b"\\n", 12: b"\\f", 13: b"\\r", 34: b'\\"', 92: b"\\\\"}
+
+    def __init__(self, builder):
+        self.b, self._multibyte = builder, {}
+
+    @classmethod
+    def encode(cls, code):
+        if code in cls.ESCAPES:
+            return cls.ESCAPES[code]
+        if code < 0x20:
+            return b"\\u%04x" % code
+        return chr(code).encode("utf-8")
+
+    def literal(self, char):
+        return self.b.literal(self.encode(ord(char)))
+
+    def multibyte(self, separators=True):
+        """Every non-ASCII character as raw UTF-8; without U+2028 and U+2029 when `separators` is false."""
+        if separators not in self._multibyte:
+            b = self.b
+            def char(low, high):
+                return b.chars(range(low, high + 1))
+            cont = char(0x80, 0xbf)
+            three = [b.sequence([char(0xe0, 0xe0), char(0xa0, 0xbf), cont]),
+                     b.sequence([char(0xed, 0xed), char(0x80, 0x9f), cont]),
+                     b.sequence([char(0xee, 0xef), cont, cont])]
+            if separators:
+                three.append(b.sequence([char(0xe1, 0xec), cont, cont]))
+            else:
+                three += [b.sequence([b.chars([0xe1] + list(range(0xe3, 0xed))), cont, cont]),
+                          b.sequence([0xe2, 0x80, b.chars(set(range(0x80, 0xc0)) - {0xa8, 0xa9})]),
+                          b.sequence([0xe2, char(0x81, 0xbf), cont])]
+            self._multibyte[separators] = b.choice([b.sequence([char(0xc2, 0xdf), cont])] + three + [
+                b.sequence([char(0xf0, 0xf0), char(0x90, 0xbf), cont, cont]),
+                b.sequence([char(0xf1, 0xf3), cont, cont, cont]),
+                b.sequence([char(0xf4, 0xf4), char(0x80, 0x8f), cont, cont])])
+        return self._multibyte[separators]
+
+    def chars(self, values, invert=False, separators=True):
+        """ASCII code points `values` (or every character but them), each in its canonical encoding."""
+        if any(v > 127 for v in values):
+            raise UnsupportedConstraint("pattern character classes need ASCII characters")
+        codes = sorted(set(range(128)) - set(values)) if invert else sorted(set(values))
+        parts = []
+        plain = [v for v in codes if len(self.encode(v)) == 1]
+        if plain:
+            parts.append(self.b.chars(plain))
+        parts += [self.b.literal(self.encode(v)) for v in codes if len(self.encode(v)) > 1]
+        if invert:
+            parts.append(self.multibyte(separators))
+        if not parts:
+            raise UnsupportedConstraint("empty character class")
+        return parts[0] if len(parts) == 1 else self.b.choice(parts)
+
+    def dot(self):
+        """ECMA-262 '.' without flags: any character except the line terminators."""
+        return self.chars({10, 13}, invert=True, separators=False)
+
+    # ECMA-262 \s beyond ASCII: no-break space, Ogham space mark, the U+2000 spaces, line and paragraph separators,
+    # narrow no-break space, medium mathematical space, ideographic space and the byte order mark.
+    SPACES = "\u00a0\u1680" + "".join(chr(c) for c in range(0x2000, 0x200b)) + "\u2028\u2029\u202f\u205f\u3000\ufeff"
+
+    def space(self):
+        """ECMA-262 \\s: ASCII whitespace and the Unicode spaces it includes."""
+        return self.b.choice([self.chars({9, 10, 11, 12, 13, 32})] + [self.b.literal(c.encode("utf-8")) for c in self.SPACES])
+
+
 class Expression:
-    """Recursive-descent byte-regex / line-EBNF frontend; bounded nesting."""
-    def __init__(self, text, builder, names=None):
-        self.text, self.b, self.names, self.at, self.depth = text, builder, names, 0, 0
+    """Recursive-descent byte-regex / line-EBNF frontend; bounded nesting. With `string`, a JsonText, the expression
+    matches decoded JSON string content and its atoms become canonical JSON encodings."""
+    def __init__(self, text, builder, names=None, string=None):
+        self.text, self.b, self.names, self.at, self.depth, self.string = text, builder, names, 0, 0, string
 
     def peek(self):
         if self.names is not None:
@@ -174,6 +248,8 @@ class Expression:
         self.at += 1
         if not values:
             raise UnsupportedConstraint("empty character class")
+        if self.string is not None:
+            return self.string.chars(values, invert)
         if invert:
             values = set(range(256)) - values
         if not values:
@@ -205,18 +281,21 @@ class Expression:
             raise UnsupportedConstraint("unknown rule or unsupported EBNF atom")
         self.at += 1
         if char == ".":
-            return self.b.chars(set(range(256)) - {10})
+            return self.string.dot() if self.string is not None else self.b.chars(set(range(256)) - {10})
         if char == "\\":
             special = self.text[self.at:self.at + 1]
             groups = {"d": b"0123456789", "w": b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_",
                       "s": b" \t\r\n\f\v"}
             if special in groups:
                 self.at += 1
-                return self.b.chars(groups[special])
-            return self.b.chars([self.escaped()])
+                if self.string is None:
+                    return self.b.chars(groups[special])
+                return self.string.space() if special == "s" else self.string.chars(set(groups[special]))
+            value = self.escaped()
+            return self.string.chars({value}) if self.string is not None else self.b.chars([value])
         if char in "*+?{}^$" or not char:
             raise UnsupportedConstraint("unsupported regex operator")
-        return self.b.literal(char)
+        return self.string.literal(char) if self.string is not None else self.b.literal(char)
 
     def expression(self):
         choices, sequence = [], []
@@ -248,9 +327,135 @@ class Expression:
         return root
 
 
+def _normalized(value):
+    """A JSON value with JSON Schema equality made structural: integral numbers as ints, objects key-sorted."""
+    if type(value) is float and value.is_integer():
+        return int(value)
+    if isinstance(value, list):
+        return [_normalized(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _normalized(v) for k, v in value.items()}
+    return value
+
+
+def _kind(value):
+    return ("null" if value is None else "boolean" if type(value) is bool else
+            "integer" if type(value) is int or (type(value) is float and value.is_integer()) else
+            "number" if type(value) is float else "string" if isinstance(value, str) else
+            "array" if isinstance(value, list) else "object")
+
+
+# The JSON kinds a type name generates; "number" also generates integral values.
+_TYPE_KINDS = {"null": {"null"}, "boolean": {"boolean"}, "integer": {"integer"}, "number": {"integer", "number"},
+               "string": {"string"}, "array": {"array"}, "object": {"object"}}
+_ALL_KINDS = frozenset().union(*_TYPE_KINDS.values())
+_ANNOTATIONS = {"title", "description", "$comment"}
+
+
 class Schema:
     def __init__(self, builder):
         self.b, self.character = builder, None
+        self.text = JsonText(builder)
+        self.defs, self.refs = {}, {}
+
+    def root(self, schema):
+        """The start rule of a whole schema: its $defs become rules that $ref reaches, recursion included."""
+        if not isinstance(schema, dict):
+            raise UnsupportedConstraint("schema object with bounded nesting required")
+        schema = dict(schema)
+        defs = schema.pop("$defs", {})
+        if (not isinstance(defs, dict) or len(defs) > 256
+                or any(not isinstance(k, str) or not isinstance(v, dict) for k, v in defs.items())):
+            raise UnsupportedConstraint("$defs must map at most 256 names to schemas")
+        self.defs = defs
+        self.refs["#"] = rule = self.b.new()
+        self.b.define(rule, [(self.compile(schema),)])
+        return rule
+
+    def reference(self, pointer):
+        """A local reference: "#" (the whole schema) or "#/$defs/<name>", one rule per target."""
+        if pointer == "#":
+            return self.refs["#"]
+        if not isinstance(pointer, str) or not pointer.startswith("#/$defs/") or "/" in pointer[8:]:
+            raise UnsupportedConstraint("only local #/$defs/<name> and # references are supported")
+        name = pointer[8:].replace("~1", "/").replace("~0", "~")
+        if name not in self.defs:
+            raise UnsupportedConstraint("$ref names an undefined $defs entry")
+        if name not in self.refs:
+            self.refs[name] = rule = self.b.new()
+            self.b.define(rule, [(self.compile(self.defs[name], 1),)])
+        return self.refs[name]
+
+    def resolve(self, schema, seen=()):
+        """A branch without annotations, with references followed (None for a reference cycle)."""
+        schema = {k: v for k, v in schema.items() if k not in _ANNOTATIONS and k != "$schema"} if isinstance(schema, dict) else schema
+        if isinstance(schema, dict) and set(schema) == {"$ref"}:
+            pointer = schema["$ref"]
+            if pointer in seen:
+                return None
+            target = self.defs.get(pointer[8:].replace("~1", "/").replace("~0", "~")) if isinstance(pointer, str) and \
+                pointer.startswith("#/$defs/") else None
+            return self.resolve(target, seen + (pointer,)) if target is not None else None
+        return schema
+
+    def facts(self, schema, seen=()):
+        """(kinds, literals): the JSON kinds a branch can generate and, for enum/const, its normalized values."""
+        schema = self.resolve(schema, seen)
+        if not isinstance(schema, dict):
+            return _ALL_KINDS, None
+        for key in ("anyOf", "oneOf"):
+            if key in schema and isinstance(schema[key], list):
+                parts = [self.facts(x, seen) for x in schema[key]]
+                literals = None if any(lit is None for _, lit in parts) else frozenset().union(*(lit for _, lit in parts))
+                return frozenset().union(*(kinds for kinds, _ in parts)), literals
+        if "enum" in schema or "const" in schema:
+            values = schema.get("enum", [schema.get("const")]) if "enum" in schema else [schema["const"]]
+            if isinstance(values, list):
+                literals = frozenset((_kind(v), json.dumps(_normalized(v), sort_keys=True)) for v in values)
+                return frozenset(kind for kind, _ in literals), literals
+        kind = schema.get("type")
+        names = kind if isinstance(kind, list) else [kind]
+        if all(isinstance(n, str) and n in _TYPE_KINDS for n in names):
+            return frozenset().union(*(_TYPE_KINDS[n] for n in names)), None
+        return _ALL_KINDS, None
+
+    def discriminator(self, a, b):
+        """Whether two object branches require one property whose enum/const values are disjoint."""
+        a, b = self.resolve(a), self.resolve(b)
+        if not all(isinstance(x, dict) and x.get("type") == "object" for x in (a, b)):
+            return False
+        for name in set(a.get("required", [])) & set(b.get("required", [])):
+            values = [self.facts(x.get("properties", {}).get(name, {}))[1] for x in (a, b)]
+            if values[0] is not None and values[1] is not None and not values[0] & values[1]:
+                return True
+        return False
+
+    def disjoint(self, branches):
+        """oneOf is exact only when no value matches two branches; anything not provable is rejected."""
+        facts = [self.facts(x) for x in branches]
+        for i in range(len(branches)):
+            for j in range(i + 1, len(branches)):
+                (kinds_i, lit_i), (kinds_j, lit_j) = facts[i], facts[j]
+                if not (kinds_i & kinds_j or False):
+                    continue
+                if lit_i is not None and lit_j is not None and not lit_i & lit_j:
+                    continue
+                if self.discriminator(branches[i], branches[j]):
+                    continue
+                raise UnsupportedConstraint("oneOf branches are not provably disjoint")
+
+    def pattern(self, text):
+        """A string pattern (ECMA-262 search semantics, no flags) over the decoded string: unanchored ends accept
+        any characters; the matched part is written in JsonText's canonical encoding."""
+        if not isinstance(text, str) or len(text) > 4096:
+            raise UnsupportedConstraint("pattern must be a string of at most 4096 characters")
+        start = text.startswith("^")
+        body = text[1:] if start else text
+        end = body.endswith("$") and (len(body[:-1]) - len(body[:-1].rstrip("\\"))) % 2 == 0
+        body = body[:-1] if end else body
+        core = Expression(body, self.b, string=self.text).parse()
+        run = self.b.repeat(self.string_character())
+        return self.b.sequence(([] if start else [run]) + [core] + ([] if end else [run]))
 
     def string_character(self):
         if self.character is not None:
@@ -286,11 +491,26 @@ class Schema:
         if depth > 32 or not isinstance(schema, dict):
             raise UnsupportedConstraint("schema object with bounded nesting required")
         b = self.b
-        annotations = {"title", "description", "$comment"}
-        schema = {k: v for k, v in schema.items() if k not in annotations}
+        schema = {k: v for k, v in schema.items() if k not in _ANNOTATIONS}
         if "$schema" in schema:
             if schema.pop("$schema") != "https://json-schema.org/draft/2020-12/schema":
                 raise UnsupportedConstraint("only the declared 2020-12 subset is supported")
+        if "$defs" in schema:
+            raise UnsupportedConstraint("$defs are supported at the schema root only")
+        if "$ref" in schema:
+            if set(schema) != {"$ref"}:
+                raise UnsupportedConstraint("$ref with sibling keywords is unsupported")
+            return self.reference(schema["$ref"])
+        for key in ("anyOf", "oneOf"):
+            if key in schema:
+                branches = schema[key]
+                if set(schema) != {key}:
+                    raise UnsupportedConstraint(f"{key} with sibling keywords is unsupported")
+                if not isinstance(branches, list) or not 1 <= len(branches) <= 64:
+                    raise UnsupportedConstraint(f"{key} needs 1 to 64 schemas")
+                if key == "oneOf":
+                    self.disjoint(branches)
+                return b.choice(self.compile(x, depth + 1) for x in branches)
         if "enum" in schema or "const" in schema:
             key = "enum" if "enum" in schema else "const"
             if set(schema) - {key, "type"}:
@@ -311,8 +531,20 @@ class Schema:
         kind = schema.get("type")
         permitted = {"object": {"properties", "required", "additionalProperties"},
                      "array": {"items", "minItems", "maxItems"},
-                     "string": {"minLength", "maxLength"},
+                     "string": {"minLength", "maxLength", "pattern"},
                      "integer": {"minimum", "maximum"}, "number": set(), "boolean": set(), "null": set()}
+        if isinstance(kind, list):
+            # Each listed type takes the keywords that apply to it; a keyword no listed type takes is unsupported.
+            if not kind or len(kind) > 7 or any(not isinstance(k, str) or k not in permitted for k in kind) or len(set(kind)) != len(kind):
+                raise UnsupportedConstraint("type lists need distinct supported type names")
+            used, parts = set(), []
+            for name in kind:
+                keys = {key for key in schema if key in permitted[name]}
+                used |= keys
+                parts.append(self.compile({"type": name, **{key: schema[key] for key in keys}}, depth + 1))
+            if set(schema) - used - {"type"}:
+                raise UnsupportedConstraint("unsupported schema type/keyword")
+            return parts[0] if len(parts) == 1 else b.choice(parts)
         if not isinstance(kind, str) or kind not in permitted or set(schema) - permitted[kind] - {"type"}:
             raise UnsupportedConstraint("unsupported schema type/keyword")
         if kind in {"boolean", "null"}:
@@ -328,6 +560,10 @@ class Schema:
                 expression += r"(\.[0-9]+)?([eE][+-]?[0-9]+)?"
             return Expression(expression, b).parse()
         if kind == "string":
+            if "pattern" in schema:
+                if "minLength" in schema or "maxLength" in schema:
+                    raise UnsupportedConstraint("pattern together with length bounds is unsupported")
+                return b.sequence([34, self.pattern(schema["pattern"]), 34])
             low = _integer(schema.get("minLength", 0), "minLength")
             high = schema.get("maxLength")
             if "maxLength" in schema:
@@ -377,7 +613,7 @@ def compile_language(kind, source):
     b = Builder()
     try:
         if kind == "schema":
-            start = Schema(b).compile(_json(source))
+            start = Schema(b).root(_json(source))
         elif kind == "regex":
             # All regexes use whole-byte-string matching; optional outer anchors.
             if source.startswith("^"):

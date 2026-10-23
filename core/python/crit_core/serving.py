@@ -32,7 +32,11 @@ chat-tool-stream-v1). Reasoning in the template's markers (<think>...</think>) i
 the same way, as `reasoning`, which crit serve gives clients as reasoning_content. An engine that reports token
 log-probabilities sets `logprobs = True` and declares capabilities(..., logprobs=True) (chat-logprobs-v1): a request
 then carries "logprobs": n, ResidentChat passes logprobs=n to generate_tokens, and the decoder calls
-on_tokens(tokens, rows) with one (logprob, [(token, logprob), ...n alternatives]) row per token.
+on_tokens(tokens, rows) with one (logprob, [(token, logprob), ...n alternatives]) row per token. An engine that
+scores fixed text through its serving paths sets `scores = True`, implements score_tokens() and declares
+capabilities(..., score=True) (chat-score-v1): crit serve's POST /v1/crit/score then returns, for given prompt and
+continuation ids, every prompt position's row from its prefill and every continuation token's from its decode,
+forced to the continuation.
 """
 from pathlib import Path
 from contextlib import contextmanager
@@ -41,6 +45,7 @@ from dataclasses import dataclass
 SAMPLING = ("temperature", "top_p", "top_k", "min_p", "seed", "presence_penalty", "frequency_penalty",
             "repetition_penalty", "logit_bias")
 LOGPROBS_CAPABILITY = "chat-logprobs-v1"
+SCORE_CAPABILITY = "chat-score-v1"
 TOP_LOGPROBS = 20  # the most alternatives per token a request asks for (OpenAI's top_logprobs range)
 MIN_LOGPROB = -9999.0  # what a zero probability reads as, as OpenAI reports it (JSON has no infinity)
 
@@ -71,9 +76,10 @@ def kept_special_ids(text, tool_format=None):
 
 
 def capabilities(text, sampling=(), *, stream=True, config=True, tool_format=None, images=False, concurrent=False,
-                 logprobs=False):
+                 logprobs=False, score=False):
     """The serving capabilities a package built on ResidentChat declares, for a model's ModelText and the package's
-    own `tool_format` (ResidentChat.tool_format), if any. logprobs: the engine sets ResidentChat.logprobs."""
+    own `tool_format` (ResidentChat.tool_format), if any. logprobs: the engine sets ResidentChat.logprobs; score:
+    it sets ResidentChat.scores and implements score_tokens()."""
     unknown = sorted(set(sampling) - set(SAMPLING))
     if unknown:
         raise ValueError("Unknown sampling fields: " + ", ".join(unknown))
@@ -83,6 +89,7 @@ def capabilities(text, sampling=(), *, stream=True, config=True, tool_format=Non
     result += ["chat-images-v1"] if images else []
     result += ["chat-concurrent-v1"] if concurrent else []
     result += [LOGPROBS_CAPABILITY] if logprobs else []
+    result += [SCORE_CAPABILITY] if score else []
     if tool_format is not None or template_tool_format(text):
         result += ["chat-tools-v1"] + (["chat-tool-stream-v1"] if stream else [])
     return result + [sampling_capability(name) for name in SAMPLING if name in sampling]
@@ -131,6 +138,7 @@ class ResidentChat:
     them for every generated token but stop tokens, reasoning and tool calls included."""
     sampling = ()
     logprobs = False
+    scores = False
     tool_format = None
     reasoning_format = None
     images = False
@@ -174,6 +182,37 @@ class ResidentChat:
         on_tokens(tokens, rows): per token (logprob, [(token, logprob), ...]) with its n most likely alternatives,
         ranked, natural-log probabilities of the raw logits (crit::core::TokenLogprob)."""
         raise NotImplementedError
+
+    def score_tokens(self, ids, continuation, top_k, cancelled, prompt_rows):
+        """chat-score-v1: (prompt rows, continuation rows, timing) for prompt `ids` followed by the fixed
+        `continuation`, each row (logprob of the token, [(token, logprob), ...its top_k alternatives, ranked]).
+        Prompt rows score ids[1:] from one prefill of `ids`, as the engine prefills a request, reading every
+        position; with prompt_rows false there are none ([]), and the prompt is only prefilled as for a reply.
+        Continuation rows score each continuation token as decoding after that prefill produces it, every step
+        forced to the continuation (a speculative engine's drafts accepted only while they equal it, each
+        correction and bonus token taken from it): the first from the prefill's last position, the others from
+        decode steps. Return None for the rows when cancelled() turned true. timing: prefill_ms, decode_ms."""
+        raise NotImplementedError
+
+    def score(self, request, cancellation):
+        """The response record of a score request (chat-score-v1): {"prompt": rows, "continuation": rows,
+        "telemetry"}, rows [token, logprob, [[token, logprob], ...top_logprobs]] as logprob_row makes them."""
+        ids, continuation = list(request["prompt_ids"]), list(request["continuation_ids"])
+        top_k, wanted = request["top_logprobs"], request["prompt_rows"]
+        prompt_rows, continuation_rows, timing = self.score_tokens(ids, continuation, top_k, cancellation.is_set,
+                                                                   wanted)
+        if prompt_rows is None or continuation_rows is None:
+            cancellation.check()
+            raise ValueError("The engine stopped scoring without being cancelled")
+        expected = len(ids) - 1 if wanted else 0
+        if len(prompt_rows) != expected or len(continuation_rows) != len(continuation):
+            raise ValueError(f"The engine scored {len(prompt_rows)} prompt and {len(continuation_rows)} continuation "
+                             f"positions, not {expected} and {len(continuation)}")
+        return {"schema_version": 1, "record_kind": "score_response", "request_id": request["request_id"],
+                "candidate_id": request["candidate_id"], "package_sha256": request["package_sha256"],
+                "prompt": [logprob_row(token, row, top_k) for token, row in zip(ids[1:], prompt_rows)],
+                "continuation": [logprob_row(token, row, top_k) for token, row in zip(continuation, continuation_rows)],
+                "telemetry": {key: timing.get(key) for key in ("prefill_ms", "decode_ms")}}
 
     def effective_configuration(self):
         return dict(self.configuration)
@@ -365,6 +404,7 @@ class ResidentChat:
         pass
 
 
-__all__ = ["ResidentChat", "PreparedPrompt", "SAMPLING", "LOGPROBS_CAPABILITY", "TOP_LOGPROBS", "capabilities",
+__all__ = ["ResidentChat", "PreparedPrompt", "SAMPLING", "LOGPROBS_CAPABILITY", "SCORE_CAPABILITY", "TOP_LOGPROBS",
+           "capabilities",
            "chat_prompt", "kept_special_ids", "logprob_row", "special_marker_ids", "sampling_capability",
            "template_tool_format"]

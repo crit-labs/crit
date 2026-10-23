@@ -148,6 +148,30 @@ def curve_prompt(pieces, filler, length):
     return head + middle[:need] + tail
 
 
+def required_prompts(pieces, retrieval, length, positions):
+    """At the required context, (the curve prompt of exactly `length` tokens, the retrieval prompt) sharing every
+    token up to the end of the document: the curve case's head, its document followed by the filler (repeated as
+    needed) with one retrieval fact at each of `positions` (fractions of that text), then the curve case's tail or
+    the retrieval question's (pieces retrieval_tail_ids). None when `length` cannot hold the frame and the facts.
+    pieces: prepared["context"]; retrieval: prepared["retrieval"]."""
+    head, facts = list(pieces["head_ids"]), retrieval["facts"]
+    plain = length - len(head) - len(pieces["tail_ids"]) - sum(len(f["ids"]) for f in facts)
+    if plain < len(facts) + 1:
+        return None
+    text = list(pieces["document_ids"])
+    if len(text) < plain:
+        rest = plain - len(text)
+        text += (list(retrieval["filler_ids"]) * -(-rest // len(retrieval["filler_ids"])))[:rest]
+    text = text[:plain]
+    middle, last = [], 0
+    for fraction, fact in zip(positions, facts):
+        cut = max(last, min(plain, int(plain * float(fraction))))
+        middle += text[last:cut] + list(fact["ids"])
+        last = cut
+    middle += text[last:]
+    return head + middle + list(pieces["tail_ids"]), head + middle + list(pieces["retrieval_tail_ids"])
+
+
 def retrieval_points(required, rule):
     """Context lengths the retrieval check fills: its fixed points below the requirement, then the requirement
     itself (near capacity: prompt plus output equal it). rule: protocol.json's context.retrieval."""

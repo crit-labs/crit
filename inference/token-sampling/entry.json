@@ -3,16 +3,17 @@
   "category": "sampling-and-constraints",
   "summary": "Device token selection after the head: greedy with index tie-break, or temperature / top-k / top-p sampling with Core's seeded counter-based draws",
   "implementation_status": "native_source",
-  "implementation_scope": "Two-stage CUDA top-k (256 block slices, then one global block), tempered weights, top-p prefix and one draw per token from Core's counter-based uniform (crit/sampling.h) at a position advanced on the device. The host oracle is Core's Sampler; an FP64 Python mirror uses Core's draw bit for bit. Logit processing before selection and per-request parameter storage are engine supplied.",
+  "implementation_scope": "Two-stage CUDA top-k (256 block slices, then one global block), tempered weights, top-p prefix and one draw per token from Core's counter-based uniform (crit/sampling.h) at a position advanced on the device. The host oracle is Core's Sampler; an FP64 Python mirror uses Core's draw bit for bit. A constraint-bitmask kernel sets disallowed logits to -inf for several rows (Core's TokenMatcher::allowed_bits layout). Other logit processing before selection and per-request parameter storage are engine supplied.",
   "agent_guidance": {
     "use_when": "Logits are produced on the device and requests need temperature, top-k or top-p sampling with reproducible seeds",
-    "avoid_when": "Only greedy decoding is served, or selection must include penalties, biases or grammars that are not applied to the logits first",
+    "avoid_when": "Only greedy decoding is served, or selection must include penalties or biases that are not applied to the logits first (structured-output masks go through enqueue_mask)",
     "provides": [
       "Rank order by logit with lowest-index tie-break; greedy path",
       "Top-k up to 64 candidates over a full vocabulary in two device stages",
       "Temperature weights, top-p rank prefix and one draw per sampled token",
       "Core's Philox draw on the device at a device-advanced position, so device tokens equal crit::core::Sampler's away from FP32 rounding",
-      "FP64 Python mirror of the device rules with Core's bit-identical draw"
+      "FP64 Python mirror of the device rules with Core's bit-identical draw",
+      "A kernel applying a structured-output bitmask (Core's TokenMatcher::allowed_bits) to logit rows before selection"
     ],
     "engine_supplies": [
       "The logits row on the device and the candidate scratch",
@@ -34,8 +35,8 @@
   "path": "inference/token-sampling/README.md",
   "code_path": "inference/token-sampling/code",
   "code_files": [
-    {"path": "inference/token-sampling/code/sampling.h", "purpose": "Params and the selection launch interface"},
-    {"path": "inference/token-sampling/code/sampling.cu", "purpose": "Two-stage top-k selection, tempered top-p draw with Core's uniform and device position advance"},
+    {"path": "inference/token-sampling/code/sampling.h", "purpose": "Params and the selection and mask launch interfaces"},
+    {"path": "inference/token-sampling/code/sampling.cu", "purpose": "Two-stage top-k selection, tempered top-p draw with Core's uniform and device position advance; constraint bitmask masking"},
     {"path": "inference/token-sampling/code/sampling.py", "purpose": "FP64 Python mirror of the device rules with Core's Philox draw and a runnable example"}
   ],
   "requires": {
@@ -58,6 +59,7 @@
   "symbols": [
     "Params",
     "enqueue_select",
+    "enqueue_mask",
     "philox4x32",
     "uniform",
     "candidates",
@@ -73,7 +75,7 @@
   ],
   "validation": {
     "host": "Core's sampling fixture covers the rules, the generator and Sampler; the Python mirror is checked against Core's Philox vectors and Sampler draws, plus greedy ties, nucleus membership and top-k/top-p reductions",
-    "native": "Greedy ties, top-k 1 and tiny top-p reducing to greedy, position advance and repeatability, every draw inside Core's kept set and equal to crit::core::Sampler::sample away from boundaries, and frequencies within four standard errors of the tempered distribution",
+    "native": "Greedy ties, top-k 1 and tiny top-p reducing to greedy, position advance and repeatability, every draw inside Core's kept set and equal to crit::core::Sampler::sample away from boundaries, and frequencies within four standard errors of the tempered distribution; masks equal the host's -inf pattern on strided rows, and greedy selection on a masked row equals Core's constrained Sampler while draws stay inside the allowed set",
     "performance": "No throughput or output-quality claim"
   }
 }

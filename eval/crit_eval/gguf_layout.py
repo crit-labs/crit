@@ -182,7 +182,7 @@ class GgufCheckpoint:
         return (f"GGUF decoded by gguf {self.version} with the reference converter's layout undone "
                 f"({self.gguf.architecture}); ")
 
-    def prefix(self):
+    def prefix(self, names=()):
         return "model."
 
     def _gguf_name(self, name):

@@ -220,7 +220,7 @@ cc::NativeEngine refusing_factory(std::string_view) { throw std::runtime_error("
 void check_native_engine() {
     cc::ReplayContinuation replay;
     replay.tokens = {1, 2, 3};
-    require(replay.host_bytes() == 3 * sizeof(cc::Token) && cc::native_api::abi_version == 1, "native_engine.h: types");
+    require(replay.host_bytes() == 3 * sizeof(cc::Token) && cc::native_api::abi_version == 2, "native_engine.h: types");
     require(cc::native_api::open(&refusing_factory, "{}") == nullptr &&
                 std::string_view(cc::native_api::last_error()) == "consumer factory refused",
             "native_engine.h: a failing factory");

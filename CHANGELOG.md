@@ -9,6 +9,205 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-23
+
+### Overview
+
+crit 0.5.0 judges quality on what an engine serves. Eval protocol `crit-eval-v6` scores fixed
+text once per model on the reference and stores it; each engine scores the same ids through
+crit serve's new `chat-score-v1` (its prefill and its decode forced to the text), is judged on
+the positions it serves, and must score its own served replies alike (honesty). No reference
+runs per candidate, and the reference itself streams layers ahead, gathers rows in parallel
+reads and runs long prompts layer-major. Eval also runs in one attempt with no fixed time cap,
+measures follow-up turns and prompt caches, and repeats a speed case only when its runs
+disagree. Core adds batched paged serving, hybrid and sliding-window prefix reuse and faster
+constraints; Inference gains paged attention, a batched reference engine, GGUF projections and
+dense-layer offload. Breaking: v6 quality results do not compare with v5 (prepare data again;
+`crit eval status` refuses other majors); the native engine ABI is 2, so engines built on
+`crit/native_engine.h` must be rebuilt; `crit run eval` needs packages declaring
+`chat-score-v1`, whose `score_tokens` takes `prompt_rows`. The Python distribution and the Core
+SDK share version 0.5.0.
+
+### Changed
+
+- Eval protocol `crit-eval-v6` measures quality on fixed text through the engine's serving paths
+  instead of scoring every candidate's replies on the reference. Each quality text is a
+  conversation's generation prompt followed by its written answer (restored in
+  `suite/quality.json`, cut to 256 tokens); `crit eval reference --model --data` scores every
+  position once per model, suite and reference version and stores each position's log-probability
+  and top 16 under the data (about 16 MB). The engine scores the same ids through crit serve's
+  `chat-score-v1`, prompt positions from its prefill and answer tokens from its decode forced to the
+  answer, and each set is judged on the positions it serves (`SET/served`: the answer's first token
+  from the prefill's last position, the rest from decode); prompt positions, whose prefill logits no
+  request returns, are reported in `quality.prompt` and not judged. Both come with figures by
+  position bucket so thresholds show as steps. An honesty check
+  scores the engine's served greedy replies through the same call; they must agree within 1e-3
+  nats. `crit run ... eval` scores the data's texts before serving the first candidate and needs
+  `chat-score-v1`; no reference runs per candidate. v5 results do not compare with v6, and a
+  baseline compares only within its prepared data, suite and major version. Prepare data again
+  for v6.
+- `crit eval status` judges results of the current protocol major only and refuses others (their
+  status is stored in them), instead of rendering pre-v4 results without the request-history and
+  retrieval gates, results without an exactness mode as `required`, and v5 quality as unmeasured.
+- v5's per-reply quality scoring is gone: `StreamingReference.score` (each sequence run whole) and
+  `metrics.reply_quality`. The reference scores through `score_texts` only.
+- Eval measures follow-up turns (protocol `followup`, suite `followup.json`): a conversation's
+  turns, each resending the history, may be served from a prompt cache; each reports time to
+  first token, its cached prompt tokens and the prefill rate of the rest (`followup` KPIs), and
+  the turns run again after every other part must answer as they did first (`prompt_cache`
+  gate). An engine without a cache reports its fresh prefill and passes. `crit serve` reports
+  the prompt tokens an engine did not compute as `usage.prompt_tokens_details.cached_tokens`.
+- At the required context, the long-context curve's prompt holds the retrieval facts, and the
+  retrieval request right after that point shares its prompt up to the end of the document,
+  then asks the retrieval question (suite `long.json` `retrieval.question`), so an engine with a
+  prompt cache prefills that text once. Retrieval requests may be served from a prompt cache
+  (they are judged on their text; their cached tokens are recorded); every timed request still
+  prefills. Prepare data again.
+- Eval measures each speed case twice after its warmup and a third time only when the two
+  disagree: decode speed or time to first token spread by more than 5%, or the outputs differ
+  (protocol `speed.extra_repetition`); before, every case ran three times.
+- Eval's quality phase records where its time goes (`quality.timing`: per score request, honesty
+  reply and rescore, the request's seconds, the engine's own prefill and decode time, the rest,
+  response bytes and parse time), and the honesty rescore asks the score call for the reply's
+  rows alone: `chat-score-v1` takes `"prompt_rows": false`, and `score_tokens` takes
+  `prompt_rows`, so the engine prefills the prompt as for a reply instead of scoring every
+  position the fixed texts already scored. Results are unchanged.
+- `crit run eval` runs every part in one `eval` attempt on one loaded engine instead of within the
+  1800 s benchmark cap, which a long required context outgrew and made Eval run in parts, each
+  loading the engine again. The attempt runs to the segment's deadline; each request to the
+  engine may take the protocol's floor plus a slack times what the engine's earlier requests in
+  the same Eval say it should (`requests.timeout`), so a hung engine ends the attempt
+  (`eval_failed`). crit serve's own bound on each request is then the attempt's deadline.
+- Native engine ABI 2 (`crit/native_engine.h`): `crit_engine_score` takes `top_k` and returns the
+  engine's own ranked alternatives with the target scores, query rows and argmax. Every export is
+  required: `crit_core.native` no longer probes for the request and log-probability exports and
+  refuses ABI-1 libraries; rebuild native engines against this crit's headers.
+  `NativeEngine.score(ids, first_target, path, queries, top_k)` returns
+  `Scores(target, query, argmax, top)`.
+
+- `crit eval reference` drives the text model's own transformers forward instead of rebuilding
+  its embedding, masks, positions and final norm: decoder layers still stream onto the GPU one at
+  a time, but what the forward hands each layer is recorded first and its own tail runs on the
+  last layer's output. Models that do more around their layers (repeated residual streams,
+  multi-axis rotary positions, per-layer inputs, a final mixer, a sparse-attention indexer that
+  needs a mask) score as transformers scores them. Experts run transformers' eager per-expert loop
+  rather than its grouped GEMM. Scores of models the reference already read are unchanged (the
+  existing reference and format tests pass with exact equality).
+- The reference reads safetensors tensors through a mapping of the file made per read, so the
+  pages it reads stay in the page cache rather than in its own resident memory, and no open
+  mapping holds the files.
+
+- `crit eval reference` scores long texts in chunks of 8,192 tokens that resume the cache the
+  model's own forward builds (transformers' Cache: keys and values, sliding windows,
+  linear-attention and Mamba states), kept per decoder layer in FP32 scratch files while the text
+  is scored, so no mask of a whole long prompt is built. A model whose cache cannot be resumed is
+  scored by whole passes.
+- `crit run ... eval` stops the reference at the reservation's deadline, checked between its
+  layers and sequences, and settles the attempt as timed out instead of scoring past it.
+- The reference gathers embedding rows (such as a hashed n-gram table far larger than memory) by
+  parallel reads of exactly their bytes, every part of a split table in one batch, instead of
+  faulting pages in through a mapping one at a time: a Flash-Next pass gathers its 25,791 rows in
+  seconds rather than minutes. The rows are byte-identical.
+- The reference reads each decoder layer's stored tensors ahead, while the previous layer runs: in
+  large reads in file order into one page-locked host buffer (at most one layer, up to 8 GiB),
+  copied to the GPU in one transfer and dequantized there as before, instead of mapping, copying
+  and transferring thousands of tensors one by one (a Flash-Next layer holds 6,166). Loaded layers
+  are bit-identical.
+- The reference runs the texts' chunks layer-major: each decoder layer, once loaded, runs every
+  chunk it can, rather than every layer being loaded again for each round of 8,192-token chunks.
+  Only the layers up to those whose cache state the forward reads between chunks (the first layer
+  of each kind) run chunk by chunk: Flash-Next's 32K-token texts load 64 layers instead of 240.
+  Reads of another layer's cache state, or of the cache's own attributes, that would differ from
+  the chunk-major order make the texts run chunk-major; either order gives the same scores.
+
+- The schema/regex compiler is `crit-language-compiler-2`: it builds unbounded repetition left
+  recursive, which an Earley recognizer extends in constant work per item, so compiled artifacts
+  change while the languages they accept do not; cached artifacts compile again under the new
+  version. Eval compiles no constraints, so its results are unaffected.
+- Host ISA detection (cpuid, xgetbv) lives in host-expert-arithmetic's `host_isa.h`, shared by
+  every host path with AVX2/AVX-512 files, and `crit_inference_isa_sources` builds those files
+  under one x86-64 condition.
+
+### Added
+
+- `crit serve` scores fixed text through an engine's serving paths: `POST /v1/crit/score` with
+  prompt and continuation ids returns every prompt position's log-probability and top
+  alternatives from the engine's prefill and every continuation token's from its decode,
+  forced to the continuation (packages declaring `chat-score-v1`; `ResidentChat.score_tokens`).
+  `crit_core.native.ResidentEngine` implements it for engines with query scoring, replay and
+  token log-probabilities, through `crit_engine_score` with `top_k`, which returns the engine's own
+  top-k with Core's scores.
+- The reference maps checkpoint names through transformers' conversion mapping for the model
+  type: per-expert matrices (in any stored scheme, NVFP4 included) become the fused expert tensors
+  the modeling code holds, sharded tables are concatenated, and a text model stored under a
+  multimodal prefix is found by matching its layer names; vision and draft (MTP) tensors are never
+  read.
+- Embedding lookups in the reference gather only the rows they need from the memory-mapped
+  checkpoint and decode those (plain, FP8 and NVFP4, also a sharded table with one scale for the
+  whole table), so a hashed n-gram table larger than host memory is never built; building the
+  model skeleton allocates no parameter memory either.
+- `chunked_attention` honours a supplied mask per block of query rows, and the long prompts get
+  sdpa's mask rules: no mask where causality suffices, a boolean one where the modeling code needs
+  it.
+
+- Inference entry `paged-attention`: CUDA attention for a ragged batch of sequences whose KV
+  pages are addressed through Core StateCache block tables. One decode launch covers every
+  sequence of a step (and multi-column speculative verify), a varlen causal prefill covers
+  ragged prompt chunks over a paged prefix, and pages hold BF16 values or E4M3 codes with
+  per-head-vector scales. Launch shapes depend only on host counts, so one captured graph
+  serves every length and table, and a deterministic split-key combine keeps a column decoded
+  alone equal to the same column in a verify. `DevicePages` implements the cache's
+  copy-on-write for every layer; `BatchTables` packs a step's tables, lengths and slots.
+  Validated against the attention-state CPU reference over the same pages. The kernels need sm_80
+  or later and build for sm_80, sm_86, sm_89 and sm_120; their tests ran on sm_120.
+- Inference entry `batched-reference-engine`: a complete batched serving engine for a
+  synthetic transformer. A Core `ConcurrentModel` with mixed batches runs every request's rows
+  of a step through one GEMM per weight, keeps KV in StateCache pages with prefix reuse
+  (reported as `reused_prompt_tokens`), attends with `paged-attention` and is exported as a
+  native engine library with concurrent requests for `crit serve`. Its arithmetic is batch
+  invariant, so batched requests equal their serial runs token for token. On an RTX 5090, a 0.98 GB
+  synthetic model with 128-token prompts and replies went from 535 completion tokens/s for one
+  request to 28,958 for 64 concurrent requests.
+- Core's StateCache reuses prefixes of hybrid models: each recurrent component may keep a quota of
+  snapshots (its state after an indexed page's last row, copied through `copy_slot` when a commit
+  fills the page), `attach` restores the latest one with the pages, and snapshots leave with their
+  pages. Snapshot slots are a private pool that never takes the slots sequences are guaranteed.
+  Sliding-window layer groups (`StateCacheConfig::windows`) keep their own pages and window
+  tables: pages older than the next row's window are dropped, full ones stay linked to the prefix
+  index, and reuse ends where a window's pages are gone. New `Round::window_kv`, `window_table`,
+  `window_stats`, `StateStorage::copy_window_rows` and `StateCacheStats::snapshots`; the prefix
+  cache no longer rejects recurrent components.
+- Core's constraint matchers compute allowed sets by walking a byte trie of the vocabulary once per
+  state (shared piece prefixes advance the language state once) and cache them by exact state in a
+  bounded, thread-safe `AllowedCache` shared by the matchers of one language; results equal the full
+  scan (`allowed_by_scan`), grammar chart exhaustion included. `TokenMatcher::allowed_bits` fills a
+  bitmask for device masks. Grammar recognizers scan single-byte rules (character classes) as one
+  terminal. Measured on one thread of an AMD Ryzen 5 9600 with Nemotron 3.5 Super's 131,072-token
+  byte vocabulary, per generated position: a JSON-schema grammar inside a string went from 9.4 s to
+  0.2 s for a new state and 0.13 ms for a repeated one; JSON mode from 2-6 ms to 0.01-0.06 ms (small
+  allowed sets) and 0.13 ms (repeated string states).
+- The JSON schema compiler takes `anyOf`, type lists, root `$defs` with local `$ref` (recursive
+  schemas through grammar rules), and string `pattern` (ECMA-262 search semantics on the decoded
+  string, through the regex frontend). `oneOf` compiles only when its branches are provably disjoint
+  (kinds, literal values or a required discriminator property) and is rejected otherwise.
+- Inference `token-sampling` adds `enqueue_mask`, which applies a constraint's bitmask
+  (`TokenMatcher::allowed_bits`) to device logit rows before selection.
+- Inference entry `gguf-projections`: GGUF Q4_0, Q8_0, Q4_K, Q5_K and Q6_K blocks decoded on the
+  host bit for bit as gguf-py's `quants.dequantize` does (checked against gguf 0.19.0), and CUDA
+  kernels that decode the same bits in registers: a GEMV over the stored blocks for 1 to 8 activation
+  rows and a dequantizing copy for prompt GEMMs.
+- Inference entry `dense-layer-offload`: layer-granular placement of dense models larger than device
+  memory. A planner predicts each placement's decode step from measured device, upload and host
+  rates and the engine times the leading candidates; host layers run AVX2/AVX-512 BF16 GEMVs over a
+  thread pool with host KV, and streamed layers upload two ahead into device staging slots. Streamed
+  layers give the resident logits bit for bit; on one machine (RTX 5090, AMD Ryzen 5 9600, a 7 GB
+  synthetic model) predictions were within 0-16% of measured step times.
+
+### Fixed
+
+- The reference loads stored integer buffers (such as hashing multipliers) in their own dtype
+  instead of converting them to FP32.
+
 ## [0.4.0] - 2026-10-21
 
 ### Overview
@@ -584,7 +783,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/crit-labs/crit/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/crit-labs/crit/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/crit-labs/crit/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/crit-labs/crit/compare/v0.2.2...v0.2.3

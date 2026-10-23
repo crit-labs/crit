@@ -10,13 +10,15 @@ from pathlib import Path
 
 from . import CONTRACT, EVAL_DIR, load_json, write_json
 from .hostload import HostLoad
-from . import headroom, metrics, status
+from . import fixed, headroom, metrics, status
 from .ceiling import model_ceiling
-from .chat import Server
-from .context import (GIB, curve_points, curve_prompt, lower_context, max_context, retrieval_points, retrieval_prompt,
-                      token_text)
+from .chat import ChatEngine, Server
+from .deadline import Hung
+from .context import (GIB, curve_points, curve_prompt, lower_context, max_context, required_prompts, retrieval_points,
+                      retrieval_prompt, token_text)
 from .pin import CONTINUATIONS, load_continuations
 from .prepare import PREPARED, check_prepared
+from .reference import REFERENCE_VERSION
 
 
 def load_adapter(path):
@@ -82,8 +84,12 @@ def _timed(call, prompt, output_tokens, expected=None):
     return tokens, sample
 
 
-def timed_generate(engine, prompt, output_tokens):
-    return _timed(lambda on_tokens: engine.generate(list(prompt), output_tokens, on_tokens), prompt, output_tokens)
+def timed_generate(engine, prompt, output_tokens, prompt_cache=False):
+    """prompt_cache: the request is judged on its text alone, so an engine behind a server may serve it from its
+    prompt cache."""
+    cache = {"prompt_cache": True} if prompt_cache and isinstance(engine, ChatEngine) else {}
+    return _timed(lambda on_tokens: engine.generate(list(prompt), output_tokens, on_tokens, **cache), prompt,
+                  output_tokens)
 
 
 def timed_plain(engine, prompt, output_tokens):
@@ -143,11 +149,21 @@ def decode_text(info, continuations):
     return {"source": "generated", "reason": reason}
 
 
+def disagree(samples, outputs, tolerance):
+    """Whether a case's measured repetitions disagree (protocol speed.extra_repetition): decode tok/s or time to
+    first token spread by more than `tolerance`, or the outputs differ."""
+    measured = [s for s in samples if not s.get("warmup")]
+    spreads = [headroom.spread([s[key] for s in measured if s.get(key)]) for key in ("decode_tps", "ttft_ms")]
+    return any(spread is not None and spread > tolerance for spread in spreads) or any(o != outputs[0] for o in outputs)
+
+
 def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, continuations=None, disturbed_spread=None):
     """Speed cases. With a pinned continuation and a replaying adapter, every speed KPI comes from replays
     of the pinned text (identical for every engine) and two free generations record the engine's own
-    output for repeatability and exactness; otherwise the KPIs come from free generation.
+    output for repeatability and exactness; otherwise the KPIs come from free generation. After the case's
+    repetitions, one more when they disagree (protocol speed.extra_repetition).
     disturbed_spread: stop the round (Disturbed) when a case's decode speeds spread by more than this."""
+    tolerance = protocol["speed"]["extra_repetition"]["tolerance"]
     cases = {}
     stop_ids = set(prepared["stop_ids"])
     text = decode_text(info, continuations)
@@ -167,12 +183,16 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
             for _ in range(2):
                 tokens, _ = timed_generate(engine, prompt, n)
                 outputs.append(tokens)
-            for i in range(warmups + repetitions):
+            for i in range(warmups + repetitions + 1):
+                if i == warmups + repetitions and not disagree(samples, outputs, tolerance):
+                    break
                 _, sample = timed_replay(engine, prompt, continuation)
                 sample["warmup"] = i < warmups
                 samples.append(sample)
         else:
-            for i in range(warmups + repetitions):
+            for i in range(warmups + repetitions + 1):
+                if i == warmups + repetitions and not disagree(samples, outputs, tolerance):
+                    break
                 tokens, sample = timed_generate(engine, prompt, n)
                 sample["warmup"] = i < warmups
                 samples.append(sample)
@@ -271,32 +291,148 @@ def quality_thresholds(protocol, budget=None):
     return {**protocol["quality"]["thresholds"], **{k: float(v) for k, v in budget.items()}}
 
 
-def run_quality(engine, info, prepared, protocol, log):
-    """protocol quality: the engine's greedy reply to every quality prompt, with the log-probabilities it reports
-    (an engine's reply(prompt, max_new_tokens, top_k): an engine behind a server, crit_eval.chat). `crit eval
-    reference` scores them on the prepared model's checkpoint (reference.score_result). A set with a prompt that
-    does not fit the engine's max_context with reply_tokens is skipped."""
+def _engine_rows(rows):
+    return [{"logprob": row["logprob"], "top": row["top"]} for row in rows]
+
+
+def _phase_timing(timings):
+    """Sums of request timings (crit_eval.chat): requests, seconds, the engine's own prefill and decode seconds, the
+    rest of the request's seconds (transfer and the server's own work), response bytes and parse seconds."""
+    engine = [t for t in timings if t.get("engine_prefill_ms") is not None]
+    out = {"requests": len(timings), "seconds": sum(t["seconds"] for t in timings),
+           "response_bytes": sum(t["response_bytes"] for t in timings),
+           "parse_seconds": sum(t["parse_seconds"] for t in timings)}
+    if engine:
+        out["engine_prefill_seconds"] = sum(t["engine_prefill_ms"] or 0.0 for t in engine) / 1000
+        out["engine_decode_seconds"] = sum(t["engine_decode_ms"] or 0.0 for t in engine) / 1000
+        out["outside_engine_seconds"] = sum(t["seconds"] for t in engine) - out["engine_prefill_seconds"] - \
+            out["engine_decode_seconds"]
+    return out
+
+
+def run_quality(engine, info, prepared, protocol, log, reference, thresholds):
+    """protocol quality: every quality text scored by the engine through its serving paths (an engine's score(prompt,
+    continuation, top_k): an engine behind crit serve, crit_eval.chat) and judged against the reference's stored
+    scores of the same text (reference: crit_eval.fixed.load, None when the data has none). Each set is judged on
+    the positions the engine serves (SET/served: the continuation, its first token from the prefill's last position,
+    the rest from decode); its prompt positions, whose prefill logits no request returns, are reported in
+    quality.prompt and never judged; both per bucket. Then the honesty check (run_honesty). A set whose texts do not
+    fit the engine's max_context is skipped."""
     rule = protocol["quality"]
-    out = {"top_k": rule["top_k"], "reply_tokens": rule["reply_tokens"]}
-    if not callable(getattr(engine, "reply", None)):
-        log("quality: not measured (an adapter's engine; quality is measured over the chat API)")
+    out = {"top_k": rule["top_k"], "continuation_tokens": rule["continuation_tokens"]}
+    if not callable(getattr(engine, "score", None)):
+        log("quality: not measured (an adapter's engine; quality is measured through crit serve's chat-score-v1)")
         return {**out, "status": "unsupported",
-                "reason": "quality is measured over the chat API: serve the engine and run crit eval run --url"}
-    started, replies, skipped = time.time(), [], {}
-    for prompt in prepared["quality"]:
-        need = max(len(p["prompt_ids"]) for p in prepared["quality"] if p["set"] == prompt["set"]) + rule["reply_tokens"]
+                "reason": "quality is measured through crit serve's score call: serve the engine and run crit eval "
+                          "run --url"}
+    if reference is None:
+        log("quality: not measured (no reference scores for this data)")
+        return {**out, "status": "unsupported",
+                "reason": "the data holds no reference scores: run crit eval reference --model --data first"}
+    started, skipped, parts, labels, timings = time.time(), {}, {}, {}, []
+    for text in prepared["quality"]:
+        need = max(len(t["prompt_ids"]) + len(t["continuation_ids"]) for t in prepared["quality"] if t["set"] == text["set"])
         if need > info["max_context"]:
-            skipped[prompt["set"]] = f"needs {need:,} tokens of context"
+            skipped[text["set"]] = f"needs {need:,} tokens of context"
             continue
-        replies.append({"id": prompt["id"], "set": prompt["set"],
-                        **engine.reply(prompt["prompt_ids"], rule["reply_tokens"], rule["top_k"])})
+        prompt, continuation = text["prompt_ids"], text["continuation_ids"]
+        scored = engine.score(prompt, continuation, rule["top_k"])
+        if scored.get("timing"):
+            timings.append({"id": text["id"], "positions": len(prompt) + len(continuation) - 1, **scored["timing"]})
+        rows = reference[text["id"]]
+        if len(rows) != len(prompt) + len(continuation) - 1:
+            raise RuntimeError(f"{text['id']}: the reference scores {len(rows)} positions, the text has "
+                               f"{len(prompt) + len(continuation) - 1}")
+        engine_rows = _engine_rows(scored["prompt"] + scored["continuation"])
+        last = len(prompt) - 1   # rows before it predict prompt tokens; from it on, the served continuation
+        for part, pick, bucket in (("prompt", slice(0, last), lambda i: metrics.log2_bucket(i + 1, 512)),
+                                   ("served", slice(last, None), lambda i: metrics.log2_bucket(i - last + 1, 32))):
+            reference_rows, found, ids = parts.setdefault(f"{text['set']}/{part}", ([], [], []))
+            reference_rows += rows[pick]
+            found += engine_rows[pick]
+            ids.append(text["id"])
+            labels.setdefault(f"{text['set']}/{part}", []).extend(
+                bucket(i) for i in range(len(rows))[pick])
     for name, reason in skipped.items():
         log(f"quality {name}: skipped ({reason})")
-    if not replies:
+    if not parts:
         return {**out, "status": "skipped", "skipped": skipped,
-                "reason": f"no quality prompt fits the engine's {info['max_context']:,}-token context"}
-    log(f"quality: {len(replies)} replies, {sum(len(r['tokens']) for r in replies):,} tokens, await the reference")
-    return {**out, "status": "replied", "replies": replies, "skipped": skipped, "seconds": time.time() - started}
+                "reason": f"no quality text fits the engine's {info['max_context']:,}-token context"}
+    judging = time.perf_counter()
+    sets, prompts, buckets = {}, {}, {}
+    for name, (reference_rows, found, ids) in parts.items():
+        if not found:
+            continue   # a prompt of a single token has no prompt positions
+        row = metrics.text_quality(reference_rows, found)
+        if name.endswith("/prompt"):
+            failures = []
+            prompts[name[:-len("/prompt")]] = {**row, "texts": ids}
+        else:
+            failures = metrics.judge(row, thresholds)
+            sets[name] = {**row, "texts": ids, "passed": not failures, "failures": failures,
+                          "budget_used": metrics.budget_used(row, thresholds)}
+        buckets[name] = {label: {key: value[key] for key in ("targets", "ppl_ratio", "kld_mean", "kld_p99",
+                                                              "top1_agreement")}
+                         for label, value in metrics.bucketed(reference_rows, found, labels[name]).items()}
+        log(f"quality {name}: KLD mean {row['kld_mean']:.2e}, p99 {row['kld_p99']:.2e}, PPL x{row['ppl_ratio']:.4f}, "
+            f"top-1 {row['top1_agreement']:.3f} over {row['targets']:,} positions"
+            + ("" if not failures else " - " + "; ".join(failures)))
+    judged = time.perf_counter() - judging
+    honesty = run_honesty(engine, info, prepared, protocol, log, skipped)
+    passed = all(s["passed"] for s in sets.values()) and honesty["passed"] is not False
+    timing = {"scores": _phase_timing(timings), "metrics_seconds": judged, "texts": timings,
+              **({"honesty": honesty.pop("timing")} if "timing" in honesty else {})}
+    return {**out, "status": "scored", "sets": sets, "prompt": prompts, "buckets": buckets, "honesty": honesty,
+            "skipped": skipped, "thresholds": thresholds, "passed": passed, "seconds": time.time() - started,
+            "timing": timing}
+
+
+def run_honesty(engine, info, prepared, protocol, log, skipped):
+    """protocol quality.honesty: the engine's greedy reply over the chat API to every text of the honesty sets (an
+    engine's reply(prompt, max_new_tokens, top_k)), then the same reply tokens scored as the continuation: the served
+    and the scored log-probabilities must agree within tolerance, top-k alternatives included, and the top-k lists
+    hold the same tokens but those within tolerance of the k-th."""
+    rule, top_k = protocol["quality"]["honesty"], protocol["quality"]["top_k"]
+    tolerance = rule["tolerance"]
+    if not callable(getattr(engine, "reply", None)):
+        return {"passed": None, "reason": "the engine replies over no chat API", "tolerance": tolerance}
+    replies, failures, worst, timing = [], [], 0.0, {"replies": [], "scores": []}
+    for text in prepared["quality"]:
+        if text["set"] not in rule["sets"] or text["set"] in skipped:
+            continue
+        served = engine.reply(text["prompt_ids"], rule["reply_tokens"], top_k)
+        # Only the reply's rows are compared: the prompt is prefilled as for the reply, its positions not scored.
+        rescored = engine.score(text["prompt_ids"], served["tokens"], top_k, prompt_rows=False)
+        scored = rescored["continuation"]
+        for part, value in (("replies", served), ("scores", rescored)):
+            if value.get("timing"):
+                timing[part].append(value["timing"])
+        diff, lists = 0.0, []
+        for position, (logprob, top, row) in enumerate(zip(served["logprobs"], served["top"], scored)):
+            diff = max(diff, abs(logprob - row["logprob"]))
+            mine, theirs = dict(top), dict(row["top"])
+            diff = max([diff] + [abs(mine[t] - theirs[t]) for t in mine.keys() & theirs.keys()])
+            # A token in only one list must sit at that list's edge: within tolerance of its k-th value.
+            for found, other in ((mine, theirs), (theirs, mine)):
+                if len(found) < top_k:
+                    continue   # alternatives the server could not name by bytes were left out
+                edge = min(found.values())
+                if any(value > edge + tolerance for t, value in found.items() if t not in other):
+                    lists.append(position)
+                    break
+        worst = max(worst, diff)
+        replies.append({"id": text["id"], "tokens": len(served["tokens"]), "max_abs_logprob_diff": diff,
+                        "top_k_differs_at": lists[:8]})
+        if diff > tolerance:
+            failures.append(f"{text['id']}: scored log-probabilities differ from the served ones by {diff:.2e} "
+                            f"(tolerance {tolerance})")
+        if lists:
+            failures.append(f"{text['id']}: the scored and served top-{top_k} lists differ at {len(lists)} tokens")
+    log(f"quality honesty: {len(replies)} served replies scored again, max |difference| {worst:.2e}"
+        + ("" if not failures else " - " + "; ".join(failures)))
+    return {"passed": not failures if replies else None, "tolerance": tolerance, "max_abs_logprob_diff": worst,
+            "replies": replies, "failures": failures,
+            "timing": {part: _phase_timing(values) for part, values in timing.items()}}
 
 
 def plain_on_engine(engine, info):
@@ -366,18 +502,23 @@ def run_context(engine, info, prepared, settings, required, log, continuations=N
     the point). The prompt is the longest speed case with its document and filler text after it
     (curve_prompt), so the engine decodes an answer to that case: a replay of its pinned continuation when
     there is one (the same text for every engine, as in the speed cases), else the engine's own output. A
-    request the engine cannot serve is recorded as failed. Returns (points, decode text)."""
+    request the engine cannot serve is recorded as failed. At the required context the filler holds the retrieval
+    facts, and the retrieval request, which shares the prompt up to the end of the document (required_prompts),
+    follows the point at once, so an engine with a prompt cache prefills that text once. Returns (points, decode
+    text, the retrieval point at the required context or None)."""
     pieces, filler = prepared["context"], prepared["retrieval"]["filler_ids"]
     n = int(settings["output_tokens"])
     text, continuation = context_text(info, continuations, prepared, n)
-    points = {}
+    points, asked = {}, None
     for point in curve_points(required, settings):
         if point > info["max_context"]:
             points[str(point)] = {"status": "skipped", "context": point,
                                   "reason": f"the engine's max_context {info['max_context']:,} is below {point:,}"}
             log(f"context {point:,}: skipped (max_context {info['max_context']:,})")
             continue
-        prompt = curve_prompt(pieces, filler, point - n)
+        shared = (required_prompts(pieces, prepared["retrieval"], point - n, settings["retrieval"]["positions"])
+                  if point == required else None)
+        prompt = shared[0] if shared else curve_prompt(pieces, filler, point - n)
         if prompt is None:
             points[str(point)] = {"status": "skipped", "context": point,
                                   "reason": f"no room for the {pieces['case']} prompt before {n} output tokens"}
@@ -390,52 +531,110 @@ def run_context(engine, info, prepared, settings, required, log, continuations=N
                 else:
                     _, sample = timed_generate(engine, prompt, n)
                 samples.append(sample)
+        except Hung:
+            raise
         except Exception as error:  # an engine that cannot hold the context fails here, however it fails
             points[str(point)] = {"status": "failed", "context": point, "error": f"{type(error).__name__}: {error}"[:2000]}
             log(f"context {point:,}: failed ({type(error).__name__}: {error})")
+            if shared:
+                asked = retrieval_point(engine, info, prepared, settings["retrieval"], shared[1], point, log)
             continue
         summary = _summary(samples)
         points[str(point)] = {"status": "measured", "context": point, "prompt_tokens": len(prompt), "output_tokens": n,
                               **summary, "samples": samples}
         log(f"context {point:,}: decode {summary['decode_tps'] or 0:.1f} tok/s, first token after {summary['ttft_ms']:,.0f} ms, "
             f"tokens/round {summary['tokens_per_round'] or 0:.2f}")
-    return points, text
+        if shared:
+            asked = retrieval_point(engine, info, prepared, settings["retrieval"], shared[1], point, log)
+    return points, text, asked
 
 
-def run_retrieval(engine, info, prepared, settings, required, log):
+def retrieval_point(engine, info, prepared, rule, prompt, point, log):
+    """One retrieval request (protocol context.retrieval): passes when the output up to its first stop token
+    contains every fact's answer verbatim; one the engine cannot serve fails. It is judged on its text alone, so it
+    may be served from a prompt cache."""
+    pieces, n = prepared["retrieval"], int(rule["output_tokens"])
+    if point > info["max_context"]:
+        log(f"retrieval {point:,}: not served (max_context {info['max_context']:,})")
+        return {"status": "failed", "context": point,
+                "error": f"the engine's max_context {info['max_context']:,} is below {point:,}"}
+    try:
+        tokens, sample = timed_generate(engine, prompt, n, prompt_cache=True)
+    except Hung:
+        raise
+    except Exception as error:  # an engine that cannot hold the context fails here, however it fails
+        log(f"retrieval {point:,}: failed ({type(error).__name__}: {error})")
+        return {"status": "failed", "context": point, "error": f"{type(error).__name__}: {error}"[:2000]}
+    text = token_text(tokens, pieces["token_text"], prepared["stop_ids"])
+    found = {fact["id"]: fact["answer"] in text for fact in pieces["facts"]}
+    log(f"retrieval {point:,}: " + ", ".join(f"{k} {'found' if v else 'MISSING'}" for k, v in found.items()))
+    return {"status": "measured", "context": point, "prompt_tokens": len(prompt), "found": found,
+            "passed": all(found.values()), "text": text[:2000], "tokens": tokens, "ttft_ms": sample["ttft_ms"],
+            "cached_tokens": (sample.get("served") or {}).get("cached_tokens")}
+
+
+def run_retrieval(engine, info, prepared, settings, required, log, at_required=None):
     """Facts near the start, middle and end of filler text, asked for at the end (protocol context.retrieval):
-    one greedy request per point, the last filling the required context. A point passes when the output up to
-    its first stop token contains every fact's answer verbatim; one the engine cannot serve fails."""
+    one greedy request per point below the required context; at_required: the point at the required context,
+    asked after the curve's point there (run_context), or None when the curve did not reach it."""
     pieces, rule = prepared.get("retrieval"), settings["retrieval"]
     if not pieces:
         log("retrieval: not in the prepared data (prepare it again with crit eval prepare into a new data directory)")
         return {"status": "missing", "reason": "the prepared data has no retrieval prompts; prepare it again"}
-    n, stops, points = int(rule["output_tokens"]), prepared["stop_ids"], {}
+    n, points = int(rule["output_tokens"]), {}
     for point in retrieval_points(required, rule):
+        if point == required:
+            points[str(point)] = at_required or {"status": "failed", "context": point,
+                                                 "error": "the long-context curve did not reach the required context"}
+            continue
         prompt = retrieval_prompt(pieces, point - n, rule["positions"])
         if prompt is None:
             points[str(point)] = {"status": "skipped", "context": point, "reason": "too short to hold the facts"}
             continue
-        if point > info["max_context"]:
-            points[str(point)] = {"status": "failed", "context": point,
-                                  "error": f"the engine's max_context {info['max_context']:,} is below {point:,}"}
-            log(f"retrieval {point:,}: not served (max_context {info['max_context']:,})")
-            continue
-        try:
-            tokens, sample = timed_generate(engine, prompt, n)
-        except Exception as error:  # an engine that cannot hold the context fails here, however it fails
-            points[str(point)] = {"status": "failed", "context": point, "error": f"{type(error).__name__}: {error}"[:2000]}
-            log(f"retrieval {point:,}: failed ({type(error).__name__}: {error})")
-            continue
-        text = token_text(tokens, pieces["token_text"], stops)
-        found = {fact["id"]: fact["answer"] in text for fact in pieces["facts"]}
-        points[str(point)] = {"status": "measured", "context": point, "prompt_tokens": len(prompt), "found": found,
-                              "passed": all(found.values()), "text": text[:2000], "tokens": tokens,
-                              "ttft_ms": sample["ttft_ms"]}
-        log(f"retrieval {point:,}: " + ", ".join(f"{k} {'found' if v else 'MISSING'}" for k, v in found.items()))
+        points[str(point)] = retrieval_point(engine, info, prepared, rule, prompt, point, log)
     judged_points = [p for p in points.values() if p["status"] != "skipped"]
     return {"status": "measured", "points": points,
             "passed": bool(judged_points) and all(p.get("passed") for p in judged_points)}
+
+
+def run_followup(engine, info, prepared, protocol, log):
+    """protocol followup: the conversation's turns in order, each allowed a prompt cache, with time to first token,
+    the prompt tokens the engine reports as cached and the prefill rate of the rest."""
+    turns, n = prepared.get("followup"), int(protocol["followup"]["output_tokens"])
+    if not turns:
+        return {"status": "missing", "reason": "the prepared data has no follow-up turns; prepare it again"}
+    if len(turns[-1]["prompt_ids"]) + n > info["max_context"]:
+        reason = f"its last turn needs {len(turns[-1]['prompt_ids']) + n:,} tokens of context"
+        log(f"followup: skipped ({reason})")
+        return {"status": "skipped", "reason": reason}
+    rows = []
+    for turn in turns:
+        tokens, sample = timed_generate(engine, turn["prompt_ids"], n, prompt_cache=True)
+        served = sample.get("served") or {}
+        prompt = int(served.get("prompt_tokens") or len(turn["prompt_ids"]))
+        cached = served.get("cached_tokens")
+        fresh = prompt - (cached or 0)
+        rows.append({"turn": turn["turn"], "prompt_tokens": prompt, "cached_tokens": cached, "ttft_ms": sample["ttft_ms"],
+                     "prefill_tps": fresh * 1000 / sample["ttft_ms"] if sample["ttft_ms"] else None, "tokens": tokens})
+        log(f"followup turn {turn['turn']}: {prompt:,} prompt tokens"
+            + (f", {cached:,} cached" if cached is not None else "")
+            + f", first token after {sample['ttft_ms']:,.0f} ms")
+    later = [r for r in rows if r["turn"] > 1]
+    return {"status": "measured", "turns": rows,
+            "ttft_ms": metrics.geometric_mean([r["ttft_ms"] for r in later if r["ttft_ms"]]),
+            "prefill_tps": metrics.geometric_mean([r["prefill_tps"] for r in later if r["prefill_tps"]])}
+
+
+def compare_followup(first, again):
+    """Each turn's output when the turns ran again after every other part against its first output."""
+    turns = {}
+    for before, after in zip(first["turns"], again["turns"]):
+        diverge = next((i for i, (a, b) in enumerate(zip(before["tokens"], after["tokens"])) if a != b), None)
+        if diverge is None and len(before["tokens"]) != len(after["tokens"]):
+            diverge = min(len(before["tokens"]), len(after["tokens"]))
+        turns[str(before["turn"])] = {"identical": diverge is None, "first_difference": diverge,
+                                      "cached_tokens": after["cached_tokens"]}
+    return {"turns": turns, "passed": bool(turns) and all(t["identical"] for t in turns.values())}
 
 
 def history_cases(prepared, info):
@@ -522,7 +721,7 @@ def run_lower_context(module, model, config, prepared, protocol, required, warmu
                                  lambda message: log("lower context: " + message), continuations, disturbed_spread)
         finally:
             engine.close()
-    except Disturbed:
+    except (Disturbed, Hung):
         raise
     except Exception as error:  # an engine that cannot run at a lower context fails the gate, however it fails
         log(f"lower context: failed ({type(error).__name__}: {error})")
@@ -530,7 +729,7 @@ def run_lower_context(module, model, config, prepared, protocol, required, warmu
     return {"context": lower, "engine_max_context": info["max_context"], "speed": measured}
 
 
-PARTS = ("speed", "quality", "exactness", "context", "heldout", "history")
+PARTS = ("speed", "quality", "exactness", "context", "heldout", "history", "followup")
 
 
 def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
@@ -543,8 +742,8 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
     device: `crit eval probe` result (bandwidth_gbs, tflops, free memory); bandwidth_gbs overrides its bandwidth.
     baseline: an earlier result to show KPI changes against.
     quality_budget: the run's drift limits over the protocol's (ppl_ratio_max, kld_mean_max, kld_p99_max). The
-    `quality` part records the engine's replies to the quality prompts; `crit eval reference` scores them and judges
-    every set by these limits.
+    `quality` part scores the quality texts through the engine's serving paths and judges every set's prefill and
+    decode by these limits against the reference scores `crit eval reference` stored under the data.
     exactness: "reported" (default) or "required" (any difference from plain greedy fails the gate).
     context_tokens: the context every engine is built for (a run's kv_tokens); without it, Eval's max context
     for the model on the device, with vram_headroom_bytes (default 1 GiB) left free. The `context` part
@@ -576,6 +775,11 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
         except (OSError, ValueError, KeyError):
             ceiling = None
     continuations = load_continuations(data, prepared)
+    reference_scores = (fixed.load(data, {"model_sha256": prepared["model"]["sha256"],
+                                          "reference": REFERENCE_VERSION,
+                                          **fixed.identity(fixed.texts(prepared), protocol["quality"]["top_k"],
+                                                           prepared["valid_vocab"])})
+                        if "quality" in parts else None)
     opener = None if url or isinstance(adapter, (str, Path)) else adapter
     module = Server(url, prepared, served_model) if url else opener or load_adapter(adapter)
     result = {
@@ -602,7 +806,7 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
     try:
         return _measure(result, module, model, config or {}, prepared, protocol, parts, warmups, repetitions, log,
                         continuations, required, settings, exactness, disturbed, bandwidth_gbs,
-                        device, ceiling, baseline, out)
+                        device, ceiling, baseline, out, reference_scores)
     except Disturbed as error:
         log(f"aborted: {error}")
         result["aborted"] = {"reason": "disturbed", "detail": str(error)}
@@ -613,7 +817,7 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
 
 def _measure(result, module, model, config, prepared, protocol, parts, warmups, repetitions, log, continuations,
              required, settings, exactness, disturbed, bandwidth_gbs, device, ceiling, baseline,
-             out):
+             out, reference_scores=None):
     lower = None
     if "context" in parts and "speed" in parts and required and isinstance(module, Server):
         lower = {"context": None, "passed": None, "reason": "a served engine cannot be opened at a lower context"}
@@ -635,25 +839,32 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
             cases = history_cases(prepared, info)
             fresh = history_outputs(engine, cases)
             log("history: fresh outputs of " + (", ".join(fresh) or "no case (none fits the engine)"))
+        if "followup" in parts:
+            result["followup"] = run_followup(engine, info, prepared, protocol, log)
         if "speed" in parts:
             result["speed"] = run_speed(engine, info, prepared, protocol, warmups, repetitions, log, continuations,
                                         disturbed)
         if "heldout" in parts:
             result["heldout"] = run_heldout(engine, info, prepared, protocol, log)
         if "quality" in parts:
-            result["quality"] = run_quality(engine, info, prepared, protocol, log)
+            result["quality"] = run_quality(engine, info, prepared, protocol, log, reference_scores,
+                                            result["requirements"]["quality_budget"])
         if "context" in parts and required:
-            result["context"]["points"], result["context"]["decode_text"] = run_context(
+            result["context"]["points"], result["context"]["decode_text"], asked = run_context(
                 engine, info, prepared, settings, required, log, continuations)
-            result["context"]["retrieval"] = run_retrieval(engine, info, prepared, settings, required, log)
+            result["context"]["retrieval"] = run_retrieval(engine, info, prepared, settings, required, log, asked)
         if "exactness" in parts and "speed" in result and plain_on_engine(engine, info):
             # The engine decodes plain greedy itself: no second engine to load.
             result["exactness"] = run_exactness(module, model, config, prepared, result["speed"], log, exactness,
                                                 engine=engine, info=info)
+        if result.get("followup", {}).get("status") == "measured":
+            again = run_followup(engine, info, prepared, protocol, lambda message: log("again: " + message))
+            result["followup"]["again"] = compare_followup(result["followup"], again)
         if fresh is not None:
-            served = [part for part in ("speed", "heldout", "quality", "context", "exactness") if part in result
+            served = [part for part in ("followup", "speed", "heldout", "quality", "context", "exactness") if part in result
+                      and (part != "followup" or result["followup"].get("status") == "measured")
                       and (part != "context" or "points" in result["context"])
-                      and (part != "quality" or result["quality"].get("replies"))
+                      and (part != "quality" or result["quality"].get("sets"))
                       and (part != "exactness" or result["exactness"].get("engine") == "shared")]
             result["history"] = compare_history(fresh, history_outputs(engine, cases), served)
             between = ", ".join(served) or "nothing else"

@@ -8,9 +8,10 @@ Core's sampler ([Core sampling](../../core/src/sampling/README.md)).
 ## When to use it
 
 When generation needs temperature, top-k or top-p inside the decode step (after
-or inside a captured graph). Apply repetition penalties, logit biases and grammar
-masks ([Core's structured output](../../core/src/constraints/README.md)) to the
-logits first. Speculative verification with sampling needs the rejection rules in
+or inside a captured graph), or a structured-output mask on device logits. Apply
+repetition penalties and logit biases to the logits first; grammar masks
+([Core's structured output](../../core/src/constraints/README.md)) go through
+`enqueue_mask`. Speculative verification with sampling needs the rejection rules in
 [mtp-decode](../mtp-decode/README.md), not independent draws per column.
 
 ## How it works
@@ -29,7 +30,12 @@ so draws depend only on seed, stream and position.
 
 [sampling.h](code/sampling.h) / [sampling.cu](code/sampling.cu): device-resident
 `Params` and `enqueue_select(logits, vocab, params, cand_values, cand_ids, out,
-stream)`, linking `crit::core`. [sampling.py](code/sampling.py) mirrors the rules
+stream)`, linking `crit::core`. `enqueue_mask(logits, vocab, stride, mask,
+mask_stride, rows, stream)` sets a row's logits to -inf wherever its bitmask bit is
+clear, with the bitmask from Core's `TokenMatcher::allowed_bits` (bit `t % 32` of
+word `t / 32`) copied to the device: selection on the masked row is Core's
+constrained sampling (`Sampler::sample` with `AllowedTokens`), greedy ties going to
+the lowest allowed id. [sampling.py](code/sampling.py) mirrors the rules
 in FP64 with a bit-identical draw. The host oracle is `crit::core::Sampler`.
 
 ## What the engine supplies

@@ -2,10 +2,14 @@
 #include <crit/core.h>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <list>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 // Optional structured-output service: languages over exact output bytes and request-private token matchers whose
@@ -18,6 +22,7 @@ inline constexpr std::size_t constraint_vocabulary_bytes = std::size_t{64} << 20
 // The exact decoded bytes of every token id, as the engine's detokenizer joins them for output (byte-level BPE
 // spellings decoded, SentencePiece byte fallback resolved). One explicit EOS has an empty piece; every other empty
 // piece marks a token the constraint never allows (special/control tokens). Immutable; share it between matchers.
+// The constructor also builds a byte trie of the nonempty pieces, so a matcher walks each shared prefix once.
 class ByteVocabulary {
 public:
     // invalid_argument for no pieces, more than constraint_vocabulary_limit, or an EOS outside the vocabulary or
@@ -26,9 +31,65 @@ public:
     std::size_t size() const noexcept { return pieces_.size(); }
     Token eos() const noexcept { return eos_; }
     std::string_view piece(Token) const;                 // out_of_range outside the vocabulary
+    std::size_t longest_piece() const noexcept { return longest_; }
+    std::size_t trie_nodes() const noexcept { return child_begin_.size() - 1; }
+    // Depth-first walk of the piece trie up to `max_bytes` deep. advance(depth, byte) computes the caller's state at
+    // depth + 1 from its state at depth and returns false to prune the subtree; accept(token) is called for every
+    // token whose whole piece was advanced. Tokens are visited in byte order of their pieces, not in id order.
+    template <class Advance, class Accept> void walk(std::size_t max_bytes, Advance&& advance, Accept&& accept) const {
+        struct Frame { std::uint32_t node, edge; };
+        std::vector<Frame> frames;
+        frames.reserve(longest_ + 1);
+        frames.push_back({0, child_begin_[0]});
+        while(!frames.empty()) {
+            auto& frame = frames.back();
+            const std::size_t depth = frames.size() - 1;
+            if(frame.edge == child_begin_[frame.node + 1] || depth == max_bytes) { frames.pop_back(); continue; }
+            const std::uint32_t edge = frame.edge++;
+            if(!advance(depth, edge_byte_[edge])) continue;
+            const std::uint32_t child = edge_child_[edge];
+            for(std::uint32_t t = token_begin_[child]; t < token_begin_[child + 1]; ++t) accept(tokens_[t]);
+            frames.push_back({child, child_begin_[child]});
+        }
+    }
 private:
     std::vector<std::string> pieces_;
     Token eos_ = 0;
+    std::size_t longest_ = 0;
+    // Trie in creation (preorder) order, node 0 the root: node n's edges [child_begin_[n], child_begin_[n + 1]) in
+    // byte order, the tokens whose piece ends at n [token_begin_[n], token_begin_[n + 1]).
+    std::vector<std::uint32_t> child_begin_, edge_child_, token_begin_;
+    std::vector<unsigned char> edge_byte_;
+    std::vector<Token> tokens_;
+};
+
+// A bounded, thread-safe LRU of allowed sets keyed by an exact serialization of a matcher's language state, shared
+// by the matchers of one language over one vocabulary with the same limits (forks share their parent's). A matcher
+// built without one gets a private cache. The first matcher binds the cache to its language; another language throws
+// invalid_argument. `needed` lets a grammar entry stand only where the remaining chart budget covers what computing
+// it used, so a hit never hides a length_error the scan would raise.
+inline constexpr std::size_t allowed_cache_private_bytes = std::size_t{4} << 20;  // a matcher's own cache
+class AllowedCache {
+public:
+    explicit AllowedCache(std::size_t max_bytes = std::size_t{16} << 20);  // invalid_argument for 0
+    struct Stats { std::uint64_t hits = 0, misses = 0, entries = 0, bytes = 0; };
+    Stats stats() const;
+    // Internal protocol of the matchers.
+    void bind(const void* vocabulary, const void* language, std::string_view limits);
+    std::shared_ptr<const std::vector<Token>> find(const std::string& key, std::size_t budget);
+    void insert(const std::string& key, std::shared_ptr<const std::vector<Token>> ids, std::size_t needed);
+private:
+    // Entries in recency order (front: most recently used) through the map's stable keys: eviction is constant time.
+    struct Entry { std::shared_ptr<const std::vector<Token>> ids; std::size_t needed = 0, bytes = 0; std::list<const std::string*>::iterator order; };
+    mutable std::mutex mutex_;
+    std::size_t max_bytes_, bytes_ = 0;
+    std::uint64_t hits_ = 0, misses_ = 0;
+    std::unordered_map<std::string, Entry> entries_;
+    std::list<const std::string*> order_;
+    const void* vocabulary_ = nullptr;
+    const void* language_ = nullptr;
+    std::string limits_;
+    bool bound_ = false;
 };
 
 // Request-private language state over output tokens. size() counts accepted output tokens including EOS; the
@@ -45,6 +106,9 @@ public:
     virtual std::size_t vocabulary() const noexcept = 0;
     virtual bool ended() const noexcept = 0;
     virtual std::vector<Token> allowed() const = 0;
+    // The allowed set as a bitmask (bit t % 32 of word t / 32 is token t), for device masks: invalid_argument unless
+    // `words` holds exactly (vocabulary() + 31) / 32 words; throws what allowed() throws.
+    virtual void allowed_bits(std::span<std::uint32_t> words) const;
     virtual void append(Token) = 0;
     virtual void rewind(std::size_t output_tokens) = 0;
 };
@@ -66,7 +130,7 @@ private:
 };
 class ChoiceMatcher final : public TokenMatcher {
 public:
-    ChoiceMatcher(std::shared_ptr<const ChoiceGrammar>, std::shared_ptr<const ByteVocabulary>);
+    ChoiceMatcher(std::shared_ptr<const ChoiceGrammar>, std::shared_ptr<const ByteVocabulary>, std::shared_ptr<AllowedCache> = {});
     std::unique_ptr<TokenMatcher> fork() const override;
     std::size_t size() const noexcept override { return history_.size() - 1; }
     std::size_t vocabulary() const noexcept override;
@@ -78,6 +142,7 @@ private:
     struct Frontier { std::size_t node = 0; bool ended = false; };
     std::shared_ptr<const ChoiceGrammar> grammar_;
     std::shared_ptr<const ByteVocabulary> vocabulary_;
+    std::shared_ptr<AllowedCache> cache_;
     std::vector<Frontier> history_{Frontier{}};
     std::size_t next(Token) const;                       // SIZE_MAX when not allowed
 };
@@ -89,7 +154,7 @@ namespace constraints_detail { struct JsonCursor; }
 // Syntax only: duplicate names, escaped surrogate pairing and numeric range are not checked.
 class JsonObjectMatcher final : public TokenMatcher {
 public:
-    explicit JsonObjectMatcher(std::shared_ptr<const ByteVocabulary>, JsonLimits = {});   // invalid_argument
+    explicit JsonObjectMatcher(std::shared_ptr<const ByteVocabulary>, JsonLimits = {}, std::shared_ptr<AllowedCache> = {});
     JsonObjectMatcher(const JsonObjectMatcher&);
     JsonObjectMatcher& operator=(const JsonObjectMatcher&) = delete;
     ~JsonObjectMatcher() override;
@@ -104,6 +169,7 @@ public:
 private:
     std::shared_ptr<const ByteVocabulary> vocabulary_;
     JsonLimits limits_;
+    std::shared_ptr<AllowedCache> cache_;
     std::vector<constraints_detail::JsonCursor> history_;
     bool trial(Token, constraints_detail::JsonCursor& out) const;
 };
@@ -111,7 +177,8 @@ private:
 // A normalized byte context-free grammar: symbols 0..255 are bytes, 256 + i is rule i. The crit_core.constraints
 // compiler (JSON schema, byte regex and EBNF subsets) emits it as a "crit-byte-grammar-v1" artifact; engines can
 // also build one directly. Bounds: 4,096 rules, 16,384 productions, 262,144 symbols, 4 MiB artifacts. Every rule
-// must be defined and productive.
+// must be defined and productive. A rule whose productions are all single bytes is a byte class: recognizers scan
+// it as one terminal instead of predicting its productions.
 class ByteGrammar {
 public:
     struct Production { std::size_t lhs = 0; std::vector<std::size_t> rhs; };
@@ -123,11 +190,17 @@ public:
     std::size_t rules() const noexcept { return rules_.size(); }
     std::size_t start() const noexcept { return start_; }
     bool nullable(std::size_t rule) const { return nullable_.at(rule); }
+    bool byte_class(std::size_t rule) const { return classes_.at(rule).any; }
+    bool class_contains(std::size_t rule, unsigned char byte) const {
+        return (classes_[rule].bits[byte / 64] >> (byte % 64)) & 1u;
+    }
 private:
+    struct Class { std::uint64_t bits[4] = {0, 0, 0, 0}; bool any = false; };
     std::size_t start_ = 0;
     std::vector<Production> productions_;
     std::vector<std::vector<std::size_t>> rules_;
     std::vector<bool> nullable_;
+    std::vector<Class> classes_;
 };
 // Output bytes and tokens (EOS included), Earley states in one byte's chart and in all charts. Maxima 1 MiB,
 // 1,048,576, 65,536 and 4,194,304.
@@ -137,7 +210,8 @@ struct GrammarLimits { std::size_t bytes = 4096, tokens = 4096, states_per_byte 
 // leaves the matcher unchanged: states are never pruned and generation never falls back to unconstrained.
 class GrammarMatcher final : public TokenMatcher {
 public:
-    GrammarMatcher(std::shared_ptr<const ByteGrammar>, std::shared_ptr<const ByteVocabulary>, GrammarLimits = {});
+    GrammarMatcher(std::shared_ptr<const ByteGrammar>, std::shared_ptr<const ByteVocabulary>, GrammarLimits = {},
+                   std::shared_ptr<AllowedCache> = {});
     std::unique_ptr<TokenMatcher> fork() const override;
     std::size_t size() const noexcept override { return marks_.size() - 1; }
     std::size_t vocabulary() const noexcept override;
@@ -153,13 +227,21 @@ private:
     std::shared_ptr<const ByteGrammar> grammar_;
     std::shared_ptr<const ByteVocabulary> vocabulary_;
     GrammarLimits limits_;
+    std::shared_ptr<AllowedCache> cache_;
     std::vector<Chart> charts_;                          // one per output byte, plus the start
     std::size_t states_ = 0;                             // items in charts_
     std::vector<Mark> marks_{Mark{}};
     // Charts after `piece`, appended to `extension` (empty on entry); false when a byte has no continuation.
     bool scan(std::string_view piece, std::vector<Chart>& extension) const;
+    // The chart after one more byte, appended to `extension`; false when the byte has no continuation.
+    bool step(unsigned char byte, std::vector<Chart>& extension, std::size_t& states) const;
     void close(std::vector<Chart>& extension, std::size_t& states) const;
+    std::string state_key() const;                       // empty when the state is too large to cache
 };
+
+// The old full-vocabulary scan's definition of allowed(), from the public interface: every token whose append() a
+// fork accepts, for tests and measurements against the trie walk.
+std::vector<Token> allowed_by_scan(const TokenMatcher&);
 
 // Diagnostics for one raw logits row and a constraint's allowed ids: softmax probabilities normalized within the
 // allowed set (before any sampling filter), and that set's mass under the full unfiltered softmax. Logits are finite

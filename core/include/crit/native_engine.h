@@ -60,7 +60,7 @@ struct PlainDecoding final : RequestContext {
 };
 
 namespace native_api {
-inline constexpr int abi_version = 1;
+inline constexpr int abi_version = 2;
 // Called with each published token; nonzero cancels the request.
 using TokenCallback = int (*)(void* user, const std::int32_t* tokens, int count);
 // Called with each published token of a request opened with "logprobs": n, with its log-probability and its n most
@@ -72,20 +72,25 @@ void close(void* engine) noexcept;
 int info(void* engine, char* out, int capacity) noexcept;
 int generate(void* engine, const std::int32_t* prompt, int count, int output_tokens, const char* options_json,
              TokenCallback callback, void* user, std::int32_t* out, char* result, int capacity) noexcept;
-// Additive ABI-1 extension. One waiter per request; cancel may run concurrently.
-// Close the request after wait (or to cancel and settle it), before closing engine.
+// One waiter per request; cancel may run concurrently. Close the request after wait (or to cancel and settle it),
+// before closing engine.
 void* request_open(void* engine, const std::int32_t* prompt, int count, int output_tokens,
                    const char* options_json) noexcept;
 void request_cancel(void* request) noexcept;
 void request_close(void* request) noexcept;
 int request_wait(void* request, TokenCallback, void* user, std::int32_t* out, char* result, int capacity) noexcept;
-// Additive ABI-1 extension: request_wait for a request opened with "logprobs", delivering each token's
-// log-probabilities.
+// request_wait for a request opened with "logprobs", delivering each token's log-probabilities.
 int request_wait_output(void* request, OutputCallback, void* user, std::int32_t* out, char* result,
                         int capacity) noexcept;
+// Scores every target ids[i], i >= first_target, into `target`. Query scoring (ScoreQueries, requires
+// ModelInfo::query_scoring) adds per target the log-probabilities of `per_target` ids of `queries` (row-major) into
+// `query`, the argmax into `argmax` (has_argmax tells whether the engine returned one) and, with top_k, the
+// engine's own top_k ranked alternatives into top_tokens and top_logprobs (targets x top_k; requires
+// max_top_logprobs >= top_k). `path` names one of ModelInfo::score_paths (null or empty: the default). Engines
+// that declare query scoring always take that path; buffers of parts not asked for may be null.
 int score(void* engine, const std::int32_t* ids, int count, int first_target, const char* path,
-          const std::int32_t* queries, int per_target, float* target, float* query, std::int32_t* argmax,
-          int* has_argmax) noexcept;
+          const std::int32_t* queries, int per_target, int top_k, float* target, float* query, std::int32_t* argmax,
+          int* has_argmax, std::int32_t* top_tokens, float* top_logprobs) noexcept;
 const char* last_error() noexcept;
 }  // namespace native_api
 }  // namespace crit::core
@@ -97,7 +102,7 @@ const char* last_error() noexcept;
 #endif
 
 // Exports the C ABI around `factory` (a NativeFactory). Use once per shared library. Functions:
-//   int   crit_engine_abi()                     ABI version (1)
+//   int   crit_engine_abi()                     ABI version (2)
 //   void* crit_engine_open(config_json)         engine handle, or null (crit_engine_last_error)
 //   void  crit_engine_close(handle)
 //   int   crit_engine_info(handle, out, cap)    JSON length: ModelInfo fields (token_logprobs, max_top_logprobs,
@@ -111,8 +116,9 @@ const char* last_error() noexcept;
 //                                               crit_engine_request_wait_output). result: JSON
 //                                               with "finish", "timing" (ms, prefill_tokens, decode_steps) and
 //                                               the factory's request facts
-//   int   crit_engine_score(handle, ids, count, first_target, path, queries, per_target, target, query, argmax,
-//                           has_argmax)         0, or -1 error
+//   int   crit_engine_score(handle, ids, count, first_target, path, queries, per_target, top_k, target, query,
+//                           argmax, has_argmax, top_tokens, top_logprobs)
+//                                               0, or -1 error (native_api::score)
 //   const char* crit_engine_last_error()        the calling thread's last error
 #define CRIT_EXPORT_ENGINE(factory)                                                                                \
     CRIT_ENGINE_EXPORT void* crit_engine_request_open(void* engine, const std::int32_t* prompt, int count, int output, const char* options) { \
@@ -143,8 +149,9 @@ const char* last_error() noexcept;
     }                                                                                                              \
     CRIT_ENGINE_EXPORT int crit_engine_score(void* engine, const std::int32_t* ids, int count, int first_target,   \
                                              const char* path, const std::int32_t* queries, int per_target,        \
-                                             float* target, float* query, std::int32_t* argmax, int* has_argmax) { \
-        return ::crit::core::native_api::score(engine, ids, count, first_target, path, queries, per_target,        \
-                                               target, query, argmax, has_argmax);                                 \
+                                             int top_k, float* target, float* query, std::int32_t* argmax,         \
+                                             int* has_argmax, std::int32_t* top_tokens, float* top_logprobs) {     \
+        return ::crit::core::native_api::score(engine, ids, count, first_target, path, queries, per_target, top_k, \
+                                               target, query, argmax, has_argmax, top_tokens, top_logprobs);       \
     }                                                                                                              \
     CRIT_ENGINE_EXPORT const char* crit_engine_last_error() { return ::crit::core::native_api::last_error(); }

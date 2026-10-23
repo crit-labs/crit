@@ -64,7 +64,8 @@ offset with a compensating `post` (for example halved scales against doubled E2M
 
 | File | Supplies |
 | --- | --- |
-| [`host_nvfp4.h`](code/host_nvfp4.h), [`host_nvfp4.cpp`](code/host_nvfp4.cpp) | `Order`, `MatrixView`, `ScaleDecoder` and `e4m3_scales`, `Isa`, `supported`, `best_isa`, `dot_rows` for 1 to 8 tokens with a mask; the scalar oracle and CPU feature detection |
+| [`host_nvfp4.h`](code/host_nvfp4.h), [`host_nvfp4.cpp`](code/host_nvfp4.cpp) | `Order`, `MatrixView`, `ScaleDecoder` and `e4m3_scales`, `dot_rows` for 1 to 8 tokens with a mask; the scalar oracle |
+| [`host_isa.h`](code/host_isa.h), [`host_isa.cpp`](code/host_isa.cpp) | `Isa`, `supported`, `best_isa`: cpuid/xgetbv detection shared with other host paths that compile AVX2 and AVX-512 files (`crit_inference_isa_sources`) |
 | [`host_nvfp4_avx2.cpp`](code/host_nvfp4_avx2.cpp), [`host_nvfp4_avx512.cpp`](code/host_nvfp4_avx512.cpp) | The two SIMD paths, bitwise equal to the oracle |
 | [`host_nvfp4_device.cuh`](code/host_nvfp4_device.cuh) | `dot_row_halving<16 or 32>` and `dot_row_block<16 or 32>`, the device side of both products with the halving reduction |
 | [`implementation.py`](code/implementation.py) | Exact FP32 reference of the declared order (one rounding per operation), standard library only |

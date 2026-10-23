@@ -1,4 +1,4 @@
-"""crit run eval: a packaged candidate's Eval through crit serve, under a benchmark reservation."""
+"""crit run eval: a packaged candidate's Eval through crit serve, under one eval reservation."""
 import contextlib
 import io
 import json
@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import test_run_records as run_records
-from test_eval_server import Text, write_data
+from test_eval_server import Text, write_data, write_store
 from crit.run import evaluation
 from crit.run.records import file_sha, read_json
 from crit_eval import chat, prepare
@@ -23,6 +23,7 @@ OTHERS = "abcdefghijklmnopq"
 
 class Engine:
     logprobs = True
+    scores = True
 
     def __init__(self, context):
         self.weights = context.host('model.fixture')
@@ -52,6 +53,16 @@ class Engine:
             response['logprobs'] = {'tokens': rows, 'bytes': {str(t): chr(t).encode().hex() for t in named}}
         return response
 
+    def score(self, request, cancellation):
+        def row(t):
+            top = [[t, -0.1]] + [[ord(o), -3.0 - i] for i, o in enumerate(o for o in OTHERS if ord(o) != t)]
+            return [t, -0.1, top[:request['top_logprobs']]]
+        return dict(schema_version=1, record_kind='score_response',
+                    **{k: request[k] for k in ('request_id', 'candidate_id', 'package_sha256')},
+                    prompt=[row(t) for t in request['prompt_ids'][1:]] if request['prompt_rows'] else [],
+                    continuation=[row(t) for t in request['continuation_ids']],
+                    telemetry=dict(prefill_ms=1, decode_ms=2))
+
     def reset(self):
         pass
 
@@ -62,7 +73,7 @@ def create_engine(context):
     return Engine(context)
 '''
 SERVED = ["prefill", "decode", "chat-json-v1", "chat-resident-v1", "chat-stream-v1", "chat-sampling-temperature-v1",
-          "chat-logprobs-v1"]
+          "chat-logprobs-v1", "chat-score-v1"]
 
 
 class RunEvalTests(run_records.RunFixture, unittest.TestCase):
@@ -94,21 +105,18 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
         (self.eval_data / "prepared.json").write_text(json.dumps(prepared))
         self.scored = []
 
-    def score(self, model, data, path, baseline, log):
-        """The reference agrees with the engine: the quality gate passes."""
-        self.scored.append((model, Path(data), Path(path)))
-        result = read_json(Path(path))
-        result["quality"]["status"] = "scored"
-        result["status"] = {"gates": [{"name": "quality", "state": "pass", "detail": "fixture reference"}],
-                            "kpis": {}}
-        Path(path).write_text(json.dumps(result))
-        return result
+    def score(self, model, data, log, check=lambda: None):
+        """The reference scores the texts as the engine does: the quality gate passes."""
+        check()
+        self.scored.append((model, Path(data)))
+        write_store(Path(data))
+        return {"method": "scored", "positions": 1, "seconds": 0.0}
 
     def evaluate(self, parts=("speed", "heldout", "history", "quality", "context")):
-        with patch("crit_eval.reference.score_result", self.score):
+        with patch("crit_eval.reference.score_data", self.score):
             return evaluation.evaluate(self.store, self.run_id, self.candidate_id, self.eval_data, parts)
 
-    def test_eval_measures_the_packaged_candidate_through_crit_serve_and_scores_its_replies(self):
+    def test_eval_measures_the_packaged_candidate_through_crit_serve_and_its_quality(self):
         measured = self.evaluate()
         path = self.directory / measured["result"]["path"]
         self.assertEqual(measured["result"], {"path": f"candidates/{self.candidate_id}/eval/attempt-0001.json",
@@ -127,11 +135,14 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
         self.assertEqual(result["requirements"]["exactness"], "reported")
         chat_case = result["speed"]["cases"]["chat"]
         self.assertEqual(chat_case["tokens"], prepare.token_ids(Text(), ("tides rise and fall " * 20)[:12]))
-        replies = result["quality"]["replies"]
-        self.assertEqual([r["set"] for r in replies], ["conversations", "long-3000", "long-5000"])
-        self.assertEqual(replies[0]["top"][0][:2], [[ord("t"), -0.1], [ord("a"), -3.0]])
-        self.assertEqual(self.scored, [(str(self.model), self.eval_data.absolute(), path)])
-        self.assertEqual(measured["status"]["gates"][0]["state"], "pass")
+        # The reference scored the data's texts first; the candidate then scored them through crit serve.
+        self.assertEqual(self.scored, [(str(self.model), self.eval_data.absolute())])
+        quality = result["quality"]
+        self.assertEqual(sorted({name.split("/")[0] for name in quality["sets"]}),
+                         ["conversations", "long-3000", "long-5000"])
+        self.assertTrue(quality["passed"] and quality["honesty"]["passed"])
+        gates = {g["name"]: g["state"] for g in measured["status"]["gates"]}
+        self.assertEqual(gates["quality"], "pass")
         attempt = read_json(self.folder / "attempts/attempt-0001/result.json")
         self.assertEqual((attempt["outcome"], attempt["cleanup_settled"]), ("completed", True))
         log = attempt["logs"][0]
@@ -161,18 +172,35 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
         self.assertFalse((self.folder / "attempts").exists())
 
     def test_the_deadline_stops_the_served_engine_and_settles_a_timeout(self):
-        with patch("crit_eval.reference.score_result", self.score):
+        with patch("crit_eval.reference.score_data", self.score):
             with self.assertRaisesRegex(ValueError, "Eval timed_out: Eval passed its reserved deadline"):
                 evaluation.evaluate(self.store, self.run_id, self.candidate_id, self.eval_data, seconds=2)
         attempt = read_json(self.folder / "attempts/attempt-0001/result.json")
         self.assertEqual((attempt["outcome"], attempt["cleanup_settled"]), ("timed_out", True))
-        self.assertEqual(self.scored, [])
+        self.assertEqual(len(self.scored), 1)   # the reference ran before the candidate was served
         self.assertFalse((self.root / "runtime/owner.json").exists())
+
+    def test_the_deadline_stops_the_reference_while_it_scores(self):
+        # The reference checks the deadline between its layers and texts; past it, the attempt times out.
+        layers = []
+
+        def score(model, data, log, check):
+            with patch.object(evaluation, "remaining", lambda deadline: 10 - len(layers)):
+                while len(layers) < 100:
+                    check()
+                    layers.append(len(layers))
+        with patch("crit_eval.reference.score_data", score):
+            with self.assertRaisesRegex(ValueError, "Eval timed_out: Eval passed its reserved deadline while the "
+                                                    "reference scored"):
+                evaluation.evaluate(self.store, self.run_id, self.candidate_id, self.eval_data, ("quality",))
+        self.assertEqual(len(layers), 10)
+        attempt = read_json(self.folder / "attempts/attempt-0001/result.json")
+        self.assertEqual((attempt["outcome"], attempt["cleanup_settled"]), ("timed_out", True))
 
     def test_the_command_prints_the_retained_result(self):
         from crit.run.cli import main
         out = io.StringIO()
-        with patch("crit_eval.reference.score_result", self.score), contextlib.redirect_stdout(out), \
+        with patch("crit_eval.reference.score_data", self.score), contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(io.StringIO()):
             code = main(["--root", str(self.store.root), "--id", self.run_id, "eval", "--candidate", self.candidate_id,
                          "--data", str(self.eval_data), "--only", "speed", "--label", "served"])
@@ -193,15 +221,15 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
 
 
 class UnservableEvalTests(run_records.RunFixture, unittest.TestCase):
-    def test_eval_needs_a_streaming_resident_package_with_logprobs_for_quality(self):
+    def test_eval_needs_a_streaming_resident_package_that_scores_for_quality(self):
         candidate = self.candidate()["candidate_id"]
         package = self.root / "served-package"
         package.mkdir()
         (package / "engine.py").write_text(ADAPTER)
         self.store.package(self.run_id, candidate, package,
                            {"build": {"toolchain": {"fixture": "host-python"}, "dependencies": [], "command": ["fixture"]},
-                            "launch": ["engine.py"], "capabilities": [c for c in SERVED if c != "chat-logprobs-v1"]})
-        with self.assertRaisesRegex(ValueError, "must declare chat-logprobs-v1"):
+                            "launch": ["engine.py"], "capabilities": [c for c in SERVED if c != "chat-score-v1"]})
+        with self.assertRaisesRegex(ValueError, "must declare chat-score-v1"):
             evaluation.evaluate(self.store, self.run_id, candidate, self.root)
         with self.assertRaisesRegex(ValueError, "holds no prepared.json"):
             evaluation.evaluate(self.store, self.run_id, candidate, self.root, ["speed"])

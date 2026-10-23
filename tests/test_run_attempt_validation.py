@@ -206,6 +206,26 @@ class AttemptReservationTests(AttemptFixture, unittest.TestCase):
                 self.assert_reservation_rejected(reservation, value)
                 self.assert_reservation_rejected(reservation, value, settlement=True)
 
+    def test_an_eval_runs_to_the_segment_deadline_and_no_further(self):
+        self.view = self.store.create(self.data | {"budget_minutes": 180})
+        self.run = self.view["run"]
+        self.run_id = self.run["run_id"]
+        self.directory = self.store.directory(self.run_id)
+        candidate = self.candidate()
+        self.package(candidate)
+        reservation = self.store.reserve(self.run_id, candidate["candidate_id"], "eval")
+        # Past the benchmark cap, up to the segment's deadline.
+        self.assertGreater((timestamp(reservation["deadline_at"], "deadline")
+                            - timestamp(reservation["reserved_at"], "start")).total_seconds(),
+                           self.view["segment"]["limits"]["process_seconds"]["benchmark"])
+        self.assertEqual(reservation["deadline_at"], self.view["segment"]["deadline_at"])
+        self.assertEqual(candidate_projection(self.directory, self.run, candidate["candidate_id"])["lifecycle"],
+                         "benchmarking")
+        later = (timestamp(self.view["segment"]["deadline_at"], "deadline") + timedelta(microseconds=1)).isoformat()
+        self.assert_reservation_rejected(reservation, reservation | {"deadline_at": later})
+        with self.assertRaises(ValueError):
+            self.store.reserve(self.run_id, None, "eval")
+
     def test_candidate_identity_checks_remain_in_projection(self):
         candidate = self.candidate()
         self.package(candidate)

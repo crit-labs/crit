@@ -14,9 +14,9 @@ and quality references, so results from different runs, agents and machines comp
 crit eval probe --out device.json
 crit eval context --model MODEL_DIR --device device.json
 crit eval pin --adapter my_adapter.py --model MODEL_DIR --data EVAL_DATA_DIR [--context TOKENS]
+crit eval reference --model MODEL_DIR --data EVAL_DATA_DIR
 crit eval run --adapter my_adapter.py --model MODEL_DIR --data EVAL_DATA_DIR --device device.json [--context TOKENS] --out result.json
 crit eval run --url http://127.0.0.1:8000/v1 --model MODEL_DIR --data EVAL_DATA_DIR --context TOKENS --out result.json
-crit eval reference --model MODEL_DIR --data EVAL_DATA_DIR --result result.json
 crit eval status result.json [--baseline earlier.json]
 crit eval compare a.json b.json
 crit eval ab --adapter my_adapter.py --config A.json --config-b B.json --model MODEL_DIR --data EVAL_DATA_DIR --out ab.json
@@ -27,8 +27,11 @@ Results report facts; Eval does not classify or rank. The builder reasons from t
 
 - **Gates**, the only pass/fail checks: every speed case ran and repeated its output; the same
   greedy requests give the same tokens on the fresh engine and after everything else it served
-  (request history); the engine's own replies, scored on the model's checkpoint, stay within the
-  drift budget in every quality set, including replies after 1K-, 4K- and 32K-token prompts; the
+  (request history); the engine's scores of the served tokens of fixed quality texts (after its own
+  prefill, through its decode) stay within the drift budget of the model's checkpoint's in every
+  quality set, including texts of 1K-, 4K- and 32K-token prompts, and its served replies score
+  alike (honesty); follow-up turns run again after everything else answer as they did first,
+  whatever the engine served from a prompt cache (prompt_cache); the
   engine serves a request at the required context, answers facts placed at the start, middle
   and end of long prompts up to it verbatim (retrieval) and is not slower at a lower context;
   with `--exactness required`, speculative output equals plain greedy; against a baseline, the
@@ -51,7 +54,7 @@ separately:
 | `probe` | Device ceilings: free memory, copy bandwidth, GEMM TFLOPS per weight format | CUDA toolkit (`nvcc`, cuBLASLt) on the target machine |
 | `context` | The max context the engine must serve | the probe result, `config.json`, safetensors or GGUF headers |
 | `prepare --model M --data D` | Freeze the suite as token ids, with arithmetic per token | `tokenizers`, `jinja2` |
-| `reference --model M --data D --result R` | Score a run's quality replies on the checkpoint `D` was prepared from and judge them | `torch`, `transformers`, `safetensors` (`gguf` for a GGUF), a GPU |
+| `reference --model M --data D` | Score the quality texts once on the checkpoint `D` was prepared from and store the scores in `D` | `torch`, `transformers`, `safetensors` (`gguf` for a GGUF), a GPU |
 | `pin` | Pin the decode text (once per data directory) | the engine's dependencies |
 | `run` | Evaluate an engine | Python standard library and the engine's dependencies |
 | `kernels` | Rank kernels by GPU time per phase | Linux, a CUDA toolkit with CUPTI |
@@ -129,13 +132,56 @@ nvfp4. Refused by name: AWQ GEMV layouts, GPTQModel's planar 5/6/7-bit layout, O
 onnxruntime-genai's builder, ONNX quantized ops other than MatMulNBits, and EXL2 and EXL3,
 which exllama decodes only in CUDA kernels, so there is no CPU dequantization to check against.
 
+`reference` runs the text model's own transformers forward in FP32 and streams its decoder
+layers onto the GPU one at a time ([reference.py](../../eval/crit_eval/reference.py)). One pass
+per prompt records what the forward hands each layer, without running it; each layer is then
+loaded once and run for every prompt, and the forward runs again on the last layer's output so
+its own tail (final norm or mixer) gives the head its input. Whatever a model does around its
+layers, such as embedding scales, repeated residual streams, multi-axis positions, per-layer
+inputs and its masks, is therefore its own code. Checkpoint names reach the modeling code's
+parameters through transformers' conversion mapping for the model type: per-expert matrices
+become fused expert tensors (each expert decoded on its own first), a table stored in shards is
+concatenated, and a text model stored under a multimodal prefix is found by its layer names.
+Vision towers and draft (MTP) layers are never read. Each layer's stored tensors are read ahead
+while the previous layer runs, in large reads in file order into one host buffer (one layer, at
+most 8 GiB), and reach the GPU in one transfer, where they are dequantized. Embedding lookups
+read and decode only the rows they need, by parallel reads of exactly their bytes (plain, FP8 and
+NVFP4 tables, including a sharded table with one scale), so a hashed n-gram table larger than
+host memory is never built. Experts
+run transformers' eager per-expert loop. The long prompts use chunked attention with boolean
+masks only where the modeling code needs one (for example a sparse-attention indexer).
+
+`reference` scores every position of every prepared quality text (a conversation's prompt
+followed by its written answer) once per model, suite and reference version, and stores per
+position the target log-probability and the reference's top 16 under `D/reference/`: one
+safetensors file per text and `index.json` with the identity (the reference's version, the
+transformers and torch versions, the GPU, the model and every text's ids) and each file's sha256,
+about 16 MB for the suite. Every engine's scores of the same texts are judged against them, so a
+candidate costs only its own engine time. A text runs in chunks of 8,192 tokens that resume the
+cache the model's own forward builds (transformers' Cache: keys and values, sliding windows,
+linear-attention or Mamba states), kept per decoder layer in scratch files until the text is
+scored, so no mask of the whole text's length squared is built. The chunks run layer-major: a
+layer, once loaded, runs every chunk it can before the next layer loads, with each chunk's hidden
+states on the host. The forward reads the state of a few layers between chunks (usually the first
+layer of each kind), so the layers up to those run chunk by chunk and the rest are loaded once;
+the reference checks every read of another layer's state and of the cache's own attributes against
+what the chunk-major order (each chunk a round through every layer) would see, and runs the texts
+that way where they differ; either order gives the same scores. A model whose cache cannot be
+resumed runs each text whole. Under `crit run ... eval` the reference scores the data's texts
+before the first candidate is served, stopping at the reservation's deadline, which it checks
+between layers and texts.
+
 ## Engines behind a server
 
 `--url` measures an engine behind any OpenAI-compatible server through its streaming
 `/chat/completions`, with no adapter: `crit serve` and other servers alike. `--context` is the
 context the server was started with, `--model` the model directory the data was prepared from
 (its tokenizer encodes the replies), and `--served-model` names the model when the server lists
-several. A key for the server goes in `CRIT_SERVER_KEY`.
+several. A key for the server goes in `CRIT_SERVER_KEY`. Eval sets no time budget of its own:
+each request may take the protocol's floor plus a slack times what the engine's earlier requests
+in the same Eval say it should (`requests.timeout`: prefill time grows at most quadratically with
+the prompt, a decode step at most linearly with the context), and a request past that stops the
+Eval as hung.
 
 Every prompt goes as the chat messages and tools `prepare` froze next to its token ids, and the
 server applies its own chat template: the speed cases, held-out prompts, request history, the
@@ -143,20 +189,26 @@ long-context curve and retrieval. Prompt and output lengths are the server's `us
 which it must stream (`stream_options.include_usage`), and every sample records them as `served`
 with the finish reason. No standard field turns end tokens off, so a reply that ends early,
 typically at a tool call, is measured on the tokens it has. The server must prefill every
-request: a reply whose usage reports cached prompt tokens fails, so turn its prompt cache off.
+timed request: a reply whose usage reports cached prompt tokens
+(`usage.prompt_tokens_details.cached_tokens`) fails. Retrieval requests, judged on their text
+alone, may be served from a prompt cache.
 Prefill and first-token times include the server's HTTP and templating. A running server cannot
 be opened at a lower context, so the lower-context gate stays unmeasured, except under
 `crit run ... eval`: it serves a run's candidate itself and starts it again at the lower context
 ([Building engines](../BUILDING_ENGINES.md#run-the-common-eval-suite)).
 
-Quality prompts go the same way, with `logprobs` and 16 `top_logprobs`
-([Measurements](MEASUREMENTS.md#quality)). The server must render each to the token count the
-model's chat template does (its own template, thinking off), report every reply token's bytes
-with its log-probability and alternatives (`crit serve` does for packages declaring
-`chat-logprobs-v1`, [Serving](../SERVING.md#token-log-probabilities)), and the result records the
-replies. Stop the server, then `crit eval reference --result result.json` scores them on the
-checkpoint the data was prepared from and writes the quality sets and the status into the result.
-An adapter's engine gets no quality figures: quality is measured over the chat API.
+Quality needs the engine's own scores of the fixed texts, from the paths it serves with: `POST
+/v1/crit/score` on `crit serve` for packages declaring `chat-score-v1`
+([Serving](../SERVING.md#fixed-text-scores)) returns every prompt position from one prefill of the
+prompt and every continuation token from its decode, forced to the continuation
+([Measurements](MEASUREMENTS.md#quality)). The honesty check then takes the engine's greedy replies
+to the conversations and the 32K-token prompts as quality replies, with `logprobs` and 16
+`top_logprobs` (the server renders each prompt to the token count the model's chat template does,
+its own template, thinking off, and names every reply token by its bytes; `crit serve` does for
+packages declaring `chat-logprobs-v1`, [Serving](../SERVING.md#token-log-probabilities)), and
+scores the same tokens through the score call: the two must agree. Run `crit eval reference
+--model M --data D` once before, with no engine on the device. An adapter's engine, or a server
+without the score call, gets no quality figures.
 
 ## Protocol versions
 
@@ -170,7 +222,8 @@ a reported-only field, a diagnostic) takes the next minor version. `compare` war
 come from different major versions. Data prepared under one major version runs under each of its
 minor versions as long as it froze the suite Eval ships; otherwise `run` and `ab` ask to prepare
 it again. A test pins every version to its protocol and suite, so an edit to either fails until
-it has a new version.
+it has a new version. A baseline compares only with results of its prepared data, suite and major
+version.
 
 ## Results and status
 
@@ -183,8 +236,11 @@ with each score:
 - `speed.complete` records whether every case ran; a partial decode score is not the full one.
 - `context` records the required context and its source (`given` or `computed`), `max_context`,
   the curve and the lower-context comparison.
-- Quality covers the sets whose prompts and replies fit the engine's context (`quality.skipped`
-  names the others); it is unmeasured until `crit eval reference` has scored the replies.
+- Quality covers the sets whose texts fit the engine's context (`quality.skipped` names the
+  others), each judged on its served positions (`SET/served`), with its prompt positions in
+  `quality.prompt` (reported, not judged), `quality.buckets` by position and `quality.honesty`; it
+  is unmeasured until `crit eval
+  reference` has stored the reference scores in the data directory.
 - Exactness covers measured speed cases and is a gate only with `--exactness required`. A drop
   in plain-greedy equality against `--baseline` (status notes it) and any difference between
   repeated identical requests are bugs until a root cause is shown ([AGENTS.md](../../AGENTS.md)).
@@ -202,7 +258,8 @@ that compute on the host slow down with other programs.
 
 `crit eval status result.json` (also printed by `run`, stored as `status`) reports the gates,
 goals, each KPI against its limit, the gaps and missing inputs, with no verdict or ranking.
-`--baseline earlier.json` adds each KPI's change; `--json` prints the structure.
+`--baseline earlier.json` adds each KPI's change; `--json` prints the structure. A result of
+another protocol major version is refused: its status is the one stored in it when it was measured.
 `status.stop_record_headroom` holds each goal's start, reached score and limit in the form
 [`crit run ... stop`](../RUN_RECORDS.md#stop) takes. The **end-to-end score** (output tokens over
 whole requests) mixes KPIs by the suite's case mix: a fact, not a weighting.

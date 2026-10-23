@@ -319,7 +319,8 @@ class GgufConformanceTests(unittest.TestCase):
         from transformers import AutoModel, AutoModelForCausalLM
         from crit_core.model import open_model
         from crit_eval.gguf_layout import GgufCheckpoint
-        from crit_eval.reference import StreamingReference, _text_config
+        from crit_eval.reference import _text_config
+        from test_eval_formats import scored
         torch.manual_seed(1)
         sequences = [(torch.randint(0, 300, (40,)).tolist(), 5), (torch.randint(0, 300, (23,)).tolist(), 3)]
         for name, (model_type, options) in CONVERSIONS.items():
@@ -342,13 +343,12 @@ class GgufConformanceTests(unittest.TestCase):
                         torch.testing.assert_close(got, expected, rtol=1e-6, atol=1e-7, msg=key)
                     else:
                         self.assertTrue(torch.equal(got, expected), key)
-                gguf_scores = StreamingReference(folder, device="cpu").score(sequences, 5, None, log=lambda *_: None)
+                gguf_scores = scored(folder, sequences)
                 model = AutoModelForCausalLM.from_pretrained(hf, dtype=torch.float32, attn_implementation="eager")
                 with torch.no_grad():
-                    for (ids, first), rows in zip(sequences, gguf_scores):
+                    for (ids, first), (got, _, _) in zip(sequences, gguf_scores):
                         logprobs = torch.log_softmax(model(torch.tensor([ids])).logits[0].double(), -1)
-                        self.assertEqual([row["logprob"] for row in rows],
-                                         [logprobs[i - 1, ids[i]].item() for i in range(first, len(ids))])
+                        self.assertEqual(got, [logprobs[i - 1, ids[i]].item() for i in range(first, len(ids))])
 
 
 if __name__ == "__main__":

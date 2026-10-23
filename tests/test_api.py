@@ -79,7 +79,9 @@ class ApiTests(ServeFixture, unittest.TestCase):
         reply = json.loads(value["choices"][0]["message"]["content"])
         self.assertEqual(reply["limit"], 50)
         self.assertEqual(value["choices"][0]["finish_reason"], "stop")
-        self.assertEqual(value["usage"], {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14})
+        # The engine computed every prompt token: none came from a prompt cache.
+        self.assertEqual(value["usage"], {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14,
+                                          "prompt_tokens_details": {"cached_tokens": 0}})
         self.assertEqual(value["crit_telemetry"]["decode_tps"], 300)
         self.assertNotIn("tokens_per_round", value["crit_telemetry"])  # the engine reported no decode rounds
         self.assertEqual(value["model"], self.run_id + "/" + self.a)
@@ -179,9 +181,9 @@ class StructuredOutputTests(ApiTests):
         self.assertEqual(self.served.status()["engine_loads"], 1)
 
     def test_unsupported_schemas_and_formats_are_refused_before_generation(self):
-        for value, code in (({"type": "string", "pattern": "a+"}, "unsupported_schema"),
+        for value, code in (({"type": "string", "format": "email"}, "unsupported_schema"),
                             ({"type": "object", "properties": {"x": {"type": "string"}}}, "unsupported_schema"),
-                            ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "unsupported_schema")):
+                            ({"oneOf": [{"type": "string"}, {"type": "string", "maxLength": 2}]}, "unsupported_schema")):
             with self.subTest(schema=value):
                 response, error = self.chat(response_format=self.schema_format(value))
                 self.assertEqual((response.status, error["error"]["param"], error["error"]["code"]),

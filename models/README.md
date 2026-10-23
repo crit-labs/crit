@@ -31,11 +31,11 @@ crit models verify --record transform.json
    be free of other measurements.
 3. **Eval** measures the output in your engine: serve `OUT_DIR` with it on any
    OpenAI-compatible server and run `crit eval run --url` against data prepared from the
-   **source** checkpoint ([Engines behind a server](../docs/eval/README.md#engines-behind-a-server)).
-   Stop the server, then `crit models eval` verifies the output, scores the engine's quality
-   replies on the source checkpoint (`crit eval reference`) and writes the `models_evaluation`
+   **source** checkpoint ([Engines behind a server](../docs/eval/README.md#engines-behind-a-server)),
+   whose reference scores `crit eval reference --model SOURCE --data DATA` stored first. Stop
+   the server, then `crit models eval` verifies the output and writes the `models_evaluation`
    record. It refuses data prepared from another model and a result measured on other data or
-   through an adapter, so quality is always the engine's own replies against the original.
+   through an adapter, so quality is always the engine's own scores against the original's.
    Pass `--baseline` with the same engine's result on the source to see the speed change.
 4. **Verify** re-hashes the output and source against the record.
 

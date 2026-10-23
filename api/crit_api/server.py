@@ -8,6 +8,7 @@ import time
 import uuid
 
 from crit_core.constraints import UnsupportedConstraint, compile_language, json_object_matches, matches
+from crit_core.serving import TOP_LOGPROBS
 from crit_core.text import StopMatcher, TextError, message_content
 
 from .disconnect import ClientDisconnect
@@ -185,6 +186,31 @@ class Api:
         self.created = int(time.time())
         self.log = log
 
+    def score_request(self, body):
+        """A fixed-text score request (chat-score-v1, POST /v1/crit/score): {"model", "prompt_ids",
+        "continuation_ids", "top_logprobs", "prompt_rows"}, ids as the model's tokenizer numbers them; prompt_rows
+        false (default true) returns no prompt rows."""
+        if not isinstance(body, dict):
+            raise RequestError("The request body must be a JSON object")
+        unknown = sorted(set(body) - {"model", "prompt_ids", "continuation_ids", "top_logprobs", "prompt_rows"})
+        if unknown:
+            raise RequestError("Unknown score parameter " + unknown[0], param=unknown[0])
+        candidate = self.candidate(body.get("model"))
+        for key in ("prompt_ids", "continuation_ids"):
+            value = body.get(key, [])
+            if not isinstance(value, list) or not all(type(t) is int and t >= 0 for t in value):
+                raise RequestError(f"{key} must be a list of token ids", param=key)
+        if not body.get("prompt_ids"):
+            raise RequestError("prompt_ids must hold at least one token", param="prompt_ids")
+        top = body.get("top_logprobs", 0)
+        if type(top) is not int or not 0 <= top <= TOP_LOGPROBS:
+            raise RequestError(f"top_logprobs must be an integer from 0 to {TOP_LOGPROBS}", param="top_logprobs")
+        prompt_rows = body.get("prompt_rows", True)
+        if type(prompt_rows) is not bool:
+            raise RequestError("prompt_rows must be a boolean", param="prompt_rows")
+        return {"model": body.get("model") or self.model, "candidate": candidate, "prompt_ids": body["prompt_ids"],
+                "continuation_ids": body.get("continuation_ids", []), "top_logprobs": top, "prompt_rows": prompt_rows}
+
     def completion_request(self, body):
         if not isinstance(body, dict):
             raise RequestError("The request body must be a JSON object")
@@ -261,10 +287,15 @@ class Api:
         return cards
 
     def usage(self, measured):
+        """OpenAI usage; prompt_tokens_details.cached_tokens counts the prompt tokens the engine did not compute
+        (its telemetry's prompt_tokens minus prefill_tokens), when it reports them."""
         if measured is None:
             return None
-        return {"prompt_tokens": measured["prompt_tokens"], "completion_tokens": measured["output_tokens"],
-                "total_tokens": measured["prompt_tokens"] + measured["output_tokens"]}
+        usage = {"prompt_tokens": measured["prompt_tokens"], "completion_tokens": measured["output_tokens"],
+                 "total_tokens": measured["prompt_tokens"] + measured["output_tokens"]}
+        if measured.get("prefill_tokens") is not None:
+            usage["prompt_tokens_details"] = {"cached_tokens": measured["prompt_tokens"] - measured["prefill_tokens"]}
+        return usage
 
     def finish_reason(self, stopped, measured, limit):
         if stopped:
@@ -424,6 +455,22 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         if not self.authorized():
             return
+        if path == "/v1/crit/score":
+            try:
+                request = self.api.score_request(json.loads(raw))
+            except (ValueError, UnicodeDecodeError) as exc:
+                return self.error(400, "Invalid JSON body: " + str(exc))
+            except RequestError as exc:
+                return self.error(exc.status, str(exc), param=exc.param, code=exc.code)
+            with ClientDisconnect(self.connection) as client:
+                try:
+                    self.scored(request, client.cancel)
+                except OSError:
+                    client.cancel.set()
+                    self.close_connection = True
+            if client.disconnected.is_set():
+                self.close_connection = True
+            return None
         if path != "/v1/chat/completions":
             if path == "/v1/completions":
                 return self.error(404, "Raw-prompt completions need the engine's tokenizer in crit; use /v1/chat/completions",
@@ -447,6 +494,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def headers_for(self, request):
         return [("X-Crit-Ignored-Parameters", ",".join(request["ignored"]))] if request["ignored"] else []
+
+    def scored(self, request, cancel):
+        try:
+            status, scored, telemetry = self.api.engine.score(request["prompt_ids"], request["continuation_ids"],
+                                                              request["top_logprobs"], cancel, request["candidate"],
+                                                              prompt_rows=request["prompt_rows"])
+        except EngineError as exc:
+            return self.error(exc.status, str(exc), "server_error" if exc.status >= 500 else "invalid_request_error")
+        if status != "completed":
+            return self.error(504 if status == "timed_out" else 499, "Request " + status.replace("_", " "),
+                              "server_error")
+        self.send_json(200, {"object": "crit.score", "model": request["model"],
+                             "system_fingerprint": self.api.engine.spec(request["candidate"])["package_sha256"][:16],
+                             **scored, "crit_telemetry": telemetry})
 
     def complete(self, request, cancel):
         pieces = []

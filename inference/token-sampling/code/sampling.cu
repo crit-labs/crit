@@ -114,7 +114,23 @@ __global__ void __launch_bounds__(1024) pick_kernel(const float* cand_values, co
     out[0] = chosen;
 }
 
+// One thread per logit: a clear bit in its row's mask word bans the token.
+__global__ void mask_kernel(float* logits, int vocab, int stride, const std::uint32_t* mask, int mask_stride) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    if(t >= vocab) return;
+    if(!((mask[static_cast<std::size_t>(r) * mask_stride + t / 32] >> (t % 32)) & 1u))
+        logits[static_cast<std::size_t>(r) * stride + t] = __int_as_float(0xff800000);  // -inf
+}
+
 } // namespace
+
+cudaError_t enqueue_mask(float* logits, int vocab, int stride, const std::uint32_t* mask, int mask_stride, int rows,
+                         cudaStream_t stream) {
+    if(!logits || !mask || vocab < 1 || rows < 1 || rows > 65535 || stride < vocab || mask_stride < (vocab + 31) / 32)
+        return cudaErrorInvalidValue;
+    mask_kernel<<<dim3((vocab + kThreads - 1) / kThreads, rows), kThreads, 0, stream>>>(logits, vocab, stride, mask, mask_stride);
+    return cudaGetLastError();
+}
 
 cudaError_t enqueue_select(const float* logits, int vocab, Params* params, float* cand_values, std::int32_t* cand_ids,
                            std::int32_t* out, cudaStream_t stream) {

@@ -14,6 +14,9 @@ class TensorRoleTests(unittest.TestCase):
             ("model.layers.0.self_attn.q_proj.weight", ""): ("layer", False),
             ("model.embed_tokens.weight", ""): ("embedding", False),
             ("backbone.embeddings.weight", ""): ("embedding", False),
+            ("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_7.weight", ""):
+                ("embedding", False),
+            ("model.language_model.layers.1.ple.key_proj.weight", ""): ("layer", False),
             ("lm_head.weight", ""): ("head", False),
             ("model.layers.3.mlp.experts.7.down_proj.weight", ""): ("expert", False),
             ("mtp.layers.0.mlp.experts.1.up_proj.weight", ""): ("expert", True),

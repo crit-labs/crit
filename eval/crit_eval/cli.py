@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 
 # runner.PARTS, kept here so parsing imports nothing else.
-PARTS = ("speed", "quality", "exactness", "context", "heldout", "history")
+PARTS = ("speed", "quality", "exactness", "context", "heldout", "history", "followup")
 
 
 def main(argv=None):
@@ -79,12 +79,11 @@ def main(argv=None):
     prepare.add_argument("--model", required=True)
     prepare.add_argument("--data", required=True)
 
-    reference = subs.add_parser("reference", help="Score a run's quality replies on the prepared model's checkpoint "
-                                                  "and judge them (torch + transformers, GPU; stop the engine first)")
+    reference = subs.add_parser("reference", help="Score the prepared quality texts once on the checkpoint they were "
+                                                  "prepared from and store the scores under the data (torch + "
+                                                  "transformers, GPU; stop any engine first)")
     reference.add_argument("--model", required=True, help="The checkpoint the data was prepared from")
-    reference.add_argument("--data", required=True, help="Prepared suite directory the run measured")
-    reference.add_argument("--result", required=True, help="Result JSON of the run; its quality and status are updated")
-    reference.add_argument("--baseline", metavar="RESULT", help="Earlier result to show KPI changes against")
+    reference.add_argument("--data", required=True, help="Prepared suite directory")
 
     compare = subs.add_parser("compare", help="Print a side-by-side table of result files")
     compare.add_argument("results", nargs="+")
@@ -153,15 +152,14 @@ def _command(args):
     if args.command == "prepare":
         from .prepare import prepare as do_prepare
         prepared = do_prepare(args.model, args.data)
-        print(f"prepared {len(prepared['speed'])} speed cases and {len(prepared['quality'])} quality prompts in {args.data}")
+        print(f"prepared {len(prepared['speed'])} speed cases and {len(prepared['quality'])} quality texts in {args.data}")
+        print(f"quality: score them once on the checkpoint: crit eval reference --model {args.model} --data {args.data}")
         return 0
     if args.command == "reference":
-        from . import load_json as load
-        from .reference import score_result
-        from .status import render
-        result = score_result(args.model, args.data, args.result, load(args.baseline) if args.baseline else None)
-        print(f"wrote {args.result}")
-        print(render(result["status"]))
+        from .reference import score_data
+        how = score_data(args.model, args.data, log=lambda line: print(line, flush=True))
+        print(f"reference scores of {how['positions']:,} positions {how['method']} in {Path(args.data) / 'reference'}"
+              + (f" ({how['seconds']:.0f} s, {how['bytes'] / 2**20:.1f} MiB)" if how["method"] == "scored" else ""))
         return 0
     if args.command == "context":
         from . import load_json as load
@@ -229,9 +227,6 @@ def _command(args):
         print(f"aborted: {result['aborted']['detail']}")
         return 3
     print(render(result["status"]))
-    if (result.get("quality") or {}).get("status") == "replied":
-        print(f"quality: stop the engine, then score its replies: crit eval reference --model {args.model} --data {args.data} "
-              f"--result {args.out}" + (f" --baseline {args.baseline}" if args.baseline else ""))
     return 0
 
 

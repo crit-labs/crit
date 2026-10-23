@@ -1,0 +1,87 @@
+{
+  "id": "batched-reference-engine",
+  "category": "execution",
+  "summary": "A complete batched serving engine for a synthetic transformer: a Core ConcurrentModel with mixed batches whose steps run every request's rows through one GEMM per weight, StateCache pages with prefix reuse, paged-attention kernels, batch-invariant arithmetic and a native engine library served concurrently by crit serve",
+  "implementation_status": "native_source",
+  "implementation_scope": "CUDA and C++ source: synthetic decoder layers (RMSNorm, fused QKV with split-half rotary embedding, grouped-query paged attention, SiLU MLP, LM head) with seeded weights; a BF16 tensor-core GEMM with a K split fixed per weight shape and device and an ordered split reduction; row-local norm, rotary, SiLU and argmax kernels; a ConcurrentModel with execute() over mixed decode and prompt rows, StateCache prefix attach and reuse reporting, page-reserving admission, reuse hints, host sampling through Core's Sampler and device greedy argmax; make_engine() for a Core Engine; a native engine library with concurrent_requests; a throughput-versus-concurrency tool; a host model of the step layout, split plan and admission. A real model's weights, tokenizer, layer arithmetic and faster kernels are engine supplied.",
+  "agent_guidance": {
+    "use_when": "An engine needs to serve several requests at once with shared steps, needs a working skeleton that combines Core's concurrent scheduler, the StateCache and paged attention, or a scheduler or kernel change must be measured under concurrency without a checkpoint",
+    "avoid_when": "The engine serves one request at a time, the model is not a dense softmax-attention decoder, or a production model's quality matters (the weights are random)",
+    "provides": [
+      "One mixed step: decode rows first, then prompt chunks, every projection one GEMM over all rows so weights are read once per step",
+      "Batch invariance: row-local kernels, a GEMM K split fixed per weight and device, phase-chosen attention kernels with position-only results, lowest-id argmax; batched output equals serial output token for token",
+      "StateCache sequences per request with prefix attach in open(), reused_prompt_tokens on the first prompt step, commit and discard of rounds, retirement after synchronized steps",
+      "Admission that reserves a request's whole page need and scheduling hints with reusable tokens",
+      "Host sampling through Core's Sampler for temperature, top-k/p, min-p, penalties and bias, device argmax for plain greedy rows",
+      "A native engine library (CRIT_EXPORT_ENGINE, concurrent_requests) that crit_core.native.resident_engine serves as chat-concurrent-v1",
+      "A throughput-versus-concurrency tool reporting completion tokens over the wave's wall time"
+    ],
+    "engine_supplies": [
+      "The model's weights, layer arithmetic, tokenizer and chat template",
+      "Faster kernels (fused epilogues, quantized projections, CUDA graphs per batch shape) that keep the batch invariance rules",
+      "Device-memory sizing of the page pool and the batch bounds from the target context and concurrency"
+    ],
+    "preserve": [
+      "A row's arithmetic never depends on the other rows of its step or on prompt chunk boundaries",
+      "Keys and values written only at Round::kv slots before the attention that reads them; every round committed or discarded",
+      "Released pages retired only after the work that read them settled",
+      "Admission keeps every admitted request able to finish",
+      "The prefix identity names the weights and the KV representation"
+    ],
+    "adapt": [
+      "Model layers, normalization, positional encoding and weight formats",
+      "Asynchronous steps (BatchExecution) instead of a synchronized step, with retire() at the readiness point",
+      "Admission accounting that credits shared prefix pages, and memory preemption",
+      "GEMM tiles and split policy, sampling on the device"
+    ]
+  },
+  "path": "inference/batched-reference-engine/README.md",
+  "code_path": "inference/batched-reference-engine/code",
+  "code_files": [
+    {"path": "inference/batched-reference-engine/code/synthetic_model.h", "purpose": "Model shape and the GEMM, norm, rotary, SiLU, conversion and argmax interfaces"},
+    {"path": "inference/batched-reference-engine/code/synthetic_model.cu", "purpose": "Batch-invariant kernels: seeded weights, split-K tensor-core GEMM with ordered reduction, row-local kernels"},
+    {"path": "inference/batched-reference-engine/code/engine.h", "purpose": "The ConcurrentModel: mixed steps, StateCache with prefix reuse, paged attention, admission, sampling; make_engine()"},
+    {"path": "inference/batched-reference-engine/code/engine_library.cpp", "purpose": "Native engine library with concurrent requests, configured from JSON"},
+    {"path": "inference/batched-reference-engine/code/throughput.cpp", "purpose": "Throughput against concurrency: completion tokens over each wave's wall time"},
+    {"path": "inference/batched-reference-engine/code/reference.py", "purpose": "Host model of the step layout, the GEMM split plan and admission"}
+  ],
+  "requires": {
+    "hardware": "CUDA C++20 on sm_80+ (BF16 mma.sync, ldmatrix, cp.async; paged-attention's requirements); builds checked for sm_80, sm_86, sm_89 and sm_120, runtime validation on sm_120 only; Python 3.11+ standard library for the reference",
+    "model": "Dense decoder-only softmax attention with grouped-query heads, head dimension 64, 128 or 256 and dimensions in multiples of 64 (synthetic weights)",
+    "workload": "Concurrent requests with mixed prompt and decode steps, prefix reuse and greedy or sampled decoding"
+  },
+  "contract": {
+    "input": "Token prompts, output limits and request options through Core's Engine or the native ABI; a JSON configuration naming the shape, page format and bounds",
+    "output": "Generated tokens with Core's request timing (reused_prompt_tokens included); per-step logits rows on the device",
+    "ownership": "Core's worker thread makes every model call; the model owns weights, pages, scratch and the StateCache; each step ends with the compute stream synchronized",
+    "failure": "Invalid shapes and configurations throw at construction; requests longer than the context or larger than the page pool are infeasible; CUDA errors throw and fail the engine through Core",
+    "core_boundary": "No Core change: ConcurrentModel, StateCache, Sampler, CudaBackend and the native engine ABI as published"
+  },
+  "dependencies": [
+    "crit::core and crit::cuda (Core's CUDA backend)",
+    "paged-attention (kernels, DevicePages, BatchTables)",
+    "CUDA runtime with cuda_bf16.h",
+    "Python standard library for the reference"
+  ],
+  "symbols": [
+    "Shape", "GemmPlan", "plan_gemm", "gemm", "embed", "rmsnorm", "qkv_rope", "silu_mul", "to_bf16", "argmax", "Config", "Stats", "Model",
+    "make_engine", "arrange", "split_dot", "pages_needed"
+  ],
+  "interactions": [
+    "paged-attention",
+    "concurrent-request-execution",
+    "session-scheduling",
+    "attention-state",
+    "token-sampling"
+  ],
+  "techniques": [
+    "batched-reference-engine",
+    "paged-attention",
+    "concurrent-request-execution"
+  ],
+  "validation": {
+    "host": "The README example: the K split plan depends only on shape and device, a split dot product equals the plain one, a mixed step's row layout and logits rows, admission's page need",
+    "native": "GEMM against an FP64 host product (split and unsplit, stored and accumulated) and bitwise across row counts; norm, rotary, SiLU and argmax against host references (argmax equal to Core's greedy Sampler with ties); nine requests batched with other prompt chunking equal their serial runs token for token with BF16 and E4M3 pages, greedy and seeded sampling, with mixed steps of up to 9 requests and 48 reused prompt tokens reported for a repeated prompt; concurrent HTTP replies through crit serve equal solo replies",
+    "performance": "RTX 5090, synthetic model of 0.98 GB BF16 weights (hidden 2,048, 8 layers, 16/4 heads of 128, FFN 5,632, vocabulary 32,000), 128-token prompts and outputs: 535 completion tokens/s for one request, 2,347 for 4, 8,351 for 16, 16,627 for 32 and 28,958 for 64 concurrent requests, with 540 to 590 tokens/s per request; no claim for other devices or models"
+  }
+}

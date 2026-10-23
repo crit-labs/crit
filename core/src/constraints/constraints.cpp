@@ -11,6 +11,35 @@ constexpr std::size_t no_node = std::numeric_limits<std::size_t>::max();
 void check_token(Token token, std::size_t size) {
     if(token < 0 || std::size_t(token) >= size) throw std::out_of_range("constraint token outside the vocabulary");
 }
+// Allowed ids collected as a bitmask during a trie walk (any order), returned sorted.
+struct Collected {
+    std::vector<std::uint64_t> bits;
+    explicit Collected(std::size_t vocabulary) : bits((vocabulary + 63) / 64) {}
+    void add(Token t) { bits[std::size_t(t) / 64] |= std::uint64_t{1} << (std::size_t(t) % 64); }
+    std::vector<Token> ids() const {
+        std::size_t count = 0;
+        for(const auto word:bits) for(auto w = word; w; w &= w - 1) ++count;
+        std::vector<Token> out;
+        out.reserve(count);
+        for(std::size_t i = 0; i < bits.size(); ++i)
+            for(auto w = bits[i]; w; w &= w - 1) {
+                int bit = 0;
+                while(!((w >> bit) & 1u)) ++bit;
+                out.push_back(Token(i * 64 + std::size_t(bit)));
+            }
+        return out;
+    }
+};
+void append_raw(std::string& key, std::uint64_t value) {
+    char bytes[sizeof(value)];
+    std::memcpy(bytes, &value, sizeof(value));
+    key.append(bytes, sizeof(value));
+}
+std::string limits_key(std::initializer_list<std::size_t> values) {
+    std::string key;
+    for(const auto v:values) append_raw(key, v);
+    return key;
+}
 }
 
 ByteVocabulary::ByteVocabulary(std::vector<std::string> pieces, Token eos) : pieces_(std::move(pieces)), eos_(eos) {
@@ -22,11 +51,118 @@ ByteVocabulary::ByteVocabulary(std::vector<std::string> pieces, Token eos) : pie
     for(const auto& piece:pieces_) {
         if(piece.size() > constraint_vocabulary_bytes - bytes) throw std::length_error("constraint vocabulary exceeds 64 MiB");
         bytes += piece.size();
+        longest_ = std::max(longest_, piece.size());
     }
+    // The trie: nonempty pieces in byte order, each sharing its longest common prefix with the one before.
+    std::vector<Token> order;
+    order.reserve(pieces_.size());
+    for(std::size_t t = 0; t < pieces_.size(); ++t) if(!pieces_[t].empty()) order.push_back(Token(t));
+    std::stable_sort(order.begin(), order.end(), [&](Token a, Token b) { return pieces_[std::size_t(a)] < pieces_[std::size_t(b)]; });
+    std::vector<std::uint32_t> parent{0};
+    std::vector<unsigned char> byte_of{0};
+    std::vector<std::pair<std::uint32_t, Token>> endings;
+    endings.reserve(order.size());
+    std::vector<std::uint32_t> path{0};
+    std::string_view previous;
+    for(const Token t:order) {
+        const std::string_view piece = pieces_[std::size_t(t)];
+        std::size_t common = 0;
+        while(common < piece.size() && common < previous.size() && piece[common] == previous[common]) ++common;
+        path.resize(common + 1);
+        for(std::size_t i = common; i < piece.size(); ++i) {
+            parent.push_back(path.back());
+            byte_of.push_back(static_cast<unsigned char>(piece[i]));
+            path.push_back(std::uint32_t(parent.size() - 1));
+        }
+        endings.emplace_back(path.back(), t);
+        previous = piece;
+    }
+    const std::size_t nodes = parent.size();
+    child_begin_.assign(nodes + 1, 0);
+    for(std::size_t n = 1; n < nodes; ++n) ++child_begin_[parent[n] + 1];
+    for(std::size_t n = 0; n < nodes; ++n) child_begin_[n + 1] += child_begin_[n];
+    edge_child_.resize(nodes - 1);
+    edge_byte_.resize(nodes - 1);
+    std::vector<std::uint32_t> fill(child_begin_.begin(), child_begin_.end() - 1);
+    for(std::size_t n = 1; n < nodes; ++n) {   // creation order is byte order among siblings
+        const auto at = fill[parent[n]]++;
+        edge_child_[at] = std::uint32_t(n);
+        edge_byte_[at] = byte_of[n];
+    }
+    token_begin_.assign(nodes + 1, 0);
+    for(const auto& [node, token]:endings) ++token_begin_[node + 1];
+    for(std::size_t n = 0; n < nodes; ++n) token_begin_[n + 1] += token_begin_[n];
+    tokens_.resize(endings.size());
+    std::vector<std::uint32_t> placed(token_begin_.begin(), token_begin_.end() - 1);
+    for(const auto& [node, token]:endings) tokens_[placed[node]++] = token;
 }
 std::string_view ByteVocabulary::piece(Token token) const {
     check_token(token, pieces_.size());
     return pieces_[std::size_t(token)];
+}
+
+// ---- Allowed-set cache and shared helpers ------------------------------------------------------------------------
+AllowedCache::AllowedCache(std::size_t max_bytes) : max_bytes_(max_bytes) {
+    if(!max_bytes) throw std::invalid_argument("allowed cache needs a positive byte bound");
+}
+AllowedCache::Stats AllowedCache::stats() const {
+    std::lock_guard lock(mutex_);
+    return {hits_, misses_, entries_.size(), bytes_};
+}
+void AllowedCache::bind(const void* vocabulary, const void* language, std::string_view limits) {
+    std::lock_guard lock(mutex_);
+    if(!bound_) { vocabulary_ = vocabulary; language_ = language; limits_ = std::string(limits); bound_ = true; return; }
+    if(vocabulary_ != vocabulary || language_ != language || limits_ != limits)
+        throw std::invalid_argument("allowed cache is bound to another language, vocabulary or limits");
+}
+std::shared_ptr<const std::vector<Token>> AllowedCache::find(const std::string& key, std::size_t budget) {
+    std::lock_guard lock(mutex_);
+    const auto it = entries_.find(key);
+    if(it == entries_.end() || it->second.needed > budget) { ++misses_; return {}; }
+    ++hits_;
+    order_.splice(order_.begin(), order_, it->second.order);
+    return it->second.ids;
+}
+void AllowedCache::insert(const std::string& key, std::shared_ptr<const std::vector<Token>> ids, std::size_t needed) {
+    const std::size_t bytes = key.size() + ids->size() * sizeof(Token) + 64;
+    std::lock_guard lock(mutex_);
+    if(bytes > max_bytes_ || entries_.count(key)) return;
+    while(bytes_ + bytes > max_bytes_ && !order_.empty()) {
+        const auto oldest = entries_.find(*order_.back());
+        bytes_ -= oldest->second.bytes;
+        order_.pop_back();
+        entries_.erase(oldest);
+    }
+    const auto it = entries_.emplace(key, Entry{std::move(ids), needed, bytes, {}}).first;
+    order_.push_front(&it->first);
+    it->second.order = order_.begin();
+    bytes_ += bytes;
+}
+
+void TokenMatcher::allowed_bits(std::span<std::uint32_t> words) const {
+    if(words.size() != (vocabulary() + 31) / 32) throw std::invalid_argument("allowed bitmask must hold (vocabulary + 31) / 32 words");
+    const auto ids = allowed();
+    std::fill(words.begin(), words.end(), 0u);
+    for(const Token t:ids) words[std::size_t(t) / 32] |= std::uint32_t{1} << (std::size_t(t) % 32);
+}
+
+std::vector<Token> allowed_by_scan(const TokenMatcher& matcher) {
+    const auto vocabulary = matcher.vocabulary();
+    std::vector<Token> ids;
+    if(matcher.ended()) {
+        for(std::size_t t = 0; t < vocabulary && ids.empty(); ++t) {   // after EOS only EOS stays allowed
+            const auto copy = matcher.fork();
+            copy->rewind(copy->size() - 1);
+            try { copy->append(Token(t)); if(copy->ended()) ids.push_back(Token(t)); } catch(const std::domain_error&) {}
+        }
+        return ids;
+    }
+    for(std::size_t t = 0; t < vocabulary; ++t) {
+        auto copy = matcher.fork();
+        try { copy->append(Token(t)); ids.push_back(Token(t)); } catch(const std::domain_error&) {}
+    }
+    if(ids.empty()) throw std::domain_error("no token can continue the constraint");
+    return ids;
 }
 
 // ---- Finite choices --------------------------------------------------------------------------------------------
@@ -74,9 +210,12 @@ std::size_t ChoiceGrammar::walk(std::size_t node, std::string_view bytes) const 
     return node;
 }
 
-ChoiceMatcher::ChoiceMatcher(std::shared_ptr<const ChoiceGrammar> grammar, std::shared_ptr<const ByteVocabulary> vocabulary)
-    : grammar_(std::move(grammar)), vocabulary_(std::move(vocabulary)) {
+ChoiceMatcher::ChoiceMatcher(std::shared_ptr<const ChoiceGrammar> grammar, std::shared_ptr<const ByteVocabulary> vocabulary,
+                             std::shared_ptr<AllowedCache> cache)
+    : grammar_(std::move(grammar)), vocabulary_(std::move(vocabulary)), cache_(std::move(cache)) {
     if(!grammar_ || !vocabulary_) throw std::invalid_argument("choice matcher needs a grammar and a vocabulary");
+    if(!cache_) cache_ = std::make_shared<AllowedCache>(allowed_cache_private_bytes);
+    cache_->bind(vocabulary_.get(), grammar_.get(), "choice");
 }
 std::unique_ptr<TokenMatcher> ChoiceMatcher::fork() const { return std::make_unique<ChoiceMatcher>(*this); }
 std::size_t ChoiceMatcher::vocabulary() const noexcept { return vocabulary_->size(); }
@@ -89,9 +228,22 @@ std::size_t ChoiceMatcher::next(Token token) const {
 }
 std::vector<Token> ChoiceMatcher::allowed() const {
     if(ended()) return {vocabulary_->eos()};
-    std::vector<Token> ids;
-    for(std::size_t i = 0; i < vocabulary_->size(); ++i) if(next(Token(i)) != no_node) ids.push_back(Token(i));
+    const std::size_t node = history_.back().node;
+    std::string key;
+    append_raw(key, node);
+    if(const auto hit = cache_->find(key, 0)) return *hit;
+    // The choice trie walked together with the piece trie: each shared piece prefix is followed once.
+    Collected collected(vocabulary_->size());
+    std::vector<std::size_t> states(vocabulary_->longest_piece() + 1);
+    states[0] = node;
+    vocabulary_->walk(vocabulary_->longest_piece(), [&](std::size_t depth, unsigned char byte) {
+        states[depth + 1] = grammar_->walk(states[depth], std::string_view(reinterpret_cast<const char*>(&byte), 1));
+        return states[depth + 1] != no_node;
+    }, [&](Token t) { collected.add(t); });
+    if(grammar_->terminal(node)) collected.add(vocabulary_->eos());
+    auto ids = collected.ids();
     if(ids.empty()) throw std::domain_error("no token can continue the choice language");
+    cache_->insert(key, std::make_shared<const std::vector<Token>>(ids), 0);
     return ids;
 }
 void ChoiceMatcher::append(Token token) {
@@ -262,11 +414,14 @@ struct JsonCursor {
 }
 using constraints_detail::JsonCursor;
 
-JsonObjectMatcher::JsonObjectMatcher(std::shared_ptr<const ByteVocabulary> vocabulary, JsonLimits limits)
-    : vocabulary_(std::move(vocabulary)), limits_(limits), history_(1) {
+JsonObjectMatcher::JsonObjectMatcher(std::shared_ptr<const ByteVocabulary> vocabulary, JsonLimits limits, std::shared_ptr<AllowedCache> cache)
+    : vocabulary_(std::move(vocabulary)), limits_(limits), cache_(std::move(cache)), history_(1) {
     if(!vocabulary_ || !limits.depth || limits.depth > 256 || !limits.bytes || limits.bytes > (std::size_t{1} << 30) ||
        !limits.tokens || limits.tokens > 1048576)
         throw std::invalid_argument("invalid JSON matcher vocabulary or limits");
+    if(!cache_) cache_ = std::make_shared<AllowedCache>(allowed_cache_private_bytes);
+    static const char json_language = 0;
+    cache_->bind(vocabulary_.get(), &json_language, limits_key({limits.depth, limits.bytes, limits.tokens}));
 }
 JsonObjectMatcher::JsonObjectMatcher(const JsonObjectMatcher&) = default;
 JsonObjectMatcher::~JsonObjectMatcher() = default;
@@ -296,10 +451,29 @@ bool JsonObjectMatcher::trial(Token token, JsonCursor& out) const {
 }
 std::vector<Token> JsonObjectMatcher::allowed() const {
     if(ended()) return {vocabulary_->eos()};
-    std::vector<Token> ids;
-    JsonCursor scratch;
-    for(std::size_t i = 0; i < vocabulary_->size(); ++i) if(trial(Token(i), scratch)) ids.push_back(Token(i));
+    const JsonCursor& here = history_.back();
+    if(size() == limits_.tokens) throw std::domain_error("no token can continue the JSON object within its limits");
+    // The allowed set is a function of the cursor and of the byte room up to the longest piece.
+    const std::size_t room = std::min(limits_.bytes - here.bytes, vocabulary_->longest_piece());
+    std::string key;
+    key.reserve(48 + here.frames.size());
+    for(const std::size_t v:{std::size_t(here.lex), std::size_t(here.number), here.literal.empty() ? 0 : std::size_t(here.literal[0]),
+                             here.literal_at, here.hex_left, here.utf8_left, std::size_t(here.utf8_low), std::size_t(here.utf8_high),
+                             std::size_t(here.string_key) | std::size_t(here.started) << 1 | std::size_t(here.complete) << 2, room})
+        append_raw(key, v);
+    for(const auto frame:here.frames) key.push_back(static_cast<char>(frame));
+    if(const auto hit = cache_->find(key, 0)) return *hit;
+    Collected collected(vocabulary_->size());
+    std::vector<JsonCursor> states(room + 1);
+    states[0] = here;
+    vocabulary_->walk(room, [&](std::size_t depth, unsigned char byte) {
+        states[depth + 1] = states[depth];
+        return states[depth + 1].consume(byte, limits_.depth);
+    }, [&](Token t) { collected.add(t); });
+    if(complete()) collected.add(vocabulary_->eos());
+    auto ids = collected.ids();
     if(ids.empty()) throw std::domain_error("no token can continue the JSON object within its limits");
+    cache_->insert(key, std::make_shared<const std::vector<Token>>(ids), 0);
     return ids;
 }
 void JsonObjectMatcher::append(Token token) {

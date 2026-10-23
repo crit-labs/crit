@@ -4,7 +4,8 @@
 `GrammarState` runs the same bounded Earley recognizer as the native `GrammarMatcher`, one byte string at a time.
 `matches(language, data)` and `json_object_matches(data)` answer whether a whole output belongs to a language: a
 server can check what an engine returned, and tests can use them as references. Per-token masks during generation
-come from the native matchers (crit/constraints.h), which scan the whole vocabulary at every position.
+come from the native matchers (crit/constraints.h), which walk the vocabulary's piece trie. A rule whose productions
+are all single bytes is a byte class, scanned as one terminal by both recognizers, so their chart budgets agree.
 """
 from dataclasses import dataclass
 import json
@@ -23,6 +24,7 @@ class ByteGrammar:
     productions: tuple  # (lhs, rhs tuple)
     rules: tuple
     nullable: frozenset
+    classes: tuple = ()  # per rule: the bytes of a byte-class rule, else None
 
     @classmethod
     def build(cls, rule_count, start, productions):
@@ -46,7 +48,10 @@ class ByteGrammar:
                     productive.add(lhs); changed = True
         if len(productive) != rule_count:
             raise GrammarError("grammar has undefined or unproductive rules")
-        return cls(start, productions, tuple(tuple(r) for r in rules), frozenset(nullable))
+        classes = tuple(frozenset(productions[i][1][0] for i in rule)
+                        if all(len(productions[i][1]) == 1 and productions[i][1][0] < 256 for i in rule) else None
+                        for rule in rules)
+        return cls(start, productions, tuple(tuple(r) for r in rules), frozenset(nullable), classes)
 
     @classmethod
     def load(cls, artifact):
@@ -119,6 +124,8 @@ class GrammarState:
                         add((parent_production, parent_dot + 1, parent_origin))
             elif rhs[dot] >= 256:
                 symbol = rhs[dot] - 256
+                if grammar.classes[symbol] is not None:
+                    continue  # scanned as one terminal by advance()
                 for index in grammar.rules[symbol]:
                     add((index, 0, position))
                 if symbol in grammar.nullable:
@@ -127,9 +134,11 @@ class GrammarState:
 
     def advance(self, data):
         charts, total = list(self._charts), self._total
+        productions, classes = self.grammar.productions, self.grammar.classes
         for byte in data:
-            scanned = [(p, d + 1, o) for p, d, o in charts[-1]
-                       if d < len(self.grammar.productions[p][1]) and self.grammar.productions[p][1][d] == byte]
+            scanned = [(p, d + 1, o) for p, d, o in charts[-1] if d < len(productions[p][1]) and
+                       (productions[p][1][d] == byte or (productions[p][1][d] >= 256 and classes[productions[p][1][d] - 256] is not None
+                                                         and byte in classes[productions[p][1][d] - 256]))]
             if not scanned:
                 return None
             charts.append(scanned)

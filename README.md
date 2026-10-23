@@ -7,7 +7,7 @@
 
 ### Why wait for someone to optimize an LLM for your GPU when an AI agent can build a specialized inference engine in a few hours?
 
-[![Version 0.4.0](docs/assets/badge-version.svg)](CHANGELOG.md)
+[![Version 0.5.0](docs/assets/badge-version.svg)](CHANGELOG.md)
 [![License Apache-2.0](docs/assets/badge-license.svg)](LICENSE)
 [![crit-hub engines](docs/assets/badge-crit-hub.svg)](https://github.com/crit-labs/crit-hub)
 [![CI](https://github.com/crit-labs/crit/actions/workflows/ci.yml/badge.svg)](https://github.com/crit-labs/crit/actions/workflows/ci.yml)
@@ -23,8 +23,7 @@
 
 ## Summary
 
-**`crit` is a toolkit for quickly building a new inference engine
-tailored to your model and hardware or optimizing a pre-existing one.**
+**`crit` is a toolkit for optimizing or building inference engines tailored to your hardware and desired model.**
 > [!IMPORTANT]
 > Combines a runtime foundation, reusable techniques, kernel discovery
 > and physics-based evaluation. In our first case study, a coding agent built an engine for
@@ -40,13 +39,13 @@ tailored to your model and hardware or optimizing a pre-existing one.**
 
 ## Quick start
 
-Give this prompt to your coding agent and specify your target LLM or target engine:
+Give one of these prompts to your coding agent and specify your target LLM or target engine:
 ```bash
-Use github.com/crit-labs/crit to build an optimized inference engine for <url_to_llm_on_huggingface>.
+Use github.com/crit-labs/crit to build an optimized inference engine for <huggingface_url>.
 ```
 
 ```bash
-Use github.com/crit-labs/crit to optimize my own inference engine in <path_to_your_engine> / <url_to_engine_on_crit-hub>.
+Use github.com/crit-labs/crit to optimize my own inference engine in <engine_reference>.
 ```
 
 ---

@@ -28,7 +28,11 @@ _verification_cache = ContextVar("crit_verification_cache", default=None)
 
 RUN_ID = r"run-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}"
 LIFECYCLES = {"queued", "building", "built", "checking", "benchmarking", "completed", "build_failed",
-              "check_failed", "benchmark_failed", "cancelled", "timed_out", "interrupted"}
+              "check_failed", "benchmark_failed", "eval_failed", "cancelled", "timed_out", "interrupted"}
+# A candidate attempt's lifecycle while it runs. Eval (crit run eval) has no fixed process cap: its work scales with
+# the model and the device, so it runs to the segment's deadline and bounds each request by the rates it measures.
+RUNNING = {"build": "building", "check": "checking", "benchmark": "benchmarking", "eval": "benchmarking"}
+UNCAPPED = {"eval"}
 STOP_REASONS = {"satisfied", "search_exhausted", "blocked", "budget_exhausted", "cancelled", "interrupted"}
 METRICS = {"prefill_tps": "tokens/second", "decode_tps": "tokens/second", "request_ms": "milliseconds",
            "load_ms": "milliseconds", "peak_vram_bytes": "bytes", "peak_ram_bytes": "bytes",
@@ -562,13 +566,14 @@ def evidence(root, ref):
 
 
 def attempt_process_cap(bounds, candidate_id, operation):
-    """Check the operation's owner and return its fixed process cap."""
+    """Check the operation's owner and return its fixed process cap, None for an operation the segment's deadline
+    alone bounds (UNCAPPED)."""
     if candidate_id is not None:
         ident(candidate_id, "candidate")
-    if (not isinstance(operation, str) or operation not in bounds["limits"]["process_seconds"]
+    if (not isinstance(operation, str) or operation not in set(bounds["limits"]["process_seconds"]) | UNCAPPED
             or (candidate_id is None) != (operation in {"agent", "discovery"})):
         raise ValueError("Invalid reservation operation/owner")
-    return bounds["limits"]["process_seconds"][operation]
+    return None if operation in UNCAPPED else bounds["limits"]["process_seconds"][operation]
 
 
 def validate_attempt_reservation(root, run, value, *, bounds=None):
@@ -586,7 +591,7 @@ def validate_attempt_reservation(root, run, value, *, bounds=None):
     if not (timestamp(bounds["started_at"], "segment start") <= start <= deadline
             <= timestamp(bounds["deadline_at"], "segment deadline")):
         raise ValueError("Reservation exceeds fixed segment bounds")
-    if (deadline - start).total_seconds() > cap:
+    if cap is not None and (deadline - start).total_seconds() > cap:
         raise ValueError("Attempt exceeds its process cap")
     if digest(value["cost"]) != digest({"unit": "attempt", "amount": 1}):
         raise ValueError("Invalid attempt counter reservation")
@@ -741,7 +746,7 @@ def candidate_projection(root, run, candidate_id, overlay=None, *, candidate_roo
         result_path = safe_path(attempt, "result.json")
         if not exists(result_path):
             unresolved = True
-            lifecycle = {"build": "building", "check": "checking", "benchmark": "benchmarking"}[reservation["operation"]]
+            lifecycle = RUNNING[reservation["operation"]]
             continue
         result = validate_attempt_result(root, run["run_id"], reservation, read(result_path))
         attempt_view.update(outcome=result["outcome"], cleanup_settled=result["cleanup_settled"], ended_at=result["ended_at"], logs=result["logs"])

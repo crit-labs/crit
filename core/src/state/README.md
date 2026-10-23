@@ -3,10 +3,11 @@
 [state_cache.cpp](state_cache.cpp) implements `StateCache` from
 [state.h](../../include/crit/state.h): a storage-agnostic ledger of KV pages and
 recurrent state slots for one engine. Core never touches state bytes. The engine
-owns storage, writes where a `Round` points and copies through two `StateStorage`
-hooks (`copy_rows`, `copy_slot`); the cache decides which ids hold what, when ids
-may be reused and which committed pages a new prompt may share. One `PageId`
-indexes every attention layer; slot ids are per component.
+owns storage, writes where a `Round` points and copies through `StateStorage`
+hooks (`copy_rows`, `copy_slot`, and `copy_window_rows` with window groups); the
+cache decides which ids hold what, when ids may be reused and which committed pages
+a new prompt may share. One `PageId` indexes every full-attention layer; each
+sliding-window group has a PageId space of its own; slot ids are per component.
 
 The runtime does not call it. An engine calls `begin` in `advance`, `commit` or
 `discard` in its commit hook, `close` when the session closes and `retire` after
@@ -21,14 +22,19 @@ rules below.
 | `sequences` | Open sequences, forks included |
 | `max_tokens` | Logical rows per sequence; at most `pages x page_tokens` |
 | `max_round_rows` | Most rows one round stages (drafts + 1 for speculation) |
-| `prefix_cache`, `identity` | Cross-sequence reuse of full committed pages; nonzero identity names weights, adapter, KV representation and position policy |
-| `components` | Recurrent components: `slots` and a `RecurrentCommit` mode each |
+| `prefix_cache`, `identity` | Cross-sequence reuse of full committed pages; nonzero identity names weights, adapter, KV and recurrent representation and position policy |
+| `components` | Recurrent components: `slots`, a `RecurrentCommit` mode and, with the prefix cache, a `snapshots` quota each |
+| `windows` | Sliding-window groups: `pages` of their own and a `window` of rows each |
 | `hash` | Page hash; null selects `chain_hash` |
 
-Each component needs `slots >= sequences + scratch`, where a round takes
+Each component needs `slots >= sequences + scratch + snapshots`, where a round takes
 `max_round_rows` scratch slots in `column_checkpoints` mode, one in `recompute`
-and none in `in_place`. The prefix cache is attention-only: `prefix_cache` with
-components is rejected.
+and none in `in_place`, and `snapshots` counts only with the prefix cache, which
+requires a nonzero quota for every component. A window group needs pages for one
+sequence's window plus a round and a copied tail (at most a whole table), and the
+cache needs `pages`: full-attention page ids also name the token rows prefix reuse
+matches, even for a model whose attention layers are all windowed (its engine
+then stores no bytes for them).
 
 ## Sequences and rounds
 
@@ -50,8 +56,9 @@ equals `discard`) and records their tokens. `column_checkpoints` swaps live to
 `scratch[n-1]`; in `recompute` the engine writes accepted state into `scratch[0]`
 from `start`, which becomes live; `in_place` updates live directly. One round may
 be pending per sequence; commit consumes it even when it throws.
-`rewind(seq, tokens)` shortens an attention-only sequence. `pages_needed` reports
-what a round would acquire now. `checkpoint_node(prefix_after, accepted,
+`rewind(seq, tokens)` shortens an attention-only sequence, but never to a point
+whose window would read a window group's dropped pages. `pages_needed` reports the
+full-attention pages a round would acquire now. `checkpoint_node(prefix_after, accepted,
 boundary_after)` maps an after-token boundary to the verify node holding its state.
 
 ## Ownership and reuse of ids
@@ -61,8 +68,8 @@ a retiring list at `epoch()` and becomes allocatable only after `retire(e)` with
 `e` at or past that epoch, called once device work up to `e` has settled.
 `advance_epoch()` closes an epoch for engines with several batches in flight; a
 single-stream engine calls `retire(epoch())` after each step's readiness.
-`layout_generation(seq)` changes whenever block table, live slots or scratch take
-new ids, so captured graphs know when to rebind.
+`layout_generation(seq)` changes whenever block table, window tables, live slots or
+scratch take new ids, so captured graphs know when to rebind.
 
 ## Prefix reuse
 
@@ -80,6 +87,52 @@ first, then evicts the least recently released cached page; `evict(n)` does it
 explicitly. Referenced pages are never evicted, and recomputing an evicted prefix
 repairs the index level by level.
 
+## Hybrid prefix reuse
+
+With recurrent components, reusing pages is not enough: the sequence also needs each
+component's state after the last reused row. A commit that fills a page (one that
+gets indexed) copies every component's state after that page's last row into a
+snapshot slot through `copy_slot`. The state exists for any boundary inside a
+`column_checkpoints` round (that column's scratch slot) and, in `recompute` and
+`in_place` modes, only for the round's last accepted row. A boundary that lacks the
+state for any component gets no snapshot, and the newest boundaries are snapshotted
+first. Snapshots belong to the indexed page and are kept per component in page order.
+
+`reusable` and `attach` end reuse at the last matched page that has a snapshot of
+every component. `attach` copies those snapshots into the sequence's live slots
+before publishing anything (a throwing copy publishes nothing; the engine
+initializes the live slots again), so the engine must not reinitialize them after a
+successful attach. A page that leaves the index drops its snapshots.
+
+Snapshot slots are a private pool of at most `snapshots` slots per component, taken
+from the free slots once and then recycled: when the pool is full, the oldest
+snapshot's slot holds the new one. Only `copy_slot` reads or writes snapshot slots,
+so the engine's ordered queue settles every read of an old snapshot before the copy
+that reuses its slot, and snapshots never take the slots that sequences and rounds
+are guaranteed. `stats().snapshots` counts the pool (its slots count as live). A
+throwing snapshot copy in `commit` leaves the round pending and publishes nothing.
+
+## Sliding-window groups
+
+Layers that attend to a window of `window` rows (a row's own included) keep their
+keys and values in a window group: its own pages, a window table per sequence
+(`window_table`, the same length as the block table) and one `Round::window_kv` row
+slot per staged row. Row `r` reads rows `r - window + 1 .. r`, so after each commit
+the pages wholly before the next row's window leave the table (`no_page`); they
+retire like any page. A group's shared or reusable partial tail is copied through
+`copy_window_rows` before a round writes into it, as `copy_rows` does for full
+attention.
+
+With the prefix cache, a full window page is linked to the indexed full-attention page
+with the same rows when that page is sealed, and stays cached for reuse after its
+sequence drops it; allocation evicts cached window pages least recently released
+first, and a full-attention page that leaves the index drops its links. Reuse ending
+after `n` rows needs, for every group, the window pages holding rows
+`n - window + 1 .. n - 1`, so `reusable` and `attach` end at the last matched page
+whose window pages are all present; `attach` references them and leaves the pages
+before the window as `no_page`. `window_stats(w)` reports a group's pages, with
+`indexed_pages` counting the linked ones.
+
 ## Failure atomicity, memory and threading
 
 `begin` and `fork` acquire ids and call hooks before publishing with non-throwing
@@ -94,9 +147,9 @@ rejected.
 | Exception | When |
 | --- | --- |
 | `std::invalid_argument` | Bad configuration, rows over `max_round_rows`, negative tokens |
-| `std::logic_error` | Stale sequence or round, pending round, attach on a non-empty sequence, rewind with components, reentrant mutation |
+| `std::logic_error` | Stale sequence or round, pending round, attach on a non-empty sequence, rewind with components or into dropped window pages, window groups without `copy_window_rows`, reentrant mutation |
 | `std::length_error` | A round past `max_tokens` |
-| `std::out_of_range` | Commit over staged rows, rewind past committed rows, bad component or checkpoint |
+| `std::out_of_range` | Commit over staged rows, rewind past committed rows, bad component, window group or checkpoint |
 | `CapacityExhausted` (a `std::runtime_error`) | No free sequence, page or slot; retiring ids wait for `retire` |
 | `std::runtime_error` | Metadata reservation over the host ceiling |
 | `std::overflow_error` | Accounting overflow; round ids or epochs exhausted |
@@ -104,6 +157,7 @@ rejected.
 ## Limits
 
 Ids are 32-bit (at most `0xfffffffe` pages and slots per component). Reuse is
-page-granular and attention-only, with one indexed page per hash. Snapshots for
-hybrid reuse, sliding-window or cross-attention groups, and admission watermarks
-are not provided.
+page-granular, with one indexed page per hash; recurrent reuse is bounded by the
+snapshots taken at page boundaries, so a prefix filled inside a `recompute` or
+`in_place` round reuses only to its last snapshot. Cross-attention groups and
+admission watermarks are not provided.
