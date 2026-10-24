@@ -117,7 +117,10 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
         raise interrupted
     if outcome != "completed":
         raise ValueError(f"Eval {outcome}: {failure} (log {log_path.relative_to(root).as_posix()})")
-    return {"result": {"path": out.relative_to(root).as_posix(), "sha256": file_sha(out)}, "status": result["status"]}
+    # A candidate created from a plan gets the plan's outcome: its forecast next to what Eval measured.
+    planned = store.plan_outcome(run_id, candidate_id, attempt)
+    return {"result": {"path": out.relative_to(root).as_posix(), "sha256": file_sha(out)}, "status": result["status"],
+            **({"plan_outcome": f"plans/{planned['plan_id']}/outcomes/{attempt}.json"} if planned else {})}
 
 
 class EvalEngines(Served):

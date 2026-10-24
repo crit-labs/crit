@@ -41,7 +41,7 @@ struct RoundSteps {
     // and the control fields (n_emitted, n_matched, base_frontier, base_last, frontier,
     // last_token) exactly as enqueue_greedy_accept defines them, so enqueue_truncate and
     // commit work unchanged. Unset: the greedy accept kernel.
-    std::function<void(cudaStream_t, const AcceptRows&)> accept;
+    std::function<void(cudaStream_t, const AcceptRows&)> accept = {};
 };
 struct RoundConfig {
     std::uint32_t draft_tokens = 0;   // K; zero is ordinary one-token decoding

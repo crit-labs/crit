@@ -17,7 +17,8 @@ namespace crit::core {
 
 // Compute capability 9.0 or later on `device`; false when the query fails. Cached per device after the first call.
 bool programmatic_launch_supported(int device) noexcept;
-// The same for the device that `stream` belongs to (the current device for the legacy or per-thread default stream).
+// The same for the device that `stream` belongs to (the current device for the legacy or per-thread default stream,
+// and for a capturing stream, whose device cannot be queried without invalidating the capture).
 bool programmatic_launch_supported(cudaStream_t stream) noexcept;
 
 struct LaunchShape {

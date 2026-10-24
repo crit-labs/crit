@@ -48,7 +48,7 @@ void run(int rank, int rope, int heads, bool paged, bool sinks, std::mt19937& rn
     const auto q = random_bf16(std::size_t(T) * heads * W, rng, qh, 1.f), cache = random_bf16(std::size_t(L) * W, rng, ch, 1.f);
     // Paged: logical page i at physical page (i * 7) % pages of a larger pool.
     const int pages = (L + page - 1) / page, pool = pages * 2;
-    std::vector<std::int32_t> table(std::size_t(pages));
+    std::vector<std::int32_t> table(static_cast<std::size_t>(pages));
     for(int i = 0; i < pages; ++i) table[std::size_t(i)] = (i * 7) % pool;
     std::vector<__nv_bfloat16> stored = cache;
     if(paged) {
@@ -57,7 +57,7 @@ void run(int rank, int rope, int heads, bool paged, bool sinks, std::mt19937& rn
             std::copy_n(cache.begin() + std::ptrdiff_t(std::size_t(j) * W), W,
                         stored.begin() + std::ptrdiff_t((std::size_t(table[std::size_t(j / page)]) * page + std::size_t(j % page)) * W));
     }
-    std::vector<float> sink(std::size_t(heads));
+    std::vector<float> sink(static_cast<std::size_t>(heads));
     for(int h = 0; h < heads; ++h) sink[std::size_t(h)] = 0.1f * float(h);
     Device<__nv_bfloat16> dq(q), dc(stored);
     Device<std::int32_t> dt(table);

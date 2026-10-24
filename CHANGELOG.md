@@ -9,6 +9,128 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-25
+
+### Overview
+
+crit 0.8.0 is a run release: the engine agent's decisions become records crit checks. Before any
+code, a candidate starts from a recorded plan that froze the parent's newest Eval: the needed flags
+and their evidence, the current strategy's ceiling and the best alternative's, the levers with each
+KPI's projected change and a forecast per KPI. crit computes the priorities (decode and prefill are
+needed while a lever can still raise them beyond their noise, the one further from its limit first,
+time to first token never alone), refuses an incomplete or inconsistent plan, and after Eval sets the
+plan's forecast next to the measured result and gives every lever its fate. An early stop is a stop
+plan, and the run stops when neither decode nor prefill is needed. Runs created from this version
+freeze plan rules 2: crit computes the decode limits Eval leaves out with Eval's own cost model, and
+alternatives name their drafter and stay within its measured acceptance. Core keeps a graph capture
+across programmatic launches, and four Inference fixes land with five CUDA fixtures that now compile.
+The Python distribution and the Core SDK share version 0.8.0.
+
+### Added
+
+- Candidate plans as records: `crit run ... plan --record plan.json`, after the parent's Eval and
+  before any code, stores `plans/PLAN_ID/plan.json` with the needed flags and their evidence, the
+  current strategy's ceiling and the best alternative's, the levers with each KPI's projected change
+  and joint groups, a forecast per KPI and the gates. crit freezes the parent's newest Eval (scores,
+  fractions of the limits, noise, gaps), computes the priorities and refuses an incomplete or
+  inconsistent plan (a stop decision with a KPI needed, an unanswered gap above the noise on a KPI
+  marked not needed, an ungrouped lever below the noise, a p1 KPI without a lever, a TTFT-only plan, a
+  forecast without an improvement beyond the noise). A plan proved wrong before its candidate exists
+  is superseded by a new one.
+- After `crit run ... eval`, a candidate built from a plan gets the plan's outcome,
+  `plans/PLAN_ID/outcomes/ATTEMPT.json`: the forecast next to each measured KPI and flags for greedy
+  decode, held-out decode and follow-up time to first token when they fell beyond their noise.
+  `crit run ... eval` also prints the priorities the result's fractions give.
+- An early stop is a plan: `stop --reason search_exhausted` with budgeted candidates left requires a
+  stop plan (`"decision": "stop"`) that froze the run's newest Eval, and the stop record's headroom
+  accounts for `context_decode` and `context_ttft` whenever that Eval measured the long-context curve.
+- Estimated limits in plans: when Eval gives a KPI no limit (a plain engine's decode, or a served engine
+  without draft-step bytes), a plan comparing decode with prefill states `estimated_limits` for it, a
+  limit in Eval's units and how it was derived. crit refuses a missing, physically inconsistent or
+  underived estimate and one that would replace Eval's limit, ranks with the estimated fractions and
+  marks them in `priorities.estimated`; the plan's outcome sets each estimate next to the measured score
+  and, once Eval gives one, its real limit.
+- Lever fates: a candidate built from a plan gives each lever its fate in the proposal's `lever_fates`
+  (`built`, `pruned` or `deferred`, with a detail unless built); runs created from this version require
+  one fate per lever (`"lever_fates": "required"` in the run spec), older runs check fates when given.
+  The plan's outcome lists each lever's fate next to its forecast changes, and `forecast_on_p2` flags a
+  forecast whose expected gain falls mostly on a p2 KPI instead of p1.
+- Requirement levers in plans: a lever may be `"kind": "requirement"` with `serves` naming the rule or
+  gate it is for, such as sampled speculation the rules require before Eval scores it. It needs no
+  projected change, is exempt from the noise check and never counts as the plan's lever for a KPI; the
+  plan's outcome lists requirement levers separately. Levers default to `speed`, so existing plans stay
+  valid.
+- Computed limits in plans: in runs created from this version (`"plan_limits": "computed"` in the run
+  spec), when the parent's Eval states no decode or long-context decode limit, crit computes one from the
+  same attempt, the measured tokens per round over the pass floor (bytes per pass, else the run's model
+  files, over the memory bandwidth), and freezes it as `inputs.computed_limits` with its formula and input
+  paths. Priorities use Eval's limit, then crit's, then the agent's estimate, and `priorities.sources`
+  names each fraction's source; an estimate for a limit crit computed is kept with its difference and not
+  used. Decode and long-context decode rank by the best strategy's ceiling: the higher of the current
+  strategy's limit and the alternative strategy's ceiling (`strategy.alternative.limits`, its tokens per
+  round and draft steps over a round floor crit computes from the attempt or the checkpoint's draft
+  layers), whichever strategy the plan chooses, so a plain baseline with a drafter available no longer
+  looks nearly done on decode. The outcome compares the alternative's ceiling with the measurement when
+  the plan builds it.
+- Plan rules 2: runs created from this version freeze `"plan_rules": 2` in the run spec (with
+  `plan_limits`), and their plans are checked with the second version of the plan rules; older runs
+  keep the first. The alternative strategy's tokens per round is at most its draft steps + 1, so a
+  plan can no longer claim a ceiling no round of its drafter reaches.
+- Plan rules 2, noise: a noise Eval leaves unknown takes the largest noise the Eval knows (else 5%)
+  instead of counting as zero, a family's noise is the largest of its members' instead of the noise of
+  the member that sets its fraction, the near tie combines both families' noise in quadrature, and
+  checks 4, 6 and 9 weigh each gap, lever change and forecast against its own KPI's noise. A one-percent
+  move no longer flips p1 between decode and prefill, and a long-context member that drops below its
+  main KPI no longer drops its family from p1.
+- Plan rules 2, one cost model, Eval's: crit's computed limit and the alternative strategy's ceiling both
+  charge the draft steps at Eval's draft floor (Eval's `draft_floor_ms`, else the engine's draft bytes per
+  step, else the checkpoint's draft layers, recorded), as Eval's round floor does, labelled `"bound"` in
+  the plan's inputs. Where the draft width is unknown the computed limit stays the pass-floor upper bound,
+  labelled as such. Before, the alternative charged its draft steps at the checkpoint's draft-layer bytes
+  (several times an engine's own) and the computed limit charged none.
+- Plan rules 2, drafters: each alternative limit names the drafter it assumes, the one the parent's Eval
+  measured or a new one. Its draft steps stay within the widest draft Eval projects (8, or the parent's
+  draft width) and its tokens per round within the measured drafter's acceptance bound at those steps,
+  per case `(1 - a^(k+1)) / (1 - a)` at the acceptance rate Eval's own acceptance bound uses (for
+  long-context decode, the rate the long-context points measured). A new drafter is held to the same bound
+  unless the plan cites another candidate's Eval attempt in the run that measured it, which bounds it by
+  its own acceptance; no alternative gives a bare limit, and the plan records every claim's implied
+  acceptance rate. A plan can no longer move p1 by claiming acceptance its drafter never showed.
+- Plan rules 2: the run's first plan is held to check 3 too, so it builds only with decode or prefill
+  needed and stops only with neither.
+- Plan rules 2, near the limit (0.85): when both families are needed and both are at 0.85 of their
+  limits or above, a near tie puts only the family with the lower fraction in p1 (decode on an exact
+  tie); and a family marked not needed below 0.85 needs a `gaps` entry for its limit (`"gap": "limit"`,
+  `"answer": "cause"`) with the physical cause that keeps the rest of it out of reach.
+
+### Changed
+
+- The engine agent orders Eval's goals by a priority rule instead of pursuing all at once (AGENTS.md,
+  the agent request): decode and prefill are each needed while some lever can still raise it by more
+  than its noise, the one further from its limit is p1 and the other p2 (both p1 within the noise of
+  each other; long-context decode counts toward decode, long-context time to first token toward
+  prefill), and time to first token is p2 or p3, never p1 and never a candidate's only reason.
+  Priorities decide conflicts and order, never what is left out. Quality and the required context
+  stay gates. When neither decode nor prefill is needed the run stops, even with candidates left.
+- Runs created from this version freeze `"plans": "required"` in the run spec: every proposal names a
+  recorded plan's `plan_id`, which `candidate` checks (it exists, is the newest of its chain, builds,
+  is unlinked and starts from the proposal's parent). Older runs keep `plan_id` optional.
+
+### Fixed
+
+- Core's `launch(..., programmatic = true)` asked `cudaStreamGetDevice` on every launch, which invalidates a
+  stream capture, so a programmatic launch could never be captured into a CUDA graph. A capturing stream now
+  answers for the current device.
+- device-speculative-round's `RoundSteps::accept` had no default member initializer, so the documented
+  three-step brace initialization (draft, verify, commit_state) failed under `-Wextra -Werror`; it defaults
+  to the greedy accept kernel again.
+- Five CUDA fixtures had never compiled (`latent_attention_tests`, `draft_tree_tests`, `sampled_round_tests`,
+  `token_law_tests`, `hidden_drafter_tests`): most-vexing-parse declarations, a raw newline inside a string
+  literal, typed `cudaMalloc` without `<cuda_runtime.h>`. They build with GCC 13 and pass on an RTX 5090.
+- token-sampling's `enqueue_select` answered a token id for a row with no selectable logit on its two-stage
+  path (2147483647 when greedy, or an out-of-bounds read that gave token 0 when sampling); it returns -1 there,
+  as the full law does, and still advances the device position.
+
 ## [0.7.0] - 2026-10-24
 
 ### Overview
@@ -1080,7 +1202,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/crit-labs/crit/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/crit-labs/crit/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/crit-labs/crit/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/crit-labs/crit/compare/v0.5.0...v0.6.0

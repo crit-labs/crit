@@ -26,8 +26,13 @@ bool programmatic_launch_supported(int device) noexcept {
 }
 
 bool programmatic_launch_supported(cudaStream_t stream) noexcept {
+    // cudaStreamGetDevice is not permitted on a capturing stream: it fails and invalidates the capture. A capturing
+    // stream (or one whose capture status cannot be read) answers for the current device instead, which is the
+    // stream's device for every stream a kernel can be launched into.
     int device = 0;
-    if(cudaStreamGetDevice(stream, &device) != cudaSuccess) {
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    const bool idle = cudaStreamIsCapturing(stream, &capture) == cudaSuccess && capture == cudaStreamCaptureStatusNone;
+    if(!idle || cudaStreamGetDevice(stream, &device) != cudaSuccess) {
         static_cast<void>(cudaGetLastError());
         if(cudaGetDevice(&device) != cudaSuccess) {
             static_cast<void>(cudaGetLastError());

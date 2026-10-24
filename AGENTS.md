@@ -115,10 +115,17 @@ Work in rounds, one candidate per round:
    thresholds, known issues) in each proposal's `strategy` and `rationale`.
 2. **Plan** each candidate as an ambitious one-shot from the physical limits and the
    last round: `crit eval status` goals, gaps and failed gates, the profile's heaviest
-   kernels, the parent's result. Include everything expected to reach every goal;
-   effort is never a reason to leave something out.
+   kernels, the parent's result. Include every lever that helps a goal without costing
+   a higher priority; effort is never a reason to leave something out. Record the plan
+   with `crit run ... plan --record plan.json` after the parent's Eval and before
+   writing code ([Run records](docs/RUN_RECORDS.md#plan)), and name its `plan_id` in the
+   proposal. A plan proved wrong before its candidate exists is replaced by a new plan
+   with `supersedes`.
 3. **Build** it (`crit run ... candidate`); fix or prune what is slow or fails a gate
-   (prune only after measuring) until the plan is implemented.
+   until the plan is implemented. Prune a part only after measuring it against its
+   floor (Eval's floors per term, the profile's kernels). The proposal gives every lever
+   of its plan a fate in `lever_fates`: built, pruned or deferred, with the reason for a
+   pruned or deferred one.
 4. **Evaluate:** `crit eval run --baseline FIRST_RESULT`, `crit eval kernels`, then
    `crit eval status RESULT --baseline PARENT_RESULT`. A failed gate, an exactness drop
    or a repeat difference is a bug and the next candidate's first item.
@@ -127,15 +134,59 @@ Work in rounds, one candidate per round:
    `recon.md` (and the frozen block if needed) and add a run case that crosses it
    before the next candidate.
 6. **Repeat** from step 2 until the targets are met, the candidate budget (a number of
-   candidates, not time) is used or the run is blocked. On resume, re-measure first.
+   candidates, not time) is used, neither decode nor prefill is needed or the run is
+   blocked. When neither is needed the run stops even with candidates left: record a
+   stop plan (`"decision": "stop"`) from the newest Eval, then stop with
+   `search_exhausted`. On resume, re-measure first.
 
 - **Strategy first.** Working baseline, measured bottlenecks, then compare strategies,
   not only settings. Reach the highest-ceiling strategy in working form before tuning
   kernels; sessions can end early and tuning does not transfer between strategies.
 - **Eval sets the goals.** `crit eval status` gives one goal per KPI: decode, prefill,
   time to first token, and long-context decode and time to first token, each from
-  current score to physical limit. From crit-eval-v7 the decode goal is the sampled decode. Pursue all at once; none trades against another.
-  Never weigh by the end-to-end score.
+  current score to physical limit with its fraction of the limit and its noise. From
+  crit-eval-v7 the decode goal is the sampled decode. Never weigh by the end-to-end score.
+- **The priority rule orders them.** Decode and prefill are each *needed* while some
+  lever can still raise it by more than its run-to-run noise; one stops being needed
+  when the distance left is within the noise, or when every Eval gap on it above the
+  noise has a physical cause or a measured rejection. Long-context decode counts toward
+  decode and long-context time to first token toward prefill; a family's fraction of
+  its limit is the lower of its members'. The needed one further from its limit is p1,
+  the other p2; both are p1 when their fractions are within the noise of each other.
+  Time to first token is p2 or p3: never p1 and never the reason for a candidate on its
+  own. Priorities decide conflicts and order, never what is left out: every lever that
+  costs no higher priority goes in. crit computes the priorities in each plan. When Eval
+  gives decode or long-context decode no limit, crit computes one from the parent's Eval:
+  the measured tokens per round over the pass floor (bytes per pass over bandwidth).
+  Where it cannot, the plan states an estimated limit and how it was derived (for example a
+  drafter's expected tokens per round over the pass floor). The current strategy's limit is
+  Eval's, then crit's, then the estimate; crit ranks decode by the best strategy's ceiling,
+  the higher of that limit and the alternative strategy's ceiling the plan gives in
+  `strategy.alternative.limits` (its tokens per round and draft steps: crit computes the
+  round floor), whichever strategy the plan chooses, and names the source of each fraction.
+  In runs with `"plan_rules": 2` the alternative's tokens per round is at most its draft
+  steps + 1; an unknown noise takes the largest noise the Eval knows (else 5%), a family's
+  noise is the largest of its members', the two families' noise bands combine in quadrature
+  for the near tie, and each gap and lever change is weighed against its own KPI's noise.
+  There crit's computed limit and the alternative's ceiling follow Eval's cost model: tokens
+  per round over the pass floor plus the draft steps at Eval's draft floor (where the draft
+  width is unknown, the pass floor alone, a labelled upper bound). An alternative names the
+  `drafter` it assumes (`measured` or `new`); its tokens per round stays within the measured
+  drafter's acceptance bound at its draft steps (at most 8 or the parent's draft width) unless
+  the plan cites another candidate's Eval attempt that measured the new drafter. The first
+  plan's decision
+  follows its needed flags like every other plan's. Near the limit (both families at 0.85 of
+  it or above) a near tie puts only the lower one in p1, and a family marked not needed below
+  0.85 answers why the rest of its limit is out of reach (`gaps` entry `limit`, answer `cause`).
+- **Plans are checkable.** Each plan forecasts every KPI (low, expected, high), names the
+  current strategy's ceiling and the best alternative's, groups levers that only pay
+  together, and puts no lever below the noise into a candidate on its own. Work the rules
+  require that Eval does not score (for example sampled speculation before Eval measures
+  it) is a requirement lever (`"kind": "requirement"` with the rule it `serves`): it needs
+  no projected change and never counts as the plan's lever for a KPI. After the
+  candidate's Eval crit writes the plan's outcome next to the forecast; a drop in
+  greedy decode, held-out decode or follow-up time to first token beyond its noise is
+  flagged there, outside the priorities.
 - **The context is a requirement.** Build every candidate for `kv_tokens` and pass it to
   Eval as `--context`. Beyond weights and KV cache the engine gets `context_reserve_gib`
   (default 3 GiB) for activations, workspaces, graphs and speed techniques. Speed must

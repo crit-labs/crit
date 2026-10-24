@@ -30,7 +30,7 @@ struct Params {
 // 1 <= top_k <= kMaxTopK selection runs in two stages over the cand_values and cand_ids
 // scratch (kStageBlocks * kMaxTopK entries each); top_k 0 or above kMaxTopK runs the
 // full-vocabulary law. The parameters choose the path on the device, so one captured
-// launch serves both.
+// launch serves both. *out is -1 when no logit is selectable (all -inf), on every path.
 cudaError_t enqueue_select(const float* logits, int vocab, Params* params, float* cand_values, std::int32_t* cand_ids,
                            std::int32_t* out, cudaStream_t stream);
 

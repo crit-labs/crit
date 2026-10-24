@@ -19,8 +19,13 @@ from crit.run.store import RunStore, lease
 
 class RunFixture:
     model_files = None  # {name: text} makes the model a recon'd fixture folder (core_text_fixtures.llama_files)
+    # Runs as created before plans (no plans field, plan_id optional); plan tests create runs that require them.
+    new_run_plans = None
 
     def setUp(self):
+        plans = patch("crit.run.records.NEW_RUN_PLANS", self.new_run_plans)
+        plans.start()
+        self.addCleanup(plans.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()

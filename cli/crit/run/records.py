@@ -21,6 +21,18 @@ WEIGHTS_POLICIES = {"as_stored", "transformable"}  # run: may candidates change 
 # Drift a run allows against the Eval reference, spent on speed; matches eval/protocol.json.
 DEFAULT_QUALITY_BUDGET = {"ppl_ratio_max": 1.05, "kld_mean_max": 0.05, "kld_p99_max": 0.5}
 EXACTNESS_MODES = {"reported", "required"}  # must speculative output equal plain greedy?
+# Runs created from this version on require a recorded plan (crit run ... plan) for every candidate; older runs
+# have no plans field and keep plan_id optional.
+NEW_RUN_PLANS = "required"
+# Runs created from this version on rank plans with the decode limits crit computes from the Eval attempt's facts
+# when Eval states none (crit.run.plans.computed_limits); older runs keep the agent's estimates.
+NEW_RUN_PLAN_LIMITS = "computed"
+# Runs created from this version on give every lever of a candidate's plan its fate in the proposal; older runs keep
+# fates optional.
+NEW_RUN_LEVER_FATES = "required"
+# Runs created from this version on check plans with the second version of the plan rules (crit.run.plans.rules);
+# older runs keep the rules they were created with.
+NEW_RUN_PLAN_RULES = 2
 WEIGHTS = {"as_stored", "transformed"}             # candidate: did it change them?
 HASH_PARALLEL_BYTES = 256 * 1024 * 1024
 GIB = 1024 ** 3
@@ -487,7 +499,11 @@ def request_spec(data):
             "objectives": {"targets": targets, "verification_level": level},
             "resource_limits": resource_limits(data),
             **({"eval_sampling": eval_sampling(data["eval_sampling"])} if "eval_sampling" in data else {}),
-            **({"origin_engine": validate_origin(data["origin_engine"])} if "origin_engine" in data else {})}
+            **({"origin_engine": validate_origin(data["origin_engine"])} if "origin_engine" in data else {}),
+            **({"plans": NEW_RUN_PLANS} if NEW_RUN_PLANS else {}),
+            **({"plan_limits": NEW_RUN_PLAN_LIMITS} if NEW_RUN_PLANS and NEW_RUN_PLAN_LIMITS else {}),
+            **({"lever_fates": NEW_RUN_LEVER_FATES} if NEW_RUN_PLANS and NEW_RUN_LEVER_FATES else {}),
+            **({"plan_rules": NEW_RUN_PLAN_RULES} if NEW_RUN_PLANS and NEW_RUN_PLAN_LIMITS and NEW_RUN_PLAN_RULES else {})}
     validate_spec(spec)
     return spec
 
@@ -534,7 +550,15 @@ def validate_workload(value):
 
 def validate_spec(value):
     keys(value, {"model_path", "hardware_constraints", "cases", "benchmark_protocol", "correctness", "objectives", "resource_limits"},
-         {"eval_sampling", "origin_engine"})
+         {"eval_sampling", "origin_engine", "plans", "plan_limits", "lever_fates", "plan_rules"})
+    if value.get("plans", "required") != "required":
+        raise ValueError("plans is required when present")
+    if value.get("plan_limits", "computed") != "computed" or ("plan_limits" in value and "plans" not in value):
+        raise ValueError("plan_limits is computed when present, in a run that requires plans")
+    if value.get("lever_fates", "required") != "required" or ("lever_fates" in value and "plans" not in value):
+        raise ValueError("lever_fates is required when present, in a run that requires plans")
+    if value.get("plan_rules", 2) != 2 or ("plan_rules" in value and value.get("plan_limits") != "computed"):
+        raise ValueError("plan_rules is 2 when present, in a run that computes plan limits")
     if "eval_sampling" in value and eval_sampling(value["eval_sampling"]) != value["eval_sampling"]:
         raise ValueError("eval_sampling is not in its validated form")
     if "origin_engine" in value:
@@ -748,7 +772,11 @@ def candidate_projection(root, run, candidate_id, overlay=None, *, candidate_roo
         folder = candidate_root
     candidate = read(safe_path(folder, "candidate.json"))
     required = {"candidate_id", "segment_id", "ordinal", "parent_candidate_id", "origin_candidate_id", "created_at", "label", "rationale", "strategy", "configuration", "store_decisions", "source_manifest_sha256", "inputs_manifest_sha256", "request_sha256"}
-    header(candidate, "candidate", run["run_id"], required, {"weights", "lineage"})
+    header(candidate, "candidate", run["run_id"], required, {"weights", "lineage", "plan_id", "lever_fates"})
+    if "lever_fates" in candidate and ("plan_id" not in candidate or not isinstance(candidate["lever_fates"], dict)):
+        raise ValueError("Candidate lever_fates belong to the candidate's plan")
+    if "plan_id" in candidate:
+        ident(candidate["plan_id"], "plan")
     if "weights" in candidate and candidate["weights"] not in WEIGHTS:
         raise ValueError("Candidate weights declaration requires as_stored or transformed")
     if "lineage" in candidate and (candidate["lineage"] != LINEAGE or "origin_engine" not in run["spec"]):
