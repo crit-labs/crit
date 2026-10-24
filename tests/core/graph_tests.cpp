@@ -3,6 +3,7 @@
 #include <crit/device_graph.h>
 #include "allocation_failure.h"
 #include <functional>
+#include <map>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -104,6 +105,45 @@ void graph_generations() {
     rebound.binding_generations = {3, 8};
     cache.capture(rebound, owners, capture);
     require(captures == 2, "a binding generation change must recapture");
+}
+// Speculative verify widths that alternate between rounds (llama.cpp PRs 28666 and 31004 found a single cached graph
+// re-captured on every alternation): the width is part of a graph's shape identity, so each width is captured once
+// and every later round of that width replays it. Capacity bounds the widths kept; past it a new width needs an
+// explicit settled eviction, never a silent recapture of a kept one.
+void graph_widths() {
+    const std::vector<std::size_t> widths{5, 3, 5, 3, 1, 5, 2, 2, 5, 3, 1, 4, 5, 3, 5, 3};
+    GraphCache cache(8);
+    const auto bound = owner();
+    int captures = 0, launches = 0;
+    std::map<std::size_t, GraphHandle> captured;   // the handle each width's capture returned
+    std::size_t current = 0;                       // the width of the round being replayed
+    const GraphCache::Capture capture = [&](const GraphKey& k) {
+        ++captures;
+        return captured[k.shapes[0][0]] = graph();
+    };
+    const GraphCache::Launch launch = [&](const GraphHandle& h) {
+        require(h == captured.at(current), "a round replayed another width's graph");
+        ++launches;
+        return receipt(true);
+    };
+    auto verify = [](std::size_t width) { auto k = key(); k.phase = "verify"; k.shapes = {{width, 64}}; return k; };
+    for(int pass = 0; pass < 2; ++pass)
+        for(const auto width : widths) {
+            const auto k = verify(width);
+            const auto handle = cache.capture(k, {bound}, capture);   // a hit returns the cached graph
+            require(handle == captured.at(width), "capture of a cached width returned another graph");
+            current = width;
+            cache.replay(k, launch);
+        }
+    require(captures == 5 && cache.size() == 5, "alternating verify widths recaptured a graph");
+    require(launches == 2 * static_cast<int>(widths.size()), "a round did not replay its width's graph");
+    for(std::size_t width = 6; width <= 8; ++width) cache.capture(verify(width), {bound}, capture);
+    rejects<std::logic_error>([&] { cache.capture(verify(9), {bound}, capture); }, "explicit settled eviction required");
+    require(captures == 8, "a refused capture ran the capture hook");
+    for(std::size_t width = 1; width <= 8; ++width) require(cache.contains(verify(width)), "a full cache dropped a kept width");
+    cache.evict(verify(4), [](const GraphHandle&) {});
+    cache.capture(verify(9), {bound}, capture);
+    require(captures == 9 && cache.size() == 8 && !cache.contains(verify(4)), "eviction did not make room for a new width");
 }
 void graph_prerequisites() {
     GraphCache cache(1);
@@ -383,6 +423,7 @@ int main(int argc, char** argv) {
         const std::string test = argc > 1 ? argv[1] : "all";
         const std::vector<std::pair<std::string, std::function<void()>>> tests{
             {"graph_key", graph_key}, {"graph_identity", graph_identity}, {"graph_generations", graph_generations},
+            {"graph_widths", graph_widths},
             {"graph_owner_lifetime", graph_owner_lifetime},
             {"graph_capture_allocation_failure", graph_capture_allocation_failure},
             {"graph_owner_moves", graph_owner_moves},

@@ -76,6 +76,49 @@ class DraftTreeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             m.draft(random_drafter(0), root=0, depth=2, branch=2, beam=2, nodes=65)
 
+    def test_draft_ranks_measure_what_a_wider_tree_would_accept(self):
+        m = load()
+        drafter, vocab, K, ranks = random_drafter(5), 12, 4, 3
+        stats = m.DraftRanks(K, ranks)
+        rng = random.Random(8)
+        accepted_at, compared_at, cut = [0] * K, [0] * K, 0
+        for trial in range(300):
+            root = trial % vocab
+            rows, path, drafts = [], [], []   # drafter paths are the tokens after the root
+            for _ in range(K):   # a chain of the drafter's first choices
+                rows.append(drafter([path])[0])
+                drafts.append(m.expand(rows[-1], 1)[0][0])
+                path.append(drafts[-1])
+            # The target takes the draft or a token of rank 1 .. 5 in the drafter's row.
+            predictions = [m.expand(r, 6)[0 if rng.random() < 0.6 else rng.randrange(1, 6)][0] for r in rows] + [0]
+            # Every third round has a smaller output allowance, so some end on the allowance with nothing rejected.
+            emitted, walk = m.accept(m.chain(root, drafts), predictions, remaining=K + 1 if trial % 3 else 1 + trial % K)
+            matched = len(walk) - 1
+            for d in range(matched):
+                accepted_at[d] += 1
+                compared_at[d] += 1
+            if len(emitted) > matched and matched < K:
+                compared_at[matched] += 1   # the correction's position was compared
+            cut += len(emitted) == matched
+            stats.record(rows, predictions, matched, len(emitted))
+            # At position 0 a one-level tree of width w holds the target's token exactly when its rank is below w.
+            for width in range(1, 6):
+                _, tree = m.draft(drafter, root=root, depth=1, branch=width, beam=1, nodes=width + 1)
+                held = m.accept(tree, [predictions[0]] + [0] * width, remaining=2)[1] != [0]
+                self.assertEqual(held, m.draft_rank(rows[0], predictions[0]) < width)
+        self.assertEqual([stats.counts[d][0] for d in range(K)], accepted_at)
+        self.assertEqual([stats.reached(d) for d in range(K)], compared_at)
+        self.assertGreater(cut, 0)   # rounds cut off by their allowance occurred and compared nothing past their drafts
+        for d in range(K):
+            shares = [stats.covered(d, w) for w in range(1, ranks + 2)]
+            self.assertEqual(shares, sorted(shares))
+            self.assertEqual(shares[-1], 1.0 if stats.reached(d) else 0.0)
+        self.assertGreater(stats.counts[0][ranks], 0)   # ranks >= 3 land in the last column
+        with self.assertRaises(ValueError):
+            m.DraftRanks(0, 1)
+        with self.assertRaises(ValueError):
+            stats.record(rows, predictions, 1, 3)   # at most one token past the accepted drafts
+
 
 if __name__ == "__main__":
     unittest.main()

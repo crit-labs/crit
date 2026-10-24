@@ -3,6 +3,8 @@
 // adaptation can take over (keeping FP32-equivalent accuracy, for example split TF32).
 #include "recurrent_kernels.h"
 
+#include <cstdint>
+
 namespace crit::recurrent_kernels {
 namespace {
 
@@ -235,6 +237,18 @@ __global__ void __launch_bounds__(kThreads) delta_scan_kernel(DeltaShape d, Delt
     for(int e = tid; e < DK * 64; e += kThreads) st[std::size_t(e / 64) * d.dv + jb + e % 64] = S[e];
 }
 
+// A lane's 4 value columns of key row r: one 16-byte access when the base is 16-byte aligned (j0 is a multiple of 4
+// and dv of 64), else 4 scalar ones. Only the memory access differs; the values are the same.
+__device__ __forceinline__ void load4(const float* p, bool wide, float (&x)[4]) {
+    if(wide) { const float4 v = *reinterpret_cast<const float4*>(p); x[0] = v.x; x[1] = v.y; x[2] = v.z; x[3] = v.w; }
+    else for(int j = 0; j < 4; ++j) x[j] = p[j];
+}
+__device__ __forceinline__ void store4(float* p, bool wide, const float (&x)[4]) {
+    if(wide) *reinterpret_cast<float4*>(p) = make_float4(x[0], x[1], x[2], x[3]);
+    else for(int j = 0; j < 4; ++j) p[j] = x[j];
+}
+__device__ __forceinline__ bool aligned16(const void* p) { return (reinterpret_cast<std::uintptr_t>(p) & 15u) == 0; }
+
 // Column scan, block per (value head, 32 value columns): warp w owns 4 value columns, lane l key rows l * R .. + R - 1.
 template <int DK>
 __global__ void __launch_bounds__(kThreads) delta_columns_kernel(DeltaShape d, DeltaInputs in, int rows, const float* state_in,
@@ -245,10 +259,9 @@ __global__ void __launch_bounds__(kThreads) delta_columns_kernel(DeltaShape d, D
     const int j0 = blockIdx.y * 32 + warp * 4, kh = h / (d.v_heads / d.k_heads);
     const std::size_t head = std::size_t(h) * DK * d.dv;
     float S[R][4];
+    const bool wide_in = aligned16(state_in), wide_out = aligned16(state_out), wide_ck = checkpoints && aligned16(checkpoints);
 #pragma unroll
-    for(int r = 0; r < R; ++r)
-#pragma unroll
-        for(int j = 0; j < 4; ++j) S[r][j] = state_in[head + std::size_t(lane * R + r) * d.dv + j0 + j];
+    for(int r = 0; r < R; ++r) load4(state_in + head + std::size_t(lane * R + r) * d.dv + j0, wide_in, S[r]);
     for(int t = 0; t < rows; ++t) {
         const float* kr = in.k + std::size_t(t) * in.qk_stride + std::size_t(kh) * DK + lane * R;
         const float* qr = in.q + std::size_t(t) * in.qk_stride + std::size_t(kh) * DK + lane * R;
@@ -286,15 +299,11 @@ __global__ void __launch_bounds__(kThreads) delta_columns_kernel(DeltaShape d, D
         if(checkpoints) {
             float* ck = checkpoints + std::size_t(t) * d.v_heads * DK * d.dv + head;
 #pragma unroll
-            for(int r = 0; r < R; ++r)
-#pragma unroll
-                for(int j = 0; j < 4; ++j) ck[std::size_t(lane * R + r) * d.dv + j0 + j] = S[r][j];
+            for(int r = 0; r < R; ++r) store4(ck + std::size_t(lane * R + r) * d.dv + j0, wide_ck, S[r]);
         }
     }
 #pragma unroll
-    for(int r = 0; r < R; ++r)
-#pragma unroll
-        for(int j = 0; j < 4; ++j) state_out[head + std::size_t(lane * R + r) * d.dv + j0 + j] = S[r][j];
+    for(int r = 0; r < R; ++r) store4(state_out + head + std::size_t(lane * R + r) * d.dv + j0, wide_out, S[r]);
 }
 
 // ---------------------------------------------------------------------------------------------- Mamba-2

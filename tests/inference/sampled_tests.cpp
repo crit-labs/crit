@@ -209,21 +209,44 @@ void arithmetic() {
   rejects([]{Distribution({1}).sample(1);});rejects([]{Distribution::logits(std::array<float,1>{0},-1);});
   sparse_arithmetic();
 }
-void statistical() {
-  constexpr std::size_t trials=90000;std::array<std::size_t,9> counts{};
+// Three tokens per trial with draft budgets 0 .. 4: a round can accept two drafts and reject (or resample after)
+// the third, so the residual law is exercised after accepted drafts, not only at a round's first position.
+template<class Factory> void statistical_case(const char* name,Factory make) {
+  constexpr std::size_t trials=90000;std::array<std::size_t,27> counts{};
   for(std::size_t seed=0;seed<trials;++seed) {
-    auto t=std::make_shared<Fault>(),d=std::make_shared<Fault>();auto s=loop(seed,t,d);
+    auto t=std::make_shared<Fault>(),d=std::make_shared<Fault>();auto s=make(seed,t,d);
     std::vector<SpecToken> emitted;
-    while(emitted.size()<2){auto r=s->prepare(2-emitted.size(),seed%5);auto c=s->commit(r.id,r.tokens.size());emitted.insert(emitted.end(),c.tokens.begin(),c.tokens.end());}
-    ++counts[static_cast<std::size_t>(emitted[0]*3+emitted[1])];s.reset();check(t->live==0 && d->live==0,"Statistical fixture leaked states");
+    while(emitted.size()<3){auto r=s->prepare(3-emitted.size(),seed%5);auto c=s->commit(r.id,r.tokens.size());emitted.insert(emitted.end(),c.tokens.begin(),c.tokens.end());}
+    ++counts[static_cast<std::size_t>(emitted[0]*9+emitted[1]*3+emitted[2])];s.reset();check(t->live==0 && d->live==0,"Statistical fixture leaked states");
   }
   const std::array<double,3> p{.1,.3,.6};
   const std::array<std::array<double,3>,3> conditional{{{{.1,.3,.6}},{{.5,.2,.3}},{{.4,.5,.1}}}};
   // Fixed 0.008 absolute-frequency bound, chosen before measurement (>= 4.8
   // standard deviations even at probability .25); no seeded trajectory claim.
-  for(std::size_t x=0;x<3;++x)for(std::size_t y=0;y<3;++y)
-    check(std::abs(static_cast<double>(counts[x*3+y])/trials-p[x]*conditional[x][y])<.008,"Sampled joint distribution differs");
-  std::cout<<trials<<" two-token histories passed fixed distribution bounds\n";
+  // It holds for the two-token marginal and for each of the 27 three-token cells.
+  for(std::size_t x=0;x<3;++x)for(std::size_t y=0;y<3;++y) {
+    std::size_t pair=0;
+    for(std::size_t z=0;z<3;++z) {
+      pair+=counts[x*9+y*3+z];
+      check(std::abs(static_cast<double>(counts[x*9+y*3+z])/trials-p[x]*conditional[x][y]*conditional[y][z])<.008,"Sampled three-token distribution differs");
+    }
+    check(std::abs(static_cast<double>(pair)/trials-p[x]*conditional[x][y])<.008,"Sampled joint distribution differs");
+  }
+  // Pearson's statistic over the 27 cells, against chi-square(26)'s 1 - 1e-6 quantile (75.55), a fixed quantile
+  // rather than a fit to the measured value. It sees what the per-cell bound cannot: a wrong residual only after two accepted drafts (drawing
+  // from p instead of the residual) gives 138 here, the rule as written about 32.
+  double pearson=0;
+  for(std::size_t i=0;i<27;++i) {
+    const double expected=trials*p[i/9]*conditional[i/9][(i/3)%3]*conditional[(i/3)%3][i%3],observed=static_cast<double>(counts[i]);
+    pearson+=(observed-expected)*(observed-expected)/expected;
+  }
+  check(pearson<75.55,"Sampled three-token distribution fails the chi-square bound");
+  std::cout<<name<<": "<<trials<<" three-token histories passed fixed distribution bounds (chi-square "<<pearson<<" of 75.55)\n";
+}
+void statistical() {
+  statistical_case("dense",[](std::uint64_t seed,std::shared_ptr<Fault> t,std::shared_ptr<Fault> d){return loop(seed,t,d);});
+  statistical_case("sparse",[](std::uint64_t seed,std::shared_ptr<Fault> t,std::shared_ptr<Fault> d){return sparse_loop(seed,t,d);});
+  statistical_case("sparse fallback",[](std::uint64_t seed,std::shared_ptr<Fault> t,std::shared_ptr<Fault> d){return sparse_loop(seed,t,d,{},2);});
 }
 template<class Factory> void transaction_cases(Factory make) {
   auto t=std::make_shared<Fault>(),d=std::make_shared<Fault>();auto s=make(42,t,d),ordinary=make(42,t,d);

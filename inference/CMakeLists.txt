@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_inference VERSION 0.9.0 LANGUAGES CXX)
+project(crit_inference VERSION 0.9.1 LANGUAGES CXX)
 # Inference's native examples and fixtures. Inference uses Core only through its public SDK
 # (crit::core, crit::cuda); Core never builds or includes Inference code.
 find_package(Threads REQUIRED)
@@ -8,7 +8,7 @@ option(CRIT_INFERENCE_CUDA "Build Inference's CUDA reference kernels and their f
 option(CRIT_INFERENCE_INSTALLED_CORE "Use an installed Core SDK (CMAKE_PREFIX_PATH) instead of this checkout's core/" OFF)
 if(NOT TARGET crit::core)
   if(CRIT_INFERENCE_INSTALLED_CORE)
-    find_package(critCore 0.9.0 CONFIG REQUIRED)
+    find_package(critCore 0.9.1 CONFIG REQUIRED)
   else()
     if(CRIT_INFERENCE_CUDA)
       set(CRIT_CORE_CUDA ON CACHE BOOL "Build the explicit CUDA backend services" FORCE)
@@ -103,7 +103,7 @@ crit_inference_executable(crit_inference_io_codec_tests SOURCES ${FIXTURES}/infe
 crit_inference_test(crit_inference_io_codec 30 crit_inference_io_codec_tests "${CMAKE_CURRENT_BINARY_DIR}/gather-fixture")
 
 crit_inference_executable(crit_nvfp4_tests SOURCES ${FIXTURES}/nvfp4_tests.cpp INCLUDES ${INFERENCE}/quantized-projections/code)
-crit_inference_test(crit_nvfp4 30 crit_nvfp4_tests)
+crit_inference_test(crit_nvfp4 30 crit_nvfp4_tests ${FIXTURES}/e4m3_scale_vectors.txt)
 # Host ISA files: AVX2 and AVX-512 sources compiled with their own flags and chosen at run time through host_isa.h.
 # One condition builds them for every library, so host_isa's supported() answers for all of them.
 set(_host_nvfp4 ${INFERENCE}/host-expert-arithmetic/code)
@@ -158,7 +158,7 @@ crit_inference_executable(crit_speculative_example SOURCES ${INFERENCE}/mtp-deco
 crit_inference_test(crit_speculative_example 30 crit_speculative_example)
 crit_inference_executable(crit_speculative_tests SOURCES ${FIXTURES}/speculative_tests.cpp
   INCLUDES ${INFERENCE}/mtp-decode/code ${INFERENCE}/attention-state/code LINK crit::core)
-crit_inference_tests(crit_speculative_tests crit_speculative 45 transactions failures copy attention core)
+crit_inference_tests(crit_speculative_tests crit_speculative 45 transactions failures copy attention matrix core)
 
 crit_inference_executable(crit_attention_example SOURCES ${INFERENCE}/attention-state/code/attention_example.cpp LINK crit::core)
 crit_inference_test(crit_attention_example 30 crit_attention_example)
@@ -255,7 +255,7 @@ crit_inference_tests(crit_device_round_tests crit_device_round 60 accept graphs 
 crit_inference_kernels(crit_draft_trees ${INFERENCE}/draft-trees/code draft_tree.cu)
 target_link_libraries(crit_draft_trees PUBLIC crit_device_round_kernels)
 crit_inference_executable(crit_draft_tree_tests SOURCES ${FIXTURES}/draft_tree_tests.cpp LINK crit_draft_trees)
-crit_inference_tests(crit_draft_tree_tests crit_draft_trees 120 build accept compact)
+crit_inference_tests(crit_draft_tree_tests crit_draft_trees 120 build accept compact ranks)
 crit_inference_kernels(crit_hidden_drafters ${INFERENCE}/hidden-state-drafters/code hidden_drafters.cu)
 target_link_libraries(crit_hidden_drafters PUBLIC crit_device_round_kernels)
 crit_inference_executable(crit_hidden_drafter_tests SOURCES ${FIXTURES}/hidden_drafter_tests.cpp LINK crit_hidden_drafters)
@@ -316,7 +316,7 @@ crit_inference_kernels(crit_paged_attention ${INFERENCE}/paged-attention/code pa
 target_link_libraries(crit_paged_attention PUBLIC crit::core)
 crit_inference_executable(crit_paged_attention_tests SOURCES ${FIXTURES}/paged_attention_tests.cpp
   INCLUDES ${INFERENCE}/attention-state/code LINK crit_paged_attention)
-crit_inference_tests(crit_paged_attention_tests crit_paged_attention 300 decode invariance graph rejects)
+crit_inference_tests(crit_paged_attention_tests crit_paged_attention 300 decode invariance widths graph rejects)
 
 crit_inference_kernels(crit_batched_engine ${INFERENCE}/batched-reference-engine/code synthetic_model.cu)
 target_link_libraries(crit_batched_engine PUBLIC crit_paged_attention crit::cuda)

@@ -56,6 +56,14 @@ equals `discard`) and records their tokens. `column_checkpoints` swaps live to
 `scratch[n-1]`; in `recompute` the engine writes accepted state into `scratch[0]`
 from `start`, which becomes live; `in_place` updates live directly. One round may
 be pending per sequence; commit consumes it even when it throws.
+
+`begin(seq, rows, RoundStates::final_row)` is for kernels that compute no state
+inside the round, such as a chunked recurrent prefill: its `column_checkpoints`
+components behave as `recompute` for that round (one scratch slot, the accepted
+state written into `scratch[0]`, snapshots only at the last accepted row), so
+Core never takes a page-boundary snapshot from a slot the engine did not write.
+The default `every_row` keeps the per-row scratch of a column scan, which a
+speculative verify needs; `Round::states` reports the choice.
 `rewind(seq, tokens)` shortens an attention-only sequence, but never to a point
 whose window would read a window group's dropped pages. `pages_needed` reports the
 full-attention pages a round would acquire now. `checkpoint_node(prefix_after, accepted,
@@ -94,7 +102,7 @@ component's state after the last reused row. A commit that fills a page (one tha
 gets indexed) copies every component's state after that page's last row into a
 snapshot slot through `copy_slot`. The state exists for any boundary inside a
 `column_checkpoints` round (that column's scratch slot) and, in `recompute` and
-`in_place` modes, only for the round's last accepted row. A boundary that lacks the
+`in_place` modes and in a `final_row` round, only for the round's last accepted row. A boundary that lacks the
 state for any component gets no snapshot, and the newest boundaries are snapshotted
 first. Snapshots belong to the indexed page and are kept per component in page order.
 

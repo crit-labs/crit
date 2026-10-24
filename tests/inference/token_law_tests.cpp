@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <random>
@@ -191,6 +192,85 @@ int main() {
             require(params.get()[0].position == 400, "the full law advances the position");
             require(beyond > 300, "full-vocabulary draws stay inside the top 64");
             std::cout << "full vocabulary: " << beyond << " of 400 draws beyond rank 64, " << exact << " inside Core's exact interval\n";
+        }
+
+        // 1b. Ties at the top-k boundary on a 151,936-token row: logits on a 0.25 grid, so every boundary k falls inside
+        //     a run of equal values and ties must resolve by ascending id as Core's do. For k in {40, 64, 65, 1024, 4096,
+        //     the vocabulary, 0}, with and without penalties, the device's kept set equals Core's id for id, its law
+        //     matches, and ten launches give the same law and draw bytes (no atomics, fixed-order sums).
+        {
+            constexpr int V = 151936;
+            cc::Sampler host(V);
+            std::vector<float> row(V);
+            for(auto& v : row) v = std::round(4.f * 1.5f * normal(rng)) / 4.f;
+            {
+                // The premise, checked: at every finite k the k-th and (k+1)-th ranked logits are equal.
+                std::vector<int> ranked(V);
+                for(int i = 0; i < V; ++i) ranked[std::size_t(i)] = i;
+                std::sort(ranked.begin(), ranked.end(), [&](int a, int b) { return row[std::size_t(a)] == row[std::size_t(b)] ? a < b : row[std::size_t(a)] > row[std::size_t(b)]; });
+                for(const int k : {40, 64, 65, 1024, 4096})
+                    require(row[std::size_t(ranked[std::size_t(k - 1)])] == row[std::size_t(ranked[std::size_t(k)])], "a top-k boundary is not inside a tie run");
+            }
+            int checked = 0, draws = 0;
+            for(const std::uint32_t k : {40u, 64u, 65u, 1024u, 4096u, std::uint32_t(V), 0u})
+                for(const bool penalties : {false, true}) {
+                    Case c(V);
+                    c.rules.temperature = 0.8;
+                    c.rules.top_k = k;
+                    c.rules.seed = 4242;
+                    if(penalties) {
+                        c.rules.repetition_penalty = 1.1;
+                        c.rules.frequency_penalty = 0.5;
+                        c.rules.presence_penalty = 0.25;
+                        // History on tokens of the top runs, so penalties move tokens across the boundary.
+                        std::vector<cc::Token> top(V);
+                        for(int i = 0; i < V; ++i) top[std::size_t(i)] = i;
+                        std::partial_sort(top.begin(), top.begin() + 64, top.end(), [&](int a, int b) {
+                            return row[std::size_t(a)] == row[std::size_t(b)] ? a < b : row[std::size_t(a)] > row[std::size_t(b)];
+                        });
+                        for(int i = 0; i < 64; i += 3) c.prompt.push_back(top[std::size_t(i)]);
+                        for(int i = 0; i < 64; i += 5) c.outputs.push_back(top[std::size_t(i)]);
+                    }
+                    c.finish();
+                    DeviceCase dc(c);
+                    Device<ts::Request> request(1);
+                    Device<float> logits(row), scratch(ts::scratch_floats(V, 1)), probs(V);
+                    Device<std::int32_t> out(1);
+                    ts::Rows rows;
+                    rows.logits = logits.p; rows.stride = V; rows.vocab = V; rows.request = request.p; rows.scratch = scratch.p;
+                    std::vector<float> first;
+                    std::int32_t first_token = -2;
+                    for(int run = 0; run < 10; ++run) {
+                        request.put({dc.request});
+                        ok(ts::enqueue_sample(rows, cc::DrawPurpose::sample, out.p, probs.p, nullptr), "sample");
+                        const auto dense = probs.get();
+                        const auto token = out.get()[0];
+                        if(run == 0) { first = dense; first_token = token; continue; }
+                        require(std::memcmp(dense.data(), first.data(), sizeof(float) * V) == 0 && token == first_token,
+                                "a repeated launch changed the law or the draw");
+                    }
+                    std::vector<cc::Token> order;
+                    const auto want = core_law(host, row, c, {}, &order);
+                    // The draw equals Core's sampler away from FP32 rounding of a cumulative boundary.
+                    const auto [walked, margin] = walk(order, want, cc::uniform(c.rules.seed, c.outputs.size(), c.rules.stream));
+                    if(margin >= 1e-4) {
+                        require(first_token == walked, "the device draw differs from Core's sampler at a tied boundary");
+                        ++draws;
+                    }
+                    std::size_t kept = 0;
+                    for(int t = 0; t < V; ++t) {
+                        const double a = first[std::size_t(t)], b = want[std::size_t(t)];
+                        require(std::isfinite(a), "a law entry is not finite");
+                        require((a > 0.) == (b > 0.), "the device keeps a different token set than Core at a tied boundary");
+                        require(std::abs(a - b) <= 2e-4 * std::max(b, 1e-3), "device law differs from Core's distribution");
+                        kept += b > 0.;
+                    }
+                    require(k == 0 || k >= std::uint32_t(V) ? kept == std::size_t(V) : kept == k, "the kept set has the wrong size");
+                    ++checked;
+                }
+            std::cout << "tied boundaries: " << checked << " (top_k, penalties) cases on " << V
+                      << " tokens keep Core's set id for id, ten launches byte-identical, " << draws
+                      << " draws equal Core's sampler\n";
         }
 
         // 2. Processing and filters against Core over staged columns: bias (including a ban), suppression before

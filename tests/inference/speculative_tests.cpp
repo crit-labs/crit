@@ -351,14 +351,110 @@ void run() {
           "Core published failed repaired output or leaked its KV");
 }
 } // namespace core_fixture
+// Greedy output under every way of proposing drafts equals plain greedy decoding token for token: no speculation
+// (draft budget 0), prompt copying (windows 1 and 3), a self-draft that predicts exactly what the target will
+// (MTP-like, every draft accepted), a separate stateful drafter model (its own sequence, reconciled with the committed
+// history before each proposal, agreeing only sometimes), a drafter that is always wrong, and random drafts; each with
+// and without a stop token, over draft budgets 1 .. 8. Methods with mixed agreement must both accept and correct.
+void matrix() {
+  enum class Method { none, copy1, copy3, self, drafter, wrong, random };
+  const std::array<std::pair<Method, const char*>, 7> methods{{{Method::none, "none"}, {Method::copy1, "copy window 1"},
+      {Method::copy3, "copy window 3"}, {Method::self, "self draft"}, {Method::drafter, "drafter model"},
+      {Method::wrong, "always wrong"}, {Method::random, "random"}}};
+  for (const auto& entry : methods) {
+    const Method method = entry.first;
+    const char* const name = entry.second;
+    std::mt19937 prompts(4242), rng(977);  // the same prompts and stops for every method
+    std::size_t produced_total = 0, accepted_total = 0, corrections = 0, proposed_total = 0, drafter_rewinds = 0;
+    for (int trial = 0; trial < 24; ++trial) {
+      auto weights = std::make_shared<AttentionWeights>();
+      std::vector<SpecToken> prompt(2 + prompts() % 7);
+      for (auto& token : prompt) token = static_cast<SpecToken>(prompts() % 5);
+      // Plain greedy reference, truncated after the first stop token when one is set.
+      std::vector<SpecToken> expected;
+      {
+        AttentionTarget plain(weights, prompt);
+        for (int i = 0; i < 24; ++i) { expected.push_back(plain.next_token()); plain.append(expected.back()); }
+      }
+      std::vector<SpecToken> stops;
+      if (trial % 2) {
+        stops.push_back(expected[std::min<std::size_t>(expected.size() - 1, 3 + prompts() % 12)]);
+        expected.resize(static_cast<std::size_t>(std::find(expected.begin(), expected.end(), stops[0]) - expected.begin()) + 1);
+      }
+      GreedySpeculator loop(std::make_unique<AttentionTarget>(weights, prompt), {64, 8, 5}, stops);
+      AttentionTarget oracle(weights, prompt);  // the committed history's own continuation, for self and wrong drafts
+      // The drafter model sees the history without its first token, so it agrees with the target only sometimes.
+      std::unique_ptr<AttentionTarget> drafter;
+      auto propose = [&](std::span<const SpecToken> history, std::size_t limit) {
+        std::vector<SpecToken> result;
+        switch (method) {
+        case Method::none: break;
+        case Method::copy1: result = PromptCopyProposer(1, 32)(history, limit); break;
+        case Method::copy3: result = PromptCopyProposer(3, 32)(history, limit); break;
+        case Method::self: case Method::wrong: {
+          auto branch = oracle.fork();
+          while (result.size() < limit) {
+            const auto token = branch->next_token();
+            result.push_back(method == Method::self ? token : static_cast<SpecToken>((token + 1) % 5));
+            branch->append(token);
+          }
+          break;
+        }
+        case Method::drafter: {
+          const auto view = history.subspan(1);
+          if (!drafter) drafter = std::make_unique<AttentionTarget>(weights, view);
+          const auto have = drafter->tokens();
+          const auto common = static_cast<std::size_t>(std::mismatch(have.begin(), have.end(), view.begin(), view.end()).first - have.begin());
+          // The drafter keeps its own drafts in its sequence, as a draft model's KV does; a rejected suffix differs from
+          // the committed history and is rewound here before the accepted tokens are appended.
+          if (common == 0) drafter = std::make_unique<AttentionTarget>(weights, view);
+          else {
+            if (common < have.size()) { drafter->rewind(common); ++drafter_rewinds; }
+            for (auto token : view.subspan(common)) drafter->append(token);
+          }
+          while (result.size() < limit) { const auto token = drafter->next_token(); result.push_back(token); drafter->append(token); }
+          break;
+        }
+        case Method::random:
+          result.resize(limit);
+          for (auto& token : result) token = static_cast<SpecToken>(rng() % 5);
+          break;
+        }
+        return result;
+      };
+      std::vector<SpecToken> got;
+      while (got.size() < expected.size() && !loop.finished()) {
+        const auto budget = method == Method::none ? std::size_t{0} : std::size_t{1} + rng() % 8;
+        const auto round = loop.prepare(24 - got.size(), budget, propose);
+        const auto committed = loop.commit(round.id, round.tokens.size());
+        for (auto token : committed.tokens) { got.push_back(token); oracle.append(token); }
+        accepted_total += committed.accepted_drafts; proposed_total += committed.proposed;
+        corrections += committed.accepted_drafts < committed.proposed ? 1 : 0;
+      }
+      if (got != expected) throw std::runtime_error(std::string(name) + ": speculative output differs from plain greedy decoding");
+      if (!stops.empty() && !loop.finished()) throw std::runtime_error(std::string(name) + ": the stop token did not finish the loop");
+      produced_total += got.size();
+    }
+    if (method == Method::none) require(proposed_total == 0, "draft budget 0 proposed drafts");
+    if (method == Method::self) require(accepted_total == proposed_total && accepted_total > 0, "self drafts were rejected");
+    if (method == Method::wrong) require(accepted_total == 0 && proposed_total > 0, "wrong drafts were accepted");
+    if (method == Method::drafter) require(drafter_rewinds > 0, "the drafter model never rewound a rejected draft");
+    if (method == Method::drafter || method == Method::random || method == Method::copy1 || method == Method::copy3)
+      require(accepted_total > 0 && corrections > 0, "a mixed-agreement method did not both accept and correct");
+    std::cout << name << ": " << produced_total << " tokens equal plain greedy decoding (" << accepted_total << " of "
+              << proposed_total << " drafts accepted)\n";
+  }
+}
+
 int main(int argc, char** argv) {
   try {
-    if (argc != 2) throw std::invalid_argument("Choose transactions, failures, copy, attention or core");
+    if (argc != 2) throw std::invalid_argument("Choose transactions, failures, copy, attention, matrix or core");
     const std::string mode = argv[1];
     if (mode == "transactions") transactions();
     else if (mode == "failures") { failures(); broken_fork(); }
     else if (mode == "copy") copy_proposals();
     else if (mode == "attention") attention();
+    else if (mode == "matrix") matrix();
     else if (mode == "core") core_fixture::run();
     else throw std::invalid_argument("Unknown speculative fixture");
     std::cout << "Native greedy speculative " << mode << " passed\n";

@@ -54,6 +54,11 @@ class Fp8Channel:
         return {"weight": codes.view(torch.float8_e4m3fn).contiguous(), "weight_scale": self.scale[:, None].contiguous()}
 
 
+def e4m3_scale_codes(scale):
+    """E4M3FN block scales of FP32 values: round to nearest even, saturating at 448."""
+    return scale.clamp(max=E4M3_MAX).to(torch.float8_e4m3fn)
+
+
 class Nvfp4:
     grouped = True
 
@@ -64,7 +69,7 @@ class Nvfp4:
         self.current = None
 
     def _block_scale(self, block_amax):
-        return (block_amax * self.global_scale / E2M1_MAX).clamp(max=E4M3_MAX).to(torch.float8_e4m3fn)
+        return e4m3_scale_codes(block_amax * self.global_scale / E2M1_MAX)
 
     def _quantize(self, values, decoded):
         scaled = torch.where(decoded > 0, values * self.global_scale / torch.where(decoded > 0, decoded, 1.0), 0.0)

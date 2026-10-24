@@ -984,6 +984,53 @@ void file_read_exact() {
 #endif
 }
 
+// Reader slots: every slot reads the held file's bytes (a pattern whose period exceeds a sector, at a size that is not
+// a sector multiple), ids past the slots use the held handle, eight threads reading through their own slots at
+// once all see their own regions, and the slot count opens exactly readers - 1 private handles on Windows (none on
+// POSIX, where pread is concurrent on one descriptor) and closes the previous ones when reset.
+void file_read_slots() {
+    TempDir dir;
+    std::string data(1048576 + 1234, '\0');
+    for(std::size_t i = 0; i < data.size(); ++i) data[i] = char(std::uint8_t((i * 31 + 7 + (i >> 12) * 17) & 0xFF));
+    write_file(dir.path / "rows.bin", data);
+    auto file = ReadOnlyFile::open(dir.path / "rows.bin");
+    require(file.readers() == 1 && file.private_readers() == 0, "one reader slot by default");
+    rejects_as<std::invalid_argument>([&] { file.set_readers(0); }, "at least one reader slot");
+    for(const std::size_t slots : {std::size_t(8), std::size_t(3)}) {
+        file.set_readers(slots);
+#ifdef _WIN32
+        require(file.readers() == slots && file.private_readers() == slots - 1, "private handles for slots 1 .. readers - 1");
+#else
+        require(file.readers() == slots && file.private_readers() == 0, "POSIX slots share the held descriptor");
+#endif
+        for(std::size_t worker = 0; worker < slots + 2; ++worker) {   // the last two ids are past the slots
+            std::vector<std::byte> got(64);
+            file.read_exact(1000, got, worker);
+            require(text_of(got) == data.substr(1000, 64), "a reader slot reads the file's bytes");
+            require(text_of(got) != data.substr(2000, 64), "the pattern distinguishes offsets");
+            std::vector<std::byte> tail(1234);
+            file.read_exact(data.size() - 1234, tail, worker);
+            require(text_of(tail) == data.substr(data.size() - 1234), "a reader slot reads the unaligned tail");
+        }
+    }
+    file.set_readers(8);
+    std::vector<std::thread> threads;
+    std::atomic<int> wrong{0};
+    for(std::size_t t = 0; t < 8; ++t)
+        threads.emplace_back([&, t] {
+            for(int rep = 0; rep < 16; ++rep) {
+                const std::size_t offset = (t * 131071 + std::size_t(rep) * 4099) % (data.size() - 777);
+                std::vector<std::byte> got(777);
+                file.read_exact(offset, got, t);
+                if(text_of(got) != data.substr(offset, 777)) ++wrong;
+            }
+        });
+    for(auto& thread : threads) thread.join();
+    require(wrong == 0, "concurrent reads through reader slots");
+    std::vector<std::byte> over(10);
+    rejects_as<std::out_of_range>([&] { file.read_exact(data.size() - 9, over, 3); }, "extends past end of file");
+}
+
 // Whether the file system holding path rejects misaligned direct reads (EINVAL, ERROR_INVALID_PARAMETER).
 bool enforces_direct_alignment(const fs::path& path) {
 #if defined(_WIN32)
@@ -1481,7 +1528,7 @@ int main(int argc, char** argv) {
             {"json_numbers", json_numbers}, {"json_limits", json_limits}, {"json_access", json_access}, {"json_file", json_file},
             {"json_nonfinite", json_nonfinite},
             {"json_random", json_random}, {"sha256_vectors", sha256_vectors}, {"sha256_chunked", sha256_chunked},
-            {"file_identity", file_identity}, {"file_change", file_change}, {"file_read_exact", file_read_exact},
+            {"file_identity", file_identity}, {"file_change", file_change}, {"file_read_exact", file_read_exact}, {"file_read_slots", file_read_slots},
             {"file_read_chunks", file_read_chunks}, {"file_read_errors", file_read_errors}, {"file_map", file_map},
             {"file_open_errors", file_open_errors}, {"host_memory_v2", host_memory_v2}, {"host_memory_v1", host_memory_v1},
             {"host_memory_malformed", host_memory_malformed}, {"host_memory_admission", host_memory_admission},

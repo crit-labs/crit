@@ -58,7 +58,14 @@ held handle and the path against the identity captured at open (device, inode or
 file id, size and change times).
 
 `read_exact(offset, dst)` reads exactly `dst.size()` bytes with a positioned read,
-safe from several threads.
+safe from several threads. On Windows, synchronous reads through one handle are
+serialised by its file object, so threads sharing it do not scale. `set_readers(n)`
+opens `n - 1` private handles reopened from the held one (`ReOpenFile`, the same
+file, random-access hint) before concurrent reads begin, and
+`read_exact(offset, dst, worker)` reads through slot `worker` (slot 0, and ids past
+the slots, use the held handle). POSIX `pread` is concurrent on one descriptor, so
+there every slot uses it. The caller chooses the slot count, for example from a
+measurement of the volume; Core sets none.
 
 `read_chunks(offset, length, consume, options)` streams a region to `consume` in
 file order on the calling thread; each span is valid only during the call, and

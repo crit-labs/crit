@@ -148,7 +148,11 @@ Python fixtures (`tests/test_reusable_techniques.py`, `tests/test_techniques.py`
 cover proposals and verification. [Native fixtures](../../tests/inference/speculative_tests.cpp)
 cover multi-round repair, bonus, partial/zero commits, stops, stale rounds,
 cancellation, failures and poisoned mutation; the paged-attention fixture compares
-2,400 generated tokens with ordinary decoding, and `ctest -R crit_prompt_copy`
+2,400 generated tokens with ordinary decoding, `crit_speculative_matrix` runs each of
+these ways of proposing on its own (none, prompt copy with windows 1 and 3, a self
+draft, a stateful drafter model, always wrong and random drafts, with and without
+stops) and requires each to emit ordinary
+greedy output token for token, and `ctest -R crit_prompt_copy`
 checks the native index against a reverse-scan oracle. All use synthetic weights
 on the CPU: trained-model quality, device completion and performance are
 unqualified. The approach follows
@@ -215,4 +219,9 @@ seconds)` resets a width after graph rebuilds.
 The [sampled example](code/sampled_example.cpp) and
 [native checks](../../tests/inference/sampled_tests.cpp) (`ctest -R crit_sampled`)
 cover exhaustive small-support path mass, filters, sparse/dense coupling,
-transaction rollback and budget tickets, without a model or GPU.
+transaction rollback and budget tickets, without a model or GPU. A statistical
+check runs 90,000 seeded three-token generations through draft and verify (draft
+budgets 0 to 3 in effect, the allowance capping 4) and compares their frequencies with sampling the target directly, per cell and with a chi-square
+bound, so a wrong residual law after accepted drafts fails it. It runs on the dense,
+sparse and sparse-fallback laws; those are coupled draw for draw (the sparse/dense
+coupling check), so they replicate one trajectory rather than add independent samples.

@@ -1,4 +1,5 @@
-// FP8 KV cache attention against FP64 references over the dequantized cache, and decode column invariance.
+// FP8 KV cache attention against FP64 references over the dequantized cache, and decode column invariance (for every
+// verify width at 2048 to 16384 keys).
 #include "fp8_kv_attention.h"
 
 #include <cmath>
@@ -183,6 +184,53 @@ bool decode_case(int hd, int heads, int kv_heads, int T, int pos0, int blocks, s
     return rel < 1e-2 && invariant;
 }
 
+// Every verify width at long contexts: for each T in 1 .. 64 / group, a T-column decode over keys 0 .. len - 1 equals
+// each column decoded alone at its own position, bit for bit, at 2048, 7168 and 16384 keys (and one length off a piece
+// boundary), with and without a sliding window, for blocks 1, 5 and the SM count over key/value heads.
+bool widths_case(int hd, int heads, int kv_heads, std::mt19937& rng) {
+    constexpr int max_len = 16384;
+    Setup s(hd, heads, kv_heads, max_len, rng);
+    int sms = 0;
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+    const int stride = heads * hd, n_max = 64 / (heads / kv_heads);
+    std::normal_distribution<float> normal(0.f, 1.f);
+    std::vector<__nv_bfloat16> bank(static_cast<std::size_t>(n_max) * stride);
+    auto* dq = s.dev.alloc<__nv_bfloat16>(bank.size());
+    auto* dout = s.dev.alloc<float>(bank.size());
+    const float scale = 1.f / std::sqrt(static_cast<float>(hd));
+    int compared = 0;
+    for(const int blocks : {1, 5, sms / kv_heads > 1 ? sms / kv_heads : 1}) {
+        auto* partial = s.dev.alloc<float>(kv::decode_partial_floats(kv_heads, hd, blocks));
+        auto run = [&](int T, int pos0, int window, const __nv_bfloat16* rows, std::vector<float>& got) {
+            kv::Decode p{rows, stride, s.cache, dout, stride, T, pos0, heads, nullptr, scale, blocks, partial, window};
+            got.resize(static_cast<std::size_t>(T) * stride);
+            return kv::decode(p, nullptr) == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess &&
+                   cudaMemcpy(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+        };
+        for(const int len : {2048, 7168, 16384, 3001})
+            for(const int window : {0, 1000}) {
+                for(auto& x : bank) x = __float2bfloat16(normal(rng));
+                if(cudaMemcpy(dq, bank.data(), bank.size() * 2, cudaMemcpyHostToDevice) != cudaSuccess) return false;
+                // Row j of the bank is the query at position len - n_max + j.
+                std::vector<std::vector<float>> alone(n_max);
+                for(int j = 0; j < n_max; ++j)
+                    if(!run(1, len - n_max + j, window, dq + static_cast<std::size_t>(j) * stride, alone[j])) return false;
+                std::vector<float> verify;
+                for(int T = 1; T <= n_max; ++T) {
+                    if(!run(T, len - T, window, dq + static_cast<std::size_t>(n_max - T) * stride, verify)) return false;
+                    for(int t = 0; t < T; ++t, ++compared)
+                        if(std::memcmp(alone[n_max - T + t].data(), verify.data() + static_cast<std::size_t>(t) * stride, stride * 4) != 0) {
+                            std::printf("widths hd %d heads %d/%d: T %d column %d at %d keys (window %d, blocks %d) differs from the column alone\n",
+                                        hd, heads, kv_heads, T, t, len, window, blocks);
+                            return false;
+                        }
+                }
+            }
+    }
+    std::printf("widths hd %d heads %d/%d: T 1..%d, %d verify columns bitwise equal to columns alone\n", hd, heads, kv_heads, n_max, compared);
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -205,6 +253,9 @@ int main() {
     ok = prefill_case(128, 4, 4, 33, 7, rng) && ok;       // multi-head (no grouping)
     ok = prefill_case(128, 4, 4, 33, 7, rng, true) && ok;
     ok = decode_case(128, 4, 4, 1, 4000, 7, rng) && ok;
+    ok = widths_case(128, 32, 8, rng) && ok;   // 4 query heads per key/value head: T up to 16
+    ok = widths_case(64, 8, 8, rng) && ok;     // no grouping: T up to 64
+    ok = widths_case(256, 16, 2, rng) && ok;   // 8 per key/value head: T up to 8
     const kv::Cache none{};
     ok = kv::prefill(kv::Prefill{}, nullptr) == cudaErrorInvalidValue && ok;
     ok = kv::prefill_fp8(kv::Prefill{}, nullptr) == cudaErrorInvalidValue && ok;

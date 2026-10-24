@@ -1773,7 +1773,7 @@ void metadata() {
         require(resources.usage(Memory::host).live == bytes,"metadata reservation differs from metadata_bytes");
         // Every preallocated array, by element: per page, index entry, per sequence and per round row.
         const std::size_t P = 64, S = 8, T = 64, R = 5, index = 128;
-        const auto expected = P*(4+1+1+8*4+4*4+16*sizeof(Token))+index*4+4+S*(8*3+1*2+4*4+T*4+R*sizeof(RowSlot));
+        const auto expected = P*(4+1+1+8*4+4*4+16*sizeof(Token))+index*4+4+S*(8*3+1*3+4*4+T*4+R*sizeof(RowSlot));
         require(bytes == expected,"metadata bytes differ from the documented arrays");
         StateCache second(c,storage,resources);
         require(resources.usage(Memory::host).live == 2*bytes,"each cache reserves its own metadata");
@@ -1789,7 +1789,7 @@ void metadata() {
     StateCache hybrid(h,storage,resources);
     const std::size_t slots = 6, S = 2, C = 1, R = 2, T = 4, P = 4;
     const auto expected = sizeof(StateComponent)*C+P*(4+1+1+8*4+4*4+2*sizeof(Token))+C*(1+4*4)+4+slots*(4+4+8)+
-                          S*(8*3+1*2+4*4+T*4+C*4*2+C*R*4+R*sizeof(RowSlot));
+                          S*(8*3+1*3+4*4+T*4+C*4*2+C*R*4+R*sizeof(RowSlot));
     require(hybrid.metadata_bytes() == expected,"hybrid metadata bytes differ from the documented arrays");
     // Spare capacity moved in with the components vector is not retained uncharged.
     auto spare = h;
@@ -2048,14 +2048,77 @@ void checkpoints() {
 }
 }
 
+// A chunked prefill computes no state inside its round, only the state after the last row. As an every_row round of a
+// column_checkpoints component, its commit snapshots page boundaries from scratch slots the engine never wrote, and a
+// later prompt sharing only the first page attaches that state (on this fixture: 4 tokens reused, the live slot holds
+// the never-written value). A final_row round takes one scratch slot, snapshots only its last row and reuses only that.
+void round_states() {
+    auto c = attention(16,4,4,32,8,true);
+    c.components = {component(RecurrentCommit::column_checkpoints,4+8+4)};
+    c.components[0].snapshots = 4;
+    Fake storage(c);
+    Resources resources{std::size_t{1} << 20,0};
+    StateCache cache(c,storage,resources);
+    const Tokens prompt = range(1,8);
+    const auto states = digests(prompt);
+    const Value poison = 0xdeadull;
+    const auto a = cache.open();
+    const auto free_before = cache.stats().free_slots;
+    const auto r = cache.begin(a,8,RoundStates::final_row);
+    require(r.states == RoundStates::final_row && r.scratch[0] != no_slot,"a final_row round names its state slot");
+    for(std::uint32_t i = 1; i < 8; ++i) require(r.scratch[i] == no_slot,"a final_row round takes one scratch slot");
+    require(cache.stats().free_slots == free_before-1,"one slot taken for the round");
+    for(auto& value:storage.slots[0]) value = poison;   // nothing but the engine's write below holds a state
+    storage.slots[0][r.scratch[0]] = states[7];          // the chunked prefill: the state after the last row
+    cache.commit(a,r.id,prompt);
+    require(storage.slots[0][cache.live_slot(a,0)] == states[7],"the round's state becomes live");
+    // A prompt sharing the first page only: no snapshot exists at that boundary, so nothing is reused.
+    const auto b = cache.open();
+    Tokens other(prompt.begin(),prompt.begin()+5);
+    other.push_back(99); other.push_back(100);
+    require(cache.attach(b,other,std::uint32_t(other.size()-1)) == 0,"no reuse at a boundary without a written state");
+    // The whole prompt reuses to the round's last row, with its state.
+    cache.close(b);
+    const auto d = cache.open();
+    Tokens longer = prompt;
+    longer.push_back(9);
+    require(cache.attach(d,longer,std::uint32_t(longer.size()-1)) == 8,"reuse to the round's last row");
+    require(storage.slots[0][cache.live_slot(d,0)] == states[7],"the reused state is the one the round wrote");
+    // A final_row round may keep fewer rows (the engine then writes that state into scratch[0], as in recompute).
+    const auto e = cache.open();
+    const auto partial = cache.begin(e,6,RoundStates::final_row);
+    storage.slots[0][partial.scratch[0]] = states[3];
+    cache.commit(e,partial.id,Tokens(prompt.begin(),prompt.begin()+4));
+    require(cache.committed(e) == 4 && storage.slots[0][cache.live_slot(e,0)] == states[3],"a shorter final_row commit");
+    // Every-row rounds keep their per-row scratch.
+    const auto next = cache.begin(e,3);
+    require(next.states == RoundStates::every_row && next.scratch[2] != no_slot,"every_row rounds take a slot per row");
+    cache.discard(e,next.id);
+    rejects_as<std::invalid_argument>([&] { cache.begin(e,2,RoundStates(7)); },"unknown round states");
+    // try_begin, discard and close of final_row rounds return their one slot; the next round is every_row again.
+    cache.retire(cache.epoch());
+    const auto before = cache.stats().free_slots;
+    const auto tried = cache.try_begin(e,5,RoundStates::final_row);
+    require(tried && tried->states == RoundStates::final_row && cache.stats().free_slots == before-1,"try_begin takes one slot");
+    cache.discard(e,tried->id);
+    cache.retire(cache.epoch());   // released slots become free once their epoch retires
+    require(cache.stats().free_slots == before,"a discarded final_row round returns its slot");
+    const auto again = cache.begin(e,2);
+    require(again.states == RoundStates::every_row && again.scratch[1] != no_slot,"a later round is every_row by default");
+    cache.discard(e,again.id);
+    cache.begin(e,4,RoundStates::final_row);
+    require(cache.close(e),"close discards a pending final_row round");
+    cache.retire(cache.epoch());
+}
+
 int main(int argc, char** argv) {
-    const std::array<std::pair<std::string_view,void(*)()>,22> cases{{
+    const std::array<std::pair<std::string_view,void(*)()>,23> cases{{
         {"state_config",config_rules},{"state_transactions",transactions},{"state_ownership",ownership},
         {"state_prefixes",prefixes},{"state_collisions",collisions},{"state_reuse",reuse},
         {"state_completeness",completeness},{"state_index",index_probing},{"state_lru",lru},{"state_epochs",epochs},
         {"state_forks",forks},{"state_recurrent",recurrent},{"state_hybrid",hybrid},{"state_failures",failures},
         {"state_randomized",randomized},{"state_capacity",capacity},{"state_layout",layout},{"state_metadata",metadata},
-        {"state_hot_path",hot_path},{"state_checkpoints",checkpoints},{"state_snapshots",snapshots},{"state_windows",windows}}};
+        {"state_hot_path",hot_path},{"state_checkpoints",checkpoints},{"state_snapshots",snapshots},{"state_windows",windows},{"state_round_states",round_states}}};
     try {
         const std::string_view name = argc > 1 ? argv[1] : "";
         bool found = false;

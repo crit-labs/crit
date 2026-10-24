@@ -519,10 +519,10 @@ class DeliveryTests(unittest.TestCase):
             with self.subTest(interval=interval, cause=cause):
                 connection, wire = self.scripted_socket()
                 cancel, shutdown = threading.Event(), threading.Event()
+                if cause:  # set before the pinger starts, so a busy test machine cannot reach its first interval first
+                    (cancel if cause == "cancel" else shutdown).set()
                 with StreamDelivery(connection, cancel, shutdown, 60) as writer:
                     with writer.pinging(b": ping\n\n", interval):
-                        if cause:
-                            (cancel if cause == "cancel" else shutdown).set()
                         time.sleep(.1)
                 self.assertEqual(wire, b"")
                 connection.send.assert_not_called()

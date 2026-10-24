@@ -124,7 +124,7 @@ struct StateCache::Impl {
     std::vector<std::uint64_t> slot_released;
     // Sequences.
     std::vector<std::uint64_t> seq_generation, round_ids, layouts;
-    std::vector<std::uint8_t> opened, pending;
+    std::vector<std::uint8_t> opened, pending, final_rows;   // final_rows: the pending round is RoundStates::final_row
     std::vector<std::uint32_t> committed, staged, table_size, seq_free;
     std::vector<PageId> tables;
     std::vector<SlotId> live, starts, scratch;
@@ -201,7 +201,7 @@ struct StateCache::Impl {
         f(parent,p); f(prev,p); f(next,p); f(free_pages,p); f(index,index_capacity); f(tokens,product(p,pt));
         f(mode,c); f(base,c+1); f(slot_free_count,c); f(ring_head,c); f(ring_size,c);
         f(slot_free,slot_total); f(ring,slot_total); f(slot_released,slot_total);
-        f(seq_generation,s); f(round_ids,s); f(layouts,s); f(opened,s); f(pending,s);
+        f(seq_generation,s); f(round_ids,s); f(layouts,s); f(opened,s); f(pending,s); f(final_rows,s);
         f(committed,s); f(staged,s); f(table_size,s); f(seq_free,s);
         f(tables,product(s,T)); f(live,product(s,c)); f(starts,product(s,c)); f(scratch,product(product(s,c),R));
         f(kv,P ? product(s,R) : 0);
@@ -257,6 +257,13 @@ struct StateCache::Impl {
     }
 
     RecurrentCommit commit_mode(std::uint32_t c) const noexcept { return RecurrentCommit(mode[c]); }
+    // Component c's mode in a round: a final_row round commits column_checkpoints as recompute. The one rule for
+    // scratch allocation (begin), commit and snapshot selection.
+    RecurrentCommit mode_for(bool final_row, std::uint32_t c) const noexcept {
+        const auto m = commit_mode(c);
+        return final_row && m == RecurrentCommit::column_checkpoints ? RecurrentCommit::recompute : m;
+    }
+    RecurrentCommit round_mode(std::uint32_t s, std::uint32_t c) const noexcept { return mode_for(final_rows[s] != 0, c); }
     bool valid(SequenceId id) const noexcept {
         return id.index < S && opened[id.index] && seq_generation[id.index] == id.generation;
     }
@@ -361,9 +368,9 @@ struct StateCache::Impl {
     SlotId snapshot_source(std::uint32_t s, std::uint32_t c, std::uint32_t first, std::uint32_t rows, std::uint32_t n,
                            std::uint32_t boundary) noexcept {
         const auto* entries = scratch_of(s)+std::size_t(c)*rows;
-        if(commit_mode(c) == RecurrentCommit::column_checkpoints) return entries[boundary-first-1];
+        if(round_mode(s,c) == RecurrentCommit::column_checkpoints) return entries[boundary-first-1];
         if(boundary != first+n) return no_slot;
-        return commit_mode(c) == RecurrentCommit::recompute ? entries[0] : live_of(s)[c];
+        return round_mode(s,c) == RecurrentCommit::recompute ? entries[0] : live_of(s)[c];
     }
     // Before publication: copies each component's state after every page boundary the commit fills into fresh slots.
     // Best effort: a boundary without an after-page state of every component, or without a free slot, is skipped. A
@@ -639,24 +646,26 @@ struct StateCache::Impl {
         auto* lives = live_of(s);
         for(std::uint32_t c = 0; c < C; ++c) {
             const auto* entries = scratch_of(s)+std::size_t(c)*rows;
-            if(commit_mode(c) == RecurrentCommit::column_checkpoints) {
+            if(round_mode(s,c) == RecurrentCommit::column_checkpoints) {
                 if(n) { release_slot(c,lives[c]); lives[c] = entries[n-1]; changed = true; }
                 for(std::uint32_t i = 0; i < rows; ++i) if(!n || i != n-1) release_slot(c,entries[i]);
-            } else if(commit_mode(c) == RecurrentCommit::recompute && rows) {
+            } else if(round_mode(s,c) == RecurrentCommit::recompute && rows) {
                 if(n) { release_slot(c,lives[c]); lives[c] = entries[0]; changed = true; }
                 else release_slot(c,entries[0]);
             }
         }
-        committed[s] = last; staged[s] = 0; pending[s] = 0;
+        committed[s] = last; staged[s] = 0; pending[s] = 0; final_rows[s] = 0;
         if(changed) bump(s);
     }
-    std::optional<Round> begin_round(SequenceId id, std::uint32_t rows, bool throws) {
+    std::optional<Round> begin_round(SequenceId id, std::uint32_t rows, RoundStates states, bool throws) {
         Busy guard(busy);
         const auto s = check(id);
         if(pending[s]) throw std::logic_error("state round already pending");
         if(rows > R) throw std::invalid_argument("round rows exceed max_round_rows");
         if(rows > config.max_tokens-committed[s]) throw std::length_error("state sequence exceeds max_tokens");
         if(next_round == std::numeric_limits<std::uint64_t>::max()) throw std::overflow_error("state round ids exhausted");
+        if(states != RoundStates::every_row && states != RoundStates::final_row) throw std::invalid_argument("unknown round states");
+        const auto final_row = std::uint8_t(states == RoundStates::final_row);
         const auto first = committed[s];
         const bool copy = rows && copy_tail(s);
         const auto target = P ? pages_for(std::uint64_t(first)+rows,pt) : 0;
@@ -671,7 +680,7 @@ struct StateCache::Impl {
                 return std::nullopt;
             }
         }
-        for(std::uint32_t c = 0; c < C; ++c) if(scratch_for(commit_mode(c),rows) > slot_free_count[c]) {
+        for(std::uint32_t c = 0; c < C; ++c) if(scratch_for(mode_for(final_row != 0, c),rows) > slot_free_count[c]) {
             if(throws) throw CapacityExhausted("state cache slots exhausted");
             return std::nullopt;
         }
@@ -722,12 +731,12 @@ struct StateCache::Impl {
         SlotId* start_of = C ? starts.data()+std::size_t(s)*C : nullptr;
         for(std::uint32_t c = 0; c < C; ++c) {
             start_of[c] = live_of(s)[c];
-            const auto taken = scratch_for(commit_mode(c),rows);
+            const auto taken = scratch_for(mode_for(final_row != 0, c),rows);
             auto* entries = scratch_of(s)+std::size_t(c)*rows;
             for(std::uint32_t i = 0; i < rows; ++i) entries[i] = i < taken ? take_slot(c) : no_slot;
             if(taken) changed = true;
         }
-        pending[s] = 1; staged[s] = rows; round_ids[s] = next_round++;
+        pending[s] = 1; final_rows[s] = final_row; staged[s] = rows; round_ids[s] = next_round++;
         if(changed) bump(s);
         Round round;
         round.id = round_ids[s]; round.first_row = first; round.rows = rows;
@@ -735,6 +744,7 @@ struct StateCache::Impl {
         round.start = std::span<const SlotId>(start_of,C);
         round.scratch = std::span<const SlotId>(C ? scratch_of(s) : nullptr,std::size_t(C)*rows);
         round.window_kv = std::span<const RowSlot>(window_rows,std::size_t(W)*rows);
+        round.states = states;
         return round;
     }
 };
@@ -851,8 +861,10 @@ std::uint32_t StateCache::pages_needed(SequenceId id, std::uint32_t rows) const 
     if(!m.P || !rows) return 0;
     return pages_for(std::uint64_t(m.committed[s])+rows,m.pt)-m.table_size[s]+(m.copy_tail(s) ? 1u : 0u);
 }
-std::optional<Round> StateCache::try_begin(SequenceId id, std::uint32_t rows) { return impl_->begin_round(id,rows,false); }
-Round StateCache::begin(SequenceId id, std::uint32_t rows) { return *impl_->begin_round(id,rows,true); }
+std::optional<Round> StateCache::try_begin(SequenceId id, std::uint32_t rows, RoundStates states) {
+    return impl_->begin_round(id,rows,states,false);
+}
+Round StateCache::begin(SequenceId id, std::uint32_t rows, RoundStates states) { return *impl_->begin_round(id,rows,states,true); }
 void StateCache::commit(SequenceId id, std::uint64_t round, std::span<const Token> inputs) {
     auto& m = *impl_;
     Busy guard(m.busy);

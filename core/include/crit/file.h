@@ -62,6 +62,19 @@ public:
     // Exactly dst.size() bytes at offset from the held handle. std::out_of_range past identity().size;
     // std::runtime_error "unexpected end of file" when the file shrank.
     void read_exact(std::uint64_t offset, std::span<std::byte> dst) const;
+    // read_exact through reader slot `worker`, for several threads reading one file at once. Slot 0, and any id at or
+    // past readers(), uses the held handle. On Windows synchronous reads through one handle are serialised by its file
+    // object, so slots 1 .. readers() - 1 each own a private handle reopened from the held one (same file, random-
+    // access hint); POSIX pread is concurrent on one descriptor, so every slot uses it there.
+    void read_exact(std::uint64_t offset, std::span<std::byte> dst, std::size_t worker) const;
+    // Sets the reader slots (at least 1) and opens their private handles, closing the previous ones. Call it before
+    // concurrent reads begin, not during them: threads already running must be ordered after it (for example by
+    // the mutex or queue that hands them work). std::system_error when a handle cannot be reopened, and the
+    // allocation's error for a count that cannot be held; no slot changes then. std::logic_error on a moved-from
+    // file.
+    void set_readers(std::size_t readers);
+    std::size_t readers() const noexcept;           // 0 on a moved-from file
+    std::size_t private_readers() const noexcept;   // private handles held (0 on POSIX and on a moved-from file)
     // [offset, offset + length) in chunks; with overlap one reader thread fills the next chunk while
     // the consumer runs. A consumer exception propagates after the in-flight read finishes. At most
     // two chunk buffers are allocated. Invalid options: std::invalid_argument; past end: std::out_of_range.

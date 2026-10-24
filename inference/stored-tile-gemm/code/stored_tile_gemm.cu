@@ -220,8 +220,9 @@ __device__ __forceinline__ void mma_nvfp4(float (&c)[4], std::uint32_t a0, std::
 
 // ------------------------------------------------------------------------------------------- GEMM kernels
 // Grid (Tpad / (8 NT), N / (128 RT), SK). A block of 8 warps; warp w owns RT consecutive 16-row tiles; a B fragment
-// from shared memory feeds RT MMAs. Weights stream through a PF-deep register ring; activations through a 3-stage
-// cp.async ring. SK > 1 writes FP32 partials [SK][T][N] for finish_partials_kernel.
+// from shared memory feeds RT MMAs (the NVFP4 kernel reads it once per row tile instead, so only one row tile's A
+// fragment is live). Weights stream through a PF-deep register ring; activations through a 3-stage cp.async ring.
+// SK > 1 writes FP32 partials [SK][T][N] for finish_partials_kernel.
 template <int NT, int RT, int PF>
 __global__ void __launch_bounds__(256) gemm_fp8_kernel(const std::uint8_t* __restrict__ W, const __nv_bfloat16* __restrict__ row_scale,
                                                       const uint2* __restrict__ X8, const float* __restrict__ token_scale,
@@ -353,7 +354,6 @@ __global__ void __launch_bounds__(256) gemm_fp4_kernel(const std::uint8_t* __res
             if(kk >= kt1) break;
             stage(kk + 2);
             const uint4 (*xb)[32] = xsm[kk % 3];
-            std::uint32_t a[RT][4];
 #pragma unroll
             for(int r = 0; r < RT; ++r) {
                 const uint4 w = wv[u][r];
@@ -361,19 +361,16 @@ __global__ void __launch_bounds__(256) gemm_fp4_kernel(const std::uint8_t* __res
                 const std::uint32_t own0 = hi ? w.y : w.x, own2 = hi ? w.w : w.z;
                 const std::uint32_t give0 = hi ? w.x : w.y, give2 = hi ? w.z : w.w;
                 const std::uint32_t got0 = __shfl_xor_sync(0xffffffffu, give0, 2), got2 = __shfl_xor_sync(0xffffffffu, give2, 2);
-                a[r][0] = __byte_perm(own0, got0, 0x6420); a[r][1] = __byte_perm(own0, got0, 0x7531);
-                a[r][2] = __byte_perm(own2, got2, 0x6420); a[r][3] = __byte_perm(own2, got2, 0x7531);
-            }
-            std::uint32_t sa[RT];
+                const std::uint32_t a0 = __byte_perm(own0, got0, 0x6420), a1 = __byte_perm(own0, got0, 0x7531);
+                const std::uint32_t a2 = __byte_perm(own2, got2, 0x6420), a3 = __byte_perm(own2, got2, 0x7531);
+                const std::uint32_t sa = sv[u][r];
 #pragma unroll
-            for(int r = 0; r < RT; ++r) sa[r] = sv[u][r];
+                for(int n = 0; n < NT; ++n) {
+                    const uint4 bb = xb[n][lane];
+                    mma_nvfp4(acc[r][n], a0, a1, a2, a3, bb.x, bb.y, sa, bb.z);
+                }
+            }
             load_w(kk + PF, u);
-#pragma unroll
-            for(int n = 0; n < NT; ++n) {
-                const uint4 bb = xb[n][lane];
-#pragma unroll
-                for(int r = 0; r < RT; ++r) mma_nvfp4(acc[r][n], a[r][0], a[r][1], a[r][2], a[r][3], bb.x, bb.y, sa[r], bb.z);
-            }
             cp_async_wait<1>();
             __syncthreads();
         }

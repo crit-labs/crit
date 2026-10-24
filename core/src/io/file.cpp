@@ -15,6 +15,7 @@
 #include <system_error>
 #include <thread>
 #include <utility>
+#include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -260,6 +261,8 @@ struct ReadOnlyFile::Impl {
     FileIdentity identity;
     bool follow = true;
     Handle handle;
+    std::size_t reader_slots = 1;
+    std::vector<Handle> private_handles;   // Windows: slot i + 1 reads through private_handles[i]
     mutable std::mutex mapping_mutex;
     mutable std::shared_ptr<const Mapping> mapping;
 
@@ -525,16 +528,36 @@ void ReadOnlyFile::verify_unchanged() const {
     }
     if(named != f.identity) throw std::runtime_error(f.display + ": file changed since open (path: " + differences(f.identity, named) + ")");
 }
-void ReadOnlyFile::read_exact(std::uint64_t offset, std::span<std::byte> dst) const {
+void ReadOnlyFile::read_exact(std::uint64_t offset, std::span<std::byte> dst) const { read_exact(offset, dst, 0); }
+void ReadOnlyFile::read_exact(std::uint64_t offset, std::span<std::byte> dst, std::size_t worker) const {
     const auto& f = live();
     const auto size = f.identity.size;
     if(offset > size || dst.size() > size - offset)
         throw std::out_of_range(f.display + ": read of " + std::to_string(dst.size()) + " bytes at offset " + std::to_string(offset) +
                                 " extends past end of file (size " + std::to_string(size) + ")");
-    const auto got = read_at(f.handle.get(), dst.data(), dst.size(), offset, false);
+    const bool own = worker >= 1 && worker - 1 < f.private_handles.size();
+    const auto got = read_at(own ? f.private_handles[worker - 1].get() : f.handle.get(), dst.data(), dst.size(), offset, false);
     if(got.error) fail_os(f.display, "read", got.error);
     if(got.bytes < dst.size()) throw std::runtime_error(f.display + ": unexpected end of file at offset " + std::to_string(offset + got.bytes));
 }
+void ReadOnlyFile::set_readers(std::size_t readers) {
+    live();   // rejects a moved-from file
+    auto& f = *impl_;
+    if(readers == 0) throw std::invalid_argument(f.display + ": at least one reader slot is required");
+    std::vector<Handle> opened;
+#ifdef _WIN32
+    opened.reserve(readers - 1);
+    for(std::size_t i = 1; i < readers; ++i) {
+        const HANDLE reopened = ReOpenFile(f.handle.get(), GENERIC_READ, FILE_SHARE_READ, FILE_FLAG_RANDOM_ACCESS);
+        if(reopened == INVALID_HANDLE_VALUE) fail_os(f.display, "open reader", last_error());
+        opened.emplace_back(reopened);
+    }
+#endif
+    f.private_handles = std::move(opened);
+    f.reader_slots = readers;
+}
+std::size_t ReadOnlyFile::readers() const noexcept { return impl_ ? impl_->reader_slots : 0; }
+std::size_t ReadOnlyFile::private_readers() const noexcept { return impl_ ? impl_->private_handles.size() : 0; }
 ReadStats ReadOnlyFile::read_chunks(std::uint64_t offset, std::uint64_t length, const ChunkConsumer& consume,
                                     const ReadOptions& options) const {
     const auto& f = live();

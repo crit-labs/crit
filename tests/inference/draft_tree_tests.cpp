@@ -1,7 +1,8 @@
 // Token trees on the device against a host mirror of tree.py: EAGLE-2-style expansion, beam and final selection and
 // the tree they build (tokens, parents, masks, depths, padding nodes); the tree walk's emitted tokens, path and
 // control fields for random trees, budgets and stops, and equality with the greedy accept kernel on chains; and
-// compaction of kept rows (contiguous and slot-mapped) that a rerun after a smaller count leaves unchanged.
+// compaction of kept rows (contiguous and slot-mapped) that a rerun after a smaller count leaves unchanged; and draft
+// rank histograms over chain rounds.
 #include "draft_tree.h"
 #include "greedy_accept.h"
 
@@ -297,12 +298,86 @@ void case_compact() {
 }
 }  // namespace
 
+// Draft ranks over chain rounds against a host mirror: rows with tied logits, the target taking the draft or a
+// token of another rank, n_matched from the tree walk over a chain, counts accumulated over rounds.
+void case_ranks() {
+    constexpr int rows = 5, K = 6, vocab = 1000, ranks = 8, rounds = 4;
+    std::mt19937 rng(91);
+    std::vector<unsigned long long> want(std::size_t(K) * (ranks + 1), 0);
+    Device<unsigned long long> histogram(want.size());
+    ok(cudaMemset(histogram.p, 0, sizeof(unsigned long long) * want.size()), "zero histogram");
+    std::size_t reached = 0, cut = 0;
+    for(int round = 0; round < rounds; ++round) {
+        std::vector<float> logits(std::size_t(rows) * K * vocab);
+        for(auto& x : logits) x = float(int(rng() % 40)) * 0.25f;   // many ties: the id order decides
+        std::vector<std::int32_t> drafts(std::size_t(rows) * K), predictions(std::size_t(rows) * (K + 1)), parents(drafts.size());
+        std::vector<int> matched(rows), budget(rows);
+        for(int r = 0; r < rows; ++r) {
+            for(int d = 0; d < K; ++d) {
+                const float* row = logits.data() + (std::size_t(r) * K + d) * vocab;
+                std::vector<int> order(vocab);
+                for(int t = 0; t < vocab; ++t) order[std::size_t(t)] = t;
+                std::sort(order.begin(), order.end(), [&](int a, int b) { return row[a] > row[b] || (row[a] == row[b] && a < b); });
+                drafts[std::size_t(r) * K + d] = order[0];
+                // The target takes the draft half the time, else a token of rank 1 .. 11.
+                predictions[std::size_t(r) * (K + 1) + d] = rng() % 2 ? order[0] : order[std::size_t(1 + rng() % 11)];
+                parents[std::size_t(r) * K + d] = d;
+            }
+            predictions[std::size_t(r) * (K + 1) + K] = int(rng() % vocab);
+            // The walk under this row's output budget: some rounds end on the budget with nothing rejected, and then
+            // the position after their accepted drafts was never compared.
+            budget[std::size_t(r)] = (round + r) % 3 ? K + 1 : 1 + int(rng() % K);
+            int m = 0, out = 0;
+            while(out < budget[std::size_t(r)]) {
+                ++out;
+                if(m < K && predictions[std::size_t(r) * (K + 1) + m] == drafts[std::size_t(r) * K + m]) ++m;
+                else break;
+            }
+            matched[std::size_t(r)] = m;
+            const int compared = std::min(out > m ? m + 1 : m, K);
+            cut += out == m;
+            for(int d = 0; d < compared; ++d) {
+                const float* row = logits.data() + (std::size_t(r) * K + d) * vocab;
+                const int p = predictions[std::size_t(r) * (K + 1) + d];
+                int rank = 0;
+                for(int t = 0; t < vocab; ++t) rank += row[t] > row[p] || (row[t] == row[p] && t < p);
+                ++want[std::size_t(d) * (ranks + 1) + std::size_t(std::min(rank, ranks))];
+                ++reached;
+            }
+        }
+        std::vector<std::int32_t> control(std::size_t(rows) * dr::control::fields, 0);
+        for(int r = 0; r < rows; ++r) control[std::size_t(r) * dr::control::fields + dr::control::output_budget] = budget[std::size_t(r)];
+        Device<float> dlogits(logits);
+        Device<std::int32_t> ddrafts(drafts), dpred(predictions), dparents(parents), dcontrol(control),
+            result(std::size_t(rows) * dr::result_width(K)), path(std::size_t(rows) * (K + 1));
+        dr::AcceptRows a;
+        a.drafts = ddrafts.p; a.predictions = dpred.p; a.control = dcontrol.p; a.result = result.p; a.rows = rows; a.draft_tokens = K;
+        ok(dt::enqueue_tree_accept(a, dparents.p, path.p, nullptr), "chain accept");
+        dt::DraftRanks p;
+        p.logits = dlogits.p; p.stride = vocab; p.vocab = vocab; p.predictions = dpred.p; p.control = dcontrol.p;
+        p.histogram = histogram.p; p.rows = rows; p.draft_tokens = K; p.ranks = ranks;
+        ok(dt::enqueue_draft_ranks(p, nullptr), "draft ranks");
+        const auto back = dcontrol.get();
+        for(int r = 0; r < rows; ++r)
+            require(back[std::size_t(r) * dr::control::fields + dr::control::n_matched] == matched[std::size_t(r)], "chain walk matched count");
+    }
+    require(histogram.get() == want, "draft rank histogram differs from the host mirror");
+    require(cut > 0, "some rounds ended on their output budget");
+    dt::DraftRanks bad;
+    require(dt::enqueue_draft_ranks(bad, nullptr) == cudaSuccess, "zero rows is a no-op");
+    bad.rows = 1;
+    require(dt::enqueue_draft_ranks(bad, nullptr) == cudaErrorInvalidValue, "missing buffers are rejected");
+    std::cout << "draft ranks: " << reached << " compared positions over " << rounds << " rounds (" << cut
+              << " cut off by their budget) equal the host mirror\n";
+}
+
 int main(int argc, char** argv) {
     try {
         const std::string which = argc > 1 ? argv[1] : "all";
         if(which == "build" || which == "all") case_build();
         if(which == "accept" || which == "all") case_accept();
         if(which == "compact" || which == "all") case_compact();
+        if(which == "ranks" || which == "all") case_ranks();
         ok(cudaDeviceSynchronize(), "sync");
         return 0;
     } catch(const std::exception& e) {

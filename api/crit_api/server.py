@@ -1085,7 +1085,7 @@ class Handler(BaseHTTPRequestHandler):
         """Any other method: 405 with the methods a known path takes, else 404, in the path's dialect."""
         path = self.path.split("?", 1)[0].rstrip("/")
         if self.headers.get("Content-Length", "0") != "0" or self.headers.get("Transfer-Encoding"):
-            self.close_connection = True  # An unread body must not be parsed as the next request.
+            self.discard_body()
         if path not in {"", "/health", "/api/version"} and not self.authorized():
             return None
         if path.startswith("/v1/responses/"):
@@ -1097,6 +1097,20 @@ class Handler(BaseHTTPRequestHandler):
                          headers=[("Allow", allowed + ", OPTIONS")])
 
     do_PUT = do_PATCH = do_DELETE
+
+    def discard_body(self):
+        """Read and drop a body the answer will not use, so the connection stays usable; one that cannot be read
+        closes it. Closing with unread bytes would reset the connection on Windows before the client reads the answer."""
+        try:
+            if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+                self.read_chunks()
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            if 0 <= length <= MAX_BODY and len(self.rfile.read(length)) == length:
+                return
+        except (RequestError, ValueError):
+            pass
+        self.close_connection = True  # An unread body must not be parsed as the next request.
 
     def read_body(self, empty=False):
         """The request body, sent with Content-Length or Transfer-Encoding: chunked, or None once the error is sent;
