@@ -32,7 +32,18 @@ Install from the repo root with `python -m pip install -e .`, then run `crit ...
   citing sources. Where they override the files, edit the `frozen` block of
   `recon.json` and say why under Decisions. Every later candidate freezes that block
   (sampling, chat template and its variables, stop tokens) as `configuration["recon"]`
-  instead of defaulting to greedy.
+  instead of defaulting to greedy. `recon.json` also fingerprints the checkpoint (architecture,
+  weight layout, tokenizer, template), and every candidate records it; when the engine should
+  run a related checkpoint (a finetune, a re-quantization, a sibling model), `crit run --id RUN_ID
+  recon --compare OTHER_MODEL` says what differs for it, and an equal fingerprint means the weight
+  values differ only.
+- **Start from a crit-hub engine when one exists for the model.** `create --from-engine ENGINE_DIR`
+  (the engine's folder in a crit-hub checkout) records it as the run's origin: its source pin, the
+  checkpoint it was measured on and its published Eval results under `captured/origin/`. Check the
+  source out at the pinned commit and make it the first candidate, with `"lineage": "origin-engine"`
+  in the proposal, built and measured before any change: it is the baseline. `resolve` records
+  whether your model is that exact checkpoint; if not, the first candidate absorbs what
+  `recon --compare` says differs.
 - **The sampling is the model's, not yours.** Recon records the sampling Eval measures under
   "Eval sampling" in `recon.md`: the model's `generation_config.json` (temperature, top_p,
   top_k, min_p when it samples by default), else the protocol default (temperature 1.0, no
@@ -49,7 +60,10 @@ Install from the repo root with `python -m pip install -e .`, then run `crit ...
   probability min(1, p/q) under the processed target distribution p, sample from
   max(p - q, 0) on the first rejection; a greedy draft is q one-hot) so the output keeps the
   model's distribution (the `sampling` gate), and sample on the device inside the decode
-  graph rather than copying logits to the host for every token. A drafter that only helps
+  graph rather than copying logits to the host for every token
+  ([token-sampling](inference/token-sampling/README.md)'s `enqueue_verify` feeds
+  [device-speculative-round](inference/device-speculative-round/README.md); its host
+  oracle is [mtp-decode](inference/mtp-decode/README.md)). A drafter that only helps
   greedy requests leaves the headline at one token per pass. Requests at other settings
   must stay correct too.
 - Create the run per [Building engines](docs/BUILDING_ENGINES.md) in the user's
@@ -137,8 +151,12 @@ Work in rounds, one candidate per round:
   stated in the proposal; when in doubt keep the general option (the full draft head).
   Pass `--baseline` (the run's first candidate) so Eval's generality gate applies, and
   check each candidate against its parent (`crit eval status RESULT --baseline PARENT_RESULT`).
-- **Never train or fine-tune a drafter.** Use the checkpoint's drafter or a published
-  companion draft model as released.
+- **Never train or fine-tune a drafter.** Use the checkpoint's drafter, a published
+  companion draft model as released, or a drafter the user produced with
+  [`crit models drafter`](models/README.md#drafters) and handed you with its transform
+  record: retain that record with the candidate's source, name the drafter's
+  `output.manifest_sha256` in the configuration, and verify every draft with the stored
+  target, so `weights` stays `as_stored`.
 - **Ceilings, in milliseconds.** Decode = tokens per round ÷ round time. A model pass
   cannot beat bytes read ÷ bandwidth (weights read plus KV and recurrent state). A draft
   step has its own bytes floor; acceptance at a generous width projects every smaller
@@ -170,7 +188,8 @@ Work in rounds, one candidate per round:
   dependencies need a new candidate.
 - **Compare and select** on the same model and workload; explain missing metrics.
   Apply agreed criteria without relaxing them or demanding byte-identical output.
-  Spend the `quality_budget` (default 5% perplexity) on speed; drift below it is no
+  Spend the `quality_budget` (defaults: perplexity ratio 1.05, mean KL 0.05, p99 KL 0.5;
+  [Run records](docs/RUN_RECORDS.md#request)) on speed; drift below it is no
   gain. Speculative output must equal plain greedy only when the run requires
   `exactness`. Failed required checks stay exploratory. Select the best qualified
   candidate and say whether it beats the baseline.
@@ -203,6 +222,9 @@ Write `summary.md` at the run root and tell the user: target and workload; basel
 versus recommended candidate; gains and tradeoffs; checks and limitations; techniques
 and kernels; Eval results and missing coverage; remaining work; source and package
 paths. Say when none qualified. Put toolkit feedback here, not into Core or Inference.
+Record what the run cost with `crit run ... cost --transcript <your session transcript> --agent "<agent and
+model>"`: it attributes your model requests to the candidates built in their spans and writes `cost.json`
+(wall time, tokens, API-equivalent price per candidate), which crit-hub shows on the engine's card.
 
 Always give the actual candidate and its serve command:
 

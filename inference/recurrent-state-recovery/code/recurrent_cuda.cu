@@ -112,6 +112,11 @@ __global__ void verify_deferred(DeviceGeometry g, float* state, DeviceSteps s, s
     for(std::uint32_t t = 0; t < columns; ++t) advance_column(g, running, running, s, t, h, v, outputs, &capture);
 }
 
+// Runs after verify_deferred on the same stream, so every block has read *pending:
+// the prefix is applied exactly once, and a flush or an abandoned round that is
+// never recorded does not replay it again over the overwritten stash.
+__global__ void consume_pending(std::int32_t* pending) { *pending = 0; }
+
 __global__ void record_accepted(const std::int32_t* accepted, std::uint32_t columns, std::int32_t* pending) {
     auto n = *accepted;
     if(n < 0) n = 0;
@@ -151,12 +156,14 @@ cudaError_t enqueue_recompute_accepted(const DeviceGeometry& g, const float* sta
 }
 
 cudaError_t enqueue_verify_deferred(const DeviceGeometry& g, float* state, DeviceSteps s, std::uint32_t columns,
-                                    const std::int32_t* pending, DeferredStash stash, float* outputs, float* work,
+                                    std::int32_t* pending, DeferredStash stash, float* outputs, float* work,
                                     cudaStream_t stream) {
     if(!valid(g) || !state || !pending || !stash.key || !stash.decay || !stash.delta || columns > stash.capacity)
         return cudaErrorInvalidValue;
     if(columns && (!outputs || !work || !s.query || !s.key || !s.value || !s.log_decay || !s.beta)) return cudaErrorInvalidValue;
     verify_deferred<<<g.heads, g.values, 0, stream>>>(g, state, s, columns, pending, stash, outputs, work);
+    if(const auto e = cudaPeekAtLastError(); e != cudaSuccess) return e;
+    consume_pending<<<1, 1, 0, stream>>>(pending);
     return cudaPeekAtLastError();
 }
 

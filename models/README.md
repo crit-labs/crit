@@ -2,8 +2,9 @@
 
 Models produces transformed weights for an engine and records how they were made.
 [Inference](../inference/README.md) executes encoded formats; Models chooses and produces
-the weights. The first transform is post-training quantization (PTQ). Pruning and
-quantization-aware distillation will reuse the same workflow and records.
+the weights. The transforms are post-training quantization (PTQ) and
+[drafter production](#drafters), a draft head distilled from the target for speculative
+decoding. Pruning and quantization-aware distillation will reuse the same workflow and records.
 
 A run allows transformed weights only with `weights_policy: transformable`
 ([Run records](../docs/RUN_RECORDS.md#request)); its `quality_budget` is the drift
@@ -102,6 +103,52 @@ speed prompts, the long document), and the general rule against
 [fitting the engine to Eval](../AGENTS.md#3-build-and-compare-candidates) applies. Use a
 general corpus in several languages and domains.
 
+## Drafters
+
+Most checkpoints ship no draft layer, and the run rules forbid the agent to train one. A drafter is
+the user's transform instead: `crit models drafter` distills a draft head from the target itself,
+records how (recipe, calibration data, seed, hashes, cost, the agreement it reached), and the result
+rides along with the target like a published companion draft model. The target's weights never
+change, so a candidate that verifies every draft with the stored target keeps the target's output
+and declares `weights: as_stored` as before; it records the drafter's transform record with its
+source and names the drafter's `output.manifest_sha256` in its configuration.
+
+```text
+crit models plan    --recipe drafter.json --source MODEL_DIR
+crit models drafter --recipe drafter.json --source MODEL_DIR --out DRAFTER_DIR --record drafter-transform.json --calibration data.jsonl
+crit models verify  --record drafter-transform.json
+```
+
+The recipe (`method: drafter`), every field optional:
+
+| Field | Meaning / default |
+| --- | --- |
+| `kind` | `mtp-head` (the only kind yet) |
+| `init_layer` | The target layer the drafter's layer starts from; `-1` (default) is the last |
+| `calibration` | `samples` windows of `sequence_tokens` tokens, default 64 x 1024, from the JSONL as for GPTQ ([calibration data](#calibration-data)) |
+| `heldout_fraction` | The share of windows held out to measure the drafter, default 0.1 |
+| `train` | `steps` (1000), `windows_per_step` (4), `learning_rate` (1e-4), `warmup_steps` (50), `weight_decay` (0) |
+| `dtype` | `bf16` (default) or `fp32` for the stored tensors |
+| `seed` | Orders the windows and the training draws, default 0 |
+
+The `mtp-head` drafter (`crit-drafter-v1`): at position t it takes the target's final hidden state
+before the final norm and the embedding of token t+1, normalizes both with copies of the target's final
+norm (`pre_fc_norm_hidden`, `pre_fc_norm_embedding`), fuses them with `fc` (2 x hidden to hidden, no
+bias), runs one decoder layer of the target's own architecture (`layers.0`, initialized from
+`init_layer`) and a copy of the final norm (`norm`), and predicts through the target's own output head,
+which is not trained and not stored. It is trained to match the target's next-token distribution one
+position ahead (the KL divergence from the target's distribution) over the calibration windows, with
+the held-out windows reporting the greedy agreement (`top1_agreement`: how often the draft's argmax
+equals the target's, the acceptance a greedy engine would see) and the KL left, before and after
+training. The output folder holds `config.json`, the target's config with `num_hidden_layers: 1` and
+a `crit_drafter` block that says what the tensors are and which target they belong to
+(`eval_model_sha256`), and `model.safetensors` with the tensors under `drafter.`. The target pass is
+the PTQ calibration pass (embeddings through the layers with the model's rotary embeddings and a
+causal mask), so models whose forward does more around their layers are outside it, as for GPTQ.
+Calibration text must be unrelated to Eval ([calibration data](#calibration-data)); the agreement is
+measured on held-out windows of the same corpus, so a corpus in several languages and domains is the
+honest one.
+
 ## Records
 
 `models_transform` (JSON, written once):
@@ -111,9 +158,9 @@ general corpus in several languages and domains.
 | `recipe`, `recipe_sha256`, `seed` | The resolved recipe and its canonical hash |
 | `source` | Path, file inventory (`path`, `bytes`, `sha256`), `manifest_sha256` and Eval's model identity |
 | `calibration` | `null` for RTN; else file path, bytes and sha256, documents, windows, separator ids, `windows_sha256` of the token ids, and whether the suite-overlap check ran |
-| `plan` | Decoder prefix, module count, `modules_sha256`, stored and transformed bytes |
+| `plan` | PTQ: decoder prefix, module count, `modules_sha256`, stored and transformed bytes. Drafter: prefix, `layers`, `init_layer`, `parameters`, the stored tensors |
 | `output` | Path, file inventory, `manifest_sha256`, Eval's model identity, files copied byte for byte, skipped subdirectories |
-| `errors` | Mean and worst `weight_error` (relative Frobenius) and, for GPTQ, `output_error` (Hessian-weighted) |
+| `errors` | PTQ: mean and worst `weight_error` (relative Frobenius) and, for GPTQ, `output_error` (Hessian-weighted). Drafter: `train_loss` (start, end, steps) and the held-out `kl_mean` and `top1_agreement` before (`heldout_before`) and after (`heldout`) training |
 | `cost` | Wall seconds, seconds per phase, device and name, peak device and host bytes |
 | `environment`, `crit_version`, `started_at`, `ended_at` | Python, platform, torch, CUDA, safetensors, transformers |
 

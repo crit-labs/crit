@@ -33,6 +33,14 @@ def main(argv=None):
     ptq.add_argument("--record", required=True, help="New models_transform JSON outside the source and output")
     ptq.add_argument("--calibration", help="JSONL of {\"text\": ...} documents unrelated to Eval (gptq only)")
     ptq.add_argument("--device", help="torch device (default: cuda when available, else cpu)")
+    drafter = subs.add_parser("drafter", help="Distill a draft head for speculative decoding from the target itself and "
+                                              "write its models_transform record")
+    drafter.add_argument("--recipe", required=True, help="models_recipe JSON with method drafter")
+    drafter.add_argument("--source", required=True, help="The target model directory (the checkpoint the engine serves)")
+    drafter.add_argument("--out", required=True, help="New or empty directory for the drafter")
+    drafter.add_argument("--record", required=True, help="New models_transform JSON outside the source and output")
+    drafter.add_argument("--calibration", required=True, help="JSONL of {\"text\": ...} documents unrelated to Eval")
+    drafter.add_argument("--device", help="torch device (default: cuda when available, else cpu)")
     evaluation = subs.add_parser("eval", help="Bind the Eval result of an engine serving the output to its record, "
                                               "with its quality replies scored on the source checkpoint")
     evaluation.add_argument("--record", required=True, help="models_transform JSON")
@@ -49,6 +57,16 @@ def main(argv=None):
             from crit_core.model import inspect_model
             from .recipe import plan as make_plan
             recipe = _recipe(args.recipe)
+            if recipe["method"] == "drafter":
+                from .drafter import plan_drafter
+                resolved = plan_drafter(recipe, inspect_model(args.source))
+                if args.json:
+                    print(json.dumps({"recipe": recipe, "plan": resolved}, indent=1))
+                else:
+                    print(f"{recipe['kind']} drafter from layer {resolved['init_layer']} of {resolved['layers']}: "
+                          f"{len(resolved['layer_tensors'])} tensors, {resolved['parameters']:,} parameters, "
+                          f"{resolved['stored_bytes'] / 2**20:.1f} MiB stored")
+                return 0
             resolved = make_plan(recipe, inspect_model(args.source))
             if args.json:
                 print(json.dumps({"recipe": recipe, "plan": resolved}, indent=1))
@@ -62,7 +80,17 @@ def main(argv=None):
             return 0
         if args.command == "ptq":
             from .ptq import run_ptq
-            run_ptq(_recipe(args.recipe), args.source, args.out, args.record, args.calibration, args.device)
+            recipe = _recipe(args.recipe)
+            if recipe["method"] != "ptq":
+                raise ValueError("crit models ptq takes a recipe with method ptq; crit models drafter takes a drafter recipe")
+            run_ptq(recipe, args.source, args.out, args.record, args.calibration, args.device)
+            return 0
+        if args.command == "drafter":
+            from .drafter import run_drafter
+            recipe = _recipe(args.recipe)
+            if recipe["method"] != "drafter":
+                raise ValueError("crit models drafter takes a recipe with method drafter")
+            run_drafter(recipe, args.source, args.out, args.record, args.calibration, args.device)
             return 0
         if args.command == "eval":
             from crit_eval import SUITE_DIR, load_json

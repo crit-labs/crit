@@ -4,6 +4,7 @@
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -49,7 +50,7 @@ double compare(const std::vector<float>& got, const std::vector<double>& want) {
     return worst;
 }
 
-bool fp8_case(int N, int K, int T, bool add, std::mt19937& rng, int min_blocks = 340) {
+bool fp8_case(int N, int K, int T, bool add, std::mt19937& rng, int min_blocks = 340, int plan_tokens = 0) {
     std::uniform_int_distribution<int> code(0, 255);
     std::uniform_real_distribution<float> value(-2.f, 2.f);
     std::vector<std::uint8_t> w(static_cast<std::size_t>(N) * K);
@@ -76,7 +77,7 @@ bool fp8_case(int N, int K, int T, bool add, std::mt19937& rng, int min_blocks =
             want[static_cast<std::size_t>(t) * N + n] = add ? want[static_cast<std::size_t>(t) * N + n] + v : v;
         }
     }
-    const st::Plan p = st::plan(false, N, K, T, 256, min_blocks);
+    const st::Plan p = st::plan(false, N, K, std::max(T, plan_tokens), 256, min_blocks);
     std::uint8_t* d_codes = upload(w);
     std::uint8_t* d_tiles = nullptr;
     CHECK(cudaMalloc(&d_tiles, w.size()));
@@ -100,7 +101,7 @@ bool fp8_case(int N, int K, int T, bool add, std::mt19937& rng, int min_blocks =
     return err < 1e-5;
 }
 
-bool fp4_case(int N, int K, int T, bool add, std::mt19937& rng, int min_blocks = 340) {
+bool fp4_case(int N, int K, int T, bool add, std::mt19937& rng, int min_blocks = 340, int plan_tokens = 0) {
     std::uniform_int_distribution<int> nibble(0, 15), scale_code(0x28, 0x48);
     std::uniform_real_distribution<float> value(-3.f, 3.f);
     std::vector<std::uint8_t> codes(static_cast<std::size_t>(N) * K / 2), scales(static_cast<std::size_t>(N) * K / 16);
@@ -134,7 +135,7 @@ bool fp4_case(int N, int K, int T, bool add, std::mt19937& rng, int min_blocks =
             want[static_cast<std::size_t>(t) * N + n] = add ? want[static_cast<std::size_t>(t) * N + n] + acc : acc;
         }
     }
-    const st::Plan p = st::plan(true, N, K, T, 256, min_blocks);
+    const st::Plan p = st::plan(true, N, K, std::max(T, plan_tokens), 256, min_blocks);
     std::uint8_t* d_codes = upload(codes);
     std::uint8_t* d_scales = upload(scales);
     std::uint8_t *d_tiles = nullptr, *d_stiles = nullptr;
@@ -158,6 +159,34 @@ bool fp4_case(int N, int K, int T, bool add, std::mt19937& rng, int min_blocks =
     return err < 1e-5;
 }
 
+// A plan sizes scratch for its format, N, K and at most its token count; any other launch must be refused before
+// it writes past the activations, token scales or partials. Checks run before any launch, so no buffers are needed.
+bool fp8_rejects_plan_mismatch() {
+    const st::Plan p = st::plan(false, 256, 512, 64, 256, 340);
+    const auto run = [](const st::Fp8Weights& w, int T, const st::Plan& plan) {
+        return st::enqueue_fp8(w, nullptr, T, nullptr, w.N, false, plan, {}, nullptr) == cudaErrorInvalidValue;
+    };
+    const bool ok = run({nullptr, nullptr, 256, 512}, 65, p) && run({nullptr, nullptr, 256, 512}, p.tpad + 1, p) &&
+                    run({nullptr, nullptr, 512, 512}, 64, p) && run({nullptr, nullptr, 256, 256}, 64, p) &&
+                    run({nullptr, nullptr, 256, 512}, 64, st::plan(true, 256, 512, 64, 256, 340)) &&
+                    run({nullptr, nullptr, 256, 512}, 1, st::Plan{});
+    std::printf("fp8 plan mismatch (T > plan tokens, other N / K / format): %s\n", ok ? "rejected" : "NOT rejected");
+    return ok;
+}
+
+bool fp4_rejects_plan_mismatch() {
+    const st::Plan p = st::plan(true, 256, 512, 64, 256, 340);
+    const auto run = [](const st::Fp4Weights& w, int T, const st::Plan& plan) {
+        return st::enqueue_fp4(w, nullptr, T, nullptr, w.N, false, plan, {}, nullptr) == cudaErrorInvalidValue;
+    };
+    const bool ok = run({nullptr, nullptr, 1.f, 1.f, 256, 512}, 65, p) && run({nullptr, nullptr, 1.f, 1.f, 256, 512}, p.tpad + 1, p) &&
+                    run({nullptr, nullptr, 1.f, 1.f, 512, 512}, 64, p) && run({nullptr, nullptr, 1.f, 1.f, 256, 256}, 64, p) &&
+                    run({nullptr, nullptr, 1.f, 1.f, 256, 512}, 64, st::plan(false, 256, 512, 64, 256, 340)) &&
+                    run({nullptr, nullptr, 1.f, 1.f, 256, 512}, 1, st::Plan{});
+    std::printf("fp4 plan mismatch (T > plan tokens, other N / K / format): %s\n", ok ? "rejected" : "NOT rejected");
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -178,6 +207,9 @@ int main() {
         ok = fp8_case(256, 512, 300, false, rng, 1) && ok;
         ok = st::enqueue_fp8({nullptr, nullptr, 100, 64}, nullptr, 1, nullptr, 0, false, st::plan(false, 100, 64, 1), {}, nullptr)
                  == cudaErrorInvalidValue && ok;
+        ok = fp8_case(256, 512, 40, false, rng, 340, 300) && ok;  // fewer tokens than the plan's
+        ok = fp8_case(256, 512, 200, false, rng, 0) && ok;  // split threshold from the device's SM count
+        ok = fp8_rejects_plan_mismatch() && ok;
     } else {
         std::printf("FP8 MMA needs sm_89+; skipped\n");
     }
@@ -189,6 +221,9 @@ int main() {
         ok = fp4_case(256, 512, 300, false, rng, 1) && ok;
         ok = st::enqueue_fp4({nullptr, nullptr, 0.f, 1.f, 256, 64}, nullptr, 1, nullptr, 0, false, st::plan(true, 256, 64, 1), {}, nullptr)
                  == cudaErrorInvalidValue && ok;
+        ok = fp4_case(256, 512, 40, true, rng, 340, 300) && ok;
+        ok = fp4_case(256, 512, 200, false, rng, 0) && ok;
+        ok = fp4_rejects_plan_mismatch() && ok;
     } else {
         std::printf("NVFP4 block-scaled MMA not in this build (needs sm_120a / sm_121a); skipped\n");
     }

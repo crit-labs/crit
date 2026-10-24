@@ -1,18 +1,20 @@
-# Run a whole greedy speculative round on the device
+# Run a whole speculative round on the device
 
-One Core `Session::advance()` runs a complete greedy speculative round on the
-GPU (draft K tokens, verify K+1 columns, accept, select the accepted state,
-advance the frontier); the host waits once, on one `readback_async`.
+One Core `Session::advance()` runs a complete speculative round on the GPU (draft
+K tokens, verify K+1 columns, accept, select the accepted state, advance the
+frontier); the host waits once, on one `readback_async`. Greedy requests compare
+drafts with the target's argmax; sampled requests verify by rejection sampling
+through [token-sampling](../token-sampling/README.md), which writes predictions the
+same accept kernel consumes, so both decode modes share one round.
 
 ## When to use it
 
 Use it once a synchronous speculative loop is correct and the remaining cost is
 host round trips: per-token readbacks, host acceptance and bookkeeping, or many
-small launches. Keep the synchronous
-[GreedyTargetState loop](../mtp-decode/README.md) as the correctness oracle.
+small launches. Keep the synchronous loops in [mtp-decode](../mtp-decode/README.md)
+(`GreedySpeculator`, `SampledSpeculator`) as the correctness oracles.
 
 It does not help when verifying K+1 columns costs about K+1 ordinary steps.
-Greedy acceptance only; sampled acceptance needs its own kernel and RNG contract.
 
 ## How it works
 
@@ -53,6 +55,40 @@ a device truncation that recomputes frontier, pending token and count from
 function of round-start state and verify outputs, this is exact. Draft width zero
 is ordinary decoding through the same path, the natural timing baseline.
 
+### Sampled requests
+
+The accept kernel only compares `drafts[i]` with `predictions[i]`. For a sampled
+request, verify writes the target's K+1 FP32 logit rows instead of argmaxes, and
+[`token_sampling::enqueue_verify`](../token-sampling/README.md#how-it-works) turns
+them into predictions. With greedy drafts every column holds the target's own draw,
+so a draft stands exactly when it equals it and the round emits, token for token,
+what plain sampling emits with the same seed (given column-invariant verify
+arithmetic). With sampled drafts column `i` holds the draft when the rejection test
+`u_accept * q(d) < p(d)` accepts it, otherwise a draw from `max(p - q, 0)`, and
+column K a bonus draw from the target. The unchanged greedy rule then emits the
+accepted drafts and the first differing prediction. Every draw is Core's
+`uniform(seed, output position, stream, purpose)`, so a truncation or a rejected
+tail needs no generator state, and the emitted text is a sample of the target's
+processed law (temperature, top-k, top-p, min-p, penalties) for any drafter and
+width.
+
+```text
+Forward: copy the allowance
+         token_sampling::enqueue_commit(result + 1, control + n_emitted)   # the previous round's tokens
+         draft: greedy argmax (q one-hot), or enqueue_sample(DrawPurpose::draft) writing q rows
+         verify: K + 1 target logit rows, then enqueue_verify -> predictions
+Finish:  enqueue_greedy_accept, commit_state
+```
+
+The commit kernel runs first in Forward because Core can still trim the previous
+round after Finish; `control[n_emitted]` holds the trimmed count by the next
+launch, and `start()` zeroes it, so the engine initializes `Request.position`,
+`counts` and `prompt_seen` (including the pending first output) at request start.
+Greedy drafts are simplest; drafts drawn from the drafter's own processed law accept
+more often at high temperature (`1 - TV(p, q)` instead of `p(argmax q)`), at the
+cost of one law per draft step and K dense `q` rows. A drafter's stopping rule (for
+example a confidence threshold) changes only the width, never the output law.
+
 ### Column-invariant arithmetic
 
 Greedy speculative output equals plain greedy output only when verify computes
@@ -90,6 +126,11 @@ plus all model arithmetic, KV layout, sampling and batching across requests:
 | `draft` | Write `drafts[0..K)` from `control[last_token]` at `control[frontier]`, plus any private draft state |
 | `verify` | Feed `last_token` then the drafts at `frontier..frontier+K`; write `predictions[0..K]`; keep per-column state or inputs |
 | `commit_state` | Select model state for `control[n_emitted]` relative to the round start; idempotent, may run twice |
+
+An optional fourth step, `accept`, replaces the greedy accept kernel in Finish
+with another walk that keeps its control and packed-result contract, such as the
+tree walk of [draft trees](../draft-trees/README.md); truncation, commit and the
+single readback stay unchanged.
 
 Steps submit only to the supplied stream: no host synchronization, readback,
 allocation or pointer that changes between rounds. A recurrent layer can use the
@@ -246,4 +287,9 @@ state undefined, so the request must fail.
 [native fixtures](../../tests/inference/device_round_tests.cpp) check catch-up
 against exact ingestion, the accept kernel against `GreedySpeculator` on 4,000
 random rows, graph replay against eager and greedy for K = 0..4, truncation and
-one copy per round. They qualify round mechanics, not model arithmetic or speed.
+one copy per round. [sampled_round_tests.cpp](../../tests/inference/sampled_round_tests.cpp)
+runs token-sampling's verify predictions through the accept, truncation and commit
+kernels and compares each request with a host round over Core's laws and draws (the
+target's draw per column, drafts kept while they match, stops, allowances), and
+checks that a zero-width round is one ordinary draw. They qualify round mechanics, not
+model arithmetic or speed.

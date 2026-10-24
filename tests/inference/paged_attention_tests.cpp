@@ -1,8 +1,8 @@
 // Batched paged attention against the attention-state CPU reference over Core's StateCache: ragged batches with
 // forks (copy-on-write tails), reused prefix pages and rows crossing page boundaries, for BF16 and E4M3 pages and head
 // dimensions 64, 128 and 256. Also: E4M3 writes equal a host encoder, decode columns alone equal the same columns in a
-// verify, a sequence's result does not depend on its batch, captured graphs replay new tables and lengths, and invalid
-// problems are rejected.
+// verify, a sequence's result does not depend on its batch, captured graphs replay new tables and lengths, invalid
+// problems are rejected, and sequences whose device counts break the batch get NaN rows and a fault flag.
 #include "device_pages.h"
 #include "paged_attention.h"
 
@@ -363,6 +363,66 @@ void case_rejects() {
     require(pa::write(d.pages, rows.p, rows.p, 128, 1, nullptr, nullptr) == cudaErrorInvalidValue, "a write without slots is rejected");
 }
 
+// Counts the launch cannot see (they live on the device) and that break the batch: more queries than max_columns or
+// max_queries, more queries than keys, or more keys than the table addresses. Such a sequence gets NaN in every query
+// row and raises the fault flag; a valid sequence in the same batch is attended as usual. BatchTables rejects the
+// host-visible cases.
+void case_bounds() {
+    constexpr int hd = 64, pt = 16;
+    Buffer<__nv_bfloat16> keys(static_cast<std::size_t>(2) * pt * hd), values(keys.n), q(static_cast<std::size_t>(8) * hd);
+    std::vector<__nv_bfloat16> ones(keys.n, __float2bfloat16(0.5f));
+    keys.put(ones); values.put(ones); q.put(std::vector<__nv_bfloat16>(q.n, __float2bfloat16(0.25f)));
+    Buffer<float> out(q.n), partial(pa::decode_partial_floats(2, 1, hd, 2, 8, 1));
+    Buffer<std::int32_t> fault(1), tables(2), lens(2), starts(3);
+    tables.put({0, 1});
+    struct Want { int queries0, kv0, queries1, kv1, limit; bool broken; const char* what; };
+    // Sequence 0 is the one under test (rows 0 .. queries0 - 1); sequence 1 is a valid one-query decode after it.
+    for(const Want w : {Want{3, 10, 1, 5, 3, false, "a valid verify"},
+                        Want{3, 10, 1, 5, 1, true, "more queries than max_columns"},
+                        Want{3, 2, 1, 5, 3, true, "more queries than keys"},
+                        Want{1, pt + 1, 1, 5, 3, true, "more keys than the table addresses"}})
+        for(const bool prefill : {false, true}) {
+            lens.put({w.kv0, w.kv1});
+            starts.put({0, w.queries0, w.queries0 + w.queries1});
+            check(cudaMemset(fault.p, 0, sizeof(std::int32_t)), "fault reset");
+            check(cudaMemset(out.p, 0, sizeof(float) * out.n), "out reset");
+            const pa::Pages pages{keys.p, values.p, nullptr, nullptr, pa::Format::bf16, pt, 1, hd};
+            const pa::Batch batch{2, tables.p, 1, lens.p, starts.p, fault.p};
+            cudaError_t e;
+            if(prefill) {
+                pa::Prefill p;
+                p.q = q.p; p.q_stride = hd; p.pages = pages; p.batch = batch; p.out = out.p; p.out_stride = hd; p.heads = 1;
+                p.scale = 0.125f; p.max_queries = w.limit;
+                e = pa::prefill(p, nullptr);
+            } else {
+                pa::Decode d;
+                d.q = q.p; d.q_stride = hd; d.pages = pages; d.batch = batch; d.out = out.p; d.out_stride = hd; d.heads = 1;
+                d.scale = 0.125f; d.max_columns = w.limit; d.blocks = 2; d.partial = partial.p;
+                e = pa::decode(d, nullptr);
+            }
+            check(e, "bounds launch");
+            check(cudaDeviceSynchronize(), "bounds sync");
+            const auto got = out.get(out.n);
+            const std::string what = std::string(prefill ? "prefill: " : "decode: ") + w.what;
+            for(int r = 0; r < w.queries0 + w.queries1; ++r)
+                for(int i = 0; i < hd; ++i) {
+                    const float x = got[static_cast<std::size_t>(r) * hd + i];
+                    // Every key and value is 0.5, so an attended row is 0.5 in every dimension.
+                    require(r < w.queries0 && w.broken ? std::isnan(x) : std::fabs(x - 0.5f) < 1e-3f, what + ": row " + std::to_string(r));
+                }
+            require(fault.get(1)[0] == (w.broken ? 1 : 0), what + ": fault flag");
+        }
+    pa::BatchTables host(2, 1, 4);
+    const std::vector<cc::PageId> one_page{0};
+    host.add(one_page, pt, 1, pt);
+    bool threw = false;
+    try { host.add(one_page, pt + 1, 1, pt); } catch(const std::invalid_argument&) { threw = true; }
+    require(threw, "BatchTables rejects more keys than the table addresses");
+    threw = false;
+    try { host.add(one_page, 2, 3); } catch(const std::invalid_argument&) { threw = true; }
+    require(threw, "BatchTables rejects more queries than keys");
+}
+
 using Case = void (*)(Fixture&);
 void each_geometry(Case run, const char* name) {
     struct G { int hd, heads, kv_heads; };
@@ -384,7 +444,7 @@ int main(int argc, char** argv) {
         if(which == "decode" || which == "all") each_geometry(case_decode, "decode");
         if(which == "invariance" || which == "all") each_geometry(case_invariance, "invariance");
         if(which == "graph" || which == "all") each_geometry(case_graph, "graph");
-        if(which == "rejects" || which == "all") case_rejects();
+        if(which == "rejects" || which == "all") { case_rejects(); case_bounds(); }
         std::cout << "paged attention " << which << " passed\n";
         return 0;
     } catch(const std::exception& error) {

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_core VERSION 0.6.1 LANGUAGES CXX)
+project(crit_core VERSION 0.7.0 LANGUAGES CXX)
 find_package(Threads REQUIRED)
 function(crit_strict_warnings target)
   if(MSVC)
@@ -68,7 +68,7 @@ include(CTest)
 if(CRIT_CORE_CUDA)
   find_package(CUDAToolkit 13.1 REQUIRED)
   add_library(crit_core_cuda STATIC src/backends/cuda/cuda.cpp src/backends/cuda/category_timer.cpp
-    src/backends/cuda/cuda_graph.cpp src/backends/cuda/cuda_memory.cpp)
+    src/backends/cuda/cuda_graph.cpp src/backends/cuda/cuda_memory.cpp src/backends/cuda/cuda_launch.cpp)
   add_library(crit::cuda ALIAS crit_core_cuda)
   set_target_properties(crit_core_cuda PROPERTIES EXPORT_NAME cuda POSITION_INDEPENDENT_CODE ON)
   target_link_libraries(crit_core_cuda PUBLIC crit_core CUDA::cudart)
@@ -84,7 +84,8 @@ install(FILES include/crit/core.h include/crit/text.h include/crit/sampling.h in
 install(FILES ../LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/crit)
 if(CRIT_CORE_CUDA)
   install(TARGETS crit_core_cuda EXPORT critCoreTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
-  install(FILES include/crit/cuda.h include/crit/cuda_graph.h include/crit/cuda_memory.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/crit)
+  install(FILES include/crit/cuda.h include/crit/cuda_graph.h include/crit/cuda_memory.h include/crit/cuda_launch.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/crit)
 endif()
 configure_package_config_file(cmake/critCoreConfig.cmake.in
   ${CMAKE_CURRENT_BINARY_DIR}/critCoreConfig.cmake

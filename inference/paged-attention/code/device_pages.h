@@ -117,11 +117,14 @@ public:
     BatchTables& operator=(const BatchTables&) = delete;
 
     void clear() { seqs_ = queries_ = rows_ = max_queries_ = 0; starts()[0] = 0; }
-    // A sequence holding kv_len rows through `table`, whose newest `queries` rows are queried.
-    void add(std::span<const crit::core::PageId> table, std::uint32_t kv_len, int queries) {
+    // A sequence holding kv_len rows through `table`, whose newest `queries` rows are queried. With page_tokens > 0 the
+    // table must also address every row (kv_len <= table.size() * page_tokens). Pass max_queries() or more as the
+    // launch's max_columns (decode) or max_queries (prefill): the kernels do not attend a sequence beyond it (Batch).
+    void add(std::span<const crit::core::PageId> table, std::uint32_t kv_len, int queries, int page_tokens = 0) {
         if(seqs_ == max_seqs_) throw std::length_error("Batch sequence bound reached");
         if(table.size() > static_cast<std::size_t>(max_pages_) || queries < 0 || static_cast<std::uint32_t>(queries) > kv_len ||
-           kv_len > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()))
+           kv_len > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) || page_tokens < 0 ||
+           (page_tokens > 0 && kv_len > table.size() * static_cast<std::uint64_t>(page_tokens)))
             throw std::invalid_argument("Block table, length and queries must fit the batch");
         std::int32_t* row = tables() + static_cast<std::size_t>(seqs_) * max_pages_;
         for(std::size_t i = 0; i < table.size(); ++i) row[i] = static_cast<std::int32_t>(table[i]);
@@ -133,7 +136,8 @@ public:
     // A sequence's committed and staged rows, querying its staged rows (a round's new tokens).
     void add(const crit::core::StateCache& cache, crit::core::SequenceId sequence) {
         const auto staged = cache.staged(sequence);
-        add(cache.block_table(sequence), cache.committed(sequence) + staged, static_cast<int>(staged));
+        add(cache.block_table(sequence), cache.committed(sequence) + staged, static_cast<int>(staged),
+            static_cast<int>(cache.config().page_tokens));
     }
     // Padding for a captured batch size: no queries, no keys.
     void add_idle() { add({}, 0, 0); }

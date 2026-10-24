@@ -64,7 +64,7 @@
   "techniques": ["recurrent-state-recovery", "mtp-decode", "checkpoint-storage"],
   "validation": {
     "host": "Independent long-double matrix-transition oracle, all accepted lengths, absolute boundary/tree mapping, varied chunk decomposition and boundary-adjacent continuation, zero-step rounds after acceptance, exact sibling frontiers, private sibling failures, zero/partial/cancelled/stale commits and finite limits; two-pass chunked prefill equals the token-by-token recurrence for several chunk sizes, normalizations and partial last chunks",
-    "native": "C++20 host example and regressions; CUDA reference against the FP64 host oracle over 96 geometries for outputs and every accepted count within 2e-5 + 2e-5*|ref|, with bitwise agreement of checkpoint and recompute commits, and 96 multi-round deferred commits (including truncation reruns) bitwise equal to checkpoint commits. Engine casts, asynchronous ordering and model continuation remain unqualified",
+    "native": "C++20 host example and regressions; CUDA reference against the FP64 host oracle over 96 geometries for outputs and every accepted count within 2e-5 + 2e-5*|ref|, with bitwise agreement of checkpoint and recompute commits, and 96 multi-round deferred commits (including truncation reruns) bitwise equal to checkpoint commits, with the pending count consumed once across flushes and abandoned rounds. Engine casts, asynchronous ordering and model continuation remain unqualified",
     "performance": "Unmeasured; retained state is bounded independently of speculative matrix snapshot count"
   }
 }

@@ -455,3 +455,80 @@ class EvaluationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(HAS_TRANSFORMERS, "needs torch, safetensors and transformers")
+class DrafterTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        sys.path.insert(0, str(ROOT / "tests"))
+
+    def drafter_recipe(self, **overrides):
+        value = {"schema_version": 1, "record_kind": "models_recipe", "method": "drafter", "seed": 3,
+                 "calibration": {"samples": 6, "sequence_tokens": 32}, "heldout_fraction": 0.34,
+                 "train": {"steps": 12, "windows_per_step": 2, "learning_rate": 1e-3, "warmup_steps": 2}}
+        value.update(overrides)
+        return value
+
+    def test_drafter_recipes_fill_their_defaults_and_refuse_the_unknown(self):
+        value = recipes.load_recipe(self.drafter_recipe())
+        self.assertEqual((value["kind"], value["dtype"], value["init_layer"]), ("mtp-head", "bf16", -1))
+        self.assertEqual(value["train"]["weight_decay"], 0.0)
+        self.assertEqual(recipes.load_recipe({"schema_version": 1, "record_kind": "models_recipe", "method": "drafter"})["calibration"],
+                         {"samples": 64, "sequence_tokens": 1024})
+        for bad in (self.drafter_recipe(kind="eagle"), self.drafter_recipe(heldout_fraction=0.9),
+                    self.drafter_recipe(format="nvfp4"), self.drafter_recipe(train={"epochs": 1})):
+            with self.assertRaises(ValueError):
+                recipes.load_recipe(bad)
+        with self.assertRaises(ValueError):
+            recipes.load_recipe(recipe(method="prune"))
+
+    def test_a_drafter_is_distilled_recorded_and_reloadable(self):
+        import torch
+        from safetensors import safe_open
+        from crit_models import main
+        from crit_models.drafter import run_drafter
+        from crit_models.evaluate import load_record
+        from crit_models.ptq import verify
+        source = tiny_model(self.root / "source")
+        words = "river map stone cloud lantern harbor meadow copper violin orchard".split()
+        lines = [json.dumps({"text": " ".join(words[(i + j) % len(words)] for j in range(40))}) for i in range(20)]
+        (self.root / "calibration.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        write_json(self.root / "recipe.json", self.drafter_recipe())
+        value = recipes.load_recipe(self.drafter_recipe())
+        record = run_drafter(value, source, self.root / "drafter", self.root / "drafter.json", self.root / "calibration.jsonl",
+                             device="cpu", log=lambda m: None)
+        self.assertEqual(load_record(self.root / "drafter.json"), record)
+        out = self.root / "drafter"
+        self.assertEqual(sorted(p.name for p in out.iterdir()), ["config.json", "model.safetensors"])
+        config = json.loads((out / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(config["num_hidden_layers"], 1)
+        self.assertEqual(config["crit_drafter"]["kind"], "mtp-head")
+        self.assertEqual((config["crit_drafter"]["init_layer"], config["crit_drafter"]["target_layers"]), (1, 2))
+        self.assertEqual(config["crit_drafter"]["target"]["eval_model_sha256"], record["source"]["eval_model_sha256"])
+        with safe_open(str(out / "model.safetensors"), "pt") as handle:
+            keys = set(handle.keys())
+            self.assertEqual(handle.get_tensor("drafter.fc.weight").shape, (64, 128))
+            self.assertEqual(handle.get_tensor("drafter.fc.weight").dtype, torch.bfloat16)
+        for name in ("drafter.layers.0.self_attn.q_proj.weight", "drafter.norm.weight", "drafter.pre_fc_norm_hidden.weight",
+                     "drafter.pre_fc_norm_embedding.weight"):
+            self.assertIn(name, keys)
+        self.assertEqual(record["plan"]["init_layer"], 1)
+        self.assertEqual(sorted(record["plan"]["tensors"]), sorted(keys))
+        self.assertEqual((record["calibration"]["train_windows"], record["calibration"]["heldout_windows"]), (4, 2))
+        errors = record["errors"]
+        self.assertEqual(errors["train_loss"]["steps"], 12)
+        self.assertTrue(0 <= errors["heldout"]["top1_agreement"] <= 1)
+        self.assertGreaterEqual(errors["heldout"]["kl_mean"], 0)
+        self.assertIn("heldout_before", errors)
+        self.assertEqual(sorted(record["cost"]["phases"]), ["export", "hash_source", "target_pass", "train"])
+        self.assertEqual(verify(record), [])
+        shown = subprocess.run([sys.executable, "-B", LAUNCHER, "models", "plan", "--recipe", str(self.root / "recipe.json"),
+                                "--source", str(source)], capture_output=True, text=True)
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertIn("drafter from layer 1 of 2", shown.stdout)
+        with self.assertRaises(SystemExit):
+            main(["ptq", "--recipe", str(self.root / "recipe.json"), "--source", str(source), "--out", str(self.root / "x"),
+                  "--record", str(self.root / "x.json")])

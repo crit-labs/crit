@@ -17,6 +17,22 @@ float e4m3(std::uint8_t b) {
     return sign ? -magnitude : magnitude;
 }
 float bf16_round(float x) { return __bfloat162float(__float2bfloat16(x)); }
+// The target of the code the runtime loads for this test, built with the kernels' flags: prefill_fp8 runs from sm_89
+// code on and returns cudaErrorNotSupported below it (a build for older targets, or such code JIT-loaded on a newer GPU).
+__global__ void loaded_arch(int* arch) {
+#ifdef __CUDA_ARCH__
+    *arch = __CUDA_ARCH__;
+#endif
+}
+bool fp8_mma_loaded() {
+    int* d = nullptr;
+    int arch = 0;
+    if(cudaMalloc(&d, sizeof(int)) != cudaSuccess) return false;
+    loaded_arch<<<1, 1>>>(d);
+    const bool ran = cudaMemcpy(&arch, d, sizeof(int), cudaMemcpyDeviceToHost) == cudaSuccess;
+    cudaFree(d);
+    return ran && arch >= 890;
+}
 
 struct Device {
     std::vector<void*> owned;
@@ -107,6 +123,10 @@ bool prefill_case(int hd, int heads, int kv_heads, int T, int pos0, std::mt19937
     const float scale = 1.f / std::sqrt(static_cast<float>(hd));
     const kv::Prefill p{dq, heads * hd, s.cache, dout, heads * hd, T, pos0, heads, scale};
     const cudaError_t e = fp8 ? kv::prefill_fp8(p, nullptr) : kv::prefill(p, nullptr);
+    if(fp8 && !fp8_mma_loaded()) {
+        std::printf("prefill_fp8 hd %d: no E4M3 mma in the loaded code, %s\n", hd, e == cudaErrorNotSupported ? "not supported" : "NOT REFUSED");
+        return e == cudaErrorNotSupported;
+    }
     std::vector<float> got(q.size());
     const bool ran = e == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess &&
                      cudaMemcpy(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess;

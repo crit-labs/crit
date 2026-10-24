@@ -32,6 +32,14 @@ key tile gathers its rows one by one, so tiles may span pages.
 the step's new keys included) and `q_start[s] .. q_start[s + 1]` (its query rows). With
 `n` queries, query `i` sits at position `kv_len - n + i` and sees keys up to it. A
 sequence with no queries is an idle slot, so a captured batch size can be padded.
+The counts live on the device, so the launch cannot check them: a sequence with more
+queries than the launch's `max_columns` (decode) or `max_queries` (prefill), more
+queries than `kv_lens[s]`, or more keys than its `table_stride * page_tokens` table
+addresses is not attended. Its rows read no keys and come out NaN in every head, and
+the optional `Batch::fault` flag is set to 1 (the engine clears it), so a too-small
+bound shows up instead of leaving rows unwritten. `BatchTables` rejects more queries
+than keys and, given `page_tokens` (always from the StateCache), short tables on the
+host; pass its `max_queries()` or more as the launch bound.
 
 **Write.** `write` stores a step's new rows at the physical rows Core's `Round::kv`
 names (`slot = page * page_tokens + offset`; negative slots are skipped). E4M3 pages take
@@ -65,6 +73,26 @@ holds the pages of all attention layers and implements `StateStorage::copy_rows`
 2-D device copy per array on the engine's stream. `BatchTables` packs one step's tables,
 lengths, offsets and write slots and uploads the used part.
 
+## Sliding windows, sinks, soft-caps and trees
+
+- **Window** (`window > 0`): a query at position `p` sees keys `p - window + 1 .. p`. Read
+  the window group's pages through Core's `window_table`: pages a sequence has passed are
+  `no_page` there, and the kernels never fetch a key before the oldest query's window, so
+  those entries are never dereferenced. Decode starts each block's walk at the first piece
+  inside the window (pieces stay assigned by position), so its work follows the window.
+- **Sinks** (`sinks[h]`, scaled-score units): `exp(sink)` joins each row's denominator,
+  in decode after the blocks' weights in the ordered combine.
+- **Soft-cap** (`softcap > 0`): `score = softcap * tanh(score / softcap)` after the scale.
+- **Trees** (`Decode::tree`): verify column `i` of sequence `s` sees the round's column `j`
+  only when bit `j` of `tree[q_start[s] + i]` is set: its ancestors and itself, listed in
+  topological order, for speculative token trees (see [draft trees](../draft-trees/README.md)).
+  With a window, a column's window is measured from its depth (`popcount - 1`), so trees
+  need `window > 64`.
+
+Masked keys contribute exact zeros, so a window, a tree mask and skipped pieces change no
+bits of the visible keys' contribution: a windowed column decoded alone still equals the
+same column in a verify.
+
 ## Worked example
 
 From `code/`:
@@ -88,6 +116,12 @@ assert all(abs(x - y) < 1e-12 for r1, r2 in zip(one, split) for x, y in zip(r1, 
 # The last verify column alone (its own position, same keys) equals the column inside the verify.
 alone = attend(storage, page_tokens, seq_b[0], 37, seq_b[2][2:], 1 / math.sqrt(dim))
 assert all(abs(x - y) < 1e-12 for x, y in zip(alone[0], one[3]))
+# A chain tree mask is the causal default; with a window, pages before it are never read (no_page in Core's
+# window table: a bogus id here would raise if it were).
+assert batch(storage, page_tokens, [seq_b], 1 / math.sqrt(dim), trees=[0b1, 0b11, 0b111]) == batch(storage, page_tokens, [seq_b], 1 / math.sqrt(dim))
+passed = [10 ** 6] * 50 + seq_a[0][50:]   # pages 0..49 hold keys 0..199, all before the window of key 299
+windowed = attend(storage, page_tokens, passed, 300, seq_a[2], 1 / math.sqrt(dim), window=100, sink=0.5, softcap=4.0)
+assert windowed == attend(storage, page_tokens, seq_a[0], 300, seq_a[2], 1 / math.sqrt(dim), window=100, sink=0.5, softcap=4.0)
 ```
 
 The CUDA interface ([paged_attention.h](code/paged_attention.h),
@@ -143,7 +177,14 @@ reference (`PagedAttentionPlan`, FP64 accumulation) over the same pages: within 
 the output magnitude (BF16 probabilities; at most 2.6e-3 measured on an RTX 5090). E4M3
 codes and scales equal a host encoder exactly; decode columns alone equal verify columns
 and lone sequences equal batched ones bit for bit; a captured graph replays new tables
-and lengths with the bits of a direct launch.
+and lengths with the bits of a direct launch. Sequences whose device counts break the
+batch (too many queries for `max_columns` or `max_queries`, more queries than keys,
+more keys than the table addresses) come out NaN with the fault flag set, next to a
+valid sequence attended as usual, in decode and prefill.
+[attention_variants_tests.cu](../../tests/inference/cuda/attention_variants_tests.cu) checks
+windowed prefill and a tree verify with sinks and soft-caps against an FP64 reference for
+both formats, with every page before the window pointing at a page of NaN, and windowed
+decode columns alone against the verify bit for bit.
 
 Measured on an RTX 5090 (170 SMs, 1,438 GB/s from `crit eval probe`), decode of one
 query per sequence at 4,096 keys, head dimension 128, 32 query and 8 key/value heads,

@@ -52,10 +52,14 @@ class Table:
     def choose(self, k, count, time=None):
         """Return (index, source). `time(i)` returns a duration or None when candidate
         i cannot run; it is called only when tuning and `k` has no recorded choice.
-        Ties keep the lower index; the first choice for a key is reused."""
+        Ties keep the lower index; the first choice for a key is reused, and a later
+        call whose list no longer holds it is an error, as for a recorded index."""
         if count < 1:
             raise ValueError("selection needs at least one candidate")
+        validate({k: 0})
         if k in self.chosen:
+            if self.chosen[k][0] >= count:
+                raise ValueError("choice for %s exceeds the candidate count" % k)
             return self.chosen[k]
         if k in self.recorded:
             if self.recorded[k] >= count:

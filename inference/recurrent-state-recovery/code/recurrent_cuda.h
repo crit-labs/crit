@@ -54,9 +54,11 @@ struct DeferredStash {
     std::uint32_t capacity = 0; // stash columns; columns <= capacity
 };
 // Applies min(*pending, capacity) stashed steps to `state`, then verifies
-// `columns` steps (columns may be zero: apply only). `work` holds one running copy.
+// `columns` steps (columns may be zero: apply only) and zeroes *pending, so each
+// recorded prefix is applied once. `work` holds one running copy.
 cudaError_t enqueue_verify_deferred(const DeviceGeometry&, float* state, DeviceSteps, std::uint32_t columns,
-                                    const std::int32_t* pending, DeferredStash, float* outputs, float* work, cudaStream_t);
-// Strategy C commit: *pending = clamp(*accepted, 0, columns). Idempotent.
+                                    std::int32_t* pending, DeferredStash, float* outputs, float* work, cudaStream_t);
+// Strategy C commit: *pending = clamp(*accepted, 0, columns). Idempotent; rerun it
+// only before the next enqueue_verify_deferred, which consumes the count.
 cudaError_t enqueue_record_accepted(const std::int32_t* accepted, std::uint32_t columns, std::int32_t* pending, cudaStream_t);
 }

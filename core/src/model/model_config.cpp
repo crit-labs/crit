@@ -326,6 +326,7 @@ ModelConfig parse_model_config(json::Document document) {
             moe.norm_topk_prob = r.boolean(get("norm_topk_prob"), "norm_topk_prob");
             moe.routed_scaling_factor = r.real(get("routed_scaling_factor"), "routed_scaling_factor");
             moe.scoring_func = r.string(get("scoring_func"), "scoring_func").value_or("");
+            moe.topk_method = r.string(get("topk_method"), "topk_method").value_or("");
             c.moe = std::move(moe);
             break;
         }

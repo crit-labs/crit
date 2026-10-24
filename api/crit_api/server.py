@@ -14,10 +14,14 @@ from crit_core.constraints import UnsupportedConstraint, compile_language, json_
 from crit_core.serving import TOP_LOGPROBS
 from crit_core.text import StopMatcher, TextError, message_content
 
+from crit import __version__
+
+from . import anthropic, ollama
 from .disconnect import ClientDisconnect
 from .delivery import StreamDelivery
 from .engine import CONSTRAINTS_CAPABILITY, EngineError
 from .logprobs import logprob_options
+from .metrics import Metrics
 from .options import (RequestError, SAMPLING, TOOLS_CAPABILITY, TOOL_STREAM_CAPABILITY, complete_arguments, crit_options,
                       require, sampling_capability, sampling_options, tool_calls, tool_options)
 
@@ -204,6 +208,7 @@ class Api:
         self.cors_origin = cors_origin
         self.created = int(time.time())
         self.log = log
+        self.metrics = Metrics()
 
     def score_request(self, body):
         """A fixed-text score request (chat-score-v1, POST /v1/crit/score): {"model", "prompt_ids",
@@ -331,8 +336,8 @@ class Api:
 
     def run(self, request, emit, cancel, emit_tools=None, emit_reasoning=None, on_started=None):
         """Generate; emit receives text, emit_tools indexed deltas, emit_reasoning reasoning text (apart from the
-        reply). Returns (finish_reason, measured, calls, reasoning, logprobs), logprobs being OpenAI's logprobs
-        content when the request asked for it.
+        reply). Returns (finish_reason, measured, calls, reasoning, logprobs, stopped), logprobs being OpenAI's
+        logprobs content when the request asked for it and stopped the stop string that ended the reply, or None.
         Stop strings follow
         Core's rule (crit_core.text.StopMatcher): the first stop to complete wins, and only text that could still
         begin a stop is held back."""
@@ -391,10 +396,10 @@ class Api:
                 if emit_tools and not tool_incremental:
                     emit_tools([dict(call, index=i) for i, call in enumerate(calls)])
                 # A call the output limit cut keeps the arguments written so far, and the reply finishes as cut.
-                return ("tool_calls" if complete_arguments(calls[-1]) else "length"), measured, calls, reasoning, logprobs
-            return finish, measured, [], reasoning, logprobs
+                return ("tool_calls" if complete_arguments(calls[-1]) else "length"), measured, calls, reasoning, logprobs, None
+            return finish, measured, [], reasoning, logprobs, scanner.stopped
         if scanner.stopped is not None:
-            return "stop", None, [], "".join(streamed), None
+            return "stop", None, [], "".join(streamed), None, scanner.stopped
         if status == "timed_out":
             raise EngineError("The engine did not finish within the request timeout", 504)
         raise EngineError("Request cancelled", 499)
@@ -436,16 +441,48 @@ class Handler(BaseHTTPRequestHandler):
     def cors(self):
         if self.api.cors_origin:
             self.send_header("Access-Control-Allow-Origin", self.api.cors_origin)
-            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, x-api-key, anthropic-version")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 
+    def send_text(self, status, text, content_type="text/plain; charset=utf-8"):
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.cors()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def dialect(self):
+        """The API dialect a path belongs to: anthropic (/v1/messages), ollama (/api/...), else openai."""
+        path = self.path.split("?", 1)[0].rstrip("/")
+        if path.startswith("/v1/messages"):
+            return "anthropic"
+        if path.startswith("/api/") or path == "":
+            return "ollama"
+        return "openai"
+
+    def fail(self, status, message, kind="invalid_request_error", param=None, code=None):
+        """An error in the shape of the dialect the request used."""
+        dialect = self.dialect()
+        if dialect == "anthropic":
+            return self.send_json(status, anthropic.error_body(status, message))
+        if dialect == "ollama":
+            return self.send_json(status, ollama.error_body(message))
+        return self.error(status, message, kind, param, code)
+
     def authorized(self):
+        """With an API key configured, every request carries it as a Bearer token or, as Anthropic clients send it,
+        in x-api-key."""
         if not self.api.api_key:
             return True
         supplied = self.headers.get("Authorization", "")
         if supplied.startswith("Bearer ") and hmac.compare_digest(supplied[7:].encode(), self.api.api_key.encode()):
             return True
-        self.error(401, "Missing or invalid API key", "authentication_error", code="invalid_api_key")
+        key = self.headers.get("x-api-key", "")
+        if key and hmac.compare_digest(key.encode(), self.api.api_key.encode()):
+            return True
+        self.fail(401, "Missing or invalid API key", "authentication_error", code="invalid_api_key")
         return False
 
     def do_OPTIONS(self):
@@ -460,6 +497,10 @@ class Handler(BaseHTTPRequestHandler):
             status = self.api.engine.status()
             ok = status.get("state") not in {"blocked", "interrupted"}
             return self.send_json(200 if ok else 503, {"status": "ok" if ok else "unavailable", "engine": status})
+        if path == "":
+            return self.send_text(200, "Ollama is running")  # what Ollama clients probe first
+        if path == "/api/version":
+            return self.send_json(200, {"version": __version__})
         if not self.authorized():
             return
         if path == "/v1/models":
@@ -469,7 +510,17 @@ class Handler(BaseHTTPRequestHandler):
             if card:
                 return self.send_json(200, card)
             return self.error(404, "Unknown model", code="model_not_found")
-        self.error(404, "Unknown endpoint " + path, code="not_found")
+        if path == "/metrics":
+            return self.send_text(200, self.api.metrics.render(self.api.engine.status()), "text/plain; version=0.0.4; charset=utf-8")
+        if path == "/api/tags":
+            return self.send_json(200, {"models": [ollama.model_card(c, self.api.created) for c in self.api.models()]})
+        if path == "/api/ps":
+            status = self.api.engine.status()
+            loaded = (status.get("engine") or {}).get("candidate_id")
+            cards = [c for c in self.api.models() if loaded and c["id"].endswith(loaded)]
+            return self.send_json(200, {"models": [dict(ollama.model_card(c, self.api.created), expires_at="", size_vram=status.get("device_bytes", 0))
+                                                   for c in cards]})
+        self.fail(404, "Unknown endpoint " + path, code="not_found")
 
     def do_POST(self):
         path = self.path.split("?", 1)[0].rstrip("/")
@@ -499,26 +550,58 @@ class Handler(BaseHTTPRequestHandler):
             if client.disconnected.is_set():
                 self.close_connection = True
             return None
+        if path == "/v1/messages":
+            return self.dispatch(raw, anthropic.chat_body, self.anthropic_complete, self.anthropic_stream)
+        if path == "/api/chat":
+            return self.dispatch(raw, ollama.chat_body, self.ollama_complete, self.ollama_stream)
+        if path == "/api/generate":
+            return self.dispatch(raw, ollama.generate_body, self.ollama_complete, self.ollama_stream, generate=True)
+        if path == "/api/show":
+            return self.ollama_show(raw)
+        if path == "/v1/messages/count_tokens":
+            return self.fail(404, "Token counting needs the engine's tokenizer in crit; send the request to /v1/messages",
+                             code="not_supported")
+        if path.startswith("/api/"):
+            return self.fail(404, f"{path} is not available on a crit engine: it serves /api/chat, /api/generate, /api/show, "
+                                  "/api/tags, /api/ps and /api/version")
         if path != "/v1/chat/completions":
             if path == "/v1/completions":
                 return self.error(404, "Raw-prompt completions need the engine's tokenizer in crit; use /v1/chat/completions",
                                   code="not_supported")
             return self.error(404, "Unknown endpoint " + path, code="not_found")
+        self.dispatch(raw, None, self.complete, self.stream)
+
+    def dispatch(self, raw, translate, complete, stream, **extra):
+        """Parse a chat request in its dialect (translate: body -> (OpenAI body, ignored), None for OpenAI itself),
+        validate it as every chat request is validated, then run it as a reply or a stream."""
         try:
-            request = self.api.completion_request(json.loads(raw))
+            body = json.loads(raw)
+            ignored = []
+            if translate is not None:
+                body, ignored = translate(body)
+            request = self.api.completion_request(body)
+            request["ignored"] = sorted(set(request["ignored"]) | set(ignored))
+            request["requested_model"] = body.get("model") if isinstance(body, dict) else None
         except (ValueError, UnicodeDecodeError) as exc:
-            return self.error(400, "Invalid JSON body: " + str(exc))
+            return self.fail(400, "Invalid JSON body: " + str(exc))
         except RequestError as exc:
-            return self.error(exc.status, str(exc), param=exc.param, code=exc.code)
+            return self.fail(exc.status, str(exc), param=exc.param, code=exc.code)
         with ClientDisconnect(self.connection) as client:
             try:
-                (self.stream if request["stream"] else self.complete)(request, client.cancel)
+                (stream if request["stream"] else complete)(request, client.cancel, **extra)
             except OSError:
                 # A response write can fail between transport polls.
                 client.cancel.set()
                 self.close_connection = True
         if client.disconnected.is_set():
             self.close_connection = True
+
+    def measure(self, dialect, started, outcome, measured=None):
+        self.api.metrics.end(dialect, outcome, measured, time.perf_counter() - started)
+
+    @staticmethod
+    def outcome(exc):
+        return {499: "cancelled", 504: "timed_out"}.get(exc.status, "error")
 
     def headers_for(self, request):
         return [("X-Crit-Ignored-Parameters", ",".join(request["ignored"]))] if request["ignored"] else []
@@ -542,10 +625,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def complete(self, request, cancel):
         pieces = []
+        started = time.perf_counter()
+        self.api.metrics.begin()
         try:
-            finish, measured, calls, reasoning, logprobs = self.api.run(request, pieces.append, cancel)
+            finish, measured, calls, reasoning, logprobs, _ = self.api.run(request, pieces.append, cancel)
         except EngineError as exc:
+            self.measure("openai", started, self.outcome(exc))
             return self.error(exc.status, str(exc), "server_error" if exc.status >= 500 else "invalid_request_error")
+        self.measure("openai", started, "completed", measured)
         value = {"id": "chatcmpl-" + uuid.uuid4().hex, "object": "chat.completion", "created": int(time.time()),
                  "model": request["model"], "system_fingerprint": self.api.engine.spec(request["candidate"])["package_sha256"][:16],
                  "choices": [{"index": 0, "message": {"role": "assistant", "content": "".join(pieces)},
@@ -601,13 +688,17 @@ class Handler(BaseHTTPRequestHandler):
             return value
 
         event(chunk({"role": "assistant", "content": ""}))
+        started = time.perf_counter()
+        self.api.metrics.begin()
         try:
-            finish, measured, _, _, logprobs = self.api.run(request, lambda piece: event(chunk({"content": piece})),
+            finish, measured, _, _, logprobs, _ = self.api.run(request, lambda piece: event(chunk({"content": piece})),
                 cancel, lambda deltas: event(chunk({"tool_calls": deltas})),
                 lambda piece: event(chunk({"reasoning_content": piece})), on_started=on_started)
         except EngineError as exc:
+            self.measure("openai", started, self.outcome(exc))
             event({"error": {"message": str(exc), "type": "server_error", "param": None, "code": None}})
         else:
+            self.measure("openai", started, "completed", measured)
             # Text streams as the engine emits it; the reply's logprobs come from its final record, with the finish chunk.
             event(chunk({}, finish, logprobs=logprobs))
             if request["include_usage"]:
@@ -617,6 +708,147 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except OSError:
             pass
+
+    # Anthropic Messages (crit_api.anthropic)
+
+    def anthropic_complete(self, request, cancel):
+        pieces = []
+        started = time.perf_counter()
+        self.api.metrics.begin()
+        try:
+            finish, measured, calls, reasoning, _, stopped = self.api.run(request, pieces.append, cancel)
+        except EngineError as exc:
+            self.measure("anthropic", started, self.outcome(exc))
+            return self.fail(exc.status, str(exc))
+        self.measure("anthropic", started, "completed", measured)
+        value = anthropic.message(request["requested_model"] or request["model"], finish, measured, "".join(pieces), calls,
+                                  reasoning, stopped)
+        self.send_json(200, value, self.headers_for(request))
+
+    def anthropic_stream(self, request, cancel):
+        with StreamDelivery(self.connection, cancel, self.api.engine._stopping, self.api.engine.timeout) as delivery:
+            previous, self.wfile = self.wfile, delivery
+            try:
+                self._anthropic_stream(request, cancel, delivery.set_deadline)
+            finally:
+                self.wfile = previous
+
+    def _anthropic_stream(self, request, cancel, on_started):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.cors()
+        for name, content in self.headers_for(request):
+            self.send_header(name, content)
+        self.end_headers()
+        self.close_connection = True
+
+        def send(event, data):
+            try:
+                self.wfile.write(f"event: {event}\n".encode("utf-8") + b"data: " + json.dumps(data).encode("utf-8") + b"\n\n")
+                self.wfile.flush()
+            except OSError:
+                cancel.set()
+
+        stream = anthropic.Stream(send, request["requested_model"] or request["model"])
+        stream.start()
+        started = time.perf_counter()
+        self.api.metrics.begin()
+        try:
+            finish, measured, _, _, _, stopped = self.api.run(request, stream.text, cancel, stream.tools, stream.thinking,
+                                                             on_started=on_started)
+        except EngineError as exc:
+            self.measure("anthropic", started, self.outcome(exc))
+            stream.error(str(exc))
+        else:
+            self.measure("anthropic", started, "completed", measured)
+            stream.finish(finish, measured, stopped)
+
+    # Ollama (crit_api.ollama)
+
+    def ollama_show(self, raw):
+        try:
+            body = json.loads(raw)
+            if not isinstance(body, dict):
+                raise RequestError("The request body must be a JSON object")
+            name = body.get("model", body.get("name"))
+            candidate = self.api.candidate(name)
+        except (ValueError, UnicodeDecodeError) as exc:
+            return self.fail(400, "Invalid JSON body: " + str(exc))
+        except RequestError as exc:
+            return self.fail(exc.status, str(exc))
+        wanted = self.api.engine.model_id(candidate)
+        card = next((c for c in self.api.models() if c["id"] == wanted or (candidate == self.api.engine.default and c["default"])), None)
+        if card is None:
+            return self.fail(404, f"model '{name}' not found")
+        self.send_json(200, ollama.show(card))
+
+    def ollama_complete(self, request, cancel, generate=False):
+        pieces, thoughts = [], []
+        model = request["requested_model"] or request["model"]
+        started = time.perf_counter()
+        self.api.metrics.begin()
+        try:
+            finish, measured, calls, reasoning, _, _ = self.api.run(request, pieces.append, cancel, None, thoughts.append)
+        except EngineError as exc:
+            self.measure("ollama", started, self.outcome(exc))
+            return self.fail(exc.status, str(exc))
+        self.measure("ollama", started, "completed", measured)
+        seconds = time.perf_counter() - started
+        text = "".join(pieces)
+        if generate:
+            value = ollama.final(model, finish, measured, seconds, response=text, thinking=reasoning or None)
+        else:
+            message = {"role": "assistant", "content": text}
+            if reasoning:
+                message["thinking"] = reasoning
+            if calls:
+                message["tool_calls"] = [ollama.tool_call(call) for call in calls]
+            value = ollama.final(model, finish, measured, seconds, message=message)
+        self.send_json(200, value, self.headers_for(request))
+
+    def ollama_stream(self, request, cancel, generate=False):
+        with StreamDelivery(self.connection, cancel, self.api.engine._stopping, self.api.engine.timeout) as delivery:
+            previous, self.wfile = self.wfile, delivery
+            try:
+                self._ollama_stream(request, cancel, delivery.set_deadline, generate)
+            finally:
+                self.wfile = previous
+
+    def _ollama_stream(self, request, cancel, on_started, generate):
+        model = request["requested_model"] or request["model"]
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.cors()
+        for name, content in self.headers_for(request):
+            self.send_header(name, content)
+        self.end_headers()
+        self.close_connection = True
+
+        def send(value):
+            try:
+                self.wfile.write(json.dumps(value).encode("utf-8") + b"\n")
+                self.wfile.flush()
+            except OSError:
+                cancel.set()
+
+        started = time.perf_counter()
+        self.api.metrics.begin()
+        try:
+            finish, measured, calls, _, _, _ = self.api.run(
+                request, lambda piece: send(ollama.chunk(model, piece, generate=generate)), cancel, None,
+                lambda piece: send(ollama.chunk(model, "", thinking=piece, generate=generate)), on_started=on_started)
+        except EngineError as exc:
+            self.measure("ollama", started, self.outcome(exc))
+            send(ollama.error_body(str(exc)))
+            return
+        self.measure("ollama", started, "completed", measured)
+        if calls and not generate:
+            send(ollama.chunk(model, "", tool_calls=[ollama.tool_call(call) for call in calls]))
+        send(ollama.final(model, finish, measured, time.perf_counter() - started, response="" if generate else None))
 
 
 class Server(ThreadingHTTPServer):

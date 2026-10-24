@@ -8,15 +8,16 @@ reports three independent observations, each possibly unknown:
 - commit_available: commit headroom where the OS enforces commit (Windows
   available page file; Linux only with vm.overcommit_memory = 2);
 - cgroup_available: the tightest ancestor cgroup headroom on Linux, counting
-  only clean file pages as reclaimable (dirty and writeback pages are not).
+  only clean page cache as reclaimable (tmpfs/shmem, dirty and writeback pages
+  are not).
 
 `admit` compares a request plus an explicit reserve with the tightest known
 observation. Standard library only; nothing is allocated or changed.
 
 This is the Python host reference. Native engines call Core's
 crit::core::observe_host_memory and crit::core::admit_host (crit/host_memory.h),
-which apply these observation rules and also turn malformed values into unknowns;
-admit_working_set follows admit_host.
+which apply the same observation rules, including malformed values becoming
+unknowns (or no reclaimable pages) with a note; admit_working_set follows admit_host.
 """
 from dataclasses import dataclass, field
 import os
@@ -57,20 +58,31 @@ def parse_meminfo(text):
 
 
 def parse_stat(text):
-    """cgroup memory.stat: 'key value' per line."""
+    """cgroup memory.stat: 'key value' per line; a malformed value is None."""
     values = {}
     for line in text.splitlines():
         parts = line.split()
-        if len(parts) == 2 and parts[1].isdigit():
-            values[parts[0]] = int(parts[1])
+        if len(parts) == 2:
+            values[parts[0]] = _u64(parts[1])
     return values
+
+
+_U64_MAX = (1 << 64) - 1
+
+
+def _u64(text):
+    """Decimal digits only, without sign, below 2**64; otherwise None."""
+    if not (text.isascii() and text.isdigit()):
+        return None
+    value = int(text)
+    return value if value <= _U64_MAX else None
 
 
 def _read(path):
     try:
         with open(path, encoding="ascii") as f:
             return f.read()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
 
 
@@ -78,49 +90,94 @@ def _join(root, absolute):
     return os.path.join(root, absolute.lstrip("/"))
 
 
+def clean_pages(stat, cache, dirty, writeback, totals, source, notes):
+    """Clean page cache: the file LRUs (active_file + inactive_file, which exclude
+    tmpfs/shmem pages) when listed, else cache - shmem; minus dirty and writeback.
+    v1 (totals) prefers each key's hierarchical total_ form. A malformed entry
+    counts nothing as reclaimable, as in Core."""
+    def key(name):
+        return "total_" + name if totals and "total_" + name in stat else name
+    active, inactive = key("active_file"), key("inactive_file")
+    lru = active in stat or inactive in stat
+    a, b, d, w = (stat.get(k, 0) for k in ((active, inactive) if lru else (key(cache), key("shmem")))
+                  + (key(dirty), key(writeback)))
+    if None in (a, b, d, w):
+        notes.append(source + " malformed; no file pages counted as reclaimable")
+        return 0
+    return max(0, (min(a + b, _U64_MAX) if lru else max(0, a - b)) - d - w)
+
+
 def cgroup_headroom(root="/"):
-    """Tightest headroom over this process's cgroup and its ancestors, or (None, note).
-    v2: memory.max - memory.current + clean file pages; v1: the memory controller's
-    hierarchical limit with cache minus dirty/writeback as reclaimable."""
+    """Tightest headroom over this process's cgroup and its ancestors, and a note
+    (None when there is nothing to say). v2: min(memory.max, memory.high) -
+    memory.current + clean page cache; v1: the memory controller's hierarchical
+    limit with the same reclaimable rule. Follows Core's observe_host_memory_linux."""
+    notes = []
     membership = _read(_join(root, "/proc/self/cgroup"))
     if membership is None:
         return None, "cgroup membership unreadable"
     v2_path = v1_path = None
     for line in membership.splitlines():
-        hierarchy, _, rest = line.partition(":")
-        controllers, _, path = rest.partition(":")
+        hierarchy, sep1, rest = line.partition(":")
+        controllers, sep2, path = rest.partition(":")
+        if not (sep1 and sep2):
+            continue
         if hierarchy == "0" and controllers == "":
             v2_path = path
         elif "memory" in controllers.split(","):
             v1_path = path
-    best = None
+
+    def result(value):
+        return value, "; ".join(notes) or None
+
     if v2_path is not None:
+        best = None
         current = v2_path
         while True:
             base = _join(_join(root, "/sys/fs/cgroup"), current)
-            limit_text, usage_text = _read(os.path.join(base, "memory.max")), _read(os.path.join(base, "memory.current"))
-            if limit_text is not None and usage_text is not None and limit_text.strip() != "max":
-                stat = parse_stat(_read(os.path.join(base, "memory.stat")) or "")
-                clean = max(0, stat.get("file", 0) - stat.get("file_dirty", 0) - stat.get("file_writeback", 0))
-                headroom = max(0, int(limit_text) - int(usage_text) + clean)
-                best = headroom if best is None else min(best, headroom)
+            # Past memory.high the kernel throttles and reclaims, so a level limited
+            # only by memory.high is still limited. Unreadable reads as "max".
+            max_text, high_text = (("max" if t is None else t).strip()
+                                   for t in (_read(os.path.join(base, n)) for n in ("memory.max", "memory.high")))
+            usage_text = _read(os.path.join(base, "memory.current"))
+            if usage_text is not None and (max_text != "max" or high_text != "max"):
+                limits = [_U64_MAX if t == "max" else _u64(t) for t in (max_text, high_text)]
+                used = _u64(usage_text.strip())
+                if None in limits or used is None:
+                    notes.append("cgroup %s memory.max, memory.high or memory.current malformed" % base)
+                else:
+                    stat_path = os.path.join(base, "memory.stat")
+                    stat = parse_stat(_read(stat_path) or "")
+                    clean = clean_pages(stat, "file", "file_dirty", "file_writeback", False, stat_path, notes)
+                    headroom = max(0, min(min(limits) + clean, _U64_MAX) - used)
+                    best = headroom if best is None else min(best, headroom)
             if current in ("/", ""):
                 break
             current = current.rsplit("/", 1)[0] or "/"
-        if best is not None or v1_path is None:
-            return best, None if best is not None else "no cgroup v2 memory limit"
+        if best is not None:
+            return result(best)
     # No limited v2 level: a v1 memory hierarchy (systemd hybrid hosts) still applies.
     if v1_path is not None:
         base = _join(_join(root, "/sys/fs/cgroup/memory"), v1_path)
-        stat = parse_stat(_read(os.path.join(base, "memory.stat")) or "")
+        stat_path = os.path.join(base, "memory.stat")
+        stat = parse_stat(_read(stat_path) or "")
         usage_text = _read(os.path.join(base, "memory.usage_in_bytes"))
-        limit = stat.get("hierarchical_memory_limit")
-        if limit is None or usage_text is None or limit >= 1 << 62:
-            return None, "no cgroup v1 memory limit"
-        clean = max(0, stat.get("total_cache", stat.get("cache", 0)) - stat.get("total_dirty", stat.get("dirty", 0))
-                    - stat.get("total_writeback", stat.get("writeback", 0)))
-        return max(0, limit - int(usage_text) + clean), None
-    return None, "no memory cgroup"
+        if "hierarchical_memory_limit" not in stat or usage_text is None:
+            notes.append("no cgroup v1 memory limit")
+        elif stat["hierarchical_memory_limit"] is None:
+            notes.append("cgroup %s hierarchical_memory_limit malformed" % base)
+        elif stat["hierarchical_memory_limit"] >= 1 << 62:
+            notes.append("no cgroup v1 memory limit")
+        elif _u64(usage_text.strip()) is None:
+            notes.append("cgroup %s memory.usage_in_bytes malformed" % base)
+        else:
+            clean = clean_pages(stat, "cache", "dirty", "writeback", True, stat_path, notes)
+            return result(max(0, min(stat["hierarchical_memory_limit"] + clean, _U64_MAX) - _u64(usage_text.strip())))
+        if v2_path is not None:
+            notes.append("no cgroup v2 memory limit")
+        return result(None)
+    notes.append("no cgroup v2 memory limit" if v2_path is not None else "no memory cgroup")
+    return result(None)
 
 
 def observe_linux(root="/"):

@@ -1246,6 +1246,35 @@ void host_memory_v2() {
     o = observe_host_memory_linux(root);
     require(!o.commit && !o.cgroup && o.physical && o.notes.size() == 2, "unknown commit and cgroup");
     require(has_note(o, "commit not enforced (overcommit_memory=0)") && has_note(o, "no cgroup v2 memory limit"), "unknown reasons");
+    // tmpfs/shmem pages sit in file but are swap-backed: only the file LRUs, else file - shmem, are reclaimable.
+    put(root / "sys/fs/cgroup/app/memory.max", "500000\n");
+    put(root / "sys/fs/cgroup/app/memory.current", "450000\n");
+    put(root / "sys/fs/cgroup/app/memory.stat", "file 60000\nshmem 50000\nfile_dirty 1000\nfile_writeback 0\n");
+    require(observe_host_memory_linux(root).cgroup == 59000u, "file minus shmem without the file LRUs");
+    put(root / "sys/fs/cgroup/app/memory.stat",
+        "file 60000\nshmem 50000\nactive_file 4000\ninactive_file 6000\nfile_dirty 1000\nfile_writeback 500\n");
+    require(observe_host_memory_linux(root).cgroup == 58500u, "file LRUs preferred");
+    // A cgroup at its limit holding mostly shmem has no reclaimable headroom for a large request.
+    constexpr std::uint64_t gib = std::uint64_t(1) << 30;
+    put(root / "sys/fs/cgroup/app/memory.max", std::to_string(8 * gib) + "\n");
+    put(root / "sys/fs/cgroup/app/memory.current", std::to_string(8 * gib) + "\n");
+    put(root / "sys/fs/cgroup/app/memory.stat", "anon " + std::to_string(2 * gib) + "\nfile " + std::to_string(6 * gib) +
+        "\nshmem " + std::to_string(6 * gib) + "\nactive_file 0\ninactive_file 0\nfile_dirty 0\nfile_writeback 0\n");
+    o = observe_host_memory_linux(root);
+    const auto shmem = admit_host(anonymous(5 * gib), o);
+    require(o.cgroup == 0u && !shmem.admitted && shmem.binding == "cgroup", "shmem is not reclaimable");
+    // memory.high limits too: the effective limit is min(memory.max, memory.high).
+    put(root / "sys/fs/cgroup/app/memory.max", "max\n");
+    put(root / "sys/fs/cgroup/app/memory.high", "460000\n");
+    put(root / "sys/fs/cgroup/app/memory.current", "450000\n");
+    put(root / "sys/fs/cgroup/app/memory.stat", "active_file 4000\ninactive_file 6000\nfile_dirty 1000\nfile_writeback 500\n");
+    require(observe_host_memory_linux(root).cgroup == 18500u, "memory.high alone limits");
+    put(root / "sys/fs/cgroup/app/memory.max", "455000\n");
+    require(observe_host_memory_linux(root).cgroup == 13500u, "memory.max below memory.high");
+    put(root / "sys/fs/cgroup/app/memory.max", "max\n");
+    put(root / "sys/fs/cgroup/app/memory.high", "max\n");
+    o = observe_host_memory_linux(root);
+    require(!o.cgroup && has_note(o, "no cgroup v2 memory limit"), "memory.max and memory.high both max");
 }
 
 void host_memory_v1() {
@@ -1291,6 +1320,15 @@ void host_memory_v1() {
     put(root / "proc/self/cgroup", "0::/job\n12:memory:/job\n");   // line order does not matter
     put(root / "sys/fs/cgroup/memory/job/memory.stat", "hierarchical_memory_limit 1000\n");
     require(observe_host_memory_linux(root).cgroup == 300u, "hybrid membership in either order");
+    // v1 shmem is in cache but not reclaimable: the file LRUs, else cache - shmem, each preferring total_.
+    put(root / "sys/fs/cgroup/memory/job/memory.stat", "cache 500\nshmem 300\ndirty 50\nhierarchical_memory_limit 1000\n");
+    require(observe_host_memory_linux(root).cgroup == 450u, "v1 cache minus shmem");
+    put(root / "sys/fs/cgroup/memory/job/memory.stat",
+        "cache 500\nshmem 300\ntotal_cache 900\ntotal_shmem 800\ndirty 50\nhierarchical_memory_limit 1000\n");
+    require(observe_host_memory_linux(root).cgroup == 350u, "v1 hierarchical shmem preferred");
+    put(root / "sys/fs/cgroup/memory/job/memory.stat", "cache 500\nshmem 300\ntotal_active_file 100\n"
+        "total_inactive_file 60\ninactive_file 1\ntotal_dirty 20\nhierarchical_memory_limit 1000\n");
+    require(observe_host_memory_linux(root).cgroup == 440u, "v1 file LRUs preferred");
 }
 
 void host_memory_malformed() {
@@ -1312,7 +1350,17 @@ void host_memory_malformed() {
     require(!o.physical && has_note(o, "MemAvailable malformed"), "malformed MemAvailable");
     require(!o.commit && has_note(o, "commit headroom unknown"), "malformed commit counters");
     require(o.cgroup == 600u, "malformed level skipped; malformed stat counts no reclaimable pages");
-    require(has_note(o, "memory.max or memory.current malformed") && has_note(o, "memory.stat malformed"), "cgroup notes");
+    require(has_note(o, "memory.max, memory.high or memory.current malformed") && has_note(o, "memory.stat malformed"), "cgroup notes");
+    for(const char* counters:{"file 100\nshmem x\n", "active_file 100\ninactive_file -1\n", "active_file 100\nfile_writeback 1.5\n"}) {
+        put(root / "sys/fs/cgroup/a/memory.stat", counters);
+        o = observe_host_memory_linux(root);
+        require(o.cgroup == 600u && has_note(o, "memory.stat malformed"), "malformed reclaimable counters count nothing");
+    }
+    put(root / "sys/fs/cgroup/a/memory.stat", "file 100\n");
+    put(root / "sys/fs/cgroup/a/memory.high", "lots\n");
+    o = observe_host_memory_linux(root);
+    require(!o.cgroup && has_note(o, "memory.max, memory.high or memory.current malformed"), "malformed memory.high skips the level");
+    fs::remove(root / "sys/fs/cgroup/a/memory.high");
     put(root / "proc/meminfo", "MemAvailable: 18446744073709551615 kB\nCommitLimit: 99999999999999999999999\nCommitted_AS: 1\n");
     put(root / "proc/sys/vm/overcommit_memory", "two\n");
     o = observe_host_memory_linux(root);

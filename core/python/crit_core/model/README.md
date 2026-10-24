@@ -112,6 +112,22 @@ counts recurrent state only for layers `layer_types` lists as `linear_attention`
 so a hybrid declared only through `full_attention_interval` reports none. Only
 `text_config` nests.
 
+## Hidden-state drafters
+
+`read_drafter(config, target_layers=None)` ([drafters.py](drafters.py)) reads a
+published companion drafter's `config.json` into one `Drafter`: `kind` (`eagle3`,
+or `block` for DFlash and DSpark), `taps`, widths, draft vocabulary, block size,
+mask token, anchor sampling, causality, confidence head, the publisher's draft
+width and verifier. Formats: speculators (`speculators_model_type` eagle3, peagle,
+dflash, dflash2, dspark), native EAGLE-3 (an `Eagle3` architecture; without taps
+the default `(2, L // 2, L - 3)` for an `L`-layer target), native DFlash
+(`dflash_config`) and native DSpark. Taps are residual-stream indices, the hidden
+state after `k` target decoder layers: EAGLE-3 and speculators spell them so,
+native DFlash and DSpark name the layer whose output is read (tap = id + 1). A
+config of any other kind reads as `None`; taps past the target, a block drafter
+without a block size or mask token, and EAGLE-3 defaults without the target's
+depth raise `ConfigError`. The engine supplies the device side.
+
 ## safetensors
 
 `inspect_safetensors(path)` validates one `.safetensors` file and returns a

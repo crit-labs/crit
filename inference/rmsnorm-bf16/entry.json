@@ -1,7 +1,7 @@
 {
   "id": "rmsnorm-bf16",
   "category": "projections",
-  "summary": "BF16 RMS normalization with optional offset gain or SiLU gate",
+  "summary": "BF16 RMS normalization with optional offset gain or SiLU gate, rounded once or Llama-style",
   "implementation_status": "native_source",
   "implementation_scope": "CUDA row kernel, validated borrowed BF16 views, host formula and standalone native mode/shape/alias POC; engine quality/performance remain external",
   "agent_guidance": {
@@ -9,6 +9,7 @@
     "avoid_when": "Views or formulas differ without adaptation, or an existing fused kernel already handles normalization efficiently",
     "provides": [
       "CUDA FP32 row reduction with BF16 output and plain/unit-offset/gated modes",
+      "Selectable BF16 rounding order: once after gain (Gemma style) or normalized value first, then the gain product (HF Llama-family style)",
       "Native shape, stride, workspace and alias validation",
       "CMake target and executable Python formula reference",
       "Host reference for folding split-reduction partials into the residual in a fixed order before normalizing (deterministic, no atomics)"
@@ -19,7 +20,7 @@
       "Native numerical, alias, shape-boundary and performance validation"
     ],
     "preserve": [
-      "Gain convention and epsilon placement",
+      "Gain convention, rounding order and epsilon placement",
       "Declared input/output representations, supported aliases and view lifetime",
       "Rounding and reduction behavior assessed under engine criteria"
     ],
@@ -54,16 +55,16 @@
     },
     {
       "path": "inference/rmsnorm-bf16/code/example.cpp",
-      "purpose": "Standalone native borrowed-view POC with independent BF16 oracle, boundary shapes, aliases and metadata rejection"
+      "purpose": "Standalone native borrowed-view POC with independent BF16 oracle, both rounding orders, boundary and wide shapes, aliases and metadata rejection"
     }
   ],
   "requires": {
     "hardware": "Python 3.11+ for the formula; native source requires CMake 3.28+, C++/CUDA 20, the CUDA toolkit and a device compatible with the chosen build",
     "model": "Row RMS normalization on BF16 input/gain/output; optional equal-shaped gate",
-    "workload": "Native source accepts width 1..8192, rows 1..49152 and contiguous two-byte elements"
+    "workload": "Native source accepts width 1..2^24, rows 1..2^31-1 and contiguous two-byte elements"
   },
   "contract": {
-    "input": "BF16 device views, gain row, optional gate, positive FP32 epsilon and caller stream",
+    "input": "BF16 device views, gain row, optional gate, positive FP32 epsilon, rounding order (default single) and caller stream",
     "output": "Enqueued BF16 output plus Dispatch metadata",
     "ownership": "Caller retains all device views until stream completion. Exact input/output or gate/output aliases are admitted; partial aliases and output/gain overlap are rejected.",
     "failure": "Host validation rejects unsupported views, shapes, modes, epsilon, workspace and aliases before enqueue. Launch errors throw; caller handles physical settlement.",
@@ -89,8 +90,8 @@
     "quantized-projections"
   ],
   "validation": {
-    "host": "Python formula fixtures and worked example cover modes, shapes, finite values and gain conventions; no CUDA execution",
-    "native": "Standalone CUDA example checks 91 bounded finite mode/shape/alias cases against an independent double/BF16 formula, width/row limits and metadata rejection; extreme numerical ranges, full-model quality and speed require consumer evidence",
+    "host": "Python formula fixtures and worked example cover modes, rounding orders, BF16 rounding, shapes, finite values and gain conventions; no CUDA execution",
+    "native": "Standalone CUDA example checks 238 bounded finite mode/rounding/shape/alias cases (widths to 16384, rows to 65537) against an independent double/BF16 formula, 9 exact normalize_first rounding-order cases at widths 4096-16384, width/row limits and metadata rejection; extreme numerical ranges, full-model quality and speed require consumer evidence",
     "performance": "Unmeasured for a native engine; host fixture success is not a speed claim"
   }
 }

@@ -31,16 +31,22 @@
 
 namespace crit::stored_tile {
 
-// Launch geometry and the scratch a GEMM needs.
+// Launch geometry and the scratch a GEMM needs, for one format and shape (fp4, n, k) and at most `tokens` tokens.
 struct Plan {
+    bool fp4 = false;
+    int n = 0, k = 0, tokens = 0;
     int nt = 8, rt = 1, sk = 1, tpad = 0;
     // Scratch the caller provides: packed activations, per-token scales (FP8) and split-K partials.
     std::size_t activation_bytes = 0, token_scale_count = 0, partial_floats = 0;
 };
 
 // Token groups per block: 16 (128 tokens) above `wide_tokens`, else 8; two row tiles per warp when N allows.
-// Split K until the grid holds at least `min_blocks` blocks (at most 8 parts).
-Plan plan(bool fp4, int N, int K, int T, int wide_tokens = 256, int min_blocks = 340, bool two_row_tiles = true);
+// Split K until the grid holds at least `min_blocks` blocks (at most 8 parts). min_blocks <= 0 uses two blocks per
+// SM of the current device (cudaDevAttrMultiProcessorCount); wide_tokens = 256 was measured on one sm_120 device
+// and is a starting point for the engine to measure on its own. The split changes the accumulation order, so the
+// plan (and the bits of the result) can differ between devices.
+// A plan serves launches of its own format and N, K with 1..T tokens; scratch sized from it covers that range.
+Plan plan(bool fp4, int N, int K, int T, int wide_tokens = 256, int min_blocks = 0, bool two_row_tiles = true);
 
 struct Fp8Weights { const std::uint8_t* tiles; const __nv_bfloat16* row_scale; int N, K; };
 // Dequantization: weight = code * scale / weight_global_scale (the checkpoint's divisor); activations are quantized
@@ -55,8 +61,9 @@ cudaError_t enqueue_repack_fp4(const std::uint8_t* codes, const std::uint8_t* sc
                                std::uint8_t* scale_tiles, int N, int K, cudaStream_t stream);
 
 // Y[t][n] (row stride ldo) = (add ? Y : 0) + sum_k W[n][k] x[t][k] with each format's dequantization; x is BF16
-// [T][K] row-major. Returns cudaErrorInvalidValue for unsupported shapes; the NVFP4 path traps on a device without
-// the block-scaled MMA (sm_120a / sm_121a builds only).
+// [T][K] row-major. Returns cudaErrorInvalidValue for unsupported shapes and for a plan made for another format,
+// N or K, or for fewer than T tokens (its scratch would overflow); the NVFP4 path traps on a device without the
+// block-scaled MMA (sm_120a / sm_121a builds only).
 cudaError_t enqueue_fp8(const Fp8Weights& w, const __nv_bfloat16* x, int T, float* y, int ldo, bool add,
                         const Plan& p, const Scratch& s, cudaStream_t stream);
 cudaError_t enqueue_fp4(const Fp4Weights& w, const __nv_bfloat16* x, int T, float* y, int ldo, bool add,

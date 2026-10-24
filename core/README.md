@@ -41,6 +41,7 @@ the Python package in `python/` and the [contracts](contracts/README.md) in
 | [Structured output](src/constraints/README.md) | Optional token matchers for choices, JSON and compiled grammars, masked sampling | [constraints.h](include/crit/constraints.h) |
 | [Device graphs](src/backends/cuda/README.md#graph-capture) | Optional graph cache, staged geometry and replay state machine; CUDA harness with `CRIT_CORE_CUDA` | [device_graph.h](include/crit/device_graph.h), [cuda_graph.h](include/crit/cuda_graph.h) |
 | [Shared device allocations](src/backends/cuda/README.md#shared-allocations-and-mapped-sources) | Optional leases charged once, mapped-source resolution; CUDA hooks with `CRIT_CORE_CUDA` | [device_memory.h](include/crit/device_memory.h), [cuda_memory.h](include/crit/cuda_memory.h) |
+| [Programmatic dependent launch](src/backends/cuda/README.md#programmatic-dependent-launch) | Kernel launches that overlap the previous kernel's tail on sm_90+, with a device query and an ordinary fallback; `CRIT_CORE_CUDA` | [cuda_launch.h](include/crit/cuda_launch.h) |
 | [CUDA backend](src/backends/cuda/README.md) | Allocation, streams/events, ownership services, [device time by category](src/backends/cuda/README.md#device-time-by-category) | [cuda.h](include/crit/cuda.h) |
 | [Python package](python/README.md) | `crit_core`: model files, strict JSON, [config and safetensors](python/crit_core/model/README.md), [text layer](python/crit_core/text/README.md), constraints | [crit_core](python/crit_core) |
 | [Contracts](contracts/README.md) | Native ownership and request responsibilities | [CONTRACTS.json](contracts/CONTRACTS.json) |
@@ -75,16 +76,17 @@ cmake --build build/consumer
 ctest --test-dir build/consumer --output-on-failure
 ```
 
-The SDK is version 0.6.1. Include `<crit/core.h>` and link the installed target:
+The SDK is version 0.7.0. Include `<crit/core.h>` and link the installed target:
 
 ```cmake
-find_package(critCore 0.6.1 EXACT CONFIG REQUIRED)
+find_package(critCore 0.7.0 EXACT CONFIG REQUIRED)
 target_link_libraries(your_engine PRIVATE crit::core)
 ```
 
 The component headers in the table come with the same target; optional CUDA
-services use `<crit/cuda.h>`, `<crit/cuda_graph.h>`, `<crit/cuda_memory.h>` and
-`crit::cuda`. Supply `build/core-install` through `CMAKE_PREFIX_PATH`. See the
+services use `<crit/cuda.h>`, `<crit/cuda_graph.h>`, `<crit/cuda_memory.h>`,
+`<crit/cuda_launch.h>` and `crit::cuda`. Supply `build/core-install` through
+`CMAKE_PREFIX_PATH`. See the
 [installed consumer example](../tests/core/concurrency_consumer/main.cpp).
 
 Adapters can return an independent `TextFrontend` from `Model::text_frontend()`

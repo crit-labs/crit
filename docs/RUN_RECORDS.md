@@ -17,7 +17,9 @@ Default root: `CRIT_ROOT/runs/`, outside product folders and protected retention
 Global options precede the action; `create` omits `--id`.
 
 Optional, untracked `CRIT_ROOT/settings.toml` holds machine settings that `create`
-uses when the request omits them; unknown keys are an error:
+uses when the request omits them; unknown keys are an error. Copy
+[settings.example.toml](../settings.example.toml) to `settings.toml`: it lists every key with its
+default and a comment. In short:
 
 ```toml
 wsl_run_root = "/srv/crit/runs"  # folder for work that must run under WSL; empty: none
@@ -34,7 +36,7 @@ and speed techniques; a larger one trades context for that room.
 
 | Action | Arguments / effect |
 | --- | --- |
-| `create` | `--record request.json`; new run and first segment |
+| `create` | `--record request.json [--from-engine ENGINE_DIR]`; new run and first segment; with an engine folder of a crit-hub checkout, the run starts from that engine ([origin engine](#origin-engine)) |
 | `resolve` | `--record inputs.json`; freezes verified model and input identities |
 | `candidate` | `--source DIR --record proposal.json`; allocates an ID, retains source |
 | `reserve` | `--operation discovery/build/check/benchmark [--candidate ID] [--seconds N]`; consumes an attempt before launch; only discovery omits the candidate |
@@ -47,6 +49,7 @@ and speed techniques; a larger one trades context for that room.
 | `select` | `--candidate ID`; selects a sealed eligible candidate |
 | `stop` | `--record stop.json` |
 | `resume` | `--candidates N [--attempt-limit N] [--external-agent-stopped]`; new segment for N more candidates (`--minutes N` alone: legacy time-budget segment). `--quality-budget JSON`, `--exactness MODE`, `--approved-by NAME` amend quality terms from this segment on, recorded as the segment's `amendment` |
+| `cost` | `--transcript PATH [--transcript PATH ...] [--agent NAME] [--prices JSON] [--until TIMESTAMP]`; accounts the run's build cost from the agent's transcripts and writes `cost.json` ([cost](#cost)) |
 | `show`, `recover` | Inspect; or prove abandoned ownership and rebuild active projections |
 
 ## Payloads
@@ -75,6 +78,7 @@ hashes; add them only where a field below requires one.
 | `quality_budget` | Optional drift budget against Eval's reference: any of `ppl_ratio_max` (≥ 1), `kld_mean_max`, `kld_p99_max` (≥ 0); defaults 1.05, 0.05, 0.5. Agents spend it on speed |
 | `exactness` | `reported` (default: speculative output may differ from plain greedy; the drift budget judges it) or `required` (any difference fails Eval's gate) |
 | `eval_sampling` | Optional, the user's only: `{settings, approved_by}`, settings `temperature` (> 0, required) and any of `top_p`, `top_k`, `min_p`, as an object or `"temperature=0.6,top_p=0.95"`. Eval's sampled suite then measures at these settings instead of the model's `generation_config.json`: `crit run ... eval` requires data prepared with `crit eval prepare --sampling` and the same settings (and refuses overridden data without it), recon applies them to the served default, and results label them as an override |
+| `origin_engine` | Written by `create --from-engine`, never by hand: the crit-hub engine the run starts from ([origin engine](#origin-engine)) |
 
 Workload keys: `prompt_tokens`, `output_tokens` (1–1,000,000), `concurrency` (1–256),
 `repetitions` (1–100), `warmup_runs` (0–100), `mode` (`resident`/`cold`). KV capacity
@@ -90,8 +94,8 @@ Provider spend limits are the caller's responsibility.
 
 | Payload | Fields |
 | --- | --- |
-| Inputs | Nonempty `hardware_manifest`, `environment_manifest`; `case_manifests` mapping **every** fixed case ID to an ordered nonempty list of `{path, bytes, sha256}` under the run's `captured/` |
-| Proposal | `label`, `rationale`, `strategy`, `configuration` object, `store_decisions` object; optional `parent_candidate_id`, `origin_candidate_id` (earlier retained candidates); `weights` (`as_stored` or `transformed`, required when `weights_policy` is `as_stored`). A run whose model is a folder needs `work/recon.json` (`recon`) before its first candidate; crit adds its `frozen` block as `configuration.recon` (a supplied `recon` must equal it) and `extensions.recon` with its path and SHA-256 |
+| Inputs | Nonempty `hardware_manifest`, `environment_manifest`; `case_manifests` mapping **every** fixed case ID to an ordered nonempty list of `{path, bytes, sha256}` under the run's `captured/`. In a run with an origin engine, crit adds `origin_checkpoint`: whether the model is the exact checkpoint the engine was measured on |
+| Proposal | `label`, `rationale`, `strategy`, `configuration` object, `store_decisions` object; optional `parent_candidate_id`, `origin_candidate_id` (earlier retained candidates); `weights` (`as_stored` or `transformed`, required when `weights_policy` is `as_stored`); `lineage` (`origin-engine`: the candidate is the origin engine's source as imported, in a run created with `--from-engine`). A run whose model is a folder needs `work/recon.json` (`recon`) before its first candidate; crit adds its `frozen` block as `configuration.recon` (a supplied `recon` must equal it) and `extensions.recon` with its path and SHA-256 |
 | Package recipe | `build: {toolchain: {...}, dependencies: [...], command: [...]}`, literal `launch` argument list, `capabilities` list |
 
 In an `as_stored` run, a candidate declaring `transformed` weights (requantized,
@@ -276,6 +280,39 @@ was built for the KPI, `cause` the physical cause of any remaining distance. Eva
 `search_exhausted` and `budget_exhausted` require decode, prefill and ttft. The account
 is recorded in the `run_stopped` event.
 
+### Origin engine
+
+`crit run create --record request.json --from-engine ENGINE_DIR` starts a run from an engine listed in
+crit-hub: `ENGINE_DIR` is its `engines/<owner>/<name>/` folder in a crit-hub checkout (`card.yaml`,
+`card.lock.json`, `evidence/`; reading the card needs PyYAML, as crit-hub's tools do). The request's
+`origin_engine` then records the engine (`<owner>/<name>`, title, origin, contributor), the repository,
+commit and folder of its source, the card's and lock's hashes, every checkpoint it was measured on with
+each file's size and SHA-256, its sealed provenance and its published crit Eval results, which are copied
+into the run under `captured/origin/` as the numbers before the run's work. The agent request tells the
+agent to check the source out at that commit and make it the first candidate, declared with
+`"lineage": "origin-engine"` in its proposal and measured before any change, so it is the baseline. At
+`resolve`, `inputs.json` gains `origin_checkpoint`: per checkpoint the files the run's model lacks or
+stores with other bytes, and `matched`, the checkpoint the model is, or null; a different checkpoint is
+recorded, never refused, and `recon --compare` shows what it changes. crit-hub's exporter writes the
+origin into the new engine's card as `derived_from`.
+
+### Cost
+
+`crit run ... cost` writes `cost.json`, the run's build cost: wall time, the agent's model requests and
+tokens, and their API-equivalent price, per candidate and for the run. It reads the coding agent's
+transcripts (`--transcript`, repeatable: a Claude Code session JSONL, a Codex rollout JSONL, or a plain
+JSONL of `{"timestamp", "model", "input_tokens", "output_tokens", "cache_read_input_tokens",
+"cache_creation_input_tokens"}`), counts each response once and attributes it by time to the candidate
+being built: a candidate's span runs from the previous candidate's seal (the run's creation for the
+first) to its own seal, so its row is what it cost to reach it, with running totals from the run's first
+event; requests after the last seal are `selection`, requests before the run `before_run`, and the run's
+`until` is its stop, `--until`, or now. Tokens are priced at Anthropic's list prices per million tokens
+(input, cache reads, cache writes with a 5-minute or 1-hour lifetime, output; the record keeps the table);
+`--prices` adds a model or changes a rate. A request whose model has no price keeps its tokens and makes
+the bucket's `usd` null, with the priced part in `usd_priced`. `--agent` names who built the run. The
+record is derived data, written again on each call; crit-hub's exporter copies its summary into the
+engine's card as `built`.
+
 ## Files and identities
 
 ```text
@@ -286,6 +323,7 @@ run-ID/
   segments/segment-NNNN/         agent_request.md and discovery/agent attempts
   events/event-NNNNNNNN.json     ordered events
   captured/                     retained workload files
+  captured/origin/              the origin engine's published Eval results (create --from-engine)
   work/                         mutable build scratch
   work/recon.json, recon.md     model recon: gathered facts with sources, frozen block, notes
   candidates/candidate-NNNN/
@@ -297,6 +335,7 @@ run-ID/
     eval/ATTEMPT.json           Eval results of crit run eval
     telemetry.json             active projection
     outcome.json, seal.json     final outcome and complete inventory
+  cost.json                    build cost from the agent's transcripts (crit run cost)
   chats/                       separate requests, replies and conversations
 ```
 

@@ -10,8 +10,10 @@ namespace crit::core {
 //   physical: obtainable without paging (Linux MemAvailable, Windows ullAvailPhys)
 //   commit:   commit headroom where enforced (Windows ullAvailPageFile; Linux only with
 //             vm.overcommit_memory = 2: CommitLimit - Committed_AS)
-//   cgroup:   tightest ancestor cgroup headroom on Linux; only clean file pages
-//             (file - file_dirty - file_writeback) count as reclaimable
+//   cgroup:   tightest ancestor cgroup headroom on Linux against min(memory.max, memory.high)
+//             (v1: hierarchical_memory_limit); only clean page cache counts as reclaimable:
+//             active_file + inactive_file (else file - shmem; v1 cache - shmem), minus dirty and
+//             writeback. tmpfs/shmem pages are swap-backed, never reclaimable cache.
 // Malformed source values never throw: they become unknown (or zero reclaimable pages) plus a note.
 struct HostMemoryObservation {
     std::optional<std::uint64_t> physical = {}, commit = {}, cgroup = {};

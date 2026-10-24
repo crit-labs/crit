@@ -55,7 +55,9 @@ cudaError_t enqueue_plan(const Directory& d, int group, const std::int32_t* expe
 cudaError_t enqueue_fill(const Fill* fills, const int* fill_count, int max_fills, std::size_t bundle_bytes,
                          int blocks_per_bundle, cudaStream_t stream);
 // Lookahead: tags the pool half for `group` with the predicted experts that are not
-// resident and writes their store-to-pool copies. Reads the directory without
+// resident and writes their store-to-pool copies. Pool slots go to the valid, distinct,
+// nonresident predictions in prediction order, at most pool_slots of them, so `fills`
+// holds pool_slots entries and `count` may exceed the pool. Reads the directory without
 // changing residency; run the copies on a side stream and join before planning `group`.
 cudaError_t enqueue_prefetch_plan(const Directory& d, int group, const std::int32_t* predicted, int count, Fill* fills,
                                   int* fill_count, cudaStream_t stream);

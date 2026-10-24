@@ -89,23 +89,23 @@ class ClockDirectory:
         raise RuntimeError("no victim: every slot is pinned by this plan")
 
     def prefetch(self, group, predicted):
-        """Tags the pool half for `group`; returns (key, pool index) copies to make."""
+        """Tags the pool half for `group`; returns (key, pool index) copies to make.
+        Pool indices go to the nonresident, valid, distinct predictions in order."""
         if not self.pool_slots:
             raise ValueError("no prefetch pool")
         tags = self.pool_tags[group & 1]
+        tags[:] = [None] * self.pool_slots
         copies = []
-        for p in range(self.pool_slots):
-            tags[p] = None
-            if p >= len(predicted):
-                continue
-            e = predicted[p]
+        for e in predicted:
+            if len(copies) == self.pool_slots:
+                break
             if not (0 <= group < self.groups and 0 <= e < self.experts):
                 continue
             k = group * self.experts + e
-            if k in self.key_slot or k in tags[:p]:
+            if k in self.key_slot or k in tags:
                 continue
-            tags[p] = k
-            copies.append((k, p))
+            tags[len(copies)] = k
+            copies.append((k, len(copies)))
         return copies
 
 

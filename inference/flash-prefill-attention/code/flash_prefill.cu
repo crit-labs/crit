@@ -47,8 +47,10 @@ __global__ void __launch_bounds__(128, 1) flash_kernel(Problem p) {
     const int qt0 = blockIdx.x * kQ;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gl = lane >> 2, t4 = lane & 3;
     const int last_q = min(p.T, qt0 + kQ) - 1;
-    const int nkeys = p.pos0 + last_q + 1;
+    const int nkeys = p.causal ? p.pos0 + last_q + 1 : p.pos0 + p.T;
     const int ntiles = (nkeys + kK - 1) / kK;
+    // Keys before the block's first window are never read (a ring may already hold newer rows there).
+    const int klo = p.window > 0 ? max(0, p.pos0 + qt0 - p.window + 1) : 0, jt0 = klo / kK;
     const __nv_bfloat16* kbase = p.k + static_cast<std::size_t>(g) * HD;
     const __nv_bfloat16* vbase = p.v + static_cast<std::size_t>(g) * HD;
     for(int e = tid; e < kQ * C; e += 128) {
@@ -62,16 +64,17 @@ __global__ void __launch_bounds__(128, 1) flash_kernel(Problem p) {
         uint4* vd = Vs + buf * kK * C;
         for(int e = tid; e < kK * C; e += 128) {
             const int r = e / C, c = e % C, key = tile * kK + r;
-            if(key < nkeys) {
-                cp_async16(kd + swz(r, c, C), kbase + static_cast<std::size_t>(key) * p.kv_stride + c * 8);
-                cp_async16(vd + swz(r, c, C), vbase + static_cast<std::size_t>(key) * p.kv_stride + c * 8);
+            if(key >= klo && key < nkeys) {
+                const std::size_t row = static_cast<std::size_t>(p.ring > 0 ? key % p.ring : key);
+                cp_async16(kd + swz(r, c, C), kbase + row * p.kv_stride + c * 8);
+                cp_async16(vd + swz(r, c, C), vbase + row * p.kv_stride + c * 8);
             } else {
                 kd[swz(r, c, C)] = make_uint4(0u, 0u, 0u, 0u);
                 vd[swz(r, c, C)] = make_uint4(0u, 0u, 0u, 0u);
             }
         }
     };
-    load_kv(0, 0);
+    load_kv(jt0, jt0 & 1);
     cp_async_commit();
     float o[HD / 8][4];
 #pragma unroll
@@ -79,7 +82,9 @@ __global__ void __launch_bounds__(128, 1) flash_kernel(Problem p) {
     float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;  // rows gl and gl + 8 of this warp
     const int qr0 = warp * 16;
     const int qpos0 = p.pos0 + qt0 + qr0 + gl, qpos1 = qpos0 + 8;
-    for(int j = 0; j < ntiles; ++j) {
+    const int lo0 = p.window > 0 ? qpos0 - p.window + 1 : 0, lo1 = p.window > 0 ? qpos1 - p.window + 1 : 0;
+    const int hi0 = p.causal ? qpos0 : nkeys - 1, hi1 = p.causal ? qpos1 : nkeys - 1;  // the last key each row sees
+    for(int j = jt0; j < ntiles; ++j) {
         if(j + 1 < ntiles) load_kv(j + 1, (j + 1) & 1);
         cp_async_commit();
         cp_async_wait<1>();
@@ -108,7 +113,10 @@ __global__ void __launch_bounds__(128, 1) flash_kernel(Problem p) {
 #pragma unroll
             for(int i = 0; i < 4; ++i) {
                 const int key = kfirst + n * 8 + 2 * t4 + (i & 1);
-                s[n][i] = key > ((i >> 1) ? qpos1 : qpos0) ? -INFINITY : s[n][i] * p.scale;
+                const bool visible = (i >> 1) ? key <= hi1 && key >= lo1 : key <= hi0 && key >= lo0;
+                float x = s[n][i] * p.scale;
+                if(p.softcap > 0.f) x = p.softcap * tanhf(x / p.softcap);
+                s[n][i] = visible ? x : -INFINITY;
             }
         float mx0 = m0, mx1 = m1;
 #pragma unroll
@@ -149,7 +157,15 @@ __global__ void __launch_bounds__(128, 1) flash_kernel(Problem p) {
     cp_async_wait<0>();
     l0 += __shfl_xor_sync(0xffffffffu, l0, 1); l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
     l1 += __shfl_xor_sync(0xffffffffu, l1, 1); l1 += __shfl_xor_sync(0xffffffffu, l1, 2);
-    const float i0 = l0 > 0.f ? 1.f / l0 : 0.f, i1 = l1 > 0.f ? 1.f / l1 : 0.f;
+    float i0 = l0 > 0.f ? 1.f / l0 : 0.f, i1 = l1 > 0.f ? 1.f / l1 : 0.f;
+    if(p.sinks) {  // the sink's weight joins each row's denominator
+        const float sink = p.sinks[h], M0 = fmaxf(m0, sink), M1 = fmaxf(m1, sink);
+        const float c0 = m0 == -INFINITY ? 0.f : __expf(m0 - M0), c1 = m1 == -INFINITY ? 0.f : __expf(m1 - M1);
+        l0 = l0 * c0 + __expf(sink - M0);
+        l1 = l1 * c1 + __expf(sink - M1);
+        i0 = c0 / l0;
+        i1 = c1 / l1;
+    }
     const int t0r = qt0 + qr0 + gl, t1r = t0r + 8;
 #pragma unroll
     for(int n = 0; n < HD / 8; ++n) {
@@ -179,7 +195,8 @@ std::size_t shared_bytes(int head_dim) { return static_cast<std::size_t>(kQ + 4 
 cudaError_t enqueue(const Problem& p, cudaStream_t stream) {
     if(!p.q || !p.k || !p.v || !p.out || p.T <= 0 || p.pos0 < 0 || p.heads <= 0 || p.kv_heads <= 0 || p.heads % p.kv_heads ||
        p.q_stride % 8 || p.kv_stride % 8 || p.out_stride % 2 || p.q_stride < p.heads * p.head_dim ||
-       p.kv_stride < p.kv_heads * p.head_dim || p.out_stride < p.heads * p.head_dim)
+       p.kv_stride < p.kv_heads * p.head_dim || p.out_stride < p.heads * p.head_dim || p.window < 0 || !(p.softcap >= 0.f) ||
+       p.ring < 0 || (p.ring > 0 && (p.window <= 0 || p.ring < p.window + p.T - 1)))
         return cudaErrorInvalidValue;
     switch(p.head_dim) {
     case 64: return launch<64>(p, stream);

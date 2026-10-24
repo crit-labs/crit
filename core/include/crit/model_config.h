@@ -36,7 +36,7 @@ struct MoeConfig {
     std::vector<std::uint32_t> mlp_only_layers = {};
     std::optional<bool> norm_topk_prob = {};
     std::optional<double> routed_scaling_factor = {};
-    std::string scoring_func = {};
+    std::string scoring_func = {}, topk_method = {};
 };
 // Multi-head latent attention: present when kv_lora_rank is positive; absent sizes read as 0.
 struct MlaConfig {

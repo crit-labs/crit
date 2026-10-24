@@ -51,19 +51,57 @@ activation quantizations.
 | --- | --- |
 | [`implementation.py`](code/implementation.py) | `ResidencyGroup`, `ResidencyPlan`, `prefix_residency_plans`; `Route`, `partition`, `combine`; `ReadySlot`, `MixedRoute`, `MixedSourcePlan`, `mixed_source_plan`; `execute_mixed`, which calls `quantize(activations)` once then `project(encoded, plan)` once |
 | [`measured_dispatch.py`](code/measured_dispatch.py) | `CalibrationKey`, `TimingCurve`, `DispatchCalibration`, `plan_dispatch` returning a `DispatchDecision` of every `DispatchCandidate`; optional `HostMemoryCosts`, `admit_host` and `revalidate_memory` |
-| [fused_moe.h](code/fused_moe.h) | CUDA `entry_cuda` (FP8 router plus shared gate/up in one grid, BF16-rounded `SiLU(gate) * up`) and `route_down_cuda` (deterministic top-k routing beside BF16 shared-down) for batches of 1 to 8 tokens |
+| [`routing.py`](code/routing.py) | `Routing`, one description of top-k routing; `route`, its host reference for one token; `routing_from_config`, which maps the config.json fields Core parses |
+| [fused_moe.h](code/fused_moe.h) | CUDA `entry_cuda` (FP8 router plus shared gate/up in one grid, BF16-rounded `SiLU(gate) * up`) and `route_down_cuda` (routing under a `crit::moe::Routing` beside BF16 shared-down) for batches of 1 to 8 tokens |
 
 `decision.best` is `None` when no feasible measured split exists; the engine then
 uses its ordinary exact path. Rejected splits keep their bytes and reasons. The
 planner performs no tuning or file writes. `execute_mixed` is an orchestration
 boundary, not a hidden kernel.
 
-The fused routing supports 1 to 1024 experts and up to 32 selected, uses the row
-codec in [quantized projections](../quantized-projections/README.md), picks the
-lower expert ID on equal logits, and returns original expert IDs, softmax weights
-over the selected scores and an unweighted FP32 shared-expert output. The model's
-shared-expert gate and routed-expert evaluation are not included. Build with an
-explicit `CMAKE_CUDA_ARCHITECTURES` (SM80+).
+**Routing.** One `Routing` describes how a token's router logits become expert IDs
+and weights, and the CUDA kernel reads the same fields:
+
+| Field | Meaning |
+| --- | --- |
+| `scoring` | `softmax` or `sigmoid` |
+| `score_before_selection` | Score every expert and select on the scores; otherwise select on raw logits and score only the selected (softmax over them, or sigmoid of each) |
+| `correction_bias` | A per-expert bias added to the selection value only; weights use the unbiased scores |
+| `groups`, `selected_groups`, `group_score_top` | Equal contiguous expert groups, each ranked by the sum of its `group_score_top` best selection values; only the best `selected_groups` groups are selectable |
+| `renormalize`, `renormalize_epsilon`, `renormalize_floor` | Divide the selected weights by `max(sum + epsilon, floor)` |
+| `scaling` | Multiply every final weight |
+
+Ties keep the lower expert ID, and the lower group index. IDs come back in selection
+order. The defaults, softmax over the top-k raw logits, are the kernel's previous
+behavior bit for bit. The same fields describe, for example, Mixtral's renormalized
+softmax, Qwen-MoE's `norm_topk_prob`, GPT-OSS's and Llama 4's scoring after
+selection, and DeepSeek-V3's sigmoid with a correction bias, eight groups ranked by
+their two best values, renormalization and 2.5x scaling (GLM-4.5 and Kimi K2 use the
+same form with one group). The host fixtures check each against the transformers
+router it names.
+
+`routing_from_config` reads Core's `scoring_func`, `norm_topk_prob`,
+`routed_scaling_factor`, `n_group`, `topk_group` and `topk_method`. A field the
+config omits comes from `defaults`, the value the model's reference code assumes,
+and fails when neither gives it, because references disagree (Mixtral always
+renormalizes; a Qwen-MoE config without `norm_topk_prob` does not). The engine also
+states `score_before_selection`, which no config declares, and whether the
+checkpoint has an `e_score_correction_bias` tensor. `topk_method` sets the group
+rank: `group_limited_greedy` ranks by the best value, `noaux_tc` by the best two and
+requires the bias, `greedy` ignores groups. Not covered: scoring other than softmax
+and sigmoid (for example `sqrtsoftplus`), and a renormalization floor stored under a
+config key Core does not parse (Ernie 4.5's `moe_norm_min`), which the engine passes
+as `renormalize_floor`.
+
+**Native fusion.** The fused routing supports 1 to 1024 experts, up to 32 selected
+experts and up to 32 selected groups, and returns original expert IDs, weights under
+the `Routing` and an unweighted FP32 shared-expert output. Its arithmetic is one
+example instance: an FP8 router and FP8 shared gate/up in the row codec of
+[quantized projections](../quantized-projections/README.md), BF16-rounded SiLU
+products and a BF16 shared down projection. Other layouts keep the `Routing`
+contract and supply their own projections. The model's shared-expert gate and
+routed-expert evaluation are not included. Build with an explicit
+`CMAKE_CUDA_ARCHITECTURES` (SM80+).
 
 ## What the engine supplies
 
@@ -75,9 +113,10 @@ scratch storage, and stage every component in `plan.demands` before projection
 reads it. If source formats differ, dispatch compatible decode explicitly, and keep
 the original-source fallback executable when scratch runs out.
 
-For the fused CUDA operations: validated FP8/BF16 payloads and finite router
-scores, owners retained until the stream settles, and input dependencies and
-output publication. No host readback or synchronization is inserted.
+For the fused CUDA operations: validated FP8/BF16 payloads, finite router
+scores and correction bias, the model's `Routing`, owners retained until the stream
+settles, and input dependencies and output publication. No host readback or
+synchronization is inserted.
 
 For measured dispatch: a complete current `CalibrationKey` (model content,
 representation, workload, implementation and hardware topology, including shapes,
@@ -180,6 +219,19 @@ assert safe.best is not None and not safe.best.host
 assert revalidate_memory(safe.best, admission)
 seen = Observation(physical_available=10, commit_available=128)
 assert not revalidate_memory(safe.best, admission)  # replan before allocating
+
+# Routing for one token, with DeepSeek-V3's form on four groups of two experts
+# (synthetic values).
+from routing import Routing, route
+
+rule = Routing(scoring="sigmoid", score_before_selection=True, correction_bias=True,
+               groups=4, selected_groups=3, group_score_top=2, renormalize=True,
+               renormalize_epsilon=1e-20, scaling=2.5)
+ids, weights = route((2.0, 1.0, -1.0, 0.0, 3.0, -2.0, 0.5, 0.5), 2, rule,
+                     bias=(0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0))
+assert ids == (0, 1)  # without the bias, group 2 is selectable and expert 4 ranks first
+assert abs(sum(weights) - 2.5) < 1e-12
+assert route((1.0, 3.0, 2.0), 2) == ((1, 2), route((3.0, 2.0), 2)[1])
 ```
 
 ## Adapting it
@@ -242,7 +294,14 @@ aliasing scratch with live content.
 
 [CUDA fixtures](../../tests/inference/cuda/kernels.cpp) compare 24 fused cases
 with independent host arithmetic and check top-k identities, normalization, ties
-and aliases. Host fixtures cover placement feasibility, duplicate occurrences,
+and aliases. They also run 12 routing variants (scoring before and after
+selection, bias, groups, renormalization, floor, scaling and ties, up to 1024
+experts) against expectations that [routing_cases.py](../../tests/inference/cuda/routing_cases.py)
+writes from the host reference. [Routing fixtures](../../tests/test_expert_routing.py)
+check the host reference against hand-worked cases and, when transformers is
+installed, against the Mixtral, Qwen2/Qwen3-MoE, GPT-OSS, Llama 4, DeepSeek-V2/V3,
+GLM-4.5, MiniMax-M2, Ernie 4.5 and LongCat-Flash router code, plus the config
+mapping. Host fixtures cover placement feasibility, duplicate occurrences,
 ordered combination, staging demands, exact fallback and single activation
 preparation. [Measured policy fixtures](../../tests/test_measured_expert_policies.py)
 cover stale identities, nonlinear curves, overlap, capacity limits, memory

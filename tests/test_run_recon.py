@@ -72,6 +72,37 @@ class ReconTests(unittest.TestCase):
             self.assertIn(heading, notes)
         self.assertIn("<|eot_id|>", notes)
 
+    def test_companion_drafters_are_recorded_with_their_taps(self):
+        eagle = self.root / "eagle"
+        eagle.mkdir()
+        (eagle / "config.json").write_text(json.dumps({
+            "speculators_model_type": "eagle3", "eagle_aux_hidden_state_layer_ids": [0, 1, 2], "draft_vocab_size": 64,
+            "transformer_layer_config": {"num_hidden_layers": 1},
+            "speculators_config": {"proposal_methods": [{"speculative_tokens": 3}], "verifier": {"name_or_path": "fixture"}}}),
+            encoding="utf-8")
+        mtp = self.root / "mtp"
+        mtp.mkdir()
+        (mtp / "config.json").write_text(json.dumps({"num_hidden_layers": 1, "crit_drafter": {
+            "format": "crit-drafter-v1", "kind": "mtp-head", "target_layers": 2, "target": {"path": str(self.model)}}}),
+            encoding="utf-8")
+        value = self.store.recon(self.run_id, drafters=[eagle, mtp])
+        first, second = value["gathered"]["drafters"]
+        self.assertEqual((first["kind"], first["taps"], first["draft_vocab_size"], first["speculative_tokens"]),
+                         ("eagle3", [0, 1, 2], 64, 3))
+        self.assertEqual(first["config_sha256"], file_sha(eagle / "config.json"))
+        self.assertEqual((second["kind"], second["taps"], second["drafts_per_pass"]), ("mtp-head", [2], 1))
+        notes = (self.directory / recon.RECON_MD).read_text(encoding="utf-8")
+        self.assertIn(str(eagle), notes)
+        self.assertIn("map through d2t", notes)
+        deep = self.root / "deep"
+        deep.mkdir()
+        (deep / "config.json").write_text(json.dumps({"speculators_model_type": "eagle3",
+                                                      "eagle_aux_hidden_state_layer_ids": [2, 9]}), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "reach past"):
+            self.store.recon(self.run_id, force=True, drafters=[deep])
+        with self.assertRaisesRegex(ValueError, "not a hidden-state drafter"):
+            self.store.recon(self.run_id, force=True, drafters=[self.model])
+
     def test_template_switches_are_listed_and_rerun_needs_force_but_keeps_notes(self):
         (self.model / "chat_template.jinja").write_text(THINKING, encoding="utf-8")
         value = self.store.recon(self.run_id)
@@ -92,7 +123,8 @@ class ReconTests(unittest.TestCase):
         candidate = self.candidate({"batch": 1})
         self.assertEqual(candidate["configuration"]["batch"], 1)
         self.assertEqual(candidate["configuration"]["recon"], value["frozen"])
-        self.assertEqual(candidate["extensions"]["recon"], {"path": recon.RECON_JSON, "sha256": file_sha(path)})
+        self.assertEqual(candidate["extensions"]["recon"], {"path": recon.RECON_JSON, "sha256": file_sha(path),
+                                                            "fingerprint_sha256": value["gathered"]["fingerprint"]["sha256"]})
         with self.assertRaisesRegex(ValueError, "differs"):
             self.candidate({"recon": {**value["frozen"], "sampling": {}}})
         self.assertEqual(self.candidate({"recon": value["frozen"]})["configuration"]["recon"], value["frozen"])
@@ -185,3 +217,96 @@ class ReconTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def header_only_safetensors(path, tensors):
+    """A safetensors file with real headers and zeroed data for {name: (dtype, shape)}."""
+    import struct
+    width = {"BF16": 2, "F32": 4, "F8_E4M3": 1, "U8": 1}
+    header, offset = {}, 0
+    for name, (dtype, shape) in tensors.items():
+        size = width[dtype]
+        for dim in shape:
+            size *= dim
+        header[name] = {"dtype": dtype, "shape": list(shape), "data_offsets": [offset, offset + size]}
+        offset += size
+    data = json.dumps(header).encode()
+    data += b" " * (-len(data) % 8)
+    path.write_bytes(struct.pack("<Q", len(data)) + data + bytes(offset))
+
+
+class FingerprintTests(unittest.TestCase):
+    """Two checkpoints compare by what an engine is written against: architecture, weight layout, tokenizer, template."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name).resolve()
+        self.store = RunStore(self.root / "runs")
+
+    def model(self, name, layers=2, dtype="BF16", **extra):
+        folder = write_files(self.root / name, llama_files(**{
+            "config.json": {"architectures": ["FixtureForCausalLM"], "model_type": "fixture", "hidden_size": 8,
+                            "num_hidden_layers": layers, "torch_dtype": "bfloat16", "eos_token_id": 1,
+                            "text_config": {"eos_token_id": 4, "vocab_size": 420}}, **extra}))
+        tensors = {"model.embed_tokens.weight": ("BF16", (420, 8)), "lm_head.weight": ("BF16", (420, 8))}
+        for index in range(layers):
+            tensors[f"model.layers.{index}.mlp.down_proj.weight"] = (dtype if index == layers - 1 else "BF16", (8, 16))
+        header_only_safetensors(folder / "model.safetensors", tensors)
+        return folder
+
+    def test_fingerprint_sections_and_the_weight_layout(self):
+        _, gathered, _ = recon.gather(self.model("a"))
+        print_ = gathered["fingerprint"]
+        self.assertEqual(print_["version"], recon.FINGERPRINT_VERSION)
+        self.assertEqual(sorted(print_["hashes"]), sorted(recon.FINGERPRINT_SECTIONS))
+        self.assertEqual(print_["architecture"]["num_hidden_layers"], 2)
+        self.assertNotIn("torch_dtype", print_["architecture"])
+        self.assertEqual(print_["weights"]["format"], "safetensors")
+        self.assertEqual(print_["weights"]["dtype"], "bfloat16")
+        self.assertEqual(print_["weights"]["layout"]["model.layers.*.mlp.down_proj.weight"],
+                         [{"dtype": "BF16", "shape": [8, 16], "count": 2}])
+        self.assertIn("tokenizer.json", print_["tokenizer"]["files"])
+        self.assertEqual(print_["tokenizer"]["eos_token_ids"], [1, 4])
+        self.assertEqual(print_["template"], {"default": gathered["chat_templates"]["default"]["sha256"]})
+        _, again, _ = recon.gather(self.model("a-copy"))
+        self.assertEqual(again["fingerprint"]["sha256"], print_["sha256"], "the fingerprint is the checkpoint's shape, not its path")
+
+    def test_compare_names_what_changes_for_the_engine(self):
+        a = self.model("a")
+        same = recon.compare_models(a, self.model("finetune"))["comparison"]
+        self.assertTrue(same["same"])
+        self.assertEqual(same["differences"], [])
+        self.assertIn("weight values only", same["assessment"][0])
+        layers = recon.compare_models(a, self.model("deeper", layers=3))["comparison"]
+        self.assertFalse(layers["same"])
+        self.assertEqual(layers["sections"]["architecture"], "differs")
+        self.assertIn({"section": "architecture", "key": "num_hidden_layers", "a": 2, "b": 3}, layers["differences"])
+        self.assertEqual(layers["sections"]["weights"], "differs", "a third layer changes the layout's counts")
+        self.assertTrue(any(note.startswith("Architecture differs in num_hidden_layers") for note in layers["assessment"]))
+        quant = recon.compare_models(a, self.model("fp8", dtype="F8_E4M3"))["comparison"]
+        self.assertEqual(quant["sections"], {"architecture": "same", "weights": "differs", "tokenizer": "same", "template": "same"})
+        self.assertTrue(any("1 tensor patterns differ" in note and "down_proj" in note for note in quant["assessment"]))
+        other_template = self.model("template", **{"chat_template.jinja": THINKING})
+        template = recon.compare_models(a, other_template)["comparison"]
+        self.assertEqual(template["sections"]["template"], "differs")
+        self.assertTrue(any(note.startswith("Chat template differs") for note in template["assessment"]))
+        (other_template / "tokenizer_config.json").write_text(json.dumps({"bos_token": "<s>", "added_tokens_decoder": {}}), encoding="utf-8")
+        tokenizer = recon.compare_models(a, other_template)["comparison"]
+        self.assertEqual(tokenizer["sections"]["tokenizer"], "differs")
+        self.assertIn("files.tokenizer_config.json", {row["key"] for row in tokenizer["differences"]})
+
+    def test_a_run_compares_its_model_through_the_cli(self):
+        a = self.model("a")
+        run_id = self.store.create({"model_path": str(a), "correctness_criteria": "Fixture gates", "budget_minutes": 1,
+                                    "kv_tokens": 8192})["run"]["run_id"]
+        with self.assertRaisesRegex(ValueError, "Run recon first"):
+            self.store.recon_compare(run_id, self.model("b"))
+        self.store.recon(run_id)
+        notes = (self.store.directory(run_id) / recon.RECON_MD).read_text(encoding="utf-8")
+        self.assertIn("## Fingerprint", notes)
+        result = self.store.recon_compare(run_id, self.model("b", layers=1))
+        self.assertEqual(result["run_model"]["model"], str(a))
+        self.assertFalse(result["comparison"]["same"])
+        code = main(["--project", str(ROOT), "--root", str(self.store.root), "--id", run_id, "recon", "--compare", str(self.root / "b")])
+        self.assertEqual(code, 0)

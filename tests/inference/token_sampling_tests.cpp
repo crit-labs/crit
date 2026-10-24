@@ -52,12 +52,12 @@ struct Sampler {
     }
 };
 
-// Core's rules for the device parameters; the device caps top_k (0 included) at kMaxTopK.
+// Core's rules for the device parameters: top_k 0 is the whole vocabulary on both sides.
 cc::SamplingParams core_params(const ts::Params& p) {
     cc::SamplingParams q;
     q.temperature = p.temperature > 0.f ? double(p.temperature) : 0.0;
     q.top_p = p.top_p > 0.f && p.top_p < 1.f ? double(p.top_p) : 1.0;
-    q.top_k = static_cast<std::uint32_t>(p.top_k > 0 ? std::min(p.top_k, ts::kMaxTopK) : ts::kMaxTopK);
+    q.top_k = static_cast<std::uint32_t>(p.top_k > 0 ? p.top_k : 0);
     q.seed = p.seed;
     q.stream = p.stream;
     return q;

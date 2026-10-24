@@ -96,6 +96,9 @@ simultaneously.
 | `GET /v1/models`, `GET /v1/models/{id}` | The run's sealed resident candidates, or catalog names, with `label`, `context_length` (the candidate's `kv_tokens`), `default`, package `capabilities`, `supported_sampling_parameters` and `engine_facts` ([facts for Eval](#engine-facts-and-plain-decoding)) |
 | `POST /v1/chat/completions` | Chat completion, JSON or server-sent events |
 | `POST /v1/crit/score` | [Fixed-text scores](#fixed-text-scores) for packages declaring `chat-score-v1` |
+| `POST /v1/messages` | The same engine through the [Anthropic Messages API](#other-api-dialects) |
+| `GET /`, `/api/version`, `/api/tags`, `/api/ps`; `POST /api/chat`, `/api/generate`, `/api/show` | The same engine through the [Ollama API](#other-api-dialects) |
+| `GET /metrics` | [Prometheus metrics](#metrics) of the server |
 
 `model` selects a candidate by `RUN_ID/CANDIDATE_ID` or `CANDIDATE_ID`; any other name
 (`"default"`, `"gpt-4o"`) uses the default. An unknown candidate returns 404, one that
@@ -336,6 +339,62 @@ when the candidate is not loaded or reports none. A speculative engine that decl
 `chat-plain-v1` decodes a request carrying `"crit": {"decode": "plain"}` one token per
 target pass without drafting, which is how Eval compares speculative output with plain
 greedy on the served engine.
+
+## Other API dialects
+
+The same engine answers two more APIs, so the tools people already run need only a base URL. Every
+request is translated into the chat request above and validated the same way, so the capabilities a
+package declares (tools, images, sampling fields, structured output) gate it in every dialect, and an
+API key set with `--api-key` guards every endpoint except `/health`, `/` and `/api/version`.
+
+**Anthropic Messages** (`POST /v1/messages`, [crit_api/anthropic.py](../api/crit_api/anthropic.py)): the
+API Claude Code and the Anthropic SDKs speak. Point them at the server (`ANTHROPIC_BASE_URL`, or the
+SDK's `base_url`) with the key in `x-api-key` or as a Bearer token; `anthropic-version` is accepted.
+`system` (a string or text blocks) becomes the leading system message, content blocks become text and
+image parts, `tool_use` blocks become tool calls and `tool_result` blocks tool messages (tool results
+first, then the turn's text, as Anthropic orders them), `tools` with an `input_schema` become
+functions, `tool_choice` (`auto`, `any`, `tool`, `none`, `disable_parallel_tool_use`) and
+`stop_sequences` map one to one, `temperature`, `top_p` and `top_k` pass through, and
+`output_config.format` of type `json_schema` becomes `response_format`. `max_tokens` is required.
+`metadata`, `thinking`, `service_tier`, `betas` and the other service settings are accepted and ignored
+(listed in `X-Crit-Ignored-Parameters`); `mcp_servers`, `container`, document blocks and Anthropic-defined
+tools (web search, code execution) return 400, and `/v1/messages/count_tokens` 404. The reply is a
+Messages response: `thinking` (the engine's reasoning), `text` and `tool_use` blocks, `stop_reason`
+`end_turn`, `max_tokens`, `stop_sequence` (with the sequence) or `tool_use`, and `usage` with the prompt
+tokens the engine computed as `input_tokens` and the ones its prompt cache served as
+`cache_read_input_tokens`. With `stream: true` the reply is the Messages event stream: `message_start`,
+`content_block_start`, `content_block_delta` (`text_delta`, `thinking_delta`, `input_json_delta`) and
+`content_block_stop` per block in the order the engine produces them, `message_delta` with the stop
+reason and usage, `message_stop`; an engine failure is an `error` event. Errors use Anthropic's
+shape, `{"type": "error", "error": {"type", "message"}}`.
+
+**Ollama** (`GET /` answers "Ollama is running", `/api/version`, `/api/tags`, `/api/ps`; `POST
+/api/chat`, `/api/generate`, `/api/show`; [crit_api/ollama.py](../api/crit_api/ollama.py)): the API the
+local chat UIs look for. Models are listed under the ids `/v1/models` shows (and the default name).
+`/api/chat` takes Ollama's messages (`images` as bare base64, their type read from the bytes; assistant
+`tool_calls` with arguments as objects, given ids when they have none; `tool` messages matched to the
+latest assistant's calls in order), `tools`, `format` (`"json"`, or a JSON schema) and `options`:
+`temperature`, `top_p`, `top_k`, `min_p`, `seed`, `num_predict` (the output cap), `stop`,
+`repeat_penalty`, `presence_penalty` and `frequency_penalty` apply; Ollama's runtime settings
+(`num_ctx`, `num_gpu`, `num_thread`, `mirostat`, ...) and `keep_alive` and `think` are ignored and
+listed; an unknown option is 400. `/api/generate` renders `prompt` (and `system`) as one user turn
+through the model's chat template; `raw`, `suffix`, `template` and `context` are refused. Replies
+stream by default as newline-delimited JSON objects (`message.content`, `message.thinking` and
+`message.tool_calls`, or `response` for generate), the last with `done`, `done_reason` (`stop` or
+`length`), `total_duration`, `prompt_eval_duration` and `eval_duration` in nanoseconds from the
+engine's own phase times, and `prompt_eval_count` and `eval_count`; `stream: false` returns one object.
+`/api/show` reports the context length as `model_info["crit.context_length"]` and the
+`capabilities` (`completion`, `tools`, `vision`) the package declares. Errors are `{"error": message}`;
+`/api/pull`, `/api/embed` and the other model-management endpoints return 404.
+
+## Metrics
+
+`GET /metrics` serves the Prometheus text format (behind the API key when one is set): requests
+finished by dialect (`openai`, `anthropic`, `ollama`) and outcome (`completed`, `error`, `cancelled`,
+`timed_out`), requests in flight, prompt, cached-prompt and completion tokens, wall seconds in
+requests, uptime, the last completed request's prefill and decode rates, time to first token and
+tokens per round, and `crit_serve_engine_loaded` with the loaded run, candidate and state
+([crit_api/metrics.py](../api/crit_api/metrics.py)). Counters start at zero when the server starts.
 
 ## Structured output
 

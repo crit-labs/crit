@@ -8,6 +8,7 @@
 !/CHANGELOG.md
 !/LICENSE
 !/pyproject.toml
+!/settings.example.toml
 !/core/
 !/inference/
 !/kernels/

@@ -35,6 +35,13 @@ struct RoundSteps {
     // Pure function of round-start state and verify outputs: it reruns eagerly
     // after a Core truncation with a smaller count.
     DeviceStep commit_state;
+    // Optional replacement for the greedy accept kernel in Finish, for example draft-trees'
+    // tree accept. It receives the AcceptRows the greedy kernel would get (drafts,
+    // predictions, device stops, control, writable result) and must write the packed result
+    // and the control fields (n_emitted, n_matched, base_frontier, base_last, frontier,
+    // last_token) exactly as enqueue_greedy_accept defines them, so enqueue_truncate and
+    // commit work unchanged. Unset: the greedy accept kernel.
+    std::function<void(cudaStream_t, const AcceptRows&)> accept;
 };
 struct RoundConfig {
     std::uint32_t draft_tokens = 0;   // K; zero is ordinary one-token decoding

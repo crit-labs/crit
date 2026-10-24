@@ -64,6 +64,29 @@ and fewer launches or a captured graph help more than faster kernels. Span minus
 the category sums is idle time between kernels. To judge one operator, capture it
 alone in a graph and replay it many times.
 
+## Programmatic dependent launch
+
+[cuda_launch.h](../../../include/crit/cuda_launch.h) ([cuda_launch.cpp](cuda_launch.cpp))
+lets a kernel start while the previous kernel in its stream is still running, on
+devices of compute capability 9.0 and later. `programmatic_launch_supported(device)`
+(or `(stream)`) is the device query; `launch(kernel, LaunchShape{grid, block, shared},
+stream, programmatic, args...)` launches with programmatic stream serialization when
+asked and supported, and as an ordinary launch otherwise. In the kernel, do what does
+not read the previous kernel's output first (address math, loading weights or constants
+into registers or shared memory), then `wait_for_prior_grid()`; the previous kernel may
+call `launch_dependents()` once it no longer needs the SMs to itself. Both compile to
+nothing below sm_90 and are no-ops for ordinary launches.
+
+The pay-off is the gap between consecutive kernels of a decode step (launch, block
+scheduling and ramp-up), which matters most for many small kernels: draft steps, norms
+and short GEMVs. Stream capture records the launches as programmatic graph edges, so a
+captured decode graph keeps the overlap. Measure it per engine: kernel times in Eval's
+kernel profile are exclusive, so an overlapped kernel is charged only from its
+predecessor's end ([kernel profile](../../../../docs/eval/README.md#kernel-profile)).
+[programmatic_launch_tests.cu](../../../../tests/inference/programmatic_launch_tests.cu)
+checks the query, and that a programmatic consumer reads every value a slow producer
+wrote, eagerly and from a replayed graph.
+
 ## Graph capture
 
 Core ships the harness for CUDA engines that replay fixed topology; CPU engines

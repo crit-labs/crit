@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_inference VERSION 0.6.1 LANGUAGES CXX)
+project(crit_inference VERSION 0.7.0 LANGUAGES CXX)
 # Inference's native examples and fixtures. Inference uses Core only through its public SDK
 # (crit::core, crit::cuda); Core never builds or includes Inference code.
 find_package(Threads REQUIRED)
@@ -8,7 +8,7 @@ option(CRIT_INFERENCE_CUDA "Build Inference's CUDA reference kernels and their f
 option(CRIT_INFERENCE_INSTALLED_CORE "Use an installed Core SDK (CMAKE_PREFIX_PATH) instead of this checkout's core/" OFF)
 if(NOT TARGET crit::core)
   if(CRIT_INFERENCE_INSTALLED_CORE)
-    find_package(critCore 0.6.1 CONFIG REQUIRED)
+    find_package(critCore 0.7.0 CONFIG REQUIRED)
   else()
     if(CRIT_INFERENCE_CUDA)
       set(CRIT_CORE_CUDA ON CACHE BOOL "Build the explicit CUDA backend services" FORCE)
@@ -252,6 +252,33 @@ crit_inference_executable(crit_device_round_tests SOURCES ${FIXTURES}/device_rou
   INCLUDES ${INFERENCE}/mtp-decode/code ${FIXTURES} LINK crit_device_round crit_device_round_fixture)
 crit_inference_tests(crit_device_round_tests crit_device_round 60 accept graphs readback budget)
 
+crit_inference_kernels(crit_draft_trees ${INFERENCE}/draft-trees/code draft_tree.cu)
+target_link_libraries(crit_draft_trees PUBLIC crit_device_round_kernels)
+crit_inference_executable(crit_draft_tree_tests SOURCES ${FIXTURES}/draft_tree_tests.cpp LINK crit_draft_trees)
+crit_inference_tests(crit_draft_tree_tests crit_draft_trees 120 build accept compact)
+crit_inference_kernels(crit_hidden_drafters ${INFERENCE}/hidden-state-drafters/code hidden_drafters.cu)
+target_link_libraries(crit_hidden_drafters PUBLIC crit_device_round_kernels)
+crit_inference_executable(crit_hidden_drafter_tests SOURCES ${FIXTURES}/hidden_drafter_tests.cpp LINK crit_hidden_drafters)
+crit_inference_test(crit_hidden_drafters 60 crit_hidden_drafter_tests)
+
+crit_inference_kernels(crit_w4a16 ${INFERENCE}/w4a16-projections/code w4a16.cu)
+crit_inference_executable(crit_w4a16_tests SOURCES ${FIXTURES}/w4a16_tests.cpp LINK crit_w4a16)
+crit_inference_tests(crit_w4a16_tests crit_w4a16 180 formats products rejects)
+crit_inference_kernels(crit_latent_attention ${INFERENCE}/latent-attention/code latent_attention.cu)
+crit_inference_executable(crit_latent_attention_tests SOURCES ${FIXTURES}/latent_attention_tests.cpp LINK crit_latent_attention)
+crit_inference_test(crit_latent_attention 180 crit_latent_attention_tests)
+
+add_executable(crit_programmatic_launch_tests ${FIXTURES}/programmatic_launch_tests.cu)
+target_compile_features(crit_programmatic_launch_tests PRIVATE cxx_std_20 cuda_std_20)
+target_link_libraries(crit_programmatic_launch_tests PRIVATE crit::cuda)
+crit_inference_test(crit_programmatic_launch 60 crit_programmatic_launch_tests)
+
+add_executable(crit_recurrent_kernels_tests ${FIXTURES}/recurrent_kernels_tests.cu ${INFERENCE}/recurrent-layer-kernels/code/recurrent_kernels.cu)
+target_include_directories(crit_recurrent_kernels_tests PRIVATE ${INFERENCE}/recurrent-layer-kernels/code)
+target_compile_features(crit_recurrent_kernels_tests PRIVATE cxx_std_20 cuda_std_20)
+target_link_libraries(crit_recurrent_kernels_tests PRIVATE CUDA::cudart)
+crit_inference_test(crit_recurrent_kernels 300 crit_recurrent_kernels_tests)
+
 set(_recurrent_code ${INFERENCE}/recurrent-state-recovery/code)
 crit_inference_kernels(crit_recurrent_cuda ${_recurrent_code} recurrent_cuda.cu)
 crit_inference_executable(crit_recurrent_cuda_tests SOURCES ${FIXTURES}/recurrent_cuda_tests.cpp LINK crit::cuda crit_recurrent_cuda)
@@ -273,6 +300,11 @@ crit_inference_kernels(crit_token_sampling ${INFERENCE}/token-sampling/code samp
 target_link_libraries(crit_token_sampling PUBLIC crit::core)
 crit_inference_executable(crit_token_sampling_tests SOURCES ${FIXTURES}/token_sampling_tests.cpp LINK crit_token_sampling)
 crit_inference_test(crit_token_sampling 120 crit_token_sampling_tests)
+crit_inference_executable(crit_token_law_tests SOURCES ${FIXTURES}/token_law_tests.cpp LINK crit_token_sampling)
+crit_inference_test(crit_token_law 300 crit_token_law_tests)
+crit_inference_executable(crit_sampled_round_tests SOURCES ${FIXTURES}/sampled_round_tests.cpp
+  LINK crit_token_sampling crit_device_round_kernels)
+crit_inference_test(crit_sampled_round 300 crit_sampled_round_tests)
 
 crit_inference_kernels(crit_host_mailbox ${INFERENCE}/host-work-mailbox/code mailbox.cu)
 add_library(crit_host_mailbox_fixture STATIC ${FIXTURES}/host_mailbox_fixture.cu)
@@ -325,7 +357,8 @@ target_link_libraries(crit_device_round_toy PUBLIC crit_device_round_kernels cri
 crit_inference_executable(crit_toy_round_example SOURCES ${_round_code}/toy_example.cpp LINK crit_device_round crit_device_round_toy)
 crit_inference_test(crit_toy_round_example 120 crit_toy_round_example)
 
-if(CRIT_INFERENCE_HAS_LINKER_WRAP)
+# MSVC's linker accepts an unknown --wrap with a warning, so the probe passes there but nothing is wrapped.
+if(CRIT_INFERENCE_HAS_LINKER_WRAP AND NOT MSVC)
   target_compile_definitions(crit_device_round_tests PRIVATE CRIT_TEST_LINKER_WRAP=1)
   target_link_options(crit_device_round_tests PRIVATE -Wl,--wrap=cudaMemcpyAsync
     -Wl,--wrap=cudaStreamSynchronize -Wl,--wrap=cudaEventSynchronize -Wl,--wrap=cudaDeviceSynchronize)

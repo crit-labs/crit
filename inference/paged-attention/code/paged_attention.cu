@@ -6,20 +6,23 @@
 // (BF16 pages) or dequantized (E4M3 pages: code * scale rounded to BF16) into one shared K / V stage with a 16-byte
 // XOR swizzle (chunk c of row r at c ^ (r & 7)), so ldmatrix reads are conflict free. S = Q K^T and O = P V run on
 // BF16 mma.m16n8k16 with an FP32 online softmax; probabilities are rounded to BF16 and the row sums use the rounded
-// values. A tile entirely after a row's position leaves that row's maximum, sum and output bit for bit unchanged
-// (exp(0) = 1 and p = 0), which decode's column invariance relies on.
+// values. A tile entirely outside a row's visible keys (after its position, before its window, or off its tree path)
+// leaves that row's maximum, sum and output bit for bit unchanged (exp(0) = 1 and p = 0), which decode's column
+// invariance relies on: skipping such tiles, or fetching keys only from the oldest row's window on, changes no bits.
 #include "paged_attention.h"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <limits>
 
+#include <climits>
 #include <cstdint>
 
 namespace crit::paged_attention {
 namespace {
 
 constexpr float kInf = std::numeric_limits<float>::infinity();
+constexpr float kNaN = std::numeric_limits<float>::quiet_NaN();
 constexpr int kK = 32;          // keys per tile
 constexpr int kPiece = 4 * kK;  // keys per decode piece
 constexpr int kRows = 64;       // decode rows per block: columns x query heads of one key/value head
@@ -63,6 +66,44 @@ __device__ __forceinline__ std::size_t physical(const std::int32_t* table, int p
 }
 __device__ __forceinline__ int swizzle(int row, int chunk, int chunks) { return row * chunks + (chunk ^ (row & 7)); }
 
+// Sequence s with n queries breaks the batch's counts (Batch): more queries than the launch's bound `limit` or than
+// its keys, or more keys than its table row addresses.
+__device__ __forceinline__ bool broken(const Batch& b, int s, int n, int limit, int page_tokens) {
+    if(n == 0) return false;
+    const int kv = b.kv_lens[s];
+    return n < 0 || n > limit || n > kv || static_cast<long long>(kv) > static_cast<long long>(b.table_stride) * page_tokens;
+}
+// A broken sequence's answer: NaN in every dimension of head h of its query rows first, first + step, ...; one caller
+// per sequence (lead) raises the fault flag.
+__device__ __forceinline__ void poison(const Batch& b, float* out, int out_stride, int q0, int n, int first, int step, int h, int HD,
+                                       bool lead) {
+    for(int r = first; r < n; r += step)
+        for(int d = threadIdx.x; d < HD; d += blockDim.x)
+            out[static_cast<std::size_t>(q0 + r) * out_stride + static_cast<std::size_t>(h) * HD + d] = kNaN;
+    if(lead && threadIdx.x == 0 && b.fault) *b.fault = 1;
+}
+
+// The keys one query row sees: key <= pos (pos < 0: an unused row), key >= lo (sliding window), and keys from `base`
+// on only where the row's tree bit (key - base) is set.
+struct Visible {
+    int pos = -1, lo = 0, base = INT_MAX;
+    std::uint64_t tree = ~0ull;
+    __device__ __forceinline__ bool operator()(int key) const {
+        return key <= pos && key >= lo && (key < base || key - base >= 64 || ((tree >> (key - base)) & 1ull));
+    }
+};
+__device__ __forceinline__ int window_lo(int pos, int window) { return window > 0 ? max(0, pos - window + 1) : 0; }
+__device__ __forceinline__ float capped(float x, float cap) { return cap > 0.f ? cap * tanhf(x / cap) : x; }
+// Folds a sink logit into a finished row: its weight exp(sink) joins the denominator. Returns the factor that turns
+// the row's unnormalized output into its result (0 for an empty row without a sink).
+__device__ __forceinline__ float finish_row(float m, float& l, const float* sinks, int h) {
+    if(!sinks) return l > 0.f ? 1.f / l : 0.f;
+    const float sink = sinks[h], M = fmaxf(m, sink);
+    const float c = m == -kInf ? 0.f : __expf(m - M);
+    l = l * c + __expf(sink - M);
+    return c / l;
+}
+
 // ------------------------------------------------------------------------------------------------ write
 template <int HD, Format F>
 __global__ void __launch_bounds__(HD) write_kernel(Pages pg, const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
@@ -103,11 +144,11 @@ struct Tile<HD, Format::bf16, NT> {
     static constexpr int PER = (kK * C + NT - 1) / NT;
     uint4 kr[PER], vr[PER];
 
-    __device__ __forceinline__ void fetch(const Pages& pg, const std::int32_t* table, int g, int key0, int nkeys, int tid) {
+    __device__ __forceinline__ void fetch(const Pages& pg, const std::int32_t* table, int g, int key0, int klo, int nkeys, int tid) {
 #pragma unroll
         for(int i = 0; i < PER; ++i) {
             const int e = tid + NT * i, key = key0 + e / C;
-            if(e < kK * C && key < nkeys) {
+            if(e < kK * C && key >= klo && key < nkeys) {
                 const std::size_t off = (physical(table, pg.page_tokens, key) * pg.kv_heads + g) * HD + (e % C) * 8;
                 kr[i] = __ldcg(reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(pg.k) + off));
                 vr[i] = __ldcg(reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(pg.v) + off));
@@ -135,11 +176,11 @@ struct Tile<HD, Format::e4m3, NT> {
     uint4 kr[PER], vr[PER];
     float ks[PER], vs[PER];
 
-    __device__ __forceinline__ void fetch(const Pages& pg, const std::int32_t* table, int g, int key0, int nkeys, int tid) {
+    __device__ __forceinline__ void fetch(const Pages& pg, const std::int32_t* table, int g, int key0, int klo, int nkeys, int tid) {
 #pragma unroll
         for(int i = 0; i < PER; ++i) {
             const int e = tid + NT * i, key = key0 + e / CC;
-            if(e < kK * CC && key < nkeys) {
+            if(e < kK * CC && key >= klo && key < nkeys) {
                 const std::size_t row = physical(table, pg.page_tokens, key) * pg.kv_heads + g, off = row * HD + (e % CC) * 16;
                 kr[i] = __ldcg(reinterpret_cast<const uint4*>(static_cast<const std::uint8_t*>(pg.k) + off));
                 vr[i] = __ldcg(reinterpret_cast<const uint4*>(static_cast<const std::uint8_t*>(pg.v) + off));
@@ -165,8 +206,8 @@ struct Tile<HD, Format::e4m3, NT> {
     }
 };
 
-// One warp's 16 query rows against one staged 32-key tile: S = Q K^T, causal mask (key > position: excluded), online
-// softmax update of m / l and O = O * c + P V. A position < 0 marks an unused row.
+// One warp's 16 query rows against one staged 32-key tile: S = Q K^T, the scale and soft-cap, the rows' visibility
+// mask, online softmax update of m / l and O = O * c + P V.
 template <int HD>
 struct Rows {
     static constexpr int C = HD / 8;
@@ -178,8 +219,8 @@ struct Rows {
         for(int n = 0; n < HD / 8; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.f;
     }
 
-    __device__ __forceinline__ void step(const uint4* Qs, const uint4* Ks, const uint4* Vs, int qr0, int kfirst, int qpos0, int qpos1,
-                                         float scale, int lane) {
+    __device__ __forceinline__ void step(const uint4* Qs, const uint4* Ks, const uint4* Vs, int qr0, int kfirst, const Visible& v0,
+                                         const Visible& v1, float scale, float softcap, int lane) {
         const int t4 = lane & 3;
         float s[4][4];
 #pragma unroll
@@ -202,7 +243,7 @@ struct Rows {
 #pragma unroll
             for(int i = 0; i < 4; ++i) {
                 const int key = kfirst + n * 8 + 2 * t4 + (i & 1);
-                s[n][i] = key > ((i >> 1) ? qpos1 : qpos0) ? -kInf : s[n][i] * scale;
+                s[n][i] = ((i >> 1) ? v1(key) : v0(key)) ? capped(s[n][i] * scale, softcap) : -kInf;
             }
         float mx0 = m0, mx1 = m1;
 #pragma unroll
@@ -255,6 +296,10 @@ __global__ void __launch_bounds__(kThreads, 1) prefill_kernel(Prefill p) {
     uint4* Vs = Ks + kK * C;
     const int h = blockIdx.y, s = blockIdx.z, g = h / (p.heads / p.pages.kv_heads);
     const int q0 = p.batch.q_start[s], n = p.batch.q_start[s + 1] - q0, qtiles = (n + kQ - 1) / kQ;
+    if(broken(p.batch, s, n, p.max_queries, p.pages.page_tokens)) {
+        poison(p.batch, p.out, p.out_stride, q0, n, blockIdx.x, gridDim.x, h, HD, blockIdx.x == 0 && h == 0);
+        return;
+    }
     if(static_cast<int>(blockIdx.x) >= qtiles) return;
     const int qt0 = (qtiles - 1 - static_cast<int>(blockIdx.x)) * kQ;  // a sequence's latest (heaviest) query tile first
     const int pos0 = p.batch.kv_lens[s] - n;
@@ -263,6 +308,7 @@ __global__ void __launch_bounds__(kThreads, 1) prefill_kernel(Prefill p) {
     const int last_q = min(n, qt0 + kQ) - 1;
     const int nkeys = pos0 + last_q + 1;
     const int ntiles = (nkeys + kK - 1) / kK;
+    const int klo = window_lo(pos0 + qt0, p.window), jt0 = klo / kK;  // the block's oldest query sees nothing earlier
     for(int e = tid; e < kQ * C; e += kThreads) {
         const int r = e / C, c = e % C;
         uint4* dst = Qs + swizzle(r, c, C);
@@ -271,24 +317,30 @@ __global__ void __launch_bounds__(kThreads, 1) prefill_kernel(Prefill p) {
     }
     asm volatile("cp.async.commit_group;");
     Tile<HD, F, kThreads> tile;
-    tile.fetch(p.pages, table, g, 0, nkeys, tid);
+    tile.fetch(p.pages, table, g, jt0 * kK, klo, nkeys, tid);
     tile.stage(Ks, Vs, tid);
     asm volatile("cp.async.wait_group 0;" ::: "memory");
     __syncthreads();
     Rows<HD> rows;
     const int qr0 = warp * 16;
-    const int qpos0 = pos0 + qt0 + qr0 + gl, qpos1 = qpos0 + 8, warp_last = pos0 + qt0 + qr0 + 15;
-    for(int j = 0; j < ntiles; ++j) {
+    Visible v0, v1;
+    v0.pos = pos0 + qt0 + qr0 + gl;
+    v1.pos = v0.pos + 8;
+    v0.lo = window_lo(v0.pos, p.window);
+    v1.lo = window_lo(v1.pos, p.window);
+    const int warp_last = pos0 + qt0 + qr0 + 15, warp_lo = window_lo(pos0 + qt0 + qr0, p.window);
+    for(int j = jt0; j < ntiles; ++j) {
         const bool more = j + 1 < ntiles;
-        if(more) tile.fetch(p.pages, table, g, (j + 1) * kK, nkeys, tid);
-        if(j * kK <= warp_last && qt0 + qr0 < n) rows.step(Qs, Ks, Vs, qr0, j * kK, qpos0, qpos1, p.scale, lane);
+        if(more) tile.fetch(p.pages, table, g, (j + 1) * kK, klo, nkeys, tid);
+        if(j * kK <= warp_last && (j + 1) * kK > warp_lo && qt0 + qr0 < n)
+            rows.step(Qs, Ks, Vs, qr0, j * kK, v0, v1, p.scale, p.softcap, lane);
         if(!more) break;
         __syncthreads();
         tile.stage(Ks, Vs, tid);
         __syncthreads();
     }
     rows.finish_sums();
-    const float i0 = rows.l0 > 0.f ? 1.f / rows.l0 : 0.f, i1 = rows.l1 > 0.f ? 1.f / rows.l1 : 0.f;
+    const float i0 = finish_row(rows.m0, rows.l0, p.sinks, h), i1 = finish_row(rows.m1, rows.l1, p.sinks, h);
     const int t0r = qt0 + qr0 + gl, t1r = t0r + 8;
 #pragma unroll
     for(int c = 0; c < HD / 8; ++c) {
@@ -317,18 +369,23 @@ __global__ void __launch_bounds__(kThreads, 1) decode_kernel(Decode p) {
     uint4* Qs = smem;
     const int g = blockIdx.x, blk = blockIdx.y, s = blockIdx.z, group = p.heads / p.pages.kv_heads;
     const int R = p.max_columns * group;
-    const int q0 = p.batch.q_start[s], n = min(p.batch.q_start[s + 1] - q0, p.max_columns);
+    const int q0 = p.batch.q_start[s], n = p.batch.q_start[s + 1] - q0;
+    const bool bad = broken(p.batch, s, n, p.max_columns, p.pages.page_tokens);  // the combine answers it
     const int nkeys = p.batch.kv_lens[s], pos0 = nkeys - n;
     const std::int32_t* table = p.batch.tables + static_cast<std::size_t>(s) * p.batch.table_stride;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gl = lane >> 2, t4 = lane & 3;
     const int stream = warp / 4, stid = tid % kStreamThreads;
+    // Pieces stay assigned by position (piece P to block P mod blocks); with a window the walk starts at the oldest
+    // column's window, so the work follows the window, not the context.
+    const int klo = window_lo(pos0, p.window), first = klo / kPiece;
+    const int piece0 = first + ((blk - first % p.blocks) % p.blocks + p.blocks) % p.blocks;
     uint4* Ks = Qs + kRows * C + stream * 2 * kK * C;
     uint4* Vs = Ks + kK * C;
     const std::size_t unit = ((static_cast<std::size_t>(s) * p.pages.kv_heads + g) * p.blocks + blk) * kStreams + stream;
     float* part = p.partial + unit * R * HD;
     float* ml = p.partial + static_cast<std::size_t>(p.batch.seqs) * p.pages.kv_heads * p.blocks * kStreams * R * HD + unit * R * 2;
-    auto tile_key = [&](int j) { return (blk + (j >> 2) * p.blocks) * kPiece + (j & 3) * kK; };
-    if(n <= 0 || tile_key(0) >= nkeys) {
+    auto tile_key = [&](int j) { return (piece0 + (j >> 2) * p.blocks) * kPiece + (j & 3) * kK; };
+    if(n <= 0 || bad || tile_key(0) >= nkeys) {
         for(int r = stid; r < R; r += kStreamThreads) { ml[r * 2] = -kInf; ml[r * 2 + 1] = 0.f; }
         return;
     }
@@ -341,19 +398,33 @@ __global__ void __launch_bounds__(kThreads, 1) decode_kernel(Decode p) {
     }
     asm volatile("cp.async.commit_group;");
     Tile<HD, F, kStreamThreads> tile;
-    tile.fetch(p.pages, table, g, tile_key(stream), nkeys, stid);
+    tile.fetch(p.pages, table, g, tile_key(stream), klo, nkeys, stid);
     tile.stage(Ks, Vs, stid);
     asm volatile("cp.async.wait_group 0;" ::: "memory");
     __syncthreads();
     Rows<HD> rows;
     const int qr0 = (warp % 4) * 16, r0 = qr0 + gl, r1 = r0 + 8;
     const bool computes = qr0 < used;
-    const int qpos0 = r0 < used ? pos0 + r0 / group : -1, qpos1 = r1 < used ? pos0 + r1 / group : -1;
+    auto visible = [&](int r) {
+        Visible v;
+        if(r >= used) return v;
+        const int column = r / group;
+        v.pos = pos0 + column;
+        int depth = column;
+        if(p.tree) {
+            v.tree = p.tree[q0 + column];
+            v.base = pos0;
+            depth = __popcll(v.tree) - 1;
+        }
+        v.lo = window_lo(pos0 + depth, p.window);
+        return v;
+    };
+    const Visible v0 = visible(r0), v1 = visible(r1);
     for(int i = 0;; i += kStreams) {
         const int kfirst = tile_key(i + stream);
         const bool more = tile_key(i + kStreams) < nkeys;  // the same for both streams
-        if(more) tile.fetch(p.pages, table, g, tile_key(i + kStreams + stream), nkeys, stid);
-        if(computes && kfirst < nkeys) rows.step(Qs, Ks, Vs, qr0, kfirst, qpos0, qpos1, p.scale, lane);
+        if(more) tile.fetch(p.pages, table, g, tile_key(i + kStreams + stream), klo, nkeys, stid);
+        if(computes && kfirst < nkeys) rows.step(Qs, Ks, Vs, qr0, kfirst, v0, v1, p.scale, p.softcap, lane);
         if(!more) break;
         __syncthreads();
         tile.stage(Ks, Vs, stid);
@@ -381,7 +452,11 @@ __global__ void __launch_bounds__(HD) combine_kernel(Decode p) {
     __shared__ float total;
     const int c = blockIdx.x, h = blockIdx.y, s = blockIdx.z, d = threadIdx.x;
     const int group = p.heads / p.pages.kv_heads, g = h / group, R = p.max_columns * group;
-    const int q0 = p.batch.q_start[s], n = min(p.batch.q_start[s + 1] - q0, p.max_columns);
+    const int q0 = p.batch.q_start[s], n = p.batch.q_start[s + 1] - q0;
+    if(broken(p.batch, s, n, p.max_columns, p.pages.page_tokens)) {
+        poison(p.batch, p.out, p.out_stride, q0, n, c, gridDim.x, h, HD, c == 0 && h == 0);
+        return;
+    }
     if(c >= n) return;
     const int r = c * group + h % group;
     const int nkeys = p.batch.kv_lens[s];
@@ -392,7 +467,7 @@ __global__ void __launch_bounds__(HD) combine_kernel(Decode p) {
     for(int b = d; b < ns; b += blockDim.x) wsp[b] = ml[(static_cast<std::size_t>(b) * R + r) * 2];
     __syncthreads();
     if(d == 0) {
-        float M = -kInf;
+        float M = p.sinks ? p.sinks[h] : -kInf;
         for(int b = 0; b < ns; ++b) M = fmaxf(M, wsp[b]);
         float den = 0.f;
         for(int b = 0; b < ns; ++b) {
@@ -401,6 +476,7 @@ __global__ void __launch_bounds__(HD) combine_kernel(Decode p) {
             wsp[b] = w;
             den += w;
         }
+        if(p.sinks) den += __expf(p.sinks[h] - M);  // the sink's weight joins the denominator after the blocks'
         total = den;
     }
     __syncthreads();
@@ -476,7 +552,8 @@ cudaError_t write(const Pages& pg, const __nv_bfloat16* k, const __nv_bfloat16* 
 }
 
 cudaError_t prefill(const Prefill& p, cudaStream_t s) {
-    if(!valid(p.pages) || !valid(p.batch) || !p.q || !p.out || p.max_queries <= 0 || !valid_heads(p.pages, p.heads, p.q_stride, p.out_stride))
+    if(!valid(p.pages) || !valid(p.batch) || !p.q || !p.out || p.max_queries <= 0 || !valid_heads(p.pages, p.heads, p.q_stride, p.out_stride) ||
+       p.window < 0 || !(p.softcap >= 0.f))
         return cudaErrorInvalidValue;
     return dispatch<PrefillRun>(p, s);
 }
@@ -488,7 +565,8 @@ std::size_t decode_partial_floats(int seqs, int kv_heads, int head_dim, int bloc
 
 cudaError_t decode(const Decode& p, cudaStream_t s) {
     if(!valid(p.pages) || !valid(p.batch) || !p.q || !p.out || !p.partial || !valid_heads(p.pages, p.heads, p.q_stride, p.out_stride) ||
-       p.max_columns < 1 || p.max_columns * (p.heads / p.pages.kv_heads) > kRows || p.blocks < 1 || p.blocks > 1024)
+       p.max_columns < 1 || p.max_columns * (p.heads / p.pages.kv_heads) > kRows || p.blocks < 1 || p.blocks > 1024 ||
+       p.window < 0 || !(p.softcap >= 0.f) || (p.tree && p.window > 0 && p.window <= 64))
         return cudaErrorInvalidValue;
     return dispatch<DecodeRun>(p, s);
 }

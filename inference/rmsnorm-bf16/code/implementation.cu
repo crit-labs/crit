@@ -10,7 +10,7 @@ constexpr int threads = 256;
 
 __global__ void normalize(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                           const __nv_bfloat16* gate, __nv_bfloat16* out,
-                          std::int64_t width, float epsilon, Mode mode) {
+                          std::int64_t width, float epsilon, Mode mode, Rounding rounding) {
     __shared__ float reduction[threads];
     const auto offset = std::int64_t(blockIdx.x) * width;
     float squares = 0.0f;
@@ -28,7 +28,14 @@ __global__ void normalize(const __nv_bfloat16* x, const __nv_bfloat16* weight,
     for (std::int64_t column = threadIdx.x; column < width; column += threads) {
         float gain = __bfloat162float(weight[column]);
         if (mode == Mode::unit_offset) gain += 1.0f;
-        float value = __bfloat162float(x[offset + column]) * inverse * gain;
+        float value = __bfloat162float(x[offset + column]) * inverse;
+        if (rounding == Rounding::normalize_first) {
+            // BF16 x * r, then a BF16 product with the gain, as the input dtype would.
+            value = __bfloat162float(__float2bfloat16_rn(value));
+            value = __bfloat162float(__float2bfloat16_rn(value * gain));
+        } else {
+            value *= gain;
+        }
         if (mode == Mode::gated) {
             const float g = __bfloat162float(gate[offset + column]);
             value *= g / (1.0f + expf(-g));
@@ -44,7 +51,8 @@ Dispatch enqueue(ReadView x, ReadView weight, const ReadView* gate, WriteView ou
     normalize<<<static_cast<unsigned>(x.rows), threads, 0, context.stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
         gate ? static_cast<const __nv_bfloat16*>(gate->data) : nullptr,
-        static_cast<__nv_bfloat16*>(out.data), x.width, parameters.epsilon, parameters.mode);
+        static_cast<__nv_bfloat16*>(out.data), x.width, parameters.epsilon, parameters.mode,
+        parameters.rounding);
     const auto error = cudaPeekAtLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
     return {"crit-rmsnorm-fp32", 1};

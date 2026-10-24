@@ -13,7 +13,8 @@ Use prompt/history copying for repeated or edited text when it proposes useful
 continuations cheaply. Any draft source can use the greedy verifier. Compare
 proposal, verification and repair cost with ordinary decoding; acceptance rate
 alone does not establish a speedup. Sampling needs the probability-based
-acceptance in [sampled.h](code/sampled.h), not the greedy verifier.
+acceptance in [sampled.h](code/sampled.h), not the greedy verifier; its device path is
+[token-sampling](../token-sampling/README.md)'s `enqueue_verify`, with this loop as the oracle.
 
 Use the checkpoint's drafter (MTP head or companion draft model) as published. It
 may be re-encoded or given a vocabulary subset, but never trained or fine-tuned:

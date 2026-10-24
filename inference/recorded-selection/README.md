@@ -30,7 +30,9 @@ version and device beside the table and retune when either changes.
 **Replay.** A recorded index is used as is; an index beyond the list is an error. With
 no entry and no tuning, candidate 0 is taken (deterministic, maybe slower). Only explicit
 tuning times candidates: fastest wins, ties keep the lower index, candidates that cannot
-run are skipped, and the first choice for a key is kept. Before using a bucket's choice
+run are skipped, and the first choice for a key is kept; a later call for that key
+whose list no longer holds the kept index is an error too. Keys are nonempty and contain
+no quotes or backslashes, so the exported table reads back. Before using a bucket's choice
 at another width, ask the backend whether it accepts that implementation for the exact
 shape; if not, use the backend's first candidate for that shape.
 

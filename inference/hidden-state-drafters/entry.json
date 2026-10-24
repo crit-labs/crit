@@ -1,0 +1,92 @@
+{
+  "id": "hidden-state-drafters",
+  "category": "speculation",
+  "summary": "Published drafters that read the target's hidden states (EAGLE-3) or draft a block per pass (DFlash, DSpark): one Core description of every published format with one tap convention, and device glue for catch-up, block input, draft-vocabulary mapping and confidence truncation in the device speculative round",
+  "implementation_status": "native_source",
+  "implementation_scope": "Core's crit_core.model.drafters reads speculators (eagle3, peagle, dflash, dflash2, dspark), native EAGLE-3, native DFlash and native DSpark configs into one Drafter with taps as residual-stream indices. A Python reference and CUDA reference kernels supply EAGLE-3 catch-up columns from the round's packed result and settled count, block-drafter input, d2t mapping, draft-law scatter to the target vocabulary and confidence truncation. flash-prefill-attention's causal = false runs a block drafter's non-causal block. Drafter arithmetic and the target's tap writes are engine supplied.",
+  "agent_guidance": {
+    "use_when": "A drafter trained for the target is published (speculators, EAGLE-3, DFlash or DSpark checkpoints) and the target has no built-in draft head or its head accepts less",
+    "avoid_when": "No published drafter matches the target (crit never trains one), the drafter needs another model family's state, or the measured tap writes and drafter passes cost more than the tokens they add",
+    "provides": [
+      "One Drafter description from every published config format, with taps as residual-stream indices and EAGLE-3's default taps",
+      "EAGLE-3 catch-up columns (taps of column c with the c-th emitted token) over a fixed width from the device's settled count",
+      "Block-drafter input [anchor, mask...] at frontier positions, and non-causal block attention through flash-prefill-attention",
+      "Draft-vocabulary to target mapping through d2t, and draft-law scatter for rejection sampling",
+      "Confidence truncation that stops a round at the first unlikely draft without a narrower graph"
+    ],
+    "engine_supplies": [
+      "The drafter's arithmetic as published (fc over fused taps, decoder layer, head; block layers with context injection)",
+      "Tap writes in the target's verify and prefill, and the drafter's own KV",
+      "Argmax over the drafter's head (for example draft-vocabulary-subset's gather-argmax)",
+      "The confidence threshold, chosen on general text"
+    ],
+    "preserve": [
+      "Taps from Core's reader, never a format's own convention re-derived",
+      "EAGLE-3 alignment: taps at position p with the token at p + 1",
+      "Catch-up from the count Core's truncation has settled",
+      "d2t mapping before verification; truncated drafts that no prediction matches"
+    ],
+    "adapt": [
+      "Fusing tap writes into the target's residual adds",
+      "The drafter's precision and its draft width up to the publisher's",
+      "The confidence source (a confidence head or the drafter's top probability)"
+    ]
+  },
+  "path": "inference/hidden-state-drafters/README.md",
+  "code_path": "inference/hidden-state-drafters/code",
+  "code_files": [
+    {"path": "inference/hidden-state-drafters/code/drafting.py", "purpose": "Host reference: catch-up columns, block input and drafts, d2t mapping, law scatter and confidence truncation"},
+    {"path": "inference/hidden-state-drafters/code/hidden_drafters.h", "purpose": "Launch interfaces over device-speculative-round's control block and packed result"},
+    {"path": "inference/hidden-state-drafters/code/hidden_drafters.cu", "purpose": "Reference CUDA kernels for catch-up, block input, mapping, scatter and truncation"}
+  ],
+  "requires": {
+    "hardware": "CUDA C++20 and device-speculative-round's greedy_accept.h; Python 3.11+ for Core's reader and the reference",
+    "model": "A target with a published hidden-state drafter sharing its tokenizer (or a d2t table into it)",
+    "workload": "Speculative decoding through the device round, greedy or sampled"
+  },
+  "contract": {
+    "input": "A drafter config.json and the target's layer count; per round the control block, packed result, d2t, draft-law rows and confidences",
+    "output": "A Drafter; catch-up tokens and positions, block tokens and positions, mapped drafts, target-vocabulary laws and truncated drafts",
+    "ownership": "The engine owns every device buffer; kernels borrow them on the caller's stream",
+    "failure": "Malformed or inconsistent drafter configs raise ConfigError (taps past the target, a block drafter without block size or mask, EAGLE-3 defaults without the target's depth); foreign configs read as None; launches reject null buffers and blocks without a mask slot",
+    "core_boundary": "crit_core.model.drafters is Core's reader; recon can record its Drafter beside the target's config facts"
+  },
+  "dependencies": [
+    "Core crit_core.model (ConfigError, jsonfile)",
+    "CUDA runtime",
+    "device-speculative-round (greedy_accept.h)",
+    "Python standard library"
+  ],
+  "symbols": [
+    "Drafter",
+    "read_drafter",
+    "read_drafter_file",
+    "eagle_inputs",
+    "block_input",
+    "block_drafts",
+    "map_tokens",
+    "scatter_law",
+    "truncate",
+    "enqueue_eagle_ingest",
+    "enqueue_block_input",
+    "enqueue_map_tokens",
+    "enqueue_scatter_law",
+    "enqueue_truncate_drafts"
+  ],
+  "interactions": [
+    "device-speculative-round",
+    "mtp-decode",
+    "token-sampling",
+    "draft-vocabulary-subset",
+    "flash-prefill-attention",
+    "draft-trees"
+  ],
+  "techniques": [
+    "hidden-state-drafters"
+  ],
+  "validation": {
+    "host": "Core's reader on speculators EAGLE-3, DFlash and DSpark, native EAGLE-3 with default taps, native DFlash and DSpark agreeing on one tap convention, rejected and foreign configs and a drafter directory; the drafting reference's rules",
+    "native": "Catch-up tokens and positions from the packed result, including after a Core truncation; block input; d2t mapping and law scatter keeping mass; confidence truncation",
+    "performance": "No drafter arithmetic or speedup is qualified"
+  }
+}

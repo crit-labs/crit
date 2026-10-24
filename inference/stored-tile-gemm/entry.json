@@ -53,7 +53,7 @@
     "input": "Row-major stored codes and scales (repacked once); BF16 activations [T][K]; plan, scratch and a CUDA stream",
     "output": "FP32 [T][ldo] results written or added per element; tiles and scale tiles that a GEMV can share",
     "ownership": "The engine owns weights, tiles, activations, outputs and scratch; launches borrow them until the stream reaches them",
-    "failure": "Unsupported shapes, non-positive sizes or global scales return cudaErrorInvalidValue; the NVFP4 kernel traps where the block-scaled MMA is not compiled; launch errors are returned from cudaGetLastError",
+    "failure": "Unsupported shapes, non-positive sizes or global scales, and a plan made for another format, N or K or for fewer tokens return cudaErrorInvalidValue; the NVFP4 kernel traps where the block-scaled MMA is not compiled; launch errors are returned from cudaGetLastError",
     "core_boundary": "No Core change; these are engine kernels inside its forward pass"
   },
   "dependencies": [
@@ -75,7 +75,7 @@
   ],
   "validation": {
     "host": "Exact host model: the FP8 permutation and the NVFP4 exchange reproduce direct dot products; wrong selectors or exchange partners do not; activation slots cover every column once",
-    "native": "CUDA test against an FP64 host reference with the same activation quantization for 1-300 tokens, split and unsplit, one or two row tiles per warp and add; fragment probe of the scale mapping and value layout on sm_120",
+    "native": "CUDA test against an FP64 host reference with the same activation quantization for 1-300 tokens, split and unsplit, one or two row tiles per warp, add and fewer tokens than planned; plan mismatches refused; fragment probe of the scale mapping and value layout on sm_120",
     "performance": "One measured engine: 670 vs 550 TFLOPS (library GEMM with re-layout) on 17408x5120 NVFP4 matrices at 1,536 tokens on an sm_120 device; no claim for other devices or shapes"
   }
 }

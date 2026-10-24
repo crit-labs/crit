@@ -3,11 +3,16 @@ import re
 
 from crit.run.records import digest, number
 
+METHODS = ("ptq", "drafter")
 FORMATS = ("fp8-channel", "nvfp4")
 ALGORITHMS = ("rtn", "gptq")
 DEFAULT_INCLUDE = (r"^layers\.\d+\..+_proj$",)
 DEFAULT_CALIBRATION = {"samples": 128, "sequence_tokens": 2048}
 DEFAULT_GPTQ = {"dampening": 0.01, "block": 128}
+DRAFTER_KINDS = ("mtp-head",)
+DRAFTER_DTYPES = ("bf16", "fp32")
+DEFAULT_DRAFTER_CALIBRATION = {"samples": 64, "sequence_tokens": 1024}
+DEFAULT_TRAIN = {"steps": 1000, "windows_per_step": 4, "learning_rate": 1e-4, "warmup_steps": 50, "weight_decay": 0.0}
 LAYER_ANCHOR = "layers.0.input_layernorm.weight"
 SOURCE_DTYPES = {"BF16", "F16", "F32"}
 # Tensors a quantized module may carry; a target's stored ones are replaced as a whole.
@@ -36,12 +41,14 @@ def _patterns(value, name):
 
 def load_recipe(value):
     """Validate a models_recipe and return it with every default filled in (the recipe a record freezes)."""
+    if not isinstance(value, dict) or value.get("record_kind") != "models_recipe" or value.get("schema_version") != 1:
+        raise ValueError("Expected schema_version 1, record_kind models_recipe")
+    if value.get("method") not in METHODS:
+        raise ValueError("method must be one of " + ", ".join(METHODS) + " (pruning and QAD are not available yet)")
+    if value["method"] == "drafter":
+        return _drafter_recipe(value)
     _fields(value, "models_recipe", {"schema_version", "record_kind", "method", "format", "algorithm"},
             {"include", "exclude", "seed", "calibration", "gptq"})
-    if type(value["schema_version"]) is not int or value["schema_version"] != 1 or value["record_kind"] != "models_recipe":
-        raise ValueError("Expected schema_version 1, record_kind models_recipe")
-    if value["method"] != "ptq":
-        raise ValueError("method must be ptq (pruning and QAD are not available yet)")
     if value["format"] not in FORMATS:
         raise ValueError("format must be one of " + ", ".join(FORMATS))
     if value["algorithm"] not in ALGORITHMS:
@@ -67,6 +74,37 @@ def load_recipe(value):
             raise ValueError("gptq.block must be a multiple of 16")
         recipe.update(calibration=calibration, gptq=settings)
     return recipe
+
+
+def _drafter_recipe(value):
+    """A drafter recipe: the kind of head, the target layer it starts from, the calibration windows, the share held
+    out, the training settings and the stored dtype, every default filled in."""
+    _fields(value, "models_recipe", {"schema_version", "record_kind", "method"},
+            {"kind", "init_layer", "seed", "calibration", "heldout_fraction", "train", "dtype"})
+    kind = value.get("kind", DRAFTER_KINDS[0])
+    if kind not in DRAFTER_KINDS:
+        raise ValueError("kind must be one of " + ", ".join(DRAFTER_KINDS))
+    dtype = value.get("dtype", "bf16")
+    if dtype not in DRAFTER_DTYPES:
+        raise ValueError("dtype must be one of " + ", ".join(DRAFTER_DTYPES))
+    init_layer = value.get("init_layer", -1)
+    if type(init_layer) is not int or not -1024 <= init_layer <= 1024:
+        raise ValueError("init_layer is the index of the target layer the drafter starts from (-1: the last)")
+    calibration = {**DEFAULT_DRAFTER_CALIBRATION, **_checked(value.get("calibration", {}), "calibration", DEFAULT_DRAFTER_CALIBRATION)}
+    number(calibration["samples"], "calibration.samples", 2, 65536, integer=True)
+    number(calibration["sequence_tokens"], "calibration.sequence_tokens", 16, 1 << 20, integer=True)
+    heldout = value.get("heldout_fraction", 0.1)
+    if type(heldout) not in (int, float) or not 0 < heldout < 0.5:
+        raise ValueError("heldout_fraction is the share of windows held out to measure the drafter, above 0 and below 0.5")
+    train = {**DEFAULT_TRAIN, **_checked(value.get("train", {}), "train", DEFAULT_TRAIN)}
+    number(train["steps"], "train.steps", 1, 1_000_000, integer=True)
+    number(train["windows_per_step"], "train.windows_per_step", 1, 1024, integer=True)
+    number(train["learning_rate"], "train.learning_rate", 1e-9, 1.0)
+    number(train["warmup_steps"], "train.warmup_steps", 0, 1_000_000, integer=True)
+    number(train["weight_decay"], "train.weight_decay", 0, 1.0)
+    return {"schema_version": 1, "record_kind": "models_recipe", "method": "drafter", "kind": kind, "init_layer": init_layer,
+            "seed": number(value.get("seed", 0), "seed", 0, 2 ** 32 - 1, integer=True), "calibration": calibration,
+            "heldout_fraction": heldout, "train": train, "dtype": dtype}
 
 
 def _checked(value, name, defaults):

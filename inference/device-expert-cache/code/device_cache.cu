@@ -121,20 +121,22 @@ __global__ void prefetch_kernel(Directory d, int group, const std::int32_t* pred
     if(threadIdx.x != 0) return;
     const int half = group & 1;
     std::int32_t* tags = d.pool_tags + half * d.pool_slots;
+    for(int p = 0; p < d.pool_slots; ++p) tags[p] = -1;
+    // Pool slots go to the nonresident predictions in prediction order, so resident or
+    // invalid predictions do not take a slot.
     int n = 0;
-    for(int p = 0; p < d.pool_slots; ++p) {
-        tags[p] = -1;
-        if(p >= count) continue;
-        const int e = predicted[p];
+    for(int i = 0; i < count && n < d.pool_slots; ++i) {
+        const int e = predicted[i];
         if(e < 0 || e >= d.experts || group < 0 || group >= d.groups) continue;
         const int key = group * d.experts + e;
         if(d.key_slot[key] >= 0) continue;  // resident now (if evicted before use, it is an ordinary miss)
         bool repeated = false;
-        for(int q = 0; q < p; ++q) repeated |= tags[q] == key;
+        for(int q = 0; q < n; ++q) repeated |= tags[q] == key;
         if(repeated) continue;
-        tags[p] = key;
-        fills[n++] = Fill{reinterpret_cast<const uint4*>(d.store + std::size_t(key) * d.bundle_bytes),
-                          reinterpret_cast<uint4*>(d.pool_base + (std::size_t(half) * d.pool_slots + p) * d.bundle_bytes)};
+        tags[n] = key;
+        fills[n] = Fill{reinterpret_cast<const uint4*>(d.store + std::size_t(key) * d.bundle_bytes),
+                        reinterpret_cast<uint4*>(d.pool_base + (std::size_t(half) * d.pool_slots + n) * d.bundle_bytes)};
+        ++n;
     }
     *fill_count = n;
     d.counters[3] += n;

@@ -64,7 +64,7 @@ DEEPSEEK = {
     "q_lora_rank": 1536, "qk_rope_head_dim": 64, "qk_nope_head_dim": 128, "v_head_dim": 128,
     "n_routed_experts": 256, "n_shared_experts": 1, "num_experts_per_tok": 8, "moe_intermediate_size": 2048,
     "first_k_dense_replace": 3, "n_group": 8, "topk_group": 4, "routed_scaling_factor": 2.5, "scoring_func": "sigmoid",
-    "norm_topk_prob": True, "max_position_embeddings": 163840, "rope_theta": 10000,
+    "topk_method": "noaux_tc", "norm_topk_prob": True, "max_position_embeddings": 163840, "rope_theta": 10000,
     "rope_scaling": {"type": "yarn", "factor": 40, "original_max_position_embeddings": 4096, "beta_fast": 32,
                      "beta_slow": 1, "mscale": 1.0, "mscale_all_dim": 1.0},
     "num_nextn_predict_layers": 1, "rms_norm_eps": 1e-6, "bos_token_id": 0, "eos_token_id": 1,
@@ -478,8 +478,8 @@ class ModelConfigTests(unittest.TestCase):
         self.assertEqual(model.mla, mc.MlaConfig(512, 64, 128, 128, 1536))
         self.assertEqual((model.moe.experts, model.moe.experts_key, model.moe.experts_per_token, model.moe.shared_experts,
                           model.moe.first_k_dense_replace, model.moe.n_group, model.moe.topk_group,
-                          model.moe.routed_scaling_factor, model.moe.scoring_func),
-                         (256, "n_routed_experts", 8, 1, 3, 8, 4, 2.5, "sigmoid"))
+                          model.moe.routed_scaling_factor, model.moe.scoring_func, model.moe.topk_method),
+                         (256, "n_routed_experts", 8, 1, 3, 8, 4, 2.5, "sigmoid", "noaux_tc"))
         self.assertEqual((model.rope.type, model.rope.factor, model.rope.original_max_position_embeddings,
                           model.rope.beta_fast, model.rope.mscale_all_dim, model.rope.theta),
                          ("yarn", 40.0, 4096, 32.0, 1.0, 10000.0))

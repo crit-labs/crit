@@ -110,6 +110,70 @@ HEADROOM_REASONS = {"search_exhausted", "budget_exhausted"}
 STOP_KPIS = ("decode", "prefill", "ttft")  # a stop's headroom accounts for each
 CONTEXT_KPIS = ("context_decode", "context_ttft")  # and for these when Eval measured the required context
 KV_TOKENS_MAX = 2_000_000
+# A run started from a crit-hub engine (crit run create --from-engine) keeps the engine's published evidence here,
+# and its first candidate declares this lineage to say it is the imported source re-measured.
+ORIGIN_DIR = "captured/origin"
+LINEAGE = "origin-engine"
+COMMIT = r"[0-9a-f]{40}"
+HTTPS_REPOSITORY = r"https://[A-Za-z0-9.-]+(/[A-Za-z0-9_.~-]+)+/?"
+
+
+def validate_origin(value, stored=None):
+    """A run's origin_engine (hub.describe_engine): the crit-hub engine it starts from. Evidence entries name their
+    source file before the run exists (`source`) and their copy under captured/origin/ once it does (`path`);
+    `stored` True or False requires one form, None accepts either."""
+    keys(value, {"engine", "title", "origin", "summary", "contributor", "source", "card", "lock", "checkpoints",
+                 "provenance", "evidence"})
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", str(value["engine"])):
+        raise ValueError("origin_engine.engine is <owner>/<name>, the engine's folder in crit-hub")
+    text(value["title"], "origin_engine.title", 400)
+    if value["origin"] not in ("crit", "external"):
+        raise ValueError("origin_engine.origin is crit or external")
+    if value["summary"] is not None:
+        text(value["summary"], "origin_engine.summary", 400)
+    keys(value["contributor"], {"name", "repository"})
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", str(value["contributor"]["name"])) \
+            or not re.fullmatch(HTTPS_REPOSITORY, str(value["contributor"]["repository"])):
+        raise ValueError("origin_engine.contributor needs a name and an https repository")
+    keys(value["source"], {"repository", "revision", "path"})
+    if not re.fullmatch(HTTPS_REPOSITORY, str(value["source"]["repository"])) or not re.fullmatch(COMMIT, str(value["source"]["revision"])):
+        raise ValueError("origin_engine.source needs an https repository and a full commit revision")
+    if value["source"]["path"] is not None:
+        text(value["source"]["path"], "origin_engine.source.path", 512)
+    for name in ("card", "lock"):
+        keys(value[name], {"path", "sha256"})
+        text(value[name]["path"], f"origin_engine.{name}.path")
+        sha(value[name]["sha256"], f"origin_engine.{name}.sha256")
+    if not isinstance(value["checkpoints"], dict) or not value["checkpoints"]:
+        raise ValueError("origin_engine.checkpoints lists the checkpoints the engine was measured on")
+    for model, entry in value["checkpoints"].items():
+        text(model, "origin_engine checkpoint id", 200)
+        keys(entry, {"repository", "revision", "files", "files_sha256"})
+        if not isinstance(entry["files"], list) or not entry["files"]:
+            raise ValueError(f"origin_engine.checkpoints.{model}.files lists the checkpoint's files")
+        for row in entry["files"]:
+            keys(row, {"path", "bytes", "sha256"})
+            text(row["path"], "checkpoint file path", 1024)
+            number(row["bytes"], "checkpoint file bytes", 0, 2 ** 53, integer=True)
+            sha(row["sha256"], "checkpoint file sha256")
+        if digest(entry["files"]) != entry["files_sha256"]:
+            raise ValueError(f"origin_engine.checkpoints.{model}.files_sha256 does not match its files")
+    if not isinstance(value["provenance"], dict):
+        raise ValueError("origin_engine.provenance is an object")
+    if not isinstance(value["evidence"], list):
+        raise ValueError("origin_engine.evidence is a list")
+    for ref in value["evidence"]:
+        keys(ref, {"file", "sha256", "measured_with", "gpu", "model"}, {"source", "path"})
+        text(ref["file"], "origin evidence file", 512)
+        sha(ref["sha256"], "origin evidence sha256")
+        has_path, has_source = "path" in ref, "source" in ref
+        if has_path == has_source:
+            raise ValueError("origin_engine.evidence entries name either their source file or their stored path")
+        if stored is True and not has_path or stored is False and not has_source:
+            raise ValueError("origin_engine.evidence is " + ("not yet " if stored else "already ") + "stored in the run")
+        if has_path and not str(ref["path"]).startswith(ORIGIN_DIR + "/"):
+            raise ValueError(f"origin_engine.evidence is kept under {ORIGIN_DIR}/")
+    return value
 
 
 def quality_terms(correctness, amendments=()):
@@ -385,7 +449,7 @@ def request_spec(data):
     keys(data, {"model_path", "correctness_criteria"}, {"kv_tokens", "device", "vram_headroom_gib", "ram_headroom_gib",
          "context_reserve_gib", "context_tokens",
          "budget_minutes", "workload", "cases", "benchmark_protocol", "targets", "verification_level", "attempt_limit",
-         "weights_policy", "candidate_budget", "quality_budget", "exactness", "eval_sampling"})
+         "weights_policy", "candidate_budget", "quality_budget", "exactness", "eval_sampling", "origin_engine"})
     path = Path(text(data["model_path"], "Model path")).expanduser().resolve()
     if not path.exists():
         raise ValueError("Model path does not exist on this computer")
@@ -422,7 +486,8 @@ def request_spec(data):
                             **({"exactness": data["exactness"]} if "exactness" in data else {})},
             "objectives": {"targets": targets, "verification_level": level},
             "resource_limits": resource_limits(data),
-            **({"eval_sampling": eval_sampling(data["eval_sampling"])} if "eval_sampling" in data else {})}
+            **({"eval_sampling": eval_sampling(data["eval_sampling"])} if "eval_sampling" in data else {}),
+            **({"origin_engine": validate_origin(data["origin_engine"])} if "origin_engine" in data else {})}
     validate_spec(spec)
     return spec
 
@@ -469,9 +534,11 @@ def validate_workload(value):
 
 def validate_spec(value):
     keys(value, {"model_path", "hardware_constraints", "cases", "benchmark_protocol", "correctness", "objectives", "resource_limits"},
-         {"eval_sampling"})
+         {"eval_sampling", "origin_engine"})
     if "eval_sampling" in value and eval_sampling(value["eval_sampling"]) != value["eval_sampling"]:
         raise ValueError("eval_sampling is not in its validated form")
+    if "origin_engine" in value:
+        validate_origin(value["origin_engine"])
     if not Path(text(value["model_path"], "model locator")).is_absolute():
         raise ValueError("Model locator requires an absolute local path")
     hardware = value["hardware_constraints"]
@@ -554,8 +621,15 @@ def segment(root, run, segment_id):
 
 def inputs(root, run):
     value = read_json(safe_path(root, "inputs.json"))
-    header(value, "run_inputs", run["run_id"], {"created_at", "request_sha256", "model_manifest", "hardware_manifest", "environment_manifest", "case_manifests", "manifest_sha256"})
+    header(value, "run_inputs", run["run_id"], {"created_at", "request_sha256", "model_manifest", "hardware_manifest", "environment_manifest", "case_manifests", "manifest_sha256"},
+           {"origin_checkpoint"})
     timestamp(value["created_at"], "input creation")
+    if "origin_checkpoint" in value:
+        if "origin_engine" not in run["spec"]:
+            raise ValueError("origin_checkpoint belongs to a run started from a crit-hub engine")
+        keys(value["origin_checkpoint"], {"matched", "checkpoints"})
+        if value["origin_checkpoint"]["matched"] is not None and value["origin_checkpoint"]["matched"] not in run["spec"]["origin_engine"]["checkpoints"]:
+            raise ValueError("origin_checkpoint names a checkpoint the origin engine does not have")
     if value["request_sha256"] != run["request_sha256"] or value["manifest_sha256"] != digest({k: v for k, v in value.items() if k != "manifest_sha256"}):
         raise ValueError("Resolved input identity mismatch")
     for key in ("hardware_manifest", "environment_manifest"):
@@ -674,9 +748,11 @@ def candidate_projection(root, run, candidate_id, overlay=None, *, candidate_roo
         folder = candidate_root
     candidate = read(safe_path(folder, "candidate.json"))
     required = {"candidate_id", "segment_id", "ordinal", "parent_candidate_id", "origin_candidate_id", "created_at", "label", "rationale", "strategy", "configuration", "store_decisions", "source_manifest_sha256", "inputs_manifest_sha256", "request_sha256"}
-    header(candidate, "candidate", run["run_id"], required, {"weights"})
+    header(candidate, "candidate", run["run_id"], required, {"weights", "lineage"})
     if "weights" in candidate and candidate["weights"] not in WEIGHTS:
         raise ValueError("Candidate weights declaration requires as_stored or transformed")
+    if "lineage" in candidate and (candidate["lineage"] != LINEAGE or "origin_engine" not in run["spec"]):
+        raise ValueError(f"Candidate lineage {LINEAGE} belongs to a run started from a crit-hub engine")
     if candidate["candidate_id"] != candidate_id or candidate["request_sha256"] != run["request_sha256"]:
         raise ValueError("Candidate request/identity mismatch")
     number(candidate["ordinal"], "candidate ordinal", 1, 99_999_999, integer=True)
