@@ -1295,9 +1295,10 @@ class StatusTests(unittest.TestCase):
 
     def test_portable_paths_name_no_user(self):
         anchor = Path(ROOT.anchor)
-        with tempfile.TemporaryDirectory() as home, patch.object(crit_eval.Path, "home", return_value=Path(home)):
+        home = anchor / "home" / "tester"  # outside the checkout, which may hold the temporary directory
+        with patch.object(crit_eval.Path, "home", return_value=home):
             for path, stored in ((ROOT / "eval" / "examples" / "mock_adapter.py", "eval/examples/mock_adapter.py"),
-                                 (Path(home) / "engines" / "adapter.py", "~/engines/adapter.py"),
+                                 (home / "engines" / "adapter.py", "~/engines/adapter.py"),
                                  (anchor / "Users" / "someone" / "build" / "libengine.so", "libengine.so"),
                                  (anchor / "mnt" / "c" / "Users" / "someone" / "adapter.py", "adapter.py"),
                                  (anchor / "home" / "someone" / "cuda" / "bin" / "nvcc", "nvcc"),
