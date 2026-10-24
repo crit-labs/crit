@@ -87,8 +87,8 @@ int main() {
             rules.top_p = trial % 2 ? 0.9 : 1.0;
             rules.top_k = trial % 3 ? 0u : 64u;
             rules.presence_penalty = 0.3;
-            std::vector<std::vector<cc::Token>> outputs(std::size_t(R));
-            std::vector<ts::Request> reqs(std::size_t(R));
+            std::vector<std::vector<cc::Token>> outputs(static_cast<std::size_t>(R));
+            std::vector<ts::Request> reqs(static_cast<std::size_t>(R));
             std::vector<std::int32_t> counts(std::size_t(R) * V, 0);
             Device<std::int32_t> counts_d(counts);
             for(int r = 0; r < R; ++r) {
@@ -118,7 +118,7 @@ int main() {
                 }
             if(trial == 1) drafts[0] = stop;   // an accepted stop ends the round
             std::vector<std::int32_t> control(std::size_t(R) * dr::control::fields, 0);
-            std::vector<std::uint32_t> budget(std::size_t(R));
+            std::vector<std::uint32_t> budget(static_cast<std::size_t>(R));
             for(int r = 0; r < R; ++r) {
                 budget[std::size_t(r)] = 1 + std::uint32_t(r % (K + 1));
                 control[std::size_t(r) * dr::control::fields + dr::control::frontier] = 100 + r;

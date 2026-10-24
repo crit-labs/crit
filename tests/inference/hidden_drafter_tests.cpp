@@ -4,6 +4,8 @@
 #include "greedy_accept.h"
 #include "hidden_drafters.h"
 
+#include <cuda_runtime.h>
+
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>

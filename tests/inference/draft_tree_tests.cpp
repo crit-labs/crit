@@ -5,6 +5,8 @@
 #include "draft_tree.h"
 #include "greedy_accept.h"
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -45,8 +47,8 @@ std::vector<float> draft_row(const std::vector<int>& path, int vocab) {
     std::uint64_t h = 1469598103934665603ull;
     for(int t : path) h = (h ^ std::uint64_t(t + 1)) * 1099511628211ull;
     std::mt19937_64 rng(h);
-    std::vector<float> row(std::size_t(vocab));
-    std::vector<int> perm(std::size_t(vocab));
+    std::vector<float> row(static_cast<std::size_t>(vocab));
+    std::vector<int> perm(static_cast<std::size_t>(vocab));
     for(int i = 0; i < vocab; ++i) perm[std::size_t(i)] = i;
     std::shuffle(perm.begin(), perm.end(), rng);
     std::uniform_real_distribution<float> jitter(0.f, 0.3f);   // keeps paths' scores apart, ranks within a row fixed
@@ -92,7 +94,7 @@ void case_build() {
                 double sum = 0.;
                 for(float x : row) sum += std::exp(double(x - top));
                 const double lse = double(top) + std::log(sum);
-                std::vector<int> order(std::size_t(V));
+                std::vector<int> order(static_cast<std::size_t>(V));
                 for(int t = 0; t < V; ++t) order[std::size_t(t)] = t;
                 std::sort(order.begin(), order.end(), [&](int a, int b) { return row[std::size_t(a)] != row[std::size_t(b)] ? row[std::size_t(a)] > row[std::size_t(b)] : a < b; });
                 const double base = fid >= 0 ? host[std::size_t(r)][std::size_t(fid)].score : 0.;
@@ -127,7 +129,8 @@ void case_build() {
     Device<std::uint64_t> masks(std::size_t(rows) * nodes);
     dt::Build b{kept.p, roots.p, 1, drafts.p, parents.p, masks.p, depths.p, tokens.p, nodes, rows};
     ok(dt::enqueue_build(c, b, nullptr), "build");
-    const auto dk = kept.get(), dd = drafts.get(), dp = parents.get(), dm = masks.get(), ddep = depths.get(), dtok = tokens.get();
+    const auto dk = kept.get(), dd = drafts.get(), dp = parents.get(), ddep = depths.get(), dtok = tokens.get();
+    const auto dm = masks.get();
     for(int r = 0; r < rows; ++r) {
         std::vector<int> all;
         for(int i = 0; i < int(host[std::size_t(r)].size()); ++i) if(host[std::size_t(r)][std::size_t(i)].depth >= 1) all.push_back(i);

@@ -99,12 +99,19 @@ add_generation_prompt=True, **chat_template_kwargs)`, with the candidate's confi
 
 ```text
 crit run --project CRIT_ROOT --root RUN_ROOT --id RUN_ID resolve --record inputs.json
+crit run --project CRIT_ROOT --root RUN_ROOT --id RUN_ID plan --record plan.json
 crit run --project CRIT_ROOT --root RUN_ROOT --id RUN_ID candidate --source SOURCE_DIR --record proposal.json
 ```
 
-The proposal gives label, rationale, strategy, configuration and Inference decisions
-(`implemented`, `inherited`, `rejected`, `untested`) in `store_decisions`, plus
-parent/origin IDs when reusing earlier work. The coordinator allocates IDs and copies
+Before any code for a candidate, record its [plan](RUN_RECORDS.md#plan) after the parent's
+Eval: whether decode and prefill are still needed, the current strategy's ceiling and the
+best alternative's, the levers with each KPI's projected change, a forecast for every KPI
+and how the gates hold. crit freezes the parent's newest Eval, computes the priorities and
+refuses an incomplete plan; the run's first plan has no parent and may import a baseline as
+is. The proposal names the plan's `plan_id`, gives each of its levers a fate in `lever_fates`
+(built, pruned or deferred, with the reason unless built) and gives label, rationale, strategy,
+configuration and Inference decisions (`implemented`, `inherited`, `rejected`, `untested`)
+in `store_decisions`, plus parent/origin IDs when reusing earlier work. The coordinator allocates IDs and copies
 the source; build in the run's `work/`. Changed source, flags, dependencies or
 configuration need a new candidate.
 
@@ -170,7 +177,9 @@ engine's score call against the run's model's scores of the same texts, which th
 reference stores in the data once (`crit eval reference`, before the first candidate is
 served). It applies the run's
 `quality_budget`, `exactness` and `kv_tokens` and retains the result as
-`candidates/ID/eval/ATTEMPT.json` for checks to reference. The package therefore needs its
+`candidates/ID/eval/ATTEMPT.json` for checks to reference. For a candidate built from a plan it
+writes the plan's [outcome](RUN_RECORDS.md#outcome), the forecast next to the measurement, and it
+prints the priorities the result's fractions give the next plan. The package therefore needs its
 [resident adapter](#4-make-the-package-servable-and-seal) with `chat-stream-v1`,
 `chat-logprobs-v1` and `chat-score-v1` from its first Eval on; `crit_core.serving.ResidentChat`
 provides them (`score_tokens` runs the engine's prefill at every position and its decode forced
@@ -216,10 +225,17 @@ does not prevent serving, but prevents qualification.
 
 ## 5. Deliver
 
-Plan each candidate as [AGENTS.md](../AGENTS.md) describes, aiming at every Eval goal.
+Plan each candidate as [AGENTS.md](../AGENTS.md) describes. crit orders the Eval goals in
+each plan: decode and prefill are p1 and p2 by which is further from its limit (both p1
+when their fractions are within the noise of each other; long-context decode counts toward
+decode, long-context time to first token toward prefill), time to first token is p2 or p3
+and never p1, and quality and the required context stay gates. Priorities order the work
+and settle conflicts; every lever that costs no higher priority goes in.
 The stop record accounts for each goal ([stop](RUN_RECORDS.md#stop)). Stop for the
 objective, exhausted search, a blocker, cancellation or a used candidate budget
 (`budget_exhausted` is refused while budgeted candidates remain); `resume` adds candidates.
+When neither decode nor prefill is needed the run stops even with candidates left: record a
+stop plan from the newest Eval, then stop with `search_exhausted`.
 
 ```text
 crit run --root RUN_ROOT --id RUN_ID stop --record stop.json

@@ -97,6 +97,8 @@ __global__ void __launch_bounds__(1024) pick_kernel(const float* cand_values, co
     }
     __syncthreads();
     if(threadIdx.x != 0) return;
+    // No selectable logit (every one -inf or NaN): -1, as the full law answers; the position advances as for any select.
+    if(ti[0] == kNone) { out[0] = -1; p->position += 1; return; }
     if(!(p->temperature > 0.f)) { out[0] = ti[0]; p->position += 1; return; }
     float w[kMaxTopK], total = 0.f;
     int n = 0;

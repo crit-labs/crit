@@ -288,7 +288,7 @@ int main() {
                 Device<ts::Request> request(1);
                 request.put({dc.request});
                 Device<float> logits(row), dlogits(draft_row), scratch(ts::scratch_floats(V, K + 1)), q(std::size_t(K) * V);
-                Device<std::int32_t> drafts_d(std::size_t(K)), predictions(K + 1);
+                Device<std::int32_t> drafts_d(static_cast<std::size_t>(K)), predictions(K + 1);
                 std::vector<cc::Token> drafts(K);
                 if(sampled) {
                     // The drafter draws all K drafts at once here (a fixed draft law per column), staging nothing.
@@ -354,8 +354,7 @@ int main() {
                 }
             }
             std::cout << "verify: " << checked << " columns equal Core's draws or the rejection rule (" << accepted << " accepts), "
-                      << skipped << " near boundaries skipped
-";
+                      << skipped << " near boundaries skipped\n";
         }
 
         // 4. Distribution: over many seeds the first emitted token (prediction 0) follows the target law, with a
@@ -377,7 +376,7 @@ int main() {
                     std::copy(drafter.begin(), drafter.end(), draft_rows.begin() + std::ptrdiff_t(std::size_t(r) * V));
                 }
                 Device<float> logits(rows), dlogits(draft_rows), scratch(ts::scratch_floats(V, 2 * R)), q(std::size_t(R) * V);
-                Device<std::int32_t> drafts(std::size_t(R)), predictions(std::size_t(R) * 2);
+                Device<std::int32_t> drafts(static_cast<std::size_t>(R)), predictions(std::size_t(R) * 2);
                 if(mode == 0) {
                     drafts.put(std::vector<std::int32_t>(std::size_t(R), 1));   // greedy draft token 1, not the argmax
                 } else {

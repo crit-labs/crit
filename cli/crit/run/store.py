@@ -12,13 +12,14 @@ import time
 import uuid
 
 from .records import (
-    LIFECYCLES, LINEAGE, MAX_CANDIDATES, SAFETY_WINDOW_MINUTES, STOP_REASONS, WEIGHTS, amendment, attempt_process_cap,
+    HEADROOM_REASONS, LIFECYCLES, LINEAGE, MAX_CANDIDATES, SAFETY_WINDOW_MINUTES, STOP_REASONS, WEIGHTS, amendment,
+    attempt_process_cap,
     candidate_projection, quality_terms, digest, evidence, file_sha, header, headroom_record, ident,
     ineligibility, inputs, inventory, keys, load_run, now, number, read_candidates, read_json, record,
     request_spec, safe_path, segment, text, timestamp, validate_attempt_reservation, validate_attempt_result,
     validate_spec, verify_inventory, write_json,
 )
-from . import cost, hub, recon
+from . import cost, hub, plans, recon
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -242,7 +243,8 @@ class RunStore:
         run = load_run(root)
         state = read_json(safe_path(root, "state.json"))
         header(state, "run_state", run_id, {"revision", "updated_at", "current_segment_id", "phase", "candidates", "baseline_candidate_id",
-            "proposed_candidate_id", "selected_candidate_id", "target_satisfied", "budget", "stopping_reason", "critique", "opportunities", "cleanup", "message"})
+            "proposed_candidate_id", "selected_candidate_id", "target_satisfied", "budget", "stopping_reason", "critique", "opportunities", "cleanup", "message"},
+            {"plans"})
         number(state["revision"], "state revision", 1, 2 ** 31, integer=True)
         timestamp(state["updated_at"], "state update")
         if state["phase"] not in LIFECYCLES | STOP_REASONS | {"awaiting_agent", "running", "discovering", "finished", "failed", "launch_failed", "expired"}:
@@ -308,6 +310,7 @@ class RunStore:
         state["baseline_candidate_id"] = sealed[0]["candidate_id"] if sealed else None
         selected = next((c for c in candidates if c["candidate_id"] == state["selected_candidate_id"]), None)
         state["target_satisfied"] = bool(selected and selected["target_satisfied"])
+        state["plans"] = plans.summaries(root, run)
         segments = sorted((root / "segments").glob("segment-*.json"))
         attempts = self._attempts(root)
         bounds = segment(root, run, state["current_segment_id"])
@@ -516,7 +519,7 @@ class RunStore:
             run, _, bounds = self._active(root)
             resolved = inputs(root, run)
             keys(proposal, {"label", "rationale", "strategy", "configuration", "store_decisions"},
-                 {"parent_candidate_id", "origin_candidate_id", "weights", "lineage"})
+                 {"parent_candidate_id", "origin_candidate_id", "weights", "lineage", "plan_id", "lever_fates"})
             if "weights" in proposal and proposal["weights"] not in WEIGHTS:
                 raise ValueError("weights requires as_stored or transformed")
             if "lineage" in proposal:
@@ -526,6 +529,16 @@ class RunStore:
                     raise ValueError(f"lineage {LINEAGE} needs a run created with --from-engine")
             if run["spec"]["correctness"].get("weights_policy") == "as_stored" and "weights" not in proposal:
                 raise ValueError("This run requires weights used as stored: declare weights as_stored or transformed")
+            if "plan_id" in proposal:
+                plan = plans.check_link(root, run, proposal["plan_id"], proposal.get("parent_candidate_id"))
+                required = run["spec"].get("lever_fates") == "required"
+                if required or "lever_fates" in proposal:
+                    plans.check_fates(plan, proposal.get("lever_fates", {}), required)
+            elif "lever_fates" in proposal:
+                raise ValueError("lever_fates give the fate of each lever of the candidate's plan: name its plan_id")
+            elif run["spec"].get("plans") == "required":
+                raise ValueError("This run requires a plan for every candidate: record it with crit run ... plan --record "
+                                 "plan.json after the parent's Eval and before any code, and name its plan_id in the proposal")
             if len(list((root / "candidates").glob("candidate-*"))) >= MAX_CANDIDATES:
                 raise ValueError("Candidate limit exceeded")
             budget = bounds["limits"].get("candidate_budget")
@@ -557,6 +570,8 @@ class RunStore:
                 **{k: proposal[k] for k in ("label", "rationale", "strategy", "store_decisions")}, configuration=configuration,
                 **({"weights": proposal["weights"]} if "weights" in proposal else {}),
                 **({"lineage": proposal["lineage"]} if "lineage" in proposal else {}),
+                **({"plan_id": proposal["plan_id"]} if "plan_id" in proposal else {}),
+                **({"lever_fates": proposal["lever_fates"]} if "lever_fates" in proposal else {}),
                 extensions=extensions, source_manifest_sha256=digest(source_manifest), inputs_manifest_sha256=resolved["manifest_sha256"], request_sha256=run["request_sha256"])
             with staging(root, "candidate") as staged:
                 staged.mkdir()
@@ -569,7 +584,46 @@ class RunStore:
             (root / "work" / candidate_id).mkdir(exist_ok=True)
             self._refresh(root, candidate_id)
             self._state(root)
-            self._event(root, "candidate_created", candidate_id, detail={"parent_candidate_id": value["parent_candidate_id"], "rationale": value["rationale"]})
+            self._event(root, "candidate_created", candidate_id, detail={"parent_candidate_id": value["parent_candidate_id"], "rationale": value["rationale"],
+                                                                         **({"plan_id": value["plan_id"]} if "plan_id" in value else {})})
+        return value
+
+    def plan(self, run_id, data):
+        """Record a candidate plan (plans.py): checked against the parent's newest Eval, which it freezes, with the
+        priorities crit computes. Never changed afterwards; a revision is a new plan that supersedes it."""
+        root = self.directory(run_id)
+        with lease(root):
+            run, _, bounds = self._active(root)
+            value = plans.build(root, run, bounds, data)
+            plan_id = next_id(safe_path(root, "plans"), "plan")
+            value = record("plan", run_id, plan_id=plan_id, **value)
+            path = safe_path(root, f"plans/{plan_id}/plan.json")
+            write_json(path, value, immutable=True)
+            self._state(root)
+            self._event(root, "plan_recorded", reference={"path": f"plans/{plan_id}/plan.json", "sha256": file_sha(path)},
+                        detail={"plan_id": plan_id, "decision": value["decision"], "parent_candidate_id": value["parent_candidate_id"],
+                                "supersedes": value["supersedes"], "priorities": value["priorities"]})
+        return value
+
+    def plan_outcome(self, run_id, candidate_id, attempt_id):
+        """After a retained Eval attempt of a candidate created from a plan: the plan's forecast next to what Eval
+        measured, at plans/PLAN_ID/outcomes/ATTEMPT.json. None when the candidate has no plan."""
+        root = self.directory(run_id)
+        with lease(root):
+            run = load_run(root)
+            candidate = read_json(safe_path(root, f"candidates/{ident(candidate_id, 'candidate')}/candidate.json"))
+            if candidate.get("plan_id") is None:
+                return None
+            plan = plans.load(root, run, candidate["plan_id"])
+            result = safe_path(root, f"candidates/{candidate_id}/eval/{ident(attempt_id, 'attempt')}.json")
+            reference = {"path": result.relative_to(root).as_posix(), "sha256": file_sha(result)}
+            value = plans.outcome(run, plan, candidate_id, attempt_id, reference, plans.read_status(result),
+                                  candidate.get("lever_fates"))
+            path = safe_path(root, f"plans/{plan['plan_id']}/outcomes/{attempt_id}.json")
+            write_json(path, value, immutable=True)
+            self._event(root, "plan_outcome_recorded", candidate_id,
+                        reference={"path": path.relative_to(root).as_posix(), "sha256": file_sha(path)},
+                        detail={"plan_id": plan["plan_id"], "flags": [flag["kpi"] for flag in value["flags"]]})
         return value
 
     def recon(self, run_id, force=False, drafters=()):
@@ -804,7 +858,16 @@ class RunStore:
                 used = self._segment_candidates(root, run, bounds)
                 if reason == "budget_exhausted" and used < budget:
                     raise ValueError(f"Only {used} of {budget} budgeted candidates exist; build the next one-shot candidate")
+                # Stopping early is itself a plan: neither decode nor prefill is needed any more.
+                if reason == "search_exhausted" and used < budget and run["spec"].get("plans") == "required":
+                    plans.require_stop_plan(root, run, bounds)
             headroom = headroom_record(headroom, reason)
+            newest = plans.newest_eval(root) if reason in HEADROOM_REASONS else None
+            if newest is not None and "context_decode" in plans.extract(plans.read_status(newest))["kpis"]:
+                missing = [kpi for kpi in plans.CONTEXT if kpi not in {row["kpi"] for row in headroom["kpis"]}]
+                if missing:
+                    raise ValueError(f"{reason} requires an account of {', '.join(missing)}: the newest Eval "
+                                     f"({newest.relative_to(root).as_posix()}) measured the long-context curve")
             self._state(root, phase=reason, stopping_reason=reason, critique=critique, opportunities=opportunities or [], cleanup=cleanup, message=message)
             self._event(root, "run_stopped", detail={"reason": reason, "cleanup": cleanup, "critique": critique, "opportunities": opportunities or [],
                                                         "headroom": headroom})
@@ -882,8 +945,40 @@ class RunStore:
         budget = bounds["limits"].get("candidate_budget")
         budget_line = (f"Segment: {bounds['segment_id']}; candidate budget: {budget} candidates. There is no working time "
                        "budget: each candidate is an ambitious one-shot at the best engine you can build, and the segment ends "
-                       "when its candidates are built, its target is met, or it is blocked." if budget is not None else
+                       "when its candidates are built, when neither decode nor prefill is needed any more (even with "
+                       "candidates left), when its target is met, or when it is blocked." if budget is not None else
                        f"Segment: {bounds['segment_id']}; hard deadline UTC: {bounds['deadline_at']}")
+        plan_line = ("\nPlan each candidate before any code: after the parent's Eval, crit run ... plan --record plan.json\n"
+                     "records whether decode and prefill are needed and the evidence, the current strategy's ceiling and\n"
+                     "the best alternative's, the levers with each KPI's projected change (levers that only pay together\n"
+                     "share a group, and none below the noise goes in on its own; work the rules require that Eval does not\n"
+                     "score is a requirement lever naming the rule it serves), a forecast (low, expected, high) for every\n"
+                     "KPI and how the gates hold. crit freezes the parent's Eval, computes the priorities and refuses an\n"
+                     "incomplete plan; name its plan_id in the proposal and give every lever of the plan its fate in\n"
+                     "lever_fates (built, pruned or deferred, with the reason unless built). A plan proved wrong before its\n"
+                     "candidate exists is\n"
+                     "replaced by a new plan that supersedes it. After crit run ... eval, crit writes the plan's outcome, the\n"
+                     "forecast next to the measurement. Stopping with candidates left in the budget (search_exhausted) needs\n"
+                     "a stop plan from the newest Eval first."
+                     if run["spec"].get("plans") == "required" else "")
+        # The second version of the plan rules, in runs created with it ("plan_rules": 2).
+        rules = run["spec"].get("plan_rules", 1) >= 2
+        if rules:
+            plan_line += ("\nThe alternative strategy's tokens per round is at most its draft steps + 1: a round emits\n"
+                          "its drafts and the target's own token. A noise Eval leaves unknown counts as the largest\n"
+                          "noise it knows (else 5%); a family's noise is the largest of its members'; the near tie\n"
+                          "combines both families' noise in quadrature; each gap and lever change is weighed against\n"
+                          "its own KPI's noise. crit's computed limit and the alternative's ceiling follow Eval's\n"
+                          "cost model: tokens per round over the pass floor plus the draft steps at Eval's draft floor.\n"
+                          "An alternative names the drafter it assumes (measured or new); its tokens per round stays\n"
+                          "within the measured drafter's acceptance bound at its draft steps (at most 8 or the parent's\n"
+                          "draft width) unless the plan cites another candidate's Eval attempt that measured the new\n"
+                          "drafter; it gives tokens_per_round and draft_steps, never a bare limit.\n"
+                          "The first\n"
+                          "plan's decision follows its needed flags too. When both families are at 0.85 of their\n"
+                          "limits or above, a near tie puts only the lower one in p1; a family marked not needed\n"
+                          "below 0.85 needs a gaps entry for its limit (gap \"limit\", answer \"cause\") saying why the\n"
+                          "rest of the limit is out of reach.")
         return f"""# crit run {run['run_id']}
 
 Repository: {self.project}
@@ -905,12 +1000,25 @@ Kernels is optional: no engine must use a particular kernel provider, framework 
 Eval reports facts: the gates, each KPI's score next to its physical limit, where the time goes against each
 floor, and the goals for the next candidate: decode, prefill and time to first token each from its current score
 to its physical limit, and decode and time to first token over the long-context curve up to the required context.
-Every goal is the candidate's goal at once; none is enough on its own and none trades against another. Eval does
-not rank them; you reason out how to reach them.
+Eval does not order the goals; the run's priority rule does. Decode and prefill are each needed while some lever
+can still raise it by more than its run-to-run noise: long-context decode counts toward decode, long-context first
+token toward prefill, and a family's fraction of its limit is the lower of its members'. The needed one further from
+its limit is p1 and the other p2, both p1 when their fractions are within the noise of each other; time to first
+token is p2 or p3, never p1 and never the reason for a candidate on its own. Priorities decide conflicts and order,
+never what is left out: every lever that helps any KPI without costing a higher priority goes in. When Eval gives
+decode no limit, crit computes one in runs that compute plan limits (measured tokens per round over the pass
+floor); otherwise the plan states an estimated limit and how it was derived (for example a drafter's expected
+tokens per round over the pass floor). crit ranks decode by the best strategy's ceiling: the higher of the
+current strategy's limit (Eval's, then crit's, then the estimate) and the alternative strategy's ceiling, from
+the tokens per round the plan gives for it over the round floor crit computes; it names each fraction's source.
+The required
+context and quality inside the drift budget are gates, not goals. When neither decode nor prefill is needed, the
+run stops.{plan_line}
 Make each candidate an ambitious one-shot at the best engine you can build: work out everything that has to be
 implemented to reach every goal and build it together; large rewrites and new kernels are expected.
 A candidate is more than one pass: build, run Eval and a profile, fix or prune what is slow or breaks a gate, and
-keep going until everything you reasoned out is implemented. Plan the next candidate from the new goals.
+keep going until everything you reasoned out is implemented; prune a part only after measuring it against its
+floor (Eval's floors per term, the profile's kernels). Plan the next candidate from the new goals.
 At stop, account for each goal (decode, prefill, ttft, and context_decode and context_ttft when Eval measured the
 required context): the score at the start, the score reached and the limit, what you built for it, and the
 physical cause of any distance left. Effort, time or the candidate count are not causes.

@@ -60,11 +60,14 @@ def main(argv=None):
     parser.add_argument("--root", type=Path, help="Run root; defaults to PROJECT/runs")
     parser.add_argument("--id", help="Existing run identity")
     subs = parser.add_subparsers(dest="action", required=True)
-    for name in ("create", "resolve", "check", "benchmark", "stop"):
+    for name in ("create", "resolve", "plan", "check", "benchmark", "stop"):
         sub = subs.add_parser(name)
         sub.add_argument("--record", type=Path, required=True)
         if name in {"check", "benchmark"}:
             sub.add_argument("--candidate", required=True)
+    subs.choices["plan"].description = ("Record the next candidate's plan after the parent's Eval and before any code: "
+                                        "needed flags, strategy, levers, forecast and gates; crit freezes the parent's "
+                                        "newest Eval and computes the priorities")
     subs.choices["create"].add_argument("--from-engine", type=Path, metavar="ENGINE_DIR",
                                         help="Start from a crit-hub engine: its engines/<owner>/<name>/ folder (card.yaml, "
                                              "card.lock.json, evidence/) is recorded as the run's origin_engine")
@@ -148,6 +151,8 @@ def main(argv=None):
             result = store.create(payload, args.from_engine)
         elif args.action == "resolve":
             result = store.freeze_inputs(args.id, payload)
+        elif args.action == "plan":
+            result = store.plan(args.id, payload)
         elif args.action == "candidate":
             result = store.candidate(args.id, args.source, payload)
         elif args.action == "recon" and args.compare:
@@ -175,7 +180,15 @@ def main(argv=None):
             result = evaluate(store, args.id, args.candidate, args.data, args.only,
                               read_json(args.baseline) if args.baseline else None, args.seconds, args.label)
             from crit_eval.status import render
-            print(render(result.pop("status")), file=sys.stderr)
+            from .plans import extract, priorities, rules
+            status = result.pop("status")
+            print(render(status), file=sys.stderr)
+            # Eval states the goals without an order; the run's priority rule orders them for the next plan.
+            order, reason = priorities({"decode": {"needed": True}, "prefill": {"needed": True}}, extract(status),
+                                       rules(store.get(args.id)["run"]))
+            print("priorities while decode and prefill are both needed: " + (
+                "; ".join(f"{tier} {', '.join(order[tier])}" for tier in ("p1", "p2", "p3") if order[tier])
+                if order else reason) + " (crit run ... plan computes them from the plan's needed flags)", file=sys.stderr)
         elif args.action == "seal":
             failure = {"message": args.failure} if args.failure else None
             result = store.seal(args.id, args.candidate, args.lifecycle, failure)

@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("core/python", "api", "eval", "kernels", "cli", "tests"): sys.path.insert(0, str(ROOT / _folder))
@@ -23,6 +24,10 @@ THINKING = """{%- for message in messages %}<|im_start|>{{ message.role }}
 
 class ReconTests(unittest.TestCase):
     def setUp(self):
+        # A run as created before plans: recon freezing does not depend on them.
+        plans = patch("crit.run.records.NEW_RUN_PLANS", None)
+        plans.start()
+        self.addCleanup(plans.stop)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name).resolve()
