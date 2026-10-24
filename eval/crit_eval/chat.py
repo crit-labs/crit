@@ -21,9 +21,12 @@ the server goes in the CRIT_SERVER_KEY environment variable.
 Each request may take as long as the engine's own earlier requests say it should (crit_eval.deadline, protocol
 requests.timeout); one that takes longer raises Hung.
 """
+import array
+import base64
 import json
 import os
 import socket
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -31,6 +34,12 @@ import urllib.request
 from . import EVAL_DIR, load_json
 from .deadline import Hung, RequestDeadline
 from .prepare import token_ids, with_document
+
+# The engine facts crit serve publishes for Eval (crit_core.serving.ENGINE_FACTS), and the capability that lets a
+# request decode plainly.
+FACTS = ("speculative", "plain", "draft_width", "bytes_per_pass", "draft_bytes_per_step", "draft_ms",
+         "kv_bytes_per_token")
+PLAIN_CAPABILITY = "chat-plain-v1"
 
 
 class Server:
@@ -46,12 +55,10 @@ class Server:
         self.headers = {"Content-Type": "application/json", **({"Authorization": f"Bearer {key}"} if key else {})}
         cases = prepared["speed"] + prepared.get("heldout", []) + prepared.get("quality", []) + prepared.get("followup", [])
         self.prompts = {tuple(case["prompt_ids"]): (case["messages"], case.get("tools")) for case in cases}
-        self.frames = [(p["head_ids"], p["tail_ids"], p["messages"], p.get("tools"))
-                       for p in (prepared.get("context"), prepared.get("retrieval")) if p]
-        context = prepared.get("context")
-        if context and context.get("retrieval_tail_ids"):
-            self.frames.append((context["head_ids"], context["retrieval_tail_ids"], context["retrieval_messages"],
-                                context.get("tools")))
+        retrieval = prepared.get("retrieval")
+        self.frames = [(retrieval["head_ids"], retrieval["tail_ids"], retrieval["messages"], None)] if retrieval else []
+        if retrieval and retrieval.get("curve_tail_ids"):   # the long-context curve's request after the same archive
+            self.frames.append((retrieval["head_ids"], retrieval["curve_tail_ids"], retrieval["curve_messages"], None))
         # The longest tail first: frames that share a head and end alike are told apart by their whole tail.
         self.frames.sort(key=lambda frame: -len(frame[1]))
 
@@ -143,6 +150,28 @@ def prefilled(server, usage):
         raise RuntimeError(f"{server.url} served {cached} prompt tokens from its cache: turn its prompt cache off")
 
 
+def rendered(url, served, prepared):
+    """The failure of a server that rendered a prompt to another token count than the model's chat template."""
+    return (f"{url} rendered the prompt as {served} tokens where the model's chat template renders {prepared}: serve "
+            "the model's own chat template, thinking off")
+
+
+def unpacked(part):
+    """Score rows [token, logprob, [[token, logprob], ...]] from crit serve's packed format: base64 of little-endian
+    int32 tokens and float32 log-probabilities, the alternatives row by row."""
+    def numbers(kind, key):
+        data = array.array(kind, base64.b64decode(part[key]))
+        if sys.byteorder != "little":
+            data.byteswap()
+        return data.tolist()
+    tokens, logprobs = numbers("i", "tokens"), numbers("f", "logprobs")
+    tops, values, k = numbers("i", "top_tokens"), numbers("f", "top_logprobs"), int(part["alternatives"])
+    if not len(tokens) == len(logprobs) == int(part["count"]) or len(tops) != len(values) or len(tops) != k * len(tokens):
+        raise ValueError("packed score rows do not add up")
+    return [[t, v, [[a, b] for a, b in zip(tops[i * k:(i + 1) * k], values[i * k:(i + 1) * k])]]
+            for i, (t, v) in enumerate(zip(tokens, logprobs))]
+
+
 def reply_text(delta):
     """What one streamed delta adds to the reply: every text field but the role, and tool-call names and arguments."""
     parts = [value for key, value in delta.items() if key != "role" and isinstance(value, str)]
@@ -159,18 +188,34 @@ class ChatEngine:
             raise SystemExit("an engine behind a server needs --context: the context it was started with")
         self.max_context = int(context["context_tokens"])
         self.deadline = RequestDeadline(server.timeout_rule)
-        listed = [m.get("id") for m in server.get("/models", self.deadline.seconds(0)).get("data") or []]
+        cards = server.get("/models", self.deadline.seconds(0)).get("data") or []
+        listed = [m.get("id") for m in cards]
         if server.model_name and server.model_name not in listed:
             raise SystemExit(f"{server.url}/models does not list {server.model_name}: it lists {', '.join(listed) or 'none'}")
         if not server.model_name and len(listed) != 1:
             raise SystemExit(f"{server.url}/models lists {', '.join(listed) or 'no model'}: name one with --served-model")
         self.model = server.model_name or listed[0]
+        card = next((m for m in cards if m.get("id") == self.model), {})
+        # crit serve lists the sampling fields a package applies; another server lists none, and gets every field.
+        supported = card.get("supported_sampling_parameters")
+        self.sampling_fields = set(supported) if isinstance(supported, list) else None
+        # The loaded engine's facts crit serve publishes (engine_facts): drafting, plain decoding, bytes per pass.
+        self.facts = {key: value for key, value in (card.get("engine_facts") or {}).items() if key in FACTS}
+        self.plain = bool(self.facts.get("speculative") and self.facts.get("plain")
+                          and PLAIN_CAPABILITY in (card.get("capabilities") or []))
+        if self.plain:
+            self.generate_plain = self._generate_plain
         self.text = load_text(context["model"])
         self.by_bytes = None  # ids_by_bytes, built for the first quality reply
+        self.packed = None   # whether the score call answers in the packed format (None: not asked yet)
+        # With quality measured (crit_eval.runner), every prompt sent as its frozen messages must render to the ids
+        # prepare froze, as the honesty check requires: a server on another template fails at its first request.
+        self.exact_prompts = False
 
     def info(self):
         return {"name": self.model, "configuration": {"url": self.server.url, "model": self.model},
-                "max_context": self.max_context, "speculative": False, "served": True}
+                "max_context": self.max_context, **self.facts, "speculative": bool(self.facts.get("speculative")),
+                "plain": self.plain, "served": True}
 
     def messages(self, prompt):
         """The messages and tools a prompt renders from: a speed or held-out prompt's own, or a frame's with the
@@ -184,14 +229,25 @@ class ChatEngine:
                 return with_document(messages, self.text.tokenizer.decode(prompt[len(head):end])), tools
         raise RuntimeError("the prompt is not one the prepared data sends to a server")
 
-    def generate(self, prompt, max_new_tokens, on_tokens, prompt_cache=False):
-        """A greedy reply; with prompt_cache it may be served from the server's prompt cache (a request judged on
-        its text alone), and served records the cached prompt tokens."""
+    def generate(self, prompt, max_new_tokens, on_tokens, prompt_cache=False, sampling=None, logprobs=None,
+                 plain=False):
+        """A greedy reply, or with sampling a sampled one (temperature, top_p, top_k, min_p and seed in the request
+        body, protocol sampled_speed); with logprobs n each reply token's log-probability and n alternatives are
+        returned as "logprobs". With prompt_cache it may be served from the server's prompt cache (a request judged
+        on its text alone), and served records the cached prompt tokens."""
         prompt = list(prompt)
         messages, tools = self.messages(prompt)
         body = {"model": self.model, "messages": messages, "max_tokens": max_new_tokens, "temperature": 0,
                 "stream": True, "stream_options": {"include_usage": True}, **({"tools": tools} if tools else {})}
-        pieces, usage, finish, telemetry = [], None, None, None
+        if sampling:
+            # Every field the server applies: one it leaves out would keep the engine's own default.
+            body.update({key: value for key, value in sampling.items()
+                         if self.sampling_fields is None or key in self.sampling_fields})
+        if logprobs:
+            body.update(logprobs=True, top_logprobs=int(logprobs))
+        if plain:
+            body["crit"] = {"decode": "plain"}   # one token per target pass (chat-plain-v1)
+        pieces, usage, finish, telemetry, entries = [], None, None, None, []
         started = time.monotonic()
         first = last = None
         for event in self.server.events("/chat/completions", body, self.deadline.seconds(len(prompt), max_new_tokens)):
@@ -204,6 +260,7 @@ class ChatEngine:
             usage = event.get("usage") or usage
             for choice in event.get("choices") or []:
                 finish = choice.get("finish_reason") or finish
+                entries += ((choice.get("logprobs") or {}).get("content") or []) if logprobs else []
                 piece = reply_text(choice.get("delta") or {})
                 if piece:
                     last = time.monotonic()
@@ -214,6 +271,8 @@ class ChatEngine:
             raise RuntimeError(f"{self.server.url} streamed no usage: it must support stream_options.include_usage")
         if not prompt_cache:
             prefilled(self.server, usage)
+        if self.exact_prompts and tuple(prompt) in self.server.prompts and usage.get("prompt_tokens") != len(prompt):
+            raise RuntimeError(rendered(self.server.url, usage.get("prompt_tokens"), len(prompt)))
         if not pieces:
             raise RuntimeError(f"{self.server.url} streamed no reply text")
         self.deadline.observe(usage["prompt_tokens"], first - started, usage["completion_tokens"], last - first)
@@ -221,9 +280,31 @@ class ChatEngine:
         per_round = (telemetry or {}).get("tokens_per_round")
         rounds = (round(usage["completion_tokens"] / per_round)
                   if isinstance(per_round, (int, float)) and per_round > 0 else None)
-        return {"tokens": token_ids(self.text, "".join(pieces)), "rounds": rounds,
-                "served": {"prompt_tokens": usage["prompt_tokens"], "output_tokens": usage["completion_tokens"],
-                           "finish_reason": finish, "cached_tokens": cached_tokens(usage)}}
+        out = {"tokens": token_ids(self.text, "".join(pieces)), "rounds": rounds,
+               "served": {"prompt_tokens": usage["prompt_tokens"], "output_tokens": usage["completion_tokens"],
+                          "finish_reason": finish, "cached_tokens": cached_tokens(usage)}}
+        # Draft telemetry crit serve passes on: drafts accepted per round, verify and draft milliseconds.
+        accepted = (telemetry or {}).get("accepted")
+        if isinstance(accepted, list) and all(type(a) is int for a in accepted):
+            out.update(accepted=accepted, rounds=len(accepted))
+        out.update({key: telemetry[key] for key in ("verify_ms", "draft_ms")
+                    if isinstance((telemetry or {}).get(key), (int, float))})
+        if logprobs and entries:
+            # Tokens are named by their bytes (their text where a server gives none): the sampling check only matches
+            # each token among its alternatives, and pieces of one character can share a text.
+            name = lambda e: bytes(e["bytes"]) if e.get("bytes") is not None else e.get("token")  # noqa: E731
+            out["logprobs"] = [{"token": name(e), "logprob": e.get("logprob"),
+                                "top": [[name(a), a.get("logprob")] for a in e.get("top_logprobs") or []]}
+                               for e in entries]
+        return out
+
+    def generate_sampled(self, prompt, max_new_tokens, on_tokens, sampling, logprobs=None):
+        """A sampled reply (protocol sampled_speed) at the sampling fields given."""
+        return self.generate(prompt, max_new_tokens, on_tokens, sampling=sampling, logprobs=logprobs)
+
+    def _generate_plain(self, prompt, max_new_tokens, on_tokens):
+        """Plain greedy on the served speculative engine (crit serve's crit.decode plain): Eval's exactness check."""
+        return self.generate(prompt, max_new_tokens, on_tokens, plain=True)
 
     def reply(self, prompt, max_new_tokens, top_k):
         """A quality prompt's greedy reply with the log-probabilities the server reports for each token (protocol
@@ -240,8 +321,7 @@ class ChatEngine:
         self.deadline.observe(len(prompt), timing["seconds"])
         usage = response.get("usage") or {}
         if usage.get("prompt_tokens") != len(prompt):
-            raise RuntimeError(f"{url} rendered the prompt as {usage.get('prompt_tokens')} tokens where the model's chat "
-                               f"template renders {len(prompt)}: serve the model's own chat template, thinking off")
+            raise RuntimeError(rendered(url, usage.get("prompt_tokens"), len(prompt)))
         prefilled(self.server, usage)
         choice = (response.get("choices") or [{}])[0]
         entries, finish = (choice.get("logprobs") or {}).get("content"), choice.get("finish_reason")
@@ -282,14 +362,16 @@ class ChatEngine:
         decode forced to the continuation (none with prompt_rows false), "timing"}, rows {"logprob",
         "top": [[id, logprob], ...]}; timing: the
         request's seconds, the engine's own prefill_ms and decode_ms (crit_telemetry), the response's bytes and the
-        seconds parsing it took."""
+        seconds parsing it took. The rows come packed (unpacked) from a crit serve that offers it, else as JSON."""
+        body = {"model": self.model, "prompt_ids": list(prompt), "continuation_ids": list(continuation),
+                "top_logprobs": top_k, "prompt_rows": prompt_rows, **({} if self.packed is False else {"format": "packed"})}
         try:
-            value, timing = self.server.post_timed(
-                "/crit/score", {"model": self.model, "prompt_ids": list(prompt), "continuation_ids": list(continuation),
-                                "top_logprobs": top_k, "prompt_rows": prompt_rows},
-                self.deadline.seconds(len(prompt), len(continuation)))
+            value, timing = self.server.post_timed("/crit/score", body, self.deadline.seconds(len(prompt), len(continuation)))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:500]
+            if exc.code == 400 and self.packed is None and '"param": "format"' in detail:
+                self.packed = False   # an earlier crit serve: JSON rows
+                return self.score(prompt, continuation, top_k, prompt_rows)
             if exc.code == 404:
                 raise RuntimeError(f"{self.server.url} scores no fixed text: serve the engine with crit serve and a "
                                    "package declaring chat-score-v1") from exc
@@ -297,8 +379,14 @@ class ChatEngine:
         self.deadline.observe(len(prompt) + len(continuation), timing["seconds"])
         converted = time.monotonic()
         rows = {}
+        self.packed = value.get("format") == "packed"
         for part, tokens in (("prompt", list(prompt)[1:] if prompt_rows else []), ("continuation", list(continuation))):
             found = value.get(part)
+            if self.packed and isinstance(found, dict):
+                try:
+                    found = unpacked(found)
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RuntimeError(f"{self.server.url} returned malformed packed {part} rows: {exc}") from exc
             if not isinstance(found, list) or [row[0] for row in found] != tokens:
                 raise RuntimeError(f"{self.server.url} scored other {part} tokens than it was sent")
             if any(len(row[2]) != top_k for row in found):

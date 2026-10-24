@@ -14,10 +14,10 @@ from . import fixed, headroom, metrics, status
 from .ceiling import model_ceiling
 from .chat import ChatEngine, Server
 from .deadline import Hung
-from .context import (GIB, curve_points, curve_prompt, lower_context, max_context, required_prompts, retrieval_points,
+from .context import (GIB, curve_points, curve_prompt, lower_context, max_context, pass_bytes, retrieval_points,
                       retrieval_prompt, token_text)
 from .pin import CONTINUATIONS, load_continuations
-from .prepare import PREPARED, check_prepared
+from .prepare import PREPARED, check_prepared, sampled_request, unapplied
 from .reference import REFERENCE_VERSION
 
 
@@ -38,12 +38,16 @@ def load_adapter(path):
     return module
 
 
-def open_engine(module, model, config, speculative, context_tokens=None):
-    """context_tokens: the context (prompt plus output) the engine is built for, when one is required."""
+def open_engine(module, model, config, speculative, context_tokens=None, exact_prompts=False):
+    """context_tokens: the context (prompt plus output) the engine is built for, when one is required. exact_prompts:
+    an engine behind a server must render every frozen prompt to its prepared ids from the first request on, as the
+    quality honesty check needs (crit_eval.chat), so a wrong template fails at once instead of after the speed parts."""
     context = {"contract": CONTRACT, "model": str(model), "config": dict(config), "speculative": speculative}
     if context_tokens:
         context["context_tokens"] = int(context_tokens)
     engine = module.create_eval_engine(context)
+    if exact_prompts and hasattr(engine, "exact_prompts"):
+        engine.exact_prompts = True
     info = engine.info()
     for key in ("name", "configuration", "max_context"):
         if key not in info:
@@ -97,6 +101,13 @@ def timed_plain(engine, prompt, output_tokens):
     return _timed(lambda on_tokens: engine.generate_plain(list(prompt), output_tokens, on_tokens), prompt, output_tokens)
 
 
+def timed_sampled(engine, prompt, output_tokens, sampling):
+    """A sampled request (protocol sampled_speed): the engine's generate_sampled with the request's sampling fields
+    (prepare.sampled_request)."""
+    return _timed(lambda on_tokens: engine.generate_sampled(list(prompt), output_tokens, on_tokens, dict(sampling)),
+                  prompt, output_tokens)
+
+
 def timed_replay(engine, prompt, continuation):
     """The engine's speculative loop on a fixed continuation: drafts are accepted while they match it and
     each round's correction is its next token, so every engine decodes the same text."""
@@ -113,17 +124,19 @@ class Disturbed(Exception):
 DISTURBED_MIN_REQUEST_MS = 100  # shorter requests vary with timer and scheduler jitter, not with the device
 
 
-def check_disturbed(case_id, samples, limit, other_cores=None):
-    """Raise Disturbed when the measured decode speeds of one case spread (max - min over the median) by more
-    than `limit`. Quiet rounds recorded at most about 10%; a disturbed one 37%. other_cores: CPU cores other
-    processes kept busy during the case (HostLoad), named in the message."""
+def check_disturbed(case_id, samples, limit, other_cores=None, key="decode_tps"):
+    """Raise Disturbed when the measured `key` (decode tok/s, or round_ms for sampled repetitions, whose texts and
+    so their tokens per round differ) of one case spreads (max - min over the median) by more than `limit`. Quiet
+    rounds recorded at most about 10%; a disturbed one 37%. other_cores: CPU cores other processes kept busy during
+    the case (HostLoad), named in the message."""
     measured = [s for s in samples if not s.get("warmup")]
     if not limit or not measured or metrics.median([s["request_ms"] for s in measured]) < DISTURBED_MIN_REQUEST_MS:
         return
-    spread = headroom.spread([s["decode_tps"] for s in measured if s.get("decode_tps")])
+    spread = headroom.spread([s[key] for s in measured if s.get(key)])
     if spread is not None and spread > limit:
         load = f"; other processes kept {other_cores:.1f} CPU cores busy" if other_cores is not None else ""
-        raise Disturbed(f"speed {case_id}: decode varied {spread:.0%} between repetitions (limit {limit:.0%}){load}; "
+        what = "decode" if key == "decode_tps" else "the time per target pass"
+        raise Disturbed(f"speed {case_id}: {what} varied {spread:.0%} between repetitions (limit {limit:.0%}){load}; "
                         "the device was disturbed. Measure again when nothing else uses it")
 
 
@@ -221,12 +234,112 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
     return {
         "warmup_runs": warmups, "repetitions": repetitions, "decode_text": text,
         "decode_score": metrics.geometric_mean([c["decode_tps"] for c in measured]),
+        "decode_se": metrics.score_error([[s["decode_tps"] for s in c["samples"] if not s["warmup"]] for c in measured]),
         "prefill_score": metrics.geometric_mean(prefill)
         if prefill and len(prefill) == len(protocol["speed"].get("prefill_cases", [])) else None,
         "ttft_score_ms": metrics.geometric_mean([c["ttft_ms"] for c in measured if c.get("ttft_ms")]),
         "complete": len(measured) == len(cases),
         "cases": cases,
     }
+
+
+def run_sampled_speed(engine, info, prepared, protocol, warmups, repetitions, log, disturbed_spread=None):
+    """The speed cases again at the model's own sampling (protocol sampled_speed), each repetition with its own
+    fixed seed: `repetitions` of them (None: one per protocol seed), with no extra repetition, since different seeds
+    decode different texts. A disturbed device shows in the time per target pass, which the text does not change.
+    The sampled decode score is the headline decode from crit-eval-v7 on."""
+    rule = protocol["sampled_speed"]
+    settings = prepared.get("sampling")
+    if not hasattr(engine, "generate_sampled"):
+        log("sampled speed: unsupported (the engine has no generate_sampled)")
+        return {"status": "unsupported", "reason": "the engine cannot sample (no generate_sampled)"}
+    if settings is None:
+        return {"status": "unsupported", "reason": "the prepared data names no sampling (prepare it again)"}
+    # An engine that names the sampling fields it applies (sampling_fields) leaves out the others, which only
+    # neutral values may be.
+    fields = getattr(engine, "sampling_fields", None)
+    missing = unapplied(sampled_request(settings, 0), fields) if fields is not None else []
+    if missing:
+        log(f"sampled speed: unsupported (the engine does not apply {', '.join(missing)})")
+        return {"status": "unsupported", "reason": f"the engine does not apply the sampling's {', '.join(missing)}"}
+    repetitions = len(rule["seeds"]["repetitions"]) if repetitions is None else repetitions
+    seeds = [rule["seeds"]["warmup"]] * warmups + list(rule["seeds"]["repetitions"])
+    cases = {}
+    for case in prepared["speed"]:
+        prompt, n = case["prompt_ids"], case["output_tokens"]
+        if len(prompt) + n > info["max_context"]:
+            cases[case["id"]] = {"status": "skipped", "reason": f"needs {len(prompt) + n} tokens of context"}
+            continue
+        samples = []
+        load = HostLoad().start()
+        for i in range(warmups + repetitions):
+            _, sample = timed_sampled(engine, prompt, n, sampled_request(settings, seeds[min(i, len(seeds) - 1)]))
+            sample["warmup"] = i < warmups
+            samples.append(sample)
+        other = load.cores()
+        # Only replies decoded to their full length show the device: one a server ended early, at an end token or a
+        # tool call, has its time per pass from a few tokens and from how the server streamed the call.
+        full = [s for s in samples if not s["warmup"] and s["output_tokens"] == n and s.get("round_ms")
+                and (s.get("served") or {}).get("finish_reason", "length") == "length"]
+        if len(full) >= 2:
+            check_disturbed(case["id"], full, disturbed_spread, other, key="round_ms")
+        summary = _summary([s for s in samples if not s["warmup"]])
+        cases[case["id"]] = {"status": "measured", "kind": case["kind"], "prompt_tokens": len(prompt), "output_tokens": n,
+                             **summary, "samples": samples,
+                             "host_other_cpu_cores": None if other is None else round(other, 2)}
+        log(f"sampled speed {case['id']}: decode {rate(summary['decode_tps'], 1)}, "
+            f"tokens/round {summary['tokens_per_round'] or 0:.2f}")
+    measured = [c for c in cases.values() if c["status"] == "measured"]
+    rounds = [c["tokens_per_round"] for c in measured if c.get("tokens_per_round")]
+    return {"status": "measured", "sampling": settings, "sampling_source": prepared.get("sampling_source"),
+            "warmup_runs": warmups, "repetitions": repetitions,
+            "decode_score": metrics.geometric_mean([c["decode_tps"] for c in measured]),
+            "decode_se": metrics.score_error([[s["decode_tps"] for s in c["samples"] if not s["warmup"]]
+                                              for c in measured]),
+            "tokens_per_round": metrics.geometric_mean(rounds) if rounds else None,
+            "complete": len(measured) == len(cases), "cases": cases}
+
+
+def run_sampling_check(engine, info, prepared, protocol, log):
+    """protocol sampling_check: one more sampled reply per speed case, with log-probabilities, and whether its
+    tokens follow the processed distribution (metrics.sampling_calibration)."""
+    rule = protocol["sampling_check"]
+    settings = prepared.get("sampling")
+    if not hasattr(engine, "generate_sampled") or settings is None:
+        return {"status": "unsupported", "reason": "the engine cannot sample"}
+    top = int(rule["top_logprobs"])
+    rows, cases = [], {}
+    for case in prepared["speed"]:
+        prompt, n = case["prompt_ids"], case["output_tokens"]
+        if len(prompt) + n > info["max_context"]:
+            continue
+        try:
+            result = engine.generate_sampled(list(prompt), n, lambda tokens: None, sampled_request(settings, rule["seed"]),
+                                             logprobs=top)
+        except RuntimeError as error:
+            log(f"sampling check: unsupported ({error})")
+            return {"status": "unsupported", "reason": f"a sampled reply with log-probabilities failed: {error}"}
+        reported = result.get("logprobs")
+        if not reported:
+            log("sampling check: unsupported (the engine reports no log-probabilities for sampled tokens)")
+            return {"status": "unsupported", "reason": "the engine reports no log-probabilities for sampled tokens"}
+        # A token missing from its alternatives is one of the unreported rest (metrics.sampling_calibration).
+        case_rows = [{"top": [lp for _, lp in r["top"]],
+                      "chosen": next((i for i, (t, _) in enumerate(r["top"]) if t == r["token"]), None)}
+                     for r in reported]
+        rows += case_rows
+        cases[case["id"]] = metrics.sampling_calibration(case_rows, settings, rule["seed"], prepared.get("valid_vocab"),
+                                                         float(rule["tail_tolerance"]))
+    found = metrics.sampling_calibration(rows, settings, rule["seed"], prepared.get("valid_vocab"),
+                                         float(rule["tail_tolerance"]))
+    enough = found["tokens"] >= int(rule["min_tokens"])
+    passed = (found["outside"] == 0 and abs(found["z"]) <= float(rule["z_max"])) if enough else None
+    log(f"sampling check: {found['tokens']} tokens judged, {found['unresolved']} unresolved, z "
+        f"{found['z'] if found['z'] is None else round(found['z'], 2)}, {found['outside']} outside the processed "
+        "distribution" + ("" if enough else f" (fewer than {rule['min_tokens']} judged: unmeasured)"))
+    return {"status": "measured", "sampling": settings, "sampling_source": prepared.get("sampling_source"),
+            **found, "z_max": float(rule["z_max"]), "min_tokens": int(rule["min_tokens"]), "passed": passed,
+            "cases": cases}
 
 
 def run_heldout(engine, info, prepared, protocol, log):
@@ -314,10 +427,10 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds):
     """protocol quality: every quality text scored by the engine through its serving paths (an engine's score(prompt,
     continuation, top_k): an engine behind crit serve, crit_eval.chat) and judged against the reference's stored
     scores of the same text (reference: crit_eval.fixed.load, None when the data has none). Each set is judged on
-    the positions the engine serves (SET/served: the continuation, its first token from the prefill's last position,
-    the rest from decode); its prompt positions, whose prefill logits no request returns, are reported in
-    quality.prompt and never judged; both per bucket. Then the honesty check (run_honesty). A set whose texts do not
-    fit the engine's max_context is skipped."""
+    both paths the engine computes it with: its prompt positions from the prefill (SET/prompt: the arithmetic every
+    reply's first token comes from, and the KV and state the decode reads) and the positions it serves (SET/served:
+    the continuation, its first token from the prefill's last position, the rest from decode); both per bucket.
+    Then the honesty check (run_honesty). A set whose texts do not fit the engine's max_context is skipped."""
     rule = protocol["quality"]
     out = {"top_k": rule["top_k"], "continuation_tokens": rule["continuation_tokens"]}
     if not callable(getattr(engine, "score", None)):
@@ -359,18 +472,14 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds):
         return {**out, "status": "skipped", "skipped": skipped,
                 "reason": f"no quality text fits the engine's {info['max_context']:,}-token context"}
     judging = time.perf_counter()
-    sets, prompts, buckets = {}, {}, {}
+    sets, buckets = {}, {}
     for name, (reference_rows, found, ids) in parts.items():
         if not found:
             continue   # a prompt of a single token has no prompt positions
         row = metrics.text_quality(reference_rows, found)
-        if name.endswith("/prompt"):
-            failures = []
-            prompts[name[:-len("/prompt")]] = {**row, "texts": ids}
-        else:
-            failures = metrics.judge(row, thresholds)
-            sets[name] = {**row, "texts": ids, "passed": not failures, "failures": failures,
-                          "budget_used": metrics.budget_used(row, thresholds)}
+        failures = metrics.judge(row, thresholds)
+        sets[name] = {**row, "texts": ids, "passed": not failures, "failures": failures,
+                      "budget_used": metrics.budget_used(row, thresholds)}
         buckets[name] = {label: {key: value[key] for key in ("targets", "ppl_ratio", "kld_mean", "kld_p99",
                                                               "top1_agreement")}
                          for label, value in metrics.bucketed(reference_rows, found, labels[name]).items()}
@@ -382,7 +491,7 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds):
     passed = all(s["passed"] for s in sets.values()) and honesty["passed"] is not False
     timing = {"scores": _phase_timing(timings), "metrics_seconds": judged, "texts": timings,
               **({"honesty": honesty.pop("timing")} if "timing" in honesty else {})}
-    return {**out, "status": "scored", "sets": sets, "prompt": prompts, "buckets": buckets, "honesty": honesty,
+    return {**out, "status": "scored", "sets": sets, "buckets": buckets, "honesty": honesty,
             "skipped": skipped, "thresholds": thresholds, "passed": passed, "seconds": time.time() - started,
             "timing": timing}
 
@@ -400,6 +509,8 @@ def run_honesty(engine, info, prepared, protocol, log, skipped):
     for text in prepared["quality"]:
         if text["set"] not in rule["sets"] or text["set"] in skipped:
             continue
+        if text["set"] != "conversations" and text["id"].split("@")[0] not in rule["long_conversations"]:
+            continue   # a long set's other texts: their prompts would be prefilled twice more for the same path
         served = engine.reply(text["prompt_ids"], rule["reply_tokens"], top_k)
         # Only the reply's rows are compared: the prompt is prefilled as for the reply, its positions not scored.
         rescored = engine.score(text["prompt_ids"], served["tokens"], top_k, prompt_rows=False)
@@ -474,79 +585,71 @@ def run_exactness(module, model, config, prepared, speed, log, mode="reported", 
             engine.close()
 
 
-def context_requirement(model, device, context_tokens, vram_headroom_bytes, settings):
-    """The context every engine is built and measured for: the given one (a run's kv_tokens) or Eval's
-    max context for the model on the device. `tokens` is None when neither is known."""
+def context_requirement(model, device, context_tokens, vram_headroom_bytes, settings, requested=None, basis=None):
+    """The context every engine is built and measured for: the given one (a run's kv_tokens, with the run's basis:
+    requested, bound, limits) or Eval's max context for the model on the device, capped at the requested context.
+    `tokens` is None when neither is known."""
     if context_tokens:
-        return {"tokens": int(context_tokens), "source": "given", "missing": [], "reason": None}
-    return {**max_context(model, device, vram_headroom_bytes, settings), "source": "computed"}
+        return {"tokens": int(context_tokens), "source": "given", "missing": [], "reason": None,
+                **{key: (basis or {})[key] for key in ("requested", "bound", "note", "model_limit", "device_limit")
+                   if (basis or {}).get(key) is not None}}
+    return {**max_context(model, device, vram_headroom_bytes, settings, requested), "source": "computed"}
 
 
-def context_text(info, continuations, prepared, output_tokens):
-    """The text the long-context points decode, and the replayed tokens: the curve case's pinned continuation
-    (its first output_tokens), since every point's prompt ends with that case's request, when the data has one
-    and the adapter replays; else each engine's own greedy output."""
-    text = decode_text(info, continuations)
-    if text["source"] != "pinned":
-        return text, None
-    case = prepared["context"]["case"]
-    pinned = continuations["cases"].get(case) or []
-    if len(pinned) < output_tokens:
-        return {"source": "generated", "reason": f"the pinned continuation of {case} has {len(pinned)} tokens, "
-                f"fewer than the {output_tokens} each point decodes"}, None
-    return {**text, "case": case}, list(pinned[:output_tokens])
+CONTEXT_TEXT = {"source": "generated", "reason": "each point answers the retrieval request in the engine's own words"}
 
 
-def run_context(engine, info, prepared, settings, required, log, continuations=None):
-    """One greedy request per curve point, each filling the context exactly (prompt plus output equal
-    the point). The prompt is the longest speed case with its document and filler text after it
-    (curve_prompt), so the engine decodes an answer to that case: a replay of its pinned continuation when
-    there is one (the same text for every engine, as in the speed cases), else the engine's own output. A
-    request the engine cannot serve is recorded as failed. At the required context the filler holds the retrieval
-    facts, and the retrieval request, which shares the prompt up to the end of the document (required_prompts),
-    follows the point at once, so an engine with a prompt cache prefills that text once. Returns (points, decode
-    text, the retrieval point at the required context or None)."""
-    pieces, filler = prepared["context"], prepared["retrieval"]["filler_ids"]
+def judged_retrieval(tokens, prepared, prompt, point):
+    """A reply's retrieval verdict (protocol context.retrieval): every fact's answer in its text up to the first stop
+    token, decoded with the prepared token strings."""
+    pieces = prepared["retrieval"]
+    text = token_text(tokens, pieces["token_text"], prepared["stop_ids"])
+    found = {fact["id"]: fact["answer"] in text for fact in pieces["facts"]}
+    return {"status": "measured", "context": point, "prompt_tokens": len(prompt), "found": found,
+            "passed": all(found.values()), "text": text[:2000], "tokens": tokens}
+
+
+def run_context(engine, info, prepared, settings, required, log):
+    """One greedy request per curve point, each filling the context exactly (prompt plus output equal the point).
+    The prompt is the retrieval check's archive, filler text with the retrieval facts in it, and a request for the
+    facts and then a summary of the archive (curve_prompt): the point times that reply, the engine's own, and judges
+    retrieval on it, so a long prompt is prefilled once for both. A request the engine cannot serve is recorded as
+    failed. Returns (points, the decode text, the retrieval verdict of every point the curve served or failed)."""
+    pieces, rule = prepared["retrieval"], settings["retrieval"]
     n = int(settings["output_tokens"])
-    text, continuation = context_text(info, continuations, prepared, n)
-    points, asked = {}, None
+    points, asked = {}, {}
     for point in curve_points(required, settings):
         if point > info["max_context"]:
             points[str(point)] = {"status": "skipped", "context": point,
                                   "reason": f"the engine's max_context {info['max_context']:,} is below {point:,}"}
             log(f"context {point:,}: skipped (max_context {info['max_context']:,})")
             continue
-        shared = (required_prompts(pieces, prepared["retrieval"], point - n, settings["retrieval"]["positions"])
-                  if point == required else None)
-        prompt = shared[0] if shared else curve_prompt(pieces, filler, point - n)
+        prompt = curve_prompt(pieces, point - n, rule["positions"])
         if prompt is None:
             points[str(point)] = {"status": "skipped", "context": point,
-                                  "reason": f"no room for the {pieces['case']} prompt before {n} output tokens"}
+                                  "reason": f"no room for the curve's prompt before {n} output tokens"}
             continue
         samples = []
         try:
             for _ in range(int(settings.get("repetitions", 1))):
-                if continuation is not None:
-                    _, sample = timed_replay(engine, prompt, continuation)
-                else:
-                    _, sample = timed_generate(engine, prompt, n)
+                tokens, sample = timed_generate(engine, prompt, n)
                 samples.append(sample)
         except Hung:
             raise
         except Exception as error:  # an engine that cannot hold the context fails here, however it fails
-            points[str(point)] = {"status": "failed", "context": point, "error": f"{type(error).__name__}: {error}"[:2000]}
-            log(f"context {point:,}: failed ({type(error).__name__}: {error})")
-            if shared:
-                asked = retrieval_point(engine, info, prepared, settings["retrieval"], shared[1], point, log)
+            error = f"{type(error).__name__}: {error}"[:2000]
+            points[str(point)] = {"status": "failed", "context": point, "error": error}
+            asked[point] = {"status": "failed", "context": point, "error": error}
+            log(f"context {point:,}: failed ({error})")
             continue
         summary = _summary(samples)
         points[str(point)] = {"status": "measured", "context": point, "prompt_tokens": len(prompt), "output_tokens": n,
                               **summary, "samples": samples}
+        asked[point] = {**judged_retrieval(tokens, prepared, prompt, point), "ttft_ms": summary["ttft_ms"]}
         log(f"context {point:,}: decode {summary['decode_tps'] or 0:.1f} tok/s, first token after {summary['ttft_ms']:,.0f} ms, "
-            f"tokens/round {summary['tokens_per_round'] or 0:.2f}")
-        if shared:
-            asked = retrieval_point(engine, info, prepared, settings["retrieval"], shared[1], point, log)
-    return points, text, asked
+            f"tokens/round {summary['tokens_per_round'] or 0:.2f}; retrieval "
+            + ", ".join(f"{k} {'found' if v else 'MISSING'}" for k, v in asked[point]["found"].items()))
+    return points, dict(CONTEXT_TEXT), asked
 
 
 def retrieval_point(engine, info, prepared, rule, prompt, point, log):
@@ -565,27 +668,28 @@ def retrieval_point(engine, info, prepared, rule, prompt, point, log):
     except Exception as error:  # an engine that cannot hold the context fails here, however it fails
         log(f"retrieval {point:,}: failed ({type(error).__name__}: {error})")
         return {"status": "failed", "context": point, "error": f"{type(error).__name__}: {error}"[:2000]}
-    text = token_text(tokens, pieces["token_text"], prepared["stop_ids"])
-    found = {fact["id"]: fact["answer"] in text for fact in pieces["facts"]}
-    log(f"retrieval {point:,}: " + ", ".join(f"{k} {'found' if v else 'MISSING'}" for k, v in found.items()))
-    return {"status": "measured", "context": point, "prompt_tokens": len(prompt), "found": found,
-            "passed": all(found.values()), "text": text[:2000], "tokens": tokens, "ttft_ms": sample["ttft_ms"],
-            "cached_tokens": (sample.get("served") or {}).get("cached_tokens")}
+    found = judged_retrieval(tokens, prepared, prompt, point)
+    log(f"retrieval {point:,}: " + ", ".join(f"{k} {'found' if v else 'MISSING'}" for k, v in found["found"].items()))
+    return {**found, "ttft_ms": sample["ttft_ms"], "cached_tokens": (sample.get("served") or {}).get("cached_tokens")}
 
 
-def run_retrieval(engine, info, prepared, settings, required, log, at_required=None):
+def run_retrieval(engine, info, prepared, settings, required, log, from_curve=None):
     """Facts near the start, middle and end of filler text, asked for at the end (protocol context.retrieval):
-    one greedy request per point below the required context; at_required: the point at the required context,
-    asked after the curve's point there (run_context), or None when the curve did not reach it."""
+    from_curve holds the verdicts of the points the long-context curve asked (run_context); every other point below
+    the required context gets a request of its own, and the required one fails when the curve did not reach it."""
+    from_curve = from_curve or {}
     pieces, rule = prepared.get("retrieval"), settings["retrieval"]
     if not pieces:
         log("retrieval: not in the prepared data (prepare it again with crit eval prepare into a new data directory)")
         return {"status": "missing", "reason": "the prepared data has no retrieval prompts; prepare it again"}
     n, points = int(rule["output_tokens"]), {}
-    for point in retrieval_points(required, rule):
+    for point in sorted(set(retrieval_points(required, rule)) | set(from_curve)):   # every curve point too
+        if point in from_curve:
+            points[str(point)] = from_curve[point]
+            continue
         if point == required:
-            points[str(point)] = at_required or {"status": "failed", "context": point,
-                                                 "error": "the long-context curve did not reach the required context"}
+            points[str(point)] = {"status": "failed", "context": point,
+                                  "error": "the long-context curve did not reach the required context"}
             continue
         prompt = retrieval_prompt(pieces, point - n, rule["positions"])
         if prompt is None:
@@ -703,7 +807,7 @@ def compare_lower(at_max, at_lower, lower, settings):
 
 
 def run_lower_context(module, model, config, prepared, protocol, required, warmups, repetitions, log,
-                      continuations=None, disturbed_spread=None):
+                      continuations=None, disturbed_spread=None, exact_prompts=False):
     """The speed cases on an engine opened at a lower context. It runs just before the engine built for the
     required context, so the two speed runs sit side by side and ahead of the long-context curve's heat.
     Lowering the context frees device memory and must never make a case slower (compare_lower)."""
@@ -715,7 +819,8 @@ def run_lower_context(module, model, config, prepared, protocol, required, warmu
                 "reason": f"the required {required:,} tokens leave no lower context that holds the longest speed case ({longest:,})"}
     log(f"lower context: opening the engine at {lower:,} tokens")
     try:
-        engine, info = open_engine(module, model, config, speculative=True, context_tokens=lower)
+        engine, info = open_engine(module, model, config, speculative=True, context_tokens=lower,
+                                   exact_prompts=exact_prompts)
         try:
             measured = run_speed(engine, info, prepared, protocol, warmups, repetitions,
                                  lambda message: log("lower context: " + message), continuations, disturbed_spread)
@@ -723,6 +828,11 @@ def run_lower_context(module, model, config, prepared, protocol, required, warmu
             engine.close()
     except (Disturbed, Hung):
         raise
+    except RuntimeError as error:
+        if "rendered the prompt as" in str(error):
+            raise   # the server's template, not the lower context: the round cannot measure quality
+        log(f"lower context: failed ({type(error).__name__}: {error})")
+        return {"context": lower, "passed": False, "error": f"{type(error).__name__}: {error}"[:2000]}
     except Exception as error:  # an engine that cannot run at a lower context fails the gate, however it fails
         log(f"lower context: failed ({type(error).__name__}: {error})")
         return {"context": lower, "passed": False, "error": f"{type(error).__name__}: {error}"[:2000]}
@@ -735,7 +845,7 @@ PARTS = ("speed", "quality", "exactness", "context", "heldout", "history", "foll
 def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
         repetitions=None, label=None, log=print, bandwidth_gbs=None, device=None, baseline=None,
         quality_budget=None, exactness=None, context_tokens=None, vram_headroom_bytes=None, context_reserve_bytes=None,
-        abort_disturbed=True, url=None, served_model=None):
+        abort_disturbed=True, url=None, served_model=None, requested_context=None, context_basis=None):
     """adapter: the eval-v1 adapter file, or an object that opens engines as an adapter module does
     (create_eval_engine), its `server` naming them in the result (crit run eval serves a candidate per engine); with
     url instead, the engine behind that OpenAI-compatible server (crit_eval.chat), served_model naming its model.
@@ -746,7 +856,8 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
     decode by these limits against the reference scores `crit eval reference` stored under the data.
     exactness: "reported" (default) or "required" (any difference from plain greedy fails the gate).
     context_tokens: the context every engine is built for (a run's kv_tokens); without it, Eval's max context
-    for the model on the device, with vram_headroom_bytes (default 1 GiB) left free. The `context` part
+    for the model on the device, with vram_headroom_bytes (default 1 GiB) left free, capped at requested_context
+    (the user's wanted context); context_basis: the run's record of how its kv_tokens came about. The `context` part
     measures the long-context curve and the retrieval check up to it and the speed cases again at a lower context.
     The `heldout` part decodes the held-out prompts; with a baseline that measured them, the generality gate judges
     them. The `history` part repeats protocol history's cases right after the engine opens and after every other
@@ -766,7 +877,8 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
     if context_reserve_bytes is not None:  # the machine's own reserve for workspaces and speed techniques
         settings = {**settings, "reserve_gib": context_reserve_bytes / GIB}
     requirement = context_requirement(model, device, context_tokens,
-                                      GIB if vram_headroom_bytes is None else vram_headroom_bytes, settings)
+                                      GIB if vram_headroom_bytes is None else vram_headroom_bytes, settings,
+                                      requested_context, context_basis)
     required = requirement["tokens"]
     ceiling = prepared.get("ceiling")
     if ceiling is None:
@@ -796,17 +908,19 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
     }
     if required:
         log(f"context: {required:,} tokens ({requirement['source']}"
-            + (f", {requirement['bound']} bound" if requirement.get("bound") else "") + ")")
+            + (f", {requirement['bound']} bound" if requirement.get("bound") else "") + ")"
+            + (f"; {requirement['note']}" if requirement.get("note") else ""))
     else:
         log("context: unknown (" + "; ".join(requirement["missing"] or [requirement["reason"] or "no input"])
             + "); engines use their own")
     warmups = protocol["speed"]["warmup_runs"] if warmups is None else warmups
+    sampled_repetitions = repetitions   # None: one per seed (protocol sampled_speed.seeds)
     repetitions = protocol["speed"]["repetitions"] if repetitions is None else repetitions
     disturbed = protocol["speed"].get("disturbed_spread") if abort_disturbed else None
     try:
         return _measure(result, module, model, config or {}, prepared, protocol, parts, warmups, repetitions, log,
                         continuations, required, settings, exactness, disturbed, bandwidth_gbs,
-                        device, ceiling, baseline, out, reference_scores)
+                        device, ceiling, baseline, out, reference_scores, sampled_repetitions)
     except Disturbed as error:
         log(f"aborted: {error}")
         result["aborted"] = {"reason": "disturbed", "detail": str(error)}
@@ -817,15 +931,16 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
 
 def _measure(result, module, model, config, prepared, protocol, parts, warmups, repetitions, log, continuations,
              required, settings, exactness, disturbed, bandwidth_gbs, device, ceiling, baseline,
-             out, reference_scores=None):
+             out, reference_scores=None, sampled_repetitions=None):
     lower = None
     if "context" in parts and "speed" in parts and required and isinstance(module, Server):
         lower = {"context": None, "passed": None, "reason": "a served engine cannot be opened at a lower context"}
     elif "context" in parts and "speed" in parts and required:
         lower = run_lower_context(module, model, config, prepared, protocol, required, warmups, repetitions, log,
-                                  continuations, disturbed)
+                                  continuations, disturbed, exact_prompts="quality" in parts)
     started = time.perf_counter()
-    engine, info = open_engine(module, model, config, speculative=True, context_tokens=required)
+    engine, info = open_engine(module, model, config, speculative=True, context_tokens=required,
+                               exact_prompts="quality" in parts)
     result["load_ms"] = (time.perf_counter() - started) * 1000
     result["engine"] = info
     result["context"]["engine_max_context"] = info["max_context"]
@@ -844,6 +959,10 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
         if "speed" in parts:
             result["speed"] = run_speed(engine, info, prepared, protocol, warmups, repetitions, log, continuations,
                                         disturbed)
+            result["sampled_speed"] = run_sampled_speed(engine, info, prepared, protocol, warmups, sampled_repetitions, log,
+                                                        disturbed)
+            if result["sampled_speed"]["status"] == "measured":
+                result["sampling_check"] = run_sampling_check(engine, info, prepared, protocol, log)
         if "heldout" in parts:
             result["heldout"] = run_heldout(engine, info, prepared, protocol, log)
         if "quality" in parts:
@@ -851,7 +970,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                                             result["requirements"]["quality_budget"])
         if "context" in parts and required:
             result["context"]["points"], result["context"]["decode_text"], asked = run_context(
-                engine, info, prepared, settings, required, log, continuations)
+                engine, info, prepared, settings, required, log)
             result["context"]["retrieval"] = run_retrieval(engine, info, prepared, settings, required, log, asked)
         if "exactness" in parts and "speed" in result and plain_on_engine(engine, info):
             # The engine decodes plain greedy itself: no second engine to load.
@@ -874,8 +993,15 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
     finally:
         engine.close()
     if "exactness" in parts and "speed" in result and info.get("speculative") and "exactness" not in result:
-        result["exactness"] = run_exactness(module, model, config, prepared, result["speed"], log, exactness,
-                                            context_tokens=required)
+        if info.get("served"):
+            # Another engine opened for a server would be the same speculative one: comparing it with itself proves
+            # nothing.
+            reason = "the served package declares no plain decoding (chat-plain-v1)"
+            log(f"exactness: unmeasured ({reason})")
+            result["exactness"] = {"mode": exactness, "status": "unmeasured", "reason": reason, "cases": {}}
+        else:
+            result["exactness"] = run_exactness(module, model, config, prepared, result["speed"], log, exactness,
+                                                context_tokens=required)
     if lower is not None and "speed" in lower:
         result["context"]["lower"] = {**compare_lower(result["speed"], lower["speed"], lower["context"], settings),
                                       "engine_max_context": lower["engine_max_context"]}
@@ -891,10 +1017,21 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
             measured = {cid: c for cid, c in result["speed"]["cases"].items() if c["status"] == "measured"}
             step_ms = headroom.step_ms_from([s for c in measured.values() for s in c["samples"] if not s["warmup"]])
             steps = {cid: headroom.step_ms_from([s for s in c["samples"] if not s["warmup"]]) for cid, c in measured.items()}
-        result["headroom"] = headroom.summarize(info, result["speed"], step_ms, bandwidth_gbs, protocol["headroom"],
+        decode_name, decode_speed = headroom.decode_suite(result)
+        facts, source = dict(info), "engine" if info.get("bytes_per_pass") else None
+        if not facts.get("bytes_per_pass"):
+            try:
+                facts["bytes_per_pass"] = pass_bytes(model, float(settings["kv_bytes_per_element"]))
+            except (OSError, ValueError, KeyError):
+                facts["bytes_per_pass"] = None
+            source = "model files" if facts["bytes_per_pass"] else None
+        result["headroom"] = headroom.summarize(facts, result["speed"], step_ms, bandwidth_gbs, protocol["headroom"],
                                                 ceiling=ceiling, tflops=device.get("tflops"), steps=steps,
                                                 prefill_cases=protocol["speed"].get("prefill_cases", []),
-                                                context=result["context"], context_settings=settings)
+                                                context=result["context"], context_settings=settings,
+                                                decode_speed=decode_speed, decode_name=decode_name)
+        # Bytes per pass from the engine, or from the stored model when it reports none (crit_eval.context.pass_bytes).
+        result["headroom"]["bytes_per_pass_source"] = source
         for warning in result["headroom"]["warnings"]:
             log("headroom: " + warning)
     result["status"] = status.build(result, protocol, baseline)

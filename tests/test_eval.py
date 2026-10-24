@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, mock_open, patch
@@ -34,21 +35,19 @@ FACTS = 2000  # retrieval fact ids in the fixture start here; the mock's facts_f
 
 def fixture(directory):
     prepared = {
-        "protocol": "crit-eval-v6", "suite_sha256": SUITE, "model": {"sha256": "model"}, "stop_ids": [999],
+        "protocol": "crit-eval-v7", "suite_sha256": SUITE, "model": {"sha256": "model"}, "stop_ids": [999],
+        "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 8}, "sampling_source": "generation_config",
         "valid_vocab": 1000,
         "speed": [{"id": "short", "kind": "prose", "prompt_ids": [1, 2, 3], "output_tokens": 12},
                   {"id": "long", "kind": "long-context", "prompt_ids": list(range(60)), "output_tokens": 12}],
         "quality": [{"id": "c", "set": "conversations", "prompt_ids": [5, 6], "continuation_ids": [7, 8, 9],
                      "messages": [{"role": "user", "content": "c"}]}],
-        "retrieval": {"head_ids": [1, 2], "tail_ids": [3, 4], "filler_ids": list(range(10, 50)),
+        # The long-context curve asks for the facts and a summary ([5, 6]) after the same archive.
+        "retrieval": {"head_ids": [1, 2], "tail_ids": [3, 4], "curve_tail_ids": [5, 6], "filler_ids": list(range(10, 50)),
                       "facts": [{"id": "start", "answer": "ab", "ids": [FACTS, FACTS + 1]},
                                 {"id": "middle", "answer": "cd", "ids": [FACTS + 2, FACTS + 3]},
                                 {"id": "end", "answer": "ef", "ids": [FACTS + 4, FACTS + 5]}],
                       "token_text": [None] * FACTS + list("abcdef")},
-        # The long-context curve extends "long": its 60 ids are a frame around a document. At the required context
-        # the retrieval question ([3, 4]) follows the same document instead of the case's tail.
-        "context": {"case": "long", "head_ids": [0, 1], "tail_ids": [58, 59], "document_ids": list(range(2, 58)),
-                    "retrieval_tail_ids": [3, 4]},
     }
     (directory / "prepared.json").write_text(json.dumps(prepared))
     return prepared
@@ -175,15 +174,17 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(room["draft_width"], 4)
             self.assertAlmostEqual(room["pass_floor_ms"], 1.0)
             self.assertGreater(room["step_ms"], 0)
-            self.assertAlmostEqual(room["cases"]["short"]["saturation"], 12 / 3 / 5)
-            self.assertEqual(room["cases"]["short"]["tokens_by_width"], [1.0, 2.0, 3.0, 4.0, 5.0])
+            # From crit-eval-v7 the decode terms describe the sampled suite; the mock drafts nothing when it samples.
+            self.assertEqual(room["decode_suite"], "sampled")
+            self.assertAlmostEqual(room["cases"]["short"]["saturation"], 1 / 5)
+            self.assertEqual(room["cases"]["short"]["tokens_by_width"], [1.0] * 5)
             self.assertIsNotNone(room["projection"]["speed_of_light_score"])
             table = report.compare([data / "result.json", data / "result.json"])
             self.assertIn("Decode tok/s: short", table)
             self.assertNotIn("Quality:", table)
             self.assertIn("Model pass vs bandwidth floor", table)
             self.assertIn("Decode ceiling", table)
-            minor = {**json.loads((data / "result.json").read_text()), "protocol": "crit-eval-v6.1"}
+            minor = {**json.loads((data / "result.json").read_text()), "protocol": "crit-eval-v7.1"}
             (data / "minor.json").write_text(json.dumps(minor))
             (data / "v4.json").write_text(json.dumps({**minor, "protocol": "crit-eval-v4"}))
             self.assertNotIn("major versions", report.compare([data / "result.json", data / "minor.json"]))
@@ -295,6 +296,7 @@ PROTOCOLS = {
     "crit-eval-v4.1": "90b938a9641178a19c14e3b505491757c844a442bcbcb86ccad1d7415a5cc0af",  # served engines
     "crit-eval-v5": "24a1ca7b64b191246c7e4a964bd3a6d413207a6c2cddf9d8ba4a747493822bd1",  # chat messages, reply quality
     "crit-eval-v6": "5efdc396d65f37edd3c19c10ca91c34d1be262b86f522c25b9b2e4f4685e611e",  # fixed-text quality, honesty
+    "crit-eval-v7": "2b752699bd3895c0f14809ddd7ee16ed78a26e1faedc83042e936b25ef68d21e",  # sampled decode, sampling check
 }
 
 
@@ -640,6 +642,333 @@ class RepetitionTests(unittest.TestCase):
                 self.assertEqual(len([s for s in speed["cases"]["a"]["samples"] if not s["warmup"]]), runs - 1)
 
 
+class SampledSpeedTests(unittest.TestCase):
+    """crit-eval-v7: the speed cases at the model's own sampling, and whether sampled tokens follow it."""
+
+    def run_mock(self, directory, min_tokens=1, **config):
+        """The mock through Eval; min_tokens: the sampling check's least judged tokens (the fixture samples 12)."""
+        data = Path(directory)
+        fixture(data)
+        config = {"max_context": 64, "bytes_per_pass": 1e6, "draft_bytes_per_step": 1e5, **config}
+        load = runner.load_json
+
+        def protocol(path):
+            value = load(path)
+            if Path(path).name == "protocol.json" and min_tokens is not None:
+                value["sampling_check"]["min_tokens"] = min_tokens
+            return value
+        with patch.object(runner, "load_json", protocol):
+            return runner.run(MOCK, "unused-model", data, data / "result.json", config, warmups=0, repetitions=2,
+                              log=lambda message: None, bandwidth_gbs=1.0)
+
+    def test_sampled_decode_is_measured_at_the_frozen_sampling_and_reported_next_to_greedy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_mock(directory)
+            sampled = result["sampled_speed"]
+            self.assertEqual(sampled["status"], "measured")
+            self.assertEqual(sampled["sampling"], {"temperature": 1.0, "top_p": 0.95, "top_k": 8})
+            self.assertGreater(sampled["decode_score"], 0)
+            self.assertEqual(sampled["cases"]["short"]["status"], "measured")
+            self.assertEqual(sampled["cases"]["long"]["status"], "skipped")
+            # The mock does not speculate when it samples: one token per pass.
+            self.assertAlmostEqual(sampled["cases"]["short"]["tokens_per_round"], 1.0)
+            kpis = result["status"]["kpis"]
+            self.assertEqual((kpis["decode"]["score"], kpis["decode"]["suite"]), (sampled["decode_score"], "sampled"))
+            self.assertEqual(kpis["greedy_decode"]["score"], result["speed"]["decode_score"])
+            text = status.render(result["status"])
+            self.assertIn("at the model's sampling", text)
+            self.assertIn("greedy", text)
+
+    def test_goals_headroom_and_stop_records_follow_the_sampled_decode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_mock(directory)
+            sampled, room = result["sampled_speed"], result["headroom"]
+            goal = next(g for g in result["status"]["goals"] if g["kpi"] == "decode")
+            self.assertEqual(goal["score"], sampled["decode_score"])
+            stop = next(k for k in result["status"]["stop_record_headroom"]["kpis"] if k["kpi"] == "decode")
+            self.assertEqual(stop["reached"], round(sampled["decode_score"], 3))
+            projection = room["projection"]
+            # Drafting nothing under sampling, this drafter at floor costs is one token per pass; the ceiling keeps
+            # the greedy suite's first-draft acceptance, reachable by rejection sampling.
+            self.assertGreater(projection["acceptance_bound_score"], projection["speed_of_light_score"])
+            self.assertEqual(goal["limit"], projection["ceiling_score"])
+            gap = next(g for g in room["gaps"] if g["name"].startswith("sampled requests decoded as fast as greedy"))
+            self.assertAlmostEqual(gap["projected_gain"] + 1, metrics.geometric_mean(
+                [max(result["speed"]["cases"][c]["decode_tps"], s["decode_tps"]) for c, s in sampled["cases"].items()
+                 if s["status"] == "measured"]) / sampled["decode_score"])
+
+    def test_without_a_sampled_suite_the_decode_stays_greedy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            fixture(data)
+            prepared = json.loads((data / "prepared.json").read_text())
+            del prepared["sampling"]
+            (data / "prepared.json").write_text(json.dumps(prepared))
+            result = runner.run(MOCK, "unused-model", data, data / "result.json",
+                                {"max_context": 64, "bytes_per_pass": 1e6, "draft_bytes_per_step": 1e5}, warmups=0,
+                                repetitions=2, log=lambda message: None, bandwidth_gbs=1.0)
+            room, kpis = result["headroom"], result["status"]["kpis"]
+            self.assertEqual(result["sampled_speed"]["status"], "unsupported")
+            self.assertEqual(room["decode_suite"], "greedy")
+            self.assertEqual(room["cases"]["short"]["tokens_by_width"], [1.0, 2.0, 3.0, 4.0, 5.0])
+            self.assertEqual((kpis["decode"]["score"], kpis["decode"]["suite"]), (result["speed"]["decode_score"], "greedy"))
+            self.assertIsNone(kpis["greedy_decode"])
+            goal = next(g for g in result["status"]["goals"] if g["kpi"] == "decode")
+            self.assertEqual(goal["score"], result["speed"]["decode_score"])
+
+    def test_a_sampler_that_favours_likely_tokens_fails_the_sampling_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            good = self.run_mock(directory)["sampling_check"]
+            self.assertTrue(good["passed"])
+            self.assertEqual(good["outside"], 0)
+            self.assertLessEqual(abs(good["z"]), good["z_max"])
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_mock(directory, greedy_sampling=True)
+            bad = result["sampling_check"]
+            self.assertFalse(bad["passed"])
+            self.assertLess(bad["z"], -bad["z_max"])
+            gates = {g["name"]: g["state"] for g in result["status"]["gates"]}
+            self.assertEqual(gates["sampling"], "fail")
+        with tempfile.TemporaryDirectory() as directory:
+            # The protocol's least judged tokens: the fixture's 12 sampled tokens leave the gate unmeasured.
+            result = self.run_mock(directory, min_tokens=None)
+            self.assertIsNone(result["sampling_check"]["passed"])
+            gate = next(g for g in result["status"]["gates"] if g["name"] == "sampling")
+            self.assertEqual(gate["state"], "unmeasured")
+            self.assertIn("fewer than 256 tokens judged", gate["detail"])
+
+    def test_an_engine_that_cannot_sample_has_no_sampled_decode(self):
+        class Greedy:
+            def __init__(self, inner):
+                self.inner = inner
+
+            def __getattr__(self, name):
+                if name == "generate_sampled":
+                    raise AttributeError(name)
+                return getattr(self.inner, name)
+        found = runner.run_sampled_speed(Greedy(object()), {"max_context": 64}, {"speed": [], "sampling": {}},
+                                         runner.load_json(runner.EVAL_DIR / "protocol.json"), 0, 2, lambda m: None)
+        self.assertEqual(found["status"], "unsupported")
+        gate = status._sampling_gate({"sampled_speed": found})
+        self.assertEqual(gate["state"], "unmeasured")
+
+    def test_processed_distribution_applies_temperature_top_k_top_p_and_min_p(self):
+        logprobs = [math.log(p) for p in (0.5, 0.3, 0.15, 0.05)]
+        self.assertEqual([round(p, 6) for p in metrics.processed_distribution(logprobs, {"temperature": 1.0})],
+                         [0.5, 0.3, 0.15, 0.05])
+        top_k = metrics.processed_distribution(logprobs, {"temperature": 1.0, "top_k": 2})
+        self.assertAlmostEqual(top_k[0], 0.5 / 0.8)
+        self.assertEqual(top_k[2:], [0.0, 0.0])
+        top_p = metrics.processed_distribution(logprobs, {"temperature": 1.0, "top_p": 0.75})
+        self.assertEqual(sum(1 for p in top_p if p > 0), 2)  # 0.5 + 0.3 reaches 0.75
+        cold = metrics.processed_distribution(logprobs, {"temperature": 0.5})
+        self.assertGreater(cold[0], 0.5)
+        min_p = metrics.processed_distribution(logprobs, {"temperature": 1.0, "min_p": 0.2})
+        self.assertEqual(min_p[3], 0.0)  # 0.05 < 0.2 * 0.5
+
+    def test_calibration_is_uniform_for_true_samples_and_skewed_for_greedy_ones(self):
+        import random
+        rng = random.Random(3)
+        settings = {"temperature": 1.0, "top_k": 8}
+        logprobs = [math.log(p) for p in (0.35, 0.2, 0.14, 0.1, 0.08, 0.06, 0.04, 0.03)]
+        probs = metrics.processed_distribution(logprobs, settings)
+        true_rows = [{"top": logprobs, "chosen": rng.choices(range(8), weights=probs)[0]} for _ in range(2000)]
+        greedy_rows = [{"top": logprobs, "chosen": 0} for _ in range(2000)]
+        fair = metrics.sampling_calibration(true_rows, settings, seed=7)
+        self.assertLess(abs(fair["z"]), 4)
+        self.assertLess(fair["ks"], 0.05)
+        skewed = metrics.sampling_calibration(greedy_rows, settings, seed=7)
+        self.assertLess(skewed["z"], -20)
+        # Two of eight reported under top_k 8: the six kept unreported tokens' share is open, so it is unresolved.
+        open_tail = metrics.sampling_calibration([{"top": logprobs[:2], "chosen": None}], settings)
+        self.assertEqual((open_tail["tokens"], open_tail["outside"], open_tail["unresolved"]), (0, 0, 1))
+        # top_k 2 keeps only reported tokens: one missing from them is outside.
+        outside = metrics.sampling_calibration([{"top": logprobs[:4], "chosen": None}], {"temperature": 1.0, "top_k": 2})
+        self.assertEqual((outside["tokens"], outside["outside"]), (0, 1))
+
+    def test_the_unreported_rest_of_a_large_vocabulary_is_judged_where_the_alternatives_determine_it(self):
+        import random
+        rng = random.Random(5)
+        vocab = 4000
+
+        def position():
+            # Zipf-like rows, some peaked and some flat, sorted likeliest first.
+            exponent = rng.choice([2.5, 2.5, 1.6, 1.2])
+            weights = [r ** -exponent * math.exp(rng.gauss(0, 0.3)) for r in range(1, vocab + 1)]
+            total = sum(weights)
+            return sorted((math.log(w / total) for w in weights), reverse=True)
+
+        def full(row, settings):
+            # The sampler's own processed distribution over the whole vocabulary.
+            probs = metrics.processed_distribution(row, settings)
+            return probs
+
+        def check(settings, bias=0.0, n=600):
+            rows = []
+            for _ in range(n):
+                row = position()
+                probs = full(row, settings)
+                k = 0 if rng.random() < bias else rng.choices(range(vocab), weights=probs)[0]
+                rows.append({"top": row[:20], "chosen": k if k < 20 else None})
+            return metrics.sampling_calibration(rows, settings, 7, vocab)
+        for settings in ({"temperature": 1.0}, {"temperature": 1.0, "top_p": 0.95}, {"temperature": 1.0, "top_k": 64,
+                         "top_p": 0.95}, {"temperature": 0.6, "top_p": 0.9}, {"temperature": 1.0, "min_p": 0.05}):
+            with self.subTest(settings=settings):
+                fair = check(settings)
+                self.assertEqual(fair["outside"], 0)   # tokens past the top 20 are not counted outside
+                self.assertGreater(fair["tokens"], 150)
+                self.assertLess(abs(fair["z"]), 4)
+        # Without filters the rest is exact: every position is judged, and a sampler favouring the likeliest fails.
+        self.assertEqual(check({"temperature": 1.0})["unresolved"], 0)
+        self.assertLess(check({"temperature": 1.0}, bias=0.3, n=1500)["z"], -4)
+
+    def test_a_resolved_distribution_follows_the_filters_or_stays_open(self):
+        top = [math.log(p) for p in (0.5, 0.3, 0.1)]   # 0.1 of the mass unreported
+        # Temperature 1 without filters: the rest is one last alternative holding 0.1.
+        self.assertEqual([round(p, 6) for p in metrics.resolved_distribution(top, {"temperature": 1.0})],
+                         [0.5, 0.3, 0.1, 0.1])
+        # top_p 0.75 ends at the second token whatever the rest holds.
+        self.assertEqual([round(p, 6) for p in metrics.resolved_distribution(top, {"temperature": 1.0, "top_p": 0.75})],
+                         [0.625, 0.375, 0.0, 0.0])
+        # top_p 0.95 reaches into the unreported rest: open.
+        self.assertIsNone(metrics.resolved_distribution(top, {"temperature": 1.0, "top_p": 0.95}))
+        # min_p 0.3 drops the third token and every unreported one (each at most as likely as it).
+        self.assertEqual([round(p, 6) for p in metrics.resolved_distribution(top, {"temperature": 1.0, "min_p": 0.3})],
+                         [0.625, 0.375, 0.0, 0.0])
+        # A top_p edge within rounding of a cumulative mass is left open.
+        self.assertIsNone(metrics.resolved_distribution(top, {"temperature": 1.0, "top_p": 0.8}))
+
+    def test_a_sampled_request_names_every_field_and_an_engine_need_apply_only_the_others(self):
+        request = prepare.sampled_request({"temperature": 0.7, "top_k": 20}, 3)
+        self.assertEqual(request, {"temperature": 0.7, "top_p": 1.0, "top_k": 20, "min_p": 0.0, "presence_penalty": 0.0,
+                                   "frequency_penalty": 0.0, "repetition_penalty": 1.0, "seed": 3})
+        self.assertEqual(prepare.unapplied(request, {"temperature", "top_k"}), [])   # the rest are neutral
+        self.assertEqual(prepare.unapplied(request, {"temperature"}), ["top_k"])
+        self.assertEqual(prepare.unapplied(request, set()), ["temperature", "top_k"])
+
+    def test_the_sampled_suite_sends_neutral_penalties_and_refuses_an_engine_short_of_the_models_fields(self):
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        prepared = {"speed": [{"id": "a", "kind": "prose", "prompt_ids": [1, 2], "output_tokens": 4}],
+                    "sampling": {"temperature": 1.0, "top_p": 0.95}, "sampling_source": "generation_config"}
+        sent = []
+
+        class Engine:
+            sampling_fields = {"temperature", "top_p", "seed"}
+
+            def generate_sampled(self, prompt, n, on_tokens, sampling, logprobs=None):
+                sent.append(dict(sampling))
+                on_tokens([5] * n)
+                return {"tokens": [5] * n, "rounds": n - 1}
+        found = runner.run_sampled_speed(Engine(), {"max_context": 64}, prepared, protocol, 0, 2, lambda m: None)
+        self.assertEqual(found["status"], "measured")
+        self.assertEqual(sent[0], {"temperature": 1.0, "top_p": 0.95, "top_k": 0, "min_p": 0.0, "presence_penalty": 0.0,
+                                   "frequency_penalty": 0.0, "repetition_penalty": 1.0, "seed": 1})
+        Engine.sampling_fields = {"temperature", "seed"}
+        found = runner.run_sampled_speed(Engine(), {"max_context": 64}, prepared, protocol, 0, 2, lambda m: None)
+        self.assertEqual(found, {"status": "unsupported", "reason": "the engine does not apply the sampling's top_p"})
+
+    def test_sampled_repetitions_run_every_seed_and_a_disturbance_shows_in_the_time_per_pass(self):
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        prepared = {"speed": [{"id": "a", "kind": "prose", "prompt_ids": [1, 2], "output_tokens": 17}],
+                    "sampling": {"temperature": 1.0}, "sampling_source": "protocol_default"}
+
+        class Engine:
+            """Each seed's text drafts differently: seed 2 accepts twice as many tokens per round. With slow, the
+            third repetition's passes take three times as long."""
+            def __init__(self, slow=False):
+                self.slow, self.seeds = slow, []
+
+            def generate_sampled(self, prompt, n, on_tokens, sampling, logprobs=None):
+                self.seeds.append(sampling["seed"])
+                per_round = 4 if sampling["seed"] == 2 else 2
+                pause = 0.06 if self.slow and sampling["seed"] == 3 else 0.02   # above Windows' timer step
+                for i in range(0, n, per_round):
+                    time.sleep(pause)
+                    on_tokens([5] * min(per_round, n - i))
+                return {"tokens": [5] * n, "rounds": -(-(n - 1) // per_round)}
+        quiet = Engine()
+        found = runner.run_sampled_speed(quiet, {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None,
+                                         disturbed_spread=0.25)
+        self.assertEqual(quiet.seeds, [0, 1, 2, 3])   # the warmup, then every seed, and no extra repetition
+        decode = [s["decode_tps"] for s in found["cases"]["a"]["samples"] if not s["warmup"]]
+        self.assertGreater(max(decode) / min(decode), 1.5)   # far past the disturbed spread, from the text alone
+        with self.assertRaisesRegex(runner.Disturbed, "time per target pass"):
+            runner.run_sampled_speed(Engine(slow=True), {"max_context": 1000}, prepared, protocol, 1, None,
+                                     lambda m: None, disturbed_spread=0.25)
+
+        class Served(Engine):
+            """Behind a server: seed 3's reply ends early at a tool call, its few passes streamed slowly."""
+            def generate_sampled(self, prompt, n, on_tokens, sampling, logprobs=None):
+                if sampling["seed"] != 3:
+                    out = Engine.generate_sampled(self, prompt, n, on_tokens, sampling)
+                    return {**out, "served": {"prompt_tokens": 2, "output_tokens": n, "finish_reason": "length"}}
+                for _ in range(3):
+                    time.sleep(0.06)
+                    on_tokens([5, 5])
+                return {"tokens": [5] * 6, "rounds": 3,
+                        "served": {"prompt_tokens": 2, "output_tokens": 6, "finish_reason": "tool_calls"}}
+        found = runner.run_sampled_speed(Served(), {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None,
+                                         disturbed_spread=0.25)
+        self.assertEqual(found["status"], "measured")   # judged on the two full-length replies alone
+
+    def test_the_decode_score_carries_its_standard_error_and_small_changes_read_as_noise(self):
+        # Two cases of three repetitions: log spreads give each case's variance of its mean.
+        found = metrics.score_error([[100.0, 110.0, 90.0], [200.0, 200.0, 200.0]])
+        logs = [math.log(v) for v in (100.0, 110.0, 90.0)]
+        mean = sum(logs) / 3
+        self.assertAlmostEqual(found, math.sqrt(sum((x - mean) ** 2 for x in logs) / 2 / 3) / 2)
+        self.assertIsNone(metrics.score_error([[100.0]]))
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as other:
+            result, before = self.run_mock(directory), self.run_mock(other)
+            sampled = result["sampled_speed"]
+            self.assertIsNotNone(sampled["decode_se"])
+            self.assertEqual(result["status"]["kpis"]["decode"]["standard_error"], sampled["decode_se"])
+            # A change smaller than two standard errors of the difference is called noise.
+            result["sampled_speed"]["decode_se"] = before["sampled_speed"]["decode_se"] = 0.03
+            result["sampled_speed"]["decode_score"] = before["sampled_speed"]["decode_score"] * 1.02
+            built = status.build(result, runner.load_json(runner.EVAL_DIR / "protocol.json"), before)
+            self.assertAlmostEqual(built["baseline"]["decode_score_se"], math.sqrt(2) * 0.03)
+            self.assertIn("within the noise: two standard errors are 8.5%", status.render(built))
+
+    def test_prepare_freezes_the_models_own_sampling(self):
+        from crit_core.text.generation import GenerationConfig
+        self.assertEqual(prepare.sampled_settings(GenerationConfig(do_sample=True, temperature=0.7, top_p=0.8, top_k=20,
+                                                                   repetition_penalty=1.05)),
+                         {"temperature": 0.7, "top_p": 0.8, "top_k": 20})
+        self.assertEqual(prepare.sampled_settings(GenerationConfig(do_sample=True)), {"temperature": 1.0})
+        self.assertEqual(prepare.sampled_settings(GenerationConfig(temperature=0.6)), {"temperature": 1.0})
+        self.assertEqual(prepare.sampling_source(GenerationConfig(do_sample=True, temperature=0.7)), "generation_config")
+        self.assertEqual(prepare.sampling_source(GenerationConfig(temperature=0.6)), "protocol_default")
+        self.assertEqual(prepare.sampling_source(GenerationConfig(do_sample=True, temperature=0.0)), "protocol_default")
+
+    def test_only_a_well_formed_user_override_replaces_the_models_sampling(self):
+        self.assertEqual(prepare.sampling_override("top_k=20, temperature=0.6,top_p=0.95"),
+                         {"temperature": 0.6, "top_p": 0.95, "top_k": 20})
+        self.assertEqual(prepare.sampling_override({"temperature": 1, "min_p": 0.05}), {"temperature": 1.0, "min_p": 0.05})
+        for bad in ("top_p=0.9", "temperature=0", "temperature=0.6,top_k=2.5", "temperature=0.6,repetition_penalty=1.1",
+                    "temperature=0.6,top_p=1.5", "temperature=0.6,min_p=1", "temperature", {"temperature": True}):
+            with self.assertRaises(ValueError, msg=bad):
+                prepare.sampling_override(bad)
+
+    def test_a_user_override_is_recorded_and_labelled_and_not_compared_with_the_models_sampling(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as other:
+            data = Path(directory)
+            prepared = fixture(data)
+            prepared.update(sampling={"temperature": 0.6, "top_k": 8}, sampling_source="override")
+            (data / "prepared.json").write_text(json.dumps(prepared))
+            config = {"max_context": 64, "bytes_per_pass": 1e6, "draft_bytes_per_step": 1e5}
+            result = runner.run(MOCK, "unused-model", data, data / "result.json", config, warmups=0, repetitions=2,
+                                log=lambda message: None, bandwidth_gbs=1.0)
+            self.assertEqual((result["sampled_speed"]["sampling"], result["sampled_speed"]["sampling_source"]),
+                             ({"temperature": 0.6, "top_k": 8}, "override"))
+            self.assertEqual(result["sampling_check"]["sampling_source"], "override")
+            self.assertEqual(result["status"]["kpis"]["decode"]["sampling_source"], "override")
+            self.assertIn("at the user's sampling override (temperature 0.6, top_k 8)", status.render(result["status"]))
+            self.assertIn("temperature 0.6, top_k 8 (user override)", report.compare([data / "result.json"]))
+            default = SampledSpeedTests.run_mock(self, other)
+            self.assertIsNone(status.changes(result, default)["decode_score"])
+
+
 class StatusTests(unittest.TestCase):
     def run_mock(self, directory, device, **config):
         data = Path(directory)
@@ -660,8 +989,9 @@ class StatusTests(unittest.TestCase):
             gates = {g["name"]: g["state"] for g in current["gates"]}
             # Exactness is reported by default, so it is a note rather than a gate.
             # The fixture's prepared data predates the held-out prompts: generality is unmeasured, not failed.
+            # The fixture samples 12 tokens, fewer than the sampling check judges (SampledSpeedTests run it).
             self.assertEqual(gates, {"coverage": "pass", "repeatable": "pass", "request_history": "pass",
-                                     "prompt_cache": "unmeasured", "quality": "unmeasured",
+                                     "prompt_cache": "unmeasured", "quality": "unmeasured", "sampling": "unmeasured",
                                  "capacity": "unmeasured", "retrieval": "unmeasured", "lower_context": "unmeasured",
                                  "generality": "unmeasured"})
             self.assertIn("exactness reported: 2/2 cases equal plain greedy", current["notes"])
@@ -709,9 +1039,9 @@ class StatusTests(unittest.TestCase):
         opened = []
         original = runner.open_engine
 
-        def counting(module, model, config, speculative, context_tokens=None):
+        def counting(module, model, config, speculative, context_tokens=None, **options):
             opened.append(speculative)
-            return original(module, model, config, speculative, context_tokens)
+            return original(module, model, config, speculative, context_tokens, **options)
         runner.open_engine = counting
         try:
             with tempfile.TemporaryDirectory() as directory:
@@ -780,7 +1110,7 @@ class StatusTests(unittest.TestCase):
         self.assertAlmostEqual(e2e["ceiling_score"], ((101000 / 405) * (101000 / 1400)) ** 0.5)
         self.assertFalse(hasattr(headroom, "end_to_end_gains"))
 
-    def test_goals_take_every_kpi_to_its_limit_at_once(self):
+    def test_goals_take_every_kpi_to_its_limit_with_the_share_reached(self):
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
         room = {"projection": {"ceiling_score": 250.0, "fraction_of_ceiling": 0.88},
                 "prefill": {"score": 5000.0, "ceiling_score": 14000.0, "fraction_of_ceiling": 5 / 14, "cases": {}},
@@ -792,11 +1122,46 @@ class StatusTests(unittest.TestCase):
         current = status.build(result, protocol)
         changes = {goal["kpi"]: round(goal["change"], 3) for goal in current["goals"]}
         self.assertEqual(changes, {"decode": round(250 / 220 - 1, 3), "prefill": 1.8, "ttft": round(200 / 300 - 1, 3)})
+        shares = {goal["kpi"]: round(goal["fraction_of_limit"], 3) for goal in current["goals"]}
+        self.assertEqual(shares, {"decode": 0.88, "prefill": round(5 / 14, 3), "ttft": round(2 / 3, 3)})
         text = status.render(current)
-        self.assertIn("prefill  5,000 -> 14,000 tok/s (+180%)", text)
-        self.assertIn("ttft     300 -> 200 ms (-33%)", text)
+        # Eval states the goals; the run's priority rule orders them.
+        self.assertIn("goals for the next candidate: each KPI to its physical limit (Eval states them; the run orders "
+                      "them)", text)
+        self.assertIn("prefill  5,000 -> 14,000 tok/s (+180%; 36% of its limit)", text)
+        self.assertIn("ttft     300 -> 200 ms (-33%; 67% of its limit)", text)
         self.assertNotIn("end to end", text)  # older results' end-to-end gains are not shown
         self.assertNotIn("end_to_end_gain", current["gaps"][0])
+
+    def test_every_kpi_has_its_noise_and_a_baseline_change_inside_it_is_marked(self):
+        sample = lambda decode, prefill: {"decode_tps": decode, "prefill_tps": prefill, "ttft_ms": 10.0,  # noqa: E731
+                                          "request_ms": 100.0, "output_tokens": 8}
+        speed = {"cases": {"long": {"status": "measured", "samples": [sample(100, 1000), sample(104, 1040)]},
+                           "chat": {"status": "measured", "samples": [sample(50, 200), sample(50, 200)]}}}
+        found = headroom.noise(speed, ["long"])
+        self.assertAlmostEqual(found["prefill"], 40 / 1020)   # the prefill cases alone
+        self.assertIsNone(headroom.noise(speed, ["long", "missing"])["prefill"])
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+
+        def result(prefill, context_ttft):
+            noise = {"decode": 0.01, "prefill": 0.05, "ttft": 0.02, "context_decode": 0.01, "context_ttft": 0.05}
+            room = {"prefill": {"score": prefill, "ceiling_score": 2000.0, "fraction_of_ceiling": prefill / 2000,
+                                "cases": {}},
+                    "gaps": [{"kpi": "prefill", "name": "prefill at its compute ceiling", "projected_gain": 1.0}],
+                    "noise": noise, "missing": [],
+                    "context": {"decode": {"score": 100.0}, "ttft": {"score_ms": context_ttft}}}
+            return {**MEASURED, "engine": {"speculative": False}, "headroom": room,
+                    "context": {"tokens": 4096, "decode_text": {"source": "generated"}},
+                    "speed": {"decode_score": 90.0, "ttft_score_ms": 10.0, "complete": True,
+                              "cases": {"a": {"status": "measured", "repeatable": True}}}}
+        current = status.build(result(1020.0, 1000.0), protocol, result(1000.0, 1300.0))
+        self.assertEqual(current["kpis"]["prefill"]["noise"], 0.05)
+        self.assertEqual(current["gaps"][0]["noise"], 0.05)
+        self.assertEqual(current["baseline"]["noise"]["context_ttft"], 0.05)
+        text = status.render(current)
+        self.assertIn("+100% prefill score (noise 5.0%)", text)
+        self.assertIn("prefill +2.0% (within the noise: spread 5.0%)", text)   # a 2% change inside a 5% spread
+        self.assertIn("context ttft +30.0%,", text)   # 30% faster first tokens: outside it
 
     def test_status_reports_each_kpi_against_its_limit_and_no_classification(self):
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
@@ -811,7 +1176,8 @@ class StatusTests(unittest.TestCase):
                   "speed": {"decode_score": 90.0, "complete": True, "cases": {"a": {"status": "measured", "repeatable": True}}}}
         current = status.build(result, protocol)
         self.assertFalse({"verdict", "meaning", "next", "levers"} & set(current))
-        self.assertEqual(current["gaps"], [{"kpi": "decode", "name": "old", "projected_gain": 0.1}])  # older results
+        self.assertEqual(current["gaps"], [{"kpi": "decode", "name": "old", "projected_gain": 0.1,
+                                            "noise": None}])  # older results
         text = status.render(current)
         self.assertIn("decode   90.0 tok/s, 90% of its ceiling 100.0", text)
         self.assertIn("prefill  800 tok/s, 80% of its compute ceiling 1,000", text)
@@ -852,7 +1218,9 @@ class StatusTests(unittest.TestCase):
             self.assertEqual(free["speed"]["decode_text"]["source"], "generated")
             compared = status.changes(free, result)
             self.assertTrue(compared["decode_text_differs"])
-            self.assertIsNone(compared["decode_score"])  # different texts are not compared
+            self.assertIsNone(compared["greedy_decode_score"])  # different greedy texts are not compared
+            # The decode KPI is the sampled one from v7: same sampling, so it compares.
+            self.assertIsNotNone(compared["decode_score"])
             self.assertIn("decoded different texts", report.compare([data / "result.json", data / "free.json"]))
             stored = json.loads((data / pin.CONTINUATIONS).read_text())
             stored["cases"]["short"][0] += 1
@@ -951,6 +1319,43 @@ class ContextTests(unittest.TestCase):
             self.assertIsNone(value["tokens"])
             self.assertIn("free device memory (re-run crit eval probe)", value["missing"])
 
+    def test_the_requested_context_caps_the_max_context_and_says_when_it_cannot_be_served(self):
+        import crit_eval
+        self.assertEqual(crit_eval.DEFAULT_CONTEXT_TOKENS, 262144)
+        with tempfile.TemporaryDirectory() as directory:
+            model = safetensors_model(directory, SHAPES, DENSE)
+            device = {"device": "fixture gpu", "memory_free_bytes": self.overhead + RESIDENT + 32 * 20000}
+            value = context.max_context(model, device, context.GIB, self.settings, requested=16384)
+            self.assertEqual((value["tokens"], value["bound"], value["requested"], value["note"]),
+                             (16384, "requested", 16384, None))
+            self.assertIn("requested    16,384 tokens", context.render(value))
+            value = context.max_context(model, device, context.GIB, self.settings, requested=262144)
+            self.assertEqual((value["tokens"], value["bound"]), (19456, "device"))
+            self.assertIn("the requested 262,144 tokens exceed the 19,456 tokens whose KV cache fits the device",
+                          value["note"])
+            (model / "config.json").write_text(json.dumps({**DENSE, "max_position_embeddings": 8192}))
+            value = context.max_context(model, device, context.GIB, self.settings, requested=262144)
+            self.assertEqual((value["tokens"], value["bound"]), (8192, "model"))
+            self.assertIn("exceed the model's 8,192 positions", value["note"])
+            requirement = runner.context_requirement(model, device, None, context.GIB, self.settings, 4096)
+            self.assertEqual((requirement["tokens"], requirement["bound"], requirement["source"]), (4096, "requested", "computed"))
+            given = runner.context_requirement(model, device, 8192, context.GIB, self.settings,
+                                               basis={"requested": 262144, "bound": "model", "note": "clamped"})
+            self.assertEqual((given["tokens"], given["source"], given["requested"], given["bound"]),
+                             (8192, "given", 262144, "model"))
+
+    def test_a_pass_reads_the_resident_weights_and_the_routed_experts_share(self):
+        with tempfile.TemporaryDirectory() as directory:
+            shapes = {**SHAPES, "model.layers.0.mlp.experts.1.up_proj.weight": (128, 64),
+                      "model.layers.0.mlp.experts.2.up_proj.weight": (128, 64),
+                      "model.layers.0.mlp.experts.3.up_proj.weight": (128, 64)}
+            model = safetensors_model(directory, shapes, {**DENSE, "num_experts": 4, "num_experts_per_tok": 1})
+            # Resident weights, then one of four experts; no vision tower or embedding rows.
+            self.assertEqual(context.pass_bytes(model, 1.0), RESIDENT + 128 * 64 * 2)
+            (model / "config.json").write_text(json.dumps(DENSE))   # no routing known: experts are not counted
+            self.assertEqual(context.pass_bytes(model, 1.0), RESIDENT)
+            self.assertIsNone(context.pass_bytes(Path(directory) / "missing", 1.0))
+
     def test_a_tied_output_head_keeps_the_embedding_in_device_memory(self):
         with tempfile.TemporaryDirectory() as directory:
             shapes = {name: shape for name, shape in SHAPES.items() if name != "lm_head.weight"}
@@ -967,19 +1372,15 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(context.lower_context(262144, 14000, self.settings), 65536)
         self.assertEqual(context.lower_context(8192, 72, self.settings), 2048)
         self.assertIsNone(context.lower_context(4096, 3500, self.settings))  # the longest case needs all of it
-        pieces = {"case": "c", "head_ids": [1], "tail_ids": [9], "document_ids": [2, 3]}
-        self.assertEqual(context.curve_prompt(pieces, [5, 6], 9), [1, 2, 3, 5, 6, 5, 6, 5, 9])
-        self.assertEqual(context.curve_prompt(pieces, [5, 6], 3), [1, 2, 9])
-        self.assertIsNone(context.curve_prompt(pieces, [5, 6], 2))  # no room inside the frame
 
-    def test_at_the_required_context_retrieval_shares_the_curve_prompt_up_to_its_question(self):
-        pieces = {"case": "c", "head_ids": [1], "tail_ids": [9], "document_ids": [2, 3], "retrieval_tail_ids": [7, 8, 8]}
-        retrieval = {"filler_ids": [5, 6], "facts": [{"ids": [40]}, {"ids": [41]}]}
-        curve, asked = context.required_prompts(pieces, retrieval, 12, [0.0, 0.5])
-        self.assertEqual(curve, [1, 40, 2, 3, 5, 6, 41, 5, 6, 5, 6, 9])
-        self.assertEqual(len(curve), 12)
-        self.assertEqual(asked, curve[:-1] + [7, 8, 8])   # every token up to the curve case's tail is shared
-        self.assertIsNone(context.required_prompts(pieces, retrieval, 4, [0.0, 0.5]))
+    def test_a_curve_prompt_is_the_retrieval_archive_with_its_own_request(self):
+        retrieval = {"head_ids": [1], "tail_ids": [9], "curve_tail_ids": [7, 8, 8], "filler_ids": [5, 6],
+                     "facts": [{"ids": [40]}, {"ids": [41]}]}
+        prompt = context.curve_prompt(retrieval, 14, [0.0, 0.5])
+        # The archive's head, filler with a fact at 0% and 50% of it, then the request for the facts and a summary.
+        self.assertEqual(prompt, [1, 40, 5, 6, 5, 6, 41, 5, 6, 5, 6, 7, 8, 8])
+        self.assertEqual(prompt[:-3], context.retrieval_prompt(retrieval, 12, [0.0, 0.5])[:-1])
+        self.assertIsNone(context.curve_prompt(retrieval, 6, [0.0, 0.5]))   # no room for the frame and facts
 
     def test_a_case_is_slower_at_a_lower_context_beyond_its_own_spread(self):
         def case(decode, ttft, decodes=None):
@@ -1078,54 +1479,43 @@ class ContextTests(unittest.TestCase):
 
 
 class ContextTextTests(unittest.TestCase):
-    """Long-context points replay the curve case's pinned continuation, like the speed cases."""
+    """Each long-context point asks the retrieval question, decodes the engine's own reply and judges retrieval on
+    it: one prefill of each long prompt serves both."""
 
     class Engine:
-        def __init__(self):
-            self.calls = []
+        def __init__(self, answer):
+            self.calls, self.answer = [], answer
 
         def generate(self, prompt, n, on_tokens):
-            self.calls.append(("generate", len(prompt)))
-            tokens = [7] * n
+            self.calls.append(len(prompt))
+            tokens = (self.answer + [7] * n)[:n]
             on_tokens(tokens)
             return {"tokens": tokens, "rounds": n}
 
-        def replay(self, prompt, continuation, on_tokens):
-            self.calls.append(("replay", len(prompt)))
-            on_tokens(list(continuation))
-            return {"tokens": list(continuation), "rounds": 2}
-
     prepared = {"speed": [{"id": "short", "prompt_ids": [1, 2]}, {"id": "long", "prompt_ids": [3, 4, 5, 6]}],
-                "context": {"case": "long", "head_ids": [3], "tail_ids": [6], "document_ids": [4, 5],
-                            "retrieval_tail_ids": [7]},
-                "retrieval": {"filler_ids": [8, 9], "facts": [], "token_text": []}, "stop_ids": []}
+                "retrieval": {"head_ids": [30], "tail_ids": [31], "curve_tail_ids": [7], "filler_ids": [8, 9],
+                              "facts": [{"id": "only", "ids": [40], "answer": "ab"}],
+                              "token_text": ["", "a", "b"] + [""] * 50}, "stop_ids": []}
     settings = {"output_tokens": 4, "curve_from": 16, "repetitions": 1,
-                "retrieval": {"positions": [], "output_tokens": 4}}
-    pinned = {"sha256": "ab" * 32, "engine": "fixture", "cases": {"short": [9] * 6, "long": [5, 6, 7, 8, 9, 10]}}
+                "retrieval": {"positions": [0.5], "output_tokens": 4, "points": [12]}}
 
-    def run_points(self, info, continuations):
-        engine = self.Engine()
-        points, text, asked = runner.run_context(engine, {"max_context": 64, **info}, self.prepared, self.settings, 32,
-                                                 lambda message: None, continuations)
-        # The retrieval request at the required context follows its curve point, always the engine's own output.
-        self.assertEqual((asked["status"], engine.calls[-1][0]), ("measured", "generate"))
-        return engine, points, text
-
-    def test_points_replay_the_curve_cases_pinned_text(self):
-        engine, points, text = self.run_points({"replay": True, "speculative": True}, self.pinned)
-        self.assertEqual(text["source"], "pinned")
-        self.assertEqual(text["case"], "long")
-        self.assertTrue(engine.calls and all(kind == "replay" for kind, _ in engine.calls[:-1]))
+    def test_every_point_times_its_reply_and_judges_retrieval_on_it(self):
+        engine = self.Engine([1, 2])   # "ab": the fact's answer
+        points, text, asked = runner.run_context(engine, {"max_context": 64}, self.prepared, self.settings, 32,
+                                                 lambda message: None)
+        self.assertEqual(engine.calls, [12, 28])   # the curve's 16 and 32, one request each, prompt plus output
+        self.assertEqual(text["source"], "generated")
         self.assertTrue(all(p["status"] == "measured" for p in points.values()))
-
-    def test_points_fall_back_to_own_output_without_replay_or_enough_text(self):
-        engine, _, text = self.run_points({"replay": False, "speculative": True}, self.pinned)
-        self.assertEqual(text["source"], "generated")
-        self.assertTrue(all(kind == "generate" for kind, _ in engine.calls))
-        short = {**self.pinned, "cases": {"long": [5, 6]}}
-        _, _, text = self.run_points({"replay": True, "speculative": True}, short)
-        self.assertEqual(text["source"], "generated")
-        self.assertIn("fewer than the 4", text["reason"])
+        self.assertEqual({point: verdict["passed"] for point, verdict in asked.items()}, {16: True, 32: True})
+        # The point below the curve gets a request of its own; the curve's points take their verdicts.
+        retrieval = runner.run_retrieval(engine, {"max_context": 64}, self.prepared, self.settings, 32,
+                                         lambda message: None, asked)
+        self.assertEqual(list(retrieval["points"]), ["12", "16", "32"])
+        self.assertEqual(engine.calls[2:], [8])
+        self.assertTrue(retrieval["passed"])
+        missing = runner.run_context(self.Engine([2, 1]), {"max_context": 64}, self.prepared, self.settings, 32,
+                                     lambda message: None)[2]
+        self.assertFalse(missing[32]["passed"])
 
     def test_context_decode_compares_only_on_the_same_text(self):
         pinned = {"context": {"tokens": 32, "decode_text": {"source": "pinned", "sha256": "ab" * 32}}}
@@ -1140,6 +1530,24 @@ class QualityTests(unittest.TestCase):
 
     LP = softmax_logprobs([3.0, 1.0, 0.5, 0.0])
     TOP = [7, 8, 9]
+
+    def test_the_honesty_check_replies_to_the_conversations_and_one_long_text(self):
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        texts = [{"id": text_id, "set": set_name, "prompt_ids": [1, 2, 3]} for text_id, set_name in (
+            ("tides", "conversations"), ("letter", "conversations"), ("explain-tides@32768", "long-32768"),
+            ("german-letter@32768", "long-32768"), ("explain-tides@4096", "long-4096"))]
+        replied = []
+
+        class Engine:
+            def reply(self, prompt, n, top_k):
+                return {"tokens": [5], "logprobs": [-0.5], "top": [[[5, -0.5]]]}
+
+            def score(self, prompt, continuation, top_k, prompt_rows=True):
+                replied.append(len(replied))
+                return {"continuation": [{"logprob": -0.5, "top": [[5, -0.5]]}]}
+        found = runner.run_honesty(Engine(), {}, {"quality": texts}, protocol, lambda m: None, {})
+        # Both conversations and explain-tides at 32K; not the other 32K text, nor a set outside honesty's.
+        self.assertEqual([r["id"] for r in found["replies"]], ["tides", "letter", "explain-tides@32768"])
 
     def lp(self, token):
         return self.LP[self.TOP.index(token)] if token in self.TOP else self.LP[3]
@@ -1200,10 +1608,12 @@ class QualityTests(unittest.TestCase):
         engine = self.Engine(self)
         result, current = self.measure(engine)
         quality = result["quality"]
-        # Judged: the served continuation (its first token from the prefill's last position, the rest from decode);
-        # reported: the prompt positions.
-        self.assertEqual(list(quality["sets"]), ["conversations/served", "long-600/served"])
-        self.assertEqual((quality["sets"]["conversations/served"]["targets"], quality["prompt"]["conversations"]["targets"]),
+        # Judged: the prompt positions from the prefill and the served continuation (its first token from the
+        # prefill's last position, the rest from decode).
+        self.assertEqual(list(quality["sets"]), ["conversations/prompt", "conversations/served", "long-600/prompt",
+                                                 "long-600/served"])
+        self.assertNotIn("prompt", quality)
+        self.assertEqual((quality["sets"]["conversations/served"]["targets"], quality["sets"]["conversations/prompt"]["targets"]),
                          (4 + 2, 2 + 1))
         self.assertEqual(quality["sets"]["conversations/served"]["texts"], ["a", "b"])
         self.assertTrue(all(s["passed"] and s["kld_mean"] == 0.0 and s["top1_agreement"] == 1.0
@@ -1230,19 +1640,22 @@ class QualityTests(unittest.TestCase):
         self.assertIn("long-600/served: ", gate["detail"])
         self.assertEqual(current["kpis"]["quality"]["worst_kld_mean_set"], "long-600/served")
 
-    def test_drift_at_prompt_positions_alone_is_reported_and_not_judged(self):
-        # Prompt positions' prefill logits are no request's output: their drift shows per bucket, the gate holds.
+    def test_drift_in_the_prefill_alone_fails_the_prompt_positions(self):
+        # A prefill that drifts while decode does not: every reply's first token comes from that arithmetic.
         result, current = self.measure(self.Engine(self, drift_from=520, shift=2.0, prompt_only=True))
         self.assertGreater(result["quality"]["buckets"]["long-600/prompt"]["512-1023"]["kld_mean"], 0.05)
-        self.assertGreater(result["quality"]["prompt"]["long-600"]["kld_mean"], 0.0)
-        self.assertTrue(all(s["passed"] for s in result["quality"]["sets"].values()))
-        self.assertEqual(self.gate(current)["state"], "pass")
+        sets = result["quality"]["sets"]
+        self.assertFalse(sets["long-600/prompt"]["passed"])
+        self.assertTrue(sets["long-600/served"]["passed"] and sets["conversations/prompt"]["passed"])
+        gate = self.gate(current)
+        self.assertEqual(gate["state"], "fail")
+        self.assertIn("long-600/prompt: ", gate["detail"])
 
     def test_drift_in_the_decode_path_fails_the_served_positions(self):
         result, _ = self.measure(self.Engine(self, decode_drift=0.4))
         sets = result["quality"]["sets"]
         self.assertFalse(sets["conversations/served"]["passed"] or sets["long-600/served"]["passed"])
-        self.assertEqual(result["quality"]["prompt"]["conversations"]["kld_mean"], 0.0)
+        self.assertEqual(sets["conversations/prompt"]["kld_mean"], 0.0)
 
     def test_a_scoring_path_other_than_the_serving_path_fails_the_honesty_check(self):
         result, current = self.measure(self.Engine(self, served_shift=-0.01))
@@ -1265,7 +1678,7 @@ class QualityTests(unittest.TestCase):
     def test_a_set_beyond_the_context_is_skipped_and_its_replies_not_checked(self):
         engine = self.Engine(self)
         result, current = self.measure(engine, max_context=100)
-        self.assertEqual(list(result["quality"]["sets"]), ["conversations/served"])
+        self.assertEqual(list(result["quality"]["sets"]), ["conversations/prompt", "conversations/served"])
         self.assertEqual(result["quality"]["skipped"], {"long-600": "needs 641 tokens of context"})
         self.assertEqual(len(result["quality"]["honesty"]["replies"]), 2)
         self.assertIn("skipped: long-600, needs 641 tokens of context", self.gate(current)["detail"])

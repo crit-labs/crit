@@ -21,6 +21,20 @@ def geometric_mean(values):
     return math.exp(sum(math.log(v) for v in values) / len(values)) if values else None
 
 
+def score_error(case_values):
+    """Relative standard error of a geometric mean of per-case centres, from each case's measured repetitions: the
+    spread of their logarithms over the square root of their count, combined over the cases. None when a case has
+    fewer than two. Sampled repetitions decode different texts, so this includes how much the text moves the score."""
+    terms = []
+    for values in case_values:
+        logs = [math.log(v) for v in values if v]
+        if len(logs) < 2:
+            return None
+        mean = sum(logs) / len(logs)
+        terms.append(sum((x - mean) ** 2 for x in logs) / (len(logs) - 1) / len(logs))
+    return math.sqrt(sum(terms)) / len(terms) if terms else None
+
+
 def percentile(values, fraction):
     """Nearest-rank percentile (fraction in (0, 1])."""
     values = sorted(values)
@@ -218,3 +232,154 @@ def judge(quality, thresholds):
         if value is None or value > limit:
             failures.append(f"{name} {value} > {limit}")
     return failures
+
+
+def processed_distribution(logprobs, settings):
+    """The distribution a sampler draws from at one position, over the alternatives an engine reported: their raw
+    log-probabilities, highest first (a final entry may lump the unreported tail). Temperature scales them, then
+    top_k keeps the k most likely, top_p the smallest prefix holding top_p of the mass, and min_p those at least
+    min_p times the most likely. Returns probabilities aligned with `logprobs` (0 for dropped entries)."""
+    temperature = float(settings.get("temperature") or 1.0)
+    order = sorted(range(len(logprobs)), key=lambda i: (-logprobs[i], i))
+    kept = order[:int(settings["top_k"])] if settings.get("top_k") else order
+    scaled = {i: logprobs[i] / temperature for i in kept}
+    top = max(scaled.values())
+    weights = {i: math.exp(v - top) for i, v in scaled.items()}
+    total = sum(weights.values())
+    probs = {i: w / total for i, w in weights.items()}
+    if settings.get("top_p") is not None and float(settings["top_p"]) < 1:
+        mass, prefix = 0.0, []
+        for i in kept:
+            prefix.append(i)
+            mass += probs[i]
+            if mass >= float(settings["top_p"]):
+                break
+        probs = {i: probs[i] / mass for i in prefix}
+    if settings.get("min_p"):
+        floor = float(settings["min_p"]) * max(probs.values())
+        probs = {i: p for i, p in probs.items() if p >= floor}
+        total = sum(probs.values())
+        probs = {i: p / total for i, p in probs.items()}
+    return [probs.get(i, 0.0) for i in range(len(logprobs))]
+
+
+TAIL_TOLERANCE = 1e-3  # the most the unreported tail's processed mass may be uncertain (protocol tail_tolerance)
+TOP_P_MARGIN = 1e-6    # cumulative mass this close to top_p leaves the nucleus edge to rounding
+
+
+def _tail_weight(lumped, count, ratio, temperature):
+    """Bounds of sum (q / p0) ** (1 / temperature) over unreported tokens q holding `lumped` raw mass (relative to the
+    likeliest token's p0), each at most the last reported token (`ratio` = p_last / p0), `count` of them (None:
+    unknown). Each q <= p_last bounds one side; spreading the mass evenly over `count` tokens bounds the other."""
+    if lumped <= 0:
+        return 0.0, 0.0
+    a = 1.0 / temperature
+    if a == 1.0:
+        return lumped, lumped
+    capped = lumped * ratio ** (a - 1)     # every q at p_last: the most for a > 1, the least for a < 1
+    spread = count ** (1 - a) * lumped ** a if count else None
+    if a > 1:
+        return (spread or 0.0), capped
+    return capped, (spread if spread is not None else math.inf)
+
+
+def resolved_distribution(logprobs, settings, vocab=None, tolerance=TAIL_TOLERANCE):
+    """The processed distribution at one sampled position, over the alternatives an engine reported (their raw
+    log-probabilities, the model's own before temperature and filters) plus one last entry for the unreported rest of
+    the vocabulary, or None when the reported alternatives do not determine it. Temperature scales the logits, then
+    top_k keeps the k most likely, top_p the smallest prefix holding top_p of the mass, and min_p those at least min_p
+    times the most likely. The unreported tokens are each at most as likely as the last reported one; their raw mass
+    is what the reported ones leave, and `vocab` (the vocabulary size) bounds how far it spreads. A position is
+    resolved when top_k keeps only reported tokens, or the top_p or min_p edge falls among them whatever the
+    unreported tokens hold, or the unreported tail's processed mass is known within `tolerance` of the whole
+    (temperature 1 without filters: exactly). Returns probabilities aligned with `logprobs`, then the tail's."""
+    n = len(logprobs)
+    if not n:
+        return None
+    temperature = float(settings.get("temperature") or 1.0)
+    top_k = int(settings.get("top_k") or 0)
+    top_p = float(settings["top_p"]) if settings.get("top_p") is not None else 1.0
+    min_p = float(settings.get("min_p") or 0.0)
+    order = sorted(range(n), key=lambda i: (-logprobs[i], i))
+    ranked = [float(logprobs[i]) for i in order]
+    kept = min(n, top_k) if top_k else n
+    weights = [math.exp((v - ranked[0]) / temperature) for v in ranked[:kept]]   # the likeliest weighs 1
+    p0, ratio = math.exp(ranked[0]), math.exp(ranked[-1] - ranked[0])
+    rest = max(0.0, 1.0 - sum(math.exp(v) for v in ranked))
+    low = high = 0.0
+    if not (top_k and top_k <= n) and rest > 0:
+        others = None if vocab is None else max(0, int(vocab) - n)
+        allowed = others if not top_k else min(top_k - n, others) if others is not None else top_k - n
+        # top_k beyond the reported list keeps an unknown part of the tail: from none of it to `allowed` tokens.
+        lumped_low, lumped_high = (rest, rest) if not top_k else (0.0, min(rest, allowed * math.exp(ranked[-1])))
+        low = _tail_weight(lumped_low / p0, allowed, ratio, temperature)[0]
+        high = _tail_weight(lumped_high / p0, allowed, ratio, temperature)[1]
+    if min_p and ratio ** (1 / temperature) < min_p * (1 - TOP_P_MARGIN):
+        low = high = 0.0   # every unreported token is below the min_p floor
+    total = sum(weights)
+    if top_p < 1:
+        def edge(normalizer):
+            mass = 0.0
+            for i, w in enumerate(weights):
+                mass += w / normalizer
+                if abs(mass - top_p) <= TOP_P_MARGIN:
+                    return "ambiguous"
+                if mass > top_p:
+                    return i
+            return None   # the nucleus reaches into the unreported tokens
+        first, last = edge(total + low), edge(total + high)
+        if first != last or first in (None, "ambiguous"):
+            return None
+        weights, low = weights[:first + 1], 0.0
+        high = 0.0
+        total = sum(weights)
+    if high - low > tolerance * (total + low):
+        return None
+    tail = (low + high) / 2
+    if min_p:
+        weights = [w if w >= min_p * (1 + TOP_P_MARGIN) else (None if w > min_p * (1 - TOP_P_MARGIN) else 0.0)
+                   for w in weights]
+        if None in weights:
+            return None   # a token at the min_p edge, within rounding
+    total = sum(weights) + tail
+    probs = [0.0] * n
+    for rank, w in enumerate(weights):
+        probs[order[rank]] = w / total
+    return probs + [tail / total]
+
+
+def sampling_calibration(rows, settings, seed=0, vocab=None, tolerance=TAIL_TOLERANCE):
+    """Whether sampled tokens follow the distribution the settings define (protocol sampling_check). rows: one per
+    sampled token, {"top": raw log-probabilities of the reported alternatives, "chosen": the emitted token's index
+    among them (None when it is not reported, so it is one of the unreported rest)}. At every position whose processed
+    distribution the alternatives determine (resolved_distribution) the token gets a randomized probability integral
+    transform u = (mass of the more likely alternatives, the unreported rest last) + V * p(token), V uniform: u is
+    uniform on [0, 1] exactly when every token was drawn from its processed distribution. A sampler that favours
+    likely tokens (greedy acceptance of drafts) pulls the mean of u below 1/2. Returns the judged token count, the
+    mean of u and its z-score against 1/2, the Kolmogorov-Smirnov distance from uniform, the tokens outside the
+    processed support and the positions left unresolved."""
+    import random
+    rng = random.Random(seed)
+    us, outside, unresolved = [], 0, 0
+    for row in rows:
+        top = list(row["top"])
+        probs = resolved_distribution(top, settings, vocab, tolerance) if top else None
+        if probs is None:
+            unresolved += 1
+            continue
+        chosen = row.get("chosen")
+        chosen = len(top) if chosen is None else chosen
+        if probs[chosen] <= 0:
+            outside += 1
+            continue
+        order = sorted(range(len(top)), key=lambda i: (-probs[i], i)) + [len(top)]
+        before = sum(probs[i] for i in order[:order.index(chosen)])
+        us.append(min(1.0, before + rng.random() * probs[chosen]))
+    n = len(us)
+    if not n:
+        return {"tokens": 0, "outside": outside, "unresolved": unresolved, "mean_u": None, "z": None, "ks": None}
+    mean = sum(us) / n
+    ordered = sorted(us)
+    ks = max(max((i + 1) / n - u, u - i / n) for i, u in enumerate(ordered))
+    return {"tokens": n, "outside": outside, "unresolved": unresolved, "mean_u": mean,
+            "z": (mean - 0.5) / math.sqrt(1 / (12 * n)), "ks": ks}

@@ -69,6 +69,33 @@ class RunSettingsTest(unittest.TestCase):
         limits = self.limits(output)
         self.assertEqual((limits["kv_tokens"], limits["context"]["bound"]), (65536, "model"))
 
+    def test_the_wanted_context_defaults_to_262144_and_settings_context_tokens_changes_it(self):
+        model = self.project / "model"
+        model.mkdir()
+        header = json.dumps({"lm_head.weight": {"dtype": "BF16", "shape": [64, 64], "data_offsets": [0, 8192]}}).encode()
+        (model / "model.safetensors").write_bytes(len(header).to_bytes(8, "little") + header + bytes(8192))
+        (model / "config.json").write_text(json.dumps({"num_hidden_layers": 2, "num_attention_heads": 2, "num_key_value_heads": 1,
+                                                       "head_dim": 8, "max_position_embeddings": 1_048_576}), encoding="utf-8")
+        (self.project / "device.json").write_text(json.dumps({"device": "fixture gpu", "memory_free_bytes": 8 * GIB}),
+                                                  encoding="utf-8")
+        request = {key: value for key, value in json.loads(self.request.read_text(encoding="utf-8")).items() if key != "kv_tokens"}
+        self.request.write_text(json.dumps(request | {"model_path": str(model)}), encoding="utf-8")
+        for text, tokens in (('device = "device.json"\n', 262144), ('device = "device.json"\ncontext_tokens = 32768\n', 32768)):
+            (self.project / "settings.toml").write_text(text, encoding="utf-8")
+            code, output = self.create()
+            self.assertEqual(code, 0)
+            limits = self.limits(output)
+            self.assertEqual((limits["kv_tokens"], limits["context"]["bound"], limits["context"]["requested"]),
+                             (tokens, "requested", tokens))
+        (self.project / "settings.toml").write_text('device = "device.json"\ncontext_tokens = 2000000\n', encoding="utf-8")
+        code, output = self.create()
+        context = self.limits(output)["context"]
+        self.assertEqual((self.limits(output)["kv_tokens"], context["bound"]), (1_048_576, "model"))
+        self.assertIn("the requested 2,000,000 tokens exceed the model's 1,048,576 positions", context["note"])
+        (self.project / "settings.toml").write_text('context_tokens = "big"\n', encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "context_tokens has the wrong type"):
+            load_settings(self.project)
+
     def test_context_reserve_setting_keeps_device_memory_out_of_the_kv_cache(self):
         model = self.project / "model"
         model.mkdir()

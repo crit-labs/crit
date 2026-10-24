@@ -36,7 +36,11 @@ on_tokens(tokens, rows) with one (logprob, [(token, logprob), ...n alternatives]
 scores fixed text through its serving paths sets `scores = True`, implements score_tokens() and declares
 capabilities(..., score=True) (chat-score-v1): crit serve's POST /v1/crit/score then returns, for given prompt and
 continuation ids, every prompt position's row from its prefill and every continuation token's from its decode,
-forced to the continuation.
+forced to the continuation. A speculative engine that also decodes one token per target pass, without drafting,
+sets `plain = True` and declares capabilities(..., plain=True) (chat-plain-v1): a request carrying "decode":
+"plain" then reaches generate_tokens as plain=True (Eval's exactness check on the served engine). An engine keeps
+the facts Eval's headroom reads in `facts` (engine_facts), and generate_tokens' timing may add accepted (drafts
+accepted per round), verify_ms and draft_ms for crit serve's telemetry.
 """
 from pathlib import Path
 from contextlib import contextmanager
@@ -46,6 +50,11 @@ SAMPLING = ("temperature", "top_p", "top_k", "min_p", "seed", "presence_penalty"
             "repetition_penalty", "logit_bias")
 LOGPROBS_CAPABILITY = "chat-logprobs-v1"
 SCORE_CAPABILITY = "chat-score-v1"
+PLAIN_CAPABILITY = "chat-plain-v1"
+# What a resident engine reports for Eval (crit serve's /v1/models engine_facts): whether it speculates and can decode
+# plainly, its draft width, and the bytes one model pass and one draft step read.
+ENGINE_FACTS = ("speculative", "plain", "draft_width", "bytes_per_pass", "draft_bytes_per_step", "draft_ms",
+                "kv_bytes_per_token")
 TOP_LOGPROBS = 20  # the most alternatives per token a request asks for (OpenAI's top_logprobs range)
 MIN_LOGPROB = -9999.0  # what a zero probability reads as, as OpenAI reports it (JSON has no infinity)
 
@@ -76,10 +85,10 @@ def kept_special_ids(text, tool_format=None):
 
 
 def capabilities(text, sampling=(), *, stream=True, config=True, tool_format=None, images=False, concurrent=False,
-                 logprobs=False, score=False):
+                 logprobs=False, score=False, plain=False):
     """The serving capabilities a package built on ResidentChat declares, for a model's ModelText and the package's
     own `tool_format` (ResidentChat.tool_format), if any. logprobs: the engine sets ResidentChat.logprobs; score:
-    it sets ResidentChat.scores and implements score_tokens()."""
+    it sets ResidentChat.scores and implements score_tokens(); plain: it sets ResidentChat.plain."""
     unknown = sorted(set(sampling) - set(SAMPLING))
     if unknown:
         raise ValueError("Unknown sampling fields: " + ", ".join(unknown))
@@ -90,9 +99,31 @@ def capabilities(text, sampling=(), *, stream=True, config=True, tool_format=Non
     result += ["chat-concurrent-v1"] if concurrent else []
     result += [LOGPROBS_CAPABILITY] if logprobs else []
     result += [SCORE_CAPABILITY] if score else []
+    result += [PLAIN_CAPABILITY] if plain else []
     if tool_format is not None or template_tool_format(text):
         result += ["chat-tools-v1"] + (["chat-tool-stream-v1"] if stream else [])
     return result + [sampling_capability(name) for name in SAMPLING if name in sampling]
+
+
+def engine_facts(engine):
+    """The ENGINE_FACTS a resident engine holds in its `facts` (crit_core.native's engines hold their info there):
+    booleans for speculative and plain, non-negative finite numbers for the rest; plain only on a speculative engine
+    that sets `plain`. None when it reports none."""
+    import math
+    found = getattr(engine, "facts", None)
+    if not isinstance(found, dict):
+        return None
+    out = {}
+    for key in ENGINE_FACTS:
+        value = found.get(key)
+        if key in ("speculative", "plain"):
+            if isinstance(value, bool):
+                out[key] = value
+        elif isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+            out[key] = value
+    if "plain" in out:
+        out["plain"] = bool(out["plain"] and out.get("speculative") and getattr(engine, "plain", False))
+    return out or None
 
 
 def logprob_row(token, row, alternatives):
@@ -139,6 +170,7 @@ class ResidentChat:
     sampling = ()
     logprobs = False
     scores = False
+    plain = False
     tool_format = None
     reasoning_format = None
     images = False
@@ -180,7 +212,10 @@ class ResidentChat:
         passes after prefill, a speculative engine's verify rounds; crit serve reports output tokens per round).
         An engine with `logprobs` also takes logprobs=n when the request asks for them and then calls
         on_tokens(tokens, rows): per token (logprob, [(token, logprob), ...]) with its n most likely alternatives,
-        ranked, natural-log probabilities of the raw logits (crit::core::TokenLogprob)."""
+        ranked, natural-log probabilities of the raw logits (crit::core::TokenLogprob). An engine with `plain` also takes
+        plain=True when the request asks for plain decoding: one token per target pass, no drafting. timing may add
+        accepted (drafts accepted in each round), verify_ms and draft_ms (device time in verify passes and draft
+        steps), which crit serve reports in its telemetry."""
         raise NotImplementedError
 
     def score_tokens(self, ids, continuation, top_k, cancelled, prompt_rows):
@@ -264,6 +299,11 @@ class ResidentChat:
         alternatives = request.get("logprobs")
         if alternatives is not None and not self.logprobs:
             raise ValueError("This engine does not report log-probabilities")
+        plain = request.get("decode") == "plain"
+        if request.get("decode") not in (None, "plain"):
+            raise ValueError("decode must be plain")
+        if plain and not self.plain:
+            raise ValueError("This engine does not decode plainly (plain)")
         if alternatives is not None and not (type(alternatives) is int and 0 <= alternatives <= TOP_LOGPROBS):
             raise ValueError(f"logprobs must be an integer in [0, {TOP_LOGPROBS}]")
         calls_format, reply = None, None
@@ -319,6 +359,8 @@ class ResidentChat:
                 route(part)
 
         options = {} if alternatives is None else {"logprobs": alternatives}
+        if plain:
+            options["plain"] = True
         tokens, timing = self.generate_prepared(prompt, output_tokens, sampling, on_tokens, cancellation.is_set,
                                                 **options)
         if tokens is None:
@@ -343,6 +385,11 @@ class ResidentChat:
             telemetry["missing"]["decode"] = "the reply has a single token"
         elif timing.get("rounds"):
             telemetry["decode_rounds"] = min(int(timing["rounds"]), n)
+            if isinstance(timing.get("accepted"), list) and len(timing["accepted"]) == telemetry["decode_rounds"]:
+                telemetry["accepted"] = [int(a) for a in timing["accepted"]]
+        if n > 1:
+            telemetry.update({key: float(timing[key]) for key in ("verify_ms", "draft_ms")
+                              if isinstance(timing.get(key), (int, float)) and not isinstance(timing[key], bool)})
         logprobs = None
         if rows is not None:
             # Each token named once by its bytes, so the server can give clients token text and bytes.
@@ -404,7 +451,7 @@ class ResidentChat:
         pass
 
 
-__all__ = ["ResidentChat", "PreparedPrompt", "SAMPLING", "LOGPROBS_CAPABILITY", "SCORE_CAPABILITY", "TOP_LOGPROBS",
-           "capabilities",
+__all__ = ["ResidentChat", "PreparedPrompt", "SAMPLING", "LOGPROBS_CAPABILITY", "SCORE_CAPABILITY", "PLAIN_CAPABILITY",
+           "ENGINE_FACTS", "TOP_LOGPROBS", "capabilities", "engine_facts",
            "chat_prompt", "kept_special_ids", "logprob_row", "special_marker_ids", "sampling_capability",
            "template_tool_format"]

@@ -276,6 +276,11 @@ class EvalEngine:
             self.replay = self._replay
         if self.speculative and self.facts.get("plain"):
             self.generate_plain = self._generate_plain
+        # Eval's sampled suite (crit-eval-v7): the engine samples at the settings Eval names, applying these fields.
+        support = self.facts.get("sampling") or {}
+        self.sampling_fields = {key for key in SAMPLING if support.get(PENALTY if key in PENALTIES else key)}
+        if support.get("temperature"):
+            self.generate_sampled = self._generate_sampled
 
     def info(self):
         info = {"name": self.facts.get("name") or self.facts["implementation"], "configuration": self.configuration,
@@ -294,6 +299,26 @@ class EvalEngine:
         tokens, result = self.native.generate(list(prompt_ids), int(max_new_tokens), stop_tokens=[],
                                               sampling=self.sampling, on_tokens=on_tokens)
         return self._result(tokens, result)
+
+    def _generate_sampled(self, prompt_ids, max_new_tokens, on_tokens, sampling, logprobs=None):
+        """A sampled request; with logprobs n, the emitted token's log-probability and n alternatives per token, when
+        the engine reports them (token_logprobs, max_top_logprobs). Fields the engine does not apply
+        (sampling_fields) are left out; Eval sends such fields only at their neutral values."""
+        sampling = {key: value for key, value in sampling.items() if key in self.sampling_fields}
+        rows = []
+        reports = logprobs and self.facts.get("token_logprobs") and int(self.facts.get("max_top_logprobs", 0)) >= logprobs
+
+        def deliver(tokens, found=None):
+            on_tokens(tokens)
+            if found:
+                rows.extend(zip(tokens, found))
+        tokens, result = self.native.generate(list(prompt_ids), int(max_new_tokens), stop_tokens=[], sampling=dict(sampling),
+                                              logprobs=logprobs if reports else None, on_tokens=deliver)
+        out = self._result(tokens, result)
+        if reports:
+            out["logprobs"] = [{"token": token, "logprob": logprob, "top": [list(pair) for pair in top]}
+                               for token, (logprob, top) in rows]
+        return out
 
     def _generate_plain(self, prompt_ids, max_new_tokens, on_tokens):
         # One target pass per token after the first; the engine's request facts describe drafting, so none apply.
@@ -317,8 +342,10 @@ class ResidentEngine(ResidentChat):
     seed, penalties, logit_bias}), and token log-probabilities (chat-logprobs-v1) when its info reports
     token_logprobs with max_top_logprobs of at least 20. It scores fixed text (chat-score-v1) when the engine also
     declares query_scoring and replay: the prompt by query scoring with the engine's own top-k on its "prefill" score
-    path (the default path when it names none), the continuation by replay with log-probabilities.
-    Configuration "chat_template_kwargs" passes variables to the chat template."""
+    path (the default path when it names none), the continuation by replay with log-probabilities. A speculative
+    engine that declares plain decodes plainly on request (chat-plain-v1), and its info is the resident engine's
+    `facts` (crit_core.serving.engine_facts). Configuration "chat_template_kwargs" passes variables to the chat
+    template."""
 
     def __init__(self, context, library, defaults=None):
         configuration = {**(defaults or {}), **(context.configuration or {})}
@@ -339,6 +366,7 @@ class ResidentEngine(ResidentChat):
         self.logprobs = bool(self.facts.get("token_logprobs")
                              and int(self.facts.get("max_top_logprobs", 0)) >= TOP_LOGPROBS)
         self.scores = bool(self.logprobs and self.facts.get("query_scoring") and self.facts.get("replay"))
+        self.plain = bool(self.facts.get("speculative") and self.facts.get("plain"))
 
     def create_request(self, request):
         # Share only the immutable tokenizer/configuration and the synchronized native
@@ -353,16 +381,20 @@ class ResidentEngine(ResidentChat):
         child.__dict__.pop("_thinking", None)
         return child
 
-    def generate_tokens(self, ids, max_new_tokens, sampling, on_tokens, cancelled, logprobs=None):
+    def generate_tokens(self, ids, max_new_tokens, sampling, on_tokens, cancelled, logprobs=None, plain=False):
         tokens, result = self.native.generate(ids, max_new_tokens, on_tokens=on_tokens, sampling=sampling,
-                                              logprobs=logprobs, cancelled=cancelled)
+                                              logprobs=logprobs, plain=plain, cancelled=cancelled)
         if tokens is None:
             return None, {}
         timing = result["timing"]
-        return tokens, {"prefill_tokens": timing["prefill_tokens"] - timing["reused_prompt_tokens"],
-                        "prefill_ms": timing["prefill_ms"], "decode_ms": timing["decode_ms"],
-                        "first_token_ms": timing["first_token_ms"],
-                        "rounds": decode_rounds(tokens, result, bool(self.facts.get("speculative")))}
+        out = {"prefill_tokens": timing["prefill_tokens"] - timing["reused_prompt_tokens"],
+               "prefill_ms": timing["prefill_ms"], "decode_ms": timing["decode_ms"],
+               "first_token_ms": timing["first_token_ms"],
+               "rounds": decode_rounds(tokens, result, bool(self.facts.get("speculative")) and not plain)}
+        if not plain:
+            # The engine's request facts describe drafting, which plain decoding does none of.
+            out.update({key: result[key] for key in ("accepted", "verify_ms", "draft_ms") if key in result})
+        return tokens, out
 
     def score_tokens(self, ids, continuation, top_k, cancelled, prompt_rows):
         started = time.monotonic()

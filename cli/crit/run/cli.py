@@ -10,7 +10,7 @@ from .records import exploratory_reason, ineligibility, read_json, safe_path
 from .store import ROOT, RunStore
 
 SETTINGS = {"wsl_run_root": str, "ram_headroom_gib": (int, float), "vram_headroom_gib": (int, float),
-            "context_reserve_gib": (int, float), "device": str}
+            "context_reserve_gib": (int, float), "device": str, "context_tokens": int}
 
 
 def load_settings(project):
@@ -123,8 +123,8 @@ def main(argv=None):
             settings = load_settings(args.project)
             if isinstance(payload, dict):
                 # Request values win; the run records the headroom it actually used.
-                filled = {key: settings[key] for key in ("ram_headroom_gib", "vram_headroom_gib", "context_reserve_gib")
-                          if key in settings}
+                filled = {key: settings[key] for key in ("ram_headroom_gib", "vram_headroom_gib", "context_reserve_gib",
+                                                         "context_tokens") if key in settings}
                 if "device" in settings:
                     # This machine's probe result: the run is built for Eval's max context on it.
                     device = Path(settings["device"]).expanduser()

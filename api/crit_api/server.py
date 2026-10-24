@@ -1,9 +1,12 @@
 """OpenAI-compatible HTTP endpoints over one ServedEngine (standard library and crit_core only)."""
+import array
+import base64
 import functools
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
 import json
 import re
+import sys
 import time
 import uuid
 
@@ -15,8 +18,8 @@ from .disconnect import ClientDisconnect
 from .delivery import StreamDelivery
 from .engine import CONSTRAINTS_CAPABILITY, EngineError
 from .logprobs import logprob_options
-from .options import (RequestError, SAMPLING, TOOLS_CAPABILITY, TOOL_STREAM_CAPABILITY, complete_arguments, require,
-                      sampling_capability, sampling_options, tool_calls, tool_options)
+from .options import (RequestError, SAMPLING, TOOLS_CAPABILITY, TOOL_STREAM_CAPABILITY, complete_arguments, crit_options,
+                      require, sampling_capability, sampling_options, tool_calls, tool_options)
 
 MAX_BODY = 8 * 1024 * 1024
 MAX_STOPS = 4
@@ -27,7 +30,8 @@ UNSUPPORTED = {"functions": "legacy function calls (use tools)",
                "function_call": "function calls", "audio": "audio output",
                "reasoning_effort": "reasoning effort", "prediction": "predicted output", "modalities": "modalities"}
 KNOWN = {"model", "messages", "stream", "stream_options", "max_tokens", "max_completion_tokens", "stop", "n",
-         "response_format", "tools", "tool_choice", "parallel_tool_calls", "logprobs", "top_logprobs"} | SAMPLING
+         "response_format", "tools", "tool_choice", "parallel_tool_calls", "logprobs", "top_logprobs", "crit"} | SAMPLING
+SCORE_FORMATS = ("json", "packed")
 
 
 def content_text(content, index, capabilities=()):
@@ -170,6 +174,21 @@ def response_format(value):
     return {"type": "json_schema", "name": name, "schema": spec["schema"], "grammar": grammar}
 
 
+def packed_rows(rows, alternatives):
+    """Score rows [token, logprob, [[token, logprob], ...]] in a score request's "packed" format: base64 of
+    little-endian arrays, the tokens and alternative tokens int32, the log-probabilities float32, the alternatives
+    row by row (count x alternatives)."""
+    def encoded(typecode, values):
+        data = array.array(typecode, values)
+        if sys.byteorder != "little":
+            data.byteswap()
+        return base64.b64encode(data.tobytes()).decode("ascii")
+    return {"count": len(rows), "alternatives": alternatives,
+            "tokens": encoded("i", [row[0] for row in rows]), "logprobs": encoded("f", [row[1] for row in rows]),
+            "top_tokens": encoded("i", [pair[0] for row in rows for pair in row[2]]),
+            "top_logprobs": encoded("f", [pair[1] for row in rows for pair in row[2]])}
+
+
 def conforms(constraint, text):
     """Whether a complete reply belongs to the constraint's language (Core's host checks)."""
     data = text.encode("utf-8")
@@ -188,11 +207,13 @@ class Api:
 
     def score_request(self, body):
         """A fixed-text score request (chat-score-v1, POST /v1/crit/score): {"model", "prompt_ids",
-        "continuation_ids", "top_logprobs", "prompt_rows"}, ids as the model's tokenizer numbers them; prompt_rows
-        false (default true) returns no prompt rows."""
+        "continuation_ids", "top_logprobs", "prompt_rows", "format"}, ids as the model's tokenizer numbers them;
+        prompt_rows false (default true) returns no prompt rows; format "packed" (default "json") returns each part's
+        rows as packed arrays (packed_rows)."""
         if not isinstance(body, dict):
             raise RequestError("The request body must be a JSON object")
-        unknown = sorted(set(body) - {"model", "prompt_ids", "continuation_ids", "top_logprobs", "prompt_rows"})
+        unknown = sorted(set(body) - {"model", "prompt_ids", "continuation_ids", "top_logprobs", "prompt_rows",
+                                      "format"})
         if unknown:
             raise RequestError("Unknown score parameter " + unknown[0], param=unknown[0])
         candidate = self.candidate(body.get("model"))
@@ -208,8 +229,11 @@ class Api:
         prompt_rows = body.get("prompt_rows", True)
         if type(prompt_rows) is not bool:
             raise RequestError("prompt_rows must be a boolean", param="prompt_rows")
+        if body.get("format", "json") not in SCORE_FORMATS:
+            raise RequestError("format must be json or packed", param="format")
         return {"model": body.get("model") or self.model, "candidate": candidate, "prompt_ids": body["prompt_ids"],
-                "continuation_ids": body.get("continuation_ids", []), "top_logprobs": top, "prompt_rows": prompt_rows}
+                "continuation_ids": body.get("continuation_ids", []), "top_logprobs": top, "prompt_rows": prompt_rows,
+                "format": body.get("format", "json")}
 
     def completion_request(self, body):
         if not isinstance(body, dict):
@@ -230,6 +254,7 @@ class Api:
             # The turn is cancelled where a stop string completes, before the engine reports its tokens.
             raise RequestError("Stop strings cannot be combined with logprobs", param="stop")
         tools = tool_options(body, capabilities)
+        decode = crit_options(body.get("crit"), capabilities)
         constraint = response_format(body.get("response_format"))
         if constraint and CONSTRAINTS_CAPABILITY not in self.engine.spec(candidate)["capabilities"]:
             raise RequestError(f"This engine cannot apply response_format {constraint['type']}: its package does not "
@@ -254,7 +279,7 @@ class Api:
                 "messages": messages, "max_tokens": limit, "stream": bool(body.get("stream")),
                 "include_usage": bool(options.get("include_usage")), "stop": stops(body.get("stop")),
                 "response_format": constraint, "sampling": sampling, "tool_options": tools, "logprobs": logprobs,
-                "ignored": ignored}
+                "decode": decode, "ignored": ignored}
 
     def candidate(self, model):
         """The candidate a request's model names: RUN_ID/CANDIDATE_ID or a bare candidate ID. Any other name (clients
@@ -283,7 +308,9 @@ class Api:
                           "context_length": spec["limits"]["kv_tokens"], "default": default,
                           "capabilities": spec["capabilities"],
                           "supported_sampling_parameters": sorted(k for k in SAMPLING if sampling_capability(k)
-                                                                  in spec["capabilities"])})
+                                                                  in spec["capabilities"]),
+                          # What Eval's headroom and exactness read, while this candidate's engine is loaded.
+                          "engine_facts": self.engine.facts(candidate["candidate_id"])})
         return cards
 
     def usage(self, measured):
@@ -334,7 +361,8 @@ class Api:
                                                                sampling=request["sampling"], tool_options=request["tool_options"],
                                                                on_tools=emit_tools if tool_incremental else None,
                                                                on_reasoning=reasoned if request["stream"] else None,
-                                                               on_started=on_started, logprobs=request.get("logprobs"))
+                                                               on_started=on_started, logprobs=request.get("logprobs"),
+                                                               decode=request.get("decode"))
         except (ValueError, OSError) as exc:
             raise EngineError(str(exc)) from exc
         if status == "completed":
@@ -375,7 +403,7 @@ class Api:
         if measured is None:
             return None
         return {key: measured[key] for key in ("prompt_tokens", "output_tokens", "prefill_tps", "decode_tps", "ttft_ms",
-                                               "tokens_per_round") if key in measured}
+                                               "tokens_per_round", "accepted", "verify_ms", "draft_ms") if key in measured}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -505,6 +533,9 @@ class Handler(BaseHTTPRequestHandler):
         if status != "completed":
             return self.error(504 if status == "timed_out" else 499, "Request " + status.replace("_", " "),
                               "server_error")
+        if request["format"] == "packed":
+            scored = {"format": "packed",
+                      **{part: packed_rows(rows, request["top_logprobs"]) for part, rows in scored.items()}}
         self.send_json(200, {"object": "crit.score", "model": request["model"],
                              "system_fingerprint": self.api.engine.spec(request["candidate"])["package_sha256"][:16],
                              **scored, "crit_telemetry": telemetry})

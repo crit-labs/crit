@@ -58,6 +58,26 @@ class ResidentChatTests(unittest.TestCase):
         engine.generate_tokens = decode
         self.assertNotIn("decode_rounds", engine.generate(request(), threading.Event())["telemetry"])
 
+    def test_plain_decoding_and_draft_telemetry_reach_the_decoder_and_the_telemetry(self):
+        engine = Decoder(self.context, self.model)
+        seen = []
+
+        def decode(ids, max_new_tokens, sampling, on_tokens, cancelled, plain=False):
+            seen.append(plain)
+            tokens, timing = Decoder.generate_tokens(engine, ids, max_new_tokens, sampling, on_tokens, cancelled)
+            return tokens, dict(timing, rounds=2, accepted=[1, 0], verify_ms=1.25, draft_ms=0.5)
+        engine.generate_tokens = decode
+        with self.assertRaisesRegex(ValueError, "does not decode plainly"):
+            engine.generate(request(decode="plain"), threading.Event())
+        engine.plain = True
+        found = engine.generate(request(decode="plain"), threading.Event())["telemetry"]
+        self.assertEqual(seen, [True])
+        self.assertEqual((found["accepted"], found["verify_ms"], found["draft_ms"]), ([1, 0], 1.25, 0.5))
+        engine.generate(request(), threading.Event())
+        self.assertEqual(seen, [True, False])
+        with self.assertRaisesRegex(ValueError, "decode must be plain"):
+            engine.generate(request(decode="greedy"), threading.Event())
+
     def test_capabilities_follow_the_template_and_the_decoder(self):
         engine = Decoder(self.context, self.model)
         self.assertEqual(capabilities(engine.text, Decoder.sampling),

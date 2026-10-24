@@ -44,6 +44,9 @@ def main(argv=None):
     run.add_argument("--context", type=int, metavar="TOKENS",
                      help="Context (prompt plus output) every engine is built and measured for: the run's kv_tokens. "
                           "Default: Eval's max context for the model on the --device")
+    run.add_argument("--requested-context", type=int, metavar="TOKENS", default=None,
+                     help="The longest request wanted, which caps the max context Eval computes without --context "
+                          "(default: settings.toml context_tokens, else 262,144)")
     run.add_argument("--context-reserve-gib", type=float, default=None,
                      help="Device memory kept out of the KV cache when Eval computes the max context: activations, "
                           "workspaces, graphs and speed techniques (default: settings.toml context_reserve_gib, else the "
@@ -63,6 +66,8 @@ def main(argv=None):
     context.add_argument("--context-reserve-gib", type=float, default=None,
                          help="Device memory kept out of the KV cache for workspaces and speed techniques "
                               "(default: settings.toml context_reserve_gib, else the protocol's reserve_gib)")
+    context.add_argument("--requested-context", type=int, metavar="TOKENS", default=None,
+                         help="The longest request wanted (default: settings.toml context_tokens, else 262,144)")
     context.add_argument("--json", action="store_true", help="Print the computation as JSON")
 
     probe = subs.add_parser("probe", help="Measure device bandwidth and GEMM rates per weight format (needs nvcc)")
@@ -78,6 +83,10 @@ def main(argv=None):
     prepare = subs.add_parser("prepare", help="Freeze the suite as token ids for one model")
     prepare.add_argument("--model", required=True)
     prepare.add_argument("--data", required=True)
+    prepare.add_argument("--sampling", metavar="NAME=VALUE,...",
+                         help="The user's sampling for the sampled speed suite in place of the model's "
+                              "generation_config.json, e.g. temperature=0.6,top_p=0.95,top_k=20 (temperature "
+                              "required; top_p, top_k, min_p optional). Results record and label it as an override")
 
     reference = subs.add_parser("reference", help="Score the prepared quality texts once on the checkpoint they were "
                                                   "prepared from and store the scores under the data (torch + "
@@ -151,8 +160,12 @@ def _command(args):
         return 0
     if args.command == "prepare":
         from .prepare import prepare as do_prepare
-        prepared = do_prepare(args.model, args.data)
+        try:
+            prepared = do_prepare(args.model, args.data, sampling=args.sampling)
+        except ValueError as error:
+            raise SystemExit(f"crit eval prepare: {error}")
         print(f"prepared {len(prepared['speed'])} speed cases and {len(prepared['quality'])} quality texts in {args.data}")
+        print(f"sampled suite: {prepared['sampling']} ({prepared['sampling_source'].replace('_', ' ')})")
         print(f"quality: score them once on the checkpoint: crit eval reference --model {args.model} --data {args.data}")
         return 0
     if args.command == "reference":
@@ -165,7 +178,7 @@ def _command(args):
         from . import load_json as load
         from .context import GIB, max_context, render as render_context
         settings = context_settings(load(Path(__file__).resolve().parents[1] / "protocol.json")["context"], args)
-        value = max_context(args.model, load(args.device), headroom_gib(args) * GIB, settings)
+        value = max_context(args.model, load(args.device), headroom_gib(args) * GIB, settings, requested(args))
         print(json.dumps(value, indent=1) if args.json else render_context(value))
         return 0 if value["tokens"] else 1
     if args.command == "compare":
@@ -218,7 +231,7 @@ def _command(args):
     result = do_run(args.adapter, args.model, data, args.out, json.loads(args.config), parts,
                     args.warmups, args.repetitions, args.label, bandwidth_gbs=args.bandwidth, device=device,
                     baseline=baseline, quality_budget=json.loads(args.quality_budget) if args.quality_budget else None,
-                    exactness=args.exactness, context_tokens=args.context,
+                    exactness=args.exactness, context_tokens=args.context, requested_context=requested(args),
                     vram_headroom_bytes=round(headroom_gib(args) * (1 << 30)),
                     context_reserve_bytes=round(reserve_gib(args) * (1 << 30)) if reserve_gib(args) is not None else None,
                     abort_disturbed=not args.keep_disturbed, url=args.url, served_model=args.served_model)
@@ -240,6 +253,12 @@ def reserve_gib(args):
     """--context-reserve-gib, else settings.toml's context_reserve_gib, else None (the protocol's reserve)."""
     from . import machine_settings
     return args.context_reserve_gib if args.context_reserve_gib is not None else machine_settings().get("context_reserve_gib")
+
+
+def requested(args):
+    """--requested-context, else settings.toml's context_tokens, else 262,144."""
+    from . import requested_context
+    return args.requested_context if args.requested_context is not None else requested_context()
 
 
 def context_settings(settings, args):

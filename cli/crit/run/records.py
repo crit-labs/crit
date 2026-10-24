@@ -337,9 +337,10 @@ def verify_inventory(root, rows, exclude=()):
         raise ValueError("Retained artifact bytes differ from manifest")
 
 
-def eval_max_context(model, device, vram_headroom_bytes, reserve_bytes=None):
-    """Eval's max context (eval/crit_eval/context.py) for MODEL on DEVICE, a `crit eval probe` result. reserve_bytes
-    replaces the protocol's reserve (device memory kept out of the KV cache for workspaces and speed techniques)."""
+def eval_max_context(model, device, vram_headroom_bytes, reserve_bytes=None, requested=None):
+    """Eval's max context (eval/crit_eval/context.py) for MODEL on DEVICE, a `crit eval probe` result, capped at the
+    requested context. reserve_bytes replaces the protocol's reserve (device memory kept out of the KV cache for
+    workspaces and speed techniques)."""
     from crit_eval import EVAL_DIR
     from crit_eval.context import max_context
     protocol = EVAL_DIR / "protocol.json"
@@ -348,25 +349,29 @@ def eval_max_context(model, device, vram_headroom_bytes, reserve_bytes=None):
     settings = json.loads(protocol.read_text(encoding="utf-8"))["context"]
     if reserve_bytes is not None:
         settings = {**settings, "reserve_gib": reserve_bytes / GIB}
-    return max_context(model, device, vram_headroom_bytes, settings)
+    return max_context(model, device, vram_headroom_bytes, settings, requested)
 
 
 def kv_capacity(data, model, vram_headroom_bytes, reserve_bytes=None):
     """The run's KV capacity in tokens of prompt plus output, and what it rests on. An explicit kv_tokens
     is taken as given. Otherwise the request names its device (a `crit eval probe` result) and the run is
-    built for Eval's max context: the model's positions, capped by the KV cache that fits on the device."""
+    built for Eval's max context: the context the user wants (context_tokens, from settings.toml; default 262,144),
+    capped by the model's positions and the KV cache that fits on the device."""
     if "kv_tokens" in data:
         return number(data["kv_tokens"], "KV cache", 1, KV_TOKENS_MAX, integer=True), None
     if "device" not in data:
         raise ValueError("Request needs device (a crit eval probe result, so the run is built for Eval's max context) "
                          "or an explicit kv_tokens")
     device = Path(text(data["device"], "Device file")).expanduser().resolve()
-    value = eval_max_context(model, read_json(device), vram_headroom_bytes, reserve_bytes)
+    from crit_eval import DEFAULT_CONTEXT_TOKENS
+    requested = number(data.get("context_tokens", DEFAULT_CONTEXT_TOKENS), "context_tokens", 1, KV_TOKENS_MAX, integer=True)
+    value = eval_max_context(model, read_json(device), vram_headroom_bytes, reserve_bytes, requested)
     if not value["tokens"]:
         raise ValueError("Eval cannot derive the max context: " + (value["reason"] or "; ".join(value["missing"])))
     tokens, bound = min(value["tokens"], KV_TOKENS_MAX), value["bound"] if value["tokens"] <= KV_TOKENS_MAX else "crit"
     basis = value.get("basis") or {}
-    context = {"source": "eval", "bound": bound, "model_limit": value["model_limit"],
+    context = {"source": "eval", "bound": bound, "requested": requested,
+               **({"note": value["note"]} if value.get("note") else {}), "model_limit": value["model_limit"],
                "model_limit_source": value["model_limit_source"], "device_limit": value["device_limit"],
                "kv_precision": value["kv_precision"], "kv_bytes_per_token": value["kv_bytes_per_token"],
                **{key: basis[key] for key in ("device", "memory_free_bytes", "memory_total_bytes", "reserve_bytes",
@@ -378,9 +383,9 @@ def kv_capacity(data, model, vram_headroom_bytes, reserve_bytes=None):
 
 def request_spec(data):
     keys(data, {"model_path", "correctness_criteria"}, {"kv_tokens", "device", "vram_headroom_gib", "ram_headroom_gib",
-         "context_reserve_gib",
+         "context_reserve_gib", "context_tokens",
          "budget_minutes", "workload", "cases", "benchmark_protocol", "targets", "verification_level", "attempt_limit",
-         "weights_policy", "candidate_budget", "quality_budget", "exactness"})
+         "weights_policy", "candidate_budget", "quality_budget", "exactness", "eval_sampling"})
     path = Path(text(data["model_path"], "Model path")).expanduser().resolve()
     if not path.exists():
         raise ValueError("Model path does not exist on this computer")
@@ -416,9 +421,20 @@ def request_spec(data):
                             **({"quality_budget": data["quality_budget"]} if "quality_budget" in data else {}),
                             **({"exactness": data["exactness"]} if "exactness" in data else {})},
             "objectives": {"targets": targets, "verification_level": level},
-            "resource_limits": resource_limits(data)}
+            "resource_limits": resource_limits(data),
+            **({"eval_sampling": eval_sampling(data["eval_sampling"])} if "eval_sampling" in data else {})}
     validate_spec(spec)
     return spec
+
+
+def eval_sampling(value):
+    """The user's override of the sampling Eval's sampled suite measures, for the whole run: {"settings": {temperature,
+    and any of top_p, top_k, min_p} or "temperature=0.6,top_p=0.95", "approved_by": who asked for it}. Without it
+    Eval measures at the model's own sampling; the engine builder never sets it."""
+    keys(value, {"settings", "approved_by"})
+    text(value["approved_by"], "eval_sampling approved_by", 400)
+    from crit_eval.prepare import sampling_override
+    return {"settings": sampling_override(value["settings"]), "approved_by": value["approved_by"]}
 
 
 def resource_limits(data):
@@ -452,7 +468,10 @@ def validate_workload(value):
 
 
 def validate_spec(value):
-    keys(value, {"model_path", "hardware_constraints", "cases", "benchmark_protocol", "correctness", "objectives", "resource_limits"})
+    keys(value, {"model_path", "hardware_constraints", "cases", "benchmark_protocol", "correctness", "objectives", "resource_limits"},
+         {"eval_sampling"})
+    if "eval_sampling" in value and eval_sampling(value["eval_sampling"]) != value["eval_sampling"]:
+        raise ValueError("eval_sampling is not in its validated form")
     if not Path(text(value["model_path"], "model locator")).is_absolute():
         raise ValueError("Model locator requires an absolute local path")
     hardware = value["hardware_constraints"]

@@ -34,11 +34,15 @@ Results report facts; Eval does not classify or rank. The builder reasons from t
   whatever the engine served from a prompt cache (prompt_cache); the
   engine serves a request at the required context, answers facts placed at the start, middle
   and end of long prompts up to it verbatim (retrieval) and is not slower at a lower context;
-  with `--exactness required`, speculative output equals plain greedy; against a baseline, the
+  with `--exactness required`, speculative output equals plain greedy; sampled tokens follow the
+  model's sampling distribution ([sampling](MEASUREMENTS.md#sampling-check)); against a baseline, the
   held-out prompts keep up (generality). A failing gate blocks qualification whatever the speed.
 - **Goals and KPIs:** decode, prefill, time to first token and the long-context scores, each
   against its physical [limit](MEASUREMENTS.md#limits); quality as the share of the drift budget
-  the worst set uses. All goals hold at once for the next candidate.
+  the worst set uses. Eval states each goal with the fraction of its limit reached and its run-to-run
+  spread, and leaves their order to the run (`crit run`). From crit-eval-v7 the decode KPI,
+  its goal and the stop record's decode are the [sampled decode](MEASUREMENTS.md#sampled-speed), at the
+  model's own sampling, with the greedy decode reported next to it.
 - **Gaps:** what each term (model pass, draft steps, draft width, drafter acceptance, prefill,
   TTFT) would give at its floor, plus missing inputs that hide a limit.
 
@@ -82,6 +86,11 @@ the tensors.
 ```text
 crit eval prepare --model ~/models/Qwen3.5-27B-IQ3_S.gguf --data DATA
 ```
+
+The sampled speed suite runs at the model's own sampling defaults. A user who wants another
+sampling measured passes it at prepare, `--sampling temperature=0.6,top_p=0.95,top_k=20`, and every
+result from that data records and labels it as an override
+([Sampled speed](MEASUREMENTS.md#sampled-speed)).
 
 From a Hugging Face GGUF repository, download the one quantization you want and point at that
 file: a folder with several quantizations holds several models and is refused.
@@ -149,7 +158,11 @@ read and decode only the rows they need, by parallel reads of exactly their byte
 NVFP4 tables, including a sharded table with one scale), so a hashed n-gram table larger than
 host memory is never built. Experts
 run transformers' eager per-expert loop. The long prompts use chunked attention with boolean
-masks only where the modeling code needs one (for example a sparse-attention indexer).
+masks only where the modeling code needs one (for example a sparse-attention indexer). Where
+modeling code loops in Python over every token, the reference binds a form that computes the same
+at once, only to the code it was checked against ([indexers.py](../../eval/crit_eval/indexers.py):
+qwen4_exp's sparse-attention indexer, which pools every complete key block once instead of once per
+query; floating-point ties at its top-k edge are left to the device, as in the loop).
 
 `reference` scores every position of every prepared quality text (a conversation's prompt
 followed by its written answer) once per model, suite and reference version, and stores per
@@ -183,6 +196,10 @@ in the same Eval say it should (`requests.timeout`: prefill time grows at most q
 the prompt, a decode step at most linearly with the context), and a request past that stops the
 Eval as hung.
 
+The greedy cases send `temperature: 0`; the [sampled speed](MEASUREMENTS.md#sampled-speed) cases send the
+model's own sampling (`temperature`, `top_p`, `top_k`, `min_p`) and a `seed`, and the sampling check asks
+for `logprobs` and `top_logprobs` on its streamed replies.
+
 Every prompt goes as the chat messages and tools `prepare` froze next to its token ids, and the
 server applies its own chat template: the speed cases, held-out prompts, request history, the
 long-context curve and retrieval. Prompt and output lengths are the server's `usage` counts,
@@ -194,8 +211,14 @@ timed request: a reply whose usage reports cached prompt tokens
 alone, may be served from a prompt cache.
 Prefill and first-token times include the server's HTTP and templating. A running server cannot
 be opened at a lower context, so the lower-context gate stays unmeasured, except under
-`crit run ... eval`: it serves a run's candidate itself and starts it again at the lower context
-([Building engines](../BUILDING_ENGINES.md#run-the-common-eval-suite)).
+`crit run ... eval`: it serves a run's candidate itself, first at the lower context, then builds it
+again at the run's context in the same resident host, which keeps the model's files, device
+weights and whatever host-side weights the adapter keeps in the process
+([Building engines](../BUILDING_ENGINES.md#run-the-common-eval-suite)). From `crit serve` Eval also
+reads the loaded engine's `engine_facts` (whether it speculates, its draft width and the bytes a
+pass and a draft step read, [Serving](../SERVING.md#engine-facts-and-plain-decoding)) and each
+reply's drafts accepted per round, so a served candidate gets the same decode limits as an
+adapter's, and checks exactness on the same engine through plain decoding (`chat-plain-v1`).
 
 Quality needs the engine's own scores of the fixed texts, from the paths it serves with: `POST
 /v1/crit/score` on `crit serve` for packages declaring `chat-score-v1`
@@ -206,9 +229,12 @@ to the conversations and the 32K-token prompts as quality replies, with `logprob
 `top_logprobs` (the server renders each prompt to the token count the model's chat template does,
 its own template, thinking off, and names every reply token by its bytes; `crit serve` does for
 packages declaring `chat-logprobs-v1`, [Serving](../SERVING.md#token-log-probabilities)), and
-scores the same tokens through the score call: the two must agree. Run `crit eval reference
---model M --data D` once before, with no engine on the device. An adapter's engine, or a server
-without the score call, gets no quality figures.
+scores the same tokens through the score call: the two must agree. Since that needs the model's
+own chat template, a round that measures quality requires every prompt sent as its frozen messages
+to render to its prepared token count from the first request on: a server on another template
+(thinking on, a default system prompt) fails at once, not after the speed parts. Run `crit eval
+reference --model M --data D` once before, with no engine on the device. An adapter's engine, or a
+server without the score call, gets no quality figures.
 
 ## Protocol versions
 
@@ -237,8 +263,8 @@ with each score:
 - `context` records the required context and its source (`given` or `computed`), `max_context`,
   the curve and the lower-context comparison.
 - Quality covers the sets whose texts fit the engine's context (`quality.skipped` names the
-  others), each judged on its served positions (`SET/served`), with its prompt positions in
-  `quality.prompt` (reported, not judged), `quality.buckets` by position and `quality.honesty`; it
+  others), each judged on its prompt positions (`SET/prompt`, from the prefill) and its served
+  positions (`SET/served`), with `quality.buckets` by position and `quality.honesty`; it
   is unmeasured until `crit eval
   reference` has stored the reference scores in the data directory.
 - Exactness covers measured speed cases and is a gate only with `--exactness required`. A drop

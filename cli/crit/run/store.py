@@ -873,8 +873,18 @@ Eval result JSON is separate evidence; it does not automatically publish run che
 Use the record coordinator: crit run --project "{self.project}" --root "{self.root}" --id {run['run_id']} --help
 Before the first candidate, run recon (required for a model folder; crit run ... --id {run['run_id']} recon): it writes work/recon.json from the
 model's generation_config.json, tokenizer files, chat templates and config.json, and scaffolds work/recon.md. Finish
-recon.md from the model card and the transformers reference code; every candidate freezes recon.json's frozen
-block (sampling, chat template, stop tokens) into configuration["recon"] instead of defaulting to greedy.
+recon.md from the model card and the transformers reference code, and its drafting plan for both decode modes;
+every candidate freezes recon.json's frozen block (sampling, chat template, stop tokens) into configuration["recon"]
+instead of defaulting to greedy. The sampling is not yours to choose: recon.md's Eval sampling section names the
+sampling Eval measures (the model's generation_config.json, else the protocol default) and the served default
+follows it; only the user overrides it, with eval_sampling at run create. Never pass crit eval prepare --sampling
+unless the run declares eval_sampling, and then exactly that. The required context (kv_tokens, recon.md's Required
+context section) is the user's too: plan the KV cache for it; Eval's capacity gate fails a candidate below it.
+Eval scores decode in both modes and you build for both: greedy (temperature 0), where speculative output must stay
+token-exact against plain greedy decoding, and sampled, at the Eval sampling in recon.md, the headline decode and
+its goal, where drafts are verified by rejection sampling (accept with probability min(1, p/q), resample from
+max(p - q, 0) on the first rejection) so the output keeps the model's distribution (the sampling gate), with
+sampling on the device inside the decode graph.
 Develop source and builds under this run's work/; keep candidates and failures visible with decision reasoning.
 Capture fixed benchmark inputs under captured/: each case's chat request as JSON {{"messages": [...]}} that renders
 to its prompt_tokens (docs/BUILDING_ENGINES.md). Freeze inputs before construction with resolve.

@@ -18,7 +18,7 @@
   "retrieval": {
     "system": "Follow the user's request carefully. When asked for identifiers, copy them exactly.",
     "user": "Read this archive. It contains the secret identifiers of three stations; remember them.\n\n{document}\n\nList the exact secret identifiers of stations ALPHA, BETA and GAMMA, one per line, as STATION: identifier.",
-    "question": "The files above also contain the secret identifiers of three stations. Without calling a tool, list the exact secret identifiers of stations ALPHA, BETA and GAMMA, one per line, as STATION: identifier.",
+    "curve_user": "Read this archive. It contains the secret identifiers of three stations; remember them.\n\n{document}\n\nList the exact secret identifiers of stations ALPHA, BETA and GAMMA, one per line, as STATION: identifier. Then summarize the archive in detail, part by part.",
     "facts": [
       {
         "id": "start",

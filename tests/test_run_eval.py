@@ -148,10 +148,13 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
         log = attempt["logs"][0]
         self.assertEqual(log["path"], f"candidates/{self.candidate_id}/logs/eval-attempt-0001.log")
         logged = (self.directory / log["path"]).read_text()
-        self.assertEqual([line for line in logged.splitlines() if line.startswith("crit serve: loading")],
+        # The run's context is built again in the resident host that served the lower context.
+        self.assertEqual([line for line in logged.splitlines() if line.startswith(("crit serve: loading",
+                                                                                   "crit serve: reloading"))],
                          [f"crit serve: loading {self.candidate_id} at 2,048 tokens of context",
-                          f"crit serve: loading {self.candidate_id} at 8,192 tokens of context"])
-        self.assertEqual(logged.count("crit serve: stopped"), 2)
+                          f"crit serve: reloading {self.candidate_id} at 8,192 tokens of context in the same host"])
+        self.assertEqual(result["context"]["engine_max_context"], 8192)
+        self.assertEqual(logged.count("crit serve: stopped"), 1)
         self.assertFalse((self.root / "runtime/owner.json").exists())
         self.store.seal(self.run_id, self.candidate_id, "built")  # the result is part of the sealed inventory
         self.assertIn(measured["result"]["path"].split("/", 2)[2],

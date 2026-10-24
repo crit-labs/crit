@@ -43,6 +43,15 @@ against the drafter's bandwidth floor, and the verify pass against the ordinary 
 the verify stays memory bound, its extra columns read the same weights, so their floor adds nothing).
 Without them, round time beyond one ordinary pass per draft is one combined term.
 
+From crit-eval-v7 the decode terms (cases, projection, decode gaps, decode noise and the end-to-end
+score) describe the sampled speed suite, the decode real requests get (decode_suite); prefill and
+time to first token stay on the greedy suite's cases. A result without a measured sampled suite
+(v6, or an engine that cannot sample) keeps them on the greedy suite. Rejection sampling lets a
+drafter speculate under sampling too, so the sampled decode's acceptance bound takes each case's
+first-draft acceptance from the better of the two suites, and a sampled case that drafts nothing
+projects from its measured tokens per round. One more decode gap compares the suites directly:
+every sampled case as fast as its greedy one.
+
 Gaps state what one term would give its own KPI at its floor, with everything else as measured.
 They are facts in a fixed order (decode terms, prefill, time to first token), not a ranking:
 Eval does not judge or classify speed. Noise is the spread of each score across the measured
@@ -50,6 +59,15 @@ repetitions.
 """
 from . import ceiling as model_ceiling
 from . import metrics
+
+
+def decode_suite(result):
+    """(name, section) of the suite the decode KPI, its headroom, the goals and stop records follow: the sampled
+    speed suite when it measured a decode score (crit-eval-v7), else the greedy speed suite."""
+    sampled = result.get("sampled_speed") or {}
+    if sampled.get("status") == "measured" and sampled.get("decode_score"):
+        return "sampled", sampled
+    return "greedy", result.get("speed") or {}
 
 
 def pass_floor_ms(bytes_per_pass, bandwidth_gbs):
@@ -147,21 +165,33 @@ def spread(values):
     return (max(values) - min(values)) / middle if middle else None
 
 
-def noise(speed):
-    """Run-to-run spread of the decode, TTFT and end-to-end scores across measured repetitions."""
-    cases = [c for c in (speed or {}).get("cases", {}).values() if c.get("status") == "measured"]
-    reps = [[s for s in c.get("samples", []) if not s.get("warmup")] for c in cases]
-    if not reps or min(len(r) for r in reps) < 2:
-        return {"decode": None, "ttft": None, "end_to_end": None}
-    count = min(len(r) for r in reps)
-    decode, ttft, e2e = [], [], []
+def noise(speed, prefill_cases=()):
+    """Run-to-run spread of the decode, TTFT, end-to-end and prefill scores across measured repetitions (the
+    prefill score over prefill_cases)."""
+    cases = {cid: c for cid, c in (speed or {}).get("cases", {}).items() if c.get("status") == "measured"}
+    reps = {cid: [s for s in c.get("samples", []) if not s.get("warmup")] for cid, c in cases.items()}
+    if not reps or min(len(r) for r in reps.values()) < 2:
+        return {"decode": None, "ttft": None, "end_to_end": None, "prefill": None}
+    count = min(len(r) for r in reps.values())
+    decode, ttft, e2e, prefill = [], [], [], []
     for i in range(count):
-        row = [r[i] for r in reps]
+        row = [r[i] for r in reps.values()]
         decode.append(metrics.geometric_mean([s["decode_tps"] for s in row if s.get("decode_tps")]))
         ttft.append(metrics.geometric_mean([s["ttft_ms"] for s in row if s.get("ttft_ms")]))
         e2e.append(metrics.geometric_mean([s["output_tokens"] * 1000 / s["request_ms"] for s in row
                                            if s.get("request_ms") and s.get("output_tokens")]))
-    return {"decode": spread(decode), "ttft": spread(ttft), "end_to_end": spread(e2e)}
+        prefill.append(metrics.geometric_mean([reps[cid][i]["prefill_tps"] for cid in prefill_cases
+                                               if cid in reps and reps[cid][i].get("prefill_tps")]))
+    return {"decode": spread(decode), "ttft": spread(ttft), "end_to_end": spread(e2e),
+            "prefill": spread(prefill) if all(cid in reps for cid in prefill_cases) and prefill_cases else None}
+
+
+def _noises(speed, decode_speed, prefill_cases):
+    """Each KPI's run-to-run spread. The long-context curve runs once per point, so its decode and first token take
+    the device's spread from the speed suite's repetitions: the greedy decode's and the prefill's."""
+    greedy = noise(speed, prefill_cases)
+    return {**greedy, "decode": noise(decode_speed)["decode"], "end_to_end": noise(decode_speed)["end_to_end"],
+            "context_decode": greedy["decode"], "context_ttft": greedy["prefill"]}
 
 
 def end_to_end_summary(speed, ttft, decode_score, speed_of_light):
@@ -225,12 +255,14 @@ def ttft_summary(info, speed, ceiling, tflops, bandwidth_gbs):
 
 
 def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tflops=None, steps=None,
-              prefill_cases=(), context=None, context_settings=None):
+              prefill_cases=(), context=None, context_settings=None, decode_speed=None, decode_name="greedy"):
     """info: adapter info(); speed: run_speed() result; step_ms: median ordinary one-token step
     in ms (None when unmeasured); bandwidth_gbs: achievable device bandwidth in GB/s; ceiling:
     the prepared model arithmetic (ceiling.model_ceiling); tflops: GEMM rates by format; steps:
     ordinary step ms by case; prefill_cases: case ids in the prefill score; context: the result's
-    context section (the requirement and the measured curve); context_settings: the protocol's."""
+    context section (the requirement and the measured curve); context_settings: the protocol's;
+    decode_speed: the suite the decode terms describe (decode_suite), named decode_name; speed by default."""
+    decode_speed = decode_speed or speed
     width = info.get("draft_width")
     bandwidth_gbs = bandwidth_gbs or info.get("bandwidth_gbs")
     floor = pass_floor_ms(info.get("bytes_per_pass"), bandwidth_gbs)
@@ -239,7 +271,7 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
     steps = steps or {}
     cases, warnings, curves, case_floors, missing, bound_curves = {}, [], [], [], [], []
     bound_width = max(width or 0, thresholds.get("acceptance_ceiling_width", 8))
-    for case_id, case in (speed or {}).get("cases", {}).items():
+    for case_id, case in (decode_speed or {}).get("cases", {}).items():
         if case.get("status") != "measured":
             continue
         row = {"round_ms": case.get("round_ms"), "tokens_per_round": case.get("tokens_per_round"),
@@ -257,11 +289,19 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
             row["verify_ms"] = metrics.median([v for v, _ in parts])
             row["draft_step_ms"] = metrics.median([d for _, d in parts])
         accepted = [a for s in measured_samples for a in (s.get("accepted") or [])]
-        if width and accepted:
-            row["tokens_by_width"] = tokens_by_width(accepted, width)
-            row["conditional_acceptance"] = conditional_acceptance(accepted, width)
+        greedy = (speed or {}).get("cases", {}).get(case_id) or {} if decode_speed is not speed else {}
+        greedy_accepted = [a for s in greedy.get("samples", []) if not s.get("warmup") for a in (s.get("accepted") or [])]
+        if width and (accepted or greedy_accepted):
+            row["tokens_by_width"] = (tokens_by_width(accepted, width) if accepted
+                                      else [case.get("tokens_per_round") or 1.0] * (width + 1))
+            rate = 0.0
+            if accepted:
+                row["conditional_acceptance"] = conditional_acceptance(accepted, width)
+                rate = row["conditional_acceptance"][0]
+            if greedy_accepted:
+                rate = max(rate, conditional_acceptance(greedy_accepted, width)[0])
             curves.append(row["tokens_by_width"])
-            bound_curves.append(tokens_at_rate(row["conditional_acceptance"][0], bound_width))
+            bound_curves.append(tokens_at_rate(rate, bound_width))
             case_floors.append(row.get("pass_floor_ms"))
         cases[case_id] = row
 
@@ -281,7 +321,7 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
     if draft_ms is None and width and step_ms and rounds:
         draft_ms = max(0.0, (metrics.median(rounds) - step_ms) / width)
     projection = None
-    score = (speed or {}).get("decode_score")
+    score = (decode_speed or {}).get("decode_score")
     if curves and step_ms and draft_ms is not None:
         now_width, now_score = best_width(curves, step_ms, draft_ms)
         projection = {"draft_ms": draft_ms, "draft_floor_ms": draft_floor,
@@ -296,7 +336,7 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
                               acceptance_bound_score=bound_score, acceptance_bound_width=bound_at,
                               ceiling_score=decode_ceiling, fraction_of_ceiling=score / decode_ceiling if score else None)
             if score:
-                warnings.append(f"decode score {score:.1f} is {score / decode_ceiling:.0%} of its ceiling {decode_ceiling:.1f} "
+                warnings.append(f"{decode_name} decode score {score:.1f} is {score / decode_ceiling:.0%} of its ceiling {decode_ceiling:.1f} "
                                 f"(this drafter at floor costs: {sol_score:.1f} at width {sol_width}; later drafts "
                                 f"accepted like the first: {bound_score:.1f} at width {bound_at})")
         if width in (projection.get("best_width_now"), projection.get("best_width_at_floor")):
@@ -314,6 +354,8 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
 
     gaps = decode_gaps(cases, score, width, draft_floor, projection)
     gaps += acceptance_gaps(cases, score, width, bound_width, step_ms, draft_ms)
+    if decode_speed is not speed:
+        gaps += sampling_gaps(decode_speed, speed, score)
     prefill = prefill_summary(speed, ceiling, tflops, prefill_cases)
     if prefill["fraction_of_ceiling"] is not None:
         parts = [r["floor"] for r in prefill["cases"].values() if r.get("floor")]
@@ -342,7 +384,7 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
                         f"of its {ttft['floor_ms']:,.0f} ms floor")
     missing += [m for m in ttft["missing"] if m not in missing]
     decode_ceiling = (projection or {}).get("ceiling_score")
-    end_to_end = end_to_end_summary(speed, ttft, score, decode_ceiling)
+    end_to_end = end_to_end_summary(decode_speed, ttft, score, decode_ceiling)
     long_context = None
     if (context or {}).get("points"):
         long_context = context_summary(info, context, ceiling, tflops, bandwidth_gbs, draft_floor, kv_per_token,
@@ -354,11 +396,11 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
                             f"{long_context['decode']['fraction_of_ceiling']:.0%} of its ceiling "
                             f"{long_context['decode']['ceiling_score']:.1f}")
     return {
-        "draft_width": width, "bytes_per_pass": info.get("bytes_per_pass"), "bandwidth_gbs": bandwidth_gbs,
+        "decode_suite": decode_name, "draft_width": width, "bytes_per_pass": info.get("bytes_per_pass"), "bandwidth_gbs": bandwidth_gbs,
         "kv_bytes_per_token": kv_per_token or None,
         "pass_floor_ms": floor, "step_ms": step_ms, "pass_efficiency": efficiency,
         "projection": projection, "cases": cases, "prefill": prefill, "ttft": ttft, "gaps": gaps,
-        "end_to_end": end_to_end, "noise": noise(speed), "context": long_context,
+        "end_to_end": end_to_end, "noise": _noises(speed, decode_speed, prefill_cases), "context": long_context,
         "missing": missing, "warnings": warnings,
     }
 
@@ -492,6 +534,25 @@ def decode_gaps(cases, score, width, draft_floor, projection):
                          "projected_gain": gain, "detail": "at current pass and draft costs",
                          "case_speedup": {cid: 1 + gain for cid in timed}})
     return gaps
+
+
+def sampling_gaps(sampled, greedy, score):
+    """Sampled requests as fast as greedy ones: each sampled case at its greedy case's decode, where that is faster
+    (speculation kept under sampling by rejection sampling)."""
+    pairs = {cid: (case, (greedy or {}).get("cases", {}).get(cid) or {}) for cid, case in (sampled or {}).get("cases", {}).items()
+             if case.get("status") == "measured" and case.get("decode_tps")}
+    if not score or not pairs or not all(g.get("decode_tps") for _, g in pairs.values()):
+        return []
+    factors = {cid: max(1.0, g["decode_tps"] / s["decode_tps"]) for cid, (s, g) in pairs.items()}
+    projected = metrics.geometric_mean([s["decode_tps"] * factors[cid] for cid, (s, _) in pairs.items()])
+    gain = projected / score - 1 if projected else 0.0
+    if gain <= 0:
+        return []
+    detail = ", ".join(f"{cid} {s['decode_tps']:.1f} vs {g['decode_tps']:.1f} tok/s"
+                       + (f" ({s.get('tokens_per_round') or 0:.2f} vs {g.get('tokens_per_round') or 0:.2f} tokens/round)")
+                       for cid, (s, g) in pairs.items())
+    return [{"kpi": "decode", "name": "sampled requests decoded as fast as greedy ones (drafts verified by rejection sampling)",
+             "projected_gain": gain, "detail": "sampled vs greedy: " + detail, "case_speedup": factors}]
 
 
 def acceptance_gaps(cases, score, width, bound_width, step_ms, draft_ms):

@@ -20,8 +20,9 @@ from crit.run.records import file_sha, read_json
 
 # A resident chat adapter whose prompt is one token per character of its messages and whose greedy reply is one "x"
 # per token, three tokens per decode round. A message starting "early" ends after 40 tokens, one starting "hold"
-# decodes until it is cancelled. Every request writes the host's process id next to the model.
+# decodes until it is cancelled. Every request writes the host's process id and the sampling it got next to the model.
 ADAPTER = r'''
+import json
 import os
 import time
 from pathlib import Path
@@ -35,6 +36,7 @@ class Engine:
 
     def generate_stream(self, request, cancellation, emit):
         Path(request['model_path']).with_name('host.pid').write_text(str(os.getpid()))
+        Path(request['model_path']).with_name('sampling.json').write_text(json.dumps(request.get('sampling')))
         content = request['messages'][-1]['content']
         n = request['limits']['max_output_tokens']
         n = min(n, 40) if content.startswith('early') else n
@@ -114,7 +116,8 @@ class RunMeasureTests(MeasureFixture, unittest.TestCase):
         # crit serve's telemetry: 128 output tokens over 43 decode rounds.
         self.assertEqual(record["metrics"]["accepted_tokens_per_round"]["samples"], [128 / 43] * 3)
         self.assertEqual(record["extensions"], {"measured_by": "crit run measure", "served_by": "crit serve",
-                                                "attempt_id": "attempt-0001", "output_tokens": [128] * 3})
+                                                "attempt_id": "attempt-0001", "output_tokens": [128] * 3,
+                                                "sampling": {"temperature": 0}})
         for key in ("peak_vram_bytes", "minimum_free_vram_bytes", "peak_ram_bytes", "minimum_free_ram_bytes"):
             self.assertTrue(key in record["metrics"] or key in record["missing_metrics"], key)
         if sys.platform.startswith("linux") or os.name == "nt":
@@ -135,6 +138,14 @@ class RunMeasureTests(MeasureFixture, unittest.TestCase):
         view = self.store.get(self.run_id)
         self.assertEqual(view["errors"], [])
         self.assertEqual([s["benchmark_id"] for s in view["candidates"][0]["series"]], [record["benchmark_id"]])
+
+    def test_a_captured_requests_sampling_is_sent_and_recorded(self):
+        self.case.update(temperature=0.7, top_p=0.9, seed=3)
+        candidate = self.served(capabilities=SERVED + ["chat-sampling-top-p-v1", "chat-sampling-seed-v1"])
+        (record,) = measure.measure(self.store, self.run_id, candidate)
+        self.assertEqual(record["extensions"]["sampling"], {"temperature": 0.7, "top_p": 0.9, "seed": 3})
+        self.assertEqual(json.loads((self.root / "sampling.json").read_text()),
+                         {"temperature": 0.7, "top_p": 0.9, "seed": 3})
 
     def test_a_package_measure_cannot_serve_or_a_sealed_candidate_is_refused_before_any_reservation(self):
         candidate = self.served(capabilities=[c for c in SERVED if c != "chat-stream-v1"])

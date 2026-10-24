@@ -1,8 +1,8 @@
 """crit run measure: the run's benchmark cases measured on a candidate's package, through crit serve.
 
 Under a benchmark reservation crit serve serves the candidate (its resident chat adapter, packaged and not yet
-sealed) at the run's context, and each case's chat request streams to it over the chat API with greedy decoding, as
-a client of the server gets it. crit serve's usage must count the workload's prompt tokens. Every candidate decodes
+sealed) at the run's context, and each case's chat request streams to it over the chat API at the sampling the
+captured request names (greedy when it names none), as a client of the server gets it. crit serve's usage must count the workload's prompt tokens. Every candidate decodes
 its own reply; one that ends before the workload's output length is measured on the tokens it has. Host and device
 memory are sampled on the resident host process during every request, and tokens per round comes from crit serve's
 telemetry. The attempt settles once the server has stopped, then one benchmark is recorded per case.
@@ -24,8 +24,14 @@ TIMED = ("prefill_tps", "decode_tps", "request_ms", "ttft_ms")
 MEMORY = ("peak_ram_bytes", "minimum_free_ram_bytes", "peak_vram_bytes", "minimum_free_vram_bytes")
 
 
+# Sampling fields a captured chat request keeps, as crit serve takes them (crit_api.options).
+CAPTURED_SAMPLING = ("temperature", "top_p", "top_k", "min_p", "seed", "presence_penalty", "frequency_penalty",
+                     "repetition_penalty")
+
+
 def case_request(root, rows):
-    """A case's chat request: its first retained JSON file holding {"messages": [...]}, with optional "tools"."""
+    """A case's chat request: its first retained JSON file holding {"messages": [...]}, with optional "tools" and the
+    sampling fields (CAPTURED_SAMPLING) it was sent with."""
     from crit_api.server import MAX_BODY
     for row in rows:
         path = safe_path(root, row["path"])
@@ -40,7 +46,10 @@ def case_request(root, rows):
             tools = value.get("tools")
             if tools is not None and not isinstance(tools, list):
                 raise ValueError(f"{row['path']}: tools must be a list")
-            return {"messages": messages, **({"tools": tools} if tools else {})}
+            sampling = {key: value[key] for key in CAPTURED_SAMPLING if value.get(key) is not None}
+            if any(type(v) not in (int, float) for v in sampling.values()):
+                raise ValueError(f"{row['path']}: sampling fields must be numbers")
+            return {"messages": messages, **({"tools": tools} if tools else {}), **sampling}
     raise ValueError('No retained chat request for the case; keep a captured JSON file {"messages": [...]} in its '
                      'manifest')
 
@@ -117,7 +126,7 @@ def measure(store, run_id, candidate_id, seconds=None):
                    "checks": [], "outcome": "completed", "started_at": result["started_at"],
                    "ended_at": result["ended_at"],
                    "extensions": {"measured_by": "crit run measure", "served_by": "crit serve", "attempt_id": attempt,
-                                  "output_tokens": result["output_tokens"]}}
+                                  "output_tokens": result["output_tokens"], "sampling": result["sampling"]}}
         recorded.append(store.append(run_id, candidate_id, "benchmark", payload))
     return recorded
 
@@ -143,7 +152,8 @@ def _measure(store, run_id, candidate_id, attempt, deadline_at, kv_tokens, cases
 def _case(port, case, load_ms, sampler, timeout, log):
     """A case's warmups and repetitions: its metrics and missing metrics as a benchmark records them."""
     from crit_eval.metrics import speed_sample
-    body = {**case["request"], "max_tokens": case["output_tokens"], "temperature": 0, "stream": True,
+    # Greedy unless the captured request names its own sampling.
+    body = {"temperature": 0, **case["request"], "max_tokens": case["output_tokens"], "stream": True,
             "stream_options": {"include_usage": True}}
     samples = {name: [] for name in TIMED + MEMORY + ("accepted_tokens_per_round",)}
     outputs, begun = [], now()
@@ -173,7 +183,8 @@ def _case(port, case, load_ms, sampler, timeout, log):
                if all(value is not None for value in values)}
     metrics["load_ms"] = {"unit": ALL_METRICS["load_ms"], "samples": [load_ms] * case["repetitions"]}
     missing = {name: reasons.get(name, "Not measurable on this host") for name in samples if name not in metrics}
-    return {"metrics": metrics, "missing": missing, "output_tokens": outputs, "started_at": begun, "ended_at": now()}
+    return {"metrics": metrics, "missing": missing, "output_tokens": outputs, "started_at": begun, "ended_at": now(),
+            "sampling": {key: body[key] for key in CAPTURED_SAMPLING if key in body}}
 
 
 def _request(port, body, timeout):

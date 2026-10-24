@@ -38,11 +38,23 @@ class Served:
 
     def open(self, tokens=None):
         """Serve the candidate at `tokens` of context (default the run's). Returns the ServedEngine, crit serve's Api
-        and the loopback port it listens on."""
+        and the loopback port it listens on. An engine already served is built again at the new context in the same
+        resident host, which keeps the model's files, device weights and the adapter's host-side weights."""
         from crit_api.engine import ServedEngine
         from crit_api.server import Api, Server
-        self.stop()  # an engine that failed to open
         tokens = tokens or self.kv_tokens
+        with self.lock:
+            current = self.current
+        if current is not None and current[1] is not None and not self.expired:
+            engine, server = current
+            self.log(f"crit serve: reloading {self.candidate_id} at {tokens:,} tokens of context in the same host")
+            try:
+                engine.reopen(None if tokens == self.kv_tokens else tokens)
+            except BaseException:
+                self.stop()
+                raise
+            return engine, server.api, server.server_address[1]
+        self.stop()  # an engine that failed to open
         engine = ServedEngine(self.store.root, self.run_id, self.candidate_id, project=self.store.project,
                               timeout=self.timeout, attempt=self.attempt,
                               kv_tokens=None if tokens == self.kv_tokens else tokens)
