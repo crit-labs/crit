@@ -33,7 +33,7 @@ import urllib.request
 
 from . import EVAL_DIR, load_json
 from .deadline import Hung, RequestDeadline
-from .prepare import token_ids, with_document
+from .prepare import GREEDY_REQUEST, token_ids, with_document
 
 # The engine facts crit serve publishes for Eval (crit_core.serving.ENGINE_FACTS), and the capability that lets a
 # request decode plainly.
@@ -212,6 +212,12 @@ class ChatEngine:
         # prepare froze, as the honesty check requires: a server on another template fails at its first request.
         self.exact_prompts = False
 
+    def applied(self, sampling):
+        """The fields of `sampling` the server applies (all of them for a server that lists none); temperature
+        always goes."""
+        return {key: value for key, value in sampling.items()
+                if self.sampling_fields is None or key in self.sampling_fields or key == "temperature"}
+
     def info(self):
         return {"name": self.model, "configuration": {"url": self.server.url, "model": self.model},
                 "max_context": self.max_context, **self.facts, "speculative": bool(self.facts.get("speculative")),
@@ -237,12 +243,11 @@ class ChatEngine:
         on its text alone), and served records the cached prompt tokens."""
         prompt = list(prompt)
         messages, tools = self.messages(prompt)
-        body = {"model": self.model, "messages": messages, "max_tokens": max_new_tokens, "temperature": 0,
+        body = {"model": self.model, "messages": messages, "max_tokens": max_new_tokens,
                 "stream": True, "stream_options": {"include_usage": True}, **({"tools": tools} if tools else {})}
-        if sampling:
-            # Every field the server applies: one it leaves out would keep the engine's own default.
-            body.update({key: value for key, value in sampling.items()
-                         if self.sampling_fields is None or key in self.sampling_fields})
+        # Every sampling field the server applies, greedy requests' neutral penalties included: one it leaves out
+        # would keep the engine's own default.
+        body.update(self.applied(sampling or GREEDY_REQUEST))
         if logprobs:
             body.update(logprobs=True, top_logprobs=int(logprobs))
         if plain:
@@ -314,7 +319,7 @@ class ChatEngine:
         messages, tools = self.messages(prompt)
         url = self.server.url
         response, timing = self.server.post_timed("/chat/completions", {
-            "model": self.model, "messages": messages, "max_tokens": max_new_tokens, "temperature": 0,
+            "model": self.model, "messages": messages, "max_tokens": max_new_tokens, **self.applied(GREEDY_REQUEST),
             "logprobs": True, "top_logprobs": top_k, **({"tools": tools} if tools else {})},
             self.deadline.seconds(len(prompt), max_new_tokens))
         # A whole reply's time bounds its prefill from above.

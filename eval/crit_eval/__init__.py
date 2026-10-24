@@ -45,6 +45,24 @@ def requested_context():
     return machine_settings().get("context_tokens", DEFAULT_CONTEXT_TOKENS)
 
 
+def portable_path(path):
+    """A path as results store it, naming no user: relative to the crit checkout (posix) inside it, `~/...` inside
+    the home directory, the bare file name where another user directory (/home/NAME, C:/Users/NAME, WSL's
+    /mnt/c/Users/NAME) holds it, else the absolute path (toolkits under /usr/local or Program Files). None stays
+    None."""
+    if path is None:
+        return None
+    path = Path(os.path.abspath(path))
+    for root, prefix in ((EVAL_DIR.parent, ""), (Path.home(), "~/")):
+        try:
+            return prefix + path.relative_to(root).as_posix()
+        except ValueError:
+            pass
+    if any(part.lower() in ("users", "home") for part in path.parts[:-2]):
+        return path.name
+    return path.as_posix()
+
+
 def load_json(path):
     with open(path, encoding="utf-8") as handle:
         return json.load(handle)

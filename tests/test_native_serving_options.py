@@ -32,6 +32,31 @@ class NativeServingOptionsTests(unittest.TestCase):
         engine.native.generate.side_effect = generate
         return engine
 
+    def test_eval_requests_take_neutral_penalties_instead_of_the_engines_defaults(self):
+        from unittest.mock import patch
+        from crit_core import native
+        facts = {"sampling": {"temperature": True, "penalties": True}, "speculative": False, "context": 4096}
+        library = Mock()
+        library.return_value.info.return_value = facts
+        library.return_value.generate.return_value = ([5, 6], {"timing": {"decode_steps": 1}})
+        with patch.object(native, "NativeEngine", library):
+            engine = native.EvalEngine({"model": "m", "config": {}}, "libengine.so")
+        neutral = {"temperature": 0.0, "presence_penalty": 0.0, "frequency_penalty": 0.0, "repetition_penalty": 1.0}
+        self.assertEqual(engine.sampling, neutral)
+        engine.generate([1, 2], 2, lambda tokens: None)
+        self.assertEqual(library.return_value.generate.call_args.kwargs["sampling"], neutral)
+        facts["sampling"] = {"temperature": True}   # an engine without penalties gets none
+        with patch.object(native, "NativeEngine", library):
+            self.assertEqual(native.EvalEngine({"model": "m", "config": {}}, "libengine.so").sampling,
+                             {"temperature": 0.0})
+        # Fixed-text scores replay greedily with neutral penalties too.
+        resident = self.engine()
+        resident.facts = {"score_paths": []}
+        resident.native.generate.side_effect = lambda ids, n, **options: (list(options["replay"]), {
+            "timing": {"decode_ms": 1.0}})
+        resident.score_tokens([1, 2], [3], 2, lambda: False, False)
+        self.assertEqual(resident.native.generate.call_args.kwargs["sampling"], neutral)
+
     def test_override_forwarding_and_default_isolation(self):
         engine = self.engine()
         request = {"messages": [{"role": "user", "content": "hi"}], "sampling": {

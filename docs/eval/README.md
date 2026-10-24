@@ -271,6 +271,13 @@ with each score:
   in plain-greedy equality against `--baseline` (status notes it) and any difference between
   repeated identical requests are bugs until a root cause is shown ([AGENTS.md](../../AGENTS.md)).
   `requirements` records the drift budget and exactness mode used.
+- `host` records the machine: OS (and WSL), CPU model and cores, physical RAM (the VM's under WSL)
+  and each GPU's VRAM, driver and PCIe link. `pcie.gen_current` is sampled idle, when GPUs lower
+  their link; `gen_max` is what the GPU and slot allow together, `gen_gpu_max` and `gen_host_max`
+  each side's own. Unreadable values are null. Compare engines that move weights over PCIe or
+  compute on the CPU only on matching hosts. Paths in results (`adapter`, with `adapter_sha256`,
+  `native_libraries`, the probe's and kernel profile's nvcc) name no user: relative to the
+  checkout, `~/...` in the home directory, the file name in another user directory, else absolute.
 - Physical RAM/VRAM use, cancellation and lifecycle need separate engine measurements.
 
 A round stops early when a speed case's measured decode speeds spread by more than the protocol's

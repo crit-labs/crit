@@ -2,6 +2,7 @@
 from pathlib import Path
 
 from . import load_json, protocol_version
+from .host import summary
 from .status import decode_text_identity
 
 
@@ -21,6 +22,7 @@ def compare(paths):
     names = [r.get("label") or r["engine"]["name"] or Path(p).stem for r, p in zip(results, paths)]
     rows = [("Engine", [r["engine"]["name"] for r in results]),
             ("Host", [r["host"]["platform"] for r in results]),
+            ("Host hardware", [summary(r["host"]) for r in results]),
             ("Model data", [r["model_sha256"][:12] for r in results])]
     warn = []
     if len({r["model_sha256"] for r in results}) > 1 or len({r["suite_sha256"] for r in results}) > 1:

@@ -249,6 +249,9 @@ class ChatServerTests(unittest.TestCase):
         sent = self.server.requests
         self.assertEqual({(r["model"], r["temperature"], r["max_tokens"], r["stream"]) for r in sent},
                          {("fake", 0, 12, True)})
+        # Greedy requests name the penalties neutral, so no served default changes them.
+        self.assertEqual({(r["presence_penalty"], r["frequency_penalty"], r["repetition_penalty"]) for r in sent},
+                         {(0.0, 0.0, 1.0)})
         agent = next(r for r in sent if r.get("tools"))
         self.assertEqual(agent["tools"], TOOLS)
         call, answer = agent["messages"][1]["tool_calls"][0], agent["messages"][2]
@@ -325,6 +328,43 @@ class ChatServerTests(unittest.TestCase):
         self.assertEqual((room["bytes_per_pass_source"], room["pass_floor_ms"]), ("engine", 2.0))
         gates = {g["name"]: g["state"] for g in result["status"]["gates"]}
         self.assertEqual(gates["exactness"], "pass")
+
+    def test_greedy_requests_send_the_neutral_penalties_the_server_applies(self):
+        self.server.card = {"supported_sampling_parameters": ["presence_penalty", "seed", "temperature"]}
+        self.run_eval(("speed",))
+        greedy = [r for r in self.server.requests if r["temperature"] == 0]
+        self.assertTrue(greedy)
+        # The penalty it applies goes neutral; the ones it lists no support for stay out, so it refuses nothing.
+        self.assertEqual({(r["presence_penalty"], "frequency_penalty" in r, "repetition_penalty" in r) for r in greedy},
+                         {(0.0, False, False)})
+
+    def test_a_server_that_drafts_without_engine_facts_counts_as_speculative(self):
+        self.server.telemetry = {"tokens_per_round": 3.0}   # more than one token per target pass, and no facts
+        logged = []
+        result = runner.run(None, "unused-model", self.data, self.data / "result.json", parts=("speed", "exactness"),
+                            warmups=0, repetitions=1, log=logged.append, context_tokens=4096, url=self.url,
+                            exactness="required")
+        self.assertEqual((result["engine"]["speculative"], result["engine"]["speculative_source"]), (True, "telemetry"))
+        self.assertEqual(result["exactness"]["status"], "unmeasured")
+        self.assertIn("engine: speculative (its telemetry reports more than one token per target pass)", logged)
+        gates = {g["name"]: g["state"] for g in result["status"]["gates"]}
+        self.assertEqual(gates["exactness"], "unmeasured")
+        self.server.telemetry = {"tokens_per_round": 1.0}   # one token per pass: a plain engine
+        plain = runner.run(None, "unused-model", self.data, self.data / "result.json", parts=("speed", "exactness"),
+                           warmups=0, repetitions=1, log=lambda line: None, context_tokens=4096, url=self.url)
+        self.assertFalse(plain["engine"]["speculative"])
+        self.assertNotIn("exactness", plain)
+        # What crit serve reports for a plain engine: its n output tokens over n - 1 rounds (the first token comes
+        # from the prefill), n / (n - 1) tokens per round, above 1 without any draft.
+        self.server.telemetry = {"tokens_per_round": 12 / 11}
+        served = runner.run(None, "unused-model", self.data, self.data / "result.json", parts=("speed", "exactness"),
+                            warmups=0, repetitions=1, log=lambda line: None, context_tokens=4096, url=self.url,
+                            exactness="required")
+        sample = served["speed"]["cases"]["chat"]["samples"][0]
+        self.assertEqual((sample["output_tokens"], sample["rounds"]), (12, 11))
+        self.assertFalse(served["engine"]["speculative"])
+        self.assertNotIn("exactness", served)
+        self.assertNotIn("exactness", {g["name"] for g in served["status"]["gates"]})
 
     def test_a_served_speculative_engine_without_plain_decoding_has_its_exactness_unmeasured(self):
         self.server.card = {"engine_facts": {"speculative": True, "plain": True}}   # the package declares no plain

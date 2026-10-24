@@ -9,6 +9,55 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-24
+
+### Overview
+
+crit 0.6.1 is an Eval release. Results record the machine they ran on (OS, CPU, RAM and each GPU's
+VRAM, driver and PCIe link) and no longer store absolute paths that name the user. A plain engine gets
+a decode ceiling, a drafting engine that reports no draft step gets one from the checkpoint's own draft
+layers, a server whose requests take fewer target passes than tokens counts as speculative, and greedy
+requests name neutral penalties so an engine's served defaults cannot reach them. The protocol stays
+`crit-eval-v7` and prepared data stays valid. The Python distribution and the Core SDK share version
+0.6.1; Core and Inference are unchanged.
+
+### Added
+
+- Eval results record the machine they ran on: `host` keeps `platform` and `python` and adds the OS
+  (with distribution and whether it is WSL), the CPU model with physical and logical cores, physical
+  RAM and per GPU its VRAM, driver and PCIe link (current generation and width, sampled idle, the
+  link maximum and the GPU's and host's own maximum generation). Engines that stream weights or
+  experts over PCIe or compute on the CPU depend on these. Every probe is best-effort (null when it
+  cannot be read); `run` logs a one-line host summary and `compare` shows it as `Host hardware`.
+- A plain engine's decode ceiling: an engine that does not speculate decodes one token per model pass,
+  so with `bytes_per_pass` and the bandwidth its ceiling is every pass at its floor, the geometric mean
+  of 1 / pass floor over the cases (`headroom.projection.basis` is `one token per pass`). An engine that
+  drafts but reports no width still keeps no ceiling.
+
+### Changed
+
+- Eval results no longer store absolute paths that name the user: `adapter` is relative to the
+  checkout (or `~/...`, or the file name in another user directory) with a new `adapter_sha256`,
+  and the same applies to `native_libraries` (also inside `engine`), the probe's `nvcc` and the
+  kernel profile's `toolkit`. A native library's read error no longer repeats its path. Readers
+  take old absolute values unchanged.
+- A drafting engine that reports no `draft_bytes_per_step` gets the checkpoint's own draft (MTP)
+  layers, their routed experts' share and the output head their logits go through as its draft step
+  (`headroom.draft_bytes_per_step_source` is `model files`), so a served speculative engine gets a
+  decode ceiling; a drafter that is a model of its own has none to derive.
+- A served engine counts as speculative when crit serve's `engine_facts` say so or when a measured
+  request took fewer target passes than tokens after the first (the first token comes from the
+  prefill's logits), so a drafting server without engine facts gets unmeasured exactness instead of
+  a skipped one, and a plain engine served through crit serve stays plain.
+
+### Fixed
+
+- Greedy requests sent temperature 0 alone, so an engine's served default penalties still applied (a
+  model card's presence penalty of 1.5 sent one run's greedy requests through the host sampler). Every
+  greedy request now names presence and frequency 0 and repetition 1 where the engine applies them:
+  the speed, held-out, history, curve and honesty requests over a server, an adapter's greedy, plain
+  and replayed decoding, and the replay behind crit serve's fixed-text scores.
+
 ## [0.6.0] - 2026-10-24
 
 ### Overview
@@ -893,7 +942,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/crit-labs/crit/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/crit-labs/crit/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/crit-labs/crit/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/crit-labs/crit/compare/v0.3.0...v0.4.0

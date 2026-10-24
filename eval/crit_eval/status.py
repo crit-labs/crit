@@ -355,6 +355,8 @@ def build(result, protocol, baseline=None):
               "standard_error": decoded.get("decode_se"),
               "speed_of_light": projection.get("speed_of_light_score"),
               "acceptance_bound": projection.get("acceptance_bound_score"),
+              # "one token per pass": an engine that does not speculate, its ceiling every pass at its floor.
+              "ceiling_basis": projection.get("basis"),
               # Results from before the acceptance bound use the drafter's speed of light as the ceiling.
               "ceiling": projection.get("ceiling_score") or projection.get("speed_of_light_score"),
               "fraction_of_ceiling": projection.get("fraction_of_ceiling") or projection.get("fraction_of_speed_of_light"),
@@ -605,7 +607,10 @@ def render(status):
             d.get("sampling_source"), "the model's sampling")
         decode += f" at {where} ({settings})" + (
             f", {d['tokens_per_round']:.2f} tokens/round" if d.get("tokens_per_round") else "")
-    if d["ceiling"]:
+    if d["ceiling"] and d.get("ceiling_basis"):
+        decode += (f", {_pct(d['fraction_of_ceiling'])} of its ceiling {d['ceiling']:.1f} "
+                   "(one token per model pass at its bandwidth floor)")
+    elif d["ceiling"]:
         decode += (f", {_pct(d['fraction_of_ceiling'])} of its ceiling {d['ceiling']:.1f} "
                    f"(this drafter at floor costs {_num(d['speed_of_light'], '.1f')}"
                    + (f", later drafts accepted like the first {d['acceptance_bound']:.1f}" if d.get("acceptance_bound") else "")

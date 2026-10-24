@@ -34,6 +34,8 @@ TOKEN_CALLBACK = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(
 OUTPUT_CALLBACK = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int32, ctypes.c_float,
                                    ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float), ctypes.c_int)
 PENALTY, PENALTIES = "penalties", {"repetition_penalty", "presence_penalty", "frequency_penalty"}
+# The penalties at the values that change nothing, for requests that must not take an engine's defaults (Eval's).
+NEUTRAL_PENALTIES = {"presence_penalty": 0.0, "frequency_penalty": 0.0, "repetition_penalty": 1.0}
 FACTS = ("draft_width", "bytes_per_pass", "draft_bytes_per_step", "draft_ms", "kv_bytes_per_token", "kernel_work")
 # NativeEngine.score per target: its log-probability, the query rows, the argmax and the engine's own ranked top_k
 # [(token, logprob), ...] (None for parts not asked for or not returned).
@@ -270,14 +272,16 @@ class EvalEngine:
         self.native = NativeEngine(library, configuration)
         self.facts = self.native.info()
         self.speculative = bool(self.facts.get("speculative"))
-        # Eval decodes greedily: request temperature zero where the engine samples; a greedy-only engine needs none.
-        self.sampling = {"temperature": 0.0} if (self.facts.get("sampling") or {}).get("temperature") else {}
+        # Eval decodes greedily: request temperature zero where the engine samples (a greedy-only engine needs none),
+        # and neutral penalties where it applies them, whatever its defaults.
+        support = self.facts.get("sampling") or {}
+        self.sampling = {**({"temperature": 0.0} if support.get("temperature") else {}),
+                         **(NEUTRAL_PENALTIES if support.get(PENALTY) else {})}
         if self.facts.get("replay"):
             self.replay = self._replay
         if self.speculative and self.facts.get("plain"):
             self.generate_plain = self._generate_plain
         # Eval's sampled suite (crit-eval-v7): the engine samples at the settings Eval names, applying these fields.
-        support = self.facts.get("sampling") or {}
         self.sampling_fields = {key for key in SAMPLING if support.get(PENALTY if key in PENALTIES else key)}
         if support.get("temperature"):
             self.generate_sampled = self._generate_sampled
@@ -405,8 +409,10 @@ class ResidentEngine(ResidentChat):
         prefill_ms = (time.monotonic() - started) * 1000
         rows = []
         if continuation:
-            # Greedy: a sampled replay would accept drafts by the sampling rule instead of by equality.
-            greedy = {"temperature": 0.0} if "temperature" in self.sampling else None
+            # Greedy, with neutral penalties: a sampled replay would accept drafts by the sampling rule instead of by
+            # equality, and the engine's default penalties would move the scores.
+            greedy = {**({"temperature": 0.0} if "temperature" in self.sampling else {}),
+                      **{key: value for key, value in NEUTRAL_PENALTIES.items() if key in self.sampling}} or None
             tokens, result = self.native.generate(list(ids), len(continuation), stop_tokens=[], replay=list(continuation),
                                                   sampling=greedy, logprobs=top_k,
                                                   on_tokens=lambda _tokens, found: rows.extend(found),
