@@ -331,8 +331,11 @@ def sampling_override(value):
 
 # Every sampling field a sampled request names, at the value that leaves the distribution as the model's own
 # settings make it: filters off and penalties neutral (top_k 0 keeps every token).
-NEUTRAL_SAMPLING = {"top_p": 1.0, "top_k": 0, "min_p": 0.0, "presence_penalty": 0.0, "frequency_penalty": 0.0,
-                    "repetition_penalty": 1.0}
+NEUTRAL_PENALTIES = {"presence_penalty": 0.0, "frequency_penalty": 0.0, "repetition_penalty": 1.0}
+NEUTRAL_SAMPLING = {"top_p": 1.0, "top_k": 0, "min_p": 0.0, **NEUTRAL_PENALTIES}
+# Every greedy request: temperature zero and the penalties neutral, which an engine's served defaults (a model card's
+# presence penalty, say) would otherwise change, sending the request through another sampler.
+GREEDY_REQUEST = {"temperature": 0, **NEUTRAL_PENALTIES}
 
 
 def sampled_request(settings, seed):

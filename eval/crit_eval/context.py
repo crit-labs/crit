@@ -26,10 +26,13 @@ of it on every pass, so a context beyond the device limit is a cliff, not a slop
 Below the maximum, an engine sized for it must be at least as fast: Eval measures the engine built for
 the maximum, a curve of long-context points up to it, and the speed cases again at a lower context.
 """
+import re
+
 from .ceiling import model_config, weight_files
 from .tensors import tensor_role
 
 GIB = 1 << 30
+DRAFT_HEAD = re.compile(r"(^|\.)head\.weight$")   # a draft layer's own output head (DeepSeek-style shared_head.head)
 
 
 def weight_split(model, config):
@@ -77,6 +80,36 @@ def pass_bytes(model, kv_bytes_per_element):
     experts = (split["experts"] * min(1.0, moe.experts_per_token / moe.experts)
                if split["experts"] and moe and moe.experts and moe.experts_per_token else 0)
     return int(split["resident"] - split["draft"] + experts + config.fixed_state_bytes(kv_bytes_per_element))
+
+
+def draft_step_bytes(model):
+    """What one draft step of the checkpoint's own draft (MTP) layers reads, for an engine that drafts and reports no
+    draft_bytes_per_step: those layers' weights (their routed experts' share as in pass_bytes) and the output head
+    their logits go through, the draft layers' own head where they have one, else the model's (the embedding table
+    when the head is tied to it). None without draft layers or weight headers."""
+    config = model_config(model)
+    shards, drafts = weight_files(model, drafts=True)
+    layers = experts = draft_head = head = embedding = 0
+    for shard in shards:
+        for tensor in shard.tensors:
+            role, size = tensor_role(tensor.name, shard.path.name, drafts), tensor.nbytes
+            if role.draft:
+                if role.kind == "expert":
+                    experts += size
+                elif role.kind == "head" or DRAFT_HEAD.search(tensor.name):
+                    draft_head += size
+                elif role.kind == "layer":
+                    layers += size   # a draft embedding table is gathered by rows, never read whole
+            elif role.kind == "head":
+                head += size
+            elif role.kind == "embedding":
+                embedding += size
+    if not layers and not experts:
+        return None
+    moe = config.moe
+    if experts and moe and moe.experts and moe.experts_per_token:
+        experts *= min(1.0, moe.experts_per_token / moe.experts)
+    return int(layers + experts + (draft_head or head or (embedding if config.tie_word_embeddings else 0)))
 
 
 def max_context(model, device, vram_headroom_bytes, settings, requested=None):

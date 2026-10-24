@@ -18,7 +18,9 @@ its first (the same conditional rate at every depth, up to a wider width):
 
     tokens*(k)  = 1 + c1 + c1^2 + ... + c1^k      with c1 = P(accepted >= 1)
 
-The decode ceiling is the larger of the two at floor costs.
+The decode ceiling is the larger of the two at floor costs. An engine that does not speculate
+decodes one token per model pass, so its ceiling is every pass at its floor: the geometric mean of
+1 / pass floor over the cases.
 
 Prefill is compute bound: its floor is the model's FLOPs over the device's GEMM rates per
 weight format (see ceiling.py). The prefill score is the geometric mean of prefill tok/s over
@@ -347,6 +349,14 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
         warnings.append("speed-of-light projection needs per-round `accepted` counts from generate() and an ordinary step")
         if not curves:
             missing.append("per-round `accepted` counts from generate()")
+    elif not info.get("speculative") and floor and cases:
+        # A plain engine decodes one token per model pass: its ceiling is every pass at its bandwidth floor.
+        ceiling_score = metrics.geometric_mean([1000 / row["pass_floor_ms"] for row in cases.values()])
+        projection = {"basis": "one token per pass", "ceiling_score": ceiling_score,
+                      "fraction_of_ceiling": score / ceiling_score if score else None}
+        if score:
+            warnings.append(f"{decode_name} decode score {score:.1f} is {score / ceiling_score:.0%} of its ceiling "
+                            f"{ceiling_score:.1f} (one token per model pass at its bandwidth floor)")
     if width and info.get("draft_bytes_per_step") is None:
         missing.append("draft_bytes_per_step from the adapter")
     if width and cases and not all(row.get("verify_ms") is not None for row in cases.values()):

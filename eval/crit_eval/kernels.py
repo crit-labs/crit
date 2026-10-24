@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 
-from . import CONTRACT, EVAL_DIR, load_json, write_json
+from . import CONTRACT, EVAL_DIR, load_json, portable_path, write_json
 from .prepare import PREPARED
 
 SOURCE = EVAL_DIR / "probe" / "kernel_trace.cpp"
@@ -287,7 +287,7 @@ def trace(adapter, model, data, out, config=None, cases=None, nvcc=None, device=
         kernels, device_info = read_traces(directory)
     if not kernels:
         raise SystemExit("no kernels were recorded: the engine may not run on CUDA, or CUPTI could not attach")
-    result = {"contract": CONTRACT, "kind": "kernels", "engine": marks["info"], "toolkit": toolkit["nvcc"],
+    result = {"contract": CONTRACT, "kind": "kernels", "engine": marks["info"], "toolkit": portable_path(toolkit["nvcc"]),
               **analyze(kernels, device_info, marks, device)}
     write_json(out, result)
     return result

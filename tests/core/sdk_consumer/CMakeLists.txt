@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 project(crit_core_consumer LANGUAGES CXX)
-find_package(critCore 0.6.0 EXACT CONFIG REQUIRED)
+find_package(critCore 0.6.1 EXACT CONFIG REQUIRED)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_executable(crit_core_consumer main.cpp)
 target_link_libraries(crit_core_consumer PRIVATE crit::core crit::cuda)

@@ -3,19 +3,18 @@ import datetime
 import hashlib
 import importlib.util
 import json
-import platform
 import sys
 import time
 from pathlib import Path
 
-from . import CONTRACT, EVAL_DIR, load_json, write_json
+from . import CONTRACT, EVAL_DIR, load_json, portable_path, write_json
 from .hostload import HostLoad
-from . import fixed, headroom, metrics, status
+from . import fixed, headroom, host, metrics, status
 from .ceiling import model_ceiling
 from .chat import ChatEngine, Server
 from .deadline import Hung
-from .context import (GIB, curve_points, curve_prompt, lower_context, max_context, pass_bytes, retrieval_points,
-                      retrieval_prompt, token_text)
+from .context import (GIB, curve_points, curve_prompt, draft_step_bytes, lower_context, max_context, pass_bytes,
+                      retrieval_points, retrieval_prompt, token_text)
 from .pin import CONTINUATIONS, load_continuations
 from .prepare import PREPARED, check_prepared, sampled_request, unapplied
 from .reference import REFERENCE_VERSION
@@ -371,19 +370,24 @@ def run_heldout(engine, info, prepared, protocol, log):
             "complete": len(measured) == len(prompts)}
 
 
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def native_identity(info):
-    """sha256 and size of each native library the adapter declares it loaded (`native_libraries`)."""
+    """sha256 and size of each native library the adapter declares it loaded (`native_libraries`), each path as
+    portable_path stores it."""
     out = []
     for path in info.get("native_libraries") or []:
-        entry = {"path": str(path)}
+        entry = {"path": portable_path(path)}
         try:
-            digest = hashlib.sha256()
-            with open(path, "rb") as handle:
-                for block in iter(lambda: handle.read(1 << 20), b""):
-                    digest.update(block)
-            entry.update(sha256=digest.hexdigest(), bytes=Path(path).stat().st_size)
+            entry.update(sha256=file_sha256(path), bytes=Path(path).stat().st_size)
         except OSError as error:
-            entry["error"] = str(error)
+            entry["error"] = error.strerror or type(error).__name__   # str(error) would name the path
         out.append(entry)
     return out
 
@@ -741,6 +745,15 @@ def compare_followup(first, again):
     return {"turns": turns, "passed": bool(turns) and all(t["identical"] for t in turns.values())}
 
 
+def drafts(speed):
+    """Whether any measured speed case decoded more than one token per target pass. The first token comes from the
+    prefill's logits, so a plain engine counts one round per later token (n tokens over n - 1 rounds, n / (n - 1)
+    tokens per round); only fewer rounds than that mean accepted drafts."""
+    return any(s.get("rounds") is not None and s["rounds"] < s["output_tokens"] - 1
+               for c in (speed or {}).get("cases", {}).values() if c.get("status") == "measured"
+               for s in c.get("samples", []) if not s.get("warmup"))
+
+
 def history_cases(prepared, info):
     """The speed cases the request-history check repeats (protocol history): those with the shortest and the
     longest prompt the engine holds."""
@@ -898,14 +911,18 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
         "contract": CONTRACT, "protocol": protocol["protocol"], "label": label,
         "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "model_sha256": prepared["model"]["sha256"], "suite_sha256": prepared["suite_sha256"],
-        "host": {"platform": platform.platform(), "python": platform.python_version()},
-        "adapter": None if url or opener else str(Path(adapter).resolve()), "server": url or getattr(opener, "server", None),
+        "host": host.describe(),
+        # The adapter by its checkout-relative path (no user's home in results) and its bytes.
+        "adapter": None if url or opener else portable_path(adapter),
+        "adapter_sha256": None if url or opener else file_sha256(adapter),
+        "server": url or getattr(opener, "server", None),
         "device": {k: device.get(k) for k in ("device", "bandwidth_gbs", "tflops", "memory_total_bytes",
                                                "memory_free_bytes", "measured_at")} if device else None,
         "bandwidth_gbs": bandwidth_gbs,
         "requirements": {"quality_budget": thresholds, "exactness": exactness},
         "context": requirement,
     }
+    log("host: " + host.summary(result["host"]))
     if required:
         log(f"context: {required:,} tokens ({requirement['source']}"
             + (f", {requirement['bound']} bound" if requirement.get("bound") else "") + ")"
@@ -942,7 +959,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
     engine, info = open_engine(module, model, config, speculative=True, context_tokens=required,
                                exact_prompts="quality" in parts)
     result["load_ms"] = (time.perf_counter() - started) * 1000
-    result["engine"] = info
+    result["engine"] = info if not info.get("native_libraries") else         {**info, "native_libraries": [portable_path(p) for p in info["native_libraries"]]}
     result["context"]["engine_max_context"] = info["max_context"]
     if info.get("native_libraries"):
         result["native_libraries"] = native_identity(info)
@@ -959,6 +976,11 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
         if "speed" in parts:
             result["speed"] = run_speed(engine, info, prepared, protocol, warmups, repetitions, log, continuations,
                                         disturbed)
+            if info.get("served") and not info.get("speculative") and drafts(result["speed"]):
+                # A server that publishes no engine facts but decodes more than a token per target pass speculates:
+                # its exactness is unmeasured, not taken for a plain engine's.
+                info.update(speculative=True, speculative_source="telemetry")
+                log("engine: speculative (its telemetry reports more than one token per target pass)")
             result["sampled_speed"] = run_sampled_speed(engine, info, prepared, protocol, warmups, sampled_repetitions, log,
                                                         disturbed)
             if result["sampled_speed"]["status"] == "measured":
@@ -1025,6 +1047,14 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
             except (OSError, ValueError, KeyError):
                 facts["bytes_per_pass"] = None
             source = "model files" if facts["bytes_per_pass"] else None
+        draft_source = "engine" if info.get("draft_bytes_per_step") else None
+        if facts.get("speculative") and not facts.get("draft_bytes_per_step"):
+            # A drafting engine that reports none: the checkpoint's own draft layers and the head they read.
+            try:
+                facts["draft_bytes_per_step"] = draft_step_bytes(model)
+            except (OSError, ValueError, KeyError):
+                facts["draft_bytes_per_step"] = None
+            draft_source = "model files" if facts["draft_bytes_per_step"] else None
         result["headroom"] = headroom.summarize(facts, result["speed"], step_ms, bandwidth_gbs, protocol["headroom"],
                                                 ceiling=ceiling, tflops=device.get("tflops"), steps=steps,
                                                 prefill_cases=protocol["speed"].get("prefill_cases", []),
@@ -1032,6 +1062,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                                                 decode_speed=decode_speed, decode_name=decode_name)
         # Bytes per pass from the engine, or from the stored model when it reports none (crit_eval.context.pass_bytes).
         result["headroom"]["bytes_per_pass_source"] = source
+        result["headroom"]["draft_bytes_per_step_source"] = draft_source
         for warning in result["headroom"]["warnings"]:
             log("headroom: " + warning)
     result["status"] = status.build(result, protocol, baseline)

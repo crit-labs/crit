@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-from . import EVAL_DIR, metrics, write_json
+from . import EVAL_DIR, metrics, portable_path, write_json
 
 SOURCE = EVAL_DIR / "probe" / "device_probe.cu"
 
@@ -119,7 +119,7 @@ def probe(out, nvcc=None, repeats=3, log=print):
                 + ", ".join(f"{k} {v:.0f} TFLOPS" for k, v in sample.get("tflops", {}).items()))
     result = combine(samples)
     result["host_memory_total_bytes"], result["host_memory_available_bytes"] = host_memory()
-    result.update(samples=samples, nvcc=nvcc,
+    result.update(samples=samples, nvcc=portable_path(nvcc),
                   probe_sha256=hashlib.sha256(SOURCE.read_bytes()).hexdigest(),
                   measured_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
     write_json(out, result)

@@ -54,6 +54,10 @@ suite's decode score stays next to it (`status.kpis.greedy_decode`), and prefill
 token, held-out prompts and exactness stay on the greedy suite. A result with no measured sampled
 decode (v6, or an engine that cannot sample) keeps the decode KPI on the greedy suite.
 
+Every greedy request names the penalties too, at their neutral values (presence and frequency 0,
+repetition 1), where the engine applies them: a served default such as a model card's presence penalty
+would otherwise change the output and send the request through another sampler.
+
 Every sampled request names every sampling field, so no engine default changes the distribution
 (an engine applies its own defaults, such as a model card's presence penalty, to the fields a
 request leaves out): the prepared settings, the filters they leave unset off (`top_p` 1, `top_k` 0,
@@ -131,7 +135,10 @@ adapter fields add the ceiling:
   An engine that reports no `bytes_per_pass`, such as one behind another server, gets the stored
   model's: the weights read on every pass but draft layers, the routed experts' share
   (`num_experts_per_tok` of the experts) and the fixed recurrent and sliding-window state
-  (`headroom.bytes_per_pass_source` says `engine` or `model files`).
+  (`headroom.bytes_per_pass_source` says `engine` or `model files`). A drafting engine that reports no
+  `draft_bytes_per_step` gets the checkpoint's own draft (MTP) layers, their routed experts' share and
+  the output head their logits go through (`headroom.draft_bytes_per_step_source`); a drafter that is
+  a model of its own has none to derive.
 - `accepted` per round from `generate()`: tokens per round at every width up to the measured one.
   With the draft cost (`draft_ms`, else round time beyond one pass ÷ width) Eval projects the
   **best draft width at current costs**; with `draft_bytes_per_step` also the best width at floor
@@ -140,6 +147,10 @@ adapter fields add the ceiling:
 - A better drafter raises tokens per round, so Eval also projects one whose later drafts are
   accepted as often as its first (each case's depth-1 rate, up to width 8) at floor costs. The
   **decode ceiling** is the larger projection.
+- An engine that does not speculate decodes one token per model pass, so with `bytes_per_pass` and
+  the bandwidth its **decode ceiling** is every pass at its floor: the geometric mean of 1 ÷ pass
+  floor over the cases (`headroom.projection.basis` is `one token per pass`). An engine that drafts
+  but reports no width keeps no ceiling.
 - From v7 these describe the sampled suite. Rejection sampling lets a drafter speculate under
   sampling, so the depth-1 rate of the projection is the better of the sampled and greedy suites'
   for each case; a sampled case that drafts nothing projects from its measured tokens per round.
@@ -243,9 +254,9 @@ engine's non-speculative output and reports whether they are identical, the firs
 token and the agreeing prefix. An engine declaring `plain` decodes the non-speculative output
 itself before it closes; otherwise Eval opens a second engine with `speculative` false
 (`exactness.engine` is `shared` or `separate`). A served engine is speculative when crit serve's
-`engine_facts` say so, and decodes plainly when its package declares `chat-plain-v1`; without it
-exactness is unmeasured, since a second engine from the same server would be the same speculative
-one. By default (`--exactness reported`) this is
+`engine_facts` say so, or when its telemetry reports more than one token per target pass, and decodes
+plainly when its package declares `chat-plain-v1`; without it exactness is unmeasured, since a second
+engine from the same server would be the same speculative one. By default (`--exactness reported`) this is
 information, since verify and decode may sum in different orders and the drift budget judges the
 output; `--exactness required` makes any difference fail. The drift budget compares distributions,
 so it does not judge a lossy acceptance rule (accepting drafts that are not the target's argmax);

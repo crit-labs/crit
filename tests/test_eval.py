@@ -15,7 +15,8 @@ from unittest.mock import Mock, mock_open, patch
 ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("core/python", "eval"): sys.path.insert(0, str(ROOT / _folder))
 from crit_core.model import inspect_safetensors  # noqa: E402
-from crit_eval import ab, ceiling, context, headroom, hostload, metrics, pin, prepare, probe, report, runner, status  # noqa: E402
+from crit_eval import ab, ceiling, context, headroom, host, hostload, metrics, pin, prepare, probe, report, runner, status  # noqa: E402
+import crit_eval  # noqa: E402
 from crit_eval import protocol_version  # noqa: E402
 
 MOCK = ROOT / "eval/examples/mock_adapter.py"
@@ -162,6 +163,9 @@ class RunnerTests(unittest.TestCase):
             result = runner.run(MOCK, "unused-model", data, data / "result.json", config,
                                 warmups=0, repetitions=2, log=lambda message: None, bandwidth_gbs=1.0)
             speed = result["speed"]
+            # The adapter by its checkout-relative path and its bytes: no user's home directory in a result.
+            self.assertEqual(result["adapter"], "eval/examples/mock_adapter.py")
+            self.assertEqual(result["adapter_sha256"], hashlib.sha256(MOCK.read_bytes()).hexdigest())
             self.assertEqual(speed["cases"]["short"]["status"], "measured")
             self.assertEqual(speed["cases"]["long"]["status"], "skipped")  # 60 + 12 > 64
             self.assertAlmostEqual(speed["cases"]["short"]["tokens_per_round"], 12 / 3)
@@ -478,6 +482,26 @@ class GapTests(unittest.TestCase):
         room = headroom.summarize(info, self.speed(), 16.0, 1000, THRESHOLDS, ceiling={"kv_bytes_per_token": 1e5})
         self.assertAlmostEqual(room["cases"]["short"]["pass_floor_ms"], (10e9 + 1e5 * 200) / 1e12 * 1000)
         self.assertAlmostEqual(room["cases"]["long"]["pass_floor_ms"], (10e9 + 1e5 * 10000) / 1e12 * 1000)
+
+    def test_a_plain_engine_has_one_token_per_pass_at_its_floor_as_its_decode_ceiling(self):
+        speed = self.speed()
+        speed["decode_score"] = 50.0
+        for case in speed["cases"].values():
+            case.update(decode_tps=50.0, tokens_per_round=1.0)
+        room = headroom.summarize({"bytes_per_pass": 10e9}, speed, 20.0, 1000, THRESHOLDS,
+                                  ceiling={"kv_bytes_per_token": 1e5})
+        # Pass floors with the KV read at each case's context (200 and 10,000 tokens): 10.02 and 11 ms.
+        ceiling = (1000 / 10.02 * 1000 / 11.0) ** 0.5
+        projection = room["projection"]
+        self.assertEqual(projection["basis"], "one token per pass")
+        self.assertAlmostEqual(projection["ceiling_score"], ceiling)
+        self.assertAlmostEqual(projection["fraction_of_ceiling"], 50.0 / ceiling)
+        self.assertIn(f"greedy decode score 50.0 is {50 / ceiling:.0%} of its ceiling {ceiling:.1f} "
+                      "(one token per model pass at its bandwidth floor)", room["warnings"])
+        # An engine that drafts without stating its width has no ceiling to derive; nor has one without bytes per pass.
+        self.assertIsNone(headroom.summarize({"bytes_per_pass": 10e9, "speculative": True}, speed, 20.0, 1000,
+                                             THRESHOLDS)["projection"])
+        self.assertIsNone(headroom.summarize({}, speed, 20.0, 1000, THRESHOLDS)["projection"])
 
     def test_decode_gaps_project_single_terms_in_a_fixed_order(self):
         info = {"draft_width": 3, "bytes_per_pass": 10e9, "draft_bytes_per_step": 1e9}
@@ -1185,6 +1209,12 @@ class StatusTests(unittest.TestCase):
         self.assertNotIn("next step", text)
         self.assertEqual(current["stop_record_headroom"]["kpis"][0], {"kpi": "decode", "start": None, "reached": 90.0,
                                                                       "limit": 100.0, "built": "", "cause": ""})
+        # A plain engine's ceiling is one token per pass at its floor, not a drafter's.
+        room["projection"] = {"basis": "one token per pass", "ceiling_score": 100.0, "fraction_of_ceiling": 0.9}
+        plain = status.build(result, protocol)
+        self.assertEqual(plain["goals"][0]["limit"], 100.0)
+        self.assertIn("decode   90.0 tok/s, 90% of its ceiling 100.0 (one token per model pass at its bandwidth floor)",
+                      status.render(plain))
 
     def test_noise_is_the_spread_of_per_repetition_scores(self):
         def sample(tps, warmup=False):
@@ -1258,6 +1288,25 @@ class StatusTests(unittest.TestCase):
             self.assertEqual(identity[0]["sha256"], hashlib.sha256(b"native bytes").hexdigest())
             self.assertEqual(identity[0]["bytes"], 12)
             self.assertIn("error", identity[1])
+            # Neither the stored paths nor the error message name the directory the libraries were in.
+            self.assertEqual([e["path"] for e in identity], [crit_eval.portable_path(library),
+                                                             crit_eval.portable_path(Path(directory) / "missing.so")])
+            self.assertNotIn(Path(directory).name, identity[1]["error"])
+
+    def test_portable_paths_name_no_user(self):
+        anchor = Path(ROOT.anchor)
+        home = anchor / "home" / "tester"  # outside the checkout, which may hold the temporary directory
+        with patch.object(crit_eval.Path, "home", return_value=home):
+            for path, stored in ((ROOT / "eval" / "examples" / "mock_adapter.py", "eval/examples/mock_adapter.py"),
+                                 (home / "engines" / "adapter.py", "~/engines/adapter.py"),
+                                 (anchor / "Users" / "someone" / "build" / "libengine.so", "libengine.so"),
+                                 (anchor / "mnt" / "c" / "Users" / "someone" / "adapter.py", "adapter.py"),
+                                 (anchor / "home" / "someone" / "cuda" / "bin" / "nvcc", "nvcc"),
+                                 (anchor / "usr" / "local" / "cuda-13.1" / "bin" / "nvcc",
+                                  (anchor / "usr" / "local" / "cuda-13.1" / "bin" / "nvcc").as_posix()),
+                                 (None, None)):
+                with self.subTest(path=path):
+                    self.assertEqual(crit_eval.portable_path(path), stored)
 
     def test_missing_device_ceilings_are_listed_as_missing_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1355,6 +1404,22 @@ class ContextTests(unittest.TestCase):
             (model / "config.json").write_text(json.dumps(DENSE))   # no routing known: experts are not counted
             self.assertEqual(context.pass_bytes(model, 1.0), RESIDENT)
             self.assertIsNone(context.pass_bytes(Path(directory) / "missing", 1.0))
+
+    def test_a_draft_step_reads_the_draft_layers_their_experts_share_and_the_head(self):
+        mtp = {"mtp.fc.weight": (64, 128), "mtp.layers.0.self_attn.q_proj.weight": (64, 64),
+               "mtp.layers.0.mlp.experts.0.up_proj.weight": (128, 64), "mtp.layers.0.mlp.experts.1.up_proj.weight": (128, 64),
+               "mtp.embed_tokens.weight": (1000, 64)}
+        draft_layers = (64 * 128 + 64 * 64) * 2
+        with tempfile.TemporaryDirectory() as directory:
+            model = safetensors_model(directory, {**SHAPES, **mtp}, {**DENSE, "num_experts": 2, "num_experts_per_tok": 1})
+            # The draft layers, one of their two experts, and the model's head; their own embedding rows are gathered.
+            self.assertEqual(context.draft_step_bytes(model), draft_layers + 128 * 64 * 2 + 1000 * 64 * 2)
+        with tempfile.TemporaryDirectory() as directory:
+            own = {**SHAPES, **mtp, "mtp.shared_head.head.weight": (500, 64)}
+            model = safetensors_model(directory, own, {**DENSE, "num_experts": 2, "num_experts_per_tok": 1})
+            self.assertEqual(context.draft_step_bytes(model), draft_layers + 128 * 64 * 2 + 500 * 64 * 2)
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertIsNone(context.draft_step_bytes(safetensors_model(directory, SHAPES, DENSE)))   # no draft layers
 
     def test_a_tied_output_head_keeps_the_embedding_in_device_memory(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2547,6 +2612,85 @@ class HostLoadCountersTest(unittest.TestCase):
                 self.assertTrue(math.isfinite(before) and math.isfinite(after))
                 self.assertGreaterEqual(before, 0.0)
                 self.assertGreaterEqual(after, before)
+
+
+class HostTest(unittest.TestCase):
+    """The result's host record: nvidia-smi, /proc/cpuinfo and every probe failing to None."""
+
+    def smi(self, *answers):
+        """Patch nvidia-smi to give answers in order: (stdout, returncode) or an exception."""
+        def run(command, **kwargs):
+            answer = replies.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return SimpleNamespace(stdout=answer[0], returncode=answer[1])
+        replies = list(answers)
+        return patch.object(host, "_nvidia_smi", return_value="nvidia-smi"), patch.object(host.subprocess, "run", run)
+
+    def gpus(self, *answers):
+        found, run = self.smi(*answers)
+        with found, run:
+            return host.gpus()
+
+    def test_gpu_link_vram_and_driver(self):
+        gpus = self.gpus(("0, NVIDIA GeForce RTX 5090, 32607, 596.49, 1, 4, 16, 16\n"
+                          "1, Other, 24576, 596.49, [N/A], [Not Supported], 8, 16\n", 0), ("5, 4\n5, [N/A]\n", 0))
+        self.assertEqual(gpus[0], {"index": 0, "name": "NVIDIA GeForce RTX 5090", "memory_total_bytes": 32607 * 1024 ** 2,
+                                   "driver": "596.49",
+                                   "pcie": {"gen_current": 1, "width_current": 16, "current_sampled": "idle",
+                                            "gen_max": 4, "width_max": 16, "gen_gpu_max": 5, "gen_host_max": 4}})
+        self.assertEqual(gpus[1]["pcie"], {"gen_current": None, "width_current": 8, "current_sampled": "idle",
+                                           "gen_max": None, "width_max": 16, "gen_gpu_max": 5, "gen_host_max": None})
+
+    def test_a_driver_without_side_maxima_keeps_the_link(self):
+        for side in (("Field \"pcie.link.gen.gpumax\" is not a valid field", 2), FileNotFoundError(), ("5, 4\n5, 4\n", 0)):
+            with self.subTest(side=side):
+                gpus = self.gpus(("0, G, 1024, 1.0, 4, 4, 16, 16\n", 0), side)
+                self.assertEqual((gpus[0]["pcie"]["gen_max"], gpus[0]["pcie"]["gen_gpu_max"]), (4, None))
+
+    def test_nvidia_smi_failures_record_none(self):
+        for answer in (("NVIDIA-SMI has failed", 9), OSError("denied"), host.subprocess.TimeoutExpired("nvidia-smi", 15),
+                       ("", 0), ("0, short\n", 0)):
+            with self.subTest(answer=answer):
+                self.assertIsNone(self.gpus(answer))
+        with patch.object(host, "_nvidia_smi", return_value=None):
+            self.assertIsNone(host.gpus())
+
+    def test_cpuinfo_counts_cores_not_threads(self):
+        block = "processor\t: {0}\nmodel name\t: Ryzen\nphysical id\t: 0\ncore id\t\t: {1}\n\n"
+        text = "".join(block.format(i, i % 6) for i in range(12))
+        with patch("builtins.open", mock_open(read_data=text)):
+            self.assertEqual(host._cpuinfo(), ("Ryzen", 6))
+        with patch("builtins.open", mock_open(read_data="processor\t: 0\nmodel name\t: Arm\n")):
+            self.assertEqual(host._cpuinfo(), ("Arm", None))
+
+    def test_a_failing_probe_records_none_and_never_raises(self):
+        with patch.object(host, "cpu", side_effect=RuntimeError("probe")), \
+                patch.object(host, "gpus", side_effect=ValueError("probe")), \
+                patch.object(host, "host_memory", side_effect=OSError("probe")):
+            described = host.describe()
+        self.assertEqual((described["cpu"], described["gpus"], described["memory_total_bytes"]), (None, None, None))
+        self.assertIsInstance(described["platform"], str)
+        with patch("builtins.open", side_effect=OSError("no proc")), \
+                patch.object(host, "_windows_cpu_model", side_effect=OSError("no registry")):
+            self.assertEqual(host.cpu()["logical_cores"], os.cpu_count())
+
+    def test_summary_names_the_link_the_host_allows(self):
+        record = {"platform": "Windows-11", "os": {"system": "Windows", "release": "11", "wsl": False},
+                  "cpu": {"model": "Ryzen", "physical_cores": 6, "logical_cores": 12}, "memory_total_bytes": 96 * 1024 ** 3,
+                  "gpus": [{"name": "RTX", "memory_total_bytes": 32 * 1024 ** 3,
+                            "pcie": {"gen_max": 4, "width_max": 16, "gen_gpu_max": 5}}]}
+        self.assertEqual(host.summary(record),
+                         "Windows 11; Ryzen (6/12 cores); 96 GiB RAM; RTX 32 GiB, PCIe 4.0 x16 (GPU supports 5.0)")
+        record["os"] = {"system": "Linux", "distribution": "Ubuntu", "wsl": True}
+        self.assertTrue(host.summary(record).startswith("Ubuntu (WSL); "))
+        self.assertEqual(host.summary({"platform": "Linux-6.1"}), "Linux-6.1")   # a result from before the probe
+
+    def test_this_machine_describes_itself(self):
+        described = host.describe()
+        self.assertEqual(set(described), {"platform", "python", "os", "cpu", "memory_total_bytes", "gpus"})
+        self.assertEqual(described["cpu"]["logical_cores"], os.cpu_count())
+        json.dumps(described)
 
 
 if __name__ == "__main__":
