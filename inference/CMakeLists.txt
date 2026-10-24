@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_inference VERSION 0.8.0 LANGUAGES CXX)
+project(crit_inference VERSION 0.9.0 LANGUAGES CXX)
 # Inference's native examples and fixtures. Inference uses Core only through its public SDK
 # (crit::core, crit::cuda); Core never builds or includes Inference code.
 find_package(Threads REQUIRED)
@@ -8,7 +8,7 @@ option(CRIT_INFERENCE_CUDA "Build Inference's CUDA reference kernels and their f
 option(CRIT_INFERENCE_INSTALLED_CORE "Use an installed Core SDK (CMAKE_PREFIX_PATH) instead of this checkout's core/" OFF)
 if(NOT TARGET crit::core)
   if(CRIT_INFERENCE_INSTALLED_CORE)
-    find_package(critCore 0.8.0 CONFIG REQUIRED)
+    find_package(critCore 0.9.0 CONFIG REQUIRED)
   else()
     if(CRIT_INFERENCE_CUDA)
       set(CRIT_CORE_CUDA ON CACHE BOOL "Build the explicit CUDA backend services" FORCE)

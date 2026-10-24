@@ -81,17 +81,22 @@ class Server:
         return value, {"seconds": read - started, "response_bytes": len(raw), "parse_seconds": time.monotonic() - read}
 
     def events(self, path, body, timeout):
-        """The streamed events of a request; `timeout` bounds the wait for each."""
+        """The streamed events of a request; `timeout` bounds the wait for each. Lines without data, such as the
+        keep-alive comments crit serve sends while the engine is quiet, are no answer."""
         request = urllib.request.Request(self.url + path, data=json.dumps(body).encode(), headers=self.headers)
         with _bounded(timeout, path), self.opener.open(request, timeout=timeout) as response:
+            waiting = time.monotonic()
             for line in response:
                 line = line.strip()
                 if not line.startswith(b"data:"):
+                    if time.monotonic() - waiting > timeout:
+                        raise TimeoutError
                     continue
                 data = line[5:].strip()
                 if data == b"[DONE]":
                     return
                 yield json.loads(data)
+                waiting = time.monotonic()
 
     def create_eval_engine(self, context):
         return ChatEngine(self, context)

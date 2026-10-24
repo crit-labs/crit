@@ -194,7 +194,8 @@ several. A key for the server goes in `CRIT_SERVER_KEY`. Eval sets no time budge
 each request may take the protocol's floor plus a slack times what the engine's earlier requests
 in the same Eval say it should (`requests.timeout`: prefill time grows at most quadratically with
 the prompt, a decode step at most linearly with the context), and a request past that stops the
-Eval as hung.
+Eval as hung. The bound is the wait for each streamed event: keep-alive comments a server sends in
+between, such as `crit serve`'s `: ping`, are no answer.
 
 The greedy cases send `temperature: 0`; the [sampled speed](MEASUREMENTS.md#sampled-speed) cases send the
 model's own sampling (`temperature`, `top_p`, `top_k`, `min_p`) and a `seed`, and the sampling check asks

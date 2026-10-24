@@ -69,10 +69,47 @@ class ScoreApiTests(ServeFixture, unittest.TestCase):
                 self.assertEqual(response.status, 400, value)
                 self.assertEqual(value["error"]["param"], param)
 
+    def test_a_full_queue_refuses_a_score_with_retry_after(self):
+        engine = self.server.api.engine
+        engine.lock.max_queue = 0
+        with engine.lock:  # lifecycle work holds the engine
+            response, value = self.post({"prompt_ids": [5, 6], "top_logprobs": 1})
+        self.assertEqual((response.status, response.getheader("Retry-After"), value["error"]["code"]),
+                         (429, "1", "rate_limit_exceeded"))
+        response, value = self.post({"prompt_ids": [5, 6], "top_logprobs": 1})
+        self.assertEqual(response.status, 200, value)
+        connection = http.client.HTTPConnection(*self.server.server_address[:2], timeout=30)
+        self.addCleanup(connection.close)
+        connection.request("GET", "/metrics")
+        text = connection.getresponse().read().decode()
+        for line in ('crit_serve_requests_total{dialect="crit",outcome="rejected"} 1',
+                     'crit_serve_requests_total{dialect="crit",outcome="completed"} 1',
+                     "crit_serve_requests_in_flight 0", "crit_serve_requests_waiting 0"):
+            self.assertIn(line, text)
+
     def test_a_response_naming_other_tokens_fails_the_request(self):
         response, value = self.post({"prompt_ids": [999, 6, 7], "top_logprobs": 1})
         self.assertEqual(response.status, 500, value)
         self.assertIn("invalid response", value["error"]["message"])
+        self.assertEqual(value["request_id"], response.getheader("X-Request-Id"))
+
+    def test_metrics_count_score_requests_by_outcome(self):
+        self.post({"prompt_ids": [5, 6, 7], "continuation_ids": [8], "top_logprobs": 1})
+        self.post({"prompt_ids": []})
+        self.post({"prompt_ids": [999, 6, 7], "top_logprobs": 1})
+        connection = http.client.HTTPConnection(*self.server.server_address[:2], timeout=30)
+        self.addCleanup(connection.close)
+        connection.request("GET", "/metrics")
+        text = connection.getresponse().read().decode()
+        for line in ('crit_serve_requests_total{dialect="crit",outcome="completed"} 1',
+                     'crit_serve_requests_total{dialect="crit",outcome="rejected"} 1',
+                     'crit_serve_requests_total{dialect="crit",outcome="error"} 1',
+                     "crit_serve_requests_in_flight 0", "crit_serve_prompt_tokens_total 0",
+                     "crit_serve_requests_running 0", "crit_serve_requests_waiting 0",
+                     # The two scores the engine ran were dispatched to it; the invalid one never began.
+                     "crit_serve_request_queue_time_seconds_count 2", "crit_serve_e2e_request_latency_seconds_count 2",
+                     "crit_serve_request_prompt_tokens_count 0"):
+            self.assertIn(line, text)
 
 
 class ScoreWithoutCapabilityTests(ServeFixture, unittest.TestCase):

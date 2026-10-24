@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crit"
-version = "0.8.0"
+version = "0.9.0"
 description = "crit: inference runtime, reusable techniques, kernel discovery, evaluation and an OpenAI-compatible serving API"
 readme = "README.md"
 license = "Apache-2.0"

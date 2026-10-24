@@ -3,6 +3,7 @@ from pathlib import Path
 import json
 import re
 import threading
+import time
 import uuid
 
 from crit.process.ownership import RuntimeOwnership
@@ -10,22 +11,27 @@ from crit.run.records import (digest, keys, now, number, read_json, record, safe
                               verification_scope, write_json)
 from crit.run.store import ROOT, RunStore
 
-from crit_core.serving import MIN_LOGPROB, PLAIN_CAPABILITY, SCORE_CAPABILITY
+from crit_core.serving import (COMPLETION_CAPABILITY, CONTINUE_CAPABILITY, FIT_OUTPUT_CAPABILITY, MIN_LOGPROB,
+                               PLAIN_CAPABILITY, SCORE_CAPABILITY, TOKENIZE_CAPABILITY)
 
 from .residency import CAPABILITY as RESIDENT_CAPABILITY, ResidentRuntime
-from .admission import Admission
+from .admission import Admission, Refused
 from .content import response_content, tool_size
-from .logprobs import logprob_entries, logprob_options, response_bytes
+from .logprobs import logprob_entries, logprob_options, prompt_entries, response_bytes
 from .stream import CAPABILITY as STREAM_CAPABILITY
 from .options import (MAX_CHAT_RECORD, RequestError, TOOL_STREAM_CAPABILITY, sampling_options, serving_capabilities,
-                      tool_options as validate_tool_options, validate_tool_reply)
+                      template_options, tool_options as validate_tool_options, validate_tool_reply)
 
 CAPABILITY = "chat-json-v1"
 # The adapter applies a request's response_format (crit_core.constraints / crit/constraints.h); see docs/SERVING.md.
 CONSTRAINTS_CAPABILITY = "chat-constraints-v1"
+# With it, also a response_format of type grammar: any compiled grammar (structured_outputs regex, choice, grammar).
+GRAMMAR_CAPABILITY = "chat-constraints-grammar-v1"
 MAX_CONVERSATION = 8 * 1024 * 1024
 LOAD_BYTES_PER_SECOND = 200e6  # model bytes per second assumed by the default load bound (the engine's own load)
 VERIFY_BYTES_PER_SECOND = 50e6  # with --verify-model: read, hash and copy every model file, then the engine load
+# What a tokenize request (chat-tokenize-v1) returns for each operation.
+TOKENIZED = {"tokenize": ("tokens",), "render": ("prompt", "tokens"), "detokenize": ("prompt",)}
 
 
 class EngineError(Exception):
@@ -33,6 +39,38 @@ class EngineError(Exception):
     def __init__(self, message, status=500):
         super().__init__(message)
         self.status = status
+
+
+class RequestRejected(EngineError):
+    """The engine refused the request before generating (crit_core.serving.RequestRejected): a 400 that leaves the
+    engine loaded. `reason` names the adapter's rule and `details` its facts."""
+    def __init__(self, message, reason, details=None):
+        super().__init__(message, 400)
+        self.reason, self.details = reason, details or {}
+
+
+class Overloaded(EngineError):
+    """The queue refused the request (admission.Refused) before the engine saw it: a full queue or an expired wait.
+    crit serve answers 429 (Anthropic 529, Ollama 503) with Retry-After."""
+    def __init__(self, message):
+        super().__init__(message, 429)
+
+
+class ContextLengthError(RequestRejected):
+    """The prompt plus the requested output exceeds the engine's context (crit_core.serving.ContextExceeded)."""
+    def __init__(self, message, prompt_tokens, output_tokens, capacity):
+        super().__init__(message, "context_exceeded", {"prompt_tokens": prompt_tokens, "output_tokens": output_tokens,
+                                                       "capacity": capacity})
+        self.prompt_tokens, self.output_tokens, self.capacity = prompt_tokens, output_tokens, capacity
+
+
+def rejected(result):
+    """The RequestRejected for a host result of status "rejected"."""
+    found, message = result["rejection"], result["error"] or "The engine rejected the request"
+    counts = [found.get(key) for key in ("prompt_tokens", "output_tokens", "capacity")]
+    if found["reason"] == "context_exceeded" and all(type(n) is int and n >= 0 for n in counts):
+        return ContextLengthError(message, *counts)
+    return RequestRejected(message, found["reason"], {k: v for k, v in found.items() if k != "reason"})
 
 
 class _CommandStop:
@@ -95,15 +133,30 @@ def telemetry(value, request):
 
 def reply(value, request):
     keys(value, {"schema_version", "record_kind", "request_id", "candidate_id", "package_sha256", "assistant", "telemetry"},
-         {"tool_calls", "reasoning", "logprobs"})
+         {"tool_calls", "reasoning", "logprobs", "max_output_tokens", "prompt"})
     if type(value["schema_version"]) is not int or value["schema_version"] != 1 or value["record_kind"] != "chat_response":
         raise ValueError("Invalid engine chat response")
     if any(value[key] != request[key] for key in ("request_id", "candidate_id", "package_sha256")):
         raise ValueError("Reply belongs to a different request or engine")
     measured = telemetry(value["telemetry"], request)
-    calls = validate_tool_reply(value.get("tool_calls"), request,
-                                measured["output_tokens"] == request["limits"]["max_output_tokens"])
-    assistant, reasoning = response_content(value, tool_size(calls))
+    limit = request["limits"]["max_output_tokens"]
+    if ("max_output_tokens" in value) != bool(request["limits"].get("fit_output")):
+        raise ValueError("Reply max_output_tokens does not match the request")
+    if "max_output_tokens" in value:
+        # chat-fit-output-v1: the cap the engine applied, the room the prompt left in the context.
+        limit = number(value["max_output_tokens"], "applied output tokens", measured["output_tokens"], limit,
+                       integer=True)
+        if measured["prompt_tokens"] + limit > request["limits"]["kv_tokens"]:
+            raise ValueError("The applied output cap exceeds the requested KV capacity")
+        measured = dict(measured, max_output_tokens=limit)
+    calls = validate_tool_reply(value.get("tool_calls"), request, measured["output_tokens"] == limit)
+    raw = "prompt" in request  # completion-v1: the text continues the prompt, which may echo back
+    if raw and "reasoning" in value:
+        raise ValueError("A raw prompt's reply has no reasoning")
+    if ("prompt" in value) != bool(request.get("echo")):
+        raise ValueError("Reply prompt does not match the request")
+    assistant, reasoning = response_content(value, tool_size(calls),
+                                            continued=bool(request.get("continue_final_message")), blank=raw)
     if calls:
         assistant = {"content": assistant, "tool_calls": calls}
     if reasoning:
@@ -115,7 +168,18 @@ def reply(value, request):
         entries = logprob_entries(value["logprobs"], request)
         if len(entries) > measured["output_tokens"]:
             raise ValueError("Reply logprobs exceed its output tokens")
+        if request.get("echo"):
+            prompt = prompt_entries(value["logprobs"], request)
+            if len(prompt) != measured["prompt_tokens"]:
+                raise ValueError("Reply prompt logprobs need one row per prompt token")
+            entries = prompt + entries
         assistant = dict(assistant if isinstance(assistant, dict) else {"content": assistant}, logprobs=entries)
+    if request.get("echo"):
+        echo = value["prompt"]
+        if (not isinstance(echo, str) or len(echo.encode("utf-8")) > MAX_CONVERSATION
+                or ("text" in request["prompt"] and echo != request["prompt"]["text"])):
+            raise ValueError("Reply prompt is not the request's prompt text")
+        assistant = dict(assistant if isinstance(assistant, dict) else {"content": assistant}, prompt=echo)
     return assistant, measured
 
 
@@ -160,6 +224,24 @@ def score_reply(value, request):
             "telemetry": telemetry}
 
 
+def tokenize_reply(value, request):
+    """A tokenize response record (chat-tokenize-v1) checked against its request: the text's ids for tokenize, the
+    prompt's text and ids for render, the ids' text for detokenize."""
+    parts = TOKENIZED[request["operation"]]
+    keys(value, {"schema_version", "record_kind", "request_id", "candidate_id", "package_sha256", *parts})
+    if (type(value["schema_version"]) is not int or value["schema_version"] != 1
+            or value["record_kind"] != "tokenize_response"):
+        raise ValueError("Invalid engine tokenize response")
+    if any(value[key] != request[key] for key in ("request_id", "candidate_id", "package_sha256")):
+        raise ValueError("Tokens belong to a different request or engine")
+    if "tokens" in parts and (not isinstance(value["tokens"], list)
+                              or not all(type(t) is int and 0 <= t < 2**31 for t in value["tokens"])):
+        raise ValueError("Tokens must be a list of token ids")
+    if "prompt" in parts and not isinstance(value["prompt"], str):
+        raise ValueError("A prompt must be text")
+    return {part: value[part] for part in parts}
+
+
 def package_signature(folder):
     result = []
     for path in sorted(Path(folder).rglob("*")):
@@ -183,11 +265,16 @@ class ServedEngine:
     benchmark attempt of the candidate, whose reservation settles after the server stops; `kv_tokens` then serves it
     at a lower context than the run's (Eval's lower-context gate).
 
-    The server owns the machine's crit runtime while it runs: no other crit process can load an engine.
+    Requests the engine cannot take yet wait in its queue: `max_queue` of them at most, each for `queue_timeout`
+    seconds at most (None: no bound); past either a request raises Overloaded.
+
+    The server owns the machine's crit runtime while it runs, also while its engine is unloaded: no other crit process
+    can load an engine. With `idle_unload` (crit serve --idle-unload) the engine unloads after that many seconds
+    without a request, and the next request loads it again.
     """
     def __init__(self, workspace, run_id=None, candidate_id=None, project=ROOT, runtime_directory=None,
                  host_limit=None, device_limit=None, timeout=600, load_timeout=None, verify_model=False, attempt=None,
-                 kv_tokens=None):
+                 kv_tokens=None, max_queue=None, queue_timeout=None, idle_unload=None):
         self.store = RunStore(workspace, project)
         self.run_id = run_id or single_run(self.store)
         self.requested_candidate = candidate_id
@@ -200,14 +287,19 @@ class ServedEngine:
         self.timeout = number(timeout, "request timeout", .01, 86400)
         self.load_timeout = None if load_timeout is None else number(load_timeout, "load timeout", .01, 7 * 86400)
         self.verify_model = bool(verify_model)
+        self.idle_unload = None if idle_unload is None else number(idle_unload, "idle unload", .01, 7 * 86400)
         self.ownership = RuntimeOwnership(runtime_directory)
         self.runtime = ResidentRuntime(self.ownership, host_limit, device_limit)
-        self.lock = Admission()
+        self.lock = Admission(
+            None if max_queue is None else number(max_queue, "queue size", 0, 1_000_000, integer=True),
+            None if queue_timeout is None else number(queue_timeout, "queue timeout", 0, 86400))
         self.runtime.on_retire = self.lock.invalidate
         self._stopping = threading.Event()
         self.specs = {}
         self.listed = None
         self.closed = False
+        self.loads = self.switches = 0  # completed engine loads, and those that replaced another candidate's engine
+        self.last_load = None
 
     def _verify(self, candidate_id, *, store=None, run_id=None):
         """The candidate's retained bytes, seal, chat interface, model file and settled attempts."""
@@ -321,10 +413,13 @@ class ServedEngine:
                                            _CommandStop(stop or threading.Event(), self._stopping), self.load_seconds(spec))
                 if result["status"] != "completed":
                     raise ValueError(result["error"] or "Engine loading failed")
+                self._loaded(self.default)
                 self.lock.configure(self.default, result.get("max_concurrent_requests", 1))
             except BaseException:
                 self._release()
                 raise
+            if self.idle_unload is not None:
+                threading.Thread(target=self._unload_idle, name="crit-idle-unload", daemon=True).start()
 
     def reopen(self, kv_tokens=None, stop=None):
         """Serve the measured candidate at `kv_tokens` of context (None: the run's) on the loaded runtime: the
@@ -342,6 +437,7 @@ class ServedEngine:
                                        self.load_seconds(spec))
             if result["status"] != "completed":
                 raise ValueError(result["error"] or "Engine loading failed")
+            self._loaded(self.default)
             self.lock.configure(self.default, result.get("max_concurrent_requests", 1))
 
     def load_seconds(self, spec):
@@ -374,44 +470,73 @@ class ServedEngine:
             return {"state": "blocked", "error": self.ownership.blocked}
         return self.runtime.status()
 
+    def ready(self, status=None):
+        """Whether a request for the loaded engine runs without loading one: the host has an engine ready or
+        generating and no switch, reload or retire is under way. After a retire it stays false until a request loads
+        the engine again."""
+        status = status if status is not None else self.status()
+        return (status.get("state") in {"ready", "generating"} and bool(status.get("engine"))
+                and not self.lock.loading() and not self._stopping.is_set())
+
     def facts(self, candidate_id=None):
         """The loaded engine's facts for Eval (crit_core.serving.engine_facts) when `candidate_id` (default: the
         default candidate) is the one loaded, else None."""
         status = self.runtime.status()
-        engine = status.get("engine") or {}
-        if engine.get("candidate_id") != (candidate_id or self.default) or engine.get("run_id") != self.run_id:
-            return None
-        return status.get("engine_facts")
+        return status.get("engine_facts") if self.loaded(candidate_id, status) else None
+
+    def loaded(self, candidate_id=None, status=None):
+        """Whether the host's engine is `candidate_id`'s (default: the default candidate's) package: the same run,
+        candidate and package digest, which a catalog name resolves to."""
+        engine = (status if status is not None else self.runtime.status()).get("engine") or {}
+        spec = self.spec(candidate_id)
+        return all(engine.get(k) == spec[k] for k in ("run_id", "candidate_id", "package_sha256"))
 
     def generate(self, messages, max_tokens, stop, on_text=None, candidate_id=None, response_format=None,
                  sampling=None, tool_options=None, on_tools=None, on_reasoning=None, on_started=None, logprobs=None,
-                 decode=None):
+                 decode=None, template_kwargs=None, fit_output=False, on_admitted=None, priority=0, request_id=None,
+                 timeout=None, continue_final_message=False, prompt=None, echo=False):
         """Run one request. `on_text(text)` receives each piece of accepted text as the adapter streams it.
-        `response_format` (from crit_api.server.response_format) goes into the request record for adapters that
-        declare chat-constraints-v1. Sampling and tool options are capability-gated request overrides; logprobs n
-        asks a chat-logprobs-v1 adapter for every token's log-probability with n alternatives; decode "plain" asks a
-        chat-plain-v1 adapter to decode one token per target pass.
+        `response_format` (from crit_api.server.response_format or structured_outputs) goes into the request record
+        for adapters that declare chat-constraints-v1, and also chat-constraints-grammar-v1 for type grammar.
+        Sampling and tool options are capability-gated request overrides; logprobs n asks a chat-logprobs-v1 adapter
+        for every token's log-probability with n alternatives; decode "plain" asks a chat-plain-v1 adapter to decode
+        one token per target pass; template_kwargs set the chat-template variables a chat-template-kwargs-v1 adapter
+        declares; fit_output asks a chat-fit-output-v1 adapter to cut max_tokens to the room the prompt leaves in the
+        context, and the telemetry then carries the cap it applied as max_output_tokens; continue_final_message asks
+        a chat-continue-v1 adapter to continue the final assistant message, its reply only what follows it.
+        `prompt`, {"text"} or {"ids"} in place of messages (None), asks a completion-v1 adapter to continue a raw
+        prompt without the chat template; with `echo` the reply also returns the prompt, and with logprobs its rows
+        (from a chat-score-v1 adapter's score path).
+        `priority` orders the request among those waiting for the engine, lower first (Admission.admit). `timeout`
+        (seconds) bounds this request in place of the server's timeout, which caps it.
         `on_started(deadline)` receives the command's absolute monotonic deadline
         after dispatch, so response delivery can honor the same execution budget.
+        `on_admitted()` runs once the request leaves the queue, before the engine loads or sees it. `request_id` (crit
+        serve's id of the HTTP request; default a new one) is the request record's id, which names its records when it
+        fails.
 
         Returns (status, assistant, telemetry): status is "completed", "cancelled" or "timed_out"; a cancelled
         or timed-out request has no reply or telemetry. Assistant is text, or {content, tool_calls, reasoning,
-        logprobs (OpenAI's logprobs content)} with the parts the reply has. Raises EngineError when the engine fails.
+        logprobs (OpenAI's logprobs content, an echoed prompt's first), prompt (the echoed prompt)} with the parts the
+        reply has. Raises EngineError when the engine fails.
         """
         image_input = any(isinstance(m.get("content"), list) and any(p.get("type") == "image_url" for p in m["content"])
-                          for m in messages)
+                          for m in messages or ())
         # The HTTP body's bound, in bytes: a character count would refuse a prompt that fits the model's context.
-        if len(json.dumps(messages, ensure_ascii=False).encode("utf-8")) > MAX_CONVERSATION:
-            raise EngineError("Conversation exceeds 8 MiB", 400)
+        sent = messages if prompt is None else prompt
+        if len(json.dumps(sent, ensure_ascii=False).encode("utf-8")) > MAX_CONVERSATION:
+            raise EngineError(("Conversation" if prompt is None else "Prompt") + " exceeds 8 MiB", 400)
         # A disconnected waiter must leave promptly without taking ownership of
         # the active turn or eventually loading/switching an engine for dead work.
         candidate_id = candidate_id or self.default
-        needs_load = self.lock.admit(candidate_id, _CommandStop(stop, self._stopping))
+        needs_load = self._admit(candidate_id, stop, priority)
         if needs_load is None:
             if self._stopping.is_set():
                 raise EngineError("Engine is stopping", 503)
             return "cancelled", None, None
         try:
+            if on_admitted:
+                on_admitted()
             if stop.is_set():
                 return "cancelled", None, None
             if self._stopping.is_set():
@@ -426,17 +551,35 @@ class ServedEngine:
                 raise EngineError("max_tokens must be between 1 and %d" % (limits["kv_tokens"] - 1), 400)
             if response_format is not None and CONSTRAINTS_CAPABILITY not in spec["capabilities"]:
                 raise EngineError("This engine package does not declare " + CONSTRAINTS_CAPABILITY, 400)
+            if (response_format or {}).get("type") == "grammar" and GRAMMAR_CAPABILITY not in spec["capabilities"]:
+                raise EngineError("This engine package does not declare " + GRAMMAR_CAPABILITY, 400)
             if decode is not None and (decode != "plain" or PLAIN_CAPABILITY not in spec["capabilities"]):
                 raise EngineError("This engine package does not declare " + PLAIN_CAPABILITY, 400)
+            if fit_output and FIT_OUTPUT_CAPABILITY not in spec["capabilities"]:
+                raise EngineError("This engine package does not declare " + FIT_OUTPUT_CAPABILITY, 400)
+            if continue_final_message and CONTINUE_CAPABILITY not in spec["capabilities"]:
+                raise EngineError("This engine package does not declare " + CONTINUE_CAPABILITY, 400)
+            if timeout is not None and (type(timeout) not in (int, float) or not 0 < timeout < float("inf")):
+                raise EngineError("timeout must be a positive number of seconds", 400)
+            if prompt is not None and COMPLETION_CAPABILITY not in spec["capabilities"]:
+                raise EngineError("This engine package does not declare " + COMPLETION_CAPABILITY, 400)
+            if echo and logprobs is not None and SCORE_CAPABILITY not in spec["capabilities"]:
+                raise EngineError("This engine package does not declare " + SCORE_CAPABILITY, 400)
+            timeout = self.timeout if timeout is None else min(timeout, self.timeout)
             extra = {} if response_format is None else {"response_format": response_format}
             if decode is not None:
                 extra["decode"] = decode
+            if continue_final_message:
+                extra["continue_final_message"] = True
             try:
                 applied = sampling_options(sampling or {}, spec["capabilities"])
                 extra.update(validate_tool_options(tool_options or {}, spec["capabilities"]))
                 if logprobs is not None:
                     extra["logprobs"] = logprob_options({"logprobs": True, "top_logprobs": logprobs},
                                                         spec["capabilities"])
+                if template_kwargs:
+                    extra["template_kwargs"] = template_options({"chat_template_kwargs": template_kwargs},
+                                                                spec["capabilities"])
             except RequestError as exc:
                 raise EngineError(str(exc), 400) from exc
             if applied:
@@ -449,16 +592,19 @@ class ServedEngine:
                 loaded = self._load(spec, candidate_id, stop)
                 if loaded is not None:
                     return loaded, None, None
-            request = record("chat_request", spec["run_id"], chat_id="chat-" + uuid.uuid4().hex, request_id=uuid.uuid4().hex,
+            text = {"messages": messages} if prompt is None else {"prompt": prompt, **({"echo": True} if echo else {})}
+            request = record("chat_request", spec["run_id"], chat_id="chat-" + uuid.uuid4().hex,
+                request_id=request_id or uuid.uuid4().hex,
                 candidate_id=spec["candidate_id"], package_sha256=spec["package_sha256"], created_at=now(),
                 model_path=spec["model_path"], package_path=spec["package_path"],
-                model_manifest=spec["model_manifest"], configuration=spec["configuration"], messages=messages,
-                limits={"max_output_tokens": max_tokens, "kv_tokens": limits["kv_tokens"], "timeout_seconds": self.timeout,
-                        **{k: v for k, v in limits.items() if k.endswith("headroom_bytes")}}, **extra)
+                model_manifest=spec["model_manifest"], configuration=spec["configuration"], **text,
+                limits={"max_output_tokens": max_tokens, "kv_tokens": limits["kv_tokens"], "timeout_seconds": timeout,
+                        **{k: v for k, v in limits.items() if k.endswith("headroom_bytes")},
+                        **({"fit_output": True} if fit_output else {})}, **extra)
             streams = STREAM_CAPABILITY in spec["capabilities"]
             try:
                 result = self.runtime.call("generate", {"spec": spec, "request": request},
-                    _CommandStop(stop, self._stopping), self.timeout,
+                    _CommandStop(stop, self._stopping), timeout,
                     progress=on_text if streams and on_text else None, request=request,
                     progress_tools=on_tools if TOOL_STREAM_CAPABILITY in spec["capabilities"] else None,
                     progress_reasoning=on_reasoning if streams else None, on_started=on_started)
@@ -478,6 +624,8 @@ class ServedEngine:
                 if self._stopping.is_set():
                     raise EngineError("Engine is stopping", 503)
                 return result["status"], None, None
+            if result["status"] == "rejected":
+                raise rejected(result)  # refused before generating: the host settled and keeps the engine
             if result["status"] != "completed":
                 self._keep(request)
                 self._retire(result["error"])
@@ -493,6 +641,14 @@ class ServedEngine:
         finally:
             self.lock.release()
 
+    def _admit(self, candidate_id, stop, priority=0):
+        """Wait in the queue (Admission.admit), lower priority values first: whether the request must load, None when
+        cancelled."""
+        try:
+            return self.lock.admit(candidate_id, _CommandStop(stop, self._stopping), priority)
+        except Refused as exc:
+            raise Overloaded(str(exc)) from None
+
     def _load(self, spec, candidate_id, stop):
         """Load the candidate's engine on the host: None once loaded, else "cancelled" or "timed_out"."""
         try:
@@ -505,6 +661,7 @@ class ServedEngine:
                 return loaded["status"]
             if loaded["status"] != "completed":
                 raise EngineError(loaded.get("error") or "Engine loading failed")
+            self._loaded(candidate_id)
             self.lock.configure(candidate_id, loaded.get("max_concurrent_requests", 1))
         except BaseException as exc:
             if not self._stopping.is_set():
@@ -512,14 +669,93 @@ class ServedEngine:
             raise
         return None
 
-    def score(self, prompt_ids, continuation_ids, top_logprobs, stop, candidate_id=None, prompt_rows=True):
+    def _loaded(self, candidate_id):
+        """Count a completed load for GET /metrics, before admission lets other requests in."""
+        if self.last_load not in (None, candidate_id):
+            self.switches += 1
+        self.loads += 1
+        self.last_load = candidate_id
+
+    def load(self, stop, candidate_id=None):
+        """Load the candidate's engine (default: the default candidate's) without generating, as a request would:
+        "completed" once it is loaded, else "cancelled" or "timed_out"."""
+        candidate_id = candidate_id or self.default
+        needs_load = self._admit(candidate_id, stop)
+        if needs_load is None:
+            if self._stopping.is_set():
+                raise EngineError("Engine is stopping", 503)
+            return "cancelled"
+        try:
+            if self._stopping.is_set():
+                raise EngineError("Engine is stopping", 503)
+            if self.ownership.blocked:
+                raise EngineError("Runtime cleanup is unresolved: " + self.ownership.blocked, 503)
+            loaded = self._load(self.spec(candidate_id), candidate_id, stop) if needs_load else None
+            return loaded or "completed"
+        finally:
+            self.lock.release()
+
+    def unload(self, candidate_id=None, idle=None):
+        """Release the loaded engine's weights once the requests it runs drain, while later requests wait: the resident
+        host closes the engine and frees the model's pool, as at shutdown, but keeps its process and the runtime's
+        ownership, and the next request loads the engine again as a switch does. With `candidate_id`, only when its
+        engine is the one loaded; with `idle` seconds (--idle-unload), only when no request has used the engine for
+        that long and none is waiting. Returns whether an engine was unloaded."""
+        if idle is None:
+            self.lock.acquire()
+        elif not self.lock.acquire(blocking=False):
+            return False
+        try:
+            if self.closed or self._stopping.is_set():
+                raise EngineError("Engine is stopping", 503)
+            if self.ownership.blocked:
+                raise EngineError("Runtime cleanup is unresolved: " + self.ownership.blocked, 503)
+            status = self.runtime.status()
+            if (not status.get("engine") or (candidate_id is not None and not self.loaded(candidate_id, status))
+                    or (idle is not None and time.monotonic() - self.lock.used < idle)):
+                return False
+            try:
+                result = self.runtime.call("unload", {}, _CommandStop(threading.Event(), self._stopping), self.timeout)
+            except BaseException as exc:
+                self._retire(exc)  # retiring the host process releases the weights too
+                if not isinstance(exc, (ValueError, OSError)):
+                    raise
+            else:
+                if result["status"] != "completed":
+                    self._retire(result["error"])
+            if self.ownership.blocked:
+                raise EngineError("Runtime cleanup is unresolved: " + self.ownership.blocked, 503)
+            self.lock.invalidate()
+            return True
+        finally:
+            self.lock.release()
+
+    def _unload_idle(self):
+        """--idle-unload: unload the engine once no request has used it for idle_unload seconds."""
+        while not self._stopping.wait(min(1, self.idle_unload)):
+            if time.monotonic() - self.lock.used >= self.idle_unload and self.runtime.status().get("engine"):
+                try:
+                    self.unload(idle=self.idle_unload)
+                except EngineError:
+                    pass  # the next request reports the runtime's state
+
+    def unloads_at(self):
+        """With idle_unload, the time (seconds since the epoch) the loaded engine unloads unless a request uses it;
+        else None."""
+        if self.idle_unload is None:
+            return None
+        return time.time() + max(0, self.lock.used + self.idle_unload - time.monotonic())
+
+    def score(self, prompt_ids, continuation_ids, top_logprobs, stop, candidate_id=None, prompt_rows=True,
+              request_id=None, on_started=None):
         """Score fixed text through the engine's serving paths (chat-score-v1): every prompt position from its
         prefill (none with prompt_rows false) and every continuation token from its decode, forced to the
         continuation, each with the token's log-probability and top_logprobs ranked alternatives. Returns (status,
         scored, telemetry) as generate() does, scored {"prompt": rows, "continuation": rows} with rows
-        [token, logprob, [[token, logprob], ...]]."""
+        [token, logprob, [[token, logprob], ...]]; `request_id` is the request record's id and `on_started(deadline)`
+        runs once the command goes to the engine, as for generate()."""
         candidate_id = candidate_id or self.default
-        needs_load = self.lock.admit(candidate_id, _CommandStop(stop, self._stopping))
+        needs_load = self._admit(candidate_id, stop)
         if needs_load is None:
             if self._stopping.is_set():
                 raise EngineError("Engine is stopping", 503)
@@ -541,14 +777,15 @@ class ServedEngine:
                 loaded = self._load(spec, candidate_id, stop)
                 if loaded is not None:
                     return loaded, None, None
-            request = record("score_request", spec["run_id"], request_id=uuid.uuid4().hex,
+            request = record("score_request", spec["run_id"], request_id=request_id or uuid.uuid4().hex,
                              candidate_id=spec["candidate_id"], package_sha256=spec["package_sha256"], created_at=now(),
                              prompt_ids=list(prompt_ids), continuation_ids=list(continuation_ids),
                              top_logprobs=top_logprobs, prompt_rows=bool(prompt_rows),
                              limits={"kv_tokens": limits["kv_tokens"], "timeout_seconds": self.timeout})
             try:
                 result = self.runtime.call("score", {"spec": spec, "request": request},
-                                           _CommandStop(stop, self._stopping), self.timeout, request=request)
+                                           _CommandStop(stop, self._stopping), self.timeout, request=request,
+                                           on_started=on_started)
             except BaseException as exc:
                 self._retire(exc)
                 if isinstance(exc, (ValueError, OSError)):
@@ -560,6 +797,8 @@ class ServedEngine:
                 if self._stopping.is_set():
                     raise EngineError("Engine is stopping", 503)
                 return result["status"], None, None
+            if result["status"] == "rejected":
+                raise rejected(result)
             if result["status"] != "completed":
                 self._retire(result["error"])
                 raise EngineError(result["error"] or "Engine failed the request")
@@ -572,6 +811,74 @@ class ServedEngine:
             return "completed", {"prompt": scored["prompt"], "continuation": scored["continuation"]}, scored["telemetry"]
         finally:
             self.lock.release()
+
+    def tokenize(self, operation, fields, stop, candidate_id=None):
+        """Run a tokenize request (chat-tokenize-v1) on the candidate's engine: "tokenize" a text ({"prompt",
+        "add_special_tokens"}), "render" a conversation as a reply would prefill it ({"messages"}, the tool options
+        and any "template_kwargs" and "continue_final_message") or "detokenize" ids ({"tokens"}). While the
+        candidate's engine is loaded it runs at once, beside any generation and outside admission; otherwise it is
+        admitted and loads the engine as a reply would (a full queue refuses it as one, Overloaded), and `stop` (the
+        client's disconnect) cancels that wait and load as a reply's, a 499. Returns TOKENIZED[operation]:
+        {"tokens"}, {"prompt", "tokens"} or {"prompt"}."""
+        candidate_id = candidate_id or self.default
+        if self._stopping.is_set():
+            raise EngineError("Engine is stopping", 503)
+        spec = self.spec(candidate_id)
+        if TOKENIZE_CAPABILITY not in spec["capabilities"]:
+            raise EngineError("This engine package does not declare " + TOKENIZE_CAPABILITY, 404)
+        request = record("tokenize_request", spec["run_id"], request_id=uuid.uuid4().hex,
+                         candidate_id=spec["candidate_id"], package_sha256=spec["package_sha256"], created_at=now(),
+                         operation=operation, **fields)
+        if not self.ownership.blocked and self.loaded(candidate_id):
+            found = self._tokenize(spec, request)
+            if found is not None:
+                return found
+        # Not loaded, or switched away meanwhile: admitted and loaded as for a reply, never for a client that left; a
+        # full queue refuses it as a reply (Overloaded).
+        needs_load = self._admit(candidate_id, stop)
+        if needs_load is None:
+            if self._stopping.is_set():
+                raise EngineError("Engine is stopping", 503)
+            raise EngineError("Request cancelled", 499)
+        try:
+            if stop.is_set():
+                raise EngineError("Request cancelled", 499)
+            if self._stopping.is_set():
+                raise EngineError("Engine is stopping", 503)
+            if self.ownership.blocked:
+                raise EngineError("Runtime cleanup is unresolved: " + self.ownership.blocked, 503)
+            loaded = self._load(spec, candidate_id, stop) if needs_load else None
+            if loaded == "timed_out":
+                raise EngineError("The engine did not load within its load timeout", 504)
+            if loaded is not None:
+                raise EngineError("Request cancelled", 499)
+            found = self._tokenize(spec, request)
+            if found is None:
+                raise EngineError("The resident host has not loaded the request's engine")
+            return found
+        finally:
+            self.lock.release()
+
+    def _tokenize(self, spec, request):
+        """The host's checked answer to a tokenize request, or None when it has not loaded the candidate's engine. A
+        tokenize leaves the engine loaded whatever its outcome; the client's disconnect does not cancel it."""
+        try:
+            result = self.runtime.call("tokenize", {"spec": spec, "request": request}, threading.Event(),
+                                       self.timeout, request=request)
+        except (ValueError, OSError) as exc:
+            raise EngineError("Engine host failed: " + str(exc)) from exc
+        if result["status"] == "rejected":
+            if result["rejection"]["reason"] == "unloaded":   # crit_api.host.Unloaded
+                return None
+            raise rejected(result)
+        if result["status"] == "timed_out":
+            raise EngineError("The engine did not finish within the request timeout", 504)
+        if result["status"] != "completed":
+            raise EngineError(result["error"] or "Engine failed the request")
+        try:
+            return tokenize_reply(result["response"], request)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise EngineError("Engine returned an invalid response: " + str(exc)) from exc
 
     def _check_sealed(self, spec):
         """The package must still be the sealed one after the engine ran. Unchanged file metadata skips rehashing;

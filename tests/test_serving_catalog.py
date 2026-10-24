@@ -48,8 +48,8 @@ class CatalogTests(ServeFixture, unittest.TestCase):
     def test_http_model_routing_unloads_before_loading_and_applies_each_context(self):
         engine = self.catalog_engine()
         api = Api(engine)
-        self.assertEqual([(m["id"], m["context_length"]) for m in api.models()],
-                         [("first", 8192), ("second", 4096)])
+        self.assertEqual([(m["id"], m["context_length"], m["limits"]["context_length"], m["limits"]["max_output_tokens"])
+                          for m in api.models()], [("first", 8192, 8192, 8191), ("second", 4096, 4096, 4095)])
         with self.assertRaises(RequestError) as missing:
             api.completion_request({"model": "typo", "messages": [{"role": "user", "content": "hello"}]})
         self.assertEqual(missing.exception.status, 404)
@@ -88,6 +88,112 @@ class CatalogTests(ServeFixture, unittest.TestCase):
         self.assertNotEqual(results[0]["weights"], results[1]["weights"])
         self.assertEqual(len({r["device"] for r in results}), 3)
         self.assertEqual(len({r["generation"] for r in results}), 3)
+
+    def test_ps_and_engine_facts_follow_the_loaded_name(self):
+        engine = self.catalog_engine()
+        status = engine.runtime.status
+        facts = {"speculative": False}
+        api = Api(engine)
+        server = Server(("127.0.0.1", 0), api)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.shutdown)
+
+        def get(path):
+            client = http.client.HTTPConnection(*server.server_address, timeout=20)
+            self.addCleanup(client.close)
+            client.request("GET", path)
+            return json.loads(client.getresponse().read())
+
+        with patch.object(engine.runtime, "status", lambda: dict(status(), engine_facts=facts)):
+            for name, other in (("first", "second"), ("second", "first")):
+                if name == "second":
+                    self.ask(engine, candidate="second")
+                self.assertEqual({m["id"]: m["engine_facts"] for m in api.models()}, {name: facts, other: None})
+                loaded = get("/api/ps")["models"]
+                self.assertEqual([(m["name"], m["digest"], m["context_length"]) for m in loaded],
+                                 [(name, engine.spec(name)["package_sha256"], engine.spec(name)["limits"]["kv_tokens"])])
+        self.assertEqual({m["name"]: m["digest"] for m in get("/api/tags")["models"]},
+                         {n: engine.spec(n)["package_sha256"] for n in ("first", "second")})
+
+    def test_aliases_and_an_opt_in_fallback_select_configured_names(self):
+        value = json.loads(self.catalog.read_text())
+        value["models"][0]["aliases"] = ["gpt-4o", "claude-*", "llama3:8b"]
+        value["models"][1]["aliases"] = ["claude-haiku-*", "*-mini", "openai/gpt-4o-mini"]
+        write_json(self.catalog, value)
+        engine = ModelCatalog(self.catalog)
+        # Names and exact aliases first, then the pattern with the most characters besides *.
+        for model, name in (("first", "first"), ("second", "second"), ("gpt-4o", "first"), ("llama3:8b", "first"),
+                            ("claude-sonnet-4-5-20250929", "first"), ("claude-haiku-4-5-20251001", "second"),
+                            ("o3-mini", "second"), ("openai/gpt-4o-mini", "second"), ("claude-x-mini", "first")):
+            with self.subTest(model=model):
+                self.assertEqual(engine.resolve_model(model), name)
+        for model in ("gpt-4", "gpt-4o-2024-08-06", "Claude-sonnet-4", "claude", "llama3:70b"):
+            with self.subTest(model=model), self.assertRaises(EngineError) as unknown:
+                engine.resolve_model(model)
+            self.assertEqual(unknown.exception.status, 404)
+        write_json(self.catalog, value | {"fallback": "second"})
+        engine = ModelCatalog(self.catalog)
+        self.assertEqual([engine.resolve_model(m) for m in ("gpt-4", "gpt-4o", "first")], ["second", "first", "first"])
+
+    def test_catalog_refuses_clashing_or_malformed_aliases_and_fallbacks(self):
+        value = json.loads(self.catalog.read_text())
+        for rows, catalog, message in (
+                ([{"aliases": ["second"]}, {}], {}, "also a model name"),
+                ([{"aliases": ["gpt-4o"]}, {"aliases": ["claude-*", "gpt-4o"]}], {}, "Duplicate model alias"),
+                ([{"aliases": "gpt-4o"}, {}], {}, "aliases must be"),
+                ([{"aliases": ["claude 3"]}, {}], {}, "aliases must be"),
+                ([{"aliases": ["gpt-[45]"]}, {}], {}, "aliases must be"),
+                ([{"display_name": " "}, {}], {}, "display_name"),
+                ([{"aliases": ["gpt-4o"]}, {}], {"fallback": "gpt-4o"}, "fallback"),
+                ([{}, {}], {"fallback": None}, "fallback")):
+            with self.subTest(rows=rows, catalog=catalog):
+                write_json(self.catalog, value | catalog | {"models": [m | r for m, r in zip(value["models"], rows)]})
+                with self.assertRaisesRegex(ValueError, message):
+                    ModelCatalog(self.catalog)
+
+    def test_cards_carry_display_name_and_max_model_len_and_aliases_reach_their_model(self):
+        value = json.loads(self.catalog.read_text())
+        value["models"][0] |= {"aliases": ["gpt-4o"], "display_name": "First model"}
+        value["models"][1]["aliases"] = ["claude-haiku-*"]
+        write_json(self.catalog, value)
+        engine = self.catalog_engine()
+        server = Server(("127.0.0.1", 0), Api(engine))
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.shutdown)
+
+        def call(method, path, body=None):
+            client = http.client.HTTPConnection(*server.server_address, timeout=20)
+            self.addCleanup(client.close)
+            client.request(method, path, None if body is None else json.dumps(body))
+            response = client.getresponse()
+            return response.status, json.loads(response.read())
+
+        cards = call("GET", "/v1/models")[1]["data"]
+        self.assertEqual([(m["id"], m["display_name"], m["label"], m["context_length"], m["max_model_len"])
+                          for m in cards], [("first", "First model", "Fixture engine", 8192, 8192),
+                                            ("second", "Fixture engine", "Fixture engine", 4096, 4096)])
+        # Clients list the configured names only; an alias still finds its model's details.
+        self.assertEqual([m["name"] for m in call("GET", "/api/tags")[1]["models"]], ["first", "second"])
+        self.assertEqual(call("GET", "/v1/models/gpt-4o")[0], 404)
+        shown = call("POST", "/api/show", {"model": "claude-haiku-4-5"})[1]
+        self.assertEqual(shown["model_info"]["crit.context_length"], 4096)
+        hello = [{"role": "user", "content": "hello"}]
+        status, reply = call("POST", "/v1/messages", {"model": "claude-haiku-4-5-20251001", "max_tokens": 64,
+                                                      "messages": hello})
+        self.assertEqual((status, reply["model"]), (200, "claude-haiku-4-5-20251001"))
+        self.assertEqual(json.loads(reply["content"][0]["text"])["weights"], "a second synthetic model")
+        status, reply = call("POST", "/v1/chat/completions", {"model": "gpt-4o", "messages": hello})
+        self.assertEqual((status, reply["model"]), (200, "first"))
+        self.assertEqual(json.loads(reply["choices"][0]["message"]["content"])["weights"],
+                         "synthetic input, not a model")
+        status, reply = call("POST", "/api/chat", {"model": "gpt-4", "stream": False, "messages": hello})
+        self.assertEqual(status, 404, reply)
 
     def test_duplicate_names_default_and_launchers(self):
         args = parser().parse_args(["--models", str(self.catalog), "--write-launchers"])

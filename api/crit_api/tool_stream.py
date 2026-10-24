@@ -5,7 +5,7 @@ import re
 from crit_core.constraints import ByteGrammar, GrammarState
 
 from .content import content_size, content_text, tool_size
-from .options import function_name
+from .options import complete_arguments, function_name
 
 
 class ToolCallStream:
@@ -13,6 +13,7 @@ class ToolCallStream:
         # Adapters receive a mutable request. Their local edits must not change the policy already admitted.
         self.request = copy.deepcopy(request)
         self.calls, self.states = [], []
+        self.grown = set()  # indices of calls whose arguments grew since the last text
 
     @property
     def size(self):
@@ -61,7 +62,15 @@ class ToolCallStream:
                     raise ValueError("Streamed arguments violate the strict tool schema")
             result.append(out)
         self.calls, self.states = calls, states
+        self.grown.update(delta["index"] for delta in result)
         return result
+
+    def before_text(self):
+        """Check that text may follow: every call is whole before the text after it, so a stop string in the text
+        never ends the reply inside a call."""
+        if any(not complete_arguments(self.calls[index]) for index in self.grown):
+            raise ValueError("Stream text arrived inside an unfinished tool call")
+        self.grown.clear()
 
     def snapshot(self, calls):
         """Validate a coalesced snapshot and return only unseen argument suffixes."""

@@ -50,9 +50,18 @@ class Engine:
             return response
         if self.mode == 'echo-request':
             return self.response(request, json.dumps({k: request.get(k) for k in
-                ('sampling', 'tools', 'tool_choice', 'parallel_tool_calls', 'messages', 'tool_grammars')}))
+                ('sampling', 'tools', 'tool_choice', 'parallel_tool_calls', 'messages', 'tool_grammars',
+                 'template_kwargs', 'limits', 'continue_final_message')}))
         if self.mode == 'crash':
             os._exit(17)
+        if self.mode.startswith('overflow:'):
+            # A prompt of that many tokens; fitted (chat-fit-output-v1), the reply fills the rest of the context.
+            from crit_core.serving import ContextExceeded
+            prompt, limits = int(self.mode[len('overflow:'):]), request['limits']
+            if limits.get('fit_output') and prompt < limits['kv_tokens']:
+                return self.response(request, 'full', min(limits['max_output_tokens'], limits['kv_tokens'] - prompt),
+                                     prompt_tokens=prompt)
+            raise ContextExceeded(prompt, limits['max_output_tokens'], limits['kv_tokens'])
         if self.mode.startswith('reply:'):
             return self.response(request, self.mode[len('reply:'):])
         if self.mode == 'hang':
@@ -65,16 +74,19 @@ class Engine:
         data = dict(pid=os.getpid(), generation=self.context.pool.generation,
                     device=self.lease.buffer['id'], calls=self.calls, private=len(self.private),
                     history=len(request['messages']), roles=[m['role'] for m in request['messages']],
-                    limit=request['limits']['max_output_tokens'], weights=bytes(self.weights).decode(),
-                    format=(request.get('response_format') or {}).get('type'))
+                    limit=request['limits']['max_output_tokens'], fit_output=request['limits'].get('fit_output'),
+                    weights=bytes(self.weights).decode(), format=(request.get('response_format') or {}).get('type'))
         return self.response(request, json.dumps(data))
 
-    def response(self, request, assistant, output_tokens=4, rounds=None):
+    def response(self, request, assistant, output_tokens=4, rounds=None, prompt_tokens=10):
+        limits = request['limits']
         return dict(schema_version=1, record_kind='chat_response',
                     **{k: request[k] for k in ('request_id', 'candidate_id', 'package_sha256')},
-                    assistant=assistant, telemetry=dict(prompt_tokens=10, output_tokens=output_tokens,
-                    prefill_tokens=10, prefill_ms=5, decode_tokens=output_tokens - 1, decode_ms=10, ttft_ms=6, missing={},
-                    **({'decode_rounds': rounds} if rounds else {})))
+                    assistant=assistant, telemetry=dict(prompt_tokens=prompt_tokens, output_tokens=output_tokens,
+                    prefill_tokens=prompt_tokens, prefill_ms=5, decode_tokens=output_tokens - 1, decode_ms=10, ttft_ms=6,
+                    missing={}, **({'decode_rounds': rounds} if rounds else {})),
+                    **({'max_output_tokens': min(limits['max_output_tokens'], limits['kv_tokens'] - prompt_tokens)}
+                       if limits.get('fit_output') else {}))
 
     def generate_stream(self, request, cancellation, emit):
         message = request['messages'][-1]['content']
@@ -118,6 +130,8 @@ class ServeFixture(RunFixture):
     request_options = False  # sampling and tool fixtures
     strict_tools = False
     tool_stream = False
+    tool_choice = True  # with request_options, declare chat-tool-choice-v1
+    fit_output = False  # declare chat-fit-output-v1
     temperature = True  # declare chat-sampling-temperature-v1, which crit run package requires
     adapter_suffix = ''
     extra_capabilities = ()
@@ -135,12 +149,15 @@ class ServeFixture(RunFixture):
         if self.request_options:
             from crit_api.options import SAMPLING, sampling_capability
             capabilities += ['chat-tools-v1', *map(sampling_capability, sorted(SAMPLING))]
+            capabilities += ['chat-tool-choice-v1'] if self.tool_choice else []
         elif self.temperature:
             capabilities.append('chat-sampling-temperature-v1')
         if self.strict_tools:
             capabilities.append('chat-tools-strict-v1')
         if self.tool_stream:
             capabilities.append('chat-tool-stream-v1')
+        if self.fit_output:
+            capabilities.append('chat-fit-output-v1')
         if self.reported is not None:
             capabilities.append('chat-config-v1')
             adapter += '\nEngine.effective_configuration = lambda self: %r\n' % (self.reported,)
@@ -274,6 +291,9 @@ class ResidentTests(ServeFixture, unittest.TestCase):
         self.assertEqual(self.ask(engine)['history'], 1)
         with self.assertRaisesRegex(EngineError, 'max_tokens'):
             engine.generate(messages, 8192, threading.Event())
+        with self.assertRaisesRegex(EngineError, 'does not declare chat-fit-output-v1') as raised:
+            engine.generate(messages, 8191, threading.Event(), fit_output=True)
+        self.assertEqual(raised.exception.status, 400)
 
     def test_conversation_size_is_bounded_by_bytes_not_a_character_count(self):
         # A full-context prompt of a 262,144-token model is over a million characters; the bound is the
@@ -295,6 +315,65 @@ class ResidentTests(ServeFixture, unittest.TestCase):
         self.assertEqual(wait(), ('cancelled', None))
         self.assertEqual(self.ask(engine, candidate=self.b)['generation'], original['generation'])
         self.assertEqual(self.ask(engine, candidate=self.a)['generation'], original['generation'])
+
+    def test_unload_frees_the_weights_in_the_same_host_and_load_brings_them_back(self):
+        engine = self.engine()
+        first = self.ask(engine)
+        self.assertFalse(engine.unload(candidate_id=self.b))  # B is not the loaded engine
+        self.assertTrue(engine.unload())
+        status = engine.status()
+        self.assertEqual((status['state'], status['engine'], status['host_bytes'], status['device_bytes']),
+                         ('unloaded', None, 0, 0))
+        self.assertFalse(engine.loaded())
+        self.assertTrue(engine.ownership.path.exists())  # the server keeps the runtime, and the host its process
+        self.assertFalse(engine.unload())
+        self.assertEqual(engine.load(threading.Event(), self.b), 'completed')
+        self.assertTrue(engine.loaded(self.b))
+        self.assertEqual(engine.load(threading.Event(), self.b), 'completed')  # already loaded
+        again = self.ask(engine, candidate=self.b)
+        self.assertEqual(again['pid'], first['pid'])
+        self.assertNotEqual((again['generation'], again['device']), (first['generation'], first['device']))
+        self.assertEqual(engine.status()['engine_loads'], 2)
+
+    def test_unload_drains_the_active_request_and_holds_later_ones_until_it_is_done(self):
+        engine = self.engine()
+        self.ask(engine)
+        stop = threading.Event()
+        wait = self.background(engine, 'slow', stop)
+        self.generating(engine)
+        unloaded = []
+        unloading = threading.Thread(target=lambda: unloaded.append(engine.unload()))
+        unloading.start()
+        time.sleep(.2)
+        queued = self.background(engine, 'hello', threading.Event())
+        time.sleep(.2)
+        self.assertEqual((unloaded, engine.status()['state']), ([], 'generating'))
+        stop.set()
+        self.assertEqual(wait(), ('cancelled', None))
+        unloading.join(10)
+        self.assertEqual(queued(), ('completed', None))
+        # The queued request ran after the unload and loaded the engine again.
+        self.assertEqual(unloaded, [True])
+        self.assertEqual((engine.status()['state'], engine.status()['engine_loads']), ('ready', 2))
+
+    def test_idle_unload_frees_the_weights_after_the_last_request(self):
+        with self.assertRaisesRegex(ValueError, 'idle unload'):
+            self.engine(open=False, idle_unload=0)
+        engine = self.engine(idle_unload=.3)
+        stop = threading.Event()
+        wait = self.background(engine, 'slow', stop)
+        self.generating(engine)
+        time.sleep(.8)
+        self.assertEqual(engine.status()['state'], 'generating')  # a running request is never idle
+        stop.set()
+        self.assertEqual(wait(), ('cancelled', None))
+        self.assertLess(engine.unloads_at() - time.time(), .4)
+        end = time.monotonic() + 10
+        while engine.status()['state'] != 'unloaded' and time.monotonic() < end:
+            time.sleep(.05)
+        self.assertEqual(engine.status()['state'], 'unloaded')
+        self.ask(engine)
+        self.assertEqual(engine.status()['engine_loads'], 2)
 
     def test_noncooperative_stop_timeout_crash_and_reset_failure_retire_host(self):
         engine = self.engine()

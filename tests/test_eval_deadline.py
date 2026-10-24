@@ -3,6 +3,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import sys
 import threading
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +45,32 @@ class Silent(BaseHTTPRequestHandler):
         pass
 
 
+class Pinging(BaseHTTPRequestHandler):
+    """A stream of server.events events .1 s apart with keep-alive comments between them, as crit serve sends while
+    the engine is quiet, then server.stalled seconds of comments alone."""
+
+    def do_POST(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        try:
+            for _ in range(self.server.events):
+                self.wfile.write(b'data: {"choices": []}\n\n')
+                for _ in range(4):
+                    time.sleep(.025)
+                    self.wfile.write(b": ping\n\n")
+            stalled = time.monotonic() + self.server.stalled
+            while time.monotonic() < stalled:
+                time.sleep(.025)
+                self.wfile.write(b": ping\n\n")
+            self.wfile.write(b"data: [DONE]\n\n")
+        except OSError:
+            pass  # the client gave up
+
+    def log_message(self, *_):
+        pass
+
+
 class HungServerTests(unittest.TestCase):
     def test_a_request_past_its_bound_raises_hung(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), Silent)
@@ -57,6 +84,20 @@ class HungServerTests(unittest.TestCase):
             Silent.release.set()
             server.shutdown()
             server.server_close()
+
+    def test_keep_alive_comments_are_no_answer_and_each_event_has_the_whole_bound(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Pinging)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        client = chat.Server(f"http://127.0.0.1:{server.server_address[1]}/v1", {"speed": []})
+        server.events, server.stalled = 8, 0
+        self.assertEqual(len(list(client.events("/chat/completions", {}, 0.5))), 8)  # .8 s in all
+        server.events, server.stalled = 1, 5
+        found = []
+        with self.assertRaisesRegex(Hung, "/chat/completions gave no answer within 0 s"):
+            found.extend(client.events("/chat/completions", {}, 0.5))
+        self.assertEqual(found, [{"choices": []}])
 
     def test_a_hung_request_stops_the_context_checks_instead_of_failing_a_point(self):
         class Engine:

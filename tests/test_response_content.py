@@ -94,6 +94,10 @@ class ResponseContentTests(unittest.TestCase):
                 reply(response | change, self.request)
         with self.assertRaisesRegex(ValueError, "required tool call"):
             reply(response, self.request | {"tool_choice": "required"})
+        # A reply its output limit cut before the forced call began ends as "length", as a cut call does.
+        cut = response | {"telemetry": response["telemetry"] | {"output_tokens": 8, "decode_tokens": 7}}
+        assistant, _ = reply(cut, self.request | {"tool_choice": "required"})
+        self.assertEqual(assistant, {"content": "", "reasoning": "still thinking"})
         with self.assertRaisesRegex(ValueError, "reused a tool call id"):
             reply(response | {"tool_calls": [CALL]},
                   self.request | {"messages": [{"role": "assistant", "tool_calls": [CALL]}]})

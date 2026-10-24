@@ -9,6 +9,263 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-25
+
+### Overview
+
+crit 0.9.0 is a serving release: `crit serve` behaves the way OpenAI, Anthropic, Ollama and vLLM
+clients expect. It answers the OpenAI Responses API statelessly, continues raw prompts on
+`/v1/completions` and Ollama's raw `/api/generate`, constrains replies with vLLM's
+`structured_outputs`, continues a final assistant message, and exposes the engine's tokenizer and
+chat template (`/tokenize`, `/detokenize`, `/apply-template`, `/v1/messages/count_tokens`). A server
+shared on a LAN takes several API keys and serves HTTPS, `/health` reports readiness, and the engine
+can be unloaded through the API so a shared GPU is freed until the next request. Requests are queued
+by priority with a bounded queue that answers 429, 529 or 503 with Retry-After, quiet streams get
+keep-alive pings, every request carries an id that `POST /v1/crit/abort` cancels, and `/metrics` gains
+latency and token histograms. Thinking controls, stop strings, logprobs, model aliases and many
+dialect details now match each API, and fields crit does not apply are a clear 400 unless
+`--lenient` is given. The Python distribution and the Core SDK share version 0.9.0, and Core's
+Python serving and tool-call layers carry the new request fields; Inference is unchanged.
+
+### Added
+
+- `crit serve --lenient` ignores the request parameters crit does not apply instead of answering 400:
+  unknown keys in every dialect (and unknown `stream_options` keys and Ollama options),
+  `reasoning_effort` and `prediction`, sampling fields the package does not declare and extra samplers
+  that are not off. Each is listed in `X-Crit-Ignored-Parameters` and logged once, so a name that is not
+  1 to 64 letters, digits, `_`, `.` or `-`, which the header and the log would carry as sent, is still a
+  400, in Anthropic's `output_config` too; values crit knows are still range-checked, and features that
+  change the reply (`functions`, `audio`, tools or `logprobs` without the capability) stay refused.
+  Strict stays the default, and the servers `crit run ... eval` and `crit run measure` start never use
+  it (docs/SERVING.md).
+- crit serve takes per-request thinking controls in every dialect for packages declaring the new
+  `chat-template-kwargs-v1`: OpenAI `chat_template_kwargs` and `reasoning_effort`, Anthropic `thinking`
+  and `output_config.effort`, and Ollama `think` set the chat-template variables the package declares
+  (`enable_thinking`, `thinking`, `reasoning_effort`, each with its own capability) for that request,
+  over the configured ones, and `/api/show` lists `thinking`. Anthropic's `between_tools` turns thinking
+  off, and `xhigh` and `max` efforts, like OpenAI's `xhigh`, take `high`. ResidentChat declares the
+  variables its model's templates read and renders a request's; a variable or value the package does not
+  take, or turning off a template that always thinks, is a 400. Other packages still refuse the OpenAI
+  fields and ignore and list Anthropic's and Ollama's controls, whatever they hold. `--lenient` ignores
+  and lists the OpenAI fields of those packages whatever they hold, and on a declaring package a variable
+  crit does not set or the package does not declare and a control its template cannot take; values are
+  still checked.
+- crit serve fits an output cap at or above the context (OpenAI `max_tokens` or
+  `max_completion_tokens`, Anthropic `max_tokens`, Ollama `num_predict`) for packages declaring the new
+  `chat-fit-output-v1`, which ResidentChat declares: the engine stops where its prompt leaves no room
+  and finishes with `length`, and a reply that is not streamed names the cap it applied in
+  `X-Crit-Max-Tokens-Applied`. Agent clients that send a model's largest budget got a 400; only a
+  prompt that fills the context by itself still does. Ollama's `num_predict` -1 and -2 (until the
+  context is full) are fitted the same way; they silently meant 1024, which other packages keep as
+  documented. Caps below the context, as Eval sends, reach the engine unchanged.
+- `crit serve --max-queue N` (default 64) and `--queue-timeout SECONDS` (default none) bound the queue of
+  requests waiting for a busy engine: a request that finds N already waiting, or that waits past the
+  timeout, is refused before the engine sees it with a 429 `rate_limit_exceeded` (Anthropic 529
+  `overloaded_error`, Ollama 503) and `Retry-After`, and the engine stays loaded. The queue was unbounded
+  and outside `--timeout`, so the background calls of chat UIs and agents piled up with no answer. A
+  stream sends its headers once the engine takes the request, so a refused stream gets the same status,
+  and `GET /metrics` adds `crit_serve_requests_waiting`.
+- crit serve takes vLLM's `priority` on `/v1/chat/completions`, an integer that defaults to 0. Requests
+  waiting for the engine went strictly in arrival order; now lower values go first, then arrival order, so
+  a background job that sends a higher value no longer holds up an interactive chat queued behind it.
+  Priority only reorders requests for the same model: a request never moves ahead of a queued model
+  switch, nor a switch ahead of requests queued before it, and a running request is never preempted.
+  Anthropic and Ollama requests, whose APIs have no such field, wait at 0.
+- crit serve sends keep-alive pings on a quiet stream, after `--sse-ping-interval` seconds without output
+  (default 15, 0 for none): the SSE comment `: ping` on OpenAI streams and Anthropic's `event: ping` on
+  Messages streams, always between whole events. Nothing was written between the role chunk or
+  `message_start` and the first token, so while a model loaded or a long prompt prefilled, proxy idle
+  timeouts and clients such as Claude Code closed the stream and the disconnect cancelled the turn.
+  Pings start when the stream opens, once the engine takes the request, so a request the queue refuses
+  still gets its own status. Ollama streams get no pings, nor do the servers `crit run ... eval` and
+  `measure` start, and Eval's request bound counts a ping as no answer, so a stalled engine still stops
+  it as hung.
+- crit serve names every request: each response carries `X-Request-Id`, crit's own id of the request, which
+  error bodies and stream error events repeat as `request_id` and which names a failed request's records
+  (`requests/<request_id>/` in the runtime directory). A client's own `X-Request-Id` is logged next to it and
+  never names records. `POST /v1/crit/abort` with `{"request_id": ID}` (crit's id or the client's) or
+  `{"all": true}` cancels requests in flight as a closed connection does: a running turn ends with a 499, a
+  queued request leaves the queue without running, and a cooperative adapter keeps its weights loaded.
+- crit serve's `GET /metrics` has fixed-bucket histograms for percentiles: queue time, the engine's time
+  to first token, time per output token, end-to-end latency and prompt and completion tokens per request.
+  `crit_serve_requests_running` and `crit_serve_requests_waiting`, which counts requests waiting for an
+  engine load as well as the queue, tell running chat and score requests from queued ones, which
+  `crit_serve_requests_in_flight` still counts together, and `crit_serve_engine_loads_total` and
+  `crit_serve_model_switches_total` count engine loads and model switches (docs/SERVING.md).
+- crit serve model catalogs take `aliases` per model, exact client names (`gpt-4o`, `llama3:8b`) or
+  patterns with `*` (`claude-haiku-*`), so Claude Code's main and small models and clients with fixed
+  names reach a configured model; the pattern with the most characters besides `*` wins. Names and
+  aliases must all be distinct. An opt-in catalog `fallback` names the model that serves any other
+  name; without one an unknown name stays a 404. Model cards carry `display_name` (a catalog entry's
+  optional `display_name`, else the candidate's label) and `max_model_len` (the context, vLLM's name
+  for it, which LiteLLM reads); `/v1/models` and `/api/tags` list the configured names only.
+- crit serve's Ollama `/api/chat` and `/api/generate` take `logprobs` and `top_logprobs` (0 to 20) for
+  packages declaring `chat-logprobs-v1` and return the reply's token log-probabilities as Ollama's
+  `logprobs` on the last object, streamed or not; both were refused as unknown parameters. The last
+  object also carries `prompt_eval_cached_count`, the prompt tokens the engine did not compute, and
+  `crit_telemetry` passes on the engine's `prefill_tokens`, `prefill_ms`, `decode_tokens` and `decode_ms`.
+- `crit serve` takes vLLM's `include_stop_str_in_output`: `true` ends the reply's text with the stop
+  string that ended it. A request's `"crit": {"timeout": SECONDS}` gives its turn less time than
+  `--timeout` (a larger value keeps `--timeout`), with the same 504 when it runs out and the engine
+  kept loaded when the turn settles. Each `logprobs` entry and alternative, OpenAI's and Ollama's,
+  carries its token's id as `crit_token_id` (docs/SERVING.md).
+- ResidentChat forces tool calls for engines that decode to a grammar: an engine that sets
+  `grammars = True` and declares `capabilities(..., grammars=True)` gets `chat-tool-choice-v1` for a
+  call syntax crit registers whose markers the tokenizer spells as text, and `tool_choice` `required`
+  or a named function (Anthropic `any` or `tool`) then reaches `generate_tokens` as `grammar`, a
+  `crit-byte-grammar-v1` artifact from `crit_core.text.tools.call_grammar`: a reply of calls only, in
+  the template's syntax, to an offered or the named function, arguments shaped by the function's
+  schema, with room to reason first. A reply `max_tokens` cuts before a forced call has begun
+  finishes as `length` with no call, where crit serve answered 500 and retired the host.
+- crit serve continues a conversation's final assistant message for packages declaring the new
+  `chat-continue-v1`, which ResidentChat declares: an OpenAI request with vLLM's
+  `continue_final_message: true` and `add_generation_prompt: false`, Anthropic prefill (a final
+  assistant message) and an Ollama chat that ends with an assistant message. The chat template
+  leaves the message open (Core's `continue_final_message`) and the reply holds only the
+  continuation, which may be empty. A final assistant message without the flags is still a 400, and
+  so is a continuation with `tools` or `response_format`.
+- crit serve takes vLLM's `structured_outputs` on `/v1/chat/completions`: one of `regex`, `choice`,
+  `grammar` (Core's line EBNF) or `json` (a JSON schema), or vLLM's earlier `guided_regex`,
+  `guided_choice`, `guided_grammar` and `guided_json`, compiled with Core's constraint compiler before
+  generation; a source it cannot compile is a 400 with the compiler's reason. Regex, choice and grammar
+  reach the engine as a compiled grammar for packages that declare the new `chat-constraints-grammar-v1`
+  (`json` as `json_schema`, with `chat-constraints-v1`); only JSON schemas were exposed, though Core
+  compiles regex and EBNF too. A second constraint or a `response_format` with one is a 400; like
+  `response_format`, one applies with `tools` only when `tool_choice` is `none`, and never to a
+  continued final message.
+- `crit serve` continues raw prompts for packages declaring `completion-v1` (which ResidentChat
+  declares and implements for any decoder, an images engine only with `completion=True`):
+  `POST /v1/completions` takes one prompt as text or token ids, encodes text with the model's
+  tokenizer and generates without the chat template, with `max_tokens` (fitted as a chat's is),
+  sampling, `stop`, `include_stop_str_in_output`, `priority`, `crit`, `stream` (`text_completion`
+  chunks, with keep-alive pings), `logprobs` as an integer in the legacy shape (`tokens`,
+  `token_logprobs`, `top_logprobs`, `text_offset`, the stop token that ended the reply included) and
+  `echo`, whose prompt rows come from the engine's score path (`chat-score-v1`), as lm-eval's
+  `local-completions` asks for them. Several prompts and `suffix` are a 400, and `--lenient` ignores
+  unknown keys as in chat. Ollama's `/api/generate` with `raw: true` takes the same path, its
+  `logprobs` and `top_logprobs` giving the alternatives and `think` ignored and listed. Without the
+  capability both answer as before (docs/SERVING.md).
+- `crit serve` answers the OpenAI Responses API statelessly (`POST /v1/responses`), which Codex CLI, the
+  OpenAI Agents SDK and the Responses modes of LangChain and LibreChat speak: `instructions` and `input`
+  (messages, function calls, their outputs and reasoning items) become the conversation, function tools,
+  `tool_choice`, `text.format`, `max_output_tokens` and `reasoning.effort` map onto the chat request and
+  its validation, and the reply is a Response with reasoning, message and function_call items and usage, or the Responses
+  event stream numbered by `sequence_number` and ending in `response.completed`, `response.incomplete` or
+  `response.failed`. crit serve keeps no responses, so `previous_response_id`, `conversation`,
+  `background` and OpenAI's built-in tools are a 400 and `GET`, `DELETE` and cancel by id a 404
+  (docs/SERVING.md).
+- crit serve's `/health` reports `ready`, whether an engine is loaded with no model switch, reload or
+  retire under way, and `/health?ready=1` answers 503 until it is; `/health` alone said ok while a
+  catalog switched models and after a retire left no engine loaded. Model cards (`/v1/models`) and Ollama
+  `/api/show` carry `limits`: the context, the largest output cap (a larger `max_tokens` fitted for
+  packages declaring `chat-fit-output-v1`), body bytes, stop strings, tools, `top_logprobs` and reply
+  characters a request is held to, which clients learned only from a 400.
+- `crit serve` takes several API keys, for a server shared on a LAN: `--api-key` may be repeated,
+  `CRIT_API_KEY` may hold a comma-separated list, and `--api-key-file PATH` adds one key per line (blank
+  lines and `#` comments skipped); a request's key is compared in constant time with each.
+  `--ssl-certfile` and `--ssl-keyfile` serve HTTPS, each TLS handshake on its connection's own thread so
+  a stalled client holds up no other. Launchers keep `--api-key-file` and the certificate paths, never a
+  key.
+- `crit serve` unloads and loads its engine through the API, so a GPU shared with games or other tools is freed
+  without stopping the server: `POST /v1/crit/unload` waits for the running requests, holds new ones and has the
+  resident host close the engine and free the model's weights, and the next request loads it again as a model
+  switch does; `POST /v1/crit/load` loads a model ahead of time, waiting in the request queue as a request does,
+  and `POST /v1/crit/abort` cancels it. Ollama clients do the same with a request without a prompt or messages
+  (`done_reason` `load`) and `keep_alive` 0 (`unload`, or after the reply), `--idle-unload SECONDS` unloads an
+  idle engine, and `/health` and the `/v1/models` cards report `loaded`. The server keeps its runtime ownership
+  and the machine's engine lock while the engine is unloaded.
+- crit serve exposes the engine's tokenizer and chat template for packages declaring the new
+  `chat-tokenize-v1`, so clients can check a prompt against the context before sending it: `POST /tokenize`
+  (a `prompt`, or `messages` with `tools`, template variables and `continue_final_message` as a chat request
+  takes them) returns `tokens`, `count` and `max_model_len` as vLLM does, `/detokenize` the text of `tokens`,
+  `/apply-template` the chat template's text as llama-server does, and Anthropic's `/v1/messages/count_tokens`,
+  which Claude Code calls, `input_tokens`, with `thinking` and a prefill rendered as `/v1/messages` renders
+  them; the last was a 404. They run on the loaded engine beside generation, never queued behind it; one for a
+  candidate that is not loaded queues and loads it as a reply would, unless its client disconnects first or an
+  abort cancels it, and a full queue refuses it as a reply. A refusal or failure leaves the engine loaded.
+  ResidentChat implements the adapter's `tokenize`, `render` and `detokenize`, and `capabilities()` declares the
+  capability; packages without it keep a 404 `not_supported`.
+
+### Fixed
+
+- crit serve accepts up to 16 stop strings (`stop`, Anthropic `stop_sequences`, Ollama `options.stop`),
+  Core's StopMatcher limit; it refused more than 4, OpenAI's limit, in every dialect, which broke
+  template and Modelfile stop lists.
+- crit serve answers a prompt that, with its output cap, does not fit the context with a 400 in each
+  dialect's words (OpenAI `context_length_exceeded`, Anthropic "prompt is too long", Ollama
+  `{"error"}`; an error event in a stream) and keeps the engine loaded; it was a 500 that retired the
+  host and reloaded the weights on the next request. Adapters refuse a request this way by raising
+  `crit_core.serving.RequestRejected` (ResidentChat raises its `ContextExceeded`) before generating.
+- crit serve answers `tool_choice` `required` or a named function (Anthropic `any` or `tool`) with a 400
+  `unsupported_parameter` unless the package declares the new `chat-tool-choice-v1`, which adapters
+  that force a call declare; ResidentChat packages, which parse calls from free generation, accepted
+  the request, failed it with a 500 and retired the host. ResidentChat now refuses such a choice with
+  `RequestRejected` too.
+- crit serve's Ollama `/api/version` reports an Ollama release, `0.12.0`, with crit's own version as
+  `crit_version`; it reported crit's 0.6.0, which clients such as VS Code Copilot and Continue compare
+  with a minimum Ollama version and then disabled features or refused the server.
+- crit serve's Ollama `/api/ps` lists the loaded model under `--model-name` and in a model catalog, by the
+  run, candidate and package the host loaded, with `context_length` and a far-future `expires_at`; it
+  matched ids by suffix, so it listed nothing there and could list the wrong candidate, and `expires_at` was
+  empty. `/api/tags` digests are the package's sha256, not empty, and `/v1/models` `engine_facts` reach
+  catalog models, which had them null.
+- crit serve answers `HEAD` on its `GET` paths with the headers alone and other methods (`DELETE`,
+  `PUT`, `PATCH`) with a 405 (or a 404 on an unknown path) in the path's dialect; they were http.server's
+  501 HTML page. Request bodies may be `Transfer-Encoding: chunked`, up to the same 8 MiB, where
+  `Content-Length` was required, and a missing, empty or oversized body is an error in the path's dialect,
+  not OpenAI's shape on the Anthropic and Ollama paths.
+- crit serve takes `n: null` as the default single choice, as it takes a null sampling field; it was a 400.
+  An unknown `stream_options` key is a 400 `unsupported_parameter`, as an unknown top-level key is; it was
+  dropped silently.
+- crit serve's Anthropic errors carry the type Anthropic gives their status, in a response and as a
+  stream's `error` event: a 503 (the engine is stopping or its cleanup is unresolved) is
+  `overloaded_error`, which Anthropic clients retry, and a 504 `timeout_error`; both were `api_error`. A
+  stream's error event in every dialect is the error the request gets as a response, its status's type
+  and code included.
+- crit serve's `/metrics` counts every chat request and every `/v1/crit/score` request (as dialect `crit`)
+  by outcome, with a new outcome `rejected` for a 4xx: a request that fails validation or a prompt over the
+  context. Requests that failed validation and all scores were not counted, and a context overflow counted
+  as an `error`.
+- docs/SERVING.md lists every OpenAI field refused with a 400 (`modalities`, `reasoning_effort` and
+  `prediction` were missing), says where the Anthropic Messages translation differs from Anthropic's
+  service, where it said `tool_choice` and `stop_sequences` mapped one to one, and that waiting requests
+  queue in arrival order without a limit. README.md and AGENTS.md name the Anthropic and Ollama APIs and
+  `/metrics`.
+- crit serve keeps an assistant message's `reasoning`, vLLM's and OpenRouter's name for `reasoning_content`, in a
+  tool conversation; it was dropped, so clients that replay it lost the model's reasoning across tool turns. A null
+  `reasoning`, as those servers return when there is none, is ignored, and a message giving both with different
+  text is a 400. `--reasoning-alias` returns reasoning under both names, in replies and stream deltas; it is off by
+  default, since a client that joins every field of a delta, as crit Eval does, would read it twice.
+- crit serve accepts a `system` (or OpenAI `developer`) message after the first turn, on
+  `/v1/chat/completions` and Ollama's `/api/chat`, as user text marked `System: `, joined to the user message
+  after it or before it, or as a user turn of its own after an assistant reply or tool result; it answered 400,
+  which broke role-play UIs, RAG injectors and agent handoffs that send one. Adapters still receive at most one
+  system message, before the conversation; Anthropic's messages have no system role and are unchanged.
+- crit serve accepts OpenAI's client metadata `prompt_cache_key`, `prompt_cache_retention` and
+  `safety_identifier` as it accepts `user`: ignored and listed in `X-Crit-Ignored-Parameters`; they were a
+  400 for the OpenAI SDKs and agent CLIs that send them. `typical_p`, `tfs_z`, `mirostat`,
+  `dry_multiplier` and `xtc_probability`, llama.cpp's samplers that crit's sampling law does not have,
+  are no-ops at the value that turns them off; any other value is still a 400.
+- crit serve's Anthropic Messages API builds the prompt the OpenAI path builds for the same conversation:
+  an assistant turn's `thinking` blocks become its `reasoning_content` (they were dropped, so interleaved
+  thinking agents lost their reasoning across tool turns), `tool_result` content may hold image blocks,
+  which go on the tool message, an `is_error` result's text starts with "Error: ", and a tool's `strict`
+  reaches the `chat-tools-strict-v1` gate, where it was silently left out. The event stream keeps one
+  content block open at a time: a tool_use block closes when the next call starts, not all at the end.
+- crit serve takes stop strings with tools (`stop`, Anthropic `stop_sequences`, Ollama `options.stop`) on
+  packages declaring `chat-tool-stream-v1`, and a `response_format` (Anthropic `output_config.format`) with
+  tools when `tool_choice` is `none`; it refused both with a 400 in every dialect, though clients such as
+  Continue, LibreChat and LiteLLM send stops with tools. Stops are matched in the reply's text, never in a
+  call: one ends the reply with the calls the model wrote before it and never cuts a call, since a
+  `chat-tool-stream-v1` adapter now emits text and calls in the model's order and each call whole before
+  the text after it (the host and crit serve fail a turn with text inside an unfinished call). A format
+  with tools that may be called stays a 400.
+- crit serve answers `/v1/embeddings`, `/v1/rerank`, `/v2/rerank`, `/rerank`, `/v1/score`, `/v1/audio/*`,
+  `/v1/images/*`, `/v1/moderations`, `/v1/files` and `/v1/batches` with a 404 `not_supported` that names the
+  endpoint, as it answers `/v1/completions` without `completion-v1`; they were a generic `Unknown endpoint`.
+  For embeddings and reranking, and Ollama's `/api/embed`, the message tells RAG clients pointed at crit's
+  base URL to run a separate embedding server.
+
 ## [0.8.0] - 2026-10-25
 
 ### Overview
@@ -1202,7 +1459,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/crit-labs/crit/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/crit-labs/crit/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/crit-labs/crit/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/crit-labs/crit/compare/v0.6.0...v0.6.1

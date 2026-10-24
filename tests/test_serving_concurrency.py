@@ -2,10 +2,12 @@
 import json
 import http.client
 import threading
+import time
 import unittest
 
 from test_serve_shutdown import ShutdownFixture
 from crit.process.ownership import process_identity
+from crit_api.admission import Admission
 from crit_api.server import Api, Server
 
 CONCURRENT_ADAPTER = r'''
@@ -63,16 +65,65 @@ Engine.create_request = create_request
 '''
 
 
+class PriorityAdmissionTests(unittest.TestCase):
+    def admitted(self, waiters, cancelled=()):
+        """The names of `waiters` (name, identity, priority), queued in turn behind a running request for "a", in the
+        order they are admitted once it ends; `cancelled` ones leave the queue first."""
+        admission, order, stops, threads = Admission(), [], {}, []
+        admission.configure("a", 1)
+        admission.admit("a", threading.Event())
+
+        def wait(name, identity, priority):
+            if admission.admit(identity, stops[name], priority) is not None:
+                order.append(name)
+                admission.release()
+        for name, identity, priority in waiters:
+            stops[name] = threading.Event()
+            threads.append(threading.Thread(target=wait, args=(name, identity, priority)))
+            threads[-1].start()
+            self.queued(admission, len(threads))
+        for name in cancelled:
+            stops[name].set()
+        self.queued(admission, len(threads) - len(cancelled))
+        admission.release()
+        for thread in threads:
+            thread.join(5)
+        return order
+
+    def queued(self, admission, count):
+        deadline = time.monotonic() + 5
+        while len(admission.waiters) != count:
+            self.assertLess(time.monotonic(), deadline, "the queue did not reach %d waiters" % count)
+            time.sleep(.001)
+
+    def test_equal_priorities_keep_arrival_order(self):
+        self.assertEqual(self.admitted([("first", "a", 0), ("second", "a", 0), ("third", "a", 0)]),
+                         ["first", "second", "third"])
+
+    def test_lower_priority_values_go_first_then_arrival(self):
+        self.assertEqual(self.admitted([("low", "a", 5), ("default", "a", 0), ("high", "a", -1), ("later", "a", 0)]),
+                         ["high", "default", "later", "low"])
+
+    def test_a_queued_switch_is_never_overtaken_and_never_overtakes(self):
+        waiters = [("low", "a", 5), ("high", "a", -1), ("switch", "b", 0), ("urgent", "b", -5), ("after", "a", -10)]
+        self.assertEqual(self.admitted(waiters), ["high", "low", "urgent", "switch", "after"])
+
+    def test_a_cancelled_switch_lets_the_waiters_around_it_reorder(self):
+        waiters = [("low", "a", 5), ("switch", "b", 0), ("high", "a", -1)]
+        self.assertEqual(self.admitted(waiters, cancelled=["switch"]), ["high", "low"])
+
+
 class ConcurrentTests(ShutdownFixture, unittest.TestCase):
     extra_capabilities = ("chat-concurrent-v1",)
     adapter_suffix = CONCURRENT_ADAPTER
 
-    def turn(self, engine, name, candidate=None):
+    def turn(self, engine, name, candidate=None, priority=0):
         gate = self.root / name
         stop = threading.Event()
         chunks = []
         task = self.launch(lambda: engine.generate([{"role": "user", "content": "gate:" + str(gate)}],
-                                                  256, stop, candidate_id=candidate, on_text=chunks.append))
+                                                  256, stop, candidate_id=candidate, on_text=chunks.append,
+                                                  priority=priority))
         self.addCleanup(self.finish, task)
         self.addCleanup(stop.set)
         return gate, stop, task, chunks
@@ -142,6 +193,33 @@ class ConcurrentTests(ShutdownFixture, unittest.TestCase):
         self.release(switch)
         self.started(later)
         self.release(later)
+        self.assertEqual(engine.status()["engine_loads"], 3)
+
+    def test_priority_orders_waiting_requests_and_never_overtakes_a_queued_switch(self):
+        engine = self.engine()
+        first, second = self.turn(engine, "busy1"), self.turn(engine, "busy2")
+        self.started(first)
+        self.started(second)
+        low = self.turn(engine, "low", priority=5)
+        self.until(lambda: len(engine.lock.waiters) == 1, "request did not queue")
+        high = self.turn(engine, "high", priority=-1)
+        self.until(lambda: len(engine.lock.waiters) == 2, "request did not queue")
+        self.release(first)
+        self.started(high)
+        self.assertFalse(low[0].with_suffix(".started").exists())
+        switch = self.turn(engine, "switch", self.b)
+        self.until(lambda: len(engine.lock.waiters) == 2, "switch did not queue")
+        urgent = self.turn(engine, "urgent", priority=-10)
+        self.until(lambda: len(engine.lock.waiters) == 3, "request did not queue")
+        self.release(second)
+        self.started(low)  # queued before the switch
+        self.release(high)
+        self.release(low)
+        self.started(switch)
+        self.assertFalse(urgent[0].with_suffix(".started").exists())
+        self.release(switch)
+        self.started(urgent)
+        self.release(urgent)
         self.assertEqual(engine.status()["engine_loads"], 3)
 
     def test_shutdown_settles_every_request_and_rejects_shared_request_object(self):
