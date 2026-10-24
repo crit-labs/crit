@@ -25,10 +25,11 @@ device = "device.json"              # crit eval probe result (relative: from CRI
 ram_headroom_gib = 2                # host memory free at the engine's peak (default 2)
 vram_headroom_gib = 1               # device memory free at the engine's peak (default 1)
 context_reserve_gib = 3             # device memory kept out of the KV cache (default 3)
+context_tokens = 262144             # the context wanted, prompt plus output (default 262,144)
 ```
 
-`crit eval run` and `crit eval context` read `vram_headroom_gib` and `context_reserve_gib`
-from it when their flags are omitted. The reserve holds activations, workspaces, graphs
+`crit eval run` and `crit eval context` read `vram_headroom_gib`, `context_reserve_gib` and
+`context_tokens` from it when their flags are omitted. The reserve holds activations, workspaces, graphs
 and speed techniques; a larger one trades context for that room.
 
 | Action | Arguments / effect |
@@ -61,6 +62,7 @@ hashes; add them only where a field below requires one.
 | `correctness_criteria` | Required fixed criteria; gates are `arithmetic`, `functional`, `resources` |
 | `device` | A `crit eval probe` result. Without `kv_tokens`, `create` freezes Eval's [max context](eval/CONTEXT.md) on it as `kv_tokens`, with the basis (limits, KV precision, memory, device file sha256) in `hardware_constraints.context` |
 | `kv_tokens` | Capacity for prompt + output; overrides the max context. One of `kv_tokens`, `device` is required |
+| `context_tokens` | The context the user wants (default 262,144, from `settings.toml` when the request omits it). With `device`, `kv_tokens` is the smaller of it, the model's positions and the KV cache that fits; `hardware_constraints.context` records `requested`, the `bound` (`requested`, `model` or `device`) and a `note` when the model or device allow less |
 | `ram_headroom_gib`, `vram_headroom_gib` | Physical free-memory requirements; defaults 2 and 1 |
 | `context_reserve_gib` | Device memory kept out of the KV cache when deriving `kv_tokens` from `device`; default the protocol's 3 |
 | `candidate_budget`, `attempt_limit` | Segment bounds: candidates to build (default 3, 1–64) and attempts (default 64, 1–1000). `budget_minutes` is a safety window, default and maximum 43200 (30 days). `budget_minutes` without `candidate_budget` creates a legacy time-budget segment (1–180) |
@@ -72,6 +74,7 @@ hashes; add them only where a field below requires one.
 | `weights_policy` | Optional `as_stored` (supplied weights used as stored) or `transformable`; omitted means unspecified |
 | `quality_budget` | Optional drift budget against Eval's reference: any of `ppl_ratio_max` (≥ 1), `kld_mean_max`, `kld_p99_max` (≥ 0); defaults 1.05, 0.05, 0.5. Agents spend it on speed |
 | `exactness` | `reported` (default: speculative output may differ from plain greedy; the drift budget judges it) or `required` (any difference fails Eval's gate) |
+| `eval_sampling` | Optional, the user's only: `{settings, approved_by}`, settings `temperature` (> 0, required) and any of `top_p`, `top_k`, `min_p`, as an object or `"temperature=0.6,top_p=0.95"`. Eval's sampled suite then measures at these settings instead of the model's `generation_config.json`: `crit run ... eval` requires data prepared with `crit eval prepare --sampling` and the same settings (and refuses overridden data without it), recon applies them to the served default, and results label them as an override |
 
 Workload keys: `prompt_tokens`, `output_tokens` (1–1,000,000), `concurrency` (1–256),
 `repetitions` (1–100), `warmup_runs` (0–100), `mode` (`resident`/`cold`). KV capacity
@@ -207,10 +210,12 @@ gets it. Each case keeps its chat request as a retained JSON file
 `{"messages": [...], "tools": [...]}` (`tools` optional) in its manifest. Under one
 benchmark reservation `crit serve` serves the packaged candidate at the run's
 `kv_tokens`, and every warmup and repetition streams the request to
-`/v1/chat/completions` with `temperature` 0, `max_tokens` the workload's
-`output_tokens` and usage. `crit serve`'s usage must count the workload's
+`/v1/chat/completions` with the sampling fields the captured request names
+(`temperature`, `top_p`, `top_k`, `min_p`, `seed` and the penalties), else `temperature`
+0, `max_tokens` the workload's `output_tokens` and usage. `extensions.sampling` records the
+sampling sent. `crit serve`'s usage must count the workload's
 `prompt_tokens`: a case whose messages render to another length fails the measurement,
-naming both counts. Every candidate decodes its own greedy reply, and one that ends
+naming both counts. Every candidate decodes its own reply, and one that ends
 before `output_tokens` is measured on the tokens it has; `extensions.output_tokens`
 records each repetition's length. Times are client-observed from the streamed chunks, as
 in Eval: time to first token, prefill (the prompt over the time to first token), decode

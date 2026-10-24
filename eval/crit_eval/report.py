@@ -42,7 +42,12 @@ def compare(paths):
     if any(r.get("status") for r in results):
         rows.append(("**Gates**", [_gates((r.get("status") or {}).get("gates")) for r in results]))
     if case_ids:
-        rows.append(("**Decode score** (geomean tok/s)", [_fmt(r.get("speed", {}).get("decode_score"), ".1f") for r in results]))
+        if any((r.get("sampled_speed") or {}).get("decode_score") for r in results):
+            # crit-eval-v7: the decode at the model's own sampling, which the decode ceiling below describes.
+            rows.append(("**Sampled decode score** (geomean tok/s)",
+                         [_fmt((r.get("sampled_speed") or {}).get("decode_score"), ".1f") for r in results]))
+            rows.append(("Sampling", [_sampling(r.get("sampled_speed") or {}) for r in results]))
+        rows.append(("**Decode score** (greedy, geomean tok/s)", [_fmt(r.get("speed", {}).get("decode_score"), ".1f") for r in results]))
         cells = []
         for r in results:
             p = (r.get("headroom") or {}).get("prefill") or {}
@@ -69,7 +74,10 @@ def compare(paths):
                 cell = f"{c['decode_tps']:.1f}"
                 if c.get("tokens_per_round"):
                     cell += f" ({c['tokens_per_round']:.2f}/round"
-                    saturation = r.get("headroom", {}).get("cases", {}).get(case, {}).get("saturation")
+                    room = r.get("headroom", {})
+                    # From v7 the headroom cases are the sampled suite's; these rows are the greedy suite's.
+                    saturation = (room.get("cases", {}).get(case, {}).get("saturation")
+                                  if room.get("decode_suite", "greedy") == "greedy" else None)
                     cell += f", {saturation:.0%} of cap)" if saturation is not None else ")"
                 if c.get("stop_crossed"):
                     cell += " ⚠stop"
@@ -98,7 +106,8 @@ def compare(paths):
             ceiling = p.get("ceiling_score") or p.get("speed_of_light_score")
             fraction = p.get("fraction_of_ceiling") or p.get("fraction_of_speed_of_light")
             cells.append("–" if not ceiling else f"{ceiling:.1f}" + (f" (at {fraction:.0%})" if fraction else ""))
-        rows.append(("Decode ceiling", cells))
+        rows.append(("Decode ceiling" + (" (sampled)" if any((r.get("headroom") or {}).get("decode_suite") == "sampled"
+                                                            for r in results) else ""), cells))
     sets_seen = []
     for r in results:
         for name in (r.get("quality") or {}).get("sets") or {}:
@@ -149,3 +158,12 @@ def _gates(gates):
     failed = [g["name"] for g in gates if g["state"] == "fail"]
     unmeasured = [g["name"] for g in gates if g["state"] == "unmeasured"]
     return ("fail: " + ", ".join(failed) if failed else "unmeasured: " + ", ".join(unmeasured) if unmeasured else "pass")
+
+
+def _sampling(sampled):
+    """The sampled suite's settings, marked when they are not the model's own."""
+    if not sampled.get("sampling"):
+        return "–"
+    text = ", ".join(f"{key} {value}" for key, value in sampled["sampling"].items())
+    return text + {"override": " (user override)", "protocol_default": " (protocol default)"}.get(
+        sampled.get("sampling_source"), "")

@@ -16,8 +16,11 @@ Install from the repo root with `python -m pip install -e .`, then run `crit ...
   the first candidate.
 - Probe the device (`crit eval probe`) and pass it as the request's `device` (or set
   `device` in `<crit-repo>/settings.toml`); `kv_tokens` then becomes Eval's max
-  context for the model on it. Set `kv_tokens` only when the user asks. Preflight
-  model, tools and dependencies before starting the clock.
+  context for the model on it: the user's wanted context (`context_tokens` in
+  `settings.toml`, default 262,144), capped by the model's positions and the KV cache
+  that fits. The context is the user's, like the sampling: set `kv_tokens` or
+  `context_tokens` only when the user asks. Preflight model, tools and dependencies
+  before starting the clock.
 - **Study the model before the first candidate.** After `create`, run
   `crit run --id RUN_ID recon` (`candidate` refuses a model folder without it): it reads `generation_config.json` (sampling defaults),
   the tokenizer files and chat templates (BOS/EOS and stop tokens, template switches
@@ -29,7 +32,26 @@ Install from the repo root with `python -m pip install -e .`, then run `crit ...
   citing sources. Where they override the files, edit the `frozen` block of
   `recon.json` and say why under Decisions. Every later candidate freezes that block
   (sampling, chat template and its variables, stop tokens) as `configuration["recon"]`
-  instead of defaulting to greedy; Eval's speed and exactness cases stay greedy by protocol.
+  instead of defaulting to greedy.
+- **The sampling is the model's, not yours.** Recon records the sampling Eval measures under
+  "Eval sampling" in `recon.md`: the model's `generation_config.json` (temperature, top_p,
+  top_k, min_p when it samples by default), else the protocol default (temperature 1.0, no
+  filters). The served default (`frozen.sampling`) follows it, and a candidate refuses a frozen
+  sampling that differs. Never pick a temperature, not even one the model card recommends for a
+  mode; write card recommendations down, but only the user overrides the sampling, with
+  `eval_sampling` at run create. Pass `crit eval prepare --sampling` only when the run declares
+  `eval_sampling`, and then exactly its settings. Write the drafting plan in `recon.md` for
+  these settings before the first candidate.
+- **Build for both decode modes.** Eval scores both, on the same six speed cases.
+  Greedy (temperature 0): speculative output must stay token-exact against plain greedy
+  (the exactness check). Sampled, at the Eval sampling: the headline decode, its goal and
+  the stop record's decode; verify drafts by rejection sampling (accept a draft with
+  probability min(1, p/q) under the processed target distribution p, sample from
+  max(p - q, 0) on the first rejection; a greedy draft is q one-hot) so the output keeps the
+  model's distribution (the `sampling` gate), and sample on the device inside the decode
+  graph rather than copying logits to the host for every token. A drafter that only helps
+  greedy requests leaves the headline at one token per pass. Requests at other settings
+  must stay correct too.
 - Create the run per [Building engines](docs/BUILDING_ENGINES.md) in the user's
   workspace (default `<crit-repo>/runs/`). Keep source, models, dependencies, builds
   and results out of product folders; develop in the run's `work/`. Never alter
@@ -98,7 +120,7 @@ Work in rounds, one candidate per round:
   kernels; sessions can end early and tuning does not transfer between strategies.
 - **Eval sets the goals.** `crit eval status` gives one goal per KPI: decode, prefill,
   time to first token, and long-context decode and time to first token, each from
-  current score to physical limit. Pursue all at once; none trades against another.
+  current score to physical limit. From crit-eval-v7 the decode goal is the sampled decode. Pursue all at once; none trades against another.
   Never weigh by the end-to-end score.
 - **The context is a requirement.** Build every candidate for `kv_tokens` and pass it to
   Eval as `--context`. Beyond weights and KV cache the engine gets `context_reserve_gib`

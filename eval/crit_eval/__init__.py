@@ -19,16 +19,30 @@ def protocol_version(identifier):
     return int(match[1]), int(match[2] or 0)
 
 
+# The context a user wants engines built for, unless settings.toml's context_tokens says otherwise; the model's
+# positions and the device's memory may allow less.
+DEFAULT_CONTEXT_TOKENS = 262_144
+
+
 def machine_settings():
-    """Memory thresholds from the crit checkout's settings.toml (vram_headroom_gib, context_reserve_gib), when
-    Eval runs from one; an Eval copied elsewhere without it uses the protocol's defaults."""
+    """Memory thresholds from the crit checkout's settings.toml (vram_headroom_gib, context_reserve_gib) and the
+    wanted context (context_tokens), when Eval runs from one; an Eval copied elsewhere without it uses the protocol's
+    defaults and DEFAULT_CONTEXT_TOKENS."""
     path = EVAL_DIR.parent / "settings.toml"
     if not path.is_file():
         return {}
     import tomllib
     value = tomllib.loads(path.read_text(encoding="utf-8"))
-    return {key: float(value[key]) for key in ("vram_headroom_gib", "context_reserve_gib")
-            if isinstance(value.get(key), (int, float)) and not isinstance(value.get(key), bool)}
+    found = {key: float(value[key]) for key in ("vram_headroom_gib", "context_reserve_gib")
+             if isinstance(value.get(key), (int, float)) and not isinstance(value.get(key), bool)}
+    if type(value.get("context_tokens")) is int and value["context_tokens"] > 0:
+        found["context_tokens"] = value["context_tokens"]
+    return found
+
+
+def requested_context():
+    """The context the user wants: settings.toml's context_tokens, else DEFAULT_CONTEXT_TOKENS."""
+    return machine_settings().get("context_tokens", DEFAULT_CONTEXT_TOKENS)
 
 
 def load_json(path):

@@ -93,7 +93,7 @@ simultaneously.
 | Endpoint | Behavior |
 | --- | --- |
 | `GET /health` | `{"status": "ok", "engine": ...}`; 503 when the runtime is blocked. No key needed |
-| `GET /v1/models`, `GET /v1/models/{id}` | The run's sealed resident candidates, or catalog names, with `label`, `context_length` (the candidate's `kv_tokens`), `default`, package `capabilities` and `supported_sampling_parameters` |
+| `GET /v1/models`, `GET /v1/models/{id}` | The run's sealed resident candidates, or catalog names, with `label`, `context_length` (the candidate's `kv_tokens`), `default`, package `capabilities`, `supported_sampling_parameters` and `engine_facts` ([facts for Eval](#engine-facts-and-plain-decoding)) |
 | `POST /v1/chat/completions` | Chat completion, JSON or server-sent events |
 | `POST /v1/crit/score` | [Fixed-text scores](#fixed-text-scores) for packages declaring `chat-score-v1` |
 
@@ -114,12 +114,15 @@ declares the concurrent request contract below.
 | `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias` | Per-request overrides when the package declares support for that field; otherwise 400. Omitted or null fields keep engine defaults |
 | `tools`, `tool_choice`, `parallel_tool_calls` | Function calls for packages declaring `chat-tools-v1`; `auto`, `none`, `required` or a named function (adapters that parse free generation, such as [ResidentChat](#tool-calls-from-the-chat-template): `auto` or `none`). Tool-result history is preserved |
 | `logprobs`, `top_logprobs` | [Token log-probabilities](#token-log-probabilities) for packages declaring `chat-logprobs-v1`: every token's own and up to 20 alternatives. Not with `stop` |
+| `crit` | crit's own extension: `{"decode": "plain"}` decodes the reply one token per target pass, without drafting, for packages declaring `chat-plain-v1` ([plain decoding](#engine-facts-and-plain-decoding)) |
 
 Responses carry `usage` when measured and `crit_telemetry`: prompt and output tokens, the
 prompt tokens the engine did not compute (`usage.prompt_tokens_details.cached_tokens`: its
 telemetry's prompt tokens minus `prefill_tokens`, 0 when it computed them all), the
 engine's prefill and decode rates, TTFT, and `tokens_per_round` (output tokens per target
-pass) when the engine reports its decode rounds. A stream's usage chunk carries both.
+pass) when the engine reports its decode rounds, with `accepted` (drafts accepted in each of
+those rounds), `verify_ms` and `draft_ms` (device time in verify passes and draft steps) when
+it reports them. A stream's usage chunk carries both.
 Sampling overrides are validated before generation, including for streaming requests.
 Unknown parameters and unsupported generation controls return 400 rather than being
 silently ignored. Only client metadata (`user`, `metadata`, `store`, `service_tier`)
@@ -315,9 +318,24 @@ draft only while it equals the continuation and takes every correction and bonus
 it). The first continuation row comes from the prefill's last position. With `prompt_rows`
 false, `prompt` is empty and the engine only prefills the prompt, as for a reply. Rows are `[token,
 logprob, [[token, logprob], ...]]` with exactly `top_logprobs` ranked alternatives,
-natural-log, of the raw logits; `crit_telemetry` holds `prefill_ms` and `decode_ms`. Eval's
-quality gate uses it ([docs/eval](eval/README.md)). A score runs alone on the engine, as Core
-runs scores, and is not streamed.
+natural-log, of the raw logits; `crit_telemetry` holds `prefill_ms` and `decode_ms`. With
+`"format": "packed"` each part comes as packed arrays instead, `{"count", "alternatives",
+"tokens", "logprobs", "top_tokens", "top_logprobs"}`: base64 of little-endian arrays, the
+tokens and alternative tokens int32, the log-probabilities float32, the alternatives row by
+row (`count` × `alternatives`), and the response names `"format": "packed"`. Eval's quality
+gate uses it ([docs/eval](eval/README.md)). A score runs alone on the engine, as Core runs
+scores, and is not streamed.
+
+### Engine facts and plain decoding
+
+While a candidate's engine is loaded, its `/v1/models` card carries `engine_facts`, what
+the engine reports for Eval's headroom and exactness: `speculative` and `plain` (booleans),
+`draft_width`, `bytes_per_pass`, `draft_bytes_per_step`, `draft_ms` and
+`kv_bytes_per_token` (non-negative numbers), each only when the engine reports it; `null`
+when the candidate is not loaded or reports none. A speculative engine that declares
+`chat-plain-v1` decodes a request carrying `"crit": {"decode": "plain"}` one token per
+target pass without drafting, which is how Eval compares speculative output with plain
+greedy on the served engine.
 
 ## Structured output
 
@@ -515,7 +533,10 @@ generated tokens;
 or the first token from prefill); `ttft_ms` runs from admission to first emitted token.
 Optional `decode_rounds` counts target passes after prefill (a speculative engine's verify
 rounds, at most `output_tokens`); ResidentChat reports it from `generate_tokens`' timing
-`rounds`, and Core engine libraries report theirs.
+`rounds`, and Core engine libraries report theirs. Optional `accepted` (one count of
+accepted drafts per decode round, as many as `decode_rounds`), `verify_ms` and `draft_ms`
+(non-negative milliseconds) pass through to `crit_telemetry`; ResidentChat takes them
+from `generate_tokens`' timing.
 Synchronize device work at phase boundaries, exclude startup and loading, and never
 estimate tokens from characters.
 
@@ -685,6 +706,16 @@ it. `crit_core.native.ResidentEngine` sets `scores` when the engine's `ModelInfo
 Core's query scoring with the engine's own top-k on its `"prefill"` score path (the default
 path when it names none), which must run the engine's prefill kernels at every position, and
 the continuation by a replay generation with log-probabilities.
+
+### Engine facts and plain decoding for adapters
+
+An engine keeps its facts for Eval in `facts`, a dictionary (`crit_core.native`'s engines
+hold their `ModelInfo` there); the host publishes the known ones
+(`crit_core.serving.ENGINE_FACTS`) as the card's `engine_facts`. A speculative engine
+that also decodes plainly declares **`chat-plain-v1`** (`capabilities(text, sampling,
+plain=True)`) and sets `plain = True`: a request with `"decode": "plain"` then reaches
+`generate_tokens` as `plain=True`. `crit_core.native.ResidentEngine` sets `plain` when its
+facts declare `speculative` and `plain`.
 
 ### Effective configuration
 

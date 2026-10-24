@@ -62,9 +62,8 @@ class HungServerTests(unittest.TestCase):
         class Engine:
             def generate(self, prompt, max_new_tokens, on_tokens):
                 raise Hung("/chat/completions gave no answer within 9 s")
-        prepared = {"context": {"case": "chat", "head_ids": [1], "document_ids": [2] * 50, "tail_ids": [3],
-                                "retrieval_tail_ids": [4]},
-                    "retrieval": {"filler_ids": [2] * 50, "facts": []}}
+        prepared = {"retrieval": {"head_ids": [1], "tail_ids": [3], "curve_tail_ids": [4], "filler_ids": [2] * 50,
+                                  "facts": []}}
         settings = {"output_tokens": 4, "curve_from": 64, "repetitions": 1, "retrieval": {"positions": []}}
         with self.assertRaises(Hung):
             runner.run_context(Engine(), {"max_context": 64}, prepared, settings, 64, lambda m: None)

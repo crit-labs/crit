@@ -5,6 +5,7 @@ import re
 from functools import lru_cache
 
 from crit_core.constraints import ByteGrammar, GrammarState, UnsupportedConstraint, compile_language, matches
+from crit_core.serving import PLAIN_CAPABILITY
 
 TOOLS_CAPABILITY = "chat-tools-v1"
 STRICT_TOOLS_CAPABILITY = "chat-tools-strict-v1"
@@ -73,6 +74,22 @@ def sampling_options(body, capabilities):
         require(capabilities, sampling_capability(key), key)
         result[key] = value
     return result
+
+
+def crit_options(value, capabilities):
+    """crit's own request extension, the body's "crit" object: {"decode": "plain"} decodes the reply one token per
+    target pass, without drafting, on an engine that declares chat-plain-v1. Returns the decode mode or None."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) - {"decode"}:
+        raise RequestError("crit takes an object with decode", param="crit")
+    decode = value.get("decode")
+    if decode is None:
+        return None
+    if decode != "plain":
+        raise RequestError("crit.decode must be plain", param="crit.decode")
+    require(capabilities, PLAIN_CAPABILITY, "crit.decode")
+    return decode
 
 
 def function_name(value):

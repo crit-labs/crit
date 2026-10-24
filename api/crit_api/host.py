@@ -18,7 +18,7 @@ from crit_api.logprobs import RESPONDING
 from crit_api.models import ModelContext, ModelPool
 from crit_api.stream import CAPABILITY as STREAM_CAPABILITY, StreamWriter
 from crit_api.options import MAX_CHAT_RECORD, TOOLS_CAPABILITY, STRICT_TOOLS_CAPABILITY, TOOL_STREAM_CAPABILITY
-from crit_core.serving import LOGPROBS_CAPABILITY, SCORE_CAPABILITY
+from crit_core.serving import LOGPROBS_CAPABILITY, SCORE_CAPABILITY, engine_facts
 
 CONFIG_CAPABILITY = "chat-config-v1"
 
@@ -66,6 +66,8 @@ class Host:
         self.pools = {}
         self.host_limit, self.device_limit = self.pool.host_limit, self.pool.device_limit
         self.engine = self.context = self.identity = None
+        self.facts = None  # the loaded engine's facts for Eval (crit_core.serving.engine_facts)
+        self.limits = None  # the loaded engine's limits: the same candidate at other limits is built again
         self.blocked = False
         self.loads = 0
         self.capacity = 1
@@ -83,7 +85,7 @@ class Host:
                 "host_bytes": sum(p.host_bytes for p in self.pools.values()),
                 "device_bytes": sum(p.device_bytes for p in self.pools.values()),
                 "engine_loads": self.loads, "active_requests": self.active,
-                "max_concurrent_requests": self.capacity, **extra}})
+                "max_concurrent_requests": self.capacity, "engine_facts": self.facts, **extra}})
 
     def detach(self):
         if self.engine is not None:
@@ -94,15 +96,17 @@ class Host:
             except BaseException:
                 self.blocked = True
                 raise
-            self.engine = self.context = self.identity = None
+            self.engine = self.context = self.identity = self.facts = self.limits = None
 
     def attach(self, spec):
         if self.blocked:
             raise ValueError("Resident host is quarantined")
         identity = {k: spec[k] for k in ("run_id", "candidate_id", "package_sha256")}
-        if identity == self.identity:
+        if identity == self.identity and spec.get("limits", {}) == self.limits:
             self.pool.verify_sources()
             return
+        # Another candidate, or the same one at other limits (a measurement's lower context): the engine is closed and
+        # built again; the model's pool, its mapped files and device weights, stays.
         self.detach()
         model_id = digest(spec['model_manifest'])
         if self.pool.model_id is not None and self.pool.model_id != model_id:
@@ -182,7 +186,8 @@ class Host:
             if problem:
                 self.detach()  # close the constructed engine and its context before rejecting
                 raise ValueError(problem)
-        self.identity = identity
+        self.identity, self.limits = identity, spec.get("limits", {})
+        self.facts = engine_facts(self.engine)
         self.loads += 1
         self.status("ready")
 

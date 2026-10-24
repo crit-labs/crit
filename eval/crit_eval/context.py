@@ -1,6 +1,10 @@
 """The longest request an engine must hold: `crit eval context --model DIR --device device.json`.
 
-    max context = min(model limit, device limit)      tokens of prompt plus output
+    max context = min(requested, model limit, device limit)      tokens of prompt plus output
+
+The requested context is the user's (settings.toml context_tokens, default 262,144; `--requested-context`): the
+longest request they want served. The model and the device may allow less, and then bound it; the result says
+which bound and why.
 
 The model limit is the number of positions the checkpoint declares in its config: `max_position_embeddings`
 (or another length key), or with YaRN rope scaling in the config, its original positions times the factor.
@@ -60,17 +64,34 @@ def weight_split(model, config):
     return split
 
 
-def max_context(model, device, vram_headroom_bytes, settings):
+def pass_bytes(model, kv_bytes_per_element):
+    """What one decode pass of one token reads from the stored model, for an engine that reports no bytes_per_pass:
+    the weights read on every pass but draft layers, the routed experts' share (experts_per_token of the experts,
+    taken as equally sized) and the fixed state (linear-attention and Mamba recurrence, sliding-window KV at
+    kv_bytes_per_element). None without weight headers."""
+    config = model_config(model)
+    split = weight_split(model, config)
+    if split is None:
+        return None
+    moe = config.moe
+    experts = (split["experts"] * min(1.0, moe.experts_per_token / moe.experts)
+               if split["experts"] and moe and moe.experts and moe.experts_per_token else 0)
+    return int(split["resident"] - split["draft"] + experts + config.fixed_state_bytes(kv_bytes_per_element))
+
+
+def max_context(model, device, vram_headroom_bytes, settings, requested=None):
     """The required context of an engine for MODEL on DEVICE (a `crit eval probe` result) with the facts
     behind it. `tokens` is None when an input is missing (`missing`) or the weights read on every pass do
-    not fit (`reason`). settings: protocol.json's `context` section."""
+    not fit (`reason`). settings: protocol.json's `context` section. requested: the user's wanted context; the
+    model's positions and the device's memory may cap it (`bound`, and `note` says by how much)."""
     config = model_config(model)
     limit, source = config.position_limit()
     element = float(settings["kv_bytes_per_element"])
     granularity = int(settings.get("granularity", 1))
     elements = config.kv_elements_per_token()
     kv = int(round(elements * element)) if elements else None
-    out = {"tokens": None, "bound": None, "model_limit": limit, "model_limit_source": source, "device_limit": None,
+    out = {"tokens": None, "bound": None, "requested": int(requested) if requested else None, "note": None,
+           "model_limit": limit, "model_limit_source": source, "device_limit": None,
            "kv_precision": settings.get("kv_precision"), "kv_bytes_per_token": kv, "missing": [], "reason": None}
     if limit is None:
         out["missing"].append("the model's positions (max_position_embeddings in config.json)")
@@ -108,6 +129,13 @@ def max_context(model, device, vram_headroom_bytes, settings):
         tokens, bound = min((limit, "model"), (out["device_limit"], "device"))
     else:
         tokens, bound = limit, "model"  # no cache grows with the context
+    if requested and int(requested) <= tokens:
+        tokens, bound = int(requested), "requested"
+    elif requested:
+        out["note"] = (f"the requested {int(requested):,} tokens exceed the "
+                       + (f"model's {limit:,} positions ({source})" if bound == "model" else
+                          f"{out['device_limit']:,} tokens whose KV cache fits the device")
+                       + f": the required context is {tokens:,}")
     out.update(tokens=tokens, bound=bound)
     # Experts get the device memory the KV cache leaves at the maximum context.
     out["basis"]["expert_bytes_in_device_memory_at_max"] = max(0, min(split["experts"], budget - tokens * (kv or 0)))
@@ -133,56 +161,19 @@ def curve_points(required, settings):
     return points + [required]
 
 
-def curve_prompt(pieces, filler, length):
-    """A long-context prompt of exactly `length` tokens: the curve's speed case with its document followed by the
-    filler (repeated as needed), cut to fit, so the engine answers that case's request. None when `length` cannot
-    hold the case's frame. pieces: prepared["context"]; filler: the retrieval filler ids."""
-    head, tail = list(pieces["head_ids"]), list(pieces["tail_ids"])
-    need = length - len(head) - len(tail)
-    if need < 1:
-        return None
-    middle = list(pieces["document_ids"])
-    if len(middle) < need:
-        rest = need - len(middle)
-        middle += (list(filler) * -(-rest // len(filler)))[:rest]
-    return head + middle[:need] + tail
-
-
-def required_prompts(pieces, retrieval, length, positions):
-    """At the required context, (the curve prompt of exactly `length` tokens, the retrieval prompt) sharing every
-    token up to the end of the document: the curve case's head, its document followed by the filler (repeated as
-    needed) with one retrieval fact at each of `positions` (fractions of that text), then the curve case's tail or
-    the retrieval question's (pieces retrieval_tail_ids). None when `length` cannot hold the frame and the facts.
-    pieces: prepared["context"]; retrieval: prepared["retrieval"]."""
-    head, facts = list(pieces["head_ids"]), retrieval["facts"]
-    plain = length - len(head) - len(pieces["tail_ids"]) - sum(len(f["ids"]) for f in facts)
-    if plain < len(facts) + 1:
-        return None
-    text = list(pieces["document_ids"])
-    if len(text) < plain:
-        rest = plain - len(text)
-        text += (list(retrieval["filler_ids"]) * -(-rest // len(retrieval["filler_ids"])))[:rest]
-    text = text[:plain]
-    middle, last = [], 0
-    for fraction, fact in zip(positions, facts):
-        cut = max(last, min(plain, int(plain * float(fraction))))
-        middle += text[last:cut] + list(fact["ids"])
-        last = cut
-    middle += text[last:]
-    return head + middle + list(pieces["tail_ids"]), head + middle + list(pieces["retrieval_tail_ids"])
-
-
 def retrieval_points(required, rule):
     """Context lengths the retrieval check fills: its fixed points below the requirement, then the requirement
     itself (near capacity: prompt plus output equal it). rule: protocol.json's context.retrieval."""
     return sorted({int(p) for p in rule["points"] if int(p) < required} | {int(required)})
 
 
-def retrieval_prompt(pieces, length, positions):
+def retrieval_prompt(pieces, length, positions, tail=None):
     """A retrieval prompt of exactly `length` tokens: the prepared head, the filler (repeated as needed) with
-    one fact at each of `positions` (fractions of the filler), and the tail with the question. None when
-    `length` cannot hold the head, tail and facts with filler between them. pieces: prepared["retrieval"]."""
-    head, tail, facts = pieces["head_ids"], pieces["tail_ids"], pieces["facts"]
+    one fact at each of `positions` (fractions of the filler), and the tail with the question (`tail`: another
+    request after the same head). None when `length` cannot hold the head, tail and facts with filler between them.
+    pieces: prepared["retrieval"]."""
+    head, facts = pieces["head_ids"], pieces["facts"]
+    tail = pieces["tail_ids"] if tail is None else tail
     plain = length - len(head) - len(tail) - sum(len(f["ids"]) for f in facts)
     if plain < len(facts) + 1:
         return None
@@ -194,6 +185,13 @@ def retrieval_prompt(pieces, length, positions):
         out += filler[last:cut] + list(fact["ids"])
         last = cut
     return out + filler[last:] + list(tail)
+
+
+def curve_prompt(pieces, length, positions):
+    """A long-context curve prompt of exactly `length` tokens: the retrieval prompt (retrieval_prompt) whose request
+    asks for the facts and then for a summary of the archive (curve_tail_ids), so its reply is long enough to time
+    the decode and is judged for retrieval too. None when `length` cannot hold it. pieces: prepared["retrieval"]."""
+    return retrieval_prompt(pieces, length, positions, pieces["curve_tail_ids"])
 
 
 def token_text(tokens, strings, stop_ids=()):
@@ -212,6 +210,10 @@ def render(value):
     lines = []
     if value["tokens"]:
         lines.append(f"max context {value['tokens']:,} tokens ({value['bound']} bound)")
+        if value.get("requested"):
+            lines.append(f"  requested    {value['requested']:,} tokens (settings.toml context_tokens)")
+        if value.get("note"):
+            lines.append(f"  note: {value['note']}")
     else:
         lines.append("max context unknown" + (f": {value['reason']}" if value["reason"] else ""))
     if value["model_limit"]:

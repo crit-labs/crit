@@ -1,8 +1,32 @@
 """Minimal eval-v1 adapter without a GPU, used by tests and as a template for real engines.
 
-It "generates" a fixed token pattern, so every harness path can be exercised on any host.
+It "generates" a fixed token pattern, so every harness path can be exercised on any host. Sampled requests draw
+from a fixed distribution over eight candidates per position.
 """
+import math
+import random
 import time
+
+# The mock model's distribution at every sampled position: raw log-probabilities of eight candidates, likeliest first.
+CANDIDATES = [math.log(p) for p in (0.35, 0.2, 0.14, 0.1, 0.08, 0.06, 0.04, 0.03)]
+
+
+def processed(logprobs, sampling):
+    """Temperature, then top_k and top_p, as a sampler applies them; probabilities aligned with logprobs."""
+    temperature = float(sampling.get("temperature") or 1.0)
+    keep = list(range(len(logprobs)))[:int(sampling["top_k"])] if sampling.get("top_k") else list(range(len(logprobs)))
+    weights = {i: math.exp(logprobs[i] / temperature) for i in keep}
+    total = sum(weights.values())
+    probs = {i: w / total for i, w in weights.items()}
+    if sampling.get("top_p") is not None and float(sampling["top_p"]) < 1:
+        mass, prefix = 0.0, []
+        for i in keep:
+            prefix.append(i)
+            mass += probs[i]
+            if mass >= float(sampling["top_p"]):
+                break
+        probs = {i: probs[i] / mass for i in prefix}
+    return [probs.get(i, 0.0) for i in range(len(logprobs))]
 
 
 class MockEngine:
@@ -73,6 +97,25 @@ class MockEngine:
     def generate_plain(self, prompt, max_new_tokens, on_tokens):
         """One token per target pass, no drafting: the same greedy text."""
         return self._rounds([(sum(prompt) + i) % 1000 for i in range(max_new_tokens)], on_tokens, plain=True)
+
+    def generate_sampled(self, prompt, max_new_tokens, on_tokens, sampling, logprobs=None):
+        """Optional (crit-eval-v7): a request sampled at `sampling` (temperature, top_p, top_k, min_p, seed). With
+        logprobs n, return each token's log-probability and n alternatives as "logprobs". This mock does not
+        speculate under sampling: one token per pass."""
+        rng = random.Random(int(sampling.get("seed", 0)))
+        probs = processed(CANDIDATES, sampling)
+        tokens, rows = [], []
+        for i in range(max_new_tokens):
+            base = (sum(prompt) + 10 * i) % 990
+            # Test knob: a sampler that takes the likeliest token whenever a greedy draft would match.
+            pick = 0 if self.config.get("greedy_sampling") and rng.random() < 0.6 else rng.choices(range(8), weights=probs)[0]
+            tokens.append(base + pick)
+            rows.append({"token": base + pick, "logprob": CANDIDATES[pick],
+                         "top": [[base + j, lp] for j, lp in enumerate(CANDIDATES)][:logprobs or 0]})
+        out = self._rounds(tokens, on_tokens, plain=True)
+        if logprobs:
+            out["logprobs"] = rows
+        return out
 
     def replay(self, prompt, continuation, on_tokens):
         """Decode `continuation` as if it were the engine's own greedy output (drafts accepted while

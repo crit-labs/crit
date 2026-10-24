@@ -25,15 +25,23 @@ crit run --project CRIT_ROOT --root RUN_ROOT --id RUN_ID recon
 model needs none. `work/recon.json` names every file it read with its SHA-256. Its `frozen` block
 (`sampling`, `chat_template`, `template_variables`, `stop_token_ids`, `stop_strings`)
 goes into each later candidate's configuration as `recon`; edit the block, with the
-reason in `recon.md`, before the candidate it should change. `--force` gathers again
-and keeps `recon.md`.
+reason in `recon.md`, before the candidate it should change. Its `sampling` is the
+exception: it is the model's own and stays so (a candidate refuses another). `recon.md`'s
+"Eval sampling" section names the sampling crit Eval's sampled suite measures, from the
+model's `generation_config.json` or the protocol default; only the user overrides it,
+with `eval_sampling` at `create` (and `crit eval prepare --sampling` with the same
+settings), and the served default then follows the override. Finish recon.md's drafting
+plan for both decode modes before the first candidate. `--force` gathers again and keeps
+`recon.md`.
 `candidate_budget` counts complete candidates; there is no time budget, only a 30-day
 safety window.
 
-Every candidate serves Eval's [max context](eval/CONTEXT.md) (model positions, capped by
-the KV cache that fits). Probe the device (`crit eval probe --out device.json`, or
-`device` in `settings.toml`) and `create` freezes it as `kv_tokens`; set `kv_tokens`
-only when the user asks.
+Every candidate serves Eval's [max context](eval/CONTEXT.md): the context the user wants
+(`context_tokens` in `settings.toml`, default 262,144), capped by the model's positions and
+the KV cache that fits. Probe the device (`crit eval probe --out device.json`, or `device`
+in `settings.toml`) and `create` freezes it as `kv_tokens`, with why it is that size in
+`hardware_constraints.context` and recon.md's Required context section; set `kv_tokens` or
+`context_tokens` only when the user asks.
 
 ```json
 {
@@ -137,7 +145,10 @@ paths; define aggregation first. One fast sample is not a result.
 Choose implementations (kernel variants, library algorithms) from a table recorded in
 the candidate configuration, not by timing at load: near-ties resolve differently per
 process and can change outputs. For speculative decoding, record
-`accepted_tokens_per_round` with decode speed.
+`accepted_tokens_per_round` with decode speed, greedy and sampled: Eval's headline decode samples at
+the model's defaults ([Sampled speed](eval/MEASUREMENTS.md#sampled-speed)), so a drafter that only
+helps greedy requests leaves most requests at one token per pass. Verify sampled drafts with
+rejection sampling so the distribution stays exact, and sample on the device.
 
 ### Run the common Eval suite
 

@@ -148,35 +148,6 @@ def speed_prompt(model, case):
             tools)
 
 
-def curve_case(speed):
-    """The speed case the long-context curve extends: the longest, which holds a document."""
-    case = max(speed["cases"], key=lambda c: c.get("prompt_tokens", 0))
-    if "document" not in case:
-        raise ValueError(f"{case['id']}: the longest speed case has no document for the long-context curve to extend")
-    return case
-
-
-def curve_pieces(model, case, question):
-    """What a run assembles long-context curve prompts from (context.curve_prompt): the case's token ids before
-    and after its document, and the document followed by a paragraph break. At the required context the retrieval
-    request shares the curve prompt up to the end of its document (context.required_prompts): the case's messages
-    through the one holding the document, then a user message asking `question` (retrieval_tail_ids,
-    retrieval_messages)."""
-    messages, tools = speed_messages(case, SENTINEL)
-    head_ids, tail_ids = document_frame(model, messages, tools)
-    held = next(i for i, m in enumerate(messages) if SENTINEL in (m.get("content") or ""))
-    asked = messages[:held + 1] + [{"role": "user", "content": question}]
-    shared, retrieval_tail = document_frame(model, asked, tools)
-    if shared != head_ids:
-        raise ValueError(f"{case['id']}: the chat template renders the retrieval question's prompt with another "
-                         "start than the case's, so the two cannot share their prefix")
-    document = (SUITE_DIR / case["document"]).read_text(encoding="utf-8")
-    return {"case": case["id"], "head_ids": head_ids, "tail_ids": tail_ids,
-            "document_ids": token_ids(model, document) + token_ids(model, "\n\n"),
-            "messages": api_messages(messages), "tools": tools,
-            "retrieval_tail_ids": retrieval_tail, "retrieval_messages": api_messages(asked)}
-
-
 def speed_case(model, case):
     return speed_prompt(model, case)[0]
 
@@ -275,17 +246,24 @@ def followup_prompts(model, followup, filler, prompt_tokens):
     return prompts
 
 
-def retrieval_messages(rule):
+def retrieval_messages(rule, user="user"):
     return [{"role": "system", "content": rule["system"]},
-            {"role": "user", "content": rule["user"].replace("{document}", SENTINEL)}]
+            {"role": "user", "content": rule[user].replace("{document}", SENTINEL)}]
 
 
 def retrieval_pieces(model, long, filler):
     """What a run assembles retrieval prompts from (context.retrieval_prompt): the rendered prompt's token ids
-    before and after the filler, the filler, each fact's token ids with its answer, and token_strings."""
+    before and after the filler, the filler, each fact's token ids with its answer, and token_strings. The
+    long-context curve's prompts (context.curve_prompt) end with curve_tail_ids instead, its request asking for the
+    facts and then for a summary of the archive (curve_messages), after the same head."""
     rule = long["retrieval"]
     head_ids, tail_ids = document_frame(model, retrieval_messages(rule))
+    curve_head, curve_tail = document_frame(model, retrieval_messages(rule, "curve_user"))
+    if curve_head != head_ids:
+        raise ValueError("long.json's retrieval user and curve_user must open alike: the chat template renders their "
+                         "prompts with another start")
     return {"head_ids": head_ids, "tail_ids": tail_ids, "messages": retrieval_messages(rule), "filler_ids": list(filler),
+            "curve_tail_ids": curve_tail, "curve_messages": api_messages(retrieval_messages(rule, "curve_user")),
             "facts": [{"id": f["id"], "answer": f["answer"], "ids": token_ids(model, "\n\n" + f["text"] + "\n\n")}
                       for f in rule["facts"]],
             "token_text": token_strings(model, model.tokenizer.vocab_size)}
@@ -305,7 +283,87 @@ def quality_prompts(model, quality, long, filler, rule):
     return prompts
 
 
-def prepare(model, data, speed_tokens=None):
+def sampled_settings(generation):
+    """protocol sampled_speed.sampling: the model's own sampling defaults (a crit_core.text GenerationConfig) when it
+    samples by default, temperature 1.0 with no filters when it does not. Penalties stay neutral."""
+    defaults = generation.sampling_defaults()
+    if not defaults.get("do_sample"):
+        return {"temperature": 1.0}
+    settings = {"temperature": float(defaults.get("temperature", 1.0))}
+    for key in ("top_p", "top_k", "min_p"):
+        if defaults.get(key) is not None:
+            settings[key] = defaults[key]
+    if settings["temperature"] <= 0:
+        settings = {"temperature": 1.0}
+    return settings
+
+
+SAMPLING_KEYS = {"temperature": (float, 0.0, 100.0), "top_p": (float, 0.0, 1.0), "top_k": (int, 1, 1 << 20),
+                 "min_p": (float, 0.0, 1.0)}
+
+
+def sampling_override(value):
+    """A user's sampling for the sampled suite in place of the model's own: {"temperature": > 0 (required), "top_p":
+    (0, 1], "top_k": >= 1, "min_p": [0, 1)}, or the text "temperature=0.6,top_p=0.95,top_k=20". Penalties stay
+    neutral. Raises ValueError on anything else."""
+    if isinstance(value, str):
+        pairs = [part.split("=", 1) for part in value.split(",") if part.strip()]
+        if not all(len(pair) == 2 for pair in pairs):
+            raise ValueError("sampling requires name=value pairs separated by commas, e.g. temperature=0.6,top_p=0.95")
+        value = {name.strip(): number.strip() for name, number in pairs}
+    if not isinstance(value, dict) or set(value) - set(SAMPLING_KEYS) or "temperature" not in value:
+        raise ValueError(f"sampling takes temperature (required) and any of top_p, top_k, min_p; got {value}")
+    settings = {}
+    for name, raw in value.items():
+        kind, low, high = SAMPLING_KEYS[name]
+        try:
+            number = kind(raw) if not isinstance(raw, bool) else None
+        except (TypeError, ValueError):
+            number = None
+        if kind is int and number is not None and float(raw) != number:
+            number = None
+        if number is None or not low <= number <= high or (name in ("temperature", "top_p") and number <= 0) or (
+                name == "min_p" and number >= 1):
+            raise ValueError(f"sampling {name} {raw!r} is out of range")
+        settings[name] = number
+    return dict(sorted(settings.items(), key=lambda item: list(SAMPLING_KEYS).index(item[0])))
+
+
+# Every sampling field a sampled request names, at the value that leaves the distribution as the model's own
+# settings make it: filters off and penalties neutral (top_k 0 keeps every token).
+NEUTRAL_SAMPLING = {"top_p": 1.0, "top_k": 0, "min_p": 0.0, "presence_penalty": 0.0, "frequency_penalty": 0.0,
+                    "repetition_penalty": 1.0}
+
+
+def sampled_request(settings, seed):
+    """The sampling fields of one sampled request (protocol sampled_speed): the prepared settings, every filter they
+    leave unset and every penalty at its neutral value, and the seed, so no engine default changes the distribution
+    (an engine applies its own defaults to the fields a request leaves out)."""
+    return {"temperature": float(settings["temperature"]), **NEUTRAL_SAMPLING,
+            **{key: settings[key] for key in ("top_p", "top_k", "min_p") if settings.get(key) is not None},
+            "seed": int(seed)}
+
+
+def unapplied(request, supported):
+    """The fields of a sampled request an engine that applies `supported` cannot honour: those whose value is not
+    neutral (temperature always counts; a missing seed only costs repeatability). Fields at their neutral value may
+    be left out for such an engine."""
+    return sorted(key for key, value in request.items()
+                  if key not in supported and key != "seed"
+                  and (key not in NEUTRAL_SAMPLING or value != NEUTRAL_SAMPLING[key]))
+
+
+def sampling_source(generation):
+    """Where the model's sampled-suite settings come from: its generation_config.json when it samples by default with a
+    positive temperature, else the protocol's default (temperature 1.0, no filters)."""
+    defaults = generation.sampling_defaults()
+    if defaults.get("do_sample") and float(defaults.get("temperature", 1.0)) > 0:
+        return "generation_config"
+    return "protocol_default"
+
+
+def prepare(model, data, speed_tokens=None, sampling=None):
+    """sampling: the user's override of the sampled suite's settings (sampling_override); None takes the model's."""
     from crit_core.text import legacy_eos_ids, load_model_text
     protocol = json.loads((SUITE_DIR.parent / "protocol.json").read_text(encoding="utf-8"))
     files = open_model(model).files
@@ -323,6 +381,10 @@ def prepare(model, data, speed_tokens=None):
         # Token ids that exist; head rows beyond this are padding and excluded from scoring.
         "valid_vocab": text.tokenizer.vocab_size,
         "speed": [speed_entry(text, c, speed_tokens or protocol["speed"]["output_tokens"]) for c in speed["cases"]],
+        # The sampling the sampled speed suite and the sampling check run at (protocol sampled_speed.sampling), and
+        # where it came from: the model's generation_config.json, the protocol default, or the user's override.
+        "sampling": sampling_override(sampling) if sampling is not None else sampled_settings(text.generation),
+        "sampling_source": "override" if sampling is not None else sampling_source(text.generation),
         "quality": quality_prompts(text, quality, long, filler, protocol["quality"]),
         # Arithmetic and KV bytes per token for the prefill and long-context decode floors.
         "ceiling": model_ceiling(model),
@@ -335,7 +397,6 @@ def prepare(model, data, speed_tokens=None):
     prepared["retrieval"] = retrieval_pieces(text, long, filler)
     followup = json.loads((SUITE_DIR / "followup.json").read_text(encoding="utf-8"))
     prepared["followup"] = followup_prompts(text, followup, filler, protocol["followup"]["prompt_tokens"])
-    prepared["context"] = curve_pieces(text, curve_case(speed), long["retrieval"]["question"])
     Path(data).mkdir(parents=True, exist_ok=True)
     write_json(Path(data) / PREPARED, prepared)
     return prepared

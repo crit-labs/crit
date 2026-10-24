@@ -15,8 +15,9 @@ the numbers about how to build.
    its default `reported` mode is a note: the quality budget judges output; request history is a
    gate in every mode.
 2. Goals for the next candidate: each of decode, prefill and time to first token, and decode and
-   time to first token over the long-context curve, from its current score to its physical limit.
-   All of them hold at once; none is ranked or optional.
+   time to first token over the long-context curve, from its current score to its physical limit,
+   with the fraction of the limit reached. Eval states them and does not order them: a run's
+   priority rule does (crit run).
 3. KPIs, each next to its physical limit: the decode score against its ceiling (the larger of
    this drafter's speed of light and a drafter accepting later drafts as often as the first),
    the model pass against its bandwidth floor, the prefill score against its compute ceiling,
@@ -28,7 +29,7 @@ the numbers about how to build.
 `run` writes the same status into the result and prints it. With --baseline, the KPIs also
 show the change from an earlier result of the same model and suite.
 """
-from . import load_json, metrics, protocol_version
+from . import headroom, load_json, metrics, protocol_version
 
 
 def _gates(result):
@@ -51,8 +52,11 @@ def _gates(result):
     gates += _history_gate(result)
     gates.append(_prompt_cache_gate(result))
     gates.append(_quality_gate(result))
+    gates.append(_sampling_gate(result))
     gates += _context_gates(result)
-    if speculative and _exactness_mode(result) == "required":
+    if speculative and (exact or {}).get("status") == "unmeasured":
+        gates.append({"name": "exactness", "state": "unmeasured", "detail": exact["reason"]})
+    elif speculative and _exactness_mode(result) == "required":
         if exact is None:
             gates.append({"name": "exactness", "state": "unmeasured", "detail": "exactness not run"})
         else:
@@ -61,6 +65,26 @@ def _gates(result):
                           "detail": (f"{len(exact['cases']) - len(differ)}/{len(exact['cases'])} cases equal plain greedy"
                                      + "".join(f"; {cid} differs at token {i}" for cid, i in differ.items()))})
     return gates
+
+
+def _sampling_gate(result):
+    """protocol sampling_check: sampled tokens follow the distribution the model's sampling settings define."""
+    sampled, check = result.get("sampled_speed"), result.get("sampling_check")
+    if not sampled:
+        return {"name": "sampling", "state": "unmeasured", "detail": "sampled speed not run"}
+    if sampled.get("status") != "measured":
+        return {"name": "sampling", "state": "unmeasured", "detail": sampled.get("reason") or "sampled speed not measured"}
+    if not check or check.get("status") != "measured":
+        return {"name": "sampling", "state": "unmeasured", "detail": (check or {}).get("reason") or "sampling check not run"}
+    detail = (f"{check['tokens']} sampled tokens judged, z {check['z']:.2f} (limit ±{check['z_max']:g}), "
+              f"{check['outside']} outside the processed distribution" if check.get("z") is not None
+              else f"no sampled token judged, {check['outside']} outside the processed distribution")
+    if check.get("unresolved"):
+        detail += f"; {check['unresolved']} positions unresolved (their reported alternatives leave the distribution open)"
+    if check.get("passed") is None:
+        return {"name": "sampling", "state": "unmeasured",
+                "detail": detail + f"; fewer than {check.get('min_tokens')} tokens judged"}
+    return {"name": "sampling", "state": "pass" if check["passed"] else "fail", "detail": detail}
 
 
 def _quality_gate(result):
@@ -159,7 +183,8 @@ def _context_gates(result):
         capacity = {"name": "capacity", "state": "unmeasured", "detail": "context checks not run"}
     else:
         top = points.get(str(required)) or {}
-        origin = (context.get("source") or "given") + (f", {context['bound']} bound" if context.get("bound") else "")
+        origin = ((context.get("source") or "given") + (f", {context['bound']} bound" if context.get("bound") else "")
+                  + (f"; {context['note']}" if context.get("note") else ""))
         capacity = ({"name": "capacity", "state": "pass",
                      "detail": f"served {required:,} tokens of prompt plus output, the required context ({origin})"}
                     if top.get("status") == "measured" else
@@ -217,7 +242,8 @@ def _generality_gate(result, protocol, baseline):
     if not compared["comparable"]:
         return [{"name": "generality", "state": "unmeasured", "detail": f"baseline not comparable: {compared['reason']}"}]
     held_change = score / before["decode_score"] - 1
-    suite_change = compared.get("decode_score")
+    # Held-out prompts decode greedily, so they compare with the greedy suite.
+    suite_change = compared.get("greedy_decode_score", compared.get("decode_score"))
     failures = []
     if held_change < -tolerance:
         failures.append(f"held-out decode {held_change:+.1%} (more than {tolerance:.0%} slower)")
@@ -244,7 +270,7 @@ def _exactness_mode(result):
 
 def _exactness_note(result):
     exact = result.get("exactness")
-    if not exact or _exactness_mode(result) == "required":
+    if not exact or _exactness_mode(result) == "required" or exact.get("status") == "unmeasured":
         return None
     cases = exact["cases"]
     differ = {cid: c["first_difference"] for cid, c in cases.items() if not c["identical"]}
@@ -301,6 +327,9 @@ def _context_kpi(result):
             "model_limit": context.get("model_limit"), "device_limit": context.get("device_limit"),
             "engine_max_context": context.get("engine_max_context"),
             "decode": room.get("decode") or {}, "ttft": room.get("ttft") or {},
+            # The curve runs once per point: its noise is the speed suite's (greedy decode, prefill).
+            "noise": {"decode": ((result.get("headroom") or {}).get("noise") or {}).get("context_decode"),
+                      "ttft": ((result.get("headroom") or {}).get("noise") or {}).get("context_ttft")},
             "points": {key: {k: row.get(k) for k in ("context", "decode_tps", "ceiling_tps", "ttft_ms")}
                        | {"ttft_floor_ms": (row.get("ttft_floor") or {}).get("total_ms")}
                        for key, row in (room.get("points") or {}).items()},
@@ -315,7 +344,15 @@ def build(result, protocol, baseline=None):
     speed = result.get("speed") or {}
     projection = room.get("projection") or {}
     prefill = room.get("prefill") or {}
-    decode = {"score": speed.get("decode_score"), "complete": speed.get("complete"),
+    # From crit-eval-v7 decode is the sampled suite's, the decode real requests get; its ceilings, the goals and
+    # stop records follow it. The greedy suite's decode stays beside it as greedy_decode.
+    suite, decoded = headroom.decode_suite(result)
+    decode = {"score": decoded.get("decode_score"), "suite": suite, "sampling": decoded.get("sampling"),
+              "sampling_source": decoded.get("sampling_source") if suite == "sampled" else None,
+              "tokens_per_round": decoded.get("tokens_per_round") if suite == "sampled" else None,
+              "complete": decoded.get("complete"),
+              # One standard error of the score, relative: device noise and, sampled, the texts the seeds drew.
+              "standard_error": decoded.get("decode_se"),
               "speed_of_light": projection.get("speed_of_light_score"),
               "acceptance_bound": projection.get("acceptance_bound_score"),
               # Results from before the acceptance bound use the drafter's speed of light as the ceiling.
@@ -323,8 +360,9 @@ def build(result, protocol, baseline=None):
               "fraction_of_ceiling": projection.get("fraction_of_ceiling") or projection.get("fraction_of_speed_of_light"),
               "pass_ms": room.get("step_ms"), "pass_floor_ms": room.get("pass_floor_ms"),
               "pass_efficiency": room.get("pass_efficiency")}
+    spreads = room.get("noise") or {}
     prefill_kpi = {"score": prefill.get("score"), "ceiling": prefill.get("ceiling_score"),
-                   "fraction_of_ceiling": prefill.get("fraction_of_ceiling"),
+                   "fraction_of_ceiling": prefill.get("fraction_of_ceiling"), "noise": spreads.get("prefill"),
                    "cases": {cid: {k: row.get(k) for k in ("prompt_tokens", "ttft_ms", "prefill_tps", "ceiling_tps",
                                                             "efficiency")}
                              | {"floor_ms": (row.get("floor") or {}).get("total_ms")}
@@ -337,7 +375,6 @@ def build(result, protocol, baseline=None):
                                 "bound": (row.get("floor") or {}).get("bound"), "efficiency": row.get("efficiency")}
                           for cid, row in ttft.get("cases", {}).items()}}
     e2e = room.get("end_to_end") or {}
-    spreads = room.get("noise") or {}
     end_to_end = {"score": e2e.get("score"), "ceiling": e2e.get("ceiling_score"),
                   "fraction_of_ceiling": e2e.get("fraction_of_ceiling"), "noise": spreads.get("end_to_end"),
                   "decode_noise": spreads.get("decode"), "ttft_noise": spreads.get("ttft")}
@@ -351,7 +388,9 @@ def build(result, protocol, baseline=None):
                      "turns": {str(t["turn"]): {k: t.get(k) for k in ("prompt_tokens", "cached_tokens", "ttft_ms",
                                                                      "prefill_tps")} for t in follow["turns"]}}
                     if follow.get("status") == "measured" else None)
-    kpis = {"end_to_end": end_to_end, "decode": decode, "prefill": prefill_kpi, "ttft": ttft_kpi,
+    greedy_kpi = ({"score": speed.get("decode_score"), "complete": speed.get("complete")}
+                  if suite == "sampled" else None)
+    kpis = {"end_to_end": end_to_end, "decode": decode, "greedy_decode": greedy_kpi, "prefill": prefill_kpi, "ttft": ttft_kpi,
             "context": _context_kpi(result), "heldout": heldout_kpi, "followup": followup_kpi,
             "quality": _quality_kpi(result.get("quality"), protocol["quality"]["thresholds"])}
     missing = list(room.get("missing", []))
@@ -370,13 +409,16 @@ def build(result, protocol, baseline=None):
         ctext = (result.get("context") or {}).get("decode_text") or {"source": "generated"}
         notes.append(f"long-context points replay {ctext.get('case')}'s pinned continuation {ctext['sha256'][:12]}, after copies "
                      "of its prompt" if ctext["source"] == "pinned" else
-                     "long-context points decode each engine's own output, after copies of the longest speed case's prompt"
+                     "long-context points decode each engine's own reply to the retrieval archive's request"
                      + (f" ({ctext['reason']})" if ctext.get("reason") else ""))
     text = speed.get("decode_text")
     if text:
         notes.append(f"decode measured on the pinned continuation {text['sha256'][:12]}" if text["source"] == "pinned"
                      else f"decode measured on the engine's own output ({text.get('reason')})")
     comparable = baseline and changes(result, baseline)
+    noises = kpi_noise(result)
+    for gap in gaps:
+        gap["noise"] = noises.get(gap.get("kpi"))
     status = {"kpis": kpis, "gates": _gates(result) + _generality_gate(result, protocol, baseline), "goals": goals(result),
               "gaps": gaps, "missing": missing,
               "notes": notes,
@@ -396,7 +438,8 @@ def _limits(result):
     speed = result.get("speed") or {}
     projection = room.get("projection") or {}
     prefill, ttft = room.get("prefill") or {}, room.get("ttft") or {}
-    rows = [("decode", speed.get("decode_score"), projection.get("ceiling_score") or projection.get("speed_of_light_score")),
+    rows = [("decode", headroom.decode_suite(result)[1].get("decode_score"),
+             projection.get("ceiling_score") or projection.get("speed_of_light_score")),
             ("prefill", prefill.get("score"), prefill.get("ceiling_score")),
             ("ttft", ttft.get("score_ms") or speed.get("ttft_score_ms"), ttft.get("floor_ms"))]
     if (result.get("context") or {}).get("points"):
@@ -409,11 +452,25 @@ def _limits(result):
 
 def goals(result):
     """The next candidate's goals: every KPI from its current score to its physical limit, as the
-    change that closes it (time to first token falls, the scores rise). They hold together; Eval
-    does not rank them or mark any as enough."""
+    change that closes it (time to first token falls, the scores rise), the fraction of the limit
+    reached and its run-to-run noise. Eval states them and leaves their order to the run's priority
+    rule (crit run)."""
+    noises = kpi_noise(result)
     return [{"kpi": kpi, "score": score, "limit": limit, "unit": GOAL_UNITS[kpi],
-             "change": limit / score - 1 if score and limit else None}
+             "change": limit / score - 1 if score and limit else None,
+             # The share of the limit reached: score over limit, or limit over score for the times in ms.
+             "fraction_of_limit": ((limit / score if GOAL_UNITS[kpi] == "ms" else score / limit)
+                                   if score and limit else None),
+             "noise": noises.get(kpi)}
             for kpi, score, limit in _limits(result)]
+
+
+def kpi_noise(result):
+    """Each goal KPI's run-to-run spread (headroom noise): the decode's from its own suite, prefill's over the
+    prefill cases, and the long-context scores' from the speed suite, since the curve runs once per point."""
+    spreads = (result.get("headroom") or {}).get("noise") or {}
+    return {"decode": spreads.get("decode"), "prefill": spreads.get("prefill"), "ttft": spreads.get("ttft"),
+            "context_decode": spreads.get("context_decode"), "context_ttft": spreads.get("context_ttft")}
 
 
 def stop_record_headroom(result, baseline=None):
@@ -453,8 +510,14 @@ def changes(result, baseline):
     return {"comparable": True, "label": baseline.get("label") or (baseline.get("engine") or {}).get("name"),
             # Decode depends on the text decoded: scores on different texts are not compared.
             "decode_text_differs": not same_text,
-            "decode_score": ratio((result.get("speed") or {}).get("decode_score"),
-                                  (baseline.get("speed") or {}).get("decode_score")) if same_text else None,
+            "decode_score": _decode_change(result, baseline, same_text),
+            # The change's own standard error, from both results' (relative): a smaller change is within the noise.
+            "decode_score_se": _change_error(result, baseline),
+            # Each KPI's run-to-run spread, the larger of the two results': a smaller change is within the noise.
+            "noise": {kpi: max([n for n in (now, before) if n is not None], default=None)
+                      for (kpi, now), before in zip(kpi_noise(result).items(), kpi_noise(baseline).values())},
+            "greedy_decode_score": ratio((result.get("speed") or {}).get("decode_score"),
+                                         (baseline.get("speed") or {}).get("decode_score")) if same_text else None,
             "prefill_score": ratio(((result.get("headroom") or {}).get("prefill") or {}).get("score"),
                                    ((baseline.get("headroom") or {}).get("prefill") or {}).get("score")),
             # Faster first tokens count as a gain, like the other scores.
@@ -468,6 +531,21 @@ def changes(result, baseline):
             "worst_kld_mean": ratio(worst(q_now), worst(q_before)),
             "heldout_decode": ratio((result.get("heldout") or {}).get("decode_score"),
                                     (baseline.get("heldout") or {}).get("decode_score"))}
+
+
+def _change_error(result, baseline):
+    now, before = headroom.decode_suite(result)[1].get("decode_se"), headroom.decode_suite(baseline)[1].get("decode_se")
+    return (now ** 2 + before ** 2) ** 0.5 if now is not None and before is not None else None
+
+
+def _decode_change(result, baseline, same_text):
+    """Change of the decode KPI: sampled decodes compare at the same sampling, greedy ones on the same text."""
+    (suite, now), (suite_before, before) = headroom.decode_suite(result), headroom.decode_suite(baseline)
+    if suite != suite_before or (suite == "greedy" and not same_text) or (
+            suite == "sampled" and (now.get("sampling"), now.get("sampling_source")) != (
+            before.get("sampling"), before.get("sampling_source"))):
+        return None
+    return now["decode_score"] / before["decode_score"] - 1 if now.get("decode_score") and before.get("decode_score") else None
 
 
 def _major(result):
@@ -508,17 +586,25 @@ def render(status):
         if g["state"] != "pass":
             lines.append(f"  {g['name']}: {g['detail']}")
     if status.get("goals"):
-        lines.append("goals for the next candidate, all of them at once: each KPI to its physical limit")
+        lines.append("goals for the next candidate: each KPI to its physical limit (Eval states them; the run orders "
+                     "them)")
         for g in status["goals"]:
             spec = ".1f" if g["kpi"] in ("decode", "context_decode") else ",.0f"
+            noise = f", noise {g['noise']:.1%}" if g.get("noise") is not None else ""
             if g["change"] is None:
-                lines.append(f"  {g['kpi']:<8} {_num(g['score'], spec)} {g['unit']}, limit unknown (see missing)")
+                lines.append(f"  {g['kpi']:<8} {_num(g['score'], spec)} {g['unit']}, limit unknown (see missing){noise}")
             else:
                 lines.append(f"  {g['kpi']:<8} {format(g['score'], spec)} -> {format(g['limit'], spec)} {g['unit']} "
-                             f"({g['change']:+.0%})")
+                             f"({g['change']:+.0%}; {_pct(g.get('fraction_of_limit'))} of its limit{noise})")
     lines.append("KPIs against their physical limits:")
     e = k.get("end_to_end") or {}
     decode = f"  decode   {_num(d['score'], '.1f')} tok/s"
+    if d.get("suite") == "sampled":
+        settings = ", ".join(f"{key} {value}" for key, value in (d.get("sampling") or {}).items())
+        where = {"override": "the user's sampling override", "protocol_default": "the protocol's default sampling"}.get(
+            d.get("sampling_source"), "the model's sampling")
+        decode += f" at {where} ({settings})" + (
+            f", {d['tokens_per_round']:.2f} tokens/round" if d.get("tokens_per_round") else "")
     if d["ceiling"]:
         decode += (f", {_pct(d['fraction_of_ceiling'])} of its ceiling {d['ceiling']:.1f} "
                    f"(this drafter at floor costs {_num(d['speed_of_light'], '.1f')}"
@@ -528,9 +614,15 @@ def render(status):
         decode += f"; model pass {d['pass_ms']:.2f} ms, {_pct(d['pass_efficiency'])} of its {d['pass_floor_ms']:.2f} ms floor"
     if e.get("decode_noise") is not None:
         decode += f"; run-to-run spread {e['decode_noise']:.1%}"
+    if d.get("standard_error") is not None:
+        decode += f"; standard error {d['standard_error']:.1%}"
     if d["complete"] is False:
         decode += "; incomplete (skipped cases)"
     lines.append(decode)
+    greedy = k.get("greedy_decode")
+    if greedy:
+        lines.append(f"  greedy   {_num(greedy['score'], '.1f')} tok/s decode at temperature 0"
+                     + ("; incomplete (skipped cases)" if greedy.get("complete") is False else ""))
     prefill = f"  prefill  {_num(p['score'], ',.0f')} tok/s"
     if p["ceiling"]:
         prefill += f", {_pct(p['fraction_of_ceiling'])} of its compute ceiling {p['ceiling']:,.0f}"
@@ -539,6 +631,8 @@ def render(status):
             prefill += f"; {cid} {row['ttft_ms']:,.0f} ms to first token"
             if row.get("floor_ms"):
                 prefill += f" vs {row['floor_ms']:,.0f} ms floor"
+    if p.get("noise") is not None:
+        prefill += f"; run-to-run spread {p['noise']:.1%}"
     lines.append(prefill)
     ttft = f"  ttft     {_num(t['score_ms'], ',.0f')} ms geometric mean over {len(t['cases'])} cases"
     if t["floor_ms"]:
@@ -593,7 +687,8 @@ def render(status):
         lines.append(line + " (mixes the KPIs by the suite's cases)")
     if status["gaps"]:
         lines.append("gaps: what each term would give its own KPI at its floor, everything else as measured:")
-        lines += [f"  {gap['kpi']:<8} +{gap['projected_gain']:.0%} {gap['kpi']} score  {gap['name']}"
+        lines += [f"  {gap['kpi']:<8} +{gap['projected_gain']:.0%} {gap['kpi']} score"
+                  + (f" (noise {gap['noise']:.1%})" if gap.get("noise") is not None else "") + f"  {gap['name']}"
                   + (f": {gap['detail']}" if gap.get("detail") else "") for gap in status["gaps"]]
     if status["missing"]:
         lines.append("missing: " + "; ".join(status["missing"]))
@@ -601,14 +696,24 @@ def render(status):
     base = status.get("baseline")
     if base:
         if base["comparable"]:
-            decode = ("not compared (decoded a different text)" if base.get("decode_text_differs")
+            decode = ("not compared (decoded a different text)" if base["decode_score"] is None and base.get("decode_text_differs")
                       else _signed(base["decode_score"]))
-            long = "".join(f", {name} {_signed(base[key])}" for key, name in (("context_decode", "context decode"),
-                                                                              ("context_ttft", "context ttft"))
+            se = base.get("decode_score_se")
+            noise = base.get("noise") or {}
+            if base["decode_score"] is not None and se and abs(base["decode_score"]) < 2 * se:
+                decode += f" (within the noise: two standard errors are {2 * se:.1%})"
+            elif base["decode_score"] is not None:
+                decode += _within(base["decode_score"], noise.get("decode"))
+
+            def change(key, kpi):
+                return _signed(base[key]) + _within(base[key], noise.get(kpi))
+            long = "".join(f", {name} {change(key, key)}" for key, name in (("context_decode", "context decode"),
+                                                                            ("context_ttft", "context ttft"))
                            if base.get(key) is not None)
             held = f", held-out decode {_signed(base['heldout_decode'])}" if base.get("heldout_decode") is not None else ""
-            lines.append(f"vs {base['label']}: decode {decode}, prefill {_signed(base['prefill_score'])}, "
-                         f"ttft {_signed(base['ttft_score'])} (speed){long}{held}, worst KLD mean {_signed(base['worst_kld_mean'])}")
+            lines.append(f"vs {base['label']}: decode {decode}, prefill {change('prefill_score', 'prefill')}, "
+                         f"ttft {change('ttft_score', 'ttft')} (speed){long}{held}, "
+                         f"worst KLD mean {_signed(base['worst_kld_mean'])}")
         else:
             lines.append(f"baseline not comparable: {base['reason']}")
     return "\n".join(lines)
@@ -616,6 +721,11 @@ def render(status):
 
 def _signed(value):
     return "–" if value is None else f"{value:+.1%}"
+
+
+def _within(value, noise):
+    """A baseline change's mark when it is no larger than the run-to-run spread."""
+    return f" (within the noise: spread {noise:.1%})" if value is not None and noise and abs(value) <= noise else ""
 
 
 def status_of(path, protocol, baseline_path=None):

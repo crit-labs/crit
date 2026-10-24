@@ -50,6 +50,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from . import EVAL_DIR, load_json, write_json
+from .indexers import exact_forms
 from .prepare import PREPARED, model_identity
 from .schemes import PRIMARY, SchemeError, quantization_of, refuse_unread
 
@@ -830,6 +831,9 @@ class StreamingReference:
         self.checkpoint = open_checkpoint(model, self.config)
         with _meta_parameters():
             self.skeleton = AutoModel.from_config(self.config)
+        # Faster forms of modeling-code loops, bound where the code is the one they were checked against
+        # (crit_eval.indexers): the same selection, without a Python loop per token.
+        self.forms = exact_forms(self.skeleton)
         self.names = dict(self.skeleton.state_dict(keep_vars=True))
         self.prefix = self.checkpoint.prefix(self.names)
         self.configs = list({id(c): c for m in self.skeleton.modules() for c in [getattr(m, "config", None)]
@@ -1208,7 +1212,8 @@ class StreamingReference:
         import transformers
         device = self.torch.cuda.get_device_name(self.device) if str(self.device).startswith("cuda") else "cpu"
         return {"reference": REFERENCE_VERSION, "transformers": transformers.__version__,
-                "torch": self.torch.__version__, "device": device, "model_sha256": model_sha}
+                "torch": self.torch.__version__, "device": device, "model_sha256": model_sha,
+                **({"forms": self.forms} if self.forms else {})}
 
     @staticmethod
     def _register():

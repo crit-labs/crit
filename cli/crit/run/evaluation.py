@@ -25,6 +25,21 @@ from .store import amendments
 QUALITY = ("chat-score-v1", "chat-logprobs-v1")
 
 
+def check_sampling(run, prepared, data, model):
+    """The data's sampled-suite sampling is the model's own unless the user overrode it for this run (eval_sampling at
+    create); then the data must be prepared with exactly that override."""
+    wanted = (run["spec"].get("eval_sampling") or {}).get("settings")
+    source = prepared.get("sampling_source")
+    if wanted is not None and (source != "override" or prepared.get("sampling") != wanted):
+        flag = ",".join(f"{key}={value}" for key, value in wanted.items())
+        raise ValueError(f"This run measures sampled decode at the user's sampling {wanted}: prepare the data with it "
+                         f"(crit eval prepare --model {model} --data NEW_DIR --sampling {flag})")
+    if wanted is None and source == "override":
+        raise ValueError(f"{data} was prepared with a sampling override {prepared.get('sampling')}, which only the user "
+                         "sets, for a run that declares it (eval_sampling at create): prepare the data again without "
+                         "--sampling")
+
+
 def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, seconds=None, label=None):
     """Reserve, score the data's quality texts on the run's model unless stored, serve the candidate, run Eval on it
     over the chat API, stop the server and settle. Returns the retained result (path relative to the run, sha256)
@@ -50,8 +65,10 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
     if not (data / PREPARED).is_file():
         raise ValueError(f"{data} holds no {PREPARED}: prepare it from the run's model first "
                          f"(crit eval prepare --model {model} --data {data})")
-    if load_json(data / PREPARED)["model"]["sha256"] != model_identity(model)["sha256"]:
+    prepared = load_json(data / PREPARED)
+    if prepared["model"]["sha256"] != model_identity(model)["sha256"]:
         raise ValueError(f"{data} was prepared from another model than the run's")
+    check_sampling(run, prepared, data, model)
     constraints = run["spec"]["hardware_constraints"]
     basis = constraints.get("context") or {}
     # The probe the run's context was derived from gives Eval its physical limits while its bytes are unchanged.
@@ -63,7 +80,7 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
     attempt = reservation["attempt_id"]
     budget, exactness = quality_terms(run["spec"]["correctness"], amendments(root, reservation["segment_id"]))
     options = dict(label=label, device=device, baseline=baseline, quality_budget=budget, exactness=exactness,
-                   context_tokens=constraints["kv_tokens"],
+                   context_tokens=constraints["kv_tokens"], context_basis=basis,
                    vram_headroom_bytes=round(settings.get("vram_headroom_gib", 1.0) * (1 << 30)),
                    context_reserve_bytes=round(reserve * (1 << 30)) if reserve is not None else None)
     out = folder / "eval" / f"{attempt}.json"
@@ -118,7 +135,9 @@ class EvalEngines(Served):
         from crit_eval import chat
         _, api, port = self.open(context["context_tokens"])
         served = chat.Server("http://127.0.0.1:%d/v1" % port, self.prepared, api.model).create_eval_engine(context)
-        served.close = self.stop
+        # Eval opens engines one after another: the next one is built in the same resident host (Served.open), and
+        # the server stops when Eval's attempt ends (Served.until).
+        served.close = lambda: None
         return served
 
 

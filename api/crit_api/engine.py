@@ -10,7 +10,7 @@ from crit.run.records import (digest, keys, now, number, read_json, record, safe
                               verification_scope, write_json)
 from crit.run.store import ROOT, RunStore
 
-from crit_core.serving import MIN_LOGPROB, SCORE_CAPABILITY
+from crit_core.serving import MIN_LOGPROB, PLAIN_CAPABILITY, SCORE_CAPABILITY
 
 from .residency import CAPABILITY as RESIDENT_CAPABILITY, ResidentRuntime
 from .admission import Admission
@@ -46,9 +46,11 @@ class _CommandStop:
 
 def telemetry(value, request):
     """Rates use the engine's timed phase token counts, never string lengths. Optional decode_rounds, the target
-    passes after prefill (a speculative engine's verify rounds), gives tokens_per_round: output tokens per round."""
+    passes after prefill (a speculative engine's verify rounds), gives tokens_per_round: output tokens per round.
+    Optional accepted (drafts accepted in each of those rounds), verify_ms and draft_ms (device time in verify passes
+    and draft steps) pass through for Eval's headroom."""
     keys(value, {"prompt_tokens", "output_tokens", "prefill_tokens", "prefill_ms",
-                 "decode_tokens", "decode_ms", "ttft_ms", "missing"}, {"decode_rounds"})
+                 "decode_tokens", "decode_ms", "ttft_ms", "missing"}, {"decode_rounds", "accepted", "verify_ms", "draft_ms"})
     prompt = number(value["prompt_tokens"], "prompt tokens", 1, request["limits"]["kv_tokens"], integer=True)
     output = number(value["output_tokens"], "output tokens", 1, request["limits"]["max_output_tokens"], integer=True)
     if prompt + output > request["limits"]["kv_tokens"]:
@@ -80,6 +82,14 @@ def telemetry(value, request):
         if value["decode_tokens"] is None:
             raise ValueError("Decode rounds need a measured decode phase")
         rates["tokens_per_round"] = output / number(value["decode_rounds"], "decode rounds", 1, output, integer=True)
+    if "accepted" in value:
+        accepted = value["accepted"]
+        if (value.get("decode_rounds") is None or not isinstance(accepted, list) or len(accepted) != value["decode_rounds"]
+                or not all(type(a) is int and 0 <= a < output for a in accepted)):
+            raise ValueError("Accepted drafts are one count per decode round")
+    for key in ("verify_ms", "draft_ms"):
+        if key in value:
+            number(value[key], key.replace("_ms", " milliseconds"), 0, request["limits"]["timeout_seconds"] * 1000)
     return value | rates
 
 
@@ -316,6 +326,24 @@ class ServedEngine:
                 self._release()
                 raise
 
+    def reopen(self, kv_tokens=None, stop=None):
+        """Serve the measured candidate at `kv_tokens` of context (None: the run's) on the loaded runtime: the
+        resident host closes the engine and builds it again at the new limits in the same process, keeping the
+        model's mapped files and device weights (and whatever host-side weights the adapter keeps in the process)."""
+        if self.attempt is None:
+            raise ValueError("Only a measurement serves a candidate at another context")
+        with self.lock:
+            if self.closed or self._stopping.is_set():
+                raise ValueError("Engine is closed")
+            self.context_tokens = kv_tokens
+            self.specs.clear()
+            spec = self.spec()
+            result = self.runtime.call("load", {"spec": spec}, _CommandStop(stop or threading.Event(), self._stopping),
+                                       self.load_seconds(spec))
+            if result["status"] != "completed":
+                raise ValueError(result["error"] or "Engine loading failed")
+            self.lock.configure(self.default, result.get("max_concurrent_requests", 1))
+
     def load_seconds(self, spec):
         """Bound on loading a candidate: --load-timeout, else 600 s plus the model's bytes at 200 MB/s, which the
         engine's own load reads. With --verify-model the host first reads and hashes every model file (copying it
@@ -346,12 +374,23 @@ class ServedEngine:
             return {"state": "blocked", "error": self.ownership.blocked}
         return self.runtime.status()
 
+    def facts(self, candidate_id=None):
+        """The loaded engine's facts for Eval (crit_core.serving.engine_facts) when `candidate_id` (default: the
+        default candidate) is the one loaded, else None."""
+        status = self.runtime.status()
+        engine = status.get("engine") or {}
+        if engine.get("candidate_id") != (candidate_id or self.default) or engine.get("run_id") != self.run_id:
+            return None
+        return status.get("engine_facts")
+
     def generate(self, messages, max_tokens, stop, on_text=None, candidate_id=None, response_format=None,
-                 sampling=None, tool_options=None, on_tools=None, on_reasoning=None, on_started=None, logprobs=None):
+                 sampling=None, tool_options=None, on_tools=None, on_reasoning=None, on_started=None, logprobs=None,
+                 decode=None):
         """Run one request. `on_text(text)` receives each piece of accepted text as the adapter streams it.
         `response_format` (from crit_api.server.response_format) goes into the request record for adapters that
         declare chat-constraints-v1. Sampling and tool options are capability-gated request overrides; logprobs n
-        asks a chat-logprobs-v1 adapter for every token's log-probability with n alternatives.
+        asks a chat-logprobs-v1 adapter for every token's log-probability with n alternatives; decode "plain" asks a
+        chat-plain-v1 adapter to decode one token per target pass.
         `on_started(deadline)` receives the command's absolute monotonic deadline
         after dispatch, so response delivery can honor the same execution budget.
 
@@ -387,7 +426,11 @@ class ServedEngine:
                 raise EngineError("max_tokens must be between 1 and %d" % (limits["kv_tokens"] - 1), 400)
             if response_format is not None and CONSTRAINTS_CAPABILITY not in spec["capabilities"]:
                 raise EngineError("This engine package does not declare " + CONSTRAINTS_CAPABILITY, 400)
+            if decode is not None and (decode != "plain" or PLAIN_CAPABILITY not in spec["capabilities"]):
+                raise EngineError("This engine package does not declare " + PLAIN_CAPABILITY, 400)
             extra = {} if response_format is None else {"response_format": response_format}
+            if decode is not None:
+                extra["decode"] = decode
             try:
                 applied = sampling_options(sampling or {}, spec["capabilities"])
                 extra.update(validate_tool_options(tool_options or {}, spec["capabilities"]))

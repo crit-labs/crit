@@ -3,7 +3,12 @@
 `crit run --id RUN recon` reads the run's model (crit_core.model.open_model: a folder, or a weight file such as a
 lone .gguf whose metadata derives the description files) through Core's text layer and writes work/recon.json (the
 facts, the files they came from and the `frozen` block every later candidate takes into configuration["recon"])
-and scaffolds work/recon.md, whose model-card and reference-code sections the agent writes.
+and scaffolds work/recon.md, whose model-card, reference-code and drafting-plan sections the agent writes.
+
+The sampling is not the agent's to choose. recon.json records the sampling crit Eval's sampled suite measures (the
+model's generation_config.json, else the protocol default, else the user's eval_sampling override from run create),
+and the served default (`frozen.sampling`) is the model's sampling with that override applied; a candidate refuses a
+frozen block whose sampling differs from it.
 """
 import hashlib
 
@@ -74,7 +79,29 @@ def _template_variables(source):
     return sorted(names - STANDARD_VARIABLES)
 
 
-def gather(model):
+SAMPLED_KEYS = ("temperature", "top_p", "top_k", "min_p")
+
+
+def served_sampling(model_sampling, override=None):
+    """The served default sampling: the model's own, or with the user's eval_sampling settings in place of its
+    temperature and filters."""
+    if not override:
+        return dict(model_sampling)
+    kept = {key: value for key, value in model_sampling.items() if key not in SAMPLED_KEYS}
+    return {**kept, "do_sample": True, **override}
+
+
+def eval_sampling(generation, run):
+    """{settings, source} of crit Eval's sampled suite for this run (crit_eval.prepare.sampled_settings, or the run's
+    eval_sampling override)."""
+    override = run["spec"].get("eval_sampling")
+    if override:
+        return {"settings": override["settings"], "source": "override", "approved_by": override["approved_by"]}
+    from crit_eval.prepare import sampled_settings, sampling_source
+    return {"settings": sampled_settings(generation), "source": sampling_source(generation)}
+
+
+def gather(model, run=None):
     """Facts from a model's description files: sampling defaults, stop tokens, chat templates and config.json
     fields, plus {path, bytes, sha256} for every file read. A weight file without description files (a lone
     .safetensors) yields no facts."""
@@ -116,8 +143,11 @@ def gather(model):
         # Files the weights' own metadata supplied (a GGUF without the base model's files beside it).
         "derived_files": list(source.derived_names),
     }
+    if run is not None:
+        gathered["eval_sampling"] = eval_sampling(generation, run)
+    override = (run or {}).get("spec", {}).get("eval_sampling")
     frozen = {
-        "sampling": generation.sampling_defaults(),
+        "sampling": served_sampling(generation.sampling_defaults(), override and override["settings"]),
         "chat_template": {"name": default, "sha256": chat[default]["sha256"]} if default else None,
         "template_variables": {},
         "stop_token_ids": list(generation.stop_token_ids),
@@ -162,7 +192,14 @@ def load(root, run):
         raise ValueError(f"{RECON_JSON} belongs to another run")
     if value["model_path"] != run["spec"]["model_path"]:
         raise ValueError(f"{RECON_JSON} describes another model; run recon again with --force")
-    return validate_frozen(value["frozen"]), {"path": RECON_JSON, "sha256": file_sha(path)}
+    frozen = validate_frozen(value["frozen"])
+    override = run["spec"].get("eval_sampling")
+    expected = served_sampling(value["gathered"].get("generation", {}).get("sampling", {}), override and override["settings"])
+    if frozen["sampling"] != expected:
+        raise ValueError(f"{RECON_JSON} frozen.sampling {frozen['sampling']} is not the model's sampling {expected}: the "
+                         "sampling is not the engine builder's to change. Only the user overrides it, with eval_sampling "
+                         "at run create; put frozen.sampling back")
+    return frozen, {"path": RECON_JSON, "sha256": file_sha(path)}
 
 
 def write(root, run, force=False):
@@ -171,18 +208,64 @@ def write(root, run, force=False):
     if path.exists() and not force:
         raise ValueError(f"{RECON_JSON} exists; edit its frozen block, or pass --force to gather again")
     model = run["spec"]["model_path"]
-    rows, gathered, frozen = gather(model)
+    rows, gathered, frozen = gather(model, run)
     value = record("model_recon", run["run_id"], created_at=now(), model_path=model, sources=rows,
                    gathered=gathered, frozen=frozen)
     write_json(path, value)
     notes = safe_path(root, RECON_MD)
     if not notes.exists():
-        notes.write_text(scaffold(value), encoding="utf-8")
+        notes.write_text(scaffold({**value, "context": required_context(run, gathered)}), encoding="utf-8")
     return value
 
 
 def _items(mapping):
     return "".join(f"- `{k}`: `{v}`\n" for k, v in mapping.items()) or "- none set\n"
+
+
+def required_context(run, gathered):
+    """The run's required context (kv_tokens) with how it came about and the KV cache it takes at the protocol's
+    precision, for recon.md."""
+    constraints = run["spec"]["hardware_constraints"]
+    basis = constraints.get("context") or {}
+    per_token = basis.get("kv_bytes_per_token")
+    return {"tokens": constraints["kv_tokens"], **{key: basis.get(key) for key in (
+        "requested", "bound", "note", "model_limit", "device_limit", "kv_precision")},
+            "kv_bytes": per_token * constraints["kv_tokens"] if per_token else None}
+
+
+def _context(found):
+    if not found.get("tokens"):
+        return "- not recorded\n"
+    if found.get("bound"):
+        why = {"requested": "the context the user wants (settings.toml context_tokens)",
+               "model": f"the model's {found['model_limit']:,} positions" if found.get("model_limit") else "the model's positions",
+               "device": "the KV cache that fits the device next to the weights, headroom and reserve",
+               "crit": "crit's largest supported context"}.get(found["bound"], found["bound"])
+        source = f"bounded by {why}" + (f" (requested {found['requested']:,})" if found.get("requested") else "")
+    else:
+        source = "given explicitly as kv_tokens at run create"
+    lines = f"Every candidate must serve {found['tokens']:,} tokens of prompt plus output, {source}.\n"
+    if found.get("note"):
+        lines += f"Note: {found['note']}.\n"
+    if found.get("kv_bytes"):
+        lines += (f"Its KV cache takes {found['kv_bytes'] / (1 << 30):.2f} GiB at {found.get('kv_precision') or 'the protocol'} "
+                  "precision.\n")
+    return lines + ("You cannot change it: only the user does (context_tokens in settings.toml, or kv_tokens at run "
+                    "create). Eval's capacity gate fails a candidate that cannot serve it.\n\nTODO. Plan the KV cache "
+                    "for it: precision, layout and paging, where it lives next to the weights, drafter state and "
+                    "workspaces, and how decode and time to first token hold up at this context.\n")
+
+
+def _eval_sampling(found):
+    if not found:
+        return "- not recorded (recon from before crit-eval-v7): run recon again with --force\n"
+    source = {"generation_config": "the model's generation_config.json",
+              "protocol_default": "the protocol default (the model does not sample by default)",
+              "override": f"the user's eval_sampling override (approved by {found.get('approved_by')})"}[found["source"]]
+    return (f"crit Eval's sampled speed suite and sampling check run at `{found['settings']}`, from {source}. You cannot "
+            "change them: they are the model's, or the user's alone. Only the user overrides them, with `eval_sampling` "
+            "at run create (and the data prepared with `crit eval prepare --sampling`). Plan the drafting for them "
+            "(below), and keep every other temperature correct: requests choose their own sampling.\n")
 
 
 def scaffold(value):
@@ -202,7 +285,7 @@ def scaffold(value):
 Model: `{value['model_path']}`, gathered {value['created_at']} by `crit run ... recon`.
 `recon.json` holds the facts below with the files they came from. Every candidate created after it freezes its
 `frozen` block into `configuration["recon"]`. Change `frozen` only with a reason under Decisions, before the next
-candidate. Eval's speed and exactness cases stay greedy by protocol.
+candidate; its sampling is not yours to change.
 
 ## Sources
 
@@ -212,6 +295,12 @@ candidate. Eval's speed and exactness cases stay greedy by protocol.
 ## Sampling (generation_config.json, else config.json)
 
 {_items(g['generation'].get('sampling', {}))}
+## Eval sampling
+
+{_eval_sampling(g.get('eval_sampling'))}
+## Required context
+
+{_context(value.get('context') or {})}
 ## Stop tokens
 
 - eos_token_ids: {g['eos_token_ids']}
@@ -234,6 +323,15 @@ source and its revision.
 
 TODO. The transformers modeling file and its revision: rope scaling, MTP or draft heads, norm and
 attention quirks. Cite file and line.
+
+## Drafting plan for both decode modes
+
+TODO. How the engine decodes fast in both modes Eval scores. Greedy (temperature 0): speculative output must stay
+token-exact against plain greedy decoding. Sampled, at the Eval sampling above: the headline decode and its goal;
+verify drafts by rejection sampling (accept a draft with probability min(1, p/q) under the processed target
+distribution p, sample from max(p - q, 0) on the first rejection; a greedy draft is q one-hot) so the output keeps
+the model's distribution and passes the `sampling` gate, and sample on the device inside the decode graph. Say which
+drafter, draft width and acceptance you expect at these settings, and what a request at other settings gets.
 
 ## Decisions
 

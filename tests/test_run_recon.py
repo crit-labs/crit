@@ -87,7 +87,6 @@ class ReconTests(unittest.TestCase):
         self.store.recon(self.run_id)
         path = self.directory / recon.RECON_JSON
         value = read_json(path)
-        value["frozen"]["sampling"] = {"temperature": 0.7, "top_p": 0.8, "top_k": 20}
         value["frozen"]["template_variables"] = {"enable_thinking": False}
         path.write_text(json.dumps(value), encoding="utf-8")
         candidate = self.candidate({"batch": 1})
@@ -97,6 +96,53 @@ class ReconTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "differs"):
             self.candidate({"recon": {**value["frozen"], "sampling": {}}})
         self.assertEqual(self.candidate({"recon": value["frozen"]})["configuration"]["recon"], value["frozen"])
+
+    def test_the_sampling_is_the_models_and_recon_says_the_agent_cannot_change_it(self):
+        value = self.store.recon(self.run_id)
+        self.assertEqual(value["gathered"]["eval_sampling"],
+                         {"settings": {"temperature": 0.6, "top_p": 0.9}, "source": "generation_config"})
+        notes = (self.directory / recon.RECON_MD).read_text(encoding="utf-8")
+        self.assertIn("## Eval sampling", notes)
+        self.assertIn("run at `{'temperature': 0.6, 'top_p': 0.9}`, from the model's generation_config.json. "
+                      "You cannot change them", notes)
+        self.assertIn("## Drafting plan for both decode modes", notes)
+        self.assertIn("## Required context\n\nEvery candidate must serve 8,192 tokens of prompt plus output, given "
+                      "explicitly as kv_tokens at run create.", notes)
+        self.assertIn("You cannot change it: only the user does", notes)
+        self.assertIn("Plan the KV cache", notes)
+        self.assertIn("token-exact against plain greedy", notes)
+        self.assertIn("rejection sampling", notes)
+        path = self.directory / recon.RECON_JSON
+        edited = read_json(path)
+        edited["frozen"]["sampling"] = {"do_sample": True, "temperature": 0.3, "top_p": 0.9}
+        path.write_text(json.dumps(edited), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "not the engine builder's to change"):
+            self.candidate({"batch": 1})
+
+    def test_a_users_eval_sampling_override_is_recorded_served_and_required_of_the_data(self):
+        from crit.run import evaluation
+        run = self.store.create({"model_path": str(self.model), "correctness_criteria": "Fixture gates",
+                                 "budget_minutes": 1, "kv_tokens": 8192,
+                                 "eval_sampling": {"settings": "temperature=0.3,top_k=20", "approved_by": "the user"}})["run"]
+        self.assertEqual(run["spec"]["eval_sampling"], {"settings": {"temperature": 0.3, "top_k": 20}, "approved_by": "the user"})
+        value = self.store.recon(run["run_id"])
+        self.assertEqual(value["gathered"]["eval_sampling"]["source"], "override")
+        self.assertEqual(value["frozen"]["sampling"], {"do_sample": True, "temperature": 0.3, "top_k": 20})
+        self.assertIn("the user's eval_sampling override (approved by the user)",
+                      (self.store.directory(run["run_id"]) / recon.RECON_MD).read_text(encoding="utf-8"))
+        override = {"sampling": {"temperature": 0.3, "top_k": 20}, "sampling_source": "override"}
+        own = {"sampling": {"temperature": 0.6, "top_p": 0.9}, "sampling_source": "generation_config"}
+        evaluation.check_sampling(run, override, "DATA", "MODEL")
+        with self.assertRaisesRegex(ValueError, "--sampling temperature=0.3,top_k=20"):
+            evaluation.check_sampling(run, own, "DATA", "MODEL")
+        plain = self.store.get(self.run_id)["run"]
+        evaluation.check_sampling(plain, own, "DATA", "MODEL")
+        with self.assertRaisesRegex(ValueError, "only the user"):
+            evaluation.check_sampling(plain, override, "DATA", "MODEL")
+        for bad in ({"settings": "temperature=0.3"}, {"settings": "top_k=20", "approved_by": "the user"}):
+            with self.assertRaises(ValueError):
+                self.store.create({"model_path": str(self.model), "correctness_criteria": "Fixture gates",
+                                   "budget_minutes": 1, "kv_tokens": 8192, "eval_sampling": bad})
 
     def test_model_folder_requires_recon_and_frozen_block_is_validated(self):
         with self.assertRaisesRegex(ValueError, "Run recon before the first candidate"):

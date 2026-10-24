@@ -9,6 +9,116 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-24
+
+### Overview
+
+crit 0.6.0 measures decode as requests get it. Eval protocol `crit-eval-v7` runs the six speed
+cases again at the model's own sampling and makes that **sampled decode** the headline decode,
+its KPI, headroom, goal and stop record, with the greedy decode beside it; a `sampling` gate
+checks that sampled tokens keep the processed distribution, so speculation under sampling must
+verify drafts by rejection sampling. The sampling and the required context are the user's:
+recon records the model's sampling and only the user overrides it, and `context_tokens` in
+`settings.toml` (default 262,144) caps Eval's max context. Served candidates get exactness and a
+decode limit from crit serve's new engine facts, plain decoding and draft telemetry; quality scores
+come packed, the quality gate judges prompt positions too, the long-context curve asks the retrieval
+question inside the retrieval archive so one prefill serves both, and decode scores carry their
+standard error. Breaking: prepare data again for v7 (v6 results keep their greedy decode KPI);
+`status.kpis.sampled_decode` is gone, the decode KPI is the sampled one and the greedy one is
+`status.kpis.greedy_decode`; adapters add `generate_sampled`. The Python distribution and the Core
+SDK share version 0.6.0; Core and Inference are unchanged.
+
+### Changed
+
+- Eval protocol `crit-eval-v7` measures decode as requests get it: the six speed cases run again
+  at the model's own sampling (frozen by `crit eval prepare` from `generation_config.json`, fixed
+  seeds), and the **sampled decode** is the headline decode next to the greedy one. A new
+  `sampling` gate checks that sampled tokens follow the processed distribution (a probability
+  integral transform over each token's reported log-probabilities), so speculation under sampling
+  must keep the distribution; greedy exactness is unchanged. Adapters add `generate_sampled`;
+  Core engines and servers sample through it with no adapter change. Breaking: prepare data again
+  for v7.
+- From `crit-eval-v7` the decode KPI (`status.kpis.decode`), its headroom and ceiling, the decode
+  goal, the stop record's decode and the baseline comparison follow the sampled decode; the greedy
+  decode is `status.kpis.greedy_decode`. The ceiling keeps the greedy suite's draft acceptance,
+  reachable by rejection sampling, and a new gap projects sampled requests as fast as greedy ones.
+  `status.kpis.sampled_decode` is gone. v6 results keep their greedy decode KPI.
+- The required context starts from the context the user wants: `context_tokens` in `settings.toml`
+  (default 262,144; `--requested-context` on `crit eval run` and `context`, `context_tokens` in a run
+  request). Eval's max context is the smallest of it, the model's positions and the KV cache that
+  fits; results and the run record the requested context, the bound and a note when the model or
+  device allow less. Recon's `recon.md` gains a Required context section: the tokens every candidate
+  must serve, why, the KV cache they take, that only the user changes it, and a KV cache plan to
+  write.
+- The sampled suite's sampling is the model's: prepared data and results record `sampling_source`
+  (`generation_config`, `protocol_default` or `override`). Only the user overrides it, with
+  `crit eval prepare --sampling` and, in a run, `eval_sampling` at create, which `crit run ... eval`
+  requires of the data and recon applies to the served default. Recon's `recon.md` gains an
+  "Eval sampling" section that says the agent cannot change it and a drafting plan for both decode
+  modes, and a candidate refuses a frozen sampling other than the model's.
+- The quality gate judges each set's prompt positions too: every set is judged as `SET/prompt` and
+  `SET/served` by the drift budget, so the prefill's arithmetic, which every reply's first token
+  comes from, reaches the gate in full; `quality.prompt` is gone.
+- The long-context curve asks inside the retrieval archive: every curve point holds the retrieval
+  facts and ends with the retrieval check's own framing (`long.json` `curve_user`: list the facts,
+  then summarize the archive), the point times the engine's own reply and judges retrieval on it, so
+  one prefill serves both. Retrieval points the curve does not reach (4,096 always) keep a request of
+  their own. The curve no longer extends the longest speed case or replays a pinned continuation, and
+  prepare no longer writes its frame. Prepare data again.
+- The honesty check replies at 32K tokens once, to the conversations and to explain-tides (protocol
+  `quality.honesty` `long_conversations`), instead of three 32K texts that added six 32K prefills to
+  every round.
+- The sampled suite measures one repetition per protocol seed with no extra one, and judges a
+  disturbed device by the spread of `round_ms` over the repetitions that decoded every output token
+  and finished by length (a case with fewer than two is skipped), instead of by decode speed, which
+  differs with the text each seed draws.
+- Sampled requests name every sampling field: the filters the settings leave unset as off (top_p 1,
+  top_k 0, min_p 0), the penalties neutral and the seed, so an engine applies none of its own
+  defaults. An engine that lists the fields it applies (crit serve's `supported_sampling_parameters`,
+  an adapter's `sampling_fields`) gets only those; one that cannot apply a set field has no sampled
+  decode instead of failing the round.
+- Decode scores carry their relative standard error from the repetitions' spread; status shows it,
+  prefill gets a run-to-run spread too, and a baseline change smaller than the noise is reported as
+  within the noise. The goals block prints each goal's share of its limit and its noise, and Eval
+  leaves the goals' order to the run.
+- Eval's quality score calls ask crit serve for packed scores and fall back to JSON rows once a server
+  refuses the field.
+- `crit run measure` sends a case's captured sampling (temperature, top_p, top_k, min_p, seed,
+  penalties) instead of forcing temperature 0, stays greedy when the capture names none, and records
+  the sampling sent in each benchmark's extensions.
+- `crit run eval` builds the run's context again in the resident host that served the lower-context
+  gate, keeping the model's pool and the adapter's process, instead of loading the model in a second
+  crit serve (`ServedEngine.reopen`); the server stops once at the end of the attempt.
+- The reference binds a batched form of qwen4_exp's sparse-attention indexer (transformers 5.20.2's
+  `Qwen4ExpTextQSAIndexer.forward`, by source hash) that pools and scores every visible key block at
+  once when every query sees a prefix of the keys, instead of transformers' per-token loop (214 to
+  1,307 s per full-attention layer on Qwen3.8 Flash-Next's 32K-token texts). Scores are unchanged, and
+  the reference's identity records the forms it used.
+
+### Added
+
+- `crit serve` reports the loaded candidate's `engine_facts` in `/v1/models` (speculative, plain,
+  draft width, bytes per pass and draft step, KV bytes per token), decodes plainly on request (crit
+  extension `{"decode": "plain"}`, for `chat-plain-v1` packages), and its telemetry carries the drafts
+  accepted per round, `verify_ms` and `draft_ms` when the engine reports them.
+- `crit serve` returns fixed-text scores packed on request (`"format": "packed"`): each part's rows as
+  base64 little-endian arrays instead of nested JSON lists.
+- Served candidates get exactness and a decode limit: Eval reads crit serve's engine facts and each
+  reply's accepted drafts, and runs exactness on the served engine through plain decoding when the
+  package declares `chat-plain-v1` (otherwise exactness is unmeasured with that reason). An engine
+  that reports no bytes per pass gets the stored model's.
+
+### Fixed
+
+- The sampling check judges a sampled token outside the 20 reported alternatives by the rest of the
+  vocabulary as one last alternative, instead of counting it outside the distribution, which failed a
+  correct sampler whenever top_k was unset or above 20. A position is judged when the alternatives
+  determine its processed distribution and reported as unresolved otherwise; the gate is unmeasured
+  below `min_tokens` judged tokens, and a server's tokens are matched by their bytes.
+- With quality among the parts, a frozen prompt a server renders to another token count (another chat
+  template) fails the round at its first request instead of after the speed, held-out and quality
+  parts ran on the wrong prompts.
+
 ## [0.5.0] - 2026-10-23
 
 ### Overview
@@ -783,7 +893,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/crit-labs/crit/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/crit-labs/crit/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/crit-labs/crit/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/crit-labs/crit/compare/v0.2.3...v0.3.0
