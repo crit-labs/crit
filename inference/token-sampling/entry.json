@@ -1,55 +1,62 @@
 {
   "id": "token-sampling",
   "category": "sampling-and-constraints",
-  "summary": "Device token selection after the head: greedy with index tie-break, or temperature / top-k / top-p sampling with Core's seeded counter-based draws",
+  "summary": "Device token selection and speculative verification under Core's whole sampling law: bias, suppression and penalties over committed plus staged outputs, temperature, top-k, top-p and min-p over the full vocabulary, Core's seeded counter-based draws, and rejection-sampling predictions for the device accept kernel",
   "implementation_status": "native_source",
-  "implementation_scope": "Two-stage CUDA top-k (256 block slices, then one global block), tempered weights, top-p prefix and one draw per token from Core's counter-based uniform (crit/sampling.h) at a position advanced on the device. The host oracle is Core's Sampler; an FP64 Python mirror uses Core's draw bit for bit. A constraint-bitmask kernel sets disallowed logits to -inf for several rows (Core's TokenMatcher::allowed_bits layout). Other logit processing before selection and per-request parameter storage are engine supplied.",
+  "implementation_scope": "CUDA full-vocabulary law per (request, column) row: Core's steps 2 to 5 into a scratch row, then top-k, top-p and the draw as sort-free rank-prefix searches over orderable keys (eight 4-bit digit passes plus an id-order tie scan) with fixed-order FP32/FP64 sums; enqueue_sample with a chosen DrawPurpose and optional dense law output; enqueue_verify writing accept, residual and bonus predictions for greedy (one-hot) or sampled drafts; enqueue_commit for device-held counts and positions; the two-stage top-64 selection kept for 1 <= top_k <= 64 and routed on the device; a constraint-bitmask kernel. An FP64 Python mirror uses Core's draw bit for bit. Engine supplied: target and draft logits on the device, Request storage and history initialization, scratch and the round structure.",
   "agent_guidance": {
-    "use_when": "Logits are produced on the device and requests need temperature, top-k or top-p sampling with reproducible seeds",
-    "avoid_when": "Only greedy decoding is served, or selection must include penalties or biases that are not applied to the logits first (structured-output masks go through enqueue_mask)",
+    "use_when": "Logits are produced on the device and requests sample (temperature, top-k, top-p, min-p, penalties, bias), especially when sampled requests should draft and verify inside a captured decode graph",
+    "avoid_when": "Only greedy decoding is served and the existing argmax path already matches plain greedy bit for bit, or per-token selection cost is measured to dominate a round and no split-row adaptation is planned",
     "provides": [
-      "Rank order by logit with lowest-index tie-break; greedy path",
-      "Top-k up to 64 candidates over a full vocabulary in two device stages",
-      "Temperature weights, top-p rank prefix and one draw per sampled token",
-      "Core's Philox draw on the device at a device-advanced position, so device tokens equal crit::core::Sampler's away from FP32 rounding",
-      "FP64 Python mirror of the device rules with Core's bit-identical draw",
+      "Rank order by processed value with lowest-index tie-break; greedy path",
+      "Core's steps 2 to 5 on the device: bias and bans, min_tokens suppression, repetition over prompt and outputs, frequency and presence over committed plus staged outputs",
+      "Full-vocabulary top-k, top-p and min-p and one draw per token as sort-free prefix searches, deterministic for a given vocabulary",
+      "Two-stage top-64 selection for 1 <= top_k <= 64, chosen on the device so one captured launch serves every request",
+      "Core's Philox draw on the device with sample, draft, accept and residual purposes at each output position",
+      "Rejection-sampling verification predictions for greedy or sampled drafts that the device greedy accept kernel consumes unchanged",
+      "Dense law rows for a sampled drafter's q",
+      "Device commits of output counts and positions from a device-held emitted count",
+      "FP64 Python mirror of processing, law, draw and verification with Core's bit-identical draw",
       "A kernel applying a structured-output bitmask (Core's TokenMatcher::allowed_bits) to logit rows before selection"
     ],
     "engine_supplies": [
-      "The logits row on the device and the candidate scratch",
-      "Per-sequence Params with the position set to the committed output count",
-      "Logit processing (penalties, biases, constraints) before selection",
+      "Target and draft logits as FP32 rows on the device, and the scratch rows",
+      "Per-sequence Request from crit::core::resolve_sampling with merged, sorted bias ids, position set to the committed output count, and counts/prompt_seen built from TokenHistory",
+      "The device round: commit as the first Forward kernel, drafting, verify writing logits, then the device greedy accept kernel",
       "Keeping greedy requests on their existing argmax path where bit identity matters"
     ],
     "preserve": [
-      "Rank order with index tie-break",
-      "One draw per sampled token from Core's uniform at the request's own seed, stream and position",
-      "Top-p over the top-k candidates in rank order, keeping at least one"
+      "Rank order with index tie-break and Core's processing order",
+      "One draw per emitted token from Core's uniform at its own seed, stream, output position and purpose",
+      "Each verify or draft column counts the drafts staged before it",
+      "Acceptance with u * q(d) < p(d) under the processed target law p and the law q the draft was drawn from; residual from max(p - q, 0); bonus from the last column",
+      "Fixed-order sums so repeated identical requests give identical tokens"
     ],
     "adapt": [
-      "Candidate cap and block count",
-      "Fusing selection into the head or capturing it in the decode graph",
-      "Additional truncation rules on the same candidate list"
+      "Block size, digit width and splitting a row over several blocks",
+      "Fusing selection into the head or the verify epilogue",
+      "Sparse draft laws instead of dense q rows, keeping the complete residual",
+      "The fast-path candidate cap"
     ]
   },
   "path": "inference/token-sampling/README.md",
   "code_path": "inference/token-sampling/code",
   "code_files": [
-    {"path": "inference/token-sampling/code/sampling.h", "purpose": "Params and the selection and mask launch interfaces"},
-    {"path": "inference/token-sampling/code/sampling.cu", "purpose": "Two-stage top-k selection, tempered top-p draw with Core's uniform and device position advance; constraint bitmask masking"},
-    {"path": "inference/token-sampling/code/sampling.py", "purpose": "FP64 Python mirror of the device rules with Core's Philox draw and a runnable example"}
+    {"path": "inference/token-sampling/code/sampling.h", "purpose": "Params, Request, Rows and Verify; selection, mask, sample, verify and commit launch interfaces"},
+    {"path": "inference/token-sampling/code/sampling.cu", "purpose": "Two-stage top-64 selection, the full-vocabulary law (processing, prefix searches, draw), rejection-sampling verification, commits and constraint masking"},
+    {"path": "inference/token-sampling/code/sampling.py", "purpose": "FP64 Python mirror of processing, law, draw and verification with Core's Philox draw and a runnable example"}
   ],
   "requires": {
     "hardware": "CUDA C++20 and Core's sampling header (crit::core) for the device path; Python 3.11+ standard library for the mirror",
-    "model": "One logits row per selected token",
-    "workload": "Generation that samples with temperature, top-k or top-p and needs reproducible seeds"
+    "model": "One logits row per selected token or verify column; drafter and target share token ids",
+    "workload": "Generation that samples with Core's rules, with or without speculative drafts, and needs reproducible seeds"
   },
   "contract": {
-    "input": "Device logits row and vocabulary size; device Params; scratch for 256 x 64 candidates",
-    "output": "The selected token index in device memory; Params.position advanced by one",
-    "ownership": "The engine owns logits, Params, scratch and output; kernels borrow them on the caller's stream",
-    "failure": "Null pointers or an empty vocabulary are rejected at launch; NaN logits are not filtered; FP32 weights can pick a neighbouring token when a draw lands within rounding of a boundary",
-    "core_boundary": "Sampling rules, the draw and the host sampler are Core's (crit/sampling.h: uniform, SamplingParams, resolve_sampling, Sampler); this entry is the device path of steps 7 to 12 with top_k capped at 64. Engines report support through ModelInfo::sampling and read SamplingOptions in Model::open_request"
+    "input": "Device logits rows and vocabulary size; device Params or Requests; staged drafts per column; optional draft law rows; scratch of scratch_floats(vocab, rows) floats (selection: 256 x 64 candidates)",
+    "output": "Selected tokens or verify predictions in device memory (-1 when nothing is selectable); optional dense law rows; Params.position advanced by one per selection; commits advance Request.position and counts",
+    "ownership": "The engine owns logits, Params, Requests and their arrays, scratch and outputs; kernels borrow them on the caller's stream until it reaches them",
+    "failure": "Null pointers, an empty vocabulary, short strides or too many requests are rejected at launch; NaN and +inf logits are not filtered; FP32 values and weights can pick a neighbouring token when a draw lands within rounding of a boundary",
+    "core_boundary": "Sampling rules, the draw and the host sampler are Core's (crit/sampling.h: uniform, DrawPurpose, SamplingParams, resolve_sampling, TokenHistory, Sampler); this entry is the device path of steps 2 to 5 and 7 to 12 plus speculative verification. Engines report support through ModelInfo::sampling and read SamplingOptions in Model::open_request"
   },
   "dependencies": [
     "CUDA runtime",
@@ -58,24 +65,36 @@
   ],
   "symbols": [
     "Params",
+    "Request",
+    "Rows",
+    "Verify",
     "enqueue_select",
     "enqueue_mask",
+    "enqueue_sample",
+    "enqueue_verify",
+    "enqueue_commit",
+    "scratch_floats",
     "philox4x32",
     "uniform",
-    "candidates",
+    "process",
+    "law",
     "nucleus",
-    "select"
+    "select",
+    "verify"
   ],
   "interactions": [
+    "device-speculative-round",
     "mtp-decode",
+    "token-constraints",
+    "draft-trees",
     "recorded-selection"
   ],
   "techniques": [
     "token-sampling"
   ],
   "validation": {
-    "host": "Core's sampling fixture covers the rules, the generator and Sampler; the Python mirror is checked against Core's Philox vectors and Sampler draws, plus greedy ties, nucleus membership and top-k/top-p reductions",
-    "native": "Greedy ties, top-k 1 and tiny top-p reducing to greedy, position advance and repeatability, every draw inside Core's kept set and equal to crit::core::Sampler::sample away from boundaries, and frequencies within four standard errors of the tempered distribution; masks equal the host's -inf pattern on strided rows, and greedy selection on a masked row equals Core's constrained Sampler while draws stay inside the allowed set",
-    "performance": "No throughput or output-quality claim"
+    "host": "Core's sampling fixture covers the rules, the generator and Sampler; the Python mirror is checked against Core's Philox vectors and Sampler draws, greedy ties, nucleus membership, top-k/top-p reductions, Core's processing order, the uncapped full vocabulary, min-p, and verification that keeps the target law for greedy and sampled drafts over 6,000 seeds",
+    "native": "Selection: greedy ties, top-k 1 and tiny top-p reducing to greedy, position advance and repeatability, draws equal to crit::core::Sampler::sample away from boundaries and frequencies within four standard errors; masks equal the host's -inf pattern. Law: dense law equal to Sampler::distribution with bias, bans, suppression, repetition, frequency and presence over staged columns, top-k, top-p and min-p; top_k 0 draws inside Core's interval over 50,000 tokens and mostly beyond rank 64; verify columns equal to the rejection rule with Core's accept, residual and sample draws away from boundaries; first emitted tokens follow the target law for greedy and sampled drafts over 16,384 seeds; commits of counts and positions",
+    "performance": "No throughput or output-quality claim; the full law is reference speed with one block per row"
   }
 }

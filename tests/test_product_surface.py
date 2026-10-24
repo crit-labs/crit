@@ -143,7 +143,7 @@ class ProductTests(unittest.TestCase):
     def test_real_inference_entries_are_generic_local_implementations(self):
         self.assertEqual(store.check(), [])
         entries = store.load()["entries"]
-        self.assertEqual(len(entries), 32)
+        self.assertEqual(len(entries), 37)
         for entry in entries:
             self.assertNotIn("donors", entry)
             self.assertNotIn("code_locations", entry)

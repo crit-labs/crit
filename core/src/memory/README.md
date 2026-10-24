@@ -19,7 +19,7 @@ bytes, each possibly unknown with an explaining note:
 | --- | --- | --- |
 | `physical` | `MemAvailable` | `ullAvailPhys` |
 | `commit` | `CommitLimit - Committed_AS`, only with `vm.overcommit_memory = 2` | `ullAvailPageFile` |
-| `cgroup` | Tightest headroom over this process's cgroup and ancestors (v2, or the v1 memory controller), counting clean file pages as reclaimable | unknown |
+| `cgroup` | Tightest headroom over this process's cgroup and ancestors (v2 against `min(memory.max, memory.high)`, or the v1 memory controller), counting clean page cache as reclaimable: `active_file + inactive_file` (else `file - shmem`) minus dirty and writeback | unknown |
 
 Malformed values never throw; they make that observation unknown and add a note.
 `observe_host_memory_linux(root)` reads a synthetic `/proc` and `/sys/fs/cgroup`

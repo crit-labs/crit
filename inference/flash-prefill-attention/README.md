@@ -36,6 +36,27 @@ of row `r` at `c ^ (r & 7)`), making every `ldmatrix` conflict free. The next K/
 loads by `cp.async` while the current one is used (two stages). Output accumulators take
 `head_dim / 2` registers per thread, which limits occupancy at head dimension 256.
 
+## Sliding windows, sinks and soft-caps
+
+Several model families attend over a sliding window on some layers, add a learned
+per-head sink logit to the softmax, or cap logits; the kernel supports all three without
+changing its arithmetic elsewhere.
+
+- **Window** (`window > 0`): a query at position `p` sees keys `p - window + 1 .. p`. The
+  block starts at the tile holding its oldest query's first key and never reads earlier
+  keys, so the work follows the window rather than the context.
+- **Ring** (`ring > 0`, contiguous caches): position `j` is row `j % ring`, so a window
+  layer keeps `ring >= window + T - 1` rows instead of the whole context; a launch reads
+  only rows its own writes leave intact.
+- **Sinks** (`sinks[h]`, scaled-score units): `exp(sink)` joins each row's denominator
+  after the last tile and adds no value, as in models that learn an attention sink.
+- **Soft-cap** (`softcap > 0`): `score = softcap * tanh(score / softcap)` after the scale.
+- **Non-causal** (`causal = false`): every query also sees the chunk's later keys, the
+  non-causal block of a block drafter ([hidden-state drafters](../hidden-state-drafters/README.md)).
+
+Masked keys contribute exact zeros, so a window, a ring and skipped tiles change no bits
+of the visible keys' contribution.
+
 ## What the code supplies
 
 - [flash_prefill.h](code/flash_prefill.h) / [flash_prefill.cu](code/flash_prefill.cu):
@@ -81,6 +102,14 @@ try:
     ref.attention(q, k[:-1], v[:-1], pos0, heads, kv_heads, 1.0)
 except ValueError as error:
     print("short cache rejected:", error)
+
+# Sliding window, sinks and soft-cap: the tiled walk still equals the direct definition, and keys before every
+# query's window can change (or be overwritten in a ring) without changing a bit of the result.
+variants = dict(window=24, sinks=[0.5, -1.0, 2.0, 0.0], softcap=5.0)
+direct_w = ref.attention(q, k, v, pos0, heads, kv_heads, dim ** -0.5, **variants)
+assert ref.max_difference(direct_w, ref.flash_attention(q, k, v, pos0, heads, kv_heads, dim ** -0.5, **variants)) < 1e-12
+stale = [[[x + 100.0 for x in head] for head in row] if j <= pos0 - 24 else row for j, row in enumerate(k)]
+assert ref.max_difference(direct_w, ref.attention(q, stale, v, pos0, heads, kv_heads, dim ** -0.5, **variants)) == 0
 ```
 
 ## Adapting it

@@ -4,7 +4,6 @@
 // a power-of-two width bucket. Recorded choices are replayed exactly; timing
 // happens only when the engine explicitly tunes, and the result is exported as
 // a table for the frozen configuration. Header-only, C++20 standard library.
-#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <functional>
@@ -38,15 +37,23 @@ class Table {
 public:
     Table() = default;
     explicit Table(std::map<std::string, std::uint32_t> recorded, bool tuning = false)
-        : recorded_(std::move(recorded)), tuning_(tuning) {}
+        : recorded_(std::move(recorded)), tuning_(tuning) {
+        for(const auto& [k, i] : recorded_) check_key(k);
+    }
 
     // `count` candidates in a stable order (for example a library's heuristic list
     // for the bucket width). `time_ms(i)` runs candidate i and returns its time, or
     // a negative value when the candidate cannot run; it is called only when tuning
-    // and the key has no recorded choice. Ties keep the lower index.
+    // and the key has no recorded choice. Ties keep the lower index. The first choice
+    // for a key is reused; a later call whose list no longer holds it is an error,
+    // as for a recorded index.
     Choice choose(const std::string& key, std::uint32_t count, const std::function<double(std::uint32_t)>& time_ms = {}) {
         if(count == 0) throw std::invalid_argument("selection needs at least one candidate");
-        if(const auto it = chosen_.find(key); it != chosen_.end()) return {std::min(it->second.index, count - 1), it->second.source};
+        check_key(key);
+        if(const auto it = chosen_.find(key); it != chosen_.end()) {
+            if(it->second.index >= count) throw std::out_of_range("choice for " + key + " exceeds the candidate count");
+            return it->second;
+        }
         Choice c;
         if(const auto r = recorded_.find(key); r != recorded_.end()) {
             if(r->second >= count) throw std::out_of_range("recorded choice for " + key + " exceeds the candidate count");
@@ -107,6 +114,12 @@ public:
     bool tuning() const { return tuning_; }
 
 private:
+    // Keys are written by to_json without escapes, so they must be what parse reads back.
+    static void check_key(const std::string& key) {
+        if(key.empty() || key.find_first_of("\"\\") != std::string::npos)
+            throw std::invalid_argument("selection keys must be nonempty strings without quotes or backslashes");
+    }
+
     std::map<std::string, std::uint32_t> recorded_;
     std::map<std::string, Choice> chosen_;
     bool tuning_ = false;

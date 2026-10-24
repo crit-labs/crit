@@ -414,6 +414,17 @@ __global__ void finish_partials_kernel(const float* __restrict__ part, int SK, c
 // ------------------------------------------------------------------------------------------- host launch helpers
 Plan plan(bool fp4, int N, int K, int T, int wide_tokens, int min_blocks, bool two_row_tiles) {
     Plan p;
+    p.fp4 = fp4;
+    p.n = N;
+    p.k = K;
+    p.tokens = T;
+    if(min_blocks <= 0) {
+        int device = 0, sms = 0;
+        min_blocks = cudaGetDevice(&device) == cudaSuccess &&
+                             cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) == cudaSuccess
+                         ? 2 * sms
+                         : 1;
+    }
     p.nt = T > wide_tokens ? 16 : 8;
     p.rt = two_row_tiles && N % 256 == 0 ? 2 : 1;
     const int tb = 8 * p.nt;
@@ -428,7 +439,8 @@ Plan plan(bool fp4, int N, int K, int T, int wide_tokens, int min_blocks, bool t
 
 cudaError_t enqueue_fp8(const Fp8Weights& w, const __nv_bfloat16* x, int T, float* y, int ldo, bool add,
                                const Plan& p, const Scratch& s, cudaStream_t stream) {
-    if(w.N % (128 * p.rt) || w.K % 32 || T <= 0) return cudaErrorInvalidValue;
+    if(w.N % (128 * p.rt) || w.K % 32 || T <= 0 || p.fp4 || w.N != p.n || w.K != p.k || T > p.tokens)
+        return cudaErrorInvalidValue;
     token_amax_kernel<<<T, 256, 0, stream>>>(x, w.K, s.token_scale);
     const std::size_t xe = static_cast<std::size_t>(p.tpad / 8) * (w.K / 32) * 32;
     uint2* x8 = static_cast<uint2*>(s.activations);
@@ -448,7 +460,8 @@ cudaError_t enqueue_fp8(const Fp8Weights& w, const __nv_bfloat16* x, int T, floa
 
 cudaError_t enqueue_fp4(const Fp4Weights& w, const __nv_bfloat16* x, int T, float* y, int ldo, bool add,
                                const Plan& p, const Scratch& s, cudaStream_t stream) {
-    if(w.N % (128 * p.rt) || w.K % 64 || T <= 0 || !(w.weight_global_scale > 0.f) || !(w.input_global_scale > 0.f))
+    if(w.N % (128 * p.rt) || w.K % 64 || T <= 0 || !p.fp4 || w.N != p.n || w.K != p.k || T > p.tokens ||
+       !(w.weight_global_scale > 0.f) || !(w.input_global_scale > 0.f))
         return cudaErrorInvalidValue;
     uint4* x4 = static_cast<uint4*>(s.activations);
     const std::size_t xe = static_cast<std::size_t>(p.tpad) * (w.K / 64);

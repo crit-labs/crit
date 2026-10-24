@@ -44,6 +44,18 @@ int main() {
     c = fixed.choose("other:1:1", 5, [&](std::uint32_t) { ++calls; return 0.0; });
     REQUIRE(c.index == 0 && c.source == sel::Source::fallback && calls == 4);  // not tuning: never timed
     REQUIRE(throws([&] { sel::Table t(sel::Table::parse("{\"k\":7}")); t.choose("k", 3); }));
+    // A kept choice beyond a shorter list is an error, not a clamp, and stays as it was.
+    sel::Table shrunk({}, true);
+    c = shrunk.choose("k:1:16", 4, [](std::uint32_t i) { return 4.0 - i; });
+    REQUIRE(c.index == 3 && c.source == sel::Source::tuned);
+    REQUIRE(throws([&] { shrunk.choose("k:1:16", 2); }));
+    c = shrunk.choose("k:1:16", 4);
+    REQUIRE(c.index == 3 && c.source == sel::Source::tuned);
+    // Keys to_json could not write so that parse reads them back are rejected.
+    for(const char* bad : {"", "k\"1", "k\\1"}) {
+        REQUIRE(throws([&] { sel::Table t; t.choose(bad, 2); }));
+        REQUIRE(throws([&] { sel::Table t({{bad, 0}}); }));
+    }
 
     // Malformed tables are rejected.
     for(const char* bad : {"", "{", "{\"a\":-1}", "{\"a\":1,}", "{\"a\":1}x", "{\"a\":1,\"a\":2}", "{\"\":1}", "{a:1}", "{\"a\":99999999999}"})

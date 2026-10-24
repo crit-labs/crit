@@ -48,7 +48,8 @@ struct DeviceSpeculativeRound::Impl {
         const auto* stop_block = static_cast<const std::int32_t*>(stops.data());
         AcceptRows rows{v.drafts, v.predictions, stop_block + 1, 0, v.control,
                         static_cast<std::int32_t*>(result.data()), 1, config.draft_tokens, stop_block};
-        check(enqueue_greedy_accept(rows, s), "greedy accept");
+        if(steps.accept) steps.accept(s, rows);
+        else check(enqueue_greedy_accept(rows, s), "greedy accept");
         steps.commit_state(s, v);
     }
     void capture(int which) {

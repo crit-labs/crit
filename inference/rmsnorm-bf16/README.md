@@ -1,14 +1,14 @@
 # BF16 row normalization
 
 A native CUDA row-wise RMS normalization over contiguous BF16 input, gain and output,
-with plain gain, unit-offset gain and a fused SiLU gate, plus a Python formula reference
-and a standalone CUDA example. It is an optional arithmetic component; Core prescribes
+with plain gain, unit-offset gain and a fused SiLU gate, either of two BF16 rounding
+orders, plus a Python formula reference and a standalone CUDA example. It is an optional arithmetic component; Core prescribes
 no normalization or tensor layout.
 
 ## When to use it
 
-Use it when the engine's normalization matches one of the three modes over contiguous
-BF16 rows. The example establishes operator behavior for its tested shapes and values;
+Use it when the engine's normalization matches one of the three modes and one of the
+two rounding orders over contiguous BF16 rows. The example establishes operator behavior for its tested shapes and values;
 model quality and performance need separate evidence, and width, row count, reduction
 structure and fusion decide which implementation is best for an engine.
 
@@ -22,9 +22,21 @@ For row width W, `r = 1 / sqrt(sum(x[j]^2) / W + epsilon)`, then:
 | Unit offset | `y[j] = x[j] * r * (1 + gain[j])` |
 | Gated | `y[j] = x[j] * r * gain[j] * gate[j] / (1 + exp(-gate[j]))` |
 
-One 256-thread block handles a row: threads read strided columns, convert to FP32 and
-accumulate squares, a shared 256-float tree reduction gives the sum, and the epilogue
-uses `rsqrtf`, applies gain and optional gate, and rounds to BF16 (nearest). One launch,
+`Parameters::rounding` picks where the result rounds to BF16; the default is `single`:
+
+| Rounding | Rounds to BF16 | Matches |
+| --- | --- | --- |
+| `single` | once, after gain and gate in FP32 | norms that compute in FP32 and cast once, such as Gemma's `(1 + w)` norm (unit offset) |
+| `normalize_first` | `x[j] * r`, then its product with the gain factor, then the gated product | norms that cast the normalized value to the input dtype before the weight, such as Hugging Face `LlamaRMSNorm` and its Qwen and Mistral copies, and Qwen3-Next's gated norm |
+
+The two orders differ by up to one BF16 step per extra rounding (two with a gate), so
+pick the one the model was trained and evaluated with. The unit-offset mode covers
+`(1 + w)` gains in either order.
+
+One 256-thread block handles a row of any width: threads read strided columns, convert
+to FP32 and accumulate squares, a shared 256-float tree reduction gives the sum, and the epilogue
+uses `rsqrtf`, applies gain and optional gate, and rounds to BF16 (nearest) at the
+points the rounding order names. One launch,
 no allocation or workspace.
 
 **Fold split partials.** A narrow projection feeding a residual sum can be split along
@@ -39,16 +51,19 @@ The native kernel here does not implement the fold.
 
 | Source | What it implements |
 | --- | --- |
-| [`include/crit/rmsnorm.h`](code/include/crit/rmsnorm.h) | Borrowed views, modes, parameters, execution context, `validate` and `enqueue` |
+| [`include/crit/rmsnorm.h`](code/include/crit/rmsnorm.h) | Borrowed views, modes, rounding orders, parameters, execution context, `validate` and `enqueue` |
 | [`interface.cpp`](code/interface.cpp) | Shape, representation, stride, alignment, epsilon, workspace and alias checks |
 | [`implementation.cu`](code/implementation.cu) | The reduction and normalization/gated epilogue kernel |
-| [`reference.py`](code/reference.py) | Host formula and `fold_and_normalize` with shape checks |
+| [`reference.py`](code/reference.py) | Host formula with optional BF16 rounding points (`bf16`), and `fold_and_normalize` with shape checks |
 | [`CMakeLists.txt`](code/CMakeLists.txt) | Static library `crit::rmsnorm`, C++/CUDA 20 |
-| [`example.cpp`](code/example.cpp) | Owned stream/storage, independent BF16 oracle, all modes, aliases, metadata rejection |
+| [`example.cpp`](code/example.cpp) | Owned stream/storage, independent BF16 oracle, all modes and rounding orders, aliases, metadata rejection |
 
-The native domain is width 1..8192, rows 1..49152, two-byte aligned BF16 views with row
-stride exactly `2 * width`, a one-row gain, a gate of input shape exactly in gated mode,
-positive finite FP32 epsilon, and null zero-byte workspace.
+The native domain is width 1..2^24 (exact as the FP32 divisor of the mean), rows
+1..2^31-1 (one grid-x block per row), two-byte aligned BF16 views with row stride exactly
+`2 * width`, a one-row gain, a gate of input shape exactly in gated mode,
+positive finite FP32 epsilon, a declared rounding order, and null zero-byte workspace.
+Shared memory is a fixed 1024 bytes whatever the width; wide rows only lengthen each
+thread's strided loop.
 
 ## What the engine supplies
 
@@ -95,7 +110,7 @@ else:
 
 ## Adapting it
 
-Preserve the gain convention, epsilon placement, shape and stride contract, arithmetic
+Preserve the gain convention, rounding order, epsilon placement, shape and stride contract, arithmetic
 profile, borrowed-storage lifetime and, when folding partials, the fixed split order.
 Thread count, reduction method, layouts and fusion are free; extending a shape limit
 means revisiting validation and the kernel, and vectorization must keep admitted aliases
@@ -107,13 +122,21 @@ happen; byte-identical output is not automatically required.
 
 O(RW) work for R rows: input is read twice, gain and gate once, output written once;
 1024 bytes of static shared memory per block. Small widths idle threads and few rows
-limit parallelism. Watch for confusing unit-offset and plain gain, accepting
+limit parallelism. Watch for confusing unit-offset and plain gain, the wrong rounding order, accepting
 noncontiguous views, misplaced epsilon, early buffer release, and treating a launch
 check as success.
 
-Host fixtures check the formula modes, validation and the fold's order and shapes. The
-native example compares bounded finite BF16 inputs with an independent double formula
-within one BF16 rounding step across 91 combinations of modes, widths, row counts and
-in-place outputs (up to width 8192 and 49152 rows), plus aliases, tails and invalid
-metadata; it runs in the optional [CUDA operator suite](../../tests/inference/cuda/CMakeLists.txt).
+Host fixtures check the formula modes, both rounding orders on a hand-worked tie, BF16
+rounding, validation and the fold's order and shapes. The native example compares
+bounded finite BF16 inputs with an independent double formula, rounded at the same
+points, within one BF16 rounding step across 238 combinations of modes, rounding orders,
+widths (up to 16384), row counts (up to 65537) and in-place outputs, plus aliases, tails
+and invalid metadata. Nine more cases at widths 4096, 12288 and 16384 check
+`normalize_first` exactly: with the device's own BF16 `x * r` (a unit gain in `single`)
+its plain and unit-offset outputs must match the gain product rounded once more bit for
+bit, and gated outputs within one step. On an RTX 5090 with random 4096x256 BF16 rows,
+`normalize_first` matched Hugging Face `LlamaRMSNorm` in every output, where `single`
+differed in 26% of them by one step, and `single` output stayed bit-identical to the
+earlier kernel, capped at width 8192, over the widths that kernel admitted. The example
+runs in the optional [CUDA operator suite](../../tests/inference/cuda/CMakeLists.txt).
 Extreme magnitudes can overflow FP32 squares and are not qualified.

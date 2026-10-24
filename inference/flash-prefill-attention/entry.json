@@ -3,11 +3,12 @@
   "category": "attention",
   "summary": "Causal grouped-query prompt attention on BF16 tensor cores with an online softmax, keeping scores in registers instead of a score matrix in memory",
   "implementation_status": "native_source",
-  "implementation_scope": "CUDA kernel for head dimensions 64, 128 and 256 over a contiguous BF16 KV cache: 64 queries per block, 32-key tiles, ldmatrix with a 16-byte XOR swizzle, cp.async double buffering, online softmax with BF16 probabilities, causal chunk offsets and grouped-query heads; a host reference of the direct and the tiled online-softmax attention. Paged or quantized caches and the surrounding projections are engine supplied.",
+  "implementation_scope": "CUDA kernel for head dimensions 64, 128 and 256 over a contiguous BF16 KV cache: 64 queries per block, 32-key tiles, ldmatrix with a 16-byte XOR swizzle, cp.async double buffering, online softmax with BF16 probabilities, causal chunk offsets and grouped-query heads; a host reference of the direct and the tiled online-softmax attention. Paged or quantized caches and the surrounding projections are engine supplied. Sliding windows (with an optional ring-buffer cache), per-head sinks and soft-caps are launch parameters.",
   "agent_guidance": {
     "use_when": "Prompt chunks attend over a long context and the score matrix of the straightforward formulation dominates attention time or memory",
     "avoid_when": "Prompts are short (the score matrix is small), the step is decode with one query per head, or the cache layout is paged or quantized without an adapted load",
     "provides": [
+      "Sliding-window attention that never reads keys before a block's first window, a ring-buffer cache layout for window layers, per-head sink logits and a logit soft-cap",
       "Online softmax over key tiles with a running row maximum and sum, never holding a full score row",
       "S = Q K^T and O = P V on BF16 tensor cores with register reuse of the score accumulators as the P fragment",
       "Row sums over the same BF16-rounded probabilities that feed P V",
@@ -69,7 +70,7 @@
   ],
   "validation": {
     "host": "Tiled online softmax equal to the direct definition within 1e-12; BF16 probabilities within 1e-2; short caches rejected",
-    "native": "CUDA kernel against an FP64 softmax reference for head dimensions 64/128/256, grouped and ungrouped heads, single-token, multi-tile and later chunks: at most 1.3e-3 of the output magnitude on sm_120",
+    "native": "CUDA kernel against an FP64 softmax reference for head dimensions 64/128/256, grouped and ungrouped heads, single-token, multi-tile and later chunks: at most 1.3e-3 of the output magnitude on sm_120; windows over a linear and a ring cache with NaN in every row a launch must not read, sinks and soft-caps against an FP64 reference (attention_variants_tests.cu)",
     "performance": "One measured engine: 148 -> 86 ms per 2,048-token chunk at 12K context (head dimension 256, 24 query and 4 key/value heads) against a score-matrix path on an sm_120 device; no claim for other shapes"
   }
 }

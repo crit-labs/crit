@@ -52,6 +52,26 @@ class RunSettingsTest(unittest.TestCase):
         self.assertEqual(limits["ram_headroom_bytes"], 8 * GIB)
         self.assertEqual(limits["vram_headroom_bytes"], 3 * GIB)
 
+    def test_the_example_file_lists_every_setting_with_the_codes_defaults(self):
+        import re
+        import shutil
+        import crit_eval
+        from crit.run.cli import SETTINGS
+        example = ROOT / "settings.example.toml"
+        shutil.copy(example, self.project / "settings.toml")
+        active = load_settings(self.project)  # parses, with known keys of the right types
+        text = example.read_text(encoding="utf-8")
+        commented = set(re.findall(r"^# ([a-z_]+) = ", text, flags=re.MULTILINE))
+        self.assertEqual(set(active) | commented, set(SETTINGS))
+        self.assertFalse(set(active) & commented)
+        protocol = json.loads((ROOT / "eval/protocol.json").read_text(encoding="utf-8"))
+        self.assertEqual(active, {"ram_headroom_gib": 2, "vram_headroom_gib": 1,
+                                  "context_reserve_gib": protocol["context"]["reserve_gib"],
+                                  "context_tokens": crit_eval.DEFAULT_CONTEXT_TOKENS})
+        # crit eval reads a subset of the same keys.
+        self.assertLessEqual({"vram_headroom_gib", "context_reserve_gib", "context_tokens"}, set(SETTINGS))
+        self.assertIn("!/settings.example.toml", (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines())
+
     def test_settings_device_sizes_the_run_for_eval_max_context(self):
         model = self.project / "model"
         model.mkdir()

@@ -9,6 +9,144 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-24
+
+### Overview
+
+crit 0.7.0 is an Inference release. Sampled requests speculate on the device and keep the model's
+distribution: token-sampling runs Core's whole sampling law on the GPU and verifies drafts by
+rejection sampling, greedy drafts stand exactly when they equal the target's own draw, and
+EAGLE-2-style draft trees are built, verified in one target pass and walked on the device.
+Hidden-state drafters (EAGLE-3, DFlash, DSpark) are read through Core, and `crit models drafter`
+distills a draft head from the target. New entries cover hybrid models' recurrent layers, 4-bit
+GPTQ/AWQ/compressed-tensors/MXFP4 checkpoints with BF16 activations and absorbed multi-head latent
+attention; the attention kernels take sliding windows, sinks, soft-caps and tree masks, and the
+fused MoE router takes every common routing form. `crit serve` adds the Anthropic Messages and
+Ollama APIs and Prometheus metrics, and `crit run` gains `cost`, a checkpoint fingerprint in recon
+and `create --from-engine`. The Python distribution and the Core SDK share version 0.7.0; the
+product surface counts 37 Inference entries.
+
+### Added
+
+- Speculative sampling on the device: token-sampling runs Core's whole sampling law on the GPU
+  (bias, min_tokens suppression, repetition, frequency and presence penalties over committed plus
+  staged outputs, temperature, top-k, top-p, min-p and Core's draw) over the full vocabulary with
+  sort-free prefix searches, and `enqueue_verify` turns a round's target logits into
+  verify predictions that device-speculative-round's unchanged accept kernel consumes, so sampled
+  requests draft inside the decode graph and keep the model's distribution: greedy drafts stand
+  exactly when they equal the target's own draw, so the output equals plain sampled decoding token
+  for token for the same seed, and drafts sampled from the drafter's law are verified by rejection
+  sampling (Core's accept, residual and sample draws). `enqueue_sample` draws drafts with
+  their dense law and `enqueue_commit` keeps counts and positions on the device.
+- Attention variants in the CUDA attention entries: flash-prefill-attention, fp8-kv-attention and
+  paged-attention take a sliding window (keys before the oldest query's window are never read, so
+  Core's `window_table` may hold `no_page` there and the contiguous caches can be a ring of
+  `window + rows - 1` rows), per-head sink logits, a logit soft-cap, and in decode/verify a tree
+  mask per column for speculative token trees. Windowed decode walks only the pieces inside the
+  window and keeps column invariance. Gemma-, gpt-oss-, Mistral- and Cohere-style local layers no
+  longer need their own kernels.
+- Inference entry `draft-trees`: EAGLE-2-style dynamic draft trees on the device (top-k expansion
+  with log-softmax path scores, beam and kept-node selection, tree build with ancestor masks and
+  depths), a tree walk that accepts the path the target agrees with under device-speculative-round's
+  control contract (greedy argmax or the target's own draws, so sampled trees keep the model's
+  law), and in-order compaction of the accepted KV rows. `RoundSteps::accept` lets the device round
+  run the tree walk instead of the greedy kernel.
+- Hidden-state drafters: Core's `crit_core.model.drafters.read_drafter` reads published EAGLE-3,
+  DFlash and DSpark drafters (speculators and native formats) into one description with taps as
+  residual-stream indices (native DFlash/DSpark layer ids are off by one), and the Inference entry
+  `hidden-state-drafters` supplies the device glue: EAGLE-3 catch-up from the round's settled count,
+  block-drafter input, `d2t` mapping, draft-law scatter and confidence truncation.
+  `crit run ... recon --drafter PATH` (repeatable) records each companion drafter through that reader,
+  `crit models drafter` heads included, checked against the target's depth and width.
+  flash-prefill-attention gains `causal = false` for a block drafter's non-causal block.
+- Inference entry `recurrent-layer-kernels`: CUDA kernels for hybrid models' recurrent layers, a
+  causal depthwise convolution with its carried window, gated delta (dk 64 or 128) and Mamba-2
+  (d_state 64 or 128), each as a chunked two-pass prefill and a column-invariant column scan that
+  writes the state after every column for speculative verify.
+- Inference entry `w4a16-projections`: published 4-bit checkpoints run as stored with BF16
+  activations. GPTQ (act-order permutation, both zero conventions), AWQ (its column interleave),
+  compressed-tensors int4 and MXFP4 (gpt-oss) convert exactly to one canonical layout, read by a
+  4-bit decode GEMV for up to 8 tokens and a BF16 tensor-core prompt GEMM on sm_80 and later.
+- Core: programmatic dependent launch (`<crit/cuda_launch.h>`). `launch(kernel, shape, stream,
+  programmatic, args...)` lets a kernel start while the previous one in its stream finishes, on
+  devices the query reports (compute capability 9.0 and later), and launches ordinarily elsewhere;
+  kernels call `wait_for_prior_grid()` before reading their predecessor's output and may call
+  `launch_dependents()` early. Captured graphs keep the programmatic edges.
+- Inference entry `latent-attention`: absorbed multi-head latent attention (DeepSeek-V2/V3, Kimi K2)
+  over the shared `[latent ; rope key]` cache rows, for decode, verify and prompt chunks, contiguous
+  or paged, with optional sinks and an ordered split combine that keeps columns invariant.
+
+- `crit run ... cost --transcript PATH` accounts a run's build cost from the coding agent's transcripts
+  (Claude Code sessions, Codex rollouts, or plain usage JSONL): each model response is counted once and
+  attributed by time to the candidate being built (previous seal to own seal), priced at Anthropic's list
+  prices per million tokens (input, cache reads, 5-minute and 1-hour cache writes, output; `--prices`
+  overrides), with running totals from the run's first event, and written to `cost.json` at the run root.
+  AGENTS.md asks the agent to record it before the handoff.
+- Recon fingerprints the checkpoint (`gathered.fingerprint` in `work/recon.json`): four hashed sections,
+  architecture (config.json's model shape), weights (format, quantization and the stored dtype and shape of
+  every tensor pattern, draft layers included), tokenizer (files, special and stop tokens) and template.
+  Every candidate records the fingerprint's hash in `extensions.recon`, and `crit run ... recon --compare
+  OTHER_MODEL` says which sections another checkpoint changes and what that means for the engine: an
+  equal fingerprint is a finetune or re-upload the engine loads unchanged.
+- `crit run create --from-engine ENGINE_DIR` starts a run from an engine listed in crit-hub (its
+  `engines/<owner>/<name>/` folder): the request records the engine, its source pin, the checkpoint
+  files it was measured on and its provenance as `origin_engine`, its published crit Eval results are
+  kept under `captured/origin/`, the agent request asks for the imported source as the first candidate
+  (proposal `"lineage": "origin-engine"`) measured before any change, and `resolve` records in
+  `inputs.json` whether the run's model is that exact checkpoint (`origin_checkpoint`).
+- `crit serve` speaks two more APIs over the same engine and the same validation: the Anthropic
+  Messages API (`POST /v1/messages`, with `system`, content blocks, tools, tool results, stop
+  sequences, `output_config.format` and the Messages event stream, so Claude Code and the Anthropic
+  SDKs run on a crit engine with a base URL and `x-api-key`), and the Ollama API (`/`, `/api/version`,
+  `/api/tags`, `/api/ps`, `/api/show`, `/api/chat`, `/api/generate`, with Ollama's messages, images,
+  tools, `format` and `options`, streaming newline-delimited JSON with Ollama's counts and durations),
+  so local chat UIs find it. `GET /metrics` serves Prometheus metrics: requests by dialect and outcome,
+  tokens, wall time and the last request's rates (docs/SERVING.md).
+- `crit models drafter` distills a draft head for speculative decoding from the target itself, as a
+  recorded transform (`method: drafter`, kind `mtp-head`): one decoder layer of the target's architecture
+  initialized from a target layer, fed the target's final hidden state and the next token's embedding
+  through two norms and a fusion layer, predicting through the target's own head, trained to the target's
+  next-token distribution on calibration windows unrelated to Eval, with the held-out greedy agreement and
+  KL recorded before and after. The output is `config.json` with a `crit_drafter` block and
+  `model.safetensors` under `drafter.`; `crit models plan` and `verify` take drafter recipes and records.
+  AGENTS.md lets an agent use such a drafter when the user hands it over with its record, with the
+  stored target verifying every draft.
+- heterogeneous-expert-dispatch's fused MoE router takes one `Routing` description for every common
+  router: softmax or sigmoid scoring before or after selection, a correction bias on the selection
+  value only, grouped selection, renormalization and scaling (Mixtral, Qwen-MoE, GPT-OSS, Llama 4,
+  DeepSeek-V3, GLM-4.5, Kimi K2). `routing_from_config` maps Core's parsed config fields and fails
+  where neither the config nor the model's defaults give one. The defaults are the previous kernel
+  bit for bit.
+- `settings.example.toml` at the checkout root lists every machine setting `crit run` and `crit eval`
+  read, with its default and a comment; copy it to `settings.toml`.
+
+### Changed
+
+- rmsnorm-bf16 takes any hidden size and, besides its own rounding order, a Llama-style one (normalize
+  in FP32, round to BF16, then multiply by the weight).
+- Core's cgroup host-memory headroom counts no shared memory as reclaimable and honours `memory.high`
+  as well as `memory.max`; host-memory-admission's Python reference matches.
+- stored-tile-gemm's plans refuse a launch past the tokens, N, K or format they were made for, and split
+  work by the device's SM count.
+- fp8-kv-attention builds for sm_80 and sm_86; there `prefill_fp8` returns `cudaErrorNotSupported`,
+  since those GPUs have no E4M3 tensor-core MMA.
+
+### Fixed
+
+- token-sampling's device selection treated `top_k = 0` (no filter) as the 64 best tokens, which
+  truncated the distribution at Eval's default sampling; it now draws from the whole vocabulary,
+  as Core does, and keeps the two-stage path for `1 <= top_k <= 64`.
+- recurrent-state-recovery's deferred recurrent commit applied a recorded prefix again after a flush
+  or an abandoned round; it now applies each recorded prefix exactly once.
+- recorded-selection accepted a kept choice beyond the candidate list and keys its table cannot write;
+  both are now refused.
+- device-expert-cache gave prefetch pool slots to predictions of experts already resident; only
+  nonresident predictions take a slot now.
+- paged-attention left output rows unwritten for a sequence beyond `max_columns`, `max_queries` or its
+  block table; such rows are NaN and the launch raises a fault flag.
+- Inference's CMake built the `--wrap` fixtures under MSVC, whose linker accepts the unknown option with a
+  warning, so `crit_toy_round_example` failed to link; MSVC builds now omit those fixtures.
+
 ## [0.6.1] - 2026-10-24
 
 ### Overview
@@ -942,7 +1080,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/crit-labs/crit/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/crit-labs/crit/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/crit-labs/crit/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/crit-labs/crit/compare/v0.4.0...v0.5.0

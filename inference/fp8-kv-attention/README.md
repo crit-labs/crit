@@ -34,11 +34,41 @@ to E4M3 (the accumulator is kept in those units and rescaled only when a row
 maximum or that scale grows). V's B fragments come from `ldmatrix.trans` on b16
 code pairs re-packed with byte permutes. 64-key tiles are double buffered with
 `cp.async`. It trades BF16 rounding for E4M3 in queries and probabilities, so
-measure whole-model quality before adopting it.
+measure whole-model quality before adopting it. E4M3 `mma.sync` exists from sm_89 on:
+the file also builds for sm_80 and sm_86, where `write`, `prefill` and `decode` run
+and `prefill_fp8` returns `cudaErrorNotSupported` without launching. It does the same
+whenever the code the runtime loads for the device was built for an older target
+(for example sm_80 PTX JIT-compiled on a newer GPU), so an engine can fall back to
+`prefill`.
 
 **Column invariance.** Tiles after a row's position leave it bit for bit
 unchanged and the combine order is fixed, so a decode column alone gives exactly
 its bits inside a multi-column verify.
+
+## Sliding windows, sinks and soft-caps
+
+Several model families attend over a sliding window on some layers, add a learned
+per-head sink logit to the softmax, or cap logits; the prompt and decode kernels support all three without
+changing its arithmetic elsewhere.
+
+- **Window** (`window > 0`): a query at position `p` sees keys `p - window + 1 .. p`. The
+  block starts at the tile holding its oldest query's first key and never reads earlier
+  keys, so the work follows the window rather than the context.
+- **Ring** (`ring > 0`, contiguous caches): position `j` is row `j % ring`, so a window
+  layer keeps `ring >= window + T - 1` rows instead of the whole context; a launch reads
+  only rows its own writes leave intact.
+- **Sinks** (`sinks[h]`, scaled-score units): `exp(sink)` joins each row's denominator
+  after the last tile and adds no value, as in models that learn an attention sink.
+- **Soft-cap** (`softcap > 0`): `score = softcap * tanh(score / softcap)` after the scale.
+
+**Trees** (`Decode::tree`): column `t` of a verify sees the round's column `j` only when
+bit `j` of `tree[t]` is set (its ancestors and itself, in topological order), for
+speculative token trees; with a window, a column's window is measured from its depth
+(`popcount - 1`), so trees need `window > 64`.
+
+Masked keys contribute exact zeros, so a window, a ring, a tree mask and skipped tiles
+change no bits of the visible keys' contribution: a windowed column decoded alone still
+equals the same column in a verify.
 
 ## Worked example
 
@@ -78,6 +108,13 @@ and 256 against an FP64 softmax over the dequantized cache (at most 1.5e-3 of th
 output magnitude on sm_120) and decode columns bit for bit against multi-column
 calls. In one measured engine (Qwen3.8-27B, RTX 5090) the FP8 cache raised the
 context that fits from about 122K to 244,736 tokens at 0.2% of the quality budget.
+[attention_variants_tests.cu](../../tests/inference/cuda/attention_variants_tests.cu) checks
+windows over a ring (with NaN codes in every row a launch must not read), sinks,
+soft-caps and a tree verify against an FP64 reference for prompt, `prefill_fp8` and
+decode, and windowed columns alone against the verify bit for bit. Both test files
+build for sm_80, sm_86, sm_89 and sm_120; on code built below sm_89 they expect
+`prefill_fp8` to return `cudaErrorNotSupported` (checked by running sm_80 PTX on an
+RTX 5090, where the BF16 paths pass as well).
 `prefill_fp8` passes the same cases within 7.3e-2 of the output magnitude (E4M3
 rounding of queries and probabilities) and, on the RTX 5090 with 4,096 queries
 over 131K keys, runs in 35.7 ms instead of 73.1 ms at head dimension 256 and

@@ -125,13 +125,16 @@ On a GPU the accepted count comes from a device acceptance kernel, for example a
 | --- | --- | --- |
 | Per-column checkpoints | `enqueue_verify(..., checkpoints, nullptr)` writes the state after every column | `enqueue_select_accepted` copies `checkpoints[n - 1]`, or the start state when `n == 0` |
 | Recompute | `enqueue_verify(..., nullptr, work)` keeps one running copy | `enqueue_recompute_accepted` replays the first `n` steps from the start state |
-| Deferred | `enqueue_verify_deferred` applies the previous round's pending prefix from a compact stash, then verifies and overwrites the stash | `enqueue_record_accepted` writes only the count |
+| Deferred | `enqueue_verify_deferred` applies the previous round's pending prefix from a compact stash and consumes the count, then verifies and overwrites the stash | `enqueue_record_accepted` writes only the count |
 
 Checkpoints cost `columns * S` state memory; recompute repeats `n` steps; deferred
 keeps no round-start copy and a stash of `columns * heads * (keys + 1 + values)`
 values, folds the replay into the next verify, and its commit is a scalar write.
 Apply a pending deferred prefix (`columns = 0`) before reading or serializing state
-outside a round. Counts are read through a device pointer and clamped to
+outside a round. Each deferred verify zeroes the pending count after applying it, so
+a flush, a repeated flush or a verified round that is never recorded does not replay
+a prefix twice; rerun `enqueue_record_accepted` only before the next deferred verify.
+Counts are read through a device pointer and clamped to
 `[0, columns]`; keeping round-start and live state separate lets commit rerun with
 a smaller count after a host truncation. One block per head, one thread per value
 column; all three strategies produce bitwise-identical state.
@@ -201,7 +204,8 @@ The [CUDA fixture](../../tests/inference/recurrent_cuda_tests.cpp) under
 count against the FP64 host oracle over 96 geometries within
 `|gpu - ref| <= 2e-5 + 2e-5 * |ref|`, requires bitwise equality between
 checkpoint and recompute, and runs the deferred strategy for 96 rounds (including
-truncation reruns) bit for bit against checkpoints.
+truncation reruns) bit for bit against checkpoints, plus a flush between rounds, a
+repeated flush and an abandoned round bit for bit against recompute.
 [Native fixtures](../../tests/inference/recurrent_recovery_tests.cpp) compare
 every accepted length with a long-double oracle, covering nonsequential paths,
 63/64/65 boundaries, stale commits, sibling failure, cancellation, reentry and

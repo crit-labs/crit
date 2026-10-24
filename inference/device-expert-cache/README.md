@@ -43,7 +43,9 @@ with a 1M-token FP8 KV cache gained about 1,500 and 2,300-2,900 slots next to
 **Lookahead prefetch.** The next group's router applied to the current input predicts
 many of its experts. A prefetch plan tags a pool half (by group parity, so the half
 being filled is never the one consumed) with nonresident predictions and writes
-store-to-pool copies, run on a side stream. Prefetch never changes residency.
+store-to-pool copies, run on a side stream. Pool slots go to the valid, distinct,
+nonresident predictions in prediction order, so a resident prediction takes no slot and
+a list longer than the pool fills it. Prefetch never changes residency.
 
 **Offline policy replay.** Each policy starts empty and applies the same ordered
 groups of bundle keys, pinning every hit before admitting misses in order. If a bundle
@@ -58,9 +60,12 @@ misses, fetch bytes, admissions, bypasses, evictions and the sum of optional
 per-bundle `miss_ms`, which is not elapsed time. Traces can also carry
 `Capacity(bytes)` (shrink is refused rather than evicting pins), `Decay(n, d)`,
 `Pin`/`Release` of resident content, and `Demand(keys, phase, traffic)`. Only decode
-demand promotes recency; prefill reuses hits and bypasses misses unless
-`prefill_populates=True`. Prefetch and draft traffic classes change accounting
-(wasted and unused prefetch bytes), never replacement.
+demand promotes a hit (recency, frequency and the clock bit); prefill reuses hits and
+bypasses misses unless `prefill_populates=True`. Prefetch and draft misses are admitted
+like decode misses, enter at the current recency and can evict resident bundles;
+`protect_decode_groups=n` keeps keys from the last `n` decode groups out of their
+eviction. Whether a prefetch or draft is later used changes only accounting (wasted and
+unused prefetch bytes).
 
 ## What the code supplies
 
@@ -154,7 +159,8 @@ engine: miss sizes, dispatch, copy contention and admission overhead can reverse
 
 [device_expert_cache_tests.cpp](../../tests/inference/device_expert_cache_tests.cpp)
 (under `CRIT_INFERENCE_CUDA`) runs 600 random plans with lookahead prefetch on 24 and
-72 slots against a host replica, checking slots, counters, bundle bytes,
+72 slots against a host replica, checking slots, counters, pool tags, bundle bytes,
+prediction lists longer than the pool, a resident prediction taking no pool slot,
 duplicate-route rejection and invalid launches. The host suite checks
 `ClockDirectory` pinning, victims and pool tags.
 [Measured policy fixtures](../../tests/test_measured_expert_policies.py) compare replay

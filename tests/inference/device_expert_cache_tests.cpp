@@ -64,19 +64,15 @@ struct Replica {
         }
         return out;
     }
+    // pool slots go to nonresident, distinct predictions in order
     int prefetch(int group, const std::vector<int>& pred) {
         auto& t = tags[group & 1];
+        t.assign(pool_slots, -1);
         int n = 0;
-        for(int p = 0; p < pool_slots; ++p) {
-            t[p] = -1;
-            if(p >= static_cast<int>(pred.size())) continue;
-            const int k = group * experts + pred[p];
-            if(key_slot.count(k)) continue;
-            bool repeated = false;
-            for(int q = 0; q < p; ++q) repeated |= t[q] == k;
-            if(repeated) continue;
-            t[p] = k;
-            ++n;
+        for(std::size_t i = 0; i < pred.size() && n < pool_slots; ++i) {
+            const int k = group * experts + pred[i];
+            if(key_slot.count(k) || std::count(t.begin(), t.begin() + n, k)) continue;
+            t[n++] = k;
         }
         return n;
     }
@@ -148,13 +144,15 @@ void run(const int S) {
         while(static_cast<int>(chosen.size()) < k) chosen.insert(popular(rng));
         std::vector<int> ex(chosen.begin(), chosen.end());
         std::shuffle(ex.begin(), ex.end(), rng);
-        if(step % 3 == 0) {  // lookahead for this group: part right, part guessed
+        if(step % 3 == 0) {  // lookahead for this group: part right, part guessed, more than the pool
             std::vector<int> pred(ex.begin(), ex.begin() + std::min<int>(2, k));
-            while(static_cast<int>(pred.size()) < P) pred.push_back(static_cast<int>(rng() % E));
+            while(static_cast<int>(pred.size()) < P + 2) pred.push_back(static_cast<int>(rng() % E));
             put(ids, std::vector<std::int32_t>(pred.begin(), pred.end()));
-            ok(dc::enqueue_prefetch_plan(d, group, ids, P, pf_fills, pf_count, nullptr), "prefetch plan");
+            ok(dc::enqueue_prefetch_plan(d, group, ids, static_cast<int>(pred.size()), pf_fills, pf_count, nullptr), "prefetch plan");
             ok(dc::enqueue_fill(pf_fills, pf_count, P, B, 4, nullptr), "prefetch fill");
             require(get(pf_count, 1)[0] == ref.prefetch(group, pred), "prefetch count");
+            const auto t = get(d.pool_tags + (group & 1) * P, P);
+            require(std::equal(t.begin(), t.end(), ref.tags[group & 1].begin()), "pool tags differ from the replica");
         }
         put(ids, std::vector<std::int32_t>(ex.begin(), ex.end()));
         put(w, std::vector<float>(k, 0.5f));
@@ -181,6 +179,26 @@ void run(const int S) {
     require(c[0] == hits && c[1] == misses && c[2] == pooled, "counters differ from the replica");
     require(pooled > 0 && hits > 0 && misses > 0, "sequence exercised hits, misses and pool use");
     require(get(d.state, 4)[2] == 0, "no failure on valid routes");
+
+    // a resident prediction takes no pool slot: [resident, P nonresident] fills the whole pool
+    {
+        const int group = 1;
+        std::vector<int> pred;
+        for(int e = 0; e < E && pred.empty(); ++e) if(ref.key_slot.count(group * E + e)) pred.push_back(e);
+        for(int e = 0; e < E && static_cast<int>(pred.size()) < P + 1; ++e) if(!ref.key_slot.count(group * E + e)) pred.push_back(e);
+        require(static_cast<int>(pred.size()) == P + 1, "resident and nonresident experts available");
+        put(ids, std::vector<std::int32_t>(pred.begin(), pred.end()));
+        ok(dc::enqueue_prefetch_plan(d, group, ids, P + 1, pf_fills, pf_count, nullptr), "resident-first prefetch plan");
+        ok(dc::enqueue_fill(pf_fills, pf_count, P, B, 4, nullptr), "resident-first prefetch fill");
+        ok(cudaDeviceSynchronize(), "sync");
+        require(get(pf_count, 1)[0] == P && ref.prefetch(group, pred) == P, "every pool slot copied");
+        const auto t = get(d.pool_tags + (group & 1) * P, P);
+        const auto pool = get(d.pool_base + std::size_t(group & 1) * P * B, std::size_t(P) * B);
+        for(int p = 0; p < P; ++p) {
+            require(t[p] == group * E + pred[p + 1], "pool slot holds the next nonresident prediction");
+            for(std::size_t b = 0; b < B; b += 509) require(pool[std::size_t(p) * B + b] == pattern(t[p], b), "pool bytes");
+        }
+    }
 
     // a duplicate route is rejected, not admitted twice
     put(ids, std::vector<std::int32_t>{1, 2, 1});

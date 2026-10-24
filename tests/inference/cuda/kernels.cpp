@@ -1,5 +1,6 @@
 #include "fused_moe.h"
 #include <array>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <numeric>
@@ -85,7 +86,7 @@ void fusion(cudaStream_t stream) {
     Device<std::uint16_t> separate_activation(tokens * middle);
     Device<std::int32_t> di(tokens * top);
     crit::moe::entry_cuda(router.view(), gate.view(), up.view(), dx.read(), tokens, ds.span(), da.span(), stream);
-    crit::moe::route_down_cuda(ds.read(), experts, top, da.read(), middle, dd.read(), outputs, tokens, di.span(), dw.span(), dout.span(), stream);
+    crit::moe::route_down_cuda(ds.read(), experts, top, {}, da.read(), middle, dd.read(), outputs, tokens, di.span(), dw.span(), dout.span(), stream);
     crit::fp8::project_cuda(gate.view(), dx.read(), tokens, separate_gate.span(), stream);
     crit::fp8::project_cuda(up.view(), dx.read(), tokens, separate_up.span(), stream);
     check(unfused_activation(separate_gate.pointer, separate_up.pointer, separate_activation.pointer, tokens * middle, stream));
@@ -117,7 +118,7 @@ void fusion(cudaStream_t stream) {
         near(shared[t * outputs + row], expected);
       }
     }
-    rejects([&] { crit::moe::route_down_cuda(ds.read(), experts, experts + 1, da.read(), middle, dd.read(), outputs, tokens, di.span(), dw.span(), dout.span(), stream); });
+    rejects([&] { crit::moe::route_down_cuda(ds.read(), experts, experts + 1, {}, da.read(), middle, dd.read(), outputs, tokens, di.span(), dw.span(), dout.span(), stream); });
     rejects([&] { crit::moe::entry_cuda(router.view(), gate.view(), up.view(), dx.read(), tokens, ds.span(), {reinterpret_cast<std::uint16_t*>(ds.pointer), tokens * middle}, stream); });
     ++cases;
   }
@@ -125,11 +126,55 @@ void fusion(cudaStream_t stream) {
   Device<float> scores(std::vector<float>(2 * 33, 0.f)), route_weights(2 * 32), shared(2);
   Device<std::int32_t> ids(2 * 32);
   Device<std::uint16_t> a(inputs(2, 5)), down(inputs(1, 6));
-  crit::moe::route_down_cuda(scores.read(), 33, 32, a.read(), 1, down.read(), 1, 2, ids.span(), route_weights.span(), shared.span(), stream);
+  crit::moe::route_down_cuda(scores.read(), 33, 32, {}, a.read(), 1, down.read(), 1, 2, ids.span(), route_weights.span(), shared.span(), stream);
   check(cudaStreamSynchronize(stream));
   const auto selected = ids.download(); const auto probabilities = route_weights.download();
   for (std::size_t i = 0; i < selected.size(); ++i) { require(selected[i] == static_cast<int>(i % 32), "Top-k tie/uniqueness differs"); near(probabilities[i], 1.0 / 32); }
   std::cout << cases << " MoE fusion cases and deterministic tie checks passed\n";
+}
+// Routing variants against expectations the host reference (routing.py) wrote with routing_cases.py.
+void routing(const char* path, cudaStream_t stream) {
+  std::ifstream input(path);
+  std::size_t count = 0; input >> count;
+  require(input && count, "Routing case file is unreadable");
+  for (std::size_t c = 0; c < count; ++c) {
+    int scoring = 0, before = 0, bias = 0, renormalize = 0;
+    crit::moe::Routing rule;
+    std::size_t experts = 0, top = 0, tokens = 0;
+    input >> scoring >> before >> bias >> rule.groups >> rule.selected_groups >> rule.group_score_top >> renormalize >>
+        rule.renormalize_epsilon >> rule.renormalize_floor >> rule.scaling >> experts >> top >> tokens;
+    require(static_cast<bool>(input), "Routing case header is malformed");
+    rule.scoring = scoring ? crit::moe::Scoring::sigmoid : crit::moe::Scoring::softmax;
+    rule.score_before_selection = before; rule.renormalize = renormalize;
+    const auto read = [&](std::size_t n, auto value) { std::vector<decltype(value)> v(n); for (auto& x : v) input >> x; return v; };
+    const auto logits = read(tokens * experts, 0.f);
+    const auto offsets = bias ? read(experts, 0.f) : std::vector<float>{0.f};
+    const auto expected_ids = read(tokens * top, std::int32_t{});
+    const auto expected_weights = read(tokens * top, 0.0);
+    require(static_cast<bool>(input), "Routing case payload is malformed");
+    Device<float> scores(logits), dw(tokens * top), shared(tokens), correction(offsets);
+    if (bias) rule.correction_bias = correction.read();
+    Device<std::int32_t> ids(tokens * top);
+    Device<std::uint16_t> a(inputs(tokens, 5)), down(inputs(1, 6));
+    const auto run = [&](const crit::moe::Routing& value) {
+      crit::moe::route_down_cuda(scores.read(), experts, top, value, a.read(), 1, down.read(), 1, tokens,
+                                 ids.span(), dw.span(), shared.span(), stream);
+    };
+    run(rule);
+    check(cudaStreamSynchronize(stream));
+    const auto got_ids = ids.download(); const auto got_weights = dw.download();
+    for (std::size_t i = 0; i < got_ids.size(); ++i) {
+      require(got_ids[i] == expected_ids[i], ("Routing case " + std::to_string(c) + " selected another expert").c_str());
+      near(got_weights[i], expected_weights[i], 2e-6, 1e-7);
+    }
+    if (!c) {  // invalid descriptions are rejected before launch
+      auto wrong = rule; wrong.groups = 7; rejects([&] { run(wrong); });
+      wrong = rule; wrong.correction_bias = {correction.pointer, 1}; rejects([&] { run(wrong); });
+      wrong = rule; wrong.renormalize = true; rejects([&] { run(wrong); });
+      wrong = rule; wrong.scaling = 0; rejects([&] { run(wrong); });
+    }
+  }
+  std::cout << count << " MoE routing variants matched the host reference\n";
 }
 void graph(cudaStream_t stream) {
   Weights w(weights(9, 129, 14));
@@ -163,7 +208,7 @@ void width_invariance(cudaStream_t stream) {
     Device<float> scores(tokens * experts), rw(tokens * top), shared(tokens * outputs);
     Device<std::int32_t> ids(tokens * top);
     crit::moe::entry_cuda(router.view(), gate.view(), up.view(), dx.read(), tokens, scores.span(), activation.span(), stream);
-    crit::moe::route_down_cuda(scores.read(), experts, top, activation.read(), middle, dd.read(), outputs,
+    crit::moe::route_down_cuda(scores.read(), experts, top, {}, activation.read(), middle, dd.read(), outputs,
                              tokens, ids.span(), rw.span(), shared.span(), stream);
     check(cudaStreamSynchronize(stream));
     return Result{scores.download(), rw.download(), shared.download(), activation.download(), ids.download()};
@@ -241,12 +286,13 @@ void multiple_graphs(cudaStream_t first_stream) {
   }
   std::cout << "Small/large/small captures and independent concurrent graph slots passed\n";
 }
-int main() {
+int main(int argc, char** argv) {
   try {
     cudaDeviceProp device{}; check(cudaGetDeviceProperties(&device, 0));
     require(device.major >= 8, "SM80+ GPU required");
     cudaStream_t stream{}; check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    projections(stream); fusion(stream); graph(stream); width_invariance(stream); multiple_graphs(stream);
+    if (argc == 3 && std::string(argv[1]) == "--routing") routing(argv[2], stream);
+    else { projections(stream); fusion(stream); graph(stream); width_invariance(stream); multiple_graphs(stream); }
     check(cudaStreamDestroy(stream));
     std::cout << "GPU: " << device.name << "; all operator checks passed\n"; return 0;
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

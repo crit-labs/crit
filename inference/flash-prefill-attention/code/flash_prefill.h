@@ -5,6 +5,11 @@
 // the cache holds positions 0 .. pos0 + T - 1, the chunk's own keys included. Head h reads key/value head
 // h / (heads / kv_heads). out[t][h] = sum_j softmax_j(scale * q_t . k_j) v_j, accumulated in FP32 with the
 // probabilities rounded to BF16 for the P V product (the row sums use the same rounded values).
+//
+// Variants several model families use: a sliding window (query position p sees keys p - window + 1 .. p, and keys
+// before the chunk's first window are never read, so a ring of window + T - 1 rows holds a window layer: position j
+// at row j % ring), per-head sink logits joining each row's softmax denominator, and a logit soft-cap
+// (score = softcap * tanh(score / softcap) after the scale).
 #pragma once
 #include <cstddef>
 
@@ -23,6 +28,11 @@ struct Problem {
     int out_stride;
     int T, pos0, heads, kv_heads, head_dim;
     float scale;               // multiplies q . k before the softmax (1 / sqrt(head_dim), or 1 for pre-scaled q)
+    int window = 0;            // > 0: sliding window of `window` keys, the query's own included
+    int ring = 0;              // > 0: position j is row j % ring of k and v (needs window; ring >= window + T - 1)
+    const float* sinks = nullptr;  // [heads] sink logits in scaled-score units; null: none
+    float softcap = 0.f;       // > 0: score = softcap * tanh(score / softcap)
+    bool causal = true;        // false: every query also sees the chunk's later keys (a block drafter's non-causal block)
 };
 
 // Supported head_dim: 64, 128, 256. Rows of q, k and v must be 16-byte aligned (strides multiples of 8).

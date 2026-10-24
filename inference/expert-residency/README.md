@@ -131,10 +131,14 @@ loan while it uses its memory:
 3. When the owner is done (the request ends, the prompt pass finishes), call `begin_return`, settle the
    writers, then `reclaim_loan`. The slots come back EMPTY, never with old contents.
 
-Every transition invalidates `binding()`. A device directory that reads a per-slot valid flag on each replay,
-as [device-expert-cache](../device-expert-cache/README.md) does, mirrors `on_loan(slot)` into it: it clears the flag and settles
-its readers before the owner's first write is enqueued. It sets the flag again only after `reclaim_loan`. The
-owner keeps the memory charged once; the cache gains logical capacity, not memory.
+Every transition invalidates `binding()`. A device directory has to mirror `on_loan(slot)`: it drops the slot's
+key, keeps the slot out of victim selection and settles its readers before the owner's first write is enqueued,
+and makes the slot selectable again only after `reclaim_loan`. [device-expert-cache](../device-expert-cache/README.md)
+does not do this yet. Its clock skips only slots pinned by the current plan, and it addresses slots as one
+contiguous `slots_base` array. An engine that lends memory to it adds a per-slot valid flag that the plan kernel's
+victim search honors (cleared on loan, set after reclaim), clears `key_slot`/`slot_key` for the lent slots, and,
+if the lent memory is not contiguous with the owned slots, a per-slot address table. The owner keeps the memory
+charged once; the cache gains logical capacity, not memory.
 
 ### Bundle publication
 

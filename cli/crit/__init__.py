@@ -1,2 +1,2 @@
 """crit: run records, Kernels, Eval dispatch and the serving API's command line."""
-__version__ = "0.6.1"
+__version__ = "0.7.0"

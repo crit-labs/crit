@@ -3,7 +3,7 @@ project(crit_recurrent_recovery LANGUAGES CXX)
 include(CTest)
 # checkpoint_node comes from Core (crit/state.h): an installed SDK, else this checkout's core/.
 if(NOT TARGET crit::core)
-  find_package(critCore 0.6.1 CONFIG QUIET)
+  find_package(critCore 0.7.0 CONFIG QUIET)
   if(NOT critCore_FOUND)
     add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../../core" "${CMAKE_CURRENT_BINARY_DIR}/core")
   endif()

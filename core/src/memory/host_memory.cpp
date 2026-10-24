@@ -111,15 +111,27 @@ std::optional<std::uint64_t> stat_value(const Values& stat, std::string_view key
     const auto it = stat.find(key);
     return it == stat.end() ? std::optional<std::uint64_t>(0) : it->second;
 }
-// Clean file pages = file - dirty - writeback; malformed entries count nothing as reclaimable.
-std::uint64_t clean_pages(const Values& stat, std::string_view file, std::string_view dirty, std::string_view writeback,
-                          const fs::path& source, Note& notes) {
-    const auto f = stat_value(stat, file), d = stat_value(stat, dirty), w = stat_value(stat, writeback);
-    if(!f || !d || !w) {
+// memory.stat key names per hierarchy; v1 prefers its hierarchical total_ form of each key when listed.
+struct StatKeys { std::string_view cache, dirty, writeback; bool totals; };
+constexpr StatKeys v2_keys{"file", "file_dirty", "file_writeback", false}, v1_keys{"cache", "dirty", "writeback", true};
+std::string stat_key(const Values& stat, std::string_view name, bool totals) {
+    std::string total = "total_" + std::string(name);
+    return totals && stat.count(total) ? total : std::string(name);
+}
+// Clean page cache: the file LRUs (active_file + inactive_file, which exclude tmpfs/shmem pages) when
+// listed, else cache - shmem; minus dirty and writeback. Malformed entries count nothing as reclaimable.
+std::uint64_t clean_pages(const Values& stat, const StatKeys& keys, const fs::path& source, Note& notes) {
+    const auto key = [&](std::string_view name) { return stat_key(stat, name, keys.totals); };
+    const auto active = key("active_file"), inactive = key("inactive_file");
+    const bool lru = stat.count(active) || stat.count(inactive);
+    const auto a = stat_value(stat, lru ? active : key(keys.cache)), b = stat_value(stat, lru ? inactive : key("shmem"));
+    const auto d = stat_value(stat, key(keys.dirty)), w = stat_value(stat, key(keys.writeback));
+    if(!a || !b || !d || !w) {
         notes.push_back(shown(source) + " malformed; no file pages counted as reclaimable");
         return 0;
     }
-    return sub_floor(sub_floor(*f, *d), *w);
+    const auto cache = lru ? add_saturating(*a, *b) : sub_floor(*a, *b);
+    return sub_floor(sub_floor(cache, *d), *w);
 }
 fs::path child(const fs::path& base, std::string_view absolute) {
     while(!absolute.empty() && absolute.front() == '/') absolute.remove_prefix(1);
@@ -136,9 +148,7 @@ std::optional<std::uint64_t> cgroup_v1_headroom(const fs::path& root, const std:
     if(*limit->second >= (std::uint64_t(1) << 62)) { notes.push_back("no cgroup v1 memory limit"); return std::nullopt; }
     const auto used = parse_u64(trim(*usage));
     if(!used) { notes.push_back("cgroup " + shown(base) + " memory.usage_in_bytes malformed"); return std::nullopt; }
-    const bool total = stat.count("total_cache") != 0;
-    const auto clean = clean_pages(stat, total ? "total_cache" : "cache", stat.count("total_dirty") ? "total_dirty" : "dirty",
-                                   stat.count("total_writeback") ? "total_writeback" : "writeback", base / "memory.stat", notes);
+    const auto clean = clean_pages(stat, v1_keys, base / "memory.stat", notes);
     return sub_floor(add_saturating(*limit->second, clean), *used);
 }
 // Tightest headroom over this process's cgroup and its ancestors (v2). When no v2 level is limited
@@ -168,14 +178,21 @@ std::optional<std::uint64_t> cgroup_headroom(const fs::path& root, Note& notes) 
         std::string current = *v2;
         for(;;) {
             const auto base = child(root / "sys/fs/cgroup", current);
-            const auto limit = read_text(base / "memory.max", notes), usage = read_text(base / "memory.current", notes);
-            if(limit && usage && trim(*limit) != "max") {
-                const auto bytes = parse_u64(trim(*limit)), used = parse_u64(trim(*usage));
-                if(!bytes || !used) notes.push_back("cgroup " + shown(base) + " memory.max or memory.current malformed");
+            // The effective limit is min(memory.max, memory.high): past memory.high the kernel throttles and
+            // reclaims, so a level limited only by memory.high is still limited. Unreadable reads as "max".
+            const auto max_file = read_text(base / "memory.max", notes), high_file = read_text(base / "memory.high", notes);
+            const auto usage = read_text(base / "memory.current", notes);
+            const auto max_text = max_file ? trim(*max_file) : "max", high_text = high_file ? trim(*high_file) : "max";
+            if(usage && (max_text != "max" || high_text != "max")) {
+                const auto max_bytes = max_text == "max" ? std::optional<std::uint64_t>(u64_max) : parse_u64(max_text);
+                const auto high_bytes = high_text == "max" ? std::optional<std::uint64_t>(u64_max) : parse_u64(high_text);
+                const auto used = parse_u64(trim(*usage));
+                if(!max_bytes || !high_bytes || !used)
+                    notes.push_back("cgroup " + shown(base) + " memory.max, memory.high or memory.current malformed");
                 else {
                     const auto stat = parse_stat(read_text(base / "memory.stat", notes).value_or(""));
-                    const auto clean = clean_pages(stat, "file", "file_dirty", "file_writeback", base / "memory.stat", notes);
-                    const auto headroom = sub_floor(add_saturating(*bytes, clean), *used);
+                    const auto clean = clean_pages(stat, v2_keys, base / "memory.stat", notes);
+                    const auto headroom = sub_floor(add_saturating(std::min(*max_bytes, *high_bytes), clean), *used);
                     best = best ? std::min(*best, headroom) : headroom;
                 }
             }

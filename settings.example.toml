@@ -1,0 +1,22 @@
+# Machine settings for crit run and crit eval. Copy this file to settings.toml (untracked) and edit it there;
+# docs/RUN_RECORDS.md describes every key. Values shown are the defaults; commented keys have none.
+
+# Folder for work that must run under WSL (an absolute path inside the distribution); unset: none.
+# wsl_run_root = "/srv/crit/runs"
+
+# A crit eval probe result (relative: from this folder); run create sizes the context on it.
+# device = "device.json"
+
+# Host memory left free at the engine's peak, in GiB.
+ram_headroom_gib = 2
+
+# Device memory left free at the engine's peak, in GiB.
+vram_headroom_gib = 1
+
+# Device memory kept out of the KV cache when Eval computes the max context, in GiB: activations,
+# workspaces, graphs and speed techniques. A larger reserve trades context for that room.
+context_reserve_gib = 3
+
+# The context wanted: the longest request, prompt plus output, engines are built for. The model's
+# positions and the device's free memory may allow less; the run record says which bound applied.
+context_tokens = 262144

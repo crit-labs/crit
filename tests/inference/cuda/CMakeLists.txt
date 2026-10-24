@@ -8,6 +8,15 @@ target_compile_features(crit_inference_cuda_tests PRIVATE cxx_std_20 cuda_std_20
 target_link_libraries(crit_inference_cuda_tests PRIVATE crit_fused_moe)
 add_test(NAME crit_inference_cuda_arithmetic COMMAND crit_inference_cuda_tests)
 set_tests_properties(crit_inference_cuda_arithmetic PROPERTIES TIMEOUT 120)
+# Routing variants compare with the host reference; routing_cases.py writes its expectations.
+find_package(Python3 3.11 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME crit_moe_routing_cases COMMAND Python3::Interpreter -B "${CMAKE_CURRENT_SOURCE_DIR}/routing_cases.py"
+           "${CMAKE_CURRENT_BINARY_DIR}/routing_cases.txt")
+  set_tests_properties(crit_moe_routing_cases PROPERTIES FIXTURES_SETUP crit_moe_routing_cases)
+  add_test(NAME crit_moe_routing COMMAND crit_inference_cuda_tests --routing "${CMAKE_CURRENT_BINARY_DIR}/routing_cases.txt")
+  set_tests_properties(crit_moe_routing PROPERTIES FIXTURES_REQUIRED crit_moe_routing_cases TIMEOUT 120)
+endif()
 set(CRIT_RMSNORM_EXAMPLE ON CACHE BOOL "Build RMSNorm borrowed-view example" FORCE)
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../../inference/rmsnorm-bf16/code" "${CMAKE_CURRENT_BINARY_DIR}/rmsnorm")
 add_test(NAME crit_rmsnorm_bf16 COMMAND crit_rmsnorm_example)
@@ -34,3 +43,12 @@ target_include_directories(crit_fp8_kv_attention_tests PRIVATE ../../../inferenc
 target_compile_features(crit_fp8_kv_attention_tests PRIVATE cxx_std_20 cuda_std_20)
 add_test(NAME crit_fp8_kv_attention COMMAND crit_fp8_kv_attention_tests)
 set_tests_properties(crit_fp8_kv_attention PROPERTIES TIMEOUT 300)
+add_executable(crit_attention_variants_tests attention_variants_tests.cu
+  ../../../inference/flash-prefill-attention/code/flash_prefill.cu
+  ../../../inference/fp8-kv-attention/code/fp8_kv_attention.cu
+  ../../../inference/paged-attention/code/paged_attention.cu)
+target_include_directories(crit_attention_variants_tests PRIVATE ../../../inference/flash-prefill-attention/code
+  ../../../inference/fp8-kv-attention/code ../../../inference/paged-attention/code)
+target_compile_features(crit_attention_variants_tests PRIVATE cxx_std_20 cuda_std_20)
+add_test(NAME crit_attention_variants COMMAND crit_attention_variants_tests)
+set_tests_properties(crit_attention_variants PROPERTIES TIMEOUT 600)

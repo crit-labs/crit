@@ -128,6 +128,7 @@ class MoeConfig:
     norm_topk_prob: bool | None = None
     routed_scaling_factor: float | None = None
     scoring_func: str = ""
+    topk_method: str = ""
 
 
 @dataclass(frozen=True)
@@ -748,7 +749,8 @@ def _moe(section, source):
                      mlp_only_layers=_integers(section, "mlp_only_layers", source),
                      norm_topk_prob=_boolean(section, "norm_topk_prob", source),
                      routed_scaling_factor=_real(section, "routed_scaling_factor", source),
-                     scoring_func=_string(section, "scoring_func", source) or "")
+                     scoring_func=_string(section, "scoring_func", source) or "",
+                     topk_method=_string(section, "topk_method", source) or "")
 
 
 def _mla(section, source):

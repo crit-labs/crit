@@ -1,0 +1,95 @@
+{
+  "id": "draft-trees",
+  "category": "speculation",
+  "summary": "Token trees for speculative decoding: EAGLE-2-style dynamic draft trees, ancestor-only verify masks, a device walk accepting the path the target agrees with (greedy or sampled), and compaction of the accepted rows",
+  "implementation_status": "native_source",
+  "implementation_scope": "Python reference of candidate expansion, beam and kept-node selection, tree construction, the walk and compaction; CUDA reference kernels for top-branch expansion with log-softmax scores in a fixed candidate order, selection by score with index tie-break, tree build (tokens, parents, masks, depths, padding nodes), the tree walk with device-speculative-round's control and packed-result contract (run through RoundSteps::accept), and in-order row compaction with an idempotent settle. Verify masks are paged-attention / fp8-kv-attention Decode::tree; sampled predictions are token-sampling's Rows::tree. The drafter and target arithmetic are engine supplied.",
+  "agent_guidance": {
+    "use_when": "A device chain round is correct, attention-only target state, batch-1 verify of a few dozen columns costs about one step, and the drafter's second or third choice is often right where its first is wrong",
+    "avoid_when": "The target has recurrent layers (state per node is not implemented), verify is compute bound (large batches), drafts are sampled from the drafter's law (multi-draft rejection sampling is not implemented), or measured extra verify columns cost more than the extra accepted tokens",
+    "provides": [
+      "EAGLE-2 candidate expansion and selection with deterministic ordering and ancestor-closed kept sets",
+      "Tree build: node tokens in topological order, parents, root-to-node masks, depths and unmatchable padding nodes",
+      "Device tree walk writing device-speculative-round's control block and packed result, so truncation and the single readback work unchanged",
+      "Greedy and sampled acceptance with one walk: argmax predictions, or the target's own draws at each node's depth",
+      "In-order compaction of accepted rows for contiguous and slot-mapped caches, idempotent after a Core truncation",
+      "A Python reference of every rule and a chain constructor equal to greedy speculation"
+    ],
+    "engine_supplies": [
+      "The drafter's forward over the beam with its own tree attention",
+      "The target's verify over all nodes with Decode::tree masks and RoPE positions frontier + depth",
+      "Predictions per node: argmax, or token-sampling's enqueue_sample with Rows::tree",
+      "The RowArray table of every attention array to compact, with Core's Round::kv slots for paged caches",
+      "Reservations: N KV slots per round, candidates and the mask and path buffers"
+    ],
+    "preserve": [
+      "Parents before children and masks equal to root-to-node paths",
+      "Predictions conditioned on exactly the node's path, at RoPE position frontier + depth",
+      "The walk: follow the child equal to the prediction, else emit the prediction; stop after an accepted stop or at the allowance",
+      "Compaction in increasing position and an identity path after commit"
+    ],
+    "adapt": [
+      "branch, beam, depth and N, chosen with measured verify cost on mixed text",
+      "Static tree shapes instead of dynamic selection",
+      "Fusing selection into the drafter's head, and per-round widths with one graph each"
+    ]
+  },
+  "path": "inference/draft-trees/README.md",
+  "code_path": "inference/draft-trees/code",
+  "code_files": [
+    {"path": "inference/draft-trees/code/tree.py", "purpose": "Host reference: expansion, EAGLE-2 drafting, tree build, chains, the walk and compaction"},
+    {"path": "inference/draft-trees/code/draft_tree.h", "purpose": "Candidate, build and row-array layouts; expand, select, build, tree-accept, compact and settle launch interfaces"},
+    {"path": "inference/draft-trees/code/draft_tree.cu", "purpose": "Reference CUDA kernels for expansion, selection, tree build, the tree walk, compaction and settle"}
+  ],
+  "requires": {
+    "hardware": "CUDA C++20 (sm_80+ reference kernels) and device-speculative-round's greedy_accept.h; Python 3.11+ standard library for the reference",
+    "model": "Attention-only target state (no recurrent layers), a drafter that can score several paths per step, shared token ids",
+    "workload": "Single-request (or small-batch) speculative decoding where verify columns are cheap"
+  },
+  "contract": {
+    "input": "Draft logits per frontier entry, candidate buffers, kept candidates, root tokens; per round node tokens, parents, per-node predictions, the device control block, device stops and the RowArray table",
+    "output": "Candidates, beams, kept nodes, node tokens, parents, masks and depths; the packed result, control fields and accepted path; compacted rows and an identity path",
+    "ownership": "The engine owns every buffer; kernels borrow them on the caller's stream. Under device-speculative-round the controller owns control, drafts, predictions and result, the engine the tree buffers",
+    "failure": "Null buffers, more than 64 nodes, branch above 16 and too many rows are rejected at launch; out-of-vocabulary predictions surface at the round's token validation",
+    "core_boundary": "Core's StateCache reserves N rows per round (max_round_rows) and supplies Round::kv slots; Session.commit's accepted count reaches the walk's control through device-speculative-round's truncation"
+  },
+  "dependencies": [
+    "CUDA runtime",
+    "device-speculative-round (greedy_accept.h: control block and AcceptRows)",
+    "Python standard library"
+  ],
+  "symbols": [
+    "Candidates",
+    "Build",
+    "RowArray",
+    "enqueue_expand",
+    "enqueue_select",
+    "enqueue_build",
+    "enqueue_tree_accept",
+    "enqueue_compact",
+    "enqueue_settle",
+    "Candidate",
+    "Tree",
+    "expand",
+    "draft",
+    "build",
+    "chain",
+    "accept",
+    "compaction"
+  ],
+  "interactions": [
+    "device-speculative-round",
+    "token-sampling",
+    "paged-attention",
+    "fp8-kv-attention",
+    "mtp-decode"
+  ],
+  "techniques": [
+    "draft-trees"
+  ],
+  "validation": {
+    "host": "Ancestor-closed kept sets, path masks and depths over 30 random drafters and tree sizes; emitted tokens always the target's predictions along a parent path with compaction keeping exactly the materialized nodes; chains walking as greedy speculation with budgets and stops",
+    "native": "Beams, kept nodes and built trees (tokens, parents, masks, depths) equal a host mirror on a synthetic drafter, padding nodes unmatchable; the walk's tokens, path and control fields on 200 random trees with budgets and stops, and chains equal to the greedy accept kernel; compaction of contiguous and slot-mapped rows and a no-op rerun after a smaller count",
+    "performance": "No speed claim; tree width must be measured against verify cost per engine"
+  }
+}

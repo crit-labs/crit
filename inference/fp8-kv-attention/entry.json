@@ -3,11 +3,12 @@
   "category": "attention",
   "summary": "An FP8 E4M3 KV cache with one scale per position and key/value head, read by flash-style prompt attention and by decode attention whose launch and work do not depend on the cache's capacity",
   "implementation_status": "native_source",
-  "implementation_scope": "CUDA source for head dimensions 64, 128 and 256: a write kernel quantizing chunk rows per head vector; causal prompt attention with 128-query blocks, register prefetch of the next FP8 tile, BF16 dequantization into a swizzled shared stage, BF16 tensor cores and an online softmax; an opt-in prompt attention on E4M3 tensor cores (E4M3 queries, cache codes as stored, value scales folded into E4M3 probabilities, 64-key cp.async tiles); decode attention over a fixed grid of blocks per key/value head merging strided 128-key pieces, with a fixed-order combine, device-side positions for graph capture and column invariance; a host model of the encoding. Paged caches, projections and rotary embedding are engine supplied.",
+  "implementation_scope": "CUDA source for head dimensions 64, 128 and 256: a write kernel quantizing chunk rows per head vector; causal prompt attention with 128-query blocks, register prefetch of the next FP8 tile, BF16 dequantization into a swizzled shared stage, BF16 tensor cores and an online softmax; an opt-in prompt attention on E4M3 tensor cores (E4M3 queries, cache codes as stored, value scales folded into E4M3 probabilities, 64-key cp.async tiles); decode attention over a fixed grid of blocks per key/value head merging strided 128-key pieces, with a fixed-order combine, device-side positions for graph capture and column invariance; a host model of the encoding. Paged caches, projections and rotary embedding are engine supplied. Sliding windows (ring-buffer rows for window layers), per-head sinks, soft-caps and decode tree masks are launch parameters; windowed decode keeps column invariance.",
   "agent_guidance": {
     "use_when": "The KV cache limits the context that fits on the device, decode at long context is bound by cache reads, or the engine must serve a required context without becoming slower for short requests",
     "avoid_when": "The cache is small next to the weights at the target context, the cache is paged or shared across requests without adapted loads, or the model needs finer than per-head-vector scales",
     "provides": [
+      "Sliding windows over a linear or ring-buffer FP8 cache that never read keys before the oldest query's window, per-head sinks, soft-caps and tree masks for speculative token-tree verification",
       "E4M3 codes with one FP32 scale per position and key/value head (max |x| / 448), written per chunk",
       "Register prefetch of the next FP8 tile and BF16 dequantization into one swizzled shared K / V stage",
       "Causal grouped-query prompt attention with 128 queries per block, tile skipping after a warp's last query and heaviest tiles first",
@@ -42,7 +43,7 @@
     {"path": "inference/fp8-kv-attention/code/reference.py", "purpose": "Host E4M3 encoding with per-head scales and the dequantized values the kernels read"}
   ],
   "requires": {
-    "hardware": "CUDA C++17+ on sm_89+ (E4M3 conversions, BF16 mma.sync, ldmatrix, cp.async); Python 3.11+ standard library for the reference",
+    "hardware": "CUDA C++17+ on sm_80+ (BF16 mma.sync, ldmatrix, cp.async; E4M3 conversions native from sm_89 and emulated before); prefill_fp8 needs E4M3 mma.sync (sm_89+); builds checked for sm_80, sm_86, sm_89 and sm_120, runtime validation on sm_120 (also from sm_80 PTX); Python 3.11+ standard library for the reference",
     "model": "Softmax attention with grouped-query (or multi-head) key/value heads, head dimension 64, 128 or 256",
     "workload": "Long contexts and single-request decode or speculative verify with up to 64 rows (columns times query heads per key/value head)"
   },
@@ -50,7 +51,7 @@
     "input": "BF16 key and value rows for write; BF16 queries [T][q_stride], the cache, T, the position (host or device), head counts and score scale for attention",
     "output": "FP8 codes and FP32 scales in the cache; FP32 attention output [T][out_stride] per query head",
     "ownership": "The engine owns queries, cache, scratch and output; launches borrow them on the caller stream",
-    "failure": "Null buffers, non-positive sizes, heads not a multiple of key/value heads, unaligned or short strides, unsupported head dimensions, more than 64 decode rows or a block count outside 1..1024 return cudaErrorInvalidValue; launch errors are returned",
+    "failure": "Null buffers, non-positive sizes, heads not a multiple of key/value heads, unaligned or short strides, unsupported head dimensions, more than 64 decode rows or a block count outside 1..1024 return cudaErrorInvalidValue; prefill_fp8 returns cudaErrorNotSupported without launching when the code loaded for the device lacks E4M3 mma (built for a target below sm_89); launch errors are returned",
     "core_boundary": "No Core change; the kernels run inside the engine's forward passes"
   },
   "dependencies": [
@@ -73,7 +74,7 @@
   ],
   "validation": {
     "host": "E4M3 codes round-trip, saturate at 448 and dequantize within E4M3 precision; all-zero vectors take scale 1",
-    "native": "Head dimensions 64/128/256, grouped and ungrouped heads, later chunks and multi-piece decode against FP64 softmax over the dequantized cache: at most 1.5e-3 of the output magnitude on sm_120; each decode column alone bit for bit equal to the multi-column result; prefill_fp8 on the same cases within 7.3e-2 of the output magnitude (E4M3 queries and probabilities)",
+    "native": "Head dimensions 64/128/256, grouped and ungrouped heads, later chunks and multi-piece decode against FP64 softmax over the dequantized cache: at most 1.5e-3 of the output magnitude on sm_120; each decode column alone bit for bit equal to the multi-column result; prefill_fp8 on the same cases within 7.3e-2 of the output magnitude (E4M3 queries and probabilities); windows over a ring with NaN codes in unread rows, sinks, soft-caps and a tree verify for prompt, prefill_fp8 and decode against an FP64 reference, and windowed columns alone bit for bit equal to the verify (attention_variants_tests.cu)",
     "performance": "One measured engine (head dimension 256, 24 query and 4 key/value heads, RTX 5090): the context that fits rose from about 122K to 244,736 tokens, and an engine opened at a quarter of that capacity ran within 1% of the full one. prefill_fp8 vs prefill on that GPU, 4,096 queries: 73.1 -> 35.7 ms over 131K keys at head dimension 256 (24/4 heads), 54.9 -> 29.7 ms at 128 (32/4 heads); in that engine (Qwen3.8-27B) prefill quality went from 16.7% to 18.8% of the drift budget and long-context first token from 18.5 s to 15.9 s (geometric mean); no claim for other shapes"
   }
 }

@@ -32,9 +32,19 @@ model's `generation_config.json` or the protocol default; only the user override
 with `eval_sampling` at `create` (and `crit eval prepare --sampling` with the same
 settings), and the served default then follows the override. Finish recon.md's drafting
 plan for both decode modes before the first candidate. `--force` gathers again and keeps
-`recon.md`.
+`recon.md`. `recon.json` also carries the checkpoint's fingerprint (architecture, weight layout,
+tokenizer and template, each hashed), which every candidate records; `recon --compare OTHER_MODEL`
+compares the run's model with another checkpoint and says which sections differ and what that
+means for the engine (an equal fingerprint: weight values only, so the engine loads it unchanged).
 `candidate_budget` counts complete candidates; there is no time budget, only a 30-day
 safety window.
+
+To improve, port or adapt an engine that crit-hub already lists, pass its folder in a crit-hub
+checkout to `create --from-engine ENGINE_DIR` ([origin engine](RUN_RECORDS.md#origin-engine)). The
+run records the engine, its source pin and the checkpoint it was measured on, keeps its published Eval
+results under `captured/origin/`, and `resolve` says whether the run's model is that checkpoint. Check
+the source out at the pinned commit and make it the first candidate, with `"lineage": "origin-engine"`
+in the proposal, measured before any change: that is the baseline every later Eval compares against.
 
 Every candidate serves Eval's [max context](eval/CONTEXT.md): the context the user wants
 (`context_tokens` in `settings.toml`, default 262,144), capped by the model's positions and
@@ -63,7 +73,7 @@ These values are a template, not acceptance criteria; use `cases` for multiple w
 `model_path` is the model as the user has it: a Hugging Face model folder, or a GGUF file (or a
 folder holding one), whose config, tokenizer and chat template crit derives from its metadata
 ([GGUF models](eval/README.md#gguf-models)).
-Free-memory headroom comes from `settings.toml` (`vram_headroom_gib`,
+Free-memory headroom comes from `settings.toml` (copy `settings.example.toml`; `vram_headroom_gib`,
 `ram_headroom_gib`; defaults 1 and 2 GiB), and `create` freezes it. A value in the
 request replaces the machine's setting, so add one only when the user asks for it.
 

@@ -76,6 +76,12 @@ The stored tensors, the decode GEMV over the tiles, fusion, scratch buffers and 
 parameters. Repack each matrix once at load; the tiles replace the row-major copy. FP8 row scales stay
 as they are; NVFP4 scales move into scale tiles. Size scratch from `Plan` for the largest
 prompt chunk: `activation_bytes`, `token_scale_count` floats (FP8) and `partial_floats`.
+A plan serves launches of its own format, `N` and `K` with 1 to its `T` tokens; a launch
+with more tokens, another `N` or `K`, or the other format's plan returns
+`cudaErrorInvalidValue` instead of writing past the scratch. Left at its default
+(`min_blocks = 0`), `plan` splits K until the grid holds two blocks per SM of the current
+device; `wide_tokens = 256` was measured on one sm_120 device and is the engine's to
+measure. The split sets the accumulation order, so results can differ between devices.
 Calls are asynchronous and borrow every buffer until the stream reaches them; `add`
 fuses a residual add. `N` must be a multiple of 128 (256
 with two row tiles per warp) and `K` of 32 (FP8) or 64 (NVFP4); other shapes return
@@ -123,7 +129,8 @@ in any W8A8 / W4A4 scheme.
 [layout.py](code/layout.py) checks permutation, exchange and activation order with exact
 arithmetic. The [CUDA test](../../tests/inference/cuda/stored_tile_tests.cu) compares both
 GEMMs with an FP64 reference using the same activation quantization for 1 to 300 tokens,
-with and without the split, one or two row tiles per warp and `add`; largest relative
+with and without the split, one or two row tiles per warp, `add` and fewer tokens than
+the plan's, and checks that a plan mismatch is refused; largest relative
 error was 1.5e-7 (FP8) and 6e-8 (NVFP4) on an sm_120 device.
 [fragment_probe.cu](code/fragment_probe.cu) checks the layout on the device. No speed
 claim is made for other devices or shapes.

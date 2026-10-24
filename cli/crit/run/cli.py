@@ -65,11 +65,18 @@ def main(argv=None):
         sub.add_argument("--record", type=Path, required=True)
         if name in {"check", "benchmark"}:
             sub.add_argument("--candidate", required=True)
+    subs.choices["create"].add_argument("--from-engine", type=Path, metavar="ENGINE_DIR",
+                                        help="Start from a crit-hub engine: its engines/<owner>/<name>/ folder (card.yaml, "
+                                             "card.lock.json, evidence/) is recorded as the run's origin_engine")
     sub = subs.add_parser("candidate")
     sub.add_argument("--source", type=Path, required=True)
     sub.add_argument("--record", type=Path, required=True, help="label, rationale, strategy, configuration, store_decisions, parent/origin IDs")
     sub = subs.add_parser("recon", help="Gather the model's sampling, stop tokens, chat template and config into work/recon.json")
     sub.add_argument("--force", action="store_true", help="Gather again over an existing work/recon.json")
+    sub.add_argument("--drafter", type=Path, action="append", metavar="PATH", help="A companion drafter to record "
+                     "(EAGLE-3, DFlash, DSpark or crit models drafter output); repeatable")
+    sub.add_argument("--compare", type=Path, metavar="MODEL", help="Instead: compare the run's model fingerprint with "
+                     "another checkpoint's (architecture, weight layout, tokenizer, template) and print what differs")
     sub = subs.add_parser("package")
     sub.add_argument("--candidate", required=True)
     sub.add_argument("--source", type=Path, required=True)
@@ -108,6 +115,14 @@ def main(argv=None):
     sub.add_argument("--quality-budget", metavar="JSON", help="Amend the drift budget: any of ppl_ratio_max, kld_mean_max, kld_p99_max")
     sub.add_argument("--exactness", choices=["reported", "required"], help="Amend the speculative exactness mode")
     sub.add_argument("--approved-by", help="Who approved the amendment (required with --quality-budget or --exactness)")
+    sub = subs.add_parser("cost", help="Account the run's build cost from the agent's transcripts: wall time, tokens and "
+                                       "API price per candidate, written to cost.json")
+    sub.add_argument("--transcript", type=Path, action="append", required=True, metavar="PATH",
+                     help="A Claude Code session, Codex rollout or plain usage JSONL (repeatable)")
+    sub.add_argument("--agent", help="The agent and model that built the run, as the record names it")
+    sub.add_argument("--prices", help="JSON object or file of {model: {input, cache_read, cache_write_5m, cache_write_1h, "
+                                      "output}} in USD per million tokens, over the list prices")
+    sub.add_argument("--until", help="Count requests up to this UTC timestamp (default: the run's stop, else now)")
     subs.add_parser("show")
     subs.add_parser("recover", help="Explicit dead-owner lease recovery and projection rebuild; never resets attempts/deadlines")
     args = parser.parse_args(argv)
@@ -130,13 +145,15 @@ def main(argv=None):
                     device = Path(settings["device"]).expanduser()
                     filled["device"] = str(device if device.is_absolute() else args.project / device)
                 payload = {**filled, **payload}
-            result = store.create(payload)
+            result = store.create(payload, args.from_engine)
         elif args.action == "resolve":
             result = store.freeze_inputs(args.id, payload)
         elif args.action == "candidate":
             result = store.candidate(args.id, args.source, payload)
+        elif args.action == "recon" and args.compare:
+            result = store.recon_compare(args.id, args.compare)
         elif args.action == "recon":
-            result = store.recon(args.id, args.force)
+            result = store.recon(args.id, args.force, args.drafter or ())
         elif args.action == "package":
             result = store.package(args.id, args.candidate, args.source, payload)
         elif args.action in {"check", "benchmark"}:
@@ -172,6 +189,8 @@ def main(argv=None):
                                   amend or None)
         elif args.action == "stop":
             result = store.stop(args.id, **payload)
+        elif args.action == "cost":
+            result = store.cost(args.id, args.transcript, args.agent, args.prices, args.until)
         elif args.action == "recover":
             result = store.recover(args.id)
         else:

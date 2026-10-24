@@ -1,13 +1,14 @@
 {
   "id": "device-speculative-round",
   "category": "speculation",
-  "summary": "GPU-resident greedy speculative round: draft, verify, device accept and frontier advance in two CUDA graphs with one readback",
+  "summary": "GPU-resident speculative round: draft, verify, device accept and frontier advance in two CUDA graphs with one readback, for greedy requests and for sampled requests verified by rejection sampling",
   "implementation_status": "native_source",
-  "implementation_scope": "CUDA reference greedy-accept and truncation kernels, a single-row C++20 round controller over Core CudaBackend with Forward/Finish graph capture, one readback_async per round and stage timing, a C++/Python round/step budget, and a composed toy (synthetic attention plus gated-delta target, bigram drafter) through a real Core Engine. Engine draft, verify and state steps are supplied callables; no tuned or model-specific kernels.",
+  "implementation_scope": "CUDA reference greedy-accept and truncation kernels, a single-row C++20 round controller over Core CudaBackend with Forward/Finish graph capture, one readback_async per round and stage timing, a C++/Python round/step budget, and a composed toy (synthetic attention plus gated-delta target, bigram drafter) through a real Core Engine. Sampled requests reuse the accept kernel on predictions from token-sampling's enqueue_verify (the target's own draws for greedy drafts, rejection sampling for sampled drafts, Core's counter-based draws), with a sampled-round fixture through both kernels. Engine draft, verify and state steps are supplied callables; no tuned or model-specific kernels.",
   "agent_guidance": {
-    "use_when": "A synchronous speculative loop is correct but host round trips, per-token readbacks or host acceptance dominate the round",
-    "avoid_when": "Verifying K+1 columns costs about K+1 ordinary steps, the engine cannot keep per-column state for prefix selection, or sampled acceptance is required; or routed experts stream from host memory, where every verify column adds its own expert misses",
+    "use_when": "A synchronous speculative loop is correct but host round trips, per-token readbacks or host acceptance dominate the round, for greedy or sampled requests",
+    "avoid_when": "Verifying K+1 columns costs about K+1 ordinary steps, or the engine cannot keep per-column state for prefix selection; or routed experts stream from host memory, where every verify column adds its own expert misses",
     "provides": [
+      "Sampled rounds: the same accept kernel on rejection-sampling predictions from token-sampling, with the history commit as the first Forward kernel",
       "Device greedy acceptance matching GreedySpeculator: prefix match, correction or bonus, allowance bound and stop handling",
       "Device-resident control block with frontier advance by n_emitted and pending-token update, without host writes during decoding",
       "Device truncation for a smaller Core-accepted count, rerunning engine state selection",
@@ -24,7 +25,7 @@
       "Ordinary-step timing baseline and the decision to keep speculation from measured round cost"
     ],
     "preserve": [
-      "Acceptance stays on the device and uses the greedy prefix/correction/stop rule",
+      "Acceptance stays on the device and uses the greedy prefix/correction/stop rule over argmax (greedy) or rejection-sampling (sampled) predictions",
       "One device-to-host copy per round and no host fence inside launch",
       "Frontier advances by n_emitted and the accepted state is verify column n_emitted minus one",
       "A Core truncation is applied to device state before the next round",
@@ -90,6 +91,7 @@
     "width_split_dot"
   ],
   "interactions": [
+    "token-sampling",
     "mtp-decode",
     "recurrent-state-recovery",
     "attention-state"
@@ -102,7 +104,7 @@
   ],
   "validation": {
     "host": "Python and C++ RoundBudget ratio, speedup and threshold checks; fixed-width drafter catch-up equal to exact variable-width ingestion over 120 randomized rounds (draft widths 1, 3, 5); column-invariance check: a fixed summation order passes and a width-dependent split is detected",
-    "native": "CUDA accept kernel against host GreedySpeculator on 4000 randomized rows (K 1..4, all-match, first mismatch, stop, output budget, zero budget) with frontier and truncation checks; synthetic hash-chain target for graph replay versus eager, ordinary-greedy equality for K 0..4, truncated continuation and one device-to-host copy per round counted at the CUDA API; composed toy through Core Engine matching ordinary greedy output for two prompts, graph and eager mode and K 0, one readback and one Forward/Finish trace event pair per round, and request-stop truncation; per-request device stop replacement and abandon() of a launched round left uncommitted by cancellation",
+    "native": "CUDA accept kernel against host GreedySpeculator on 4000 randomized rows (K 1..4, all-match, first mismatch, stop, output budget, zero budget) with frontier and truncation checks; synthetic hash-chain target for graph replay versus eager, ordinary-greedy equality for K 0..4, truncated continuation and one device-to-host copy per round counted at the CUDA API; composed toy through Core Engine matching ordinary greedy output for two prompts, graph and eager mode and K 0, one readback and one Forward/Finish trace event pair per round, and request-stop truncation; per-request device stop replacement and abandon() of a launched round left uncommitted by cancellation; sampled rounds: verify predictions through the accept and commit kernels equal a host round over Core's laws and draws (the target's draw per column, drafts kept while they match), K 0 equals one ordinary draw, and positions and counts follow the emitted and truncated counts",
     "performance": "No speed claim; the reference kernels are not tuned and RoundBudget measures each engine's own round. The toy prints its round/step ratio, which typically fails 1.3 because its attention reference processes verify columns serially"
   }
 }

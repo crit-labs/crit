@@ -22,7 +22,12 @@ as zero:
 | --- | --- |
 | Physical available | Linux `MemAvailable` (already counts reclaimable cache); Windows available physical memory |
 | Commit headroom | Windows `ullAvailPageFile`; Linux `CommitLimit - Committed_AS` only with `vm.overcommit_memory = 2`, otherwise unknown |
-| cgroup headroom (Linux) | Tightest level over the process's cgroup and ancestors: v2 `memory.max - memory.current + clean`, with `clean = file - file_dirty - file_writeback`; v1 `hierarchical_memory_limit` with the same rule, also used on hybrid hosts with no limited v2 level |
+| cgroup headroom (Linux) | Tightest level over the process's cgroup and ancestors: v2 `min(memory.max, memory.high) - memory.current + clean`, with `clean = active_file + inactive_file - file_dirty - file_writeback` (`file - shmem` when the file LRUs are not listed); v1 `hierarchical_memory_limit` with the same rule over `cache`, `dirty` and `writeback`, each in its `total_` form when listed, also used on hybrid hosts with no limited v2 level |
+
+tmpfs and shared memory (`shmem`) are part of `file` and `cache` but are swap-backed, so
+they are never counted as reclaimable. A level limited only by `memory.high` is limited:
+past it the kernel throttles and reclaims the cgroup. A malformed counter counts nothing
+as reclaimable and a malformed limit skips that level, each with a note.
 
 Admission compares `request + reserve` with the tightest known observation and names it.
 The reserve is the engine's room for the OS, other processes and unaccounted growth
@@ -104,8 +109,8 @@ assert not admit_working_set(anonymous_bytes=20, pinned_bytes=90, file_bytes=0,
 
 ## Adapting it
 
-Preserve: unknowns stay unknown with a reason; only clean file pages are reclaimable in
-cgroup headroom; commit headroom only where the OS enforces commit; admission against
+Preserve: unknowns stay unknown with a reason; only clean page cache (never shmem) is
+reclaimable in cgroup headroom; commit headroom only where the OS enforces commit; admission against
 the tightest known observation with an explicit reserve. Free: the reserve policy,
 accepting unknowns, extra sources (Windows job objects, container runtimes, swap policy)
 and how denials shrink the plan.
@@ -117,8 +122,8 @@ take memory before the allocation, swapping pressure is not visible as a limit, 
 unlimited nested cgroups or hidden `/sys/fs/cgroup` report cgroup headroom as unknown.
 
 [Python fixtures](../../tests/test_techniques.py) build synthetic trees covering enforced
-and unenforced commit, v2 ancestors with dirty and writeback pages, v1 limits, missing
-files, exact-fit admission and the unknown policy, and run a live observation on the
+and unenforced commit, v2 ancestors with dirty, writeback and shmem pages, `memory.high`,
+v1 limits, malformed counters and limits, missing files, exact-fit admission and the unknown policy, and run a live observation on the
 build host. Core's [files and memory fixture](../../tests/core/io_tests.cpp) covers the
 native path, and the [measured policy fixtures](../../tests/test_measured_expert_policies.py)
 cover distinct binding limits and peak working-set accounting. None prove an admitted

@@ -124,6 +124,88 @@ void oracle() {
               << relative_tolerance << "*|ref|\n";
 }
 
+// A recorded prefix is applied exactly once: a flush (zero columns) between rounds,
+// a repeated flush and a verified round that is never recorded must not replay it
+// again. Compared bitwise with recompute commits from separate round-start states.
+void deferred_consumed() {
+    Fixture f;
+    std::mt19937 random(53);
+    std::uniform_real_distribution<float> unit(-1, 1), decay(-2, 0), gate(0, 1);
+    constexpr std::uint32_t columns = 3;
+    const dc::DeviceGeometry g{2, 4, 8, 1e-6f, 0.5f, true, true};
+    const auto elements = dc::state_elements(g);
+    std::vector<float> start(elements);
+    for(auto& x : start) x = 0.5f * unit(random);
+    std::vector<CudaBuffer> inputs;
+    auto round_steps = [&] {
+        std::vector<float> q(columns * g.heads * g.keys), k(q.size()), v(columns * g.heads * g.values), ld(columns * g.heads), beta(ld.size());
+        for(auto& x : q) x = unit(random);
+        for(auto& x : k) x = unit(random);
+        for(auto& x : v) x = unit(random);
+        for(auto& x : ld) x = decay(random);
+        for(auto& x : beta) x = gate(random);
+        for(auto* x : {&q, &k, &v, &ld, &beta}) inputs.push_back(f.put(*x));
+        const auto* b = &inputs[inputs.size() - 5];
+        return dc::DeviceSteps{static_cast<const float*>(b[0].data()), static_cast<const float*>(b[1].data()),
+                               static_cast<const float*>(b[2].data()), static_cast<const float*>(b[3].data()),
+                               static_cast<const float*>(b[4].data())};
+    };
+    inputs.reserve(10); // the returned pointers stay valid
+    const auto first = round_steps(), second = round_steps();
+    const auto stream = f.backend->stream();
+    auto count = [&](std::int32_t n) {
+        auto b = f.backend->allocate(Memory::device, sizeof(std::int32_t));
+        b.upload(std::as_bytes(std::span(&n, 1)), 0, Queue::compute);
+        return b;
+    };
+    auto two = count(2), one = count(1);
+    const auto* two_ptr = static_cast<const std::int32_t*>(two.data());
+    const auto* one_ptr = static_cast<const std::int32_t*>(one.data());
+    // Oracle: start, then 2 accepted of the first round, then 1 accepted of the second.
+    auto s0 = f.put(start), s1 = f.zeros(elements), s2 = f.zeros(elements);
+    check(dc::enqueue_recompute_accepted(g, static_cast<const float*>(s0.data()), first, two_ptr, columns, static_cast<float*>(s1.data()), stream), "oracle 1");
+    check(dc::enqueue_recompute_accepted(g, static_cast<const float*>(s1.data()), second, one_ptr, columns, static_cast<float*>(s2.data()), stream), "oracle 2");
+    const auto after_first = f.get(s1, elements), after_second = f.get(s2, elements);
+    auto work = f.zeros(elements), out = f.zeros(columns * g.heads * g.values);
+    auto stash_key = f.zeros(columns * g.heads * g.keys), stash_decay = f.zeros(columns * g.heads),
+         stash_delta = f.zeros(columns * g.heads * g.values);
+    const dc::DeferredStash stash{static_cast<float*>(stash_key.data()), static_cast<float*>(stash_decay.data()),
+                                  static_cast<float*>(stash_delta.data()), columns};
+    auto pending = f.backend->allocate(Memory::device, sizeof(std::int32_t));
+    auto* pending_ptr = static_cast<std::int32_t*>(pending.data());
+    for(const bool abandon : {false, true}) {
+        auto live = f.put(start);
+        auto* live_ptr = static_cast<float*>(live.data());
+        f.backend->fill_async(pending, 0);
+        auto verify = [&](const dc::DeviceSteps& steps) {
+            check(dc::enqueue_verify_deferred(g, live_ptr, steps, columns, pending_ptr, stash, static_cast<float*>(out.data()),
+                                              static_cast<float*>(work.data()), stream), "verify deferred");
+        };
+        auto flush = [&] { check(dc::enqueue_verify_deferred(g, live_ptr, {}, 0, pending_ptr, stash, nullptr, nullptr, stream), "flush"); };
+        auto expect = [&](const std::vector<float>& ref, const char* what) {
+            const auto l = f.get(live, elements);
+            require(std::memcmp(l.data(), ref.data(), l.size() * sizeof(float)) == 0, what);
+        };
+        verify(first);
+        check(dc::enqueue_record_accepted(two_ptr, columns, pending_ptr, stream), "record");
+        if(abandon) {
+            verify(second); // never recorded: its stash must not replay the first round's count
+            flush();
+            expect(after_first, "abandoned round replayed the previous prefix");
+        } else {
+            flush();
+            expect(after_first, "flush did not apply the recorded prefix");
+            flush();
+            expect(after_first, "second flush replayed the prefix");
+        }
+        verify(second);
+        check(dc::enqueue_record_accepted(one_ptr, columns, pending_ptr, stream), "record");
+        flush();
+        expect(after_second, abandon ? "round after an abandoned round differs from recompute" : "round after a flush differs from recompute");
+    }
+    std::cout << "deferred prefix applied once across flushes and an abandoned round\n";
+}
+
 // Deferred commit over many rounds, including reruns with a smaller count after a
 // truncation, must reproduce the checkpoint strategy bit for bit.
 void deferred() {
@@ -190,6 +272,7 @@ void deferred() {
         require(std::memcmp(r.data(), l.data(), r.size() * sizeof(float)) == 0, "deferred live state differs bitwise from checkpoint commits");
     }
     std::cout << "deferred rounds " << checked << " bitwise equal to checkpoint commits\n";
+    deferred_consumed();
 }
 
 void rejects() {

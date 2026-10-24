@@ -1,6 +1,7 @@
 #include "fused_moe.h"
 #include "fp8_tile.cuh"
 #include <array>
+#include <cmath>
 #include <string>
 #include <math_constants.h>
 
@@ -35,39 +36,117 @@ template<int Tokens> __global__ void entry(fp8::DeviceRows router, fp8::DeviceRo
         activation[t * gate.rows + row0 + warp] = __bfloat16_as_ushort(__float2bfloat16_rn(fp8::detail::silu(a[t]) * b[t]));
   }
 }
-__global__ void route_down(const float* scores, int experts, int top, const std::uint16_t* activation,
+// Routing as kernel arguments; bias is null without a correction bias.
+struct Rule {
+  const float* bias; int groups, selected_groups, group_top; float epsilon, floor, scaling;
+  bool sigmoid, before, renormalize;
+};
+// The block's 256 threads reduce through `scratch` with `op`; every thread receives the result.
+template<class Op> __device__ float reduce(float value, float* scratch, Op op) {
+  const auto tid = threadIdx.x;
+  scratch[tid] = value; __syncthreads();
+  for (unsigned stride = 128; stride; stride /= 2) {
+    if (tid < stride) scratch[tid] = op(scratch[tid], scratch[tid + stride]);
+    __syncthreads();
+  }
+  const auto result = scratch[0]; __syncthreads();
+  return result;
+}
+// Every thread calls this: the `top` largest values[0..count) in descending order,
+// lower index on ties, written to chosen_id/chosen_value.
+__device__ void select_top(const float* values, int count, int top, int* chosen_id, float* chosen_value,
+                           float* best_value, int* best_id) {
+  const auto tid = threadIdx.x;
+  for (int rank = 0; rank < top; ++rank) {
+    float best = -CUDART_INF_F; int index = 0x7fffffff;
+    for (int i = static_cast<int>(tid); i < count; i += 256) {
+      bool used = false;
+      for (int previous = 0; previous < rank; ++previous) used |= chosen_id[previous] == i;
+      const auto value = values[i];
+      if (!used && (value > best || (value == best && i < index))) { best = value; index = i; }
+    }
+    best_value[tid] = best; best_id[tid] = index; __syncthreads();
+    for (unsigned stride = 128; stride; stride /= 2) {
+      if (tid < stride && (best_value[tid + stride] > best_value[tid] ||
+          (best_value[tid + stride] == best_value[tid] && best_id[tid + stride] < best_id[tid]))) {
+        best_value[tid] = best_value[tid + stride]; best_id[tid] = best_id[tid + stride];
+      }
+      __syncthreads();
+    }
+    if (!tid) { chosen_value[rank] = best_value[0]; chosen_id[rank] = best_id[0]; }
+    __syncthreads();
+  }
+}
+__global__ void route_down(const float* scores, int experts, int top, Rule rule, const std::uint16_t* activation,
     std::size_t intermediate, const std::uint16_t* down, std::size_t outputs, int tokens,
     std::int32_t* ids, float* weights, float* shared) {
   const auto tid = threadIdx.x;
   if (blockIdx.x < static_cast<unsigned>(tokens)) {
     const auto token = blockIdx.x;
-    __shared__ float best_value[256], selected_value[32];
-    __shared__ int best_id[256], selected_id[32];
-    for (int rank = 0; rank < top; ++rank) {
-      float best = -CUDART_INF_F; int index = 0x7fffffff;
-      for (int expert = static_cast<int>(tid); expert < experts; expert += 256) {
-        bool used = false;
-        for (int previous = 0; previous < rank; ++previous) used |= selected_id[previous] == expert;
-        const auto value = scores[static_cast<std::size_t>(token) * experts + expert];
-        if (!used && (value > best || (value == best && expert < index))) { best = value; index = expert; }
-      }
-      best_value[tid] = best; best_id[tid] = index; __syncthreads();
-      for (unsigned stride = 128; stride; stride /= 2) {
-        if (tid < stride && (best_value[tid + stride] > best_value[tid] ||
-            (best_value[tid + stride] == best_value[tid] && best_id[tid + stride] < best_id[tid]))) {
-          best_value[tid] = best_value[tid + stride]; best_id[tid] = best_id[tid + stride];
+    const auto* logits = scores + static_cast<std::size_t>(token) * experts;
+    __shared__ float choice[1024], group_value[1024], best_value[256], selected_value[32], group_chosen[32];
+    __shared__ int best_id[256], selected_id[32], group_id[32];
+    // Softmax before selection normalizes over every expert.
+    float peak = 0, total = 1;
+    if (rule.before && !rule.sigmoid) {
+      float local = -CUDART_INF_F, sum = 0;
+      for (int expert = static_cast<int>(tid); expert < experts; expert += 256) local = fmaxf(local, logits[expert]);
+      peak = reduce(local, best_value, [](float a, float b) { return fmaxf(a, b); });
+      for (int expert = static_cast<int>(tid); expert < experts; expert += 256) sum += expf(logits[expert] - peak);
+      total = reduce(sum, best_value, [](float a, float b) { return a + b; });
+    }
+    const auto score = [&](float logit) { return rule.sigmoid ? 1.f / (1.f + expf(-logit)) : expf(logit - peak) / total; };
+    // Selection value: the raw logit or its score, plus the correction bias when present.
+    for (int expert = static_cast<int>(tid); expert < experts; expert += 256) {
+      const auto value = rule.before ? score(logits[expert]) : logits[expert];
+      choice[expert] = rule.bias ? value + rule.bias[expert] : value;
+    }
+    __syncthreads();
+    if (rule.selected_groups < rule.groups) {
+      // Each group ranks by the sum of its group_top best selection values.
+      const int size = experts / rule.groups;
+      for (int group = static_cast<int>(tid); group < rule.groups; group += 256) {
+        float sum = 0, last = CUDART_INF_F; int last_id = -1;
+        for (int n = 0; n < rule.group_top; ++n) {
+          float best = -CUDART_INF_F; int index = 0x7fffffff;
+          for (int i = group * size; i < (group + 1) * size; ++i) {
+            const auto value = choice[i];
+            if ((value < last || (value == last && i > last_id)) && (value > best || (value == best && i < index))) {
+              best = value; index = i;
+            }
+          }
+          sum += best; last = best; last_id = index;
         }
-        __syncthreads();
+        group_value[group] = sum;
       }
-      if (!tid) { selected_value[rank] = best_value[0]; selected_id[rank] = best_id[0]; }
+      __syncthreads();
+      select_top(group_value, rule.groups, rule.selected_groups, group_id, group_chosen, best_value, best_id);
+      for (int expert = static_cast<int>(tid); expert < experts; expert += 256) {
+        bool kept = false;
+        for (int g = 0; g < rule.selected_groups; ++g) kept |= group_id[g] == expert / size;
+        if (!kept) choice[expert] = -CUDART_INF_F;
+      }
       __syncthreads();
     }
+    select_top(choice, experts, top, selected_id, selected_value, best_value, best_id);
     if (!tid) {
-      float denominator = 0;
-      for (int r = 0; r < top; ++r) denominator += expf(selected_value[r] - selected_value[0]);
+      float weight[32], denominator = 1;
+      if (rule.before || rule.sigmoid) {
+        for (int r = 0; r < top; ++r) weight[r] = score(logits[selected_id[r]]);
+      } else {  // softmax over the selected logits
+        float selected_peak = logits[selected_id[0]], sum = 0;
+        for (int r = 0; r < top; ++r) selected_peak = fmaxf(selected_peak, logits[selected_id[r]]);
+        for (int r = 0; r < top; ++r) sum += expf(logits[selected_id[r]] - selected_peak);
+        for (int r = 0; r < top; ++r) weight[r] = expf(logits[selected_id[r]] - selected_peak) / sum;
+      }
+      if (rule.renormalize) {
+        float sum = 0;
+        for (int r = 0; r < top; ++r) sum += weight[r];
+        denominator = fmaxf(sum + rule.epsilon, rule.floor);
+      }
       for (int r = 0; r < top; ++r) {
         ids[token * top + r] = selected_id[r];
-        weights[token * top + r] = expf(selected_value[r] - selected_value[0]) / denominator;
+        weights[token * top + r] = (rule.renormalize ? weight[r] / denominator : weight[r]) * rule.scaling;
       }
     }
   } else {
@@ -103,7 +182,7 @@ void entry_cuda(fp8::DeviceRows router, fp8::DeviceRows gate, fp8::DeviceRows up
   #undef CRIT_MOE_CASE
   launched();
 }
-void route_down_cuda(std::span<const float> scores, std::size_t experts, std::size_t top,
+void route_down_cuda(std::span<const float> scores, std::size_t experts, std::size_t top, const Routing& routing,
     std::span<const std::uint16_t> activation, std::size_t intermediate,
     std::span<const std::uint16_t> down, std::size_t outputs, std::size_t tokens,
     std::span<std::int32_t> ids, std::span<float> weights, std::span<float> shared, cudaStream_t stream) {
@@ -114,12 +193,26 @@ void route_down_cuda(std::span<const float> scores, std::size_t experts, std::si
       down.size() != extent(outputs, intermediate) || ids.size() != extent(tokens, top) ||
       weights.size() != extent(tokens, top) || shared.size() != extent(tokens, outputs))
     throw std::invalid_argument("MoE route/down geometry differs");
+  const std::size_t groups = routing.groups, size = groups ? experts / groups : 0;
+  const auto term = [](float value) { return std::isfinite(value) && value >= 0; };
+  if ((routing.scoring != Scoring::softmax && routing.scoring != Scoring::sigmoid) || !groups || experts % groups ||
+      !routing.selected_groups || routing.selected_groups > std::min<std::size_t>(32, groups) ||
+      !routing.group_score_top || routing.group_score_top > size || top > routing.selected_groups * size ||
+      (!routing.correction_bias.empty() && routing.correction_bias.size() != experts) ||
+      (routing.renormalize && routing.scoring == Scoring::softmax && !routing.score_before_selection) ||
+      !term(routing.renormalize_epsilon) || !term(routing.renormalize_floor) || !term(routing.scaling) || !routing.scaling)
+    throw std::invalid_argument("MoE routing differs from its geometry");
   aligned(scores); aligned(activation); aligned(down); aligned(ids); aligned(weights); aligned(shared);
-  const std::array inputs{range(scores), range(activation), range(down)};
+  const bool bias = !routing.correction_bias.empty();
+  if (bias) aligned(routing.correction_bias);
+  const std::array inputs{range(scores), range(activation), range(down), range(routing.correction_bias)};
   const std::array destinations{range(ids), range(weights), range(shared)};
-  fp8::disjoint(destinations, inputs);
+  fp8::disjoint(destinations, std::span(inputs).first(bias ? 4 : 3));
+  const Rule rule{routing.correction_bias.data(), static_cast<int>(routing.groups), static_cast<int>(routing.selected_groups),
+                  static_cast<int>(routing.group_score_top), routing.renormalize_epsilon, routing.renormalize_floor,
+                  routing.scaling, routing.scoring == Scoring::sigmoid, routing.score_before_selection, routing.renormalize};
   const auto blocks = static_cast<unsigned>(tokens + (outputs + 7) / 8);
-  route_down<<<blocks, 256, 0, stream>>>(scores.data(), static_cast<int>(experts), static_cast<int>(top),
+  route_down<<<blocks, 256, 0, stream>>>(scores.data(), static_cast<int>(experts), static_cast<int>(top), rule,
       activation.data(), intermediate, down.data(), outputs, static_cast<int>(tokens), ids.data(), weights.data(), shared.data());
   launched();
 }

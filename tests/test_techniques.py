@@ -677,6 +677,22 @@ class TechniqueTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             m.normalize([[1]], [1], 1, mode="gated")
 
+    def test_normalization_rounding_orders(self):
+        m = load("rmsnorm-bf16", "reference.py")
+        self.assertEqual([m.bf16(v) for v in (1 + 2**-8, 1 + 3 * 2**-8, 2**-130 + 2**-140, 3.4e38)],
+                         [1.0, 1 + 2**-6, 2**-130, float("inf")])
+        # x * r = 1.3887 for x = 3: once, x * r * 1.5 = 2.0831 -> 2.078125; Llama-style,
+        # bf16(x * r) = 1.390625 and 1.390625 * 1.5 = 2.0859375 ties to even -> 2.09375.
+        single = m.normalize([[1, 2, 3]], [1.5] * 3, 1e-6, rounding="single")[0]
+        first = m.normalize([[1, 2, 3]], [1.5] * 3, 1e-6, rounding="normalize_first")[0]
+        self.assertEqual(single, (0.6953125, 1.390625, 2.078125))
+        self.assertEqual(first, (0.6953125, 1.390625, 2.09375))
+        self.assertEqual(m.normalize([[1, 2, 3]], [0.5] * 3, 1e-6, mode="unit_offset", rounding="normalize_first"), (first,))
+        unrounded = m.normalize([[1, 2, 3]], [1.5] * 3, 1e-6)[0]
+        self.assertEqual(tuple(m.bf16(v) for v in unrounded), single)
+        with self.assertRaises(ValueError):
+            m.normalize([[1]], [1], 1, rounding="llama")
+
     def test_split_partials_fold_in_fixed_order(self):
         m = load("rmsnorm-bf16", "reference.py")
         residual, partials = [[1e16, 1.0]], [[[1.0, 2.0]], [[-1e16, 3.0]]]
@@ -751,6 +767,14 @@ class RecordedSelectionTests(unittest.TestCase):
             m.Table({"k:1:16": 4}).choose("k:1:16", 4)
         with self.assertRaises(ValueError):
             m.Table().choose("k", 0)
+        shrunk = m.Table(tuning=True)                              # a kept choice beyond a shorter list
+        self.assertEqual(shrunk.choose("k:1:16", 4, lambda i: 4.0 - i), (3, "tuned"))
+        with self.assertRaises(ValueError):
+            shrunk.choose("k:1:16", 2)
+        self.assertEqual(shrunk.choose("k:1:16", 4), (3, "tuned"))
+        for bad in ("", 'k"1', "k\\1"):                            # keys the exported table could not hold
+            with self.assertRaises(ValueError):
+                m.Table().choose(bad, 2)
 
     def test_differences_name_path_and_index(self):
         m = load("recorded-selection", "repeatability.py")
@@ -822,6 +846,71 @@ class HostMemoryAdmissionTests(unittest.TestCase):
             self.assertTrue(m.admit(1, unknown, require_known=False).admitted)
         with self.assertRaises(ValueError):
             m.admit(-1, unknown)
+
+    def test_cgroup_reclaimable_pages_and_memory_high(self):
+        # The same cases as Core's host_memory_v2, host_memory_v1 and host_memory_malformed fixtures.
+        m = load("host-memory-admission", "memory.py")
+        gib = 1 << 30
+        with tempfile.TemporaryDirectory() as root:
+            app = "sys/fs/cgroup/app/"
+            self.tree(root, {"proc/meminfo": "MemAvailable: 800 kB\n", "proc/self/cgroup": "0::/app/worker\n",
+                             app + "memory.max": "500000\n", app + "memory.current": "450000\n",
+                             app + "memory.stat": "file 60000\nshmem 50000\nfile_dirty 1000\nfile_writeback 0\n"})
+            # tmpfs/shmem pages sit in file but are swap-backed: only the file LRUs, else file - shmem, are reclaimable.
+            self.assertEqual(m.observe_linux(root).cgroup_available, 59000)
+            self.tree(root, {app + "memory.stat": "file 60000\nshmem 50000\nactive_file 4000\ninactive_file 6000\n"
+                                                  "file_dirty 1000\nfile_writeback 500\n"})
+            self.assertEqual(m.observe_linux(root).cgroup_available, 58500)
+            self.tree(root, {app + "memory.max": "%d\n" % (8 * gib), app + "memory.current": "%d\n" % (8 * gib),
+                             app + "memory.stat": "anon %d\nfile %d\nshmem %d\nactive_file 0\ninactive_file 0\n"
+                                                  % (2 * gib, 6 * gib, 6 * gib)})
+            seen = m.observe_linux(root)
+            self.assertEqual(seen.cgroup_available, 0)
+            denied = m.admit(5 * gib, seen)
+            self.assertEqual((denied.admitted, denied.binding), (False, "cgroup"))
+            # memory.high limits too: the effective limit is min(memory.max, memory.high).
+            self.tree(root, {app + "memory.max": "max\n", app + "memory.high": "460000\n", app + "memory.current": "450000\n",
+                             app + "memory.stat": "active_file 4000\ninactive_file 6000\nfile_dirty 1000\nfile_writeback 500\n"})
+            self.assertEqual(m.observe_linux(root).cgroup_available, 18500)
+            self.tree(root, {app + "memory.max": "455000\n"})
+            self.assertEqual(m.observe_linux(root).cgroup_available, 13500)
+            self.tree(root, {app + "memory.max": "max\n", app + "memory.high": "max\n"})
+            seen = m.observe_linux(root)
+            self.assertIsNone(seen.cgroup_available)
+            self.assertIn("no cgroup v2 memory limit", seen.notes)
+            # Malformed counters count nothing as reclaimable, as in Core; malformed limits skip the level.
+            self.tree(root, {app + "memory.max": "1000\n", app + "memory.high": "max\n", app + "memory.current": "400\n"})
+            for stat in ("file 100\nfile_dirty lots\n", "file 100\nshmem x\n", "active_file 100\ninactive_file -1\n",
+                         "active_file 100\nfile_writeback 1.5\n"):
+                self.tree(root, {app + "memory.stat": stat})
+                seen = m.observe_linux(root)
+                self.assertEqual(seen.cgroup_available, 600)
+                self.assertTrue(any("memory.stat malformed" in n for n in seen.notes))
+            for name in ("memory.max", "memory.high", "memory.current"):
+                self.tree(root, {app + "memory.max": "1000\n", app + "memory.high": "max\n", app + "memory.current": "400\n",
+                                 app + name: "12z\n"})
+                seen = m.observe_linux(root)
+                self.assertIsNone(seen.cgroup_available)
+                self.assertTrue(any("memory.max, memory.high or memory.current malformed" in n for n in seen.notes))
+            # v1: shmem is in cache but not reclaimable; each key prefers its hierarchical total_ form.
+            job = "sys/fs/cgroup/memory/job/"
+            self.tree(root, {"proc/self/cgroup": "4:memory:/job\n", job + "memory.usage_in_bytes": "700\n",
+                             job + "memory.stat": "cache 500\nshmem 300\ndirty 50\nhierarchical_memory_limit 1000\n"})
+            self.assertEqual(m.observe_linux(root).cgroup_available, 450)
+            self.tree(root, {job + "memory.stat": "cache 500\nshmem 300\ntotal_cache 900\ntotal_shmem 800\ndirty 50\n"
+                                                  "hierarchical_memory_limit 1000\n"})
+            self.assertEqual(m.observe_linux(root).cgroup_available, 350)
+            self.tree(root, {job + "memory.stat": "cache 500\nshmem 300\ntotal_active_file 100\ntotal_inactive_file 60\n"
+                                                  "inactive_file 1\ntotal_dirty 20\nhierarchical_memory_limit 1000\n"})
+            self.assertEqual(m.observe_linux(root).cgroup_available, 440)
+            self.tree(root, {job + "memory.stat": "hierarchical_memory_limit 100\ncache x\n", job + "memory.usage_in_bytes": "10\n"})
+            self.assertEqual(m.observe_linux(root).cgroup_available, 90)
+            for stat, usage, note in (("hierarchical_memory_limit 1e9\n", "10\n", "hierarchical_memory_limit malformed"),
+                                      ("hierarchical_memory_limit 100\n", "ten\n", "memory.usage_in_bytes malformed")):
+                self.tree(root, {job + "memory.stat": stat, job + "memory.usage_in_bytes": usage})
+                seen = m.observe_linux(root)
+                self.assertIsNone(seen.cgroup_available)
+                self.assertTrue(any(note in n for n in seen.notes))
 
     def test_live_observation_reports_physical_memory(self):
         m = load("host-memory-admission", "memory.py")
@@ -918,9 +1007,12 @@ class DeviceExpertCacheTests(unittest.TestCase):
         self.assertEqual((first.hits, first.misses), (0, 3))
         self.assertEqual(first.fills, [("store", 1, 0), ("store", 2, 1), ("store", 3, 2)])
         self.assertEqual(d.prefetch(1, [5, 6]), [(13, 0), (14, 1)])
-        self.assertEqual(d.prefetch(0, [1, 4]), [(4, 1)])  # resident expert 1 is not fetched
+        self.assertEqual(d.prefetch(0, [1, 4]), [(4, 0)])  # resident expert 1 is not fetched nor given a slot
         p = d.plan(1, [5, 2])
         self.assertEqual(p.fills, [(("pool", 0), 13, 3), ("store", 10, 0)])
+        # pool slots go to nonresident predictions in order: resident 5 and the repeat take none
+        self.assertEqual(d.prefetch(1, [5, 3, 3, 4, 6]), [(11, 0), (12, 1)])
+        self.assertEqual(d.pool_tags[1], [11, 12])
         again = d.plan(0, [1, 2])
         self.assertEqual((again.hits, again.misses), (1, 1))
         # hits are pinned before admissions: a plan never evicts its own experts

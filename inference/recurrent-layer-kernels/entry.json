@@ -1,0 +1,87 @@
+{
+  "id": "recurrent-layer-kernels",
+  "category": "attention",
+  "summary": "CUDA kernels for hybrid models' recurrent layers: a causal depthwise convolution with its carried window, gated-delta attention and Mamba-2's state-space recurrence, each as a chunked two-pass prefill and a column-invariant column scan with per-column state checkpoints",
+  "implementation_status": "native_source",
+  "implementation_scope": "FP32 SIMT CUDA: one thread per channel for the convolution (width 2 to 8, optional SiLU, per-token checkpoints); gated delta with dk 64 or 128 and dv a multiple of 64 (pass 1 per (head, 64-token chunk): L, P, forward-substituted T, T diag(beta), W; pass 2 per (head, 64 value columns) over the chunks; column scan with register state); Mamba-2 with d_state 64 or 128 and head_dim a multiple of 32 (pass 1: decayed C.B and cumulative decays; pass 2 per (head, 32 rows); column scan). Python references for the convolution and Mamba-2 (sequential and chunked); recurrent-state-recovery's chunked_prefill.py is the gated-delta oracle. Projections, gate activations, normalization and the output gate are engine supplied.",
+  "agent_guidance": {
+    "use_when": "The model has gated-delta or Mamba-2 layers (hybrid attention/recurrent models) and the engine needs their prefill, decode and verify kernels",
+    "avoid_when": "The recurrence differs (RWKV, Mamba-1 per-channel selective scan, lightning attention), state widths fall outside the supported shapes, or an engine-specific fused kernel is already measured faster",
+    "provides": [
+      "Causal depthwise convolution with a carried window, optional SiLU and per-token checkpoints",
+      "Gated-delta chunked two-pass prefill over 64-token chunks with partial-chunk padding",
+      "Gated-delta column scan with one update expression, dot products reduced once and broadcast, and per-column checkpoints",
+      "Mamba-2 chunked two-pass prefill and column scan with per-column checkpoints",
+      "Column invariance: a column alone equals the same column inside a verify, bit for bit"
+    ],
+    "engine_supplies": [
+      "Input projections into q, k, v, gates, B, C and dt, and the gates' activations and key/query normalization",
+      "The output gate and norm after the recurrence",
+      "State storage in Core's slots and the prefill scratch",
+      "Selection of the accepted checkpoint at commit"
+    ],
+    "preserve": [
+      "One update expression per recurrence across decode, verify and replay",
+      "Partial chunks padded with tokens that neither update nor output",
+      "Checkpoints equal to the state after each column"
+    ],
+    "adapt": [
+      "Tensor-core matrix products in the prefill passes with FP32-equivalent accuracy",
+      "BF16 inputs and fusing the convolution into the input projection",
+      "Tile shapes and chunk length"
+    ]
+  },
+  "path": "inference/recurrent-layer-kernels/README.md",
+  "code_path": "inference/recurrent-layer-kernels/code",
+  "code_files": [
+    {"path": "inference/recurrent-layer-kernels/code/recurrent_kernels.h", "purpose": "Shapes, inputs and launch interfaces for the convolution, gated delta and Mamba-2"},
+    {"path": "inference/recurrent-layer-kernels/code/recurrent_kernels.cu", "purpose": "FP32 CUDA convolution, chunked prefills and column scans"},
+    {"path": "inference/recurrent-layer-kernels/code/ssd.py", "purpose": "Host references: the convolution and Mamba-2 token by token and chunked"}
+  ],
+  "requires": {
+    "hardware": "CUDA C++20 on sm_80 or later (up to 96 KiB of shared memory per block); Python 3.11+ for the references",
+    "model": "Gated-delta layers with dk 64 or 128 and dv a multiple of 64, or Mamba-2 layers with d_state 64 or 128 and head_dim a multiple of 32",
+    "workload": "Prefill, decode and speculative verify of hybrid models"
+  },
+  "contract": {
+    "input": "FP32 token rows of q/k/v/gates or x/dt/B/C with strides, per-head A and D, the state, scratch and an optional checkpoint buffer",
+    "output": "FP32 outputs, the updated state and per-column checkpoints",
+    "ownership": "The engine owns every buffer; kernels borrow them on the caller's stream. A column scan may update its state in place",
+    "failure": "Unsupported widths, mismatched head counts, null buffers and short strides are rejected at launch",
+    "core_boundary": "Core's StateCache slots hold the states; column checkpoints implement RecurrentCommit::column_checkpoints and recurrent-state-recovery's prepare/commit"
+  },
+  "dependencies": [
+    "CUDA runtime",
+    "Python standard library"
+  ],
+  "symbols": [
+    "Conv",
+    "DeltaShape",
+    "DeltaInputs",
+    "SsdShape",
+    "SsdInputs",
+    "enqueue_conv",
+    "enqueue_delta_prefill",
+    "enqueue_delta_columns",
+    "enqueue_ssd_prefill",
+    "enqueue_ssd_columns",
+    "delta_scratch_floats",
+    "ssd_scratch_floats",
+    "conv",
+    "ssd_sequential",
+    "ssd_chunked"
+  ],
+  "interactions": [
+    "recurrent-state-recovery",
+    "device-speculative-round",
+    "session-scheduling"
+  ],
+  "techniques": [
+    "recurrent-layer-kernels"
+  ],
+  "validation": {
+    "host": "Chunked Mamba-2 equal to the recurrence for chunks 1, 4, 8 and 64 over 23 tokens; the convolution carries its window across splits",
+    "native": "Convolution outputs, state and checkpoints; gated delta (dk 64 and 128) and Mamba-2 (d_state 64 and 128) column scans against FP64 recurrences with checkpoints and five columns at once equal bit for bit to one at a time; both chunked prefills over 300 tokens (four full chunks and a partial one) against FP64 recurrences",
+    "performance": "No speed claim; reference SIMT kernels"
+  }
+}

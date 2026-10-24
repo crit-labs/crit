@@ -1435,12 +1435,12 @@ void model_config_types() {
     // Experts from the first non-null key, recorded; zero experts is dense.
     config = config_of(root, R"({"num_experts":null,"num_local_experts":8,"n_routed_experts":64,"num_experts_per_tok":2,"n_shared_experts":null,)"
                              R"("num_shared_experts":1,"moe_intermediate_size":768,"first_k_dense_replace":1,"decoder_sparse_step":1,"n_group":8,"topk_group":4,)"
-                             R"("mlp_only_layers":[0,5],"norm_topk_prob":true,"routed_scaling_factor":2.5,"scoring_func":"sigmoid","shared_expert_intermediate_size":512})");
+                             R"("mlp_only_layers":[0,5],"norm_topk_prob":true,"routed_scaling_factor":2.5,"scoring_func":"sigmoid","topk_method":"noaux_tc","shared_expert_intermediate_size":512})");
     require(config.moe && config.moe->experts == 8 && config.moe->experts_key == "num_local_experts" && config.moe->experts_per_token == 2 &&
             config.moe->shared_experts == 1u && config.moe->moe_intermediate_size == 768u && config.moe->first_k_dense_replace == 1u &&
             config.moe->decoder_sparse_step == 1u && config.moe->n_group == 8u && config.moe->topk_group == 4u &&
             config.moe->mlp_only_layers == std::vector<std::uint32_t>{0, 5} && config.moe->norm_topk_prob == true && config.moe->routed_scaling_factor == 2.5 &&
-            config.moe->scoring_func == "sigmoid" && config.moe->shared_expert_intermediate_size == 512u, "moe fields");
+            config.moe->scoring_func == "sigmoid" && config.moe->topk_method == "noaux_tc" && config.moe->shared_expert_intermediate_size == 512u, "moe fields");
     require(!config_of(root, R"({"num_experts":0,"n_routed_experts":64})").moe, "zero experts is dense");
     config = config_of(root, R"({"n_routed_experts":256,"num_nextn_predict_layers":1})");
     require(config.moe && config.moe->experts_key == "n_routed_experts" && config.moe->experts_per_token == 0 && config.num_nextn_predict_layers == 1u, "routed experts");
