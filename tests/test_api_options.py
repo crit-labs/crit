@@ -4,7 +4,8 @@ import unittest
 from unittest.mock import patch
 
 import test_api
-from crit_api.options import SAMPLING, RequestError, sampling_capability, sampling_options
+from crit_api.options import (EXTRA_SAMPLING, SAMPLING, RequestError, sampling_capability, sampling_options,
+                              template_options)
 from crit_api.engine import reply
 
 
@@ -28,6 +29,81 @@ class SamplingValidationTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(RequestError):
                 sampling_options({name: {} if name == "logit_bias" else 1}, [])
         self.assertEqual(sampling_options({"temperature": None}, []), {})
+
+    def test_extra_samplers_turned_off_are_no_ops_and_lenient_ignores_the_rest_after_range_checks(self):
+        off = {"typical_p": 1, "tfs_z": 1.0, "mirostat": 0, "dry_multiplier": 0, "xtc_probability": 0.0}
+        self.assertEqual(set(off), set(EXTRA_SAMPLING))
+        self.assertEqual(sampling_options(dict(off, temperature=.5), [sampling_capability("temperature")]),
+                         {"temperature": .5})
+        for name, value in (("typical_p", .9), ("tfs_z", .95), ("mirostat", 2), ("dry_multiplier", .8),
+                            ("xtc_probability", .5)):
+            with self.subTest(name=name):
+                with self.assertRaises(RequestError) as caught:
+                    sampling_options({name: value}, list(map(sampling_capability, SAMPLING)))
+                self.assertEqual((caught.exception.param, caught.exception.code), (name, "unsupported_parameter"))
+                ignored = []
+                self.assertEqual(sampling_options({name: value, "top_p": .9}, [], ignored), {})
+                self.assertEqual(ignored, ["top_p", name])
+        for name, value in (("typical_p", 1.5), ("tfs_z", -1), ("mirostat", 3), ("mirostat", 1.0), ("mirostat", True),
+                            ("dry_multiplier", float("inf")), ("xtc_probability", "0"), ("top_p", 0), ("seed", 1.5)):
+            with self.subTest(name=name, value=value), self.assertRaises(RequestError):
+                sampling_options({name: value}, [], [])
+
+    def test_template_variables_need_their_capability_a_value_they_take_and_one_meaning(self):
+        switch = ["chat-template-kwargs-v1", "chat-template-enable-thinking-v1"]
+        effort = ["chat-template-kwargs-v1", "chat-template-reasoning-effort-v1"]
+        both = switch + effort[1:]
+        for body, capabilities, expected in (
+                ({"chat_template_kwargs": {"enable_thinking": False}}, switch, {"enable_thinking": False}),
+                ({"reasoning_effort": "none"}, switch, {"enable_thinking": False}),
+                ({"reasoning_effort": "minimal"}, both, {"enable_thinking": True, "reasoning_effort": "low"}),
+                ({"reasoning_effort": "high"}, effort, {"reasoning_effort": "high"}),
+                ({"reasoning_effort": "xhigh"}, both, {"enable_thinking": True, "reasoning_effort": "high"}),
+                ({"reasoning_effort": "low", "chat_template_kwargs": {"enable_thinking": True}}, switch,
+                 {"enable_thinking": True}),
+                ({"chat_template_kwargs": {}, "reasoning_effort": None}, [], {})):
+            with self.subTest(body=body):
+                self.assertEqual(template_options(body, capabilities), expected)
+        for body, capabilities, param in (
+                ({"chat_template_kwargs": {"enable_thinking": False}}, [], "chat_template_kwargs"),
+                ({"reasoning_effort": "low"}, [], "reasoning_effort"),
+                ({"chat_template_kwargs": {"enable_thinking": False}}, effort, "chat_template_kwargs"),
+                ({"chat_template_kwargs": {"enable_thinking": 0}}, switch, "chat_template_kwargs"),
+                ({"chat_template_kwargs": {"bos_token": "<s>"}}, both, "chat_template_kwargs"),
+                ({"chat_template_kwargs": ["enable_thinking"]}, switch, "chat_template_kwargs"),
+                ({"reasoning_effort": "max"}, switch, "reasoning_effort"),
+                ({"reasoning_effort": "none"}, effort, "reasoning_effort"),
+                ({"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": True}}, switch,
+                 "reasoning_effort")):
+            with self.subTest(body=body, capabilities=capabilities), self.assertRaises(RequestError) as caught:
+                template_options(body, capabilities)
+            self.assertEqual(caught.exception.param, param)
+
+    def test_lenient_template_options_ignore_what_the_package_cannot_apply_once_values_are_checked(self):
+        switch = ["chat-template-kwargs-v1", "chat-template-enable-thinking-v1"]
+        effort = ["chat-template-kwargs-v1", "chat-template-reasoning-effort-v1"]
+        for body, capabilities, expected, listed in (
+                ({"chat_template_kwargs": "anything", "reasoning_effort": "max"}, [], {},
+                 ["chat_template_kwargs", "reasoning_effort"]),
+                ({"chat_template_kwargs": {}, "reasoning_effort": None}, [], {}, []),
+                ({"chat_template_kwargs": {"enable_thinking": False, "bos_token": "<s>"}}, switch,
+                 {"enable_thinking": False}, ["chat_template_kwargs.bos_token"]),
+                ({"chat_template_kwargs": {"enable_thinking": False}}, effort, {},
+                 ["chat_template_kwargs.enable_thinking"]),
+                ({"reasoning_effort": "none"}, effort, {}, ["reasoning_effort"]),
+                ({"reasoning_effort": "low"}, effort, {"reasoning_effort": "low"}, [])):
+            with self.subTest(body=body, capabilities=capabilities):
+                ignored = []
+                self.assertEqual(template_options(body, capabilities, ignored), expected)
+                self.assertEqual(ignored, listed)
+        for body, capabilities in (
+                ({"chat_template_kwargs": {"enable_thinking": 0}}, effort),
+                ({"chat_template_kwargs": {"bad\nname": True}}, switch),
+                ({"chat_template_kwargs": ["enable_thinking"]}, switch),
+                ({"reasoning_effort": "max"}, switch),
+                ({"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": True}}, switch)):
+            with self.subTest(body=body, capabilities=capabilities), self.assertRaises(RequestError):
+                template_options(body, capabilities, [])
 
     def test_tool_reply_allows_whitespace_and_requires_new_call_ids(self):
         request = {"request_id": "r", "candidate_id": "c", "package_sha256": "p", "tools": TOOLS,
@@ -61,6 +137,20 @@ class RequestOptionsTests(test_api.ApiTests):
             self.assertEqual(response.status, 200, value)
             self.assertIsNone(json.loads(value["choices"][0]["message"]["content"])["sampling"])
 
+    def test_client_metadata_is_ignored_and_extra_samplers_turned_off_are_no_ops(self):
+        response, value = self.chat("echo-request", temperature=.5, typical_p=1, tfs_z=1, mirostat=0, dry_multiplier=0,
+                                    xtc_probability=0, prompt_cache_key="thread-1", safety_identifier="u-1",
+                                    prompt_cache_retention="24h")
+        self.assertEqual(response.status, 200, value)
+        self.assertEqual(response.getheader("X-Crit-Ignored-Parameters"),
+                         "prompt_cache_key,prompt_cache_retention,safety_identifier")
+        self.assertEqual(json.loads(value["choices"][0]["message"]["content"])["sampling"], {"temperature": .5})
+        for options in ({"typical_p": .9}, {"mirostat": 2}, {"reasoning_effort": "low"}, {"verbosity": "low"}):
+            with self.subTest(options=options):
+                response, value = self.chat(**options)
+                self.assertEqual((response.status, value["error"]["param"], value["error"]["code"]),
+                                 (400, *options, "unsupported_parameter"))
+
     def test_tools_round_trip_with_results_and_streaming(self):
         response, value = self.chat("tool:" + json.dumps([CALL]), tools=TOOLS, tool_choice="required")
         self.assertEqual(response.status, 200, value)
@@ -85,6 +175,26 @@ class RequestOptionsTests(test_api.ApiTests):
         self.assertEqual(chunks[-1]["usage"]["completion_tokens"], 4)
         self.assertTrue(data.endswith(b"data: [DONE]\n\n"))
 
+    def test_tool_history_takes_reasoning_as_reasoning_content(self):
+        def sent(**reasoning):
+            history = [{"role": "user", "content": "Read a.py"},
+                       {"role": "assistant", "content": None, "tool_calls": [CALL], **reasoning},
+                       {"role": "tool", "tool_call_id": "call_1", "content": "echo-request"}]
+            return self.call("POST", "/v1/chat/completions", {"messages": history, "tools": TOOLS})
+        look = {"reasoning_content": "look"}
+        for reasoning, kept in (({"reasoning": "look"}, look), (look, look), ({"reasoning": "look", **look}, look),
+                                ({"reasoning": None, **look}, look), ({"reasoning": None}, {})):
+            with self.subTest(reasoning=reasoning):
+                response, data = sent(**reasoning)
+                self.assertEqual(response.status, 200, data)
+                echoed = json.loads(json.loads(data)["choices"][0]["message"]["content"])
+                self.assertEqual(echoed["messages"][1], {"role": "assistant", "content": "", "tool_calls": [CALL], **kept})
+        for reasoning, param in (({"reasoning": "look", "reasoning_content": "other"}, "messages[1].reasoning"),
+                                 ({"reasoning": ["look"]}, "messages[1]")):
+            with self.subTest(reasoning=reasoning):
+                response, data = sent(**reasoning)
+                self.assertEqual((response.status, json.loads(data)["error"]["param"]), (400, param), data)
+
     def test_tool_policy_and_malformed_replies_are_errors(self):
         cases = [("hello", {"tool_choice": "required"}),
                  ("tool:" + json.dumps([CALL]), {"tool_choice": "none"}),
@@ -103,7 +213,7 @@ class RequestOptionsTests(test_api.ApiTests):
                         {"tools": TOOLS, "parallel_tool_calls": "false"},
                         {"tools": TOOLS, "tool_choice": "bogus"}, {"tool_choice": "required"},
                         {"tools": TOOLS, "tool_choice": {"type": "function", "function": {"name": []}}},
-                        {"tools": TOOLS, "stop": "STOP"},
+                        {"tools": TOOLS, "stop": "STOP"}, {"stream_options": {"continuous_usage_stats": True}},
                         {"tools": [{"type": "function", "function": {"name": "x", "strict": True}}]}):
             with self.subTest(options=options):
                 response, data = self.chat(stream=True, **options)

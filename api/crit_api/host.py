@@ -14,11 +14,13 @@ if __package__ in {None, ""}:
             sys.path.insert(0, str(folder))
 from crit.run.records import MAX_JSON_BYTES, digest, read_json, safe_path
 from crit_api import channel
-from crit_api.logprobs import RESPONDING
+from crit_api.logprobs import RESPONDING, response_bytes
 from crit_api.models import ModelContext, ModelPool
 from crit_api.stream import CAPABILITY as STREAM_CAPABILITY, StreamWriter
-from crit_api.options import MAX_CHAT_RECORD, TOOLS_CAPABILITY, STRICT_TOOLS_CAPABILITY, TOOL_STREAM_CAPABILITY
-from crit_core.serving import LOGPROBS_CAPABILITY, SCORE_CAPABILITY, engine_facts
+from crit_api.options import (MAX_CHAT_RECORD, TOOLS_CAPABILITY, STRICT_TOOLS_CAPABILITY, TOOL_CHOICE_CAPABILITY,
+                              TOOL_STREAM_CAPABILITY)
+from crit_core.serving import (LOGPROBS_CAPABILITY, SCORE_CAPABILITY, TOKENIZE_CAPABILITY, RequestRejected,
+                               engine_facts)
 
 CONFIG_CAPABILITY = "chat-config-v1"
 
@@ -44,6 +46,12 @@ CAPABILITY = "chat-resident-v1"
 
 class Cancelled(Exception):
     pass
+
+
+class Unloaded(RequestRejected):
+    """A tokenize request for an engine the host has not loaded (or is loading, closing or quarantined): crit serve
+    then admits it and loads the candidate as for a reply."""
+    reason = "unloaded"
 
 
 class Cancellation:
@@ -75,6 +83,8 @@ class Host:
         self.active = 0
         self.requests = set()
         self.state_lock = threading.RLock()
+        self.texts = 0  # tokenize requests running on the engine (chat-tokenize-v1)
+        self.settled = threading.Condition(self.state_lock)
 
     def status(self, state, **extra):
         with self.state_lock:
@@ -90,6 +100,10 @@ class Host:
     def detach(self):
         if self.engine is not None:
             self.status("draining")
+            with self.state_lock:
+                self.identity = None  # no tokenize starts on the engine being closed; running ones finish first
+                while self.texts:
+                    self.settled.wait()
             try:
                 self.engine.close()
                 self.context.close()
@@ -154,8 +168,9 @@ class Host:
         self.context.limits = spec.get('limits', {})
         try:
             capabilities = spec.get("capabilities", [])
-            if (STRICT_TOOLS_CAPABILITY in capabilities or TOOL_STREAM_CAPABILITY in capabilities) and TOOLS_CAPABILITY not in capabilities:
-                raise ValueError("Strict or streaming tools require chat-tools-v1")
+            if ({STRICT_TOOLS_CAPABILITY, TOOL_STREAM_CAPABILITY, TOOL_CHOICE_CAPABILITY} & set(capabilities)
+                    and TOOLS_CAPABILITY not in capabilities):
+                raise ValueError("Strict, streaming or forced tools require chat-tools-v1")
             if TOOL_STREAM_CAPABILITY in capabilities and STREAM_CAPABILITY not in capabilities:
                 raise ValueError("chat-tool-stream-v1 requires chat-stream-v1")
             self.engine = module.create_engine(self.context)
@@ -176,6 +191,10 @@ class Host:
                                                      or not callable(getattr(self.engine, "score", None))):
                 raise ValueError(SCORE_CAPABILITY + " requires an engine that scores fixed text (scores True, "
                                  "score(request, cancellation))")
+            if TOKENIZE_CAPABILITY in capabilities and not all(callable(getattr(self.engine, name, None))
+                                                               for name in ("tokenize", "render", "detokenize")):
+                raise ValueError(TOKENIZE_CAPABILITY + " requires tokenize(text, add_special_tokens), render(request) "
+                                 "and detokenize(ids)")
         except BaseException:
             self.blocked = True  # Partial construction may own native work.
             raise
@@ -217,11 +236,47 @@ class Host:
         self.status("ready")
         return response
 
+    def tokenize(self, spec, request):
+        """A tokenize request (chat-tokenize-v1) on its own thread, beside any generation: the loaded engine's
+        tokenize, render or detokenize, which read only its tokenizer and chat template. Unloaded unless the host has
+        loaded the request's engine; closing the engine waits for running ones."""
+        if TOKENIZE_CAPABILITY not in spec.get("capabilities", []):
+            raise ValueError("This engine package does not declare " + TOKENIZE_CAPABILITY)
+        with self.state_lock:
+            if self.blocked or self.identity != {k: request[k] for k in ("run_id", "candidate_id", "package_sha256")}:
+                raise Unloaded("The resident host has not loaded the request's engine")
+            engine = self.engine
+            self.texts += 1
+        try:
+            if request["operation"] == "tokenize":
+                found = {"tokens": list(engine.tokenize(request["prompt"], request["add_special_tokens"]))}
+            elif request["operation"] == "render":
+                prompt, tokens = engine.render(request)
+                found = {"prompt": prompt, "tokens": list(tokens)}
+            elif request["operation"] == "detokenize":
+                found = {"prompt": engine.detokenize(request["tokens"])}
+            else:
+                raise ValueError("Unknown tokenize operation")
+        finally:
+            with self.state_lock:
+                self.texts -= 1
+                self.settled.notify_all()
+        response = {"schema_version": 1, "record_kind": "tokenize_response",
+                    **{k: request[k] for k in ("request_id", "candidate_id", "package_sha256")}, **found}
+        try:
+            channel.encode(response, response_bytes(request))
+        except ValueError:
+            # Refused here: a larger result would break the channel and retire the host.
+            raise RequestRejected(f"The response exceeds {response_bytes(request)} bytes; send less text") from None
+        return response
+
     def handle(self, command, cancellation):
         """Run one command; a generation returns its response."""
+        action, payload = command["action"], command["payload"]
+        if action == "tokenize":
+            return self.tokenize(payload["spec"], payload["request"])
         if self.blocked:
             raise ValueError("Resident host is quarantined")
-        action, payload = command["action"], command["payload"]
         if action == "unload":
             self.detach()
             for pool in self.pools.values():
@@ -313,10 +368,14 @@ def main():
     pending, running, cancels, closed = [], set(), {}, []
 
     def receive():
-        """Queue commands and set cancellations as crit serve sends them; any failure ends the host."""
+        """Queue commands and set cancellations as crit serve sends them; a tokenize runs at once on its own thread,
+        never queued behind the engine's work. Any failure ends the host."""
         try:
             while True:
                 message = link.receive(MAX_CHAT_RECORD + MAX_JSON_BYTES)
+                if message["kind"] == "command" and message["action"] == "tokenize":
+                    threading.Thread(target=execute, args=(message,), daemon=True).start()
+                    continue
                 with lock:
                     if message["kind"] == "command":
                         pending.append(message)
@@ -331,20 +390,30 @@ def main():
 
     def execute(command):
         cid = command["command_id"]
+        beside = command["action"] == "tokenize"  # beside the engine's work: no status, and a failure keeps the engine
         with lock:
             cancellation = cancels.setdefault(cid, Cancellation())
-        status, error, response = "completed", None, None
+        status, error, response, rejection = "completed", None, None, None
         try:
             response = host.handle(command, cancellation)
         except Cancelled as exc:
             status, error = "cancelled", str(exc)
+        except RequestRejected as exc:
+            if command["action"] not in RESPONDING:
+                status, error = "failed", str(exc)
+                host.blocked = True
+            else:
+                # Refused before generation: the engine settled and stays loaded.
+                status, error, rejection = "rejected", str(exc), exc.record()
         except BaseException as exc:
             status, error = "failed", str(exc)
-            host.blocked = True
-        host.blocked = host.blocked or host.pool.blocked
-        host.status("blocked" if host.blocked else ("ready" if host.engine else "unloaded"), error=error)
+            host.blocked = host.blocked or not beside
+        if not beside:
+            host.blocked = host.blocked or host.pool.blocked
+            host.status("blocked" if host.blocked else ("ready" if host.engine else "unloaded"), error=error)
         link.send({"kind": "result", "command_id": cid, "status": status, "error": error,
                    "max_concurrent_requests": host.capacity, "cleanup_settled": not host.blocked,
+                   **({"rejection": rejection} if rejection is not None else {}),
                    **({"response": response} if command["action"] in RESPONDING and status == "completed" else {})})
         with lock:
             cancels.pop(cid, None)

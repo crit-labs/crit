@@ -20,7 +20,7 @@ class EarlierTemplateToolsTests(unittest.TestCase):
         for choice in ("required", {"type": "function", "function": {"name": "list"}}):
             with self.assertRaises(RequestError) as caught:
                 tool_options({"tools": TOOLS, "tool_choice": choice}, streamed)
-            self.assertEqual(caught.exception.param, "tool_choice")
+            self.assertEqual((caught.exception.param, caught.exception.code), ("tool_choice", "unsupported_parameter"))
 
 
 if __name__ == "__main__":

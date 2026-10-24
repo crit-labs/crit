@@ -22,6 +22,7 @@ import test_api  # noqa: E402,F401  (puts the checkout's packages on sys.path)
 from test_chat_residency import ServeFixture  # noqa: E402
 from crit_api.engine import ServedEngine, reply  # noqa: E402
 from crit_api.server import Api, Server  # noqa: E402
+from crit_api.cli import parser  # noqa: E402
 
 # A template that strips thinking from history and opens the generation prompt inside it (Qwen3 style).
 THINK_TEMPLATE = ("{%- for message in messages %}{{ message.role }}:{{ message.content.split('</think>')[-1] }};"
@@ -173,7 +174,8 @@ def create_engine(context):
 
 
 class ServeReasoningTests(ServeFixture, unittest.TestCase):
-    """crit serve gives clients reasoning_content, in JSON replies and as stream deltas before the content."""
+    """crit serve gives clients reasoning_content (and reasoning with --reasoning-alias), in JSON replies and as stream
+    deltas before the content."""
     stream = True
     adapter_suffix = ADAPTER
 
@@ -209,6 +211,25 @@ class ServeReasoningTests(ServeFixture, unittest.TestCase):
         self.assertEqual("".join(d.get("reasoning_content") or "" for d in deltas), "why")
         self.assertEqual("".join(d.get("content") or "" for d in deltas), "Because.")
         self.assertEqual(kinds[0], "reasoning_content")
+        # Without --reasoning-alias the text has one name, so a client joining a delta's fields reads it once.
+        self.assertFalse(any("reasoning" in d for d in deltas + [message]))
+
+    def test_reasoning_alias_gives_the_reasoning_both_names(self):
+        self.assertTrue(parser().parse_args(["--workspace", "w", "--reasoning-alias"]).reasoning_alias)
+        self.server.api.reasoning_alias = True
+        status, body = self.chat()
+        self.assertEqual(status, 200, body)
+        message = json.loads(body)["choices"][0]["message"]
+        self.assertEqual((message["content"], message["reasoning_content"], message["reasoning"]),
+                         ("Because.", "why", "why"))
+        status, body = self.chat(stream=True)
+        self.assertEqual(status, 200, body)
+        deltas = [json.loads(line[6:])["choices"][0]["delta"] for line in body.splitlines()
+                  if line.startswith("data: {") and json.loads(line[6:]).get("choices")]
+        thoughts = [d for d in deltas if "reasoning_content" in d or "reasoning" in d]
+        self.assertTrue(thoughts)
+        self.assertTrue(all(d.get("reasoning") == d.get("reasoning_content") for d in thoughts))
+        self.assertEqual("".join(d["reasoning"] for d in thoughts), "why")
 
     def test_reasoning_only_completes_and_reuses_the_resident_host(self):
         served = self.server.api.engine

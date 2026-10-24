@@ -72,6 +72,8 @@ class EvalExtensionTests(Served, unittest.TestCase):
         self.assertEqual(json.loads(value["choices"][0]["message"]["content"]), {"decode": "plain"})
         response, value = self.chat("decode")
         self.assertEqual(json.loads(value["choices"][0]["message"]["content"]), {"decode": None})
+        response, value = self.chat("decode", crit={"decode": "plain", "timeout": 30})
+        self.assertEqual(json.loads(value["choices"][0]["message"]["content"]), {"decode": "plain"})
         for extension, param in (({"decode": "greedy"}, "crit.decode"), ({"speculative": False}, "crit"), ("plain", "crit")):
             with self.subTest(extension=extension):
                 response, value = self.chat("decode", crit=extension)

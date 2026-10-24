@@ -15,6 +15,9 @@ is that call: one that closes without parsing, or that the model ends its reply 
 cut by its output limit inside it keeps the call with the arguments written so far, as OpenAI's API returns a call
 cut by finish_reason "length".
 
+`call_grammar` writes a registered format's calls as a grammar (crit_core.constraints), so an engine that keeps its
+decoding to it makes the model call: tool_choice "required" or a named function.
+
 - "xml-function" (Qwen3-Coder, Qwen3.5+, Nemotron 3): <tool_call>\\n<function=NAME>\\n<parameter=KEY>\\nVALUE
   \\n</parameter>\\n</function>\\n</tool_call>. A value is a JSON value unless the function's schema declares the
   parameter a string (or does not declare it); an undecodable value stays a string, as the template writes strings
@@ -204,13 +207,165 @@ def _space(text, position):
     return position
 
 
+# Text in a call grammar: tab, newline, carriage return and printable ASCII, other characters as whole UTF-8 sequences.
+# A JSON string holds the printable ASCII but " and \ as it is, UTF-8 sequences and escapes.
+_TEXT = (9, 10, 13, *range(0x20, 0x7f))
+_STRING = tuple(byte for byte in range(0x20, 0x7f) if byte not in (0x22, 0x5c))
+
+
+class _Grammar:
+    """A call grammar built with crit_core.constraints' rule builder: rules are ids, productions tuples of bytes and
+    rules. Its text and JSON strings never hold `forbidden`, the markers that would end a call's block early (the
+    parser takes the first one)."""
+
+    def __init__(self, forbidden):
+        from crit_core.constraints.compiler import Builder
+        self.b, self.classes = Builder(), {}
+        b, chars = self.b, self.chars
+        tail = chars(range(0x80, 0xc0))
+        self.utf8 = b.rule([(chars(range(0xc2, 0xe0)), tail), (0xe0, chars(range(0xa0, 0xc0)), tail),
+                            (chars([*range(0xe1, 0xed), 0xee, 0xef]), tail, tail),
+                            (0xed, chars(range(0x80, 0xa0)), tail), (0xf0, chars(range(0x90, 0xc0)), tail, tail),
+                            (chars(range(0xf1, 0xf4)), tail, tail, tail), (0xf4, chars(range(0x80, 0x90)), tail, tail)])
+        self.text = self.excluding(_TEXT, [self.utf8], forbidden)
+        self.key = b.repeat(b.rule([(chars(set(range(0x21, 0x7f)) - {0x3c, 0x3e}),), (self.utf8,)]), 1)
+        x, u = chars(b"0123456789ABCDEFabcdef"), (0x5c, 0x75)   # a hex digit; \u
+        escape = b.rule([(0x5c, chars(b'"\\/bfnrt')), (*u, chars(b"0123456789ABCabcEeFf"), x, x, x),
+                         (*u, chars(b"Dd"), chars(b"01234567"), x, x),   # no unpaired surrogates, as the compiler
+                         (*u, chars(b"Dd"), chars(b"89ABab"), x, x, *u, chars(b"Dd"), chars(b"CDEFcdef"), x, x)])
+        self.string = b.rule([(0x22, self.excluding(_STRING, [self.utf8, escape], forbidden), 0x22)])
+        digit = chars(b"0123456789")
+        natural = b.rule([(0x30,), (chars(b"123456789"), b.repeat(digit))])
+        self.integer = b.rule([(natural,), (0x2d, natural)])
+        self.number = b.rule([(self.integer, b.rule([(), (0x2e, b.repeat(digit, 1))]),
+                               b.rule([(), (chars(b"Ee"), b.rule([(), (chars(b"+-"),)]), b.repeat(digit, 1))]))])
+        self.boolean, self.null = b.rule([tuple(b"true"), tuple(b"false")]), b.rule([tuple(b"null")])
+        self.comma = (0x2c, b.rule([(), (0x20,)]))   # "," and an optional space, as json.dumps and compact JSON write
+        self.value, self.object = b.new(), b.new()
+        self.array = self.sequence(0x5b, self.value, 0x5d)
+        member = b.rule([(self.string, 0x3a, self.comma[1], self.value)])
+        b.define(self.object, [(0x7b, 0x7d), (0x7b, self.items(member), 0x7d)])
+        b.define(self.value, [(self.object,), (self.array,), (self.string,), (self.number,), (self.boolean,),
+                              (self.null,)])
+
+    def chars(self, values):
+        key = frozenset(values)
+        if key not in self.classes:
+            self.classes[key] = self.b.chars(key)
+        return self.classes[key]
+
+    def items(self, item):
+        """One or more `item`s apart by commas."""
+        rule = self.b.new()
+        return self.b.define(rule, [(item,), (rule, *self.comma, item)])
+
+    def sequence(self, opening, item, closing):
+        """A bracketed list of `item`s, maybe empty."""
+        return self.b.rule([(opening, closing), (opening, self.items(item), closing)])
+
+    def excluding(self, alphabet, others, forbidden):
+        """Text of the `alphabet` bytes and the rules `others` (characters with none of the forbidden bytes) that
+        holds no `forbidden` string (ASCII): one left-linear rule per state, the longest end of the text that may
+        still grow into one of them."""
+        states = sorted({""} | {word[:size] for word in forbidden for size in range(1, len(word))}, key=len)
+        rules = {state: self.b.new() for state in states}
+        choices = {state: [] for state in states}
+        choices[""].append(())
+        letters = set("".join(forbidden))
+        for state in states:
+            targets = {}
+            for byte in alphabet:
+                text = state + chr(byte)
+                if chr(byte) not in letters:
+                    targets.setdefault("", []).append(byte)
+                elif not any(text.endswith(word) for word in forbidden):
+                    targets.setdefault(next(text[start:] for start in range(len(text) + 1) if text[start:] in rules),
+                                       []).append(byte)
+            for target, values in targets.items():
+                choices[target].append((rules[state], self.chars(values)))
+            choices[""] += [(rules[state], other) for other in others]
+        for state in states:
+            self.b.define(rules[state], choices[state])
+        return self.b.rule([(rules[state],) for state in states])
+
+    def schema(self, schema, depth=0):
+        """JSON values of `schema` as far as its structure goes: its const or enum values, its type or types, an
+        object's declared properties and an array's items; any JSON value where it says no more."""
+        if not isinstance(schema, dict) or depth > 32:
+            return self.value
+        values = [schema["const"]] if "const" in schema else schema.get("enum")
+        if isinstance(values, list) and values:
+            return self.b.rule([tuple(_dumps(value).encode("utf-8")) for value in values])
+        kinds = schema.get("type", "object" if isinstance(schema.get("properties"), dict) else None)
+        parts = []
+        for kind in kinds if isinstance(kinds, list) else [kinds]:
+            if kind == "object":
+                parts.append(self.properties(schema, depth))
+            elif kind == "array":
+                parts.append(self.sequence(0x5b, self.schema(schema.get("items"), depth + 1), 0x5d))
+            elif kind in ("string", "integer", "number", "boolean", "null"):
+                parts.append(getattr(self, kind))
+            else:
+                return self.value
+        return self.b.rule([(part,) for part in parts]) if len(parts) > 1 else parts[0] if parts else self.value
+
+    def properties(self, schema, depth=0):
+        """An object of the declared properties in their order, the required ones always; any object when it declares
+        none."""
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return self.object
+        required = schema.get("required") if isinstance(schema.get("required"), list) else []
+        tails = {False: (), True: ()}   # the members after one, when a member came before it (True) or none did
+        for key, value in reversed(properties.items()):
+            member = (*(_dumps(key) + ":").encode("utf-8"), self.comma[1], self.schema(value, depth + 1))
+            following = {}
+            for seen in (False, True):
+                choices = [(*(self.comma if seen else ()), *member, *tails[True])]
+                following[seen] = (self.b.rule(choices + ([] if key in required else [tails[seen]])),)
+            tails = following
+        return self.b.rule([(0x7b, *tails[False], 0x7d)])
+
+
+def _xml_function_call(grammar, function):
+    """One xml-function call to `function`: its declared parameters in their order (the required ones always), any
+    parameters when it declares none; a value is text unless its schema declares another type (_xml_value)."""
+    parameters = function.get("parameters")
+    properties = parameters.get("properties") if isinstance(parameters, dict) else None
+
+    def parameter(key, value):
+        return (*b"<parameter=", *key, *b">\n", value, *b"\n</parameter>\n")
+
+    if isinstance(properties, dict):
+        required = parameters.get("required") if isinstance(parameters.get("required"), list) else []
+        body = []
+        for key, schema in properties.items():
+            if key and key == key.strip() and ">" not in key and "\n" not in key:  # a name the syntax can write
+                value = grammar.text if _schema_type(function, key) in (None, "string") else grammar.schema(schema, 1)
+                block = parameter(key.encode("utf-8"), value)
+                body += block if key in required else (grammar.b.rule([(), block]),)
+    else:
+        body = (grammar.b.repeat(grammar.b.rule([parameter((grammar.key,), grammar.text)])),)
+    return (*(OPEN + "\n<function=" + function["name"] + ">\n").encode("utf-8"), *body,
+            *("</function>\n" + CLOSE).encode("utf-8"))
+
+
+def _json_object_call(grammar, function):
+    """One json-object call to `function`, written name first, its arguments shaped by its parameters schema."""
+    parameters = function.get("parameters")
+    arguments = grammar.properties(parameters, 1) if isinstance(parameters, dict) else grammar.object
+    return (*(OPEN + '\n{"name": ' + _dumps(function["name"]) + ', "arguments": ').encode("utf-8"), arguments,
+            *("}\n" + CLOSE).encode("utf-8"))
+
+
 # name: (detect(template source), parse(block body, {function name: function spec}) -> (name, arguments) | None,
-#        opening marker, closing marker, stream(unfinished block body, functions) -> (name, arguments start) | None)
+#        opening marker, closing marker, stream(unfinished block body, functions) -> (name, arguments start) | None,
+#        (call(_Grammar, function spec) -> one call block's production, the strings no text or string in it holds))
 FORMATS = {
     "xml-function": (lambda source: OPEN in source and "<function=" in source and "<parameter=" in source,
-                     _xml_function, OPEN, CLOSE, _xml_function_stream),
+                     _xml_function, OPEN, CLOSE, _xml_function_stream, (_xml_function_call, ("</parameter>", CLOSE))),
     "json-object": (lambda source: OPEN in source and CLOSE in source and "<function=" not in source,
-                    _json_object, OPEN, CLOSE, _json_object_stream),
+                    _json_object, OPEN, CLOSE, _json_object_stream, (_json_object_call, (CLOSE,))),
 }
 
 
@@ -239,7 +394,7 @@ def _format(format):
         return format
     if format not in FORMATS:
         raise TextError(f"unknown tool-call format {format!r}; registered: {', '.join(FORMATS)}")
-    _, parse, opening, closing, stream = FORMATS[format]
+    _, parse, opening, closing, stream, _ = FORMATS[format]
     return ToolFormat(parse, opening, closing, stream=stream)
 
 
@@ -264,6 +419,41 @@ def templates_tool_format(sources):
     if len(formats) > 1:
         raise TextError("the model's chat templates disagree on the tool-call format: " + ", ".join(sorted(formats)))
     return formats.pop() if formats else None
+
+
+def call_grammar(format, tools, choice="required", parallel=True, *, reasoning=None, opened=False):
+    """A reply that only calls tools, in registered format `format`, as a crit-byte-grammar-v1 artifact
+    (crit_core.constraints): calls to `tools` (the request's OpenAI tools), or to the function a named `choice` names,
+    one or with `parallel` one or more, written as the chat template writes them. Arguments follow the function's
+    parameters schema as far as its structure goes (declared properties in their order, the required ones always,
+    types, enums), and no text or string in a call holds a marker that would end its block early. `reasoning`, the
+    (opening, closing) reasoning markers (ASCII), lets the model think before it calls; with `opened` the generation
+    prompt ends with the opening marker, so the reply starts inside the reasoning. None for a format crit does not
+    register (a package's own ToolFormat): it cannot write that syntax."""
+    if not isinstance(format, str) or format not in FORMATS:
+        return None
+    call, forbidden = FORMATS[format][5]
+    named = choice["function"]["name"] if isinstance(choice, dict) else None
+    functions = [tool["function"] for tool in tools if named is None or tool["function"]["name"] == named]
+    if not functions:
+        raise TextError(f"tool_choice names {named!r}, which the tools do not offer")
+    if opened and reasoning is None:
+        raise TextError("a reply that starts inside its reasoning needs the reasoning markers")
+    if reasoning is not None and not "".join(reasoning).isascii():
+        raise TextError("a call grammar writes ASCII reasoning markers only")
+    grammar = _Grammar(forbidden)
+    b = grammar.b
+    calls = b.rule([call(grammar, function) for function in functions])
+    if parallel:   # one or more, a newline between two allowed
+        one, calls = calls, b.new()
+        b.define(calls, [(one,), (calls, one), (calls, 0x0a, one)])
+    root = [(calls,)]
+    if reasoning is not None:
+        opening, closing = reasoning
+        thought = (grammar.excluding(_TEXT, [grammar.utf8], (closing,)), *closing.encode("utf-8"),
+                   b.rule([(), (0x0a,), (0x0a, 0x0a)]), calls)
+        root = [thought] if opened else root + [(*opening.encode("utf-8"), *thought)]
+    return b.artifact(b.rule(root))
 
 
 class ToolCallParser:
@@ -424,5 +614,5 @@ class ToolReply:
         return self.content, self.calls
 
 
-__all__ = ["FORMATS", "ToolCallParser", "ToolFormat", "ToolReply", "format_markers", "templates_tool_format",
-           "tool_call_format"]
+__all__ = ["FORMATS", "ToolCallParser", "ToolFormat", "ToolReply", "call_grammar", "format_markers",
+           "templates_tool_format", "tool_call_format"]

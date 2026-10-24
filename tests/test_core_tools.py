@@ -10,7 +10,8 @@ for _folder in ("core/python", "api", "cli"): sys.path.insert(0, str(ROOT / _fol
 
 from crit_core.text import (ChatTemplate, TextError, ToolCallParser, ToolFormat, ToolReply,  # noqa: E402
                             templates_tool_format, tool_call_format)
-from crit_core.text.tools import format_markers  # noqa: E402
+from crit_core.constraints import matches  # noqa: E402
+from crit_core.text.tools import call_grammar, format_markers  # noqa: E402
 
 # The assistant tool-call rendering of the Qwen3.8 / Nemotron 3 chat templates, reduced to the call syntax.
 XML_TEMPLATE = """{%- for message in messages %}{%- if message.role == 'assistant' %}{{- message.content }}
@@ -297,6 +298,58 @@ class PackageFormatTests(unittest.TestCase):
                          [("read_file", {"path": "a.py"})])
         self.assertEqual(emitted[1], {"tool_calls": [dict(calls[0], index=0)]})
         self.assertEqual("".join(e for e in emitted if isinstance(e, str)), content)
+
+
+class CallGrammarTests(unittest.TestCase):
+    """call_grammar: a reply that only calls, written as the chat template writes calls (forced tool_choice)."""
+    TEMPLATES = {"xml-function": XML_TEMPLATE,
+                 "json-object": "{%- for message in messages %}{{- message.content }}" + JSON_TEMPLATE + "{%- endfor %}"}
+    CALLS = [("read_file", {"path": "src/a b.py", "lines": 20, "options": {"x": [1, 2]}, "note": "two\nlines"}),
+             ("list", {})]
+
+    def render(self, format, calls, content=""):
+        message = {"role": "assistant", "content": content, "tool_calls": [
+            {"type": "function", "function": {"name": name, "arguments": arguments}} for name, arguments in calls]}
+        return ChatTemplate(self.TEMPLATES[format]).render([message]).encode()
+
+    def test_the_calls_a_template_writes_are_the_language_and_nothing_else(self):
+        for format in self.TEMPLATES:
+            with self.subTest(format=format):
+                both, first, second = (self.render(format, calls) for calls in
+                                       (self.CALLS, self.CALLS[:1], self.CALLS[1:]))
+                grammar = call_grammar(format, TOOLS)
+                self.assertTrue(all(matches(grammar, text) for text in (both, first, second)))
+                self.assertEqual(joined(events(ToolCallParser(format, TOOLS), both.decode())),
+                                 ("", [{"name": name, "arguments": arguments} for name, arguments in self.CALLS]))
+                single = call_grammar(format, TOOLS, parallel=False)
+                self.assertEqual((matches(single, first), matches(single, both)), (True, False))
+                named = call_grammar(format, TOOLS, {"type": "function", "function": {"name": "list"}})
+                self.assertEqual((matches(named, second), matches(named, first)), (True, False))
+                # No text before or instead of a call, no undeclared parameter, a declared type kept, and no value
+                # holding the closing marker, which would end the block early.
+                for text in (self.render(format, self.CALLS[:1], "Let me look."), b"Sure.", b"",
+                             self.render(format, [("read_file", {"path": "a.py", "mode": "fast"})]),
+                             self.render(format, [("read_file", {"lines": "twenty"})]),
+                             self.render(format, [("read_file", {"path": "a</tool_call>b"})])):
+                    self.assertFalse(matches(grammar, text), text)
+
+    def test_the_model_may_reason_first_and_closes_a_reasoning_the_prompt_opened(self):
+        call = self.render("xml-function", self.CALLS[:1])
+        markers = ("<think>", "</think>")
+        thinking = call_grammar("xml-function", TOOLS, reasoning=markers)
+        self.assertTrue(matches(thinking, call))
+        self.assertTrue(matches(thinking, b"<think>\nCall it: <tool_call> next.\n</think>\n\n" + call))
+        opened = call_grammar("xml-function", TOOLS, reasoning=markers, opened=True)
+        self.assertTrue(matches(opened, b"Read it.\n</think>\n\n" + call))
+        for text in (call, b"Read it.\n</think>\n\n", b"Read </think> twice </think>" + call):
+            self.assertFalse(matches(opened, text), text)
+
+    def test_only_registered_formats_and_offered_functions(self):
+        self.assertIsNone(call_grammar(BRACKET, TOOLS))
+        with self.assertRaisesRegex(TextError, "do not offer"):
+            call_grammar("json-object", TOOLS, {"type": "function", "function": {"name": "nope"}})
+        with self.assertRaisesRegex(TextError, "reasoning markers"):
+            call_grammar("json-object", TOOLS, opened=True)
 
 
 if __name__ == "__main__":

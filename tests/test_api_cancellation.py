@@ -83,14 +83,14 @@ class DisconnectTests(ServeFixture, unittest.TestCase):
                           struct.pack('HH' if os.name == 'nt' else 'ii', 1, 0))
         client.close()
 
-    def http_request(self, stream=False, content=None):
+    def http_request(self, stream=False, content=None, headers=None):
         """Use ordinary HTTP client APIs, without changing TCP close behavior."""
         connection = http.client.HTTPConnection(*self.server.server_address, timeout=5)
         self.addCleanup(connection.close)
         connection.request('POST', '/v1/chat/completions', json.dumps({
             'messages': [{'role': 'user', 'content': content or 'gate:' + str(self.gate)}],
             'stream': stream, 'max_tokens': 128,
-        }), {'Content-Type': 'application/json'})
+        }), {'Content-Type': 'application/json', **(headers or {})})
         response = None
         if stream:
             response = connection.getresponse()
@@ -101,6 +101,13 @@ class DisconnectTests(ServeFixture, unittest.TestCase):
         if content is None:
             self.until(self.gate.with_suffix('.started').exists, 'Generation did not reach the gate')
         return connection, response
+
+    def abort(self, body):
+        connection = http.client.HTTPConnection(*self.server.server_address, timeout=5)
+        self.addCleanup(connection.close)
+        connection.request('POST', '/v1/crit/abort', json.dumps(body), {'Content-Type': 'application/json'})
+        response = connection.getresponse()
+        return response.status, json.loads(response.read())
 
     def assert_cancelled_and_reusable(self, before):
         self.until(self.gate.with_suffix('.settled').exists,
@@ -225,6 +232,99 @@ class DisconnectTests(ServeFixture, unittest.TestCase):
 
     def test_http_client_close_while_waiting_skips_generation_without_cancelling_the_active_turn(self):
         self.check_cancel_while_waiting(reset=False)
+
+    def test_abort_by_request_id_ends_a_streaming_turn_and_keeps_weights(self):
+        before = self.ask(self.served)
+        _, response = self.http_request(stream=True)
+        ident = response.getheader('X-Request-Id')
+        self.assertEqual(self.abort({'request_id': ident}),
+                         (200, {'object': 'crit.abort', 'found': True, 'request_ids': [ident]}))
+        events = [line[6:] for line in response.read().decode().splitlines() if line.startswith('data: ')]
+        self.assertEqual(events[-1], '[DONE]')
+        self.assertEqual(json.loads(events[-2])['error']['message'], 'Request cancelled')
+        self.assertEqual(json.loads(events[-2])['request_id'], ident)
+        self.assert_cancelled_and_reusable(before)
+        self.assertEqual(self.abort({'request_id': ident}),
+                         (200, {'object': 'crit.abort', 'found': False, 'request_ids': []}))
+
+    def test_abort_by_the_clients_request_id_answers_a_waiting_client_on_its_open_connection(self):
+        before = self.ask(self.served)
+        connection, _ = self.http_request(headers={'X-Request-Id': 'client-7'})
+        status, value = self.abort({'request_id': 'client-7'})
+        self.assertEqual((status, value['found'], len(value['request_ids'])), (200, True, 1))
+        response = connection.getresponse()
+        error = json.loads(response.read())
+        self.assertEqual((response.status, error['error']['message']), (499, 'Request cancelled'))
+        self.assertEqual([response.getheader('X-Request-Id'), error['request_id']], value['request_ids'] * 2)
+        self.assert_cancelled_and_reusable(before)
+        connection.request('GET', '/health')
+        self.assertEqual(connection.getresponse().status, 200)
+
+    def test_abort_removes_a_queued_request_and_all_ends_every_request(self):
+        before = self.ask(self.served)
+        entered = threading.Event()
+        generate = self.served.generate
+
+        def observed(messages, *args, **kwargs):
+            if messages[-1]['content'] == 'reply:abandoned':
+                entered.set()
+            return generate(messages, *args, **kwargs)
+
+        with patch.object(self.served, 'generate', side_effect=observed):
+            active, _ = self.http_request()
+            queued, _ = self.http_request(content='reply:abandoned', headers={'X-Request-Id': 'queued'})
+            self.assertTrue(entered.wait(5), 'Second request did not enter the engine queue')
+            status, value = self.abort({'request_id': 'queued'})
+            self.assertEqual((status, value['found']), (200, True))
+            response = queued.getresponse()
+            self.assertEqual((response.status, json.loads(response.read())['request_id']),
+                             (499, value['request_ids'][0]))
+            self.assertFalse(self.gate.with_suffix('.settled').exists())
+            self.assertEqual(self.served.status()['state'], 'generating')
+            status, value = self.abort({'all': True})
+            self.assertEqual((status, value['found'], len(value['request_ids'])), (200, True, 1))
+            response = active.getresponse()
+            self.assertEqual((response.status, json.loads(response.read())['request_id']),
+                             (499, value['request_ids'][0]))
+        self.assert_cancelled_and_reusable(before)
+        # The aborted queue entry never reached the adapter: only the two asks counted as generations.
+        self.assertEqual(self.ask(self.served)['calls'], before['calls'] + 2)
+
+    def test_abort_answers_a_queued_stream_with_its_status_since_the_stream_has_not_begun(self):
+        before = self.ask(self.served)
+        entered = threading.Event()
+        generate = self.served.generate
+
+        def observed(messages, *args, **kwargs):
+            if messages[-1]['content'] == 'reply:abandoned':
+                entered.set()
+            return generate(messages, *args, **kwargs)
+
+        with patch.object(self.served, 'generate', side_effect=observed):
+            active, _ = self.http_request()
+            # A stream's headers wait for the engine to take it, so the client's id is the one it has to abort by.
+            queued = http.client.HTTPConnection(*self.server.server_address, timeout=5)
+            self.addCleanup(queued.close)
+            queued.request('POST', '/v1/chat/completions', json.dumps({
+                'messages': [{'role': 'user', 'content': 'reply:abandoned'}], 'stream': True, 'max_tokens': 128,
+            }), {'Content-Type': 'application/json', 'X-Request-Id': 'queued-stream'})
+            self.assertTrue(entered.wait(5), 'Queued stream did not enter the engine queue')
+            status, value = self.abort({'request_id': 'queued-stream'})
+            self.assertEqual((status, value['found'], len(value['request_ids'])), (200, True, 1))
+            response = queued.getresponse()
+            error = json.loads(response.read())
+            self.assertEqual((response.status, response.getheader('Content-Type'), error['error']['message']),
+                             (499, 'application/json', 'Request cancelled'))
+            self.assertEqual([response.getheader('X-Request-Id'), error['request_id']], value['request_ids'] * 2)
+            self.assertEqual(self.served.status()['state'], 'generating')
+            self.gate.with_suffix('.release').touch()
+            response = active.getresponse()
+            self.assertEqual((response.status, json.loads(response.read())['choices'][0]['message']['content']),
+                             (200, 'released'))
+        # The aborted stream never reached the adapter, nor does the gated turn count: only this ask is a generation.
+        after = self.ask(self.served)
+        self.assertEqual(after['calls'], before['calls'] + 1)
+        self.assertEqual((after['pid'], after['device']), (before['pid'], before['device']))
 
     def check_uncooperative_cancel(self, reset):
         before = self.ask(self.served)

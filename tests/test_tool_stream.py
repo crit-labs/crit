@@ -74,6 +74,33 @@ class ToolStreamContractTests(test_chat_stream.StreamContractTests):
         self.assertEqual([r["id"] for r in rebuilt.values()], ["call_1", "call_2"])
         self.assertEqual(text, [])
 
+    def test_text_follows_a_call_only_once_its_arguments_are_whole(self):
+        writer = self.writer(tools=True)
+        writer.emit({"tool_calls": [dict(CALL, index=0, function={"name": "read_file", "arguments": '{"path":'})]})
+        with self.assertRaisesRegex(ValueError, "unfinished tool call"):
+            writer.emit("Observation:")
+        with self.assertRaises(ValueError):
+            writer.finish({"assistant": "", "tool_calls": [CALL]})
+        text = []
+        reader = self.reader(text)
+        reader.apply(self.sent[0])
+        with self.assertRaisesRegex(ValueError, "unfinished tool call"):
+            reader.apply(self.piece(text="Observation:"))
+        self.assertEqual(text, [])
+        # Calls may interleave with each other; text goes out once every call before it is whole.
+        self.sent.clear()
+        writer, calls = self.writer(tools=True), [CALL, dict(CALL, id="call_2")]
+        for i, call in enumerate(calls):
+            writer.emit({"tool_calls": [dict(call, index=i, function={"name": "read_file", "arguments": "{"})]})
+        for i in (1, 0):
+            writer.emit({"tool_calls": [{"index": i, "function": {"arguments": CALL["function"]["arguments"][1:]}}]})
+        writer.emit("Done.")
+        writer.finish({"assistant": "Done.", "tool_calls": calls})
+        reader = self.reader(text)
+        for piece in self.sent:
+            reader.apply(piece)
+        self.assertEqual(text, ["Done."])
+
     def test_bad_prefix_and_swallowed_callback_errors_fail_the_turn(self):
         writer = self.writer(tools=True)
         with self.assertRaisesRegex(ValueError, "strict tool schema"):

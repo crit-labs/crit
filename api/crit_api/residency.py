@@ -112,9 +112,12 @@ class ResidentRuntime:
                     for piece in pieces:  # every piece the host sent before its result
                         stream.apply(piece)
                 if result is not None:
-                    if (set(result) - {"response"} != RESULT or type(result["cleanup_settled"]) is not bool
-                            or result["status"] not in {"completed", "cancelled", "failed"}
-                            or ("response" in result) != (action in RESPONDING and result["status"] == "completed")):
+                    if (set(result) - {"response", "rejection"} != RESULT or type(result["cleanup_settled"]) is not bool
+                            or result["status"] not in {"completed", "cancelled", "failed", "rejected"}
+                            or ("response" in result) != (action in RESPONDING and result["status"] == "completed")
+                            or ("rejection" in result) != (action in RESPONDING and result["status"] == "rejected")
+                            or ("rejection" in result and not (isinstance(result["rejection"], dict)
+                                                              and isinstance(result["rejection"].get("reason"), str)))):
                         raise ValueError("Resident completion identity/cleanup mismatch")
                     result = {k: v for k, v in result.items() if k not in {"kind", "command_id"}}
                     if not result["cleanup_settled"]:
@@ -123,6 +126,7 @@ class ResidentRuntime:
                     if cancelled_at is not None and result["status"] != "failed":
                         result.update(status="timed_out" if timed_out else "cancelled", error="Reply timed out" if timed_out else "Stopped")
                         result.pop("response", None)
+                        result.pop("rejection", None)
                     return result
                 if tree.process.poll() is not None or link.failure:
                     try:

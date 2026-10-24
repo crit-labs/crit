@@ -11,13 +11,13 @@
 
 ### Why wait for someone to optimize an LLM for your GPU when an AI agent can build a specialized inference engine in a few hours?
 
-[![Version 0.8.0](docs/assets/badge-version.svg)](CHANGELOG.md)
+[![Version 0.9.0](docs/assets/badge-version.svg)](CHANGELOG.md)
 [![License Apache-2.0](docs/assets/badge-license.svg)](LICENSE)
 [![crit-hub engines](docs/assets/badge-crit-hub.svg)](https://github.com/crit-labs/crit-hub)
 [![CI](https://github.com/crit-labs/crit/actions/workflows/ci.yml/badge.svg)](https://github.com/crit-labs/crit/actions/workflows/ci.yml)
 
 [Summary](#summary) • [Quick start](#quick-start) • [What crit solves](#what-crit-solves) • [Case studies](#case-study) •
-[Methodology](#methodology) • [crit-hub](#crit-hub) • [Serving](#serving) • [Limitations](#limitations) • [Documentation](#documentation)
+[How crit works](#how-crit-works) • [crit-hub](#crit-hub) • [Serving](#serving) • [Limitations](#limitations) • [Documentation](#documentation)
 
 </div>
 
@@ -34,6 +34,7 @@
 > Qwen3.8-27B on one RTX 5090 in about 4 hours and seven candidates,
 > reaching 252 tok/s greedy decode with the model's full 262,144-token context.
 > You get runnable source, measured candidate comparisons and an OpenAI-compatible API.
+> 
 > Follow the [building guide](docs/BUILDING_ENGINES.md) yourself, or give your coding
 > agent the [agent instructions](AGENTS.md), target model and hardware.
 
@@ -231,9 +232,9 @@ output, so candidates 3 and 4 have the same round time but accept different numb
 
 ---
 
-<a id="methodology"></a>
+<a id="how-crit-works"></a>
 
-## Methodology
+## How `crit` works
 
 We studied working tailored engines and where specialization makes them fast. The
 runtime every engine needs became Core. Techniques whose value depends on model and
@@ -369,8 +370,11 @@ Use them as jump-off point for further optimization.
 <br />
 
 `crit serve` loads a sealed candidate, keeps it resident and answers OpenAI-compatible
-chat requests, including streaming, stop strings and structured output. Engines
-implement the [adapter contract](docs/SERVING.md#adapter-contract).
+chat requests, including streaming, stop strings and structured output. The same engine
+also speaks the [Anthropic Messages and Ollama APIs](docs/SERVING.md#other-api-dialects),
+so Claude Code and local chat UIs need only a base URL, and `GET /metrics` serves
+[Prometheus metrics](docs/SERVING.md#metrics). Engines implement the
+[adapter contract](docs/SERVING.md#adapter-contract).
 
 </details>
 
@@ -406,6 +410,6 @@ implement the [adapter contract](docs/SERVING.md#adapter-contract).
 | Find and adapt kernels | [Kernels](kernels/README.md) |
 | Quantize weights and record the transform | [Models](models/README.md) |
 | Compare speed, quality and speculative output | [Eval](docs/eval/README.md) |
-| Serve an engine as an OpenAI-compatible API | [Serving](docs/SERVING.md) · [Adapter contract](docs/SERVING.md#adapter-contract) |
+| Serve an engine through the OpenAI, Anthropic or Ollama API | [Serving](docs/SERVING.md) · [Adapter contract](docs/SERVING.md#adapter-contract) |
 | Change `crit` or run its tests | [What belongs in crit](docs/CONTRIBUTION_CRITERIA.md) · [Contributing](docs/CONTRIBUTING.md) · [Licensing](docs/LICENSES.md) |
 | See release history | [Changelog](CHANGELOG.md) |

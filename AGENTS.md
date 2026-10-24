@@ -283,7 +283,9 @@ Always give the actual candidate and its serve command:
 crit serve --workspace "RUN_ROOT" --run "RUN_ID" --candidate "CANDIDATE_ID" --project "CRIT_ROOT"
 ```
 
-Clients connect to `http://127.0.0.1:8000/v1`. Also run it with `--write-launchers`
+Clients connect to `http://127.0.0.1:8000/v1`; Anthropic and Ollama clients (Claude Code,
+local chat UIs) use `http://127.0.0.1:8000` ([other API dialects](docs/SERVING.md#other-api-dialects)),
+and `GET /metrics` serves Prometheus metrics. Also run it with `--write-launchers`
 (writes `serve.cmd` and `serve.sh` into the run folder) and name them. Headless agents
 deliver transferable artifacts and target-machine instructions. Without the target
 hardware, label results unmeasured; never invent measurements or claim to have started

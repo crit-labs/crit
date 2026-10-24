@@ -5,19 +5,30 @@ import re
 from functools import lru_cache
 
 from crit_core.constraints import ByteGrammar, GrammarState, UnsupportedConstraint, compile_language, matches
-from crit_core.serving import PLAIN_CAPABILITY
+from crit_core.serving import (PLAIN_CAPABILITY, TEMPLATE_KWARGS, TEMPLATE_KWARGS_CAPABILITY, template_kwarg_capability,
+                               template_value)
 
 TOOLS_CAPABILITY = "chat-tools-v1"
 STRICT_TOOLS_CAPABILITY = "chat-tools-strict-v1"
 TOOL_STREAM_CAPABILITY = "chat-tool-stream-v1"
+TOOL_CHOICE_CAPABILITY = "chat-tool-choice-v1"   # tool_choice required or a named function: the adapter forces a call
 # Declared by packages sealed before crit 0.2.2 with the interim template tools. Their adapters are ResidentChats, which
 # now parse calls themselves, so it reads as chat-tools-v1 (and chat-tool-stream-v1 when the package streams), with
 # tool_choice auto or none.
 TOOL_TEMPLATE_CAPABILITY = "chat-tool-template-v1"
 STREAM_CAPABILITY = "chat-stream-v1"
 MAX_CHAT_RECORD = 16 * 1024 * 1024  # bounded image data plus retained request metadata
+MAX_TOOLS = 128  # functions one request may offer
 SAMPLING = {"temperature", "top_p", "top_k", "min_p", "seed", "presence_penalty",
             "frequency_penalty", "repetition_penalty", "logit_bias"}
+# Samplers crit's sampling law does not have, by llama.cpp's and Ollama's names: (the value that turns it off, range).
+# No engine applies them, so the off value is a no-op.
+EXTRA_SAMPLING = {"typical_p": (1, 0, 1), "tfs_z": (1, 0, 1), "mirostat": (0, 0, 2),
+                  "dry_multiplier": (0, 0, float("inf")), "xtc_probability": (0, 0, 1)}
+SWITCHES = ("enable_thinking", "thinking")  # the TEMPLATE_KWARGS that turn a template's thinking on or off
+# OpenAI's reasoning_effort as a template's reasoning_effort: none turns thinking off, minimal and xhigh take the
+# lowest and highest it takes.
+EFFORTS = {"none": None, "minimal": "low", "low": "low", "medium": "medium", "high": "high", "xhigh": "high"}
 
 
 class RequestError(Exception):
@@ -47,7 +58,27 @@ def require(capabilities, capability, param):
                            code="unsupported_parameter")
 
 
-def sampling_options(body, capabilities):
+def parameter_name(value):
+    """Whether crit serve may ignore a parameter by this name: X-Crit-Ignored-Parameters and the server log carry it as
+    sent, so it is 1 to 64 letters, digits, _, . or -."""
+    return re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", value)
+
+
+def unknown_parameters(body, known, lenient, prefix=""):
+    """The request's keys outside `known`, sorted and named with `prefix` (stream_options. for that object's keys).
+    Strict crit serve refuses the first; --lenient refuses only a name it cannot list (parameter_name)."""
+    unknown = sorted(k for k in body if k not in known)
+    refused = [k for k in unknown if not (lenient and parameter_name(k))]
+    if refused:
+        raise RequestError("Unknown request parameter: " + prefix + refused[0], param=prefix + refused[0],
+                           code="unsupported_parameter")
+    return [prefix + k for k in unknown]
+
+
+def sampling_options(body, capabilities, ignored=None):
+    """The request's sampling fields the package applies, each checked against its range. An extra sampler
+    (EXTRA_SAMPLING) at its off value is a no-op. Any other field the package does not apply is refused, or, given an
+    `ignored` list (crit serve --lenient), named there and left out."""
     result = {}
     bounds = {"temperature": (0, 2), "top_p": (0, 1), "min_p": (0, 1),
               "frequency_penalty": (-2, 2), "presence_penalty": (-2, 2),
@@ -71,25 +102,117 @@ def sampling_options(body, capabilities):
                     or (type(value) is float and not math.isfinite(value))):
                 raise RequestError(f"Invalid {key}: expected a finite number in [{low}, {high}]"
                                    + (" (strictly positive)" if key in {"top_p", "repetition_penalty"} else ""), param=key)
+        if ignored is not None and sampling_capability(key) not in capabilities:
+            ignored.append(key)
+            continue
         require(capabilities, sampling_capability(key), key)
         result[key] = value
+    for key in sorted(EXTRA_SAMPLING.keys() & body.keys()):
+        value, (off, low, high) = body[key], EXTRA_SAMPLING[key]
+        if value is None:
+            continue
+        if (type(value) not in ((int,) if key == "mirostat" else (int, float)) or not low <= value <= high
+                or (type(value) is float and not math.isfinite(value))):
+            raise RequestError(f"Invalid {key}: expected " + ("0, 1 or 2" if key == "mirostat"
+                                                               else f"a finite number in [{low}, {high}]"), param=key)
+        if value == off:
+            continue
+        if ignored is None:
+            raise RequestError(f"This engine does not apply {key}; omit it or send {off}, which turns it off",
+                               param=key, code="unsupported_parameter")
+        ignored.append(key)
     return result
 
 
 def crit_options(value, capabilities):
     """crit's own request extension, the body's "crit" object: {"decode": "plain"} decodes the reply one token per
-    target pass, without drafting, on an engine that declares chat-plain-v1. Returns the decode mode or None."""
+    target pass, without drafting, on an engine that declares chat-plain-v1; {"timeout": seconds} gives the request
+    less time than the server's --timeout. Returns {"decode", "timeout"}, None where unset."""
     if value is None:
-        return None
-    if not isinstance(value, dict) or set(value) - {"decode"}:
-        raise RequestError("crit takes an object with decode", param="crit")
-    decode = value.get("decode")
-    if decode is None:
-        return None
-    if decode != "plain":
-        raise RequestError("crit.decode must be plain", param="crit.decode")
-    require(capabilities, PLAIN_CAPABILITY, "crit.decode")
-    return decode
+        return {"decode": None, "timeout": None}
+    if not isinstance(value, dict) or set(value) - {"decode", "timeout"}:
+        raise RequestError("crit takes an object with decode and timeout", param="crit")
+    decode, timeout = value.get("decode"), value.get("timeout")
+    if decode is not None:
+        if decode != "plain":
+            raise RequestError("crit.decode must be plain", param="crit.decode")
+        require(capabilities, PLAIN_CAPABILITY, "crit.decode")
+    if timeout is not None and (type(timeout) not in (int, float) or timeout <= 0
+                                or (type(timeout) is float and not math.isfinite(timeout))):
+        raise RequestError("crit.timeout must be a positive number of seconds", param="crit.timeout")
+    return {"decode": decode, "timeout": timeout}
+
+
+def template_variables(capabilities):
+    """The TEMPLATE_KWARGS a request may set: those the package declares, with chat-template-kwargs-v1."""
+    if TEMPLATE_KWARGS_CAPABILITY not in capabilities:
+        return []
+    return [name for name in TEMPLATE_KWARGS if template_kwarg_capability(name) in capabilities]
+
+
+def thinking_kwargs(capabilities, enabled=None, effort=None, param="reasoning_effort", ignored=None):
+    """The chat-template variables that turn thinking on or off (`enabled`) and set its effort (`effort`: low, medium
+    or high, which turns it on), through those the package declares: a switch (enable_thinking or thinking) and
+    reasoning_effort. A template with reasoning_effort and no switch always thinks: turning it off is refused, or,
+    given an `ignored` list (crit serve --lenient), `param` is named there and no variable is set."""
+    require(capabilities, TEMPLATE_KWARGS_CAPABILITY, param)
+    declared = template_variables(capabilities)
+    switches = [name for name in SWITCHES if name in declared]
+    if not declared or (enabled is False and not switches):
+        if ignored is not None:
+            ignored.append(param)
+            return {}
+        raise RequestError("This engine's chat template cannot turn thinking " + ("off" if declared else "on or off"),
+                           param=param, code="unsupported_parameter")
+    result = dict.fromkeys(switches, enabled is not False)
+    if enabled is not False and effort is not None and "reasoning_effort" in declared:
+        result["reasoning_effort"] = effort
+    return result
+
+
+def template_options(body, capabilities, ignored=None):
+    """The chat-template variables a request sets (chat-template-kwargs-v1): its chat_template_kwargs, each one of the
+    package's template_variables with a value TEMPLATE_KWARGS gives it, and its reasoning_effort (EFFORTS) through
+    thinking_kwargs; the two must agree on a variable both set. Given an `ignored` list (crit serve --lenient), what
+    the package cannot apply is named there and left out instead of refused: both fields, whatever they hold, without
+    chat-template-kwargs-v1; otherwise a variable crit does not set (by a name parameter_name takes) or the package
+    does not declare, once its value is checked, and a reasoning_effort its template cannot take."""
+    value = body.get("chat_template_kwargs")
+    if ignored is not None and TEMPLATE_KWARGS_CAPABILITY not in capabilities:
+        ignored += ["chat_template_kwargs"] if value is not None and value != {} else []
+        ignored += ["reasoning_effort"] if body.get("reasoning_effort") is not None else []
+        return {}
+    if value is not None and not isinstance(value, dict):
+        raise RequestError("chat_template_kwargs must be an object", param="chat_template_kwargs")
+    result = {}
+    for name, item in (value or {}).items():
+        require(capabilities, TEMPLATE_KWARGS_CAPABILITY, "chat_template_kwargs")
+        if name not in TEMPLATE_KWARGS:
+            if ignored is not None and parameter_name(name):
+                ignored.append("chat_template_kwargs." + name)
+                continue
+            raise RequestError(f"chat_template_kwargs.{name} is not a template variable crit serve sets; it sets "
+                               + ", ".join(TEMPLATE_KWARGS), param="chat_template_kwargs", code="unsupported_parameter")
+        declared = template_kwarg_capability(name) in capabilities
+        if not declared and ignored is None:
+            require(capabilities, template_kwarg_capability(name), "chat_template_kwargs")
+        if not template_value(name, item):
+            raise RequestError(f"chat_template_kwargs.{name} must be one of "
+                               + ", ".join(map(json.dumps, TEMPLATE_KWARGS[name])), param="chat_template_kwargs")
+        if not declared:
+            ignored.append("chat_template_kwargs." + name)
+            continue
+        result[name] = item
+    effort = body.get("reasoning_effort")
+    if effort is not None:
+        if not isinstance(effort, str) or effort not in EFFORTS:
+            raise RequestError("reasoning_effort must be " + ", ".join(EFFORTS), param="reasoning_effort")
+        mapped = thinking_kwargs(capabilities, effort != "none", EFFORTS[effort], ignored=ignored)
+        if any(result.get(name, item) != item for name, item in mapped.items()):
+            raise RequestError("reasoning_effort and chat_template_kwargs set a template variable differently",
+                               param="reasoning_effort")
+        result = {**mapped, **result}
+    return result
 
 
 def function_name(value):
@@ -104,8 +227,8 @@ def tool_grammar(source):
 def tool_options(body, capabilities):
     tools = body.get("tools")
     tools = [] if tools is None else tools
-    if not isinstance(tools, list) or len(tools) > 128:
-        raise RequestError("tools must be a list of at most 128 functions", param="tools")
+    if not isinstance(tools, list) or len(tools) > MAX_TOOLS:
+        raise RequestError(f"tools must be a list of at most {MAX_TOOLS} functions", param="tools")
     names, grammars = set(), {}
     for tool in tools:
         spec = tool.get("function") if isinstance(tool, dict) else None
@@ -148,9 +271,8 @@ def tool_options(body, capabilities):
         raise RequestError("parallel_tool_calls must be a boolean", param="parallel_tool_calls")
     if tools:
         require(capabilities, TOOLS_CAPABILITY, "tools")
-        if TOOL_TEMPLATE_CAPABILITY in capabilities and choice not in ("auto", "none"):
-            raise RequestError("This engine parses tool calls from free generation; tool_choice must be auto or none",
-                               param="tool_choice", code="unsupported_parameter")
+        if choice not in ("auto", "none"):
+            require(capabilities, TOOL_CHOICE_CAPABILITY, "tool_choice")
     options = {"tools": tools, "tool_choice": choice, "parallel_tool_calls": parallel} if tools else {}
     if grammars:
         options["tool_grammars"] = grammars
@@ -198,13 +320,13 @@ def complete_arguments(call):
 
 def validate_tool_reply(calls, options, truncated=False):
     """A reply's calls against the request's tool policy; `truncated`: the reply reached its output limit, so its last
-    call may be cut (tool_calls)."""
+    call may be cut (tool_calls), or a forced call not yet begun."""
     calls = [] if calls is None or calls == [] else tool_calls(calls, truncated)
     choice = options.get("tool_choice", "none")
     names = {t["function"]["name"] for t in options.get("tools", [])}
     if calls and (choice == "none" or any(c["function"]["name"] not in names for c in calls)):
         raise ValueError("Engine returned an unrequested tool call")
-    if (choice == "required" or isinstance(choice, dict)) and not calls:
+    if (choice == "required" or isinstance(choice, dict)) and not calls and not truncated:
         raise ValueError("Engine did not return the required tool call")
     if isinstance(choice, dict) and any(c["function"]["name"] != choice["function"]["name"] for c in calls):
         raise ValueError("Engine did not call the selected function")

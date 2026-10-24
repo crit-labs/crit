@@ -39,6 +39,8 @@ class StreamWriter:
                 piece = {"tool_calls": self.tools.update(chunk["tool_calls"])}
             else:
                 piece = {"text": content_text(chunk, "Stream text")}
+                if self.tools is not None:
+                    self.tools.before_text()
                 self.text.append(piece["text"])
                 self.text_size += len(piece["text"])
             content_size(self.text_size, self.tools.size if self.tools else 0, self.reasoning_size)
@@ -56,11 +58,13 @@ class StreamWriter:
             raise ValueError("Final reasoning differs from emitted stream reasoning")
         telemetry = response.get("telemetry")
         output = telemetry.get("output_tokens") if isinstance(telemetry, dict) else None
-        calls = validate_tool_reply(response.get("tool_calls"), self.request,
-                                    output == self.request["limits"]["max_output_tokens"])
+        # A fitted request (chat-fit-output-v1) reaches its limit at the cap the engine applied.
+        limit = response.get("max_output_tokens", self.request["limits"]["max_output_tokens"])
+        calls = validate_tool_reply(response.get("tool_calls"), self.request, output == limit)
         if self.tools is not None and calls != self.tools.calls:
             raise ValueError("Final tool calls differ from emitted tool calls")
-        response_content(response, tool_size(calls))
+        response_content(response, tool_size(calls), continued=bool(self.request.get("continue_final_message")),
+                         blank="prompt" in self.request)
 
     def close(self):
         self.closed = True
@@ -79,6 +83,7 @@ class StreamReader:
             raise ValueError("A resident stream piece carries one of " + ", ".join(PARTS))
         if "text" in piece:
             text = content_text(piece["text"], "Stream text")
+            self.tools.before_text()
             self.text += len(text)
             content_size(self.text, self.tools.size, self.reasoning)
             self.publish(text)
