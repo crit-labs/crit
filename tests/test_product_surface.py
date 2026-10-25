@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "cli"))
 from crit import inference as store
 LAUNCHER = str(ROOT / "tests/run_crit.py")
-PRODUCT_FOLDERS = ("core", "inference", "kernels", "models", "eval", "api", "tests", "docs", "cli", ".github")
+PRODUCT_FOLDERS = ("core", "inference", "kernels", "models", "api", "tests", "docs", "cli", ".github")
 
 
 class ProductTests(unittest.TestCase):
@@ -197,7 +197,7 @@ class ProductTests(unittest.TestCase):
     def test_cli_only_package_has_one_entrypoint_and_no_browser_sources(self):
         package = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertEqual(package["project"]["scripts"], {"crit": "crit.cli:main"})
-        self.assertEqual(package["tool"]["setuptools"]["packages"]["find"]["where"], ["cli", "api", "eval", "kernels", "models", "core/python"])
+        self.assertEqual(package["tool"]["setuptools"]["packages"]["find"]["where"], ["cli", "api", "kernels", "models"])
         self.assertEqual({p.name for p in (ROOT / "cli").iterdir() if p.is_dir()}, {"crit"})
         self.assertEqual({p.name for p in (ROOT / "api").iterdir() if p.is_dir()}, {"crit_api"})
         self.assertEqual({p.name for p in (ROOT / "kernels").iterdir() if p.is_dir()}, {"crit_kernels", "examples"})

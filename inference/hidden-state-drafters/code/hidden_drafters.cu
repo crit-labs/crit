@@ -6,14 +6,14 @@ namespace {
 
 namespace control = device_round::control;
 
-__global__ void eagle_ingest_kernel(const std::int32_t* control_all, const std::int32_t* result_all, std::uint32_t k,
-                                    std::int32_t* tokens, std::int32_t* positions, std::uint32_t rows) {
+__global__ void eagle_ingest_kernel(const std::int32_t* control_all, const std::int32_t* result_all, std::uint32_t stride,
+                                    std::uint32_t columns, std::int32_t* tokens, std::int32_t* positions, std::uint32_t rows) {
     const std::uint32_t r = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
-    if(r >= rows || c > k) return;
+    if(r >= rows || c >= columns) return;
     const std::int32_t* ctl = control_all + std::size_t(r) * control::fields;
-    const std::int32_t* result = result_all + std::size_t(r) * device_round::result_width(k);
+    const std::int32_t* result = result_all + std::size_t(r) * stride;
     const std::int32_t n = ctl[control::n_emitted];
-    const std::size_t at = std::size_t(r) * (k + 1) + c;
+    const std::size_t at = std::size_t(r) * columns + c;
     const bool live = std::int32_t(c) < n;
     tokens[at] = live ? result[1 + c] : -1;
     positions[at] = live ? ctl[control::base_frontier] + std::int32_t(c) : -1;
@@ -62,10 +62,17 @@ __global__ void truncate_kernel(std::int32_t* drafts, const float* confidence, s
 
 cudaError_t enqueue_eagle_ingest(const std::int32_t* control, const std::int32_t* result, std::uint32_t k, std::int32_t* tokens,
                                  std::int32_t* positions, std::uint32_t rows, cudaStream_t stream) {
+    return enqueue_eagle_ingest(control, result, device_round::result_width(k), k + 1, tokens, positions, rows, stream);
+}
+
+cudaError_t enqueue_eagle_ingest(const std::int32_t* control, const std::int32_t* result, std::uint32_t stride,
+                                 std::uint32_t columns, std::int32_t* tokens, std::int32_t* positions, std::uint32_t rows,
+                                 cudaStream_t stream) {
     if(!rows) return cudaSuccess;
-    if(!control || !result || !tokens || !positions || rows > 65535) return cudaErrorInvalidValue;
+    if(!control || !result || !tokens || !positions || rows > 65535 || !columns || stride < columns + 1) return cudaErrorInvalidValue;
     constexpr unsigned threads = 64;
-    eagle_ingest_kernel<<<dim3((k + 1 + threads - 1) / threads, rows), threads, 0, stream>>>(control, result, k, tokens, positions, rows);
+    eagle_ingest_kernel<<<dim3((columns + threads - 1) / threads, rows), threads, 0, stream>>>(control, result, stride, columns,
+                                                                                               tokens, positions, rows);
     return cudaGetLastError();
 }
 

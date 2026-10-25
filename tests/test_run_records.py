@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "api", "eval", "kernels", "cli"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("core/python", "api", "../crit-eval", "kernels", "cli"): sys.path.insert(0, str(ROOT / _folder))
 from crit.run.records import (GIB, candidate_projection, digest, file_sha, ineligibility, inventory, now, read_json, safe_path,
                               write_json)
 from crit.run.store import RunStore, lease
@@ -129,7 +129,7 @@ class RunRecordTests(RunFixture, unittest.TestCase):
             self.resolve()
         handoff = (self.directory / "agent_request.md").read_text()
         self.assertIn("candidate --source", handoff)
-        for resource in ("core/README.md", "inference/README.md", "kernels/README.md", "docs/eval/README.md"):
+        for resource in ("core/README.md", "inference/README.md", "kernels/README.md", "crit-eval's docs/README.md"):
             self.assertIn(resource, handoff)
         self.assertIn("eval-v1 adapter", handoff)
         self.assertIn("Eval result JSON is separate evidence", handoff)

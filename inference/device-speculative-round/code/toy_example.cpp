@@ -1,7 +1,8 @@
 // Composed device speculative rounds through a real Core Engine: a synthetic
 // one-attention, one-gated-delta target, a bigram drafter and one advance() per
-// round. Checks ordinary-greedy equality, one readback per round and trace stage
-// timings, then prints the round/step ratio. Synthetic weights; no speed claim.
+// round. Checks ordinary-greedy equality (tokens, and log-probabilities carried in
+// the round's one readback), one readback per round and trace stage timings, then
+// prints the round/step ratio. Synthetic weights; no speed claim.
 #include "device_round.h"
 #include "round_budget.h"
 #include "toy_model.h"
@@ -11,6 +12,7 @@
 #include <cmath>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -30,6 +32,7 @@ namespace {
 using namespace crit::core;
 namespace dr = crit::techniques::device_round;
 namespace toy = crit::techniques::device_round::toy;
+constexpr std::uint32_t toy_top = 4; // ranked alternatives the toy head writes per token
 
 void check(cudaError_t s, const char* what) {
     if(s != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(s));
@@ -72,6 +75,7 @@ struct ToyWeights {
 // Per-request device state with stable pointers for graph capture.
 struct ToyBuffers {
     CudaBuffer k_cache, v_cache, x1, q, k, v, ld, beta, out, live, start, checkpoints, inputs, predictions, scalars;
+    CudaBuffer chosen, top_ids, top_logprobs; // ordinary steps' log-probabilities
     toy::State state;
     explicit ToyBuffers(CudaBackend& b) {
         k_cache = floats(b, toy::context * toy::width); v_cache = floats(b, toy::context * toy::width);
@@ -85,23 +89,31 @@ struct ToyBuffers {
         inputs = b.allocate(Memory::device, toy::context * sizeof(std::int32_t));
         predictions = b.allocate(Memory::device, toy::max_columns * sizeof(std::int32_t));
         scalars = b.allocate(Memory::device, 2 * sizeof(std::int32_t)); // {frontier, count} for eager steps
+        chosen = floats(b, toy::max_columns); top_logprobs = floats(b, toy::max_columns * toy_top);
+        top_ids = b.allocate(Memory::device, toy::max_columns * toy_top * sizeof(std::int32_t));
         auto f = [](CudaBuffer& x) { return static_cast<float*>(x.data()); };
         state = {f(k_cache), f(v_cache), f(x1), f(q), f(k), f(v), f(ld), f(beta), f(out), f(live), f(start), f(checkpoints)};
     }
     std::int32_t* ints(CudaBuffer& x) const { return static_cast<std::int32_t*>(x.data()); }
     // Eager materialization of `count` tokens at `frontier` (prefill or ordinary step).
-    void materialize(CudaBackend& b, const toy::Weights& w, const std::int32_t* tokens, std::uint32_t frontier, std::uint32_t count) {
+    void materialize(CudaBackend& b, const toy::Weights& w, const std::int32_t* tokens, std::uint32_t frontier, std::uint32_t count,
+                     std::uint32_t top = 0) {
         auto* s = ints(scalars);
         const auto stream = b.stream();
         check(toy::enqueue_set(s, std::int32_t(frontier), stream), "set frontier");
         check(toy::enqueue_set(s + 1, std::int32_t(count), stream), "set count");
-        check(toy::enqueue_forward(w, state, tokens, s, count, ints(predictions), stream), "forward");
+        const toy::Logprobs lp = top ? toy::Logprobs{static_cast<float*>(chosen.data()), ints(top_ids),
+                                                     static_cast<float*>(top_logprobs.data()), top} : toy::Logprobs{};
+        check(toy::enqueue_forward(w, state, tokens, s, count, ints(predictions), stream, lp), "forward");
         check(toy::enqueue_commit(state, s + 1, count, stream), "commit");
     }
 };
 
-// Ordinary greedy decoding, one token per step with a synchronous read. Oracle only.
-std::vector<std::int32_t> ordinary(CudaBackend& b, const toy::Weights& w, const std::vector<std::int32_t>& prompt, std::size_t count) {
+// Ordinary greedy decoding, one token per step with a synchronous read. Oracle only. With `top`, also each
+// token's log-probability and its `top` ranked alternatives.
+struct Logprobs { std::vector<float> chosen; std::vector<TokenLogprob> top; };
+std::vector<std::int32_t> ordinary(CudaBackend& b, const toy::Weights& w, const std::vector<std::int32_t>& prompt, std::size_t count,
+                                   std::uint32_t top = 0, Logprobs* logprobs = nullptr) {
     ToyBuffers buffers(b);
     auto inputs = upload(b, prompt);
     std::uint32_t frontier = 0;
@@ -115,9 +127,19 @@ std::vector<std::int32_t> ordinary(CudaBackend& b, const toy::Weights& w, const 
     auto single = b.allocate(Memory::device, sizeof(std::int32_t));
     while(out.size() < count) {
         single.upload(std::as_bytes(std::span(&token, 1)), 0, Queue::compute);
-        buffers.materialize(b, w, static_cast<const std::int32_t*>(single.data()), frontier++, 1);
+        buffers.materialize(b, w, static_cast<const std::int32_t*>(single.data()), frontier++, 1, top);
         buffers.predictions.download(std::as_writable_bytes(std::span(&token, 1)), 0, Queue::compute);
         out.push_back(token);
+        if(top) {
+            float chosen = 0;
+            std::vector<std::int32_t> ids(top);
+            std::vector<float> values(top);
+            buffers.chosen.download(std::as_writable_bytes(std::span(&chosen, 1)), 0, Queue::compute);
+            buffers.top_ids.download(std::as_writable_bytes(std::span(ids)), 0, Queue::compute);
+            buffers.top_logprobs.download(std::as_writable_bytes(std::span(values)), 0, Queue::compute);
+            logprobs->chosen.push_back(chosen);
+            for(std::uint32_t i = 0; i < top; ++i) logprobs->top.push_back({ids[i], values[i]});
+        }
     }
     return out;
 }
@@ -132,13 +154,15 @@ class ToySession final : public Session {
     ToyBuffers buffers_;
     std::unique_ptr<dr::DeviceSpeculativeRound> round_;
     Stats& stats_;
-    std::uint32_t consumed_ = 0;
-    bool decoding_ = false;
+    std::uint32_t consumed_ = 0, top_ = 0;
+    bool decoding_ = false, logprobs_ = false;
 public:
+    // top: Core's RequestOptions::logprobs (alternatives per token), or none.
     ToySession(std::shared_ptr<CudaBackend> backend, const toy::Weights& w, const CudaBuffer& table, std::span<const Token> prompt,
-               std::uint32_t draft_tokens, bool graphs, Stats& stats)
+               std::uint32_t draft_tokens, bool graphs, Stats& stats, std::optional<std::uint32_t> top)
         : backend_(std::move(backend)), weights_(w), prompt_(prompt.begin(), prompt.end()),
-          prompt_device_(upload(*backend_, prompt_)), buffers_(*backend_), stats_(stats) {
+          prompt_device_(upload(*backend_, prompt_)), buffers_(*backend_), stats_(stats), top_(top.value_or(0)),
+          logprobs_(top.has_value()) {
         auto state = buffers_.state;
         auto* inputs = buffers_.ints(buffers_.inputs);
         const auto* bigram = static_cast<const std::int32_t*>(table.data());
@@ -149,15 +173,19 @@ public:
             },
             [weights, state, inputs](cudaStream_t s, const dr::RoundView& v) {
                 check(toy::enqueue_round_inputs(v.control, v.drafts, v.draft_tokens, inputs, s), "round inputs");
-                check(toy::enqueue_forward(*weights, state, inputs, v.control + dr::control::frontier,
-                                           v.draft_tokens + 1, v.predictions, s), "verify");
+                // With log-probabilities, the head writes the rows the readback block carries.
+                check(toy::enqueue_forward(*weights, state, inputs, v.control + dr::control::frontier, v.draft_tokens + 1,
+                                           v.predictions, s, {v.logprob, v.top_ids, v.top_logprobs, v.top}), "verify");
             },
             [state](cudaStream_t s, const dr::RoundView& v) {
                 // Recurrent state from the device-held count; the KV frontier already moved on the device.
                 check(toy::enqueue_commit(state, v.control + dr::control::n_emitted, v.draft_tokens + 1, s), "commit state");
             }};
-        round_ = std::make_unique<dr::DeviceSpeculativeRound>(backend_,
-            dr::RoundConfig{draft_tokens, toy::vocabulary, toy::context, {}, graphs}, std::move(steps));
+        dr::RoundConfig config{draft_tokens, toy::vocabulary, toy::context, {}, graphs};
+        config.logprobs = logprobs_;
+        config.top_logprobs = logprobs_ ? toy_top : 0;
+        round_ = std::make_unique<dr::DeviceSpeculativeRound>(backend_, std::move(config), std::move(steps));
+        if(logprobs_) round_->set_top_logprobs(top_);
     }
     Progress advance(WorkBudget budget) override {
         decoding_ = budget.prefill_complete;
@@ -179,7 +207,9 @@ public:
         auto* ready = round_->launch(budget.output_tokens);
         stats_.readbacks = round_->readbacks();
         stats_.captured = round_->captured();
-        return {0, true, {}, ready, true};
+        Progress progress{0, true, {}, ready, true};
+        if(logprobs_) { progress.logprobs = round_->logprobs(); progress.top_logprobs = round_->top_logprobs(); }
+        return progress;
     }
     std::span<const Token> ready_tokens() override {
         const auto tokens = round_->tokens();
@@ -211,12 +241,15 @@ public:
         m.vocabulary = toy::vocabulary;
         m.context = toy::context;
         m.prefill_chunk = 16;
+        m.token_logprobs = true;
+        m.max_top_logprobs = toy_top;
         return m;
     }
-    std::unique_ptr<Session> open(std::span<const Token> prompt) override {
+    std::unique_ptr<Session> open(std::span<const Token> prompt) override { return open_request(prompt, {}); }
+    std::unique_ptr<Session> open_request(std::span<const Token> prompt, const RequestOptions& options) override {
         if(prompt.empty()) throw std::invalid_argument("Nonempty prompt required");
         stats = {};
-        return std::make_unique<ToySession>(backend_, weights_.view, table_, prompt, draft_tokens_, graphs_, stats);
+        return std::make_unique<ToySession>(backend_, weights_.view, table_, prompt, draft_tokens_, graphs_, stats, options.logprobs);
     }
     std::vector<Token> tokenize(std::string_view text) override {
         std::vector<Token> t;
@@ -323,6 +356,32 @@ int main() {
                 "request stop truncation differs");
 
         // Ordinary step through the same path (K = 0) for the round/step budget.
+        // Each token's log-probability and ranked alternatives ride in the round's one readback block and reach
+        // Core's result equal to ordinary decoding's (Core asks for 3 of the controller's 4 alternatives).
+        {
+            Logprobs want;
+            {
+                auto backend = std::make_shared<CudaBackend>();
+                Resources resources(1 << 24, 1 << 26);
+                backend->initialize(resources);
+                ToyWeights weights(*backend);
+                const auto tokens = ordinary(*backend, weights.view, prompt, output, 3, &want);
+                require(tokens == expected, "ordinary decoding with log-probabilities");
+                backend->drain();
+            }
+            for(const bool graphed : {true, false}) {
+                RequestOptions with;
+                with.logprobs = 3;
+                auto scored = generate(draft_tokens, graphed, table, prompt, output, std::move(with));
+                require(scored.result.tokens == expected && scored.result.logprobs == want.chosen,
+                        "speculative log-probabilities differ from ordinary decoding");
+                require(scored.result.top_logprobs.size() == want.top.size() &&
+                        std::equal(want.top.begin(), want.top.end(), scored.result.top_logprobs.begin(),
+                                   [](const TokenLogprob& a, const TokenLogprob& b) { return a.token == b.token && a.logprob == b.logprob; }),
+                        "speculative ranked alternatives differ from ordinary decoding");
+            }
+        }
+
         auto step = generate(0, true, table, prompt, output);
         require(step.result.tokens == expected, "K=0 device path differs from ordinary greedy decoding");
         dr::RoundBudget budget;

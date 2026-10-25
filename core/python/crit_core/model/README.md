@@ -216,11 +216,16 @@ must carry the `split.no` and `split.count` its name says, and
 into the GGUF's metadata, and [gguf_files.py](gguf_files.py) gives it back as
 the files the rest of crit reads: `config.json` (`derive_config`, by
 `CONFIG_RULES` per architecture: `llama`, `qwen2`, `qwen3`, `qwen3moe`,
-`qwen35`, `qwen35moe`, each the inverse of the converter's parameters for it,
+`qwen35`, `qwen35moe`, `deepseek4` (DeepSeek V4, in
+[gguf_deepseek4.py](gguf_deepseek4.py), in the keys of DeepSeek's released
+`config.json`), `qwen4exp` (Qwen3.8-Flash-Next, in
+[gguf_qwen4exp.py](gguf_qwen4exp.py): the seed, n-gram base and padding from
+which transformers computes the PLE hash constants and table rows the GGUF
+stores, each refused when none reproduces them), each the inverse of the converter's parameters for it,
 with what the reference runtime fixes for the architecture stated; another architecture
 gets the generic shape keys when its metadata needs nothing more, and is
 refused by name otherwise), `tokenizer.json` (`derive_tokenizer`: byte-level
-BPE with the pre-tokenizer regex, normalizer and `ignore_merges` that
+BPE with the pre-tokenizer regexes, normalizer and `ignore_merges` that
 `PRE_TOKENIZERS` gives `tokenizer.ggml.pre`), `tokenizer_config.json`, the
 chat templates (`chat_template.jinja` and `additional_chat_templates/`) and
 `generation_config.json` (BOS, padding, the end-of-generation ids and

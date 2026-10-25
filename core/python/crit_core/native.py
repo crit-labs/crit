@@ -3,7 +3,7 @@
 An engine library exports its core::Engine with CRIT_EXPORT_ENGINE(factory). Its package then needs no glue of
 its own beyond two small entry files:
 
-    # eval adapter (eval-v1, docs/eval/ADAPTER.md)
+    # eval adapter (eval-v1, crit-eval's docs/ADAPTER.md)
     from crit_core.native import eval_engine
     def create_eval_engine(context):
         return eval_engine(context, Path(__file__).with_name("libengine.so"), defaults={...})
@@ -17,6 +17,7 @@ The factory receives a JSON object: the adapter's configuration plus "model" (th
 "context_tokens" (the context the engine must serve); the Eval adapter also passes "speculative" (false when
 Eval asks for plain one-token decoding on a second engine; an engine declaring "plain" decodes it per request).
 """
+import array
 import ctypes
 from collections import namedtuple
 import copy
@@ -26,7 +27,7 @@ from contextlib import contextmanager, nullcontext
 import json
 from pathlib import Path
 
-from crit_core.serving import SAMPLING, TOP_LOGPROBS, ResidentChat
+from crit_core.serving import SAMPLING, TOP_LOGPROBS, ResidentChat, ScoreRows
 
 ABI = 2
 RESULT_BYTES = 1 << 20  # a generation's result JSON: finish, timing and the engine's request facts
@@ -206,11 +207,12 @@ class NativeEngine:
             raise NativeError("generation failed: " + error)
         return [out[i] for i in range(count)], json.loads(result.value.decode("utf-8"))
 
-    def score(self, ids, first_target, path="", queries=None, top_k=0):
+    def score(self, ids, first_target, path="", queries=None, top_k=0, packed=False):
         """Scores (crit_engine_score) of every target ids[i], i >= first_target: its log-probability, the
         log-probabilities of its row of `queries` (one equally long row of token ids per target), the argmax when the
         engine returns one, and with top_k the engine's own top_k ranked [(token, logprob), ...]. path: one of the
-        engine's score_paths ("": the default)."""
+        engine's score_paths ("": the default). With `packed`, `top` is the targets' rows as ScoreRows of the
+        engine's arrays (float32 log-probabilities), copied without a Python object per value."""
         with self._lease():
             targets = len(ids) - first_target
             per = len(queries[0]) if queries else 0
@@ -230,11 +232,17 @@ class NativeEngine:
                                               values)
             if code != 0:
                 raise NativeError("scoring failed: " + self._error())
+            if packed and top_k:
+                # Byte copies of the engine's arrays; c_int32 and c_float are array.array's "i" and "f".
+                copied = lambda kind, data, count: array.array(kind, bytes(data)[:count * ctypes.sizeof(data._type_)])
+                top = ScoreRows(copied("f", target, targets), copied("i", tokens, targets * top_k),
+                                copied("f", values, targets * top_k), top_k)
+            else:
+                top = ([[(tokens[t * top_k + k], values[t * top_k + k]) for k in range(top_k)] for t in range(targets)]
+                       if top_k else None)
             return Scores(list(target)[:targets],
                           [[query[t * per + j] for j in range(per)] for t in range(targets)] if per else None,
-                          list(argmax)[:targets] if has_argmax.value else None,
-                          [[(tokens[t * top_k + k], values[t * top_k + k]) for k in range(top_k)]
-                           for t in range(targets)] if top_k else None)
+                          list(argmax)[:targets] if has_argmax.value else None, top)
 
     def close(self):
         with self._condition:
@@ -258,7 +266,7 @@ def decode_rounds(tokens, result, speculative):
 
 
 class EvalEngine:
-    """eval-v1 (docs/eval/ADAPTER.md) over a native engine: greedy generation with stop tokens disabled, replay
+    """eval-v1 (crit-eval's docs/ADAPTER.md) over a native engine: greedy generation with stop tokens disabled, replay
     and plain decoding when the engine declares them, and its headroom facts."""
 
     def __init__(self, context, library, defaults=None):
@@ -403,9 +411,9 @@ class ResidentEngine(ResidentChat):
     def score_tokens(self, ids, continuation, top_k, cancelled, prompt_rows):
         started = time.monotonic()
         paths = self.facts.get("score_paths") or []
-        scored = (self.native.score(ids, 1, "prefill" if "prefill" in paths else "", top_k=top_k)
+        # The engine's own arrays as ScoreRows (top_k > 0), which ResidentChat.score packs without a row loop.
+        scored = (self.native.score(ids, 1, "prefill" if "prefill" in paths else "", top_k=top_k, packed=True)
                   if prompt_rows and len(ids) > 1 else None)
-        targets, tops = (scored.target, scored.top) if scored else ([], [])
         prefill_ms = (time.monotonic() - started) * 1000
         rows = []
         if continuation:
@@ -422,9 +430,17 @@ class ResidentEngine(ResidentChat):
             if list(tokens) != list(continuation):
                 raise NativeError("replay emitted other tokens than the continuation")
             decode_ms = result["timing"]["decode_ms"]
+            # The replay prefills the prompt again before its first row: engine time like the score's prefill.
+            prefill_ms += result["timing"].get("prefill_ms") or 0.0
         else:
             decode_ms = None
-        return list(zip(targets, tops)), rows, {"prefill_ms": prefill_ms, "decode_ms": decode_ms}
+        if scored is None:
+            found = []
+        elif isinstance(scored.top, ScoreRows):
+            found = scored.top
+        else:
+            found = list(zip(scored.target, scored.top if top_k else [[] for _ in scored.target]))
+        return found, rows, {"prefill_ms": prefill_ms, "decode_ms": decode_ms}
 
     def close(self):
         if self._owns_native:

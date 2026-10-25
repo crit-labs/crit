@@ -41,12 +41,17 @@ _QWEN35 = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}|
            r"\s*[\r\n]+|\s+(?!\S)|\s+")
 _LLAMA3 = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|"
            r"\s*[\r\n]+|\s+(?!\S)|\s+")
-# tokenizer.ggml.pre -> (Split regex or None for GPT-2's own ByteLevel regex, normalizer, ignore_merges), as
-# The reference runtime's llama_vocab::load groups the names.
+# DeepSeek V3's splits in turn (digits in threes, CJK runs, then words and punctuation), which DeepSeek V4 shares.
+_DEEPSEEK3 = (r"\p{N}{1,3}", r"[一-龥぀-ゟ゠-ヿ]+",
+              r"""[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+|"""
+              r" ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+# tokenizer.ggml.pre -> (Split regex, a tuple of Split regexes applied in turn, or None for GPT-2's own ByteLevel
+# regex; normalizer; ignore_merges), as the reference runtime's llama_vocab::load groups the names.
 PRE_TOKENIZERS = {
     "qwen2": (_QWEN2, "NFC", False), "deepseek-r1-qwen": (_QWEN2, "NFC", False), "megrez": (_QWEN2, "NFC", False),
     "qwen35": (_QWEN35, None, False),
     "llama-bpe": (_LLAMA3, None, True), "llama3": (_LLAMA3, None, True), "llama-v3": (_LLAMA3, None, True),
+    "deepseek-v3": (_DEEPSEEK3, None, False), "joyai-llm": (_DEEPSEEK3, None, False),
     "gpt-2": (None, None, False),
 }
 # Control tokens the reference runtime ends generation on by their text (llama_vocab::load), when the file has them.
@@ -312,6 +317,16 @@ def _qwen35(model, get, moe=False):
     return out
 
 
+def _deepseek4(model, get):
+    from .gguf_deepseek4 import deepseek4_config
+    return deepseek4_config(model, get)
+
+
+def _qwen4exp(model, get):
+    from .gguf_qwen4exp import qwen4exp_config
+    return qwen4exp_config(model, get, _qwen35(model, get, moe=True))
+
+
 # general.architecture -> the inverse of the converter's set_gguf_parameters for it (crit_eval.gguf_layout holds
 # the inverse of its tensor transforms for the same architectures).
 CONFIG_RULES = {
@@ -321,6 +336,8 @@ CONFIG_RULES = {
     "qwen3moe": _qwen3moe,
     "qwen35": _qwen35,
     "qwen35moe": lambda model, get: _qwen35(model, get, moe=True),
+    "deepseek4": _deepseek4,
+    "qwen4exp": _qwen4exp,
 }
 # Metadata the generic keys cannot say: an architecture with any of it needs its own rule.
 _BEYOND_GENERIC = (".attention.sliding_window", ".attention.sliding_window_pattern", ".attention.kv_lora_rank",
@@ -391,8 +408,8 @@ def derive_tokenizer(model):
     merges = [merge.split(" ", 1) for merge in get("tokenizer.ggml.merges") or ()]
     if any(len(merge) != 2 for merge in merges):
         raise GgufError("tokenizer.ggml.merges holds an entry that is not two tokens")
-    splitter = ({"type": "Split", "pattern": {"Regex": regex}, "behavior": "Isolated", "invert": False}
-                if regex else None)
+    splitters = [{"type": "Split", "pattern": {"Regex": one}, "behavior": "Isolated", "invert": False}
+                 for one in ((regex,) if isinstance(regex, str) else regex or ())]
     byte_level = _byte_level() if regex else {**_byte_level(), "use_regex": True}
     post = _byte_level()
     bos = get("tokenizer.ggml.bos_token_id")
@@ -407,7 +424,7 @@ def derive_tokenizer(model):
     return {
         "version": "1.0", "truncation": None, "padding": None, "added_tokens": added,
         "normalizer": {"type": normalizer} if normalizer else None,
-        "pre_tokenizer": {"type": "Sequence", "pretokenizers": [splitter, byte_level]} if splitter else byte_level,
+        "pre_tokenizer": {"type": "Sequence", "pretokenizers": [*splitters, byte_level]} if splitters else byte_level,
         "post_processor": post, "decoder": _byte_level(),
         "model": {"type": "BPE", "dropout": None, "unk_token": None, "continuing_subword_prefix": "",
                   "end_of_word_suffix": "", "fuse_unk": False, "byte_fallback": False,

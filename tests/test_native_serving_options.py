@@ -4,7 +4,8 @@ import unittest
 from unittest.mock import Mock
 
 from core_text_fixtures import byte_level_json
-from crit_core.native import ResidentEngine
+from crit_core.native import ResidentEngine, Scores
+from crit_core.serving import ScoreRows
 from crit_core.text import TextStream, Tokenizer
 
 
@@ -56,6 +57,26 @@ class NativeServingOptionsTests(unittest.TestCase):
             "timing": {"decode_ms": 1.0}})
         resident.score_tokens([1, 2], [3], 2, lambda: False, False)
         self.assertEqual(resident.native.generate.call_args.kwargs["sampling"], neutral)
+
+    def test_scores_pass_the_engines_arrays_and_count_both_prefills(self):
+        import array
+        engine = self.engine()
+        engine.facts = {"score_paths": ["prefill"]}
+        rows = ScoreRows(array.array("f", [-0.5]), array.array("i", [2, 0]), array.array("f", [-0.5, -1.0]), 2)
+        engine.native.score.return_value = Scores([-0.5], None, None, rows)
+        engine.native.generate.side_effect = lambda ids, n, **options: (
+            options["on_tokens"]([3], [(-0.25, [(3, -0.25), (0, -1.0)])]) or list(options["replay"]),
+            {"timing": {"prefill_ms": 7.0, "decode_ms": 1.0}})
+        prompt, continuation, timing = engine.score_tokens([1, 2], [3], 2, lambda: False, True)
+        self.assertIs(prompt, rows)   # packed by ResidentChat.score without a loop over its rows
+        self.assertEqual(engine.native.score.call_args.kwargs, {"top_k": 2, "packed": True})
+        self.assertEqual(continuation, [(-0.25, [(3, -0.25), (0, -1.0)])])
+        # The replay prefills the prompt again: its prefill is engine time too, not transfer.
+        self.assertGreaterEqual(timing["prefill_ms"], 7.0)
+        self.assertEqual(timing["decode_ms"], 1.0)
+        # Without alternatives the engine returns no top rows: each row has none.
+        engine.native.score.return_value = Scores([-0.5], None, None, None)
+        self.assertEqual(engine.score_tokens([1, 2], [], 0, lambda: False, True)[0], [(-0.5, [])])
 
     def test_override_forwarding_and_default_isolation(self):
         engine = self.engine()

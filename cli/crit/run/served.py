@@ -1,13 +1,15 @@
-"""A packaged candidate served through crit serve under one of its benchmark attempts, for crit run eval and crit run
-measure: crit serve's resident host loads the candidate's resident chat adapter, packaged and not yet sealed, behind
-its chat API on a loopback port. One engine is served at a time, and the reservation's deadline stops it, cancelling
-the request in flight.
+"""A packaged candidate served through crit serve under one of its attempts, for crit run eval, crit run measure and
+crit run serve: crit serve's resident host loads the candidate's resident chat adapter, packaged and not yet sealed,
+behind its chat API. One engine is served at a time, and the reservation's deadline stops it, cancelling the request
+in flight.
 """
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import sys
 import threading
+import time
 
-from .records import timestamp
+from .records import file_sha, ident, load_run, now, read_json, safe_path, timestamp
 
 # What crit serve needs from a package to serve it for a measurement: a resident chat adapter that streams. Every
 # resident package declares the temperature (crit run package), which greedy decoding sets.
@@ -27,9 +29,10 @@ class Served:
     """The candidate served through crit serve. `name` names the measurement in its deadline's message, and `log`
     receives a line when an engine loads and stops; `timeout` bounds each request."""
 
-    def __init__(self, store, run_id, candidate_id, attempt, kv_tokens, log, name, timeout=600):
+    def __init__(self, store, run_id, candidate_id, attempt, kv_tokens, log, name, timeout=600, address=("127.0.0.1", 0)):
         self.store, self.run_id, self.candidate_id, self.attempt = store, run_id, candidate_id, attempt
         self.kv_tokens, self.log, self.name, self.timeout = kv_tokens, log, name, timeout
+        self.address = address  # where the chat API listens: a free loopback port unless given
         self.server = f"crit serve {run_id}/{candidate_id}"
         self.lock = threading.Lock()
         self.current = None  # (ServedEngine, HTTP server) while one is served
@@ -65,7 +68,7 @@ class Served:
         self.log(f"crit serve: loading {self.candidate_id} at {tokens:,} tokens of context")
         engine.open()
         api = Api(engine)
-        server = Server(("127.0.0.1", 0), api)
+        server = Server(self.address, api)
         with self.lock:
             self.current = (engine, server)
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -120,3 +123,62 @@ class Served:
             exc.settled = False
             raise
         self.log("crit serve: stopped")
+
+
+def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None, ready=None, stop=None):
+    """crit run serve: the packaged candidate, not yet sealed, served through crit serve under a check attempt until
+    Ctrl+C, `stop` (a threading.Event) or the reservation's deadline, for the checks a candidate passes before it is
+    sealed (streaming, stop strings, tool calls, cancellation, Ctrl+C). `ready(port)` runs once the API listens.
+    Settles the attempt and returns its result; crit serve serves the candidate once it is sealed."""
+    root = store.directory(run_id)
+    folder = safe_path(root, f"candidates/{ident(candidate_id, 'candidate')}")
+    if (folder / "seal.json").exists():
+        raise ValueError("The candidate is sealed: serve it with crit serve")
+    manifest_path = folder / "package" / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError("Package the candidate before serving it")
+    missing = [c for c in SERVED if c not in read_json(manifest_path)["capabilities"]]
+    if missing:
+        raise ValueError("crit serve needs the package to declare " + ", ".join(missing) + " (docs/SERVING.md)")
+    kv_tokens = load_run(root)["spec"]["hardware_constraints"]["kv_tokens"]
+    reservation = store.reserve(run_id, candidate_id, "check", seconds)
+    attempt = reservation["attempt_id"]
+    log_path = folder / "logs" / f"serve-{attempt}.log"
+    outcome, failure, settled, interrupted = "completed", None, True, None
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as stream:
+            def log(message):
+                print(message, file=sys.stderr, flush=True)
+                stream.write(message + "\n")
+                stream.flush()
+            served = Served(store, run_id, candidate_id, attempt, kv_tokens, log, "crit run serve", address=(host, port))
+            with served.until(reservation["deadline_at"]):
+                _, _, bound = served.open()
+                log(f"Serving {run_id}/{candidate_id} (not sealed, {attempt}) at http://{host}:{bound}/v1; Ctrl+C stops")
+                if ready is not None:
+                    ready(bound)
+                try:
+                    while not served.expired and not (stop is not None and stop.wait(.25)):
+                        if stop is None:
+                            time.sleep(.25)
+                except KeyboardInterrupt:
+                    log("crit run serve: interrupted, stopping the engine")
+    except BaseException as exc:
+        settled = getattr(exc, "settled", True)
+        if isinstance(exc, (Expired, TimeoutError)):
+            outcome, failure = "timed_out", str(exc) or "crit run serve passed its reserved deadline"
+        elif isinstance(exc, KeyboardInterrupt):
+            outcome, failure, interrupted = "interrupted", "Interrupted", exc
+        else:
+            outcome, failure = "failed", (type(exc).__name__ + ": " + str(exc))[:8000]
+    logs = ([{"path": log_path.relative_to(root).as_posix(), "sha256": file_sha(log_path)}]
+            if settled and log_path.is_file() else [])
+    result = store.settle(run_id, reservation, {"outcome": outcome, "ended_at": now(),
+                                                "exit_code": 0 if outcome == "completed" else None,
+                                                "cleanup_settled": settled, "logs": logs, "failure": failure})
+    if interrupted is not None:
+        raise interrupted
+    if outcome != "completed":
+        raise ValueError(f"crit run serve {outcome}: {failure} (log {log_path.relative_to(root).as_posix()})")
+    return result

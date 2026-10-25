@@ -15,7 +15,6 @@
 !/models/
 !/tests/
 !/docs/
-!/eval/
 !/cli/
 !/api/
 !/.github/
@@ -23,3 +22,4 @@
 # Python bytecode
 __pycache__/
 *.py[co]
+*.egg-info/

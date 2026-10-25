@@ -1,6 +1,0 @@
-[
-  {"type": "function", "function": {"name": "read_file", "description": "Read a text file from the repository. Returns its full contents.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Path relative to the repository root"}}, "required": ["path"]}}},
-  {"type": "function", "function": {"name": "grep", "description": "Search files for a regular expression. Returns matching lines as path:line: text.", "parameters": {"type": "object", "properties": {"pattern": {"type": "string", "description": "Regular expression"}, "path": {"type": "string", "description": "File or directory to search"}}, "required": ["pattern"]}}},
-  {"type": "function", "function": {"name": "edit_file", "description": "Replace one exact occurrence of old_text with new_text in a file. old_text must match the file exactly, including indentation.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}}},
-  {"type": "function", "function": {"name": "run_command", "description": "Run a shell command in the repository root and return its exit code, stdout and stderr.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "timeout_seconds": {"type": "integer"}}, "required": ["command"]}}}
-]

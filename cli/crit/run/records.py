@@ -18,7 +18,7 @@ MAX_JSON_BYTES = 1_048_576
 MAX_CANDIDATES = 512
 MAX_FILES = 100_000
 WEIGHTS_POLICIES = {"as_stored", "transformable"}  # run: may candidates change stored weights?
-# Drift a run allows against the Eval reference, spent on speed; matches eval/protocol.json.
+# Drift a run allows against the Eval reference, spent on speed; matches crit_eval/protocol.json.
 DEFAULT_QUALITY_BUDGET = {"ppl_ratio_max": 1.05, "kld_mean_max": 0.05, "kld_p99_max": 0.5}
 EXACTNESS_MODES = {"reported", "required"}  # must speculative output equal plain greedy?
 # Runs created from this version on require a recorded plan (crit run ... plan) for every candidate; older runs
@@ -414,7 +414,7 @@ def verify_inventory(root, rows, exclude=()):
 
 
 def eval_max_context(model, device, vram_headroom_bytes, reserve_bytes=None, requested=None):
-    """Eval's max context (eval/crit_eval/context.py) for MODEL on DEVICE, a `crit eval probe` result, capped at the
+    """Eval's max context (crit_eval/context.py) for MODEL on DEVICE, a `crit eval probe` result, capped at the
     requested context. reserve_bytes replaces the protocol's reserve (device memory kept out of the KV cache for
     workspaces and speed techniques)."""
     from crit_eval import EVAL_DIR

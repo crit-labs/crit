@@ -553,7 +553,7 @@ declare `"plain": true` when the session implements it.
 
 `crit_core.native` ([Python](../../python/README.md)) loads such a library and
 supplies the stock adapters: `eval_engine(context, library, defaults)` for
-[eval-v1](../../../docs/eval/ADAPTER.md) and `resident_engine(context, library,
+[eval-v1](https://github.com/crit-labs/crit-eval/blob/main/docs/ADAPTER.md) and `resident_engine(context, library,
 defaults)` for crit serve's [chat-resident-v1](../../../docs/SERVING.md#adapter-contract).
 The [toy engine fixture](../../../tests/core/native_engine_fixture.cpp) and its
 [check](../../../tests/core/native_engine_check.py) exercise both.

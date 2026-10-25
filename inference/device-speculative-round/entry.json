@@ -3,17 +3,22 @@
   "category": "speculation",
   "summary": "GPU-resident speculative round: draft, verify, device accept and frontier advance in two CUDA graphs with one readback, for greedy requests and for sampled requests verified by rejection sampling",
   "implementation_status": "native_source",
-  "implementation_scope": "CUDA reference greedy-accept and truncation kernels, a single-row C++20 round controller over Core CudaBackend with Forward/Finish graph capture, one readback_async per round and stage timing, a C++/Python round/step budget, and a composed toy (synthetic attention plus gated-delta target, bigram drafter) through a real Core Engine. Sampled requests reuse the accept kernel on predictions from token-sampling's enqueue_verify (the target's own draws for greedy drafts, rejection sampling for sampled drafts, Core's counter-based draws), with a sampled-round fixture through both kernels. Engine draft, verify and state steps are supplied callables; no tuned or model-specific kernels.",
+  "implementation_scope": "CUDA reference greedy-accept, truncation, seed, readback-block and allowance kernels, a single-row C++20 round controller over Core CudaBackend with Forward/Finish graph capture per draft width (chosen per round up to the widest), one readback per round of a block with the tokens, matched count, frontier and optional log-probabilities (a copy, or zero copy through mapped pinned memory) and stage timing, a C++/Python round/step budget, and a composed toy (synthetic attention plus gated-delta target, bigram drafter) through a real Core Engine. Sampled requests reuse the accept kernel on predictions from token-sampling's enqueue_verify (the target's own draws for greedy drafts, rejection sampling for sampled drafts, Core's counter-based draws), with a sampled-round fixture through both kernels. Engine draft, verify and state steps are supplied callables; no tuned or model-specific kernels.",
   "agent_guidance": {
     "use_when": "A synchronous speculative loop is correct but host round trips, per-token readbacks or host acceptance dominate the round, for greedy or sampled requests",
     "avoid_when": "Verifying K+1 columns costs about K+1 ordinary steps, or the engine cannot keep per-column state for prefix selection; or routed experts stream from host memory, where every verify column adds its own expert misses",
     "provides": [
       "Sampled rounds: the same accept kernel on rejection-sampling predictions from token-sampling, with the history commit as the first Forward kernel",
       "Device greedy acceptance matching GreedySpeculator: prefix match, correction or bonus, allowance bound and stop handling",
-      "Device-resident control block with frontier advance by n_emitted and pending-token update, without host writes during decoding",
+      "Device-resident control block with frontier advance by n_emitted and pending-token update, without host writes during decoding, and the sampling history's pending count (commit_tokens) kept apart from the catch-up's n_emitted",
+      "A one-column seed (enqueue_seed, seed()) after a prefill that produced the first output itself, so a stateful drafter's first catch-up ingests it and the sampling history does not take it in twice",
       "Device truncation for a smaller Core-accepted count, rerunning engine state selection",
       "Forward and Finish CUDA graph capture of engine steps with an eager mode for comparison",
-      "Exactly one readback_async of the packed {n_emitted, tokens[K+1]} result per round and Forward/Finish stage timings",
+      "Draft widths chosen per round (launch(output_tokens, K) up to the configured widest) over one set of buffers, with one Forward/Finish graph pair per width captured on first use",
+      "Exactly one readback_async per round of the readback block (enqueue_pack: the packed {n_emitted, tokens[K+1]} result, n_matched, the frontier after the round and optional per-column log-probability rows) and Forward/Finish stage timings",
+      "Forced replay of a fixed continuation (crit Eval's replay, the score call) through the unchanged accept: a verify step writing predictions from the continuation at the device's committed output count",
+      "Zero-copy rounds (RoundConfig::zero_copy): the allowance read in place by enqueue_set_budget and the readback block written to mapped pinned host memory, so a round has no copy; same tokens and state as copying rounds",
+      "Log-probabilities and ranked alternatives of the emitted tokens for Core's deferred Progress spans (RoundConfig::logprobs, logprobs(), top_logprobs(), set_top_logprobs) from rows the verify step writes, without a second copy",
       "RoundBudget tokens per round, round/step ratio, implied speedup and pass/fail at a default 1.3 threshold",
       "Fixed-width catch-up plan for stateful drafters, so the draft step's launch shape never depends on the device-held emitted count",
       "A host check that a batched operator computes every column bitwise identically at any batch width, with fixed-order and width-dependent reference operators"
@@ -26,12 +31,15 @@
     ],
     "preserve": [
       "Acceptance stays on the device and uses the greedy prefix/correction/stop rule over argmax (greedy) or rejection-sampling (sampled) predictions",
-      "One device-to-host copy per round and no host fence inside launch",
+      "One readback per round (one device-to-host copy, or the block written in place with zero copy) and no host fence inside launch",
       "Frontier advances by n_emitted and the accepted state is verify column n_emitted minus one",
       "A Core truncation is applied to device state before the next round",
+      "The sampling history's commit takes control[commit_tokens] (n_emitted after an accept or truncation, 0 after start or a seed), never n_emitted",
       "commit_state is idempotent from round-start state",
       "A stateful drafter writes each position before reading it, so fixed-width catch-up junk is overwritten before any read",
-      "Verify and step kernels compute each column identically for any number of columns (fixed K split and reduction order)"
+      "With widths chosen per round, the catch-up covers the widest K + 1 columns, since the previous round may have emitted more than a narrower round's K + 1",
+      "Verify and step kernels compute each column identically for any number of columns (fixed K split and reduction order)",
+      "Junk and padding columns of fixed-width graphs hold finite values, and valid token ids and positions where a step gathers or writes for them: a masked term has weight 0, and 0 x NaN poisons the real rows"
     ],
     "adapt": [
       "Drafter, draft width and per-configuration graph slots; sweep the width on mixed text (prose, code, reasoning, another language) rather than one prompt, or choose it per round from recent acceptance",
@@ -43,13 +51,13 @@
   "path": "inference/device-speculative-round/README.md",
   "code_path": "inference/device-speculative-round/code",
   "code_files": [
-    {"path": "inference/device-speculative-round/code/greedy_accept.h", "purpose": "Device control block layout, packed result width and greedy accept/truncate launch interfaces"},
-    {"path": "inference/device-speculative-round/code/greedy_accept.cu", "purpose": "Reference one-thread-per-row greedy accept and truncation kernels, not for performance"},
+    {"path": "inference/device-speculative-round/code/greedy_accept.h", "purpose": "Device control block layout, packed result width, readback block layout and greedy accept/truncate/seed/pack launch interfaces"},
+    {"path": "inference/device-speculative-round/code/greedy_accept.cu", "purpose": "Reference one-thread-per-row greedy accept, truncation and seed kernels and the readback-block pack kernel, not for performance"},
     {"path": "inference/device-speculative-round/code/device_round.h", "purpose": "Single-row device round controller interface, engine step contract and round configuration"},
     {"path": "inference/device-speculative-round/code/device_round.cpp", "purpose": "Forward/Finish capture, launch with stage timing, one readback_async, validated tokens and device truncation on commit"},
     {"path": "inference/device-speculative-round/code/toy_model.h", "purpose": "Synthetic toy target dimensions, weights/state views and reference kernel launch interfaces"},
-    {"path": "inference/device-speculative-round/code/toy_model.cu", "purpose": "Reference attention, gated-delta input, head, round-input, bigram-draft and commit kernels for the toy target"},
-    {"path": "inference/device-speculative-round/code/toy_example.cpp", "purpose": "Core Engine adapter running one device round per advance with ordinary-greedy, readback, trace and round/step checks"},
+    {"path": "inference/device-speculative-round/code/toy_model.cu", "purpose": "Reference attention, gated-delta input, head (with optional log-probabilities and ranked alternatives), round-input, bigram-draft and commit kernels for the toy target"},
+    {"path": "inference/device-speculative-round/code/toy_example.cpp", "purpose": "Core Engine adapter running one device round per advance with ordinary-greedy (tokens and log-probabilities), readback, trace and round/step checks"},
     {"path": "inference/device-speculative-round/code/round_budget.h", "purpose": "C++ round/step ratio, tokens per round and threshold check from Core DeviceTiming"},
     {"path": "inference/device-speculative-round/code/round_budget.py", "purpose": "Python round/step budget reference and worked example"},
     {"path": "inference/device-speculative-round/code/catch_up.py", "purpose": "Fixed-width catch-up position plan for stateful drafters and a toy positional drafter"},
@@ -58,11 +66,11 @@
   "requires": {
     "hardware": "CUDA 13.1+ GPU through Core CRIT_CORE_CUDA, CMake 3.28+ with CUDA C++20; Python 3.11+ for the budget reference",
     "model": "Greedy target with capture-safe draft and K+1-column verify steps and selectable per-column state",
-    "workload": "Single-row greedy speculative decoding with a fixed draft width per captured configuration"
+    "workload": "Single-row greedy or sampled speculative decoding with draft widths up to a configured widest, one captured configuration per width"
   },
   "contract": {
     "input": "Core CudaBackend, draft width, vocabulary, context capacity, stop IDs and engine draft/verify/commit_state steps; per round a positive output allowance",
-    "output": "Per round the device-chosen tokens (1..K+1), a readiness event, Forward/Finish DeviceTiming values and an advanced device frontier",
+    "output": "Per round the device-chosen tokens (1..K+1), the accepted draft count, optionally their log-probabilities and ranked alternatives, a readiness event, Forward/Finish DeviceTiming values and an advanced device frontier",
     "ownership": "The controller owns control, draft, prediction and result buffers, pinned result/allowance buffers, the completion event, the stage timer and graphs; steps own their model state. Borrowed tokens expire at commit or the next launch. Serialize access",
     "failure": "Reject missing steps, out-of-vocabulary stops, rounds past context, launches before start or with a pending round, invalid device counts or tokens and over-long commits. A failed truncation leaves device state undefined and the request must fail. Destruction drains the stream and retains graphs if draining fails",
     "core_boundary": "Session.advance launches one round and returns its readback event as readiness with deferred_tokens; Session.ready_tokens returns the device-chosen tokens after Core's single wait; device_timings returns the stage timings; Session.commit applies the accepted count; Session.close abandons a round Core cancelled after launch"
@@ -81,7 +89,12 @@
     "AcceptRows",
     "enqueue_greedy_accept",
     "enqueue_truncate",
+    "enqueue_seed",
     "result_width",
+    "PackedLayout",
+    "PackRows",
+    "enqueue_pack",
+    "enqueue_set_budget",
     "RoundBudget",
     "RoundBudgetReport",
     "catch_up_plan",
@@ -103,8 +116,8 @@
     "attention-state"
   ],
   "validation": {
-    "host": "Python and C++ RoundBudget ratio, speedup and threshold checks; fixed-width drafter catch-up equal to exact variable-width ingestion over 120 randomized rounds (draft widths 1, 3, 5); column-invariance check: a fixed summation order passes and a width-dependent split is detected",
-    "native": "CUDA accept kernel against host GreedySpeculator on 4000 randomized rows (K 1..4, all-match, first mismatch, stop, output budget, zero budget) with frontier and truncation checks; synthetic hash-chain target for graph replay versus eager, ordinary-greedy equality for K 0..4, truncated continuation and one device-to-host copy per round counted at the CUDA API; composed toy through Core Engine matching ordinary greedy output for two prompts, graph and eager mode and K 0, one readback and one Forward/Finish trace event pair per round, and request-stop truncation; per-request device stop replacement and abandon() of a launched round left uncommitted by cancellation; sampled rounds: verify predictions through the accept and commit kernels equal a host round over Core's laws and draws (the target's draw per column, drafts kept while they match), K 0 equals one ordinary draw, and positions and counts follow the emitted and truncated counts",
-    "performance": "No speed claim; the reference kernels are not tuned and RoundBudget measures each engine's own round. The toy prints its round/step ratio, which typically fails 1.3 because its attention reference processes verify columns serially"
+    "host": "Python and C++ RoundBudget ratio, speedup and threshold checks; fixed-width drafter catch-up equal to exact variable-width ingestion over 120 randomized rounds (draft widths 1, 3, 5) and over 80 rounds of widths chosen per round with the widest width + 1 columns; column-invariance check: a fixed summation order passes and a width-dependent split is detected; the worked example shows a masked non-finite junk column poisoning a weighted sum and a finite one not",
+    "native": "CUDA accept kernel against host GreedySpeculator on 4000 randomized rows (K 1..4, all-match, first mismatch, stop, output budget, zero budget) with frontier and truncation checks; synthetic hash-chain target for graph replay versus eager, ordinary-greedy equality for K 0..4, truncated continuation and one device-to-host copy per round counted at the CUDA API; widths chosen per round (0..6, many rounds narrower than the one before) over one controller: graph replay equal to eager, ordinary greedy output with and without truncations, one graph pair per width used, seeded sampling history; forced replay (K 0 and 4) of a continuation that departs from greedy decoding every ninth token emitting exactly that continuation with drafts accepted, graph equal to eager; zero-copy rounds equal to copying rounds (tokens, counts, matched counts, log-probabilities, device state, history; graph and eager, K 0 and 3) with no device-to-host copy at the CUDA API; readback block equal to the packed result, n_matched and frontier of 4000 accepted rows with log-probability rows masked past the count; log-probability rows and matched counts through the controller, graph and eager; composed toy through Core Engine matching ordinary greedy output for two prompts, graph and eager mode and K 0, with log-probabilities and three ranked alternatives in Core's result equal to ordinary decoding's, one readback and one Forward/Finish trace event pair per round, and request-stop truncation; per-request device stop replacement and abandon() of a launched round left uncommitted by cancellation; a sampling-history stand-in taking control[commit_tokens] first in each round holds exactly the tokens Core kept, after start() and after a one-column seed() (whose token the engine published itself), with truncations between rounds, K 0 and 3; commit_tokens after the accept, truncation and seed kernels; sampled rounds from seeded rows, whose first history commit with token-sampling's enqueue_commit and control[commit_tokens] leaves positions and counts unchanged (n_emitted would add the seed's token again): verify predictions through the accept and commit kernels equal a host round over Core's laws and draws (the target's draw per column, drafts kept while they match), K 0 equals one ordinary draw, and positions and counts follow the emitted and truncated counts",
+    "performance": "No speed claim for the kernels; the reference kernels are not tuned and RoundBudget measures each engine's own round. crit_device_round_tests timing compares copying and zero-copy rounds of the hash fixture (illustration: one RTX 5090 under WSL2, 170 to 215 us against 65 to 100 us per round). The toy prints its round/step ratio, which typically fails 1.3 because its attention reference processes verify columns serially"
   }
 }

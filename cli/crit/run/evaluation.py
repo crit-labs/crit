@@ -1,7 +1,7 @@
 """crit run eval: Eval of a packaged candidate through crit serve, under one eval reservation.
 
 crit serve's resident host loads the candidate's resident chat adapter, packaged and not yet sealed, and Eval
-measures it over the chat API like any served engine (docs/eval/README.md#engines-behind-a-server): speed, request
+measures it over the chat API like any served engine (crit-eval's docs/README.md#engines-behind-a-server): speed, request
 history, held-out prompts, the long-context curve, retrieval and quality, the engine's scores of the fixed quality
 texts through its serving paths (chat-score-v1) against the reference scores of the run's model stored under the
 data. When the data holds none yet, the run's model scores the texts first (crit eval reference), once, before the
@@ -45,7 +45,7 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
     over the chat API, stop the server and settle. Returns the retained result (path relative to the run, sha256)
     and its status."""
     from crit_eval import load_json, machine_settings
-    from crit_eval.prepare import PREPARED, model_identity
+    from crit_eval.prepare import PREPARED, model_identity, prepared_template
     from crit_eval.runner import PARTS
     root = store.directory(run_id)
     run = load_run(root)
@@ -66,7 +66,7 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
         raise ValueError(f"{data} holds no {PREPARED}: prepare it from the run's model first "
                          f"(crit eval prepare --model {model} --data {data})")
     prepared = load_json(data / PREPARED)
-    if prepared["model"]["sha256"] != model_identity(model)["sha256"]:
+    if prepared["model"]["sha256"] != model_identity(model, prepared_template(prepared))["sha256"]:
         raise ValueError(f"{data} was prepared from another model than the run's")
     check_sampling(run, prepared, data, model)
     constraints = run["spec"]["hardware_constraints"]
@@ -160,6 +160,9 @@ def _measure(store, run_id, candidate_id, attempt, deadline_at, model, data, out
                 # Between the reference's layers and texts: scoring stops at the reservation's deadline.
                 if remaining(deadline_at) <= 0:
                     raise Expired("Eval passed its reserved deadline while the reference scored the quality texts")
+            from crit_eval.packages import fetch, source
+            if source() is not None and not (data / "reference" / "index.json").is_file():
+                fetch(model, data, source(), log)   # a published package's scores, when the source has them
             how = score_data(model, data, log, check)
             log(f"quality: reference scores of {how['positions']:,} positions {how['method']}"
                 + (f" in {how['seconds']:.0f} s" if how["method"] == "scored" else ""))

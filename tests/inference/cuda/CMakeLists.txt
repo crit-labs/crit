@@ -21,7 +21,8 @@ set(CRIT_RMSNORM_EXAMPLE ON CACHE BOOL "Build RMSNorm borrowed-view example" FOR
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../../inference/rmsnorm-bf16/code" "${CMAKE_CURRENT_BINARY_DIR}/rmsnorm")
 add_test(NAME crit_rmsnorm_bf16 COMMAND crit_rmsnorm_example)
 set_tests_properties(crit_rmsnorm_bf16 PROPERTIES TIMEOUT 120)
-add_executable(crit_stored_tile_tests stored_tile_tests.cu ../../../inference/stored-tile-gemm/code/stored_tile_gemm.cu)
+add_executable(crit_stored_tile_tests stored_tile_tests.cu ../../../inference/stored-tile-gemm/code/stored_tile_gemm.cu
+  ../../../inference/stored-tile-gemm/code/stored_tile_bf16.cu)
 target_include_directories(crit_stored_tile_tests PRIVATE ../../../inference/stored-tile-gemm/code)
 target_compile_features(crit_stored_tile_tests PRIVATE cxx_std_20 cuda_std_20)
 add_test(NAME crit_stored_tile_gemm COMMAND crit_stored_tile_tests)

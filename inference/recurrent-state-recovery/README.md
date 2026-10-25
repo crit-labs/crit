@@ -137,7 +137,12 @@ a prefix twice; rerun `enqueue_record_accepted` only before the next deferred ve
 Counts are read through a device pointer and clamped to
 `[0, columns]`; keeping round-start and live state separate lets commit rerun with
 a smaller count after a host truncation. One block per head, one thread per value
-column; all three strategies produce bitwise-identical state.
+column; all three strategies produce bitwise-identical state. A second
+`enqueue_record_accepted` writes the count into `count` slots of each of `groups` groups in
+one launch, for a deferred commit that keeps a count per block:
+[recurrent-layer-kernels](../recurrent-layer-kernels/README.md) runs Strategy C on its
+column scan and convolution (`enqueue_delta_columns_deferred`, `enqueue_conv_deferred`), the
+performant form for the shapes that scan supports, with the scan's own update expression.
 
 With Core's `StateCache` ([Core state cache](../../core/src/state/README.md)),
 declare the layers as a `StateComponent` whose `RecurrentCommit` matches the

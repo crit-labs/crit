@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crit"
-version = "0.9.1"
+version = "0.10.0"
 description = "crit: inference runtime, reusable techniques, kernel discovery, evaluation and an OpenAI-compatible serving API"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-dependencies = ["tokenizers>=0.22,<0.24", "jinja2>=3.1.4,<4"]
+# crit Core's Python package (core/python) and crit Eval (https://github.com/crit-labs/crit-eval) install on their own.
+dependencies = ["tokenizers>=0.22,<0.24", "jinja2>=3.1.4,<4", "crit-core==0.10.0", "crit-eval==0.10.0"]
 
 [project.urls]
 Repository = "https://github.com/crit-labs/crit"
@@ -19,8 +20,6 @@ Repository = "https://github.com/crit-labs/crit"
 crit = "crit.cli:main"
 
 [tool.setuptools.packages.find]
-where = ["cli", "api", "eval", "kernels", "models", "core/python"]
-include = ["crit*", "crit_api*", "crit_eval*", "crit_kernels*", "crit_models*", "crit_core*"]
+where = ["cli", "api", "kernels", "models"]
+include = ["crit", "crit.*", "crit_api*", "crit_kernels*", "crit_models*"]
 
-[tool.setuptools.package-data]
-crit_core = ["model/config_keys.json"]

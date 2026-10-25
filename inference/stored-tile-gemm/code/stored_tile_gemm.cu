@@ -1,10 +1,19 @@
 // Stored-tile low-precision prompt GEMMs; see stored_tile_gemm.h for layouts and the public interface.
 #include "stored_tile_gemm.h"
 
+#include "stored_tile_device.cuh"
+
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
 
 namespace crit::stored_tile {
+
+using detail::cp_async16;
+using detail::cp_async8;
+using detail::cp_async_commit;
+using detail::cp_async_wait;
+using detail::gated_value;
+using detail::load_streaming;
 
 #if defined(__CUDA_ARCH__) && (defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL))
 #define CRIT_STORED_TILE_FP4_MMA 1
@@ -13,8 +22,10 @@ namespace crit::stored_tile {
 #endif
 
 // ------------------------------------------------------------------------------------------- weight repacking
-// One thread per (tile, lane). src: row-major E4M3 codes [N][K]; dst: tiles [N / 16][K / 32][512 bytes].
-__global__ void repack_fp8_kernel(const std::uint8_t* __restrict__ src, std::uint8_t* __restrict__ dst, int N, int K) {
+// One thread per (tile, lane). src: row-major E4M3 codes [N][K]; dst: tiles [N / 16][K / 32][512 bytes], source tile
+// row rt written to destination tile row first + step * rt.
+__global__ void repack_fp8_kernel(const std::uint8_t* __restrict__ src, std::uint8_t* __restrict__ dst, int N, int K,
+                                  int first, int step) {
     const std::size_t tid = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
     const int KT = K / 32;
     const std::size_t tiles = static_cast<std::size_t>(N / 16) * KT;
@@ -23,7 +34,8 @@ __global__ void repack_fp8_kernel(const std::uint8_t* __restrict__ src, std::uin
     const int lane = static_cast<int>(tid % 32), g = lane >> 2, t4 = lane & 3;
     const int rt = static_cast<int>(tile / KT), kt = static_cast<int>(tile % KT);
     const std::size_t rg = static_cast<std::size_t>(rt) * 16 + g, rg8 = rg + 8;
-    std::uint8_t* d = dst + tile * 512 + lane * 16;
+    const std::size_t dtile = (static_cast<std::size_t>(first) + static_cast<std::size_t>(step) * rt) * KT + kt;
+    std::uint8_t* d = dst + dtile * 512 + lane * 16;
     for(int s = 0; s < 2; ++s) {
         const std::size_t col = static_cast<std::size_t>(kt) * 32 + s * 16 + 2 * t4;
         const std::uint8_t* a = src + rg * K + col;
@@ -36,9 +48,10 @@ __global__ void repack_fp8_kernel(const std::uint8_t* __restrict__ src, std::uin
 }
 
 // codes: row-major packed E2M1 [N][K / 2] (low nibble = even column); scales: E4M3 [N][K / 16].
-// dst_codes: tiles [N / 16][K / 64][512]; dst_scales: [N / 16][K / 64][64].
+// dst_codes: tiles [N / 16][K / 64][512]; dst_scales: [N / 16][K / 64][64]; tile rows placed as in repack_fp8_kernel.
 __global__ void repack_fp4_kernel(const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
-                                  std::uint8_t* __restrict__ dst_codes, std::uint8_t* __restrict__ dst_scales, int N, int K) {
+                                  std::uint8_t* __restrict__ dst_codes, std::uint8_t* __restrict__ dst_scales, int N, int K,
+                                  int first, int step) {
     const std::size_t tid = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
     const int KT = K / 64;
     const std::size_t tiles = static_cast<std::size_t>(N / 16) * KT;
@@ -48,9 +61,10 @@ __global__ void repack_fp4_kernel(const std::uint8_t* __restrict__ codes, const 
     const int rt = static_cast<int>(tile / KT), kt = static_cast<int>(tile % KT);
     const std::size_t rg = static_cast<std::size_t>(rt) * 16 + g, rg8 = rg + 8;
     const std::size_t rb = static_cast<std::size_t>(K / 2);
+    const std::size_t dtile = (static_cast<std::size_t>(first) + static_cast<std::size_t>(step) * rt) * KT + kt;
     for(int s = 0; s < 4; ++s) {
         const int col = kt * 64 + s * 16 + 2 * t4;
-        std::uint8_t* d = dst_codes + tile * 512 + lane * 16 + s * 4;
+        std::uint8_t* d = dst_codes + dtile * 512 + lane * 16 + s * 4;
         d[0] = codes[rg * rb + col / 2];
         d[1] = codes[rg8 * rb + col / 2];
         d[2] = codes[rg * rb + (col + 8) / 2];
@@ -59,10 +73,17 @@ __global__ void repack_fp4_kernel(const std::uint8_t* __restrict__ codes, const 
     if(t4 == 0) {
         const std::size_t sb = static_cast<std::size_t>(K / 16);
         for(int s = 0; s < 4; ++s) {
-            dst_scales[tile * 64 + g * 8 + s] = scales[rg * sb + kt * 4 + s];
-            dst_scales[tile * 64 + g * 8 + 4 + s] = scales[rg8 * sb + kt * 4 + s];
+            dst_scales[dtile * 64 + g * 8 + s] = scales[rg * sb + kt * 4 + s];
+            dst_scales[dtile * 64 + g * 8 + 4 + s] = scales[rg8 * sb + kt * 4 + s];
         }
     }
+}
+
+__global__ void place_row_scales_kernel(const __nv_bfloat16* __restrict__ src, __nv_bfloat16* __restrict__ dst, int N,
+                                        int first, int step) {
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if(n >= N) return;
+    dst[(static_cast<std::size_t>(first) + static_cast<std::size_t>(step) * (n / 16)) * 16 + n % 16] = src[n];
 }
 
 // ------------------------------------------------------------------------------------------- activation packing
@@ -175,24 +196,6 @@ __global__ void pack_fp4_activations_kernel(const __nv_bfloat16* __restrict__ x,
 }
 
 // ------------------------------------------------------------------------------------------- tensor-core helpers
-__device__ __forceinline__ uint4 load_streaming(const void* p) {
-    uint4 v;
-    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
-    return v;
-}
-__device__ __forceinline__ void cp_async8(void* smem, const void* gmem) {
-    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" :: "r"(s), "l"(gmem));
-}
-__device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
-    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(s), "l"(gmem));
-}
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;"); }
-template <int N_>
-__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;" :: "n"(N_)); }
-
 __device__ __forceinline__ void mma_e4m3(float (&c)[4], std::uint32_t a0, std::uint32_t a1, std::uint32_t a2, std::uint32_t a3,
                                          std::uint32_t b0, std::uint32_t b1) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
@@ -222,12 +225,15 @@ __device__ __forceinline__ void mma_nvfp4(float (&c)[4], std::uint32_t a0, std::
 // Grid (Tpad / (8 NT), N / (128 RT), SK). A block of 8 warps; warp w owns RT consecutive 16-row tiles; a B fragment
 // from shared memory feeds RT MMAs (the NVFP4 kernel reads it once per row tile instead, so only one row tile's A
 // fragment is live). Weights stream through a PF-deep register ring; activations through a 3-stage cp.async ring.
-// SK > 1 writes FP32 partials [SK][T][N] for finish_partials_kernel.
-template <int NT, int RT, int PF>
+// SK > 1 writes FP32 partials [SK][T][N] for finish_partials_kernel. GATED (RT == 2, SK == 1): the warp's row tiles
+// are the gate and up tiles of the same 16 intermediate rows, and the epilogue writes bf16(act(gate) * up) to G
+// (row stride ldo) instead of Y, gate and up scaled exactly as the plain epilogue scales them.
+template <int NT, int RT, int PF, bool GATED = false>
 __global__ void __launch_bounds__(256) gemm_fp8_kernel(const std::uint8_t* __restrict__ W, const __nv_bfloat16* __restrict__ row_scale,
                                                       const uint2* __restrict__ X8, const float* __restrict__ token_scale,
                                                       float* __restrict__ Y, float* __restrict__ part, int N, int K, int T,
-                                                      int ldo, int add) {
+                                                      int ldo, int add, __nv_bfloat16* __restrict__ G = nullptr, int act = 0) {
+    static_assert(!GATED || RT == 2, "the gated epilogue pairs a warp's two row tiles");
     __shared__ uint2 xsm[3][NT][32];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
     const int rt0 = (blockIdx.y * 8 + warp) * RT;
@@ -286,29 +292,50 @@ __global__ void __launch_bounds__(256) gemm_fp8_kernel(const std::uint8_t* __res
         }
     }
     cp_async_wait<0>();
-#pragma unroll
-    for(int r = 0; r < RT; ++r) {
-        const int row = (rt0 + r) * 16 + g;
+    if constexpr(GATED) {
+        // Scales read once ahead of the math (token index clamped; the store is guarded), the same products as below.
+        const int r0 = rt0 * 16 + g;
+        const float sg[2] = {__bfloat162float(row_scale[r0]), __bfloat162float(row_scale[r0 + 8])};
+        const float su[2] = {__bfloat162float(row_scale[r0 + 16]), __bfloat162float(row_scale[r0 + 24])};
 #pragma unroll
         for(int n = 0; n < NT; ++n) {
+            const int tok0 = (tg0 + n) * 8 + 2 * t4;
+            const float ts[2] = {token_scale[min(tok0, T - 1)], token_scale[min(tok0 + 1, T - 1)]};
+            __nv_bfloat16 o[4];
 #pragma unroll
-            for(int i = 0; i < 4; ++i) {
-                const int rr = row + (i >> 1) * 8, tok = (tg0 + n) * 8 + 2 * t4 + (i & 1);
-                if(tok >= T || rr >= N) continue;
-                if(SK > 1) { part[(static_cast<std::size_t>(blockIdx.z) * T + tok) * N + rr] = acc[r][n][i]; continue; }
-                const float v = acc[r][n][i] * __bfloat162float(row_scale[rr]) * token_scale[tok];
-                float* p = Y + static_cast<std::size_t>(tok) * ldo + rr;
-                *p = add ? *p + v : v;
+            for(int i = 0; i < 4; ++i) o[i] = gated_value(act, acc[0][n][i] * sg[i >> 1] * ts[i & 1], acc[1][n][i] * su[i >> 1] * ts[i & 1]);
+#pragma unroll
+            for(int i = 0; i < 4; ++i)
+                if(tok0 + (i & 1) < T) G[static_cast<std::size_t>(tok0 + (i & 1)) * ldo + rt0 / 2 * 16 + g + (i >> 1) * 8] = o[i];
+        }
+    } else {
+#pragma unroll
+        for(int r = 0; r < RT; ++r) {
+            const int row = (rt0 + r) * 16 + g;
+#pragma unroll
+            for(int n = 0; n < NT; ++n) {
+#pragma unroll
+                for(int i = 0; i < 4; ++i) {
+                    const int rr = row + (i >> 1) * 8, tok = (tg0 + n) * 8 + 2 * t4 + (i & 1);
+                    if(tok >= T || rr >= N) continue;
+                    if(SK > 1) { part[(static_cast<std::size_t>(blockIdx.z) * T + tok) * N + rr] = acc[r][n][i]; continue; }
+                    const float v = acc[r][n][i] * __bfloat162float(row_scale[rr]) * token_scale[tok];
+                    float* p = Y + static_cast<std::size_t>(tok) * ldo + rr;
+                    *p = add ? *p + v : v;
+                }
             }
         }
     }
 }
 
-template <int NT, int RT, int PF>
+// GATED as in gemm_fp8_kernel; alpha scales the gate tile, alpha_up the up tile.
+template <int NT, int RT, int PF, bool GATED = false>
 __global__ void __launch_bounds__(256) gemm_fp4_kernel(const std::uint8_t* __restrict__ W, const std::uint8_t* __restrict__ S,
                                                       const uint4* __restrict__ X4, float alpha,
                                                       float* __restrict__ Y, float* __restrict__ part, int N, int K, int T,
-                                                      int ldo, int add) {
+                                                      int ldo, int add, __nv_bfloat16* __restrict__ G = nullptr, int act = 0,
+                                                      float alpha_up = 0.f) {
+    static_assert(!GATED || RT == 2, "the gated epilogue pairs a warp's two row tiles");
     __shared__ uint4 xsm[3][NT][32];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
     const int rt0 = (blockIdx.y * 8 + warp) * RT;
@@ -376,19 +403,31 @@ __global__ void __launch_bounds__(256) gemm_fp4_kernel(const std::uint8_t* __res
         }
     }
     cp_async_wait<0>();
+    if constexpr(GATED) {
 #pragma unroll
-    for(int r = 0; r < RT; ++r) {
-        const int row = (rt0 + r) * 16 + g;
-#pragma unroll
-        for(int n = 0; n < NT; ++n) {
+        for(int n = 0; n < NT; ++n)
 #pragma unroll
             for(int i = 0; i < 4; ++i) {
-                const int rr = row + (i >> 1) * 8, tok = (tg0 + n) * 8 + 2 * t4 + (i & 1);
-                if(tok >= T || rr >= N) continue;
-                if(SK > 1) { part[(static_cast<std::size_t>(blockIdx.z) * T + tok) * N + rr] = acc[r][n][i]; continue; }
-                const float v = acc[r][n][i] * alpha;
-                float* p = Y + static_cast<std::size_t>(tok) * ldo + rr;
-                *p = add ? *p + v : v;
+                const int tok = (tg0 + n) * 8 + 2 * t4 + (i & 1);
+                if(tok >= T) continue;
+                const float gate = acc[0][n][i] * alpha, up = acc[1][n][i] * alpha_up;
+                G[static_cast<std::size_t>(tok) * ldo + rt0 / 2 * 16 + g + (i >> 1) * 8] = gated_value(act, gate, up);
+            }
+    } else {
+#pragma unroll
+        for(int r = 0; r < RT; ++r) {
+            const int row = (rt0 + r) * 16 + g;
+#pragma unroll
+            for(int n = 0; n < NT; ++n) {
+#pragma unroll
+                for(int i = 0; i < 4; ++i) {
+                    const int rr = row + (i >> 1) * 8, tok = (tg0 + n) * 8 + 2 * t4 + (i & 1);
+                    if(tok >= T || rr >= N) continue;
+                    if(SK > 1) { part[(static_cast<std::size_t>(blockIdx.z) * T + tok) * N + rr] = acc[r][n][i]; continue; }
+                    const float v = acc[r][n][i] * alpha;
+                    float* p = Y + static_cast<std::size_t>(tok) * ldo + rr;
+                    *p = add ? *p + v : v;
+                }
             }
         }
     }
@@ -408,87 +447,222 @@ __global__ void finish_partials_kernel(const float* __restrict__ part, int SK, c
     *p = add ? *p + v : v;
 }
 
+// The gated finish: gate and up of intermediate row j (interleaved rows 32 (j / 16) + j % 16 and 16 further) summed
+// and scaled as finish_partials_kernel does, then G[tok][j] = bf16(act(gate) * up).
+__global__ void finish_gated_kernel(const float* __restrict__ part, int SK, const __nv_bfloat16* __restrict__ row_scale,
+                                    const float* __restrict__ token_scale, float alpha, float alpha_up, int act,
+                                    __nv_bfloat16* __restrict__ G, int N, int T, int ldo) {
+    const int I = N / 2;
+    const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    if(i >= static_cast<std::size_t>(T) * I) return;
+    const int tok = static_cast<int>(i / I), j = static_cast<int>(i % I), rg = j / 16 * 32 + j % 16, ru = rg + 16;
+    float gate = 0.f, up = 0.f;
+    for(int z = 0; z < SK; ++z) {
+        gate += part[(static_cast<std::size_t>(z) * T + tok) * N + rg];
+        up += part[(static_cast<std::size_t>(z) * T + tok) * N + ru];
+    }
+    gate = row_scale ? gate * __bfloat162float(row_scale[rg]) * token_scale[tok] : gate * alpha;
+    up = row_scale ? up * __bfloat162float(row_scale[ru]) * token_scale[tok] : up * alpha_up;
+    G[static_cast<std::size_t>(tok) * ldo + j] = gated_value(act, gate, up);
+}
+
 // ------------------------------------------------------------------------------------------- host launch helpers
+namespace {
+// Blocks of the plain GEMM kernel for (format, nt, rt) the current device holds at once; 0 when unknown.
+long resident_blocks(bool fp4, int nt, int rt) {
+    int device = 0, sms = 0, per_sm = 0;
+    if(cudaGetDevice(&device) != cudaSuccess || cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess)
+        return 0;
+    const void* k = nullptr;
+    if(fp4) k = nt == 16 ? (rt == 2 ? reinterpret_cast<const void*>(gemm_fp4_kernel<16, 2, 4>) : reinterpret_cast<const void*>(gemm_fp4_kernel<16, 1, 4>))
+                         : (rt == 2 ? reinterpret_cast<const void*>(gemm_fp4_kernel<8, 2, 4>) : reinterpret_cast<const void*>(gemm_fp4_kernel<8, 1, 4>));
+    else k = nt == 16 ? (rt == 2 ? reinterpret_cast<const void*>(gemm_fp8_kernel<16, 2, 4>) : reinterpret_cast<const void*>(gemm_fp8_kernel<16, 1, 4>))
+                      : (rt == 2 ? reinterpret_cast<const void*>(gemm_fp8_kernel<8, 2, 4>) : reinterpret_cast<const void*>(gemm_fp8_kernel<8, 1, 4>));
+    if(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, k, 256, 0) != cudaSuccess) return 0;
+    return static_cast<long>(sms) * per_sm;
+}
+}  // namespace
+
 Plan plan(bool fp4, int N, int K, int T, int wide_tokens, int min_blocks, bool two_row_tiles) {
     Plan p;
     p.fp4 = fp4;
     p.n = N;
     p.k = K;
     p.tokens = T;
-    if(min_blocks <= 0) {
-        int device = 0, sms = 0;
-        min_blocks = cudaGetDevice(&device) == cudaSuccess &&
-                             cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) == cudaSuccess
-                         ? 2 * sms
-                         : 1;
-    }
     p.nt = T > wide_tokens ? 16 : 8;
     p.rt = two_row_tiles && N % 256 == 0 ? 2 : 1;
     const int tb = 8 * p.nt;
     p.tpad = (T + tb - 1) / tb * tb;
-    const int blocks = (p.tpad / tb) * (N / (128 * p.rt));
-    while(p.sk < 8 && blocks * p.sk < min_blocks) p.sk *= 2;
+    const long blocks = static_cast<long>(p.tpad / tb) * (N / (128 * p.rt));
+    if(min_blocks > 0) {
+        while(p.sk < 8 && blocks * p.sk < min_blocks) p.sk *= 2;
+    } else {
+        // Split K only into the block slots the unsplit grid leaves idle in one wave (SM count x the occupancy of the
+        // kernel this plan launches), never past it: each part adds T x N partials to write, read and sum, and a part
+        // that starts a second wave runs after the first.
+        const long slots = resident_blocks(fp4, p.nt, p.rt);
+        while(p.sk < 8 && blocks * p.sk * 2 <= slots) p.sk *= 2;
+    }
     p.activation_bytes = static_cast<std::size_t>(p.tpad) * K;  // FP8: 1 byte per value; NVFP4: 16 bytes per 16 values
     p.token_scale_count = fp4 ? 0 : static_cast<std::size_t>(T);
     p.partial_floats = p.sk > 1 ? static_cast<std::size_t>(p.sk) * T * N : 0;
     return p;
 }
 
-cudaError_t enqueue_fp8(const Fp8Weights& w, const __nv_bfloat16* x, int T, float* y, int ldo, bool add,
-                               const Plan& p, const Scratch& s, cudaStream_t stream) {
-    if(w.N % (128 * p.rt) || w.K % 32 || T <= 0 || p.fp4 || w.N != p.n || w.K != p.k || T > p.tokens)
-        return cudaErrorInvalidValue;
-    token_amax_kernel<<<T, 256, 0, stream>>>(x, w.K, s.token_scale);
-    const std::size_t xe = static_cast<std::size_t>(p.tpad / 8) * (w.K / 32) * 32;
+namespace {
+// Tokens a launch with T tokens packs and computes: whole blocks of 8 nt tokens, not the plan's tpad. A token's
+// accumulation order depends only on the plan (nt, rt, sk) and its activation scales only on its own row, so its
+// result is the same for every T the plan serves.
+int launch_tpad(const Plan& p, int T) {
+    const int tb = 8 * p.nt;
+    return (T + tb - 1) / tb * tb;
+}
+
+bool fp8_launch_ok(const Fp8Weights& w, int T, const Plan& p) {
+    return !(w.N % (128 * p.rt) || w.K % 32 || T <= 0 || p.fp4 || w.N != p.n || w.K != p.k || T > p.tokens);
+}
+bool fp4_launch_ok(const Fp4Weights& w, int T, const Plan& p) {
+    return !(w.N % (128 * p.rt) || w.K % 64 || T <= 0 || !p.fp4 || w.N != p.n || w.K != p.k || T > p.tokens ||
+             !(w.weight_global_scale > 0.f) || !(w.input_global_scale > 0.f));
+}
+bool activation_ok(Activation act) {
+    return act == Activation::silu || act == Activation::gelu_tanh || act == Activation::gelu;
+}
+
+const uint2* pack_fp8(const __nv_bfloat16* x, int T, int K, int tpad, const Scratch& s, cudaStream_t stream) {
+    token_amax_kernel<<<T, 256, 0, stream>>>(x, K, s.token_scale);
+    const std::size_t xe = static_cast<std::size_t>(tpad / 8) * (K / 32) * 32;
     uint2* x8 = static_cast<uint2*>(s.activations);
-    pack_fp8_activations_kernel<<<static_cast<unsigned>((xe + 255) / 256), 256, 0, stream>>>(x, s.token_scale, T, w.K, p.tpad, x8);
-    const dim3 grid(p.tpad / (8 * p.nt), w.N / (128 * p.rt), p.sk);
-#define CRIT_ST_FP8(NT_, RT_) gemm_fp8_kernel<NT_, RT_, 4><<<grid, 256, 0, stream>>>(w.tiles, w.row_scale, x8, s.token_scale, y, s.partials, w.N, w.K, T, ldo, add ? 1 : 0)
+    pack_fp8_activations_kernel<<<static_cast<unsigned>((xe + 255) / 256), 256, 0, stream>>>(x, s.token_scale, T, K, tpad, x8);
+    return x8;
+}
+const uint4* pack_fp4(const __nv_bfloat16* x, int T, int K, int tpad, float gx, const Scratch& s, cudaStream_t stream) {
+    uint4* x4 = static_cast<uint4*>(s.activations);
+    const std::size_t xe = static_cast<std::size_t>(tpad) * (K / 64);
+    pack_fp4_activations_kernel<<<static_cast<unsigned>((xe + 127) / 128), 128, 0, stream>>>(x, T, K, tpad, gx, x4);
+    return x4;
+}
+
+// The plain kernels for a plan (they also write the partials of a split gated launch).
+void launch_fp8(const Fp8Weights& w, const uint2* x8, const float* ts, int T, float* y, int ldo, bool add, const Plan& p,
+                float* partials, dim3 grid, cudaStream_t stream) {
+#define CRIT_ST_FP8(NT_, RT_) gemm_fp8_kernel<NT_, RT_, 4><<<grid, 256, 0, stream>>>(w.tiles, w.row_scale, x8, ts, y, partials, w.N, w.K, T, ldo, add ? 1 : 0)
     if(p.nt == 16 && p.rt == 2) CRIT_ST_FP8(16, 2);
     else if(p.nt == 16) CRIT_ST_FP8(16, 1);
     else if(p.rt == 2) CRIT_ST_FP8(8, 2);
     else CRIT_ST_FP8(8, 1);
 #undef CRIT_ST_FP8
+}
+void launch_fp4(const Fp4Weights& w, const uint4* x4, float alpha, int T, float* y, int ldo, bool add, const Plan& p,
+                float* partials, dim3 grid, cudaStream_t stream) {
+#define CRIT_ST_FP4(NT_, RT_) gemm_fp4_kernel<NT_, RT_, 4><<<grid, 256, 0, stream>>>(w.tiles, w.scale_tiles, x4, alpha, y, partials, w.N, w.K, T, ldo, add ? 1 : 0)
+    if(p.nt == 16 && p.rt == 2) CRIT_ST_FP4(16, 2);
+    else if(p.nt == 16) CRIT_ST_FP4(16, 1);
+    else if(p.rt == 2) CRIT_ST_FP4(8, 2);
+    else CRIT_ST_FP4(8, 1);
+#undef CRIT_ST_FP4
+}
+unsigned blocks_for(std::size_t n) { return static_cast<unsigned>((n + 255) / 256); }
+}  // namespace
+
+cudaError_t enqueue_fp8(const Fp8Weights& w, const __nv_bfloat16* x, int T, float* y, int ldo, bool add,
+                               const Plan& p, const Scratch& s, cudaStream_t stream) {
+    if(!fp8_launch_ok(w, T, p)) return cudaErrorInvalidValue;
+    const int tpad = launch_tpad(p, T);
+    const uint2* x8 = pack_fp8(x, T, w.K, tpad, s, stream);
+    launch_fp8(w, x8, s.token_scale, T, y, ldo, add, p, s.partials, dim3(tpad / (8 * p.nt), w.N / (128 * p.rt), p.sk), stream);
     if(p.sk > 1)
-        finish_partials_kernel<<<static_cast<unsigned>((static_cast<std::size_t>(T) * w.N + 255) / 256), 256, 0, stream>>>(
+        finish_partials_kernel<<<blocks_for(static_cast<std::size_t>(T) * w.N), 256, 0, stream>>>(
             s.partials, p.sk, w.row_scale, s.token_scale, 1.f, y, w.N, T, ldo, add ? 1 : 0);
     return cudaGetLastError();
 }
 
 cudaError_t enqueue_fp4(const Fp4Weights& w, const __nv_bfloat16* x, int T, float* y, int ldo, bool add,
                                const Plan& p, const Scratch& s, cudaStream_t stream) {
-    if(w.N % (128 * p.rt) || w.K % 64 || T <= 0 || !p.fp4 || w.N != p.n || w.K != p.k || T > p.tokens ||
-       !(w.weight_global_scale > 0.f) || !(w.input_global_scale > 0.f))
-        return cudaErrorInvalidValue;
-    uint4* x4 = static_cast<uint4*>(s.activations);
-    const std::size_t xe = static_cast<std::size_t>(p.tpad) * (w.K / 64);
-    pack_fp4_activations_kernel<<<static_cast<unsigned>((xe + 127) / 128), 128, 0, stream>>>(x, T, w.K, p.tpad, w.input_global_scale, x4);
+    if(!fp4_launch_ok(w, T, p)) return cudaErrorInvalidValue;
+    const int tpad = launch_tpad(p, T);
+    const uint4* x4 = pack_fp4(x, T, w.K, tpad, w.input_global_scale, s, stream);
     const float alpha = 1.f / (w.weight_global_scale * w.input_global_scale);
-    const dim3 grid(p.tpad / (8 * p.nt), w.N / (128 * p.rt), p.sk);
-#define CRIT_ST_FP4(NT_, RT_) gemm_fp4_kernel<NT_, RT_, 4><<<grid, 256, 0, stream>>>(w.tiles, w.scale_tiles, x4, alpha, y, s.partials, w.N, w.K, T, ldo, add ? 1 : 0)
-    if(p.nt == 16 && p.rt == 2) CRIT_ST_FP4(16, 2);
-    else if(p.nt == 16) CRIT_ST_FP4(16, 1);
-    else if(p.rt == 2) CRIT_ST_FP4(8, 2);
-    else CRIT_ST_FP4(8, 1);
-#undef CRIT_ST_FP4
+    launch_fp4(w, x4, alpha, T, y, ldo, add, p, s.partials, dim3(tpad / (8 * p.nt), w.N / (128 * p.rt), p.sk), stream);
     if(p.sk > 1)
-        finish_partials_kernel<<<static_cast<unsigned>((static_cast<std::size_t>(T) * w.N + 255) / 256), 256, 0, stream>>>(
+        finish_partials_kernel<<<blocks_for(static_cast<std::size_t>(T) * w.N), 256, 0, stream>>>(
             s.partials, p.sk, nullptr, nullptr, alpha, y, w.N, T, ldo, add ? 1 : 0);
     return cudaGetLastError();
 }
 
-cudaError_t enqueue_repack_fp8(const std::uint8_t* codes, std::uint8_t* tiles, int N, int K, cudaStream_t stream) {
-    if(N <= 0 || K <= 0 || N % 16 || K % 32) return cudaErrorInvalidValue;
-    const std::size_t threads = static_cast<std::size_t>(N / 16) * (K / 32) * 32;
-    repack_fp8_kernel<<<static_cast<unsigned>((threads + 255) / 256), 256, 0, stream>>>(codes, tiles, N, K);
+cudaError_t enqueue_fp8_gated(const Fp8Weights& w, const __nv_bfloat16* x, int T, Activation act, __nv_bfloat16* out,
+                              int ldo, const Plan& p, const Scratch& s, cudaStream_t stream) {
+    if(p.rt != 2 || !fp8_launch_ok(w, T, p) || !activation_ok(act) || ldo < w.N / 2) return cudaErrorInvalidValue;
+    const int tpad = launch_tpad(p, T);
+    const uint2* x8 = pack_fp8(x, T, w.K, tpad, s, stream);
+    const dim3 grid(tpad / (8 * p.nt), w.N / 256, p.sk);
+    if(p.sk > 1) {
+        launch_fp8(w, x8, s.token_scale, T, nullptr, 0, false, p, s.partials, grid, stream);
+        finish_gated_kernel<<<blocks_for(static_cast<std::size_t>(T) * (w.N / 2)), 256, 0, stream>>>(
+            s.partials, p.sk, w.row_scale, s.token_scale, 1.f, 1.f, static_cast<int>(act), out, w.N, T, ldo);
+    } else if(p.nt == 16) {
+        gemm_fp8_kernel<16, 2, 4, true><<<grid, 256, 0, stream>>>(w.tiles, w.row_scale, x8, s.token_scale, nullptr, nullptr, w.N, w.K, T,
+                                                                   ldo, 0, out, static_cast<int>(act));
+    } else {
+        gemm_fp8_kernel<8, 2, 4, true><<<grid, 256, 0, stream>>>(w.tiles, w.row_scale, x8, s.token_scale, nullptr, nullptr, w.N, w.K, T,
+                                                                  ldo, 0, out, static_cast<int>(act));
+    }
     return cudaGetLastError();
+}
+
+cudaError_t enqueue_fp4_gated(const Fp4Weights& w, float up_weight_global_scale, const __nv_bfloat16* x, int T,
+                              Activation act, __nv_bfloat16* out, int ldo, const Plan& p, const Scratch& s,
+                              cudaStream_t stream) {
+    if(p.rt != 2 || !fp4_launch_ok(w, T, p) || !(up_weight_global_scale > 0.f) || !activation_ok(act) || ldo < w.N / 2)
+        return cudaErrorInvalidValue;
+    const int tpad = launch_tpad(p, T);
+    const uint4* x4 = pack_fp4(x, T, w.K, tpad, w.input_global_scale, s, stream);
+    const float alpha = 1.f / (w.weight_global_scale * w.input_global_scale);
+    const float alpha_up = 1.f / (up_weight_global_scale * w.input_global_scale);
+    const dim3 grid(tpad / (8 * p.nt), w.N / 256, p.sk);
+    if(p.sk > 1) {
+        launch_fp4(w, x4, alpha, T, nullptr, 0, false, p, s.partials, grid, stream);
+        finish_gated_kernel<<<blocks_for(static_cast<std::size_t>(T) * (w.N / 2)), 256, 0, stream>>>(
+            s.partials, p.sk, nullptr, nullptr, alpha, alpha_up, static_cast<int>(act), out, w.N, T, ldo);
+    } else if(p.nt == 16) {
+        gemm_fp4_kernel<16, 2, 4, true><<<grid, 256, 0, stream>>>(w.tiles, w.scale_tiles, x4, alpha, nullptr, nullptr, w.N, w.K, T, ldo, 0,
+                                                                   out, static_cast<int>(act), alpha_up);
+    } else {
+        gemm_fp4_kernel<8, 2, 4, true><<<grid, 256, 0, stream>>>(w.tiles, w.scale_tiles, x4, alpha, nullptr, nullptr, w.N, w.K, T, ldo, 0,
+                                                                  out, static_cast<int>(act), alpha_up);
+    }
+    return cudaGetLastError();
+}
+
+cudaError_t enqueue_repack_fp8_rows(const std::uint8_t* codes, std::uint8_t* tiles, int N, int K, int first, int step,
+                                    cudaStream_t stream) {
+    if(N <= 0 || K <= 0 || N % 16 || K % 32 || first < 0 || step < 1) return cudaErrorInvalidValue;
+    const std::size_t threads = static_cast<std::size_t>(N / 16) * (K / 32) * 32;
+    repack_fp8_kernel<<<blocks_for(threads), 256, 0, stream>>>(codes, tiles, N, K, first, step);
+    return cudaGetLastError();
+}
+
+cudaError_t enqueue_repack_fp4_rows(const std::uint8_t* codes, const std::uint8_t* scales, std::uint8_t* tiles,
+                                    std::uint8_t* scale_tiles, int N, int K, int first, int step, cudaStream_t stream) {
+    if(N <= 0 || K <= 0 || N % 16 || K % 64 || first < 0 || step < 1) return cudaErrorInvalidValue;
+    const std::size_t threads = static_cast<std::size_t>(N / 16) * (K / 64) * 32;
+    repack_fp4_kernel<<<blocks_for(threads), 256, 0, stream>>>(codes, scales, tiles, scale_tiles, N, K, first, step);
+    return cudaGetLastError();
+}
+
+cudaError_t enqueue_repack_fp8(const std::uint8_t* codes, std::uint8_t* tiles, int N, int K, cudaStream_t stream) {
+    return enqueue_repack_fp8_rows(codes, tiles, N, K, 0, 1, stream);
 }
 
 cudaError_t enqueue_repack_fp4(const std::uint8_t* codes, const std::uint8_t* scales, std::uint8_t* tiles,
                                std::uint8_t* scale_tiles, int N, int K, cudaStream_t stream) {
-    if(N <= 0 || K <= 0 || N % 16 || K % 64) return cudaErrorInvalidValue;
-    const std::size_t threads = static_cast<std::size_t>(N / 16) * (K / 64) * 32;
-    repack_fp4_kernel<<<static_cast<unsigned>((threads + 255) / 256), 256, 0, stream>>>(codes, scales, tiles, scale_tiles, N, K);
+    return enqueue_repack_fp4_rows(codes, scales, tiles, scale_tiles, N, K, 0, 1, stream);
+}
+
+cudaError_t enqueue_place_row_scales(const __nv_bfloat16* src, __nv_bfloat16* dst, int N, int first, int step,
+                                     cudaStream_t stream) {
+    if(N <= 0 || N % 16 || first < 0 || step < 1) return cudaErrorInvalidValue;
+    place_row_scales_kernel<<<blocks_for(static_cast<std::size_t>(N)), 256, 0, stream>>>(src, dst, N, first, step);
     return cudaGetLastError();
 }
 

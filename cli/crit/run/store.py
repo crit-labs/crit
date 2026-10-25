@@ -993,7 +993,7 @@ Follow AGENTS.md and docs/BUILDING_ENGINES.md for the engine-building workflow.
 Use docs/RUN_RECORDS.md for payloads. This run and segment define the project scope;
 keep progress in run records and change the toolkit only when requested.
 Use core/README.md for runtime contracts, inference/README.md for reusable techniques,
-kernels/README.md for kernel discovery and integration, and docs/eval/README.md for the common
+kernels/README.md for kernel discovery and integration, and crit-eval's docs/README.md for the common
 speed, quality and speculative-exactness suite. Select compatible existing kernels
 before writing replacements; record exact dependencies and the checks for this engine.
 Kernels is optional: no engine must use a particular kernel provider, framework or accelerator.

@@ -3,7 +3,7 @@
   "category": "projections",
   "summary": "One value-preserving tensor-core tile layout read by both the decode GEMV and FP8 / NVFP4 prompt GEMMs, with a k permutation and an intra-quad exchange instead of per-call re-layout",
   "implementation_status": "native_source",
-  "implementation_scope": "CUDA repack kernels for row-major FP8 and NVFP4 weights, per-token FP8 and static-scale NVFP4 activation packing, W8A8 (mma m16n8k32 e4m3) and W4A4 (mma m16n8k64 kind::mxf4nvf4 scale_vec::4X) prompt GEMMs with register-ring weights, cp.async activations, two row tiles per warp and fixed-order split-K, host launch planning; a device fragment probe; a pure-Python model of tiles, register assembly and both MMAs. The decode GEMV over the same tiles and fusion are engine supplied.",
+  "implementation_scope": "CUDA repack kernels for row-major FP8 and NVFP4 weights, per-token FP8 and static-scale NVFP4 activation packing, W8A8 (mma m16n8k32 e4m3) and W4A4 (mma m16n8k64 kind::mxf4nvf4 scale_vec::4X) prompt GEMMs with register-ring weights, cp.async activations, two row tiles per warp and fixed-order split-K, repacking straight into concatenated or gate | up interleaved matrices, a gated-MLP epilogue (SiLU, tanh-GELU, erf-GELU) writing BF16 act(gate) * up, host launch planning; a 1-16 row decode / verify GEMV over the same tiles on BF16 tensor cores (sm_80+, software E4M3 / E2M1 decodes where the hardware conversions are missing) with bitwise row invariance, plain and gated, and its block shape derived from N, the SM count and occupancy; W8A16 / W4A16 prompt GEMMs over the same tiles (exact BF16 decode in registers, BF16 mma with ldmatrix activations, FP32 fold every 512 columns, one-wave K split), plain and gated, sm_80+; a device fragment probe; a pure-Python model of tiles, register assembly and both MMAs. Other fusions are engine supplied.",
   "agent_guidance": {
     "use_when": "Weights are stored in a block-scaled low-precision format with a matching tensor-core MMA, and prompts of every length should use it without a second weight copy or per-call re-layout",
     "avoid_when": "The device has no matching low-precision MMA, the engine can afford a second weight copy in a library's layout, or the format's scale grouping cannot be reconciled with the instruction's",
@@ -13,26 +13,34 @@
       "NVFP4 W4A4 GEMM: lanes t and t^2 swap one word per register pair so each 16-value scale group sits in one lane pair",
       "Activation packing in the matching slot order: per-token E4M3, or NVFP4 with the checkpoint's static input scale",
       "Register-ring weight streaming, a 3-stage cp.async activation ring, two row tiles per warp and fixed-order split-K",
-      "Launch planning with scratch sizes and an fp4_mma_compiled() capability check",
+      "Repacking each checkpoint tensor straight into its tile rows of a combined matrix: concatenated along N (q | k | v) or gate | up interleaved in 16-row tiles, FP8 row scales placed alike",
+      "Gated MLP prompt GEMMs writing BF16 act(gate) * up (SiLU, tanh-GELU, erf-GELU) from the accumulators or the split finish, with no FP32 [T][2I] output",
+      "Launch planning with scratch sizes and an fp4_mma_compiled() capability check; the default K split fills one wave of resident blocks (SM count x kernel occupancy) and never goes past it",
+      "A 1-16 row decode / verify GEMV over the same FP8 / NVFP4 tiles: exact BF16 decode in registers, mma.m16n8k16 BF16, each row's bits independent of M and of the other rows (plain and gated)",
+      "GEMV block shape from N, the SM count and the kernel's occupancy (the largest K split whose grid fits one wave), overridable to fix bits across devices",
+      "BF16-activation (W8A16 / W4A16) prompt GEMMs over the same tiles for checkpoints that cannot afford activation quantization: exact decode, BF16 MMA, FP32 fold every 512 columns, N % 16 and FP8 K % 32 tails handled, plain and gated",
       "A device probe that measures the block-scaled MMA's scale-operand mapping and checks its value layout",
       "A host model that proves the permutation, exchange and activation order with exact arithmetic"
     ],
     "engine_supplies": [
       "The stored tensors, repacked once at load before any reader",
-      "The 1-8 token decode GEMV over the same tiles (their byte order is its FP16 fragment)",
       "Scratch buffers sized from the plan for the largest prompt chunk",
-      "Plan parameters for its shapes and device, and fusion of activation quantization or epilogues",
+      "Plan parameters for its shapes and device (one GemvPlan per matrix shared by decode and verify), and fusion of activation quantization or other epilogues",
       "Whole-model quality measurement of the W8A8 / W4A4 activation quantization"
     ],
     "preserve": [
       "Every stored code and scale keeps its value; repacking only moves bytes",
       "Activation slot order equals weight slot order, and scale groups stay inside one MMA scale group",
       "A fixed accumulation order for a given launch shape, including the split-K finish",
-      "NVFP4 dequantization 1 / (weight_global_scale * input_global_scale) and the checkpoint's activation scale rule"
+      "NVFP4 dequantization 1 / (weight_global_scale * input_global_scale) and the checkpoint's activation scale rule",
+      "Gate and up of a gated launch scaled exactly as the plain launch scales them; NVFP4 gate and up share the input global scale",
+      "One GEMV plan for decode and verify of a matrix: a row's bits depend only on the plan, not on M or the other rows",
+      "Exact BF16 decode of every stored value in the GEMV and the BF16-activation GEMM, and a bounded MMA chain before each FP32 fold"
     ],
     "adapt": [
       "Tile shape and the permutation/exchange for another MMA instruction or format",
       "Tokens per block, row tiles per warp, ring depth and the split threshold",
+      "GEMV group counts and ring depth; the BF16-activation GEMM's stage count, ring and fold length",
       "Activation quantization fused into its producer instead of a separate packing pass"
     ]
   },
@@ -41,11 +49,13 @@
   "code_files": [
     {"path": "inference/stored-tile-gemm/code/stored_tile_gemm.h", "purpose": "Tile layouts, plan, weight/scratch descriptors and launch interface"},
     {"path": "inference/stored-tile-gemm/code/stored_tile_gemm.cu", "purpose": "Repack, activation packing, FP8 and NVFP4 tensor-core GEMM and split-K finish kernels with launchers"},
+    {"path": "inference/stored-tile-gemm/code/stored_tile_bf16.cu", "purpose": "BF16-activation kernels over the tiles: the 1-16 row decode / verify GEMV and the W8A16 / W4A16 prompt GEMMs, plain and gated, and their plans"},
+    {"path": "inference/stored-tile-gemm/code/stored_tile_device.cuh", "purpose": "Device helpers shared by the kernels: exact E4M3 / E2M1 decodes to BF16 fragments, BF16 MMA, tile loads, gated activation"},
     {"path": "inference/stored-tile-gemm/code/fragment_probe.cu", "purpose": "Standalone device probe of the block-scaled NVFP4 MMA scale-operand mapping and value layout"},
     {"path": "inference/stored-tile-gemm/code/layout.py", "purpose": "Host model of tiles, register assembly and both MMAs with exact product checks"}
   ],
   "requires": {
-    "hardware": "CUDA C++17+; FP8 kernels need sm_89+, NVFP4 kernels an sm_120a or sm_121a build; Python 3.11+ standard library for the host model",
+    "hardware": "CUDA C++17+; W8A8 prompt GEMMs need sm_89+, W4A4 prompt GEMMs an sm_120a or sm_121a build, the decode GEMV and the BF16-activation prompt GEMMs sm_80+; Python 3.11+ standard library for the host model",
     "model": "Projection weights stored as FP8 E4M3 with per-row scales, or NVFP4 (E2M1 codes, E4M3 group-16 scales, FP32 global scale) with a static input global scale",
     "workload": "Prompt GEMMs from one token to a full prefill chunk, sharing weights with a decode GEMV"
   },
@@ -63,11 +73,16 @@
   "symbols": [
     "Plan", "plan", "Fp8Weights", "Fp4Weights", "Scratch",
     "enqueue_repack_fp8", "enqueue_repack_fp4", "enqueue_fp8", "enqueue_fp4", "fp4_mma_compiled",
+    "enqueue_repack_fp8_rows", "enqueue_repack_fp4_rows", "enqueue_place_row_scales", "Activation",
+    "enqueue_fp8_gated", "enqueue_fp4_gated", "GemvPlan", "plan_gemv", "enqueue_gemv_fp8", "enqueue_gemv_fp4",
+    "enqueue_gemv_fp8_gated", "enqueue_gemv_fp4_gated", "A16Plan", "plan_a16", "enqueue_fp8_a16", "enqueue_fp4_a16",
+    "enqueue_fp8_a16_gated", "enqueue_fp4_a16_gated",
     "check_fp8", "check_fp4", "fp4_mma_column", "fp8_slot_column"
   ],
   "interactions": [
     "quantized-projections",
-    "recorded-selection"
+    "recorded-selection",
+    "mtp-decode"
   ],
   "techniques": [
     "stored-tile-gemm",
@@ -75,7 +90,7 @@
   ],
   "validation": {
     "host": "Exact host model: the FP8 permutation and the NVFP4 exchange reproduce direct dot products; wrong selectors or exchange partners do not; activation slots cover every column once",
-    "native": "CUDA test against an FP64 host reference with the same activation quantization for 1-300 tokens, split and unsplit, one or two row tiles per warp, add and fewer tokens than planned; plan mismatches refused; fragment probe of the scale mapping and value layout on sm_120",
-    "performance": "One measured engine: 670 vs 550 TFLOPS (library GEMM with re-layout) on 17408x5120 NVFP4 matrices at 1,536 tokens on an sm_120 device; no claim for other devices or shapes"
+    "native": "CUDA test against an FP64 host reference with the same activation quantization for 1-300 tokens, split and unsplit, one or two row tiles per warp, add and fewer tokens than planned; a token's bits equal for every launch size a plan serves; repacking into place equals the fused matrix's repack byte for byte; gated launches within one BF16 ulp of act(gate) * up of the plain launch's rows for SiLU, tanh-GELU and erf-GELU, split and unsplit, and against FP64; plan mismatches refused; GEMV for M = 1-16 rows bitwise row invariant (and with rows reversed), deterministic, add exact, within 1.3e-7 of sum |wx| of FP64, every E4M3 code and E2M1 x E4M3 product decoded exactly, gated GEMV within one BF16 ulp of the plain rows, BF16-activation GEMMs against FP64 within 5e-7 of sum |wx| for 1-200 tokens and K up to 16384, split and unsplit, with row and K tails, token bits independent of T, add exact, gated within one BF16 ulp; GEMV and BF16-activation GEMM checks also through the software decodes of an sm_80 PTX build; fragment probe of the scale mapping and value layout on sm_120",
+    "performance": "One measured engine: 670 vs 550 TFLOPS (library GEMM with re-layout) on 17408x5120 NVFP4 matrices at 1,536 tokens on an sm_120 device; GEMV 1,420-1,700 GB/s (FP8) and 1,170-1,690 GB/s (NVFP4) for one row on an RTX 5090; BF16-activation GEMMs 155-205 TFLOPS from 512 tokens, 86-102% of cuBLAS BF16 on a dequantized copy; the one-wave default K split took 8% less time than a split to two blocks per SM over 40 prompt GEMMs there, within 5% of the best split in 35; no claim for other devices or shapes"
   }
 }

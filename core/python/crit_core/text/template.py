@@ -4,13 +4,15 @@ The environment matches transformers: trim_blocks and lstrip_blocks, the loopcon
 {% generation %} tag, `tojson` as json.dumps (ensure_ascii=False, insertion order kept, indent and separators
 passed through), `raise_exception` and `strftime_now`. The clock behind strftime_now is injectable; with no clock
 the global is undefined, so templates fall back to their own date. Template discovery and selection follow
-transformers too (see template_sources and ChatTemplates.select).
+transformers too (see template_sources and ChatTemplates.select). For a model family whose checkpoints carry no chat
+template, crit ships one (SHIPPED_TEMPLATES, by config.json model_type; see chat_template_sources).
 """
 from collections.abc import Mapping
 import contextvars
 from datetime import datetime
 import hashlib
 import json
+from pathlib import Path
 from types import MappingProxyType
 
 import jinja2
@@ -19,13 +21,18 @@ from jinja2 import filters as jinja_filters
 import jinja2.nodes
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
-from .errors import ModelTextError, TemplateError, TextError, list_names, model_files, read_json_object, read_text
+from .errors import (MAX_CONFIG_BYTES, ModelTextError, TemplateError, TextError, list_names, model_files,
+                     read_json_object, read_text)
 
 CONTINUE_TAG = "CONTINUE_FINAL_MESSAGE_TAG "
 MAX_RENDER_CHARS = 1 << 26        # rendered text, and single results of the guarded operations, above this are refused
 TEMPLATE_FILE = "chat_template.jinja"
 TEMPLATE_DIR = "additional_chat_templates/"
 LEGACY_TEMPLATE_FILE = "chat_template.json"
+SHIPPED_DIR = Path(__file__).resolve().parent / "templates"
+# The chat templates crit ships, by config.json model_type, for families whose checkpoints carry none: DeepSeek V4
+# publishes a Python encoder (encoding_dsv4.py) instead, which templates/deepseek-v4.jinja ports.
+SHIPPED_TEMPLATES = MappingProxyType({"deepseek_v4": "deepseek-v4.jinja"})
 
 _SPANS = contextvars.ContextVar("crit_core_text_generation_spans", default=None)
 
@@ -367,6 +374,35 @@ def template_sources(files, tokenizer_config=None):
     if tokenizer_config is None:
         tokenizer_config = read_json_object(files, "tokenizer_config.json") or {}
     return _config_templates(tokenizer_config.get("chat_template"))
+
+
+def shipped_template(model_type):
+    """(file name, source) of the chat template crit ships for config.json model_type `model_type`, or None."""
+    name = SHIPPED_TEMPLATES.get(model_type) if isinstance(model_type, str) else None
+    if name is None:
+        return None
+    return name, (SHIPPED_DIR / name).read_text(encoding="utf-8")
+
+
+def chat_template_sources(files, chat_template=None, tokenizer_config=None):
+    """(origin, {name: source}, shipped file) of the chat templates a model renders with: its own (template_sources),
+    origin "model"; for a model whose files hold none, `chat_template` (a template source), origin "given", else the
+    one crit ships for its config.json model_type (shipped_template), origin "crit", with its file name; else (None,
+    {}, None). A chat_template for a model that carries its own raises ModelTextError: engines serve the model's."""
+    files = model_files(files)
+    if chat_template is not None and not isinstance(chat_template, str):
+        raise TextError("chat_template must be a template source string")
+    own = template_sources(files, tokenizer_config)
+    if own:
+        if chat_template is not None:
+            raise ModelTextError("the model carries its own chat template: a chat template is given only for a model "
+                                 "without one")
+        return "model", own, None
+    if chat_template is not None:
+        return "given", {"default": chat_template}, None
+    config = read_json_object(files, "config.json", max_bytes=MAX_CONFIG_BYTES, allow_nonfinite=True) or {}
+    shipped = shipped_template(config.get("model_type"))
+    return ("crit", {"default": shipped[1]}, shipped[0]) if shipped is not None else (None, {}, None)
 
 
 class ChatTemplates(Mapping):

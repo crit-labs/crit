@@ -117,11 +117,14 @@ __global__ void verify_deferred(DeviceGeometry g, float* state, DeviceSteps s, s
 // never recorded does not replay it again over the overwritten stash.
 __global__ void consume_pending(std::int32_t* pending) { *pending = 0; }
 
-__global__ void record_accepted(const std::int32_t* accepted, std::uint32_t columns, std::int32_t* pending) {
+__global__ void record_accepted(const std::int32_t* accepted, std::uint32_t columns, std::int32_t* pending, std::uint32_t count,
+                                std::uint32_t groups, std::size_t stride) {
+    const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if(i >= std::size_t(count) * groups) return;
     auto n = *accepted;
     if(n < 0) n = 0;
     if(std::uint32_t(n) > columns) n = std::int32_t(columns);
-    *pending = n;
+    pending[i / count * stride + i % count] = n;
 }
 
 bool valid(const DeviceGeometry& g) {
@@ -168,8 +171,15 @@ cudaError_t enqueue_verify_deferred(const DeviceGeometry& g, float* state, Devic
 }
 
 cudaError_t enqueue_record_accepted(const std::int32_t* accepted, std::uint32_t columns, std::int32_t* pending, cudaStream_t stream) {
-    if(!accepted || !pending) return cudaErrorInvalidValue;
-    record_accepted<<<1, 1, 0, stream>>>(accepted, columns, pending);
+    return enqueue_record_accepted(accepted, columns, pending, 1, 1, 1, stream);
+}
+
+cudaError_t enqueue_record_accepted(const std::int32_t* accepted, std::uint32_t columns, std::int32_t* pending,
+                                    std::uint32_t count, std::uint32_t groups, std::size_t stride, cudaStream_t stream) {
+    if(!accepted || !pending || !count || !groups || (groups > 1 && stride < count)) return cudaErrorInvalidValue;
+    const auto total = std::size_t(count) * groups;
+    constexpr unsigned threads = 256;
+    record_accepted<<<unsigned((total + threads - 1) / threads), threads, 0, stream>>>(accepted, columns, pending, count, groups, stride);
     return cudaPeekAtLastError();
 }
 }

@@ -21,6 +21,13 @@ may be re-encoded or given a vocabulary subset, but never trained or fine-tuned:
 a drafter trained on text resembling the evaluation raises acceptance there and
 nowhere else.
 
+A drafter with a single decoder layer (an MTP head, a one-layer EAGLE drafter) computes
+a position's keys and values from that position's own input alone: its fused input,
+the layer's input norm and the key/value projections, never the attention. Prompt
+ingestion for such a drafter therefore needs only those steps for every prompt
+position, not the attention or the MLP, and its cost does not grow with the context.
+Keep the full layer for the rows whose output a draft reads.
+
 ## How it works
 
 `PromptCopyIndex` indexes exact token windows over accepted context, keeping at

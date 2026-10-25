@@ -1,7 +1,7 @@
 # Build and publish an engine
 
 Use [Core](../core/README.md) for runtime contracts, [Inference](../inference/README.md)
-for techniques, [Kernels](../kernels/README.md) for kernels and [Eval](eval/README.md)
+for techniques, [Kernels](../kernels/README.md) for kernels and [Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md)
 for common speed, quality and exactness checks. Agents start with
 [AGENTS.md](../AGENTS.md). All model-specific source, dependencies, builds and results
 belong in the run workspace (default `CRIT_ROOT/runs/`). [Run records](RUN_RECORDS.md)
@@ -46,7 +46,7 @@ results under `captured/origin/`, and `resolve` says whether the run's model is 
 the source out at the pinned commit and make it the first candidate, with `"lineage": "origin-engine"`
 in the proposal, measured before any change: that is the baseline every later Eval compares against.
 
-Every candidate serves Eval's [max context](eval/CONTEXT.md): the context the user wants
+Every candidate serves Eval's [max context](https://github.com/crit-labs/crit-eval/blob/main/docs/CONTEXT.md): the context the user wants
 (`context_tokens` in `settings.toml`, default 262,144), capped by the model's positions and
 the KV cache that fits. Probe the device (`crit eval probe --out device.json`, or `device`
 in `settings.toml`) and `create` freezes it as `kv_tokens`, with why it is that size in
@@ -72,7 +72,7 @@ in `settings.toml`) and `create` freezes it as `kv_tokens`, with why it is that 
 These values are a template, not acceptance criteria; use `cases` for multiple workloads.
 `model_path` is the model as the user has it: a Hugging Face model folder, or a GGUF file (or a
 folder holding one), whose config, tokenizer and chat template crit derives from its metadata
-([GGUF models](eval/README.md#gguf-models)).
+([GGUF models](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md#gguf-models)).
 Free-memory headroom comes from `settings.toml` (copy `settings.example.toml`; `vram_headroom_gib`,
 `ram_headroom_gib`; defaults 1 and 2 GiB), and `create` freezes it. A value in the
 request replaces the machine's setting, so add one only when the user asks for it.
@@ -148,8 +148,8 @@ shell expansion.
 | Headroom | `crit eval status`: each KPI and the long-context curve against its floor or ceiling. Re-measure every candidate and on resume |
 | Correctness | Separate arithmetic, functional and resource gates with fixed criteria; failures stay failed |
 | Repeatability | Same output in a fresh process and after other requests, long ones included (Eval's request-history gate; [recorded selection](../inference/recorded-selection/README.md)) |
-| Quality | When arithmetic changes, perplexity and KL divergence from a reference ([full-vocabulary comparison](eval/MEASUREMENTS.md#full-vocabulary-comparison)). Under `weights_policy: as_stored`, requantized or pruned weights don't qualify and each candidate declares `weights` ([run records](RUN_RECORDS.md)) |
-| Performance | Matched inputs/protocol, warmups, every repetition, prefill/decode/request/load costs, physical memory, plus [`crit eval`](eval/README.md); tune text-dependent settings such as draft width on its mixed cases |
+| Quality | When arithmetic changes, perplexity and KL divergence from a reference ([full-vocabulary comparison](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#full-vocabulary-comparison)). Under `weights_policy: as_stored`, requantized or pruned weights don't qualify and each candidate declares `weights` ([run records](RUN_RECORDS.md)) |
+| Performance | Matched inputs/protocol, warmups, every repetition, prefill/decode/request/load costs, physical memory, plus [`crit eval`](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md); tune text-dependent settings such as draft width on its mixed cases |
 | Coverage | Representative contexts and request shapes; operator tests alone don't qualify a model |
 
 Preserve representation, ownership and readiness invariants when specializing or fusing
@@ -163,7 +163,7 @@ Choose implementations (kernel variants, library algorithms) from a table record
 the candidate configuration, not by timing at load: near-ties resolve differently per
 process and can change outputs. For speculative decoding, record
 `accepted_tokens_per_round` with decode speed, greedy and sampled: Eval's headline decode samples at
-the model's defaults ([Sampled speed](eval/MEASUREMENTS.md#sampled-speed)), so a drafter that only
+the model's defaults ([Sampled speed](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#sampled-speed)), so a drafter that only
 helps greedy requests leaves most requests at one token per pass. Verify sampled drafts with
 rejection sampling so the distribution stays exact, and sample on the device.
 
@@ -172,7 +172,7 @@ rejection sampling so the distribution stays exact, and sample on the device.
 Eval measures a candidate as a chat client gets it. `crit run ... eval --candidate ID
 --data EVAL_DATA_DIR` reserves a benchmark attempt, serves the packaged candidate through
 `crit serve` before it is sealed and runs every Eval part over the chat API
-([Engines behind a server](eval/README.md#engines-behind-a-server)), quality through the
+([Engines behind a server](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md#engines-behind-a-server)), quality through the
 engine's score call against the run's model's scores of the same texts, which the
 reference stores in the data once (`crit eval reference`, before the first candidate is
 served). It applies the run's
@@ -188,7 +188,7 @@ scoring and replay).
 Every candidate of a model uses the same prepared data, kept in the run workspace. `--only`
 runs some parts, `--baseline` shows KPI changes against an earlier result.
 
-Hardware telemetry stays in process, through an [Eval adapter](eval/ADAPTER.md) retained
+Hardware telemetry stays in process, through an [Eval adapter](https://github.com/crit-labs/crit-eval/blob/main/docs/ADAPTER.md) retained
 with the candidate's source: tokens per round and acceptance on the pinned continuation
 (`crit eval pin`, with the adapter's `replay`), `crit eval ab` to confirm small
 differences and `crit eval kernels` to start kernel work, checking
@@ -200,16 +200,18 @@ retain raw results, settings, inputs and the Eval revision; report skipped cases
 overrides.
 
 Eval results are evidence, not run records, and Eval's drift budget does not replace
-the agreed gates. See [Eval results](eval/README.md#results-and-status) and
+the agreed gates. See [Eval results](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md#results-and-status) and
 [Eval evidence](RUN_RECORDS.md#eval-evidence).
 
 ## 4. Make the package servable and seal
 
 Before the candidate's first Eval, implement the [resident adapter](SERVING.md#adapter-contract)
 (`chat-json-v1`, `chat-resident-v1`, `chat-stream-v1`, `chat-logprobs-v1`,
-`create_engine(context)`, model allocations reused across requests). Verify with `crit serve`: consecutive requests, a leading system
-message, streaming, a stop string, A → B → A switching, cancellation and Ctrl+C, with
-real tokenizer counts and synchronized phase times. Declare `chat-config-v1` so the host
+`create_engine(context)`, model allocations reused across requests). Before sealing, serve the package with
+`crit run --root RUN_ROOT --id RUN_ID serve --candidate CANDIDATE_ID` (crit serve under a check attempt, until
+Ctrl+C) and verify consecutive requests, a leading system message, streaming, a stop string, cancellation and
+Ctrl+C, with real tokenizer counts and synchronized phase times; once sealed, verify A → B → A switching with
+`crit serve`. Declare `chat-config-v1` so the host
 rejects an adapter that drops or changes a configuration key. For `response_format`,
 apply Core's [structured-output service](../core/src/constraints/README.md) while
 sampling and declare `chat-constraints-v1`

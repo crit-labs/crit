@@ -32,7 +32,7 @@ crit models verify --record transform.json
    be free of other measurements.
 3. **Eval** measures the output in your engine: serve `OUT_DIR` with it on any
    OpenAI-compatible server and run `crit eval run --url` against data prepared from the
-   **source** checkpoint ([Engines behind a server](../docs/eval/README.md#engines-behind-a-server)),
+   **source** checkpoint ([Engines behind a server](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md#engines-behind-a-server)),
    whose reference scores `crit eval reference --model SOURCE --data DATA` stored first. Stop
    the server, then `crit models eval` verifies the output and writes the `models_evaluation`
    record. It refuses data prepared from another model and a result measured on other data or

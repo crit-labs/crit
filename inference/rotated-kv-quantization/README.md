@@ -51,7 +51,7 @@ two codes per byte, the cache layout and its representation identity. On append,
 rotate-quantize new key and value rows; per step, rotate the query once and unrotate the
 output (or use a folded projection). Record seed, dimension, bit width and group size in
 the representation key, and measure quality with Eval's
-[full-vocabulary comparison](../../docs/eval/MEASUREMENTS.md#full-vocabulary-comparison)
+[full-vocabulary comparison](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#full-vocabulary-comparison)
 against both the unquantized cache and unrotated storage at the same bits and group.
 
 ## Worked example

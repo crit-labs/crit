@@ -6,7 +6,7 @@ import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-for folder in ("api", "cli", "core/python", "eval"):
+for folder in ("api", "cli", "core/python", "../crit-eval"):
     sys.path.insert(0, str(ROOT / folder))
 
 from crit_api.engine import reply

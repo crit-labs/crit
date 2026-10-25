@@ -28,10 +28,12 @@ ram_headroom_gib = 2                # host memory free at the engine's peak (def
 vram_headroom_gib = 1               # device memory free at the engine's peak (default 1)
 context_reserve_gib = 3             # device memory kept out of the KV cache (default 3)
 context_tokens = 262144             # the context wanted, prompt plus output (default 262,144)
+eval_packages = "/srv/crit/packages" # reference package source, a folder or https URL; unset: none
 ```
 
 `crit eval run` and `crit eval context` read `vram_headroom_gib`, `context_reserve_gib` and
-`context_tokens` from it when their flags are omitted. The reserve holds activations, workspaces, graphs
+`context_tokens` from it when their flags are omitted; `crit eval run`, `crit eval fetch` and
+`crit run eval` fetch reference packages from `eval_packages`. The reserve holds activations, workspaces, graphs
 and speed techniques; a larger one trades context for that room.
 
 | Action | Arguments / effect |
@@ -45,6 +47,7 @@ and speed techniques; a larger one trades context for that room.
 | `package` | `--candidate ID --source DIR --record recipe.json`; runnable files and manifest |
 | `check`, `benchmark` | `--candidate ID --record payload.json`; appends evidence |
 | `measure` | `--candidate ID [--seconds N]`; reserves a benchmark attempt, serves the packaged candidate through `crit serve`, streams every resident case's chat request to it, settles it and records one benchmark per case ([measured benchmarks](#measured-benchmarks)) |
+| `serve` | `--candidate ID [--host HOST] [--port 8000] [--seconds N]`; reserves a check attempt, serves the packaged, not yet sealed candidate through `crit serve` at `http://HOST:PORT/v1` until Ctrl+C or the reservation's deadline, for the checks a candidate passes before sealing, and settles the attempt (log `logs/serve-ATTEMPT.log`); `crit serve` serves the candidate once it is sealed |
 | `eval` | `--candidate ID --data EVAL_DATA_DIR [--only PART] [--baseline RESULT] [--label TEXT] [--seconds N]`; reserves a benchmark attempt, serves the packaged candidate through `crit serve`, scores the data's quality texts on the run's model unless stored, runs Eval over the chat API with the run's quality terms and `kv_tokens`, settles it and retains the result as `candidates/ID/eval/ATTEMPT.json` ([Eval evidence](#eval-evidence)); for a candidate created from a plan it writes the plan's [outcome](#outcome), and it prints the priorities the result's fractions give |
 | `seal` | `--candidate ID --lifecycle STATE [--failure TEXT]`; closes the candidate |
 | `select` | `--candidate ID`; selects a sealed eligible candidate |
@@ -64,7 +67,7 @@ hashes; add them only where a field below requires one.
 | --- | --- |
 | `model_path` | Required existing local model file/directory |
 | `correctness_criteria` | Required fixed criteria; gates are `arithmetic`, `functional`, `resources` |
-| `device` | A `crit eval probe` result. Without `kv_tokens`, `create` freezes Eval's [max context](eval/CONTEXT.md) on it as `kv_tokens`, with the basis (limits, KV precision, memory, device file sha256) in `hardware_constraints.context` |
+| `device` | A `crit eval probe` result. Without `kv_tokens`, `create` freezes Eval's [max context](https://github.com/crit-labs/crit-eval/blob/main/docs/CONTEXT.md) on it as `kv_tokens`, with the basis (limits, KV precision, memory, device file sha256) in `hardware_constraints.context` |
 | `kv_tokens` | Capacity for prompt + output; overrides the max context. One of `kv_tokens`, `device` is required |
 | `context_tokens` | The context the user wants (default 262,144, from `settings.toml` when the request omits it). With `device`, `kv_tokens` is the smaller of it, the model's positions and the KV cache that fits; `hardware_constraints.context` records `requested`, the `bound` (`requested`, `model` or `device`) and a `note` when the model or device allow less |
 | `ram_headroom_gib`, `vram_headroom_gib` | Physical free-memory requirements; defaults 2 and 1 |
@@ -464,7 +467,7 @@ is proven; otherwise the log stays in the candidate's `logs/` directory unhashed
 
 ### Eval evidence
 
-[Eval](eval/README.md) result JSON is not a `check` or `benchmark` payload and is
+[Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md) result JSON is not a `check` or `benchmark` payload and is
 never imported automatically. `eval` retains it under the candidate before sealing;
 reference its bytes from a check's `evidence`. Keep any Eval adapter and inputs with the
 candidate. Publish benchmark samples only under cases and a protocol frozen for them;

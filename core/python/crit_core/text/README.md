@@ -28,7 +28,8 @@ else:
 | --- | --- |
 | [errors.py](errors.py) | `TextError(ValueError)` and its subclasses `ModelTextError`, `TemplateError`, `TokenError`; read caps `MAX_FILE_BYTES` and `MAX_CONFIG_BYTES` |
 | [tokenizer.py](tokenizer.py) | `Tokenizer`, `AddedToken`, `SPECIAL_TOKEN_NAMES`, `special_tokens_from` |
-| [template.py](template.py) | `environment`, `ChatTemplate`, `ChatTemplates`, `template_sources`, `GenerationTag` |
+| [template.py](template.py) | `environment`, `ChatTemplate`, `ChatTemplates`, `template_sources`, `chat_template_sources`, `shipped_template`, `GenerationTag` |
+| [templates/](templates) | The chat templates crit ships for families whose checkpoints carry none: [deepseek-v4.jinja](templates/deepseek-v4.jinja) |
 | [messages.py](messages.py) | `openai_messages` (OpenAI chat messages to template messages) |
 | [generation.py](generation.py) | `GenerationConfig`, `legacy_eos_ids`, `model_generation_view` |
 | [detokenize.py](detokenize.py) | `IncrementalDetokenizer` |
@@ -39,7 +40,7 @@ else:
 
 ## Loading a model
 
-`load_model_text(model, *, clock=datetime.now, split_special_tokens=False)` takes
+`load_model_text(model, *, clock=datetime.now, split_special_tokens=False, chat_template=None)` takes
 a directory path or any `ModelFiles` from [crit_core.files](../files.py); any
 other object raises `TypeError`. Every read passes a cap
 (`read(name, max_bytes=...)`), so a subclass that overrides `read` must accept
@@ -47,12 +48,15 @@ other object raises `TypeError`. Every read passes a cap
 more. `tokenizer.json` is required; `tokenizer_config.json`,
 `special_tokens_map.json`, `chat_template.jinja`, `additional_chat_templates/*.jinja`,
 `chat_template.json`, `generation_config.json` and `config.json` are read when
-present. A model without a chat template loads, but `render` raises
-`ModelTextError`.
+present. A model whose files hold no chat template renders with `chat_template`
+(a template source) when given, else with the one crit ships for its family
+(below); without either it loads, but `render` raises `ModelTextError`.
+`ModelText.template_origin` says which: `model`, `given`, `crit` or None.
 
 `ModelText.identity` records each file read (`FileRecord`), the `crit_core`,
-`jinja2` and `tokenizers` versions and a sha256 over both; callers record their
-own render variables (a fixed clock, `enable_thinking`).
+`jinja2` and `tokenizers` versions, a template that is none of the model's files
+(`template`: its origin and sha256 by name) and a sha256 over them; callers record
+their own render variables (a fixed clock, `enable_thinking`).
 
 Caps are 16 MiB (`MAX_CONFIG_BYTES`) for `config.json` and
 `generation_config.json` and 128 MiB (`MAX_FILE_BYTES`) for the others. JSON
@@ -104,6 +108,19 @@ continue_final_message, assistant_spans, **variables)`:
 legacy `chat_template.json`). `ChatTemplates.select(name=None, *, tools=None)` picks
 the named template, else `tool_use` when tools are given and it exists, else
 `default`, else raises `ModelTextError`.
+
+Some families publish no chat template: DeepSeek V4 ships a Python encoder,
+`encoding_dsv4.py`, instead. For those crit ships one (`SHIPPED_TEMPLATES`, by
+`config.json` `model_type`; `shipped_template(model_type)` gives its file name
+and source). [deepseek-v4.jinja](templates/deepseek-v4.jinja) ports DeepSeek's
+encoder (MIT; the notice is in its header) and renders exactly what
+`encode_messages` does: thinking or `enable_thinking` (default off) picks thinking
+or chat mode, `drop_thinking` and `reasoning_effort` (`high`, `max`) are the
+encoder's, `tools` go to the first system message, tool-call arguments are a
+mapping, and `add_generation_prompt` adds what the encoder writes after the last
+message. `chat_template_sources(files, chat_template=None)` returns the origin,
+sources and shipped file name `load_model_text` renders with; a `chat_template`
+for a model that carries its own raises `ModelTextError`.
 
 ## Messages
 
