@@ -21,6 +21,11 @@ inline constexpr SlotId no_slot = 0xffffffffu;
 // scratch[i] and live becomes scratch[n-1] by id swap. recompute: the engine writes the accepted state into
 // scratch[0] (from start) and live becomes it when n > 0. in_place: the engine updates the live slot; counts only.
 enum class RecurrentCommit : std::uint8_t { column_checkpoints, recompute, in_place };
+// The states a round's engine writes for its column_checkpoints components. every_row: the state after row i into
+// scratch[i] (a column scan). final_row: only the accepted state, into scratch[0], as in recompute; for kernels that
+// compute no state inside the round, such as a chunked prefill. A final_row round takes one scratch slot per such
+// component and snapshots only its last accepted row, so no snapshot names a slot the engine never wrote.
+enum class RoundStates : std::uint8_t { every_row, final_row };
 // Layers sharing one slot geometry. slots >= sequences + one max_round_rows round's scratch (rows for
 // column_checkpoints, 1 for recompute, 0 for in_place) + snapshots; sequences x (1 + scratch) lets every sequence run
 // a round.
@@ -29,7 +34,7 @@ struct StateComponent {
     RecurrentCommit commit = RecurrentCommit::column_checkpoints;
     // Prefix cache only: at most this many snapshots (the state after an indexed page's last row) kept for reuse,
     // oldest dropped first. A commit snapshots each page it fills whose after-page state exists: any boundary inside
-    // a column_checkpoints round, only the round's last accepted row for recompute and in_place.
+    // a column_checkpoints round, only the round's last accepted row for recompute, in_place and a final_row round.
     std::uint32_t snapshots = 0;
 };
 // Attention layers that keep keys and values for a sliding window of `window` rows (a row's own included), in pages
@@ -89,6 +94,7 @@ struct Round {
     std::span<const SlotId> start = {};      // per component: the live slot at round start, read-only in the round
     std::span<const SlotId> scratch = {};    // components x rows, row-major; unused entries are no_slot
     std::span<const RowSlot> window_kv = {};  // windows x rows, row-major: row i of window group w at [w * rows + i]
+    RoundStates states = RoundStates::every_row;
 };
 // No free id of the requested kind; retiring ids wait for retire(). try_begin reports this as nullopt.
 class CapacityExhausted : public std::runtime_error {
@@ -139,8 +145,8 @@ public:
     // Stages rows after the committed frontier: validate, acquire every page and slot, copy a shared or indexed
     // partial tail through copy_rows, then publish. nullopt (try_begin) or CapacityExhausted means no change;
     // a copy_rows throw returns its page (a page evicted for it goes to the free list, not back to the cache).
-    std::optional<Round> try_begin(SequenceId, std::uint32_t rows);
-    Round begin(SequenceId, std::uint32_t rows);
+    std::optional<Round> try_begin(SequenceId, std::uint32_t rows, RoundStates states = RoundStates::every_row);
+    Round begin(SequenceId, std::uint32_t rows, RoundStates states = RoundStates::every_row);
     // Keeps the first inputs.size() staged rows; inputs are their materialized tokens. Zero inputs equals discard.
     // Consumes the round even when it throws (too many inputs, negative tokens): the round is then discarded. A
     // throwing snapshot copy_slot is the exception: the round stays pending and nothing is published.

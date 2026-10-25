@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_core VERSION 0.9.0 LANGUAGES CXX)
+project(crit_core VERSION 0.9.1 LANGUAGES CXX)
 find_package(Threads REQUIRED)
 function(crit_strict_warnings target)
   if(MSVC)
@@ -158,9 +158,9 @@ if(BUILD_TESTING AND PROJECT_IS_TOP_LEVEL)
     set_tests_properties(crit_core_native_engine PROPERTIES TIMEOUT 60)
   endif()
 
-  crit_core_cases(state_tests 120 state_config state_transactions state_ownership state_prefixes state_collisions state_reuse state_completeness state_index state_lru state_epochs state_forks state_recurrent state_hybrid state_failures state_randomized state_capacity state_layout state_metadata state_hot_path state_checkpoints state_snapshots state_windows)
+  crit_core_cases(state_tests 120 state_config state_transactions state_ownership state_prefixes state_collisions state_reuse state_completeness state_index state_lru state_epochs state_forks state_recurrent state_hybrid state_failures state_randomized state_capacity state_layout state_metadata state_hot_path state_checkpoints state_snapshots state_windows state_round_states)
 
-  crit_core_cases(io_tests 120 json_valid json_rejects json_utf8 json_strings json_numbers json_nonfinite json_limits json_access json_file json_random sha256_vectors sha256_chunked file_identity file_change file_read_exact file_read_chunks file_read_errors file_map file_open_errors host_memory_v2 host_memory_v1 host_memory_malformed host_memory_admission host_memory_live)
+  crit_core_cases(io_tests 120 json_valid json_rejects json_utf8 json_strings json_numbers json_nonfinite json_limits json_access json_file json_random sha256_vectors sha256_chunked file_identity file_change file_read_exact file_read_slots file_read_chunks file_read_errors file_map file_open_errors host_memory_v2 host_memory_v1 host_memory_malformed host_memory_admission host_memory_live)
 
   crit_core_cases(model_tests 60 model_dtypes model_header_valid model_header_rejects model_limits model_subbyte model_header_only model_index model_extra_files model_directory model_symlinks model_bytes model_digests model_change_detection model_retained model_random model_config_eval model_config_types model_generation model_stop_ids)
 
@@ -177,7 +177,7 @@ if(BUILD_TESTING AND PROJECT_IS_TOP_LEVEL)
   add_test(NAME crit_core_trace_disabled COMMAND crit_core_trace_disabled_tests trace_disabled)
   set_tests_properties(crit_core_trace_disabled PROPERTIES TIMEOUT 30)
 
-  crit_core_cases(graph_tests 30 graph_key graph_identity graph_generations graph_prerequisites graph_failures graph_receipts
+  crit_core_cases(graph_tests 30 graph_key graph_identity graph_generations graph_widths graph_prerequisites graph_failures graph_receipts
     graph_owner_lifetime graph_capture_allocation_failure graph_owner_moves graph_destroy_failure
     graph_plan graph_state graph_state_failures)
 

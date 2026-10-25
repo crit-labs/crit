@@ -254,6 +254,25 @@ __global__ void settle_kernel(const std::int32_t* control_all, std::int32_t* pat
     for(int i = 0; i < m; ++i) path_all[std::size_t(r) * nodes + i] = i;
 }
 
+// Block (position d, request r): the number of tokens ranked before the target's prediction in the drafter's row
+// (logit desc, id asc), counted in the histogram when the round compared position d.
+__global__ void __launch_bounds__(kThreads) draft_ranks_kernel(DraftRanks p) {
+    const int d = blockIdx.x, r = blockIdx.y;
+    const std::int32_t* control_row = p.control + std::size_t(r) * control::fields;
+    const std::int32_t matched = control_row[control::n_matched], emitted = control_row[control::n_emitted];
+    const std::int32_t token = p.predictions[std::size_t(r) * (p.draft_tokens + 1) + d];
+    // Position matched was compared only when the walk emitted a token there (a correction); a round that ended on
+    // its output budget or after an accepted stop emitted exactly the accepted drafts and never reached it.
+    const bool reached = d < matched || (d == matched && emitted > matched);
+    if(!reached || token < 0 || token >= p.vocab) return;
+    const float* row = p.logits + (std::size_t(r) * p.draft_tokens + d) * p.stride;
+    const float x = row[token];
+    double ahead = 0.;
+    for(int t = threadIdx.x; t < p.vocab; t += kThreads) ahead += before(row[t], t, x, token) ? 1. : 0.;
+    const auto rank = static_cast<int>(block_sum(ahead));
+    if(threadIdx.x == 0) atomicAdd(p.histogram + std::size_t(d) * (p.ranks + 1) + min(rank, p.ranks), 1ull);
+}
+
 bool valid(const Candidates& c) { return c.token && c.parent && c.score && c.depth && c.count && c.capacity > 0; }
 
 }  // namespace
@@ -289,6 +308,15 @@ cudaError_t enqueue_tree_accept(const device_round::AcceptRows& rows, const std:
        rows.draft_tokens + 1 > std::uint32_t(kMaxNodes) || ((rows.stop_count || rows.device_stop_count) && !rows.stops))
         return cudaErrorInvalidValue;
     tree_accept_kernel<<<(rows.rows + 127) / 128, 128, 0, stream>>>(rows, parents, path);
+    return cudaGetLastError();
+}
+
+cudaError_t enqueue_draft_ranks(const DraftRanks& p, cudaStream_t stream) {
+    if(!p.rows) return cudaSuccess;
+    if(!p.logits || !p.predictions || !p.control || !p.histogram || p.vocab < 1 || p.stride < p.vocab || p.draft_tokens < 1 ||
+       p.draft_tokens > 65535 || p.rows < 0 || p.rows > 65535 || p.ranks < 1)
+        return cudaErrorInvalidValue;
+    draft_ranks_kernel<<<dim3(p.draft_tokens, p.rows), kThreads, 0, stream>>>(p);
     return cudaGetLastError();
 }
 

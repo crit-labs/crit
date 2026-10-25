@@ -106,7 +106,9 @@ the SM count divided by KV heads is a good `blocks`.
 `tests/inference/cuda/fp8_kv_attention_tests.cu` checks head dimensions 64, 128
 and 256 against an FP64 softmax over the dequantized cache (at most 1.5e-3 of the
 output magnitude on sm_120) and decode columns bit for bit against multi-column
-calls. In one measured engine (Qwen3.8-27B, RTX 5090) the FP8 cache raised the
+calls, including every verify width `T` from 1 to `64 / (heads / kv_heads)` at 2,048,
+3,001, 7,168 and 16,384 keys, with and without a window, for 1, 5 and SM-count /
+`kv_heads` blocks. In one measured engine (Qwen3.8-27B, RTX 5090) the FP8 cache raised the
 context that fits from about 122K to 244,736 tokens at 0.2% of the quality budget.
 [attention_variants_tests.cu](../../tests/inference/cuda/attention_variants_tests.cu) checks
 windows over a ring (with NaN codes in every row a launch must not read), sinks,

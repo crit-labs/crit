@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -150,7 +151,25 @@ void delta_case(int dk, std::mt19937& rng) {
         for(std::size_t i = 0; i < vs; ++i) require(a[i] == got5[std::size_t(t) * vs + i], "a gated-delta column alone differs from the verify column");
         for(std::size_t i = 0; i < ss; ++i) require(st[i] == cks[std::size_t(t) * ss + i], "a checkpoint differs from the state after its column");
     }
-    std::printf("gated delta dk %d columns: recurrence, checkpoints and column invariance hold\n", dk);
+    // Every verify width 1 .. 16: each column of an n-column scan equals the same token scanned alone, bit for bit.
+    constexpr int Wn = 16;
+    Buffer<float> serial(s0), on(std::size_t(Wn) * vs);
+    std::vector<float> alone(std::size_t(Wn) * vs);
+    for(int t = 0; t < Wn; ++t) {
+        rk::DeltaInputs one = in;
+        one.q = dq.p + std::size_t(t) * qs; one.k = dkk.p + std::size_t(t) * qs; one.v = dv.p + std::size_t(t) * vs;
+        one.log_decay = dl.p + std::size_t(t) * d.v_heads; one.beta = db.p + std::size_t(t) * d.v_heads;
+        ok(rk::enqueue_delta_columns(d, one, 1, serial.p, serial.p, nullptr, o1.p, vs, nullptr), "delta one column");
+        const auto a = o1.get();
+        std::copy(a.begin(), a.end(), alone.begin() + std::ptrdiff_t(std::size_t(t) * vs));
+    }
+    for(int n = 1; n <= Wn; ++n) {
+        ok(rk::enqueue_delta_columns(d, in, n, start.p, sout.p, nullptr, on.p, vs, nullptr), "delta columns");
+        const auto got = on.get();
+        require(std::memcmp(got.data(), alone.data(), std::size_t(n) * vs * sizeof(float)) == 0,
+                "a gated-delta verify of " + std::to_string(n) + " columns differs from its columns scanned alone");
+    }
+    std::printf("gated delta dk %d columns: recurrence, checkpoints and column invariance hold (widths 1..%d)\n", dk, Wn);
 }
 
 void ssd_reference(const rk::SsdShape& d, const std::vector<float>& x, const std::vector<float>& dt, const std::vector<float>& B,
@@ -215,6 +234,106 @@ void ssd_case(int N, std::mt19937& rng) {
     }
     std::printf("mamba-2 d_state %d columns: recurrence, checkpoints and column invariance hold\n", N);
 }
+
+// The checkpoint contract a speculative round's rollback rests on (Core's column_checkpoints): after a T-column scan,
+// checkpoint i is bit for bit the final state of a separate scan over the first i + 1 tokens from the same start, for
+// gated delta (dk 64 and 128, 16 to 64 value heads), the causal convolution and Mamba-2, T in {1, 2, 4, 8}, three
+// seeds each; a checkpoint plane past the round keeps its sentinel bytes (the scan writes exactly T planes).
+template <class Scan> void checkpoint_planes(const char* what, std::size_t plane, Scan scan) {
+    for(const int T : {1, 2, 4, 8}) {
+        Buffer<float> planes(std::size_t(T + 1) * plane);
+        ok(cudaMemset(planes.p, 0x3e, sizeof(float) * planes.n), "sentinel");
+        scan(T, planes.p, nullptr);
+        const auto all = planes.get();
+        for(int n = 1; n <= T; ++n) {
+            Buffer<float> final_state(plane);
+            scan(n, nullptr, final_state.p);
+            const auto got = final_state.get();
+            require(std::memcmp(got.data(), all.data() + std::size_t(n - 1) * plane, plane * sizeof(float)) == 0,
+                    std::string(what) + ": checkpoint " + std::to_string(n - 1) + " of " + std::to_string(T) +
+                        " differs from the state after " + std::to_string(n) + " tokens");
+        }
+        const auto* tail = reinterpret_cast<const unsigned char*>(all.data() + std::size_t(T) * plane);
+        for(std::size_t i = 0; i < plane * sizeof(float); ++i) require(tail[i] == 0x3e, std::string(what) + ": a plane past the round was written");
+    }
+}
+
+void checkpoint_contract(std::mt19937& rng) {
+    int cells = 0;
+    for(int seed = 0; seed < 3; ++seed) {
+        for(const int dk : {64, 128})
+            for(const int v_heads : {16, 32, 48, 64}) {
+                rk::DeltaShape d{v_heads / 4, v_heads, dk, dk};
+                constexpr int T = 8;
+                const std::size_t qs = std::size_t(d.k_heads) * dk, vs = std::size_t(d.v_heads) * d.dv, ss = std::size_t(d.v_heads) * dk * d.dv;
+                auto q = normal(rng, T * qs, 0.125f), k = normal(rng, T * qs, 0.125f);
+                const auto v = normal(rng, T * vs), s0 = normal(rng, ss, 0.1f);
+                std::uniform_real_distribution<float> unit(0.f, 1.f);
+                std::vector<float> l(std::size_t(T) * d.v_heads), b(l.size());
+                for(auto& x : l) x = -0.3f * unit(rng);
+                for(auto& x : b) x = unit(rng);
+                Buffer<float> dq(q), dkk(k), dv(v), dl(l), db(b), start(s0), out(T * vs), scratch_state(ss);
+                rk::DeltaInputs in;
+                in.q = dq.p; in.k = dkk.p; in.qk_stride = qs; in.v = dv.p; in.v_stride = vs; in.log_decay = dl.p; in.beta = db.p;
+                in.gate_stride = std::size_t(d.v_heads); in.scale = 1.f / std::sqrt(float(dk));
+                checkpoint_planes("gated delta", ss, [&](int n, float* planes, float* final_state) {
+                    ok(rk::enqueue_delta_columns(d, in, n, start.p, final_state ? final_state : scratch_state.p, planes, out.p, vs, nullptr), "delta columns");
+                });
+                ++cells;
+            }
+        {
+            constexpr int C = 1024, W = 4, T = 8;
+            const auto x = normal(rng, std::size_t(T) * C), w = normal(rng, std::size_t(C) * W, 0.5f), s0 = normal(rng, std::size_t(C) * (W - 1));
+            Buffer<float> dx(x), dw(w), state(s0), out(std::size_t(T) * C);
+            checkpoint_planes("conv", std::size_t(C) * (W - 1), [&](int n, float* planes, float* final_state) {
+                state.put(s0);
+                rk::Conv c;
+                c.x = dx.p; c.x_stride = C; c.channels = C; c.width = W; c.weight = dw.p; c.state = state.p; c.out = out.p;
+                c.out_stride = C; c.checkpoints = planes;
+                ok(rk::enqueue_conv(c, n, nullptr), "conv");
+                if(final_state) ok(cudaMemcpy(final_state, state.p, sizeof(float) * C * (W - 1), cudaMemcpyDeviceToDevice), "conv state");
+            });
+            ++cells;
+        }
+        for(const int N : {64, 128}) {
+            rk::SsdShape d{16, 2, 64, N};
+            constexpr int T = 8;
+            const std::size_t xs = std::size_t(d.heads) * d.head_dim, bs = std::size_t(d.groups) * N, ss = std::size_t(d.heads) * d.head_dim * N;
+            const auto x = normal(rng, T * xs), B = normal(rng, T * bs, 0.3f), Cm = normal(rng, T * bs, 0.3f), h0 = normal(rng, ss, 0.1f);
+            std::uniform_real_distribution<float> unit(0.f, 1.f);
+            std::vector<float> dt(std::size_t(T) * d.heads), A(d.heads);
+            for(auto& v : dt) v = 0.01f + 0.2f * unit(rng);
+            for(auto& v : A) v = -0.5f - 1.5f * unit(rng);
+            Buffer<float> dx(x), ddt(dt), dB(B), dC(Cm), dA(A), start(h0), out(T * xs), scratch_state(ss);
+            rk::SsdInputs in;
+            in.x = dx.p; in.x_stride = xs; in.dt = ddt.p; in.dt_stride = std::size_t(d.heads); in.B = dB.p; in.C = dC.p; in.bc_stride = bs;
+            in.A = dA.p;
+            checkpoint_planes("mamba-2", ss, [&](int n, float* planes, float* final_state) {
+                ok(rk::enqueue_ssd_columns(d, in, n, start.p, final_state ? final_state : scratch_state.p, planes, out.p, xs, nullptr), "ssd columns");
+            });
+            ++cells;
+        }
+    }
+    // State and checkpoint pointers off a 16-byte boundary take the scalar accesses and give the same bits.
+    {
+        rk::DeltaShape d{2, 4, 64, 64};
+        constexpr int T = 4;
+        const std::size_t qs = 128, vs = 256, ss = std::size_t(4) * 64 * 64;
+        const auto q = normal(rng, T * qs, 0.125f), k = normal(rng, T * qs, 0.125f), v = normal(rng, T * vs), s0 = normal(rng, ss, 0.1f);
+        std::vector<float> l(std::size_t(T) * 4, -0.2f), b(l.size(), 0.5f);
+        Buffer<float> dq(q), dkk(k), dv(v), dl(l), db(b), start(s0), out(T * vs), shifted_start(ss + 1), so(ss), sso(ss + 1), ck(T * ss), sck(T * ss + 1);
+        ok(cudaMemcpy(shifted_start.p + 1, start.p, sizeof(float) * ss, cudaMemcpyDeviceToDevice), "shift");
+        rk::DeltaInputs in;
+        in.q = dq.p; in.k = dkk.p; in.qk_stride = qs; in.v = dv.p; in.v_stride = vs; in.log_decay = dl.p; in.beta = db.p; in.gate_stride = 4;
+        ok(rk::enqueue_delta_columns(d, in, T, start.p, so.p, ck.p, out.p, vs, nullptr), "aligned");
+        ok(rk::enqueue_delta_columns(d, in, T, shifted_start.p + 1, sso.p + 1, sck.p + 1, out.p, vs, nullptr), "misaligned");
+        const auto a = ck.get(), m = sck.get(), fa = so.get(), fm = sso.get();
+        require(std::memcmp(a.data(), m.data() + 1, a.size() * sizeof(float)) == 0 && std::memcmp(fa.data(), fm.data() + 1, fa.size() * sizeof(float)) == 0,
+                "misaligned state or checkpoint pointers change the bits");
+    }
+    std::printf("checkpoint contract: %d shapes x T in {1, 2, 4, 8}, every checkpoint equals the shorter scan's state\n", cells);
+}
+
 }  // namespace
 
 int main() {
@@ -225,6 +344,7 @@ int main() {
         conv_case(rng);
         for(const int dk : {64, 128}) delta_case(dk, rng);
         for(const int n : {64, 128}) ssd_case(n, rng);
+        checkpoint_contract(rng);
         rk::Conv bad;
         require(rk::enqueue_conv(bad, 3, nullptr) == cudaErrorInvalidValue, "an empty convolution is rejected");
         rk::DeltaShape wrong{2, 4, 96, 128};

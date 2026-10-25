@@ -4,7 +4,8 @@ Builds probe/device_probe.cu with nvcc (CUDA toolkit with cuBLASLt), runs it sev
 keeps the median of each value: achievable copy bandwidth (GB/s, bytes read plus written) for
 the decode pass floor, and dense GEMM TFLOPS per weight format (bf16, fp8, nvfp4) for the
 prefill floor. It also keeps the least free device memory any run saw, for the max context,
-and the host's physical and available memory. Pass the file to `crit eval run --device
+the host's physical and available memory, and host-to-device rates per transfer size (pinned
+copy, pageable copy, mapped read) for engines that keep weights in host memory. Pass the file to `crit eval run --device
 device.json`. Probe on the machine and in the environment the engine runs in, with the same
 other GPU load as the evaluation.
 """
@@ -63,6 +64,22 @@ def build(nvcc, directory):
     return binary
 
 
+def host_to_device(samples):
+    """Median host-to-device GB/s per kind and transfer size over the samples' nonzero (measured) values; a size
+    no sample measured, and a kind with no measured size, are left out."""
+    curves = {}
+    for kind in sorted({k for s in samples for k in s.get("host_to_device_gbs", {})}):
+        sizes = sorted({n for s in samples for n in s.get("host_to_device_gbs", {}).get(kind, {})}, key=int)
+        curve = {}
+        for size in sizes:
+            measured = [s["host_to_device_gbs"][kind][size] for s in samples if s.get("host_to_device_gbs", {}).get(kind, {}).get(size)]
+            if measured:
+                curve[size] = metrics.median(measured)
+        if curve:
+            curves[kind] = curve
+    return curves
+
+
 def combine(samples):
     """Median of each measured value over repeated probe runs."""
     first = samples[0]
@@ -72,6 +89,8 @@ def combine(samples):
         "cuda_runtime": first.get("cuda_runtime"),
         "bandwidth_gbs": metrics.median([s["bandwidth_gbs"] for s in samples if s.get("bandwidth_gbs")]),
         "tflops": {f: metrics.median([s["tflops"][f] for s in samples if f in s.get("tflops", {})]) for f in formats},
+        # Host to device GB/s per kind (pinned, pageable, mapped_read) and transfer size in bytes.
+        "host_to_device_gbs": host_to_device(samples),
         "memory_total_bytes": max((s["memory_total_bytes"] for s in samples if s.get("memory_total_bytes")), default=None),
         # The least free memory any run saw: the max context must fit the device as it is shared.
         "memory_free_bytes": min((s["memory_free_bytes"] for s in samples if s.get("memory_free_bytes")), default=None),

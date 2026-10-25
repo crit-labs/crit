@@ -1,10 +1,16 @@
-// NVFP4 codec: every E2M1 code, E4M3 decode/encode round trips and ties, packing,
-// quantization error bounds and batched projection against an FP64 reference.
+// NVFP4 codec: every E2M1 code, E4M3 decode/encode round trips and ties, the shared scale encoder vectors
+// (argument 1: tests/inference/e4m3_scale_vectors.txt), every scale byte's decode, packing, quantization error bounds
+// and batched projection against an FP64 reference.
 #include "nvfp4.h"
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <string>
 #include <random>
 #include <stdexcept>
 #include <vector>
@@ -19,7 +25,33 @@ bool throws(F&& f) {
     return false;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    REQUIRE(argc > 1);
+    std::ifstream vectors(argv[1]);
+    REQUIRE(vectors.good());
+    int checked = 0;
+    for(std::string line; std::getline(vectors, line);) {
+        std::istringstream fields(line.substr(0, line.find('#')));
+        std::string bits_text, code_text;
+        if(!(fields >> bits_text >> code_text)) continue;
+        const auto bits = std::uint32_t(std::stoul(bits_text, nullptr, 16));
+        float x;
+        std::memcpy(&x, &bits, sizeof x);
+        if(unsigned(fp4::e4m3_encode(x)) != unsigned(std::stoul(code_text, nullptr, 16))) {
+            std::fprintf(stderr, "FAILED scale vector %s: got 0x%02X, want %s\n", bits_text.c_str(), unsigned(fp4::e4m3_encode(x)), code_text.c_str());
+            return 1;
+        }
+        ++checked;
+    }
+    REQUIRE(checked > 0);
+    // Every byte a checkpoint can hold decodes to its fields' value: bit 7 the sign, 0x7F and 0xFF NaN, magnitude
+    // mantissa * 2^-9 at exponent 0, else (8 + mantissa) * 2^(exponent - 10).
+    for(int b = 0; b < 0x80; ++b) {
+        const float low = fp4::e4m3(std::uint8_t(b)), high = fp4::e4m3(std::uint8_t(b | 0x80));
+        const int exponent = b >> 3, mantissa = b & 7;
+        const double magnitude = exponent == 0 ? std::ldexp(double(mantissa), -9) : std::ldexp(double(8 + mantissa), exponent - 10);
+        REQUIRE(b == 0x7F ? std::isnan(low) && std::isnan(high) : double(low) == magnitude && high == -low && std::signbit(high));
+    }
     const float expect[16] = {0, .5f, 1, 1.5f, 2, 3, 4, 6, -0.0f, -.5f, -1, -1.5f, -2, -3, -4, -6};
     for(int c = 0; c < 16; ++c) REQUIRE(fp4::e2m1(std::uint8_t(c)) == expect[c]);
     REQUIRE(fp4::e4m3(0x7E) == 448.0f && fp4::e4m3(0x38) == 1.0f && fp4::e4m3(0x08) == std::ldexp(1.0f, -6));

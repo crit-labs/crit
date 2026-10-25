@@ -111,7 +111,11 @@ and exactness. `speed.decode_text` records which text was decoded.
 `nvcc`, runs it three times and keeps medians: copy bandwidth (2 GiB device-to-device copies,
 read plus written) and dense cuBLASLt GEMM rates with FP32 accumulation at prefill-like shapes
 for BF16, FP8 E4M3 and NVFP4 (16-element E4M3 block scales), plus total and least free device
-memory and host memory. Pass it with `run --device`; `--bandwidth GBS` overrides the bandwidth.
+memory and host memory. `host_to_device_gbs` records host-to-device rates per transfer size
+(64 KiB to 256 MiB, keyed by bytes) for pinned copies, pageable copies and a kernel reading
+mapped pinned memory, for engines that keep weights in host memory (offloaded layers,
+host-resident experts) and size their transfers from it; no Eval score reads it. Pass it with
+`run --device`; `--bandwidth GBS` overrides the bandwidth.
 
 **Prefill ceiling.** `prepare` counts arithmetic per token from safetensors or GGUF headers and config
 ([crit_eval/ceiling.py](../../eval/crit_eval/ceiling.py)): 2 × rows × columns for every

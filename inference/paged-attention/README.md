@@ -171,12 +171,16 @@ sm_120; the tests below ran on sm_120 only.
 `tests/inference/paged_attention_tests.cpp` drives Core's StateCache with prefix
 caching, ragged prefills of 64, 300, 130, 9 (after 64 reused rows) and 1 rows, a fork
 whose shared tail is copied on write, an idle slot, 3-column verifies and decode steps
-across page boundaries, for head dimensions 64, 128 and 256 (16/2, 4/4 and 8/2 query/KV
-heads) and both formats. Every output row is compared with the attention-state CPU
+across page boundaries, for head dimension / query / KV heads 64/8/2, 128/4/4, 256/16/2 and
+128/12/2, and both formats. Every output row is compared with the attention-state CPU
 reference (`PagedAttentionPlan`, FP64 accumulation) over the same pages: within 2^-8 of
 the output magnitude (BF16 probabilities; at most 2.6e-3 measured on an RTX 5090). E4M3
 codes and scales equal a host encoder exactly; decode columns alone equal verify columns
-and lone sequences equal batched ones bit for bit; a captured graph replays new tables
+and lone sequences equal batched ones bit for bit, and its `widths` case checks every verify
+width from 1 to the 64 rows' limit (16, 64, 8, 21 and 10 columns at 4, 1, 8, 3 and 6 query
+heads per key/value head, head dimensions 128, 64, 256, 128 and 256) against columns decoded alone at 2,048, 3,001, 7,168 and 16,384 keys over
+shuffled pages, with and without a window, for 1, 5 and SM-count / `kv_heads` blocks, and
+with `max_columns` 1 or the largest width; a captured graph replays new tables
 and lengths with the bits of a direct launch. Sequences whose device counts break the
 batch (too many queries for `max_columns` or `max_queries`, more queries than keys,
 more keys than the table addresses) come out NaN with the fault flag set, next to a

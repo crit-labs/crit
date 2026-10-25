@@ -136,3 +136,38 @@ def apply(rows, moves, base=0):
     for src, dst in moves:
         out[base + dst] = out[base + src]
     return out
+
+
+def draft_rank(row, token):
+    """Rank of `token` in a drafter logit row by (logit desc, id asc), the order expand() takes children in."""
+    return sum(1 for t, x in enumerate(row) if x > row[token] or (x == row[token] and t < token))
+
+
+class DraftRanks:
+    """Per draft position, where the target's token ranked among the drafter's candidates (enqueue_draft_ranks).
+
+    counts[d][r] counts chain rounds that compared position d (every accepted draft, and the first rejected one) with the target's token at rank r of the drafter's row there; counts[d][ranks] counts ranks >= ranks.
+    covered(d, w) is the share of those rounds a tree of width w at depth d would have held from the chain's context.
+    """
+
+    def __init__(self, positions, ranks):
+        if positions < 1 or ranks < 1:
+            raise ValueError("positive positions and ranks are required")
+        self.ranks = ranks
+        self.counts = [[0] * (ranks + 1) for _ in range(positions)]
+
+    def record(self, rows, predictions, matched, emitted):
+        """One chain round: rows[d] the drafter's logits at draft d, predictions[d] the target's token after the
+        first d drafts, matched the accepted drafts and emitted the round's emitted tokens (accept's walk). Position
+        matched counts only when a correction was emitted there (emitted > matched): a round cut off by its output
+        allowance or ending on an accepted stop never compared it."""
+        if len(rows) > len(self.counts) or len(predictions) < len(rows) or not 0 <= matched <= emitted <= matched + 1:
+            raise ValueError("a row per draft position, a prediction per row and emitted in [matched, matched + 1]")
+        for d in range(min(matched + (1 if emitted > matched else 0), len(rows))):
+            self.counts[d][min(draft_rank(rows[d], predictions[d]), self.ranks)] += 1
+
+    def reached(self, d):
+        return sum(self.counts[d])
+
+    def covered(self, d, width):
+        return sum(self.counts[d][:width]) / self.reached(d) if self.reached(d) else 0.0

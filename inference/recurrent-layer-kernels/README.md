@@ -69,7 +69,9 @@ recurrence (the convolution's SiLU is here, the gates' softplus, `exp` and `sigm
 key/query normalization are the engine's); the output gate and norm; state storage in
 Core's slots; and the scratch (`delta_scratch_floats`, `ssd_scratch_floats`). For verify,
 pass the round's columns to the column scan with checkpoints and let Core's commit select
-the checkpoint of the accepted count.
+the checkpoint of the accepted count. A chunked prefill writes only the state after its
+last row: begin its round with `RoundStates::final_row` and write that state into
+`scratch[0]`, so a prefix-cache commit never snapshots a page boundary inside the chunk.
 
 ## Worked example
 
@@ -107,7 +109,9 @@ prefill's pass 1 is parallel over (head, chunk) and pass 2 over (head, value til
 
 [recurrent_kernels_tests.cu](../../tests/inference/recurrent_kernels_tests.cu) compares the
 convolution (outputs, state, checkpoints), both column scans (outputs, state, checkpoints,
-and five columns at once equal bit for bit to one at a time) and both chunked prefills over
+and every verify width from 1 to 16 equal bit for bit to the same tokens one at a time; every
+checkpoint of a 1-, 2-, 4- or 8-column scan bit for bit the final state of a separate shorter scan, for 33
+shapes up to 64 value heads, with the plane after the round left unwritten) and both chunked prefills over
 300 tokens (four full chunks and a partial one) with FP64 token-by-token references, for
 `dk` 64 and 128 and `d_state` 64 and 128. [test_recurrent_kernels.py](../../tests/test_recurrent_kernels.py)
 checks the host references.

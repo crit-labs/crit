@@ -174,6 +174,22 @@ class CodecTests(unittest.TestCase):
             self.assertTrue(all(abs(a - b) <= 1e-6 * max(1.0, abs(b)) for a, b in zip(values[r].tolist(), decoded)))
         self.assertLess(errors["weight_error"], 0.2)
 
+    def test_nvfp4_block_scales_encode_the_shared_vectors(self):
+        from e4m3_vectors import e4m3_magnitude, e4m3_scale_vectors
+        vectors = e4m3_scale_vectors()
+        scales = self.torch.tensor([b for b, _ in vectors], dtype=self.torch.int64).to(self.torch.int32).view(self.torch.float32)
+        # The codec's block-scale encoder applied to the vectors themselves (saturation, 256 .. 448, ties).
+        self.assertEqual(self.codecs.e4m3_scale_codes(scales).view(self.torch.uint8).tolist(), [c for _, c in vectors])
+        # The codec's blocks go through it: _block_scale of amax with global scale 6 encodes amax * 6 / 6.
+        codec = self.codecs.Nvfp4(self.weight)
+        codec.global_scale = self.torch.tensor(6.0)
+        amax = scales[self.torch.isfinite(scales) & (scales < 1e30)]
+        self.assertTrue(self.torch.equal(codec._block_scale(amax).view(self.torch.uint8),
+                                         self.codecs.e4m3_scale_codes(amax * 6.0 / 6.0).view(self.torch.uint8)))
+        # torch's E4M3FN decode, which the codec's checkpoints are read with, agrees with the fields' value.
+        decoded = self.torch.arange(0x80, dtype=self.torch.uint8).view(self.torch.float8_e4m3fn).float().tolist()
+        self.assertEqual([None if b == 0x7F else v for b, v in enumerate(decoded)], [e4m3_magnitude(b) for b in range(0x80)])
+
     def test_fp8_channel_scales_rows_and_round_trips(self):
         tensors, values, errors = self.codecs.quantize("fp8-channel", self.weight)
         self.assertEqual(tensors["weight"].dtype, self.torch.float8_e4m3fn)

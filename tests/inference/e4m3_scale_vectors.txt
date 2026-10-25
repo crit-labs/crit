@@ -1,0 +1,28 @@
+# E4M3FN scale encoding vectors: FP32 input bits, expected code (round to nearest even, saturating at 448).
+# Read by tests/test_techniques.py (nvfp4.py), tests/test_models.py (the PTQ codec) and tests/inference/nvfp4_tests.cpp
+# (nvfp4.h). The cases around 256 and the ties are the inputs of llama.cpp issue 31010 / PR 31020, which found an
+# encoder that saturated every value >= 256 and rounded on a single bit; positive values only, as block scales are.
+0x43800000 0x78  # 256: exponent field 15 is finite (only 0x7F is NaN)
+0x43960000 0x79  # 300 -> 288
+0x43C80000 0x7C  # 400 -> 384
+0x43C00000 0x7C  # 384
+0x43D7FFFF 0x7D  # 431.99997 -> 416, just below the 416 | 448 midpoint
+0x43D80000 0x7E  # 432: tie 416 | 448 -> even (448)
+0x43780000 0x78  # 248: tie 240 | 256 -> even (256)
+0x43700000 0x77  # 240
+0x43D00000 0x7D  # 416
+0x43E00000 0x7E  # 448, the largest finite value
+0x43E08000 0x7E  # 449 saturates
+0x43E80000 0x7E  # 464 (past the next would-be step) saturates
+0x7149F2CA 0x7E  # 1e30 saturates
+0x7F800000 0x7E  # +inf saturates
+0x43480000 0x74  # 200: tie 192 | 208 -> even (192)
+0x3F880000 0x38  # 1.0625: tie 1 | 1.125 -> even (1)
+0x3F900000 0x39  # 1.125
+0x3C700000 0x08  # 0.0146484375: tie 0.013671875 | 0.015625 -> even (0x08, the smallest normal)
+0x3C757CA8 0x08  # 0.0149833 -> 0.015625
+0x3C800000 0x08  # 2^-6, the smallest normal
+0x3B000000 0x01  # 2^-9, the smallest subnormal
+0x3A800000 0x00  # 2^-10: tie 0 | 2^-9 -> even (0)
+0x3A800001 0x01  # just above 2^-10 rounds up
+0x00000000 0x00  # 0

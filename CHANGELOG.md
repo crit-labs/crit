@@ -9,6 +9,51 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-25
+
+### Overview
+
+crit 0.9.1 is a speed and correctness release for the Inference kernels and Core. Core's state cache
+never snapshots an unwritten slot in a chunked prefill (`final_row` rounds), gated-delta column
+checkpoints cost about 1.5x the plain scan instead of 3.8x, and the stored-tile NVFP4 GEMM is 4-15%
+faster at two row tiles with the same bits. Core's `ReadOnlyFile` gains reader slots so concurrent
+positional reads scale on Windows, draft trees count the target token's rank per draft position to
+choose tree widths from data, and `crit eval probe` records host-to-device rates per transfer size.
+New tests pin the NVFP4 scale encoder, sampled speculation's distribution, greedy speculation's
+equality with plain decoding, verify widths at long contexts and top-k ties. The Python distribution
+and the Core SDK share version 0.9.1.
+
+### Added
+
+- draft-trees' `enqueue_draft_ranks` (and tree.py's `DraftRanks`): per draft position of chain rounds, the rank the
+  target's token had in the drafter's row, counted on the device after accept, to choose tree widths from data.
+- `crit eval probe` records `host_to_device_gbs`: pinned copy, pageable copy and mapped-read rates per transfer size,
+  for engines that size host-resident weights (offloaded layers, host experts) from a measurement.
+- Core's `ReadOnlyFile` has reader slots: `set_readers(n)` and `read_exact(offset, dst, worker)`. On Windows each
+  slot past the first reads through its own handle reopened from the held one, since synchronous reads through one
+  handle are serialised by its file object; on POSIX every slot shares the held descriptor.
+
+### Changed
+
+- stored-tile-gemm's NVFP4 GEMM loops over row tiles outside its token groups, reading each activation fragment
+  from shared memory once per row tile, so one row tile's weight fragment is live at a time; two-row-tile launches
+  (wide N) run faster and results are unchanged bit for bit.
+- recurrent-layer-kernels' gated-delta column scan reads and writes the state and its per-column checkpoints
+  as one 16-byte access per lane and key row (scalar when a pointer is not 16-byte aligned), so a speculative
+  verify's checkpoints cost far less (one tested GPU: about 1.5x the plain scan at 8 columns instead of 3.8x).
+  Results are unchanged bit for bit.
+
+### Fixed
+
+- crit serve closed the connection on a `DELETE`, `PUT` or `PATCH` with a body it answers 405 or 404 without
+  reading that body, which on Windows can reset the connection before the client reads the answer; it now
+  reads and drops the body and keeps the connection, closing it only for a body it cannot read.
+- Core's StateCache took prefix-cache snapshots at page boundaries inside a `column_checkpoints` round from
+  the round's per-row scratch, but a chunked recurrent prefill writes only the state after its last row, so a
+  later prompt sharing an inner page attached a state the engine never wrote. `begin(seq, rows,
+  RoundStates::final_row)` runs such a round's `column_checkpoints` components as `recompute` (one scratch
+  slot, snapshots only at the last accepted row); `every_row` stays the default for column scans.
+
 ## [0.9.0] - 2026-10-25
 
 ### Overview
@@ -1459,7 +1504,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/crit-labs/crit/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/crit-labs/crit/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/crit-labs/crit/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/crit-labs/crit/compare/v0.6.1...v0.7.0

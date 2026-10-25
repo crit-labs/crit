@@ -61,8 +61,8 @@ Core truncation moves nothing.
 
 | File | Supplies |
 | --- | --- |
-| [tree.py](code/tree.py) | Host reference: `expand`, `draft` (EAGLE-2 candidates and the kept tree), `build`, `chain`, `accept`, `compaction`, `apply` |
-| [draft_tree.h](code/draft_tree.h) / [draft_tree.cu](code/draft_tree.cu) | CUDA `enqueue_expand` (top-`branch` children with log-softmax scores, fixed candidate order), `enqueue_select` (beam or kept nodes by score, index tie-break), `enqueue_build` (tokens, parents, masks, depths, padding nodes), `enqueue_tree_accept` (device-round control and packed-result contract), `enqueue_compact` and `enqueue_settle` |
+| [tree.py](code/tree.py) | Host reference: `expand`, `draft` (EAGLE-2 candidates and the kept tree), `build`, `chain`, `accept`, `compaction`, `apply`, `draft_rank` and `DraftRanks` |
+| [draft_tree.h](code/draft_tree.h) / [draft_tree.cu](code/draft_tree.cu) | CUDA `enqueue_expand` (top-`branch` children with log-softmax scores, fixed candidate order), `enqueue_select` (beam or kept nodes by score, index tie-break), `enqueue_build` (tokens, parents, masks, depths, padding nodes), `enqueue_tree_accept` (device-round control and packed-result contract), `enqueue_compact`, `enqueue_settle` and `enqueue_draft_ranks` (per-position rank histogram) |
 
 `device_round::RoundSteps::accept` lets [device-speculative-round](../device-speculative-round/README.md)
 run the tree walk in its Finish graph instead of the greedy kernel, with the same control
@@ -89,13 +89,27 @@ Reserve `N` KV slots per round (Core's `max_round_rows`), `branch * (1 + (depth 
 beam)` candidates per request and the path and mask buffers. With fewer candidates than
 nodes the build pads with token 0 under no parent, which the walk never follows.
 
+## Choosing widths from data
+
+Measure before building a tree. Run chain rounds and, after each accept, `enqueue_draft_ranks`
+with the drafter's logit row at each draft position: for every position `d` the round
+compared (`d < n_matched`, and `d = n_matched` when a correction was emitted there; a round
+cut off by its output budget or ending on an accepted stop compared no further) it counts the rank of the
+target's token in the drafter's row, ranked as `enqueue_expand` ranks children, in a device
+histogram `[positions][ranks + 1]`, with no readback. Row `d`'s rank-0 count is the drafts
+accepted at `d`; the share of its counts below `w` (`DraftRanks.covered(d, w)` in tree.py)
+is how often a tree of width `w` at depth `d` would have held the target's token. Widen a
+depth only where that share grows by more than the extra verify columns cost, measured on
+the device that runs the engine. The counts come from the chain's context: past the first
+widened depth they estimate a tree's acceptance, they do not measure it.
+
 ## Worked example
 
 From `code/`: a toy drafter that prefers `x + 1`, then `x + 2`, after token `x`, and a
 target that takes the drafter's second choice after the first token.
 
 ```python
-from tree import accept, apply, chain, compaction, draft
+from tree import DraftRanks, accept, apply, chain, compaction, draft
 
 def drafter(paths):
     """After token x the drafter prefers x + 1, then x + 2, ... (mod 10)."""
@@ -118,6 +132,9 @@ line = chain(0, [1, 2, 3])                                     # the drafter's f
 assert accept(line, predictions(line), remaining=8)[0] == [1, 3]
 assert compaction(path, len(emitted)) == [(4, 2)]
 assert apply(["r%d" % i for i in range(7)], compaction(path, 3))[:3] == ["r0", "r1", "r4"]
+ranks = DraftRanks(positions=3, ranks=2)                       # the chain round above: its first draft accepted
+ranks.record(drafter([[], [1], [1, 2]]), [1, 3, 7], matched=1, emitted=2)  # the target's 3: drafter's second choice
+assert ranks.counts == [[1, 0, 0], [0, 1, 0], [0, 0, 0]] and ranks.covered(1, 2) == 1.0
 ```
 
 ## Adapting it
@@ -140,7 +157,10 @@ passes over each frontier row.
 nodes and built trees (tokens, parents, masks, depths, padding) with a host mirror on a
 synthetic drafter; the walk's tokens, path and control fields on 200 random trees with
 budgets and stops, and on chains against the greedy accept kernel; and compaction of
-contiguous and slot-mapped rows, including a rerun after a smaller count.
+contiguous and slot-mapped rows, including a rerun after a smaller count; and draft rank
+histograms over four rounds of chain walks, with tied logits, against a host mirror.
 [test_draft_trees.py](../../tests/test_draft_trees.py) checks the reference: kept sets are
 ancestor closed, chains walk as greedy speculation does, emitted tokens are always the
-target's, and compaction places exactly the kept rows. No end-to-end speedup is claimed.
+target's, compaction places exactly the kept rows, and a draft rank below `w` at the first
+position is exactly when a one-level tree of width `w` accepts the target's token. No
+end-to-end speedup is claimed.

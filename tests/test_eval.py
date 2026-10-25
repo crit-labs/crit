@@ -465,6 +465,20 @@ class CeilingTests(unittest.TestCase):
         self.assertEqual(combined["bandwidth_gbs"], 200)
         self.assertEqual(combined["tflops"], {"fp8": 6})
 
+    def test_probe_keeps_the_median_host_to_device_rate_per_kind_and_size(self):
+        curves = ({"pinned": {"65536": 9.0, "268435456": 28.0}, "pageable": {"65536": 5.0}},
+                  {"pinned": {"65536": 7.0, "268435456": 29.0}, "pageable": {"65536": 6.0}, "mapped_read": {"65536": 4.0}},
+                  {"pinned": {"65536": 8.0, "268435456": 27.0}, "pageable": {"65536": 0.0}})   # 0: an allocation failed
+        samples = [{"device": "gpu", "bandwidth_gbs": 100, "host_to_device_gbs": c} for c in curves]
+        combined = probe.combine(samples)
+        self.assertEqual(combined["host_to_device_gbs"], {"mapped_read": {"65536": 4.0}, "pageable": {"65536": 5.5},
+                                                         "pinned": {"65536": 8.0, "268435456": 28.0}})
+        self.assertEqual(list(combined["host_to_device_gbs"]["pinned"]), ["65536", "268435456"])   # sizes in byte order
+        self.assertEqual(probe.combine([{"device": "gpu", "bandwidth_gbs": 1}])["host_to_device_gbs"], {})   # older probes
+        failed = [{"device": "gpu", "bandwidth_gbs": 1, "host_to_device_gbs": {"pinned": {"65536": 0.0, "1048576": 9.0},
+                                                                              "mapped_read": {"65536": 0.0}}}]
+        self.assertEqual(probe.combine(failed)["host_to_device_gbs"], {"pinned": {"1048576": 9.0}})   # unmeasured left out
+
 
 THRESHOLDS = {"acceptance_ceiling_width": 8}
 

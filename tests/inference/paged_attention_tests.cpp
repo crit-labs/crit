@@ -1,7 +1,7 @@
 // Batched paged attention against the attention-state CPU reference over Core's StateCache: ragged batches with
 // forks (copy-on-write tails), reused prefix pages and rows crossing page boundaries, for BF16 and E4M3 pages and head
 // dimensions 64, 128 and 256. Also: E4M3 writes equal a host encoder, decode columns alone equal the same columns in a
-// verify, a sequence's result does not depend on its batch, captured graphs replay new tables and lengths, invalid
+// verify (also for every verify width at 2048 to 16384 keys), a sequence's result does not depend on its batch, captured graphs replay new tables and lengths, invalid
 // problems are rejected, and sequences whose device counts break the batch get NaN rows and a fault flag.
 #include "device_pages.h"
 #include "paged_attention.h"
@@ -302,6 +302,100 @@ void case_invariance(Fixture& f) {
     f.commit({s.b, s.c}, rounds, 7000);
 }
 
+// Every verify width at long contexts: for each width n in 1 .. n_max (the most columns a key/value head's 64 rows
+// hold), a verify of n columns at keys L - n .. L - 1 equals, row by row and bit for bit, each column decoded alone at
+// its own length, with max_columns 1 or n_max (as a graph captured for the widest round would launch it), and a
+// verify launched with max_columns n_max equals one launched with max_columns n. Lengths 2048, 7168 and 16384 (plus one off a piece
+// boundary), shuffled pages, with and without a sliding window, for blocks 1, 5 and the SM count over key/value heads.
+void case_widths() {
+    struct G { int hd, heads, kv_heads; };
+    int sms = 0;
+    check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0), "SM count");
+    constexpr int pt = 16, max_len = 16384, pages_n = max_len / pt;
+    std::mt19937 rng(4321);
+    std::normal_distribution<float> normal(0.f, 1.f);
+    std::size_t compared = 0;
+    // Query heads per key/value head 4, 1, 8, 3 and 6: n_max 16, 64, 8, 21 and 10 (the last two not powers of two,
+    // so a block's 64 rows hold padding past its last column).
+    for(const G g : {G{128, 32, 8}, G{64, 8, 8}, G{256, 16, 2}, G{128, 24, 8}, G{256, 48, 8}})
+        for(const auto format : {pa::Format::bf16, pa::Format::e4m3}) {
+            const int width = g.kv_heads * g.hd, stride = g.heads * g.hd, n_max = 64 / (g.heads / g.kv_heads);
+            const bool e4m3 = format == pa::Format::e4m3;
+            Buffer<std::uint8_t> kp(static_cast<std::size_t>(max_len) * width * (e4m3 ? 1 : 2)), vp(kp.n);
+            Buffer<float> ks(e4m3 ? static_cast<std::size_t>(max_len) * g.kv_heads : 0), vs(ks.n);
+            const pa::Pages pages{kp.p, vp.p, e4m3 ? ks.p : nullptr, e4m3 ? vs.p : nullptr, format, pt, g.kv_heads, g.hd};
+            // Pages in shuffled order: key t lives on page table[t / pt].
+            std::vector<std::int32_t> table(pages_n), slots(max_len);
+            for(int i = 0; i < pages_n; ++i) table[i] = i;
+            std::shuffle(table.begin(), table.end(), rng);
+            for(int t = 0; t < max_len; ++t) slots[t] = table[t / pt] * pt + t % pt;
+            {
+                std::vector<__nv_bfloat16> kb(static_cast<std::size_t>(max_len) * width), vb(kb.size());
+                for(auto& x : kb) x = __float2bfloat16(normal(rng));
+                for(auto& x : vb) x = __float2bfloat16(2.f * normal(rng));
+                Buffer<__nv_bfloat16> k(kb.size()), v(vb.size());
+                Buffer<std::int32_t> ds(slots.size());
+                k.put(kb); v.put(vb); ds.put(slots);
+                check(pa::write(pages, k.p, v.p, width, max_len, ds.p, nullptr), "write");
+                check(cudaDeviceSynchronize(), "write sync");
+            }
+            Buffer<std::int32_t> dtable(table.size()), lens(1), starts(2);
+            dtable.put(table);
+            Buffer<__nv_bfloat16> q(static_cast<std::size_t>(n_max) * stride);
+            Buffer<float> out(q.n);
+            const float scale = 1.f / std::sqrt(static_cast<float>(g.hd));
+            for(const int blocks : {1, 5, std::max(1, sms / g.kv_heads)}) {
+                Buffer<float> partial(pa::decode_partial_floats(1, g.kv_heads, g.hd, blocks, n_max, g.heads));
+                auto run = [&](int kv_len, int n, int max_columns, int window, const __nv_bfloat16* rows) {
+                    lens.put({kv_len});
+                    starts.put({0, n});
+                    pa::Decode p;
+                    p.q = rows; p.q_stride = stride; p.pages = pages; p.batch = pa::Batch{1, dtable.p, pages_n, lens.p, starts.p};
+                    p.out = out.p; p.out_stride = stride; p.heads = g.heads; p.scale = scale; p.max_columns = max_columns;
+                    p.blocks = blocks; p.partial = partial.p; p.window = window;
+                    check(pa::decode(p, nullptr), "decode");
+                    check(cudaDeviceSynchronize(), "decode sync");
+                    return out.get(static_cast<std::size_t>(n) * stride);
+                };
+                for(const int len : {2048, 7168, 16384, 3001})
+                    for(const int window : {0, 1000}) {
+                        // Query bank: row j is the query at position len - n_max + j.
+                        std::vector<__nv_bfloat16> bank(q.n);
+                        for(auto& x : bank) x = __float2bfloat16(normal(rng));
+                        q.put(bank);
+                        std::vector<std::vector<float>> alone(n_max);
+                        for(int j = 0; j < n_max; ++j) {
+                            alone[j] = run(len - n_max + j + 1, 1, 1, window, q.p + static_cast<std::size_t>(j) * stride);
+                            const auto wide = run(len - n_max + j + 1, 1, n_max, window, q.p + static_cast<std::size_t>(j) * stride);
+                            require(std::memcmp(alone[j].data(), wide.data(), stride * sizeof(float)) == 0,
+                                    "a decode column with max_columns " + std::to_string(n_max) + " differs from max_columns 1");
+                        }
+                        for(int n = 1; n <= n_max; ++n) {
+                            const __nv_bfloat16* rows = q.p + static_cast<std::size_t>(n_max - n) * stride;
+                            const auto verify = run(len, n, n, window, rows);
+                            const auto wide = run(len, n, n_max, window, rows);
+                            require(std::memcmp(verify.data(), wide.data(), verify.size() * sizeof(float)) == 0,
+                                    "a " + std::to_string(n) + "-column verify depends on max_columns");
+                            for(int i = 0; i < n; ++i) {
+                                const auto& want = alone[n_max - n + i];
+                                if(std::memcmp(want.data(), verify.data() + static_cast<std::size_t>(i) * stride, stride * sizeof(float)) != 0) {
+                                    float worst = 0.f;
+                                    for(int e = 0; e < stride; ++e) worst = std::max(worst, std::fabs(want[e] - verify[static_cast<std::size_t>(i) * stride + e]));
+                                    throw std::runtime_error("verify width " + std::to_string(n) + " column " + std::to_string(i) + " at " +
+                                                             std::to_string(len) + " keys (window " + std::to_string(window) + ", blocks " +
+                                                             std::to_string(blocks) + ") differs from the column alone by " + std::to_string(worst));
+                                }
+                                ++compared;
+                            }
+                        }
+                    }
+            }
+            std::cout << "widths head_dim=" << g.hd << " heads=" << g.heads << "/" << g.kv_heads << (e4m3 ? " e4m3" : " bf16")
+                      << ": widths 1.." << n_max << " bitwise equal to columns alone\n";
+        }
+    std::cout << "widths: " << compared << " verify columns compared, all bitwise equal\n";
+}
+
 void case_graph(Fixture& f) {
     Scenario s(f);
     // Capture one decode for four sequences, then replay it for later steps with new lengths and tables.
@@ -426,7 +520,7 @@ void case_bounds() {
 using Case = void (*)(Fixture&);
 void each_geometry(Case run, const char* name) {
     struct G { int hd, heads, kv_heads; };
-    for(const G g : {G{64, 8, 2}, G{128, 4, 4}, G{256, 16, 2}})
+    for(const G g : {G{64, 8, 2}, G{128, 4, 4}, G{256, 16, 2}, G{128, 12, 2}})
         for(const auto format : {pa::Format::bf16, pa::Format::e4m3}) {
             Fixture f(g.hd, g.heads, g.kv_heads, format);
             run(f);
@@ -443,6 +537,7 @@ int main(int argc, char** argv) {
         const std::string which = argc > 1 ? argv[1] : "all";
         if(which == "decode" || which == "all") each_geometry(case_decode, "decode");
         if(which == "invariance" || which == "all") each_geometry(case_invariance, "invariance");
+        if(which == "widths" || which == "all") case_widths();
         if(which == "graph" || which == "all") each_geometry(case_graph, "graph");
         if(which == "rejects" || which == "all") { case_rejects(); case_bounds(); }
         std::cout << "paged attention " << which << " passed\n";

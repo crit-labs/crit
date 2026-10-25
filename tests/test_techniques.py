@@ -40,6 +40,9 @@ def load(ident, name="implementation.py"):
     return module
 
 
+from e4m3_vectors import e4m3_magnitude, e4m3_scale_vectors  # noqa: E402
+
+
 class Receipt:
     def __init__(self, done=False):
         self.finished = done
@@ -936,6 +939,20 @@ class Nvfp4CodecTests(unittest.TestCase):
                     lambda: m.Matrix(1, 16, b"\0" * 8, b"\0", 0.0), lambda: m.Matrix(1, 16, b"\0" * 7, b"\0", 1.0)):
             with self.assertRaises(ValueError):
                 bad()
+
+    def test_scale_encoder_vectors_and_every_scale_byte(self):
+        m = load("quantized-projections", "nvfp4.py")
+        for bits, code in e4m3_scale_vectors():
+            x = __import__("struct").unpack("<f", bits.to_bytes(4, "little"))[0]
+            self.assertEqual(m.e4m3_encode(x), code, f"{bits:#010x} ({x})")
+        # Every byte a checkpoint can hold decodes to its fields' value: bit 7 the sign, 0x7F and 0xFF NaN.
+        for b in range(0x80):
+            low, high = m.e4m3_value(b), m.e4m3_value(b | 0x80)
+            if b == 0x7F:
+                self.assertTrue(math.isnan(low) and math.isnan(high))
+            else:
+                self.assertEqual(low, e4m3_magnitude(b), hex(b))
+                self.assertEqual((high, math.copysign(1.0, high)), (-low, -1.0))
 
     def test_quantization_error_and_batched_projection(self):
         m = load("quantized-projections", "nvfp4.py")

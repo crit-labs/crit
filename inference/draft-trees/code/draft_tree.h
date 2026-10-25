@@ -65,6 +65,25 @@ cudaError_t enqueue_build(const Candidates& candidates, const Build& build, cuda
 cudaError_t enqueue_tree_accept(const device_round::AcceptRows& rows, const std::int32_t* parents, std::int32_t* path,
                                 cudaStream_t stream);
 
+// Draft ranks, to choose tree widths from data: after a chain round's accept (device_round's control block), for each
+// draft position d the round compared (d < control[n_matched], or d == n_matched when the walk emitted a correction
+// there, n_emitted > n_matched; a round cut off by its output budget or ending on an accepted stop never compared
+// the next position; d < draft_tokens), the rank of the target's prediction d among the drafter's logits at
+// d (logit desc, id asc: the order enqueue_expand takes children in), counted in
+// histogram[d * (ranks + 1) + min(rank, ranks)]; the last column counts ranks >= `ranks`. Row d's rank-0 count is the
+// drafts accepted at d, and the share of its counts below w is the share of reached rounds whose target token a tree of
+// width w at depth d would have held (from the chain's context). Counts accumulate over rounds (zero the histogram
+// once), the launch has no host dependency, so it can run in a captured round, and the host reads it when it decides.
+struct DraftRanks {
+    const float* logits = nullptr;              // [rows][draft_tokens][stride]: the drafter's row at each position
+    int stride = 0, vocab = 0;
+    const std::int32_t* predictions = nullptr;  // [rows][draft_tokens + 1]
+    const std::int32_t* control = nullptr;      // [rows][control::fields], after the round's accept
+    unsigned long long* histogram = nullptr;    // [draft_tokens][ranks + 1]
+    int rows = 0, draft_tokens = 0, ranks = 0;
+};
+cudaError_t enqueue_draft_ranks(const DraftRanks& ranks, cudaStream_t stream);
+
 // Rows of one state array: node i of request r lives at base + slot * row_stride with slot = slots[r * nodes + i], or
 // control[r][base_frontier] + i when slots is null (a contiguous cache). row_bytes per row, 16-byte aligned for the
 // vector path.

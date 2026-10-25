@@ -52,8 +52,10 @@ mapping by setting one scale byte to 2.0 at a time. On the tested device, row `g
 scales come from lane `4g`, row `g+8`'s from lane `4g+1`, column `g`'s from lane `4g`,
 and byte `j` covers `k = 16j .. 16j+15`.
 
-**Pipeline.** A block of 8 warps covers 8 x 16 x `RT` rows and `8 NT` tokens; one
-activation fragment from shared memory feeds `RT` MMAs. Weight tiles stream through a
+**Pipeline.** A block of 8 warps covers 8 x 16 x `RT` rows and `8 NT` tokens. In the FP8
+kernel one activation fragment from shared memory feeds `RT` MMAs; the NVFP4 kernel loops
+over row tiles outside token groups instead, reading each activation fragment once per row
+tile so that only one row tile's weight fragment is live (same bits either way). Weight tiles stream through a
 `PF`-deep register ring (L1 no-allocate), activations through a 3-stage `cp.async`
 ring. When the grid is too small, K is split into up to 8 parts whose FP32 partials a
 finish kernel sums in a fixed order.
