@@ -17,7 +17,7 @@ from pathlib import Path
 import sys
 import time
 
-from .records import file_sha, ident, load_run, now, quality_terms, read_json, safe_path, timestamp
+from .records import file_sha, ident, load_run, now, quality_mode, quality_terms, read_json, safe_path, timestamp
 from .served import Expired, SERVED, Served, remaining
 from .store import amendments
 
@@ -80,6 +80,7 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
     attempt = reservation["attempt_id"]
     budget, exactness = quality_terms(run["spec"]["correctness"], amendments(root, reservation["segment_id"]))
     options = dict(label=label, device=device, baseline=baseline, quality_budget=budget, exactness=exactness,
+                   quality_mode=quality_mode(run["spec"]["correctness"]),
                    context_tokens=constraints["kv_tokens"], context_basis=basis,
                    vram_headroom_bytes=round(settings.get("vram_headroom_gib", 1.0) * (1 << 30)),
                    context_reserve_bytes=round(reserve * (1 << 30)) if reserve is not None else None)
@@ -160,10 +161,12 @@ def _measure(store, run_id, candidate_id, attempt, deadline_at, model, data, out
                 # Between the reference's layers and texts: scoring stops at the reservation's deadline.
                 if remaining(deadline_at) <= 0:
                     raise Expired("Eval passed its reserved deadline while the reference scored the quality texts")
+            from crit_eval.fixed import STORES
             from crit_eval.packages import fetch, source
-            if source() is not None and not (data / "reference" / "index.json").is_file():
+            mode = options["quality_mode"]
+            if source() is not None and not (data / STORES[mode] / "index.json").is_file():
                 fetch(model, data, source(), log)   # a published package's scores, when the source has them
-            how = score_data(model, data, log, check)
+            how = score_data(model, data, log, check, quality_mode=mode)
             log(f"quality: reference scores of {how['positions']:,} positions {how['method']}"
                 + (f" in {how['seconds']:.0f} s" if how["method"] == "scored" else ""))
         with served.until(deadline_at):

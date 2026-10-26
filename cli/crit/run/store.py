@@ -14,12 +14,12 @@ import uuid
 from .records import (
     HEADROOM_REASONS, LIFECYCLES, LINEAGE, MAX_CANDIDATES, SAFETY_WINDOW_MINUTES, STOP_REASONS, WEIGHTS, amendment,
     attempt_process_cap,
-    candidate_projection, quality_terms, digest, evidence, file_sha, header, headroom_record, ident,
+    candidate_projection, quality_mode, quality_terms, digest, evidence, file_sha, header, headroom_record, ident,
     ineligibility, inputs, inventory, keys, load_run, now, number, read_candidates, read_json, record,
     request_spec, safe_path, segment, text, timestamp, validate_attempt_reservation, validate_attempt_result,
     validate_spec, verify_inventory, write_json,
 )
-from . import cost, hub, plans, recon
+from . import cost, hub, plans, recon, replay
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -238,6 +238,12 @@ class RunStore:
             raise ValueError("Unknown run")
         return path
 
+    def _recording(self, run_id):
+        """The run's folder for a command that records or changes something: never a replay's (replay.py)."""
+        root = self.directory(run_id)
+        replay.refuse(root)
+        return root
+
     def get(self, run_id):
         root = self.directory(run_id)
         run = load_run(root)
@@ -422,7 +428,7 @@ class RunStore:
         """amend: {quality_budget?, exactness?, approved_by} changes the run's quality terms from this segment on."""
         if type(external_cleanup_confirmed) is not bool:
             raise ValueError("External cleanup confirmation requires a boolean")
-        root = self.directory(run_id)
+        root = self._recording(run_id)
         with lease(root):
             run = load_run(root)
             previous = read_json(root / "state.json")
@@ -449,7 +455,7 @@ class RunStore:
         return self.get(run_id)
 
     def freeze_inputs(self, run_id, data):
-        root = self.directory(run_id)
+        root = self._recording(run_id)
         with lease(root):
             run, _, _ = self._active(root)
             keys(data, {"hardware_manifest", "environment_manifest", "case_manifests"})
@@ -514,7 +520,7 @@ class RunStore:
         return sum(c.get("segment_id") == bounds["segment_id"] for c in candidates)
 
     def candidate(self, run_id, source, proposal):
-        root = self.directory(run_id)
+        root = self._recording(run_id)
         with lease(root):
             run, _, bounds = self._active(root)
             resolved = inputs(root, run)
@@ -594,10 +600,19 @@ class RunStore:
                                                                          **({"plan_id": value["plan_id"]} if "plan_id" in value else {})})
         return value
 
-    def plan(self, run_id, data):
+    def plan(self, run_id, data, check=False):
         """Record a candidate plan (plans.py): checked against the parent's newest Eval, which it freezes, with the
-        priorities crit computes. Never changed afterwards; a revision is a new plan that supersedes it."""
+        priorities crit computes. Never changed afterwards; a revision is a new plan that supersedes it. check: run
+        the same checks and return the record crit would store, writing nothing (the only plan command a replay
+        takes; there the parent's Eval status is the one the replay rendered again)."""
         root = self.directory(run_id)
+        if check:
+            with lease(root):
+                run = load_run(root)
+                bounds = segment(root, run, read_json(safe_path(root, "state.json"))["current_segment_id"])
+                value = plans.build(root, run, bounds, data, replay.status_for(root))
+            return {"checked": True, "recorded": False, **value}
+        replay.refuse(root)
         with lease(root):
             run, _, bounds = self._active(root)
             value = plans.build(root, run, bounds, data)
@@ -614,7 +629,7 @@ class RunStore:
     def plan_outcome(self, run_id, candidate_id, attempt_id):
         """After a retained Eval attempt of a candidate created from a plan: the plan's forecast next to what Eval
         measured, at plans/PLAN_ID/outcomes/ATTEMPT.json. None when the candidate has no plan."""
-        root = self.directory(run_id)
+        root = self._recording(run_id)
         with lease(root):
             run = load_run(root)
             candidate = read_json(safe_path(root, f"candidates/{ident(candidate_id, 'candidate')}/candidate.json"))
@@ -633,7 +648,7 @@ class RunStore:
         return value
 
     def recon(self, run_id, force=False, drafters=()):
-        root = self.directory(run_id)
+        root = self._recording(run_id)
         with lease(root):
             value = recon.write(root, load_run(root), force, drafters)
             self._event(root, "model_recon", reference={"path": recon.RECON_JSON, "sha256": file_sha(root / recon.RECON_JSON)})
@@ -645,7 +660,7 @@ class RunStore:
         return recon.compare_with_run(root, load_run(root), Path(other).expanduser().resolve())
 
     def package(self, run_id, candidate_id, source, recipe):
-        root = self.directory(run_id)
+        root = self._recording(run_id)
         with lease(root):
             run, _, _ = self._active(root)
             folder = safe_path(root, f"candidates/{ident(candidate_id, 'candidate')}")
@@ -693,7 +708,7 @@ class RunStore:
         return value
 
     def append(self, run_id, candidate_id, kind, data):
-        root = self.directory(run_id)
+        root = self._recording(run_id)
         with lease(root):
             run = load_run(root)  # Result publication grants no new process execution.
             candidate = read_json(safe_path(root, f"candidates/{ident(candidate_id, 'candidate')}/candidate.json"))
@@ -718,7 +733,7 @@ class RunStore:
         return [{"path": path.relative_to(root).as_posix(), "sha256": file_sha(path)} for path in sorted(latest.values())]
 
     def reserve(self, run_id, candidate_id, operation, seconds=None):
-        root = self.directory(run_id)
+        root = self._recording(run_id)
         with lease(root):
             run, _, bounds = self._active(root)
             cap = attempt_process_cap(bounds, candidate_id, operation)
@@ -776,7 +791,7 @@ class RunStore:
             pass
 
     def settle(self, run_id, reservation, data):
-        root = self.directory(run_id)
+        root = self._recording(run_id)
         with lease(root):
             candidate_id = reservation["candidate_id"]
             owner = f"candidates/{candidate_id}" if candidate_id else f"segments/{reservation['segment_id']}"
@@ -798,7 +813,7 @@ class RunStore:
         return value
 
     def seal(self, run_id, candidate_id, lifecycle, failure=None):
-        root = self.directory(run_id)
+        root = self._recording(run_id)
         with lease(root):
             folder = safe_path(root, f"candidates/{ident(candidate_id, 'candidate')}")
             outcome_path = safe_path(folder, "outcome.json")
@@ -831,7 +846,7 @@ class RunStore:
         return value
 
     def select(self, run_id, candidate_id):
-        root = self.directory(run_id)
+        root = self._recording(run_id)
         with lease(root):
             data = self.get(run_id)
             candidate = next((c for c in data["candidates"] if c["candidate_id"] == candidate_id), None)
@@ -848,7 +863,7 @@ class RunStore:
     def stop(self, run_id, reason, critique=None, opportunities=None, cleanup="external", message="", headroom=None):
         if reason not in STOP_REASONS or cleanup not in {"external", "settled", "unresolved"}:
             raise ValueError("Invalid stopping reason or cleanup state")
-        root = self.directory(run_id)
+        root = self._recording(run_id)
         with lease(root):
             data = self.get(run_id)
             if reason == "satisfied" and not data["state"]["target_satisfied"]:
@@ -881,7 +896,7 @@ class RunStore:
 
     def cost(self, run_id, transcripts, agent=None, prices=None, until=None):
         """Write cost.json: the run's wall time, agent tokens and API price per candidate (cost.py)."""
-        root = self.directory(run_id)
+        root = self._recording(run_id)
         with lease(root):
             run = load_run(root)
             candidates, _ = read_candidates(root, run)
@@ -905,10 +920,17 @@ class RunStore:
                         " docs/RUN_RECORDS.md.") if policy == "as_stored" else ""
         amended = amendments(root, bounds["segment_id"])
         quality_budget, exactness = quality_terms(run["spec"]["correctness"], amended)
+        mode = quality_mode(run["spec"]["correctness"])
+        mode_line = (" Quality mode preserve: Eval's reference keeps the activations exact, so quantizing them counts as "
+                     "drift, and prefill's limits are priced at 16-bit prompt activations." if mode == "preserve" else
+                     " Quality mode as_quantized (the user's choice): Eval's reference runs the checkpoint as quantized, "
+                     "its activations quantized as the checkpoint declares, so the checkpoint's own activation "
+                     "quantization is no drift and prefill's limits are priced at its stored format.")
         quality_line = (f"Quality budget: PPL ratio ≤ {quality_budget['ppl_ratio_max']}, mean KLD ≤ "
                         f"{quality_budget['kld_mean_max']}, p99 KLD ≤ {quality_budget['kld_p99_max']} against Eval's reference; "
-                        f"speculative exactness {exactness}. crit run ... eval applies both; pass them to crit eval run as "
-                        f"--quality-budget '{json.dumps(quality_budget)}' --exactness {exactness} when you run it yourself. The budget is a resource to spend on speed: a "
+                        f"speculative exactness {exactness}." + mode_line + " crit run ... eval applies them; pass them to "
+                        f"crit eval run as --quality-budget '{json.dumps(quality_budget)}' --exactness {exactness} "
+                        f"--quality-mode {mode} when you run it yourself. The budget is a resource to spend on speed: a "
                         "lever inside it counts in full, being close to a limit is no reason to reject it, and lower drift "
                         "than the budget is not a gain."
                         + (f" These terms amend the original request (approved by {amended[-1]['approved_by']}) and"
@@ -988,6 +1010,11 @@ class RunStore:
         if run["spec"].get("plan_rules", 1) >= 3:
             plan_line += ("\nPlan rules 3: a plan whose forecast gains more on p2 than on p1, or lets a p1 KPI fall, gives\n"
                           "forecast_justification.")
+            plan_line += ("\nA kernel term is exhausted only when it runs near its floor at the arithmetic the engine\n"
+                          "already uses (crit eval status --kernels: each matmul's achieved TFLOPS and its gap at the rate\n"
+                          "of its own prompt activations) or when another kernel structure, or a vendor library at the same\n"
+                          "arithmetic as a yardstick, was measured on it; tiling, block and launch variants of one kernel\n"
+                          "reject those variants, not the term.")
             plan_line += ("\nBelow half its limit a family is not needed only on measured rejections: each gaps entry\n"
                           "names its evidence (a file in the run), an Eval gap answers rejected, and for prefill every\n"
                           "prompt activation format Eval prices faster than the engine's own needs a gaps entry\n"

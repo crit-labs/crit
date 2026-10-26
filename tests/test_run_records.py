@@ -455,9 +455,18 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         strict = (self.store.directory(run_id) / "agent_request.md").read_text(encoding="utf-8")
         self.assertIn("PPL ratio ≤ 1.0, mean KLD ≤ 0.0, p99 KLD ≤ 0.5", strict)
         self.assertIn("--exactness required", strict)
-        for bad in ({"quality_budget": {"ppl_ratio_max": 0.9}}, {"quality_budget": {"kld_max": 1}}, {"exactness": "maybe"}):
+        self.assertIn("Quality mode preserve", prompt)
+        self.assertIn("--quality-mode preserve", prompt)
+        for bad in ({"quality_budget": {"ppl_ratio_max": 0.9}}, {"quality_budget": {"kld_max": 1}}, {"exactness": "maybe"},
+                    {"quality_mode": "fast"}):
             with self.assertRaises(ValueError):
                 self.store.create(self.data | bad)
+        # The user's other quality mode: the run records it and the brief says what it means.
+        run = self.store.create(self.data | {"quality_mode": "as_quantized"})["run"]
+        self.assertEqual(run["spec"]["correctness"]["quality_mode"], "as_quantized")
+        quantized = (self.store.directory(run["run_id"]) / "agent_request.md").read_text(encoding="utf-8")
+        self.assertIn("Quality mode as_quantized (the user's choice)", quantized)
+        self.assertIn("--quality-mode as_quantized", quantized)
 
     def test_resume_amends_quality_terms_for_later_segments(self):
         prompt = (self.directory / "agent_request.md").read_text(encoding="utf-8")

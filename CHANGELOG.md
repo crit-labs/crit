@@ -9,6 +9,56 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-26
+
+### Overview
+
+crit 0.11.0 lets the user choose what quality means, and replays old runs against today's rules. A run's
+`quality_mode` is `preserve` (the default: quality against the checkpoint with exact activations, prefill measured
+against 16-bit prompt arithmetic) or `as_quantized` (against the checkpoint run as quantized, as serving stacks run
+NVFP4 and FP8 checkpoints, with prefill measured against the stored format); crit-eval 0.1.2 scores both references
+and prices each mode's limits. `crit run ... replay` copies a run as it stood when a candidate's Eval finished, or just
+before a plan, renders its Eval statuses again with today's crit-eval and asks any agent harness for the plan it would
+record next, which `plan --check` validates without recording: a change to crit's rules or Eval's reports is tested on
+an old run in minutes instead of a new run. Recon serves thinking off by default, as Eval renders prompts, a kernel
+term counts as exhausted only near its floor or against another kernel structure, and the README is reorganized. The
+Python distributions and the Core SDK share version 0.11.0; crit depends on crit-eval 0.1.2.
+
+### Added
+
+- A run's `quality_mode` (request or `settings.toml`): `preserve`, the default, judges quality against the checkpoint
+  with exact activations; `as_quantized` against it run as quantized (crit-eval's quality modes), so the checkpoint's
+  own activation quantization is no drift and prefill is measured against its stored format. `crit run ... eval`
+  scores, fetches and judges in the run's mode, and the brief names it.
+- `crit run ... replay --at CANDIDATE --out DIR --count N`: N copies of a run as it stood when the candidate's Eval
+  finished, with every copied Eval status rendered again by today's crit-eval and a brief for an agent to say what it
+  would do next (`replay/plan.json`, `replay/next.md`). A replay records nothing: crit refuses candidates, plans,
+  attempts, Eval, seals and stops in it. `replay --collect` checks and lists the replays' plans side by side. It shows
+  in minutes whether a change to crit or crit-eval changes what an agent decides at that point of an old run.
+  `--agent CMD` starts any harness on every replay at once (a command template with `{brief}`, `{folder}`,
+  `{root}` and `{number}`), waits for all and collects; crit itself starts no agent otherwise. `--before PLAN` replays
+  the run as it stood just before that plan was recorded, with the work done toward it since its parent's Eval;
+  drafts of the next plan in work/ are always left out.
+- `crit run ... plan --record plan.json --check` runs a plan's checks and prints the record crit would store, recording
+  nothing.
+
+### Changed
+
+- The README presents crit's parts in the order Core, Inference, Eval, Kernels, Models, API and CLI: Core says how
+  it was distilled and lists its parts, Inference is the register of speed-up strategies by bottleneck with its entry
+  layout and contribution criteria, and Eval states crit-eval's four claims as crit-eval's own README does.
+- AGENTS.md, the run brief and Building engines: a kernel term is exhausted only when it runs near its floor at
+  the arithmetic the engine already uses (crit-eval's achieved TFLOPS and its gap at the rate of the engine's own
+  prompt activations) or when another kernel structure or a vendor yardstick was measured on it; tiling and launch
+  variants of one kernel reject those variants, not the term. Building engines asks for a trace of every
+  prefill-scored case, and stored-tile-gemm gives the `kernel_work` rules of its BF16-activation GEMMs.
+- Recon freezes a chat template's `enable_thinking` off (`template_variables`), as crit Eval renders every prompt:
+  a candidate served with thinking on by default stopped its Eval at the first request and was sealed
+  benchmark_failed. Requests still turn thinking on.
+- `crit_core.serving.ResidentChat` renders with the `template_variables` recon froze into configuration `recon` when
+  the configuration has no `chat_template_kwargs` of its own; before, the frozen variables reached no prompt unless
+  the engine copied them.
+
 ## [0.10.0] - 2026-10-26
 
 ### Overview

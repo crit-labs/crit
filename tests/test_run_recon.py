@@ -64,6 +64,7 @@ class ReconTests(unittest.TestCase):
         self.assertIn(4, frozen["stop_token_ids"])
         self.assertEqual(gathered["stop_token_text"]["4"], "<|eot_id|>")
         self.assertEqual(frozen["chat_template"]["name"], "default")
+        self.assertEqual(frozen["template_variables"], {})   # a template without a thinking switch
         self.assertEqual(gathered["architecture"]["architectures"], ["FixtureForCausalLM"])
         self.assertEqual(gathered["architecture"]["rope_scaling"], {"type": "yarn", "factor": 4.0})
         self.assertEqual(gathered["architecture"]["num_hidden_layers"], 2)
@@ -112,6 +113,9 @@ class ReconTests(unittest.TestCase):
         (self.model / "chat_template.jinja").write_text(THINKING, encoding="utf-8")
         value = self.store.recon(self.run_id)
         self.assertEqual(value["gathered"]["chat_templates"]["default"]["variables"], ["enable_thinking"])
+        # Served with thinking off by default, as crit Eval renders every prompt; requests turn it on.
+        self.assertEqual(value["frozen"]["template_variables"], {"enable_thinking": False})
+        self.assertIn("Thinking is off by default", (self.directory / recon.RECON_MD).read_text(encoding="utf-8"))
         notes = self.directory / recon.RECON_MD
         notes.write_text("my findings", encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "--force"):

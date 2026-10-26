@@ -158,7 +158,13 @@ the activations are quantized once, and keep their own weight global scales.
 
 BF16-activation GEMMs: make an `A16Plan` per (format, `N`, `K`, largest chunk) at load and
 give split plans `partial_floats` floats of scratch; `x` is dense `[T][K]` and 16-byte aligned.
-They are not bitwise equal to the GEMV (another K order) and need no activation scales.
+They are not bitwise equal to the GEMV (another K order) and need no activation scales. In a
+kernel trace they are `a16_kernel<FP4, ...>` and its finish kernels; crit-eval classes them as
+matmul by the `stored_tile` namespace, and the engine's `kernel_work` gives their formats:
+`{"match": "a16_kernel<true", "term": "matmul", "format": "nvfp4"}` and `a16_kernel<false` for
+`fp8`. They are built for the BF16 rate: an engine variant with faster activations (FP16
+accumulation, FP8) is a new kernel to measure against that format's rate (`crit eval status
+--kernels` gives its achieved TFLOPS), not a retuning of this one.
 
 Decode GEMV: make one `GemvPlan` per matrix at load and use it for every decode and verify
 call, so all rows share one reduction order. Give a drafter's matrices a plan with
