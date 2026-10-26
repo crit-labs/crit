@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "api", "eval", "kernels", "cli"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("core/python", "api", "../crit-eval", "kernels", "cli"): sys.path.insert(0, str(ROOT / _folder))
 from crit.run.cli import load_settings, main
 from crit.run.records import GIB
 
@@ -64,7 +64,8 @@ class RunSettingsTest(unittest.TestCase):
         commented = set(re.findall(r"^# ([a-z_]+) = ", text, flags=re.MULTILINE))
         self.assertEqual(set(active) | commented, set(SETTINGS))
         self.assertFalse(set(active) & commented)
-        protocol = json.loads((ROOT / "eval/protocol.json").read_text(encoding="utf-8"))
+        from crit_eval import EVAL_DIR
+        protocol = json.loads((EVAL_DIR / "protocol.json").read_text(encoding="utf-8"))
         self.assertEqual(active, {"ram_headroom_gib": 2, "vram_headroom_gib": 1,
                                   "context_reserve_gib": protocol["context"]["reserve_gib"],
                                   "context_tokens": crit_eval.DEFAULT_CONTEXT_TOKENS})

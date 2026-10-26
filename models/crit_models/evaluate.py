@@ -50,6 +50,10 @@ def evaluate(record_path, data, result_path, evaluation_path, baseline=None, log
         raise ValueError(f"{result_path} is no finished Eval round")
     status = result["status"]
     kpis = status["kpis"]
+    decode = kpis.get("decode_sampled") or kpis.get("decode_greedy") or kpis.get("decode") or {}
+    # crit-eval's quality KPIs, perplexity and kl_divergence (earlier results: one quality KPI).
+    quality = ({"perplexity": kpis.get("perplexity"), "kl_divergence": kpis.get("kl_divergence")}
+               if "perplexity" in kpis else kpis.get("quality"))
     evaluation = {
         "schema_version": 1, "record_kind": "models_evaluation",
         "transform": {"path": str(record_path.absolute()), "sha256": file_sha(record_path),
@@ -58,8 +62,8 @@ def evaluate(record_path, data, result_path, evaluation_path, baseline=None, log
         "data": {"path": str(data.absolute()), "prepared_sha256": file_sha(data / PREPARED),
                  "model_sha256": prepared["model"]["sha256"]},
         "result": {"path": str(result_path.absolute()), "sha256": file_sha(result_path)},
-        "summary": {"gates": {g["name"]: g["state"] for g in status["gates"]}, "quality": kpis.get("quality"),
-                    "decode_score": kpis["decode"]["score"], "prefill_score": kpis["prefill"]["score"],
+        "summary": {"gates": {g["name"]: g["state"] for g in status["gates"]}, "quality": quality,
+                    "decode_score": decode.get("score"), "prefill_score": kpis["prefill"]["score"],
                     "ttft_ms": kpis["ttft"]["score_ms"]},
         "recorded_at": now(),
     }

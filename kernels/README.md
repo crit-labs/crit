@@ -5,7 +5,7 @@ Start with the [Hugging Face Kernel Hub](https://huggingface.co/kernels), then c
 implementation that fits the engine's operations, representations and hardware. Existing
 backend libraries and kernels written for the candidate are equally valid.
 [Core](../core/README.md) supplies the runtime, [Inference](../inference/README.md) the
-techniques and [Eval](../docs/eval/README.md) the common checks for the integrated engine.
+techniques and [Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md) the common checks for the integrated engine.
 
 Kernels bundles no kernel runtime. It provides local applicability checks, dependency retention
 and integration guidance through the standard-library [crit_kernels](crit_kernels/__init__.py)
@@ -46,7 +46,7 @@ Three checks catch most mismatches:
 Worth searching for before writing: prompt and decode attention, matmuls in the model's weight
 formats (FP8, FP4, integer groups), fused gated activations, RMSNorm and rotary embeddings, and
 for hybrid models chunked recurrent scans (gated delta, Mamba) and short causal convolutions.
-The [kernel profile](../docs/eval/README.md#kernel-profile) shows which cost most.
+The [kernel profile](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md#kernel-profile) shows which cost most.
 
 ## Inspect and retain
 
@@ -98,7 +98,7 @@ benchmark or request. Third-party research and binaries stay outside published p
 
 Check each operator against a reference across its claimed shapes, formats, tails, strides and
 aliases, plus completion ordering and buffer lifetimes. Then validate the complete engine with
-[Eval](../docs/eval/README.md), measuring prefill, decode and speculative verify separately. In
+[Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md), measuring prefill, decode and speculative verify separately. In
 the handoff, say which operations come from backend code, Hub kernels, adapted sources or new
 kernels; an upstream benchmark is a lead, not a result. See
 [Building engines](../docs/BUILDING_ENGINES.md) for the surrounding process.

@@ -10,7 +10,7 @@ import types
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "api", "cli", "eval", "tests"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("core/python", "api", "cli", "../crit-eval", "tests"): sys.path.insert(0, str(ROOT / _folder))
 
 from core_text_fixtures import llama_files, write_files  # noqa: E402
 from crit_core.serving import ResidentChat  # noqa: E402

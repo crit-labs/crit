@@ -8,19 +8,20 @@ outputs). Candidates rank by (value descending, index ascending). Greedy (temper
 (0 = the full vocabulary) keeps a rank prefix, top-p the shortest rank prefix whose
 weight reaches top_p of the top-k weight (at least one), min_p the weights >= min_p;
 Core's draw u = uniform(seed, position, stream) picks the first kept token whose
-cumulative weight exceeds u times the kept weight. The device computes values and
-weights in FP32, this mirror in FP64, so a draw that lands within rounding of a
-boundary may differ.
+cumulative weight exceeds u times the kept weight. The device processes values in FP64
+as Core does and computes the full law's weights in FP32, this mirror everything in
+FP64, so a draw that lands within rounding of a boundary may differ.
 
 `verify` is the speculative rule of enqueue_verify. Greedy drafts: every column writes the
 target's own draw, so a draft is accepted exactly when it equals it (probability p_c(d)) and the
 emitted text equals plain sampling. Sampled drafts (draft_laws): draft d at column c is accepted
 with u_accept * q_c(d) < p_c(d), otherwise column c draws from max(p_c - q_c, 0) with
-u_residual; the last column draws the bonus with u_sample.
+u_residual; the last column draws the bonus with u_sample, and a cut column (draft -1) takes the
+target's own draw like the bonus.
 """
 import math
 
-MAX_TOP_K = 64   # the device's two-stage fast path; results equal the full law
+MAX_TOP_K = 64   # the device's fast path (greedy rows and 1 <= top_k <= 64); results are Core's law
 _WORD = 0xFFFFFFFF
 SAMPLE, DRAFT, ACCEPT, RESIDUAL = 0, 1, 2, 3   # crit::core::DrawPurpose
 
@@ -141,7 +142,8 @@ def verify(rows, drafts, temperature, top_p=1.0, top_k=0, min_p=0.0, seed=0, pos
         kept = law(values, temperature, top_p, top_k, min_p)
         total = math.fsum(x for _, x in kept)
         at = position + c
-        if c == len(drafts) or not temperature > 0 or not draft_laws:
+        # The bonus column, greedy drafts and a cut column (draft id < 0: the drafter stopped) take the target's own draw.
+        if c == len(drafts) or not temperature > 0 or not draft_laws or drafts[c] < 0:
             out.append(kept[0][0] if not temperature > 0 else walk(kept, uniform(seed, at, stream) * total))
             continue
         d = drafts[c]

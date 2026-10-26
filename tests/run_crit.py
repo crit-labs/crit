@@ -3,7 +3,7 @@ from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-for folder in ("core/python", "api", "eval", "kernels", "models", "cli"):
+for folder in ("core/python", "api", "../crit-eval", "kernels", "models", "cli"):
     sys.path.insert(0, str(ROOT / folder))
 from crit.cli import main
 

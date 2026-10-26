@@ -1,6 +1,9 @@
 """Verified sealed candidates, bounded request admission and resident lifetimes."""
+from collections import namedtuple
 from pathlib import Path
+import array
 import json
+import operator
 import re
 import threading
 import time
@@ -12,7 +15,7 @@ from crit.run.records import (digest, keys, now, number, read_json, record, safe
 from crit.run.store import ROOT, RunStore
 
 from crit_core.serving import (COMPLETION_CAPABILITY, CONTINUE_CAPABILITY, FIT_OUTPUT_CAPABILITY, MIN_LOGPROB,
-                               PLAIN_CAPABILITY, SCORE_CAPABILITY, TOKENIZE_CAPABILITY)
+                               PLAIN_CAPABILITY, SCORE_CAPABILITY, TOKENIZE_CAPABILITY, unpacked_scores)
 
 from .residency import CAPABILITY as RESIDENT_CAPABILITY, ResidentRuntime
 from .admission import Admission, Refused
@@ -183,14 +186,48 @@ def reply(value, request):
     return assistant, measured
 
 
-def score_reply(value, request):
+class PackedScores(namedtuple("PackedScores", "tokens logprobs top_tokens top_logprobs alternatives")):
+    """Checked score rows as arrays (score_reply with `packed`): the tokens and alternative tokens array.array "i",
+    the log-probabilities "d", the alternatives row by row, `alternatives` per row."""
+    __slots__ = ()
+
+    @classmethod
+    def of(cls, rows, alternatives):
+        """The arrays of [token, logprob, [[token, logprob], ...]] rows."""
+        try:
+                return cls(array.array("i", [row[0] for row in rows]), array.array("d", [row[1] for row in rows]),
+                       array.array("i", [pair[0] for row in rows for pair in row[2]]),
+                       array.array("d", [pair[1] for row in rows for pair in row[2]]), alternatives)
+        except OverflowError:
+            raise ValueError("Score token ids must be below 2**31") from None
+
+    def rows(self):
+        """The [token, logprob, [[token, logprob], ...]] rows they hold."""
+        k, tops, values = self.alternatives, self.top_tokens.tolist(), self.top_logprobs.tolist()
+        return [[token, logprob, [[t, v] for t, v in zip(tops[i * k:(i + 1) * k], values[i * k:(i + 1) * k])]]
+                for i, (token, logprob) in enumerate(zip(self.tokens.tolist(), self.logprobs.tolist()))]
+
+
+def _in_range(values):
+    """Whether every log-probability of an array is a number in [MIN_LOGPROB, 0], without a call per value: a NaN
+    anywhere makes the sum NaN, and without one min and max bound them all."""
+    total = sum(values)
+    return total == total and (not values or (min(values) >= MIN_LOGPROB and max(values) <= 0))
+
+
+def score_reply(value, request, packed=False):
     """A score response record (chat-score-v1) checked against its request: one row per prompt position after the
     first and per continuation token, each naming its own token, with exactly the requested ranked, distinct
-    alternatives and log-probabilities in [MIN_LOGPROB, 0]."""
+    alternatives and log-probabilities in [MIN_LOGPROB, 0]. A record in the packed format ("format": "packed",
+    ResidentChat.score's answer to a request offering it) is checked on its arrays by the same rules. The parts come
+    back as rows [token, logprob, [[token, logprob], ...]], or with `packed` as PackedScores."""
+    form = value.get("format") if isinstance(value, dict) else None
     keys(value, {"schema_version", "record_kind", "request_id", "candidate_id", "package_sha256", "prompt",
-                 "continuation", "telemetry"})
+                 "continuation", "telemetry"}, ("format",))
     if type(value["schema_version"]) is not int or value["schema_version"] != 1 or value["record_kind"] != "score_response":
         raise ValueError("Invalid engine score response")
+    if "format" in value and form != "packed":
+        raise ValueError("Score response format must be packed")
     if any(value[key] != request[key] for key in ("request_id", "candidate_id", "package_sha256")):
         raise ValueError("Score belongs to a different request or engine")
 
@@ -202,6 +239,8 @@ def score_reply(value, request):
     def rows(found, tokens, part):
         if part == "prompt" and not request["prompt_rows"]:
             tokens = []
+        if form == "packed":
+            return arrays(found, tokens, part)
         if not isinstance(found, list) or len(found) != len(tokens):
             raise ValueError(f"Score {part} rows must number {len(tokens)}")
         out = []
@@ -214,7 +253,27 @@ def score_reply(value, request):
                     or any(a[1] < b[1] for a, b in zip(top, top[1:]))):
                 raise ValueError(f"Score {part} rows need {request['top_logprobs']} distinct, ranked alternatives")
             out.append([token, checked(row[1]), top])
-        return out
+        return PackedScores.of(out, request["top_logprobs"]) if packed else out
+
+    def arrays(found, tokens, part):
+        try:
+            found_tokens, logprobs, top_tokens, top_logprobs, k = unpacked_scores(found)
+        except ValueError as exc:
+            raise ValueError(f"Score {part} rows are not packed arrays: {exc}") from None
+        if len(found_tokens) != len(tokens):
+            raise ValueError(f"Score {part} rows must number {len(tokens)}")
+        if found_tokens.tolist() != list(tokens):
+            raise ValueError(f"Score {part} rows are [token, logprob, alternatives] for the scored tokens")
+        if not (_in_range(logprobs) and _in_range(top_logprobs)):
+            raise ValueError(f"Score log-probabilities must be numbers in [{MIN_LOGPROB}, 0]")
+        # Each row's alternatives distinct and ranked: row by row for the tokens, column against next column for the
+        # log-probabilities (the arrays' strided slices compare without a Python loop over rows).
+        if (k != request["top_logprobs"] or (top_tokens and min(top_tokens) < 0)
+                or any(len(set(top_tokens[i:i + k])) != k for i in range(0, len(top_tokens), k or 1))
+                or not all(all(map(operator.ge, top_logprobs[c::k], top_logprobs[c + 1::k])) for c in range(k - 1))):
+            raise ValueError(f"Score {part} rows need {request['top_logprobs']} distinct, ranked alternatives")
+        scores = PackedScores(found_tokens, logprobs, top_tokens, top_logprobs, k)
+        return scores if packed else scores.rows()
     telemetry = value["telemetry"]
     if not isinstance(telemetry, dict) or set(telemetry) != {"prefill_ms", "decode_ms"} or not all(
             v is None or (type(v) in (int, float) and v >= 0) for v in telemetry.values()):
@@ -747,13 +806,14 @@ class ServedEngine:
         return time.time() + max(0, self.lock.used + self.idle_unload - time.monotonic())
 
     def score(self, prompt_ids, continuation_ids, top_logprobs, stop, candidate_id=None, prompt_rows=True,
-              request_id=None, on_started=None):
+              request_id=None, on_started=None, packed=False):
         """Score fixed text through the engine's serving paths (chat-score-v1): every prompt position from its
         prefill (none with prompt_rows false) and every continuation token from its decode, forced to the
         continuation, each with the token's log-probability and top_logprobs ranked alternatives. Returns (status,
         scored, telemetry) as generate() does, scored {"prompt": rows, "continuation": rows} with rows
-        [token, logprob, [[token, logprob], ...]]; `request_id` is the request record's id and `on_started(deadline)`
-        runs once the command goes to the engine, as for generate()."""
+        [token, logprob, [[token, logprob], ...]], or with `packed` PackedScores; `request_id` is the request record's
+        id and `on_started(deadline)` runs once the command goes to the engine, as for generate(). The request offers
+        the engine the packed format, so a ResidentChat's rows cross the host's channel as arrays."""
         candidate_id = candidate_id or self.default
         needs_load = self._admit(candidate_id, stop)
         if needs_load is None:
@@ -780,7 +840,7 @@ class ServedEngine:
             request = record("score_request", spec["run_id"], request_id=request_id or uuid.uuid4().hex,
                              candidate_id=spec["candidate_id"], package_sha256=spec["package_sha256"], created_at=now(),
                              prompt_ids=list(prompt_ids), continuation_ids=list(continuation_ids),
-                             top_logprobs=top_logprobs, prompt_rows=bool(prompt_rows),
+                             top_logprobs=top_logprobs, prompt_rows=bool(prompt_rows), format="packed",
                              limits={"kv_tokens": limits["kv_tokens"], "timeout_seconds": self.timeout})
             try:
                 result = self.runtime.call("score", {"spec": spec, "request": request},
@@ -803,7 +863,7 @@ class ServedEngine:
                 self._retire(result["error"])
                 raise EngineError(result["error"] or "Engine failed the request")
             try:
-                scored = score_reply(result["response"], request)
+                scored = score_reply(result["response"], request, packed)
                 self._check_sealed(spec)
             except (ValueError, OSError, KeyError, TypeError) as exc:
                 self._retire(exc)

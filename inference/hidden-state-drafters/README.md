@@ -45,7 +45,9 @@ with the embedding of the token at `p + 1`; it predicts the token at `p + 2`. Af
 emits `e_0 .. e_{n-1}`, positions `base .. base + n - 1` are materialized and the token after
 `base + c` is `e_c`, so the drafter ingests (taps of column `c`, `e_c`) for `c < n`: a fixed
 `K + 1` wide catch-up masked by the device's count, run first in the next draft step, after
-Core's truncation has settled `n`. Draft steps after the first in a round feed the drafter's
+Core's truncation has settled `n`. When the round picks its width per round, the catch-up
+keeps the widest `K + 1` (`enqueue_eagle_ingest` with `columns` and the rows' stride): the
+previous round may have emitted more tokens than a narrower round's `K + 1`. Draft steps after the first in a round feed the drafter's
 own output hidden state.
 
 **Block drafting.** The drafter fills `[anchor, mask x (block_size - 1)]` at positions

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_inference VERSION 0.9.1 LANGUAGES CXX)
+project(crit_inference VERSION 0.10.0 LANGUAGES CXX)
 # Inference's native examples and fixtures. Inference uses Core only through its public SDK
 # (crit::core, crit::cuda); Core never builds or includes Inference code.
 find_package(Threads REQUIRED)
@@ -8,7 +8,7 @@ option(CRIT_INFERENCE_CUDA "Build Inference's CUDA reference kernels and their f
 option(CRIT_INFERENCE_INSTALLED_CORE "Use an installed Core SDK (CMAKE_PREFIX_PATH) instead of this checkout's core/" OFF)
 if(NOT TARGET crit::core)
   if(CRIT_INFERENCE_INSTALLED_CORE)
-    find_package(critCore 0.9.1 CONFIG REQUIRED)
+    find_package(critCore 0.10.0 CONFIG REQUIRED)
   else()
     if(CRIT_INFERENCE_CUDA)
       set(CRIT_CORE_CUDA ON CACHE BOOL "Build the explicit CUDA backend services" FORCE)
@@ -273,14 +273,15 @@ target_compile_features(crit_programmatic_launch_tests PRIVATE cxx_std_20 cuda_s
 target_link_libraries(crit_programmatic_launch_tests PRIVATE crit::cuda)
 crit_inference_test(crit_programmatic_launch 60 crit_programmatic_launch_tests)
 
+set(_recurrent_code ${INFERENCE}/recurrent-state-recovery/code)
+crit_inference_kernels(crit_recurrent_cuda ${_recurrent_code} recurrent_cuda.cu)
+# The deferred commit's counts are recorded by recurrent-state-recovery's enqueue_record_accepted.
 add_executable(crit_recurrent_kernels_tests ${FIXTURES}/recurrent_kernels_tests.cu ${INFERENCE}/recurrent-layer-kernels/code/recurrent_kernels.cu)
 target_include_directories(crit_recurrent_kernels_tests PRIVATE ${INFERENCE}/recurrent-layer-kernels/code)
 target_compile_features(crit_recurrent_kernels_tests PRIVATE cxx_std_20 cuda_std_20)
-target_link_libraries(crit_recurrent_kernels_tests PRIVATE CUDA::cudart)
+target_link_libraries(crit_recurrent_kernels_tests PRIVATE CUDA::cudart crit_recurrent_cuda)
 crit_inference_test(crit_recurrent_kernels 300 crit_recurrent_kernels_tests)
 
-set(_recurrent_code ${INFERENCE}/recurrent-state-recovery/code)
-crit_inference_kernels(crit_recurrent_cuda ${_recurrent_code} recurrent_cuda.cu)
 crit_inference_executable(crit_recurrent_cuda_tests SOURCES ${FIXTURES}/recurrent_cuda_tests.cpp LINK crit::cuda crit_recurrent_cuda)
 crit_inference_tests(crit_recurrent_cuda_tests crit_recurrent_cuda 120 oracle deferred rejects)
 

@@ -1,10 +1,15 @@
-# crit Eval
+# crit-eval
 
-This folder holds Eval's harness (`crit_eval/`), its fixed speed and quality suite
-(`suite/`), the protocol (`protocol.json`), the device and kernel probes and the CUDA
-log-probability comparison reference (`probe/`) and adapters (`examples/`): a mock to start
-from and one for engines behind an HTTP server.
+crit-eval, crit's common speed, quality and exactness suite, lives in its own repository:
+**[crit-labs/crit-eval](https://github.com/crit-labs/crit-eval)**.
 
-The guide is in [docs/eval](../docs/eval/README.md): [Measurements](../docs/eval/MEASUREMENTS.md)
-(cases, scores, limits, quality), [Context](../docs/eval/CONTEXT.md) and the
-[Adapter](../docs/eval/ADAPTER.md) an engine provides.
+crit installs it as a dependency and runs it as `crit eval` (`crit-eval` on its own). For a checkout, clone
+crit-eval beside crit and install both editable:
+
+```sh
+python -m pip install -e core/python -e ../crit-eval -e .
+```
+
+- [What crit-eval measures](https://github.com/crit-labs/crit-eval#what-eval-measures)
+- [Guide](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md)
+- [Limitations](https://github.com/crit-labs/crit-eval#limitations)

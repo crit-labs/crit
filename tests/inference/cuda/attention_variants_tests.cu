@@ -246,7 +246,8 @@ void fp8_case(int hd, std::mt19937& rng) {
         require(kv::prefill_fp8(pf, nullptr) == cudaErrorNotSupported, "prefill_fp8 without E4M3 mma is refused");
     }
 
-    // Decode and verify over the last three positions: a tree whose third column hangs off the first.
+    // Decode and verify over the last three positions, for one and two key streams per decode block: a tree whose
+    // third column hangs off the first.
     constexpr int C = 3;
     const int dpos0 = L - C, blocks = 7;
     const std::vector<std::uint64_t> tree = {0b001, 0b011, 0b101};
@@ -254,37 +255,41 @@ void fp8_case(int hd, std::mt19937& rng) {
     Buffer<float> partial(kv::decode_partial_floats(kv_heads, hd, blocks)), dec(std::size_t(C) * qs);
     Buffer<__nv_bfloat16> dqd(to_bf16(std::vector<float>(q.end() - std::ptrdiff_t(std::size_t(C) * qs), q.end())));
     kv::Decode d;
-    d.q = dqd.p; d.q_stride = qs; d.cache = cache; d.out = dec.p; d.out_stride = qs; d.T = C; d.pos0 = dpos0; d.heads = heads;
-    d.scale = scale; d.blocks = blocks; d.partial = partial.p; d.window = window; d.sinks = dsinks.p; d.softcap = softcap;
-    d.tree = dtree.p;
-    ok(kv::decode(d, nullptr), "fp8 tree verify");
-    std::vector<Row> nodes(C);
-    for(int c = 0; c < C; ++c) {
-        nodes[std::size_t(c)].pos = dpos0 + c;
-        nodes[std::size_t(c)].base = dpos0;
-        nodes[std::size_t(c)].tree = tree[std::size_t(c)];
-        const int depth = std::popcount(tree[std::size_t(c)]) - 1;
-        nodes[std::size_t(c)].lo = window_lo(dpos0 + depth, window);
-    }
-    check_rows(dec.get(), C, T - C, nodes, L, sinks.data(), "tree verify", 1e-2);
-    // Chain verify without sinks: each windowed column alone equals the same column in the verify, bit for bit.
-    d.tree = nullptr;
-    d.sinks = nullptr;
-    ok(kv::decode(d, nullptr), "fp8 chain verify");
-    const auto chain = dec.get();
-    for(int c = 0; c < C; ++c) {
-        Buffer<__nv_bfloat16> one(to_bf16(std::vector<float>(q.end() - std::ptrdiff_t(std::size_t(C - c) * qs),
-                                                              q.end() - std::ptrdiff_t(std::size_t(C - c - 1) * qs))));
-        Buffer<float> out1{std::size_t(qs)};
-        kv::Decode single = d;
-        single.q = one.p;
-        single.out = out1.p;
-        single.T = 1;
-        single.pos0 = dpos0 + c;
-        ok(kv::decode(single, nullptr), "fp8 single column");
-        const auto alone = out1.get();
-        for(int i = 0; i < qs; ++i)
-            require(alone[std::size_t(i)] == chain[std::size_t(c) * qs + std::size_t(i)], "a windowed column alone differs from the verify column");
+    for(const int streams : {1, 2}) {
+        d = kv::Decode{};
+        d.q = dqd.p; d.q_stride = qs; d.cache = cache; d.out = dec.p; d.out_stride = qs; d.T = C; d.pos0 = dpos0; d.heads = heads;
+        d.scale = scale; d.blocks = blocks; d.partial = partial.p; d.window = window; d.sinks = dsinks.p; d.softcap = softcap;
+        d.tree = dtree.p;
+        d.streams = streams;
+        ok(kv::decode(d, nullptr), "fp8 tree verify");
+        std::vector<Row> nodes(C);
+        for(int c = 0; c < C; ++c) {
+            nodes[std::size_t(c)].pos = dpos0 + c;
+            nodes[std::size_t(c)].base = dpos0;
+            nodes[std::size_t(c)].tree = tree[std::size_t(c)];
+            const int depth = std::popcount(tree[std::size_t(c)]) - 1;
+            nodes[std::size_t(c)].lo = window_lo(dpos0 + depth, window);
+        }
+        check_rows(dec.get(), C, T - C, nodes, L, sinks.data(), streams == 1 ? "tree verify (1 stream)" : "tree verify (2 streams)", 1e-2);
+        // Chain verify without sinks: each windowed column alone equals the same column in the verify, bit for bit.
+        d.tree = nullptr;
+        d.sinks = nullptr;
+        ok(kv::decode(d, nullptr), "fp8 chain verify");
+        const auto chain = dec.get();
+        for(int c = 0; c < C; ++c) {
+            Buffer<__nv_bfloat16> one(to_bf16(std::vector<float>(q.end() - std::ptrdiff_t(std::size_t(C - c) * qs),
+                                                                  q.end() - std::ptrdiff_t(std::size_t(C - c - 1) * qs))));
+            Buffer<float> out1{std::size_t(qs)};
+            kv::Decode single = d;
+            single.q = one.p;
+            single.out = out1.p;
+            single.T = 1;
+            single.pos0 = dpos0 + c;
+            ok(kv::decode(single, nullptr), "fp8 single column");
+            const auto alone = out1.get();
+            for(int i = 0; i < qs; ++i)
+                require(alone[std::size_t(i)] == chain[std::size_t(c) * qs + std::size_t(i)], "a windowed column alone differs from the verify column");
+        }
     }
     kv::Decode bad = d;
     bad.tree = dtree.p;

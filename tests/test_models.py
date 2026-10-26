@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "api", "eval", "kernels", "models", "cli"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("core/python", "api", "../crit-eval", "../crit-eval/tests", "kernels", "models", "cli"): sys.path.insert(0, str(ROOT / _folder))
 from crit.run.records import write_json
 from crit_core.model import inspect_model
 from crit_models import calibration, recipe as recipes
@@ -103,6 +103,19 @@ class PlanTests(unittest.TestCase):
                 recipes.plan(recipes.load_recipe(recipe()), inspect_model(directory))
             self.assertTrue(recipes.plan(recipes.load_recipe(recipe(format="fp8-channel")), inspect_model(directory)))
 
+    def test_layers_without_an_input_norm_take_the_prefix_holding_the_most_layer_tensors(self):
+        # Hyper-connection layers norm their streams instead (Qwen4Exp's attn_hyper_connection.hc_norm); the draft
+        # layer under mtp. has a layer 0 of its own.
+        with tempfile.TemporaryDirectory() as directory:
+            specs = {name.replace("model.", "model.language_model.").replace("input_layernorm", "hc.hc_norm"): spec
+                     for name, spec in layer_specs().items()}
+            specs.update({"mtp.layers.0.self_attn.q_proj.weight": ("BF16", (32, 32)),
+                          "mtp.layers.0.hc.hc_norm.weight": ("BF16", (32,))})
+            write_header_only(Path(directory) / "model.safetensors", specs)
+            plan = recipes.plan(recipes.load_recipe(recipe()), inspect_model(directory))
+            self.assertEqual(plan["prefix"], "model.language_model.")
+            self.assertEqual(len(plan["targets"]), 2 * 4)
+
     def test_plan_command_prints_targets_without_torch_imports(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -133,7 +146,8 @@ class CalibrationTests(unittest.TestCase):
     def test_documents_quoting_the_eval_suite_are_found(self):
         texts = calibration.suite_texts()
         self.assertTrue(texts)
-        quality = json.loads((ROOT / "eval/suite/quality.json").read_text(encoding="utf-8"))
+        from crit_eval import SUITE_DIR
+        quality = json.loads((SUITE_DIR / "quality.json").read_text(encoding="utf-8"))
         quoted = max((m["content"] for c in quality["conversations"] for m in c["messages"]), key=len)
         found = calibration.suite_overlap(["An unrelated document about rivers and maps.",
                                            "Notes:\n" + quoted + "\nend"], texts)
@@ -389,6 +403,53 @@ class PtqTests(unittest.TestCase):
         repeat = run_ptq(value, source, self.root / "again", self.root / "again.json",
                          calibration=self.root / "calibration.jsonl", device="cpu", log=lambda m: None)
         self.assertEqual(repeat["calibration"]["windows_sha256"], facts["windows_sha256"])
+
+    @unittest.skipUnless(HAS_TRANSFORMERS and importlib.util.find_spec("transformers.models.qwen4_exp") is not None,
+                         "needs transformers with qwen4_exp")
+    def test_gptq_feeds_each_layer_what_the_models_forward_hands_it(self):
+        # Qwen4Exp's layers take four hyper-connection streams, n-gram token ids (PLE) and indexer masks from the
+        # model's forward, not the embeddings and one causal mask.
+        import torch
+        from transformers import AutoConfig, AutoModelForCausalLM
+        from core_text_fixtures import byte_level_json
+        from crit_eval.reference import StreamingReference
+        from crit_models.ptq import run_ptq
+        from test_eval_gguf_qwen4exp import TINY
+        source = self.root / "source"
+        tokenizer = byte_level_json()
+        vocab = len(json.loads(tokenizer)["model"]["vocab"]) + 16
+        torch.manual_seed(0)
+        model = AutoModelForCausalLM.from_config(AutoConfig.for_model(
+            "qwen4_exp_text", vocab_size=vocab, eos_token_id=json.loads(tokenizer)["added_tokens"][1]["id"], **TINY))
+        with torch.no_grad():
+            for key, parameter in model.named_parameters():
+                parameter.copy_(torch.randn_like(parameter) * 0.2 + (0.5 if "norm" in key else 0)
+                                - (1.0 if "A_log" in key else 0))
+        model.to(torch.bfloat16).save_pretrained(source)
+        (source / "tokenizer.json").write_text(tokenizer, encoding="utf-8")
+        (source / "tokenizer_config.json").write_text(json.dumps({"eos_token": "<|end_of_text|>"}), encoding="utf-8")
+        words = "river map stone cloud lantern harbor meadow copper violin orchard".split()
+        lines = [json.dumps({"text": " ".join(words[(i + j) % len(words)] for j in range(60))}) for i in range(20)]
+        (self.root / "calibration.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        value = recipes.load_recipe(recipe(algorithm="gptq", format="nvfp4", exclude=[r"\.experts\."],
+                                           calibration={"samples": 4, "sequence_tokens": 48}, gptq={"block": 16}))
+        record = run_ptq(value, source, self.root / "out", self.root / "transform.json",
+                         calibration=self.root / "calibration.jsonl", device="cpu", log=lambda m: None)
+        config = json.loads((self.root / "out/config.json").read_text(encoding="utf-8"))
+        targets = config["quantization_config"]["config_groups"]["group_0"]["targets"]
+        self.assertEqual(len(targets), record["plan"]["modules"])
+        self.assertIn("model.layers.1.ple.key_proj", targets)
+        rtn = recipes.load_recipe(recipe(format="nvfp4", exclude=[r"\.experts\."]))
+        run_ptq(rtn, source, self.root / "rtn", self.root / "rtn.json", device="cpu", log=lambda m: None)
+        ids = list(range(1, 40))
+
+        def scores(model):
+            return StreamingReference(model, "cpu").score_texts([ids], 1, None, self.root / f"scratch-{model.name}",
+                                                                log=lambda m: None)[0][0]
+        original = scores(source)
+        drift = {name: float((original - scores(self.root / name)).abs().mean()) for name in ("out", "rtn")}
+        # Calibrated on the inputs the layers really see, GPTQ drifts less than rounding to nearest.
+        self.assertLess(drift["out"], drift["rtn"])
 
 
 @unittest.skipUnless(HAS_TORCH, "needs torch and safetensors")

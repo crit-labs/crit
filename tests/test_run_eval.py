@@ -7,7 +7,11 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
+import sys
+
 import test_run_records as run_records
+# Eval's server fixtures, from the crit-eval checkout beside this one.
+sys.path.append(str(Path(__file__).resolve().parents[2] / "crit-eval" / "tests"))
 from test_eval_server import Text, write_data, write_store
 from crit.run import evaluation
 from crit.run.records import file_sha, read_json
@@ -83,7 +87,7 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
         super().setUp()
         for patcher in (patch.dict(os.environ, {"CRIT_ENGINE_LOCK": "off",
                                                 "CRIT_RUNTIME_DIRECTORY": str(self.root / "runtime")}),
-                        patch.object(chat, "load_text", lambda model: Text()),
+                        patch.object(chat, "load_text", lambda model, chat_template=None: Text()),
                         patch.object(chat, "ids_by_bytes",
                                      lambda tokenizer: {chr(i).encode(): i for i in range(1, 0xD800) if i != 0xFFFD})):
             patcher.start()

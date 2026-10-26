@@ -1,23 +1,20 @@
 <div align="center">
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/wordmark.png" />
-    <source media="(prefers-color-scheme: light)" srcset="docs/assets/wordmark-light.png" />
-    <img src="docs/assets/wordmark.png" width="200" alt="wordmark" />
-  </picture>
+  <img src="docs/assets/wordmark-light.png#gh-light-mode-only" width="200" alt="crit" />
+  <img src="docs/assets/wordmark.png#gh-dark-mode-only" width="200" alt="crit" />
   <br />
 </p>
 
 ### Why wait for someone to optimize an LLM for your GPU when an AI agent can build a specialized inference engine in a few hours?
 
-[![Version 0.9.1](docs/assets/badge-version.svg)](CHANGELOG.md)
+[![Version 0.10.0](docs/assets/badge-version.svg)](CHANGELOG.md)
 [![License Apache-2.0](docs/assets/badge-license.svg)](LICENSE)
 [![crit-hub engines](docs/assets/badge-crit-hub.svg)](https://github.com/crit-labs/crit-hub)
 [![CI](https://github.com/crit-labs/crit/actions/workflows/ci.yml/badge.svg)](https://github.com/crit-labs/crit/actions/workflows/ci.yml)
 
 [Summary](#summary) • [Quick start](#quick-start) • [What crit solves](#what-crit-solves) • [Case studies](#case-study) •
-[How crit works](#how-crit-works) • [crit-hub](#crit-hub) • [Serving](#serving) • [Limitations](#limitations) • [Documentation](#documentation)
+[How crit works](#how-crit-works) • [API](#api) • [CLI](#cli) • [crit-hub](#crit-hub) • [Limitations](#limitations) • [Documentation](#documentation)
 
 </div>
 
@@ -87,12 +84,14 @@ Less time building an engine. More performance from your hardware.
 
 We gave `Claude Opus 5.5` a target LLM along with the `crit` repository and let it cook autonomously.
 
-| What it shows               | Evidence |
-|-----------------------------| --- |
-| **`crit` engines are fast** | Qwen3.8-27B decodes greedily at 252 tok/s and prefills at 7,425 tok/s |
-| **Dense and MoE models**    | Dense: Qwen3.8-27B; Gemma 4 31B TBD. Mixture-of-experts larger than VRAM: Qwen3.8-Flash-Next and Nemotron 3.5 Super 120B TBD |
-| **Different architectures** | Qwen (gated DeltaNet and attention); Gemma and Nemotron TBD |
-| **Hours, not weeks**        | Qwen3.8-27B in 4h 15m from the run's first command to the selected engine; the others TBD |
+| What it shows | Evidence |
+| --- | --- |
+| **Fast engines** | Qwen3.8-27B on one RTX 5090: 252 tok/s greedy decode, 4x its own first working candidate, and 7,425 tok/s prefill, with the full 262,144-token context |
+| **No quality traded for speed** | Perplexity within 0.1% of the reference, 5.8% of the drift budget; drafting reproduces plain greedy decoding token for token |
+| **Hours, not weeks** | 4h 15m and seven candidates from the run's first command to the selected engine, $42 at API list prices |
+| **Every step is evidence** | Each candidate is sealed with its exact source and its Eval result, so the table below is a record, not a recollection |
+| **Honest about what is left** | Prefill runs at 50% of the GPU's measured compute ceiling; Eval reports that gap next to the score |
+| **Next** | Gemma 4 31B (dense), and Qwen3.8-Flash-Next and Nemotron 3.5 Super 120B, mixture-of-experts models larger than VRAM |
 
 ---
 
@@ -162,6 +161,10 @@ on Core without using another inference engine as a reference. It drafts up to 7
 with the model's own built-in draft layer and stops once the drafter's confidence in its latest
 draft falls below 0.5; the GPU makes that decision inside one CUDA graph per round, so the host
 never waits mid-round.
+
+<p align="center">
+  <img src="docs/assets/case-qwen-candidates.svg" width="720" alt="Decode and prefill of each of the seven candidates over the run's 4h 15m: decode jumps from 62 to 225 tok/s when drafting arrives with candidate 2 and ends at 252 tok/s; prefill climbs from 5,176 to 7,425 tok/s" />
+</p>
 
 | Candidate | What changed | Decode | Prefill | TTFT | Dev time, cumulative | Agent tokens, cumulative | API equivalent, cumulative |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -236,53 +239,132 @@ output, so candidates 3 and 4 have the same round time but accept different numb
 
 ## How `crit` works
 
-We studied working tailored engines and where specialization makes them fast. The
-runtime every engine needs became Core. Techniques whose value depends on model and
-hardware became Inference entries, with their assumptions made explicit.
+### 1. The workflow
 
----
+An agent, or you, builds the engine as a series of candidates. Each candidate is a complete,
+servable engine, measured the same way, and each next one is chosen from the last one's numbers.
+
+```mermaid
+flowchart LR
+    recon["Reconnaissance<br/>model, hardware,<br/>crit guides"] --> limits["crit eval<br/>the hardware's limits"]
+    limits --> c1["Candidate 1<br/>a working engine"]
+    c1 --> measure["crit eval<br/>scores vs limits"]
+    measure --> decide{"Decision<br/>algorithm"}
+    decide -->|"build: the biggest<br/>gap first"| next["Candidate 2 … X"]
+    next --> measure
+    decide -->|"stop: nothing left<br/>beyond the noise"| final["Final candidate,<br/>served by crit serve"]
+```
+
+1. **Reconnaissance.** Gather everything the engine depends on before writing code: the user's
+   model, hardware, workload, quality and context needs; the model's files (`crit run ... recon`
+   reads its config, tokenizer, chat template, sampling defaults and draft layers); its model card
+   and reference implementation; crit's [agent instructions](AGENTS.md), guides and docs; and any
+   [crit-hub](https://github.com/crit-labs/crit-hub) engine to start from.
+2. **Learn the hardware's limits.** `crit eval probe` measures the GPU, and Eval turns the
+   measurements into the fastest decode, prefill and time to first token this model could reach on it.
+3. **Build candidate 1:** a working engine on [Core](#core), measured by Eval. It sets the baseline.
+4. **Decide what the next candidate changes.** The [decision algorithm](#decision-algorithm) reads
+   the last Eval and names the KPI furthest from its limit, the levers that close the gap, and a
+   forecast crit checks after the build.
+5. **Build candidate 2, 3, …**, each measured by Eval and compared with its forecast.
+6. **Stop at the final candidate** once neither decode nor prefill can still move beyond its noise.
+   It is selected, sealed with its source and evidence, and served through an OpenAI-compatible API.
+
+Every step is recorded through the [CLI](cli/README.md): each candidate freezes its source by hash,
+each measurement points at that exact package, and the run's cost is counted from the agent's own
+transcripts ([run records](docs/RUN_RECORDS.md)).
+
+<a id="eval"></a>
+
+### 2. crit Eval → [Full guide](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md)
+
+Eval runs one fixed suite against every engine: the same prompts, output lengths, stop handling and
+quality references, through the same `crit serve` API a client uses. Results from different runs,
+agents and machines therefore compare.
+
+**Limits, not just tok/s.** "252 tok/s" alone does not say whether an engine is good or how much is
+left. Eval measures the GPU's memory bandwidth and matrix-multiply rates per weight format, and from
+the model's files computes what each phase costs at best: decode reads the weights (and the KV cache)
+once per pass, so bandwidth sets its floor; prefill is arithmetic, so the GEMM rates set its ceiling.
+Every score is reported as a fraction of its limit, with its run-to-run noise, and the gaps say which
+term (model pass, draft steps, draft width, drafter acceptance, prefill, first token) would give how
+much at its floor. That is what makes "speed of light" a number an agent can aim at.
+
+| KPI | What it measures | Its limit |
+| --- | --- | --- |
+| **Decode** | Tokens per second over six workloads (chat, code, math, tool calls, a long document, a 14K-token agent session), at the model's own sampling; greedy decode reported beside it | The weights read per pass at the measured bandwidth, and with drafting the best tokens per round the drafter allows |
+| **Prefill** | Prompt tokens per second on the two long prompts | The prompt's arithmetic at the measured GEMM rates |
+| **Time to first token** | Milliseconds over every workload, where short prompts expose fixed costs | The larger of the prompt's compute and one weight read |
+| **Long-context decode and first token** | The same scores along a curve of prompts up to the required context, 262,144 tokens by default | As above, with the KV cache read at each length |
+| **Quality** | The share of the drift budget the worst quality set uses: perplexity ratio, mean and p99 KL divergence | Zero drift |
+
+Gates decide whether a result counts at all: output repeats, the same greedy requests give the same
+tokens after a long request history, follow-up turns answer the same from a prompt cache, facts at the
+start, middle and end of long prompts are retrieved, speculative output equals plain greedy when
+required, sampled tokens follow the model's distribution, and quality stays inside the budget.
+
+**Quality against the checkpoint you chose.** Eval measures drift against the checkpoint as stored,
+for example an NVFP4 model, scored once in FP32 with the model's official code, not against its
+full-precision original. The user chose that checkpoint and its quantization loss; the engine cannot
+change it. Comparing with full precision would mix the publisher's loss with the engine's own, so a
+careless engine could hide behind the quantization and a careful one would be charged for it. What
+Eval reports is exactly what the engine adds, and the budget (perplexity ratio ≤ 1.05, mean KL
+≤ 0.05, p99 KL ≤ 0.5 by default) is there to be spent on speed: lower drift than needed is not a gain.
+
+<a id="decision-algorithm"></a>
+
+### 3. The decision algorithm → [Plan records](docs/RUN_RECORDS.md#plan)
+
+Before any code for the next candidate, the agent records a plan, and crit checks it against the last
+Eval, which it freezes:
+
+1. **Rank.** crit computes the priorities from the fractions of the limits: of decode and prefill, the
+   one further from its limit comes first, both when they are within noise of each other, and time to
+   first token never leads alone. Where Eval gives no limit, crit computes one with Eval's cost model.
+2. **Compare strategies.** The plan sets the current strategy's ceiling against the best alternative's,
+   for example plain decoding against drafting with the model's own draft layer, the alternative held
+   to what its drafter is measured to accept.
+3. **Name levers and a forecast.** Each lever states its projected change per KPI; the plan gives a
+   low, expected and high forecast.
+4. **Refuse bad plans.** crit rejects a plan that stops while a KPI is still needed, leaves a gap above
+   the noise unanswered, forecasts no gain beyond the noise or only chases time to first token.
+5. **Check the outcome.** After Eval, crit sets the forecast next to the measured result and records
+   each lever as built, pruned or deferred.
+
+The run stops only when neither decode nor prefill can still move beyond its noise. The agent cannot
+drift, overclaim or quit early, and every candidate has a recorded reason to exist.
 
 <a id="core"></a>
 
-<details>
-<summary><strong>📗 Core</strong> → <a href="core/README.md">Full guide</a></summary>
+### 4. crit Core → [Full guide](core/README.md)
 
-<br />
-
-**Core provides what every engine needs**: request scheduling, memory tracking,
-output delivery and safe cleanup. Your engine owns the model, tokenizer and layouts,
-and calls Core's libraries for sampling, state cache and model files. The native
-runtime supports generation and scoring, with optional CUDA and concurrent requests.
-Try the [Core + Inference walkthrough](inference/examples/core-projection/README.md).
-
-</details>
-
----
+We studied about 30 inference engines and kept what every one of them has to build before it can be
+fast: request scheduling, memory admission and tracking, output delivery, stop strings, sampling,
+state and prefix caches, model files and config, structured output, and process cleanup after a crash. That minimum became Core, a native SDK with a Python package. Your engine owns
+everything that makes it specific (the model, its kernels, its tensor layouts and its execution
+strategy) and calls Core for the plumbing. Try the
+[Core + Inference walkthrough](inference/examples/core-projection/README.md).
 
 <a id="inference"></a>
 
-<details>
-<summary><strong>📕 Inference</strong> → <a href="inference/README.md">Full guide</a></summary>
+### 5. crit Inference → [Full guide](inference/README.md)
 
-<br />
+We studied about 50 inference engines, from general-purpose runtimes to engines tuned for one model
+on one GPU, and extracted what makes each of them fast into separate techniques: speculative decoding
+with draft layers, trees and device-side rounds, expert caches and host-resident experts, quantized
+projections and KV caches, paged and partitioned attention, prefix checkpoints, CUDA graph reuse and
+more, 36 entries in all. Each says when it helps, what is tested and what the engine supplies, so an
+agent can adopt it quickly instead of rediscovering it.
 
-Inference holds **techniques with explanations, implementation code and worked
-examples**. Start from a bottleneck:
+The collection keeps growing the same way. The engines stay pinned at exact revisions, and salvage
+passes read what changed in them down to individual pull requests, merged or not. A finding enters
+crit only with its mechanism and evidence, a crit consumer and the gap it closes, the smallest useful
+adaptation and the three [contribution criteria](docs/CONTRIBUTION_CRITERIA.md): value that can be
+shown, nothing tuned to one model or GPU, useful across architectures and GPUs. Upstream numbers are
+never carried over as crit's, and rejected findings are kept with their reasons.
 
-- **Reuse prompt work.** [Prefix checkpoints](inference/checkpoint-storage/README.md)
-  resume from stored state when a prompt shares an earlier prefix.
-- **Keep useful weights close.** [Expert residency](inference/expert-residency/README.md)
-  retains reusable expert weights within a memory budget.
-- **Generate several tokens per round.** [Speculative decoding](inference/mtp-decode/README.md)
-  proposes a continuation, verifies it and keeps the accepted tokens.
-- **Reuse GPU execution.** Core's optional [CUDA graph harness](core/src/backends/cuda/README.md#graph-capture)
-  captures repeated work for replay to cut launch overhead.
+### More parts
 
-Each technique says when it helps, what is tested and what your engine supplies.
-
-</details>
-
----
 
 <a id="kernels"></a>
 
@@ -317,26 +399,37 @@ model, and records the recipe, calibration data, seed, file hashes and cost.
 
 ---
 
-<a id="eval"></a>
+<a id="api"></a>
+<a id="serving"></a>
 
 <details>
-<summary><strong>📚 Eval</strong> → <a href="docs/eval/README.md">Full guide</a></summary>
+<summary><strong>🔌 API</strong> → <a href="api/README.md">Overview</a> · <a href="docs/SERVING.md">Full guide</a></summary>
 
 <br />
 
-**Eval gives engines a common set of tests**: fixed prompts, output lengths and a
-shared quality reference per model.
+`crit serve` loads a sealed candidate, keeps it resident and answers OpenAI-compatible
+chat requests, including streaming, tool calls, stop strings and structured output. The same engine
+also speaks the [Anthropic Messages, OpenAI Responses and Ollama APIs](docs/SERVING.md#other-api-dialects),
+so Claude Code, Codex and local chat UIs need only a base URL, and `GET /metrics` serves
+[Prometheus metrics](docs/SERVING.md#metrics). Eval measures every candidate through this same
+server, so the numbers you read are the numbers you get. Engines implement the
+[adapter contract](docs/SERVING.md#adapter-contract).
 
-- **Speed** on chat, code, math, tool calling, long-document summarization and a long
-  agent session, with decode, prefill and time-to-first-token scores against their
-  physical ceilings.
-- **Quality**: the engine's predictions against the reference on fixed conversations,
-  across its execution paths.
-- **Speculative checks**: drafting against plain greedy decoding, exact when the run requires it.
-- **Repeatability**: one pinned decode text per model, and paired A/B runs for small changes.
-- **Profiling**: kernels ranked per phase by GPU time and launch width.
+</details>
 
-Results keep samples, settings and skipped cases visible.
+---
+
+<a id="cli"></a>
+
+<details>
+<summary><strong>📓 CLI</strong> → <a href="cli/README.md">Overview</a></summary>
+
+<br />
+
+One `crit` command drives everything: `crit run` keeps the run's records (plans, candidates,
+measurements, selection, cost), `crit eval` runs the common suite, `crit serve` serves an engine,
+and `crit kernels`, `crit models` and `crit inference` reach the other parts. Records are written
+only through it, so each plan, candidate, Eval and seal is checked as it is recorded.
 
 </details>
 
@@ -362,24 +455,6 @@ Use them as jump-off point for further optimization.
 
 ---
 
-<a id="serving"></a>
-
-<details>
-<summary><strong>🔌 Serving</strong> → <a href="docs/SERVING.md">Full guide</a></summary>
-
-<br />
-
-`crit serve` loads a sealed candidate, keeps it resident and answers OpenAI-compatible
-chat requests, including streaming, stop strings and structured output. The same engine
-also speaks the [Anthropic Messages and Ollama APIs](docs/SERVING.md#other-api-dialects),
-so Claude Code and local chat UIs need only a base URL, and `GET /metrics` serves
-[Prometheus metrics](docs/SERVING.md#metrics). Engines implement the
-[adapter contract](docs/SERVING.md#adapter-contract).
-
-</details>
-
----
-
 <a id="limitations"></a>
 
 <details>
@@ -392,7 +467,7 @@ so Claude Code and local chat UIs need only a base URL, and `GET /metrics` serve
 | Multi-GPU setups | Expected to work with engine-specific partitioning and communication; not yet tested end to end. |
 | macOS | Not yet tested. Current CI covers Windows and Linux. |
 | AMD and Apple GPUs | No bundled ROCm or Metal backend. The current GPU backend uses CUDA. |
-| Model formats | Hugging Face safetensors, PyTorch state dicts (`.bin`, `.pt`) and Optimum ONNX exports, unquantized or [quantized](docs/eval/README.md#other-weight-formats-and-quantization-schemes) as FP8, NVFP4, compressed-tensors int, AWQ, GPTQ, MLX, bitsandbytes or MatMulNBits, and [GGUF](docs/eval/README.md#gguf-models), a lone `.gguf` included: its config, tokenizer and chat template are derived from its metadata for the `llama`, `qwen2`, `qwen3`, `qwen3moe`, `qwen35` and `qwen35moe` architectures and byte-level BPE tokenizers (others need the base model's files beside it), and Eval's reference reads those architectures. A new format is one `ModelFormat` in `crit_core.model`. Core's C++ model library reads safetensors only; engines read a GGUF's tensors through `crit_core.model`'s offsets. |
+| Model formats | Hugging Face safetensors, PyTorch state dicts (`.bin`, `.pt`) and Optimum ONNX exports, unquantized or [quantized](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md#other-weight-formats-and-quantization-schemes) as FP8, NVFP4, compressed-tensors int, AWQ, GPTQ, MLX, bitsandbytes or MatMulNBits, and [GGUF](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md#gguf-models), a lone `.gguf` included: its config, tokenizer and chat template are derived from its metadata for the `llama`, `qwen2`, `qwen3`, `qwen3moe`, `qwen35` and `qwen35moe` architectures and byte-level BPE tokenizers (others need the base model's files beside it), and Eval's reference reads those architectures. A new format is one `ModelFormat` in `crit_core.model`. Core's C++ model library reads safetensors only; engines read a GGUF's tensors through `crit_core.model`'s offsets. |
 
 </details>
 
@@ -409,7 +484,8 @@ so Claude Code and local chat UIs need only a base URL, and `GET /metrics` serve
 | Choose or adapt a technique | [Inference](inference/README.md) |
 | Find and adapt kernels | [Kernels](kernels/README.md) |
 | Quantize weights and record the transform | [Models](models/README.md) |
-| Compare speed, quality and speculative output | [Eval](docs/eval/README.md) |
-| Serve an engine through the OpenAI, Anthropic or Ollama API | [Serving](docs/SERVING.md) · [Adapter contract](docs/SERVING.md#adapter-contract) |
+| Compare speed, quality and speculative output | [Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md) |
+| Serve an engine through the OpenAI, Anthropic or Ollama API | [API](api/README.md) · [Serving](docs/SERVING.md) · [Adapter contract](docs/SERVING.md#adapter-contract) |
+| Find a `crit` command | [CLI](cli/README.md) |
 | Change `crit` or run its tests | [What belongs in crit](docs/CONTRIBUTION_CRITERIA.md) · [Contributing](docs/CONTRIBUTING.md) · [Licensing](docs/LICENSES.md) |
 | See release history | [Changelog](CHANGELOG.md) |

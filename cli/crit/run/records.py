@@ -18,7 +18,7 @@ MAX_JSON_BYTES = 1_048_576
 MAX_CANDIDATES = 512
 MAX_FILES = 100_000
 WEIGHTS_POLICIES = {"as_stored", "transformable"}  # run: may candidates change stored weights?
-# Drift a run allows against the Eval reference, spent on speed; matches eval/protocol.json.
+# Drift a run allows against the Eval reference, spent on speed; matches crit_eval/protocol.json.
 DEFAULT_QUALITY_BUDGET = {"ppl_ratio_max": 1.05, "kld_mean_max": 0.05, "kld_p99_max": 0.5}
 EXACTNESS_MODES = {"reported", "required"}  # must speculative output equal plain greedy?
 # Runs created from this version on require a recorded plan (crit run ... plan) for every candidate; older runs
@@ -30,9 +30,9 @@ NEW_RUN_PLAN_LIMITS = "computed"
 # Runs created from this version on give every lever of a candidate's plan its fate in the proposal; older runs keep
 # fates optional.
 NEW_RUN_LEVER_FATES = "required"
-# Runs created from this version on check plans with the second version of the plan rules (crit.run.plans.rules);
+# Runs created from this version on check plans with the third version of the plan rules (crit.run.plans.rules);
 # older runs keep the rules they were created with.
-NEW_RUN_PLAN_RULES = 2
+NEW_RUN_PLAN_RULES = 3
 WEIGHTS = {"as_stored", "transformed"}             # candidate: did it change them?
 HASH_PARALLEL_BYTES = 256 * 1024 * 1024
 GIB = 1024 ** 3
@@ -414,7 +414,7 @@ def verify_inventory(root, rows, exclude=()):
 
 
 def eval_max_context(model, device, vram_headroom_bytes, reserve_bytes=None, requested=None):
-    """Eval's max context (eval/crit_eval/context.py) for MODEL on DEVICE, a `crit eval probe` result, capped at the
+    """Eval's max context (crit_eval/context.py) for MODEL on DEVICE, a `crit eval probe` result, capped at the
     requested context. reserve_bytes replaces the protocol's reserve (device memory kept out of the KV cache for
     workspaces and speed techniques)."""
     from crit_eval import EVAL_DIR
@@ -557,8 +557,8 @@ def validate_spec(value):
         raise ValueError("plan_limits is computed when present, in a run that requires plans")
     if value.get("lever_fates", "required") != "required" or ("lever_fates" in value and "plans" not in value):
         raise ValueError("lever_fates is required when present, in a run that requires plans")
-    if value.get("plan_rules", 2) != 2 or ("plan_rules" in value and value.get("plan_limits") != "computed"):
-        raise ValueError("plan_rules is 2 when present, in a run that computes plan limits")
+    if value.get("plan_rules", 2) not in (2, 3) or ("plan_rules" in value and value.get("plan_limits") != "computed"):
+        raise ValueError("plan_rules is 2 or 3 when present, in a run that computes plan limits")
     if "eval_sampling" in value and eval_sampling(value["eval_sampling"]) != value["eval_sampling"]:
         raise ValueError("eval_sampling is not in its validated form")
     if "origin_engine" in value:

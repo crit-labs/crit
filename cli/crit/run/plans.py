@@ -32,7 +32,7 @@ EVAL_JSON_BYTES = 256 * 1024 * 1024
 
 
 def rules(run):
-    """The version of the plan rules a run was created with: 2 from `"plan_rules": 2` in its spec, else 1."""
+    """The version of the plan rules a run was created with: 2 or 3 from `"plan_rules"` in its spec, else 1."""
     return run["spec"].get("plan_rules", 1)
 
 
@@ -53,7 +53,13 @@ def extract(status):
     limit, the relative run-to-run noise per KPI (None when Eval does not report it), the untiered numbers and the
     gaps. Read defensively: a missing field is unknown, never an error."""
     status = status if isinstance(status, dict) else {}
-    kpis = status.get("kpis") or {}
+    kpis = dict(status.get("kpis") or {})
+    # crit-eval names the headline decode decode_sampled (else decode_greedy); earlier results call it decode and the
+    # greedy suite's beside it greedy_decode.
+    if "decode" not in kpis and ("decode_sampled" in kpis or "decode_greedy" in kpis):
+        sampled = kpis.get("decode_sampled")
+        kpis["decode"] = sampled or kpis.get("decode_greedy")
+        kpis["greedy_decode"] = kpis.get("decode_greedy") if sampled else None
     end_to_end = kpis.get("end_to_end") or {}
     context = kpis.get("context") or {}
     rows = {"decode": (_get(kpis, "decode", "score"), _get(kpis, "decode", "ceiling"),
@@ -369,6 +375,12 @@ NEAR_LIMIT = 0.85
 LIMIT_GAP = "limit"
 # Plan rules 2: the relative noise of a KPI whose noise the Eval leaves unknown, when it knows none of its KPIs'.
 DEFAULT_NOISE = 0.05
+# Plan rules 3: a family below this fraction of its limit is marked not needed only on measured rejections: every
+# gaps entry on it carries the evidence, an Eval gap answers rejected, and (prefill) every faster prompt activation
+# format Eval reports is rejected by a quality measurement outside the quality noise.
+MEASURED_ONLY = 0.5
+# Plan rules 3: a gaps entry naming a prompt activation format Eval prices (crit-eval's ceilings by activation format).
+ACTIVATION_GAP = "activation:"
 
 
 def noise_default(facts):
@@ -468,7 +480,7 @@ def load(root, run, plan_id):
     if not path.is_file():
         raise ValueError(f"Unknown plan {plan_id}: record it with crit run ... plan --record plan.json")
     value = read_json(path)
-    header(value, "plan", run["run_id"], set(FIELDS) | CRIT_FIELDS, {"supersedes", "estimated_limits"})
+    header(value, "plan", run["run_id"], set(FIELDS) | CRIT_FIELDS, OPTIONAL)
     if value["plan_id"] != plan_id or value["request_sha256"] != run["request_sha256"]:
         raise ValueError(f"{plan_id} does not belong to this run's request")
     return value
@@ -498,9 +510,14 @@ FIELDS = {"parent_candidate_id", "decision", "needed", "gaps", "strategy", "leve
 CRIT_FIELDS = {"plan_id", "segment_id", "created_at", "request_sha256", "inputs", "priorities", "priorities_reason"}
 
 
+OPTIONAL = {"supersedes", "estimated_limits", "forecast_justification"}
+
+
 def _fields(data):
     """Check 1: fields, types and text limits; unknown keys are refused."""
-    keys(data, FIELDS, {"supersedes", "estimated_limits"})
+    keys(data, FIELDS, OPTIONAL)
+    if "forecast_justification" in data:
+        text(data["forecast_justification"], "forecast_justification", 8000)
     if data["parent_candidate_id"] is not None:
         ident(data["parent_candidate_id"], "candidate")
     if data.get("supersedes") is not None:
@@ -517,7 +534,9 @@ def _fields(data):
         if not isinstance(data[name], list) or len(data[name]) > MAX_ROWS:
             raise ValueError(f"{name} is a list of up to {MAX_ROWS} entries")
     for row in data["gaps"]:
-        keys(row, {"kpi", "gap", "answer", "detail"})
+        keys(row, {"kpi", "gap", "answer", "detail"}, {"evidence"})
+        if "evidence" in row:
+            text(row["evidence"], f"gaps evidence for {row['gap']} (a path in the run)", 400)
         if row["kpi"] not in KPIS or row["answer"] not in ("cause", "rejected"):
             raise ValueError("gaps entries name a KPI (" + ", ".join(KPIS) + ") and answer cause or rejected")
         text(row["gap"], "gaps.gap (the Eval gap's name)", 400)
@@ -843,6 +862,11 @@ def build(root, run, bounds, data):
     noise = noises(facts, version)
     gap_names = {(gap["kpi"], gap["name"]) for gap in (facts or {}).get("gaps") or []}
     for row in data["gaps"]:
+        if version >= 3 and row["gap"].startswith(ACTIVATION_GAP):
+            if row["kpi"] != "prefill" or row["answer"] != "rejected" or "evidence" not in row:
+                raise ValueError(f"gaps entry {row['gap']!r} names a prompt activation format: kpi prefill, answer "
+                                 "rejected, with the evidence of its quality measurement")
+            continue
         if version >= 2 and row["gap"] == LIMIT_GAP:
             if row["kpi"] not in FAMILIES or row["answer"] != "cause":
                 raise ValueError(f"gaps entry {LIMIT_GAP!r} names a family (decode or prefill) and answers cause: why "
@@ -880,6 +904,8 @@ def build(root, run, bounds, data):
                                  f"add a gaps entry {{\"kpi\": \"{name}\", \"gap\": \"{LIMIT_GAP}\", \"answer\": "
                                  "\"cause\", \"detail\": ...} with the physical cause that keeps the rest of the limit "
                                  "out of reach")
+    if version >= 3 and facts is not None:
+        inputs["gap_evidence"] = _measured_only(root, data, facts, result, noise, needed, version)
     order, reason = priorities(data["needed"], facts, version)
     if order is not None:
         # The ranking rests on these estimates where it compares the families.
@@ -934,6 +960,12 @@ def build(root, run, bounds, data):
                                   for kpi in scored):
                 raise ValueError("The forecast improves neither decode nor prefill beyond its noise over the parent's "
                                  "Eval: a candidate is planned for at least one of them")
+    # Check 12 (rules 3): a forecast that puts its gain on p2 or lets a p1 KPI fall says why.
+    if version >= 3 and decision == "build" and forecast is not None and facts is not None and order is not None:
+        inputs["forecast_checks"] = _forecast_checks(order, forecast, facts)
+        if inputs["forecast_checks"] and "forecast_justification" not in data:
+            raise ValueError("The forecast " + "; ".join(inputs["forecast_checks"]) + ": give forecast_justification "
+                             "(why this candidate is worth building anyway), which crit records, or plan for p1")
     # Check 11: a revision replaces the newest plan of its chain before its candidate exists.
     if data.get("supersedes") is not None:
         old = load(root, run, data["supersedes"])
@@ -947,6 +979,101 @@ def build(root, run, bounds, data):
             raise ValueError(f"{old['plan_id']} is already superseded by {summary['superseded_by']}")
     return {**data, "supersedes": data.get("supersedes"), "segment_id": bounds["segment_id"], "created_at": now(),
             "request_sha256": run["request_sha256"], "inputs": inputs, "priorities": order, "priorities_reason": reason}
+
+
+def _forecast_checks(order, forecast, facts):
+    """Plan rules 3, check 12: what the forecast does against the priorities: more expected gain on p2 than on p1
+    (priority_flag), or a p1 KPI forecast below the parent's score (above it for a time)."""
+    found = []
+    flag = priority_flag({"priorities": order, "forecast": forecast, "inputs": {"kpis": facts["kpis"]}})
+    if flag:
+        found.append(f"expects more gain on p2 ({', '.join(flag['p2'])}: {flag['p2_gain']:+.1%}) than on p1 "
+                     f"({', '.join(flag['p1'])}: {flag['p1_gain']:+.1%})")
+    for name in order["p1"]:
+        for kpi in FAMILIES.get(name, (name,)):
+            score = (facts["kpis"].get(kpi) or {}).get("score")
+            if kpi in forecast and score and (forecast[kpi]["expected"] > score if kpi in MS
+                                              else forecast[kpi]["expected"] < score):
+                found.append(f"forecasts p1 {kpi} to fall ({score:g} -> {forecast[kpi]['expected']:g})")
+    return found
+
+
+def _evidence_file(root, path, name):
+    """A gaps entry's evidence: a file retained in the run, {path, sha256}."""
+    found = safe_path(root, path)
+    if not found.is_file():
+        raise ValueError(f"{name} evidence {path} is no file of this run: retain the measurement in the run (work/ or a "
+                         "candidate's eval/) and name its path")
+    return {"path": path, "sha256": file_sha(found)}
+
+
+def _quality_rejection(root, path, activation, name):
+    """Plan rules 3: whether the crit-eval result at `path` measured `activation` (its engine's prompt_activations)
+    and its quality outside the noise: some set's share of the budget above the budget at the 5th percentile of its
+    spread over positions (crit-eval's budget_spread). A rejection inside the quality noise is not a rejection."""
+    result = read_json(safe_path(root, path), max_bytes=EVAL_JSON_BYTES)
+    declared = (result.get("engine") or {}).get("prompt_activations")
+    if declared != activation and not (isinstance(declared, dict) and declared and set(declared.values()) == {activation}):
+        raise ValueError(f"{name}: {path} measured prompt activations {declared!r}, not {activation!r} (the engine's "
+                         "prompt_activations in that result)")
+    sets = ((result.get("quality") or {}).get("sets")) or {}
+    if not sets:
+        raise ValueError(f"{name}: {path} scored no quality sets")
+    if not any("budget_spread" in s for s in sets.values()):
+        raise ValueError(f"{name}: {path} has no quality spread over positions (budget_spread, which crit-eval 0.1.0 "
+                         "reports): measure it again so the rejection can be told from the quality noise")
+    over = [set_name for set_name, s in sets.items()
+            if ((s.get("budget_spread") or {}).get("budget_used") or {}).get("p05", 0) > 1.0]
+    if not over:
+        raise ValueError(f"{name}: {path} keeps every set's budget share within its spread over positions (5th "
+                         "percentile at or below the budget): inside the quality noise, so not a rejection")
+    return over
+
+
+def _measured_only(root, data, facts, result, noise, needed, version):
+    """Plan rules 3: a family marked not needed below MEASURED_ONLY of its limit stands only on measured rejections:
+    every gaps entry on it names its evidence (a file in the run), every Eval gap on it answers rejected, and for
+    prefill every prompt activation format Eval prices faster than the engine's own is rejected, by Eval's own quality
+    evidence or by a gaps entry `activation:<format>` whose evidence is a crit-eval result that measured that format
+    outside the quality noise (_quality_rejection). Returns the evidence recorded, per gap."""
+    recorded = {}
+    for name, flag in needed.items():
+        fraction = family(facts, name, version)[0]
+        if flag or fraction is None or fraction >= MEASURED_ONLY:
+            continue
+        for row in data["gaps"]:
+            if FAMILY.get(row["kpi"], row["kpi"]) != name:
+                continue
+            label = f"{name} is marked not needed at {fraction:.0%} of its limit, below {MEASURED_ONLY:.0%}: gaps entry {row['gap']!r}"
+            if "evidence" not in row:
+                raise ValueError(f"{label} needs the evidence of its measured rejection (a path in the run); a cause "
+                                 "alone does not stand below half the limit")
+            if row["gap"] not in (LIMIT_GAP,) and not row["gap"].startswith(ACTIVATION_GAP) and row["answer"] != "rejected":
+                raise ValueError(f"{label} answers {row['answer']}: below half the limit an Eval gap is answered by a "
+                                 "measured rejection")
+            recorded[f"{row['kpi']}:{row['gap']}"] = _evidence_file(root, row["evidence"], label)
+        if name == "prefill":
+            activations = (((result or {}).get("status") or {}).get("kpis") or {}).get("prefill", {}).get("activations")
+            if activations:
+                own = (activations.get("declared") or {}).get("ceiling_score")
+                if own is None:
+                    raise ValueError(f"prefill is marked not needed at {fraction:.0%} of its limit, below "
+                                     f"{MEASURED_ONLY:.0%}, and the engine declares no prompt_activations: declare them, so "
+                                     "Eval names the format in use and the faster ones to reject")
+                answered = {row["gap"][len(ACTIVATION_GAP):]: row for row in data["gaps"]
+                            if row["gap"].startswith(ACTIVATION_GAP)}
+                for mode, row in (activations.get("modes") or {}).items():
+                    if (row.get("ceiling_score") or 0) <= own or row.get("state") == "fails":
+                        continue   # no faster than the engine's own, or ruled out by Eval's own quality evidence
+                    if mode not in answered:
+                        raise ValueError(f"prefill is marked not needed at {fraction:.0%} of its limit, and Eval prices "
+                                         f"prompt activations {mode} at {row['ceiling_score']:,.0f} tok/s, above the "
+                                         f"engine's own {own:,.0f}: reject it with a quality measurement, gaps entry "
+                                         f"{{\"kpi\": \"prefill\", \"gap\": \"{ACTIVATION_GAP}{mode}\", \"answer\": "
+                                         "\"rejected\", \"evidence\": <its crit-eval result>, \"detail\": ...}")
+                    sets = _quality_rejection(root, answered[mode]["evidence"], mode, f"gaps entry {ACTIVATION_GAP}{mode}")
+                    recorded[f"prefill:{ACTIVATION_GAP}{mode}"]["over_budget_sets"] = sets
+    return recorded
 
 
 FATES = {"built", "pruned", "deferred"}

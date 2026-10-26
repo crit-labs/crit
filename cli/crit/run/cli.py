@@ -10,7 +10,8 @@ from .records import exploratory_reason, ineligibility, read_json, safe_path
 from .store import ROOT, RunStore
 
 SETTINGS = {"wsl_run_root": str, "ram_headroom_gib": (int, float), "vram_headroom_gib": (int, float),
-            "context_reserve_gib": (int, float), "device": str, "context_tokens": int}
+            "context_reserve_gib": (int, float), "device": str, "context_tokens": int,
+            "eval_packages": str}
 
 
 def load_settings(project):
@@ -104,6 +105,12 @@ def main(argv=None):
     sub.add_argument("--label")
     sub.add_argument("--seconds", type=float, help="Reservation length (default: to the segment's deadline; each "
                                                    "request is bounded by the rates the engine measured)")
+    sub = subs.add_parser("serve", help="Serve a packaged candidate before it is sealed through crit serve, under a "
+                                        "check attempt, until Ctrl+C: for the checks a candidate passes before sealing")
+    sub.add_argument("--candidate", required=True)
+    sub.add_argument("--host", default="127.0.0.1")
+    sub.add_argument("--port", type=int, default=8000)
+    sub.add_argument("--seconds", type=float, help="Reservation length (default: the check process cap)")
     sub = subs.add_parser("seal")
     sub.add_argument("--candidate", required=True)
     sub.add_argument("--lifecycle", required=True)
@@ -189,6 +196,9 @@ def main(argv=None):
             print("priorities while decode and prefill are both needed: " + (
                 "; ".join(f"{tier} {', '.join(order[tier])}" for tier in ("p1", "p2", "p3") if order[tier])
                 if order else reason) + " (crit run ... plan computes them from the plan's needed flags)", file=sys.stderr)
+        elif args.action == "serve":
+            from .served import serve
+            result = serve(store, args.id, args.candidate, args.host, args.port, args.seconds)
         elif args.action == "seal":
             failure = {"message": args.failure} if args.failure else None
             result = store.seal(args.id, args.candidate, args.lifecycle, failure)

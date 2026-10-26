@@ -68,8 +68,9 @@ __global__ void gdn_inputs(Weights w, State s) {
     }
 }
 
-__global__ void head(Weights w, State s, std::int32_t* predictions) {
+__global__ void head(Weights w, State s, std::int32_t* predictions, Logprobs lp) {
     __shared__ float x2[width], logits[vocabulary];
+    __shared__ bool taken[vocabulary];
     const auto t = blockIdx.x, tid = threadIdx.x;
     if(tid < width) x2[tid] = s.x1[t * width + tid] + dot(w.po + tid * values, s.gdn_out + t * values, values);
     __syncthreads();
@@ -79,6 +80,22 @@ __global__ void head(Weights w, State s, std::int32_t* predictions) {
         std::uint32_t best = 0;
         for(std::uint32_t r = 1; r < vocabulary; ++r) if(logits[r] > logits[best]) best = r;
         predictions[t] = std::int32_t(best);
+        if(lp.chosen) {
+            // log-softmax in a fixed order, so every column gets the same bits at any column count
+            float sum = 0.0f;
+            for(std::uint32_t r = 0; r < vocabulary; ++r) sum += expf(logits[r] - logits[best]);
+            const float norm = logits[best] + logf(sum);
+            lp.chosen[t] = logits[best] - norm;
+            for(std::uint32_t r = 0; r < vocabulary; ++r) taken[r] = false;
+            for(std::uint32_t i = 0; i < lp.top; ++i) {
+                std::uint32_t pick = vocabulary;
+                for(std::uint32_t r = 0; r < vocabulary; ++r)
+                    if(!taken[r] && (pick == vocabulary || logits[r] > logits[pick])) pick = r;
+                taken[pick] = true;
+                lp.top_ids[t * lp.top + i] = std::int32_t(pick);
+                lp.top_logprobs[t * lp.top + i] = logits[pick] - norm;
+            }
+        }
     }
 }
 
@@ -99,14 +116,15 @@ rc::DeviceSteps steps(const State& s) { return {s.q, s.k, s.v, s.log_decay, s.be
 }
 
 cudaError_t enqueue_forward(const Weights& w, const State& s, const std::int32_t* inputs, const std::int32_t* frontier,
-                            std::uint32_t columns, std::int32_t* predictions, cudaStream_t stream) {
-    if(!columns || columns > max_columns) return cudaErrorInvalidValue;
+                            std::uint32_t columns, std::int32_t* predictions, cudaStream_t stream, const Logprobs& lp) {
+    if(!columns || columns > max_columns || lp.top > vocabulary || (lp.top && (!lp.chosen || !lp.top_ids || !lp.top_logprobs)))
+        return cudaErrorInvalidValue;
     if(auto e = cudaMemcpyAsync(s.gdn_start, s.gdn_live, keys * values * sizeof(float), cudaMemcpyDeviceToDevice, stream); e != cudaSuccess) return e;
     attention<<<1, threads, 0, stream>>>(w, s, inputs, frontier, columns);
     gdn_inputs<<<columns, threads, 0, stream>>>(w, s);
     if(auto e = cudaPeekAtLastError(); e != cudaSuccess) return e;
     if(auto e = rc::enqueue_verify(geometry(), s.gdn_start, steps(s), columns, s.gdn_out, s.gdn_checkpoints, nullptr, stream); e != cudaSuccess) return e;
-    head<<<columns, threads, 0, stream>>>(w, s, predictions);
+    head<<<columns, threads, 0, stream>>>(w, s, predictions, lp);
     return cudaPeekAtLastError();
 }
 

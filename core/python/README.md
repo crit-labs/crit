@@ -3,8 +3,8 @@
 `crit_core` is the Python side of Core: it reads model files by name, parses
 their JSON strictly, types `config.json`, checks safetensors headers and indexes,
 and turns chat messages into prompt ids and generated ids back into reply text
-with Core's stop rules. It ships in the `crit` distribution (`pip install .`),
-and `crit_core.__version__` is crit's version. From a checkout, put
+with Core's stop rules. It ships as the `crit-core` distribution (`pip install crit-core`;
+`pip install crit` brings it along), and `crit_core.__version__` is crit's version. From a checkout, put
 `core/python` on `sys.path`.
 
 | Module | Contents | Native counterpart |

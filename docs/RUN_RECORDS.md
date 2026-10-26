@@ -28,10 +28,12 @@ ram_headroom_gib = 2                # host memory free at the engine's peak (def
 vram_headroom_gib = 1               # device memory free at the engine's peak (default 1)
 context_reserve_gib = 3             # device memory kept out of the KV cache (default 3)
 context_tokens = 262144             # the context wanted, prompt plus output (default 262,144)
+eval_packages = "/srv/crit/packages" # reference package source, a folder or https URL; unset: none
 ```
 
 `crit eval run` and `crit eval context` read `vram_headroom_gib`, `context_reserve_gib` and
-`context_tokens` from it when their flags are omitted. The reserve holds activations, workspaces, graphs
+`context_tokens` from it when their flags are omitted; `crit eval run`, `crit eval fetch` and
+`crit run eval` fetch reference packages from `eval_packages`. The reserve holds activations, workspaces, graphs
 and speed techniques; a larger one trades context for that room.
 
 | Action | Arguments / effect |
@@ -45,6 +47,7 @@ and speed techniques; a larger one trades context for that room.
 | `package` | `--candidate ID --source DIR --record recipe.json`; runnable files and manifest |
 | `check`, `benchmark` | `--candidate ID --record payload.json`; appends evidence |
 | `measure` | `--candidate ID [--seconds N]`; reserves a benchmark attempt, serves the packaged candidate through `crit serve`, streams every resident case's chat request to it, settles it and records one benchmark per case ([measured benchmarks](#measured-benchmarks)) |
+| `serve` | `--candidate ID [--host HOST] [--port 8000] [--seconds N]`; reserves a check attempt, serves the packaged, not yet sealed candidate through `crit serve` at `http://HOST:PORT/v1` until Ctrl+C or the reservation's deadline, for the checks a candidate passes before sealing, and settles the attempt (log `logs/serve-ATTEMPT.log`); `crit serve` serves the candidate once it is sealed |
 | `eval` | `--candidate ID --data EVAL_DATA_DIR [--only PART] [--baseline RESULT] [--label TEXT] [--seconds N]`; reserves a benchmark attempt, serves the packaged candidate through `crit serve`, scores the data's quality texts on the run's model unless stored, runs Eval over the chat API with the run's quality terms and `kv_tokens`, settles it and retains the result as `candidates/ID/eval/ATTEMPT.json` ([Eval evidence](#eval-evidence)); for a candidate created from a plan it writes the plan's [outcome](#outcome), and it prints the priorities the result's fractions give |
 | `seal` | `--candidate ID --lifecycle STATE [--failure TEXT]`; closes the candidate |
 | `select` | `--candidate ID`; selects a sealed eligible candidate |
@@ -64,7 +67,7 @@ hashes; add them only where a field below requires one.
 | --- | --- |
 | `model_path` | Required existing local model file/directory |
 | `correctness_criteria` | Required fixed criteria; gates are `arithmetic`, `functional`, `resources` |
-| `device` | A `crit eval probe` result. Without `kv_tokens`, `create` freezes Eval's [max context](eval/CONTEXT.md) on it as `kv_tokens`, with the basis (limits, KV precision, memory, device file sha256) in `hardware_constraints.context` |
+| `device` | A `crit eval probe` result. Without `kv_tokens`, `create` freezes Eval's [max context](https://github.com/crit-labs/crit-eval/blob/main/docs/CONTEXT.md) on it as `kv_tokens`, with the basis (limits, KV precision, memory, device file sha256) in `hardware_constraints.context` |
 | `kv_tokens` | Capacity for prompt + output; overrides the max context. One of `kv_tokens`, `device` is required |
 | `context_tokens` | The context the user wants (default 262,144, from `settings.toml` when the request omits it). With `device`, `kv_tokens` is the smaller of it, the model's positions and the KV cache that fits; `hardware_constraints.context` records `requested`, the `bound` (`requested`, `model` or `device`) and a `note` when the model or device allow less |
 | `ram_headroom_gib`, `vram_headroom_gib` | Physical free-memory requirements; defaults 2 and 1 |
@@ -168,10 +171,11 @@ before any code. crit assigns `plan-0001`, `plan-0002`, ... (never recycled), st
 | `supersedes` | Optional: the plan this one replaces ([revisions](#revisions)) |
 | `decision` | `build` or `stop` |
 | `needed` | `{"decode": {"needed": bool, "evidence": text}, "prefill": {...}}` |
-| `gaps` | For KPIs marked not needed: `[{kpi, gap, answer, detail}]`, `gap` the Eval gap's `name`, `answer` `cause` (its physical cause) or `rejected` (measured and rejected) |
+| `gaps` | For KPIs marked not needed: `[{kpi, gap, answer, detail}]`, `gap` the Eval gap's `name`, `answer` `cause` (its physical cause) or `rejected` (measured and rejected); optional `evidence`, a file in the run, which [plan rules 3](#plan-rules-3) require below half the limit |
 | `strategy` | `{current: {name, ceiling, evidence}, alternative: {name, ceiling, evidence}, choice, reason}`; `ceiling` is text: a number with its unit and where it comes from; `choice` is `current` or `alternative` |
 | `levers` | `[{id, technique, description, changes, group, confidence}]`. `technique` is an Inference entry name or free text; `changes` maps KPIs (`decode`, `prefill`, `ttft`, `context_decode`, `context_ttft`) to `{change, source}`: `change` is the projected relative change of that KPI's score in its improving direction (0.12 = 12% better, negative = worse), `source` is `eval-gap:<gap name>` or `estimate`. `group` is null or a name shared by levers that only pay together; `confidence` is `low`, `medium` or `high`. Optional `kind`: `speed` (the default) or `requirement`, work a rule or gate requires that Eval does not score, with `serves` naming that rule or gate (e.g. `AGENTS.md: sampled requests speculate`); its `changes` may be empty or 0 |
 | `rejected` | `[{name, reason}]`: alternatives considered and not planned |
+| `forecast_justification` | Optional (plan rules 3): why a forecast that expects more gain on p2 than on p1, or lets a p1 KPI fall, is worth building |
 | `forecast` | `{KPI: {low, expected, high}}` in Eval's units (tok/s; ms for `ttft` and `context_ttft`) for `decode`, `prefill`, `ttft`, and `context_decode`, `context_ttft` when the parent's Eval measured them |
 | `gates` | How quality stays inside the budget and the required context is met |
 | `estimated_limits` | Optional: `{KPI: {limit, derivation}}`, the agent's estimate of a limit the parent's Eval does not give, in Eval's units (tok/s; ms for `ttft` and `context_ttft`), and how it was derived (for example a drafter's expected tokens per round over the pass floor) |
@@ -299,6 +303,30 @@ the measurement, an alternative's ceiling next to its measured score):
 - A family marked not needed with a parent Eval and a fraction below 0.85 answers why the rest of its
   limit is out of reach: a `gaps` entry `{"kpi": "decode" or "prefill", "gap": "limit", "answer": "cause",
   "detail": the physical cause}`. Such an entry names no Eval gap and must answer `cause`.
+
+#### Plan rules 3
+
+Runs created from this version on have `"plan_rules": 3`: the rules 2 above and these.
+
+- Check 12, at record time: a build plan whose forecast expects more gain on p2 than on p1 (the gain
+  summed per tier, as the outcome's `forecast_on_p2` sums it), or forecasts a p1 KPI below the parent's
+  score (above it for a time), says why in `forecast_justification`; crit records it and lists what it
+  answers in `inputs.forecast_checks`. Without it the plan is refused.
+- Below half the limit (`MEASURED_ONLY` = 0.5 in `crit.run.plans`) a family is marked not needed only on
+  measured rejections. Every `gaps` entry on it names its `evidence`, a file retained in the run (crit
+  records its path and SHA-256 in `inputs.gap_evidence`), and an Eval gap answers `rejected`: a cause
+  alone, such as "the quality budget", no longer stands. For prefill, every prompt activation format the
+  parent's Eval prices above the engine's own declared `prompt_activations` (crit-eval's
+  `kpis.prefill.activations`) is rejected too, unless Eval's own quality evidence rules it out: a `gaps`
+  entry `{"kpi": "prefill", "gap": "activation:FORMAT", "answer": "rejected", "evidence": RESULT, "detail"}`
+  whose evidence is a crit-eval result that measured that format (its engine's `prompt_activations`) and
+  kept some quality set over its budget at the 5th percentile of its spread over positions
+  (`budget_spread`). A rejection inside the quality noise is not a rejection, and a result without the
+  spread cannot give one. An engine that declares no prompt activations cannot mark prefill not needed
+  there: Eval names neither the format in use nor the faster ones.
+- recon.md's `Drafting plan for both decode modes` and `Prefill arithmetic plan` are written, neither
+  missing nor starting with TODO, before the first candidate. The prefill plan gives each matrix group's
+  prompt activation format and the quality measurement per group (`crit eval run --attribute-drift`).
 
 crit checks completeness and consistency with the frozen facts, never whether the reasoning is good,
 and refuses a plan with a message that says what to fix:
@@ -464,7 +492,7 @@ is proven; otherwise the log stays in the candidate's `logs/` directory unhashed
 
 ### Eval evidence
 
-[Eval](eval/README.md) result JSON is not a `check` or `benchmark` payload and is
+[Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md) result JSON is not a `check` or `benchmark` payload and is
 never imported automatically. `eval` retains it under the candidate before sealing;
 reference its bytes from a check's `evidence`. Keep any Eval adapter and inputs with the
 candidate. Publish benchmark samples only under cases and a protocol frozen for them;

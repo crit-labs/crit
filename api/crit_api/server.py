@@ -379,19 +379,18 @@ def structured_outputs(body):
     return {"type": "grammar", "language": language, "source": source, "grammar": grammar}, param
 
 
-def packed_rows(rows, alternatives):
-    """Score rows [token, logprob, [[token, logprob], ...]] in a score request's "packed" format: base64 of
-    little-endian arrays, the tokens and alternative tokens int32, the log-probabilities float32, the alternatives
-    row by row (count x alternatives)."""
+def packed_rows(scores):
+    """Checked score rows (crit_api.engine.PackedScores) in a score request's "packed" format: base64 of little-endian
+    arrays, the tokens and alternative tokens int32, the log-probabilities float32, the alternatives row by row
+    (count x alternatives)."""
     def encoded(typecode, values):
-        data = array.array(typecode, values)
+        data = array.array(typecode, values)   # float64 to float32 rounds each value to nearest, as C casts do
         if sys.byteorder != "little":
             data.byteswap()
         return base64.b64encode(data.tobytes()).decode("ascii")
-    return {"count": len(rows), "alternatives": alternatives,
-            "tokens": encoded("i", [row[0] for row in rows]), "logprobs": encoded("f", [row[1] for row in rows]),
-            "top_tokens": encoded("i", [pair[0] for row in rows for pair in row[2]]),
-            "top_logprobs": encoded("f", [pair[1] for row in rows for pair in row[2]])}
+    return {"count": len(scores.tokens), "alternatives": scores.alternatives,
+            "tokens": encoded("i", scores.tokens), "logprobs": encoded("f", scores.logprobs),
+            "top_tokens": encoded("i", scores.top_tokens), "top_logprobs": encoded("f", scores.top_logprobs)}
 
 
 def not_served(path):
@@ -1388,6 +1387,7 @@ class Handler(BaseHTTPRequestHandler):
             status, scored, telemetry = self.api.engine.score(request["prompt_ids"], request["continuation_ids"],
                                                               request["top_logprobs"], cancel, request["candidate"],
                                                               prompt_rows=request["prompt_rows"],
+                                                              packed=request["format"] == "packed",
                                                               request_id=self.request_id,
                                                               on_started=lambda _: self.api.metrics.dispatched(timing))
         except EngineError as exc:
@@ -1400,8 +1400,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.error(504 if status == "timed_out" else 499, "Request " + status.replace("_", " "),
                               "server_error")
         if request["format"] == "packed":
-            scored = {"format": "packed",
-                      **{part: packed_rows(rows, request["top_logprobs"]) for part, rows in scored.items()}}
+            scored = {"format": "packed", **{part: packed_rows(scores) for part, scores in scored.items()}}
         self.send_json(200, {"object": "crit.score", "model": request["model"],
                              "system_fingerprint": self.api.engine.spec(request["candidate"])["package_sha256"][:16],
                              **scored, "crit_telemetry": telemetry})
