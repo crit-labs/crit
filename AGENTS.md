@@ -32,7 +32,8 @@ Install from the repo root with `python -m pip install -e .`, then run `crit ...
   citing sources. Where they override the files, edit the `frozen` block of
   `recon.json` and say why under Decisions. Every later candidate freezes that block
   (sampling, chat template and its variables, stop tokens) as `configuration["recon"]`
-  instead of defaulting to greedy. `recon.json` also fingerprints the checkpoint (architecture,
+  instead of defaulting to greedy. A template's `enable_thinking` is frozen off, as crit
+  Eval renders prompts; keep it so. `recon.json` also fingerprints the checkpoint (architecture,
   weight layout, tokenizer, template), and every candidate records it; when the engine should
   run a related checkpoint (a finetune, a re-quantization, a sibling model), `crit run --id RUN_ID
   recon --compare OTHER_MODEL` says what differs for it, and an equal fingerprint means the weight
@@ -121,7 +122,9 @@ Work in rounds, one candidate per round:
    a higher priority; effort is never a reason to leave something out. Record the plan
    with `crit run ... plan --record plan.json` after the parent's Eval and before
    writing code ([Run records](docs/RUN_RECORDS.md#plan)), and name its `plan_id` in the
-   proposal. A plan proved wrong before its candidate exists is replaced by a new plan
+   proposal; `plan --record plan.json --check` runs the same checks without recording.
+   In a [replay](docs/RUN_RECORDS.md#replays) of a run, follow `replay/agent_request.md`:
+   it ends at the checked plan and records nothing. A plan proved wrong before its candidate exists is replaced by a new plan
    with `supersedes`.
 3. **Build** it (`crit run ... candidate`); fix or prune what is slow or fails a gate
    until the plan is implemented. Prune a part only after measuring it against its
@@ -190,6 +193,12 @@ Work in rounds, one candidate per round:
   0.85 answers why the rest of its limit is out of reach (`gaps` entry `limit`, answer `cause`).
   In runs with plan rules 3 (new runs), a plan whose forecast gains more on p2 than on p1, or
   lets a p1 KPI fall, says why (`forecast_justification`).
+  A kernel term is exhausted only when it runs near its floor at the arithmetic the engine
+  already uses (`crit eval status --kernels`: each matmul's achieved TFLOPS and its gap at the
+  rate of its own prompt activations) or when another kernel structure, or a vendor library
+  at the same arithmetic as a yardstick, was measured on it. Tiling, block and launch variants
+  of one kernel reject those variants, not the term, and no justification leaves a p1 term on
+  them alone.
   Below half its limit a family is marked not needed only on measured rejections: every gap
   entry names its evidence in the run, and for prefill every prompt activation format Eval
   prices faster than the engine's own is rejected by a quality measurement outside the quality
@@ -263,7 +272,10 @@ Work in rounds, one candidate per round:
   Apply agreed criteria without relaxing them or demanding byte-identical output.
   Spend the `quality_budget` (defaults: perplexity ratio 1.05, mean KL 0.05, p99 KL 0.5;
   [Run records](docs/RUN_RECORDS.md#request)) on speed; drift below it is no
-  gain. Measure a precision change (activation quantization, a lower-precision KV cache
+  gain. The run's `quality_mode` is the user's: `preserve` judges against the checkpoint with
+  exact activations, `as_quantized` against it run as quantized (its own activation
+  quantization is then no drift, and prefill is measured against the stored format's rate).
+  Never change it; the brief names it. Measure a precision change (activation quantization, a lower-precision KV cache
   or head) against the budget on the model, per group of layers, before building other
   levers on it: its cost depends on the model and decides how much of it fits. Do it in
   process during development: `crit eval run --adapter A --only quality` (development

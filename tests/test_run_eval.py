@@ -109,10 +109,11 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
         (self.eval_data / "prepared.json").write_text(json.dumps(prepared))
         self.scored = []
 
-    def score(self, model, data, log, check=lambda: None):
+    def score(self, model, data, log, check=lambda: None, quality_mode="preserve"):
         """The reference scores the texts as the engine does: the quality gate passes."""
         check()
         self.scored.append((model, Path(data)))
+        self.modes = getattr(self, "modes", []) + [quality_mode]
         write_store(Path(data))
         return {"method": "scored", "positions": 1, "seconds": 0.0}
 
@@ -137,6 +138,7 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
         self.assertIsNotNone(lower["cases"]["chat"]["decode_tps"])
         self.assertTrue(result["context"]["points"])  # the long-context curve, served at the run's context
         self.assertEqual(result["requirements"]["exactness"], "reported")
+        self.assertEqual((result["requirements"]["quality_mode"], self.modes), ("preserve", ["preserve"]))
         chat_case = result["speed"]["cases"]["chat"]
         self.assertEqual(chat_case["tokens"], prepare.token_ids(Text(), ("tides rise and fall " * 20)[:12]))
         # The reference scored the data's texts first; the candidate then scored them through crit serve.
@@ -191,7 +193,7 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
         # The reference checks the deadline between its layers and texts; past it, the attempt times out.
         layers = []
 
-        def score(model, data, log, check):
+        def score(model, data, log, check, quality_mode="preserve"):
             with patch.object(evaluation, "remaining", lambda deadline: 10 - len(layers)):
                 while len(layers) < 100:
                     check()

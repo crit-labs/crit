@@ -25,7 +25,10 @@ crit run --project CRIT_ROOT --root RUN_ROOT --id RUN_ID recon
 model needs none. `work/recon.json` names every file it read with its SHA-256. Its `frozen` block
 (`sampling`, `chat_template`, `template_variables`, `stop_token_ids`, `stop_strings`)
 goes into each later candidate's configuration as `recon`; edit the block, with the
-reason in `recon.md`, before the candidate it should change. Its `sampling` is the
+reason in `recon.md`, before the candidate it should change. A template that reads
+`enable_thinking` is frozen with it `false`: crit Eval renders every prompt with thinking
+off and stops at the first request a server renders otherwise, so a candidate served with
+thinking on by default never gets a result; requests still turn it on. Its `sampling` is the
 exception: it is the model's own and stays so (a candidate refuses another). `recon.md`'s
 "Eval sampling" section names the sampling crit Eval's sampled suite measures, from the
 model's `generation_config.json` or the protocol default; only the user overrides it,
@@ -218,7 +221,11 @@ info's `kernel_work` (`{"match": NAME_PART, "term": matmul|attention|recurrent|o
 nvfp4|fp8|bf16}`, or `crit eval kernels --work RULES` without engine changes) and keep the draft step's
 kernels distinctly named (stored-tile-gemm's `KernelRole::draft` plans, or `draft` in the name), so
 `crit eval status RESULT --kernels kernels.json` joins each prefill term to its floor and splits a round
-into verify and draft. Run the full suite for the final comparison;
+into verify and draft. Trace every case the prefill score takes (status names the ones a trace lacks),
+and read each matmul's achieved TFLOPS against the rate of the prompt activations it already uses: that
+gap is open whatever quality allows. A term is exhausted only when it runs near that floor or when another
+kernel structure, or a vendor library at the same arithmetic as a yardstick, was measured on it; tiling,
+block and launch variants of one kernel reject those variants, not the term. Run the full suite for the final comparison;
 retain raw results, settings, inputs and the Eval revision; report skipped cases and
 overrides.
 

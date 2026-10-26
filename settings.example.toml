@@ -21,6 +21,12 @@ context_reserve_gib = 3
 # positions and the device's free memory may allow less; the run record says which bound applied.
 context_tokens = 262144
 
+# The quality mode new runs judge quality in, when the request names none: preserve (the default) against the
+# checkpoint with exact activations; as_quantized against the checkpoint run as quantized (its own activation
+# quantization, as serving stacks run NVFP4 and FP8 checkpoints), which trades the checkpoint's exact arithmetic for
+# its stored format's prefill speed.
+# quality_mode = "preserve"
+
 # Where Eval fetches reference packages (a checkpoint's prepared data and reference scores): a folder
 # or an https base URL. With one, crit eval run and crit run eval fetch them instead of scoring here.
 # eval_packages = "https://huggingface.co/datasets/ORG/REPO/resolve/main"

@@ -809,8 +809,10 @@ def _above(lever, noise):
                for kpi, row in lever["changes"].items())
 
 
-def build(root, run, bounds, data):
-    """Validate a plan payload against the run's facts and return the record crit stores (without plan_id)."""
+def build(root, run, bounds, data, status_for=None):
+    """Validate a plan payload against the run's facts and return the record crit stores (without plan_id).
+    status_for: the Eval status to judge the parent's result by, by its path in the run (a replay's statuses rendered
+    again, replay.status_for); by default the status stored in the result."""
     _fields(data)
     version = rules(run)
     parent = data["parent_candidate_id"]
@@ -832,7 +834,8 @@ def build(root, run, bounds, data):
             path = found[-1]
             eval_ref = {"path": path.relative_to(root).as_posix(), "sha256": file_sha(path)}
             result = read_json(path, max_bytes=EVAL_JSON_BYTES)
-            facts = extract(result.get("status") or {})
+            status = (status_for or {}).get(eval_ref["path"])
+            facts = extract(status if status is not None else result.get("status") or {})
             if run["spec"].get("plan_limits") == "computed":
                 # The limits Eval leaves out that crit can compute from the attempt (and the run's model files).
                 computed = {kpi: entry for kpi, entry in computed_limits(result, run["spec"]["model_path"], version).items()

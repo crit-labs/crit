@@ -188,11 +188,18 @@ def gather(model, run=None, drafters=()):
     frozen = {
         "sampling": served_sampling(generation.sampling_defaults(), override and override["settings"]),
         "chat_template": {"name": default, "sha256": chat[default]["sha256"]} if default else None,
-        "template_variables": {},
+        "template_variables": eval_template_variables(chat.get(default)),
         "stop_token_ids": list(generation.stop_token_ids),
         "stop_strings": list(generation.stop_strings),
     }
     return rows, gathered, frozen
+
+
+def eval_template_variables(template):
+    """The template variables a candidate is served with by default: crit Eval renders every prompt with thinking off
+    (crit_eval.prepare, enable_thinking=False) and requires the server to render each to its prepared token count, so
+    a template that reads enable_thinking is served with it off, as Eval renders; a request still turns it on."""
+    return {"enable_thinking": False} if template and "enable_thinking" in template["variables"] else {}
 
 
 def _sha_text(source):
@@ -467,6 +474,9 @@ def unfinished(root):
 
 def scaffold(value):
     g, f = value["gathered"], value["frozen"]
+    thinking = ("Thinking is off by default (template variables): crit Eval renders every prompt with thinking off and "
+                "requires the server to render it so; requests turn it on with chat_template_kwargs.\n"
+                if f["template_variables"].get("enable_thinking") is False else "")
     sources = "".join(f"| {r['path']} | {r['bytes']} | `{r['sha256'][:16]}` |\n" for r in value["sources"])
     stops = ", ".join(f"{i}" + (f" `{g['stop_token_text'][str(i)]}`" if str(i) in g["stop_token_text"] else "")
                       for i in g["stop_token_ids"]) or "none"
@@ -562,5 +572,5 @@ one.
 
 Frozen for candidates: sampling `{f['sampling']}`, chat template `{(f['chat_template'] or {}).get('name')}`, template
 variables `{f['template_variables']}`, stop token ids `{f['stop_token_ids']}`, stop strings `{f['stop_strings']}`.
-TODO: say why wherever this differs from generation_config.json.
+{thinking}TODO: say why wherever this differs from generation_config.json.
 """

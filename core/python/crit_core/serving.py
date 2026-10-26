@@ -439,8 +439,10 @@ class ResidentChat:
         self.capacity = int(capacity or limits.get("kv_tokens") or 0) or None
         self.stop_ids = set(self.text.generation.stop_token_ids if stop_ids is None else stop_ids)
         if template_variables is None:
-            template_variables = self.configuration.get("chat_template_kwargs") or {}
-        self.template_variables = dict(template_variables)
+            # The engine's own chat_template_kwargs, else the variables its run's recon froze (configuration["recon"]).
+            template_variables = (self.configuration["chat_template_kwargs"] if "chat_template_kwargs" in self.configuration
+                                  else (self.configuration.get("recon") or {}).get("template_variables"))
+        self.template_variables = dict(template_variables or {})
         self.kept_special = None   # tool-marker special tokens, found on the first request with tools
         self.calls_format = None   # tool_format, else the template's registered format, found with them
         unknown = sorted(set(self.sampling) - set(SAMPLING))

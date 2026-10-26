@@ -11,7 +11,7 @@ from .store import ROOT, RunStore
 
 SETTINGS = {"wsl_run_root": str, "ram_headroom_gib": (int, float), "vram_headroom_gib": (int, float),
             "context_reserve_gib": (int, float), "device": str, "context_tokens": int,
-            "eval_packages": str}
+            "eval_packages": str, "quality_mode": str}
 
 
 def load_settings(project):
@@ -66,6 +66,9 @@ def main(argv=None):
         sub.add_argument("--record", type=Path, required=True)
         if name in {"check", "benchmark"}:
             sub.add_argument("--candidate", required=True)
+    subs.choices["plan"].add_argument("--check", action="store_true",
+                                      help="Run the plan's checks and print the record crit would store, recording nothing "
+                                           "(the plan command of a replay)")
     subs.choices["plan"].description = ("Record the next candidate's plan after the parent's Eval and before any code: "
                                         "needed flags, strategy, levers, forecast and gates; crit freezes the parent's "
                                         "newest Eval and computes the priorities")
@@ -133,6 +136,16 @@ def main(argv=None):
     sub.add_argument("--prices", help="JSON object or file of {model: {input, cache_read, cache_write_5m, cache_write_1h, "
                                       "output}} in USD per million tokens, over the list prices")
     sub.add_argument("--until", help="Count requests up to this UTC timestamp (default: the run's stop, else now)")
+    sub = subs.add_parser("replay", help="Copy the run as it stood when a candidate's Eval finished, for an agent to say "
+                                         "what it would do next with today's crit and crit-eval (records nothing)")
+    sub.add_argument("--at", metavar="CANDIDATE", help="The candidate whose newest completed Eval the replays start from")
+    sub.add_argument("--before", metavar="PLAN", help="Instead: the run as it stood just before this plan was recorded "
+                     "(with the work done toward it since its parent's Eval, without drafts of the plan)")
+    sub.add_argument("--out", type=Path, required=True, help="Folder of the replays: replay-1 ... replay-N, each a run root")
+    sub.add_argument("--count", type=int, default=1, help="Replays to make, one per agent (default 1)")
+    sub.add_argument("--agent", metavar="CMD", help="Start an agent on every replay at once with this command (any "
+                     "harness; {brief}, {folder}, {root} and {number} name the replay's), wait for all, then collect")
+    sub.add_argument("--collect", action="store_true", help="Instead: check and list the plans the replays under --out wrote")
     subs.add_parser("show")
     subs.add_parser("recover", help="Explicit dead-owner lease recovery and projection rebuild; never resets attempts/deadlines")
     args = parser.parse_args(argv)
@@ -149,7 +162,7 @@ def main(argv=None):
             if isinstance(payload, dict):
                 # Request values win; the run records the headroom it actually used.
                 filled = {key: settings[key] for key in ("ram_headroom_gib", "vram_headroom_gib", "context_reserve_gib",
-                                                         "context_tokens") if key in settings}
+                                                         "context_tokens", "quality_mode") if key in settings}
                 if "device" in settings:
                     # This machine's probe result: the run is built for Eval's max context on it.
                     device = Path(settings["device"]).expanduser()
@@ -159,7 +172,20 @@ def main(argv=None):
         elif args.action == "resolve":
             result = store.freeze_inputs(args.id, payload)
         elif args.action == "plan":
-            result = store.plan(args.id, payload)
+            result = store.plan(args.id, payload, args.check)
+        elif args.action == "replay" and args.collect:
+            from .replay import collect, render_collected
+            result = collect(args.out, args.id, RunStore, args.project)
+            print(render_collected(result), file=sys.stderr)
+        elif args.action == "replay":
+            if bool(args.at) == bool(args.before):
+                parser.error("replay needs --at CANDIDATE or --before PLAN (or --collect)")
+            from .replay import collect, launch, make, render_collected
+            result = make(store, args.id, args.at, args.out, args.count, args.before)
+            if args.agent:
+                result = launch(result, args.agent)
+                result["collected"] = collect(args.out, args.id, RunStore, args.project)
+                print(render_collected(result["collected"]), file=sys.stderr)
         elif args.action == "candidate":
             result = store.candidate(args.id, args.source, payload)
         elif args.action == "recon" and args.compare:

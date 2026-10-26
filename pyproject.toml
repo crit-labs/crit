@@ -4,18 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crit"
-version = "0.10.0"
+version = "0.11.0"
 description = "crit: inference runtime, reusable techniques, kernel discovery, evaluation and an OpenAI-compatible serving API"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 # crit Core's Python package (core/python) and crit Eval (https://github.com/crit-labs/crit-eval) install on their own.
-dependencies = ["tokenizers>=0.22,<0.24", "jinja2>=3.1.4,<4", "crit-core==0.10.0", "crit-eval==0.1.0"]
+dependencies = ["tokenizers>=0.22,<0.24", "jinja2>=3.1.4,<4", "crit-core==0.11.0", "crit-eval==0.1.1"]
 
 [project.optional-dependencies]
 # crit-eval reference: score the quality texts on the checkpoint itself.
-reference = ["crit-eval[reference]==0.1.0"]
+reference = ["crit-eval[reference]==0.1.1"]
 
 [project.urls]
 Repository = "https://github.com/crit-labs/crit"

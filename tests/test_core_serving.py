@@ -378,6 +378,16 @@ class TemplateKwargsTests(unittest.TestCase):
                 engine.generate(request(template_kwargs=refused), threading.Event())
         self.assertEqual(len(engine.calls), generated)
 
+    def test_without_its_own_kwargs_an_engine_serves_the_variables_recon_froze(self):
+        frozen = {"recon": {"template_variables": {"enable_thinking": False}}}
+        engine = Decoder(types.SimpleNamespace(configuration=frozen, limits={"kv_tokens": 4096}), self.model)
+        self.assertEqual(engine.template_variables, {"enable_thinking": False})
+        engine.generate(request(), threading.Event())
+        self.assertTrue(engine.text.tokenizer.decode(engine.calls[-1][0]).endswith("</think>\n\n"))
+        # The engine's own chat_template_kwargs win, an empty one included.
+        own = Decoder(types.SimpleNamespace(configuration={**frozen, "chat_template_kwargs": {}}, limits={}), self.model)
+        self.assertEqual(own.template_variables, {})
+
     def test_a_continued_final_message_renders_with_the_request_variables_too(self):
         # A template that reads enable_thinking in the assistant turn the request continues.
         template = ("{%- for m in messages %}{{ m.role }}: {% if m.role == 'assistant' and enable_thinking %}(thought) "
