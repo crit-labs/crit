@@ -553,7 +553,13 @@ declare `"plain": true` when the session implements it.
 
 `crit_core.native` ([Python](../../python/README.md)) loads such a library and
 supplies the stock adapters: `eval_engine(context, library, defaults)` for
-[eval-v1](../../../docs/eval/ADAPTER.md) and `resident_engine(context, library,
+[eval-v1](https://github.com/crit-labs/crit-eval/blob/main/docs/ADAPTER.md) and `resident_engine(context, library,
 defaults)` for crit serve's [chat-resident-v1](../../../docs/SERVING.md#adapter-contract).
+`eval_engine` passes each generation's `prefill_ms` and `first_token_ms` from the result's timing, for crit-eval's
+time-to-first-token breakdown, and offers `score()` when the info declares `token_logprobs`, `query_scoring` and
+`replay`: the fixed quality texts scored as crit serve scores them (the prompt by query scoring on the `prefill`
+score path, the continuation by a greedy replay with log-probabilities), so `crit eval run --adapter A --only quality`
+checks quality in process during development ([crit-eval's adapter](https://github.com/crit-labs/crit-eval/blob/main/docs/ADAPTER.md);
+development evidence, never a gate result: the gate is `crit run ... eval`'s, through crit serve).
 The [toy engine fixture](../../../tests/core/native_engine_fixture.cpp) and its
 [check](../../../tests/core/native_engine_check.py) exercise both.

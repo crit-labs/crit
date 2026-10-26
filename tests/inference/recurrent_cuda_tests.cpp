@@ -11,6 +11,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace crit::core;
@@ -206,6 +207,28 @@ void deferred_consumed() {
     std::cout << "deferred prefix applied once across flushes and an abandoned round\n";
 }
 
+// The many-count record writes the clamped count into `count` ints of every group,
+// `stride` apart, and nothing else (recurrent-layer-kernels' per-block counts).
+void record_many() {
+    Fixture f;
+    const auto stream = f.backend->stream();
+    auto pending = f.backend->allocate(Memory::device, 10 * sizeof(std::int32_t)), accepted = f.backend->allocate(Memory::device, sizeof(std::int32_t));
+    auto* pending_ptr = static_cast<std::int32_t*>(pending.data());
+    const auto* accepted_ptr = static_cast<const std::int32_t*>(accepted.data());
+    for(const auto& [n, want] : {std::pair{4, 3}, std::pair{-2, 0}, std::pair{2, 2}}) {
+        std::vector<std::int32_t> sentinel(10, -7), got(10);
+        pending.upload(std::as_bytes(std::span(sentinel)), 0, Queue::compute);
+        accepted.upload(std::as_bytes(std::span(&n, 1)), 0, Queue::compute);
+        check(dc::enqueue_record_accepted(accepted_ptr, 3, pending_ptr, 3, 2, 5, stream), "record many");
+        pending.download(std::as_writable_bytes(std::span(got)), 0, Queue::compute);
+        for(int i = 0; i < 10; ++i)
+            require(got[std::size_t(i)] == (i % 5 < 3 ? want : -7), "record many wrote " + std::to_string(got[std::size_t(i)]) + " at " + std::to_string(i));
+    }
+    require(dc::enqueue_record_accepted(accepted_ptr, 3, pending_ptr, 3, 2, 2, stream) == cudaErrorInvalidValue, "overlapping groups recorded");
+    require(dc::enqueue_record_accepted(accepted_ptr, 3, pending_ptr, 0, 1, 0, stream) == cudaErrorInvalidValue, "zero counts recorded");
+    std::cout << "many-count record writes every group's counts and nothing else\n";
+}
+
 // Deferred commit over many rounds, including reruns with a smaller count after a
 // truncation, must reproduce the checkpoint strategy bit for bit.
 void deferred() {
@@ -273,6 +296,7 @@ void deferred() {
     }
     std::cout << "deferred rounds " << checked << " bitwise equal to checkpoint commits\n";
     deferred_consumed();
+    record_many();
 }
 
 void rejects() {

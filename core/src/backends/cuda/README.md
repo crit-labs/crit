@@ -82,7 +82,7 @@ scheduling and ramp-up), which matters most for many small kernels: draft steps,
 and short GEMVs. Stream capture records the launches as programmatic graph edges, so a
 captured decode graph keeps the overlap. Measure it per engine: kernel times in Eval's
 kernel profile are exclusive, so an overlapped kernel is charged only from its
-predecessor's end ([kernel profile](../../../../docs/eval/README.md#kernel-profile)).
+predecessor's end ([kernel profile](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md#kernel-profile)).
 [programmatic_launch_tests.cu](../../../../tests/inference/programmatic_launch_tests.cu)
 checks the query, and that a programmatic consumer reads every value a slow producer
 wrote, eagerly and from a replayed graph.

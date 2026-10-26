@@ -46,6 +46,9 @@ jobs:
           PY
       - name: Install pinned runtime dependencies
         run: python -m pip install tokenizers==0.23.3 jinja2==3.1.6
+      - name: Install crit Eval from its repository
+        # crit eval and crit run's Eval steps import crit_eval, and crit's tests reuse its fixtures (tests/) beside this checkout.
+        run: git clone --depth 1 https://github.com/crit-labs/crit-eval ../crit-eval && python -m pip install --no-deps -e ../crit-eval
       - name: Host contracts and chat processes
         run: python -B -m unittest discover -s tests -v
       - name: Build native host SDK
@@ -93,6 +96,7 @@ jobs:
           mkdir -p build/package-source
           git archive HEAD | tar -x -C build/package-source
           python -B -c "import os; from setuptools.build_meta import build_sdist, build_wheel; os.chdir('build/package-source'); build_sdist('../dist'); build_wheel('../dist')"
+          (cd build/package-source/core/python && python -B -c "from setuptools.build_meta import build_wheel; build_wheel('../../../dist')")
           python -m pip install --no-deps build/dist/*.whl
           cd build/ci-temp
           crit --version

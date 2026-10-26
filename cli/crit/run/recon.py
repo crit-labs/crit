@@ -3,7 +3,8 @@
 `crit run --id RUN recon` reads the run's model (crit_core.model.open_model: a folder, or a weight file such as a
 lone .gguf whose metadata derives the description files) through Core's text layer and writes work/recon.json (the
 facts, the files they came from and the `frozen` block every later candidate takes into configuration["recon"])
-and scaffolds work/recon.md, whose model-card, reference-code and drafting-plan sections the agent writes. With
+and scaffolds work/recon.md, whose model-card, reference-code, drafting-plan and prefill-arithmetic-plan sections the
+agent writes (runs with plan rules 3 refuse a candidate while either plan is unfinished: recon.unfinished). With
 `--drafter PATH` (repeatable) it also reads each companion drafter's config.json through crit_core.model.drafters
 (EAGLE-3, DFlash, DSpark and crit's own `crit models drafter` heads) and records what the engine wires: kind, taps
 into the target, draft vocabulary, block size and mask token, checked against the target's depth.
@@ -20,6 +21,8 @@ from .records import file_sha, keys, now, read_json, record, safe_path, text, wr
 
 RECON_JSON = "work/recon.json"
 RECON_MD = "work/recon.md"
+# The recon.md sections a run with plan rules 3 needs written before its first candidate: decode's and prefill's plans.
+PLANS = ("Drafting plan for both decode modes", "Prefill arithmetic plan")
 FROZEN = ("sampling", "chat_template", "template_variables", "stop_token_ids", "stop_strings")
 # config.json fields that shape the engine, read at the top level and in the text section (crit_core.model's
 # TEXT_SECTION_KEYS: text_config, else llm_config).
@@ -444,6 +447,24 @@ def _eval_sampling(found):
             "(below), and keep every other temperature correct: requests choose their own sampling.\n")
 
 
+def unfinished(root):
+    """The PLANS sections of the run's recon.md that are missing or still start with TODO; [] without a recon.md."""
+    notes = safe_path(root, RECON_MD)
+    if not notes.is_file():
+        return []
+    text_ = notes.read_text(encoding="utf-8")
+    found = []
+    for title in PLANS:
+        head = f"## {title}"
+        if head not in text_:
+            found.append(title)
+            continue
+        body = text_.split(head, 1)[1].split("\n## ", 1)[0].strip()
+        if not body or body.startswith("TODO"):
+            found.append(title)
+    return found
+
+
 def scaffold(value):
     g, f = value["gathered"], value["frozen"]
     sources = "".join(f"| {r['path']} | {r['bytes']} | `{r['sha256'][:16]}` |\n" for r in value["sources"])
@@ -527,6 +548,16 @@ drafter, draft width and acceptance you expect at these settings, and what a req
 Companion drafters read (Inference's hidden-state-drafters entry wires them):
 
 {drafters}
+## Prefill arithmetic plan
+
+TODO. How the engine prefills fast inside the drift budget, as the drafting plan says for decode. For each matrix
+group of the checkpoint (attention projections, MLP, recurrent projections, ...) by its stored format: the activation
+format its prompt GEMMs take (bf16, fp16_acc, fp8 or stored, as crit-eval prices them) and the quality measurement
+that allows it: `crit eval run --adapter A --only quality --attribute-drift`, the engine declaring
+`prompt_activations` and one `exact_variants` entry per group, each group's share of the budget read against the
+quality spread (`budget_spread`). Name the prefill ceiling crit-eval prices for this plan next to the stored-format
+one.
+
 ## Decisions
 
 Frozen for candidates: sampling `{f['sampling']}`, chat template `{(f['chat_template'] or {}).get('name')}`, template

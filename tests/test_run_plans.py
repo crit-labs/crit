@@ -83,12 +83,15 @@ def plan(parent=None, decision="build", decode=True, prefill=True, **updates):
 
 class PlanFixture(RunFixture):
     new_run_plans = "required"
+    # The plan rules the fixture's runs are created with; PlanRules3Tests set 3, the default of new runs.
+    plan_rules = 2
 
     def setUp(self):
         super().setUp()
         # A candidate-budget run, as runs are created by default.
         self.data = {key: value for key, value in self.data.items() if key != "budget_minutes"} | {"candidate_budget": 3}
-        self.view = self.store.create(self.data)
+        with patch("crit.run.records.NEW_RUN_PLAN_RULES", self.plan_rules):
+            self.view = self.store.create(self.data)
         self.run = self.view["run"]
         self.run_id = self.run["run_id"]
         self.directory = self.store.directory(self.run_id)
@@ -828,9 +831,9 @@ class PlanRecordTests(PlanFixture, unittest.TestCase):
 
     def test_plan_rules_need_computed_limits(self):
         spec = copy.deepcopy(self.run["spec"])
-        for broken in ({**spec, "plan_rules": 3}, {key: value for key, value in spec.items() if key != "plan_limits"}):
+        for broken in ({**spec, "plan_rules": 4}, {key: value for key, value in spec.items() if key != "plan_limits"}):
             with self.subTest(broken=broken.get("plan_rules")):
-                with self.assertRaisesRegex(ValueError, "plan_rules is 2 when present"):
+                with self.assertRaisesRegex(ValueError, "plan_rules is 2 or 3 when present"):
                     validate_spec(broken)
 
     def test_without_the_round_floors_facts_the_plan_gives_the_alternatives_ceiling(self):
@@ -907,6 +910,121 @@ class PlanRecordTests(PlanFixture, unittest.TestCase):
 
 def attempt_of(test, candidate_id):
     return sorted((test.directory / "candidates" / candidate_id / "eval").glob("attempt-*.json"))[0].stem
+
+
+class PlanRules3Tests(PlanFixture, unittest.TestCase):
+    """Plan rules 3, the default of new runs: forecasts against the priorities, measured rejections below half the
+    limit, and recon's prefill arithmetic plan."""
+    plan_rules = 3
+
+    def test_new_runs_check_plans_with_rules_3(self):
+        self.assertEqual(self.run["spec"]["plan_rules"], 3)
+
+    def test_a_forecast_that_gains_more_on_p2_or_lets_p1_fall_says_why(self):
+        parent = self.first()["candidate_id"]
+        # Prefill at 25% of its limit is p1, decode at 50% p2.
+        self.evaluated(parent, status())
+        p2_heavy = plan(parent, forecast={**plan()["forecast"], "decode": {"low": 120.0, "expected": 160.0, "high": 180.0},
+                                          "prefill": {"low": 1000.0, "expected": 1100.0, "high": 1200.0}})
+        with self.assertRaisesRegex(ValueError, "expects more gain on p2 \\(decode: \\+60.0%\\) than on p1 \\(prefill: "
+                                                "\\+10.0%\\).*forecast_justification"):
+            self.store.plan(self.run_id, p2_heavy)
+        falling = plan(parent, forecast={**plan()["forecast"], "prefill": {"low": 800.0, "expected": 900.0, "high": 1000.0}})
+        with self.assertRaisesRegex(ValueError, "forecasts p1 prefill to fall \\(1000 -> 900\\)"):
+            self.store.plan(self.run_id, falling)
+        why = "the drafter rework lands first; the prefill GEMMs follow it next candidate"
+        recorded = self.store.plan(self.run_id, {**p2_heavy, "forecast_justification": why})
+        self.assertEqual(recorded["forecast_justification"], why)
+        self.assertEqual(len(recorded["inputs"]["forecast_checks"]), 1)
+        self.assertEqual(self.store.plan(self.run_id, plan(parent))["inputs"]["forecast_checks"], [])
+
+    def evidence(self, name, value):
+        path = self.directory / "work" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(value), encoding="utf-8")
+        return f"work/{name}"
+
+    def test_a_family_below_half_its_limit_is_not_needed_only_on_measured_rejections(self):
+        parent = self.first()["candidate_id"]
+        self.evaluated(parent, status(gaps=[("prefill", "prefill at its compute ceiling", 3.0)]))
+        decode_only = plan(parent, prefill=False, levers=[lever()])
+        answered = [{"kpi": "prefill", "gap": "prefill at its compute ceiling", "answer": "cause",
+                     "detail": "quality budget"}] + limit_causes("prefill")
+        with self.assertRaisesRegex(ValueError, "below 50%: gaps entry 'prefill at its compute ceiling' needs the evidence"):
+            self.store.plan(self.run_id, {**decode_only, "gaps": answered})
+        measured = self.evidence("prefill-gemm-ab.json", {"note": "fixture measurement"})
+        with_evidence = [{**row, "evidence": measured} for row in answered]
+        with self.assertRaisesRegex(ValueError, "answers cause: below half the limit an Eval gap is answered by a measured "
+                                                "rejection"):
+            self.store.plan(self.run_id, {**decode_only, "gaps": with_evidence})
+        rejected = [{**with_evidence[0], "answer": "rejected"}, with_evidence[1]]
+        recorded = self.store.plan(self.run_id, {**decode_only, "gaps": rejected})
+        self.assertEqual(recorded["inputs"]["gap_evidence"]["prefill:limit"]["path"], measured)
+        with self.assertRaisesRegex(ValueError, "is no file of this run"):
+            self.store.plan(self.run_id, {**decode_only, "gaps": [{**row, "evidence": "work/missing.json"} for row in rejected]})
+
+    def test_prefill_below_half_its_limit_rejects_every_faster_activation_format_outside_the_quality_noise(self):
+        parent = self.first()["candidate_id"]
+        value = status()
+        value["kpis"]["prefill"]["activations"] = {
+            "formats": ["nvfp4"], "declared": {"ceiling_score": 2000.0, "state": "passes"},
+            "modes": {"bf16": {"ceiling_score": 1500.0, "state": None}, "fp8": {"ceiling_score": 3000.0, "state": None},
+                      "stored": {"ceiling_score": 4000.0, "state": "fails"}}}
+        self.evaluated(parent, value)
+        measured = self.evidence("limit.json", {})
+        decode_only = plan(parent, prefill=False, levers=[lever()],
+                           gaps=[{**limit_causes("prefill")[0], "evidence": measured}])
+        # Stored is ruled out by Eval's own evidence and BF16 is slower than the engine's own: FP8 needs a rejection.
+        with self.assertRaisesRegex(ValueError, "prices prompt activations fp8 at 3,000 tok/s, above the engine's own "
+                                                "2,000: reject it with a quality measurement"):
+            self.store.plan(self.run_id, decode_only)
+
+        def quality(activations, p05, spread=True):
+            sets = {"long-4096/prompt": {"budget_used": 1.3, **({"budget_spread": {"budget_used": {
+                "p05": p05, "p50": 1.3, "p95": 1.6}}} if spread else {})}}
+            label = activations if isinstance(activations, str) else "shares"
+            return self.evidence(f"fp8-{p05}-{spread}-{label}.json",
+                                 {"engine": {"prompt_activations": activations}, "quality": {"sets": sets}})
+
+        def with_fp8(path):
+            return {**decode_only, "gaps": decode_only["gaps"] + [
+                {"kpi": "prefill", "gap": "activation:fp8", "answer": "rejected", "evidence": path,
+                 "detail": "FP8 activations on the MLP"}]}
+        for path, message in ((quality("fp8", 0.9), "inside the quality noise, so not a rejection"),
+                              (quality("fp8", 1.1, spread=False), "no quality spread over positions"),
+                              (quality("bf16", 1.1), "measured prompt activations 'bf16', not 'fp8'")):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    self.store.plan(self.run_id, with_fp8(path))
+        recorded = self.store.plan(self.run_id, with_fp8(quality({"nvfp4": "fp8"}, 1.1)))
+        self.assertEqual(recorded["inputs"]["gap_evidence"]["prefill:activation:fp8"]["over_budget_sets"],
+                         ["long-4096/prompt"])
+        value["kpis"]["prefill"]["activations"]["declared"] = None
+        self.evaluated(parent, value)
+        with self.assertRaisesRegex(ValueError, "the engine declares no prompt_activations"):
+            self.store.plan(self.run_id, with_fp8(quality("fp8", 1.1)))
+
+class ReconPlanRules3Tests(PlanFixture, unittest.TestCase):
+    """Plan rules 3 with a model folder: recon's plans are written before the first candidate."""
+    plan_rules = 3
+    model_files = {"README.md": "# Fixture model\n"}
+
+    def test_recon_needs_a_prefill_arithmetic_plan_beside_the_drafting_plan(self):
+        from crit.run import recon
+        self.store.recon(self.run_id)
+        notes = self.directory / recon.RECON_MD
+        self.assertIn("## Prefill arithmetic plan\n\nTODO.", notes.read_text(encoding="utf-8"))
+        self.assertEqual(recon.unfinished(self.directory), list(recon.PLANS))
+        recorded = self.store.plan(self.run_id, plan(levers=[], forecast=None))
+        with self.assertRaisesRegex(ValueError, "Finish work/recon.md before the candidate: Drafting plan for both decode "
+                                                "modes, Prefill arithmetic plan"):
+            self.candidate(plan_id=recorded["plan_id"])
+        text = notes.read_text(encoding="utf-8")
+        for title in recon.PLANS:
+            text = text.replace(f"## {title}\n\nTODO.", f"## {title}\n\nWritten: the fixture's plan.")
+        notes.write_text(text, encoding="utf-8")
+        self.assertEqual(recon.unfinished(self.directory), [])
+        self.assertEqual(self.candidate(plan_id=recorded["plan_id"])["plan_id"], recorded["plan_id"])
 
 
 class PriorityTests(unittest.TestCase):

@@ -7,7 +7,8 @@
 // the row sums use the same rounded values. A tile entirely outside a row's visible keys (after its position, before
 // its window, off its tree path) leaves that row's maximum, sum and output bit for bit unchanged (exp(0) = 1 and
 // p = 0), which the decode kernel's column invariance relies on: skipping such tiles, or reading keys only from the
-// oldest row's window on, changes no bits.
+// oldest row's window on, changes no bits. Two shortcuts keep the bits too: the per-key mask is skipped where both of a
+// thread's rows see the whole tile, and a warp's output rescale where none of its row maxima moved (x * 1 is exact).
 #include "fp8_kv_attention.h"
 
 #include <cuda_fp16.h>
@@ -58,6 +59,11 @@ __device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
 __device__ __forceinline__ std::size_t cache_row(const Cache& c, int key) {
     return static_cast<std::size_t>(c.ring > 0 ? key % c.ring : key);
 }
+// Positions pos0 .. pos0 + T - 1 do not all lie in the cache: pos0 is negative, or a linear cache with a capacity ends
+// before pos0 + T.
+__host__ __device__ __forceinline__ bool outside(const Cache& c, long long pos0, int T) {
+    return pos0 < 0 || (c.ring == 0 && c.capacity > 0 && pos0 + T > c.capacity);
+}
 
 // The keys one query row sees: key <= pos (pos < 0: an unused row), key >= lo (sliding window), and keys from `base`
 // on only where the row's tree bit (key - base) is set.
@@ -67,6 +73,8 @@ struct Visible {
     __device__ __forceinline__ bool operator()(int key) const {
         return key <= pos && key >= lo && (key < base || key - base >= 64 || ((tree >> (key - base)) & 1ull));
     }
+    // Every key of the tile kfirst .. kfirst + keys - 1 is visible, so the per-key mask would change nothing.
+    __device__ __forceinline__ bool all(int kfirst, int keys) const { return kfirst >= lo && kfirst + keys - 1 <= pos && kfirst + keys - 1 < base; }
 };
 __device__ __forceinline__ int window_lo(int pos, int window) { return window > 0 ? max(0, pos - window + 1) : 0; }
 __device__ __forceinline__ float capped(float x, float cap) { return cap > 0.f ? cap * tanhf(x / cap) : x; }
@@ -81,13 +89,20 @@ __device__ __forceinline__ float finish_row(float m, float& l, const float* sink
 }
 
 // ------------------------------------------------------------------------------------------------ write
-template <int HD>
-__global__ void __launch_bounds__(HD) write_kernel(Cache c, const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
-                                                   int stride, int pos0) {
+__device__ __forceinline__ float to_float(__nv_bfloat16 x) { return __bfloat162float(x); }
+__device__ __forceinline__ float to_float(float x) { return x; }
+
+// Block (row t, key/value head g), one thread per dimension. The position comes from *pos0_device when it is set; a
+// row outside the cache is skipped (host positions were checked before the launch).
+template <int HD, class In>
+__global__ void __launch_bounds__(HD) write_kernel(Cache c, const In* __restrict__ k, const In* __restrict__ v, int stride, int pos0,
+                                                   const int* pos0_device) {
     __shared__ float red[2][HD / 32];
     const int t = blockIdx.x, g = blockIdx.y, d = threadIdx.x;
-    const float kx = __bfloat162float(k[static_cast<std::size_t>(t) * stride + g * HD + d]);
-    const float vx = __bfloat162float(v[static_cast<std::size_t>(t) * stride + g * HD + d]);
+    const long long position = static_cast<long long>(pos0_device ? *pos0_device : pos0) + t;
+    if(outside(c, position, 1)) return;
+    const float kx = to_float(k[static_cast<std::size_t>(t) * stride + g * HD + d]);
+    const float vx = to_float(v[static_cast<std::size_t>(t) * stride + g * HD + d]);
     const float ak = warp_max(fabsf(kx)), av = warp_max(fabsf(vx));
     if((d & 31) == 0) { red[0][d >> 5] = ak; red[1][d >> 5] = av; }
     __syncthreads();
@@ -95,7 +110,7 @@ __global__ void __launch_bounds__(HD) write_kernel(Cache c, const __nv_bfloat16*
 #pragma unroll
     for(int i = 0; i < HD / 32; ++i) { mk = fmaxf(mk, red[0][i]); mv = fmaxf(mv, red[1][i]); }
     const float sk = mk > 0.f ? mk / 448.f : 1.f, sv = mv > 0.f ? mv / 448.f : 1.f;
-    const std::size_t pos = cache_row(c, pos0 + t), off = (pos * c.kv_heads + g) * HD + d;
+    const std::size_t pos = static_cast<std::size_t>(c.ring > 0 ? position % c.ring : position), off = (pos * c.kv_heads + g) * HD + d;
     c.k[off] = static_cast<std::uint8_t>(__nv_cvt_float_to_fp8(kx / sk, __NV_SATFINITE, __NV_E4M3));
     c.v[off] = static_cast<std::uint8_t>(__nv_cvt_float_to_fp8(vx / sv, __NV_SATFINITE, __NV_E4M3));
     if(d == 0) {
@@ -180,13 +195,20 @@ struct Rows {
                 mma_bf16(s[2 * np + 1], a[0], a[1], a[2], a[3], b[2], b[3]);
             }
         }
+        if(v0.all(kfirst, kK) && v1.all(kfirst, kK)) {  // both rows see the whole tile: no per-key mask
 #pragma unroll
-        for(int n = 0; n < 4; ++n)
+            for(int n = 0; n < 4; ++n)
 #pragma unroll
-            for(int i = 0; i < 4; ++i) {
-                const int key = kfirst + n * 8 + 2 * t4 + (i & 1);
-                s[n][i] = ((i >> 1) ? v1(key) : v0(key)) ? capped(s[n][i] * scale, softcap) : -INFINITY;
-            }
+                for(int i = 0; i < 4; ++i) s[n][i] = capped(s[n][i] * scale, softcap);
+        } else {
+#pragma unroll
+            for(int n = 0; n < 4; ++n)
+#pragma unroll
+                for(int i = 0; i < 4; ++i) {
+                    const int key = kfirst + n * 8 + 2 * t4 + (i & 1);
+                    s[n][i] = ((i >> 1) ? v1(key) : v0(key)) ? capped(s[n][i] * scale, softcap) : -INFINITY;
+                }
+        }
         float mx0 = m0, mx1 = m1;
 #pragma unroll
         for(int n = 0; n < 4; ++n) { mx0 = fmaxf(mx0, fmaxf(s[n][0], s[n][1])); mx1 = fmaxf(mx1, fmaxf(s[n][2], s[n][3])); }
@@ -207,8 +229,10 @@ struct Rows {
             pf[n][1] = *reinterpret_cast<const std::uint32_t*>(&p23);
         }
         l0 = l0 * c0 + rs0; l1 = l1 * c1 + rs1;
+        if(__any_sync(0xffffffffu, c0 != 1.f || c1 != 1.f)) {  // some row maximum of the warp moved (x * 1 is exact)
 #pragma unroll
-        for(int n = 0; n < HD / 8; ++n) { o[n][0] *= c0; o[n][1] *= c0; o[n][2] *= c1; o[n][3] *= c1; }
+            for(int n = 0; n < HD / 8; ++n) { o[n][0] *= c0; o[n][1] *= c0; o[n][2] *= c1; o[n][3] *= c1; }
+        }
 #pragma unroll
         for(int kk = 0; kk < 2; ++kk) {
             const std::uint32_t a0 = pf[2 * kk][0], a1 = pf[2 * kk][1], a2 = pf[2 * kk + 1][0], a3 = pf[2 * kk + 1][1];
@@ -543,20 +567,45 @@ __global__ void __launch_bounds__(kPrefillThreads, 1) prefill_fp8_kernel(Prefill
 }
 
 // ------------------------------------------------------------------------------------------------ decode
-constexpr int kDecodeThreads = 128;
+// A decode block runs S key streams (1 or 2) of four warps each over the same 64 rows: stream s takes tiles s, s + S,
+// s + 2S, ... of the block's pieces with its own K / V stage and online-softmax state, and synchronizes only within
+// itself, so the streams' phases drift apart and one stream's dequantization and softmax overlap the other's tensor-core
+// work (decode rows are few, so one stream leaves the tensor cores idle while tiles load). At the end a block of two
+// streams merges stream 0 then stream 1 into its one partial result. With S = 2, warp w runs row group w / 2 of stream
+// ((w >> 2) ^ w) & 1: every SM sub-partition (warp w % 4) holds one warp of each stream, and the two warps of a
+// one-column decode (row group 0) sit on different sub-partitions. Warps whose 16 rows are all unused skip the tensor
+// cores. Tile-to-stream assignment and merge order depend only on key positions, so a column's bits still depend only on
+// its own position (and on S, which the launcher fixes per device and head dimension).
+constexpr int kStreamThreads = 128;
+// A decode row no column uses sees every key, so it never forces the per-key mask on its warp; its state (zero query)
+// stays finite and is never written out.
+constexpr int kUnusedRowPos = INT_MAX / 2;
 
-template <int HD>
-__global__ void __launch_bounds__(kDecodeThreads, 1) decode_kernel(Decode p) {
-    using T_ = Tile<HD, kDecodeThreads>;
+template <int S>
+__device__ __forceinline__ void stream_sync(int stream) {
+    if constexpr(S == 1) {
+        __syncthreads();
+    } else {
+        if(stream) asm volatile("bar.sync 2, %0;" :: "n"(kStreamThreads) : "memory");
+        else asm volatile("bar.sync 1, %0;" :: "n"(kStreamThreads) : "memory");
+    }
+}
+
+template <int HD, int S>
+__global__ void __launch_bounds__(S * kStreamThreads, 1) decode_kernel(Decode p) {
+    using T_ = Tile<HD, kStreamThreads>;
     constexpr int C = HD / 8;
     extern __shared__ uint4 smem[];
     uint4* Qs = smem;
-    uint4* Ks = Qs + kDecodeRows * C;
-    uint4* Vs = Ks + kK * C;
     const int g = blockIdx.x, blk = blockIdx.y, group = p.heads / p.cache.kv_heads;
     const int pos0 = p.pos0_device ? *p.pos0_device : p.pos0;
+    if(outside(p.cache, pos0, p.T)) return;  // nothing read; the combine answers NaN
     const int nkeys = pos0 + p.T;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gl = lane >> 2, t4 = lane & 3;
+    const int stream = S == 2 ? ((warp >> 2) ^ warp) & 1 : 0, rg = S == 2 ? warp >> 1 : warp;  // row group 0..3
+    const int stid = rg * 32 + lane;  // thread index within its stream
+    uint4* Ks = Qs + kDecodeRows * C + stream * 2 * kK * C;
+    uint4* Vs = Ks + kK * C;
     float* part = p.partial + (static_cast<std::size_t>(g) * p.blocks + blk) * kDecodeRows * HD;
     float* ml = p.partial + static_cast<std::size_t>(p.cache.kv_heads) * p.blocks * kDecodeRows * HD +
                 (static_cast<std::size_t>(g) * p.blocks + blk) * kDecodeRows * 2;
@@ -566,11 +615,11 @@ __global__ void __launch_bounds__(kDecodeThreads, 1) decode_kernel(Decode p) {
     const int piece0 = first + ((blk - first % p.blocks) % p.blocks + p.blocks) % p.blocks;
     auto tile_key = [&](int j) { return (piece0 + (j >> 2) * p.blocks) * kPiece + (j & 3) * kK; };
     if(tile_key(0) >= nkeys) {
-        for(int r = tid; r < kDecodeRows; r += kDecodeThreads) { ml[r * 2] = -INFINITY; ml[r * 2 + 1] = 0.f; }
+        for(int r = tid; r < kDecodeRows; r += S * kStreamThreads) { ml[r * 2] = -INFINITY; ml[r * 2 + 1] = 0.f; }
         return;
     }
     const int used = p.T * group;
-    for(int e = tid; e < kDecodeRows * C; e += kDecodeThreads) {
+    for(int e = tid; e < kDecodeRows * C; e += S * kStreamThreads) {
         const int r = e / C, c = e % C;
         uint4* dst = Qs + T_::swz(r, c);
         if(r < used) cp_async16(dst, p.q + static_cast<std::size_t>(r / group) * p.q_stride + static_cast<std::size_t>(g * group + r % group) * HD + c * 8);
@@ -578,15 +627,16 @@ __global__ void __launch_bounds__(kDecodeThreads, 1) decode_kernel(Decode p) {
     }
     asm volatile("cp.async.commit_group;");
     T_ tile;
-    tile.fetch(p.cache, g, tile_key(0), klo, nkeys, tid);
-    tile.stage(Ks, Vs, tid);
+    tile.fetch(p.cache, g, tile_key(stream), klo, nkeys, stid);
+    tile.stage(Ks, Vs, stid);
     asm volatile("cp.async.wait_group 0;" ::: "memory");
     __syncthreads();
     Rows<HD> rows;
-    const int qr0 = warp * 16, r0 = qr0 + gl, r1 = r0 + 8;
+    const int qr0 = rg * 16, r0 = qr0 + gl, r1 = r0 + 8;
+    const bool computes = qr0 < used;
     auto visible = [&](int r) {
         Visible v;
-        if(r >= used) return v;
+        if(r >= used) { v.pos = kUnusedRowPos; return v; }
         const int column = r / group;
         v.pos = pos0 + column;
         int depth = column;
@@ -599,73 +649,151 @@ __global__ void __launch_bounds__(kDecodeThreads, 1) decode_kernel(Decode p) {
         return v;
     };
     const Visible v0 = visible(r0), v1 = visible(r1);
-    for(int j = 0;; ++j) {
-        const int kfirst = tile_key(j), knext = tile_key(j + 1);
-        const bool more = knext < nkeys;
-        if(more) tile.fetch(p.cache, g, knext, klo, nkeys, tid);
-        rows.step(Qs, Ks, Vs, qr0, kfirst, v0, v1, p.scale, p.softcap, lane);
+    for(int j = stream; tile_key(j) < nkeys; j += S) {
+        const bool more = tile_key(j + S) < nkeys;
+        if(more) tile.fetch(p.cache, g, tile_key(j + S), klo, nkeys, stid);
+        if(computes) rows.step(Qs, Ks, Vs, qr0, tile_key(j), v0, v1, p.scale, p.softcap, lane);
         if(!more) break;
-        __syncthreads();
-        tile.stage(Ks, Vs, tid);
-        __syncthreads();
+        stream_sync<S>(stream);
+        tile.stage(Ks, Vs, stid);
+        stream_sync<S>(stream);
     }
     rows.finish_sums();
-    const float i0 = rows.l0 > 0.f ? 1.f / rows.l0 : 0.f, i1 = rows.l1 > 0.f ? 1.f / rows.l1 : 0.f;
+    float a0 = 1.f, a1 = 1.f, b0 = 0.f, b1 = 0.f, m0 = rows.m0, m1 = rows.m1, l0 = rows.l0, l1 = rows.l1;
+    const float4* other = reinterpret_cast<const float4*>(Qs + kDecodeRows * C);  // stream 1's accumulators
+    if constexpr(S == 2) {
+        // Stream 1 parks its accumulators ([row group][HD / 8][lane]) in the K / V stages and its (m, l) in the query
+        // stage; the stream-0 warp of the same row group (same fragment layout) merges: m = max, l = l_0 a + l_1 b,
+        // o = o_0 a + o_1 b with a = exp(m_0 - m), b = exp(m_1 - m).
+        float4* park = reinterpret_cast<float4*>(Qs + kDecodeRows * C);
+        float4* mlb = reinterpret_cast<float4*>(Qs);
+        __syncthreads();  // every warp is done with the stages
+        if(stream == 1 && computes) {
+#pragma unroll
+            for(int n = 0; n < HD / 8; ++n) park[(rg * (HD / 8) + n) * 32 + lane] = make_float4(rows.o[n][0], rows.o[n][1], rows.o[n][2], rows.o[n][3]);
+            mlb[rg * 32 + lane] = make_float4(rows.m0, rows.l0, rows.m1, rows.l1);
+        }
+        __syncthreads();
+        if(stream == 1 || !computes) return;
+        const float4 x = mlb[rg * 32 + lane];
+        m0 = fmaxf(rows.m0, x.x);
+        m1 = fmaxf(rows.m1, x.z);
+        a0 = rows.m0 == -INFINITY ? 0.f : __expf(rows.m0 - m0);
+        b0 = x.x == -INFINITY ? 0.f : __expf(x.x - m0);
+        a1 = rows.m1 == -INFINITY ? 0.f : __expf(rows.m1 - m1);
+        b1 = x.z == -INFINITY ? 0.f : __expf(x.z - m1);
+        l0 = rows.l0 * a0 + x.y * b0;
+        l1 = rows.l1 * a1 + x.w * b1;
+    }
+    if(!computes) return;  // no used row
+    const float i0 = l0 > 0.f ? 1.f / l0 : 0.f, i1 = l1 > 0.f ? 1.f / l1 : 0.f;
 #pragma unroll
     for(int n = 0; n < HD / 8; ++n) {
         const int dd = n * 8 + 2 * t4;
-        *reinterpret_cast<float2*>(part + static_cast<std::size_t>(r0) * HD + dd) = make_float2(rows.o[n][0] * i0, rows.o[n][1] * i0);
-        *reinterpret_cast<float2*>(part + static_cast<std::size_t>(r1) * HD + dd) = make_float2(rows.o[n][2] * i1, rows.o[n][3] * i1);
+        float4 o = make_float4(rows.o[n][0], rows.o[n][1], rows.o[n][2], rows.o[n][3]);
+        if constexpr(S == 2) {
+            const float4 x = other[(rg * (HD / 8) + n) * 32 + lane];
+            o = make_float4(o.x * a0 + x.x * b0, o.y * a0 + x.y * b0, o.z * a1 + x.z * b1, o.w * a1 + x.w * b1);
+        }
+        if(r0 < used) *reinterpret_cast<float2*>(part + static_cast<std::size_t>(r0) * HD + dd) = make_float2(o.x * i0, o.y * i0);
+        if(r1 < used) *reinterpret_cast<float2*>(part + static_cast<std::size_t>(r1) * HD + dd) = make_float2(o.z * i1, o.w * i1);
     }
     if(t4 == 0) {
-        ml[r0 * 2] = rows.m0; ml[r0 * 2 + 1] = rows.l0;
-        ml[r1 * 2] = rows.m1; ml[r1 * 2 + 1] = rows.l1;
+        if(r0 < used) { ml[r0 * 2] = m0; ml[r0 * 2 + 1] = l0; }
+        if(r1 < used) { ml[r1 * 2] = m1; ml[r1 * 2 + 1] = l1; }
     }
 }
 
-// Block (column, query head), one thread per dimension: block weights l_b exp(m_b - M), summed in block order.
+// Block (column, query head): one thread per dimension plus one warp for the denominator. Block weights
+// w_b = l_b exp(m_b - M); M = max m_b is exact in any order, so the weights are computed in parallel. The denominator
+// (by the extra warp, off the numerator's path) and each dimension's numerator are summed in block order exactly as
+// one thread's loop would, with the partial outputs loaded kCombineBatch at a time.
+constexpr int kCombineBatch = 16;
+
 template <int HD>
-__global__ void __launch_bounds__(HD) combine_kernel(Decode p) {
-    extern __shared__ float wsp[];
-    __shared__ float total;
+__global__ void __launch_bounds__(HD + 32) combine_kernel(Decode p) {
+    constexpr int NT = HD + 32, kPer = (1024 + NT - 1) / NT;
+    extern __shared__ float wsp[];  // [blocks] weights
+    __shared__ float total, red[NT / 32];
     const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x, group = p.heads / p.cache.kv_heads, g = h / group;
     const int r = t * group + h % group;
     const int pos0 = p.pos0_device ? *p.pos0_device : p.pos0;
+    float* out = p.out + static_cast<std::size_t>(t) * p.out_stride + static_cast<std::size_t>(h) * HD + d;
+    if(outside(p.cache, pos0, p.T)) {
+        if(d < HD) *out = __int_as_float(0x7fffffff);  // NaN: the device position does not fit the cache
+        return;
+    }
     const int ns = min(p.blocks, (pos0 + p.T + kPiece - 1) / kPiece);  // blocks that hold at least one key
     const float* part = p.partial + static_cast<std::size_t>(g) * p.blocks * kDecodeRows * HD;
     const float* ml = p.partial + static_cast<std::size_t>(p.cache.kv_heads) * p.blocks * kDecodeRows * HD +
                       static_cast<std::size_t>(g) * p.blocks * kDecodeRows * 2;
-    for(int b = d; b < ns; b += blockDim.x) wsp[b] = ml[(static_cast<std::size_t>(b) * kDecodeRows + r) * 2];
+    float m[kPer], l[kPer];
+    float mx = -INFINITY;
+#pragma unroll
+    for(int i = 0; i < kPer; ++i) {
+        const int b = d + i * NT;
+        m[i] = b < ns ? ml[(static_cast<std::size_t>(b) * kDecodeRows + r) * 2] : -INFINITY;
+        l[i] = b < ns ? ml[(static_cast<std::size_t>(b) * kDecodeRows + r) * 2 + 1] : 0.f;
+        mx = fmaxf(mx, m[i]);
+    }
+    mx = warp_max(mx);
+    if((d & 31) == 0) red[d >> 5] = mx;
     __syncthreads();
-    if(d == 0) {
-        float M = p.sinks ? p.sinks[h] : -INFINITY;
-        for(int b = 0; b < ns; ++b) M = fmaxf(M, wsp[b]);
+    float M = p.sinks ? p.sinks[h] : -INFINITY;
+#pragma unroll
+    for(int i = 0; i < NT / 32; ++i) M = fmaxf(M, red[i]);
+#pragma unroll
+    for(int i = 0; i < kPer; ++i) {
+        const int b = d + i * NT;
+        if(b < ns) wsp[b] = m[i] == -INFINITY ? 0.f : l[i] * __expf(m[i] - M);
+    }
+    __syncthreads();
+    if(d == HD) {  // the extra warp: the denominator
         float den = 0.f;
-        for(int b = 0; b < ns; ++b) {
-            const float m = wsp[b], l = ml[(static_cast<std::size_t>(b) * kDecodeRows + r) * 2 + 1];
-            const float w = m == -INFINITY ? 0.f : l * __expf(m - M);
-            wsp[b] = w;
-            den += w;
-        }
+        for(int b = 0; b < ns; ++b) den += wsp[b];
         if(p.sinks) den += __expf(p.sinks[h] - M);  // the sink's weight joins the denominator after the blocks'
         total = den;
     }
-    __syncthreads();
     float num = 0.f;
-    for(int b = 0; b < ns; ++b) {
-        const float w = wsp[b];
-        if(w != 0.f) num = fmaf(w, part[(static_cast<std::size_t>(b) * kDecodeRows + r) * HD + d], num);
-    }
-    p.out[static_cast<std::size_t>(t) * p.out_stride + static_cast<std::size_t>(h) * HD + d] = total > 0.f ? num / total : 0.f;
+    if(d < HD)
+        for(int b0 = 0; b0 < ns; b0 += kCombineBatch) {
+            float x[kCombineBatch];
+#pragma unroll
+            for(int u = 0; u < kCombineBatch; ++u) {
+                const int b = b0 + u;
+                x[u] = b < ns && wsp[b] != 0.f ? __ldcg(part + (static_cast<std::size_t>(b) * kDecodeRows + r) * HD + d) : 0.f;
+            }
+#pragma unroll
+            for(int u = 0; u < kCombineBatch; ++u) {
+                const int b = b0 + u;
+                if(b < ns && wsp[b] != 0.f) num = fmaf(wsp[b], x[u], num);
+            }
+        }
+    __syncthreads();
+    if(d < HD) *out = total > 0.f ? num / total : 0.f;
 }
 
 bool valid(const Cache& c) {
     return c.k && c.v && c.k_scale && c.v_scale && c.kv_heads > 0 && (c.head_dim == 64 || c.head_dim == 128 || c.head_dim == 256) &&
-           c.ring >= 0;
+           c.ring >= 0 && c.capacity >= 0 && (c.ring == 0 || c.capacity == 0 || c.ring <= c.capacity);
 }
 // A ring holds a window layer when every key a launch reads survives the launch's own writes.
 bool valid_window(const Cache& c, int window, float softcap, int rows) {
     return window >= 0 && softcap >= 0.f && (c.ring == 0 || (window > 0 && c.ring >= window + rows - 1));
+}
+
+// pos0_device set: the kernel reads the position and skips rows outside the cache; else pos0 .. pos0 + T - 1 must fit.
+template <class In>
+cudaError_t run_write(const Cache& c, const In* k, const In* v, int stride, int T, int pos0, const int* pos0_device, cudaStream_t s) {
+    if(!valid(c) || !k || !v || T <= 0 || (!pos0_device && outside(c, pos0, T)) || stride < c.kv_heads * c.head_dim)
+        return cudaErrorInvalidValue;
+    const dim3 grid(T, c.kv_heads);
+    switch(c.head_dim) {
+    case 64: write_kernel<64, In><<<grid, 64, 0, s>>>(c, k, v, stride, pos0, pos0_device); break;
+    case 128: write_kernel<128, In><<<grid, 128, 0, s>>>(c, k, v, stride, pos0, pos0_device); break;
+    default: write_kernel<256, In><<<grid, 256, 0, s>>>(c, k, v, stride, pos0, pos0_device); break;
+    }
+    return cudaGetLastError();
 }
 
 template <int HD>
@@ -699,33 +827,48 @@ cudaError_t run_prefill_fp8(const Prefill& p, cudaStream_t s) {
     return cudaGetLastError();
 }
 
+template <int HD, int S>
+cudaError_t run_decode(const Decode& p, cudaStream_t s) {
+    const std::size_t bytes = decode_shared_bytes(HD, S);
+    const cudaError_t attr = cudaFuncSetAttribute(decode_kernel<HD, S>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes));
+    if(attr != cudaSuccess) return attr;
+    decode_kernel<HD, S><<<dim3(p.cache.kv_heads, p.blocks), S * kStreamThreads, bytes, s>>>(p);
+    combine_kernel<HD><<<dim3(p.T, p.heads), HD + 32, sizeof(float) * p.blocks, s>>>(p);
+    return cudaGetLastError();
+}
+// Two key streams where their shared memory fits the device's per-block limit (it is checked, not assumed), else one.
 template <int HD>
 cudaError_t run_decode(const Decode& p, cudaStream_t s) {
-    const std::size_t bytes = static_cast<std::size_t>(kDecodeRows + 2 * kK) * HD * 2;
-    const cudaError_t attr = cudaFuncSetAttribute(decode_kernel<HD>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes));
-    if(attr != cudaSuccess) return attr;
-    decode_kernel<HD><<<dim3(p.cache.kv_heads, p.blocks), kDecodeThreads, bytes, s>>>(p);
-    combine_kernel<HD><<<dim3(p.T, p.heads), HD, sizeof(float) * p.blocks, s>>>(p);
-    return cudaGetLastError();
+    int streams = p.streams;
+    if(streams == 0) {
+        int dev = 0, limit = 0;
+        cudaError_t e = cudaGetDevice(&dev);
+        if(e == cudaSuccess) e = cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        if(e != cudaSuccess) return e;
+        streams = static_cast<std::size_t>(limit) >= decode_shared_bytes(HD, 2) ? 2 : 1;
+    }
+    return streams == 2 ? run_decode<HD, 2>(p, s) : run_decode<HD, 1>(p, s);
 }
 
 }  // namespace
 
 cudaError_t write(const Cache& c, const __nv_bfloat16* k, const __nv_bfloat16* v, int stride, int T, int pos0, cudaStream_t s) {
-    if(!valid(c) || !k || !v || T <= 0 || pos0 < 0 || stride < c.kv_heads * c.head_dim) return cudaErrorInvalidValue;
-    const dim3 grid(T, c.kv_heads);
-    switch(c.head_dim) {
-    case 64: write_kernel<64><<<grid, 64, 0, s>>>(c, k, v, stride, pos0); break;
-    case 128: write_kernel<128><<<grid, 128, 0, s>>>(c, k, v, stride, pos0); break;
-    default: write_kernel<256><<<grid, 256, 0, s>>>(c, k, v, stride, pos0); break;
-    }
-    return cudaGetLastError();
+    return run_write(c, k, v, stride, T, pos0, nullptr, s);
+}
+cudaError_t write(const Cache& c, const __nv_bfloat16* k, const __nv_bfloat16* v, int stride, int T, const int* pos0_device, cudaStream_t s) {
+    return pos0_device ? run_write(c, k, v, stride, T, 0, pos0_device, s) : cudaErrorInvalidValue;
+}
+cudaError_t write(const Cache& c, const float* k, const float* v, int stride, int T, int pos0, cudaStream_t s) {
+    return run_write(c, k, v, stride, T, pos0, nullptr, s);
+}
+cudaError_t write(const Cache& c, const float* k, const float* v, int stride, int T, const int* pos0_device, cudaStream_t s) {
+    return pos0_device ? run_write(c, k, v, stride, T, 0, pos0_device, s) : cudaErrorInvalidValue;
 }
 
 std::size_t prefill_shared_bytes(int head_dim) { return static_cast<std::size_t>(kQ + 2 * kK) * head_dim * 2; }
 
 cudaError_t prefill(const Prefill& p, cudaStream_t s) {
-    if(!valid(p.cache) || !p.q || !p.out || p.T <= 0 || p.pos0 < 0 || p.heads <= 0 || p.heads % p.cache.kv_heads ||
+    if(!valid(p.cache) || !p.q || !p.out || p.T <= 0 || outside(p.cache, p.pos0, p.T) || p.heads <= 0 || p.heads % p.cache.kv_heads ||
        p.q_stride % 8 || p.q_stride < p.heads * p.cache.head_dim || p.out_stride % 2 || p.out_stride < p.heads * p.cache.head_dim ||
        !valid_window(p.cache, p.window, p.softcap, p.T))
         return cudaErrorInvalidValue;
@@ -745,7 +888,7 @@ std::size_t prefill_fp8_shared_bytes(int head_dim) {
 }
 
 cudaError_t prefill_fp8(const Prefill& p, cudaStream_t s) {
-    if(!valid(p.cache) || !p.q || !p.out || p.T <= 0 || p.pos0 < 0 || p.heads <= 0 || p.heads % p.cache.kv_heads ||
+    if(!valid(p.cache) || !p.q || !p.out || p.T <= 0 || outside(p.cache, p.pos0, p.T) || p.heads <= 0 || p.heads % p.cache.kv_heads ||
        p.q_stride % 8 || p.q_stride < p.heads * p.cache.head_dim || p.out_stride % 4 || p.out_stride < p.heads * p.cache.head_dim ||
        !valid_window(p.cache, p.window, p.softcap, p.T))
         return cudaErrorInvalidValue;
@@ -756,15 +899,17 @@ cudaError_t prefill_fp8(const Prefill& p, cudaStream_t s) {
     }
 }
 
+std::size_t decode_shared_bytes(int head_dim, int streams) { return static_cast<std::size_t>(kDecodeRows + 2 * streams * kK) * head_dim * 2; }
+
 std::size_t decode_partial_floats(int kv_heads, int head_dim, int blocks) {
     return static_cast<std::size_t>(kv_heads) * blocks * kDecodeRows * (head_dim + 2);
 }
 
 cudaError_t decode(const Decode& p, cudaStream_t s) {
     if(!valid(p.cache) || !p.q || !p.out || !p.partial || p.T <= 0 || p.heads <= 0 || p.heads % p.cache.kv_heads ||
-       p.T * (p.heads / p.cache.kv_heads) > kDecodeRows || p.blocks < 1 || p.blocks > 1024 || (!p.pos0_device && p.pos0 < 0) ||
+       p.T * (p.heads / p.cache.kv_heads) > kDecodeRows || p.blocks < 1 || p.blocks > 1024 || (!p.pos0_device && outside(p.cache, p.pos0, p.T)) ||
        p.q_stride % 8 || p.q_stride < p.heads * p.cache.head_dim || p.out_stride < p.heads * p.cache.head_dim ||
-       !valid_window(p.cache, p.window, p.softcap, p.T) || (p.tree && p.window > 0 && p.window <= 64))
+       !valid_window(p.cache, p.window, p.softcap, p.T) || (p.tree && p.window > 0 && p.window <= 64) || p.streams < 0 || p.streams > 2)
         return cudaErrorInvalidValue;
     switch(p.cache.head_dim) {
     case 64: return run_decode<64>(p, s);

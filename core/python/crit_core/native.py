@@ -3,7 +3,7 @@
 An engine library exports its core::Engine with CRIT_EXPORT_ENGINE(factory). Its package then needs no glue of
 its own beyond two small entry files:
 
-    # eval adapter (eval-v1, docs/eval/ADAPTER.md)
+    # eval adapter (eval-v1, crit-eval's docs/ADAPTER.md)
     from crit_core.native import eval_engine
     def create_eval_engine(context):
         return eval_engine(context, Path(__file__).with_name("libengine.so"), defaults={...})
@@ -17,6 +17,7 @@ The factory receives a JSON object: the adapter's configuration plus "model" (th
 "context_tokens" (the context the engine must serve); the Eval adapter also passes "speculative" (false when
 Eval asks for plain one-token decoding on a second engine; an engine declaring "plain" decodes it per request).
 """
+import array
 import ctypes
 from collections import namedtuple
 import copy
@@ -26,7 +27,7 @@ from contextlib import contextmanager, nullcontext
 import json
 from pathlib import Path
 
-from crit_core.serving import SAMPLING, TOP_LOGPROBS, ResidentChat
+from crit_core.serving import SAMPLING, TOP_LOGPROBS, ResidentChat, ScoreRows
 
 ABI = 2
 RESULT_BYTES = 1 << 20  # a generation's result JSON: finish, timing and the engine's request facts
@@ -36,7 +37,10 @@ OUTPUT_CALLBACK = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int32
 PENALTY, PENALTIES = "penalties", {"repetition_penalty", "presence_penalty", "frequency_penalty"}
 # The penalties at the values that change nothing, for requests that must not take an engine's defaults (Eval's).
 NEUTRAL_PENALTIES = {"presence_penalty": 0.0, "frequency_penalty": 0.0, "repetition_penalty": 1.0}
-FACTS = ("draft_width", "bytes_per_pass", "draft_bytes_per_step", "draft_ms", "kv_bytes_per_token", "kernel_work")
+# Engine info facts the eval-v1 adapter passes on (crit-eval's docs/ADAPTER.md): headroom inputs, kernel classes, the
+# prompt GEMMs' activation formats, and the configuration overrides of --attribute-drift and of a wider-draft probe.
+FACTS = ("draft_width", "bytes_per_pass", "draft_bytes_per_step", "draft_ms", "kv_bytes_per_token", "kernel_work",
+         "prompt_activations", "exact_variants", "wider_draft")
 # NativeEngine.score per target: its log-probability, the query rows, the argmax and the engine's own ranked top_k
 # [(token, logprob), ...] (None for parts not asked for or not returned).
 Scores = namedtuple("Scores", "target query argmax top")
@@ -206,11 +210,12 @@ class NativeEngine:
             raise NativeError("generation failed: " + error)
         return [out[i] for i in range(count)], json.loads(result.value.decode("utf-8"))
 
-    def score(self, ids, first_target, path="", queries=None, top_k=0):
+    def score(self, ids, first_target, path="", queries=None, top_k=0, packed=False):
         """Scores (crit_engine_score) of every target ids[i], i >= first_target: its log-probability, the
         log-probabilities of its row of `queries` (one equally long row of token ids per target), the argmax when the
         engine returns one, and with top_k the engine's own top_k ranked [(token, logprob), ...]. path: one of the
-        engine's score_paths ("": the default)."""
+        engine's score_paths ("": the default). With `packed`, `top` is the targets' rows as ScoreRows of the
+        engine's arrays (float32 log-probabilities), copied without a Python object per value."""
         with self._lease():
             targets = len(ids) - first_target
             per = len(queries[0]) if queries else 0
@@ -230,11 +235,17 @@ class NativeEngine:
                                               values)
             if code != 0:
                 raise NativeError("scoring failed: " + self._error())
+            if packed and top_k:
+                # Byte copies of the engine's arrays; c_int32 and c_float are array.array's "i" and "f".
+                copied = lambda kind, data, count: array.array(kind, bytes(data)[:count * ctypes.sizeof(data._type_)])
+                top = ScoreRows(copied("f", target, targets), copied("i", tokens, targets * top_k),
+                                copied("f", values, targets * top_k), top_k)
+            else:
+                top = ([[(tokens[t * top_k + k], values[t * top_k + k]) for k in range(top_k)] for t in range(targets)]
+                       if top_k else None)
             return Scores(list(target)[:targets],
                           [[query[t * per + j] for j in range(per)] for t in range(targets)] if per else None,
-                          list(argmax)[:targets] if has_argmax.value else None,
-                          [[(tokens[t * top_k + k], values[t * top_k + k]) for k in range(top_k)]
-                           for t in range(targets)] if top_k else None)
+                          list(argmax)[:targets] if has_argmax.value else None, top)
 
     def close(self):
         with self._condition:
@@ -244,6 +255,14 @@ class NativeEngine:
             if self.handle:
                 self.lib.crit_engine_close(self.handle)
                 self.handle = None
+
+
+def engine_times(result):
+    """The engine's own prefill and first-token milliseconds from a generation's timing (Core's prefill_ms and
+    first_token_ms), for crit-eval's time-to-first-token breakdown; the ones it does not report are left out."""
+    timing = (result or {}).get("timing") or {}
+    return {key: float(timing[key]) for key in ("prefill_ms", "first_token_ms")
+            if isinstance(timing.get(key), (int, float)) and not isinstance(timing[key], bool)}
 
 
 def decode_rounds(tokens, result, speculative):
@@ -258,8 +277,10 @@ def decode_rounds(tokens, result, speculative):
 
 
 class EvalEngine:
-    """eval-v1 (docs/eval/ADAPTER.md) over a native engine: greedy generation with stop tokens disabled, replay
-    and plain decoding when the engine declares them, and its headroom facts."""
+    """eval-v1 (crit-eval's docs/ADAPTER.md) over a native engine: greedy generation with stop tokens disabled, replay
+    and plain decoding when the engine declares them, fixed-text scores (`score`, for `crit eval run --only quality`
+    in process, development evidence) when it declares token_logprobs, query_scoring and replay, the engine's own
+    prefill and first-token times with every generation, and its headroom facts."""
 
     def __init__(self, context, library, defaults=None):
         configuration = {**(defaults or {}), **(context.get("config") or {})}
@@ -285,6 +306,9 @@ class EvalEngine:
         self.sampling_fields = {key for key in SAMPLING if support.get(PENALTY if key in PENALTIES else key)}
         if support.get("temperature"):
             self.generate_sampled = self._generate_sampled
+        # Fixed text scored as crit serve scores it (chat-score-v1, ResidentEngine.score_tokens).
+        if self.facts.get("token_logprobs") and self.facts.get("query_scoring") and self.facts.get("replay"):
+            self.score = self._score
 
     def info(self):
         info = {"name": self.facts.get("name") or self.facts["implementation"], "configuration": self.configuration,
@@ -297,7 +321,7 @@ class EvalEngine:
     def _result(self, tokens, result):
         out = {"tokens": tokens, "rounds": decode_rounds(tokens, result, self.speculative)}
         out.update({key: result[key] for key in ("accepted", "verify_ms", "draft_ms") if key in result})
-        return out
+        return {**out, **engine_times(result)}
 
     def generate(self, prompt_ids, max_new_tokens, on_tokens):
         tokens, result = self.native.generate(list(prompt_ids), int(max_new_tokens), stop_tokens=[],
@@ -326,9 +350,31 @@ class EvalEngine:
 
     def _generate_plain(self, prompt_ids, max_new_tokens, on_tokens):
         # One target pass per token after the first; the engine's request facts describe drafting, so none apply.
-        tokens, _ = self.native.generate(list(prompt_ids), int(max_new_tokens), stop_tokens=[], sampling=self.sampling,
-                                         plain=True, on_tokens=on_tokens)
-        return {"tokens": tokens, "rounds": max(0, len(tokens) - 1)}
+        tokens, result = self.native.generate(list(prompt_ids), int(max_new_tokens), stop_tokens=[], sampling=self.sampling,
+                                              plain=True, on_tokens=on_tokens)
+        return {"tokens": tokens, "rounds": max(0, len(tokens) - 1), **engine_times(result)}
+
+    def _score(self, prompt_ids, continuation_ids, top_k, prompt_rows=True):
+        """Fixed text as crit serve scores it: every prompt token after the first by query scoring on the engine's
+        "prefill" score path (its default path when it names none), every continuation token from a greedy replay
+        forced to it with log-probabilities, greedy with neutral penalties as Eval's requests are. Rows {"logprob", "top": [[token, logprob], ...top_k]} (crit-eval's
+        ADAPTER.md)."""
+        ids, continuation, rows = list(prompt_ids), list(continuation_ids), {"prompt": [], "continuation": []}
+        if prompt_rows and len(ids) > 1:
+            paths = self.facts.get("score_paths") or []
+            scored = self.native.score(ids, 1, "prefill" if "prefill" in paths else "", top_k=top_k)
+            rows["prompt"] = [{"logprob": float(logprob), "top": [[int(t), float(v)] for t, v in top or []]}
+                              for logprob, top in zip(scored.target, scored.top or [[] for _ in scored.target])]
+        if continuation:
+            found = []
+            tokens, _ = self.native.generate(ids, len(continuation), stop_tokens=[], replay=continuation,
+                                             sampling=self.sampling or None, logprobs=top_k,
+                                             on_tokens=lambda _tokens, values: found.extend(values))
+            if list(tokens) != continuation:
+                raise NativeError("replay emitted other tokens than the continuation")
+            rows["continuation"] = [{"logprob": float(logprob), "top": [[int(t), float(v)] for t, v in top]}
+                                    for logprob, top in found]
+        return rows
 
     def _replay(self, prompt_ids, continuation, on_tokens):
         tokens, result = self.native.generate(list(prompt_ids), len(continuation), stop_tokens=[],
@@ -403,9 +449,9 @@ class ResidentEngine(ResidentChat):
     def score_tokens(self, ids, continuation, top_k, cancelled, prompt_rows):
         started = time.monotonic()
         paths = self.facts.get("score_paths") or []
-        scored = (self.native.score(ids, 1, "prefill" if "prefill" in paths else "", top_k=top_k)
+        # The engine's own arrays as ScoreRows (top_k > 0), which ResidentChat.score packs without a row loop.
+        scored = (self.native.score(ids, 1, "prefill" if "prefill" in paths else "", top_k=top_k, packed=True)
                   if prompt_rows and len(ids) > 1 else None)
-        targets, tops = (scored.target, scored.top) if scored else ([], [])
         prefill_ms = (time.monotonic() - started) * 1000
         rows = []
         if continuation:
@@ -422,9 +468,17 @@ class ResidentEngine(ResidentChat):
             if list(tokens) != list(continuation):
                 raise NativeError("replay emitted other tokens than the continuation")
             decode_ms = result["timing"]["decode_ms"]
+            # The replay prefills the prompt again before its first row: engine time like the score's prefill.
+            prefill_ms += result["timing"].get("prefill_ms") or 0.0
         else:
             decode_ms = None
-        return list(zip(targets, tops)), rows, {"prefill_ms": prefill_ms, "decode_ms": decode_ms}
+        if scored is None:
+            found = []
+        elif isinstance(scored.top, ScoreRows):
+            found = scored.top
+        else:
+            found = list(zip(scored.target, scored.top if top_k else [[] for _ in scored.target]))
+        return found, rows, {"prefill_ms": prefill_ms, "decode_ms": decode_ms}
 
     def close(self):
         if self._owns_native:

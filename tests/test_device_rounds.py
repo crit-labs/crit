@@ -86,6 +86,33 @@ class DrafterCatchUpTests(unittest.TestCase):
                 want = exact.propose_exact(frontier, emitted, features, tokens, draft_tokens)
                 self.assertEqual(got, want)
 
+    def test_widths_chosen_per_round_catch_up_the_widest_width(self):
+        # The previous round emitted up to its own K + 1 tokens, so with K chosen per round the catch-up keeps the
+        # widest K + 1 columns; a round narrower than the one before cannot hold that count in its own K + 1.
+        rng = random.Random(8)
+        widest = 6
+        width = widest + 1
+        fixed, exact = self.m.PositionalDrafter(97), self.m.PositionalDrafter(97)
+        for p in range(6):
+            f, t = rng.randrange(1000), rng.randrange(97)
+            fixed.step(p, f, t); exact.step(p, f, t)
+        frontier, previous, narrower = 6, widest, 0
+        for _ in range(80):
+            emitted = rng.randint(1, previous + 1)
+            frontier += emitted
+            draft_tokens = rng.randint(1, widest)
+            features = [rng.randrange(1000) for _ in range(width)]
+            tokens = [rng.randrange(97) for _ in range(width)]
+            plan = self.m.catch_up_plan(frontier, emitted, width, draft_tokens)
+            self.assertEqual(fixed.propose_fixed(plan, features, tokens, draft_tokens),
+                             exact.propose_exact(frontier, emitted, features, tokens, draft_tokens))
+            if emitted > draft_tokens + 1:
+                narrower += 1
+                with self.assertRaises(ValueError):
+                    self.m.catch_up_plan(frontier, emitted, draft_tokens + 1, draft_tokens)
+            previous = draft_tokens
+        self.assertGreater(narrower, 10)
+
 
 class ColumnInvarianceTests(unittest.TestCase):
     def setUp(self):

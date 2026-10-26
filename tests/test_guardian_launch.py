@@ -11,7 +11,7 @@ import io
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "api", "eval", "kernels", "cli"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("core/python", "api", "../crit-eval", "kernels", "cli"): sys.path.insert(0, str(ROOT / _folder))
 from crit.process.ownership import process_identity
 from crit.process.tree import ProcessTree
 from crit.process import guardian

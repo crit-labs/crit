@@ -84,14 +84,16 @@ Install from the repo root with `python -m pip install -e .`, then run `crit ...
 - **[Inference](inference/README.md):** read relevant techniques and their code; adapt,
   combine or fuse them, preserving correctness and ownership invariants. Nothing is mandatory.
 - **[Kernels](kernels/README.md):** search the Hugging Face Kernel Hub by operation
-  before writing optimized arithmetic, unless the criteria exclude outside sources.
-  Check operations, formats, shapes, OS/device, licenses, dependencies and the three
-  checks Kernels lists.
+  before writing optimized arithmetic. The Hub is part of crit's toolkit: only the run's
+  criteria can exclude it, and only by naming it. A request to build from crit alone (a
+  clean test of crit) keeps the Hub and excludes earlier results: past runs, earlier
+  engines for the model and records outside this run. Check operations, formats, shapes,
+  OS/device, licenses, dependencies and the three checks Kernels lists.
 - **[Models](models/README.md):** only when the run's `weights_policy` is `transformable`:
   quantize the source with `crit models ptq`, measure the served output with
   `crit eval run --url` against the source's Eval data, bind the result with
   `crit models eval`, and keep both records with the candidate.
-- **[Eval](docs/eval/README.md):** measure each candidate with `crit run ... eval`: it
+- **[Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md):** measure each candidate with `crit run ... eval`: it
   scores the data's fixed quality texts on the model's checkpoint once (`crit eval
   reference`), serves the packaged candidate through `crit serve` and runs Eval over the
   chat API, quality through the engine's own score call. Use the same prepared data for
@@ -125,10 +127,18 @@ Work in rounds, one candidate per round:
    until the plan is implemented. Prune a part only after measuring it against its
    floor (Eval's floors per term, the profile's kernels). The proposal gives every lever
    of its plan a fate in `lever_fates`: built, pruned or deferred, with the reason for a
-   pruned or deferred one.
+   pruned or deferred one. A lever still in development when the rest of the plan is ready
+   is deferred, not waited for: build and measure the candidate without it, and let the
+   next plan take it up.
 4. **Evaluate:** `crit eval run --baseline FIRST_RESULT`, `crit eval kernels`, then
-   `crit eval status RESULT --baseline PARENT_RESULT`. A failed gate, an exactness drop
-   or a repeat difference is a bug and the next candidate's first item.
+   `crit eval status RESULT --baseline PARENT_RESULT --kernels KERNELS`. A failed gate, an exactness drop
+   or a repeat difference is a bug and the next candidate's first item. Read every report
+   status gives before planning: each prefill term's measured time against its floor and a
+   round's verify pass against its draft steps (from the trace), the prefill ceilings by
+   prompt activation format with the reachable limit quality evidence names, each case's time
+   to first token split into the engine's own time and the rest, the quality share with its
+   spread over positions, the sampled cases' standard errors, and the device memory left free
+   at the required context.
 5. **Revisit recon** when a result contradicts it, or when the engine switches behaviour
    at a threshold (prefetch, sparse attention, chunk sizes) Eval does not cross: update
    `recon.md` (and the frozen block if needed) and add a run case that crosses it
@@ -178,6 +188,14 @@ Work in rounds, one candidate per round:
   follows its needed flags like every other plan's. Near the limit (both families at 0.85 of
   it or above) a near tie puts only the lower one in p1, and a family marked not needed below
   0.85 answers why the rest of its limit is out of reach (`gaps` entry `limit`, answer `cause`).
+  In runs with plan rules 3 (new runs), a plan whose forecast gains more on p2 than on p1, or
+  lets a p1 KPI fall, says why (`forecast_justification`).
+  Below half its limit a family is marked not needed only on measured rejections: every gap
+  entry names its evidence in the run, and for prefill every prompt activation format Eval
+  prices faster than the engine's own is rejected by a quality measurement outside the quality
+  noise (`gap` `activation:FORMAT`).
+  Recon writes a prefill arithmetic plan beside the drafting plan: each matrix group's prompt
+  activation format and its quality measurement (`--attribute-drift`), before the first candidate.
 - **Plans are checkable.** Each plan forecasts every KPI (low, expected, high), names the
   current strategy's ceiling and the best alternative's, groups levers that only pay
   together, and puts no lever below the noise into a candidate on its own. Work the rules
@@ -217,8 +235,12 @@ Work in rounds, one candidate per round:
   `crit eval probe` measures bandwidth and GEMM rates; status reports each term's floor.
 - **Profile** each candidate with `crit eval kernels`; for the heaviest kernels per
   phase far from their floor, check Kernels before replacing them, and fix kernels
-  that leave SMs idle.
-- **Measure** with [`crit eval`](docs/eval/README.md) plus the run's cases
+  that leave SMs idle. A kernel's share of its phase bounds what replacing it can gain
+  (share x (1 - 1/speedup)): size and order kernel work by that bound, and a lever whose
+  bound is below its KPI's noise follows the plan rule for levers below the noise. A
+  kernel's isolated or mimicked benchmark is a lead: measure the integrated engine
+  (`crit eval kernels`, Eval) before building on it.
+- **Measure** with [`crit eval`](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md) plus the run's cases
   (`stop_record_headroom` with `--baseline` seeds the stop record). Sweep settings on
   the mixed suite, not one prompt.
   Retain adapter, applied configuration, data and results; report skipped
@@ -241,7 +263,14 @@ Work in rounds, one candidate per round:
   Apply agreed criteria without relaxing them or demanding byte-identical output.
   Spend the `quality_budget` (defaults: perplexity ratio 1.05, mean KL 0.05, p99 KL 0.5;
   [Run records](docs/RUN_RECORDS.md#request)) on speed; drift below it is no
-  gain. Speculative output must equal plain greedy only when the run requires
+  gain. Measure a precision change (activation quantization, a lower-precision KV cache
+  or head) against the budget on the model, per group of layers, before building other
+  levers on it: its cost depends on the model and decides how much of it fits. Do it in
+  process during development: `crit eval run --adapter A --only quality` (development
+  evidence, never the gate) with the engine declaring `prompt_activations` and `exact_variants`
+  (one configuration override per matrix group or arithmetic choice switched back to exact),
+  and `--attribute-drift` for each group's share of the budget. A difference inside the
+  quality spread (`budget_spread`) is no measurement. Speculative output must equal plain greedy only when the run requires
   `exactness`. Failed required checks stay exploratory. Select the best qualified
   candidate and say whether it beats the baseline.
 
@@ -255,8 +284,10 @@ requests and switches; accept an optional leading system message; keep request s
 private; honor cancellation and cleanup. Build the adapter on `crit_core.serving.ResidentChat`
 so the chat template, tools, per-request sampling and streaming come from Core, and list every
 sampling field the decoder applies; `crit run package` refuses an adapter without temperature
-or, when the model's template renders tools, without tool calls. Verify with `crit serve`: consecutive requests, streaming, a stop
-string, a tool call and its result, candidate switching and Ctrl+C. Report anything unverified.
+or, when the model's template renders tools, without tool calls. Before sealing, serve the package with
+`crit run ... serve --candidate ID` (crit serve under a check attempt) and verify consecutive requests, streaming,
+a stop string, a tool call and its result and Ctrl+C; after sealing, verify candidate switching with `crit serve`.
+Report anything unverified.
 
 ## 5. Critique and hand off
 

@@ -2,7 +2,7 @@
 // unchanged greedy accept kernel and the history commit equal a host round over Core's laws and draws (the
 // target's own draw per column, drafts kept while they match, stops and output budgets), so the round emits what
 // plain sampling would; a zero-width round equals one ordinary draw, and positions and counts follow the emitted
-// and truncated counts.
+// and truncated counts (control[commit_tokens]), taking nothing for a seed whose token is already in the history.
 #include "greedy_accept.h"
 #include "sampling.h"
 
@@ -94,10 +94,10 @@ int main() {
             for(int r = 0; r < R; ++r) {
                 for(int i = 0; i < 2 + r % 3; ++i) outputs[std::size_t(r)].push_back(cc::Token((r * 7 + i * 31) % V));
                 auto& q = reqs[std::size_t(r)];
-                q.temperature = float(rules.temperature);
-                q.top_p = float(rules.top_p);
+                q.temperature = rules.temperature;
+                q.top_p = rules.top_p;
                 q.top_k = std::int32_t(rules.top_k);
-                q.presence = float(rules.presence_penalty);
+                q.presence = rules.presence_penalty;
                 q.seed = 1000 * std::uint64_t(trial) + std::uint64_t(r);
                 q.position = outputs[std::size_t(r)].size();
                 q.counts = counts_d.p + std::size_t(r) * V;
@@ -119,15 +119,31 @@ int main() {
             if(trial == 1) drafts[0] = stop;   // an accepted stop ends the round
             std::vector<std::int32_t> control(std::size_t(R) * dr::control::fields, 0);
             std::vector<std::uint32_t> budget(static_cast<std::size_t>(R));
-            for(int r = 0; r < R; ++r) {
-                budget[std::size_t(r)] = 1 + std::uint32_t(r % (K + 1));
-                control[std::size_t(r) * dr::control::fields + dr::control::frontier] = 100 + r;
-                control[std::size_t(r) * dr::control::fields + dr::control::last_token] = outputs[std::size_t(r)].back();
-                control[std::size_t(r) * dr::control::fields + dr::control::output_budget] = std::int32_t(budget[std::size_t(r)]);
-            }
+            for(int r = 0; r < R; ++r) budget[std::size_t(r)] = 1 + std::uint32_t(r % (K + 1));
             Device<float> logits(rows), scratch(ts::scratch_floats(V, R * (K + 1)));
             Device<std::int32_t> drafts_d(drafts), predictions(std::size_t(R) * (K + 1)), control_d(control),
                 result(std::size_t(R) * dr::result_width(K)), stops(std::vector<std::int32_t>{stop});
+            // Each row starts as a prefill's one-column seed at frontier 100 + r whose token, the last output, the
+            // history already holds: the round's first history commit takes in nothing (n_emitted is 1 there, for a
+            // drafter's catch-up, so committing n_emitted would count the token twice).
+            for(int r = 0; r < R; ++r) {
+                const auto& o = outputs[std::size_t(r)];
+                ok(dr::enqueue_seed(control_d.p, result.p, K, std::uint32_t(r), std::uint32_t(100 + r), o.back(), o[o.size() - 2], nullptr),
+                   "seed");
+            }
+            Device<std::int32_t> allowance(std::vector<std::int32_t>(budget.begin(), budget.end()));
+            ok(dr::enqueue_set_budget(control_d.p, allowance.p, R, nullptr), "allowance");
+            ok(ts::enqueue_commit(request.p, R, V, result.p + 1, dr::result_width(K), control_d.p + dr::control::commit_tokens,
+                                  dr::control::fields, nullptr), "seeded commit");
+            {
+                const auto seeded = request.get();
+                const auto seeded_control = control_d.get();
+                for(int r = 0; r < R; ++r)
+                    require(seeded[std::size_t(r)].position == reqs[std::size_t(r)].position &&
+                            seeded_control[std::size_t(r) * dr::control::fields + dr::control::n_emitted] == 1,
+                            "a seeded round's history commit took in the seed's token again");
+                require(counts_d.get() == counts, "a seeded round's history commit counted the seed's token again");
+            }
             ts::Verify v;
             v.target.logits = logits.p;
             v.target.stride = V;
@@ -151,7 +167,7 @@ int main() {
             ok(dr::enqueue_greedy_accept(a, nullptr), "accept");
             // Core trims one request at a stop it alone knew: truncate before the history commit.
             ok(dr::enqueue_truncate(control_d.p, result.p, K, 0, 1, nullptr), "truncate");
-            ok(ts::enqueue_commit(request.p, R, V, result.p + 1, dr::result_width(K), control_d.p + dr::control::n_emitted,
+            ok(ts::enqueue_commit(request.p, R, V, result.p + 1, dr::result_width(K), control_d.p + dr::control::commit_tokens,
                                   dr::control::fields, nullptr), "commit");
             const auto res = result.get();
             const auto ctl = control_d.get();

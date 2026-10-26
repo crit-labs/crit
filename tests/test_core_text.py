@@ -15,7 +15,7 @@ import tokenizers
 import tokenizers.decoders
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "api", "eval", "kernels", "cli"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("core/python", "api", "../crit-eval", "kernels", "cli"): sys.path.insert(0, str(ROOT / _folder))
 
 import core_text_fixtures as fx  # noqa: E402
 from crit_core.files import CallableFiles, DirectoryFiles, MappingFiles  # noqa: E402

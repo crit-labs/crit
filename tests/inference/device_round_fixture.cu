@@ -48,6 +48,33 @@ __global__ void prefill(HashTarget t, const std::int32_t* tokens, std::uint32_t 
     for(std::uint32_t i = 0; i < count; ++i) { t.history[i] = tokens[i]; s = step_state(s, tokens[i]); }
     *t.state = s;
 }
+
+__global__ void forced(const std::int32_t* control, const std::int32_t* continuation, std::int32_t base, std::int32_t length,
+                       std::int32_t* predictions, std::uint32_t k) {
+    const auto outputs = control[control::frontier] - base; // committed outputs before this round
+    for(std::uint32_t c = 0; c <= k; ++c) {
+        const auto at = outputs + std::int32_t(c);
+        predictions[c] = at >= 0 && at < length ? continuation[at] : -1;
+    }
+}
+
+__global__ void logprobs(const std::int32_t* predictions, std::uint32_t k, float* logprob, std::int32_t* top_ids,
+                         float* top_logprobs, std::uint32_t top, std::uint32_t vocabulary) {
+    for(std::uint32_t c = 0; c <= k; ++c) {
+        const auto p = predictions[c];
+        logprob[c] = logprob_of(p);
+        for(std::uint32_t i = 0; i < top; ++i) {
+            top_ids[c * top + i] = std::int32_t((std::uint32_t(p) + i) % vocabulary);
+            top_logprobs[c * top + i] = logprob_of(p) - float(i);
+        }
+    }
+}
+
+__global__ void take(const std::int32_t* count, const std::int32_t* tokens, std::int32_t* log, std::int32_t* log_count) {
+    const auto n = *count > 0 ? *count : 0;
+    for(std::int32_t i = 0; i < n; ++i) log[*log_count + i] = tokens[i];
+    *log_count += n;
+}
 }
 
 cudaError_t enqueue_draft(const HashTarget& t, const std::int32_t* control, std::int32_t* drafts, std::uint32_t k, cudaStream_t s) {
@@ -65,6 +92,21 @@ cudaError_t enqueue_commit_state(const HashTarget& t, const std::int32_t* contro
 }
 cudaError_t enqueue_prefill(const HashTarget& t, const std::int32_t* tokens, std::uint32_t count, cudaStream_t s) {
     prefill<<<1, 1, 0, s>>>(t, tokens, count);
+    return cudaPeekAtLastError();
+}
+cudaError_t enqueue_forced(const std::int32_t* control, const std::int32_t* continuation, std::int32_t base, std::int32_t length,
+                           std::int32_t* predictions, std::uint32_t k, cudaStream_t s) {
+    forced<<<1, 1, 0, s>>>(control, continuation, base, length, predictions, k);
+    return cudaPeekAtLastError();
+}
+cudaError_t enqueue_logprobs(const std::int32_t* predictions, std::uint32_t k, float* logprob, std::int32_t* top_ids,
+                             float* top_logprobs, std::uint32_t top, std::uint32_t vocabulary, cudaStream_t s) {
+    logprobs<<<1, 1, 0, s>>>(predictions, k, logprob, top_ids, top_logprobs, top, vocabulary);
+    return cudaPeekAtLastError();
+}
+cudaError_t enqueue_take(const std::int32_t* count, const std::int32_t* tokens, std::int32_t* log, std::int32_t* log_count,
+                         cudaStream_t s) {
+    take<<<1, 1, 0, s>>>(count, tokens, log, log_count);
     return cudaPeekAtLastError();
 }
 }

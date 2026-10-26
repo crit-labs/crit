@@ -19,37 +19,190 @@ __device__ __forceinline__ float warp_sum(float x) {
     return __shfl_sync(0xffffffffu, x, 0);
 }
 
+// The 8 dot products of a gated-delta column (k . S and q . S for a warp's 4 value columns) reduced together and
+// broadcast, with the bits of warp_sum on each: every sum is formed from the same pairs as warp_sum's tree (lane distance
+// 16, then 8, 4, 2, 1; IEEE addition is commutative, so the operand order inside a pair does not matter). Lanes exchange
+// halves of their values at distances 16, 8 and 4 (a reduce-scatter: lanes 4 i .. 4 i + 3 end with value i), the
+// partials are summed at distances 2 and 1, and value i is broadcast from lane 4 i: 17 shuffles instead of 8 x 6.
+__device__ __forceinline__ void warp_sum8(float (&x)[8]) {
+    const int lane = threadIdx.x & 31;
+    float a[4], b[2], c;
+    {   // distance 16: a lane keeps values 0..3 (lane bit 4 clear) or 4..7 (set) and sends the others
+        const bool hi = lane & 16;
+#pragma unroll
+        for(int i = 0; i < 4; ++i) a[i] = (hi ? x[i + 4] : x[i]) + __shfl_xor_sync(0xffffffffu, hi ? x[i] : x[i + 4], 16);
+    }
+    {   // distance 8
+        const bool hi = lane & 8;
+#pragma unroll
+        for(int i = 0; i < 2; ++i) b[i] = (hi ? a[i + 2] : a[i]) + __shfl_xor_sync(0xffffffffu, hi ? a[i] : a[i + 2], 8);
+    }
+    {   // distance 4
+        const bool hi = lane & 4;
+        c = (hi ? b[1] : b[0]) + __shfl_xor_sync(0xffffffffu, hi ? b[0] : b[1], 4);
+    }
+    c += __shfl_xor_sync(0xffffffffu, c, 2);
+    c += __shfl_xor_sync(0xffffffffu, c, 1);
+#pragma unroll
+    for(int i = 0; i < 8; ++i) x[i] = __shfl_sync(0xffffffffu, c, 4 * i);
+}
+
+// A column scan's per-token decay e^x: FP64 exp rounded once to FP32, which is the correctly rounded value unless e^x
+// lies within an FP64 ulp of a rounding boundary. expf is not correctly rounded and errs upward more often than
+// downward, so a decay near 1 applied token after token drifts the state. The scans compute each token's decay once
+// per block (decay_rows) and every column of every call uses the same value.
+__device__ __forceinline__ float decay_of(double x) { return __double2float_rn(exp(x)); }
+
+// The decays of tokens t0 .. t0 + kThreads - 1 (up to rows), one per thread: x_of(t) gives the exponent.
+template <class X>
+__device__ __forceinline__ void decay_rows(float (&decay)[kThreads], int t0, int rows, X x_of) {
+    if(t0) __syncthreads();   // the previous tokens' readers are done
+    if(t0 + int(threadIdx.x) < rows) decay[threadIdx.x] = decay_of(x_of(t0 + int(threadIdx.x)));
+    __syncthreads();
+}
+
 // ---------------------------------------------------------------------------------------------- convolution
-__global__ void conv_kernel(Conv c, int rows) {
+// The kernels are instantiated per width, so the window lives in registers (a runtime width indexes it dynamically,
+// which puts it in local memory).
+constexpr int kConvThreads = 128, kConvBatch = 16;
+// The prompt convolution runs a thread per (channel, kConvSegment rows) when out does not alias x. A segment rereads
+// the width - 1 inputs before it, (width - 1) / kConvSegment extra reads, for rows / kConvSegment times the parallelism
+// of a thread per channel; the outputs are the same bits either way.
+constexpr int kConvSegment = 32;
+static_assert(kConvSegment >= kMaxConv, "a segment's window comes from x or from state_in, never both");
+
+// One output (bias, the window oldest first, then the new input) and the window shift.
+template <int W>
+__device__ __forceinline__ float conv_value(const float (&win)[W - 1], const float (&w)[W], float b, float xt, bool act) {
+    float acc = b;
+#pragma unroll
+    for(int i = 0; i < W - 1; ++i) acc = fmaf(w[i], win[i], acc);
+    acc = fmaf(w[W - 1], xt, acc);
+    return act ? silu(acc) : acc;
+}
+template <int W>
+__device__ __forceinline__ void conv_shift(float (&win)[W - 1], float xt) {
+#pragma unroll
+    for(int i = 0; i < W - 2; ++i) win[i] = win[i + 1];
+    win[W - 2] = xt;
+}
+template <int W>
+__device__ __forceinline__ void conv_weights(const Conv& c, int ch, float (&w)[W], float& b) {
+#pragma unroll
+    for(int i = 0; i < W; ++i) w[i] = c.weight[std::size_t(ch) * W + i];
+    b = c.bias ? c.bias[ch] : 0.f;
+}
+template <int W>
+__device__ __forceinline__ void conv_store(float* dst, const float (&win)[W - 1]) {
+#pragma unroll
+    for(int i = 0; i < W - 1; ++i) dst[i] = win[i];
+}
+
+// Thread per channel walking the rows (decode, verify, in place). kConvBatch rows are loaded before their outputs are
+// stored, so the loads overlap; each row is read before its output can overwrite it, so out may alias x.
+template <int W>
+__global__ void __launch_bounds__(kConvThreads) conv_kernel(Conv c, int rows) {
     const int ch = blockIdx.x * blockDim.x + threadIdx.x;
     if(ch >= c.channels) return;
-    const int W = c.width;
-    float win[kMaxConv - 1], w[kMaxConv];
+    float win[W - 1], w[W], b;
 #pragma unroll
-    for(int i = 0; i < kMaxConv - 1; ++i) win[i] = i < W - 1 ? c.state[std::size_t(ch) * (W - 1) + i] : 0.f;
+    for(int i = 0; i < W - 1; ++i) win[i] = c.state_in[std::size_t(ch) * (W - 1) + i];
+    conv_weights<W>(c, ch, w, b);
+    for(int t0 = 0; t0 < rows; t0 += kConvBatch) {
+        float xb[kConvBatch];
 #pragma unroll
-    for(int i = 0; i < kMaxConv; ++i) w[i] = i < W ? c.weight[std::size_t(ch) * W + i] : 0.f;
-    const float b = c.bias ? c.bias[ch] : 0.f;
+        for(int i = 0; i < kConvBatch; ++i) xb[i] = t0 + i < rows ? c.x[std::size_t(t0 + i) * c.x_stride + ch] : 0.f;
+#pragma unroll
+        for(int i = 0; i < kConvBatch; ++i) {
+            const int t = t0 + i;
+            if(t >= rows) break;
+            c.out[std::size_t(t) * c.out_stride + ch] = conv_value<W>(win, w, b, xb[i], c.silu);
+            conv_shift<W>(win, xb[i]);
+            if(c.checkpoints) conv_store<W>(c.checkpoints + (std::size_t(t) * c.channels + ch) * (W - 1), win);
+        }
+    }
+    conv_store<W>(c.state_out + std::size_t(ch) * (W - 1), win);
+}
+
+// Prompt convolution out of place, thread per (channel, segment of kConvSegment rows): a segment starts from the
+// width - 1 inputs before it (state_in for the first, x for the others) and computes each output with conv_value, so
+// every output, checkpoint and the final window are the row-sequential kernel's bits. Only segment 0 reads state_in and
+// it writes state_out (the last width - 1 rows of x: rows > kConvSegment >= width) after that read, so the two may alias.
+template <int W>
+__global__ void __launch_bounds__(kConvThreads) conv_segments_kernel(Conv c, int rows) {
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x, t0 = blockIdx.y * kConvSegment;
+    if(ch >= c.channels) return;
+    const int n = min(kConvSegment, rows - t0);
+    float win[W - 1], w[W], b;
+#pragma unroll
+    for(int i = 0; i < W - 1; ++i)   // inputs t0 - (W - 1) .. t0 - 1, oldest first
+        win[i] = t0 ? c.x[std::size_t(t0 - (W - 1) + i) * c.x_stride + ch] : c.state_in[std::size_t(ch) * (W - 1) + i];
+    conv_weights<W>(c, ch, w, b);
+    float xb[kConvSegment];
+#pragma unroll
+    for(int i = 0; i < kConvSegment; ++i) xb[i] = i < n ? c.x[std::size_t(t0 + i) * c.x_stride + ch] : 0.f;
+#pragma unroll
+    for(int i = 0; i < kConvSegment; ++i) {
+        if(i >= n) break;
+        const int t = t0 + i;
+        c.out[std::size_t(t) * c.out_stride + ch] = conv_value<W>(win, w, b, xb[i], c.silu);
+        conv_shift<W>(win, xb[i]);
+        if(c.checkpoints) conv_store<W>(c.checkpoints + (std::size_t(t) * c.channels + ch) * (W - 1), win);
+    }
+    if(blockIdx.y == 0) {
+        float last[W - 1];
+#pragma unroll
+        for(int i = 0; i < W - 1; ++i) last[i] = c.x[std::size_t(rows - (W - 1) + i) * c.x_stride + ch];
+        conv_store<W>(c.state_out + std::size_t(ch) * (W - 1), last);
+    }
+}
+
+// Deferred commit of the window: a block reads and consumes its pending count (only this block touches it), shifts the
+// stashed inputs of the accepted prefix into its channels' windows and writes them, then convolves the new rows from that
+// window without writing it, stashing the rows. Each thread owns its channel's window and stash entries.
+template <int W>
+__global__ void __launch_bounds__(kConvThreads) conv_deferred_kernel(Conv c, ConvDeferred d, int rows) {
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ int pending;
+    if(threadIdx.x == 0) pending = min(max(d.pending[blockIdx.x], 0), d.capacity);
+    __syncthreads();
+    if(threadIdx.x == 0) d.pending[blockIdx.x] = 0;
+    if(ch >= c.channels) return;
+    const int n = pending;
+    float win[W - 1];
+#pragma unroll
+    for(int i = 0; i < W - 1; ++i) win[i] = d.window[std::size_t(ch) * (W - 1) + i];
+    for(int t = 0; t < n; ++t) conv_shift<W>(win, d.rows_stash[std::size_t(t) * c.channels + ch]);
+    if(n) conv_store<W>(d.window + std::size_t(ch) * (W - 1), win);
+    if(!rows) return;
+    float w[W], b;
+    conv_weights<W>(c, ch, w, b);
     for(int t = 0; t < rows; ++t) {
         const float xt = c.x[std::size_t(t) * c.x_stride + ch];
-        float acc = b;
-#pragma unroll
-        for(int i = 0; i < kMaxConv - 1; ++i)
-            if(i < W - 1) acc = fmaf(w[i], win[i], acc);
-#pragma unroll
-        for(int i = 0; i < kMaxConv; ++i)
-            if(i == W - 1) acc = fmaf(w[i], xt, acc);
-        c.out[std::size_t(t) * c.out_stride + ch] = c.silu ? silu(acc) : acc;
-#pragma unroll
-        for(int i = 0; i < kMaxConv - 2; ++i)
-            if(i < W - 2) win[i] = win[i + 1];
-#pragma unroll
-        for(int i = 0; i < kMaxConv - 1; ++i)
-            if(i == W - 2) win[i] = xt;
-        if(c.checkpoints)
-            for(int i = 0; i < W - 1; ++i) c.checkpoints[(std::size_t(t) * c.channels + ch) * (W - 1) + i] = win[i];
+        c.out[std::size_t(t) * c.out_stride + ch] = conv_value<W>(win, w, b, xt, c.silu);
+        conv_shift<W>(win, xt);
+        d.rows_stash[std::size_t(t) * c.channels + ch] = xt;
     }
-    for(int i = 0; i < W - 1; ++i) c.state[std::size_t(ch) * (W - 1) + i] = win[i];
+}
+
+// kind 0: row by row, 1: prompt segments, 2: deferred commit (d non-null).
+template <int W>
+void conv_launch(const Conv& c, int rows, int kind, const ConvDeferred* d, cudaStream_t stream) {
+    const int blocks = (c.channels + kConvThreads - 1) / kConvThreads;
+    if(kind == 2) conv_deferred_kernel<W><<<blocks, kConvThreads, 0, stream>>>(c, *d, rows);
+    else if(kind == 1) conv_segments_kernel<W><<<dim3(blocks, (rows + kConvSegment - 1) / kConvSegment), kConvThreads, 0, stream>>>(c, rows);
+    else conv_kernel<W><<<blocks, kConvThreads, 0, stream>>>(c, rows);
+}
+void conv_dispatch(const Conv& c, int rows, int kind, const ConvDeferred* d, cudaStream_t stream) {
+    switch(c.width) {
+    case 2: conv_launch<2>(c, rows, kind, d, stream); break;
+    case 3: conv_launch<3>(c, rows, kind, d, stream); break;
+    case 4: conv_launch<4>(c, rows, kind, d, stream); break;
+    case 5: conv_launch<5>(c, rows, kind, d, stream); break;
+    case 6: conv_launch<6>(c, rows, kind, d, stream); break;
+    case 7: conv_launch<7>(c, rows, kind, d, stream); break;
+    default: conv_launch<8>(c, rows, kind, d, stream); break;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------- gated delta
@@ -249,6 +402,44 @@ __device__ __forceinline__ void store4(float* p, bool wide, const float (&x)[4])
 }
 __device__ __forceinline__ bool aligned16(const void* p) { return (reinterpret_cast<std::uintptr_t>(p) & 15u) == 0; }
 
+// The one update expression of the gated-delta recurrence: decode, verify and the deferred replay all apply it.
+__device__ __forceinline__ float delta_update(float s, float e, float k, float delta) { return fmaf(k, delta, s * e); }
+
+// One token of the column scan for a lane's R key rows and its warp's 4 value columns j0 .. j0 + 3: the dot products
+// reduced once and broadcast, delta, the output and the update. k receives the lane's keys as the update used them.
+template <int DK>
+__device__ __forceinline__ void delta_step(float (&S)[DK / 32][4], const DeltaShape& d, const DeltaInputs& in, int t, int h, int kh,
+                                           int j0, int lane, float e, float (&k)[DK / 32], float (&delta)[4], float (&o)[4]) {
+    constexpr int R = DK / 32;
+    const float* kr = in.k + std::size_t(t) * in.qk_stride + std::size_t(kh) * DK + lane * R;
+    const float* qr = in.q + std::size_t(t) * in.qk_stride + std::size_t(kh) * DK + lane * R;
+    const float* vr = in.v + std::size_t(t) * in.v_stride + std::size_t(h) * d.dv + j0;
+    const float b = in.beta[std::size_t(t) * in.gate_stride + h];
+    float q[R], qk = 0.f, x[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};   // k . S, then q . S
+#pragma unroll
+    for(int r = 0; r < R; ++r) {
+        k[r] = kr[r];
+        q[r] = qr[r] * in.scale;
+        qk = fmaf(q[r], k[r], qk);
+#pragma unroll
+        for(int j = 0; j < 4; ++j) {
+            x[j] = fmaf(k[r], S[r][j], x[j]);
+            x[4 + j] = fmaf(q[r], S[r][j], x[4 + j]);
+        }
+    }
+    qk = warp_sum(qk);
+    warp_sum8(x);
+#pragma unroll
+    for(int j = 0; j < 4; ++j) {
+        delta[j] = b * (vr[j] - e * x[j]);
+        o[j] = fmaf(e, x[4 + j], qk * delta[j]);
+    }
+#pragma unroll
+    for(int r = 0; r < R; ++r)
+#pragma unroll
+        for(int j = 0; j < 4; ++j) S[r][j] = delta_update(S[r][j], e, k[r], delta[j]);
+}
+
 // Column scan, block per (value head, 32 value columns): warp w owns 4 value columns, lane l key rows l * R .. + R - 1.
 template <int DK>
 __global__ void __launch_bounds__(kThreads) delta_columns_kernel(DeltaShape d, DeltaInputs in, int rows, const float* state_in,
@@ -259,51 +450,111 @@ __global__ void __launch_bounds__(kThreads) delta_columns_kernel(DeltaShape d, D
     const int j0 = blockIdx.y * 32 + warp * 4, kh = h / (d.v_heads / d.k_heads);
     const std::size_t head = std::size_t(h) * DK * d.dv;
     float S[R][4];
+    __shared__ float decay[kThreads];
     const bool wide_in = aligned16(state_in), wide_out = aligned16(state_out), wide_ck = checkpoints && aligned16(checkpoints);
 #pragma unroll
     for(int r = 0; r < R; ++r) load4(state_in + head + std::size_t(lane * R + r) * d.dv + j0, wide_in, S[r]);
-    for(int t = 0; t < rows; ++t) {
-        const float* kr = in.k + std::size_t(t) * in.qk_stride + std::size_t(kh) * DK + lane * R;
-        const float* qr = in.q + std::size_t(t) * in.qk_stride + std::size_t(kh) * DK + lane * R;
-        const float* vr = in.v + std::size_t(t) * in.v_stride + std::size_t(h) * d.dv + j0;
-        const float e = expf(in.log_decay[std::size_t(t) * in.gate_stride + h]);
-        const float b = in.beta[std::size_t(t) * in.gate_stride + h];
-        float k[R], q[R], qk = 0.f, kS[4] = {0.f, 0.f, 0.f, 0.f}, qS[4] = {0.f, 0.f, 0.f, 0.f};
+    for(int t0 = 0; t0 < rows; t0 += kThreads) {
+        decay_rows(decay, t0, rows, [&](int u) { return double(in.log_decay[std::size_t(u) * in.gate_stride + h]); });
+        for(int t = t0; t < min(rows, t0 + kThreads); ++t) {
+            float k[R], delta[4], o[4];
+            delta_step<DK>(S, d, in, t, h, kh, j0, lane, decay[t - t0], k, delta, o);
+            if(lane == 0)
 #pragma unroll
-        for(int r = 0; r < R; ++r) {
-            k[r] = kr[r];
-            q[r] = qr[r] * in.scale;
-            qk = fmaf(q[r], k[r], qk);
+                for(int j = 0; j < 4; ++j) out[std::size_t(t) * out_stride + std::size_t(h) * d.dv + j0 + j] = o[j];
+            if(checkpoints) {
+                float* ck = checkpoints + std::size_t(t) * d.v_heads * DK * d.dv + head;
 #pragma unroll
-            for(int j = 0; j < 4; ++j) {
-                kS[j] = fmaf(k[r], S[r][j], kS[j]);
-                qS[j] = fmaf(q[r], S[r][j], qS[j]);
+                for(int r = 0; r < R; ++r) store4(ck + std::size_t(lane * R + r) * d.dv + j0, wide_ck, S[r]);
             }
-        }
-        qk = warp_sum(qk);
-        float delta[4], o[4];
-#pragma unroll
-        for(int j = 0; j < 4; ++j) {
-            kS[j] = warp_sum(kS[j]);
-            qS[j] = warp_sum(qS[j]);
-            delta[j] = b * (vr[j] - e * kS[j]);
-            o[j] = fmaf(e, qS[j], qk * delta[j]);
-        }
-#pragma unroll
-        for(int r = 0; r < R; ++r)
-#pragma unroll
-            for(int j = 0; j < 4; ++j) S[r][j] = fmaf(k[r], delta[j], S[r][j] * e);   // the one update expression
-        if(lane == 0)
-#pragma unroll
-            for(int j = 0; j < 4; ++j) out[std::size_t(t) * out_stride + std::size_t(h) * d.dv + j0 + j] = o[j];
-        if(checkpoints) {
-            float* ck = checkpoints + std::size_t(t) * d.v_heads * DK * d.dv + head;
-#pragma unroll
-            for(int r = 0; r < R; ++r) store4(ck + std::size_t(lane * R + r) * d.dv + j0, wide_ck, S[r]);
         }
     }
 #pragma unroll
     for(int r = 0; r < R; ++r) store4(state_out + head + std::size_t(lane * R + r) * d.dv + j0, wide_out, S[r]);
+}
+
+// One half of the double-buffered deferred stash: key [capacity][k_heads][dk] (the key the update used), decay
+// [capacity][v_heads] (e^l) and delta [capacity][v_heads][dv].
+struct StashHalf { float* key; float* decay; float* delta; };
+__host__ __device__ inline std::size_t stash_half_floats(const DeltaShape& d, int capacity) {
+    return std::size_t(capacity) * (std::size_t(d.k_heads) * d.dk + d.v_heads + std::size_t(d.v_heads) * d.dv);
+}
+__device__ __forceinline__ StashHalf stash_half(const DeltaShape& d, const DeltaDeferred& dd, int parity) {
+    StashHalf s;
+    s.key = dd.stash + std::size_t(parity) * stash_half_floats(d, dd.capacity);
+    s.decay = s.key + std::size_t(dd.capacity) * d.k_heads * d.dk;
+    s.delta = s.decay + std::size_t(dd.capacity) * d.v_heads;
+    return s;
+}
+
+// Deferred commit (rows >= 1: verify; rows == 0: flush), block per (value head, 32 value columns) as the column scan.
+// The block's pending count and stash parity are control[slot] and control[slots + slot]; only this block touches them
+// here, so consuming the count needs no second launch. The replay applies delta_update to the stashed operands of the
+// accepted steps, which are the operands the verify used, so the state it reaches is the verify's running state.
+template <int DK>
+__global__ void __launch_bounds__(kThreads) delta_deferred_kernel(DeltaShape d, DeltaInputs in, int rows, float* state,
+                                                                  DeltaDeferred dd, float* out, std::size_t out_stride) {
+    constexpr int R = DK / 32;
+    const int h = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int j0 = blockIdx.y * 32 + warp * 4, ratio = d.v_heads / d.k_heads, kh = h / ratio;
+    const int slots = gridDim.x * gridDim.y, slot = h * gridDim.y + blockIdx.y;
+    __shared__ int pending, parity;
+    __shared__ float decay[kThreads];
+    if(threadIdx.x == 0) {
+        pending = min(max(dd.control[slot], 0), dd.capacity);
+        parity = dd.control[slots + slot] & 1;
+    }
+    __syncthreads();
+    const int n = pending, p = parity;
+    if(threadIdx.x == 0) {   // consumed; a verify writes the other stash half and flips the parity
+        dd.control[slot] = 0;
+        if(rows) dd.control[slots + slot] = p ^ 1;
+    }
+    if(!n && !rows) return;
+    const std::size_t head = std::size_t(h) * DK * d.dv;
+    const bool wide = aligned16(state);
+    float S[R][4];
+#pragma unroll
+    for(int r = 0; r < R; ++r) load4(state + head + std::size_t(lane * R + r) * d.dv + j0, wide, S[r]);
+    const StashHalf old = stash_half(d, dd, p), next = stash_half(d, dd, p ^ 1);
+    for(int t = 0; t < n; ++t) {   // the previous verify's accepted prefix
+        const float e = old.decay[std::size_t(t) * d.v_heads + h];
+        const float* kr = old.key + (std::size_t(t) * d.k_heads + kh) * DK + lane * R;
+        const float* dr = old.delta + (std::size_t(t) * d.v_heads + h) * d.dv + j0;
+        float k[R], delta[4];
+#pragma unroll
+        for(int r = 0; r < R; ++r) k[r] = kr[r];
+#pragma unroll
+        for(int j = 0; j < 4; ++j) delta[j] = dr[j];
+#pragma unroll
+        for(int r = 0; r < R; ++r)
+#pragma unroll
+            for(int j = 0; j < 4; ++j) S[r][j] = delta_update(S[r][j], e, k[r], delta[j]);
+    }
+    if(n)
+#pragma unroll
+        for(int r = 0; r < R; ++r) store4(state + head + std::size_t(lane * R + r) * d.dv + j0, wide, S[r]);
+    // The new rows from the state in registers; the stash's keys are written once per key head, its decays once per
+    // value head and its deltas by each warp's lane 0.
+    const bool writes_key = blockIdx.y == 0 && h % ratio == 0 && warp == 0, writes_decay = blockIdx.y == 0 && threadIdx.x == 0;
+    for(int t0 = 0; t0 < rows; t0 += kThreads) {
+        decay_rows(decay, t0, rows, [&](int u) { return double(in.log_decay[std::size_t(u) * in.gate_stride + h]); });
+        for(int t = t0; t < min(rows, t0 + kThreads); ++t) {
+            float k[R], delta[4], o[4];
+            const float e = decay[t - t0];
+            delta_step<DK>(S, d, in, t, h, kh, j0, lane, e, k, delta, o);
+            if(lane == 0)
+#pragma unroll
+                for(int j = 0; j < 4; ++j) {
+                    out[std::size_t(t) * out_stride + std::size_t(h) * d.dv + j0 + j] = o[j];
+                    next.delta[(std::size_t(t) * d.v_heads + h) * d.dv + j0 + j] = delta[j];
+                }
+            if(writes_key)
+#pragma unroll
+                for(int r = 0; r < R; ++r) next.key[(std::size_t(t) * d.k_heads + kh) * DK + lane * R + r] = k[r];
+            if(writes_decay) next.decay[std::size_t(t) * d.v_heads + h] = e;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------- Mamba-2
@@ -439,24 +690,43 @@ __global__ void __launch_bounds__(kThreads) ssd_columns_kernel(SsdShape d, SsdIn
     const std::size_t row = (std::size_t(h) * d.head_dim + p) * N;
     const float A = in.A[h], Dh = in.D ? in.D[h] : 0.f;
     float H[R];
+    __shared__ float decay[kThreads];   // e^{dt A}, the product dt A exact in FP64
 #pragma unroll
     for(int r = 0; r < R; ++r) H[r] = state_in[row + lane * R + r];
-    for(int t = 0; t < rows; ++t) {
-        const float x = in.x[std::size_t(t) * in.x_stride + std::size_t(h) * d.head_dim + p];
-        const float dt = in.dt[std::size_t(t) * in.dt_stride + h], dA = expf(dt * A), dx = dt * x;
+    // A token's inputs are loaded one token ahead, so that they are in flight while the previous token updates the state
+    // (and the first while the decays are computed).
+    struct Token { float x, dt, B[R], C[R]; };
+    auto load = [&](int t, Token& u) {
+        u.x = in.x[std::size_t(t) * in.x_stride + std::size_t(h) * d.head_dim + p];
+        u.dt = in.dt[std::size_t(t) * in.dt_stride + h];
         const float* Br = in.B + std::size_t(t) * in.bc_stride + std::size_t(g) * N + lane * R;
         const float* Cr = in.C + std::size_t(t) * in.bc_stride + std::size_t(g) * N + lane * R;
-        float y = 0.f;
 #pragma unroll
         for(int r = 0; r < R; ++r) {
-            H[r] = fmaf(dx, Br[r], H[r] * dA);   // the one update expression
-            y = fmaf(H[r], Cr[r], y);
+            u.B[r] = Br[r];
+            u.C[r] = Cr[r];
         }
-        y = warp_sum(y);
-        if(lane == 0) out[std::size_t(t) * out_stride + std::size_t(h) * d.head_dim + p] = fmaf(Dh, x, y);
-        if(checkpoints)
+    };
+    Token next;
+    load(0, next);
+    for(int t0 = 0; t0 < rows; t0 += kThreads) {
+        decay_rows(decay, t0, rows, [&](int t) { return double(in.dt[std::size_t(t) * in.dt_stride + h]) * A; });
+        for(int t = t0; t < min(rows, t0 + kThreads); ++t) {
+            const Token u = next;
+            if(t + 1 < rows) load(t + 1, next);
+            const float dA = decay[t - t0], dx = u.dt * u.x;
+            float y = 0.f;
 #pragma unroll
-            for(int r = 0; r < R; ++r) checkpoints[std::size_t(t) * d.heads * d.head_dim * N + row + lane * R + r] = H[r];
+            for(int r = 0; r < R; ++r) {
+                H[r] = fmaf(dx, u.B[r], H[r] * dA);   // the one update expression
+                y = fmaf(H[r], u.C[r], y);
+            }
+            y = warp_sum(y);
+            if(lane == 0) out[std::size_t(t) * out_stride + std::size_t(h) * d.head_dim + p] = fmaf(Dh, u.x, y);
+            if(checkpoints)
+#pragma unroll
+                for(int r = 0; r < R; ++r) checkpoints[std::size_t(t) * d.heads * d.head_dim * N + row + lane * R + r] = H[r];
+        }
     }
 #pragma unroll
     for(int r = 0; r < R; ++r) state_out[row + lane * R + r] = H[r];
@@ -512,10 +782,26 @@ cudaError_t ssd_prefill(const SsdShape& d, const SsdInputs& in, int rows, float*
 
 cudaError_t enqueue_conv(const Conv& c, int rows, cudaStream_t stream) {
     if(!rows) return cudaSuccess;
-    if(!c.x || !c.weight || !c.state || !c.out || c.channels < 1 || c.width < 2 || c.width > kMaxConv || rows < 0 ||
-       c.x_stride < std::size_t(c.channels) || c.out_stride < std::size_t(c.channels))
+    const bool in_place = static_cast<const float*>(c.out) == c.x;
+    if(!c.x || !c.weight || !c.state_in || !c.state_out || !c.out || c.channels < 1 || c.width < 2 || c.width > kMaxConv ||
+       rows < 0 || c.x_stride < std::size_t(c.channels) || c.out_stride < std::size_t(c.channels) ||
+       (in_place && c.out_stride != c.x_stride))
         return cudaErrorInvalidValue;
-    conv_kernel<<<(c.channels + 127) / 128, 128, 0, stream>>>(c, rows);
+    const int segments = (rows + kConvSegment - 1) / kConvSegment;
+    conv_dispatch(c, rows, !in_place && segments > 1 && segments <= 65535 ? 1 : 0, nullptr, stream);
+    return cudaGetLastError();
+}
+
+int conv_deferred_slots(int channels) { return channels < 1 ? 0 : (channels + kConvThreads - 1) / kConvThreads; }
+
+cudaError_t enqueue_conv_deferred(const Conv& c, const ConvDeferred& d, int rows, cudaStream_t stream) {
+    if(!d.window || !d.rows_stash || !d.pending || d.capacity < 1 || rows < 0 || rows > d.capacity || c.channels < 1 ||
+       c.width < 2 || c.width > kMaxConv)
+        return cudaErrorInvalidValue;
+    if(rows && (!c.x || !c.weight || !c.out || c.x_stride < std::size_t(c.channels) || c.out_stride < std::size_t(c.channels) ||
+                (static_cast<const float*>(c.out) == c.x && c.out_stride != c.x_stride)))
+        return cudaErrorInvalidValue;
+    conv_dispatch(c, rows, 2, &d, stream);
     return cudaGetLastError();
 }
 
@@ -542,6 +828,23 @@ cudaError_t enqueue_delta_columns(const DeltaShape& d, const DeltaInputs& in, in
     const dim3 grid(d.v_heads, d.dv / 32);
     if(d.dk == 64) delta_columns_kernel<64><<<grid, kThreads, 0, stream>>>(d, in, rows, state_in, state_out, checkpoints, out, out_stride);
     else delta_columns_kernel<128><<<grid, kThreads, 0, stream>>>(d, in, rows, state_in, state_out, checkpoints, out, out_stride);
+    return cudaGetLastError();
+}
+
+int delta_deferred_slots(const DeltaShape& d) { return valid(d) ? d.v_heads * (d.dv / 32) : 0; }
+
+std::size_t delta_stash_floats(const DeltaShape& d, int capacity) {
+    return valid(d) && capacity > 0 ? 2 * stash_half_floats(d, capacity) : 0;
+}
+
+cudaError_t enqueue_delta_columns_deferred(const DeltaShape& d, const DeltaInputs& in, int rows, float* state, const DeltaDeferred& dd,
+                                           float* out, std::size_t out_stride, cudaStream_t stream) {
+    if(!valid(d) || !state || !dd.stash || !dd.control || dd.capacity < 1 || rows < 0 || rows > dd.capacity)
+        return cudaErrorInvalidValue;
+    if(rows && (!valid(in) || !out || out_stride < std::size_t(d.v_heads) * d.dv)) return cudaErrorInvalidValue;
+    const dim3 grid(d.v_heads, d.dv / 32);
+    if(d.dk == 64) delta_deferred_kernel<64><<<grid, kThreads, 0, stream>>>(d, in, rows, state, dd, out, out_stride);
+    else delta_deferred_kernel<128><<<grid, kThreads, 0, stream>>>(d, in, rows, state, dd, out, out_stride);
     return cudaGetLastError();
 }
 

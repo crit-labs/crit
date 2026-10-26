@@ -5,8 +5,10 @@
 //
 // A column scan evaluates one token after another with the state in registers and the same expression for every
 // column, so a column decoded alone equals the same column inside a verify (column invariance), and it can write the
-// state after every column (Core's RecurrentCommit::column_checkpoints). The chunked prefills equal the token-by-token
-// recurrence up to rounding (they are a different summation), which prompts tolerate; decode and verify use the scan.
+// state after every column (Core's RecurrentCommit::column_checkpoints). Its per-token decay (e^l, e^{dt A}) is FP64 exp
+// rounded once to FP32, so a decay near 1 does not drift the state over a long decode as expf's upward bias does. The
+// chunked prefills equal the token-by-token recurrence up to rounding (they are a different summation), which prompts
+// tolerate; decode and verify use the scan.
 #pragma once
 #include <cstddef>
 #include <cstdint>
@@ -16,8 +18,11 @@ namespace crit::recurrent_kernels {
 
 // ---------------------------------------------------------------------------------------------- causal convolution
 // out[t][c] = act(bias[c] + sum_i weight[c][i] * x_{t - (width - 1) + i}[c]), where inputs before row 0 come from
-// state[c][0 .. width - 2] (oldest first); afterwards state holds the last width - 1 inputs. act is SiLU when silu.
+// state_in[c][0 .. width - 2] (oldest first) and state_out receives the last width - 1 inputs. act is SiLU when silu.
 // With checkpoints, checkpoints[t][c][..] is the state after token t (verify columns). width 2 .. 8.
+// state_out may be state_in (the window updated in place) or another buffer, so a verify can read a round-start window
+// without overwriting it. out is either x (in place, out_stride == x_stride) or does not overlap x; out of place, a
+// prompt of more than 32 rows runs a thread per (channel, 32 rows) instead of per channel, with the same bits.
 struct Conv {
     const float* x = nullptr;
     std::size_t x_stride = 0;          // floats between rows
@@ -25,12 +30,29 @@ struct Conv {
     const float* weight = nullptr;     // [channels][width]
     const float* bias = nullptr;       // [channels] or null
     bool silu = true;
-    float* state = nullptr;            // [channels][width - 1], updated in place
+    const float* state_in = nullptr;   // [channels][width - 1], the window before row 0
+    float* state_out = nullptr;        // [channels][width - 1], the window after the last row; may be state_in
     float* out = nullptr;
     std::size_t out_stride = 0;
     float* checkpoints = nullptr;      // optional [rows][channels][width - 1]
 };
 cudaError_t enqueue_conv(const Conv&, int rows, cudaStream_t stream);
+
+// Deferred commit of the window (recurrent-state-recovery's Strategy C): the live window is `window` and `rows_stash`
+// keeps the raw inputs of the last verify. A call first shifts the pending accepted inputs into the window and writes it,
+// consuming the count, then convolves `rows` new inputs from that window without writing it, stashing them (rows == 0
+// applies only: a flush). `pending` holds conv_deferred_slots(channels) counts, one per block, zeroed before first use;
+// recurrent-state-recovery's enqueue_record_accepted writes them all. Every block consumes its own count, so a flush,
+// a repeated flush or a verify that is never recorded applies nothing twice. The Conv's state_in, state_out and
+// checkpoints are not used.
+struct ConvDeferred {
+    float* window = nullptr;           // [channels][width - 1], advanced by the pending prefix only
+    float* rows_stash = nullptr;       // [capacity][channels]
+    int capacity = 0;                  // rows <= capacity
+    std::int32_t* pending = nullptr;   // conv_deferred_slots(channels) ints
+};
+int conv_deferred_slots(int channels);
+cudaError_t enqueue_conv_deferred(const Conv&, const ConvDeferred&, int rows, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------------------------- gated delta
 // Per value head h with key head kh = h / (v_heads / k_heads), state S[dk][dv] (S[key][value]), and per token the
@@ -59,6 +81,25 @@ cudaError_t enqueue_delta_prefill(const DeltaShape&, const DeltaInputs&, int row
 // checkpoints, the state after each token ([rows][v_heads][dk][dv]).
 cudaError_t enqueue_delta_columns(const DeltaShape&, const DeltaInputs&, int rows, const float* state_in, float* state_out,
                                   float* checkpoints, float* out, std::size_t out_stride, cudaStream_t stream);
+
+// Deferred commit of the state (recurrent-state-recovery's Strategy C) on the column scan: one live state, no round-start
+// copy and no checkpoints. A call first replays the pending accepted prefix of the previous verify into `state` from the
+// stash (the update expression on the stashed key, e^l and delta of each step, so the result is the verify's own
+// running state), writes it and consumes the count; then it verifies `rows` new columns from that state, writing their
+// outputs and the stash but not the state (rows == 0 applies only: a flush). The stash is double-buffered, since the
+// blocks of a key head share its stashed key. `control` holds delta_deferred_slots(shape) pending counts, one per block,
+// then as many stash parities, zeroed before first use; recurrent-state-recovery's enqueue_record_accepted writes the
+// counts. Every block consumes its own count, so a flush, a repeated flush or a verify that is never recorded applies
+// nothing twice.
+struct DeltaDeferred {
+    float* stash = nullptr;            // delta_stash_floats(shape, capacity) floats
+    int capacity = 0;                  // rows <= capacity
+    std::int32_t* control = nullptr;   // 2 * delta_deferred_slots(shape) ints
+};
+int delta_deferred_slots(const DeltaShape&);
+std::size_t delta_stash_floats(const DeltaShape&, int capacity);
+cudaError_t enqueue_delta_columns_deferred(const DeltaShape&, const DeltaInputs&, int rows, float* state, const DeltaDeferred&,
+                                           float* out, std::size_t out_stride, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------------------------- Mamba-2
 // Per head h in group g = h / (heads / groups), state H[p][n] (head_dim x d_state), and per token the input x (p),
