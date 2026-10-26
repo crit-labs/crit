@@ -143,6 +143,18 @@ class ResidentPlainTests(unittest.TestCase):
         self.assertEqual(engine_facts(Engine.__new__(Engine))["plain"], False)
         self.assertIsNone(engine_facts(object()))
 
+    def test_the_engines_declared_prompt_activations_reach_eval(self):
+        class Engine(ResidentChat):
+            plain = False
+            facts = {"draft_width": 2}
+        for declared in ("fp16_acc", {"nvfp4": "fp16_acc", "fp8": "fp8"}, {"nvfp4": {"fp16_acc": 0.93, "bf16": 0.07}}):
+            Engine.facts = {"draft_width": 2, "prompt_activations": declared}
+            self.assertEqual(engine_facts(Engine.__new__(Engine))["prompt_activations"], declared)
+        for wrong in ("int4", {"nvfp4": "int4"}, {"nvfp4": {"bf16": -1}}, {"nvfp4": {"bf16": True}}, {}, 3, [None]):
+            with self.subTest(wrong=wrong):
+                Engine.facts = {"draft_width": 2, "prompt_activations": wrong}
+                self.assertNotIn("prompt_activations", engine_facts(Engine.__new__(Engine)))
+
 
 if __name__ == "__main__":
     unittest.main()

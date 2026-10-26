@@ -217,6 +217,7 @@ __global__ void tree_accept_kernel(device_round::AcceptRows rows, const std::int
     control[control::base_last] = control[control::last_token];
     control[control::frontier] += std::int32_t(out);
     if(out) control[control::last_token] = out_tokens[out - 1];
+    control[control::commit_tokens] = std::int32_t(out);
 }
 
 // Block (array, request): moves path[i] -> i in increasing i; 16-byte words when aligned. Thread t owns word t of

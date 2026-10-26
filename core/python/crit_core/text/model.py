@@ -10,7 +10,7 @@ from crit_core.files import ModelFiles, file_name
 from .errors import TextError, model_files, read_json_object
 from .generation import GenerationConfig
 from .stream import TextStream
-from .template import ChatTemplates
+from .template import ChatTemplates, chat_template_sources
 from .tokenizer import Tokenizer
 
 
@@ -43,31 +43,42 @@ def library_versions():
 @dataclass(frozen=True)
 class TextIdentity:
     """What the text layer depends on: a FileRecord (path, bytes, sha256) for exactly the files the loader read,
-    the library versions, and a sha256 over both."""
+    the library versions, the chat templates that are none of the model's files ({"origin", "sha256": {name:
+    sha256}}, or None) and a sha256 over them."""
     files: tuple
     versions: MappingProxyType = field(hash=False)
     sha256: str = ""
+    template: MappingProxyType = field(default=None, hash=False)
 
     @classmethod
-    def of(cls, records, versions):
+    def of(cls, records, versions, template=None):
         records = tuple(sorted(records, key=lambda record: record.path))
         versions = dict(sorted(versions.items()))
-        blob = json.dumps({"files": [record.row() for record in records], "versions": versions},
-                          sort_keys=True, separators=(",", ":"))
-        return cls(records, MappingProxyType(versions), hashlib.sha256(blob.encode("utf-8")).hexdigest())
+        value = {"files": [record.row() for record in records], "versions": versions}
+        if template is not None:   # only then, so a model's own template keeps the identity it had
+            value["template"] = template
+        blob = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        return cls(records, MappingProxyType(versions), hashlib.sha256(blob.encode("utf-8")).hexdigest(),
+                   None if template is None else MappingProxyType(dict(template)))
 
     def row(self):
-        return {"files": [record.row() for record in self.files], "versions": dict(self.versions),
-                "sha256": self.sha256}
+        row = {"files": [record.row() for record in self.files], "versions": dict(self.versions),
+               "sha256": self.sha256}
+        if self.template is not None:
+            row["template"] = dict(self.template)
+        return row
 
 
 @dataclass(frozen=True, eq=False)
 class ModelText:
-    """Tokenizer, chat templates, generation config and identity of one model; immutable and thread-safe."""
+    """Tokenizer, chat templates, generation config and identity of one model; immutable and thread-safe.
+    template_origin says where the templates come from (crit_core.text.chat_template_sources): "model", "given",
+    "crit" or None (the model renders none)."""
     tokenizer: Tokenizer
     templates: ChatTemplates
     generation: GenerationConfig
     identity: TextIdentity
+    template_origin: str = None
 
     def render(self, messages, *, template=None, tools=None, **variables):
         """Render with the selected chat template (ModelTextError when the model has none); see ChatTemplate.render."""
@@ -92,21 +103,25 @@ class ModelText:
         return TextStream(self.tokenizer, prompt_ids, **options)
 
 
-def load_model_text(model, *, clock=datetime.now, split_special_tokens=False):
+def load_model_text(model, *, clock=datetime.now, split_special_tokens=False, chat_template=None):
     """Load a model's text layer from a directory path, a DirectoryFiles or any ModelFiles (TypeError otherwise).
 
     tokenizer.json is required; tokenizer_config.json, special_tokens_map.json, chat_template.jinja,
     additional_chat_templates/*.jinja, chat_template.json, generation_config.json and config.json are read when
-    present. A model without a chat template loads; render() then raises ModelTextError. `clock` drives the
-    templates' strftime_now (None leaves it undefined, for reproducible renders).
+    present. A model whose files hold no chat template renders with `chat_template` (a template source) when given,
+    else with the one crit ships for its config.json model_type (crit_core.text.chat_template_sources); without
+    either it loads, and render() raises ModelTextError. `clock` drives the templates' strftime_now (None leaves it
+    undefined, for reproducible renders).
     """
     files = model_files(model)
     reader = _ReadNames(files)
     tokenizer_config = read_json_object(reader, "tokenizer_config.json") or {}
     tokenizer = Tokenizer.from_files(reader, split_special_tokens=split_special_tokens,
                                      tokenizer_config=tokenizer_config)
-    templates = ChatTemplates.from_files(reader, special_tokens=tokenizer.special_tokens, clock=clock,
-                                         tokenizer_config=tokenizer_config)
+    origin, sources, _ = chat_template_sources(reader, chat_template, tokenizer_config)
+    templates = ChatTemplates.from_sources(sources, special_tokens=tokenizer.special_tokens, clock=clock)
     generation = GenerationConfig.from_files(reader, tokenizer)
     records = [record for record in files.records if record.path in reader.read_names]
-    return ModelText(tokenizer, templates, generation, TextIdentity.of(records, library_versions()))
+    template = None if origin in ("model", None) else {
+        "origin": origin, "sha256": {name: templates[name].sha256 for name in templates}}
+    return ModelText(tokenizer, templates, generation, TextIdentity.of(records, library_versions(), template), origin)

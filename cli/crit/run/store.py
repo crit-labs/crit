@@ -555,6 +555,12 @@ class RunStore:
             if frozen is None and described(run["spec"]["model_path"]):
                 raise ValueError(f"Run recon before the first candidate: crit run --id {run_id} recon writes "
                                  f"{recon.RECON_JSON}, then finish {recon.RECON_MD}")
+            # Plan rules 3: decode's drafting plan and prefill's arithmetic plan are written before any candidate.
+            missing = recon.unfinished(root) if run["spec"].get("plan_rules", 1) >= 3 and frozen is not None else []
+            if missing:
+                raise ValueError(f"Finish {recon.RECON_MD} before the candidate: " + ", ".join(missing) + " (still TODO "
+                                 "or missing). The prefill arithmetic plan names each matrix group's prompt activation "
+                                 "format and the quality measurement per group (crit eval run --attribute-drift)")
             configuration, extensions = proposal["configuration"], proposal.get("extensions", {})
             if frozen is not None:
                 if not isinstance(configuration, dict) or configuration.get("recon", frozen) != frozen:
@@ -979,6 +985,17 @@ class RunStore:
                           "limits or above, a near tie puts only the lower one in p1; a family marked not needed\n"
                           "below 0.85 needs a gaps entry for its limit (gap \"limit\", answer \"cause\") saying why the\n"
                           "rest of the limit is out of reach.")
+        if run["spec"].get("plan_rules", 1) >= 3:
+            plan_line += ("\nPlan rules 3: a plan whose forecast gains more on p2 than on p1, or lets a p1 KPI fall, gives\n"
+                          "forecast_justification.")
+            plan_line += ("\nBelow half its limit a family is not needed only on measured rejections: each gaps entry\n"
+                          "names its evidence (a file in the run), an Eval gap answers rejected, and for prefill every\n"
+                          "prompt activation format Eval prices faster than the engine's own needs a gaps entry\n"
+                          "activation:FORMAT whose evidence is a crit-eval result measuring it over the budget outside\n"
+                          "the quality spread.")
+            plan_line += ("\nBefore the first candidate, recon.md's prefill arithmetic plan names each matrix group's\n"
+                          "prompt activation format and its quality measurement (crit eval run --attribute-drift),\n"
+                          "beside the drafting plan.")
         return f"""# crit run {run['run_id']}
 
 Repository: {self.project}
@@ -993,7 +1010,7 @@ Follow AGENTS.md and docs/BUILDING_ENGINES.md for the engine-building workflow.
 Use docs/RUN_RECORDS.md for payloads. This run and segment define the project scope;
 keep progress in run records and change the toolkit only when requested.
 Use core/README.md for runtime contracts, inference/README.md for reusable techniques,
-kernels/README.md for kernel discovery and integration, and docs/eval/README.md for the common
+kernels/README.md for kernel discovery and integration, and crit-eval's docs/README.md for the common
 speed, quality and speculative-exactness suite. Select compatible existing kernels
 before writing replacements; record exact dependencies and the checks for this engine.
 Kernels is optional: no engine must use a particular kernel provider, framework or accelerator.
@@ -1028,6 +1045,12 @@ measure, which serves the package through crit serve too, and take in-process ha
 pinned text, kernels) through the eval-v1 adapter. Retain the adapter, prepared data and result JSON; report skipped
 cases and unsupported paths. Use the same prepared data for comparisons, and include Eval results in the handoff.
 Eval result JSON is separate evidence; it does not automatically publish run checks or benchmarks.
+Read every report crit eval status gives before a plan: with --kernels KERNELS each prefill term against its floor
+and a round's verify pass against its draft steps; the prefill ceilings by prompt activation format with the
+reachable limit (declare the engine's prompt_activations); the time to first token by part; the quality share with
+its spread over positions; the sampled cases' standard errors; the device memory left free at the required context.
+Measure a precision change in process with crit eval run --adapter A --only quality (development evidence, never the
+gate) and --attribute-drift with the engine's exact_variants: each matrix group's share of the drift budget.
 Use the record coordinator: crit run --project "{self.project}" --root "{self.root}" --id {run['run_id']} --help
 Before the first candidate, run recon (required for a model folder; crit run ... --id {run['run_id']} recon): it writes work/recon.json from the
 model's generation_config.json, tokenizer files, chat templates and config.json, and scaffolds work/recon.md. Finish

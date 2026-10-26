@@ -14,6 +14,8 @@ DRAFTER_DTYPES = ("bf16", "fp32")
 DEFAULT_DRAFTER_CALIBRATION = {"samples": 64, "sequence_tokens": 1024}
 DEFAULT_TRAIN = {"steps": 1000, "windows_per_step": 4, "learning_rate": 1e-4, "warmup_steps": 50, "weight_decay": 0.0}
 LAYER_ANCHOR = "layers.0.input_layernorm.weight"
+# A decoder layer's tensor: the prefix before `layers.<index>.` at a name boundary.
+LAYER_TENSOR = re.compile(r"(?:^|(?<=\.))layers\.(\d+)\.")
 SOURCE_DTYPES = {"BF16", "F16", "F32"}
 # Tensors a quantized module may carry; a target's stored ones are replaced as a whole.
 QUANTIZED_SUFFIXES = ("weight", "weight_scale", "weight_packed", "weight_global_scale", "input_scale",
@@ -113,11 +115,25 @@ def _checked(value, name, defaults):
 
 
 def layer_prefix(names):
-    """The decoder-layer prefix (for example `model.layers.` without `layers.`) the reference also uses."""
+    """The decoder-layer prefix (for example `model.` before `layers.`) the reference also uses: the one of its layer
+    0's input norm, else, for layers without one (such as hyper-connection layers, which norm their streams), of the
+    prefixes under which a layer 0 is stored (draft and vision layers have their own), the one holding the most layer
+    tensors."""
+    names = list(names)
     for name in names:
         if name.endswith(LAYER_ANCHOR):
             return name[: -len(LAYER_ANCHOR)]
-    raise ValueError(f"cannot find the decoder layers: no tensor ends with {LAYER_ANCHOR}")
+    counts, zero = {}, set()
+    for name in names:
+        found = LAYER_TENSOR.search(name)
+        if found:
+            prefix = name[: found.start()]
+            counts[prefix] = counts.get(prefix, 0) + 1
+            if found.group(1) == "0":
+                zero.add(prefix)
+    if not zero:
+        raise ValueError(f"cannot find the decoder layers: no tensor ends with {LAYER_ANCHOR} or holds layers.0.")
+    return max(sorted(zero), key=lambda prefix: counts[prefix])
 
 
 def plan(recipe, checkpoint):

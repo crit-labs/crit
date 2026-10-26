@@ -22,10 +22,11 @@ def main(argv=None):
         from crit_models import main as models_main
         return models_main(arguments[1:])
     if arguments and arguments[0] == "eval":
-        from crit_eval import SUITE_DIR
-        if not SUITE_DIR.is_dir():
-            raise SystemExit("crit eval runs from a crit checkout; install it with python -m pip install -e . and run crit eval")
-        from crit_eval.cli import main as eval_main
+        try:
+            from crit_eval.cli import main as eval_main
+        except ImportError:
+            raise SystemExit("crit eval needs crit Eval (https://github.com/crit-labs/crit-eval): install it with "
+                             "python -m pip install -e ../crit-eval beside this checkout") from None
         return eval_main(arguments[1:])
     parser = argparse.ArgumentParser(description="crit Core, Inference, Kernels, Models, Eval, run records and the serving API")
     from . import __version__
@@ -36,7 +37,7 @@ def main(argv=None):
     subs.add_parser("models", help="Transform model weights (PTQ) and record how; use crit models --help")
     subs.add_parser("serve", help="Serve a sealed candidate as an OpenAI-compatible API; use crit serve --help")
     subs.add_parser("run", help="Publish retained run/candidate records; use crit run --help")
-    subs.add_parser("eval", help="Run the common speed, quality and exactness suite from a checkout; use crit eval --help")
+    subs.add_parser("eval", help="Run the common speed, quality and exactness suite (crit Eval); use crit eval --help")
     sub = subs.add_parser("inference", help="Query or check the inference techniques")
     sub.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args(arguments)

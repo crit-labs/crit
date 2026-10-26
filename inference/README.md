@@ -7,9 +7,9 @@ that design, and a complete engine can use crit without any entry.
 
 Use [Core](../core/README.md) for lifecycle, requests and resources,
 [Kernels](../kernels/README.md) to find and integrate kernels (external links never
-substitute for code an entry claims to supply), and [Eval](../docs/eval/README.md)
+substitute for code an entry claims to supply), and [Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md)
 to measure the engine; NLL, perplexity and KL code is in
-[Eval measurements](../docs/eval/MEASUREMENTS.md). [crit serve](../docs/SERVING.md)
+[Eval measurements](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md). [crit serve](../docs/SERVING.md)
 never selects an Inference technique. Engines can adapt artifact-loading,
 expert-residency and Core's optional
 [CUDA graph and shared-allocation services](../core/src/backends/cuda/README.md#graph-capture)

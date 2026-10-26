@@ -38,12 +38,13 @@ on_tokens(tokens, rows) with one (logprob, [(token, logprob), ...n alternatives]
 scores fixed text through its serving paths sets `scores = True`, implements score_tokens() and declares
 capabilities(..., score=True) (chat-score-v1): crit serve's POST /v1/crit/score then returns, for given prompt and
 continuation ids, every prompt position's row from its prefill and every continuation token's from its decode,
-forced to the continuation. A speculative engine that also decodes one token per target pass, without drafting,
-sets `plain = True` and declares capabilities(..., plain=True) (chat-plain-v1): a request carrying "decode":
-"plain" then reaches generate_tokens as plain=True (Eval's exactness check on the served engine). An engine whose
-decoder keeps a reply to a crit-byte-grammar-v1 grammar, as for response_format, sets `grammars = True` and declares
-capabilities(..., grammars=True), which adds chat-tool-choice-v1 where ResidentChat can write the call syntax
-(forces_calls): tool_choice "required" or a named function then reaches generate_tokens as grammar=artifact, the
+forced to the continuation (score_tokens returns rows as a list or, from flat arrays, as ScoreRows). A speculative
+engine that also decodes one token per target pass, without drafting, sets `plain = True` and declares
+capabilities(..., plain=True) (chat-plain-v1): a request carrying "decode": "plain" then reaches generate_tokens as
+plain=True (Eval's exactness check on the served engine). An engine whose decoder keeps a reply to a
+crit-byte-grammar-v1 grammar, as for response_format, sets `grammars = True` and declares capabilities(...,
+grammars=True), which adds chat-tool-choice-v1 where ResidentChat can write the call syntax (forces_calls):
+tool_choice "required" or a named function then reaches generate_tokens as grammar=artifact, the
 grammar of a reply that makes the forced calls (crit_core.text.tools.call_grammar). An engine keeps the facts Eval's
 headroom reads in `facts` (engine_facts), and generate_tokens' timing may add accepted (drafts accepted per round),
 verify_ms and draft_ms for crit serve's telemetry. Every ResidentChat fits a request's output to the context
@@ -62,6 +63,9 @@ read only the tokenizer and the chat template.
 from pathlib import Path
 from contextlib import contextmanager
 from dataclasses import dataclass
+import array
+import base64
+import sys
 
 SAMPLING = ("temperature", "top_p", "top_k", "min_p", "seed", "presence_penalty", "frequency_penalty",
             "repetition_penalty", "logit_bias")
@@ -74,9 +78,12 @@ CONTINUE_CAPABILITY = "chat-continue-v1"
 COMPLETION_CAPABILITY = "completion-v1"
 TOKENIZE_CAPABILITY = "chat-tokenize-v1"
 # What a resident engine reports for Eval (crit serve's /v1/models engine_facts): whether it speculates and can decode
-# plainly, its draft width, and the bytes one model pass and one draft step read.
+# plainly, its draft width, the bytes one model pass and one draft step read, and the activation format of its
+# quantized matrices' prompt GEMMs (crit-eval's prefill ceilings by activation format).
 ENGINE_FACTS = ("speculative", "plain", "draft_width", "bytes_per_pass", "draft_bytes_per_step", "draft_ms",
-                "kv_bytes_per_token")
+                "kv_bytes_per_token", "prompt_activations")
+# The activation formats crit-eval prices a quantized matrix group's prompt GEMMs at (its ceiling.ACTIVATIONS).
+PROMPT_ACTIVATIONS = ("bf16", "fp16_acc", "fp8", "stored")
 TOP_LOGPROBS = 20  # the most alternatives per token a request asks for (OpenAI's top_logprobs range)
 MIN_LOGPROB = -9999.0  # what a zero probability reads as, as OpenAI reports it (JSON has no infinity)
 TEMPLATE_KWARGS_CAPABILITY = "chat-template-kwargs-v1"
@@ -186,7 +193,10 @@ def engine_facts(engine):
     out = {}
     for key in ENGINE_FACTS:
         value = found.get(key)
-        if key in ("speculative", "plain"):
+        if key == "prompt_activations":
+            if prompt_activations(value):
+                out[key] = value
+        elif key in ("speculative", "plain"):
             if isinstance(value, bool):
                 out[key] = value
         elif isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
@@ -196,14 +206,131 @@ def engine_facts(engine):
     return out or None
 
 
+def prompt_activations(value):
+    """Whether `value` declares prompt activations as crit-eval reads them: one of PROMPT_ACTIVATIONS for every quantized
+    format, or per stored format (fp8, nvfp4) one of them or {activation: share} with non-negative shares."""
+    import math
+    if isinstance(value, str):
+        return value in PROMPT_ACTIVATIONS
+    if not isinstance(value, dict) or not value:
+        return False
+    for name, mix in value.items():
+        if not isinstance(name, str):
+            return False
+        if isinstance(mix, str):
+            if mix not in PROMPT_ACTIVATIONS:
+                return False
+        elif not isinstance(mix, dict) or not mix or any(
+                key not in PROMPT_ACTIVATIONS or isinstance(share, bool) or not isinstance(share, (int, float))
+                or not math.isfinite(share) or share < 0 for key, share in mix.items()):
+            return False
+    return True
+
+
 def logprob_row(token, row, alternatives):
     """[token, logprob, [[token, logprob], ...]] for a response's "logprobs": exactly `alternatives` ranked
     alternatives, log-probabilities clamped into [MIN_LOGPROB, 0] (Core allows -inf and a rounding tolerance)."""
     logprob, top = row
     if len(top) != alternatives:
         raise ValueError(f"The engine returned {len(top)} alternatives for a token, not {alternatives}")
-    clamp = lambda value: min(0.0, max(MIN_LOGPROB, float(value)))
-    return [int(token), clamp(logprob), [[int(other), clamp(value)] for other, value in top]]
+    return [int(token), clamp_logprob(logprob), [[int(other), clamp_logprob(value)] for other, value in top]]
+
+
+def clamp_logprob(value):
+    """A log-probability clamped into [MIN_LOGPROB, 0] (NaN reads as MIN_LOGPROB)."""
+    return min(0.0, max(MIN_LOGPROB, float(value)))
+
+
+class ScoreRows:
+    """Score rows as flat arrays, which score_tokens() may return in place of a list of rows (crit_core.native's
+    engines do): each row's log-probability in `logprobs` and its `alternatives` ranked alternatives row by row in
+    `top_tokens` (array.array "i", int32) and `top_logprobs` (array.array "f" or "d"). It reads as the rows it holds
+    (len, indexing and iteration give (logprob, [(token, logprob), ...])), and ResidentChat.score packs it without a
+    loop over its rows."""
+
+    def __init__(self, logprobs, top_tokens, top_logprobs, alternatives):
+        if len(top_tokens) != len(top_logprobs) or len(top_tokens) != alternatives * len(logprobs):
+            raise ValueError(f"Score rows need {alternatives} alternative tokens and log-probabilities per row")
+        self.logprobs, self.top_tokens, self.top_logprobs = logprobs, top_tokens, top_logprobs
+        self.alternatives = alternatives
+
+    def __len__(self):
+        return len(self.logprobs)
+
+    def __getitem__(self, index):
+        index, k = range(len(self))[index], self.alternatives
+        return self.logprobs[index], list(zip(self.top_tokens[index * k:(index + 1) * k],
+                                              self.top_logprobs[index * k:(index + 1) * k]))
+
+    def __iter__(self):
+        return (self[index] for index in range(len(self)))
+
+
+def _encoded(typecode, values):
+    """base64 of `values` as a little-endian array of `typecode`."""
+    try:
+        same = isinstance(values, array.array) and values.typecode == typecode
+        data = values if same else array.array(typecode, values)
+    except OverflowError:
+        raise ValueError("Score token ids must be below 2**31") from None
+    if sys.byteorder != "little":
+        data = array.array(typecode, data)
+        data.byteswap()
+    return base64.b64encode(data.tobytes()).decode("ascii")
+
+
+def _clamped(values):
+    """array("d") of log-probabilities clamped as clamp_logprob clamps them; the comparison keeps the values already
+    in range without a call per value."""
+    return array.array("d", [value if MIN_LOGPROB <= value < 0.0 else clamp_logprob(value) for value in values])
+
+
+def packed_scores(tokens, rows, alternatives):
+    """One part of a score response record in the packed format (ResidentChat.score for a request with "format":
+    "packed"): {"count", "alternatives", "tokens", "logprobs", "top_tokens", "top_logprobs"}, base64 of
+    little-endian arrays, the tokens and alternative tokens int32 and the log-probabilities float64 (an engine's values
+    exactly, as JSON rows hold them), the alternatives row by row. `rows` are a ScoreRows or a list of (logprob,
+    [(token, logprob), ...]) rows, one per token; log-probabilities are clamped as logprob_row clamps them."""
+    if isinstance(rows, ScoreRows):
+        if rows.alternatives != alternatives:
+            raise ValueError(f"The engine returned {rows.alternatives} alternatives for a token, not {alternatives}")
+        logprobs, top_tokens, top_logprobs = rows.logprobs, rows.top_tokens, rows.top_logprobs
+    else:
+        if any(len(top) != alternatives for _, top in rows):
+            raise ValueError(f"The engine returned other than {alternatives} alternatives for a token")
+        logprobs = [logprob for logprob, _ in rows]
+        top_tokens = [int(token) for _, top in rows for token, _ in top]
+        top_logprobs = [value for _, top in rows for _, value in top]
+    return {"count": len(tokens), "alternatives": alternatives, "tokens": _encoded("i", [int(t) for t in tokens]),
+            "logprobs": _encoded("d", _clamped(logprobs)), "top_tokens": _encoded("i", top_tokens),
+            "top_logprobs": _encoded("d", _clamped(top_logprobs))}
+
+
+def unpacked_scores(part):
+    """(tokens, logprobs, top_tokens, top_logprobs, alternatives) of a packed part (packed_scores): array.array "i"
+    and "d" in this machine's byte order. ValueError when it is malformed or its arrays do not add up."""
+    if not isinstance(part, dict) or set(part) != {"count", "alternatives", "tokens", "logprobs", "top_tokens",
+                                                   "top_logprobs"}:
+        raise ValueError("A packed score part holds count, alternatives, tokens, logprobs, top_tokens and top_logprobs")
+    count, alternatives = part["count"], part["alternatives"]
+    if type(count) is not int or type(alternatives) is not int or count < 0 or not 0 <= alternatives <= TOP_LOGPROBS:
+        raise ValueError("A packed score part's count and alternatives are integers")
+
+    def numbers(typecode, key, size):
+        if not isinstance(part[key], str):
+            raise ValueError(f"A packed score part's {key} is base64 text")
+        try:
+            data = array.array(typecode, base64.b64decode(part[key], validate=True))
+        except ValueError as exc:
+            raise ValueError(f"A packed score part's {key} is not a {typecode} array: {exc}") from None
+        if sys.byteorder != "little":
+            data.byteswap()
+        if len(data) != size:
+            raise ValueError(f"A packed score part's {key} holds {len(data)} values, not {size}")
+        return data
+    return (numbers("i", "tokens", count), numbers("d", "logprobs", count),
+            numbers("i", "top_tokens", count * alternatives), numbers("d", "top_logprobs", count * alternatives),
+            alternatives)
 
 
 def chat_prompt(request, *, images=False):
@@ -351,7 +478,9 @@ class ResidentChat:
 
     def score(self, request, cancellation):
         """The response record of a score request (chat-score-v1): {"prompt": rows, "continuation": rows,
-        "telemetry"}, rows [token, logprob, [[token, logprob], ...top_logprobs]] as logprob_row makes them."""
+        "telemetry"}, rows [token, logprob, [[token, logprob], ...top_logprobs]] as logprob_row makes them; for a
+        request offering "format": "packed" (crit serve's), each part packed (packed_scores) and the record naming
+        "format": "packed", which holds the same values without a JSON row per position."""
         ids, continuation = list(request["prompt_ids"]), list(request["continuation_ids"])
         top_k, wanted = request["top_logprobs"], request["prompt_rows"]
         prompt_rows, continuation_rows, timing = self.score_tokens(ids, continuation, top_k, cancellation.is_set,
@@ -363,11 +492,15 @@ class ResidentChat:
         if len(prompt_rows) != expected or len(continuation_rows) != len(continuation):
             raise ValueError(f"The engine scored {len(prompt_rows)} prompt and {len(continuation_rows)} continuation "
                              f"positions, not {expected} and {len(continuation)}")
-        return {"schema_version": 1, "record_kind": "score_response", "request_id": request["request_id"],
-                "candidate_id": request["candidate_id"], "package_sha256": request["package_sha256"],
-                "prompt": [logprob_row(token, row, top_k) for token, row in zip(ids[1:], prompt_rows)],
-                "continuation": [logprob_row(token, row, top_k) for token, row in zip(continuation, continuation_rows)],
-                "telemetry": {key: timing.get(key) for key in ("prefill_ms", "decode_ms")}}
+        record = {"schema_version": 1, "record_kind": "score_response", "request_id": request["request_id"],
+                  "candidate_id": request["candidate_id"], "package_sha256": request["package_sha256"],
+                  "telemetry": {key: timing.get(key) for key in ("prefill_ms", "decode_ms")}}
+        prompt_tokens = ids[1:] if wanted else []
+        if request.get("format") == "packed":
+            return {**record, "format": "packed", "prompt": packed_scores(prompt_tokens, prompt_rows, top_k),
+                    "continuation": packed_scores(continuation, continuation_rows, top_k)}
+        return {**record, "prompt": [logprob_row(token, row, top_k) for token, row in zip(prompt_tokens, prompt_rows)],
+                "continuation": [logprob_row(token, row, top_k) for token, row in zip(continuation, continuation_rows)]}
 
     def effective_configuration(self):
         return dict(self.configuration)
@@ -701,6 +834,7 @@ class ResidentChat:
 __all__ = ["ResidentChat", "PreparedPrompt", "RequestRejected", "ContextExceeded", "SAMPLING", "LOGPROBS_CAPABILITY", "SCORE_CAPABILITY", "PLAIN_CAPABILITY",
            "COMPLETION_CAPABILITY", "CONTINUE_CAPABILITY", "FIT_OUTPUT_CAPABILITY", "TEMPLATE_KWARGS_CAPABILITY",
            "TOKENIZE_CAPABILITY", "TEMPLATE_KWARGS", "ENGINE_FACTS", "TOP_LOGPROBS", "capabilities", "engine_facts",
-           "forces_calls", "chat_prompt", "kept_special_ids", "logprob_row", "special_marker_ids",
+           "forces_calls", "chat_prompt", "kept_special_ids", "logprob_row", "clamp_logprob", "ScoreRows",
+           "packed_scores", "unpacked_scores", "special_marker_ids",
            "sampling_capability", "template_kwarg_capability", "template_kwargs", "template_tool_format",
            "template_value"]

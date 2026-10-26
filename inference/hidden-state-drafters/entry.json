@@ -86,7 +86,7 @@
   ],
   "validation": {
     "host": "Core's reader on speculators EAGLE-3, DFlash and DSpark, native EAGLE-3 with default taps, native DFlash and DSpark agreeing on one tap convention, rejected and foreign configs and a drafter directory; the drafting reference's rules",
-    "native": "Catch-up tokens and positions from the packed result, including after a Core truncation; block input; d2t mapping and law scatter keeping mass; confidence truncation",
+    "native": "Catch-up tokens and positions from the packed result, including after a Core truncation and at the widest width + 1 after a wider round (a narrower round's K + 1 drops its tokens); block input; d2t mapping and law scatter keeping mass; confidence truncation",
     "performance": "No drafter arithmetic or speedup is qualified"
   }
 }

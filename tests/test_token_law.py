@@ -75,6 +75,9 @@ class TokenLawTests(unittest.TestCase):
         d = 1
         out = m.verify([target, target], [d], 1.0, seed=12, draft_laws=[q])
         self.assertEqual(out[0] == d, m.uniform(12, 0, 0, m.ACCEPT) * q[d] < p[d])
+        # a cut column (draft -1: the drafter stopped) is the target's own draw whatever q holds, like the bonus
+        out = m.verify([target, target], [-1], 1.0, seed=13, draft_laws=[q])
+        self.assertEqual(out, [m.select(target, 1.0, seed=13, position=0), m.select(target, 1.0, seed=13, position=1)])
 
 
 if __name__ == "__main__":

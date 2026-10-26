@@ -197,7 +197,7 @@ class ProductTests(unittest.TestCase):
     def test_cli_only_package_has_one_entrypoint_and_no_browser_sources(self):
         package = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertEqual(package["project"]["scripts"], {"crit": "crit.cli:main"})
-        self.assertEqual(package["tool"]["setuptools"]["packages"]["find"]["where"], ["cli", "api", "eval", "kernels", "models", "core/python"])
+        self.assertEqual(package["tool"]["setuptools"]["packages"]["find"]["where"], ["cli", "api", "kernels", "models"])
         self.assertEqual({p.name for p in (ROOT / "cli").iterdir() if p.is_dir()}, {"crit"})
         self.assertEqual({p.name for p in (ROOT / "api").iterdir() if p.is_dir()}, {"crit_api"})
         self.assertEqual({p.name for p in (ROOT / "kernels").iterdir() if p.is_dir()}, {"crit_kernels", "examples"})
@@ -208,6 +208,9 @@ class ProductTests(unittest.TestCase):
         rejected = subprocess.run([sys.executable, "-S", "-B", LAUNCHER, "gui", "--help"],
                                   capture_output=True, timeout=10)
         self.assertEqual(rejected.returncode, 2)
+
+    def test_core_python_package_ships_the_root_license(self):
+        self.assertEqual((ROOT / "core/python/LICENSE").read_bytes(), (ROOT / "LICENSE").read_bytes())
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,276 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-26
+
+### Overview
+
+crit 0.10.0 gives crit Eval its own repository and distribution
+([crit-labs/crit-eval](https://github.com/crit-labs/crit-eval), crit-eval 0.1.0) and makes crit Core's Python package
+a distribution of its own, crit-core, so crit, crit-core and crit-eval install from PyPI; a pushed version tag
+publishes crit and crit-core. The Inference register grows the parts of speculative decoding on one GPU:
+device-speculative-round chooses each round's draft width, reads back one block per round, runs zero-copy rounds and
+replays a fixed continuation; token-sampling gains sparse draft laws, device log-probabilities and an exact fast path
+for greedy rows and small top-k; stored-tile-gemm gains a row-invariant decode and verify GEMV, BF16-activation prompt
+GEMMs and placement into combined matrices; fp8-kv-attention and recurrent-layer-kernels write from device positions,
+decode faster and commit speculative rounds bit for bit. Before the split, Eval moved through protocols v7.1 to v8:
+profiles, reference packages, the reference's own spread, and references for GGUF, DeepSeek V4 and mixed-precision
+checkpoints. Runs get plan rules 3 and pre-seal serving (`crit run ... serve`), and crit's adapters pass the facts
+crit-eval 0.1.0's reports read. The Python distributions and the Core SDK share version 0.10.0.
+
+### Added
+
+- Plan rules 3, the default of new runs: a plan whose forecast gains more on p2 than on p1, or lets a p1 KPI fall, is
+  refused at record time unless it gives a recorded `forecast_justification` (check 12).
+- Plan rules 3: below half its limit a family is marked not needed only on measured rejections (gaps `evidence`, a
+  file in the run; Eval gaps answered `rejected`), and prefill also rejects every prompt activation format Eval prices
+  faster than the engine's own with a quality measurement outside crit-eval's quality spread (`activation:FORMAT`).
+- Plan rules 3: recon.md's prefill arithmetic plan (each matrix group's prompt activation format and its quality
+  measurement) and drafting plan are written before the first candidate.
+- AGENTS.md, Building engines and the run brief point the agent at crit-eval's new reports: `status --kernels`
+  (prefill terms against their floors, verify against draft), the prefill ceilings by prompt activation format and
+  their reachable limit, in-process quality with `--attribute-drift`, the quality spread, the time to first token by
+  part, the sampled cases' errors and the free device memory.
+- stored-tile-gemm's `GemvPlan::role`: a plan with `KernelRole::draft` runs the same GEMV (the same bits) under kernel
+  names that carry `DraftRole`, so a kernel trace tells a drafter's GEMVs from the target's verify and decode GEMVs
+  and `crit eval status --kernels` splits a round into verify pass and draft steps. device-speculative-round and
+  Building engines say how to keep draft kernels recognisable.
+- crit serve's `engine_facts` carry the engine's declared `prompt_activations` (validated; crit-eval prices the prefill
+  ceilings by activation format with them and names the reachable one), and `crit_core.native.eval_engine` passes
+  `prompt_activations`, `exact_variants` (`crit eval run --attribute-drift`) and `wider_draft` from the engine's info.
+- `crit_core.native.eval_engine` scores fixed text (`score()`) when the engine declares `token_logprobs`,
+  `query_scoring` and `replay`, as crit serve's score call does, so `crit eval run --adapter A --only quality` checks
+  quality in process during development (crit-eval's development evidence, never a gate result).
+- `crit_core.native.eval_engine` passes each generation's `prefill_ms` and `first_token_ms` (Core's timing), so
+  crit-eval splits each case's time to first token into the engine's own time and the rest.
+- `crit run ... serve --candidate ID` serves a packaged candidate before it is sealed through crit serve, under a
+  check attempt, until Ctrl+C or the reservation's deadline, so the checks AGENTS.md asks for before sealing
+  (streaming, stop strings, tool calls, Ctrl+C) can run on the candidate itself; `crit serve` still serves only
+  sealed candidates.
+- device-speculative-round's `DeviceSpeculativeRound::launch(output_tokens, K)` chooses each round's draft width up to
+  the configured widest over one set of buffers, with one Forward/Finish graph pair per width; hidden-state-drafters'
+  `enqueue_eagle_ingest` takes a column count and row stride, so a narrower round still catches up a wider one's tokens.
+- device-speculative-round reads back one block per round (`enqueue_pack`): the packed result, the accepted draft
+  count and the frontier, which the controller checks against its mirror, and optionally each emitted token's
+  log-probability and ranked alternatives, which `logprobs()` / `top_logprobs()` hand to Core's deferred Progress spans.
+- device-speculative-round's `RoundConfig::zero_copy` reads the round's allowance in place (`enqueue_set_budget`) and
+  writes the readback block to mapped pinned memory, so a round has no copy; the fixture's rounds went from 170-215 to
+  65-100 us per round on one RTX 5090 under WSL2, with the same tokens and state.
+- device-speculative-round describes and tests forced replay of a fixed continuation (crit Eval's `replay`, crit
+  serve's score call) through the unchanged accept: a verify step writes its predictions from the continuation.
+- fp8-kv-attention's `write` takes its position from device memory (`const int* pos0_device`) and skips rows outside
+  the cache, so a captured decode graph writes each step's keys and values; FP32 rows are rounded once, straight to
+  E4M3, instead of through BF16.
+- stored-tile-gemm repacks FP8 / NVFP4 tensors straight into their place in a combined matrix
+  (`enqueue_repack_fp8_rows`, `enqueue_repack_fp4_rows`, `enqueue_place_row_scales`: concatenated along N or
+  gate | up interleaved in 16-row tiles), and its gated MLP launches (`enqueue_fp8_gated`, `enqueue_fp4_gated`)
+  write BF16 `act(gate) * up` for SiLU, tanh-GELU or erf-GELU without an FP32 `[T][2I]` output.
+- token-sampling's `enqueue_sample` can write each row's law as kept (token, probability) pairs (`SparseLaw`, count -1
+  where the row took the full law) and `enqueue_verify` checks sampled drafts against them (`Verify::draft_laws`), so
+  a sampled drafter needs no `[K][vocab]` dense `q` rows; a draft without a sparse form falls back to its dense row,
+  or to the target's own draw, which keeps the law.
+- recurrent-layer-kernels' deferred commit (recurrent-state-recovery's Strategy C) on its column scan and convolution:
+  `enqueue_delta_columns_deferred` and `enqueue_conv_deferred` replay the previous verify's accepted prefix from a
+  stash with the scan's own update expression, then verify without writing the state, so a gated-delta layer needs
+  no round-start copy and no per-column checkpoints; each block consumes its own count, which recurrent-state-recovery's
+  new many-count `enqueue_record_accepted` writes for every layer in one launch (one RTX 5090, 9 columns of 32 heads
+  of 128 x 128: 9.6 us with the record against 15.7 us with checkpoints).
+- stored-tile-gemm has a decode / verify GEMV over its FP8 and NVFP4 tiles for 1 to 16 BF16 rows (`plan_gemv`,
+  `enqueue_gemv_fp8`, `enqueue_gemv_fp4` and gated variants) on BF16 tensor cores from sm_80, with each row's bits
+  independent of the row count and its K split derived from N, the SM count and occupancy.
+- token-sampling computes Core's `TokenLogprob` values on the device: `enqueue_logprobs` gives raw rows' chosen
+  log-probabilities and up to 64 ranked alternatives (FP32 exps with FP64 sums, within ~1e-6 of Core's, ties at
+  the boundary resolved by a scan of the row as Core ranks them), and `enqueue_sample` / `enqueue_verify` fuse the
+  same values (`Logprobs`), so a device round can fill its `RoundView::logprob` rows.
+- stored-tile-gemm has BF16-activation prompt GEMMs over its FP8 and NVFP4 tiles (`plan_a16`, `enqueue_fp8_a16`,
+  `enqueue_fp4_a16` and gated variants): exact decode in registers, BF16 MMA with an FP32 fold every 512 columns, a
+  one-wave K split, sm_80 and later, for checkpoints whose quality budget cannot afford W8A8 / W4A4 activation
+  quantization.
+- Eval results record every part's wall seconds in the order the parts ran (`timing.parts`) and the run's total
+  (`timing.total_seconds`), and the log prints them.
+- Reference packages: `crit eval pack` adds a checkpoint's prepared data and reference scores to a package folder,
+  `crit eval fetch` writes them into a data folder after checking every file's sha256, found by the checkpoint's
+  identity. With `eval_packages` in `settings.toml` (a folder or an https base URL), `crit eval run` and
+  `crit run eval` fetch a missing reference instead of scoring it, so a run on a packaged checkpoint needs only the
+  engine.
+- crit-eval-v7.1: Eval profiles (`crit eval run --profile NAME`). `hub`, for crit-hub submissions, measures every
+  engine at 200,000 tokens of context, the long-context curve at its two ends with the points between interpolated
+  (`context.interpolated`), and loads the engine once (the lower-context gate is unmeasured). Results record their
+  profile; `compare` and `--baseline` do not compare results of different profiles.
+- crit-eval-v7.2: the sampling check judges each speed case's sampled-suite warmup, which now asks for the
+  log-probabilities (`sampling_check.replies`), instead of sending one more sampled reply per case; a run without
+  warmups, or an engine that cannot serve them so, still gets its own replies.
+- Eval prints a time estimate of every part and the run after the first measured speed case (`estimate` in the
+  result, crit_eval.estimate), pricing the run's fixed requests with the prefill and decode costs the engine's first
+  requests fit.
+- Core ships a chat template for a model family whose checkpoints carry none, by `config.json` `model_type`
+  (`crit_core.text.shipped_template`, `chat_template_sources`): DeepSeek V4's (`text/templates/deepseek-v4.jinja`), a
+  port of DeepSeek's official encoder (`encoding_dsv4.py`, MIT) that renders exactly what it does on its four golden
+  tests (tests/fixtures/deepseek_v4) and on every prompt of Eval's suite. `load_model_text` falls back to it, or takes
+  `chat_template=SOURCE`, so `crit eval prepare` and crit serve's ResidentChat render DeepSeek V4 checkpoints.
+  `crit eval prepare`, `run` and `fetch` take `--chat-template FILE` for any other model without one. prepared.json
+  records the template (`chat_template`: origin, sha256, file and source), and one that is none of the model's files
+  is part of its identity (`model_identity`), so references, packages and `crit run ... eval` agree on the data and
+  `crit eval run` refuses data prepared with another. Data of models with their own template keeps its identity.
+
+### Changed
+
+- crit Eval 0.1.0 (protocol crit-eval-v0.1.0) is its first release and carries the new reports; its sampled speed
+  suite repeats a noisy case at further seeds by default (`--no-adaptive-sampled` opts out). Data and results of the
+  earlier crit-eval-v0.1.0 checkout measured sampled decode on three seeds alone: prepare the data again (`crit eval
+  fetch` from the repacked reference packages, or `crit eval prepare` with the reference scores carried over) and do
+  not compare sampled decodes across the two.
+
+- crit Eval moved to its own repository, [crit-labs/crit-eval](https://github.com/crit-labs/crit-eval), with its
+  suite, protocol (crit-eval-v8, continued as crit-eval-v0.1.0), probes, docs and tests: crit depends on it and `crit eval`
+  runs it as before. crit Core's Python package installs on its own as crit-core (core/python/pyproject.toml), which
+  both depend on; crit's wheel no longer carries crit_core or crit_eval. For a checkout, install
+  `python -m pip install -e core/python -e ../crit-eval -e .` with crit-eval cloned beside crit.
+- crit models' GPTQ feeds each decoder layer what the model's own forward hands it, captured once per calibration
+  window through the reference (`StreamingReference._capture`): input states, masks, positions and token inputs. It
+  fed every layer the embeddings and one causal mask, so models whose layers take more (Qwen4Exp's four
+  hyper-connection streams, PLE n-gram ids and QSA indexer masks) failed; Qwen3-style models calibrate as before. The
+  plan finds the decoder layers of models without a layer input norm by the prefix holding the most layer tensors
+  (`layers.0.input_layernorm.weight` stays the first rule).
+- crit eval reference runs the leading 8,192-token chunks that texts share once: the other texts resume from a copy
+  of the first's cache after them, with the same score bytes. The long quality sets' texts share their document, so
+  the Qwen3.8-27B reference took 6.4 instead of 9 minutes on an RTX 5090 (Qwen3.8-Flash-Next 16 instead of 17).
+- crit-eval-v8: one quality text per long length (`german-letter` at 1K, `python-merge-intervals` at 4K,
+  `explain-tides` at 32K; v7 scored three per length that shared their document), the honesty check's long reply is
+  the long-context curve's first reply (its request asks for log-probabilities, scored once; a server that cannot
+  stream them keeps its curve point), quality fails fast (a set drifting a mean KLD over ten times the budget stops
+  the scoring and the parts after quality, `stopped_early`), and the hub profile decodes no held-out prompts and
+  runs two sampled seeds. Data prepared under v7 must be prepared and scored again. The reference also scores
+  texts of 8,192 tokens or more a second time with TF32 matmuls (an engine-sized perturbation of the model's own
+  arithmetic) and stores how far that run lands from its scores (`reference/spread.json`); a set where that spread exceeds the drift budget (a model whose
+  routing or recurrent state amplifies rounding, such as Qwen3.8-Flash-Next at 32K) is judged against twice the
+  spread instead, and the result says so. Dense models' two runs agree to rounding.
+- crit-eval-v7.3: the hub profile judges retrieval at 4,096, 32,768 and the requirement only (protocol
+  profiles.hub.retrieval_points): the 131,072-token request the curve no longer makes cost about 50 s per run.
+- crit eval reference's qwen4_exp QSA indexer form (`crit_eval.indexers`) selects exactly the blocks transformers'
+  loop selects, ties included: it runs the loop's arithmetic per query on tensors of that query's shape, pools each
+  block count once and skips queries within their budget. The earlier batched form broke ties among blocks scoring
+  exactly 0 its own way and could round near-ties differently (a tiny model's target 0.43 nats off). The form's
+  version is part of the reference identity (`FORM_VERSIONS`), so Qwen3.8-Flash-Next references are scored again.
+- crit eval reference scores long texts of models whose attention has sinks (DeepSeek V4, gpt-oss and others) with
+  the modeling code's own eager attention run in blocks of query rows, with eager's additive masks
+  (`chunked_sink_attention`). DeepSeek V4's long texts scored NaN: its compressed entries were judged by position and
+  their mask cast to boolean. Other models' long-text attention, and their stored references, are unchanged.
+- crit eval reference reads lone DeepSeek V4 (`deepseek4`) and Qwen3.8-Flash-Next (`qwen4exp`) GGUFs. DeepSeek V4:
+  every tensor in transformers' DeepseekV4 names (MXFP4 experts and Q8_0 matrices decoded as stored, hash-routing
+  tables restored), config.json in DeepSeek's released keys, and the `deepseek-v3` / `joyai-llm` pre-tokenizers.
+  Qwen3.8-Flash-Next: the converter's shared-input merges, indexer split, zero-centred norms and moved constants
+  undone, and a config whose seed, n-gram base and padding make transformers recompute the PLE hash constants and
+  table rows the GGUF stores; GGUFs whose attention layers have no compress ratio are refused. Each is proven by a
+  round trip, written to GGUF and read back (tests/test_eval_gguf_deepseek4.py, tests/test_eval_gguf_qwen4exp.py),
+  and needs a gguf-py that knows the architecture (newer than the 0.19.0 release).
+- crit eval reference reads GGUF embedding tables by rows (`GgufCheckpoint.row_source`): a row of a GGUF tensor is
+  whole blocks of its format, so a lookup reads exactly the bytes of the rows it needs and decodes them alone, the
+  same values as decoding the whole table, which it no longer does.
+- crit eval reference streams experts: a fused experts parameter that would take more than half the device's free
+  memory in FP32 keeps its stored bytes on the device and decodes each expert when the eager experts loop reads it,
+  with the same score bytes. Qwen3.8-Flash-Next forced to stream peaked at 12 instead of 26 GB, so layers such as
+  DeepSeek V4 Flash's (about 26 GB in FP32) fit consumer devices.
+- crit serve's fixed-text scores (`chat-score-v1`) cross the resident host's channel as packed arrays
+  (`ResidentChat.score` answers a request offering `"format": "packed"`; `score_tokens` may return
+  `crit_core.serving.ScoreRows`, and `crit_core.native` returns the engine's arrays without a Python object per
+  value), and Eval builds the rows without GC rescans: the same scores bit for bit, about 9x less time outside the
+  engine. `crit_core.native.ResidentEngine` now counts the replay's second prefill of the prompt in a score's
+  `prefill_ms`.
+- crit eval reference keeps the texts' prompt states in host memory, up to half the memory available less the
+  staging buffer, instead of writing every layer's state to scratch files and reading it back (about 23 GB each way
+  for Qwen3.8-Flash-Next); states that do not fit still go to disk, and the scores are the same bytes.
+- AGENTS.md says what a clean test of crit excludes: the Kernel Hub is part of crit's toolkit and stays in
+  unless the run's criteria name it; earlier runs' results and engines are what such a test leaves out.
+- AGENTS.md's build loop defers a lever still in development instead of waiting for it, bounds a kernel lever by
+  the kernel's share of its phase in the profile, treats isolated kernel benchmarks as leads until the integrated
+  engine is measured, and has a precision change measured against the quality budget before other levers build
+  on it.
+- mtp-decode states that a single-layer drafter's prompt ingestion needs only each position's key/value path
+  (fused input, input norm, key/value projections), not its attention or MLP, so its cost does not grow with
+  the context.
+- stored-tile-gemm's `enqueue_fp8` / `enqueue_fp4` pack and compute only the `ceil(T / (8 nt))` token blocks a launch
+  needs instead of the plan's padded size, with every token's bits unchanged, so a short last prompt chunk no longer
+  costs a full-size GEMM.
+- recurrent-layer-kernels' gated-delta column scan reduces a column's eight state dot products together, a
+  reduce-scatter whose pair sums are those of the per-value warp tree (17 shuffles instead of 48), so results are
+  unchanged bit for bit and verify columns cost less (one tested GPU: 11 to 28% faster at 8 to 64 columns).
+- fp8-kv-attention's tile step skips the per-key mask where both of a thread's rows see the whole tile and a warp's
+  output rescale where none of its row maxima moved, and unused decode rows see every key so they never force the
+  mask. Results are unchanged bit for bit; on one tested GPU decode over 262,144 keys runs 9-21% faster and windowed
+  prefill 7-11%.
+- token-sampling runs greedy rows and `1 <= top_k <= 64` on an exact multi-block fast path: `ceil(vocab / 4096)` stage
+  blocks per row keep each block's best `top_k + 1` processed candidates and one law block per row runs Core's steps
+  7 to 12 on them in FP64 in Core's summation order, verify rule included, so draws and laws equal Core's Sampler; open
+  rows (no top-k filter) are settled there when top-p or min-p closes within the top 64 or the draw lands there, and
+  every other row still takes the full law, chosen per row on the device. On one RTX 5090 with 248,077-token rows a
+  top-k 20 / top-p 0.95 draw went from ~3.5 ms to ~15 us and a K = 8 verify from ~4.6 ms to ~20 us. `enqueue_select`
+  now takes strided rows with their own `Params` and a `select_scratch_bytes` scratch (`kStageBlocks` and the
+  `cand_values` / `cand_ids` buffers are gone), and `scratch_floats` covers the fast path's lists.
+- recurrent-layer-kernels' convolution reads its window from `Conv::state_in` and writes it to `Conv::state_out`
+  (`Conv::state` is gone; pass the same buffer for both to update it in place), so a verify reads a round-start window
+  without copying it. Out of place, a prompt of more than 32 rows runs a thread per (channel, 32 rows) with the
+  row-by-row form's bits, and the kernels are instantiated per width, so the window stays in registers (one RTX 5090,
+  8192 rows of 10,240 channels: 3.9 ms to 0.45 ms out of place, 4.0 ms to 1.2 ms in place).
+- fp8-kv-attention's decode combine computes the block weights in parallel and moves the denominator to its own warp,
+  loading partial outputs 16 at a time while the sums keep block order, so results are unchanged bit for bit and one
+  tested GPU runs it 8-18% faster (4.4 to 3.8 us at head dimension 256 and 42 blocks).
+- device-speculative-round states that junk and padding columns of fixed-width verify and catch-up graphs must hold
+  finite values (and valid ids and positions where a step gathers or writes for them): a masked term has weight 0,
+  and 0 x NaN poisons the real rows that read it.
+- device-speculative-round's sampled-round fixture starts its rows from `enqueue_seed` and takes the history commit's
+  count from `control[commit_tokens]`, so the seed fix is also checked with token-sampling's own `enqueue_commit`.
+- stored-tile-gemm's default `plan` splits K only while the split grid fits in one wave of resident blocks (SM count
+  times the kernel's occupancy) instead of until two blocks per SM, which over-split these one-block-per-SM kernels;
+  `min_blocks` still sets the old rule explicitly.
+- fp8-kv-attention's decode runs two key streams per block, as paged-attention's decode does, where their shared
+  memory (`decode_shared_bytes`, 96 KB at head dimension 256) fits the device's per-block limit, and merges them
+  inside the block, so `decode_partial_floats` is unchanged; one tested GPU decodes one column over 262,144 keys in
+  356 instead of 494 us. Bits differ from the single-stream decode, which `Decode::streams = 1` keeps (and which runs
+  where two streams do not fit); column invariance holds for both.
+- token-sampling's README groups its validation by test file, says the timings illustrate one device instead of
+  claiming no throughput, and its contract lists the log-probability rows.
+- stored-tile-gemm's README and contract state what a GEMV or BF16-activation GEMM adaptation must keep: row chains
+  independent of the row count with one plan for decode and verify, exact decodes and a bounded chain before each
+  FP32 fold.
+
+### Fixed
+
+- `crit eval reference` reads safetensors stored in a model's own original tensor names (DeepSeek V4's
+  `hc_head_fn`, `layers.N.ffn.experts.E.w1`, `attn.attn_sink`, as released and as compressed-tensors quantizations
+  keep them) where transformers' renamings for the model type find them; it stopped on the first such tensor.
+- compressed-tensors checkpoints with several config groups (mixed-precision, such as W4A16-FP8) decode each matrix
+  with the group whose targets name it: every matrix took the first group's arguments, so packed int4 experts after
+  an FP8 group were unpacked as 8-bit codes.
+- `crit eval reference` scores DeepSeek V4's long texts on a 32 GB device: its indexer scorer runs over blocks of query
+  rows (crit_eval.indexers), the same scores bit for bit, where transformers' scorer held three 17 GiB FP32 tensors
+  for an 8192-token chunk of a 32K-token text.
+- The reference spread scores the long texts again on a model whose decoder layers hold computed buffers of their own
+  (DeepSeek V4's compressors' rotary frequencies): a layer released after the first pass gets them back when it loads
+  again, where they stayed meta and the second pass stopped.
+- `crit eval kernels` keeps kernels in unnamed namespaces readable: their demangled `(anonymous namespace)::`
+  prefix is no longer taken for the parameter list, which cut such names to their outer namespace.
+- token-sampling holds the sampling rules in double and runs Core's steps 2 to 5 in IEEE double, as Core's
+  `SamplingParams` and `Sampler` do: float rules kept one token more than Core at an exact top-p boundary (0.8,
+  0.1 or 0.3 over equal weights), and a bias past the float range turned a selectable logit into +inf (a NaN law)
+  or -inf (no token). `Params` and `Request` rule fields are now `double`.
+- token-sampling's `enqueue_verify` verifies a cut column (a draft id outside the vocabulary, such as the -1 of
+  hidden-state-drafters' confidence cut) against the target law alone, the target's own draw like the bonus
+  column: it ran the rejection rule's residual against whatever the column's `q` row still held, so the emitted
+  token followed `max(p - q, 0)` instead of `p`.
+- device-speculative-round: a sampled round's history commit takes the new `control[commit_tokens]` instead of
+  `n_emitted`. A one-column seed for a stateful drafter (now `seed()` / `enqueue_seed`) sets `n_emitted` to 1 for the
+  catch-up while its token is already in the sampling history, so the documented `n_emitted` counted that token twice.
+- fp8-kv-attention's decode read past the cache's buffers when the position it read from device memory put a column
+  after the last row. `Cache::capacity` (rows the arrays hold) now makes such a decode, or one at a negative position,
+  read nothing and write NaN rows; host positions past the capacity are rejected.
+- recurrent-layer-kernels' gated-delta and Mamba-2 column scans round each token's decay once from FP64 `exp`
+  instead of `expf`, which errs upward more often than downward: with slow decays the state drifted 5 to 10 times
+  further from an FP64 recurrence over 8192 decode tokens than an FP32 recurrence with correctly rounded decays.
+- token-sampling's README and `enqueue_commit` comment name `control[commit_tokens]`, the count
+  device-speculative-round now hands the sampling history, instead of `control[n_emitted]`, which counts a seed
+  round's token twice.
+
 ## [0.9.1] - 2026-10-25
 
 ### Overview
@@ -1477,7 +1747,7 @@ native Core SDK (`critCore`) share version 0.1.0.
   the actual device, exactness across column counts), pinned dependency retention,
   artifact verification and preservation of third-party notices, with native
   integration examples.
-- **Eval** ([guide](docs/eval/README.md)): one speed, quality and exactness suite that
+- **Eval** ([guide](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md)): one speed, quality and exactness suite that
   every engine runs the same way through a small `eval-v1` Python adapter, with prompts
   frozen as token ids per model and a layer-streamed FP32 reference. It reports decode,
   prefill, time to first token and quality against physical limits, computes an engine's

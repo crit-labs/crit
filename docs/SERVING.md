@@ -5,7 +5,8 @@ OpenAI-compatible chat requests until stopped, so any OpenAI client (the `openai
 SDKs, LangChain, Open WebUI, curl) can use the engine. Packages implement the
 [adapter contract](#adapter-contract). `crit run ... eval` serves a packaged candidate
 the same way before it is sealed, for Eval over the chat API
-([Building engines](BUILDING_ENGINES.md#run-the-common-eval-suite)).
+([Building engines](BUILDING_ENGINES.md#run-the-common-eval-suite)), and `crit run ... serve`
+serves it for the checks a candidate passes before sealing, until Ctrl+C.
 
 ## Start the server
 
@@ -350,7 +351,7 @@ events, and stop before the finish chunk and `[DONE]`, the closing Responses eve
 and `message_stop`; `--sse-ping-interval 0` turns them off. Ollama's newline-delimited JSON has no such
 line, so Ollama streams get none. Pings are `crit serve`'s alone:
 `crit run ... eval` and `measure` serve their candidate without them, and Eval's [request
-bound](eval/README.md#engines-behind-a-server) counts a ping as no answer, so a request whose engine
+bound](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md#engines-behind-a-server) counts a ping as no answer, so a request whose engine
 stalls still stops Eval as hung, `--url` included.
 
 ### Request ids and aborting requests
@@ -617,7 +618,7 @@ natural-log, of the raw logits; `crit_telemetry` holds `prefill_ms` and `decode_
 "tokens", "logprobs", "top_tokens", "top_logprobs"}`: base64 of little-endian arrays, the
 tokens and alternative tokens int32, the log-probabilities float32, the alternatives row by
 row (`count` × `alternatives`), and the response names `"format": "packed"`. Eval's quality
-gate uses it ([docs/eval](eval/README.md)). A score runs alone on the engine, as Core runs
+gate uses it ([crit Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md)). A score runs alone on the engine, as Core runs
 scores, and is not streamed.
 
 ### Raw-prompt completions
@@ -650,8 +651,11 @@ Request ids, aborts, a busy queue's 429 and the metrics are those of the OpenAI 
 While a candidate's engine is loaded, its `/v1/models` card carries `engine_facts`, what
 the engine reports for Eval's headroom and exactness: `speculative` and `plain` (booleans),
 `draft_width`, `bytes_per_pass`, `draft_bytes_per_step`, `draft_ms` and
-`kv_bytes_per_token` (non-negative numbers), each only when the engine reports it; `null`
-when the candidate is not loaded or reports none. A speculative engine that declares
+`kv_bytes_per_token` (non-negative numbers) and `prompt_activations` (the activation format of
+the quantized matrices' prompt GEMMs, `bf16`, `fp16_acc`, `fp8` or `stored`, for every quantized
+format, per stored format, or as shares of a format's FLOPs: crit-eval's prefill ceilings by
+activation format and their reachable limit), each only when the engine reports it in a valid
+form; `null` when the candidate is not loaded or reports none. A speculative engine that declares
 `chat-plain-v1` decodes a request carrying `"crit": {"decode": "plain"}` one token per
 target pass without drafting, which is how Eval compares speculative output with plain
 greedy on the served engine.
@@ -924,7 +928,9 @@ failed final check becomes an error event.
 A package is servable when it declares **`chat-json-v1` and `chat-resident-v1`** and
 `launch[0]` is a retained Python module exporting `create_engine(context)`. Build the
 adapter on **`crit_core.serving.ResidentChat`**: it renders the conversation, tools and
-tool history with the model's chat template, forwards the request's sampling fields that
+tool history with the model's chat template (for a family whose checkpoints carry none, the
+one crit ships, such as DeepSeek V4's: [Core's text layer](../core/python/crit_core/text/README.md#chat-templates)),
+forwards the request's sampling fields that
 the engine lists in `sampling`, streams text without stop tokens, honors cancellation and
 reports Core's phase telemetry, so the engine supplies only `generate_tokens(ids,
 max_new_tokens, sampling, on_tokens, cancelled)`. Declare
@@ -938,7 +944,7 @@ defaults)`, a ResidentChat over the library (see
 model's chat template teaches a tool-call format crit parses: agent clients send both on
 every turn.
 Serving works with failed or missing checks and
-never changes benchmark evidence or passes a gate. [Eval](eval/ADAPTER.md) uses a
+never changes benchmark evidence or passes a gate. [Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/ADAPTER.md) uses a
 separate `eval-v1` adapter (`create_eval_engine(context)`); both can wrap one engine.
 
 ### Factory and lifetimes
@@ -1001,7 +1007,7 @@ library that does both: its steps run every request's rows through one GEMM per 
 | --- | --- |
 | `context.host("relative/model/file")` | Read-only memoryview of the model file, mapped in place after a size check (pageable). With `--verify-model`, of a hashed private copy (needs temporary disk) |
 | `context.model_file(name)` | Native-loader path of the model file when `chat-model-file-v1` is declared; no copy |
-| `context.limits` | Context and RAM/VRAM headroom; `kv_tokens` is the built context, `context` (when present) Eval's [basis](eval/CONTEXT.md) |
+| `context.limits` | Context and RAM/VRAM headroom; `kv_tokens` is the built context, `context` (when present) Eval's [basis](https://github.com/crit-labs/crit-eval/blob/main/docs/CONTEXT.md) |
 | `context.device(compatibility, nbytes, allocate, inputs=())` | Generation-bound lease; `lease.buffer` valid for the engine lifetime. `inputs` lists non-model files whose bytes enter the allocation |
 
 Model identity is the full frozen path/size/SHA-256 manifest; treat model files as
@@ -1311,12 +1317,19 @@ prompt position after the first (none when `prompt_rows` is false: the prompt is
 prefilled) and per continuation token (None for the rows when
 cancelled) and `timing` with `prefill_ms` and `decode_ms`; the host refuses to load the
 package otherwise. ResidentChat's `score(request, cancellation)` builds the response from
-it. `crit_core.native.ResidentEngine` sets `scores` when the engine's `ModelInfo` declares
+it. Rows may also come as a `crit_core.serving.ScoreRows`, flat arrays of the log-probabilities
+and the alternatives row by row, which reads as the list it stands for. crit serve's score
+request offers `"format": "packed"`, and ResidentChat then answers with each part packed
+(`packed_scores`: base64 of int32 tokens and float64 log-probabilities, the same values as the
+JSON rows), so a long text's rows cross the host's channel without a JSON row per position; an
+adapter that implements `score()` itself may keep answering JSON rows.
+`crit_core.native.ResidentEngine` sets `scores` when the engine's `ModelInfo` declares
 `query_scoring`, `token_logprobs` with `max_top_logprobs` of at least 20, and the info facts
 `replay`: the prompt is scored by
 Core's query scoring with the engine's own top-k on its `"prefill"` score path (the default
 path when it names none), which must run the engine's prefill kernels at every position, and
-the continuation by a replay generation with log-probabilities.
+the continuation by a replay generation with log-probabilities. The replay prefills the prompt
+again, so its `prefill_ms` counts both prefills.
 
 ### Raw prompts for adapters
 

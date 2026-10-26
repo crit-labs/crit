@@ -1,0 +1,250 @@
+{#- DeepSeek V4's chat template, shipped with crit (crit_core.text.shipped_template): a port of DeepSeek's official
+    encoder, encoding_dsv4.py, which DeepSeek V4's checkpoints carry in place of a chat template. It renders the text
+    encode_messages(messages, thinking_mode, drop_thinking=drop_thinking, reasoning_effort=reasoning_effort) returns,
+    for every role the encoder knows (system, user, assistant, tool, developer, latest_reminder): tools and
+    response_format on system and developer messages, tool calls in DSML, tool results merged into the user turn and
+    sorted by call order, earlier reasoning dropped, quick-instruction tasks and the max reasoning effort.
+    Inputs as transformers passes them: thinking or enable_thinking (default false: chat mode); `tools` are the first
+    message's when it is a system message without its own, else those of a system message put first; tool-call
+    arguments are a mapping (the encoder's JSON text, parsed). add_generation_prompt adds what the encoder writes after
+    the last message (the reply's opening after a user turn, a task's token); without it the render ends before that.
+
+    encoding_dsv4.py is DeepSeek's (DeepSeek-V4), released under the MIT License: Permission is hereby granted, free of
+    charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to
+    deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge,
+    publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions: The above copyright notice and this permission notice
+    shall be included in all copies or substantial portions of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT
+    WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+    FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+    CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+    CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. -#}
+{%- set task_tokens = {'action': '<｜action｜>', 'query': '<｜query｜>', 'authority': '<｜authority｜>',
+                       'domain': '<｜domain｜>', 'title': '<｜title｜>', 'read_url': '<｜read_url｜>'} -%}
+{%- if thinking is defined and thinking is not none -%}
+    {%- set think = thinking -%}
+{%- elif enable_thinking is defined and enable_thinking is not none -%}
+    {%- set think = enable_thinking -%}
+{%- else -%}
+    {%- set think = false -%}
+{%- endif -%}
+{%- set drop = drop_thinking if drop_thinking is defined and drop_thinking is not none else true -%}
+{%- set effort = reasoning_effort if reasoning_effort is defined else none -%}
+{%- if effort is not none and effort not in ('high', 'max') -%}
+    {{- raise_exception('DeepSeek V4 takes reasoning_effort "high" or "max", not ' ~ effort) -}}
+{%- endif -%}
+{#- render_tools and the response format: what a system or developer message adds after its content. -#}
+{%- macro extras(tools, response_format) -%}
+    {%- if tools -%}
+        {{- '\n\n## Tools\n\nYou have access to a set of tools to help answer the user\'s question. You can invoke '
+            ~ 'tools by writing a "<｜DSML｜tool_calls>" block like the following:\n\n<｜DSML｜tool_calls>\n'
+            ~ '<｜DSML｜invoke name="$TOOL_NAME">\n<｜DSML｜parameter name="$PARAMETER_NAME" string="true|false">'
+            ~ '$PARAMETER_VALUE</｜DSML｜parameter>\n...\n</｜DSML｜invoke>\n<｜DSML｜invoke name="$TOOL_NAME2">\n...\n'
+            ~ '</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n\nString parameters should be specified as is and set '
+            ~ '`string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON '
+            ~ 'format and set `string="false"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output '
+            ~ 'your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n'
+            ~ 'Otherwise, output directly after </think> with tool calls or final response.\n\n'
+            ~ '### Available Tool Schemas\n\n' -}}
+        {%- for tool in tools -%}
+            {{- '\n' if not loop.first -}}
+            {{- tool['function'] | tojson -}}
+        {%- endfor -%}
+        {{- '\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n' -}}
+    {%- endif -%}
+    {%- if response_format -%}
+        {{- '\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n'
+            ~ (response_format | tojson) -}}
+    {%- endif -%}
+{%- endmacro -%}
+{#- merge_tool_messages: a tool result joins the user turn before it or opens one, and a user message joins a user
+    turn without a task. Each turn becomes a unit: its role, message, task, tools and (user turns) text blocks. -#}
+{%- set ns = namespace(units=[], sorted=[], calls=[], kept=[], last_user=-1, tools=false) -%}
+{%- if tools and not (messages and messages[0]['role'] == 'system') -%}
+    {%- set ns.units = [{'role': 'system', 'message': {}, 'task': none, 'tools': tools}] -%}
+{%- endif -%}
+{%- for m in messages -%}
+    {%- set last = ns.units[-1] if ns.units else none -%}
+    {%- if m['role'] == 'tool' -%}
+        {%- set block = {'type': 'tool_result', 'id': m['tool_call_id'] if m['tool_call_id'] is defined else '',
+                         'content': m['content'] if m['content'] is defined else ''} -%}
+        {%- if last is not none and last['role'] == 'user' -%}
+            {%- set ns.units = ns.units[:-1] + [{'role': 'user', 'message': last['message'], 'task': last['task'],
+                                                 'tools': none, 'blocks': last['blocks'] + [block]}] -%}
+        {%- else -%}
+            {%- set ns.units = ns.units + [{'role': 'user', 'message': {}, 'task': none, 'tools': none,
+                                            'blocks': [block]}] -%}
+        {%- endif -%}
+    {%- elif m['role'] == 'user' -%}
+        {%- set block = {'type': 'text', 'text': m['content'] if m['content'] is not none else ''} -%}
+        {%- if last is not none and last['role'] == 'user' and last['task'] is none -%}
+            {%- set ns.units = ns.units[:-1] + [{'role': 'user', 'message': last['message'], 'task': none,
+                                                 'tools': none, 'blocks': last['blocks'] + [block]}] -%}
+        {%- else -%}
+            {%- set ns.units = ns.units + [{'role': 'user', 'message': m, 'tools': none, 'blocks': [block],
+                                            'task': m['task'] if m['task'] is defined else none}] -%}
+        {%- endif -%}
+    {%- else -%}
+        {%- set own = m['tools'] if m['tools'] is defined else none -%}
+        {%- set ns.units = ns.units + [{'role': m['role'], 'message': m,
+                                        'task': m['task'] if m['task'] is defined else none,
+                                        'tools': tools if loop.first and m['role'] == 'system' and not own
+                                            else own}] -%}
+    {%- endif -%}
+{%- endfor -%}
+{#- sort_tool_results_by_call_order: the results in a user turn follow the order of the calls (by id) before it. -#}
+{%- for unit in ns.units -%}
+    {%- if unit['role'] == 'assistant' and unit['message']['tool_calls'] -%}
+        {%- set ns.calls = [] -%}
+        {%- for call in unit['message']['tool_calls'] -%}
+            {%- set ns.calls = ns.calls + [call['id'] or (call['function'] or {})['id'] or ''] -%}
+        {%- endfor -%}
+    {%- endif -%}
+    {%- set results = unit['blocks'] | selectattr('type', 'equalto', 'tool_result') | list
+        if unit['role'] == 'user' else [] -%}
+    {%- if results | length > 1 and ns.calls | select | list -%}
+        {%- set order = namespace(keyed=[], blocks=[], next=0) -%}
+        {%- for block in results -%}
+            {%- set position = namespace(key=0) -%}
+            {%- for id in ns.calls -%}
+                {%- if id and id == block['id'] -%}
+                    {%- set position.key = loop.index0 -%}
+                {%- endif -%}
+            {%- endfor -%}
+            {%- set order.keyed = order.keyed + [{'key': position.key, 'block': block}] -%}
+        {%- endfor -%}
+        {%- set ordered = order.keyed | sort(attribute='key') | map(attribute='block') | list -%}
+        {%- for block in unit['blocks'] -%}
+            {%- if block['type'] == 'tool_result' -%}
+                {%- set order.blocks = order.blocks + [ordered[order.next]] -%}
+                {%- set order.next = order.next + 1 -%}
+            {%- else -%}
+                {%- set order.blocks = order.blocks + [block] -%}
+            {%- endif -%}
+        {%- endfor -%}
+        {%- set ns.sorted = ns.sorted + [{'role': 'user', 'message': unit['message'], 'task': unit['task'],
+                                          'tools': none, 'blocks': order.blocks}] -%}
+    {%- else -%}
+        {%- set ns.sorted = ns.sorted + [unit] -%}
+    {%- endif -%}
+{%- endfor -%}
+{#- Reasoning is kept in every turn when any message carries tools; else, in thinking mode, _drop_thinking_messages
+    drops developer (and unknown) messages before the last user turn, whose reasoning the render leaves out. -#}
+{%- for unit in ns.sorted -%}
+    {%- if unit['tools'] -%}
+        {%- set ns.tools = true -%}
+    {%- endif -%}
+    {%- if unit['role'] in ('user', 'developer') -%}
+        {%- set ns.last_user = loop.index0 -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- set drop = drop and not ns.tools -%}
+{%- for unit in ns.sorted -%}
+    {%- if not (think and drop) or loop.index0 >= ns.last_user or unit['role'] in ('user', 'system', 'tool',
+            'latest_reminder', 'direct_search_results', 'assistant') -%}
+        {%- set ns.kept = ns.kept + [unit] -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- set ns.last_user = -1 -%}
+{%- for unit in ns.kept -%}
+    {%- if unit['role'] in ('user', 'developer') -%}
+        {%- set ns.last_user = loop.index0 -%}
+    {%- endif -%}
+{%- endfor -%}
+{#- render_message, unit by unit. -#}
+{{- '<｜begin▁of▁sentence｜>' -}}
+{%- for unit in ns.kept -%}
+    {%- set m = unit['message'] -%}
+    {%- set role = unit['role'] -%}
+    {%- if loop.first and think and effort == 'max' -%}
+        {{- 'Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your '
+            ~ 'thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing '
+            ~ 'your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out '
+            ~ 'your entire deliberation process, documenting every intermediate step, considered alternative, and '
+            ~ 'rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n' -}}
+    {%- endif -%}
+    {%- if role == 'system' -%}
+        {{- m['content'] or '' -}}
+        {{- extras(unit['tools'], m['response_format']) -}}
+    {%- elif role == 'developer' -%}
+        {%- if not m['content'] -%}
+            {{- raise_exception('DeepSeek V4 needs content in a developer message') -}}
+        {%- endif -%}
+        {{- '<｜User｜>' ~ m['content'] -}}
+        {{- extras(unit['tools'], m['response_format']) -}}
+    {%- elif role == 'user' -%}
+        {{- '<｜User｜>' -}}
+        {%- for block in unit['blocks'] -%}
+            {{- '\n\n' if not loop.first -}}
+            {%- if block['type'] == 'text' -%}
+                {{- block['text'] -}}
+            {%- elif block['content'] is iterable and block['content'] is not string
+                    and block['content'] is not mapping -%}
+                {{- '<tool_result>' -}}
+                {%- for part in block['content'] -%}
+                    {{- '\n\n' if not loop.first -}}
+                    {%- if part['type'] == 'text' -%}
+                        {{- part['text'] if part['text'] is defined else '' -}}
+                    {%- else -%}
+                        {{- '[Unsupported ' ~ (part['type'] if part['type'] is defined else none) ~ ']' -}}
+                    {%- endif -%}
+                {%- endfor -%}
+                {{- '</tool_result>' -}}
+            {%- else -%}
+                {{- '<tool_result>' ~ block['content'] ~ '</tool_result>' -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- elif role == 'latest_reminder' -%}
+        {{- '<｜latest_reminder｜>' ~ (m['content'] if m['content'] is defined else none) -}}
+    {%- elif role == 'assistant' -%}
+        {%- set after_task = not loop.first and ns.kept[loop.index0 - 1]['task'] is not none -%}
+        {%- if think and not after_task and (not drop or loop.index0 > ns.last_user) -%}
+            {{- (m['reasoning_content'] or '') ~ '</think>' -}}
+        {%- endif -%}
+        {{- m['content'] or '' -}}
+        {%- if m['tool_calls'] -%}
+            {{- '\n\n<｜DSML｜tool_calls>\n' -}}
+            {%- for call in m['tool_calls'] -%}
+                {%- set arguments = call['function']['arguments'] -%}
+                {%- if arguments is not mapping -%}
+                    {{- raise_exception('DeepSeek V4 renders tool-call arguments from a mapping: parse their JSON text '
+                                        ~ 'first') -}}
+                {%- endif -%}
+                {{- '\n' if not loop.first -}}
+                {{- '<｜DSML｜invoke name="' ~ call['function']['name'] ~ '">\n' -}}
+                {%- for key, value in arguments.items() -%}
+                    {{- '\n' if not loop.first -}}
+                    {%- if value is string -%}
+                        {{- '<｜DSML｜parameter name="' ~ key ~ '" string="true">' ~ value ~ '</｜DSML｜parameter>' -}}
+                    {%- else -%}
+                        {{- '<｜DSML｜parameter name="' ~ key ~ '" string="false">' ~ (value | tojson)
+                            ~ '</｜DSML｜parameter>' -}}
+                    {%- endif -%}
+                {%- endfor -%}
+                {{- '\n</｜DSML｜invoke>' -}}
+            {%- endfor -%}
+            {{- '\n</｜DSML｜tool_calls>' -}}
+        {%- endif -%}
+        {%- if not m['wo_eos'] -%}
+            {{- '<｜end▁of▁sentence｜>' -}}
+        {%- endif -%}
+    {%- else -%}
+        {{- raise_exception('DeepSeek V4 has no ' ~ role ~ ' role') -}}
+    {%- endif -%}
+    {#- What the encoder writes after a turn an assistant or latest_reminder turn follows, or after the last turn
+        when the reply is prompted: a task's token, or the reply's opening after a user or developer turn. -#}
+    {%- if (loop.last and add_generation_prompt) or (not loop.last
+            and ns.kept[loop.index0 + 1]['role'] in ('assistant', 'latest_reminder')) -%}
+        {%- if unit['task'] is not none -%}
+            {%- if unit['task'] not in task_tokens -%}
+                {{- raise_exception('DeepSeek V4 has no task ' ~ unit['task']) -}}
+            {%- elif unit['task'] == 'action' -%}
+                {{- '<｜Assistant｜>' ~ ('<think>' if think else '</think>') ~ task_tokens['action'] -}}
+            {%- else -%}
+                {{- task_tokens[unit['task']] -}}
+            {%- endif -%}
+        {%- elif role in ('user', 'developer') -%}
+            {{- '<｜Assistant｜>' ~ ('<think>' if think and (not drop or loop.index0 >= ns.last_user) else '</think>') -}}
+        {%- endif -%}
+    {%- endif -%}
+{%- endfor -%}

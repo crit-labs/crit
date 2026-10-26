@@ -65,6 +65,35 @@ int main() {
         const auto t2 = tokens.get();
         require(t2[2 * (K + 1) + 1] == 21 && t2[2 * (K + 1) + 2] == -1, "ingest follows Core's truncated count");
 
+        // Draft widths chosen per round over rows sized for the widest K = 6 (result stride 8): after rounds that emitted
+        // 2 and 6 tokens, a narrower round (K = 2) catches up the widest K + 1 = 7 columns; its own K + 1 = 3 would
+        // leave out the last 3 tokens the wider round emitted.
+        {
+            constexpr std::uint32_t widest = 6, S = dr::result_width(widest), Wc = widest + 1;
+            std::vector<std::int32_t> c(2 * dr::control::fields, 0), res(2 * S, -1);
+            const std::int32_t n[2] = {2, 6};
+            for(std::uint32_t r = 0; r < 2; ++r) {
+                c[r * dr::control::fields + dr::control::n_emitted] = n[r];
+                c[r * dr::control::fields + dr::control::base_frontier] = std::int32_t(30 + 10 * r);
+                res[r * S] = n[r];
+                for(std::int32_t i = 0; i < n[r]; ++i) res[r * S + 1 + std::uint32_t(i)] = 50 + 10 * std::int32_t(r) + i;
+            }
+            Device<std::int32_t> dc(c), dres2(res), tw(2 * Wc), pw(2 * Wc), t3(3), p3(3);
+            ok(hd::enqueue_eagle_ingest(dc.p, dres2.p, S, Wc, tw.p, pw.p, 2, nullptr), "wide ingest");
+            const auto tv = tw.get(), pv = pw.get();
+            for(std::uint32_t r = 0; r < 2; ++r)
+                for(std::uint32_t col = 0; col < Wc; ++col) {
+                    const bool live = std::int32_t(col) < n[r];
+                    require(tv[r * Wc + col] == (live ? 50 + 10 * std::int32_t(r) + std::int32_t(col) : -1), "wide catch-up token");
+                    require(pv[r * Wc + col] == (live ? std::int32_t(30 + 10 * r + col) : -1), "wide catch-up position");
+                }
+            ok(hd::enqueue_eagle_ingest(dc.p + dr::control::fields, dres2.p + S, 2, t3.p, p3.p, 1, nullptr), "narrow ingest");
+            require(t3.get() == std::vector<std::int32_t>{60, 61, 62}, "a K + 1 catch-up holds only the narrower round's columns");
+            require(hd::enqueue_eagle_ingest(dc.p, dres2.p, Wc, Wc, tw.p, pw.p, 2, nullptr) == cudaErrorInvalidValue &&
+                    hd::enqueue_eagle_ingest(dc.p, dres2.p, S, 0, tw.p, pw.p, 2, nullptr) == cudaErrorInvalidValue,
+                    "a catch-up needs columns and a result stride of at least columns + 1");
+        }
+
         // Block input: anchor = pending token, then mask placeholders at frontier + i.
         constexpr std::uint32_t B = 6;
         Device<std::int32_t> bt(R * B), bp(R * B);

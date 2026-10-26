@@ -1,14 +1,17 @@
 """Fixed-text scoring through crit serve (chat-score-v1) with a synthetic resident adapter."""
+import array
+import base64
 import http.client
 import json
+import math
 import threading
 import unittest
 from types import SimpleNamespace
 
 from test_chat_residency import ServeFixture
-from crit_api.engine import score_reply
+from crit_api.engine import PackedScores, score_reply
 from crit_api.server import Api, Server
-from crit_core.serving import ResidentChat, capabilities
+from crit_core.serving import ResidentChat, ScoreRows, capabilities, logprob_row, packed_scores
 
 # Every row ranks the scored token first at -0.25, then token 1 at -2.0; a prompt starting with 999 makes the engine
 # name another token than the one it scores.
@@ -29,6 +32,20 @@ def _score(self, request, cancellation):
             'telemetry': {'prefill_ms': 1.5, 'decode_ms': 2.0}}
 
 Engine.score = _score
+'''
+
+# The same rows over the host's channel in the packed format crit serve's request offers (as ResidentChat.score's).
+PACKED_SCORE_ADAPTER = SCORE_ADAPTER + r'''
+from crit_core.serving import packed_scores
+
+def _packed_score(self, request, cancellation):
+    record = _score(self, request, cancellation)
+    assert request['format'] == 'packed'   # crit serve offers it
+    def part(rows):
+        return packed_scores([row[0] for row in rows], [(row[1], row[2]) for row in rows], request['top_logprobs'])
+    return dict(record, format='packed', prompt=part(record['prompt']), continuation=part(record['continuation']))
+
+Engine.score = _packed_score
 '''
 
 
@@ -112,6 +129,22 @@ class ScoreApiTests(ServeFixture, unittest.TestCase):
             self.assertIn(line, text)
 
 
+class PackedChannelScoreApiTests(ScoreApiTests):
+    """The same requests with the engine's rows crossing the host's channel packed."""
+    adapter_suffix = PACKED_SCORE_ADAPTER
+
+    def test_packed_rows_reach_both_formats_unchanged(self):
+        body = {"model": "default", "prompt_ids": [5, 6, 7], "continuation_ids": [8, 9], "top_logprobs": 3}
+        response, value = self.post(body)
+        self.assertEqual(response.status, 200, value)
+        self.assertEqual(value["continuation"], [[8, -0.25, [[8, -0.25], [1, -2.0], [3, -3.0]]],
+                                                 [9, -0.25, [[9, -0.25], [1, -2.0], [3, -3.0]]]])
+        response, packed = self.post(dict(body, format="packed"))
+        self.assertEqual((response.status, packed["format"], packed["prompt"]["count"]), (200, "packed", 2), packed)
+        self.assertEqual(array.array("f", base64.b64decode(packed["continuation"]["top_logprobs"])).tolist(),
+                         [-0.25, -2.0, -3.0] * 2)
+
+
 class ScoreWithoutCapabilityTests(ServeFixture, unittest.TestCase):
     def test_a_package_without_chat_score_is_refused(self):
         engine = self.engine()
@@ -162,6 +195,73 @@ class ScoreRecordTests(unittest.TestCase):
             engine.score(short, cancellation)
         alone = engine.score(dict(self.request, prompt_rows=False), cancellation)
         self.assertEqual((alone["prompt"], len(alone["continuation"])), ([], 1))
+
+    def test_packed_records_hold_the_json_rows(self):
+        class Engine(ResidentChat):
+            scores = True
+
+            def score_tokens(self, ids, continuation, top_k, cancelled, prompt_rows):
+                # Values the clamp changes: rounding above zero, a negative zero, -inf, NaN and one below MIN_LOGPROB.
+                prompt = [(1e-7, [(t, -0.0), (0, -1e5)][:top_k]) for t in ids[1:]] if prompt_rows else []
+                return prompt, [(math.nan, [(t, -0.25), (0, -math.inf)][:top_k]) for t in continuation], \
+                    {"prefill_ms": 3.0, "decode_ms": 4.0}
+        engine = object.__new__(Engine)
+        cancellation = SimpleNamespace(is_set=lambda: False, check=lambda: None)
+        for request in (self.request, dict(self.request, prompt_rows=False), dict(self.request, top_logprobs=0)):
+            with self.subTest(request=request):
+                plain = score_reply(engine.score(request, cancellation), request)
+                packed = engine.score(dict(request, format="packed"), cancellation)
+                self.assertEqual(packed["format"], "packed")
+                self.assertEqual(json.dumps(score_reply(packed, request)), json.dumps(plain))
+                arrays = score_reply(packed, request, packed=True)
+                self.assertIsInstance(arrays["continuation"], PackedScores)
+                for part in ("prompt", "continuation"):
+                    self.assertEqual(arrays[part], PackedScores.of(plain[part], request["top_logprobs"]))
+                # JSON rows from an adapter that answers without the packed format come back as arrays too.
+                self.assertEqual(score_reply(engine.score(request, cancellation), request, packed=True), arrays)
+        self.assertEqual(json.dumps(score_reply(engine.score(self.request, cancellation), self.request)["prompt"]),
+                         json.dumps([[6, 0.0, [[6, 0.0], [0, -9999.0]]]]))   # 0.0, not -0.0, as logprob_row clamps
+
+    def test_score_rows_read_as_the_rows_they_hold(self):
+        rows = ScoreRows(array.array("f", [-0.5, 2.0]), array.array("i", [6, 0, 7, 1]),
+                         array.array("f", [-0.5, -1.0, 0.25, -1e5]), 2)
+        listed = [(-0.5, [(6, -0.5), (0, -1.0)]), (2.0, [(7, 0.25), (1, -1e5)])]
+        self.assertEqual((len(rows), list(rows), rows[-1]), (2, listed, listed[1]))
+        self.assertEqual(packed_scores([6, 7], rows, 2), packed_scores([6, 7], listed, 2))
+        self.assertEqual(logprob_row(7, rows[1], 2), [7, 0.0, [[7, 0.0], [1, -9999.0]]])
+        with self.assertRaisesRegex(ValueError, "3 alternative"):
+            ScoreRows(array.array("f", [-0.5]), array.array("i", [6, 0]), array.array("f", [-0.5, -1.0]), 3)
+        with self.assertRaisesRegex(ValueError, "not 1"):
+            packed_scores([6, 7], rows, 1)
+        with self.assertRaisesRegex(ValueError, "below 2"):
+            packed_scores([2 ** 31], [(-0.5, [])], 0)
+
+    def test_packed_records_are_checked_against_the_request(self):
+        request = dict(self.request, format="packed")
+
+        def record(prompt=((6, -0.5, [(6, -0.5), (2, -1.0)]),), alternatives=2, **changes):
+            part = packed_scores([row[0] for row in prompt], [(row[1], row[2]) for row in prompt], alternatives)
+            return self.value(**{"format": "packed", "prompt": part,
+                                 "continuation": packed_scores([7], [(-0.25, [(7, -0.25), (2, -2.0)])], 2), **changes})
+        self.assertEqual(score_reply(record(), request)["prompt"], [[6, -0.5, [[6, -0.5], [2, -1.0]]]])
+        part = record()["prompt"]
+        malformed = (dict(part, tokens="!"), dict(part, count=2), dict(part, logprobs=part["tokens"]),
+                     {k: v for k, v in part.items() if k != "count"}, dict(part, alternatives=-1))
+        for changes in ({"format": "json"}, {"prompt": []}, *({"prompt": bad} for bad in malformed)):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                score_reply(record(**changes), request)
+        for prompt, alternatives in ((((5, -0.5, [(6, -0.5), (2, -1.0)]),), 2), (((6, -0.5, [(6, -0.5)]),), 1),
+                                     (((6, -0.5, [(2, -1.0), (6, -0.5)]),), 2),
+                                     (((6, -0.5, [(6, -0.5), (6, -0.75)]),), 2),
+                                     (((6, -0.5, [(6, -0.5), (-1, -0.75)]),), 2)):
+            with self.subTest(prompt=prompt), self.assertRaisesRegex(ValueError, "Score prompt rows"):
+                score_reply(record(prompt, alternatives), request)
+        # Values outside [MIN_LOGPROB, 0], which packed_scores clamps, so they are written in by hand.
+        for bad in (math.nan, math.inf, -math.inf, 0.5, -1e5):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "numbers in"):
+                found = record()
+                found["prompt"]["logprobs"] = base64.b64encode(array.array("d", [bad]).tobytes()).decode()
+                score_reply(found, request)
 
     def test_the_capability_is_declared_with_score(self):
         text = SimpleNamespace(templates={})

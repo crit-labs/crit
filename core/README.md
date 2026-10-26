@@ -2,7 +2,7 @@
 
 Core is the engine foundation. [Inference](../inference/README.md) supplies
 optional techniques and [Kernels](../kernels/README.md) guides kernel selection;
-neither is required to integrate an engine. [Eval](../docs/eval/README.md)
+neither is required to integrate an engine. [Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md)
 measures the completed engine through a separate adapter.
 
 Core owns lifecycle and resource infrastructure and ships libraries for request
@@ -76,10 +76,10 @@ cmake --build build/consumer
 ctest --test-dir build/consumer --output-on-failure
 ```
 
-The SDK is version 0.9.1. Include `<crit/core.h>` and link the installed target:
+The SDK is version 0.10.0. Include `<crit/core.h>` and link the installed target:
 
 ```cmake
-find_package(critCore 0.9.1 EXACT CONFIG REQUIRED)
+find_package(critCore 0.10.0 EXACT CONFIG REQUIRED)
 target_link_libraries(your_engine PRIVATE crit::core)
 ```
 

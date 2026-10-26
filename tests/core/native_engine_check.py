@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "core" / "python"))
 
 from crit_core.native import EvalEngine, NativeEngine, NativeError, ResidentEngine  # noqa: E402
+from crit_core.serving import ScoreRows, unpacked_scores  # noqa: E402
 
 
 def expect(condition, message):
@@ -91,6 +92,10 @@ def abi(library):
            and scored.top == [[(3, -0.75), (4, -1.0)], [(4, -0.75), (5, -1.0)]], scored)
     both = engine.score([1, 2, 3, 4], 2, "decode", [[7, 8], [9, 10]], top_k=2)
     expect(both.query == [[-1.0, -1.125], [-1.25, -1.375]] and both.top == scored.top, both)
+    # Packed: the same rows as ScoreRows over byte copies of the engine's arrays, the queries and argmax unchanged.
+    packed = engine.score([1, 2, 3, 4], 2, "decode", [[7, 8], [9, 10]], top_k=2, packed=True)
+    expect(isinstance(packed.top, ScoreRows) and list(packed.top) == list(zip(scored.target, scored.top))
+           and packed[:3] == both[:3], packed)
     for bad in (lambda: engine.score([1, 2], 2), lambda: engine.generate([], 3),
                 lambda: engine.score([1, 2], 1, top_k=21)):
         try:
@@ -230,6 +235,16 @@ def resident_adapter(library):
            scored)
     expect(all(row[1] == -0.5 and [t for t, _ in row[2]] == [row[0], (row[0] + 1) % 64]
                for row in scored["prompt"] + scored["continuation"]), scored)
+    # Packed, as crit serve asks for it: the same tokens and values as arrays.
+    packed = engine.score(dict(request, prompt_ids=[1, 2, 3], continuation_ids=[11, 5, 12], top_logprobs=2,
+                               prompt_rows=True, format="packed"), Cancellation())
+    expect(packed["format"] == "packed" and packed["telemetry"].keys() == scored["telemetry"].keys(), packed)
+    for part in ("prompt", "continuation"):
+        tokens, logprobs, top_tokens, top_logprobs, k = unpacked_scores(packed[part])
+        expect((tokens.tolist(), logprobs.tolist(), top_tokens.tolist(), top_logprobs.tolist(), k)
+               == ([row[0] for row in scored[part]], [row[1] for row in scored[part]],
+                   [t for row in scored[part] for t, _ in row[2]], [v for row in scored[part] for _, v in row[2]], 2),
+               packed)
     too_long = dict(request, limits={"max_output_tokens": 196})
     try:
         engine.generate(too_long, Cancellation())

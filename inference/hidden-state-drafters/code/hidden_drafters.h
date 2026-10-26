@@ -15,6 +15,13 @@ namespace crit::techniques::hidden_drafters {
 // with the token at p + 1). Run first in the next round's draft step: Core's truncation has settled n_emitted by then.
 cudaError_t enqueue_eagle_ingest(const std::int32_t* control, const std::int32_t* result, std::uint32_t draft_tokens,
                                  std::int32_t* tokens, std::int32_t* positions, std::uint32_t rows, cudaStream_t stream);
+// The same catch-up over `columns` W columns (tokens and positions [rows][W]) from result rows `result_stride` int32
+// apart (>= W + 1). With draft widths chosen per round over buffers sized for the widest K, the previous round may
+// have emitted up to that width + 1 tokens, so W is the widest K + 1 whatever this round's K is (columns c >= n_emitted
+// stay -1); the K + 1 form would drop the tokens a wider round emitted beyond the narrower one's K + 1.
+cudaError_t enqueue_eagle_ingest(const std::int32_t* control, const std::int32_t* result, std::uint32_t result_stride,
+                                 std::uint32_t columns, std::int32_t* tokens, std::int32_t* positions, std::uint32_t rows,
+                                 cudaStream_t stream);
 
 // A block drafter's input: [control[last_token], mask_token x (block - 1)] at positions control[frontier] + i.
 cudaError_t enqueue_block_input(const std::int32_t* control, std::int32_t mask_token, std::uint32_t block,

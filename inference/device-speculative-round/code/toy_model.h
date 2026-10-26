@@ -30,11 +30,19 @@ struct State { // per request
     float* gdn_live = nullptr; float* gdn_start = nullptr; // [keys][values]
     float* gdn_checkpoints = nullptr;                     // [max_columns][keys][values]
 };
+// Optional per-column log-probabilities of the prediction under the head's logits (log-softmax, crit::core's
+// TokenLogprob definition) and its `top` ranked alternatives (log-probability descending, then id ascending).
+struct Logprobs {
+    float* chosen = nullptr;          // [columns]
+    std::int32_t* top_ids = nullptr;  // [columns][top]
+    float* top_logprobs = nullptr;    // [columns][top]
+    std::uint32_t top = 0;            // <= vocabulary
+};
 // Feed inputs[0..columns) at positions *frontier.., writing KV rows, gated-delta
 // checkpoints for every column and predictions[t] = greedy argmax after column t.
 // The live gated-delta state is copied to gdn_start first and left unchanged.
 cudaError_t enqueue_forward(const Weights&, const State&, const std::int32_t* inputs, const std::int32_t* frontier,
-                            std::uint32_t columns, std::int32_t* predictions, cudaStream_t);
+                            std::uint32_t columns, std::int32_t* predictions, cudaStream_t, const Logprobs& = {});
 // Live gated-delta state = checkpoint[*accepted - 1] (start when zero); no host read.
 cudaError_t enqueue_commit(const State&, const std::int32_t* accepted, std::uint32_t columns, cudaStream_t);
 // inputs = {control[last_token], drafts[0..k)}.

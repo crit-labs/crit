@@ -98,36 +98,62 @@ def _layer_targets(plan, layers):
     return grouped
 
 
+def _shared(records, torch):
+    """Let the windows' captured layer arguments share one tensor where their values are equal (the masks and
+    rotary tables of windows of one length), so the captures hold one copy of each."""
+    seen = {}
+
+    def share(value):
+        if isinstance(value, torch.Tensor):
+            key = (value.shape, value.dtype, value.device)
+            for kept in seen.setdefault(key, []):
+                if kept is value or torch.equal(kept, value):
+                    return kept
+            seen[key].append(value)
+            return value
+        if isinstance(value, tuple):
+            return tuple(share(item) for item in value)
+        return value
+    return [[(tuple(share(a) for a in args), {k: share(v) for k, v in kwargs.items()}, slot)
+             for args, kwargs, slot in calls] for calls in records]
+
+
+def _run(layer, call, state):
+    """Decoder layer `layer` on `state` with the other arguments the model's forward handed it (`call`)."""
+    args, kwargs, slot = call
+    if slot == 0:
+        args = (state, *args[1:])
+    else:
+        kwargs = {**kwargs, slot: state}
+    out = layer(*args, **kwargs)
+    return out[0] if isinstance(out, tuple) else out
+
+
 def calibrate(source, plan, recipe, windows, device, staging, log):
     """Sequential GPTQ: stream decoder layers through the official transformers modeling code (as Eval's reference
     does), collect each target's input Hessian over the calibration windows, quantize it, and feed the next layer
-    the outputs of the quantized layer. Writes each layer's export tensors to `staging`."""
+    the outputs of the quantized layer. Each layer gets what the model's own forward hands it (its input states,
+    masks, positions and any token inputs, such as hyper-connection streams or n-gram ids), captured once per
+    window. Writes each layer's export tensors to `staging`."""
     import torch
     from safetensors.torch import save_file
-    from crit_eval.reference import StreamingReference
+    from crit_eval.reference import StreamingReference, _hidden
     from .codecs import quantize
     reference = StreamingReference(source, device)
     if reference.prefix != plan["prefix"]:
         raise ValueError(f"decoder prefix {reference.prefix!r} differs from the plan's {plan['prefix']!r}")
     config = reference.config
     by_layer = _layer_targets(plan, config.num_hidden_layers)
-    embed = reference.checkpoint.raw(plan["prefix"] + "embed_tokens.weight")
-    states = [embed[torch.tensor(ids)].float()[None] for ids in windows]
-    del embed
-    length = len(windows[0])
-    positions = torch.arange(length, device=device)[None]
-    # The rotary module keeps its computed frequency buffers on the reference's skeleton.
-    embeddings = reference.skeleton.rotary_emb.to(device)(states[0].to(device), positions)
-    mask = torch.full((length, length), float("-inf"), device=device).triu(1)[None, None]
-    layer_types = getattr(config, "layer_types", None)
+    reference._implementation("eager")
+    with torch.no_grad():
+        reference._load_outer()   # the embeddings, rotary tables and whatever else the forward runs before layer 0
+        records = _shared([reference._capture(list(ids)) for ids in windows], torch)
+    states = [_hidden(*calls[0][:2])[1].to("cpu") for calls in records]
     errors, last = {}, max(by_layer)
 
     def forward(layer, index):
-        full = layer_types is None or layer_types[index] != "linear_attention"
-        for s, state in enumerate(states):
-            out = layer(state.to(device), position_embeddings=embeddings, attention_mask=mask if full else None,
-                        position_ids=positions)
-            states[s] = (out[0] if isinstance(out, tuple) else out).to("cpu")
+        for s, calls in enumerate(records):
+            states[s] = _run(layer, calls[index], states[s].to(device)).to("cpu")
 
     with torch.no_grad():
         for index in range(last + 1):
@@ -147,10 +173,8 @@ def calibrate(source, plan, recipe, windows, device, staging, log):
                         hessians[name] += x.T @ x
                         counts[name] += x.shape[0]
                     hooks.append(module.register_forward_pre_hook(hook))
-                full = layer_types is None or layer_types[index] != "linear_attention"
-                for state in states:
-                    layer(state.to(device), position_embeddings=embeddings, attention_mask=mask if full else None,
-                          position_ids=positions)
+                for calls, state in zip(records, states):
+                    _run(layer, calls[index], state.to(device))
                 for handle in hooks:
                     handle.remove()
                 exported = {}
