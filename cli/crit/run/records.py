@@ -21,6 +21,8 @@ WEIGHTS_POLICIES = {"as_stored", "transformable"}  # run: may candidates change 
 # Drift a run allows against the Eval reference, spent on speed; matches crit_eval/protocol.json.
 DEFAULT_QUALITY_BUDGET = {"ppl_ratio_max": 1.05, "kld_mean_max": 0.05, "kld_p99_max": 0.5}
 EXACTNESS_MODES = {"reported", "required"}  # must speculative output equal plain greedy?
+# What Eval judges quality against (crit-eval quality modes): the checkpoint with exact activations, or run as quantized.
+QUALITY_MODES = ("preserve", "as_quantized")
 # Runs created from this version on require a recorded plan (crit run ... plan) for every candidate; older runs
 # have no plans field and keep plan_id optional.
 NEW_RUN_PLANS = "required"
@@ -186,6 +188,11 @@ def validate_origin(value, stored=None):
         if has_path and not str(ref["path"]).startswith(ORIGIN_DIR + "/"):
             raise ValueError(f"origin_engine.evidence is kept under {ORIGIN_DIR}/")
     return value
+
+
+def quality_mode(correctness):
+    """The run's quality mode (QUALITY_MODES): preserve unless the request chose as_quantized."""
+    return correctness.get("quality_mode", "preserve")
 
 
 def quality_terms(correctness, amendments=()):
@@ -461,7 +468,8 @@ def request_spec(data):
     keys(data, {"model_path", "correctness_criteria"}, {"kv_tokens", "device", "vram_headroom_gib", "ram_headroom_gib",
          "context_reserve_gib", "context_tokens",
          "budget_minutes", "workload", "cases", "benchmark_protocol", "targets", "verification_level", "attempt_limit",
-         "weights_policy", "candidate_budget", "quality_budget", "exactness", "eval_sampling", "origin_engine"})
+         "weights_policy", "candidate_budget", "quality_budget", "exactness", "quality_mode", "eval_sampling",
+         "origin_engine"})
     path = Path(text(data["model_path"], "Model path")).expanduser().resolve()
     if not path.exists():
         raise ValueError("Model path does not exist on this computer")
@@ -495,7 +503,8 @@ def request_spec(data):
                             "required_gates": ["arithmetic", "functional", "resources"],
                             **({"weights_policy": data["weights_policy"]} if "weights_policy" in data else {}),
                             **({"quality_budget": data["quality_budget"]} if "quality_budget" in data else {}),
-                            **({"exactness": data["exactness"]} if "exactness" in data else {})},
+                            **({"exactness": data["exactness"]} if "exactness" in data else {}),
+                            **({"quality_mode": data["quality_mode"]} if "quality_mode" in data else {})},
             "objectives": {"targets": targets, "verification_level": level},
             "resource_limits": resource_limits(data),
             **({"eval_sampling": eval_sampling(data["eval_sampling"])} if "eval_sampling" in data else {}),
@@ -585,7 +594,8 @@ def validate_spec(value):
         if hardware["kv_tokens"] < case["workload"]["prompt_tokens"] + case["workload"]["output_tokens"]:
             raise ValueError("Case exceeds requested KV capacity")
     text(value["benchmark_protocol"], "protocol", 200)
-    keys(value["correctness"], {"criteria", "required_gates"}, {"weights_policy", "quality_budget", "exactness"})
+    keys(value["correctness"], {"criteria", "required_gates"}, {"weights_policy", "quality_budget", "exactness",
+                                                                  "quality_mode"})
     text(value["correctness"]["criteria"], "criteria", 8000)
     if value["correctness"].get("weights_policy", "as_stored") not in WEIGHTS_POLICIES:
         raise ValueError("weights_policy requires as_stored or transformable")
@@ -595,6 +605,8 @@ def validate_spec(value):
         number(limit, key, 1 if key == "ppl_ratio_max" else 0, 1_000_000)
     if value["correctness"].get("exactness", "reported") not in EXACTNESS_MODES:
         raise ValueError("exactness requires reported or required")
+    if quality_mode(value["correctness"]) not in QUALITY_MODES:
+        raise ValueError("quality_mode requires preserve or as_quantized")
     if value["correctness"]["required_gates"] != ["arithmetic", "functional", "resources"]:
         raise ValueError("Fixed arithmetic, functional and resource gates required")
     keys(value["objectives"], {"targets", "verification_level"})

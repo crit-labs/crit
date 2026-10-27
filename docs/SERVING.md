@@ -1274,7 +1274,8 @@ request that sets any carries `template_kwargs`, `{name: value}` with declared v
 TEMPLATE_KWARGS gives them; render the template with them over the configured variables, for that request
 only. ResidentChat does: `capabilities(text, sampling)` declares the variables its templates read
 (`crit_core.serving.template_kwargs`), and `prompt_ids` sets the request's over configuration
-`chat_template_kwargs` and refuses any other with `RequestRejected`. An adapter that overrides
+`chat_template_kwargs` (without it, the `template_variables` the run's recon froze into
+configuration `recon`) and refuses any other with `RequestRejected`. An adapter that overrides
 `prepare_prompt` keeps this by rendering through `self.prompt_ids(request)`.
 
 ### Token log-probabilities for adapters

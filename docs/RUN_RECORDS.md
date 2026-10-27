@@ -40,7 +40,7 @@ and speed techniques; a larger one trades context for that room.
 | --- | --- |
 | `create` | `--record request.json [--from-engine ENGINE_DIR]`; new run and first segment; with an engine folder of a crit-hub checkout, the run starts from that engine ([origin engine](#origin-engine)) |
 | `resolve` | `--record inputs.json`; freezes verified model and input identities |
-| `plan` | `--record plan.json`; records the next candidate's plan after the parent's Eval and before any code, freezes that Eval and computes the priorities ([plan](#plan)) |
+| `plan` | `--record plan.json [--check]`; records the next candidate's plan after the parent's Eval and before any code, freezes that Eval and computes the priorities ([plan](#plan)); with `--check`, runs the same checks and prints the record it would store, recording nothing |
 | `candidate` | `--source DIR --record proposal.json`; allocates an ID, retains source |
 | `reserve` | `--operation discovery/build/check/benchmark [--candidate ID] [--seconds N]`; consumes an attempt before launch; only discovery omits the candidate |
 | `settle` | `--reservation RUN_RELATIVE_PATH --record result.json`; exit, logs, cleanup |
@@ -54,6 +54,7 @@ and speed techniques; a larger one trades context for that room.
 | `stop` | `--record stop.json` |
 | `resume` | `--candidates N [--attempt-limit N] [--external-agent-stopped]`; new segment for N more candidates (`--minutes N` alone: legacy time-budget segment). `--quality-budget JSON`, `--exactness MODE`, `--approved-by NAME` amend quality terms from this segment on, recorded as the segment's `amendment` |
 | `cost` | `--transcript PATH [--transcript PATH ...] [--agent NAME] [--prices JSON] [--until TIMESTAMP]`; accounts the run's build cost from the agent's transcripts and writes `cost.json` ([cost](#cost)) |
+| `replay` | `--at CANDIDATE` or `--before PLAN`, `--out DIR [--count N] [--agent CMD]`; copies the run as it stood when the candidate's Eval finished (or just before the plan was recorded) into `DIR/replay-1` ... `DIR/replay-N`, for an agent to say what it would do next with today's crit and crit-eval; `--agent CMD` starts any harness on every replay at once and collects; `--collect` checks and lists the plans the replays wrote ([replays](#replays)) |
 | `show`, `recover` | Inspect; or prove abandoned ownership and rebuild active projections |
 
 ## Payloads
@@ -81,6 +82,7 @@ hashes; add them only where a field below requires one.
 | `weights_policy` | Optional `as_stored` (supplied weights used as stored) or `transformable`; omitted means unspecified |
 | `quality_budget` | Optional drift budget against Eval's reference: any of `ppl_ratio_max` (≥ 1), `kld_mean_max`, `kld_p99_max` (≥ 0); defaults 1.05, 0.05, 0.5. Agents spend it on speed |
 | `exactness` | `reported` (default: speculative output may differ from plain greedy; the drift budget judges it) or `required` (any difference fails Eval's gate) |
+| `quality_mode` | `preserve` (default: Eval's quality reference keeps the activations exact, and prefill's limits are priced at 16-bit prompt activations) or `as_quantized` (the reference runs the checkpoint as quantized, its activations quantized as it declares, and prefill's limits are priced at its stored format); the user's choice, from the request or `settings.toml`'s `quality_mode`. `crit run ... eval` judges in it |
 | `eval_sampling` | Optional, the user's only: `{settings, approved_by}`, settings `temperature` (> 0, required) and any of `top_p`, `top_k`, `min_p`, as an object or `"temperature=0.6,top_p=0.95"`. Eval's sampled suite then measures at these settings instead of the model's `generation_config.json`: `crit run ... eval` requires data prepared with `crit eval prepare --sampling` and the same settings (and refuses overridden data without it), recon applies them to the served default, and results label them as an override |
 | `origin_engine` | Written by `create --from-engine`, never by hand: the crit-hub engine the run starts from ([origin engine](#origin-engine)) |
 
@@ -608,6 +610,53 @@ If sealing is interrupted after writing the outcome, repeat `seal` with the same
 lifecycle and failure. It preserves the original outcome and completes the seal.
 If the seal was already published, the retry verifies its inventory and updates only
 run state and history. A different outcome or damaged sealed artifact is rejected.
+
+## Replays
+
+A replay asks what an agent decides at one point of a finished run, without building anything: after a change to
+crit's rules or to crit-eval's reports, replays of an old run at a candidate show whether an agent now plans
+differently from that candidate's Eval, in minutes instead of a run.
+
+```text
+crit run --root RUN_ROOT --id RUN_ID replay --at CANDIDATE --out DIR --count 3
+```
+
+makes `DIR/replay-1` ... `DIR/replay-3`, each a run root holding a copy of `RUN_ID` as it stood when `CANDIDATE`'s
+newest completed Eval attempt ended (its attempt's `ended_at`, the plan outcome crit wrote for it and five seconds of
+margin): every file written by then, nothing later. `--before PLAN` ends the copy where that plan's record was made
+instead, so it holds the work its agent did after the parent's Eval toward the plan (measurements, rejected tries),
+for a decision taken with that evidence. Records and candidates are copied whole; `work/` leaves out build products
+(shared libraries, objects, weights and files over 16 MiB) and drafts of the next plan (JSON with a plan's
+`parent_candidate_id`, `decision`, `needed` and `levers`, written after the parent's Eval). Work the agent kept
+outside the run folder, or only in its session, is not in any replay. `state.json` and the projections of unsealed
+candidates are rebuilt from the copied records. The run itself is only read.
+
+Each replay renders the Eval status of every copied candidate again with today's crit-eval
+(`replay/status/CANDIDATE.json` and `.txt`, against the baseline its result named), and `plan --check` there judges the
+parent's Eval by that status. `replay.json` names the run, the candidate, the cutoff and the statuses; while it exists,
+crit refuses every command that records or changes a record in the run (candidates, plans, packages, attempts, Eval,
+seals, stops, resumes). `replay/agent_request.md` is the replay's brief: the agent studies the run as its agent would
+after that Eval, writes the plan it would record next to `replay/plan.json`, checks it with `plan --record
+replay/plan.json --check` and says why in `replay/next.md`. Start one agent per replay, each with nothing but its
+replay folder (no memory or notes of the original run), so they decide independently. crit starts no agent of its
+own and works with any harness: `--agent CMD` runs a command once per replay, all at once, in the replay's run folder,
+with `{brief}`, `{folder}`, `{root}` and `{number}` replaced by the replay's brief, run folder, run root and number
+(and `CRIT_REPLAY_BRIEF` and `CRIT_REPLAY_FOLDER` set), writes its output to `replay/agent.log` and its exit to
+`replay/agent.json`, waits for all and collects:
+
+```text
+crit run --root RUN_ROOT --id RUN_ID replay --at CANDIDATE --out DIR --count 3 \
+  --agent 'codex exec "Read {brief} and do what it asks."'
+```
+
+Any command that starts an agent on a prompt works the same way (another CLI harness, or a script driving a model
+API). Agents started some other way are collected afterwards with
+
+```text
+crit run --root RUN_ROOT --id RUN_ID replay --collect --out DIR
+```
+
+checks each replay's plan and lists its decision, priorities, levers with their KPI changes, rejections and forecast.
 
 ## Recovery and Resume
 

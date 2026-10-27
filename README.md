@@ -8,7 +8,7 @@
 
 ### Why wait for someone to optimize an LLM for your GPU when an AI agent can build a specialized inference engine in a few hours?
 
-[![Version 0.10.0](docs/assets/badge-version.svg)](CHANGELOG.md)
+[![Version 0.11.0](docs/assets/badge-version.svg)](CHANGELOG.md)
 [![License Apache-2.0](docs/assets/badge-license.svg)](LICENSE)
 [![crit-hub engines](docs/assets/badge-crit-hub.svg)](https://github.com/crit-labs/crit-hub)
 [![CI](https://github.com/crit-labs/crit/actions/workflows/ci.yml/badge.svg)](https://github.com/crit-labs/crit/actions/workflows/ci.yml)
@@ -55,8 +55,6 @@ Use github.com/crit-labs/crit to optimize my own inference engine in <engine_ref
 <a id="what-crit-solves"></a>
 
 ## What `crit` solves
-
-Less time building an engine. More performance from your hardware.
 
 **The boring stuff has already been built ⏱️** 
 > Requests, memory management and cleanup
@@ -239,8 +237,6 @@ output, so candidates 3 and 4 have the same round time but accept different numb
 
 ## How `crit` works
 
-### 1. The workflow
-
 An agent, or you, builds the engine as a series of candidates. Each candidate is a complete,
 servable engine, measured the same way, and each next one is chosen from the last one's numbers.
 
@@ -263,7 +259,7 @@ flowchart LR
 2. **Learn the hardware's limits.** `crit eval probe` measures the GPU, and Eval turns the
    measurements into the fastest decode, prefill and time to first token this model could reach on it.
 3. **Build candidate 1:** a working engine on [Core](#core), measured by Eval. It sets the baseline.
-4. **Decide what the next candidate changes.** The [decision algorithm](#decision-algorithm) reads
+4. **Decide what the next candidate changes.** The [decision algorithm](docs/RUN_RECORDS.md#plan) reads
    the last Eval and names the KPI furthest from its limit, the levers that close the gap, and a
    forecast crit checks after the build.
 5. **Build candidate 2, 3, …**, each measured by Eval and compared with its forecast.
@@ -274,97 +270,113 @@ Every step is recorded through the [CLI](cli/README.md): each candidate freezes 
 each measurement points at that exact package, and the run's cost is counted from the agent's own
 transcripts ([run records](docs/RUN_RECORDS.md)).
 
-<a id="eval"></a>
-
-### 2. crit Eval → [Full guide](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md)
-
-Eval runs one fixed suite against every engine: the same prompts, output lengths, stop handling and
-quality references, through the same `crit serve` API a client uses. Results from different runs,
-agents and machines therefore compare.
-
-**Limits, not just tok/s.** "252 tok/s" alone does not say whether an engine is good or how much is
-left. Eval measures the GPU's memory bandwidth and matrix-multiply rates per weight format, and from
-the model's files computes what each phase costs at best: decode reads the weights (and the KV cache)
-once per pass, so bandwidth sets its floor; prefill is arithmetic, so the GEMM rates set its ceiling.
-Every score is reported as a fraction of its limit, with its run-to-run noise, and the gaps say which
-term (model pass, draft steps, draft width, drafter acceptance, prefill, first token) would give how
-much at its floor. That is what makes "speed of light" a number an agent can aim at.
-
-| KPI | What it measures | Its limit |
-| --- | --- | --- |
-| **Decode** | Tokens per second over six workloads (chat, code, math, tool calls, a long document, a 14K-token agent session), at the model's own sampling; greedy decode reported beside it | The weights read per pass at the measured bandwidth, and with drafting the best tokens per round the drafter allows |
-| **Prefill** | Prompt tokens per second on the two long prompts | The prompt's arithmetic at the measured GEMM rates |
-| **Time to first token** | Milliseconds over every workload, where short prompts expose fixed costs | The larger of the prompt's compute and one weight read |
-| **Long-context decode and first token** | The same scores along a curve of prompts up to the required context, 262,144 tokens by default | As above, with the KV cache read at each length |
-| **Quality** | The share of the drift budget the worst quality set uses: perplexity ratio, mean and p99 KL divergence | Zero drift |
-
-Gates decide whether a result counts at all: output repeats, the same greedy requests give the same
-tokens after a long request history, follow-up turns answer the same from a prompt cache, facts at the
-start, middle and end of long prompts are retrieved, speculative output equals plain greedy when
-required, sampled tokens follow the model's distribution, and quality stays inside the budget.
-
-**Quality against the checkpoint you chose.** Eval measures drift against the checkpoint as stored,
-for example an NVFP4 model, scored once in FP32 with the model's official code, not against its
-full-precision original. The user chose that checkpoint and its quantization loss; the engine cannot
-change it. Comparing with full precision would mix the publisher's loss with the engine's own, so a
-careless engine could hide behind the quantization and a careful one would be charged for it. What
-Eval reports is exactly what the engine adds, and the budget (perplexity ratio ≤ 1.05, mean KL
-≤ 0.05, p99 KL ≤ 0.5 by default) is there to be spent on speed: lower drift than needed is not a gain.
-
-<a id="decision-algorithm"></a>
-
-### 3. The decision algorithm → [Plan records](docs/RUN_RECORDS.md#plan)
-
-Before any code for the next candidate, the agent records a plan, and crit checks it against the last
-Eval, which it freezes:
-
-1. **Rank.** crit computes the priorities from the fractions of the limits: of decode and prefill, the
-   one further from its limit comes first, both when they are within noise of each other, and time to
-   first token never leads alone. Where Eval gives no limit, crit computes one with Eval's cost model.
-2. **Compare strategies.** The plan sets the current strategy's ceiling against the best alternative's,
-   for example plain decoding against drafting with the model's own draft layer, the alternative held
-   to what its drafter is measured to accept.
-3. **Name levers and a forecast.** Each lever states its projected change per KPI; the plan gives a
-   low, expected and high forecast.
-4. **Refuse bad plans.** crit rejects a plan that stops while a KPI is still needed, leaves a gap above
-   the noise unanswered, forecasts no gain beyond the noise or only chases time to first token.
-5. **Check the outcome.** After Eval, crit sets the forecast next to the measured result and records
-   each lever as built, pruned or deferred.
-
-The run stops only when neither decode nor prefill can still move beyond its noise. The agent cannot
-drift, overclaim or quit early, and every candidate has a recorded reason to exist.
+---
 
 <a id="core"></a>
 
-### 4. crit Core → [Full guide](core/README.md)
+<details>
+<summary><strong>📗 Core</strong> → <a href="core/README.md">Full guide</a></summary>
 
-We studied about 30 inference engines and kept what every one of them has to build before it can be
-fast: request scheduling, memory admission and tracking, output delivery, stop strings, sampling,
-state and prefix caches, model files and config, structured output, and process cleanup after a crash. That minimum became Core, a native SDK with a Python package. Your engine owns
-everything that makes it specific (the model, its kernels, its tensor layouts and its execution
-strategy) and calls Core for the plumbing. Try the
-[Core + Inference walkthrough](inference/examples/core-projection/README.md).
+<br />
+
+**Core is the plumbing every engine needs, distilled from about 30 bespoke inference engines.**
+> We took apart how each engine handles requests, memory, text and model files, kept the base
+> features they all rebuild, and turned them into one native SDK. Your engine keeps what makes it
+> fast: the model, its kernels, its layouts and its execution strategy.
+
+| Part | What it does |
+| --- | --- |
+| [Runtime](core/src/runtime/README.md) | Admits, schedules, cancels and retires requests, and publishes their output |
+| [Engine libraries](core/src/runtime/README.md#engine-libraries) | A C ABI that turns an engine into a shared library, with stock Eval and serve adapters |
+| [Memory](core/src/memory/README.md) | Resource budgets, reservations and host-memory admission |
+| [Text](core/python/crit_core/text/README.md) | Tokenizer and chat template loading, stop strings and streamed reply text |
+| [Sampling](core/src/sampling/README.md) | Sampling rules, penalties, log-probabilities and greedy draft acceptance |
+| [State cache](core/src/state/README.md) | KV pages, recurrent state slots and prefix-cache snapshots |
+| [Model files](core/python/crit_core/model/README.md) | Safetensors and GGUF checkpoints, `config.json`, generation defaults and stop tokens |
+| [Files](core/src/io/README.md) | Strict JSON, read-only, chunked and mapped file reads, SHA-256 |
+| [Structured output](core/src/constraints/README.md) | Token masks for choices, JSON schemas and grammars |
+| [Device graphs](core/src/backends/cuda/README.md#graph-capture) | CUDA graph capture and replay to cut launch overhead |
+| [CUDA backend](core/src/backends/cuda/README.md) | Allocations, streams, shared device memory and device time per category |
+| [Tracing](core/src/runtime/README.md#lifecycle-tracing) | A bounded lifecycle trace with operator ranges and NVTX |
+| [Contracts](core/contracts/README.md) | Who owns what between Core and your engine |
+
+Try the [Core + Inference walkthrough](inference/examples/core-projection/README.md).
+
+</details>
+
+---
 
 <a id="inference"></a>
 
-### 5. crit Inference → [Full guide](inference/README.md)
+<details>
+<summary><strong>📕 Inference</strong> → <a href="inference/README.md">Full guide</a></summary>
 
-We studied about 50 inference engines, from general-purpose runtimes to engines tuned for one model
-on one GPU, and extracted what makes each of them fast into separate techniques: speculative decoding
-with draft layers, trees and device-side rounds, expert caches and host-resident experts, quantized
-projections and KV caches, paged and partitioned attention, prefix checkpoints, CUDA graph reuse and
-more, 36 entries in all. Each says when it helps, what is tested and what the engine supplies, so an
-agent can adopt it quickly instead of rediscovering it.
+<br />
 
-The collection keeps growing the same way. The engines stay pinned at exact revisions, and salvage
-passes read what changed in them down to individual pull requests, merged or not. A finding enters
-crit only with its mechanism and evidence, a crit consumer and the gap it closes, the smallest useful
-adaptation and the three [contribution criteria](docs/CONTRIBUTION_CRITERIA.md): value that can be
-shown, nothing tuned to one model or GPU, useful across architectures and GPUs. Upstream numbers are
-never carried over as crit's, and rejected findings are kept with their reasons.
+**Inference is our register of speed-up strategies, curated from about 50 inference engines.**
+> We studied what makes each engine fast and turned every strategy that holds beyond one model or
+> GPU into an entry. Your agent picks the entries that match its engine's bottleneck and builds them
+> into the engine on Core.
 
-### More parts
+| Bottleneck | Example entries |
+| --- | --- |
+| One token per pass | [Speculative decoding](inference/mtp-decode/README.md), [draft trees](inference/draft-trees/README.md), [device-side rounds](inference/device-speculative-round/README.md), [EAGLE-3 and DFlash drafters](inference/hidden-state-drafters/README.md) |
+| Weight bytes per pass | [Quantized projections](inference/quantized-projections/README.md), [stored-tile FP8 and NVFP4 GEMMs](inference/stored-tile-gemm/README.md), [GGUF projections](inference/gguf-projections/README.md) |
+| Long context | [FP8 KV attention](inference/fp8-kv-attention/README.md), [flash prefill](inference/flash-prefill-attention/README.md), [paged attention](inference/paged-attention/README.md), [prefix checkpoints](inference/checkpoint-storage/README.md) |
+| Model larger than VRAM | [Expert residency](inference/expert-residency/README.md), [device expert cache](inference/device-expert-cache/README.md), [dense layer offload](inference/dense-layer-offload/README.md) |
+| Hybrid recurrent layers | [Recurrent layer kernels](inference/recurrent-layer-kernels/README.md), [recurrent state recovery](inference/recurrent-state-recovery/README.md) |
 
+All 37 entries are in the [full guide](inference/README.md), or run `crit inference search <query>`.
+
+**Every entry has the same layout**
+
+| Part | What it holds |
+| --- | --- |
+| `README.md` | When to use it, how it works, a worked example, how to adapt it, its costs and how to validate it |
+| `code/` | Real implementation code, C++, CUDA or Python, with runnable examples |
+| `entry.json` | When to use and avoid it, what the code provides, what the engine must supply and what it must preserve |
+
+**What gets in: the [contribution criteria](docs/CONTRIBUTION_CRITERIA.md)**
+
+| Criterion | Means |
+| --- | --- |
+| Shown value | A measured gain, a reproduced and fixed bug, or a capability engines had to rebuild themselves |
+| No overfitting | Nothing in it is true only for the model or GPU where it was found |
+| Broad use | Dense, MoE, hybrid and multimodal models and other CUDA GPUs use it unchanged or are unaffected |
+
+</details>
+
+---
+
+<a id="eval"></a>
+
+<details>
+<summary><strong>📚 Eval</strong> → <a href="https://github.com/crit-labs/crit-eval">Full guide</a></summary>
+
+<br />
+
+`crit-eval` is a speed and quality measurement tool to compare inference engines honestly.
+
+**There is no shared way to measure a bespoke inference engine.**
+> Different bespoke inference engines report vastly different types of numbers. An honest comparison requires
+> downloading and running the engines yourself. `crit-eval` finally makes apples-to-apples comparison possible.
+
+**Physics-based evaluation lets you see what performance is left on the table.**
+> `crit-eval` measures your GPU's memory bandwidth and matrix-multiply rates and turns them into a limit for each
+> score. Its evaluation report can tell your coding agent how much performance can still be squeezed out of your
+> inference engine.
+
+**Speed that can't hide a quality loss.**
+> Many inference engines push decode and prefill speed with no regard for quality. `crit-eval` treats quality
+> as a first-class KPI. It measures not only inference speed but also quality regressions.
+
+**A hardware report rounds out the evaluation.**
+> The same model on the same inference engine but on two different machines can also lead to different inference
+> speeds, even if the GPU is the same. We make this transparent by also reporting the runner's hardware configuration.
+
+</details>
+
+---
 
 <a id="kernels"></a>
 
