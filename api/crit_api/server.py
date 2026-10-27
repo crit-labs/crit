@@ -785,6 +785,8 @@ class Api:
     def finish_reason(self, stopped, measured, limit):
         if stopped or not measured:
             return "stop"
+        if "finish" in measured:
+            return measured["finish"]  # the engine's own answer: a stop token at the cap still finishes as stop
         # A fitted request ends at the limit the engine applied (its telemetry's max_output_tokens).
         return "length" if measured["output_tokens"] >= measured.get("max_output_tokens", limit) else "stop"
 

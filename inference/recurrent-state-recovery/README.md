@@ -88,6 +88,7 @@ per 2,048 tokens without a measurable change in time to first token.
 | [example.cpp](code/example.cpp), [CMakeLists.txt](code/CMakeLists.txt) | Native example and regression target |
 | [reference.py](code/reference.py) | Python formula, output-only verification and accepted-prefix reconstruction |
 | [chunked_prefill.py](code/chunked_prefill.py) | `prepare_chunk`, `apply_chunk`, `two_pass`, `sequential`, `max_difference` |
+| [stochastic_round.h](code/stochastic_round.h) | Host and device `bf16_stochastic` and `state_rounding_bits`: unbiased BF16 state storage from Core's keyed Philox draws |
 | [recurrent_cuda.h](code/recurrent_cuda.h) / [.cu](code/recurrent_cuda.cu) | FP32 CUDA reference for `heads` independent heads and the device commit below (not for performance) |
 
 Default native limits (65,536 state elements, 1,024 nodes, chain length 64,
@@ -196,6 +197,15 @@ Preserve one update expression on every path, after-token checkpoint identity,
 all-or-nothing commit, and idempotent device commit from round-start state. The
 strategy, storage precision and bounds are adaptable; an engine with BF16 state or
 activations must state its own cast points.
+
+An engine that stores state in BF16 rounds it once per token, and round to nearest
+pushes a slowly changing value the same way each time. `bf16_stochastic` rounds up
+with probability equal to the discarded fraction, so each stored value is an unbiased
+estimate of the FP32 one. Its 16 random bits come from `state_rounding_bits(seed,
+position, layer, element)`, Core's Philox draw, so a replay or recompute of the same
+step stores the same bits and checkpoint and recompute stay bitwise identical. It is
+opt-in: whether it brings a BF16-state engine closer to the reference over long
+outputs is a crit-eval measurement, not yet made.
 
 ## Costs and validation
 

@@ -99,6 +99,9 @@ struct Rows {
     float* scratch = nullptr;                 // scratch_floats(vocab, requests * columns), 8-byte aligned
     const std::uint64_t* tree = nullptr;      // [requests][columns] path masks, columns <= 64; overrides staged
     const std::int32_t* tree_tokens = nullptr; // [requests][columns] node tokens
+    // [requests][columns], may be null: nonzero where min_tokens suppression yields for the row, the
+    // answer of crit::core::suppression_yields for the row's constraint (a mask that allows only stops).
+    const std::uint8_t* yield = nullptr;
 };
 // The full law's processed rows (vocab floats per row) plus the fast path's candidate lists and results.
 std::size_t scratch_floats(std::uint32_t vocab, std::uint32_t rows) noexcept;
@@ -161,6 +164,20 @@ cudaError_t enqueue_sample(const Rows&, crit::core::DrawPurpose purpose, std::in
 // position n depends only on draws at n and the round output is a sample of the target law whatever
 // the drafts were. Temperature 0 writes each column's argmax, the greedy rule. Token trees with greedy
 // drafts need no verify call: enqueue_sample over the nodes (Rows::tree) writes each node's draw.
+// How enqueue_verify decides which drafts stand. token: each column with the rejection rule above. block: block
+// verification (Sun et al., arXiv 2403.10444; mtp-decode's block_verify): the standing count is the largest i whose
+// Bernoulli(h_i) succeeds, scanned from the round's width down, with h from the drafts' cumulative ratios and each
+// column's residual mass; the next token is the bonus (the token rule's column D prediction) or a draw from
+// max(w_tau p - q, 0). Its acceptance draws are uniform(seed, (round position << 7) | i, stream, block), fresh per
+// round; the drafter's draws must be fresh per round too (block_draft_purpose), since a later round revisits
+// uncommitted positions. A request whose columns lack a sparse kept law (a full-vocabulary law) keeps the token
+// rule's predictions, as does temperature 0. predictions then hold drafts[0, tau) and the next token at tau.
+enum class VerifyRule : std::uint32_t { token = 0, block = 1 };
+// The purpose a drafter samples a block-verified round's drafts with: unique per round position, so a position a
+// later round revisits gets a fresh draft draw.
+constexpr crit::core::DrawPurpose block_draft_purpose(std::uint64_t round_position) noexcept {
+    return static_cast<crit::core::DrawPurpose>(0x80000000u | static_cast<std::uint32_t>(round_position & 0x7fffffffu));
+}
 struct Verify {
     Rows target;
     const std::int32_t* drafts = nullptr;              // [requests][K]
@@ -168,6 +185,7 @@ struct Verify {
     const SparseLaw* draft_laws = nullptr;             // [requests][K] sparse laws (enqueue_sample's `sparse`); both null: greedy drafts
     std::int32_t* predictions = nullptr;               // [requests][K + 1]
     Logprobs logprobs = {};                            // row (r, c): its prediction's log-probability and alternatives
+    VerifyRule rule = VerifyRule::token;
 };
 cudaError_t enqueue_verify(const Verify&, cudaStream_t stream);
 

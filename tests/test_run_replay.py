@@ -45,8 +45,8 @@ class ReplayTests(PlanFixture, unittest.TestCase):
 
     def rendered(self, **kpis):
         """crit-eval's status of a result rendered again: the stored fixture status with other KPI values."""
-        return (patch("crit_eval.status.status_of", lambda path, protocol, baseline=None: status(**kpis)),
-                patch("crit_eval.status.render", lambda value: "status rendered again"))
+        return (patch("crit_eval.reports.status.status_of", lambda path, protocol, baseline=None: status(**kpis)),
+                patch("crit_eval.reports.status.render", lambda value: "status rendered again"))
 
     def make(self, count=1, **kpis):
         renders = self.rendered(**kpis)

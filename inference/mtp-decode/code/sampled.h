@@ -186,28 +186,80 @@ inline double acceptance_probability(const Distribution& target,const Distributi
   if (target.size()!=draft.size() || !(draft[token]>0)) throw std::invalid_argument("Invalid proposal distribution/token");
   return std::min(1.,target[token]/draft[token]);
 }
-inline Distribution rejection_distribution(const Distribution& target,const Distribution& draft) {
+// The residual law max(weight * p - q, 0), normalized: weight 1 is the token rule's; block verification passes the
+// prefix weight of the rejected position. residual_mass is its unnormalized mass Z.
+inline Distribution rejection_distribution(const Distribution& target,const Distribution& draft,double weight=1) {
   if (target.size()!=draft.size()) throw std::invalid_argument("Probability vocabularies differ");
   std::vector<double> weights(target.size());
-  for (std::size_t i=0;i<weights.size();++i) weights[i]=std::max(0.,target.values()[i]-draft.values()[i]);
+  for (std::size_t i=0;i<weights.size();++i) weights[i]=std::max(0.,weight*target.values()[i]-draft.values()[i]);
   return Distribution(std::move(weights));
+}
+inline double residual_mass(const Distribution& target,const Distribution& draft,double weight) {
+  if (target.size()!=draft.size()) throw std::invalid_argument("Probability vocabularies differ");
+  long double mass=0;
+  for (std::size_t i=0;i<target.size();++i) mass+=std::max(0.,weight*target.values()[i]-draft.values()[i]);
+  return static_cast<double>(mass);
 }
 
 inline double acceptance_probability(const SparseDistribution& target,const SparseDistribution& draft,SpecToken token) {
   if (target.size()!=draft.size() || !(draft[token]>0)) throw std::invalid_argument("Invalid sparse proposal distribution/token");
   return std::min(1.,target[token]/draft[token]);
 }
-inline SparseDistribution rejection_distribution(const SparseDistribution& target,const SparseDistribution& draft) {
+inline SparseDistribution rejection_distribution(const SparseDistribution& target,const SparseDistribution& draft,
+                                                 double weight=1) {
   if (target.size()!=draft.size()) throw std::invalid_argument("Sparse probability vocabularies differ");
   std::vector<ProbabilityMass> residual;
   const auto append=[&](SpecToken id,double probability) {
-    const auto mass=std::max(0.,probability-draft[id]);if (mass>0) residual.push_back({id,mass});
+    const auto mass=std::max(0.,weight*probability-draft[id]);if (mass>0) residual.push_back({id,mass});
   };
   if (target.is_dense()) {
     const auto values=target.dense_values();
     for (std::size_t id=0;id<values.size();++id) if (values[id]>0) append(static_cast<SpecToken>(id),values[id]);
   } else for (const auto& entry:target.support()) append(entry.token,entry.weight);
   return SparseDistribution(target.size(),std::move(residual),std::min(target.sparse_capacity(),draft.sparse_capacity()));
+}
+inline double residual_mass(const SparseDistribution& target,const SparseDistribution& draft,double weight) {
+  if (target.size()!=draft.size()) throw std::invalid_argument("Sparse probability vocabularies differ");
+  long double mass=0;
+  if (target.is_dense()) {
+    const auto values=target.dense_values();
+    for (std::size_t id=0;id<values.size();++id)
+      if (values[id]>0) mass+=std::max(0.,weight*values[id]-draft[static_cast<SpecToken>(id)]);
+  } else for (const auto& entry:target.support()) mass+=std::max(0.,weight*entry.weight-draft[entry.token]);
+  return static_cast<double>(mass);
+}
+
+// How a round decides which drafts stand. token: each draft in turn with min(1, p/q) (Leviathan et al.). block:
+// block verification (Sun et al., arXiv 2403.10444), which accepts the longest prefix by the joint ratios of its
+// drafts and accepts at least as many drafts in expectation, with the same output law and one draw per position.
+enum class VerifyRule { token, block };
+
+// Block verification of one round: p holds the target's D + 1 laws (after drafts[0, i)), q the draft's laws the D
+// drafts were drawn from, `draw` returns uniforms in [0, 1). Returns tau, the number of standing drafts, and the
+// token after them: the bonus from p[D] when tau == D, else a draw from max(w_tau * p[tau] - q[tau], 0). With the
+// prefix weights w_0 = 1 and w_i = min(1, w_(i-1) * p[i-1](d) / q[i-1](d)), draft count i stands with probability
+// h_D = w_D and h_i = Z_i / (Z_i + 1 - w_i) below it (Z_i the residual mass at row i, h_i = 1 when w_i = 1), and
+// tau is the largest i whose Bernoulli(h_i) succeeds, scanned from D down.
+template<class Law,class Draw>
+std::pair<std::size_t,SpecToken> block_verify(std::span<const Law> p,std::span<const Law> q,
+                                              std::span<const SpecToken> drafts,Draw&& draw) {
+  const std::size_t D=drafts.size();
+  if (p.size()!=D+1 || q.size()<D) throw std::invalid_argument("Block verification needs D + 1 target and D draft laws");
+  std::vector<double> w(D+1,1.);
+  for (std::size_t i=1;i<=D;++i) {
+    const auto d=drafts[i-1];const double qd=q[i-1][d];
+    if (!(qd>0)) throw std::invalid_argument("Invalid proposal distribution/token");
+    w[i]=std::min(1.,w[i-1]*p[i-1][d]/qd);
+  }
+  std::size_t tau=0;
+  for (std::size_t i=D;;--i) {
+    double h=w[i];
+    if (i<D && w[i]<1) {const double z=residual_mass(p[i],q[i],w[i]);h=z>0?z/(z+1-w[i]):0;}
+    if (h>=1 || (h>0 && draw()<h)) {tau=i;break;}
+    if (i==0) break;   // unreachable: h_0 = 1
+  }
+  const SpecToken next=tau==D?p[D].sample(draw()):rejection_distribution(p[tau],q[tau],w[tau]).sample(draw());
+  return {tau,next};
 }
 
 // Owns a completely materialized prefix and its next distribution. fork isolates
@@ -259,6 +311,7 @@ template<class State,class Law> class Controller {
   Law p_,q_;
   std::mt19937_64 rng_;
   std::optional<Pending> pending_;
+  VerifyRule rule_;
   std::uint64_t generation_=0;
   bool stopped_=false,poisoned_=false;
   std::atomic_flag running_=ATOMIC_FLAG_INIT;
@@ -295,9 +348,10 @@ template<class State,class Law> class Controller {
   }
 public:
   Controller(std::unique_ptr<State> target,std::unique_ptr<State> draft,
-                    SpeculationLimits limits,std::uint64_t seed,std::span<const SpecToken> stops={})
+                    SpeculationLimits limits,std::uint64_t seed,std::span<const SpecToken> stops={},
+                    VerifyRule rule=VerifyRule::token)
       :limits_(limits),target_(std::move(target)),draft_(std::move(draft)),
-       p_(required_next(target_)),q_(required_next(draft_)),rng_(seed) {
+       p_(required_next(target_)),q_(required_next(draft_)),rng_(seed),rule_(rule) {
     if(!target_ || !draft_ || !limits.context || !limits.vocabulary || limits.vocabulary>1048576)
       throw std::invalid_argument("Target, draft, context and bounded vocabulary required");
     auto initial=target_->tokens();
@@ -334,13 +388,22 @@ public:
       for(const auto& value:q)distribution(value);
       if(p.front()!=p_ || p.back()!=t->next() || q.front()!=q_ || q.back()!=d->next())throw std::logic_error("Verification endpoints differ");
       std::vector<SpecToken> output;std::size_t matched=0;
+      if(rule_==VerifyRule::block) {
+        // A stop draft is always the last proposal, so the round's output is a prefix of the block round's.
+        const auto [tau,next]=block_verify<Law>(p,q,proposals,[&]{return draw(rng);});
+        output.assign(proposals.begin(),proposals.begin()+static_cast<std::ptrdiff_t>(tau));
+        if(tau<proposals.size() || output.empty() || !stop_token(output.back()))output.push_back(next);
+        if(output.size()>remaining)output.resize(remaining);
+        matched=std::min(tau,output.size());
+      } else
       while(matched<proposals.size() && output.size()<remaining) {
         auto value=proposals[matched];
         if(draw(rng)<acceptance_probability(p[matched],q[matched],value)) {
           output.push_back(value);++matched;if(stop_token(value))break;
         }else {output.push_back(rejection_distribution(p[matched],q[matched]).sample(draw(rng)));break;}
       }
-      if(matched==proposals.size() && output.size()<remaining && (output.empty() || !stop_token(output.back())))
+      if(rule_==VerifyRule::token && matched==proposals.size() && output.size()<remaining &&
+         (output.empty() || !stop_token(output.back())))
         output.push_back(p[matched].sample(draw(rng)));
       if(output.empty())throw std::logic_error("Empty sampled round");
       parent();cancellation(cancelled);
@@ -508,6 +571,107 @@ public:
     timing(complete_seconds);const auto found=row(budget);
     if (!pending_.empty()) throw std::logic_error("Delayed observations require issued tickets");
     learn(*found,published,complete_seconds);
+  }
+};
+
+// Online estimate of each draft's acceptance from the drafter's own confidence, for drafters without a confidence
+// head (vLLM's adaptive verification estimator): p(k) = sigmoid(slope * logit(q_max) + intercept[k]), where q_max
+// is the draft law's largest probability at draft position k, the slope is shared and each position has its own
+// intercept. observe() records each verified draft's feature and outcome in a bounded window; refit() runs Newton
+// steps over it, where the shared slope makes the Hessian an arrowhead, so each step is a scalar solve. A draft is
+// worth verifying while its survival, the product of the predicted acceptances of it and every draft before it,
+// stays high: cut() returns how many drafts of a round to keep for a survival floor, and admit() splits one budget
+// across requests by survival, a prefix of each. The floor and the budget are the engine's to measure (for
+// example with AdaptiveDraftBudget's seconds per published token); before `minimum_samples` outcomes the estimator
+// predicts 1 and cuts nothing. Trimming drafts never changes the output law of a verification rule.
+class AcceptanceEstimator {
+  struct Sample {double feature;std::uint32_t position;bool accepted;};
+  std::vector<Sample> window_;
+  std::size_t next_=0,samples_=0,minimum_samples_;
+  double slope_=0,ridge_;
+  std::vector<double> intercept_;
+  bool fitted_=false;
+public:
+  explicit AcceptanceEstimator(std::size_t positions,std::size_t window=4096,std::size_t minimum_samples=256,double ridge=1e-3)
+      :minimum_samples_(minimum_samples),ridge_(ridge),intercept_(positions,0.) {
+    if (!positions || positions>1024 || !window || window>(std::size_t{1}<<24) || !std::isfinite(ridge) || ridge<=0)
+      throw std::invalid_argument("Invalid estimator positions/window/ridge");
+    window_.reserve(window);
+  }
+  // logit(q_max), clamped away from 0 and 1 so a one-hot draft law stays finite.
+  static double feature(double q_max) {
+    if (!(q_max>=0 && q_max<=1)) throw std::invalid_argument("Draft probability outside [0, 1]");
+    const double q=std::clamp(q_max,1e-6,1-1e-6);
+    return std::log(q/(1-q));
+  }
+  void observe(std::size_t position,double q_max,bool accepted) {
+    if (position>=intercept_.size()) throw std::out_of_range("Draft position outside the estimator");
+    const Sample sample{feature(q_max),static_cast<std::uint32_t>(position),accepted};
+    if (window_.size()<window_.capacity()) window_.push_back(sample);
+    else {window_[next_]=sample;next_=(next_+1)%window_.size();}
+    ++samples_;
+  }
+  // Newton steps on the ridge-regularized log-likelihood of the window. Returns the steps taken.
+  std::size_t refit(std::size_t steps=8) {
+    if (window_.size()<minimum_samples_) return 0;
+    const std::size_t K=intercept_.size();
+    std::vector<double> gb(K),hb(K),hwb(K);
+    std::size_t taken=0;
+    for (;taken<steps;++taken) {
+      double gw=-ridge_*slope_,hw=ridge_;
+      for (std::size_t k=0;k<K;++k){gb[k]=-ridge_*intercept_[k];hb[k]=ridge_;hwb[k]=0;}
+      for (const auto& x:window_) {
+        const double mu=1/(1+std::exp(-(slope_*x.feature+intercept_[x.position]))),r=(x.accepted?1.:0.)-mu,v=mu*(1-mu);
+        gw+=r*x.feature;hw+=v*x.feature*x.feature;gb[x.position]+=r;hb[x.position]+=v;hwb[x.position]+=v*x.feature;
+      }
+      // Arrowhead solve: eliminate the intercepts, solve the slope, back-substitute.
+      double schur=hw,rhs=gw;
+      for (std::size_t k=0;k<K;++k){schur-=hwb[k]*hwb[k]/hb[k];rhs-=hwb[k]*gb[k]/hb[k];}
+      const double dw=rhs/schur;double largest=std::abs(dw);
+      slope_+=dw;
+      for (std::size_t k=0;k<K;++k){const double db=(gb[k]-hwb[k]*dw)/hb[k];intercept_[k]+=db;largest=std::max(largest,std::abs(db));}
+      if (largest<1e-9){++taken;break;}
+    }
+    fitted_=true;return taken;
+  }
+  bool fitted() const noexcept {return fitted_;}
+  std::size_t samples() const noexcept {return samples_;}
+  double slope() const noexcept {return slope_;}
+  double intercept(std::size_t position) const {return intercept_.at(position);}
+  double predict(std::size_t position,double q_max) const {
+    if (position>=intercept_.size()) throw std::out_of_range("Draft position outside the estimator");
+    if (!fitted_) return 1;
+    return 1/(1+std::exp(-(slope_*feature(q_max)+intercept_[position])));
+  }
+  // Survival of each draft: the product of the predicted acceptances up to it.
+  std::vector<double> survival(std::span<const double> q_max) const {
+    std::vector<double> result(q_max.size());double alive=1;
+    for (std::size_t k=0;k<q_max.size();++k){alive*=predict(k,q_max[k]);result[k]=alive;}
+    return result;
+  }
+  // Drafts to keep: the longest prefix whose survival stays at or above the floor.
+  std::size_t cut(std::span<const double> q_max,double floor) const {
+    if (!(floor>=0 && floor<=1)) throw std::invalid_argument("Survival floor outside [0, 1]");
+    const auto alive=survival(q_max);std::size_t kept=0;
+    while (kept<alive.size() && alive[kept]>=floor) ++kept;
+    return kept;
+  }
+  // One draft budget over several requests: the `budget` (request, draft) slots of highest survival, ties to the
+  // earlier request and draft. Survival falls along a request, so each request keeps a prefix. Returns per request.
+  static std::vector<std::size_t> admit(std::span<const std::vector<double>> survivals,std::size_t budget) {
+    struct Slot {double survival;std::size_t request,draft;};
+    std::vector<Slot> slots;
+    for (std::size_t r=0;r<survivals.size();++r)
+      for (std::size_t k=0;k<survivals[r].size();++k) {
+        if (k && survivals[r][k]>survivals[r][k-1]) throw std::invalid_argument("Survival must not rise along a request");
+        slots.push_back({survivals[r][k],r,k});
+      }
+    const auto order=[](const Slot& a,const Slot& b){
+      return a.survival!=b.survival?a.survival>b.survival:a.request!=b.request?a.request<b.request:a.draft<b.draft;};
+    std::sort(slots.begin(),slots.end(),order);
+    std::vector<std::size_t> kept(survivals.size());
+    for (std::size_t i=0;i<std::min(budget,slots.size());++i) kept[slots[i].request]=std::max(kept[slots[i].request],slots[i].draft+1);
+    return kept;
   }
 };
 } // namespace crit::techniques

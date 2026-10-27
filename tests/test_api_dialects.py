@@ -18,8 +18,8 @@ from crit_api import anthropic, ollama
 from crit_api.engine import EngineError
 from crit_api.metrics import Histogram, Metrics
 from crit_api.server import Api, Server
-from crit_eval import chat
-from crit_eval.deadline import Hung
+from crit_eval.run import chat
+from crit_eval.run.deadline import Hung
 from test_api_cancellation import GATED_ADAPTER
 from test_chat_residency import ServeFixture
 from test_core_reasoning import ADAPTER as REASONING_ADAPTER

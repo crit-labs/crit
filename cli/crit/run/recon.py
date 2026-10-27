@@ -99,12 +99,12 @@ def served_sampling(model_sampling, override=None):
 
 
 def eval_sampling(generation, run):
-    """{settings, source} of crit Eval's sampled suite for this run (crit_eval.prepare.sampled_settings, or the run's
+    """{settings, source} of crit Eval's sampled suite for this run (crit_eval.quality.prepare.sampled_settings, or the run's
     eval_sampling override)."""
     override = run["spec"].get("eval_sampling")
     if override:
         return {"settings": override["settings"], "source": "override", "approved_by": override["approved_by"]}
-    from crit_eval.prepare import sampled_settings, sampling_source
+    from crit_eval.quality.prepare import sampled_settings, sampling_source
     return {"settings": sampled_settings(generation), "source": sampling_source(generation)}
 
 
@@ -197,7 +197,7 @@ def gather(model, run=None, drafters=()):
 
 def eval_template_variables(template):
     """The template variables a candidate is served with by default: crit Eval renders every prompt with thinking off
-    (crit_eval.prepare, enable_thinking=False) and requires the server to render each to its prepared token count, so
+    (crit_eval.quality.prepare, enable_thinking=False) and requires the server to render each to its prepared token count, so
     a template that reads enable_thinking is served with it off, as Eval renders; a request still turns it on."""
     return {"enable_thinking": False} if template and "enable_thinking" in template["variables"] else {}
 

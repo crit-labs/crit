@@ -875,6 +875,19 @@ void min_tokens() {
     require(s.sample(logits, empty_list, make_history({}, true, {}, {}), 0).token == 4, "an empty list suppresses nothing");
     const std::vector<float> only_stop{minus_inf, minus_inf, minus_inf, minus_inf, 1.f};
     rejects<std::invalid_argument>([&] { s.sample(only_stop, p, make_history({}, true, {}, {})); }, "no selectable token");
+    // A constraint that allows only stops (a finished grammar, e.g. after `true` for {"type": "boolean"}) ends the
+    // output before min_tokens: suppression yields instead of leaving nothing selectable.
+    const std::vector<Token> stop_only{4}, stop_and_more{2, 4};
+    require(suppression_yields(AllowedTokens{stop_only}, p) && !suppression_yields(AllowedTokens{stop_and_more}, p) &&
+            !suppression_yields(AllowedTokens{}, p), "suppression yields only to a stop-only allowed set");
+    require(s.sample(logits, AllowedTokens{stop_only}, p, make_history({}, true, {}, {})).token == 4,
+            "a stop-only constraint stops before min_tokens");
+    require(s.sample(logits, AllowedTokens{stop_and_more}, p, make_history({}, true, {}, {})).token == 2,
+            "suppression still holds while the constraint allows another token");
+    SamplingParams banned = p;
+    banned.logit_bias = {{4, minus_inf}};
+    rejects<std::invalid_argument>([&] { s.sample(logits, AllowedTokens{stop_only}, banned, make_history({}, true, {}, {})); },
+                                   "no selectable token");
     SamplingParams sampled = p;
     sampled.temperature = 1;
     for(int i = 0; i < 100; ++i) {
@@ -1388,7 +1401,8 @@ void constraint() {
     }
     SamplingParams suppressed = plain;
     suppressed.min_tokens = 2; suppressed.suppress_until_min = {5};
-    rejects<std::invalid_argument>([&] { s.sample(row, AllowedTokens{only}, suppressed, h); }, "no selectable token");
+    require(s.sample(row, AllowedTokens{only}, suppressed, h).token == 5,
+            "min_tokens suppression yields when the constraint allows only suppressed tokens");
     auto masked = row;
     masked[5] = minus_inf;
     rejects<std::invalid_argument>([&] { s.sample(masked, AllowedTokens{only}, plain, h); }, "no selectable token");

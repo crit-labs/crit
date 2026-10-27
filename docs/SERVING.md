@@ -934,10 +934,14 @@ forwards the request's sampling fields that
 the engine lists in `sampling`, streams text without stop tokens, honors cancellation and
 reports Core's phase telemetry, so the engine supplies only `generate_tokens(ids,
 max_new_tokens, sampling, on_tokens, cancelled)`. Declare
-`crit_core.serving.capabilities(text, sampling)`. A Core engine library exported with
+`crit_core.serving.capabilities(text, sampling)`; an adapter that exports
+`declared_capabilities(model_path)` returning that list lets `crit run build` fill the recipe's
+capabilities from it. A Core engine library exported with
 `CRIT_EXPORT_ENGINE` can return `crit_core.native.resident_engine(context, library,
 defaults)`, a ResidentChat over the library (see
-[engine libraries](../core/src/runtime/README.md#engine-libraries)).
+[engine libraries](../core/src/runtime/README.md#engine-libraries)); a Python engine with the
+library's interface passes the function that opens it in place of `library`
+([Python engines](../core/src/runtime/README.md#python-engines)).
 
 `crit run package` refuses a resident package that does not declare
 `chat-sampling-temperature-v1`, or that does not declare `chat-tools-v1` while the
@@ -1112,6 +1116,10 @@ own character budget, separate from the combined assistant/tool-call budget.
 `max_output_tokens` is present exactly when the request's `limits` carry `fit_output`: the
 cap the engine applied, from `output_tokens` to the request's `max_output_tokens`, with
 `prompt_tokens` plus the cap within `kv_tokens`. A reply that reaches it finishes as `length`.
+Optional `finish` (`stop` or `length`) says how the engine ended the reply; `length` requires
+`output_tokens` at the cap. A reply that ends on a stop token is `stop` even when that token is
+the last one the cap allows. Without it, crit serve infers `length` from `output_tokens` reaching
+the cap; ResidentChat always sends it.
 `prompt_tokens` is the full templated input, `output_tokens` all
 generated tokens;
 `prefill_*`/`decode_*` count tokens actually timed per phase (excluding a reused prefix

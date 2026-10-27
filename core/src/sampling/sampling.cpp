@@ -126,6 +126,12 @@ bool overlaps(std::span<const float> a, std::span<const float> b) noexcept {
 }
 }
 
+bool suppression_yields(AllowedTokens allowed, const SamplingParams& p) noexcept {
+    if(allowed.ids.empty()) return false;
+    for(const Token id:allowed.ids)
+        if(std::find(p.suppress_until_min.begin(), p.suppress_until_min.end(), id) == p.suppress_until_min.end()) return false;
+    return true;
+}
 SamplingParams resolve_sampling(const SamplingOptions& options, const SamplingParams& defaults, std::uint32_t vocabulary) {
     const auto& bias = options.logit_bias.empty() ? defaults.logit_bias : options.logit_bias;
     if(bias.size() > logit_bias_limit) throw std::invalid_argument("logit_bias exceeds 1024 entries");
@@ -364,7 +370,8 @@ Sampler::Law Sampler::prepare(std::span<const float> logits, const SamplingParam
             throw std::invalid_argument("allowed tokens must be nonempty, sorted, unique and in the vocabulary");
     }
     const RowScan raw = scan_row(logits);
-    const bool suppress = !p.suppress_until_min.empty() && history.outputs() + column < p.min_tokens;
+    const bool suppress = !p.suppress_until_min.empty() && history.outputs() + column < p.min_tokens &&
+                          !(allowed && suppression_yields(*allowed, p));
     const bool penalties = (p.repetition_penalty != 1.0 || p.frequency_penalty != 0.0 || p.presence_penalty != 0.0) &&
                            (!history.entries_.empty() || column);
     const bool modified = !p.logit_bias.empty() || suppress || penalties || allowed;

@@ -123,6 +123,35 @@ class ReconTests(unittest.TestCase):
         self.store.recon(self.run_id, force=True)
         self.assertEqual(notes.read_text(encoding="utf-8"), "my findings")
 
+    def test_inputs_are_refused_when_a_case_renders_otherwise_than_candidates_serve_it(self):
+        from crit_core.model import open_model
+        from crit_core.text import load_model_text
+        (self.model / "chat_template.jinja").write_text(THINKING, encoding="utf-8")
+        messages = [{"role": "user", "content": "Summarize the maintenance log in three lines."}]
+        text = load_model_text(open_model(self.model).files, clock=None)
+        thinking = len(text.encode_chat(messages, add_generation_prompt=True, enable_thinking=True))
+        self.assertNotEqual(thinking, len(text.encode_chat(messages, add_generation_prompt=True, enable_thinking=False)))
+        workload = {"prompt_tokens": thinking, "output_tokens": 16, "concurrency": 1, "repetitions": 1, "warmup_runs": 0,
+                    "mode": "resident"}
+        run_id = self.store.create({"model_path": str(self.model), "correctness_criteria": "Fixture gates",
+                                    "budget_minutes": 1, "kv_tokens": 8192, "workload": workload})["run"]["run_id"]
+        directory = self.store.directory(run_id)
+        self.store.recon(run_id)   # served with thinking off
+        captured = directory / "captured/case-0001/request.json"
+        captured.parent.mkdir(parents=True)
+
+        def freeze(request):
+            captured.write_text(json.dumps(request), encoding="utf-8")
+            return self.store.freeze_inputs(run_id, {"hardware_manifest": {"device": "host"},
+                "environment_manifest": {"benchmark": "synthetic"}, "case_manifests": {"case-0001": [
+                    {"path": "captured/case-0001/request.json", "bytes": captured.stat().st_size,
+                     "sha256": file_sha(captured)}]}})
+        with self.assertRaisesRegex(ValueError, rf"case-0001: its captured messages render to \d+ prompt tokens with "
+                                                f"template variables .*enable_thinking.*, the workload has {thinking}"):
+            freeze({"messages": messages})
+        self.assertFalse((directory / "inputs.json").exists())
+        self.assertIn("case_manifests", freeze({"messages": messages, "chat_template_kwargs": {"enable_thinking": True}}))
+
     def test_candidates_freeze_the_recon_block(self):
         self.store.recon(self.run_id)
         path = self.directory / recon.RECON_JSON

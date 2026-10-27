@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <random>
 #include <stdexcept>
@@ -176,6 +177,27 @@ void case_build() {
         ok(dt::enqueue_build(small, sb, nullptr), "small build");
         const auto kk = k8.get(), pp = pr8.get(), dd8 = dr8.get();
         require(kk[3] == -1 && pp[3] == -1 && dd8[3] == 0 && pp[0] == 0, "padding nodes hang off nothing and carry token 0");
+    }
+    // NaN ranks as -inf: a row of NaN yields in-range tokens that selection never keeps, and NaN tokens of a finite
+    // row are never drafted.
+    {
+        constexpr int W = 40;
+        std::vector<float> rows(2 * W, std::numeric_limits<float>::quiet_NaN());
+        for(int t = 0; t < W; t += 2) rows[W + t] = 0.25f * float(t);  // odd tokens of row 1 stay NaN
+        Device<float> lg(rows);
+        Device<std::int32_t> cnt(std::vector<std::int32_t>{0, 0}), t1(8), p1(8), d1(8), root(std::vector<std::int32_t>{-1, -1});
+        Device<float> s1(8);
+        dt::Candidates nan_rows{t1.p, p1.p, s1.p, d1.p, cnt.p, 4};
+        ok(dt::enqueue_expand(lg.p, W, W, root.p, 1, 3, nan_rows, 2, nullptr), "NaN expand");
+        Device<std::int32_t> kept(6);
+        ok(dt::enqueue_select(nan_rows, 0, 3, kept.p, 2, nullptr), "NaN select");
+        const auto tok = t1.get(), kk = kept.get();
+        const auto sc = s1.get();
+        require(tok[0] == 0 && tok[1] == 1 && tok[2] == 2, "a NaN row drafts the lowest in-range tokens");
+        require(std::isinf(sc[0]) && sc[0] < 0, "a NaN row scores -inf");
+        require(kk[0] == -1 && kk[1] == -1 && kk[2] == -1, "selection never keeps a NaN row's tokens");
+        require(tok[4] == 38 && tok[5] == 36 && tok[6] == 34, "a finite row drafts its best finite tokens");
+        require(std::isfinite(sc[4]) && kk[3] == 0 && kk[4] == 1 && kk[5] == 2, "a finite row keeps finite scores");
     }
     std::cout << "build: beams, kept nodes and trees equal the host's, padding nodes are unmatchable\n";
 }

@@ -521,6 +521,7 @@ struct RowView {
     std::uint32_t staged_count;
     std::uint64_t position;
     std::size_t row;
+    bool yields;                        // min_tokens suppression yields (Rows::yield)
 };
 
 // Row (r, c)'s staged tokens and draw position. `path` is shared memory for up to 63 staged tree tokens written by
@@ -532,6 +533,7 @@ __device__ RowView view_of(const Rows& rows, std::uint32_t r, std::uint32_t c, c
     v.row = std::size_t(r) * rows.columns + c;
     v.logits = rows.logits + v.row * rows.stride;
     v.values = rows.scratch + v.row * rows.vocab;
+    v.yields = rows.yield && rows.yield[v.row];
     if(rows.tree) {
         const std::uint64_t mask = rows.tree[v.row];
         const std::int32_t* tokens = rows.tree_tokens + std::size_t(r) * rows.columns;
@@ -1038,7 +1040,7 @@ __device__ RowPlan plan_row(const Rows& rows, std::uint32_t row, const std::int3
     p.fast = !(q.temperature > 0.) || (q.top_k >= 1 && q.top_k <= kMaxTopK);
     p.open = !p.fast && (q.top_k <= 0 || std::uint32_t(q.top_k) >= rows.vocab);
     p.penalties = has_penalties(q);
-    p.suppressing = q.suppress_count > 0 && p.position < q.min_tokens;
+    p.suppressing = q.suppress_count > 0 && p.position < q.min_tokens && !v.yields;
     p.modified = q.bias_count > 0 || p.penalties || p.suppressing;
     p.K = p.fast ? (q.temperature > 0. ? q.top_k + 1 : 2) : (p.open ? kCand : 0);
     return p;
@@ -1606,7 +1608,7 @@ __global__ void __launch_bounds__(kLaw) exact_select_kernel(const float* logits,
 // The full law's processing of row view r: Core's steps 2 to 5 into the row's scratch values.
 __device__ void full_process(const RowView& r, const Request& q, int vocab, Lists& lists) {
     const bool penalties = has_penalties(q);
-    const bool suppressing = q.suppress_count > 0 && r.position < q.min_tokens;
+    const bool suppressing = q.suppress_count > 0 && r.position < q.min_tokens && !r.yields;
     const Proc P = load_proc(lists, q, r.staged, r.staged_count, penalties, suppressing);
     process_row(r.logits, r.values, vocab, P);
 }
@@ -1694,6 +1696,96 @@ __global__ void __launch_bounds__(kLaw) verify_kernel(Verify v, const RowResult*
         v.predictions[std::size_t(blockIdx.y) * (K + 1) + c] = token;
         if(v.logprobs.chosen)
             v.logprobs.chosen[r.row] = token >= 0 ? raw_logprob(r.logits[token], result[r.row].max, result[r.row].log_sum) : neg_inf();
+    }
+}
+
+// Block verification of one request's round over the settled columns' kept laws (thread 0 of a one-warp block): see
+// VerifyRule. Leaves the token rule's predictions when a column has no sparse kept law or a draft has no q mass.
+__global__ void block_kernel(Verify v, const RowResult* result) {
+    if(threadIdx.x) return;
+    const Rows& rows = v.target;
+    const std::uint32_t r = blockIdx.x, K = rows.columns - 1, vocab = rows.vocab;
+    const Request q = rows.request[r];
+    if(!(q.temperature > 0.)) return;
+    const std::int32_t* drafts = v.drafts + std::size_t(r) * K;
+    std::uint32_t D = 0;
+    while(D < K && drafts[D] >= 0 && std::uint32_t(drafts[D]) < vocab) ++D;
+    for(std::uint32_t c = 0; c <= D; ++c) {
+        const RowResult& R = result[std::size_t(r) * rows.columns + c];
+        if(!R.handled || R.count <= 0) return;
+    }
+    const auto p_of = [&](std::uint32_t c, std::int32_t t) {
+        const RowResult& R = result[std::size_t(r) * rows.columns + c];
+        for(int i = 0; i < R.count; ++i) if(R.ids[i] == t) return double(R.p[i]);
+        return 0.;
+    };
+    const auto q_of = [&](std::uint32_t c, std::int32_t t) {
+        const std::size_t col = std::size_t(r) * K + c;
+        const int mode = draft_mode(v, col, drafts[c], int(vocab));
+        if(mode == 2) return double(v.draft_probabilities[col * vocab + std::size_t(t)]);
+        if(mode == 1) {
+            const SparseLaw& law = v.draft_laws[col];
+            for(int i = 0; i < law.count; ++i) if(law.ids[i] == t) return double(law.probabilities[i]);
+            return 0.;
+        }
+        return t == drafts[c] ? 1. : 0.;   // a greedy draft: q is one-hot
+    };
+    // Z_c(w): the mass of max(w p - q, 0) over column c's kept target law (q's mass elsewhere only lowers it).
+    const auto residual = [&](std::uint32_t c, double w) {
+        const RowResult& R = result[std::size_t(r) * rows.columns + c];
+        double z = 0.;
+        for(int i = 0; i < R.count; ++i) z += fmax(w * double(R.p[i]) - q_of(c, R.ids[i]), 0.);
+        return z;
+    };
+    double w[kMaxTopK];
+    w[0] = 1.;
+    for(std::uint32_t i = 1; i <= D; ++i) {
+        const double qd = q_of(i - 1, drafts[i - 1]);
+        if(!(qd > 0.)) return;
+        w[i] = fmin(1., w[i - 1] * p_of(i - 1, drafts[i - 1]) / qd);
+    }
+    const std::uint64_t base = q.position + rows.position_base;
+    std::uint32_t tau = 0;
+    for(std::uint32_t i = D;; --i) {
+        double h = w[i];
+        if(i < D && w[i] < 1.) {
+            const double z = residual(i, w[i]);
+            h = z > 0. ? z / (z + 1. - w[i]) : 0.;
+        }
+        if(h >= 1. || (h > 0. && crit::core::uniform(q.seed, (base << 7) | i, q.stream, crit::core::DrawPurpose::block) < h)) {
+            tau = i;
+            break;
+        }
+        if(i == 0) break;
+    }
+    std::int32_t next = v.predictions[std::size_t(r) * rows.columns + tau];   // the bonus: the token rule's draw at D
+    if(tau < D) {
+        const RowResult& R = result[std::size_t(r) * rows.columns + tau];
+        // The rejected draft has no residual weight in exact arithmetic; it is left out so rounding cannot redraw it.
+        const auto weight = [&](int i) { return R.ids[i] == drafts[tau] ? 0. : fmax(w[tau] * double(R.p[i]) - q_of(tau, R.ids[i]), 0.); };
+        double z = 0.;
+        for(int i = 0; i < R.count; ++i) z += weight(i);
+        if(!(z > 0.)) return;
+        const double target = crit::core::uniform(q.seed, base + tau, q.stream, crit::core::DrawPurpose::residual) * z;
+        double acc = 0.;
+        next = -1;
+        for(int i = 0; i < R.count && next < 0; ++i) {
+            const double m = weight(i);
+            acc += m;
+            if(m > 0. && target < acc) next = R.ids[i];
+        }
+        if(next < 0)   // summation roundoff at the last bin
+            for(int i = R.count - 1; i >= 0 && next < 0; --i)
+                if(weight(i) > 0.) next = R.ids[i];
+    }
+    for(std::uint32_t c = 0; c <= tau; ++c) {
+        const std::size_t row = std::size_t(r) * rows.columns + c;
+        const std::int32_t token = c < tau ? drafts[c] : next;
+        v.predictions[row] = token;
+        if(v.logprobs.chosen) {
+            const float* x = rows.logits + row * rows.stride;
+            v.logprobs.chosen[row] = raw_logprob(x[token], result[row].max, result[row].log_sum);
+        }
     }
 }
 
@@ -1836,6 +1928,7 @@ cudaError_t enqueue_sample(const Rows& rows, crit::core::DrawPurpose purpose, st
 
 cudaError_t enqueue_verify(const Verify& v, cudaStream_t stream) {
     if(!valid_rows(v.target) || !v.predictions || (v.target.columns > 1 && !v.drafts) || v.target.tree ||
+       (v.rule != VerifyRule::token && v.rule != VerifyRule::block) || (v.rule == VerifyRule::block && v.target.columns > kMaxTopK) ||
        !valid_logprobs(v.logprobs, v.target.vocab))
         return cudaErrorInvalidValue;
     const bool lp = v.logprobs.chosen || v.logprobs.top_ids;
@@ -1850,6 +1943,7 @@ cudaError_t enqueue_verify(const Verify& v, cudaStream_t stream) {
     if(lp) law_kernel<true, true><<<2 * count, kMergeThreads, 0, stream>>>(rows, false, o, v.logprobs, L);
     else law_kernel<true, false><<<count, kMergeThreads, 0, stream>>>(rows, false, o, v.logprobs, L);
     verify_kernel<<<dim3(rows.columns, rows.requests), kLaw, 0, stream>>>(v, L.result);
+    if(v.rule == VerifyRule::block && rows.columns > 1) block_kernel<<<rows.requests, 32, 0, stream>>>(v, L.result);
     return cudaGetLastError();
 }
 

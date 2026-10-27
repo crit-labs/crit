@@ -756,8 +756,10 @@ class ResidentChat:
             logprobs = {"tokens": rows, "bytes": {str(token): data[token].hex() for token in sorted(ids)}}
             if prompt_rows is not None:
                 logprobs["prompt"] = prompt_rows
+        # A reply that ends on a stop token finishes as stop even when that token is the last one the cap allows.
+        finish = "length" if n >= output_tokens and not (tokens and tokens[-1] in self.stop_ids) else "stop"
         return ("".join(pieces), telemetry, calls, "".join(reasoning), logprobs,
-                output_tokens if limits.get("fit_output") else None, echoed)
+                output_tokens if limits.get("fit_output") else None, echoed, finish)
 
     def _calls_grammar(self, request, calls_format, splitter):
         """The grammar of a reply that makes the calls tool_choice forces (crit_core.text.tools.call_grammar), with room
@@ -804,7 +806,7 @@ class ResidentChat:
         return cache[key]
 
     def _response(self, request, text, telemetry, calls=None, reasoning="", logprobs=None, max_output_tokens=None,
-                  prompt=None):
+                  prompt=None, finish=None):
         response = {"schema_version": 1, "record_kind": "chat_response", "request_id": request["request_id"],
                     "candidate_id": request["candidate_id"], "package_sha256": request["package_sha256"],
                     "assistant": text, "telemetry": telemetry}
@@ -818,6 +820,8 @@ class ResidentChat:
             response["max_output_tokens"] = max_output_tokens  # the cap a fitted request decoded under
         if prompt is not None:
             response["prompt"] = prompt   # the echoed prompt of a completion-v1 request
+        if finish is not None:
+            response["finish"] = finish   # "stop" or "length": how the engine ended the reply
         return response
 
     def generate(self, request, cancellation):

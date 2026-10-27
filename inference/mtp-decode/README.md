@@ -60,7 +60,7 @@ including zero, so Core can truncate at a stop. A failed commit consumes the rou
 | [implementation.py](code/implementation.py) | `verify`, `CommitPlan`, `commit(plan, apply)` |
 | [speculative.h](code/speculative.h) | C++20 `GreedySpeculator`, the `GreedyTargetState` contract and a stateless `PromptCopyProposer(window, lookback)` |
 | [prompt_copy.h](code/prompt_copy.h) | C++20 `IndexedPromptCopy`: keeps all occurrences for exact rewind, bounded by `max_tokens`, `max_matches`, `max_draft` |
-| [sampled.h](code/sampled.h) | `SampledSpeculator`, `Distribution`, `SparseDistribution`, `AdaptiveDraftBudget` |
+| [sampled.h](code/sampled.h) | `SampledSpeculator`, `Distribution`, `SparseDistribution`, `VerifyRule`, `block_verify`, `AdaptiveDraftBudget`, `AcceptanceEstimator` |
 
 ## What the engine supplies
 
@@ -206,6 +206,24 @@ the correction from normalized `max(p_i - q_i, 0)`; after all accepts, sample a
 bonus. This preserves the target distribution, not the seeded token sequence.
 Discard or failure consumes no committed random draws.
 
+`VerifyRule::block` (the constructor's last argument) verifies the round as a block
+([Sun et al.](https://arxiv.org/abs/2403.10444)) instead: with prefix weights
+`w_0 = 1`, `w_i = min(1, w_(i-1) p_(i-1)[x_i] / q_(i-1)[x_i])`, draft count `i`
+stands with probability `h_D = w_D` at the top and `h_i = Z_i / (Z_i + 1 - w_i)`
+below it, where `Z_i` is the mass of `max(w_i p_i - q_i, 0)` (`h_i = 1` when
+`w_i = 1`). Scanning from `D` down, the first success fixes the standing count
+`tau`; the next token is the bonus from `p_D` when `tau = D`, else a draw from the
+normalized `max(w_tau p_tau - q_tau, 0)`. A later draft can then stand even though
+an earlier one would have been rejected on its own, so the expected standing count
+is at least the token rule's, with the same output law. `block_verify` is the rule
+on its own, for engines with their own controller. It needs every row's residual
+mass, a full-vocabulary pass per position; its draws must be fresh for each round,
+since a later round that revisits a position with the same draws biases the law (a
+private RNG, as here, is fresh). The native checks compute the round's law exactly
+on a three-token Markov fixture (equal to the target's for widths 1 to 3, with 0.865
+expected standing drafts at width 3 against the token rule's 0.723) and run the
+90,000-history chi-square check through the block rule.
+
 `Distribution::logits(scores, temperature, top_k, top_p, min_p)` applies
 temperature, top-k, top-p, then min-p, ranking ties by ascending token ID;
 temperature zero selects the first maximum. The target p must match ordinary
@@ -222,6 +240,23 @@ same contract. Sparse rows cost O(S) storage; fallback costs O(V).
 delayed timings, take a ticket from `begin_observation(actual_width)` and call
 `observe(ticket, published, seconds)` after completion. `record_preparation(width,
 seconds)` resets a width after graph rebuilds.
+
+`AcceptanceEstimator(positions)` predicts each draft's acceptance from the drafter's
+own confidence, for drafters without a confidence head: `p(k) = sigmoid(slope *
+logit(q_max) + intercept[k])` with `q_max` the draft law's largest probability at
+draft position `k`, one shared slope and one intercept per position. `observe(k, q_max,
+accepted)` keeps a bounded window of verified drafts and `refit()` runs Newton steps on
+it (the shared slope makes the Hessian an arrowhead, so a step is a scalar solve).
+`survival(q_max)` multiplies the predictions along a round; `cut(q_max, floor)` keeps
+the prefix whose survival stays at or above a floor, and `admit(survivals, budget)`
+splits one draft budget across a batch by survival, a prefix per request. The floor or
+budget is the engine's to measure, for example against `AdaptiveDraftBudget`'s seconds
+per published token. Before `minimum_samples` outcomes it predicts 1 and cuts nothing.
+A cut drops drafts only, so the output law is the verification rule's. The native check
+recovers a simulated law (slope 1.3, intercepts 0.5 to -1) from 4,096 drafts to 1.34
+and within 0.06. It is the estimator vLLM uses for adaptive verification without a
+head; a drafter that publishes a confidence head uses
+[confidence cuts](../hidden-state-drafters/README.md) instead.
 
 The [sampled example](code/sampled_example.cpp) and
 [native checks](../../tests/inference/sampled_tests.cpp) (`ctest -R crit_sampled`)

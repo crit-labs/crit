@@ -54,7 +54,16 @@ holds code `2i` in the low nibble and `2i+1` in the high ("adjacent"). Other lay
 explicitly. Quantization uses `global = 6 * 448 / amax(tensor)`, block scale
 `e4m3(amax(block) * global / 6)` and codes `e2m1(x * global / scale)`, ties to even,
 saturating at 6 and 448; this is the codec's rule, not a claim of bit equality with any
-producer. The projection decodes each 16-value block once per row and reuses it for
+producer. `four_over_six` (an option of `quantize`) also tries the block scale
+`e4m3(amax(block) * global / 4)`, which maps the block maximum to the E2M1 value 4 and
+so avoids the wide 4-to-6 step for values near it, and keeps whichever scale gives the
+smaller squared block error (6 on a tie). The layout is unchanged, so every decoder
+reads it. On Gaussian 1024 x 4096 weights it lowers the relative weight error from
+0.0951 to 0.0870 (Student-t(3): 0.0906 to 0.0869). On Qwen3-1.7B with every decoder
+projection RTN-quantized (weights only, BF16 activations, RTX 5090), the mean KL divergence
+from BF16 over crit-eval's six quality conversations fell on each, by 14% to 40% (p99 by 5% to
+52%), and stayed at 0.102 on the first 8,192 tokens of its long document; token-weighted
+0.115 to 0.107. One small model: measure the model at hand before adopting it. The projection decodes each 16-value block once per row and reuses it for
 every token, so decode cost is per weight, not per weight and token.
 
 ## What the code supplies

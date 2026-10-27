@@ -137,7 +137,8 @@ def calibrate(source, plan, recipe, windows, device, staging, log):
     window. Writes each layer's export tensors to `staging`."""
     import torch
     from safetensors.torch import save_file
-    from crit_eval.reference import StreamingReference, _hidden
+    from crit_eval.quality.reference import StreamingReference
+    from crit_eval.quality.prompt_state import _hidden
     from .codecs import quantize
     reference = StreamingReference(source, device)
     if reference.prefix != plan["prefix"]:
@@ -249,7 +250,7 @@ def run_ptq(recipe, source, out, record_path, calibration=None, device=None, log
     """Transform `source` into `out` by `recipe` and write the models_transform record to `record_path`."""
     import torch
     from crit import __version__
-    from crit_eval.prepare import model_identity
+    from crit_eval.quality.prepare import model_identity
     from .calibration import load_calibration
     started_at, clock = now(), time.perf_counter()
     phases = {}

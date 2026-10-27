@@ -136,7 +136,7 @@ def telemetry(value, request):
 
 def reply(value, request):
     keys(value, {"schema_version", "record_kind", "request_id", "candidate_id", "package_sha256", "assistant", "telemetry"},
-         {"tool_calls", "reasoning", "logprobs", "max_output_tokens", "prompt"})
+         {"tool_calls", "reasoning", "logprobs", "max_output_tokens", "prompt", "finish"})
     if type(value["schema_version"]) is not int or value["schema_version"] != 1 or value["record_kind"] != "chat_response":
         raise ValueError("Invalid engine chat response")
     if any(value[key] != request[key] for key in ("request_id", "candidate_id", "package_sha256")):
@@ -152,6 +152,13 @@ def reply(value, request):
         if measured["prompt_tokens"] + limit > request["limits"]["kv_tokens"]:
             raise ValueError("The applied output cap exceeds the requested KV capacity")
         measured = dict(measured, max_output_tokens=limit)
+    if "finish" in value:
+        # How the engine ended the reply: "stop" (a stop token, a finished grammar) or "length" (at the output cap).
+        if value["finish"] not in ("stop", "length"):
+            raise ValueError("Reply finish is not stop or length")
+        if value["finish"] == "length" and measured["output_tokens"] != limit:
+            raise ValueError("A reply that finishes as length ends at its output cap")
+        measured = dict(measured, finish=value["finish"])
     calls = validate_tool_reply(value.get("tool_calls"), request, measured["output_tokens"] == limit)
     raw = "prompt" in request  # completion-v1: the text continues the prompt, which may echo back
     if raw and "reasoning" in value:

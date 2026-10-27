@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_core VERSION 0.11.0 LANGUAGES CXX)
+project(crit_core VERSION 0.12.0 LANGUAGES CXX)
 find_package(Threads REQUIRED)
 function(crit_strict_warnings target)
   if(MSVC)
@@ -149,6 +149,10 @@ if(BUILD_TESTING AND PROJECT_IS_TOP_LEVEL)
         "${CMAKE_CURRENT_SOURCE_DIR}/../tests/core/${_oracle}_constraint_oracle.py" $<TARGET_FILE:crit_core_constraints_tests>)
       set_tests_properties(crit_core_constraint_${_oracle}_oracle PROPERTIES TIMEOUT 120)
     endforeach()
+    # crit::core::rope_table against its Python twin, crit_core.model.rope_table, on the same configs.
+    add_test(NAME crit_core_model_rope_oracle COMMAND "${Python3_EXECUTABLE}" -B
+      "${CMAKE_CURRENT_SOURCE_DIR}/../tests/core/rope_oracle.py" $<TARGET_FILE:crit_core_model_tests>)
+    set_tests_properties(crit_core_model_rope_oracle PROPERTIES TIMEOUT 120)
     # The engine C ABI (crit/native_engine.h) through crit_core.native's stock adapters, against a toy engine.
     add_library(crit_core_native_engine_fixture SHARED ../tests/core/native_engine_fixture.cpp)
     target_link_libraries(crit_core_native_engine_fixture PRIVATE crit_core)
@@ -162,7 +166,7 @@ if(BUILD_TESTING AND PROJECT_IS_TOP_LEVEL)
 
   crit_core_cases(io_tests 120 json_valid json_rejects json_utf8 json_strings json_numbers json_nonfinite json_limits json_access json_file json_random sha256_vectors sha256_chunked file_identity file_change file_read_exact file_read_slots file_read_chunks file_read_errors file_map file_open_errors host_memory_v2 host_memory_v1 host_memory_malformed host_memory_admission host_memory_live)
 
-  crit_core_cases(model_tests 60 model_dtypes model_header_valid model_header_rejects model_limits model_subbyte model_header_only model_index model_extra_files model_directory model_symlinks model_bytes model_digests model_change_detection model_retained model_random model_config_eval model_config_types model_generation model_stop_ids)
+  crit_core_cases(model_tests 60 model_dtypes model_header_valid model_header_rejects model_limits model_subbyte model_header_only model_index model_extra_files model_directory model_symlinks model_bytes model_digests model_change_detection model_retained model_random model_config_eval model_config_types model_generation model_stop_ids model_rope)
 
   # Operator ranges, compiled in (every case but trace_disabled) and compiled out (trace_disabled).
   set(_crit_trace_cases trace_scopes trace_bounds trace_binding trace_reader trace_engine)

@@ -23,7 +23,7 @@ import math
 
 MAX_TOP_K = 64   # the device's fast path (greedy rows and 1 <= top_k <= 64); results are Core's law
 _WORD = 0xFFFFFFFF
-SAMPLE, DRAFT, ACCEPT, RESIDUAL = 0, 1, 2, 3   # crit::core::DrawPurpose
+SAMPLE, DRAFT, ACCEPT, RESIDUAL, BLOCK = 0, 1, 2, 3, 4   # crit::core::DrawPurpose
 
 
 def philox4x32(seed, position, stream=0, purpose=SAMPLE):
@@ -56,11 +56,12 @@ def candidates(logits, k):
 
 
 def process(logits, *, bias=None, repetition=1.0, frequency=0.0, presence=0.0, counts=None, prompt=(),
-            staged=(), min_tokens=0, suppress=(), outputs=0):
+            staged=(), min_tokens=0, suppress=(), outputs=0, yields=False):
     """Core's steps 2 to 5: values after bias, suppression and penalties.
 
     counts maps tokens to committed output counts; `staged` tokens count as outputs too (the drafts
-    before a verify column); `outputs` is Core's outputs() + column for the min_tokens rule."""
+    before a verify column); `outputs` is Core's outputs() + column for the min_tokens rule. `yields` skips
+    suppression, as Core does for a constraint that allows only suppressed tokens (suppression_yields)."""
     n = dict(counts or {})
     for t in staged:
         n[t] = n.get(t, 0) + 1
@@ -74,7 +75,7 @@ def process(logits, *, bias=None, repetition=1.0, frequency=0.0, presence=0.0, c
             if n.get(t, 0) > 0:
                 v -= frequency * n[t] + presence
         out.append(v)
-    if outputs < min_tokens:
+    if outputs < min_tokens and not yields:
         for t in suppress:
             if 0 <= t < len(out):
                 out[t] = -math.inf

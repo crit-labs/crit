@@ -129,7 +129,7 @@ def _render(root, statuses, at):
     """Every copied candidate's newest completed Eval status, rendered again with today's crit-eval against the
     baseline its result was measured with: {result path: {status, text, baseline} or {error}}."""
     from crit_eval import EVAL_DIR, load_json
-    from crit_eval.status import render, status_of
+    from crit_eval.reports.status import render, status_of
     from .plans import completed_evals, read_status
     protocol = load_json(EVAL_DIR / "protocol.json")
     newest = {}

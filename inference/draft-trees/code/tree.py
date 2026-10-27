@@ -44,18 +44,22 @@ class Tree:
 
 
 def expand(row, branch):
-    """The `branch` best tokens of a logit row by (logit desc, id asc) with their log-softmax values."""
+    """The `branch` best tokens of a logit row by (logit desc, id asc) with their log-softmax values. NaN ranks as
+    -inf; a row without a finite logit scores every token -inf."""
     if not row or branch < 1:
         raise ValueError("a nonempty row and a positive branch are required")
+    row = [x if x == x else -math.inf for x in row]
     top = max(row)
-    lse = top + math.log(math.fsum(math.exp(x - top) for x in row))
     best = sorted(range(len(row)), key=lambda t: (-row[t], t))[:branch]
+    if top == -math.inf:
+        return [(t, -math.inf) for t in best]
+    lse = top + math.log(math.fsum(math.exp(x - top) for x in row))
     return [(t, row[t] - lse) for t in best]
 
 
 def rank(candidates, ids, m):
-    """The m best candidate ids by (score desc, index asc)."""
-    return sorted(ids, key=lambda i: (-candidates[i].score, i))[:m]
+    """The m best candidate ids by (score desc, index asc). A candidate scoring -inf is never kept."""
+    return [i for i in sorted(ids, key=lambda i: (-candidates[i].score, i)) if candidates[i].score > -math.inf][:m]
 
 
 def path_tokens(candidates, index):

@@ -327,7 +327,7 @@ def _qwen4exp(model, get):
     return qwen4exp_config(model, get, _qwen35(model, get, moe=True))
 
 
-# general.architecture -> the inverse of the converter's set_gguf_parameters for it (crit_eval.gguf_layout holds
+# general.architecture -> the inverse of the converter's set_gguf_parameters for it (crit_eval.architectures.gguf_layout holds
 # the inverse of its tensor transforms for the same architectures).
 CONFIG_RULES = {
     "llama": _llama,

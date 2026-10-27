@@ -96,7 +96,7 @@ def main(argv=None):
             from crit_eval import SUITE_DIR, load_json
             if not SUITE_DIR.is_dir():
                 raise ValueError("crit models eval runs Eval from a crit checkout")
-            from crit_eval.status import render
+            from crit_eval.reports.status import render
             from .evaluate import evaluate
             result = evaluate(args.record, args.data, args.result, args.evaluation,
                               load_json(args.baseline) if args.baseline else None)

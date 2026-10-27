@@ -147,6 +147,15 @@ class RunMeasureTests(MeasureFixture, unittest.TestCase):
         self.assertEqual(json.loads((self.root / "sampling.json").read_text()),
                          {"temperature": 0.7, "top_p": 0.9, "seed": 3})
 
+    def test_a_captured_requests_template_variables_are_sent_and_recorded(self):
+        self.case.update(chat_template_kwargs={"enable_thinking": True})
+        adapter = ADAPTER.replace("Path(request['model_path']).with_name('sampling.json').write_text(json.dumps(request.get('sampling')))",
+                                  "Path(request['model_path']).with_name('template.json').write_text(json.dumps(request.get('template_kwargs')))")
+        candidate = self.served(adapter, SERVED + ["chat-template-kwargs-v1", "chat-template-enable-thinking-v1"])
+        (record,) = measure.measure(self.store, self.run_id, candidate)
+        self.assertEqual(record["extensions"]["chat_template_kwargs"], {"enable_thinking": True})
+        self.assertEqual(json.loads((self.root / "template.json").read_text()), {"enable_thinking": True})
+
     def test_a_package_measure_cannot_serve_or_a_sealed_candidate_is_refused_before_any_reservation(self):
         candidate = self.served(capabilities=[c for c in SERVED if c != "chat-stream-v1"])
         with self.assertRaisesRegex(ValueError, "must declare chat-stream-v1"):

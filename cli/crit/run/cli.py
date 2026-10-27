@@ -55,6 +55,15 @@ def warn_ineligible(store, run_id, candidate_id):
               file=sys.stderr)
 
 
+def json_argument(value, option):
+    """An option's JSON text, or a file holding it."""
+    if Path(value).is_file():
+        return read_json(Path(value))
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{option} is neither a file nor JSON: {exc}") from None
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", type=Path, default=ROOT if (ROOT / "core/include/crit/core.h").is_file() else Path.cwd())
@@ -63,9 +72,12 @@ def main(argv=None):
     subs = parser.add_subparsers(dest="action", required=True)
     for name in ("create", "resolve", "plan", "check", "benchmark", "stop"):
         sub = subs.add_parser(name)
-        sub.add_argument("--record", type=Path, required=True)
+        sub.add_argument("--record", type=Path, required=name != "check")
         if name in {"check", "benchmark"}:
             sub.add_argument("--candidate", required=True)
+    subs.choices["check"].add_argument("--from-eval", nargs="?", const="newest", metavar="ATTEMPT",
+                                       help="Instead of --record: record the arithmetic, functional and resources check "
+                                            "of every case from the candidate's retained Eval result (default its newest)")
     subs.choices["plan"].add_argument("--check", action="store_true",
                                       help="Run the plan's checks and print the record crit would store, recording nothing "
                                            "(the plan command of a replay)")
@@ -84,6 +96,27 @@ def main(argv=None):
                      "(EAGLE-3, DFlash, DSpark or crit models drafter output); repeatable")
     sub.add_argument("--compare", type=Path, metavar="MODEL", help="Instead: compare the run's model fingerprint with "
                      "another checkpoint's (architecture, weight layout, tokenizer, template) and print what differs")
+    sub = subs.add_parser("capture", help="Write a case's chat request (captured/CASE/request.json) that renders to "
+                                          "the workload's prompt tokens with the template variables candidates serve")
+    sub.add_argument("--case", default="case-0001")
+    sub.add_argument("--text", type=Path, help="File of the user message's text (default: a neutral passage); it is "
+                                               "cut to whole words and padded to the exact count")
+    sub.add_argument("--instruction", default=None, help="Line after the text (default: a summary request; '' for none)")
+    sub.add_argument("--system", help="A leading system message")
+    sub.add_argument("--template-kwargs", metavar="JSON", help="chat_template_kwargs the request renders with, over "
+                                                               "recon's frozen template_variables (text or a file)")
+    sub.add_argument("--inputs", type=Path, metavar="INPUTS_JSON", help="Set the case's manifest row in this resolve "
+                                                                        "payload (created when missing)")
+    sub = subs.add_parser("build", help="Build a candidate's retained source with the recipe's build.command under a "
+                                        "build attempt (log kept, attempt settled), then package the result")
+    sub.add_argument("--candidate", required=True)
+    sub.add_argument("--record", type=Path, required=True, help="Recipe: build {toolchain, command[, dependencies]}, "
+                     "launch[, capabilities]; the build's outputs are bound as dependencies, capabilities default to "
+                     "the adapter's declared_capabilities(model_path)")
+    sub.add_argument("--seconds", type=float, help="Reservation length (default: the build process cap)")
+    sub.add_argument("--drop", action="append", default=[], metavar="GLOB",
+                     help="Remove these build-folder paths (intermediates) before packaging; repeatable")
+    sub.add_argument("--no-package", action="store_true", help="Build and settle only")
     sub = subs.add_parser("package")
     sub.add_argument("--candidate", required=True)
     sub.add_argument("--source", type=Path, required=True)
@@ -114,6 +147,9 @@ def main(argv=None):
     sub.add_argument("--host", default="127.0.0.1")
     sub.add_argument("--port", type=int, default=8000)
     sub.add_argument("--seconds", type=float, help="Reservation length (default: the check process cap)")
+    sub.add_argument("--check", action="store_true", help="Run the standard serving checks (consecutive requests, "
+                     "system message, streaming, stop string, cancelling, tool call, logprobs, template switch, "
+                     "stopping), keep their report and record a functional check per case, then stop")
     sub = subs.add_parser("seal")
     sub.add_argument("--candidate", required=True)
     sub.add_argument("--lifecycle", required=True)
@@ -156,7 +192,7 @@ def main(argv=None):
         parser.error("--id is required for an existing run")
     try:
         store = RunStore(args.root or args.project / "runs", args.project)
-        payload = read_json(args.record) if hasattr(args, "record") else None
+        payload = read_json(args.record) if getattr(args, "record", None) else None
         if args.action == "create":
             settings = load_settings(args.project)
             if isinstance(payload, dict):
@@ -194,6 +230,23 @@ def main(argv=None):
             result = store.recon(args.id, args.force, args.drafter or ())
         elif args.action == "package":
             result = store.package(args.id, args.candidate, args.source, payload)
+        elif args.action == "check" and args.from_eval:
+            if args.record:
+                parser.error("check takes --record or --from-eval, not both")
+            from .checks import from_eval
+            result = from_eval(store, args.id, args.candidate, None if args.from_eval == "newest" else args.from_eval)
+        elif args.action == "check" and not args.record:
+            parser.error("check needs --record or --from-eval")
+        elif args.action == "capture":
+            from .capture import INSTRUCTION, capture
+            result = capture(store, args.id, args.case,
+                             args.text.read_text(encoding="utf-8") if args.text else None,
+                             INSTRUCTION if args.instruction is None else args.instruction, args.system,
+                             json_argument(args.template_kwargs, "--template-kwargs") if args.template_kwargs else None,
+                             args.inputs)
+        elif args.action == "build":
+            from .build import build
+            result = build(store, args.id, args.candidate, payload, args.seconds, args.drop, not args.no_package)
         elif args.action in {"check", "benchmark"}:
             result = store.append(args.id, args.candidate, args.action, payload)
             if args.action == "benchmark":
@@ -212,7 +265,7 @@ def main(argv=None):
             from .evaluation import evaluate
             result = evaluate(store, args.id, args.candidate, args.data, args.only,
                               read_json(args.baseline) if args.baseline else None, args.seconds, args.label)
-            from crit_eval.status import render
+            from crit_eval.reports.status import render
             from .plans import extract, priorities, rules
             status = result.pop("status")
             print(render(status), file=sys.stderr)
@@ -224,7 +277,7 @@ def main(argv=None):
                 if order else reason) + " (crit run ... plan computes them from the plan's needed flags)", file=sys.stderr)
         elif args.action == "serve":
             from .served import serve
-            result = serve(store, args.id, args.candidate, args.host, args.port, args.seconds)
+            result = serve(store, args.id, args.candidate, args.host, args.port, args.seconds, check=args.check)
         elif args.action == "seal":
             failure = {"message": args.failure} if args.failure else None
             result = store.seal(args.id, args.candidate, args.lifecycle, failure)

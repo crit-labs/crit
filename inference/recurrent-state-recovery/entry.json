@@ -45,6 +45,7 @@
     {"path": "inference/recurrent-state-recovery/code/CMakeLists.txt", "purpose": "Native example and independent recurrent regression build against Core (installed SDK or this checkout)"},
     {"path": "inference/recurrent-state-recovery/code/recurrent_cuda.h", "purpose": "FP32 CUDA reference interface for multi-head verify and checkpoint, recompute or deferred commit from a device accepted count"},
     {"path": "inference/recurrent-state-recovery/code/recurrent_cuda.cu", "purpose": "Reference one-block-per-head, one-thread-per-value-column gated-delta kernels, not for performance"},
+    {"path": "inference/recurrent-state-recovery/code/stochastic_round.h", "purpose": "Unbiased stochastic rounding of FP32 state to BF16 storage with replayable draws keyed by seed, position, layer and element"},
     {"path": "inference/recurrent-state-recovery/code/chunked_prefill.py", "purpose": "Two-pass chunked gated-delta prefill and the token-by-token recurrence for comparison"}
   ],
   "requires": {

@@ -37,7 +37,7 @@ CHUNK = 256  # positions per logits chunk when the target and draft distribution
 def plan_drafter(recipe, checkpoint):
     """What the recipe builds from a checkpoint's headers: the decoder prefix, the layer the drafter starts from, its
     tensors, parameter count and stored bytes."""
-    from .recipe import layer_prefix
+    from crit_core.model.schemes import layer_prefix
     tensors = checkpoint.tensors
     prefix = layer_prefix(tensors)
     layers = sorted({int(m.group(1)) for name in tensors for m in [LAYER.match(name[len(prefix):])] if m and name.startswith(prefix)})
@@ -237,8 +237,8 @@ def run_drafter(recipe, source, out, record_path, calibration, device=None, log=
     import torch
     from crit import __version__
     from crit_core.model import inspect_model
-    from crit_eval.prepare import model_identity
-    from crit_eval.reference import StreamingReference
+    from crit_eval.quality.prepare import model_identity
+    from crit_eval.quality.reference import StreamingReference
     from .calibration import load_calibration
     started_at, clock = now(), time.perf_counter()
     phases = {}

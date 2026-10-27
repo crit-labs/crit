@@ -63,6 +63,19 @@ class ResidentChatTests(unittest.TestCase):
         engine.generate_tokens = decode
         self.assertNotIn("decode_rounds", engine.generate(request(), threading.Event())["telemetry"])
 
+    def test_a_reply_ending_on_its_stop_token_at_the_cap_finishes_as_stop(self):
+        engine = Decoder(self.context, self.model)
+        n = len(engine.text.tokenizer.encode("Hi there", add_special_tokens=False)) + 1  # the reply and its stop token
+        at_cap = request(limits={"max_output_tokens": n, "kv_tokens": 4096, "timeout_seconds": 60})
+        found = engine.generate(at_cap, threading.Event())
+        self.assertEqual((found["telemetry"]["output_tokens"], found["finish"]), (n, "stop"))
+        self.assertEqual(reply(found, at_cap)[1]["finish"], "stop")
+        self.assertEqual(engine.generate(request(), threading.Event())["finish"], "stop")
+        decode = engine.generate_tokens
+        engine.generate_tokens = lambda *args: (lambda tokens, timing: (tokens[:-1], timing))(*decode(*args))
+        cut = request(limits={"max_output_tokens": n - 1})
+        self.assertEqual(engine.generate(cut, threading.Event())["finish"], "length")
+
     def test_plain_decoding_and_draft_telemetry_reach_the_decoder_and_the_telemetry(self):
         engine = Decoder(self.context, self.model)
         seen = []

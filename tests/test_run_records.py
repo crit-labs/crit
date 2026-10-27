@@ -518,6 +518,17 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         with self.assertRaises(ValueError):
             read_json(path)
 
+    def test_a_missing_json_file_is_named_as_missing(self):
+        missing = self.directory / "no-such-record.json"
+        with self.assertRaisesRegex(ValueError, "JSON file not found: .*no-such-record.json"):
+            read_json(missing)
+        with self.assertRaisesRegex(ValueError, r"JSON file not found: no-such-record\.json \(from "):
+            read_json(Path("no-such-record.json"))
+        big = self.directory / "big.json"
+        big.write_text(" " * (2 << 20) + "{}")
+        with self.assertRaisesRegex(ValueError, "JSON must be a regular file under 1 MiB"):
+            read_json(big)
+
     def test_bool_cannot_masquerade_as_numeric_projection_or_ordinal(self):
         candidate = self.candidate()
         package = self.package(candidate)

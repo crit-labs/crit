@@ -125,10 +125,12 @@ class Served:
         self.log("crit serve: stopped")
 
 
-def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None, ready=None, stop=None):
+def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None, ready=None, stop=None, check=False):
     """crit run serve: the packaged candidate, not yet sealed, served through crit serve under a check attempt until
     Ctrl+C, `stop` (a threading.Event) or the reservation's deadline, for the checks a candidate passes before it is
     sealed (streaming, stop strings, tool calls, cancellation, Ctrl+C). `ready(port)` runs once the API listens.
+    With `check`, crit runs the standard serving checks itself (crit.run.checks.serve_checks), stops the engine,
+    keeps their report as candidates/ID/logs/serve-check-ATTEMPT.json and records a functional check per case.
     Settles the attempt and returns its result; crit serve serves the candidate once it is sealed."""
     root = store.directory(run_id)
     folder = safe_path(root, f"candidates/{ident(candidate_id, 'candidate')}")
@@ -137,14 +139,15 @@ def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None
     manifest_path = folder / "package" / "manifest.json"
     if not manifest_path.is_file():
         raise ValueError("Package the candidate before serving it")
-    missing = [c for c in SERVED if c not in read_json(manifest_path)["capabilities"]]
+    manifest = read_json(manifest_path)
+    missing = [c for c in SERVED if c not in manifest["capabilities"]]
     if missing:
         raise ValueError("crit serve needs the package to declare " + ", ".join(missing) + " (docs/SERVING.md)")
     kv_tokens = load_run(root)["spec"]["hardware_constraints"]["kv_tokens"]
     reservation = store.reserve(run_id, candidate_id, "check", seconds)
     attempt = reservation["attempt_id"]
     log_path = folder / "logs" / f"serve-{attempt}.log"
-    outcome, failure, settled, interrupted = "completed", None, True, None
+    outcome, failure, settled, interrupted, report = "completed", None, True, None, None
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8") as stream:
@@ -158,8 +161,14 @@ def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None
                 log(f"Serving {run_id}/{candidate_id} (not sealed, {attempt}) at http://{host}:{bound}/v1; Ctrl+C stops")
                 if ready is not None:
                     ready(bound)
+                if check:
+                    from .checks import serve_checks
+                    variables = (read_json(folder / "candidate.json")["configuration"].get("recon") or {}).get(
+                        "template_variables") or {}
+                    report = serve_checks(bound, manifest["capabilities"], variables, served.timeout, log)
+                    log("crit run serve --check: stopping the engine")
                 try:
-                    while not served.expired and not (stop is not None and stop.wait(.25)):
+                    while not check and not served.expired and not (stop is not None and stop.wait(.25)):
                         if stop is None:
                             time.sleep(.25)
                 except KeyboardInterrupt:
@@ -174,11 +183,34 @@ def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None
             outcome, failure = "failed", (type(exc).__name__ + ": " + str(exc))[:8000]
     logs = ([{"path": log_path.relative_to(root).as_posix(), "sha256": file_sha(log_path)}]
             if settled and log_path.is_file() else [])
+    if report is not None:
+        report.append({"name": "stop_engine", "state": "passed" if outcome == "completed" else "failed",
+                       "detail": "the engine stopped and its resident host exited, as on Ctrl+C" if outcome == "completed"
+                       else f"stopping the engine: {failure}"})
     result = store.settle(run_id, reservation, {"outcome": outcome, "ended_at": now(),
                                                 "exit_code": 0 if outcome == "completed" else None,
                                                 "cleanup_settled": settled, "logs": logs, "failure": failure})
+    if report is not None:
+        result = {"attempt": result, "checks": _record_serve_checks(store, run_id, candidate_id, root, folder, attempt,
+                                                                     manifest, report, logs)}
     if interrupted is not None:
         raise interrupted
     if outcome != "completed":
         raise ValueError(f"crit run serve {outcome}: {failure} (log {log_path.relative_to(root).as_posix()})")
     return result
+
+
+def _record_serve_checks(store, run_id, candidate_id, root, folder, attempt, manifest, report, logs):
+    """Keep the serving checks' report and record a functional check per case citing it and the serve log."""
+    from .checks import verdict
+    from .records import digest, write_json
+    path = folder / "logs" / f"serve-check-{attempt}.json"
+    write_json(path, {"attempt_id": attempt, "checks": report}, immutable=True)
+    status, rationale = verdict(report)
+    run = load_run(root)
+    evidence = [{"path": path.relative_to(root).as_posix(), "sha256": file_sha(path)}] + logs
+    return [store.append(run_id, candidate_id, "check", {
+        "case_id": case["case_id"], "package_sha256": digest(manifest), "gate": "functional",
+        "criteria_sha256": digest(run["spec"]["correctness"]), "status": status, "rationale": rationale[:8000],
+        "evidence": evidence, "evidence_level": "artifact_verified", "recorded_at": now(),
+        "extensions": {"recorded_by": "crit run serve --check"}}) for case in run["spec"]["cases"]]

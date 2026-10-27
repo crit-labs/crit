@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_inference VERSION 0.11.0 LANGUAGES CXX)
+project(crit_inference VERSION 0.12.0 LANGUAGES CXX)
 # Inference's native examples and fixtures. Inference uses Core only through its public SDK
 # (crit::core, crit::cuda); Core never builds or includes Inference code.
 find_package(Threads REQUIRED)
@@ -8,7 +8,7 @@ option(CRIT_INFERENCE_CUDA "Build Inference's CUDA reference kernels and their f
 option(CRIT_INFERENCE_INSTALLED_CORE "Use an installed Core SDK (CMAKE_PREFIX_PATH) instead of this checkout's core/" OFF)
 if(NOT TARGET crit::core)
   if(CRIT_INFERENCE_INSTALLED_CORE)
-    find_package(critCore 0.11.0 CONFIG REQUIRED)
+    find_package(critCore 0.12.0 CONFIG REQUIRED)
   else()
     if(CRIT_INFERENCE_CUDA)
       set(CRIT_CORE_CUDA ON CACHE BOOL "Build the explicit CUDA backend services" FORCE)
@@ -306,6 +306,27 @@ crit_inference_test(crit_token_law 300 crit_token_law_tests)
 crit_inference_executable(crit_sampled_round_tests SOURCES ${FIXTURES}/sampled_round_tests.cpp
   LINK crit_token_sampling crit_device_round_kernels)
 crit_inference_test(crit_sampled_round 300 crit_sampled_round_tests)
+
+# python-bindings: one shared library of the C ABI over the CUDA entries, for engines that load it with ctypes.
+# Only the crit_* functions are exported.
+set(_bindings ${INFERENCE}/python-bindings/code)
+add_library(crit_inference_python SHARED ${_bindings}/crit_inference.cpp
+  ${INFERENCE}/stored-tile-gemm/code/stored_tile_gemm.cu ${INFERENCE}/stored-tile-gemm/code/stored_tile_bf16.cu
+  ${INFERENCE}/recurrent-layer-kernels/code/recurrent_kernels.cu ${_recurrent_code}/recurrent_cuda.cu
+  ${INFERENCE}/fp8-kv-attention/code/fp8_kv_attention.cu ${INFERENCE}/token-sampling/code/sampling.cu
+  ${_round_code}/greedy_accept.cu)
+target_include_directories(crit_inference_python PRIVATE ${_bindings} ${INFERENCE}/stored-tile-gemm/code
+  ${INFERENCE}/recurrent-layer-kernels/code ${_recurrent_code} ${INFERENCE}/fp8-kv-attention/code
+  ${INFERENCE}/token-sampling/code ${_round_code})
+target_compile_features(crit_inference_python PRIVATE cxx_std_20 cuda_std_20)
+target_link_libraries(crit_inference_python PRIVATE crit::core CUDA::cudart)
+set_target_properties(crit_inference_python PROPERTIES CXX_VISIBILITY_PRESET hidden CUDA_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN ON)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME crit_inference_python COMMAND "${Python3_EXECUTABLE}" -B
+    "${FIXTURES}/python_bindings_check.py" $<TARGET_FILE:crit_inference_python>)
+  set_tests_properties(crit_inference_python PROPERTIES TIMEOUT 120)
+endif()
 
 crit_inference_kernels(crit_host_mailbox ${INFERENCE}/host-work-mailbox/code mailbox.cu)
 add_library(crit_host_mailbox_fixture STATIC ${FIXTURES}/host_mailbox_fixture.cu)

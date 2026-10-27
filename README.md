@@ -8,7 +8,7 @@
 
 ### Why wait for someone to optimize an LLM for your GPU when an AI agent can build a specialized inference engine in a few hours?
 
-[![Version 0.11.0](docs/assets/badge-version.svg)](CHANGELOG.md)
+[![Version 0.12.0](docs/assets/badge-version.svg)](CHANGELOG.md)
 [![License Apache-2.0](docs/assets/badge-license.svg)](LICENSE)
 [![crit-hub engines](docs/assets/badge-crit-hub.svg)](https://github.com/crit-labs/crit-hub)
 [![CI](https://github.com/crit-labs/crit/actions/workflows/ci.yml/badge.svg)](https://github.com/crit-labs/crit/actions/workflows/ci.yml)
@@ -242,29 +242,16 @@ servable engine, measured the same way, and each next one is chosen from the las
 
 ```mermaid
 flowchart LR
-    recon["Reconnaissance<br/>model, hardware,<br/>crit guides"] --> limits["crit eval<br/>the hardware's limits"]
-    limits --> c1["Candidate 1<br/>a working engine"]
-    c1 --> measure["crit eval<br/>scores vs limits"]
-    measure --> decide{"Decision<br/>algorithm"}
-    decide -->|"build: the biggest<br/>gap first"| next["Candidate 2 … X"]
-    next --> measure
-    decide -->|"stop: nothing left<br/>beyond the noise"| final["Final candidate,<br/>served by crit serve"]
+    recon["<b>Reconnaissance</b><br/><small>read model spec, hardware config, workload, crit guides and docs</small>"] --> limits["<b>Evaluation</b><br/><small>measure GPU<br/>limits per KPI</small>"]
+    limits --> build
+    subgraph loop ["Candidate loop"]
+        direction LR
+        build["<b>Build candidate</b><br/><small>Core foundation<br/>plus Inference strategies</small>"] --> measure["<b>Evaluation</b><br/><small>scores vs limits,<br/>quality gates</small>"]
+        measure --> decide{"<b>Decision<br/>algorithm</b><br/><small>prioritize biggest<br/>gap first</small>"}
+        decide -- "decision:<br/>new candidate needed" --> build
+    end
+    decide -- "decision:<br/>exit condition met" --> final["<b>Final candidate</b><br/><small>sealed and served<br/>by crit serve</small>"]
 ```
-
-1. **Reconnaissance.** Gather everything the engine depends on before writing code: the user's
-   model, hardware, workload, quality and context needs; the model's files (`crit run ... recon`
-   reads its config, tokenizer, chat template, sampling defaults and draft layers); its model card
-   and reference implementation; crit's [agent instructions](AGENTS.md), guides and docs; and any
-   [crit-hub](https://github.com/crit-labs/crit-hub) engine to start from.
-2. **Learn the hardware's limits.** `crit eval probe` measures the GPU, and Eval turns the
-   measurements into the fastest decode, prefill and time to first token this model could reach on it.
-3. **Build candidate 1:** a working engine on [Core](#core), measured by Eval. It sets the baseline.
-4. **Decide what the next candidate changes.** The [decision algorithm](docs/RUN_RECORDS.md#plan) reads
-   the last Eval and names the KPI furthest from its limit, the levers that close the gap, and a
-   forecast crit checks after the build.
-5. **Build candidate 2, 3, …**, each measured by Eval and compared with its forecast.
-6. **Stop at the final candidate** once neither decode nor prefill can still move beyond its noise.
-   It is selected, sealed with its source and evidence, and served through an OpenAI-compatible API.
 
 Every step is recorded through the [CLI](cli/README.md): each candidate freezes its source by hash,
 each measurement points at that exact package, and the run's cost is counted from the agent's own
@@ -279,10 +266,12 @@ transcripts ([run records](docs/RUN_RECORDS.md)).
 
 <br />
 
-**Core is the plumbing every engine needs, distilled from about 30 bespoke inference engines.**
-> We took apart how each engine handles requests, memory, text and model files, kept the base
-> features they all rebuild, and turned them into one native SDK. Your engine keeps what makes it
-> fast: the model, its kernels, its layouts and its execution strategy.
+> [!NOTE]
+> Core is the plumbing every engine needs, distilled by studying multiple inference engines.
+
+We took apart how each engine handles requests, memory, text and model files, kept the base
+features they all rebuild, and turned them into one native SDK. Your engine keeps what makes it
+fast: the model, its kernels, its layouts and its execution strategy.
 
 | Part | What it does |
 | --- | --- |
@@ -313,10 +302,12 @@ Try the [Core + Inference walkthrough](inference/examples/core-projection/README
 
 <br />
 
-**Inference is our register of speed-up strategies, curated from about 50 inference engines.**
-> We studied what makes each engine fast and turned every strategy that holds beyond one model or
+> [!NOTE]
+> We studied bespoke inference engines and what makes them fast and turned every strategy that holds beyond one model or
 > GPU into an entry. Your agent picks the entries that match its engine's bottleneck and builds them
 > into the engine on Core.
+
+**Examples**:
 
 | Bottleneck | Example entries |
 | --- | --- |
@@ -326,7 +317,8 @@ Try the [Core + Inference walkthrough](inference/examples/core-projection/README
 | Model larger than VRAM | [Expert residency](inference/expert-residency/README.md), [device expert cache](inference/device-expert-cache/README.md), [dense layer offload](inference/dense-layer-offload/README.md) |
 | Hybrid recurrent layers | [Recurrent layer kernels](inference/recurrent-layer-kernels/README.md), [recurrent state recovery](inference/recurrent-state-recovery/README.md) |
 
-All 37 entries are in the [full guide](inference/README.md), or run `crit inference search <query>`.
+> [!TIP]
+> All 38 entries are in the [full guide](inference/README.md), or run `crit inference search <query>`.
 
 **Every entry has the same layout**
 
@@ -373,39 +365,6 @@ All 37 entries are in the [full guide](inference/README.md), or run `crit infere
 **A hardware report rounds out the evaluation.**
 > The same model on the same inference engine but on two different machines can also lead to different inference
 > speeds, even if the GPU is the same. We make this transparent by also reporting the runner's hardware configuration.
-
-</details>
-
----
-
-<a id="kernels"></a>
-
-<details>
-<summary><strong>📘 Kernels</strong> → <a href="kernels/README.md">Full guide</a></summary>
-
-<br />
-
-**Kernels helps you find and assess existing kernels** for your data format and
-hardware, including the [Hugging Face Kernel Hub](https://huggingface.co/kernels).
-It checks declared compatibility, shows mismatches and gaps, and retains chosen
-artifacts with exact versions and license notices. Your engine then measures
-whether the kernel helps.
-
-</details>
-
----
-
-<a id="models"></a>
-
-<details>
-<summary><strong>📙 Models</strong> → <a href="models/README.md">Full guide</a></summary>
-
-<br />
-
-**Models produces transformed weights** when a run allows them, starting with
-post-training quantization to FP8 or NVFP4 (round-to-nearest or GPTQ). It exports a
-checkpoint engines can read, runs it in your engine through Eval against the original
-model, and records the recipe, calibration data, seed, file hashes and cost.
 
 </details>
 

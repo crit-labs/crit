@@ -1,18 +1,25 @@
 name: Host and installed SDK
 
 on:
+  # A pull request's branch runs once (as the pull request), and a release tag reruns nothing main already ran.
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  # A newer push to the same pull request cancels its older run.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   host:
     name: ${{ matrix.os }} / Python ${{ matrix.python }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -50,7 +57,63 @@ jobs:
         # crit eval and crit run's Eval steps import crit_eval, and crit's tests reuse its fixtures (tests/) beside this checkout.
         run: git clone --depth 1 https://github.com/crit-labs/crit-eval ../crit-eval && python -m pip install --no-deps -e ../crit-eval
       - name: Host contracts and chat processes
-        run: python -B -m unittest discover -s tests -v
+        # One process per test module, four at a time: most tests wait on served engines' processes.
+        run: python -B tests/run_parallel.py --jobs 4
+      - name: Build and install Python package from a disposable snapshot
+        run: |
+          python -m pip install setuptools==84.0.0 wheel==0.48.0
+          mkdir -p build/package-source
+          git archive HEAD | tar -x -C build/package-source
+          python -B -c "import os; from setuptools.build_meta import build_sdist, build_wheel; os.chdir('build/package-source'); build_sdist('../dist'); build_wheel('../dist')"
+          (cd build/package-source/core/python && python -B -c "from setuptools.build_meta import build_wheel; build_wheel('../../../dist')")
+          python -m pip install --no-deps build/dist/*.whl
+          cd build/ci-temp
+          crit --version
+          crit kernels
+      - name: Verify source stayed unchanged
+        run: git diff --exit-code
+
+  native:
+    # The native SDK, Inference and Kernels builds do not depend on the Python version: once per OS.
+    name: ${{ matrix.os }} / native
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+        python: ['3.14']
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Use a canonical temporary directory
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          temporary = (Path(os.environ['GITHUB_WORKSPACE']).resolve() / 'build' / 'ci-temp')
+          temporary.mkdir(parents=True, exist_ok=True)
+          temporary = temporary.resolve()
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as environment:
+              for name in ('TMP', 'TEMP', 'TMPDIR'):
+                  environment.write(f'{name}={temporary}\n')
+          print(f'Temporary fixtures: {temporary}')
+          PY
+      - name: Install pinned runtime dependencies
+        run: python -m pip install tokenizers==0.23.3 jinja2==3.1.6
+      - name: Install crit Eval from its repository
+        # crit eval and crit run's Eval steps import crit_eval, and crit's tests reuse its fixtures (tests/) beside this checkout.
+        run: git clone --depth 1 https://github.com/crit-labs/crit-eval ../crit-eval && python -m pip install --no-deps -e ../crit-eval
       - name: Build native host SDK
         run: |
           cmake -S core -B build/core -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release
@@ -90,16 +153,5 @@ jobs:
           cmake -S kernels/examples/openblas -B build/kernels -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release -DPython3_EXECUTABLE="$(python -c 'import sys; print(sys.executable)')"
           cmake --build build/kernels --config Release --parallel 2
           ctest --test-dir build/kernels -C Release --output-on-failure
-      - name: Build and install Python package from a disposable snapshot
-        run: |
-          python -m pip install setuptools==84.0.0 wheel==0.48.0
-          mkdir -p build/package-source
-          git archive HEAD | tar -x -C build/package-source
-          python -B -c "import os; from setuptools.build_meta import build_sdist, build_wheel; os.chdir('build/package-source'); build_sdist('../dist'); build_wheel('../dist')"
-          (cd build/package-source/core/python && python -B -c "from setuptools.build_meta import build_wheel; build_wheel('../../../dist')")
-          python -m pip install --no-deps build/dist/*.whl
-          cd build/ci-temp
-          crit --version
-          crit kernels
       - name: Verify source stayed unchanged
         run: git diff --exit-code

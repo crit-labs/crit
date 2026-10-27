@@ -107,32 +107,32 @@ def _geomean(values):
 
 def _bytes_per_pass(room, model):
     """Bytes one decode pass reads: the Eval attempt's own figure (the engine's or the model files'), else the run's
-    model files read as Eval reads them (crit_eval.context.pass_bytes), else unknown."""
+    model files read as Eval reads them (crit_eval.limits.context.pass_bytes), else unknown."""
     found = _positive(room.get("bytes_per_pass"))
     if found:
         return found, "headroom.bytes_per_pass"
     try:
         from crit_eval import EVAL_DIR
-        from crit_eval.context import pass_bytes
+        from crit_eval.limits.context import pass_bytes
         settings = json.loads((EVAL_DIR / "protocol.json").read_text(encoding="utf-8"))["context"]
         found = _positive(pass_bytes(Path(model), float(settings["kv_bytes_per_element"])))
     except Exception:  # no Eval checkout, no weight headers, or a model this host cannot read: unknown
         found = None
-    return (found, "model files (crit_eval.context.pass_bytes)") if found else (None, None)
+    return (found, "model files (crit_eval.limits.context.pass_bytes)") if found else (None, None)
 
 
 def _draft_bytes(room, model):
     """Bytes one draft step reads: the Eval attempt's figure, else the checkpoint's own draft layers and the head they
-    read (crit_eval.context.draft_step_bytes), else unknown."""
+    read (crit_eval.limits.context.draft_step_bytes), else unknown."""
     found = _positive(room.get("draft_bytes_per_step"))
     if found:
         return found, "headroom.draft_bytes_per_step"
     try:
-        from crit_eval.context import draft_step_bytes
+        from crit_eval.limits.context import draft_step_bytes
         found = _positive(draft_step_bytes(Path(model)))
     except Exception:  # no Eval checkout, no draft layers, or a model this host cannot read: unknown
         found = None
-    return (found, "model files (crit_eval.context.draft_step_bytes)") if found else (None, None)
+    return (found, "model files (crit_eval.limits.context.draft_step_bytes)") if found else (None, None)
 
 
 # Plan rules 2: crit's computed limits and the alternative's ceiling use Eval's cost model, the round floor with the
@@ -146,7 +146,7 @@ UPPER_BOUND = "upper bound, draft cost excluded"
 def _draft_floor(result, model):
     """Plan rules 2: the time one draft step costs at its bytes floor, as Eval charges it, and where it comes from: Eval's
     own draft floor (headroom.projection.draft_floor_ms), else the engine's draft_bytes_per_step over the bandwidth,
-    else the checkpoint's draft layers (crit_eval.context.draft_step_bytes) over it; (None, None) when none is known."""
+    else the checkpoint's draft layers (crit_eval.limits.context.draft_step_bytes) over it; (None, None) when none is known."""
     room = result.get("headroom") or {}
     floor = (room.get("projection") or {}).get("draft_floor_ms")
     if type(floor) in (int, float) and floor >= 0:
@@ -204,7 +204,7 @@ def alternative_limit(result, model, kpi, tokens_per_round, draft_steps, version
 
 def _held(result, kpi):
     """Tokens each measured decode case (long-context point) holds on average while it decodes."""
-    from crit_eval.headroom import decode_suite
+    from crit_eval.limits.headroom import decode_suite
     room = result.get("headroom") or {}
     if kpi == "decode":
         suite = decode_suite(result)[1]
@@ -216,10 +216,10 @@ def _held(result, kpi):
 
 
 def acceptance_rates(result):
-    """Per decode case, the per-token acceptance rate Eval's acceptance bound uses (crit_eval.headroom.summarize): the
+    """Per decode case, the per-token acceptance rate Eval's acceptance bound uses (crit_eval.limits.headroom.summarize): the
     first draft's conditional acceptance over the decode suite's measured rounds, the greedy suite's where it is higher
     and the decode suite is the sampled one. {} without a draft width or per-round accepted counts."""
-    from crit_eval.headroom import conditional_acceptance, decode_suite
+    from crit_eval.limits.headroom import conditional_acceptance, decode_suite
     width = (result.get("headroom") or {}).get("draft_width")
     if type(width) is not int or width < 1:
         return {}
@@ -251,9 +251,9 @@ def _widest(result):
 
 def implied_rate(tokens_per_round, draft_steps):
     """The constant per-token acceptance rate a at which draft_steps draft steps emit tokens_per_round tokens a round,
-    (1 - a^(k+1)) / (1 - a) = tokens_per_round (crit_eval.headroom.tokens_at_rate inverted by bisection): 0 at one
+    (1 - a^(k+1)) / (1 - a) = tokens_per_round (crit_eval.limits.headroom.tokens_at_rate inverted by bisection): 0 at one
     token, 1 at draft_steps + 1."""
-    from crit_eval.headroom import tokens_at_rate
+    from crit_eval.limits.headroom import tokens_at_rate
     if draft_steps < 1 or tokens_per_round <= 1:
         return 0.0
     if tokens_per_round >= draft_steps + 1:
@@ -293,9 +293,9 @@ def measured_acceptance(result, kpi):
 
 def acceptance_bound(acceptance, draft_steps):
     """Plan rules 2: the most tokens per round the measured drafter reaches at draft_steps draft steps with every later
-    draft accepted as often as its first, as Eval projects its acceptance bound (crit_eval.headroom.tokens_at_rate):
+    draft accepted as often as its first, as Eval projects its acceptance bound (crit_eval.limits.headroom.tokens_at_rate):
     per case (point) (1 - a^(k+1)) / (1 - a) at its rate a, geometric mean; or the cap measured_acceptance gives."""
-    from crit_eval.headroom import tokens_at_rate
+    from crit_eval.limits.headroom import tokens_at_rate
     if "cap" in acceptance:
         return min(acceptance["cap"], draft_steps + 1)
     return _geomean([tokens_at_rate(rate, draft_steps)[draft_steps] for rate in acceptance["rates"].values()])
@@ -309,7 +309,7 @@ def computed_limits(result, model, version=1):
     an upper bound at the measured acceptance; rules 2 charge each round the engine's draft width at Eval's draft floor
     (Eval's round floor), and keep the upper bound, labelled, where the width or the draft floor is unknown. {} when the
     attempt lacks the bandwidth or the bytes per pass."""
-    from crit_eval.headroom import decode_suite
+    from crit_eval.limits.headroom import decode_suite
     room = result.get("headroom") or {}
     bandwidth = _positive(room.get("bandwidth_gbs"))
     per_pass, source = _bytes_per_pass(room, model)

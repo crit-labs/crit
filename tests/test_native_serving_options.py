@@ -1,8 +1,11 @@
 """Request sampling overrides reach the native call without changing resident defaults."""
+from pathlib import Path
+import sys
 import threading
 import unittest
 from unittest.mock import Mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core/python"))
 from core_text_fixtures import byte_level_json
 from crit_core.native import ResidentEngine, Scores
 from crit_core.serving import ScoreRows

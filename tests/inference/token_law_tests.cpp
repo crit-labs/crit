@@ -681,6 +681,57 @@ int main() {
             std::cout << "processing: " << draws << " columns equal Core's law, " << mismatches << " boundary mismatches\n";
         }
 
+        // 2b. A constraint that allows only stop tokens before min_tokens (a finished grammar): with the row's yield set
+        //     (Core's suppression_yields), suppression steps aside and the draw is Core's constrained choice, a stop;
+        //     without it nothing is selectable (-1). Greedy and sampled requests on fast and full-law rows.
+        {
+            constexpr int V = 3000, columns = 1;
+            constexpr cc::Token stop_a = 7, stop_b = 2999;
+            cc::Sampler host(V);
+            for(const std::uint32_t top_k : {0u, 1u, 40u}) {
+                Case c(V);
+                c.rules.temperature = top_k == 1 ? 0.0 : 0.9;
+                c.rules.top_k = top_k == 1 ? 0u : top_k;
+                c.rules.min_tokens = 5;
+                c.rules.seed = 31 + top_k;
+                c.suppress = {stop_a, stop_b};
+                c.finish();
+                std::vector<float> row(std::size_t(columns) * V, -INFINITY);   // the mask already applied
+                for(int col = 0; col < columns; ++col) {
+                    row[std::size_t(col) * V + stop_a] = 0.5f + float(col);
+                    row[std::size_t(col) * V + stop_b] = 1.25f;
+                }
+                const std::vector<cc::Token> allowed = {stop_a, stop_b};
+                require(cc::suppression_yields(cc::AllowedTokens{allowed}, c.rules), "Core: only suppressed tokens allowed");
+                DeviceCase dc(c);
+                Device<ts::Request> request(1);
+                request.put({dc.request});
+                Device<float> logits(row), scratch(ts::scratch_floats(V, columns));
+                Device<std::int32_t> out(columns);
+                for(const bool yield : {true, false}) {
+                    Device<std::uint8_t> yields(std::vector<std::uint8_t>(columns, yield ? 1 : 0));
+                    ts::Rows rows;
+                    rows.logits = logits.p;
+                    rows.stride = V;
+                    rows.vocab = V;
+                    rows.columns = columns;
+                    rows.request = request.p;
+                    rows.scratch = scratch.p;
+                    rows.yield = yields.p;
+                    ok(ts::enqueue_sample(rows, cc::DrawPurpose::sample, out.p, nullptr, nullptr), "sample");
+                    const auto tokens = out.get();
+                    for(int col = 0; col < columns; ++col) {
+                        if(!yield) { require(tokens[std::size_t(col)] == -1, "suppression without yield leaves nothing selectable"); continue; }
+                        auto h = c.history();
+                        const std::span<const float> r(row.data() + std::size_t(col) * V, V);
+                        const auto expect = host.sample(r, cc::AllowedTokens{allowed}, c.rules, h, std::size_t(col)).token;
+                        require(tokens[std::size_t(col)] == expect, "a yielding row differs from Core's constrained choice");
+                    }
+                }
+            }
+            std::cout << "suppression yields to a stop-only constraint as Core's does\n";
+        }
+
         // 3. Verification. Greedy drafts: every column is Core's own draw with the drafts before it staged, so the
         //    emitted text equals plain sampling. Sampled drafts (dense q): the rejection rule with Core's accept,
         //    residual and sample draws.
@@ -978,6 +1029,88 @@ int main() {
                 if(mode == 2) require(sparse.get()[0].count == V, "a 12-token draft law has no sparse form");
             }
             std::cout << "distribution: first tokens follow the target law for greedy drafts and sampled drafts with dense or sparse laws\n";
+        }
+
+        // 4b. Block verification: three drafts per round, sampled from a different draft law (dense and sparse q, drawn
+        //     with block_draft_purpose) or greedy. The first emitted token follows the target law, predictions hold the
+        //     drafts up to the first prediction that differs, and the block rule accepts at least as many drafts as
+        //     the token rule on the same rows (by more than four standard errors for sampled drafts).
+        {
+            constexpr int V = 12, R = 16384, K = 3;
+            const std::vector<float> target = {1.2f, 0.8f, 0.5f, 0.1f, 0.0f, -0.3f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -9.0f};
+            const std::vector<float> drafter = {-1.0f, 1.5f, 0.2f, 0.9f, -0.5f, 0.0f, 0.3f, -2.0f, -0.4f, -3.0f, 0.6f, -1.0f};
+            std::vector<ts::Request> reqs(R);
+            for(int r = 0; r < R; ++r) { reqs[std::size_t(r)].temperature = 1.f; reqs[std::size_t(r)].seed = 77 + std::uint64_t(r); }
+            double z = 0.;
+            for(float x : target) z += std::exp(double(x));
+            for(int mode = 0; mode < 3; ++mode) {   // greedy drafts, sampled drafts with dense q, with sparse q
+                Device<ts::Request> request(reqs);
+                std::vector<float> rows(std::size_t(R) * (K + 1) * V), draft_rows(std::size_t(R) * K * V);
+                for(int r = 0; r < R; ++r) {
+                    for(int c = 0; c <= K; ++c)
+                        std::copy(target.begin(), target.end(), rows.begin() + std::ptrdiff_t((std::size_t(r) * (K + 1) + c) * V));
+                    for(int c = 0; c < K; ++c)
+                        std::copy(drafter.begin(), drafter.end(), draft_rows.begin() + std::ptrdiff_t((std::size_t(r) * K + c) * V));
+                }
+                Device<float> logits(rows), dlogits(draft_rows), scratch(ts::scratch_floats(V, std::uint32_t((K + 1) * R))),
+                    q(std::size_t(R) * K * V);
+                Device<std::int32_t> drafts(std::size_t(R) * K), predictions(std::size_t(R) * (K + 1));
+                Device<ts::SparseLaw> sparse(std::size_t(R) * K);
+                if(mode == 0) {
+                    drafts.put(std::vector<std::int32_t>(std::size_t(R) * K, 1));
+                } else {
+                    ts::Rows d;
+                    d.logits = dlogits.p;
+                    d.stride = V;
+                    d.vocab = V;
+                    d.requests = R;
+                    d.columns = K;
+                    d.request = request.p;
+                    d.scratch = scratch.p;
+                    const auto purpose = ts::block_draft_purpose(0);
+                    if(mode == 1) ok(ts::enqueue_sample(d, purpose, drafts.p, q.p, nullptr), "draft sample");
+                    else ok(ts::enqueue_sample(d, purpose, drafts.p, nullptr, sparse.p, ts::Logprobs{}, nullptr), "draft sample");
+                }
+                double standing[2] = {0., 0.}, squares[2] = {0., 0.};
+                for(const auto rule : {ts::VerifyRule::token, ts::VerifyRule::block}) {
+                    ts::Verify v;
+                    v.target.logits = logits.p;
+                    v.target.stride = V;
+                    v.target.vocab = V;
+                    v.target.requests = R;
+                    v.target.columns = K + 1;
+                    v.target.request = request.p;
+                    v.target.scratch = scratch.p;
+                    v.drafts = drafts.p;
+                    v.draft_probabilities = mode == 1 ? q.p : nullptr;
+                    v.draft_laws = mode == 2 ? sparse.p : nullptr;
+                    v.predictions = predictions.p;
+                    v.rule = rule;
+                    ok(ts::enqueue_verify(v, nullptr), "verify");
+                    const auto got = predictions.get();
+                    const auto drafted = drafts.get();
+                    std::vector<int> hist(V, 0);
+                    for(int r = 0; r < R; ++r) {
+                        const int t = got[std::size_t(r) * (K + 1)];
+                        require(t >= 0 && t < V, "prediction outside the vocabulary");
+                        ++hist[std::size_t(t)];
+                        int matched = 0;
+                        while(matched < K && drafted[std::size_t(r) * K + std::size_t(matched)] == got[std::size_t(r) * (K + 1) + std::size_t(matched)]) ++matched;
+                        standing[int(rule)] += matched;
+                        squares[int(rule)] += double(matched) * matched;
+                    }
+                    for(int t = 0; t < V; ++t) {
+                        const double pr = std::exp(double(target[std::size_t(t)])) / z, f = double(hist[std::size_t(t)]) / R;
+                        require(std::abs(f - pr) < 4.5 * std::sqrt(pr * (1 - pr) / R) + 1e-3, "block verification changes the first token's law");
+                    }
+                }
+                const double token = standing[0] / R, block = standing[1] / R;
+                const double se = std::sqrt((squares[0] / R - token * token + squares[1] / R - block * block) / R);
+                require(block >= token - 4 * se, "block verification accepts fewer drafts than the token rule");
+                if(mode) require(block > token + 4 * se, "block verification gains nothing on sampled drafts");
+                std::cout << "block verification (" << (mode == 0 ? "greedy" : mode == 1 ? "dense q" : "sparse q") << "): " << block
+                          << " standing drafts per round against " << token << " for the token rule\n";
+            }
         }
 
         // 5. Commits: counts and positions follow the device emitted counts; null counts advance only positions.

@@ -4,6 +4,7 @@
 // values, codes packed "adjacent" (low nibble = even index). Scalar reference: each
 // 16-value block is decoded once and reused across all token rows; FP32
 // accumulation in a fixed order. Optimized ISA providers belong in Kernels.
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -11,6 +12,7 @@
 #include <limits>
 #include <span>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace crit::nvfp4 {
@@ -72,8 +74,9 @@ struct Matrix {
             out[2 * i + 1] = e2m1(p[i] >> 4) * s;
         }
     }
-    // Quantizes a dense row-major matrix with a tensor-wide global scale.
-    static Matrix quantize(std::span<const float> dense, std::size_t rows, std::size_t cols) {
+    // Quantizes a dense row-major matrix with a tensor-wide global scale. With four_over_six, each block also tries
+    // the scale that maps its maximum to 4 instead of 6 and keeps the one with the smaller squared error (6 on a tie).
+    static Matrix quantize(std::span<const float> dense, std::size_t rows, std::size_t cols, bool four_over_six = false) {
         if(dense.size() != rows * cols || cols == 0 || cols % block) throw std::invalid_argument("NVFP4 geometry mismatch");
         float amax = 0;
         for(float v : dense) {
@@ -87,13 +90,28 @@ struct Matrix {
                 const float* x = dense.data() + n * cols + b * block;
                 float bmax = 0;
                 for(std::size_t i = 0; i < block; ++i) bmax = std::fmax(bmax, std::fabs(x[i]));
-                const auto s = e4m3_encode(bmax * m.global_scale / 6.0f);
+                // Scale byte, codes and squared error (in scaled units, double) of the block mapped to `top`.
+                const auto encode = [&](float top, std::uint8_t (&codes)[block]) {
+                    const auto s = e4m3_encode(bmax * m.global_scale / top);
+                    const float decoded = e4m3(s);
+                    double error = 0;
+                    for(std::size_t i = 0; i < block; ++i) {
+                        codes[i] = decoded > 0 ? e2m1_encode(x[i] * m.global_scale / decoded) : std::uint8_t(0);
+                        const double d = double(e2m1(codes[i])) * double(decoded) - double(x[i]) * double(m.global_scale);
+                        error += d * d;
+                    }
+                    return std::pair{s, error};
+                };
+                std::uint8_t codes[block], four[block];
+                auto [s, error] = encode(6.0f, codes);
+                if(four_over_six) {
+                    const auto [s4, error4] = encode(4.0f, four);
+                    if(error4 < error) { s = s4; std::copy(four, four + block, codes); }
+                }
                 m.scales[n * (cols / block) + b] = s;
-                const float decoded = e4m3(s);
                 for(std::size_t i = 0; i < block; ++i) {
-                    const auto code = decoded > 0 ? e2m1_encode(x[i] * m.global_scale / decoded) : std::uint8_t(0);
                     auto& byte = m.packed[n * (cols / 2) + b * (block / 2) + i / 2];
-                    byte = std::uint8_t(i % 2 ? (byte | (code << 4)) : code);
+                    byte = std::uint8_t(i % 2 ? (byte | (codes[i] << 4)) : codes[i]);
                 }
             }
         return m;

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 # crit Core's Python package on its own: crit and crit Eval (https://github.com/crit-labs/crit-eval) both depend on it.
 [project]
 name = "crit-core"
-version = "0.11.0"
+version = "0.12.0"
 description = "crit Core's Python side: model inspection, tokenizers and chat templates, machine locks, native engines"
 license = "Apache-2.0"
 # A copy of the root LICENSE (CI compares them): license files must sit inside the project directory.

@@ -37,6 +37,7 @@ struct Plan {
     bool fp4 = false;
     int n = 0, k = 0, tokens = 0;
     int nt = 8, rt = 1, sk = 1, tpad = 0;
+    int group = 1;                  // weight bands per raster group (l2_raster_group); 1 is the plain launch order
     // Scratch the caller provides: packed activations, per-token scales (FP8) and split-K partials.
     std::size_t activation_bytes = 0, token_scale_count = 0, partial_floats = 0;
 };
@@ -52,6 +53,12 @@ struct Plan {
 // launch with T tokens packs and computes ceil(T / (8 nt)) token blocks, so a short chunk costs what it uses, and a
 // token's result depends only on the plan and its own row, not on T.
 Plan plan(bool fp4, int N, int K, int T, int wide_tokens = 256, int min_blocks = 0, bool two_row_tiles = true);
+// Raster grouping from the current device's L2 size (cudaDevAttrL2CacheSize): 1 while the plan's packed activations
+// (tokens x K, at the plan's activation width) fit in half the L2, else the largest power of two G of weight bands
+// (128 rt rows x K each) whose G bands fit in a quarter of it. The launch order then keeps G bands L2-resident while
+// the token blocks pass over them, which reads the activations once per G bands. The result's bits are unchanged.
+// Plans start at group 1: set it (plan.group = l2_raster_group(plan)) where a measurement on the device shows a gain.
+int l2_raster_group(const Plan&);
 
 struct Fp8Weights { const std::uint8_t* tiles; const __nv_bfloat16* row_scale; int N, K; };
 // Dequantization: weight = code * scale / weight_global_scale (the checkpoint's divisor); activations are quantized
@@ -164,11 +171,14 @@ struct A16Plan {
     bool fp4 = false;
     int n = 0, k = 0, tokens = 0;
     int sk = 1;                     // K parts
+    int group = 1;                  // weight bands per raster group (l2_raster_group); 1 is the plain launch order
     std::size_t partial_floats = 0;  // scratch for sk > 1: sk x tokens x n floats
 };
 // min_blocks > 0: split K until the grid holds min_blocks blocks (at most 8 parts); min_blocks <= 0: split only while
 // the split grid fits in one wave of resident blocks (SM count x the kernel's occupancy), as plan() does.
 A16Plan plan_a16(bool fp4, int N, int K, int T, int min_blocks = 0);
+// The same rule for BF16 activations (2 bytes per value) and 256-row bands.
+int l2_raster_group(const A16Plan&);
 // y[t][n] (row stride ldo) = (add ? y : 0) + sum_k W[n][k] x[t][k], x BF16 [T][K] row-major and 16-byte aligned.
 // N % 16 == 0 (rows past a 256-row block are skipped), K % 32 (FP8; a K % 64 == 32 tail is handled) or K % 64
 // (NVFP4); T <= plan tokens; partials: plan.partial_floats floats (may be null when sk == 1). cudaErrorInvalidValue

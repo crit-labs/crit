@@ -62,14 +62,30 @@ def e4m3_scale_codes(scale):
 class Nvfp4:
     grouped = True
 
-    def __init__(self, weight):
+    def __init__(self, weight, four_over_six=False):
         amax = weight.abs().amax().float()
         self.global_scale = torch.where(amax > 0, (E2M1_MAX * E4M3_MAX) / amax, torch.ones_like(amax))
         self.scales = torch.zeros(weight.shape[0], weight.shape[1] // BLOCK, dtype=torch.uint8, device=weight.device)
         self.current = None
+        self.four_over_six = four_over_six
 
-    def _block_scale(self, block_amax):
-        return e4m3_scale_codes(block_amax * self.global_scale / E2M1_MAX)
+    def _block_scale(self, block_amax, top=E2M1_MAX):
+        return e4m3_scale_codes(block_amax * self.global_scale / top)
+
+    def _choose(self, blocks):
+        """E4M3 block scales of blocks [..., 16]: amax / 6, or with four_over_six whichever of amax / 6 and
+        amax / 4 gives the smaller squared error in scaled units (6 on a tie), as the Inference codec does."""
+        amax = blocks.abs().amax(dim=-1)
+        six = self._block_scale(amax)
+        if not self.four_over_six:
+            return six
+        four = self._block_scale(amax, 4.0)
+
+        def error(scales):
+            decoded = scales.float()[..., None]
+            codes = e2m1_encode(torch.where(decoded > 0, blocks * self.global_scale / torch.where(decoded > 0, decoded, 1.0), 0.0))
+            return ((e2m1_decode(codes).double() * decoded.double() - blocks.double() * self.global_scale.double()) ** 2).sum(-1)
+        return torch.where(error(four) < error(six), four, six)
 
     def _quantize(self, values, decoded):
         scaled = torch.where(decoded > 0, values * self.global_scale / torch.where(decoded > 0, decoded, 1.0), 0.0)
@@ -79,14 +95,14 @@ class Nvfp4:
     def rtn(self, weight):
         rows, cols = weight.shape
         blocks = weight.reshape(rows, cols // BLOCK, BLOCK)
-        scales = self._block_scale(blocks.abs().amax(dim=2))
+        scales = self._choose(blocks)
         self.scales = scales.view(torch.uint8)
         codes, values = self._quantize(blocks, scales.float()[..., None])
         return codes.reshape(rows, cols), values.reshape(rows, cols)
 
     def start_group(self, block, column):
         """Scale of the 16 columns starting at `column`, from their current (GPTQ-updated) values."""
-        scales = self._block_scale(block.abs().amax(dim=1))
+        scales = self._choose(block)
         self.scales[:, column // BLOCK] = scales.view(torch.uint8)
         self.current = scales.float()
 
@@ -99,7 +115,7 @@ class Nvfp4:
                 "weight_global_scale": self.global_scale.reshape(1).contiguous()}
 
 
-CODECS = {"fp8-channel": Fp8Channel, "nvfp4": Nvfp4}
+CODECS = {"fp8-channel": Fp8Channel, "nvfp4": Nvfp4, "nvfp4-4over6": lambda weight: Nvfp4(weight, four_over_six=True)}
 
 
 def gptq(weight, hessian, codec, dampening, block):

@@ -18,7 +18,7 @@ namespace crit::core {
 // Every draw is a pure function of (seed, position, stream, purpose): rollback, stop/budget trimming,
 // cancellation and speculative redo need no generator state. Position = committed outputs before the
 // draw plus the verify column.
-enum class DrawPurpose : std::uint32_t { sample = 0, draft = 1, accept = 2, residual = 3, user = 16 };
+enum class DrawPurpose : std::uint32_t { sample = 0, draft = 1, accept = 2, residual = 3, block = 4, user = 16 };
 // The four 32-bit output words of one Philox4x32 block, in Random123 order (a plain array is device-safe).
 struct PhiloxBlock { std::uint32_t word[4] = {}; };
 // Philox4x32-10 with the Random123 constants. Key = {seed low, seed high};
@@ -118,6 +118,9 @@ private:
 struct Choice { Token token = 0; float logprob = 0; };
 // The sorted unique token ids a constraint permits at one position (TokenMatcher::allowed() in crit/constraints.h).
 struct AllowedTokens { std::span<const Token> ids = {}; };
+// Whether min_tokens suppression yields for a constrained row: every allowed id is in suppress_until_min, so
+// suppressing would leave nothing selectable. The device sampler takes the same answer per row (Rows::yield).
+bool suppression_yields(AllowedTokens allowed, const SamplingParams&) noexcept;
 // One per worker thread. Owns O(vocabulary) scratch allocated once; sample() never allocates and distribution()
 // allocates only to grow `out`. Logits rows hold exactly vocabulary() entries: pass only the valid vocabulary.
 // Errors: invalid_argument("logits must be finite or -inf") for NaN or +inf, invalid_argument("no selectable
@@ -144,8 +147,9 @@ public:
     // Constrained forms (structured output, crit/constraints.h): every id outside `allowed` is masked to -inf
     // before step 1's bias, so the filters see only the allowed tokens and a filter cannot empty the set. The
     // returned logprob and `top` stay raw over the whole row. invalid_argument("allowed tokens must be nonempty,
-    // sorted, unique and in the vocabulary") otherwise; "no selectable token" when bans or min_tokens suppression
-    // remove every allowed token. Without these forms behavior is unchanged.
+    // sorted, unique and in the vocabulary") otherwise; "no selectable token" when bans remove every allowed token.
+    // min_tokens suppression yields when every allowed token is a suppressed one (suppression_yields), so a
+    // constraint that only allows a stop, such as a finished grammar, ends the output instead of failing. Without these forms behavior is unchanged.
     Choice sample(std::span<const float> logits, AllowedTokens allowed, const SamplingParams&, const TokenHistory&,
                   std::size_t column = 0, std::span<TokenLogprob> top = {});
     void distribution(std::span<const float> logits, AllowedTokens allowed, const SamplingParams&,

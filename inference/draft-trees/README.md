@@ -35,7 +35,9 @@ steps run the drafter on the `beam` best candidates of the newest depth (with th
 mask in the drafter's own attention) and expand each. A candidate's score is its path's
 draft log-probability; keep the `N - 1` best of all depths. Children never outscore their
 parents and ties go to the earlier candidate, so the kept set contains every kept node's
-parent. Nodes are ordered by depth, then score, so parents come first.
+parent. Nodes are ordered by depth, then score, so parents come first. A NaN logit ranks
+as -inf, and a candidate scoring -inf is never kept, so a row of NaN from the drafter
+drafts nothing instead of an out-of-range token.
 
 **Verify.** One target pass over the `N` nodes at KV slots `frontier + i` and RoPE
 positions `frontier + depth[i]`, with the masks as attention trees (`Decode::tree` in
