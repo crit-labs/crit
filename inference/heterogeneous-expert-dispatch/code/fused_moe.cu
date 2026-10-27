@@ -96,10 +96,12 @@ __global__ void route_down(const float* scores, int experts, int top, Rule rule,
       total = reduce(sum, best_value, [](float a, float b) { return a + b; });
     }
     const auto score = [&](float logit) { return rule.sigmoid ? 1.f / (1.f + expf(-logit)) : expf(logit - peak) / total; };
-    // Selection value: the raw logit or its score, plus the correction bias when present.
+    // Selection value: the raw logit or its score, plus the correction bias when present. NaN ranks as -inf, so a
+    // row of NaN (a padding row, or a NaN that reached the router) still selects in-range experts.
     for (int expert = static_cast<int>(tid); expert < experts; expert += 256) {
       const auto value = rule.before ? score(logits[expert]) : logits[expert];
-      choice[expert] = rule.bias ? value + rule.bias[expert] : value;
+      const auto biased = rule.bias ? value + rule.bias[expert] : value;
+      choice[expert] = biased == biased ? biased : -CUDART_INF_F;
     }
     __syncthreads();
     if (rule.selected_groups < rule.groups) {

@@ -1584,18 +1584,57 @@ void model_stop_ids() {
         require(stop_token_ids(model, &*gen) == std::vector<Token>(expected.begin(), expected.end()), "randomized stop id union");
     }
 }
+
+void model_rope() {
+    TempDir dir;
+    const auto config = [&](const std::string& json) {
+        write_file(dir.path / "config.json", json);
+        return load_model_config(dir.path / "config.json");
+    };
+    const auto plain = rope_table(config(R"({"rope_theta":10000})").rope, 4);
+    require(plain.inv_freq == std::vector<double>{1.0, 0.01} && plain.attention_factor == 1.0, "plain rotary table");
+    // A declared attention_factor is the final scale, never multiplied by YaRN's own mscale.
+    const auto yarn = config(R"({"rope_theta":1e6,"rope_scaling":{"rope_type":"yarn","factor":128,"attention_factor":1.4852,)"
+                             R"("original_max_position_embeddings":4096}})");
+    require(rope_table(yarn.rope, 128).attention_factor == 1.4852, "declared YaRN attention factor");
+    const auto ratio = config(R"({"rope_theta":1e6,"rope_scaling":{"rope_type":"yarn","original_max_position_embeddings":4096}})");
+    const auto explicit8 = config(R"({"rope_theta":1e6,"rope_scaling":{"rope_type":"yarn","factor":8,"original_max_position_embeddings":4096}})");
+    require(rope_table(ratio.rope, 128, 32768).inv_freq == rope_table(explicit8.rope, 128, 32768).inv_freq,
+            "YaRN without factor uses the length ratio");
+    rejects([&] { rope_table(config(R"({"rope_scaling":{"rope_type":"su","factor":2}})").rope, 128); }, "has no table");
+    rejects([&] { rope_table(config(R"({"rope_scaling":{"rope_type":"linear"}})").rope, 128); }, "needs factor");
+    rejects([&] { rope_table(config(R"({"partial_rotary_factor":0.3})").rope, 10); }, "not a positive even number");
+    rejects([&] { rope_table(config(R"({"rope_scaling":{"rope_type":"dynamic","factor":2}})").rope, 128); },
+            "needs max_position_embeddings");
+}
+
+// rope_table of <dir>/config.json for the rope_oracle.py comparison: "attention inv_freq..." in %.17g, or
+// "error <message>".
+int print_rope(const fs::path& dir, std::uint32_t head_dim, std::optional<std::uint64_t> length) {
+    try {
+        const auto config = load_model_config(dir);
+        const auto table = rope_table(config.rope, head_dim, config.max_positions, length);
+        std::printf("%.17g", table.attention_factor);
+        for(const double f : table.inv_freq) std::printf(" %.17g", f);
+        std::printf("\n");
+    } catch(const std::exception& e) { std::printf("error %s\n", e.what()); }
+    return 0;
+}
 }
 
 int main(int argc, char** argv) {
     try {
         const std::string test = argc > 1 ? argv[1] : "all";
+        if(test == "model_rope_print" && argc == 5)
+            return print_rope(argv[2], std::uint32_t(std::stoul(argv[3])),
+                              std::string(argv[4]) == "-" ? std::nullopt : std::optional<std::uint64_t>(std::stoull(argv[4])));
         const std::vector<std::pair<std::string, std::function<void()>>> tests{
             {"model_dtypes", model_dtypes}, {"model_header_valid", model_header_valid}, {"model_header_rejects", model_header_rejects},
             {"model_limits", model_limits}, {"model_subbyte", model_subbyte}, {"model_header_only", model_header_only},
             {"model_index", model_index}, {"model_extra_files", model_extra_files}, {"model_directory", model_directory},
             {"model_symlinks", model_symlinks}, {"model_bytes", model_bytes}, {"model_digests", model_digests},
             {"model_change_detection", model_change_detection}, {"model_retained", model_retained}, {"model_random", model_random}, {"model_config_eval", model_config_eval}, {"model_config_types", model_config_types},
-            {"model_generation", model_generation}, {"model_stop_ids", model_stop_ids}};
+            {"model_generation", model_generation}, {"model_stop_ids", model_stop_ids}, {"model_rope", model_rope}};
         bool found = false;
         for(const auto& [name, run]:tests) if(test == "all" || test == name) {
             run();

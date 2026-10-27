@@ -1,6 +1,7 @@
 #include "sampled.h"
 #include <array>
 #include <iostream>
+#include <map>
 using namespace crit::techniques;
 void check(bool ok,const char* message){if(!ok)throw std::runtime_error(message);}
 template<class F>void rejects(F f){try{f();}catch(const std::exception&){return;}throw std::runtime_error("Expected rejection");}
@@ -34,9 +35,10 @@ public:
     return result;
   }
 };
-std::unique_ptr<SampledSpeculator> loop(std::uint64_t seed,std::shared_ptr<Fault> t,std::shared_ptr<Fault> d,std::span<const SpecToken> stops={}) {
+std::unique_ptr<SampledSpeculator> loop(std::uint64_t seed,std::shared_ptr<Fault> t,std::shared_ptr<Fault> d,std::span<const SpecToken> stops={},
+                                       VerifyRule rule=VerifyRule::token) {
   return std::make_unique<SampledSpeculator>(std::make_unique<Markov>(std::vector<SpecToken>{0},false,t),
-    std::make_unique<Markov>(std::vector<SpecToken>{0},true,d),SpeculationLimits{16,8,3},seed,stops);
+    std::make_unique<Markov>(std::vector<SpecToken>{0},true,d),SpeculationLimits{16,8,3},seed,stops,rule);
 }
 // Retain the same model arithmetic and faults while independently exercising
 // sparse/fallback rows, including representation changes after rewind.
@@ -65,11 +67,11 @@ public:
   }
 };
 std::unique_ptr<SparseSampledSpeculator> sparse_loop(std::uint64_t seed,std::shared_ptr<Fault> t,
-    std::shared_ptr<Fault> d,std::span<const SpecToken> stops={},std::size_t capacity=3) {
+    std::shared_ptr<Fault> d,std::span<const SpecToken> stops={},std::size_t capacity=3,VerifyRule rule=VerifyRule::token) {
   return std::make_unique<SparseSampledSpeculator>(
     std::make_unique<SparseMarkov>(std::make_unique<Markov>(std::vector<SpecToken>{0},false,t),t,capacity),
     std::make_unique<SparseMarkov>(std::make_unique<Markov>(std::vector<SpecToken>{0},true,d),d,capacity),
-    SpeculationLimits{16,8,3},seed,stops);
+    SpeculationLimits{16,8,3},seed,stops,rule);
 }
 bool same(std::span<const SpecToken> a,std::span<const SpecToken> b) {
   return std::equal(a.begin(),a.end(),b.begin(),b.end());
@@ -243,10 +245,77 @@ template<class Factory> void statistical_case(const char* name,Factory make) {
   check(pearson<75.55,"Sampled three-token distribution fails the chi-square bound");
   std::cout<<name<<": "<<trials<<" three-token histories passed fixed distribution bounds (chi-square "<<pearson<<" of 75.55)\n";
 }
+// Block verification's round law, exactly: over every draft path of width 1 .. 3 on the Markov fixture, the
+// probability of each (standing drafts, next token) outcome follows from the rule's formulas; the emitted
+// tokens must have the target's joint law (the first two tokens of a width-2+ round), and the expected
+// number of standing drafts must be at least the token rule's. block_verify's own draws are checked against
+// the same outcome probabilities by frequency.
+void block_acceptance() {
+  const auto target=[](SpecToken last){return last==0?std::array<double,3>{.1,.3,.6}:last==1?std::array<double,3>{.5,.2,.3}:std::array<double,3>{.4,.5,.1};};
+  const auto drafter=[](SpecToken last){return last==0?std::array<double,3>{.7,.2,.1}:std::array<double,3>{.1,.7,.2};};
+  for(std::size_t D=1;D<=3;++D) {
+    std::map<std::vector<SpecToken>,double> law;double block_standing=0,token_standing=0;
+    std::vector<SpecToken> path(D);
+    for(std::size_t code=0;code<static_cast<std::size_t>(std::pow(3,D));++code) {
+      std::size_t c=code;for(auto& x:path){x=static_cast<SpecToken>(c%3);c/=3;}
+      std::vector<Distribution> p,q;SpecToken last=0;double qpath=1;
+      for(std::size_t i=0;i<=D;++i) {
+        const auto pt=target(last),qt=drafter(last);p.emplace_back(std::vector<double>(pt.begin(),pt.end()));q.emplace_back(std::vector<double>(qt.begin(),qt.end()));
+        if(i==D)break;
+        qpath*=qt[path[i]];last=path[i];
+      }
+      // token rule: expected standing drafts on this path = sum over prefixes of the product of acceptances
+      double alive=1;for(std::size_t i=0;i<D;++i){alive*=std::min(1.,p[i][path[i]]/q[i][path[i]]);token_standing+=qpath*alive;}
+      // block rule: P(tau = i) from the thresholds, scanned from D down
+      std::vector<double> w(D+1,1.);
+      for(std::size_t i=1;i<=D;++i)w[i]=std::min(1.,w[i-1]*p[i-1][path[i-1]]/q[i-1][path[i-1]]);
+      double none_above=1;
+      for(std::size_t i=D;;--i) {
+        double h=w[i];
+        if(i<D && w[i]<1){const double z=residual_mass(p[i],q[i],w[i]);h=z>0?z/(z+1-w[i]):0;}
+        const double at=none_above*std::min(h,1.);none_above-=at;
+        if(at>0) {
+          block_standing+=qpath*at*static_cast<double>(i);
+          const auto next=i==D?p[D]:rejection_distribution(p[i],q[i],w[i]);
+          for(SpecToken y=0;y<3;++y) {
+            std::vector<SpecToken> out(path.begin(),path.begin()+static_cast<std::ptrdiff_t>(i));out.push_back(y);
+            if(out.size()>=2) {out.resize(2);law[out]+=qpath*at*next[y];continue;}
+            // A one-token round: the next round continues from the target's law (any law-keeping rule).
+            for(SpecToken z=0;z<3;++z)law[{y,z}]+=qpath*at*next[y]*target(y)[static_cast<std::size_t>(z)];
+          }
+        }
+        if(i==0)break;
+      }
+      check(none_above<1e-12,"Block thresholds leave mass unassigned");
+      // block_verify's draws follow the same P(tau): 20,000 draws on this path
+      if(code%5==0) {
+        std::mt19937_64 rng(code*31+D);std::vector<std::size_t> hits(D+1);
+        for(int n=0;n<20000;++n){auto [tau,next]=block_verify<Distribution>(p,q,path,[&]{return std::generate_canonical<double,53>(rng);});++hits[tau];(void)next;}
+        double above=1;
+        for(std::size_t i=D;;--i) {
+          double h=w[i];if(i<D && w[i]<1){const double z=residual_mass(p[i],q[i],w[i]);h=z>0?z/(z+1-w[i]):0;}
+          const double at=above*std::min(h,1.);above-=at;
+          check(std::abs(static_cast<double>(hits[i])/20000-at)<.015,"block_verify's standing count differs from the rule");
+          if(i==0)break;
+        }
+      }
+    }
+    // Emitted law of the first two tokens.
+    for(const auto& [out,mass]:law)
+      check(std::abs(mass-target(0)[static_cast<std::size_t>(out[0])]*target(out[0])[static_cast<std::size_t>(out[1])])<1e-12,
+            "Block verification changes the emitted law");
+    check(block_standing>=token_standing-1e-12,"Block verification accepts fewer drafts than the token rule");
+    std::cout<<"block D="<<D<<": exact law, expected standing drafts "<<block_standing<<" (token rule "<<token_standing<<")\n";
+  }
+}
 void statistical() {
   statistical_case("dense",[](std::uint64_t seed,std::shared_ptr<Fault> t,std::shared_ptr<Fault> d){return loop(seed,t,d);});
   statistical_case("sparse",[](std::uint64_t seed,std::shared_ptr<Fault> t,std::shared_ptr<Fault> d){return sparse_loop(seed,t,d);});
   statistical_case("sparse fallback",[](std::uint64_t seed,std::shared_ptr<Fault> t,std::shared_ptr<Fault> d){return sparse_loop(seed,t,d,{},2);});
+  statistical_case("block dense",[](std::uint64_t seed,std::shared_ptr<Fault> t,std::shared_ptr<Fault> d){return loop(seed,t,d,{},VerifyRule::block);});
+  statistical_case("block sparse",[](std::uint64_t seed,std::shared_ptr<Fault> t,std::shared_ptr<Fault> d){return sparse_loop(seed,t,d,{},3,VerifyRule::block);});
+  statistical_case("block sparse fallback",[](std::uint64_t seed,std::shared_ptr<Fault> t,std::shared_ptr<Fault> d){return sparse_loop(seed,t,d,{},2,VerifyRule::block);});
+  block_acceptance();
 }
 template<class Factory> void transaction_cases(Factory make) {
   auto t=std::make_shared<Fault>(),d=std::make_shared<Fault>();auto s=make(42,t,d),ordinary=make(42,t,d);
@@ -336,4 +405,32 @@ void adaptive() {
   tagged.observe(0,1,.1);tagged.observe(8,1,.1);
   check(tagged.choose(8)==5 && tagged.choose(4)==2,"Policy selected an unsupported or slower width");
 }
-int main(int argc,char** argv){try{std::string mode=argc>1?argv[1]:"all";if(mode=="all"||mode=="arithmetic")arithmetic();if(mode=="all"||mode=="statistical")statistical();if(mode=="all"||mode=="transactions")transactions();if(mode=="all"||mode=="adaptive")adaptive();std::cout<<"Sampled "<<mode<<" passed\n";}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+// The acceptance estimator recovers a known logistic law from 4,096 simulated drafts, predicts 1 before its first
+// fit, cuts at a survival floor and splits one budget across requests as prefixes.
+void estimator() {
+  AcceptanceEstimator cold(4);
+  check(cold.predict(3,.2)==1 && cold.cut(std::array<double,4>{.1,.1,.1,.1},.5)==4,"Cold estimator cut drafts");
+  const double slope=1.3;const std::array<double,4> intercept{.5,0.,-.5,-1.};
+  std::mt19937_64 rng(5);std::uniform_real_distribution<double> q(.05,.99),u(0,1);
+  AcceptanceEstimator e(4);
+  for (int n=0;n<4096;++n) {
+    const std::size_t k=static_cast<std::size_t>(n%4);const double qm=q(rng);
+    const double truth=1/(1+std::exp(-(slope*AcceptanceEstimator::feature(qm)+intercept[k])));
+    e.observe(k,qm,u(rng)<truth);
+  }
+  check(e.refit()>0 && e.fitted(),"Estimator did not fit");
+  check(std::abs(e.slope()-slope)<.15,"Estimator slope differs from the simulated law");
+  for (std::size_t k=0;k<4;++k) check(std::abs(e.intercept(k)-intercept[k])<.25,"Estimator intercept differs from the simulated law");
+  const std::array<double,4> confident{.95,.9,.9,.9},unsure{.95,.2,.9,.9};
+  const auto alive=e.survival(confident);
+  check(alive[0]>alive[1] && alive[1]>alive[2] && alive[2]>alive[3],"Survival does not fall along the round");
+  check(e.cut(confident,.3)>e.cut(unsure,.3),"An unsure draft did not shorten the round");
+  check(e.cut(confident,0)==4 && e.cut(confident,1)==0,"Floors 0 and 1 do not keep all and none");
+  const std::vector<std::vector<double>> rounds{{.9,.6,.3},{.8,.7,.65,.2},{.1}};
+  const auto kept=AcceptanceEstimator::admit(rounds,4);
+  check(kept==std::vector<std::size_t>{1,3,0},"Budget split is not the highest-survival prefixes");
+  rejects([]{AcceptanceEstimator::admit(std::vector<std::vector<double>>{{.2,.5}},1);});
+  rejects([&]{e.observe(4,.5,true);});rejects([]{AcceptanceEstimator::feature(1.5);});rejects([]{AcceptanceEstimator(0);});
+  std::cout<<"estimator: slope "<<e.slope()<<", intercepts "<<e.intercept(0)<<" "<<e.intercept(1)<<" "<<e.intercept(2)<<" "<<e.intercept(3)<<"\n";
+}
+int main(int argc,char** argv){try{std::string mode=argc>1?argv[1]:"all";if(mode=="all"||mode=="arithmetic")arithmetic();if(mode=="all"||mode=="statistical")statistical();if(mode=="all"||mode=="transactions")transactions();if(mode=="all"||mode=="adaptive"){adaptive();estimator();}std::cout<<"Sampled "<<mode<<" passed\n";}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

@@ -15,7 +15,8 @@ sys.path.append(str(Path(__file__).resolve().parents[2] / "crit-eval" / "tests")
 from test_eval_server import Text, write_data, write_store
 from crit.run import evaluation
 from crit.run.records import file_sha, read_json
-from crit_eval import chat, prepare
+from crit_eval.run import chat
+from crit_eval.quality import prepare
 
 # Answers Eval's prompts as a chat server over Text's tokens (characters): the prompt renders as Text renders it and
 # the greedy reply is REPLY, each token with its alternatives when the request asks for log-probabilities.
@@ -118,7 +119,7 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
         return {"method": "scored", "positions": 1, "seconds": 0.0}
 
     def evaluate(self, parts=("speed", "heldout", "history", "quality", "context")):
-        with patch("crit_eval.reference.score_data", self.score):
+        with patch("crit_eval.quality.reference.score_data", self.score):
             return evaluation.evaluate(self.store, self.run_id, self.candidate_id, self.eval_data, parts)
 
     def test_eval_measures_the_packaged_candidate_through_crit_serve_and_its_quality(self):
@@ -181,7 +182,7 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
         self.assertFalse((self.folder / "attempts").exists())
 
     def test_the_deadline_stops_the_served_engine_and_settles_a_timeout(self):
-        with patch("crit_eval.reference.score_data", self.score):
+        with patch("crit_eval.quality.reference.score_data", self.score):
             with self.assertRaisesRegex(ValueError, "Eval timed_out: Eval passed its reserved deadline"):
                 evaluation.evaluate(self.store, self.run_id, self.candidate_id, self.eval_data, seconds=2)
         attempt = read_json(self.folder / "attempts/attempt-0001/result.json")
@@ -198,7 +199,7 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
                 while len(layers) < 100:
                     check()
                     layers.append(len(layers))
-        with patch("crit_eval.reference.score_data", score):
+        with patch("crit_eval.quality.reference.score_data", score):
             with self.assertRaisesRegex(ValueError, "Eval timed_out: Eval passed its reserved deadline while the "
                                                     "reference scored"):
                 evaluation.evaluate(self.store, self.run_id, self.candidate_id, self.eval_data, ("quality",))
@@ -209,7 +210,7 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
     def test_the_command_prints_the_retained_result(self):
         from crit.run.cli import main
         out = io.StringIO()
-        with patch("crit_eval.reference.score_data", self.score), contextlib.redirect_stdout(out), \
+        with patch("crit_eval.quality.reference.score_data", self.score), contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(io.StringIO()):
             code = main(["--root", str(self.store.root), "--id", self.run_id, "eval", "--candidate", self.candidate_id,
                          "--data", str(self.eval_data), "--only", "speed", "--label", "served"])

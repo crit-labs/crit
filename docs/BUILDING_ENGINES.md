@@ -93,14 +93,20 @@ configured separately.
 Retain workload files under `RUN_ROOT/RUN_ID/captured/` with nonempty hardware and
 environment manifests and path/size/SHA-256 manifests for every case. The coordinator
 verifies them and hashes the model. Keep each case's request as a JSON file
-`{"messages": [...], "tools": [...]}` (`tools` optional) so `crit run measure` can
-benchmark it through `crit serve`. Its messages must render to the workload's
-`prompt_tokens` as the candidate renders them:
+`{"messages": [...], "tools": [...], "chat_template_kwargs": {...}}` (`tools` and
+`chat_template_kwargs` optional) so `crit run measure` can benchmark it through `crit serve`.
+Its messages must render to the workload's `prompt_tokens` as the candidate renders them:
 `crit_core.text.load_model_text(MODEL_DIR, clock=None).encode_chat(messages, tools=tools,
 add_generation_prompt=True, **chat_template_kwargs)`, with the candidate's configured
-`chat_template_kwargs`, counts them as `ResidentChat` does.
+`chat_template_kwargs` (recon's frozen `template_variables` when it sets none) under the
+request's own, counts them as `ResidentChat` does. A request that needs a template switch, such
+as thinking on, names it in its `chat_template_kwargs` instead of relying on the template's default.
+`crit run ... capture --case CASE_ID [--text FILE] [--inputs inputs.json]` writes such a request
+(after `recon`): the given text, or a neutral passage, cut and padded to exactly the workload's prompt
+tokens under the template variables candidates serve, and sets the case's manifest row in `inputs.json`.
 
 ```text
+crit run --project CRIT_ROOT --root RUN_ROOT --id RUN_ID capture --case case-0001 --inputs inputs.json
 crit run --project CRIT_ROOT --root RUN_ROOT --id RUN_ID resolve --record inputs.json
 crit run --project CRIT_ROOT --root RUN_ROOT --id RUN_ID plan --record plan.json
 crit run --project CRIT_ROOT --root RUN_ROOT --id RUN_ID candidate --source SOURCE_DIR --record proposal.json
@@ -125,16 +131,30 @@ nothing), supervise the process tree to the returned deadline, then settle
 descendants, logs and cleanup, failures included.
 
 ```text
+crit run --root RUN_ROOT --id RUN_ID build --candidate CANDIDATE_ID --record recipe.json [--drop GLOB]
+crit run --root RUN_ROOT --id RUN_ID measure --candidate CANDIDATE_ID
+crit run --root RUN_ROOT --id RUN_ID eval --candidate CANDIDATE_ID --data EVAL_DATA_DIR
+crit run --root RUN_ROOT --id RUN_ID check --candidate CANDIDATE_ID --from-eval
+crit run --root RUN_ROOT --id RUN_ID serve --candidate CANDIDATE_ID --check
+```
+
+Run these from the checkout or add `--project CRIT_ROOT`. Each reserves, runs and settles its own
+attempt. `build` copies the retained source to `work/builds/CANDIDATE_ID-ATTEMPT`, runs the recipe's
+literal `build.command` there to the reservation's deadline (log `logs/build-ATTEMPT.log`), settles the
+attempt and packages the folder: every file the build added or changed is bound as a dependency, and
+capabilities the recipe leaves out come from the adapter's `declared_capabilities(model_path)`; `--drop`
+removes intermediates first. `check --from-eval` records the arithmetic, functional and resources check
+of every case from the candidate's newest Eval result ([Run records](RUN_RECORDS.md#check)).
+A build or check crit does not run itself is reserved, settled and recorded by hand:
+
+```text
 crit run --root RUN_ROOT --id RUN_ID reserve --candidate CANDIDATE_ID --operation build --seconds PROCESS_CAP
 crit run --root RUN_ROOT --id RUN_ID settle --reservation RESERVATION_PATH --record result.json
 crit run --root RUN_ROOT --id RUN_ID package --candidate CANDIDATE_ID --source PACKAGE_DIR --record recipe.json
 crit run --root RUN_ROOT --id RUN_ID check --candidate CANDIDATE_ID --record check.json
-crit run --root RUN_ROOT --id RUN_ID measure --candidate CANDIDATE_ID
-crit run --root RUN_ROOT --id RUN_ID eval --candidate CANDIDATE_ID --data EVAL_DATA_DIR
 ```
 
-Run these from the checkout or add `--project CRIT_ROOT`; use the exact reservation
-path returned. `measure` and `eval` reserve, run and settle their own benchmark attempt.
+Use the exact reservation path returned.
 `measure` serves the packaged candidate through `crit serve`, as `eval` does, and
 records one benchmark per case from what a chat client receives: each candidate's own
 greedy reply, memory of the resident host process and `crit serve`'s tokens per round.
@@ -216,7 +236,9 @@ differences and `crit eval kernels` to start kernel work, checking
 [Kernels](../kernels/README.md) first. Pass the run's `kv_tokens` to `pin`, `ab` and
 `kernels` as `--context`. An engine built as a Core
 [engine library](../core/src/runtime/README.md#engine-libraries) uses the stock adapters in
-`crit_core.native` for Eval and for serving. Make the trace readable: class the engine's kernels in its
+`crit_core.native` for Eval and for serving; so does a Python engine that implements the library's
+interface (`info`, `generate`, `score`, `close`) and passes the function opening it in place of the
+library path ([Python engines](../core/src/runtime/README.md#python-engines)). Make the trace readable: class the engine's kernels in its
 info's `kernel_work` (`{"match": NAME_PART, "term": matmul|attention|recurrent|other|draft, "format":
 nvfp4|fp8|bf16}`, or `crit eval kernels --work RULES` without engine changes) and keep the draft step's
 kernels distinctly named (stored-tile-gemm's `KernelRole::draft` plans, or `draft` in the name), so
@@ -238,9 +260,12 @@ the agreed gates. See [Eval results](https://github.com/crit-labs/crit-eval/blob
 Before the candidate's first Eval, implement the [resident adapter](SERVING.md#adapter-contract)
 (`chat-json-v1`, `chat-resident-v1`, `chat-stream-v1`, `chat-logprobs-v1`,
 `create_engine(context)`, model allocations reused across requests). Before sealing, serve the package with
-`crit run --root RUN_ROOT --id RUN_ID serve --candidate CANDIDATE_ID` (crit serve under a check attempt, until
-Ctrl+C) and verify consecutive requests, a leading system message, streaming, a stop string, cancellation and
-Ctrl+C, with real tokenizer counts and synchronized phase times; once sealed, verify A → B → A switching with
+`crit run --root RUN_ROOT --id RUN_ID serve --candidate CANDIDATE_ID --check`: crit serves it under a check
+attempt and verifies consecutive greedy requests, a leading system message, streaming, a stop string, a client
+cancelling mid-reply, a tool call and its result, log-probabilities and a template switch (each where the package
+declares it) and stopping the engine, keeps the report as `logs/serve-check-ATTEMPT.json` and records a functional
+check per case. Without `--check` it serves until Ctrl+C for checks of your own, such as real tokenizer counts and
+synchronized phase times; once sealed, verify A → B → A switching with
 `crit serve`. Declare `chat-config-v1` so the host
 rejects an adapter that drops or changes a configuration key. For `response_format`,
 apply Core's [structured-output service](../core/src/constraints/README.md) while

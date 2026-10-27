@@ -1970,5 +1970,153 @@ class PackageTests(unittest.TestCase):
                 self.assertNotRegex(path.read_text(encoding="utf-8").lower(), r"inference/|crit_inference", path)
 
 
+class TensorReaderTests(SafetensorsFixture):
+    """crit_core.model.TensorReader: tensor bytes from the files inspect_model validated (Checkpoint::map/read)."""
+
+    def payload(self, specs, name="model.safetensors"):
+        header, payload = {}, bytearray()
+        for key, dtype, shape in specs:
+            length = math.prod(shape) * st.DTYPE_BITS[dtype] // 8
+            begin = len(payload)
+            payload.extend(hashlib.sha256(key.encode()).digest() * (length // 32 + 1))
+            del payload[begin + length:]
+            header[key] = {"dtype": dtype, "shape": list(shape), "data_offsets": [begin, len(payload)]}
+        return self.raw(header, bytes(payload), name)
+
+    def expected(self, tensor):
+        with open(tensor.shard, "rb") as f:
+            f.seek(tensor.data_begin)
+            return f.read(tensor.nbytes)
+
+    def test_map_and_read_every_tensor_of_an_index_and_extra_file(self):
+        from crit_core.model import TensorReader, open_tensors
+        self.payload((("a", "BF16", (3, 5)), ("b", "U8", (7,))), "model-00001-of-00002.safetensors")
+        self.payload((("c", "F32", (4,)), ("empty", "F32", (0,))), "model-00002-of-00002.safetensors")
+        self.payload((("mtp.w", "F8_E4M3", (2, 16)),), "model_mtp.safetensors")
+        index = self.index({"a": "model-00001-of-00002.safetensors", "b": "model-00001-of-00002.safetensors",
+                            "c": "model-00002-of-00002.safetensors", "empty": "model-00002-of-00002.safetensors"})
+        with open_tensors(index, extra_files=["model_mtp.safetensors"]) as reader:
+            self.assertIsInstance(reader, TensorReader)
+            for name, tensor in reader.checkpoint.tensors.items():
+                with self.subTest(name=name):
+                    view = reader.map(name)
+                    self.assertTrue(view.readonly)
+                    self.assertEqual(bytes(view), self.expected(tensor))
+                    self.assertEqual(bytes(reader.map(tensor)), bytes(view))
+                    out = bytearray(tensor.nbytes)
+                    self.assertIs(reader.read(tensor, out), out)
+                    self.assertEqual(bytes(out), bytes(view))
+            reader.verify_unchanged()
+
+    def test_view_outlives_close_and_closed_reader_refuses(self):
+        from crit_core.model import open_tensors
+        path = self.payload((("w", "U8", (64,)),))
+        reader = open_tensors(path)
+        view = reader.map("w")
+        reader.close()
+        self.assertEqual(bytes(view), self.expected(reader.checkpoint.tensors["w"]))
+        with self.assertRaisesRegex(ValueError, "closed"):
+            reader.map("w")
+
+    def test_refusals(self):
+        from crit_core.model import TensorReader, open_tensors
+        path = self.payload((("w", "U8", (64,)), ("v", "U8", (8,))))
+        with open_tensors(path) as reader:
+            with self.assertRaisesRegex(KeyError, "no tensor 'x'"):
+                reader.map("x")
+            with self.assertRaisesRegex(ValueError, "does not match tensor 'w' of 64 bytes"):
+                reader.read("w", bytearray(63))
+            with self.assertRaisesRegex(ValueError, "read-only"):
+                reader.read("w", bytes(64))
+            foreign = dataclasses.replace(reader.checkpoint.tensors["w"], data_begin=0)
+            with self.assertRaisesRegex(ValueError, "does not belong"):
+                reader.map(foreign)
+        with self.assertRaisesRegex(st.SafetensorsError, "header_only"):
+            TensorReader(st.inspect_model(path, header_only=True))
+        with self.assertRaises(TypeError):
+            TensorReader(path)
+
+    def test_refuses_a_file_rewritten_after_inspection(self):
+        from crit_core.model import open_tensors
+        path = self.payload((("w", "U8", (64,)),))
+        reader = open_tensors(path)
+        self.addCleanup(reader.close)
+        data = path.read_bytes()
+        path.unlink()
+        path.write_bytes(data[:-1] + bytes([data[-1] ^ 0xFF]))
+        with self.assertRaisesRegex(st.SafetensorsError, "changed since its header was inspected"):
+            reader.map("w")
+
+    def test_read_fills_typed_buffers(self):
+        import array
+        from crit_core.model import open_tensors
+        path = self.payload((("w", "F32", (6,)),))
+        with open_tensors(path) as reader:
+            out = array.array("f", bytes(24))
+            reader.read("w", out)
+            self.assertEqual(out.tobytes(), bytes(reader.map("w")))
+
+
+class StoredSchemeTests(unittest.TestCase):
+    """crit_core.model.schemes: header-only recognition (shared with crit-eval) and the parts engines load."""
+
+    def headers(self, specs):
+        return {name: types.SimpleNamespace(dtype=dtype, shape=tuple(shape)) for name, dtype, shape in specs}
+
+    def test_nvfp4_layouts(self):
+        from crit_core.model import StoredMatrix, matrix_parts, stored
+        ct = self.headers((("m.weight_packed", "U8", (32, 64)), ("m.weight_scale", "F8_E4M3", (32, 8)),
+                           ("m.weight_global_scale", "F32", (1,)), ("m.input_global_scale", "F32", (1,))))
+        self.assertEqual(stored(ct, "m", {"quant_method": "compressed-tensors"}), ("nvfp4", "nvfp4", 32 * 128))
+        self.assertEqual(matrix_parts(ct, "m", {"quant_method": "compressed-tensors"}), StoredMatrix(
+            "m", "nvfp4", "compressed-tensors", (32, 128), "m.weight_packed", "m.weight_scale", "group16", None,
+            "m.weight_global_scale", True, "m.input_global_scale", True))
+        mo = self.headers((("m.weight", "U8", (4, 32, 64)), ("m.weight_scale", "F8_E4M3", (4, 32, 8)),
+                           ("m.weight_scale_2", "F32", ())))
+        self.assertEqual(matrix_parts(mo, "m", {"quant_method": "modelopt"}), StoredMatrix(
+            "m", "nvfp4", "modelopt", (4, 32, 128), "m.weight", "m.weight_scale", "group16", None,
+            "m.weight_scale_2", False, None, False))
+        with self.assertRaisesRegex(ValueError, "without m.weight_scale_2"):
+            matrix_parts({k: v for k, v in mo.items() if k != "m.weight_scale_2"}, "m")
+
+    def test_fp8_granularities(self):
+        from crit_core.model import matrix_parts
+        weight = ("m.weight", "F8_E4M3", (256, 300))
+        for scale, granularity, block, quantization in (
+                ((1,), "tensor", None, {}), ((), "tensor", None, {}), ((256, 1), "row", None, {}),
+                ((256,), "row", None, {}), ((2, 3), "block", (128, 128), {}),
+                ((16, 19), "block", (16, 16), {"weight_block_size": [16, 16]})):
+            with self.subTest(scale=scale, quantization=quantization):
+                found = matrix_parts(self.headers((weight, ("m.weight_scale", "BF16", scale))), "m", quantization)
+                self.assertEqual((found.scale_granularity, found.block, found.scales),
+                                 (granularity, block, "m.weight_scale"))
+        inverse = matrix_parts(self.headers((weight, ("m.weight_scale_inv", "F32", (2, 3)),
+                                             ("m.input_scale", "F32", (1,)))), "m")
+        self.assertEqual((inverse.scales, inverse.scale_granularity, inverse.input_scale),
+                         ("m.weight_scale_inv", "block", "m.input_scale"))
+        with self.assertRaisesRegex(ValueError, "neither one scale"):
+            matrix_parts(self.headers((weight, ("m.weight_scale", "F32", (5, 5)))), "m")
+        with self.assertRaisesRegex(ValueError, "without m.weight_scale"):
+            matrix_parts(self.headers((weight,)), "m")
+
+    def test_plain_absent_and_decode_only_schemes(self):
+        from crit_core.model import matrix_parts, stored
+        self.assertEqual(matrix_parts(self.headers((("m.weight", "BF16", (8, 16)),)), "m").shape, (8, 16))
+        self.assertIsNone(matrix_parts(self.headers((("m.bias", "BF16", (8,)),)), "m"))
+        awq = self.headers((("m.qweight", "I32", (16, 1)), ("m.qzeros", "I32", (1, 1)), ("m.scales", "F16", (1, 8))))
+        self.assertEqual(stored(awq, "m", {"quant_method": "awq"})[0], "awq")
+        with self.assertRaisesRegex(ValueError, "stored as awq"):
+            matrix_parts(awq, "m", {"quant_method": "awq"})
+
+    def test_layer_prefix(self):
+        from crit_core.model import layer_prefix
+        self.assertEqual(layer_prefix(["mtp.layers.0.mlp.weight", "model.language_model.layers.0.input_layernorm.weight"]),
+                         "model.language_model.")
+        self.assertEqual(layer_prefix(["model.layers.0.hc.weight", "model.layers.1.hc.weight",
+                                       "mtp.layers.0.x.weight"]), "model.")
+        with self.assertRaisesRegex(ValueError, "cannot find the decoder layers"):
+            layer_prefix(["lm_head.weight"])
+
+
 if __name__ == "__main__":
     unittest.main()

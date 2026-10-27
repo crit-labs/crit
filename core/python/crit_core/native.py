@@ -16,6 +16,23 @@ its own beyond two small entry files:
 The factory receives a JSON object: the adapter's configuration plus "model" (the model directory) and
 "context_tokens" (the context the engine must serve); the Eval adapter also passes "speculative" (false when
 Eval asks for plain one-token decoding on a second engine; an engine declaring "plain" decodes it per request).
+
+A Python engine gets the same two adapters by implementing NativeEngine's interface (`info()`, `generate()`,
+`score()`, `close()`, with the same arguments, results and info facts) and passing the function that opens it in
+place of the library path:
+
+    def open_engine(configuration):      # the same JSON object a native factory receives
+        return MyEngine(configuration)   # info(), generate(...), score(...), close()
+
+    def create_eval_engine(context):
+        return eval_engine(context, open_engine, defaults={...})
+
+    def create_engine(context):
+        return resident_engine(context, open_engine, defaults={...})
+
+The adapters then treat both alike, so a Python engine writes no adapter code and cannot drift from what Eval and
+crit serve expect. Its generations and scores run one at a time unless its info declares max_concurrent_requests
+above 1, and close() waits for those in flight.
 """
 import array
 import ctypes
@@ -50,7 +67,39 @@ class NativeError(RuntimeError):
     pass
 
 
-class NativeEngine:
+class _Requests:
+    """Generations and scores in flight on one engine: one at a time unless its facts declare
+    max_concurrent_requests above 1; close() waits for them."""
+
+    def _start_requests(self):
+        self._condition = threading.Condition()
+        self._serial = threading.RLock()
+        self._active = 0
+        self._closing = False
+
+    @contextmanager
+    def _lease(self):
+        with self._condition:
+            if self._closing or not self._usable():
+                raise NativeError("engine is closed")
+            self._active += 1
+        try:
+            concurrent = self.facts.get("max_concurrent_requests", 1) > 1
+            with nullcontext() if concurrent else self._serial:
+                yield
+        finally:
+            with self._condition:
+                self._active -= 1
+                self._condition.notify_all()
+
+    def _drain(self):
+        """Refuse new requests and wait for those in flight; call with self._condition held."""
+        self._closing = True
+        while self._active:
+            self._condition.wait()
+
+
+class NativeEngine(_Requests):
     """One engine opened from a library exported with CRIT_EXPORT_ENGINE."""
 
     def __init__(self, library, configuration):
@@ -72,10 +121,7 @@ class NativeEngine:
                                           ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int),
                                           ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float)]
         lib.crit_engine_last_error.restype = ctypes.c_char_p
-        self._condition = threading.Condition()
-        self._serial = threading.RLock()
-        self._active = 0
-        self._closing = False
+        self._start_requests()
         lib.crit_engine_request_open.restype = ctypes.c_void_p
         lib.crit_engine_request_open.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
                                                 ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
@@ -109,20 +155,8 @@ class NativeEngine:
         """ModelInfo fields (implementation, context, stop_tokens, score_paths, ...) plus the factory's facts."""
         return dict(self.facts)
 
-    @contextmanager
-    def _lease(self):
-        with self._condition:
-            if self._closing or not self.handle:
-                raise NativeError("engine is closed")
-            self._active += 1
-        try:
-            concurrent = self.facts.get("max_concurrent_requests", 1) > 1
-            with nullcontext() if concurrent else self._serial:
-                yield
-        finally:
-            with self._condition:
-                self._active -= 1
-                self._condition.notify_all()
+    def _usable(self):
+        return bool(self.handle)
 
     def generate(self, prompt, output_tokens, **options):
         with self._lease():
@@ -249,12 +283,54 @@ class NativeEngine:
 
     def close(self):
         with self._condition:
-            self._closing = True
-            while self._active:
-                self._condition.wait()
+            self._drain()
             if self.handle:
                 self.lib.crit_engine_close(self.handle)
                 self.handle = None
+
+
+class PythonEngine(_Requests):
+    """A Python engine with NativeEngine's interface, opened by `opener(configuration)`: info() returns the facts a
+    native engine's info holds (implementation or name, context, stop_tokens, sampling, speculative, plain, replay,
+    token_logprobs, max_top_logprobs, query_scoring, score_paths, the eval-v1 facts in FACTS; native_libraries for
+    libraries it loads); generate(prompt, output_tokens, *, stop_tokens, sampling, replay, plain, logprobs,
+    on_tokens, cancelled) and score(ids, first_target, path, queries, top_k, packed) as NativeEngine documents them;
+    close(). This wrapper only adds NativeEngine's request accounting."""
+
+    path = None   # no library: eval-v1 takes native_libraries from the engine's facts
+
+    def __init__(self, opener, configuration):
+        self.engine = opener(dict(configuration))
+        self.facts = dict(self.engine.info())
+        self._start_requests()
+
+    def _usable(self):
+        return self.engine is not None
+
+    def info(self):
+        return dict(self.facts)
+
+    def generate(self, prompt, output_tokens, **options):
+        with self._lease():
+            if options.get("cancelled") and options["cancelled"]():
+                return None, {"cancelled": True}
+            return self.engine.generate(list(prompt), int(output_tokens), **options)
+
+    def score(self, ids, first_target, path="", queries=None, top_k=0, packed=False):
+        with self._lease():
+            return self.engine.score(list(ids), int(first_target), path, queries=queries, top_k=top_k, packed=packed)
+
+    def close(self):
+        with self._condition:
+            self._drain()
+            if self.engine is not None:
+                self.engine.close()
+                self.engine = None
+
+
+def open_engine(engine, configuration):
+    """NativeEngine for a library path, PythonEngine for a callable that opens a Python engine."""
+    return PythonEngine(engine, configuration) if callable(engine) else NativeEngine(engine, configuration)
 
 
 def engine_times(result):
@@ -283,6 +359,7 @@ class EvalEngine:
     prefill and first-token times with every generation, and its headroom facts."""
 
     def __init__(self, context, library, defaults=None):
+        """`library`: an engine library's path, or a function opening a Python engine (open_engine)."""
         configuration = {**(defaults or {}), **(context.get("config") or {})}
         # Eval's speculative=False (plain one-token decoding) overrides the configuration; it never turns drafting on.
         speculative = bool(configuration.get("speculative", True)) and bool(context.get("speculative", True))
@@ -290,7 +367,7 @@ class EvalEngine:
         if context.get("context_tokens"):
             configuration["context_tokens"] = int(context["context_tokens"])
         self.configuration = configuration
-        self.native = NativeEngine(library, configuration)
+        self.native = open_engine(library, configuration)
         self.facts = self.native.info()
         self.speculative = bool(self.facts.get("speculative"))
         # Eval decodes greedily: request temperature zero where the engine samples (a greedy-only engine needs none),
@@ -313,7 +390,9 @@ class EvalEngine:
     def info(self):
         info = {"name": self.facts.get("name") or self.facts["implementation"], "configuration": self.configuration,
                 "max_context": self.facts["context"], "speculative": self.speculative,
-                "native_libraries": [str(self.native.path)], "replay": bool(self.facts.get("replay")),
+                "native_libraries": ([str(self.native.path)] if self.native.path is not None
+                                     else list(self.facts.get("native_libraries") or [])),
+                "replay": bool(self.facts.get("replay")),
                 "plain": bool(self.speculative and self.facts.get("plain"))}
         info.update({key: self.facts[key] for key in FACTS if key in self.facts})
         return info
@@ -405,12 +484,13 @@ class ResidentEngine(ResidentChat):
         native = dict(self.configuration, model=str(model))
         if limits.get("kv_tokens"):
             native["context_tokens"] = int(limits["kv_tokens"])
-        self.native = NativeEngine(library, native)
+        self.native = open_engine(library, native)
         self.facts = self.native.info()
         self.max_concurrent_requests = int(self.facts.get("max_concurrent_requests", 1))
         self._owns_native = True
         self.capacity = min(int(self.facts["context"]), int(limits.get("kv_tokens") or self.facts["context"]))
-        self.stop_ids = set(self.facts.get("stop_tokens") or [])
+        if "stop_tokens" in self.facts:   # a native engine always reports them; a Python engine may keep the model's
+            self.stop_ids = set(self.facts["stop_tokens"] or [])
         support = self.facts.get("sampling") or {}
         self.sampling = tuple(key for key in SAMPLING if support.get(PENALTY if key in PENALTIES else key))
         self.logprobs = bool(self.facts.get("token_logprobs")
@@ -493,4 +573,5 @@ def resident_engine(context, library, defaults=None):
     return ResidentEngine(context, library, defaults)
 
 
-__all__ = ["NativeEngine", "NativeError", "EvalEngine", "ResidentEngine", "eval_engine", "resident_engine"]
+__all__ = ["NativeEngine", "NativeError", "PythonEngine", "EvalEngine", "ResidentEngine", "eval_engine", "open_engine",
+           "resident_engine"]

@@ -188,6 +188,24 @@ class CodecTests(unittest.TestCase):
             self.assertTrue(all(abs(a - b) <= 1e-6 * max(1.0, abs(b)) for a, b in zip(values[r].tolist(), decoded)))
         self.assertLess(errors["weight_error"], 0.2)
 
+    def test_nvfp4_four_over_six_matches_the_inference_codec(self):
+        spec = importlib.util.spec_from_file_location("nvfp4", ROOT / "inference/quantized-projections/code/nvfp4.py")
+        reference = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(reference)
+        tensors, values, errors = self.codecs.quantize("nvfp4-4over6", self.weight)
+        _, _, plain = self.codecs.quantize("nvfp4", self.weight)
+        g = float(tensors["weight_global_scale"][0])
+        for r, row in enumerate(self.weight.tolist()):
+            codes, scales = reference.quantize_row(row, g, four_over_six=True)
+            self.assertEqual(bytes(tensors["weight_packed"][r].tolist()), reference.pack(codes))
+            self.assertEqual(bytes(tensors["weight_scale"][r].view(self.torch.uint8).tolist()), bytes(scales))
+        self.assertLess(errors["weight_error"], plain["weight_error"])
+        # GPTQ with an identity Hessian gives the round-to-nearest codes, scale choice included.
+        gptq_tensors, _, _ = self.codecs.quantize("nvfp4-4over6", self.weight, self.torch.eye(self.weight.shape[1]),
+                                                  {"dampening": 0.0, "block": 16})
+        self.assertTrue(self.torch.equal(gptq_tensors["weight_scale"].view(self.torch.uint8),
+                                         tensors["weight_scale"].view(self.torch.uint8)))
+
     def test_nvfp4_block_scales_encode_the_shared_vectors(self):
         from e4m3_vectors import e4m3_magnitude, e4m3_scale_vectors
         vectors = e4m3_scale_vectors()
@@ -302,7 +320,7 @@ class PtqTests(unittest.TestCase):
     def test_rtn_exports_targets_keeps_everything_else_and_records_hashes(self):
         import torch
         from safetensors import safe_open
-        from crit_eval.reference import Checkpoint
+        from crit_eval.quality.checkpoints import Checkpoint
         from crit_models.evaluate import load_record
         from crit_models.ptq import run_ptq, verify
         source = tiny_model(self.root / "source")
@@ -377,7 +395,7 @@ class PtqTests(unittest.TestCase):
 
     @unittest.skipUnless(HAS_TRANSFORMERS, "needs transformers")
     def test_gptq_calibrates_layer_by_layer_and_tracks_the_original(self):
-        from crit_eval.reference import StreamingReference
+        from crit_eval.quality.reference import StreamingReference
         from crit_models.ptq import run_ptq
         source = tiny_model(self.root / "source")
         words = "river map stone cloud lantern harbor meadow copper violin orchard".split()
@@ -412,7 +430,7 @@ class PtqTests(unittest.TestCase):
         import torch
         from transformers import AutoConfig, AutoModelForCausalLM
         from core_text_fixtures import byte_level_json
-        from crit_eval.reference import StreamingReference
+        from crit_eval.quality.reference import StreamingReference
         from crit_models.ptq import run_ptq
         from test_eval_gguf_qwen4exp import TINY
         source = self.root / "source"
@@ -471,7 +489,7 @@ class EvaluationTests(unittest.TestCase):
         self.data.mkdir()
 
     def prepared(self, model):
-        from crit_eval.prepare import model_identity
+        from crit_eval.quality.prepare import model_identity
         self.model_sha256 = model_identity(model)["sha256"]
         write_json(self.data / "prepared.json", {"model": model_identity(model), "suite_sha256": "suite"})
 
@@ -525,7 +543,7 @@ class EvaluationTests(unittest.TestCase):
         # --model SOURCE --data DATA): the record takes its gates as they are.
         self.prepared(self.source)
         self.result(quality={"status": "scored", "passed": True})
-        with patch("crit_eval.reference.score_data", side_effect=AssertionError("ran the reference")):
+        with patch("crit_eval.quality.reference.score_data", side_effect=AssertionError("ran the reference")):
             evaluation = self.evaluate()
         self.assertEqual(evaluation["summary"]["gates"], {"quality": "pass"})
 

@@ -2,9 +2,10 @@
 import re
 
 from crit.run.records import digest, number
+from crit_core.model.schemes import layer_prefix
 
 METHODS = ("ptq", "drafter")
-FORMATS = ("fp8-channel", "nvfp4")
+FORMATS = ("fp8-channel", "nvfp4", "nvfp4-4over6")
 ALGORITHMS = ("rtn", "gptq")
 DEFAULT_INCLUDE = (r"^layers\.\d+\..+_proj$",)
 DEFAULT_CALIBRATION = {"samples": 128, "sequence_tokens": 2048}
@@ -13,9 +14,6 @@ DRAFTER_KINDS = ("mtp-head",)
 DRAFTER_DTYPES = ("bf16", "fp32")
 DEFAULT_DRAFTER_CALIBRATION = {"samples": 64, "sequence_tokens": 1024}
 DEFAULT_TRAIN = {"steps": 1000, "windows_per_step": 4, "learning_rate": 1e-4, "warmup_steps": 50, "weight_decay": 0.0}
-LAYER_ANCHOR = "layers.0.input_layernorm.weight"
-# A decoder layer's tensor: the prefix before `layers.<index>.` at a name boundary.
-LAYER_TENSOR = re.compile(r"(?:^|(?<=\.))layers\.(\d+)\.")
 SOURCE_DTYPES = {"BF16", "F16", "F32"}
 # Tensors a quantized module may carry; a target's stored ones are replaced as a whole.
 QUANTIZED_SUFFIXES = ("weight", "weight_scale", "weight_packed", "weight_global_scale", "input_scale",
@@ -114,28 +112,6 @@ def _checked(value, name, defaults):
     return value
 
 
-def layer_prefix(names):
-    """The decoder-layer prefix (for example `model.` before `layers.`) the reference also uses: the one of its layer
-    0's input norm, else, for layers without one (such as hyper-connection layers, which norm their streams), of the
-    prefixes under which a layer 0 is stored (draft and vision layers have their own), the one holding the most layer
-    tensors."""
-    names = list(names)
-    for name in names:
-        if name.endswith(LAYER_ANCHOR):
-            return name[: -len(LAYER_ANCHOR)]
-    counts, zero = {}, set()
-    for name in names:
-        found = LAYER_TENSOR.search(name)
-        if found:
-            prefix = name[: found.start()]
-            counts[prefix] = counts.get(prefix, 0) + 1
-            if found.group(1) == "0":
-                zero.add(prefix)
-    if not zero:
-        raise ValueError(f"cannot find the decoder layers: no tensor ends with {LAYER_ANCHOR} or holds layers.0.")
-    return max(sorted(zero), key=lambda prefix: counts[prefix])
-
-
 def plan(recipe, checkpoint):
     """Targets of a recipe in a crit_core.model.Checkpoint: module names relative to the decoder-layer prefix,
     matched by include and not exclude, with their stored and transformed bytes. Raises when a match cannot be
@@ -158,7 +134,7 @@ def plan(recipe, checkpoint):
         if weight.dtype not in SOURCE_DTYPES or len(weight.shape) != 2:
             raise ValueError(f"{module}: needs a 2-D BF16, F16 or F32 weight, found {weight.dtype} {list(weight.shape)}")
         rows, cols = weight.shape
-        if recipe["format"] == "nvfp4" and cols % 16:
+        if recipe["format"].startswith("nvfp4") and cols % 16:
             raise ValueError(f"{module}: nvfp4 needs input width divisible by 16, found {cols}")
         targets.append({"module": module, "name": base, "shape": [rows, cols], "dtype": weight.dtype,
                         "stored_bytes": weight.nbytes, "transformed_bytes": transformed_bytes(recipe["format"], rows, cols)})

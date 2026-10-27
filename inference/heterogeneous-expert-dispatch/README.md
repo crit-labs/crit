@@ -95,7 +95,9 @@ as `renormalize_floor`.
 
 **Native fusion.** The fused routing supports 1 to 1024 experts, up to 32 selected
 experts and up to 32 selected groups, and returns original expert IDs, weights under
-the `Routing` and an unweighted FP32 shared-expert output. Its arithmetic is one
+the `Routing` and an unweighted FP32 shared-expert output. A NaN selection value ranks
+as -inf, so a NaN row (a padding row, or a NaN that reached the router) still returns
+in-range IDs; the host reference rejects non-finite logits. Its arithmetic is one
 example instance: an FP8 router and FP8 shared gate/up in the row codec of
 [quantized projections](../quantized-projections/README.md), BF16-rounded SiLU
 products and a BF16 shared down projection. Other layouts keep the `Routing`

@@ -63,7 +63,7 @@ product folders.
 
 | Field | Meaning / default |
 | --- | --- |
-| `format` | `fp8-channel` or `nvfp4` (below) |
+| `format` | `fp8-channel`, `nvfp4` or `nvfp4-4over6` (below) |
 | `algorithm` | `rtn` (round to nearest, no calibration) or `gptq` |
 | `include`, `exclude` | Regular expressions searched in module names relative to the decoder-layer prefix (`layers.3.mlp.down_proj`); default include all `*_proj` in decoder layers, nothing excluded. Embeddings, norms, `lm_head` and tensors outside the decoder layers (for example MTP heads) stay as stored unless matched |
 | `seed` | Orders the calibration documents; recorded with the output. Default 0 |
@@ -81,6 +81,7 @@ quantize weights only; activation precision stays an engine choice, judged by Ev
 | --- | --- | --- |
 | `fp8-channel` | `weight` E4M3FN `[rows, cols]`, `weight_scale` FP32 `[rows, 1]` | scale = row amax / 448 (1 for a zero row); codes round to nearest even, saturating |
 | `nvfp4` | `weight_packed` U8 `[rows, cols/2]`, `weight_scale` E4M3FN `[rows, cols/16]`, `weight_global_scale` FP32 `[1]` | the Inference [NVFP4 codec](../inference/quantized-projections/README.md) in FP32: value = e2m1(code) x e4m3(scale) / global |
+| `nvfp4-4over6` | as `nvfp4` | `nvfp4` whose block scales also try mapping the block maximum to 4 instead of 6 and keep the smaller squared error (the codec's `four_over_six`); GPTQ chooses from the error-updated columns |
 
 ### Algorithms
 

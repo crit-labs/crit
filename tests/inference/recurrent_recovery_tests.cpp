@@ -1,4 +1,8 @@
 #include "recurrent_recovery.h"
+#include "stochastic_round.h"
+#include <cmath>
+#include <cstring>
+#include <limits>
 #include <array>
 #include <iostream>
 #include <string_view>
@@ -263,9 +267,37 @@ void rejection() {
   rejects([&] { no_space.prepare({{no_parent, good}}, {0}); });
 }
 
+// Stochastic BF16 rounding: exact values and infinities pass unchanged, NaN stays NaN, every result is one of the
+// two BF16 neighbours, the mean over many draws is the FP32 value, and the draw is a pure function of its key.
+void stochastic_rounding() {
+  const auto decode = [](std::uint16_t h) { const std::uint32_t bits = std::uint32_t{h} << 16; float x; std::memcpy(&x, &bits, 4); return x; };
+  for (const float exact : {0.0f, 1.0f, -2.5f, 0x1.fep127f, -0.0f})
+    for (const std::uint32_t r : {0u, 1u, 0x7fffu, 0xffffu})
+      require(decode(bf16_stochastic(exact, r)) == exact, "Exact BF16 values must not move");
+  const float inf = std::numeric_limits<float>::infinity();
+  require(decode(bf16_stochastic(inf, 0xffffu)) == inf && decode(bf16_stochastic(-inf, 0xffffu)) == -inf, "Infinity changed");
+  require(std::isnan(decode(bf16_stochastic(std::numeric_limits<float>::quiet_NaN(), 0xffffu))), "NaN lost");
+  for (const float x : {1.0f + 0x1.0p-10f, -3.0f - 0x1.8p-9f, 0.1f, 1.0e-30f}) {
+    const float low = decode(bf16_stochastic(x, 0)), high = decode(bf16_stochastic(x, 0xffffu));
+    double sum = 0;
+    constexpr int draws = 200000;
+    for (int i = 0; i < draws; ++i) {
+      const float y = decode(bf16_stochastic(x, state_rounding_bits(7, std::uint64_t(i), 3, 11)));
+      require(y == low || y == high, "Stochastic rounding left the two BF16 neighbours");
+      sum += y;
+    }
+    // Bernoulli mean: the standard error is at most half the gap over sqrt(draws); allow six of them.
+    require(std::abs(sum / draws - x) <= 6 * 0.5 * std::abs(double(high) - low) / std::sqrt(double(draws)),
+            "Stochastic rounding is biased");
+  }
+  require(state_rounding_bits(1, 2, 3, 4) == state_rounding_bits(1, 2, 3, 4), "Rounding draws must replay");
+  require(state_rounding_bits(1, 2, 3, 4) != state_rounding_bits(1, 2, 3, 5) ||
+          state_rounding_bits(1, 2, 3, 6) != state_rounding_bits(1, 2, 3, 7), "Neighbouring elements share draws");
+}
+
 int main() {
   try {
-    arithmetic_and_boundaries(); transactions(); chunked_continuation(); rejection();
+    arithmetic_and_boundaries(); transactions(); chunked_continuation(); rejection(); stochastic_rounding();
     std::cout << "Recurrent recovery arithmetic, checkpoint boundaries and atomic commits passed\n";
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n'; return 1;

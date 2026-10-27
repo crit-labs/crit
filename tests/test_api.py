@@ -621,6 +621,21 @@ class FittedReplyTests(unittest.TestCase):
         self.assertNotIn("max_output_tokens", engine_reply({k: v for k, v in self.value.items()
                                                             if k != "max_output_tokens"}, unfitted)[1])
 
+    def test_the_engine_finish_decides_a_reply_at_its_cap(self):
+        unfitted = dict(self.request, limits=dict(self.request["limits"], max_output_tokens=4, fit_output=False))
+        plain = {k: v for k, v in self.value.items() if k != "max_output_tokens"}
+        api = Api(mock.Mock())
+        # Four tokens under a cap of four: a stop token as the last one finishes as stop, not length.
+        measured = engine_reply(dict(plain, finish="stop"), unfitted)[1]
+        self.assertEqual((measured["finish"], api.finish_reason(False, measured, 4)), ("stop", "stop"))
+        self.assertEqual(api.finish_reason(False, engine_reply(plain, unfitted)[1], 4), "length")  # no finish: by count
+        self.assertEqual(api.finish_reason(False, engine_reply(dict(plain, finish="length"), unfitted)[1], 4), "length")
+        for finish in ("eos", None, 1):
+            with self.subTest(finish=finish), self.assertRaisesRegex(ValueError, "not stop or length"):
+                engine_reply(dict(plain, finish=finish), unfitted)
+        with self.assertRaisesRegex(ValueError, "ends at its output cap"):
+            engine_reply(dict(self.value, finish="length"), self.request)  # 4 tokens under an applied cap of 54
+
 
 class ApiKeyTests(ApiTests):
     api_keys = ("spare", "secret")

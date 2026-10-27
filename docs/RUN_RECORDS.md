@@ -42,12 +42,14 @@ and speed techniques; a larger one trades context for that room.
 | `resolve` | `--record inputs.json`; freezes verified model and input identities |
 | `plan` | `--record plan.json [--check]`; records the next candidate's plan after the parent's Eval and before any code, freezes that Eval and computes the priorities ([plan](#plan)); with `--check`, runs the same checks and prints the record it would store, recording nothing |
 | `candidate` | `--source DIR --record proposal.json`; allocates an ID, retains source |
+| `capture` | `[--case ID] [--text FILE] [--instruction TEXT] [--system TEXT] [--template-kwargs JSON] [--inputs INPUTS_JSON]`; before `resolve`, after `recon`: writes `captured/CASE/request.json`, a chat request whose messages render to the workload's `prompt_tokens` with recon's frozen `template_variables` under its own `chat_template_kwargs` (the given text or a neutral passage, cut to whole words and padded to the exact count), prints its manifest row and sets it in the inputs payload |
+| `build` | `--candidate ID --record recipe.json [--seconds N] [--drop GLOB ...] [--no-package]`; reserves a build attempt, copies the retained source to `work/builds/ID-ATTEMPT`, runs the recipe's literal `build.command` there to the deadline (whole process tree; log `logs/build-ATTEMPT.log`), settles the attempt and, when it completed, packages that folder: each file the build added or changed bound as a dependency (`version` `built by ATTEMPT`) after the recipe's own, capabilities the recipe omits from the adapter's `declared_capabilities(model_path)`; `--drop` removes intermediates first |
 | `reserve` | `--operation discovery/build/check/benchmark [--candidate ID] [--seconds N]`; consumes an attempt before launch; only discovery omits the candidate |
 | `settle` | `--reservation RUN_RELATIVE_PATH --record result.json`; exit, logs, cleanup |
 | `package` | `--candidate ID --source DIR --record recipe.json`; runnable files and manifest |
-| `check`, `benchmark` | `--candidate ID --record payload.json`; appends evidence |
+| `check`, `benchmark` | `--candidate ID --record payload.json`; appends evidence. `check --candidate ID --from-eval [ATTEMPT]` instead records every case's arithmetic, functional and resources check from the candidate's retained Eval result (default its newest; [Check](#check)) |
 | `measure` | `--candidate ID [--seconds N]`; reserves a benchmark attempt, serves the packaged candidate through `crit serve`, streams every resident case's chat request to it, settles it and records one benchmark per case ([measured benchmarks](#measured-benchmarks)) |
-| `serve` | `--candidate ID [--host HOST] [--port 8000] [--seconds N]`; reserves a check attempt, serves the packaged, not yet sealed candidate through `crit serve` at `http://HOST:PORT/v1` until Ctrl+C or the reservation's deadline, for the checks a candidate passes before sealing, and settles the attempt (log `logs/serve-ATTEMPT.log`); `crit serve` serves the candidate once it is sealed |
+| `serve` | `--candidate ID [--host HOST] [--port 8000] [--seconds N]`; reserves a check attempt, serves the packaged, not yet sealed candidate through `crit serve` at `http://HOST:PORT/v1` until Ctrl+C or the reservation's deadline, for the checks a candidate passes before sealing, and settles the attempt (log `logs/serve-ATTEMPT.log`); with `--check` crit runs the standard serving checks itself (consecutive greedy requests, a system message, streaming, a stop string, a client cancelling, a tool call and its result, log-probabilities, a template switch, each where declared, and stopping the engine), keeps their report as `logs/serve-check-ATTEMPT.json` and records a functional check per case; `crit serve` serves the candidate once it is sealed |
 | `eval` | `--candidate ID --data EVAL_DATA_DIR [--only PART] [--baseline RESULT] [--label TEXT] [--seconds N]`; reserves a benchmark attempt, serves the packaged candidate through `crit serve`, scores the data's quality texts on the run's model unless stored, runs Eval over the chat API with the run's quality terms and `kv_tokens`, settles it and retains the result as `candidates/ID/eval/ATTEMPT.json` ([Eval evidence](#eval-evidence)); for a candidate created from a plan it writes the plan's [outcome](#outcome), and it prints the priorities the result's fractions give |
 | `seal` | `--candidate ID --lifecycle STATE [--failure TEXT]`; closes the candidate |
 | `select` | `--candidate ID`; selects a sealed eligible candidate |
@@ -223,7 +225,7 @@ In a run with `"plan_limits": "computed"`, when the parent's Eval states no limi
 point) the measured `tokens_per_round` (1 where none is measured) over its pass floor, `(bytes_per_pass +
 kv_bytes_per_token × (prompt_tokens + output_tokens / 2)) / bandwidth_gbs`, and their geometric mean.
 `bytes_per_pass` is the attempt's (`headroom.bytes_per_pass`, the engine's or Eval's model-files figure),
-else the run's model files read as Eval reads them (`crit_eval.context.pass_bytes`). It uses the
+else the run's model files read as Eval reads them (`crit_eval.limits.context.pass_bytes`). It uses the
 acceptance measured so far, never full acceptance, and leaves the draft steps' own cost out, so it is
 deterministic and an upper bound at that acceptance. `inputs.computed_limits[KPI]` keeps the `limit`,
 `unit`, `formula`, the JSON paths of its `inputs` and whether it was `used`; a limit below the measured
@@ -235,7 +237,7 @@ The priorities measure the distance to what is reachable, not to the current str
 these runs `strategy.alternative` may add `limits` for `decode` and `context_decode`: `{tokens_per_round,
 draft_steps, derivation}`, from which crit computes the alternative's ceiling on the parent's Eval cases
 (points), `tokens_per_round` over the pass floor plus `draft_steps` draft steps at `draft_bytes_per_step`
-(the attempt's, else the checkpoint's draft layers, `crit_eval.context.draft_step_bytes`) over the
+(the attempt's, else the checkpoint's draft layers, `crit_eval.limits.context.draft_step_bytes`) over the
 bandwidth; or `{limit, derivation}` only where crit cannot compute that round floor. crit ranks decode and
 `context_decode` by the higher of the current strategy's limit and the alternative's ceiling, whatever
 `strategy.choice` says. `inputs.alternative_limits[KPI]` keeps the `limit`, how it was computed
@@ -409,6 +411,14 @@ Required: `case_id`, `package_sha256`, `gate`, `criteria_sha256`, `status`,
 evidence, and required failures disqualify. `artifact_verified` means evidence bytes
 are bound, not that crit repeated the computation.
 
+`check --from-eval` judges each gate by the Eval gates its criteria name, from the retained result
+of a `crit run eval` attempt on the current package under the run's current quality terms:
+`arithmetic` by `quality` and `sampling`; `functional` by `coverage`, `repeatable`, `request_history`,
+`prompt_cache`, `retrieval` and `lower_context` (and `exactness` when the run requires it); `resources`
+by `capacity` and the device memory left free at the required context against `vram_headroom_bytes`
+(host memory comes from `measure`). A failed Eval gate fails the check, an unmeasured one leaves it
+`unverified`; the check cites the result at `artifact_verified`.
+
 ### Benchmark
 
 Required: `case_id`, `package_sha256`, `case_sha256`, `protocol_sha256`, `identities`,
@@ -457,8 +467,10 @@ benchmark reservation `crit serve` serves the packaged candidate at the run's
 `kv_tokens`, and every warmup and repetition streams the request to
 `/v1/chat/completions` with the sampling fields the captured request names
 (`temperature`, `top_p`, `top_k`, `min_p`, `seed` and the penalties), else `temperature`
-0, `max_tokens` the workload's `output_tokens` and usage. `extensions.sampling` records the
-sampling sent. `crit serve`'s usage must count the workload's
+0, the chat-template variables the captured request names in `chat_template_kwargs` (for
+example `{"enable_thinking": true}` for a workload captured with thinking on, which a candidate
+serves off by default), `max_tokens` the workload's `output_tokens` and usage. `extensions.sampling`
+records the sampling sent, `extensions.chat_template_kwargs` the variables. `crit serve`'s usage must count the workload's
 `prompt_tokens`: a case whose messages render to another length fails the measurement,
 naming both counts. Every candidate decodes its own reply, and one that ends
 before `output_tokens` is measured on the tokens it has; `extensions.output_tokens`

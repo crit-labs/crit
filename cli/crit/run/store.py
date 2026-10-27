@@ -472,6 +472,11 @@ class RunStore:
             for key in ("hardware_manifest", "environment_manifest"):
                 if not isinstance(data[key], dict) or not data[key]:
                     raise ValueError(key + " must be a nonempty object")
+            # A captured chat request must render to its workload's prompt tokens as candidates will serve it.
+            frozen, _ = recon.load(root, run)
+            if frozen is not None:
+                from .measure import check_case_prompts
+                check_case_prompts(root, run, data["case_manifests"], frozen["template_variables"])
             model = Path(run["spec"]["model_path"])
             model_rows = inventory(model) if model.is_dir() else [{"path": model.name, "bytes": model.stat().st_size, "sha256": file_sha(model)}]
             if not model_rows:
@@ -1071,7 +1076,7 @@ API and scores the quality replies on the model's checkpoint. Measure this run's
 measure, which serves the package through crit serve too, and take in-process hardware telemetry (acceptance on a
 pinned text, kernels) through the eval-v1 adapter. Retain the adapter, prepared data and result JSON; report skipped
 cases and unsupported paths. Use the same prepared data for comparisons, and include Eval results in the handoff.
-Eval result JSON is separate evidence; it does not automatically publish run checks or benchmarks.
+Eval result JSON is separate evidence; it publishes run checks only through check --from-eval.
 Read every report crit eval status gives before a plan: with --kernels KERNELS each prefill term against its floor
 and a round's verify pass against its draft steps; the prefill ceilings by prompt activation format with the
 reachable limit (declare the engine's prompt_activations); the time to first token by part; the quality share with
@@ -1095,17 +1100,21 @@ max(p - q, 0) on the first rejection) so the output keeps the model's distributi
 sampling on the device inside the decode graph.
 Develop source and builds under this run's work/; keep candidates and failures visible with decision reasoning.
 Capture fixed benchmark inputs under captured/: each case's chat request as JSON {{"messages": [...]}} that renders
-to its prompt_tokens (docs/BUILDING_ENGINES.md). Freeze inputs before construction with resolve.
+to its prompt_tokens (docs/BUILDING_ENGINES.md); capture --case ID --inputs inputs.json writes one. Freeze inputs
+before construction with resolve.
 Create each candidate through candidate --source DIR --record proposal.json; it retains a complete source copy.
-Reserve every build/check/benchmark process with reserve BEFORE launch and settle after owned cleanup.
-Use package to retain a runnable package and its literal launch recipe. Submit checks and benchmark raw samples
-through check and benchmark; publish seal last. The coordinator writes telemetry.json and state.json.
+Build it with build --candidate ID --record recipe.json: crit reserves, runs the recipe's build command on the
+retained source, keeps the log, settles and packages. Reserve any other build/check/benchmark process with reserve
+BEFORE launch and settle after owned cleanup; package retains a runnable package and its literal launch recipe.
+Record the gate checks from an Eval result with check --candidate ID --from-eval, and the serving checks with serve
+--candidate ID --check; submit other checks and benchmark raw samples through check and benchmark; publish seal
+last. The coordinator writes telemetry.json and state.json.
 Every candidate serves through crit serve, where Eval measures it. Before its first Eval,
 declare chat-json-v1 and chat-resident-v1 with chat-stream-v1 and chat-logprobs-v1, export create_engine(context)
 from the retained entry, and follow docs/SERVING.md. Native code can use a factory wrapper.
 Include the adapter in source/package inventories. Load once when the server starts, accept an optional leading
 system message, retain compatible model allocations across requests and switches until the server stops, and
-verify consecutive, streamed and stopped requests and cleanup with crit serve.
+verify consecutive, streamed and stopped requests and cleanup with serve --check.
 Use actual tokenizer counts and synchronized per-request phase times; never reuse benchmark values as served telemetry.
 All evidence references use canonical paths relative to this run with exact retained-byte hashes.
 Changed source/configuration/dependencies require a new candidate. Do not overwrite or reevaluate sealed candidates.

@@ -563,3 +563,21 @@ checks quality in process during development ([crit-eval's adapter](https://gith
 development evidence, never a gate result: the gate is `crit run ... eval`'s, through crit serve).
 The [toy engine fixture](../../../tests/core/native_engine_fixture.cpp) and its
 [check](../../../tests/core/native_engine_check.py) exercise both.
+
+### Python engines
+
+A Python engine gets the same stock adapters without adapter code of its own: it implements
+`NativeEngine`'s interface and passes the function that opens it where the library path goes,
+`eval_engine(context, open_engine, defaults)` and `resident_engine(context, open_engine, defaults)`.
+`open_engine(configuration)` receives the JSON object a native factory receives and returns an
+object with `info()` (the facts a native engine's info holds: `implementation` or `name`, `context`,
+`stop_tokens`, `sampling`, `speculative`, `plain`, `replay`, `token_logprobs`, `max_top_logprobs`,
+`query_scoring`, `score_paths`, the eval-v1 facts such as `kernel_work` and `exact_variants`, and
+`native_libraries` for the libraries it loads), `generate(prompt, output_tokens, *, stop_tokens,
+sampling, replay, plain, logprobs, on_tokens, cancelled)` returning `(tokens, result)` with
+`result["timing"]` as Core reports it, `score(ids, first_target, path, queries, top_k, packed)`
+returning `Scores`, and `close()`, with the arguments and results `NativeEngine` documents.
+`crit_core.native.PythonEngine` adds the library path's request accounting: a request already
+cancelled never reaches the engine, generations and scores run one at a time unless the info
+declares `max_concurrent_requests` above 1, and `close()` waits for those in flight. Eval and crit
+serve then see a Python engine exactly as they see a library, through one code path.

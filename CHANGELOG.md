@@ -9,6 +9,95 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-27
+
+### Overview
+
+crit 0.12.0 gives engine builders the plumbing every engine rewrote. Python engines read a checkpoint's tensors
+through crit_core (`TensorReader`, `schemes`, stored-tile-gemm's `tile_source`) and get `crit_core.native`'s stock
+Eval and serve adapters; the new python-bindings Inference entry calls the CUDA entries through a C ABI and a
+ctypes loader; and `crit run` takes over the workflow steps every run rebuilt (`capture`, `build`,
+`check --from-eval`, `serve --check`). Inference adds block verification for sampled speculation, an acceptance
+estimator for drafters without a confidence head, NVFP4 four-over-six block scales, L2 raster groups for prompt
+GEMMs, Core's `rope_table` and stochastic BF16 state rounding, and fixes min_tokens under a finished grammar, NaN
+logits in top-k selection and the finish reason of a reply that stops exactly at the output cap. The Python
+distributions and the Core SDK share version 0.12.0; crit depends on crit-eval 0.2.0.
+
+### Added
+
+- `crit_core.model.TensorReader` (and `open_tensors`): the tensor bytes of an inspected safetensors checkpoint, as
+  zero-copy read-only views or copies into a caller's buffer, refusing a shard rewritten since its header was read.
+  The Python side of `Checkpoint::map` and `Checkpoint::read`, so Python engines no longer parse headers or open
+  shards themselves.
+- `crit_core.model.schemes`: how a checkpoint stores each weight matrix, from headers alone. The recognition moves here
+  from crit-eval (which reads it from crit_core from its next release), `layer_prefix` moves here from crit Models,
+  and `matrix_parts` names the tensors and scale conventions of an NVFP4 (compressed-tensors or ModelOpt), FP8 or
+  plain matrix, so engines that load matrices as stored no longer spell each format's tensor names.
+- stored-tile-gemm's `tile_source`: one NVFP4 (compressed-tensors or ModelOpt) or FP8 checkpoint matrix as the repack
+  kernels take it, its global and input scales as the kernels' divisors whatever the layout, read through
+  `matrix_parts` and `TensorReader`. The load path every engine using stored tiles wrote for itself.
+- Python engines get `crit_core.native`'s stock adapters: `eval_engine` and `resident_engine` take a function that
+  opens an engine with the engine library's interface (`info`, `generate`, `score`, `close`) in place of the library
+  path, so a Python engine writes neither an eval-v1 nor a chat-resident-v1 adapter, and Eval and crit serve reach it
+  through the same code as a native engine (`PythonEngine` adds the library's request accounting).
+- `crit run ... capture`, `build`, `check --from-eval` and `serve --check`: the workflow steps every run rebuilt for
+  itself. `capture` writes a case's chat request that renders to the workload's `prompt_tokens` under the template
+  variables candidates serve, and sets its manifest row in the inputs payload; `build` runs a recipe's
+  `build.command` on a copy of the retained source under a build attempt (log kept, attempt settled) and packages the
+  result, binding the files the build made as dependencies and taking capabilities from the adapter's
+  `declared_capabilities(model_path)`; `check --from-eval` records each case's arithmetic, functional and resources
+  check from a retained Eval result on the current package; `serve --check` runs the standard serving checks
+  (consecutive requests, a system message, streaming, a stop string, cancelling, a tool call, log-probabilities, a
+  template switch, stopping), keeps their report and records a functional check per case.
+- Inference entry python-bindings (38 entries): one shared library with a plain C ABI over the CUDA entries
+  (stored-tile GEMMs, recurrent layers and recovery, FP8 KV attention, token sampling, greedy accept; 74 functions)
+  and a standard-library ctypes loader that types every function from the header, so a Python engine calls them on
+  its own buffers and streams without writing an extension. Checked on an RTX 5090.
+- mtp-decode: block verification for sampled speculation (`VerifyRule::block`, `block_verify`; Sun et al.), which
+  keeps the target's law and accepts at least as many drafts as the per-token rule. Checked exactly on a Markov
+  fixture (0.865 against 0.723 expected standing drafts at width 3) and by the 90,000-history chi-square check.
+  token-sampling runs the same rule on the device (`Verify::rule = VerifyRule::block`, `block_draft_purpose`), and
+  Core reserves draw purpose `block` (4).
+- mtp-decode: `AcceptanceEstimator`, an online per-position logistic estimate of draft acceptance from the drafter's
+  `logit(q_max)`, with survival cuts and a batch budget split, so drafters without a confidence head can trim rounds.
+- NVFP4 "four over six" block scales: the Inference codec's `four_over_six` (Python and C++) and the Models format
+  `nvfp4-4over6` keep, per 16-value block, whichever of the amax / 6 and amax / 4 scales gives the smaller squared
+  error, in the unchanged NVFP4 layout. On Qwen3-1.7B (weights only, RTN) the mean KL divergence from BF16 fell on
+  each of crit-eval's six quality conversations, by 14% to 40%, and held on its long document.
+- stored-tile-gemm: raster groups (`Plan::group`, `A16Plan::group`, `l2_raster_group`) keep a group of weight bands
+  L2-resident while the token blocks pass over them; bit-identical to the plain order. Opt-in (plans keep group 1):
+  on an RTX 5090 the derived group took 12% off a W4A4 prompt GEMM with K = 17408, while W8A8 and smaller K stayed
+  within a few percent.
+- Core: `rope_table` (C++ `crit/model_config.h`, Python `crit_core.model.rope_table`) derives the rotary inverse
+  frequencies and attention factor from a `RopeConfig` for default, mRoPE, linear, dynamic NTK, YaRN, Llama 3 and
+  LongRoPE scaling, matching Transformers' `ROPE_INIT_FUNCTIONS`, so engines stop re-deriving them.
+- recurrent-state-recovery: `stochastic_round.h`, unbiased stochastic rounding of FP32 state to BF16 storage with
+  replayable draws keyed by (seed, position, layer, element); opt-in until a crit-eval run shows the gain.
+
+### Changed
+
+- `crit run ... resolve` refuses inputs whose captured chat requests render to another prompt length than the
+  workload's `prompt_tokens` under the template variables candidates serve (the request's own
+  `chat_template_kwargs` over recon's), so a case captured with thinking on while candidates serve it off is refused
+  before any candidate is built instead of failing `measure` afterwards.
+- `crit run ... measure` sends the `chat_template_kwargs` a captured request names and records them in
+  `extensions.chat_template_kwargs`.
+
+### Fixed
+
+- A missing JSON record file is named as missing (with the directory a relative path resolved against) instead of
+  "JSON must be a regular file under 1 MiB".
+- Core's sampler: min_tokens suppression yields when a constraint allows only suppressed tokens (`suppression_yields`),
+  so a structured request whose grammar has finished, such as `{"type": "boolean"}` after `true`, stops before
+  min_tokens instead of failing with "no selectable token". token-sampling takes the same answer per row
+  (`Rows::yield`) and its Python reference a `yields` flag.
+- heterogeneous-expert-dispatch and draft-trees: a NaN logit ranks as -inf in top-k selection. An all-NaN router row
+  returned expert id `0x7fffffff` and read out of bounds, and an all-NaN draft row drafted token `INT_MAX`; now the
+  router selects in-range experts and the tree never keeps a candidate scoring -inf (also in tree.py).
+- crit serve: a reply that ends on a stop token exactly at the output cap finished as "length" (OpenAI), `max_tokens`
+  (Anthropic) or `incomplete` (Responses), because the server inferred the reason from the token count. Engine
+  replies may now carry `finish` (`stop` or `length`), which ResidentChat sends and the server uses.
+
 ## [0.11.0] - 2026-10-26
 
 ### Overview
@@ -1825,7 +1914,10 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/crit-labs/crit/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/crit-labs/crit/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/crit-labs/crit/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/crit-labs/crit/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/crit-labs/crit/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/crit-labs/crit/compare/v0.7.0...v0.8.0

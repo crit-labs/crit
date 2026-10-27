@@ -24,7 +24,7 @@ def evaluate(record_path, data, result_path, evaluation_path, baseline=None, log
     that the result at `result_path` (crit eval run --url on the engine serving the output, stopped since) was
     measured on it, and write a models_evaluation record."""
     from crit_eval import load_json
-    from crit_eval.prepare import PREPARED
+    from crit_eval.quality.prepare import PREPARED
     record_path, data, result_path = Path(record_path), Path(data), Path(result_path)
     evaluation_path = Path(evaluation_path).absolute()
     record = load_record(record_path)

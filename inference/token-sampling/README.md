@@ -21,7 +21,8 @@ where bit identity with an existing greedy kernel matters.
 
 **Rank order and the law.** Candidates rank by (value descending, id ascending). Values
 are the logits after Core's steps 2 to 5: `+bias` (a -inf bias bans), suppression of the
-`suppress_ids` while `position + column < min_tokens`, repetition (`v / r` for positive,
+`suppress_ids` while `position + column < min_tokens` (skipped on rows whose `Rows::yield` is set:
+Core's `suppression_yields`, a constraint mask that allows only suppressed tokens), repetition (`v / r` for positive,
 `v * r` for negative values) for tokens in the prompt or the outputs, then
 `v -= frequency * n + presence` for tokens with `n > 0` outputs. The rules are Core's doubles
 (0.8 or 0.3 is not a float, and its float rounding would move a top-p boundary, or a draw near
@@ -93,6 +94,22 @@ drafts up to the first column whose prediction differs, then that prediction:
   drawn from that `q`, so the rejection rule's residual would be the wrong law; a round cut after
   `j` drafts emits what a width-`j` round would.
 
+**Block verification.** With `Verify::rule = VerifyRule::block`, a kernel after the
+token rule's predictions decides the round as a block, the rule of mtp-decode's
+`block_verify` ([Sun et al.](https://arxiv.org/abs/2403.10444)) over each column's kept
+law: from the drafts' cumulative ratios `w_i` and each column's residual mass `Z_i`,
+draft count `i` stands with probability `h_D = w_D` or `Z_i / (Z_i + 1 - w_i)`, scanned
+from the round's width `D` down; the predictions become the standing drafts, then the
+bonus (the token rule's column `D` prediction) or a draw from `max(w_tau p - q, 0)` without
+the rejected draft, so the accept kernel needs no change. A later draft can stand where an
+earlier one alone would have been rejected, which raises the standing count at the same
+law. Block decisions use every column's draws, so a position a later round revisits needs
+fresh draws: the acceptance draws use purpose `block` at position `(round position << 7) | i`,
+and the drafter samples with `block_draft_purpose(round position)`, never `draft`. A request
+whose columns hold a full-vocabulary law (no sparse kept law), or temperature 0, keeps the
+token rule's predictions. One thread per request computes the rule (`O(D x kept)` with the
+kept laws of at most 64 tokens), and rounds are at most 64 columns wide.
+
 **Token trees.** With `Rows::tree`, the columns are a tree's nodes: node `c` stages the
 tokens on its root-to-node path and draws at its depth's position. With greedy (top-k)
 children, verifying a tree is `enqueue_sample` over the nodes followed by a walk that
@@ -139,7 +156,7 @@ is computed.
 | `enqueue_mask` | A structured-output bitmask (`TokenMatcher::allowed_bits`) applied to logit rows as -inf |
 | `Request` | Device-resident resolved sampling, position, bias, suppression and penalty history |
 | `Rows`, `enqueue_sample`, `scratch_floats` | One draw per (request, column or tree node) with a chosen `DrawPurpose`, optionally the law as a dense row or a `SparseLaw` (a drafter's `q`) |
-| `Verify`, `enqueue_verify` | Verify predictions for the device greedy accept kernel: the target's draws for greedy drafts, accept/residual/bonus for sampled drafts against dense or sparse `q` |
+| `Verify`, `enqueue_verify` | Verify predictions for the device greedy accept kernel: the target's draws for greedy drafts, accept/residual/bonus for sampled drafts against dense or sparse `q`; `VerifyRule::block` for block verification |
 | `Logprobs`, `enqueue_logprobs`, `logprob_scratch_bytes` | Core's `TokenLogprob` values on the device: chosen tokens' log-probabilities and ranked alternatives of raw rows, standalone or fused into `enqueue_sample` / `enqueue_verify` (a device round's `RoundView::logprob` rows) |
 | `enqueue_commit` | Counts and positions after publication, from a device-held emitted count |
 

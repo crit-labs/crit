@@ -159,11 +159,19 @@ void delta_reference(const rk::DeltaShape& d, const std::vector<float>& q, const
         }
 }
 
-void delta_case(int dk, std::mt19937& rng) {
+// correlated: every key of a head is one direction plus 2% noise and beta is near 1, so the chunks' (I + L) blocks
+// are far from the identity and transiently grow (vLLM #53864 saw a BF16 inversion of such blocks diverge).
+void delta_case(int dk, std::mt19937& rng, bool correlated = false) {
     rk::DeltaShape d{2, 4, dk, 128};
     constexpr int T = 300;
     const std::size_t qs = std::size_t(d.k_heads) * dk, vs = std::size_t(d.v_heads) * d.dv, ss = std::size_t(d.v_heads) * dk * d.dv;
     auto q = normal(rng, T * qs), k = normal(rng, T * qs);
+    if(correlated) {
+        const auto base = normal(rng, qs);
+        for(std::size_t r = 0; r < std::size_t(T) * d.k_heads; ++r)
+            for(int x = 0; x < dk; ++x)
+                k[r * dk + std::size_t(x)] = base[(r % std::size_t(d.k_heads)) * dk + std::size_t(x)] + 0.02f * k[r * dk + std::size_t(x)];
+    }
     for(std::size_t r = 0; r < std::size_t(T) * d.k_heads; ++r) {   // unit keys and queries, as the engine normalizes them
         double nk = 0., nq = 0.;
         for(int x = 0; x < dk; ++x) { nk += double(k[r * dk + std::size_t(x)]) * k[r * dk + std::size_t(x)]; nq += double(q[r * dk + std::size_t(x)]) * q[r * dk + std::size_t(x)]; }
@@ -173,7 +181,7 @@ void delta_case(int dk, std::mt19937& rng) {
     std::uniform_real_distribution<float> unit(0.f, 1.f);
     std::vector<float> l(std::size_t(T) * d.v_heads), b(l.size());
     for(auto& x : l) x = -0.3f * unit(rng);
-    for(auto& x : b) x = unit(rng);
+    for(auto& x : b) x = correlated ? 0.9f + 0.1f * unit(rng) : unit(rng);
     const auto s0 = normal(rng, ss, 0.1f);
     const float scale = 1.f / std::sqrt(float(dk));
     Buffer<float> dq(q), dkk(k), dv(v), dl(l), db(b);
@@ -186,7 +194,7 @@ void delta_case(int dk, std::mt19937& rng) {
     Buffer<float> state(s0), scratch(rk::delta_scratch_floats(d, T)), out(T * vs);
     ok(rk::enqueue_delta_prefill(d, in, T, state.p, scratch.p, out.p, vs, nullptr), "delta prefill");
     const double e1 = relative(out.get(), want), e2 = relative(state.get(), S);
-    std::printf("gated delta dk %d prefill: outputs %.2e, state %.2e of max\n", dk, e1, e2);
+    std::printf("gated delta dk %d%s prefill: outputs %.2e, state %.2e of max\n", dk, correlated ? " correlated keys" : "", e1, e2);
     require(e1 < 2e-3 && e2 < 2e-3, "chunked gated-delta prefill differs from the recurrence");
     // Column scan over the first 5 tokens, with checkpoints, then the same tokens one at a time.
     constexpr int Cn = 5;
@@ -659,6 +667,7 @@ int main() {
         conv_case(rng);
         conv_parallel_case(rng);
         for(const int dk : {64, 128}) delta_case(dk, rng);
+        for(const int dk : {64, 128}) delta_case(dk, rng, true);
         for(const int n : {64, 128}) ssd_case(n, rng);
         checkpoint_contract(rng);
         drift_case(rng);

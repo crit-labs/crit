@@ -11,6 +11,8 @@ namespace control = device_round::control;
 constexpr int kThreads = 256;
 
 __device__ __forceinline__ bool before(float v, int i, float w, int j) { return v > w || (v == w && i < j); }
+// NaN ranks as -inf, so a row of NaN still yields in-range token ids.
+__device__ __forceinline__ float ranked(float x) { return x == x ? x : -INFINITY; }
 
 // Block-wide best (value, index) in rank order (value descending, index ascending); every thread receives it.
 __device__ void block_best(float& v, int& i) {
@@ -47,7 +49,8 @@ __device__ double block_sum(double x) {
     return t;
 }
 
-// Block (frontier entry f, request r): the entry's `branch` best tokens with log-softmax scores.
+// Block (frontier entry f, request r): the entry's `branch` best tokens with log-softmax scores. A row without a
+// finite logit gives its tokens a score of -inf, which selection never takes.
 __global__ void __launch_bounds__(kThreads) expand_kernel(const float* logits, int stride, int vocab, const std::int32_t* frontier,
                                                           int width, int branch, Candidates c) {
     const int f = blockIdx.x, r = blockIdx.y;
@@ -64,29 +67,33 @@ __global__ void __launch_bounds__(kThreads) expand_kernel(const float* logits, i
         return;
     }
     const float* row = logits + (std::size_t(r) * width + f) * stride;
-    float top = -FLT_MAX;
+    float top = -INFINITY;
     int at = INT_MAX;
     for(int t = threadIdx.x; t < vocab; t += kThreads)
-        if(before(row[t], t, top, at)) { top = row[t]; at = t; }
+        if(before(ranked(row[t]), t, top, at)) { top = ranked(row[t]); at = t; }
     block_best(top, at);
+    const bool finite = top > -INFINITY;
     float local = 0.f;
-    for(int t = threadIdx.x; t < vocab; t += kThreads) local += expf(row[t] - top);
-    const float lse = top + float(log(block_sum(double(local))));
+    if(finite)
+        for(int t = threadIdx.x; t < vocab; t += kThreads) local += expf(ranked(row[t]) - top);
+    const float lse = finite ? top + float(log(block_sum(double(local)))) : -INFINITY;
     const float base_score = parent >= 0 ? c.score[row0 + parent] : 0.f;
     const std::int32_t depth = parent >= 0 ? c.depth[row0 + parent] + 1 : 1;
     float pv = FLT_MAX;
     int pi = -1;
     for(int k = 0; k < branch; ++k) {
-        float v = -FLT_MAX;
+        float v = -INFINITY;
         int i = INT_MAX;
-        for(int t = threadIdx.x; t < vocab; t += kThreads)
-            if(before(pv, pi, row[t], t) && before(row[t], t, v, i)) { v = row[t]; i = t; }
+        for(int t = threadIdx.x; t < vocab; t += kThreads) {
+            const float x = ranked(row[t]);
+            if(before(pv, pi, x, t) && before(x, t, v, i)) { v = x; i = t; }
+        }
         block_best(v, i);
         if(threadIdx.x == 0) {
             const std::size_t at_k = row0 + base + k;
             c.token[at_k] = i;
             c.parent[at_k] = parent;
-            c.score[at_k] = base_score + (v - lse);
+            c.score[at_k] = finite && v > -INFINITY ? base_score + (v - lse) : -INFINITY;
             c.depth[at_k] = depth;
         }
         pv = v;
@@ -112,7 +119,7 @@ __global__ void __launch_bounds__(kThreads) select_kernel(Candidates c, int dept
         for(int j = threadIdx.x; j < n; j += kThreads) {
             const int d = c.depth[row0 + j];
             if(d < 1 || (depth > 0 && d != depth)) continue;
-            const float s = c.score[row0 + j];
+            const float s = ranked(c.score[row0 + j]);
             if(before(pv, pi, s, j) && before(s, j, v, i)) { v = s; i = j; }
         }
         block_best(v, i);

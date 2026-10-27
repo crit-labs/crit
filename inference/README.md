@@ -58,6 +58,7 @@ leaves to the engine.
 | Verify a tree of drafts in one pass | [draft-trees](draft-trees/README.md) | EAGLE-2 trees, ancestor masks, device tree walk (greedy or sampled), row compaction |
 | Draft with a published EAGLE-3, DFlash or DSpark drafter | [hidden-state-drafters](hidden-state-drafters/README.md) | Core's reader of every drafter format (one tap convention), catch-up, block input, d2t mapping, confidence cuts |
 | Cheapen the draft head | [draft-vocabulary-subset](draft-vocabulary-subset/README.md) | Head row subset, index mapping, CUDA gather-argmax |
+| Call the CUDA entries from a Python engine | [python-bindings](python-bindings/README.md) | C ABI shared library over stored-tile, recurrent, FP8 KV, sampling and greedy-accept launches; header-typed ctypes loader |
 | Select compatible execution and retain choices | [recorded-selection](recorded-selection/README.md) | Phase/shape replay policy, recorded choices, repeatability checks |
 
 Most code is Python host reference; some entries add C++ or CUDA. Each entry

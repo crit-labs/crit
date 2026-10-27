@@ -104,6 +104,30 @@ int main(int argc, char** argv) {
     fp4::project(m, std::span<const float>(x).subspan(cols), cols, 1, one, rows);  // batch of one equals row 1 of the batch
     for(std::size_t n = 0; n < rows; ++n) REQUIRE(one[n] == y[rows + n]);
 
+    // Four over six: per block never a larger squared error than amax / 6, and some blocks take the 4 scale.
+    {
+        const auto fos = fp4::Matrix::quantize(dense, rows, cols, true);
+        fos.validate();
+        std::size_t changed = 0;
+        double total6 = 0, total = 0;
+        float a[16], b[16];
+        for(std::size_t n = 0; n < rows; ++n)
+            for(std::size_t blk = 0; blk < cols / 16; ++blk) {
+                m.decode_block(n, blk, a);
+                fos.decode_block(n, blk, b);
+                double e6 = 0, e = 0;
+                for(std::size_t i = 0; i < 16; ++i) {
+                    const double v = dense[n * cols + blk * 16 + i];
+                    e6 += (a[i] - v) * (a[i] - v);
+                    e += (b[i] - v) * (b[i] - v);
+                }
+                REQUIRE(e <= e6 * (1 + 1e-6) + 1e-30);
+                total6 += e6;
+                total += e;
+                changed += fos.scales[n * (cols / 16) + blk] != m.scales[n * (cols / 16) + blk];
+            }
+        REQUIRE(changed > 0 && total < total6 && fos.global_scale == m.global_scale);
+    }
     REQUIRE(throws([&] { fp4::Matrix::quantize(std::vector<float>(rows * 20), rows, 20); }));
     auto broken = m;
     broken.scales.pop_back();

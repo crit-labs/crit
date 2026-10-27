@@ -102,7 +102,8 @@ Install from the repo root with `python -m pip install -e .`, then run `crit ...
   kernels) comes from `crit run ... measure` and Eval's adapter commands through an eval
   adapter. A Core engine built as a shared
   [engine library](core/src/runtime/README.md#engine-libraries) gets the Eval and serve
-  adapters from `crit_core.native`.
+  adapters from `crit_core.native`, and so does a Python engine with the library's interface
+  ([Python engines](core/src/runtime/README.md#python-engines)).
 
 Retain Core revision/build inputs, dependency identities/notices and adaptations with
 candidate source. Keep model-specific changes in the engine; record toolkit gaps in the summary. Salvage
@@ -126,7 +127,7 @@ Work in rounds, one candidate per round:
    In a [replay](docs/RUN_RECORDS.md#replays) of a run, follow `replay/agent_request.md`:
    it ends at the checked plan and records nothing. A plan proved wrong before its candidate exists is replaced by a new plan
    with `supersedes`.
-3. **Build** it (`crit run ... candidate`); fix or prune what is slow or fails a gate
+3. **Build** it (`crit run ... candidate`, then `crit run ... build`); fix or prune what is slow or fails a gate
    until the plan is implemented. Prune a part only after measuring it against its
    floor (Eval's floors per term, the profile's kernels). The proposal gives every lever
    of its plan a fate in `lever_fates`: built, pruned or deferred, with the reason for a
@@ -141,7 +142,8 @@ Work in rounds, one candidate per round:
    prompt activation format with the reachable limit quality evidence names, each case's time
    to first token split into the engine's own time and the rest, the quality share with its
    spread over positions, the sampled cases' standard errors, and the device memory left free
-   at the required context.
+   at the required context. `crit run ... check --candidate ID --from-eval` records the run's
+   arithmetic, functional and resources checks from the candidate's Eval result.
 5. **Revisit recon** when a result contradicts it, or when the engine switches behaviour
    at a threshold (prefetch, sparse attention, chunk sizes) Eval does not cross: update
    `recon.md` (and the frozen block if needed) and add a run case that crosses it
@@ -297,8 +299,9 @@ private; honor cancellation and cleanup. Build the adapter on `crit_core.serving
 so the chat template, tools, per-request sampling and streaming come from Core, and list every
 sampling field the decoder applies; `crit run package` refuses an adapter without temperature
 or, when the model's template renders tools, without tool calls. Before sealing, serve the package with
-`crit run ... serve --candidate ID` (crit serve under a check attempt) and verify consecutive requests, streaming,
-a stop string, a tool call and its result and Ctrl+C; after sealing, verify candidate switching with `crit serve`.
+`crit run ... serve --candidate ID --check` (crit serve under a check attempt): it verifies consecutive requests,
+a system message, streaming, a stop string, cancelling, a tool call and its result, log-probabilities, a template
+switch and stopping, and records a functional check per case; after sealing, verify candidate switching with `crit serve`.
 Report anything unverified.
 
 ## 5. Critique and hand off

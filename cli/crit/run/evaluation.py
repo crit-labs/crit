@@ -10,7 +10,7 @@ publishes no check or benchmark.
 
 Every part runs in one attempt on one loaded engine (the lower-context gate opens its own, at its context). The
 attempt has no fixed process cap, since Eval's work scales with the model and the device: it may run to the
-segment's deadline, and each request is bounded by the rates the engine measured in it (crit_eval.deadline), so a
+segment's deadline, and each request is bounded by the rates the engine measured in it (crit_eval.run.deadline), so a
 hung engine stops the attempt.
 """
 from pathlib import Path
@@ -45,8 +45,8 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
     over the chat API, stop the server and settle. Returns the retained result (path relative to the run, sha256)
     and its status."""
     from crit_eval import load_json, machine_settings
-    from crit_eval.prepare import PREPARED, model_identity, prepared_template
-    from crit_eval.runner import PARTS
+    from crit_eval.quality.prepare import PREPARED, model_identity, prepared_template
+    from crit_eval.run.runner import PARTS
     root = store.directory(run_id)
     run = load_run(root)
     folder = safe_path(root, f"candidates/{ident(candidate_id, 'candidate')}")
@@ -125,7 +125,7 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
 
 
 class EvalEngines(Served):
-    """Eval's engines for a packaged candidate (crit_eval.runner.run takes it as its adapter): every engine Eval opens
+    """Eval's engines for a packaged candidate (crit_eval.run.runner.run takes it as its adapter): every engine Eval opens
     is the candidate served through crit serve at the context Eval asks for, the run's or the lower-context gate's,
     and stops when Eval closes it."""
 
@@ -136,7 +136,7 @@ class EvalEngines(Served):
         self.prepared = prepared
 
     def create_eval_engine(self, context):
-        from crit_eval import chat
+        from crit_eval.run import chat
         _, api, port = self.open(context["context_tokens"])
         served = chat.Server("http://127.0.0.1:%d/v1" % port, self.prepared, api.model).create_eval_engine(context)
         # Eval opens engines one after another: the next one is built in the same resident host (Served.open), and
@@ -150,9 +150,9 @@ def _measure(store, run_id, candidate_id, attempt, deadline_at, model, data, out
     with `settled` False."""
     from crit_core.machine import engine_lock
     from crit_eval import load_json
-    from crit_eval.prepare import PREPARED
-    from crit_eval.reference import score_data
-    from crit_eval.runner import run as run_eval
+    from crit_eval.quality.prepare import PREPARED
+    from crit_eval.quality.reference import score_data
+    from crit_eval.run.runner import run as run_eval
     served = EvalEngines(store, run_id, candidate_id, attempt, options["context_tokens"], load_json(data / PREPARED),
                          log, deadline_at)
     with engine_lock(f"crit run eval {run_id} {candidate_id}", deadline=time.monotonic() + remaining(deadline_at)):
@@ -161,8 +161,8 @@ def _measure(store, run_id, candidate_id, attempt, deadline_at, model, data, out
                 # Between the reference's layers and texts: scoring stops at the reservation's deadline.
                 if remaining(deadline_at) <= 0:
                     raise Expired("Eval passed its reserved deadline while the reference scored the quality texts")
-            from crit_eval.fixed import STORES
-            from crit_eval.packages import fetch, source
+            from crit_eval.quality.fixed import STORES
+            from crit_eval.quality.packages import fetch, source
             mode = options["quality_mode"]
             if source() is not None and not (data / STORES[mode] / "index.json").is_file():
                 fetch(model, data, source(), log)   # a published package's scores, when the source has them

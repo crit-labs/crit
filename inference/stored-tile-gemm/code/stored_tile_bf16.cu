@@ -230,6 +230,7 @@ struct A16Args {
     float* part;                      // [sk][T][N] when split
     __nv_bfloat16* out;               // gated
     int ldo, act;
+    int group = 1;                    // raster group (A16Plan::group)
 };
 
 __device__ __forceinline__ void cp_async16_zfill(void* smem, const void* gmem, int src_bytes) {
@@ -253,8 +254,9 @@ __global__ void __launch_bounds__(kA16Warps * 32, 1) a16_kernel(const A16Args a)
     constexpr int NT = kA16NT, BN = 8 * NT, RT = kA16RT, TPC = FP4 ? 1 : 2;  // tiles per 64-column chunk
     __shared__ __align__(16) uint4 xs[kA16Stages][BN * 8];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
-    const int rt0 = (static_cast<int>(blockIdx.y) * kA16Warps + warp) * RT;
-    const int tok0 = static_cast<int>(blockIdx.x) * BN;
+    const int2 tile = detail::raster_tile(a.group);
+    const int rt0 = (tile.y * kA16Warps + warp) * RT;
+    const int tok0 = tile.x * BN;
     const int tiles_n = a.N / 16, KT = a.K / (FP4 ? 64 : 32), KC = (a.K + kA16Chunk - 1) / kA16Chunk;
     const int SK = gridDim.z, per = (KC + SK - 1) / SK, c0 = static_cast<int>(blockIdx.z) * per, c1 = min(KC, c0 + per);
     const std::size_t wstride = static_cast<std::size_t>(KT) * 512, sstride = static_cast<std::size_t>(KT) * 64;
@@ -424,7 +426,9 @@ __global__ void a16_finish_gated_kernel(const A16Args a, int SK) {
 }
 
 template <bool FP4, bool GATED>
-cudaError_t launch_a16(const A16Args& a, int sk, cudaStream_t stream) {
+cudaError_t launch_a16(A16Args a, const A16Plan& p, cudaStream_t stream) {
+    const int sk = p.sk;
+    a.group = p.group;
     const dim3 grid(static_cast<unsigned>((a.T + 8 * kA16NT - 1) / (8 * kA16NT)), static_cast<unsigned>((a.N + kA16Rows - 1) / kA16Rows),
                     static_cast<unsigned>(sk));
     if(sk == 1) {
@@ -439,7 +443,7 @@ cudaError_t launch_a16(const A16Args& a, int sk, cudaStream_t stream) {
 }
 
 bool a16_ok(const A16Plan& p, bool fp4, int N, int K, int T, const std::uint8_t* tiles, const __nv_bfloat16* x, const float* partials) {
-    return p.fp4 == fp4 && p.n == N && p.k == K && T >= 1 && T <= p.tokens && p.sk >= 1 && p.sk <= 8 && N > 0 && N % 16 == 0 &&
+    return p.fp4 == fp4 && p.n == N && p.k == K && T >= 1 && T <= p.tokens && p.sk >= 1 && p.sk <= 8 && p.group >= 1 && N > 0 && N % 16 == 0 &&
            K > 0 && K % (fp4 ? 64 : 32) == 0 && tiles && aligned(tiles, 16) && x && aligned(x, 16) && (p.sk == 1 || partials);
 }
 
@@ -511,6 +515,18 @@ cudaError_t enqueue_gemv_fp4_gated(const Fp4Weights& w, float up_weight_global_s
     return launch_gemv<true, true>(a, p, stream);
 }
 
+int l2_raster_group(const A16Plan& p) {
+    int device = 0, l2 = 0;
+    const int bands = (p.n + kA16Rows - 1) / kA16Rows;
+    const double activations = 2.0 * p.tokens * p.k, band = double(kA16Rows) * p.k * (p.fp4 ? 0.5 : 1.0);
+    if(cudaGetDevice(&device) != cudaSuccess || cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device) != cudaSuccess ||
+       l2 <= 0 || activations <= l2 / 2.0 || bands < 2)
+        return 1;
+    int group = 1;
+    while(group * 2 <= bands && group * 2 * band <= l2 / 4.0) group *= 2;
+    return group;
+}
+
 A16Plan plan_a16(bool fp4, int N, int K, int T, int min_blocks) {
     A16Plan p;
     p.fp4 = fp4;
@@ -538,7 +554,7 @@ cudaError_t enqueue_fp8_a16(const Fp8Weights& w, const __nv_bfloat16* x, int T, 
                             const A16Plan& p, float* partials, cudaStream_t stream) {
     if(!a16_ok(p, false, w.N, w.K, T, w.tiles, x, partials) || !w.row_scale || !y || ldo < w.N) return cudaErrorInvalidValue;
     const A16Args a{w.tiles, nullptr, w.row_scale, 1.f, 1.f, w.N, w.K, x, T, y, ldo, add ? 1 : 0, partials, nullptr, 0, 0};
-    return launch_a16<false, false>(a, p.sk, stream);
+    return launch_a16<false, false>(a, p, stream);
 }
 
 cudaError_t enqueue_fp4_a16(const Fp4Weights& w, const __nv_bfloat16* x, int T, float* y, int ldo, bool add,
@@ -548,7 +564,7 @@ cudaError_t enqueue_fp4_a16(const Fp4Weights& w, const __nv_bfloat16* x, int T, 
         return cudaErrorInvalidValue;
     const A16Args a{w.tiles, w.scale_tiles, nullptr, w.weight_global_scale, w.weight_global_scale, w.N, w.K, x, T, y, ldo, add ? 1 : 0,
                     partials, nullptr, 0, 0};
-    return launch_a16<true, false>(a, p.sk, stream);
+    return launch_a16<true, false>(a, p, stream);
 }
 
 cudaError_t enqueue_fp8_a16_gated(const Fp8Weights& w, const __nv_bfloat16* x, int T, Activation act,
@@ -556,7 +572,7 @@ cudaError_t enqueue_fp8_a16_gated(const Fp8Weights& w, const __nv_bfloat16* x, i
     if(!a16_ok(p, false, w.N, w.K, T, w.tiles, x, partials) || w.N % 32 || !w.row_scale || !out || ldo < w.N / 2 || !activation_ok(act))
         return cudaErrorInvalidValue;
     const A16Args a{w.tiles, nullptr, w.row_scale, 1.f, 1.f, w.N, w.K, x, T, nullptr, 0, 0, partials, out, ldo, static_cast<int>(act)};
-    return launch_a16<false, true>(a, p.sk, stream);
+    return launch_a16<false, true>(a, p, stream);
 }
 
 cudaError_t enqueue_fp4_a16_gated(const Fp4Weights& w, float up_weight_global_scale, const __nv_bfloat16* x, int T,
@@ -567,7 +583,7 @@ cudaError_t enqueue_fp4_a16_gated(const Fp4Weights& w, float up_weight_global_sc
         return cudaErrorInvalidValue;
     const A16Args a{w.tiles, w.scale_tiles, nullptr, w.weight_global_scale, up_weight_global_scale, w.N, w.K, x, T, nullptr, 0, 0,
                     partials, out, ldo, static_cast<int>(act)};
-    return launch_a16<true, true>(a, p.sk, stream);
+    return launch_a16<true, true>(a, p, stream);
 }
 
 }  // namespace crit::stored_tile

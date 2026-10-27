@@ -127,12 +127,22 @@ negative inputs, and divisions use `__fdividef` (2 FP32 ulp, well below BF16).
 - [fragment_probe.cu](code/fragment_probe.cu): standalone layout probe, exit 0 on match.
 - [layout.py](code/layout.py): host model of tiles, register assembly and both MMAs
   (`check_fp8`, `check_fp4`).
+- [checkpoint.py](code/checkpoint.py): `tile_source(reader, base, quantization, expert=None)`
+  reads one matrix of a checkpoint as the repacks take it, a `TileSource` with the row-major
+  codes and NVFP4 scales (zero-copy views), the NVFP4 global and input scales as the divisors
+  `Fp4Weights` takes and the FP8 scale as one FP32 value per row. Core decides which tensors
+  hold what (`crit_core.model.matrix_parts`: NVFP4 in compressed-tensors or ModelOpt layout,
+  FP8 per tensor or per row) and reads them (`crit_core.model.TensorReader`), so the engine
+  never spells a format's tensor names; a ModelOpt multiplier becomes its FP32 reciprocal.
+  Block-scaled FP8, E5M2 and shapes that do not fill 16-row tiles are refused.
 
 ## What the engine supplies
 
 The stored tensors, other fusions, scratch buffers and plan parameters. Repack each matrix
 once at load, straight into its place in a combined matrix; the tiles replace the row-major
-copy. FP8 row scales stay as they are (placed like their rows); NVFP4 scales move into scale
+copy. `tile_source` gives each matrix's bytes and scales; uploading them, the matrices the
+engine combines (q | k | v, gate | up) and the BF16 conversion of FP8 row scales are the
+engine's. FP8 row scales stay as they are (placed like their rows); NVFP4 scales move into scale
 tiles. Calls are asynchronous and borrow every buffer until the stream reaches them; `add`
 fuses a residual add.
 
@@ -150,7 +160,21 @@ plan launches): the parts fill SMs the unsplit grid leaves idle, and no part sta
 wave or adds partials beyond it. A split past one wave can still pay when the MMA rate is high
 against memory bandwidth, which no device query states; pass `min_blocks` to choose it.
 `wide_tokens = 256` was measured on one sm_120 device and is the engine's to measure. The
-split sets the accumulation order, so results can differ between devices. `N` must be a
+split sets the accumulation order, so results can differ between devices.
+
+**Raster groups.** Blocks launch token blocks first, so a wave shares one weight band and
+streams every token's activations; for long prompts the activations are re-read from memory
+once per band when they no longer fit in L2. `Plan::group` (and `A16Plan::group`) takes the
+weight bands `group` at a time instead, the token blocks walking across them, so the group's
+bands stay in L2 and the activations are read once per group. `l2_raster_group(plan)` derives
+a group from the device's L2 size (`cudaDevAttrL2CacheSize`): 1 while the plan's activations
+fit in half of it, else the largest power of two whose bands fit in a quarter. Every block keeps
+its tile and K order, so the bits do not depend on the group (checked for groups 2, 3 and 8,
+split and unsplit). Plans start at group 1, since the gain depends on the device and shape: on
+one RTX 5090 (96 MB L2), mean of 10 launches, W4A4 at N = 5120, K = 17408, T = 16384 took 4.28 ms
+plain and 3.76 ms at the derived group 8 (12% less), W4A4 at 5120 x 5120 x 16384 1.31 against
+1.21 to 1.25 ms at groups 2 to 32 (the rule derives 1 there), and W8A8 at the same shapes stayed
+within 1-2% either way. Set it where the engine's own measurement shows a gain. `N` must be a
 multiple of 128 (256 with two row tiles per warp) and `K` of 32 (FP8) or 64 (NVFP4); other
 shapes return `cudaErrorInvalidValue`. A gated launch needs a plan with two row tiles per
 warp (`N` = 2 I a multiple of 256); NVFP4 gate and up must share `input_global_scale`, since

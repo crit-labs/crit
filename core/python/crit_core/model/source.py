@@ -18,7 +18,7 @@ Everything that is not a weight (Core's config rules, the text layer, Eval's cei
 the model through it. A new weight format is one ModelFormat in FORMATS: its name, the file suffixes that hold
 its weights, and open(path) -> ModelSource; a format whose suffix other files share (.bin) also says which
 files are its own. Eval's reference also needs the weights as the Hugging Face
-checkpoint they came from; that part needs torch and lives in Eval (crit_eval.reference.open_checkpoint).
+checkpoint they came from; that part needs torch and lives in Eval (crit_eval.quality.reference.open_checkpoint).
 
 Description files come in groups (gguf_files.GROUPS: the config; the tokenizer with its templates; the
 generation config). A folder that holds any file of a group supplies that whole group, and only the groups it

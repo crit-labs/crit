@@ -337,6 +337,10 @@ def unique_object(pairs):
 
 def read_json(path, *, max_bytes=MAX_JSON_BYTES):
     limit = "1 MiB" if max_bytes == MAX_JSON_BYTES else str(max_bytes) + " bytes"
+    if not path.exists() and not path.is_symlink():
+        # A relative path resolves against the current directory, not the run.
+        raise ValueError(f"JSON file not found: {path} (from {Path.cwd()})" if not path.is_absolute()
+                         else f"JSON file not found: {path}")
     if not path.is_file() or path.is_symlink() or path.stat().st_size > max_bytes:
         raise ValueError("JSON must be a regular file under " + limit)
     data = path.read_bytes()
@@ -421,11 +425,11 @@ def verify_inventory(root, rows, exclude=()):
 
 
 def eval_max_context(model, device, vram_headroom_bytes, reserve_bytes=None, requested=None):
-    """Eval's max context (crit_eval/context.py) for MODEL on DEVICE, a `crit eval probe` result, capped at the
+    """Eval's max context (crit_eval/limits/context.py) for MODEL on DEVICE, a `crit eval probe` result, capped at the
     requested context. reserve_bytes replaces the protocol's reserve (device memory kept out of the KV cache for
     workspaces and speed techniques)."""
     from crit_eval import EVAL_DIR
-    from crit_eval.context import max_context
+    from crit_eval.limits.context import max_context
     protocol = EVAL_DIR / "protocol.json"
     if not protocol.is_file():
         raise ValueError("Deriving kv_tokens from a device needs Eval from a crit checkout; set kv_tokens explicitly")
@@ -523,7 +527,7 @@ def eval_sampling(value):
     Eval measures at the model's own sampling; the engine builder never sets it."""
     keys(value, {"settings", "approved_by"})
     text(value["approved_by"], "eval_sampling approved_by", 400)
-    from crit_eval.prepare import sampling_override
+    from crit_eval.quality.prepare import sampling_override
     return {"settings": sampling_override(value["settings"]), "approved_by": value["approved_by"]}
 
 

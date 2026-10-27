@@ -9,6 +9,20 @@
 
 namespace crit::stored_tile::detail {
 
+// The (token block, row band) a GEMM block computes. group <= 1: the launch order itself (token blocks x fastest,
+// so a wave shares one weight band and streams every token block). group G > 1: bands are taken G at a time and the
+// token blocks walk across those G bands, so while a group runs its G weight bands stay in L2 and the activations
+// are streamed once per group instead of once per band. Every block keeps its own tile and K order: the result's
+// bits do not depend on the group.
+__device__ __forceinline__ int2 raster_tile(int group) {
+    const int nx = static_cast<int>(gridDim.x), ny = static_cast<int>(gridDim.y);
+    if(group <= 1) return make_int2(static_cast<int>(blockIdx.x), static_cast<int>(blockIdx.y));
+    const long pid = static_cast<long>(blockIdx.y) * nx + blockIdx.x, per = static_cast<long>(group) * nx;
+    const int first = static_cast<int>(pid / per) * group, size = min(group, ny - first);
+    const int local = static_cast<int>(pid - (pid / per) * per);
+    return make_int2(local / size, first + local % size);
+}
+
 // Weights are read once per launch: no L1 allocation.
 __device__ __forceinline__ uint4 load_streaming(const void* p) {
     uint4 v;

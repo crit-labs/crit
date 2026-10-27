@@ -30,8 +30,9 @@ CAPTURED_SAMPLING = ("temperature", "top_p", "top_k", "min_p", "seed", "presence
 
 
 def case_request(root, rows):
-    """A case's chat request: its first retained JSON file holding {"messages": [...]}, with optional "tools" and the
-    sampling fields (CAPTURED_SAMPLING) it was sent with."""
+    """A case's chat request: its first retained JSON file holding {"messages": [...]}, with optional "tools", the
+    sampling fields (CAPTURED_SAMPLING) it was sent with and "chat_template_kwargs", the chat-template variables it
+    renders with (for example a workload captured with thinking on, where the candidate serves it off by default)."""
     from crit_api.server import MAX_BODY
     for row in rows:
         path = safe_path(root, row["path"])
@@ -49,9 +50,39 @@ def case_request(root, rows):
             sampling = {key: value[key] for key in CAPTURED_SAMPLING if value.get(key) is not None}
             if any(type(v) not in (int, float) for v in sampling.values()):
                 raise ValueError(f"{row['path']}: sampling fields must be numbers")
-            return {"messages": messages, **({"tools": tools} if tools else {}), **sampling}
+            variables = value.get("chat_template_kwargs")
+            if variables is not None and not isinstance(variables, dict):
+                raise ValueError(f"{row['path']}: chat_template_kwargs must be an object")
+            return {"messages": messages, **({"tools": tools} if tools else {}), **sampling,
+                    **({"chat_template_kwargs": variables} if variables else {})}
     raise ValueError('No retained chat request for the case; keep a captured JSON file {"messages": [...]} in its '
                      'manifest')
+
+
+def check_case_prompts(root, run, case_manifests, variables):
+    """Each case whose captured chat request crit run measure would send must render to its workload's prompt tokens
+    as a candidate serving the template `variables` (recon's frozen template_variables) renders it, the request's own
+    chat_template_kwargs over them, as ResidentChat counts them: a case that renders otherwise could never be measured
+    on a candidate (crit serve's usage would differ), so inputs are refused before they are frozen."""
+    model = None
+    for case in run["spec"]["cases"]:
+        try:
+            request = case_request(root, case_manifests[case["case_id"]])
+        except ValueError:
+            continue   # no chat request: measure refuses the case on its own
+        if model is None:
+            from crit_core.model import open_model
+            from crit_core.text import load_model_text
+            model = load_model_text(open_model(run["spec"]["model_path"]).files, clock=None)
+        applied = {**variables, **request.get("chat_template_kwargs", {})}
+        count = len(model.encode_chat(request["messages"], tools=request.get("tools"), add_generation_prompt=True,
+                                      **applied))
+        expected = case["workload"]["prompt_tokens"]
+        if count != expected:
+            raise ValueError(f"{case['case_id']}: its captured messages render to {count} prompt tokens with template "
+                             f"variables {json.dumps(applied, sort_keys=True)}, the workload has {expected}: capture them "
+                             "again for the template variables candidates serve, or name the ones the workload needs in "
+                             "the request's chat_template_kwargs")
 
 
 def measure(store, run_id, candidate_id, seconds=None):
@@ -126,7 +157,9 @@ def measure(store, run_id, candidate_id, seconds=None):
                    "checks": [], "outcome": "completed", "started_at": result["started_at"],
                    "ended_at": result["ended_at"],
                    "extensions": {"measured_by": "crit run measure", "served_by": "crit serve", "attempt_id": attempt,
-                                  "output_tokens": result["output_tokens"], "sampling": result["sampling"]}}
+                                  "output_tokens": result["output_tokens"], "sampling": result["sampling"],
+                                  **({"chat_template_kwargs": result["template_kwargs"]}
+                                     if result.get("template_kwargs") else {})}}
         recorded.append(store.append(run_id, candidate_id, "benchmark", payload))
     return recorded
 
@@ -151,7 +184,7 @@ def _measure(store, run_id, candidate_id, attempt, deadline_at, kv_tokens, cases
 
 def _case(port, case, load_ms, sampler, timeout, log):
     """A case's warmups and repetitions: its metrics and missing metrics as a benchmark records them."""
-    from crit_eval.metrics import speed_sample
+    from crit_eval.reports.metrics import speed_sample
     # Greedy unless the captured request names its own sampling.
     body = {"temperature": 0, **case["request"], "max_tokens": case["output_tokens"], "stream": True,
             "stream_options": {"include_usage": True}}
@@ -184,7 +217,8 @@ def _case(port, case, load_ms, sampler, timeout, log):
     metrics["load_ms"] = {"unit": ALL_METRICS["load_ms"], "samples": [load_ms] * case["repetitions"]}
     missing = {name: reasons.get(name, "Not measurable on this host") for name in samples if name not in metrics}
     return {"metrics": metrics, "missing": missing, "output_tokens": outputs, "started_at": begun, "ended_at": now(),
-            "sampling": {key: body[key] for key in CAPTURED_SAMPLING if key in body}}
+            "sampling": {key: body[key] for key in CAPTURED_SAMPLING if key in body},
+            "template_kwargs": body.get("chat_template_kwargs")}
 
 
 def _request(port, body, timeout):

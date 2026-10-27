@@ -24,6 +24,18 @@ struct RopeConfig {
     const json::Value* raw = nullptr;                          // the object read; lives in the config's document
     std::string key = {};                                      // "rope_scaling", "rope_parameters" or ""
 };
+// Rotary inverse frequencies (one per rotated pair, rotary_dim / 2) and the factor the cos and sin tables are
+// multiplied by, derived as Hugging Face's ROPE_INIT_FUNCTIONS derive them, in double. The Python twin is
+// crit_core.model.rope_table. type "" is "default"; "mrope", "linear", "dynamic", "yarn", "llama3" and "longrope"
+// are supported. max_position_embeddings is the model's declared length (ModelConfig::max_positions): dynamic NTK
+// needs it, and YaRN, Llama 3 and LongRoPE read it when the rope object leaves factor or
+// original_max_position_embeddings out. sequence_length selects dynamic NTK's base and LongRoPE's long factors past
+// the original length; nullopt means the declared length. Other types, missing parameters and a rotary dimension
+// (int(head_dim x partial_rotary_factor)) that is not a positive even number throw FormatError("rope", ...).
+struct RopeTable { std::vector<double> inv_freq = {}; double attention_factor = 1.0; };
+std::uint32_t rotary_dim(const RopeConfig& rope, std::uint32_t head_dim);
+RopeTable rope_table(const RopeConfig& rope, std::uint32_t head_dim, std::optional<std::uint64_t> max_position_embeddings = {},
+                     std::optional<std::uint64_t> sequence_length = {});
 // One entry of a rope_parameters object keyed by layer type (every member an object), e.g. "sliding_attention".
 struct RopeLayer { std::string layer_type = {}; RopeConfig rope = {}; };
 // Present when num_experts, else num_local_experts, else n_routed_experts is positive; experts_key names it.

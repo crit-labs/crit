@@ -14,7 +14,7 @@ from crit.run.records import file_sha, read_json, validate_spec, write_json
 
 def status(decode=100.0, prefill=1000.0, ttft=200.0, limits=(200.0, 4000.0, 100.0), noise=0.02, context=None,
            gaps=(), greedy=120.0, heldout=90.0, followup=50.0):
-    """An Eval result's stored status as crit_eval.status.build writes it, with the fields plans read."""
+    """An Eval result's stored status as crit_eval.reports.status.build writes it, with the fields plans read."""
     rows = [("decode", decode, limits[0], decode / limits[0]), ("prefill", prefill, limits[1], prefill / limits[1]),
             ("ttft", ttft, limits[2], limits[2] / ttft)]
     if context:

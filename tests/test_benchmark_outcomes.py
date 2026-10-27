@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.request import urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1].parent / "crit-eval"))
-from crit_eval import outcomes as bench  # noqa: E402
+from crit_eval.run import outcomes as bench  # noqa: E402
 
 
 def wire(payload):

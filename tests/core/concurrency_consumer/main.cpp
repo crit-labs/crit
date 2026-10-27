@@ -81,6 +81,6 @@ int main() {
             return event.phase==TracePhase::completion && event.finish==Finish::length;
         })!=3) throw std::runtime_error("installed SDK trace lost completed requests");
       }
-        std::cout<<"crit 0.11.0 installed SDK concurrent consumer passed\n";
+        std::cout<<"crit 0.12.0 installed SDK concurrent consumer passed\n";
     } catch(const std::exception& e) {std::cerr<<e.what()<<'\n';return 1;}
 }

@@ -44,7 +44,7 @@ that holds any file of a group supplies that whole group, and only the groups
 it lacks are derived. Results are cached while the folder's entries are
 unchanged. Eval's reference also needs the weights as the Hugging Face
 checkpoint they came from; that part needs torch and lives in Eval
-(`crit_eval.reference.open_checkpoint`).
+(`crit_eval.quality.reference.open_checkpoint`).
 
 ## config.json
 
@@ -176,6 +176,36 @@ checkpoint. The header size bounds the reader's memory.
 absolute file offsets; `ShardInfo` adds the header SHA-256 and file identity;
 `Checkpoint` holds tensors sorted by name, shards, the index SHA-256, notes and
 `tensor_bytes`. All results are read-only.
+
+**Tensor bytes** ([tensors.py](tensors.py)). `TensorReader(checkpoint)` (or
+`open_tensors(path, **inspect_options)`) reads the bytes the headers describe,
+as the native `Checkpoint::map` and `Checkpoint::read` do. `map(tensor)` is a
+zero-copy read-only `memoryview` into the shard's mapping that stays valid after
+`close()`; `read(tensor, out)` copies exactly the tensor's bytes into a writable
+buffer (pinned host memory, a numpy array) without mapping. `tensor` is a name
+or the checkpoint's own `TensorInfo`. Each shard must still be the file its
+header was read from (`ShardInfo.file_identity`), otherwise
+`SafetensorsError`; `verify_unchanged()` checks the opened shards again. A
+`header_only` checkpoint has no bytes to read. Values are never decoded: an
+engine views the bytes as its dtype (`torch.frombuffer`, `numpy.frombuffer`)
+and uploads them.
+
+## Stored weight matrices
+
+[schemes.py](schemes.py) decides from headers alone how a checkpoint keyed by
+Hugging Face names stores each weight matrix: plain, FP8 (per tensor, row or
+block), NVFP4 (compressed-tensors or ModelOpt), compressed-tensors int, AWQ,
+GPTQ, MLX, bitsandbytes 4- and 8-bit and ONNX MatMulNBits. crit-eval's ceiling
+and reference read the same recognition (`stored`, `RECOGNISERS`, `PRIMARY`,
+`quantization_of`, `refuse_unread`) and add the decoders. For the schemes an
+engine runs as stored (`PART_SCHEMES`: nvfp4, fp8, plain), `matrix_parts(tensors,
+base, quantization)` returns a `StoredMatrix`: the logical shape, the tensors
+holding codes, scales, the global scale and the declared input scale, and each
+scale's convention (granularity, block, whether the global or input scale
+divides or multiplies), so an engine never spells a format's tensor names
+itself. `layer_prefix(names)` finds the decoder layers' prefix (`model.`,
+`model.language_model.`) past draft and vision layers. Pass the checkpoint's
+`tensors` and `quantization_of(load_model_config(...))`.
 
 ## GGUF
 

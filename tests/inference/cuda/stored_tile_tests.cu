@@ -216,6 +216,70 @@ bool bits_independent_of_tokens(bool fp4, int Tmax, int min_blocks, std::mt19937
     return ok;
 }
 
+// The raster group only changes which block runs when: every group (1, 2, 3 with a short last group, 8 > bands)
+// must give the plain launch order's bits, W8A8 / W4A4 with and without the K split, and the BF16-activation GEMM.
+bool raster_keeps_bits(bool fp4, bool a16, int min_blocks, std::mt19937& rng) {
+    const int N = 1024, K = 512, T = 300;
+    std::uniform_int_distribution<int> byte(0, 255), scale_code(0x28, 0x48);
+    std::uniform_real_distribution<float> value(-2.f, 2.f);
+    std::vector<std::uint8_t> codes(static_cast<std::size_t>(N) * K / (fp4 ? 2 : 1)), scales(fp4 ? static_cast<std::size_t>(N) * K / 16 : 0);
+    for(auto& c : codes) {
+        do c = static_cast<std::uint8_t>(byte(rng)); while(!fp4 && (c & 0x7F) == 0x7F);
+    }
+    for(auto& v : scales) v = static_cast<std::uint8_t>(scale_code(rng));
+    std::vector<__nv_bfloat16> rs(N), x(static_cast<std::size_t>(T) * K);
+    for(auto& v : rs) v = __float2bfloat16(0.01f + std::fabs(value(rng)) * 0.01f);
+    for(auto& v : x) v = __float2bfloat16(value(rng));
+    st::Plan p = st::plan(fp4, N, K, T, 256, min_blocks);
+    st::A16Plan pa = st::plan_a16(fp4, N, K, T, min_blocks);
+    std::uint8_t* d_codes = upload(codes);
+    std::uint8_t* d_scales = upload(scales);
+    std::uint8_t *d_tiles = nullptr, *d_stiles = nullptr;
+    CHECK(cudaMalloc(&d_tiles, codes.size()));
+    CHECK(cudaMalloc(&d_stiles, scales.size() + 16));
+    __nv_bfloat16* d_rs = upload(rs);
+    __nv_bfloat16* d_x = upload(x);
+    float *d_y = nullptr, *d_ts = nullptr, *d_part = nullptr;
+    void* d_act = nullptr;
+    CHECK(cudaMalloc(&d_y, static_cast<std::size_t>(T) * N * sizeof(float)));
+    CHECK(cudaMalloc(&d_act, p.activation_bytes + 16));
+    CHECK(cudaMalloc(&d_ts, (p.token_scale_count + 1) * sizeof(float)));
+    CHECK(cudaMalloc(&d_part, (std::max(p.partial_floats, pa.partial_floats) + 1) * sizeof(float)));
+    if(fp4) CHECK(st::enqueue_repack_fp4(d_codes, d_scales, d_tiles, d_stiles, N, K, nullptr));
+    else CHECK(st::enqueue_repack_fp8(d_codes, d_tiles, N, K, nullptr));
+    const auto run = [&](int group, std::vector<float>& out) {
+        if(cudaMemset(d_y, 0xFF, static_cast<std::size_t>(T) * N * sizeof(float)) != cudaSuccess) return false;
+        p.group = group;
+        pa.group = group;
+        cudaError_t e;
+        if(a16) e = fp4 ? st::enqueue_fp4_a16({d_tiles, d_stiles, 448.f * 6.f / 3.f, 1.f, N, K}, d_x, T, d_y, N, false, pa, d_part, nullptr)
+                        : st::enqueue_fp8_a16({d_tiles, d_rs, N, K}, d_x, T, d_y, N, false, pa, d_part, nullptr);
+        else e = fp4 ? st::enqueue_fp4({d_tiles, d_stiles, 448.f * 6.f / 3.f, 448.f * 6.f / 4.f, N, K}, d_x, T, d_y, N, false, p,
+                                       {d_act, nullptr, d_part}, nullptr)
+                     : st::enqueue_fp8({d_tiles, d_rs, N, K}, d_x, T, d_y, N, false, p, {d_act, d_ts, d_part}, nullptr);
+        out.resize(static_cast<std::size_t>(T) * N);
+        return e == cudaSuccess && cudaMemcpy(out.data(), d_y, out.size() * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
+    };
+    std::vector<float> plain, grouped;
+    bool ok = run(1, plain);
+    for(const int group : {2, 3, 8}) {
+        ok = run(group, grouped) && ok;
+        ok = ok && std::memcmp(grouped.data(), plain.data(), plain.size() * sizeof(float)) == 0;
+    }
+    p.group = pa.group = 0;
+    ok = ok && (a16 ? (fp4 ? st::enqueue_fp4_a16({d_tiles, d_stiles, 1.f, 1.f, N, K}, d_x, T, d_y, N, false, pa, d_part, nullptr)
+                           : st::enqueue_fp8_a16({d_tiles, d_rs, N, K}, d_x, T, d_y, N, false, pa, d_part, nullptr))
+                    : (fp4 ? st::enqueue_fp4({d_tiles, d_stiles, 1.f, 1.f, N, K}, d_x, T, d_y, N, false, p, {d_act, nullptr, d_part}, nullptr)
+                           : st::enqueue_fp8({d_tiles, d_rs, N, K}, d_x, T, d_y, N, false, p, {d_act, d_ts, d_part}, nullptr))) ==
+                       cudaErrorInvalidValue;
+    for(void* ptr : {static_cast<void*>(d_codes), static_cast<void*>(d_scales), static_cast<void*>(d_tiles), static_cast<void*>(d_stiles),
+                     static_cast<void*>(d_rs), static_cast<void*>(d_x), static_cast<void*>(d_y), d_act, static_cast<void*>(d_ts),
+                     static_cast<void*>(d_part)}) cudaFree(ptr);
+    std::printf("%s%s raster groups 2, 3, 8 (sk=%d): bits %s the plain order's; l2_raster_group here: %d\n", fp4 ? "fp4" : "fp8",
+                a16 ? " a16" : "", a16 ? pa.sk : p.sk, ok ? "equal" : "DIFFER from", a16 ? st::l2_raster_group(pa) : st::l2_raster_group(p));
+    return ok;
+}
+
 // ------------------------------------------------------------------------------------------- shared fixtures
 template <class T>
 struct Dev {
@@ -993,6 +1057,8 @@ int main() {
             ok = a16_case(random_fp4(256, 16384, 448.f * 6.f / 3.f, rng), 64, mb, rng) && ok;
         }
         ok = a16_rejects() && ok;
+        for(const bool fp4 : {false, true})
+            for(const int mb : {1, 100000}) ok = raster_keeps_bits(fp4, true, mb, rng) && ok;
     } else {
         std::printf("BF16 MMA needs sm_80+; GEMV skipped\n");
     }
@@ -1012,6 +1078,7 @@ int main() {
         ok = gated_case(false, 128, 512, 300, 1, rng) && ok;   // 16 token groups per block, epilogue
         ok = gated_case(false, 256, 256, 64, 1, rng) && ok;
         ok = fp8_rejects_plan_mismatch() && ok;
+        for(const int mb : {1, 340}) ok = raster_keeps_bits(false, false, mb, rng) && ok;
     } else {
         std::printf("FP8 MMA needs sm_89+; skipped\n");
     }
@@ -1031,6 +1098,7 @@ int main() {
         ok = gated_case(true, 128, 512, 300, 1, rng) && ok;
         ok = gated_case(true, 256, 256, 64, 1, rng) && ok;
         ok = fp4_rejects_plan_mismatch() && ok;
+        for(const int mb : {1, 340}) ok = raster_keeps_bits(true, false, mb, rng) && ok;
     } else {
         std::printf("NVFP4 block-scaled MMA not in this build (needs sm_120a / sm_121a); skipped\n");
     }

@@ -72,18 +72,30 @@ def global_scale(values):
     return E2M1_MAX * E4M3_MAX / amax if amax > 0 else 1.0
 
 
-def quantize_row(row, g):
-    """Return (codes, scale_bytes) for one row with global scale g."""
+def _block(block, g, top):
+    """Scale byte, codes and squared error (in scaled units) of one block whose maximum maps to `top`."""
+    s = e4m3_encode(max(abs(v) for v in block) * g / top)
+    decoded = e4m3_value(s)
+    codes = [e2m1_encode(v * g / decoded) if decoded > 0 else 0 for v in block]
+    error = sum((e2m1_value(c) * decoded - v * g) ** 2 for c, v in zip(codes, block))
+    return s, codes, error
+
+
+def quantize_row(row, g, four_over_six=False):
+    """Return (codes, scale_bytes) for one row with global scale g. With four_over_six, each block also tries the
+    scale that maps its maximum to 4 instead of 6 and keeps the one with the smaller squared error (6 on a tie)."""
     if len(row) % BLOCK or not math.isfinite(g) or g <= 0:
         raise ValueError("row length must be a multiple of 16 and the global scale positive")
     codes, scales = [], []
     for b in range(0, len(row), BLOCK):
         block = row[b:b + BLOCK]
-        amax = max(abs(v) for v in block)
-        s = e4m3_encode(amax * g / E2M1_MAX)
-        decoded = e4m3_value(s)
+        s, c, error = _block(block, g, E2M1_MAX)
+        if four_over_six:
+            s4, c4, error4 = _block(block, g, 4.0)
+            if error4 < error:
+                s, c = s4, c4
         scales.append(s)
-        codes.extend(e2m1_encode(v * g / decoded) if decoded > 0 else 0 for v in block)
+        codes.extend(c)
     return codes, scales
 
 
@@ -119,12 +131,12 @@ class Matrix:
         self.rows, self.cols, self.packed, self.scales, self.g = rows, cols, bytes(packed), bytes(scales), g
 
     @classmethod
-    def quantize(cls, dense):
+    def quantize(cls, dense, four_over_six=False):
         rows, cols = len(dense), len(dense[0])
         g = global_scale([v for row in dense for v in row])
         packed, scales = bytearray(), bytearray()
         for row in dense:
-            codes, s = quantize_row(row, g)
+            codes, s = quantize_row(row, g, four_over_six)
             packed += pack(codes)
             scales += bytes(s)
         return cls(rows, cols, packed, scales, g)

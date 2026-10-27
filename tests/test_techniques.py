@@ -954,6 +954,27 @@ class Nvfp4CodecTests(unittest.TestCase):
                 self.assertEqual(low, e4m3_magnitude(b), hex(b))
                 self.assertEqual((high, math.copysign(1.0, high)), (-low, -1.0))
 
+    def test_four_over_six_never_raises_block_error(self):
+        m = load("quantized-projections", "nvfp4.py")
+        rng = __import__("random").Random(9)
+        dense = [[rng.gauss(0, 1) * (1 + 3 * (k % 16 == 0)) for k in range(256)] for _ in range(8)]
+        g = m.global_scale([v for row in dense for v in row])
+        chosen = total6 = total = 0
+        for row in dense:
+            six, s6 = m.quantize_row(row, g)
+            fos, s4 = m.quantize_row(row, g, four_over_six=True)
+            a, b = m.dequantize_row(six, s6, g), m.dequantize_row(fos, s4, g)
+            for i in range(0, len(row), 16):
+                e6 = sum((x - y) ** 2 for x, y in zip(row[i:i + 16], a[i:i + 16]))
+                e = sum((x - y) ** 2 for x, y in zip(row[i:i + 16], b[i:i + 16]))
+                self.assertLessEqual(e, e6 * (1 + 1e-9) + 1e-30)   # per block: never worse than amax / 6
+                total6, total = total6 + e6, total + e
+            chosen += sum(x != y for x, y in zip(s6, s4))
+        self.assertGreater(chosen, 0)
+        self.assertLess(total, total6)
+        self.assertEqual(m.Matrix.quantize(dense, four_over_six=True).scales,
+                         bytes(b for row in dense for b in m.quantize_row(row, g, four_over_six=True)[1]))
+
     def test_quantization_error_and_batched_projection(self):
         m = load("quantized-projections", "nvfp4.py")
         rng = __import__("random").Random(4)

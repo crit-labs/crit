@@ -23,8 +23,8 @@ Every draw is a pure function of `(seed, position, stream, purpose)`, so rollbac
 trimming, cancellation and speculative redo need no generator state. Sampling
 uses position = committed outputs plus the verify column, stream =
 `SamplingParams::stream` and purpose `DrawPurpose::sample` (0). `draft` (1),
-`accept` (2) and `residual` (3) are reserved for speculative sampling; adapters
-may use 16 (`user`) and above.
+`accept` (2), `residual` (3) and `block` (4, block verification's acceptance draws)
+are reserved for speculative sampling; adapters may use 16 (`user`) and above.
 
 `philox4x32` is Philox4x32-10 exactly as in Random123, on unsigned 32-bit words:
 
@@ -75,7 +75,10 @@ IEEE double, in this order, where n(t) counts token t among committed outputs pl
    `AllowedTokens`, ids outside the allowed set become -inf.
 2. Bias: `v[t] += double(bias)`; a -inf bias bans the token.
 3. Suppression: while `outputs() + c < min_tokens`, `v[t] = -inf` for each
-   suppress_until_min token.
+   suppress_until_min token. With `AllowedTokens` whose ids are all
+   suppress_until_min tokens (`suppression_yields`), suppression is skipped: a
+   constraint that only allows a stop (a finished grammar) ends the output
+   instead of failing the request.
 4. Repetition, once per distinct unmasked token in the prompt (when counted) or
    with n(t) > 0: `v = v > 0 ? min(v / r, DBL_MAX) : max(v * r, -DBL_MAX)`.
 5. Frequency and presence, for n(t) > 0: `v -= f * n(t) + p`.

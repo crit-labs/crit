@@ -1,7 +1,9 @@
 #include "fused_moe.h"
 #include <array>
+#include <cmath>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -130,6 +132,19 @@ void fusion(cudaStream_t stream) {
   check(cudaStreamSynchronize(stream));
   const auto selected = ids.download(); const auto probabilities = route_weights.download();
   for (std::size_t i = 0; i < selected.size(); ++i) { require(selected[i] == static_cast<int>(i % 32), "Top-k tie/uniqueness differs"); near(probabilities[i], 1.0 / 32); }
+  // NaN ranks as -inf: an all-NaN row selects the lowest ids, and NaN experts in a finite row are never chosen.
+  {
+    std::vector<float> nan_scores(2 * 33, std::numeric_limits<float>::quiet_NaN());
+    for (int e = 0; e < 30; ++e) nan_scores[33 + e] = 0.1f * static_cast<float>(e);
+    Device<float> rows(nan_scores), nan_weights(2 * 4), nan_shared(2);
+    Device<std::int32_t> nan_ids(2 * 4);
+    crit::moe::route_down_cuda(rows.read(), 33, 4, {}, a.read(), 1, down.read(), 1, 2, nan_ids.span(), nan_weights.span(), nan_shared.span(), stream);
+    check(cudaStreamSynchronize(stream));
+    const auto got = nan_ids.download(); const auto weights = nan_weights.download();
+    const std::vector<std::int32_t> want{0, 1, 2, 3, 29, 28, 27, 26};
+    require(got == want, "NaN router rows select out-of-range or NaN experts");
+    for (std::size_t i = 4; i < weights.size(); ++i) require(std::isfinite(weights[i]), "A finite row's weights are not finite");
+  }
   std::cout << cases << " MoE fusion cases and deterministic tie checks passed\n";
 }
 // Routing variants against expectations the host reference (routing.py) wrote with routing_cases.py.

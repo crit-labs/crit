@@ -13,6 +13,7 @@ using detail::cp_async8;
 using detail::cp_async_commit;
 using detail::cp_async_wait;
 using detail::gated_value;
+using detail::raster_tile;
 using detail::load_streaming;
 
 #if defined(__CUDA_ARCH__) && (defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL))
@@ -232,12 +233,14 @@ template <int NT, int RT, int PF, bool GATED = false>
 __global__ void __launch_bounds__(256) gemm_fp8_kernel(const std::uint8_t* __restrict__ W, const __nv_bfloat16* __restrict__ row_scale,
                                                       const uint2* __restrict__ X8, const float* __restrict__ token_scale,
                                                       float* __restrict__ Y, float* __restrict__ part, int N, int K, int T,
-                                                      int ldo, int add, __nv_bfloat16* __restrict__ G = nullptr, int act = 0) {
+                                                      int ldo, int add, __nv_bfloat16* __restrict__ G = nullptr, int act = 0,
+                                                      int group = 1) {
     static_assert(!GATED || RT == 2, "the gated epilogue pairs a warp's two row tiles");
     __shared__ uint2 xsm[3][NT][32];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
-    const int rt0 = (blockIdx.y * 8 + warp) * RT;
-    const int tg0 = blockIdx.x * NT;
+    const int2 tile = raster_tile(group);
+    const int rt0 = (tile.y * 8 + warp) * RT;
+    const int tg0 = tile.x * NT;
     const int KT = K / 32;
     const int SK = gridDim.z, per = (KT + SK - 1) / SK, kt0 = blockIdx.z * per, kt1 = min(KT, kt0 + per);
     float acc[RT][NT][4];
@@ -334,12 +337,13 @@ __global__ void __launch_bounds__(256) gemm_fp4_kernel(const std::uint8_t* __res
                                                       const uint4* __restrict__ X4, float alpha,
                                                       float* __restrict__ Y, float* __restrict__ part, int N, int K, int T,
                                                       int ldo, int add, __nv_bfloat16* __restrict__ G = nullptr, int act = 0,
-                                                      float alpha_up = 0.f) {
+                                                      float alpha_up = 0.f, int group = 1) {
     static_assert(!GATED || RT == 2, "the gated epilogue pairs a warp's two row tiles");
     __shared__ uint4 xsm[3][NT][32];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
-    const int rt0 = (blockIdx.y * 8 + warp) * RT;
-    const int tg0 = blockIdx.x * NT;
+    const int2 tile = raster_tile(group);
+    const int rt0 = (tile.y * 8 + warp) * RT;
+    const int tg0 = tile.x * NT;
     const int KT = K / 64;
     const int SK = gridDim.z, per = (KT + SK - 1) / SK, kt0 = blockIdx.z * per, kt1 = min(KT, kt0 + per);
     float acc[RT][NT][4];
@@ -519,10 +523,10 @@ int launch_tpad(const Plan& p, int T) {
 }
 
 bool fp8_launch_ok(const Fp8Weights& w, int T, const Plan& p) {
-    return !(w.N % (128 * p.rt) || w.K % 32 || T <= 0 || p.fp4 || w.N != p.n || w.K != p.k || T > p.tokens);
+    return !(w.N % (128 * p.rt) || w.K % 32 || T <= 0 || p.fp4 || w.N != p.n || w.K != p.k || T > p.tokens || p.group < 1);
 }
 bool fp4_launch_ok(const Fp4Weights& w, int T, const Plan& p) {
-    return !(w.N % (128 * p.rt) || w.K % 64 || T <= 0 || !p.fp4 || w.N != p.n || w.K != p.k || T > p.tokens ||
+    return !(w.N % (128 * p.rt) || w.K % 64 || T <= 0 || !p.fp4 || w.N != p.n || w.K != p.k || T > p.tokens || p.group < 1 ||
              !(w.weight_global_scale > 0.f) || !(w.input_global_scale > 0.f));
 }
 bool activation_ok(Activation act) {
@@ -546,7 +550,7 @@ const uint4* pack_fp4(const __nv_bfloat16* x, int T, int K, int tpad, float gx, 
 // The plain kernels for a plan (they also write the partials of a split gated launch).
 void launch_fp8(const Fp8Weights& w, const uint2* x8, const float* ts, int T, float* y, int ldo, bool add, const Plan& p,
                 float* partials, dim3 grid, cudaStream_t stream) {
-#define CRIT_ST_FP8(NT_, RT_) gemm_fp8_kernel<NT_, RT_, 4><<<grid, 256, 0, stream>>>(w.tiles, w.row_scale, x8, ts, y, partials, w.N, w.K, T, ldo, add ? 1 : 0)
+#define CRIT_ST_FP8(NT_, RT_) gemm_fp8_kernel<NT_, RT_, 4><<<grid, 256, 0, stream>>>(w.tiles, w.row_scale, x8, ts, y, partials, w.N, w.K, T, ldo, add ? 1 : 0, nullptr, 0, p.group)
     if(p.nt == 16 && p.rt == 2) CRIT_ST_FP8(16, 2);
     else if(p.nt == 16) CRIT_ST_FP8(16, 1);
     else if(p.rt == 2) CRIT_ST_FP8(8, 2);
@@ -555,7 +559,7 @@ void launch_fp8(const Fp8Weights& w, const uint2* x8, const float* ts, int T, fl
 }
 void launch_fp4(const Fp4Weights& w, const uint4* x4, float alpha, int T, float* y, int ldo, bool add, const Plan& p,
                 float* partials, dim3 grid, cudaStream_t stream) {
-#define CRIT_ST_FP4(NT_, RT_) gemm_fp4_kernel<NT_, RT_, 4><<<grid, 256, 0, stream>>>(w.tiles, w.scale_tiles, x4, alpha, y, partials, w.N, w.K, T, ldo, add ? 1 : 0)
+#define CRIT_ST_FP4(NT_, RT_) gemm_fp4_kernel<NT_, RT_, 4><<<grid, 256, 0, stream>>>(w.tiles, w.scale_tiles, x4, alpha, y, partials, w.N, w.K, T, ldo, add ? 1 : 0, nullptr, 0, 0.f, p.group)
     if(p.nt == 16 && p.rt == 2) CRIT_ST_FP4(16, 2);
     else if(p.nt == 16) CRIT_ST_FP4(16, 1);
     else if(p.rt == 2) CRIT_ST_FP4(8, 2);
@@ -602,10 +606,10 @@ cudaError_t enqueue_fp8_gated(const Fp8Weights& w, const __nv_bfloat16* x, int T
             s.partials, p.sk, w.row_scale, s.token_scale, 1.f, 1.f, static_cast<int>(act), out, w.N, T, ldo);
     } else if(p.nt == 16) {
         gemm_fp8_kernel<16, 2, 4, true><<<grid, 256, 0, stream>>>(w.tiles, w.row_scale, x8, s.token_scale, nullptr, nullptr, w.N, w.K, T,
-                                                                   ldo, 0, out, static_cast<int>(act));
+                                                                   ldo, 0, out, static_cast<int>(act), p.group);
     } else {
         gemm_fp8_kernel<8, 2, 4, true><<<grid, 256, 0, stream>>>(w.tiles, w.row_scale, x8, s.token_scale, nullptr, nullptr, w.N, w.K, T,
-                                                                  ldo, 0, out, static_cast<int>(act));
+                                                                  ldo, 0, out, static_cast<int>(act), p.group);
     }
     return cudaGetLastError();
 }
@@ -626,10 +630,10 @@ cudaError_t enqueue_fp4_gated(const Fp4Weights& w, float up_weight_global_scale,
             s.partials, p.sk, nullptr, nullptr, alpha, alpha_up, static_cast<int>(act), out, w.N, T, ldo);
     } else if(p.nt == 16) {
         gemm_fp4_kernel<16, 2, 4, true><<<grid, 256, 0, stream>>>(w.tiles, w.scale_tiles, x4, alpha, nullptr, nullptr, w.N, w.K, T, ldo, 0,
-                                                                   out, static_cast<int>(act), alpha_up);
+                                                                   out, static_cast<int>(act), alpha_up, p.group);
     } else {
         gemm_fp4_kernel<8, 2, 4, true><<<grid, 256, 0, stream>>>(w.tiles, w.scale_tiles, x4, alpha, nullptr, nullptr, w.N, w.K, T, ldo, 0,
-                                                                  out, static_cast<int>(act), alpha_up);
+                                                                  out, static_cast<int>(act), alpha_up, p.group);
     }
     return cudaGetLastError();
 }
@@ -678,6 +682,23 @@ bool fp4_mma_compiled() {
     const bool ok = cudaMemcpy(&h, d, sizeof(int), cudaMemcpyDeviceToHost) == cudaSuccess;
     cudaFree(d);
     return ok && h == 1;
+}
+
+namespace {
+int l2_group(double activation_bytes, double band_bytes, int bands) {
+    int device = 0, l2 = 0;
+    if(cudaGetDevice(&device) != cudaSuccess || cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device) != cudaSuccess ||
+       l2 <= 0 || activation_bytes <= l2 / 2.0 || bands < 2)
+        return 1;
+    int group = 1;
+    while(group * 2 <= bands && group * 2 * band_bytes <= l2 / 4.0) group *= 2;
+    return group;
+}
+}  // namespace
+
+int l2_raster_group(const Plan& p) {
+    const double width = p.fp4 ? 0.5 : 1.0;   // packed E2M1 or E4M3 values
+    return l2_group(double(p.tokens) * p.k * width, 128.0 * p.rt * p.k * width, p.n / (128 * p.rt));
 }
 
 }  // namespace crit::stored_tile

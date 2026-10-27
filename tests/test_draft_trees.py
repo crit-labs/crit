@@ -45,6 +45,18 @@ class DraftTreeTests(unittest.TestCase):
             kept = m.rank(candidates, range(len(candidates)), tree.nodes - 1)
             self.assertTrue(all(candidates[k].parent in kept or candidates[k].parent == -1 for k in kept))
 
+    def test_nan_ranks_as_minus_infinity(self):
+        m = load()
+        nan = float("nan")
+        self.assertEqual([t for t, _ in m.expand([nan] * 5, 3)], [0, 1, 2])
+        self.assertTrue(all(s == float("-inf") for _, s in m.expand([nan] * 5, 3)))
+        row = [nan, 1.0, nan, 3.0, 2.0]
+        self.assertEqual([t for t, _ in m.expand(row, 3)], [3, 4, 1])
+        self.assertTrue(all(s > float("-inf") for _, s in m.expand(row, 3)))
+        # a drafter that only returns NaN rows drafts nothing: its candidates are never kept
+        candidates, tree = m.draft(lambda paths: [[nan] * 6 for _ in paths], root=2, depth=3, branch=2, beam=2, nodes=5)
+        self.assertEqual(tuple(tree.tokens), (2,))
+
     def test_walk_emits_only_target_tokens(self):
         m = load()
         rng = random.Random(4)
