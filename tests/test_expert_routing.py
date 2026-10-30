@@ -1,6 +1,6 @@
 """Routing descriptions: the host reference against hand-worked cases and, when installed, the
 Hugging Face transformers router code each parameterization reproduces; config mapping from
-Core's parsed fields. The CUDA kernel is compared with this reference in tests/inference/cuda."""
+Core's parsed fields."""
 from dataclasses import replace
 import importlib.util
 import math
@@ -243,16 +243,6 @@ class ConfigRoutingTests(unittest.TestCase):
                            norm_topk_prob=False, routed_scaling_factor=1.0)
         with self.assertRaises(ValueError):  # a group limit needs its ranking rule
             r.routing_from_config(grouped, defaults={"score_before_selection": True})
-
-
-class CudaCaseTests(unittest.TestCase):
-    def test_cuda_cases_are_written_from_the_reference(self):
-        spec = importlib.util.spec_from_file_location(
-            "crit_test_routing_cases", Path(__file__).resolve().parent / "inference" / "cuda" / "routing_cases.py")
-        cases = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cases)
-        lines = cases.render().splitlines()
-        self.assertEqual(int(lines[0]), len(cases.CASES))
 
 
 if __name__ == "__main__":

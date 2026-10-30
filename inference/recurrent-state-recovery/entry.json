@@ -13,7 +13,7 @@
       "Absolute after-token checkpoint semantics and accepted ordinal to physical-node mapping",
       "Single-use atomic partial/zero commit, private sibling hook, cancellation and standalone native example",
       "Generic FP32 CUDA reference verify and device-side accepted-state commit by per-column checkpoints, recompute from saved inputs, or deferred replay at the next verify, selected from a device-held accepted count",
-      "One-launch record of the accepted count into many per-block counts (recurrent-layer-kernels' deferred column scan and convolution)",
+      "One-launch record of the accepted count into many per-block counts (an engine's deferred column scan and convolution)",
       "Two-pass chunked prefill: state-independent T, W, Ub and decayed q.k per chunk in parallel, then a sequential pass of matrix products only"
     ],
     "engine_supplies": [

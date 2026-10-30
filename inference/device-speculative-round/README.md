@@ -299,9 +299,8 @@ rows (the accept kernel takes many; a batched launch lays its rows out at its ow
 K), fusing accept into the verify epilogue, and graph slot reuse across widths.
 
 Keep the `draft` step's kernels recognisable in a kernel trace. Both steps are recorded into the
-round's graphs, so host-side ranges (NVTX) cannot separate them; kernel names can. Launch the
-drafter's matrices through [stored-tile-gemm](../stored-tile-gemm/README.md) plans with
-`role = KernelRole::draft`, give the drafter's own kernels names that contain `draft`, or declare
+round's graphs, so host-side ranges (NVTX) cannot separate them; kernel names can. Give the
+drafter's kernels names that contain `draft` (a separate launch or plan for the drafter's matrices), or declare
 `kernel_work` rules with `"term": "draft"` in the engine's info. Then `crit eval status RESULT
 --kernels kernels.json` splits each round into its verify pass and its draft steps for an engine that
 does not time them itself (`verify_ms`, `draft_ms`), and gives their gaps apart.

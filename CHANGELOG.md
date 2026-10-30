@@ -9,6 +9,126 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-30
+
+### Overview
+
+crit 0.13.0 makes a build's Eval bounded: `crit run ... eval` measures in crit-eval 0.4's stages within a
+45-minute budget, and only the candidate the agent proposes is certified at the run's full context. The wanted
+context defaults to 200,000 tokens. Inference ships techniques, not compute kernels: Kernels lists where kernels
+come from and `crit kernels new` scaffolds a kernel workbench. `crit pull` installs a crit-hub engine and
+`crit serve --engine` serves it without a run. Runs record the placement scenario and companion drafters, and
+engines report the bytes a pass reads from host memory. The Python distributions and the Core SDK share version
+0.13.0; crit depends on crit-eval 0.4.1.
+
+### Added
+
+- `crit pull OWNER/NAME` installs a crit-hub engine and `crit serve --engine OWNER/NAME` serves it, without a run:
+  it reads the card (crit-hub's index.json, or a checkout with `--hub`), checks its requirements against the
+  machine (a crit eval probe result and nvcc), fetches the source at its pinned commit and checks its configuration
+  against the sealed run's, fetches the checkpoint at its pinned revision (or takes `--model`) and checks every
+  file against card.lock.json, runs the card's `build` command and installs the package in an engine store
+  (`PROJECT/engines`) whose records hold no absolute paths. Before, using a crit-hub engine meant replaying the
+  run-record flow by hand to reach `crit serve`. docs/SERVING.md, Installed engines.
+- Recon records the run's placement scenario (`gathered.placement`, from crit-eval's `placement`) when the run names
+  its device: `fits_device`, `sparse_device_host`, `sparse_device_host_disk`, `dense_device_host` or `beyond_host`,
+  where the lookup tables go, and one plain pass's floor per expert source (device, host link, CPU) from the probe's
+  rates. recon.md shows it with the scenario's starting design and asks for a `Placement plan`, which runs with plan
+  rules 3 need written before the first candidate; candidate 1, the proof of concept, is built in that design.
+  AGENTS.md names the scenarios. Before, an overnight Qwen3.8-Flash-Next build streamed every expert over the host
+  link without a cache or drafter (11 tok/s).
+- AGENTS.md has a rule for long jobs: harness-tracked background commands, never a turn without a wake pending, and
+  the next round's CPU work while the GPU is busy. Before, an overnight build sat idle 2.5 hours after its Eval
+  reference finished.
+- Inference entry `lookup-table-rows`: rows of a file-backed embedding or n-gram table read with random-access
+  advice, exact parallel positioned reads and a hot-row cache. Before, a default mapping read 8 MB ahead per row of a
+  51 GB n-gram table (500-700 ms per token of cold rows instead of 2-5 ms).
+- `crit_core.serving.engine_facts` passes `host_bytes_per_pass` (`{"link", "cpu"}`: the bytes of a pass read from host
+  memory) to crit-eval, which prices them at the probe's host rates; AGENTS.md's ceilings price host bytes the same
+  way.
+- host-expert-arithmetic and heterogeneous-expert-dispatch say to plan the CPU's share of misses from the first
+  candidate where host memory reads faster than the host link copies.
+
+- `recon --drafter` records each companion drafter's `weight_bytes` and `pass_bytes` (crit-eval's
+  `companion_drafter_bytes`), and plan rules 2 price a separate drafter's round floor from them where the parent's
+  Eval measured no draft floor: ceil(draft_steps / drafts_per_pass) drafter passes at the bandwidth, the row naming
+  one by `companion` when recon recorded several. Before, a drafter alternative for a checkpoint without draft layers
+  could not rank decode at all (Nanbeige4.3-33B with DFlash2).
+- A run request's `drafters` names companion drafter folders a candidate may load beside the model; `create` keeps
+  their stored weights out of the KV cache when it derives `kv_tokens` from the device (crit-eval's max context), and
+  `hardware_constraints.context` records `companion_drafter_bytes`. Before, the required context filled the device
+  and left a drafter no room (Nanbeige4.3-33B at 86K: 0.09 GiB free with its DFlash2 drafter loaded).
+- `crit kernels new --format nvfp4` scaffolds a gemv or gemm on NVFP4 weights against bf16 activations: the
+  checkpoint's NVFP4 shapes (`--model`), an FP64 reference that decodes E2M1 with its E4M3 group scales and global
+  divisor, and cuBLAS on the weights widened to BF16 once as the yardstick, so `crit eval workbench check|bench`
+  measures an NVFP4 kernel the engine writes. `--starter` stays bf16 and fp8.
+- `drafted` request telemetry: an engine whose draft width varies reports the drafts it made in each decode round
+  beside `accepted`, and `crit serve` passes it on in `crit_telemetry`, so Eval reads each round against its own width.
+
+### Changed
+
+- crit needs crit-eval 0.4.1. `crit run ... eval` measures in crit-eval's stages within a 45-minute budget
+  (`--budget-minutes`, `--stage`), and `--certify` serves the run's `kv_tokens` itself, which the resources check
+  needs: AGENTS.md certifies the candidate the agent proposes. The wanted context defaults to 200,000 tokens (was
+  262,144; `context_tokens` in `settings.toml`).
+- `crit run ... eval` follows crit-eval's protocol crit-eval-v0.3.0: one `crit eval reference` run serves both
+  quality modes (the scores, their spread and, for a checkpoint that declares quantized activations, the
+  as_quantized allowance), and a run in quality mode `as_quantized` fetches the published package when the data lacks
+  the allowance. Before, as_quantized needed a second reference run with its own scores (`reference-as-quantized/`).
+- Kernels' sources name mixed-input GEMMs (CUTLASS, Marlin-style kernels in vLLM and SGLang) for prompts that keep
+  16-bit activations on 4-bit weights, as `preserve` runs do on NVFP4 checkpoints, instead of widening each chunk's
+  weights to BF16 first.
+- New runs check plans with plan rules 4: each candidate has an objective by its number in the run, recorded in the
+  plan's `inputs.objective` and named in the agent request. Candidate 1 is the proof of concept, 2 and 3 are crit
+  rounds (crit's toolkit, each technique measured against its floor and fixed or replaced where it trails), 4 on are
+  critique rounds whose plan names the parent's two weakest terms in `weakest`, with evidence and the levers for
+  each, beside other levers. Plans for candidates 2 to 5 must forecast at least +10% on a p1 KPI. Each plan reviews
+  its parent's plan against the measured outcome (`review`: the cause and evidence of every missed forecast, what
+  each lever delivered, the lesson), and the parent's largest p1 lever, pruned or deferred, is planned again or
+  rejected on a measurement of another kernel structure or a vendor library. Every speed lever names its `provider`
+  (`inference:`, `hub:`, `lib:` or `own`), and the engine's own code carries a measured `yardstick`.
+- A run in quality mode `as_quantized` defaults to a drift budget twice `preserve`'s (perplexity ratio 1.1, mean KLD
+  0.1, p99 KLD 1.0), crit-eval's own for that mode from protocol crit-eval-v0.2.0; `preserve` is unchanged and a
+  request's `quality_budget` still lays over either.
+- Kernels lists where compute kernels come from in [SOURCES.md](kernels/SOURCES.md): the Hugging Face Kernel Hub
+  first, then cuBLASLt, CUTLASS, cuDNN, FlashAttention, FlashInfer, flash-linear-attention, Triton, vLLM/SGLang,
+  ggml, CPU libraries and the ROCm and Apple stacks. AGENTS.md asks for each adopted kernel to be measured against
+  its floor and the best other provider at the same arithmetic.
+- `crit run replay --before` accepts a run's first plan: the run as it stood before any candidate, for testing an
+  agent's first plan.
+
+- `crit kernels new` scaffolds a kernel workbench folder (work/kernels/NAME): the shapes from the checkpoint's own
+  matrices (`--model`), an FP64 reference and a library yardstick for gemv and gemm in bf16 or fp8, a binding with an
+  empty kernel to write, crit-eval's harness, and for other operations the functions to fill in. `--from` starts from
+  an existing kernel's source with its license (a Hub kernel's binding gets its `registration.h`); `--starter` writes a
+  simple portable CUDA kernel instead, allowed from a run's fourth candidate on. crit-eval measures the folder.
+
+### Removed
+
+- Inference no longer ships compute kernels; entries are techniques. Removed entries: stored-tile-gemm,
+  w4a16-projections, gguf-projections, rmsnorm-bf16, flash-prefill-attention, fp8-kv-attention, paged-attention,
+  latent-attention, rotated-kv-quantization, recurrent-layer-kernels and python-bindings (its C ABI wrapped those
+  kernels), with their CUDA tests and the CUDA operator suite. quantized-projections keeps its host codecs (G32
+  integer, row-scaled FP8, NVFP4) without the FP8 CUDA projection; heterogeneous-expert-dispatch keeps its placement
+  planning and Routing reference without the fused router/shared CUDA kernel; batched-reference-engine carries its
+  own paged attention kernels as part of the example engine.
+
+### Fixed
+
+- Native DFlash drafters read `block_size` from `dflash_config` as well as the top level, so `crit run recon
+  --drafter` takes a DFlash2 drafter (which keeps it there beside its taps and mask) instead of refusing it.
+- `crit run plan` under plan rules 2 no longer tells a plan to give a bare limit where it cannot compute an
+  alternative's round floor (rules 2 refuse a bare limit): it says to leave that KPI out of the alternative's limits.
+- A Python engine's device memory returns when it closes: `crit_core.native.PythonEngine.close()` collects the
+  engine's objects and hands torch's cached blocks back. Parts that referred to each other (a drafter and its model)
+  kept the first engine allocated until a later collection, so `crit serve` could not reopen the package at full
+  context in the same host, as Eval's lower-context comparison does.
+- AGENTS.md says the exactness check runs only for a package that declares plain decoding (`chat-plain-v1`).
+- `crit run replay` leaves out a later candidate whose retained source kept file times older than the cutoff
+  while its record did not; before, the replay copied the folder without the record and failed.
+- `crit run build` refuses a recipe with `capabilities: []` before it reserves the build: an empty list kept the
+  adapter's `declared_capabilities` from being asked and packaged a candidate that could not be served.
+
 ## [0.12.0] - 2026-10-27
 
 ### Overview
@@ -1914,7 +2034,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/crit-labs/crit/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/crit-labs/crit/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/crit-labs/crit/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/crit-labs/crit/compare/v0.9.1...v0.10.0

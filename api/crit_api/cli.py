@@ -22,6 +22,10 @@ def parser():
     result = argparse.ArgumentParser(prog="crit serve", description=__doc__)
     result.add_argument("--workspace", type=Path, help="Folder containing the run-* project directories")
     result.add_argument("--models", type=Path, help="JSON catalog of named models from sealed runs (docs/SERVING.md)")
+    result.add_argument("--engine", metavar="OWNER/NAME", help="Serve an engine crit pull installed, such as "
+                        "crit-labs/nvfp4-gemv-int8kv")
+    result.add_argument("--store", type=Path, help="Installed-engine store --engine reads (default: PROJECT/engines, "
+                                                   "where crit pull installs)")
     result.add_argument("--run", help="Run ID (default: the workspace's only run)")
     result.add_argument("--candidate", help="Candidate ID (default: the run's selected candidate)")
     result.add_argument("--host", default="127.0.0.1", help="Address to listen on (default: 127.0.0.1, this machine only)")
@@ -152,11 +156,18 @@ def main(argv=None):
     if args.recover_runtime:
         print(json.dumps(RuntimeOwnership().recover()))
         return 0
-    if args.models:
+    if args.engine:
+        if any((args.models, args.workspace, args.run, args.candidate)):
+            parser().error("--engine replaces --models, --workspace, --run and --candidate")
+        if args.write_launchers:
+            parser().error("--write-launchers writes into a run folder; start an installed engine with crit serve --engine")
+    elif args.store:
+        parser().error("--store goes with --engine")
+    elif args.models:
         if any((args.workspace, args.run, args.candidate, args.model_name)):
             parser().error("--models replaces --workspace, --run, --candidate and --model-name")
     elif args.workspace is None:
-        parser().error("--workspace or --models is required")
+        parser().error("--workspace, --models or --engine is required")
     if not 0 <= args.sse_ping_interval <= 86400:
         parser().error("--sse-ping-interval takes 0 (no pings) to 86400 seconds")
     if args.ssl_keyfile and not args.ssl_certfile:
@@ -174,7 +185,7 @@ def main(argv=None):
             print(path)
         return 0
     from crit_core.machine import engine_lock
-    with engine_lock(f"crit serve {args.run or ''} {args.candidate or ''}".strip()):
+    with engine_lock(f"crit serve {args.engine or args.run or ''} {args.candidate or ''}".strip()):
         return _serve(args, keys, tls)
 
 
@@ -185,9 +196,13 @@ def _serve(args, keys, tls):
                        device_limit=gib(args.resident_vram_gib), timeout=args.timeout,
                        load_timeout=args.load_timeout, verify_model=args.verify_model, max_queue=args.max_queue,
                        queue_timeout=args.queue_timeout, idle_unload=args.idle_unload)
-        engine = (ModelCatalog(args.models, **options) if args.models else
-                  ServedEngine(args.workspace, args.run, args.candidate, **options))
-        print("Loading %s ..." % (args.candidate or "the selected candidate"), file=sys.stderr, flush=True)
+        if args.engine:
+            from .installed import InstalledEngine
+            engine = InstalledEngine(args.store or args.project / "engines", args.engine, **options)
+        else:
+            engine = (ModelCatalog(args.models, **options) if args.models else
+                      ServedEngine(args.workspace, args.run, args.candidate, **options))
+        print("Loading %s ..." % (args.engine or args.candidate or "the selected candidate"), file=sys.stderr, flush=True)
         engine.open()
     except (ValueError, EngineError) as exc:
         print("error: " + str(exc), file=sys.stderr)

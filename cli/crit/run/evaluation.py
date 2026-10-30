@@ -8,8 +8,10 @@ data. When the data holds none yet, the run's model scores the texts first (crit
 candidate is served. The result is retained under the candidate's eval/ folder for checks to reference; it
 publishes no check or benchmark.
 
-Every part runs in one attempt on one loaded engine (the lower-context gate opens its own, at its context). The
-attempt has no fixed process cap, since Eval's work scales with the model and the device: it may run to the
+Every part runs in one attempt on one loaded engine (the lower-context gate opens its own, at its context). Eval
+measures in stages (crit-eval's protocol stages): as far as its budget allows at the candidate's measured rates,
+and the run's kv_tokens itself only with certify, for the candidate that will ship. The attempt has no fixed process
+cap, since Eval's work scales with the model and the device: it may run to the
 segment's deadline, and each request is bounded by the rates the engine measured in it (crit_eval.run.deadline), so a
 hung engine stops the attempt.
 """
@@ -40,9 +42,11 @@ def check_sampling(run, prepared, data, model):
                          "--sampling")
 
 
-def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, seconds=None, label=None):
+def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, seconds=None, label=None, stage=None,
+             certify=False, budget_seconds=None):
     """Reserve, score the data's quality texts on the run's model unless stored, serve the candidate, run Eval on it
-    over the chat API, stop the server and settle. Returns the retained result (path relative to the run, sha256)
+    over the chat API, stop the server and settle. stage, certify and budget_seconds: how far Eval measures
+    (crit_eval.run.runner.run). Returns the retained result (path relative to the run, sha256)
     and its status."""
     from crit_eval import load_json, machine_settings
     from crit_eval.quality.prepare import PREPARED, model_identity, prepared_template
@@ -83,7 +87,8 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
                    quality_mode=quality_mode(run["spec"]["correctness"]),
                    context_tokens=constraints["kv_tokens"], context_basis=basis,
                    vram_headroom_bytes=round(settings.get("vram_headroom_gib", 1.0) * (1 << 30)),
-                   context_reserve_bytes=round(reserve * (1 << 30)) if reserve is not None else None)
+                   context_reserve_bytes=round(reserve * (1 << 30)) if reserve is not None else None,
+                   stage=stage, certify=certify, budget_seconds=budget_seconds)
     out = folder / "eval" / f"{attempt}.json"
     log_path = folder / "logs" / f"eval-{attempt}.log"
     outcome, failure, settled, interrupted = "completed", None, True, None
@@ -161,12 +166,14 @@ def _measure(store, run_id, candidate_id, attempt, deadline_at, model, data, out
                 # Between the reference's layers and texts: scoring stops at the reservation's deadline.
                 if remaining(deadline_at) <= 0:
                     raise Expired("Eval passed its reserved deadline while the reference scored the quality texts")
-            from crit_eval.quality.fixed import STORES
+            from crit_eval.quality.fixed import ALLOWANCE, STORE
             from crit_eval.quality.packages import fetch, source
             mode = options["quality_mode"]
-            if source() is not None and not (data / STORES[mode] / "index.json").is_file():
-                fetch(model, data, source(), log)   # a published package's scores, when the source has them
-            how = score_data(model, data, log, check, quality_mode=mode)
+            # A published package's scores (with the as_quantized allowance beside them), when the source has them.
+            if source() is not None and (not (data / STORE / "index.json").is_file()
+                                         or mode == "as_quantized" and not (data / STORE / ALLOWANCE).is_file()):
+                fetch(model, data, source(), log)
+            how = score_data(model, data, log, check)
             log(f"quality: reference scores of {how['positions']:,} positions {how['method']}"
                 + (f" in {how['seconds']:.0f} s" if how["method"] == "scored" else ""))
         with served.until(deadline_at):

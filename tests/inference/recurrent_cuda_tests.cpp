@@ -208,7 +208,7 @@ void deferred_consumed() {
 }
 
 // The many-count record writes the clamped count into `count` ints of every group,
-// `stride` apart, and nothing else (recurrent-layer-kernels' per-block counts).
+// `stride` apart, and nothing else (a deferred scan's per-block counts).
 void record_many() {
     Fixture f;
     const auto stream = f.backend->stream();

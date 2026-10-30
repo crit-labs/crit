@@ -103,6 +103,12 @@ class BuildTests(run_records.RunFixture, unittest.TestCase):
         self.assertEqual(build(self.store, self.run_id, candidate, recipe, log=lambda m: None)["package"]["capabilities"],
                          ["prefill"])
 
+    def test_an_empty_capabilities_list_is_refused_before_the_build(self):
+        candidate = self.built_candidate()
+        with self.assertRaisesRegex(ValueError, "names no capabilities: leave capabilities out"):
+            build(self.store, self.run_id, candidate, {**self.recipe(), "capabilities": []}, log=lambda m: None)
+        self.assertFalse((self.directory / "candidates" / candidate / "attempts").exists())
+
 
 def gates(**states):
     names = ("coverage", "repeatable", "request_history", "prompt_cache", "quality", "sampling", "capacity",

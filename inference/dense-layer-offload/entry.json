@@ -63,7 +63,7 @@
   "dependencies": [
     "CUDA runtime",
     "host-expert-arithmetic's host_isa (crit_host_isa) for run-time ISA detection",
-    "batched-reference-engine and paged-attention for the synthetic model runner",
+    "batched-reference-engine for the synthetic model runner",
     "Python standard library for the planner model"
   ],
   "symbols": [
@@ -73,7 +73,6 @@
   ],
   "interactions": [
     "batched-reference-engine",
-    "paged-attention",
     "host-expert-arithmetic",
     "heterogeneous-expert-dispatch",
     "host-memory-admission"

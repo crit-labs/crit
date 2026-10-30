@@ -3,8 +3,8 @@
 A tree has N nodes in topological order. Node 0 is the root, the pending token whose successors the round predicts;
 node i > 0 holds a draft token and its parent parents[i] < i. mask[i] has bit j set for every node j on the
 root-to-i path (i included) and depth[i] = popcount(mask[i]) - 1. Verification feeds all N nodes in one target pass
-with an ancestor-only attention mask at RoPE positions frontier + depth[i] (paged-attention and fp8-kv-attention
-take the masks as Decode::tree); prediction[v] is the target's next token after the path to v: its argmax for a
+with an ancestor-only attention mask at RoPE positions frontier + depth[i] (the engine's
+attention kernel takes the masks); prediction[v] is the target's next token after the path to v: its argmax for a
 greedy request, or its own draw at output position outputs + depth[v] for a sampled one (token-sampling's Rows
 with `tree`). The walk starts at the root and moves to the child whose token equals the node's prediction, emitting
 it, until no child matches; that prediction is then emitted as the correction (the bonus at a leaf). Every emitted

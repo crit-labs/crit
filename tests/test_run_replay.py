@@ -81,6 +81,45 @@ class ReplayTests(PlanFixture, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exists: replay into a new folder"):
             self.make()
 
+    def test_a_later_candidates_files_with_older_times_are_left_out_without_its_record(self):
+        # A retained source keeps its files' original times, older than the cutoff, while the candidate's record is not.
+        source = self.directory / "candidates" / "candidate-0002" / "source"
+        old = [p for p in source.rglob("*") if p.is_file()]
+        self.assertTrue(old)
+        for path in old:
+            os.utime(path, (0, 0))
+        self.make()
+        folder = self.out / "replay-1" / self.run_id
+        self.assertEqual(sorted(p.name for p in (folder / "candidates").iterdir()), [self.parent])
+
+    def test_a_replay_before_the_first_plan_is_the_run_before_any_candidate(self):
+        # The recon and work toward the first candidate stay; the first plan, every candidate and every plan draft go.
+        path = self.directory / "plans" / "plan-0001" / "plan.json"
+        value = read_json(path)
+        value["created_at"] = datetime.fromtimestamp(time.time() - 600, timezone.utc).isoformat()
+        os.chmod(path, 0o644)
+        path.write_text(json.dumps(value), encoding="utf-8")
+        early = self.directory / "work" / "recon-notes.txt"
+        early.write_text("read before the first plan", encoding="utf-8")
+        stamp = time.time() - 1200
+        for item in [early, self.directory / "run.json", *(self.directory / "segments").glob("*.json"),
+                     *(self.directory / "events").glob("event-000[12].json")]:
+            os.utime(item, (stamp, stamp))
+        later(*[p for p in (self.directory / "candidates").rglob("*") if p.is_file()])
+        made = replay.make(self.store, self.run_id, None, self.out, before="plan-0001")
+        self.assertEqual((made["at"], made["before"]), (None, "plan-0001"))
+        folder = self.out / "replay-1" / self.run_id
+        self.assertTrue((folder / "work" / "recon-notes.txt").is_file())
+        for left in ("plans/plan-0001", "work/plan-draft.json"):
+            self.assertFalse((folder / left).exists(), left)
+        self.assertEqual(list((folder / "candidates").iterdir()), [])
+        marker = read_json(folder / replay.MARKER)
+        self.assertEqual((marker["at"], marker["result"], marker["result_sha256"]), (None, None, None))
+        brief = " ".join((folder / "replay" / "agent_request.md").read_text(encoding="utf-8").split())
+        self.assertIn(f"Replay of crit run {self.run_id} before plan-0001", brief)
+        self.assertIn("just before its first plan, plan-0001, was recorded", brief)
+        self.assertIn("There is no candidate and no Eval yet", brief)
+
     def test_a_replay_before_a_plan_has_the_work_done_toward_it_but_not_the_plan(self):
         # The agent worked ten minutes after candidate-0001's Eval and recorded plan-0002 just before the later files.
         path = self.directory / "plans" / "plan-0002" / "plan.json"
@@ -111,8 +150,6 @@ class ReplayTests(PlanFixture, unittest.TestCase):
         self.assertFalse((self.root / "at" / "replay-1" / self.run_id / "work" / "tilings.txt").exists())
         with self.assertRaisesRegex(ValueError, "at a candidate .* or before a plan"):
             replay.make(self.store, self.run_id, self.parent, self.root / "both", before="plan-0002")
-        with self.assertRaisesRegex(ValueError, "starts from no candidate's Eval"):
-            replay.make(self.store, self.run_id, None, self.root / "first", before="plan-0001")
 
     def test_a_replay_records_nothing_and_checks_plans_against_the_status_rendered_again(self):
         # Rendered again, decode is the family further from its limit; the stored status had prefill further.

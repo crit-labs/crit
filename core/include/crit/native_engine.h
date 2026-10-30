@@ -28,7 +28,8 @@ struct NativeEngine {
     // "draft_width", "bytes_per_pass", "draft_bytes_per_step" or "replay".
     std::function<std::string()> info;
     // Optional: a JSON object merged into the result of each crit_engine_generate, called after the request
-    // finished on the calling thread (for example "accepted" drafts per round, "verify_ms", "draft_ms", and
+    // finished on the calling thread (for example "accepted" drafts per round, "drafted" per round when the draft
+    // width varies, "verify_ms", "draft_ms", and
     // "rounds", the target passes after prefill, when it differs from the length of "accepted").
     std::function<std::string()> request;
     // Explicit opt-in: all factory callbacks and engine state permit concurrent callers.

@@ -88,10 +88,11 @@ class _CommandStop:
 def telemetry(value, request):
     """Rates use the engine's timed phase token counts, never string lengths. Optional decode_rounds, the target
     passes after prefill (a speculative engine's verify rounds), gives tokens_per_round: output tokens per round.
-    Optional accepted (drafts accepted in each of those rounds), verify_ms and draft_ms (device time in verify passes
-    and draft steps) pass through for Eval's headroom."""
+    Optional accepted (drafts accepted in each of those rounds), drafted (drafts made in each, for an engine whose
+    draft width varies), verify_ms and draft_ms (device time in verify passes and draft steps) pass through for Eval's
+    headroom."""
     keys(value, {"prompt_tokens", "output_tokens", "prefill_tokens", "prefill_ms",
-                 "decode_tokens", "decode_ms", "ttft_ms", "missing"}, {"decode_rounds", "accepted", "verify_ms", "draft_ms"})
+                 "decode_tokens", "decode_ms", "ttft_ms", "missing"}, {"decode_rounds", "accepted", "drafted", "verify_ms", "draft_ms"})
     prompt = number(value["prompt_tokens"], "prompt tokens", 1, request["limits"]["kv_tokens"], integer=True)
     output = number(value["output_tokens"], "output tokens", 1, request["limits"]["max_output_tokens"], integer=True)
     if prompt + output > request["limits"]["kv_tokens"]:
@@ -128,6 +129,11 @@ def telemetry(value, request):
         if (value.get("decode_rounds") is None or not isinstance(accepted, list) or len(accepted) != value["decode_rounds"]
                 or not all(type(a) is int and 0 <= a < output for a in accepted)):
             raise ValueError("Accepted drafts are one count per decode round")
+    if "drafted" in value:
+        drafted = value["drafted"]
+        if (not isinstance(value.get("accepted"), list) or not isinstance(drafted, list) or len(drafted) != len(value["accepted"])
+                or not all(type(d) is int and a <= d for a, d in zip(value["accepted"], drafted))):
+            raise ValueError("Drafts made are one count per decode round, at least the drafts accepted")
     for key in ("verify_ms", "draft_ms"):
         if key in value:
             number(value[key], key.replace("_ms", " milliseconds"), 0, request["limits"]["timeout_seconds"] * 1000)
@@ -341,7 +347,8 @@ class ServedEngine:
     def __init__(self, workspace, run_id=None, candidate_id=None, project=ROOT, runtime_directory=None,
                  host_limit=None, device_limit=None, timeout=600, load_timeout=None, verify_model=False, attempt=None,
                  kv_tokens=None, max_queue=None, queue_timeout=None, idle_unload=None):
-        self.store = RunStore(workspace, project)
+        # No workspace: a subclass that serves engines from elsewhere (crit_api.installed) verifies its own.
+        self.store = RunStore(workspace, project) if workspace is not None else None
         self.run_id = run_id or single_run(self.store)
         self.requested_candidate = candidate_id
         if attempt is not None and candidate_id is None:
@@ -462,13 +469,16 @@ class ServedEngine:
     def package_sha256(self):
         return self.spec()["package_sha256"]
 
+    def selected(self):
+        """The candidate served when none is requested: the run's selected candidate, or None."""
+        return self.store.get(self.run_id)["state"]["selected_candidate_id"]
+
     def open(self, stop=None):
         """Verify the default candidate, take runtime ownership and load the engine."""
         with self.lock:
             if self.closed or self._stopping.is_set():
                 raise ValueError("Engine is closed")
-            view = self.store.get(self.run_id)
-            self.default = self.requested_candidate or view["state"]["selected_candidate_id"]
+            self.default = self.requested_candidate or self.selected()
             if self.default is None:
                 raise ValueError("The run has no selected candidate; choose one with --candidate")
             spec = self.spec()

@@ -80,8 +80,8 @@ TOKENIZE_CAPABILITY = "chat-tokenize-v1"
 # What a resident engine reports for Eval (crit serve's /v1/models engine_facts): whether it speculates and can decode
 # plainly, its draft width, the bytes one model pass and one draft step read, and the activation format of its
 # quantized matrices' prompt GEMMs (crit-eval's prefill ceilings by activation format).
-ENGINE_FACTS = ("speculative", "plain", "draft_width", "bytes_per_pass", "draft_bytes_per_step", "draft_ms",
-                "kv_bytes_per_token", "prompt_activations")
+ENGINE_FACTS = ("speculative", "plain", "draft_width", "bytes_per_pass", "host_bytes_per_pass", "draft_bytes_per_step",
+                "draft_ms", "kv_bytes_per_token", "prompt_activations")
 # The activation formats crit-eval prices a quantized matrix group's prompt GEMMs at (its ceiling.ACTIVATIONS).
 PROMPT_ACTIVATIONS = ("bf16", "fp16_acc", "fp8", "stored")
 TOP_LOGPROBS = 20  # the most alternatives per token a request asks for (OpenAI's top_logprobs range)
@@ -184,8 +184,8 @@ def capabilities(text, sampling=(), *, stream=True, config=True, tool_format=Non
 
 def engine_facts(engine):
     """The ENGINE_FACTS a resident engine holds in its `facts` (crit_core.native's engines hold their info there):
-    booleans for speculative and plain, non-negative finite numbers for the rest; plain only on a speculative engine
-    that sets `plain`. None when it reports none."""
+    booleans for speculative and plain, {"link", "cpu"} byte counts for host_bytes_per_pass, non-negative finite
+    numbers for the rest; plain only on a speculative engine that sets `plain`. None when it reports none."""
     import math
     found = getattr(engine, "facts", None)
     if not isinstance(found, dict):
@@ -199,6 +199,13 @@ def engine_facts(engine):
         elif key in ("speculative", "plain"):
             if isinstance(value, bool):
                 out[key] = value
+        elif key == "host_bytes_per_pass":
+            # The part of bytes_per_pass read from host memory: {"link": copied over the host link, "cpu": computed
+            # by the CPU}, which crit-eval prices at the probe's host rates.
+            if isinstance(value, dict) and value and set(value) <= {"link", "cpu"} and all(
+                    isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0
+                    for v in value.values()):
+                out[key] = dict(value)
         elif isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
             out[key] = value
     if "plain" in out:
@@ -742,6 +749,8 @@ class ResidentChat:
             telemetry["decode_rounds"] = min(int(timing["rounds"]), n)
             if isinstance(timing.get("accepted"), list) and len(timing["accepted"]) == telemetry["decode_rounds"]:
                 telemetry["accepted"] = [int(a) for a in timing["accepted"]]
+                if isinstance(timing.get("drafted"), list) and len(timing["drafted"]) == len(telemetry["accepted"]):
+                    telemetry["drafted"] = [int(d) for d in timing["drafted"]]
         if n > 1:
             telemetry.update({key: float(timing[key]) for key in ("verify_ms", "draft_ms")
                               if isinstance(timing.get(key), (int, float)) and not isinstance(timing[key], bool)})

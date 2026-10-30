@@ -152,6 +152,33 @@ class ReconTests(unittest.TestCase):
         self.assertFalse((directory / "inputs.json").exists())
         self.assertIn("case_manifests", freeze({"messages": messages, "chat_template_kwargs": {"enable_thinking": True}}))
 
+    def test_recon_records_the_placement_scenario_and_asks_for_its_plan(self):
+        # A run created with kv_tokens names no device: no scenario, and the placement plan is not required.
+        value = self.store.recon(self.run_id)
+        self.assertIsNone(value["gathered"]["placement"]["scenario"])
+        self.assertIn("names no device file", (self.directory / recon.RECON_MD).read_text(encoding="utf-8"))
+        self.assertNotIn(recon.PLACEMENT_PLAN, recon.unfinished(self.directory))
+        found = {"scenario": "sparse_device_host", "number": 2, "meaning": "routed experts beyond device memory fit host "
+                 "memory", "tokens": 8192, "bytes": {"resident": 6e9, "experts": 70e9, "experts_on_device": 14e9,
+                 "experts_off_device": 56e9, "lookup_tables": 51e9, "host_memory_for_weights": 80e9},
+                 "lookup_tables": {"bytes": 51e9, "tier": "disk"}, "active_expert_bytes_per_token": 1.6e9,
+                 "missed_expert_bytes_per_token": 1.3e9, "rates_gbs": {"device": 1400, "link": 27, "host_memory_read": 45},
+                 "plain_pass_floor_ms": {"device": 5.4, "link": 48.1, "cpu": 28.9},
+                 "plain_pass_ceiling_tps": {"device": 185.2, "link": 20.8, "cpu": 34.6}}
+        (self.directory / recon.RECON_MD).unlink()
+        with patch.object(recon, "placement", return_value=found):
+            value = self.store.recon(self.run_id, force=True)
+        self.assertEqual(value["gathered"]["placement"]["scenario"], "sparse_device_host")
+        notes = (self.directory / recon.RECON_MD).read_text(encoding="utf-8")
+        self.assertIn("placement sparse_device_host (2)", notes)
+        self.assertIn("misses computed on the CPU", notes)
+        self.assertIn("device expert cache", notes)
+        self.assertIn("no read-ahead", notes)
+        self.assertIn(recon.PLACEMENT_PLAN, recon.unfinished(self.directory))
+        notes = notes.replace(f"## {recon.PLACEMENT_PLAN}\n\nTODO.", f"## {recon.PLACEMENT_PLAN}\n\nCache and MTP.")
+        (self.directory / recon.RECON_MD).write_text(notes, encoding="utf-8")
+        self.assertNotIn(recon.PLACEMENT_PLAN, recon.unfinished(self.directory))
+
     def test_candidates_freeze_the_recon_block(self):
         self.store.recon(self.run_id)
         path = self.directory / recon.RECON_JSON

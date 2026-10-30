@@ -1,6 +1,6 @@
 {
   "kind": "crit.native-core.contract-documentation",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "interface": "core/include/crit/core.h",
   "cuda_interface": "core/include/crit/cuda.h",
   "component_interfaces": [

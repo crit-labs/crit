@@ -7,8 +7,9 @@ come whole; work/ leaves out build products (binaries and files over MAX_WORK_BY
 candidates' projections are rebuilt from the copied records. The Eval status of every copied candidate is rendered again with today's crit-eval
 (replay/status/), and plan checks in the replay judge the parent's Eval by it, so a replay shows what an agent decides
 from today's reports at that point of the run. `--before PLAN` replays the run as it stood just before that plan was
-recorded instead: with the work its agent did after the parent's Eval toward it. Drafts of the next plan (work/ JSON
-with a plan's fields, written after the parent's Eval) are always left out.
+recorded instead: with the work its agent did after the parent's Eval toward it; before the run's first plan, the run
+as it stood then (recon and any work toward the first candidate), with no Eval yet. Drafts of the next plan (work/ JSON
+with a plan's fields, written after the parent's Eval or, from the start, at all) are always left out.
 
 A replay builds nothing: crit refuses every command that records or changes a record in it (refuse). Its agent reads
 replay/agent_request.md, writes the plan it would record next to replay/plan.json, checks it with `plan --check`, and
@@ -153,24 +154,32 @@ def _render(root, statuses, at):
         (out / f"{candidate_id}.txt").write_text(render(status) + "\n", encoding="utf-8", newline="\n")
         statuses[relative] = {"status": f"{FOLDER}/status/{candidate_id}.json", "text": f"{FOLDER}/status/{candidate_id}.txt",
                               "baseline": baseline.relative_to(root).as_posix() if baseline else None}
-    if not any(path.endswith(f"{at}.txt") for entry in statuses.values() for path in [entry.get("text") or ""]):
+    if at is not None and not any(path.endswith(f"{at}.txt") for entry in statuses.values()
+                                  for path in [entry.get("text") or ""]):
         raise ValueError(f"{at}'s Eval status could not be rendered again: "
                          + "; ".join(e["error"] for e in statuses.values() if "error" in e))
 
 
 def brief(run_id, at, limit, root, project, segment_id, statuses, before=None):
-    status = next(entry["text"] for entry in statuses.values() if (entry.get("text") or "").endswith(f"{at}.txt"))
     command = f"crit run --project {project} --root {root.parent} --id {run_id}"
-    point = (f"just before {before} was recorded ({limit.isoformat()}), after {at}'s Eval: with the work done since that "
-             "Eval toward the next plan, but no draft of the plan itself" if before
-             else f"when {at}'s Eval finished ({limit.isoformat()})")
     title = f"before {before}" if before else f"at {at}"
+    if at is None:
+        reports = ("There is no candidate and no Eval yet: the run's records, work/recon.md and whatever else work/ held "
+                   "then are all there is. crit and crit-eval are today's versions.")
+        point = f"just before its first plan, {before}, was recorded ({limit.isoformat()})"
+    else:
+        status = next(entry["text"] for entry in statuses.values() if (entry.get("text") or "").endswith(f"{at}.txt"))
+        reports = ("crit and crit-eval are today's versions: the Eval status of every copied candidate is rendered again "
+                   f"with\nthem in {FOLDER}/status/ ({at}: {status}), and crit's plan checks here judge the parent's Eval "
+                   "by those statuses.")
+        point = (f"just before {before} was recorded ({limit.isoformat()}), after {at}'s Eval: with the work done since "
+                 "that Eval toward the next plan, but no draft of the plan itself" if before
+                 else f"when {at}'s Eval finished ({limit.isoformat()})")
     return f"""# Replay of crit run {run_id} {title}
 
 This folder ({root}) is crit run {run_id} as it stood {point}: its records, its
 candidates and their Eval results, and the files of work/ written by then (without build products). Nothing written
-later is here. crit and crit-eval are today's versions: the Eval status of every copied candidate is rendered again with
-them in {FOLDER}/status/ ({at}: {status}), and crit's plan checks here judge the parent's Eval by those statuses.
+later is here. {reports}
 
 You are the run's agent at that point. Follow AGENTS.md (in {project}) and the run's brief
 (segments/{segment_id}/agent_request.md) as you would from here, up to recording the next plan, and stop
@@ -201,18 +210,24 @@ def make(store, run_id, at, out, count=1, before=None):
         from .plans import load
         plan = load(source, load_run(source), ident(before, "plan"))
         at = plan["parent_candidate_id"]
-        if at is None or not (plan.get("inputs") or {}).get("eval"):
-            raise ValueError(f"{before} starts from no candidate's Eval: replay a plan that has a parent")
-    at = ident(at, "candidate")
-    if not (source / "candidates" / at).is_dir():
-        raise ValueError(f"{at} is not a candidate of {run_id}")
+        if at is not None and not (plan.get("inputs") or {}).get("eval"):
+            raise ValueError(f"{before} starts from no Eval of {at}: replay at {at} instead")
     if not 1 <= count <= 16:
         raise ValueError("A replay is made 1 to 16 times")
-    limit, result = cutoff(source, at)
-    drafts_after = limit - MARGIN
-    if before is not None:
-        # The plan froze the parent's Eval it was checked against; the replay ends where its record was made.
-        limit, result = timestamp(plan["created_at"], "plan creation"), plan["inputs"]["eval"]["path"]
+    if at is None:
+        # The run's first plan: the run as it stood when it was recorded, with no Eval to render; every plan draft
+        # in work/ stays out.
+        limit, result = timestamp(plan["created_at"], "plan creation"), None
+        drafts_after = datetime.fromtimestamp(0, timezone.utc)
+    else:
+        at = ident(at, "candidate")
+        if not (source / "candidates" / at).is_dir():
+            raise ValueError(f"{at} is not a candidate of {run_id}")
+        limit, result = cutoff(source, at)
+        drafts_after = limit - MARGIN
+        if before is not None:
+            # The plan froze the parent's Eval it was checked against; the replay ends where its record was made.
+            limit, result = timestamp(plan["created_at"], "plan creation"), plan["inputs"]["eval"]["path"]
     out = Path(out).expanduser().absolute()
     made = []
     for number in range(1, count + 1):
@@ -231,11 +246,15 @@ def make(store, run_id, at, out, count=1, before=None):
         _render(root, statuses, at)
         write_json(root / MARKER, {"schema_version": 1, "record_kind": "replay", "run_id": run_id, "at": at,
                                    "before": before, "cutoff": limit.isoformat(), "result": result,
-                                   "result_sha256": file_sha(root / result), "created_at": now(),
+                                   "result_sha256": file_sha(root / result) if result else None, "created_at": now(),
                                    "copied_files": copied, "left_out_files": left, "statuses": statuses})
         # Projections from the copied records alone, as the run's coordinator had them at the cutoff; a sealed
         # candidate's is the one its seal names.
         for folder in sorted((root / "candidates").glob("candidate-*")):
+            if not (folder / "candidate.json").is_file():
+                # A later candidate's files that kept older times (its retained source) without its record.
+                shutil.rmtree(folder)
+                continue
             if not (folder / "seal.json").is_file():
                 replica._refresh(root, folder.name)
         replica._state(root, current_segment_id=segment_id, phase="awaiting_agent")

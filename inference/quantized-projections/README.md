@@ -2,7 +2,7 @@
 
 Represent weights with signed integer codes and one FP32 scale per group, then project
 using exactly that representation. The entry defines one complete small codec, plus a
-native E4M3FN/BF16 row codec with a CUDA small-batch projection, a fixed-G32 C++
+native E4M3FN/BF16 row codec with a double-accumulating oracle, a fixed-G32 C++
 integer codec and an NVFP4 reference codec. Encoded model formats are interchangeable
 only when their exact word, scale and layout semantics match.
 
@@ -72,7 +72,6 @@ every token, so decode cost is per weight, not per weight and token.
 | --- | --- |
 | [implementation.py](code/implementation.py) | `QuantizedRows`, `quantize`, `dequantize`, `project` (optional `backend=` hook) |
 | [row_fp8.h](code/row_fp8.h) | BF16/E4M3FN conversion, row validation, double-accumulating oracle |
-| [fp8_cuda.h](code/fp8_cuda.h) | `project_cuda`: SIMT projection for 1-8 tokens on SM80+, one warp per output row, FP32 accumulate, no tensor cores |
 | [grouped_int.h](code/grouped_int.h) | G32 integer codec and CPU projection |
 | [nvfp4.py](code/nvfp4.py), [nvfp4.h](code/nvfp4.h) | NVFP4 codec; FP64 oracle in Python, fixed-order FP32 in C++ |
 
@@ -85,18 +84,7 @@ layout and return one value per row; the reference returns its result unchecked.
 native kernel can decode groups while accumulating; if it also quantizes activations,
 it must define their blocks, scales and rounding.
 
-For `project_cuda`, upload validated `RowWeights`, pass BF16 input `[T,K]`, an
-exclusive FP32 output `[T,N]` and the stream. `DeviceRows` carries code and scale spans
-plus `N,K`. The launch checks extents, alignment and aliases without reading device
-data or synchronizing; retain every allocation through stream completion, even after a
-launch error. Build with the actual GPU's architecture:
-
-```text
-cmake -S inference/quantized-projections/code -B build/fp8 -DCMAKE_CUDA_ARCHITECTURES=120
-cmake --build build/fp8 --config Release
-```
-
-Native FP4 tensor-core providers belong in [Kernels](../../kernels/README.md), qualified
+Device kernels for these formats (FP8 and NVFP4 GEMMs and GEMVs) come from the providers in [Kernels](../../kernels/README.md), qualified
 against the NVFP4 reference.
 
 ## Worked example
@@ -128,8 +116,7 @@ Group width, tiling, placement and fusion are engine choices.
 [Artifact loading](../artifact-loading/README.md) provides the exact encoded bytes and
 [expert dispatch](../heterogeneous-expert-dispatch/README.md) chooses their source;
 neither may silently change the representation or apply a routing weight twice. A fused
-[normalization](../rmsnorm-bf16/README.md) and projection must make intermediate
-rounding explicit.
+normalization and projection must make intermediate rounding explicit.
 
 **Calibrated activations (W4A4 prompts).** ModelOpt NVFP4 checkpoints carry a static
 `input_scale` per linear layer. For prompt GEMMs, quantizing activations to NVFP4 with that
@@ -159,7 +146,4 @@ E4M3 code, ties, saturation, zero blocks, an error bound and batched projection 
 an FP64 dot. [Host fixtures](../../tests/test_techniques.py) cover nibble decoding, odd
 extents, zero groups, invalid representations and hook dispatch.
 [Native host fixtures](../../tests/inference/inference_io_codec_tests.cpp) cover every
-finite FP8 code, signed zeros, scales and invalid encodings. The optional
-[GPU fixtures](../../tests/inference/cuda/kernels.cpp) compare 320 projection shapes,
-including tails, odd widths, every batch size and graph replay, against the double
-oracle. None of these qualify a converted model or establish a speedup.
+finite FP8 code, signed zeros, scales and invalid encodings. None of these qualify a converted model or establish a speedup.

@@ -15,6 +15,9 @@ def main(argv=None):
     if arguments and arguments[0] == "serve":
         from crit_api.cli import main as serve_main
         return serve_main(arguments[1:])
+    if arguments and arguments[0] == "pull":
+        from .pull.cli import main as pull_main
+        return pull_main(arguments[1:])
     if arguments and arguments[0] == "kernels":
         from crit_kernels import main as kernels_main
         return kernels_main(arguments[1:])
@@ -36,6 +39,7 @@ def main(argv=None):
     subs.add_parser("kernels", help="Inspect kernel applicability and retain verified dependency bytes")
     subs.add_parser("models", help="Transform model weights (PTQ) and record how; use crit models --help")
     subs.add_parser("serve", help="Serve a sealed candidate as an OpenAI-compatible API; use crit serve --help")
+    subs.add_parser("pull", help="Install a crit-hub engine for crit serve --engine; use crit pull --help")
     subs.add_parser("run", help="Publish retained run/candidate records; use crit run --help")
     subs.add_parser("eval", help="Run the common speed, quality and exactness suite (crit Eval); use crit eval --help")
     sub = subs.add_parser("inference", help="Query or check the inference techniques")

@@ -50,7 +50,7 @@ the source out at the pinned commit and make it the first candidate, with `"line
 in the proposal, measured before any change: that is the baseline every later Eval compares against.
 
 Every candidate serves Eval's [max context](https://github.com/crit-labs/crit-eval/blob/main/docs/CONTEXT.md): the context the user wants
-(`context_tokens` in `settings.toml`, default 262,144), capped by the model's positions and
+(`context_tokens` in `settings.toml`, default 200,000), capped by the model's positions and
 the KV cache that fits. Probe the device (`crit eval probe --out device.json`, or `device`
 in `settings.toml`) and `create` freezes it as `kv_tokens`, with why it is that size in
 `hardware_constraints.context` and recon.md's Required context section; set `kv_tokens` or
@@ -142,7 +142,8 @@ Run these from the checkout or add `--project CRIT_ROOT`. Each reserves, runs an
 attempt. `build` copies the retained source to `work/builds/CANDIDATE_ID-ATTEMPT`, runs the recipe's
 literal `build.command` there to the reservation's deadline (log `logs/build-ATTEMPT.log`), settles the
 attempt and packages the folder: every file the build added or changed is bound as a dependency, and
-capabilities the recipe leaves out come from the adapter's `declared_capabilities(model_path)`; `--drop`
+capabilities the recipe leaves out come from the adapter's `declared_capabilities(model_path)` (an empty
+list is refused, since a package that declares nothing cannot be served); `--drop`
 removes intermediates first. `check --from-eval` records the arithmetic, functional and resources check
 of every case from the candidate's newest Eval result ([Run records](RUN_RECORDS.md#check)).
 A build or check crit does not run itself is reserved, settled and recorded by hand:
@@ -211,6 +212,16 @@ scoring and replay).
 Every candidate of a model uses the same prepared data, kept in the run workspace. `--only`
 runs some parts, `--baseline` shows KPI changes against an earlier result.
 
+Eval measures in [stages](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md#stages) within a
+wall-clock budget (45 minutes by default, `--budget-minutes`): stage 1 (each speed case once, quality on the
+short texts, the request history, the memory the required context needs and decode projected to it) on every
+candidate, then the highest stage whose remaining requests fit the budget at the candidate's measured rates: stage 2
+adds the repetitions, the follow-up turns, the long quality text and the long-context curve's first point; stage 3
+the sampled suite, exactness, the follow-up turns again and the lower context. No stage serves the required context
+itself: `--certify`, for the candidate you will propose, runs stage 3 whatever the budget and one request at the
+run's `kv_tokens`, which the resources check needs. `--stage` caps how far a run goes, `--stage full` runs every
+part as before stages.
+
 Use the reports crit-eval gives beyond the KPIs ([Measurements](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#limits)):
 
 - **Prefill by term:** `crit eval status RESULT --kernels kernels.json` puts each prefill term (matmul per
@@ -241,7 +252,7 @@ interface (`info`, `generate`, `score`, `close`) and passes the function opening
 library path ([Python engines](../core/src/runtime/README.md#python-engines)). Make the trace readable: class the engine's kernels in its
 info's `kernel_work` (`{"match": NAME_PART, "term": matmul|attention|recurrent|other|draft, "format":
 nvfp4|fp8|bf16}`, or `crit eval kernels --work RULES` without engine changes) and keep the draft step's
-kernels distinctly named (stored-tile-gemm's `KernelRole::draft` plans, or `draft` in the name), so
+kernels distinctly named (`draft` in the name), so
 `crit eval status RESULT --kernels kernels.json` joins each prefill term to its floor and splits a round
 into verify and draft. Trace every case the prefill score takes (status names the ones a trace lacks),
 and read each matmul's achieved TFLOPS against the rate of the prompt activations it already uses: that

@@ -38,10 +38,12 @@ import array
 import ctypes
 from collections import namedtuple
 import copy
+import gc
 import threading
 import time
 from contextlib import contextmanager, nullcontext
 import json
+import sys
 from pathlib import Path
 
 from crit_core.serving import SAMPLING, TOP_LOGPROBS, ResidentChat, ScoreRows
@@ -326,6 +328,13 @@ class PythonEngine(_Requests):
             if self.engine is not None:
                 self.engine.close()
                 self.engine = None
+                # A Python engine's device memory returns only once its objects are freed. Parts that refer to each
+                # other (a drafter and its model) wait for a collection, and crit serve reopens the package in the
+                # same host (Eval's lower-context comparison), so collect now and hand torch's cached blocks back.
+                gc.collect()
+                torch = sys.modules.get("torch")
+                if torch is not None and torch.cuda.is_initialized():
+                    torch.cuda.empty_cache()
 
 
 def open_engine(engine, configuration):
@@ -399,7 +408,7 @@ class EvalEngine:
 
     def _result(self, tokens, result):
         out = {"tokens": tokens, "rounds": decode_rounds(tokens, result, self.speculative)}
-        out.update({key: result[key] for key in ("accepted", "verify_ms", "draft_ms") if key in result})
+        out.update({key: result[key] for key in ("accepted", "drafted", "verify_ms", "draft_ms") if key in result})
         return {**out, **engine_times(result)}
 
     def generate(self, prompt_ids, max_new_tokens, on_tokens):
@@ -523,7 +532,7 @@ class ResidentEngine(ResidentChat):
                "rounds": decode_rounds(tokens, result, bool(self.facts.get("speculative")) and not plain)}
         if not plain:
             # The engine's request facts describe drafting, which plain decoding does none of.
-            out.update({key: result[key] for key in ("accepted", "verify_ms", "draft_ms") if key in result})
+            out.update({key: result[key] for key in ("accepted", "drafted", "verify_ms", "draft_ms") if key in result})
         return tokens, out
 
     def score_tokens(self, ids, continuation, top_k, cancelled, prompt_rows):

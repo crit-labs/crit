@@ -8,6 +8,7 @@ the checkout) and drives every part of crit. Each subcommand prints its own opti
 | `crit run` | Keeps a run's records: create, recon, plan, candidate, package, serve, measure, eval, seal, select, stop, cost | [Run records](../docs/RUN_RECORDS.md) |
 | `crit eval` | The common suite: probe the device, pin outputs, score quality references, run, compare, A/B, profile kernels | [Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md) |
 | `crit serve` | Serves a sealed candidate over the OpenAI, Anthropic, Responses and Ollama APIs | [API](../api/README.md) |
+| `crit pull` | Installs a crit-hub engine (requirements, pinned source, build, checked checkpoint) for `crit serve --engine` | [Installed engines](../docs/SERVING.md#installed-engines) |
 | `crit kernels` | Finds, inspects and retains external kernels for the target hardware | [Kernels](../kernels/README.md) |
 | `crit models` | Quantizes weights, distills draft heads and records each transform | [Models](../models/README.md) |
 | `crit inference` | Lists, searches, shows and checks the Inference techniques | [Inference](../inference/README.md) |
@@ -41,7 +42,9 @@ one, strict record schemas ([records.py](crit/run/records.py)), candidate plans 
 ([capture.py](crit/run/capture.py)), builds under a build attempt ([build.py](crit/run/build.py)), checks from Eval
 results and the standard serving checks ([checks.py](crit/run/checks.py)), Eval and measurement
 through `crit serve` ([evaluation.py](crit/run/evaluation.py), [measure.py](crit/run/measure.py)) and build
-cost from the agent's transcripts ([cost.py](crit/run/cost.py)). [process/](crit/process/) owns the engine
+cost from the agent's transcripts ([cost.py](crit/run/cost.py)). [pull/](crit/pull/) installs crit-hub engines:
+the pipeline ([cli.py](crit/pull/cli.py)), the requirements check ([requirements.py](crit/pull/requirements.py))
+and the engine store `crit serve --engine` reads ([store.py](crit/pull/store.py)). [process/](crit/process/) owns the engine
 processes it launches: a per-user ownership record, a guardian that stops children when their parent dies,
 and process trees that Windows owns before they run,
 so a crashed run's engine processes are retired, not left holding the GPU.

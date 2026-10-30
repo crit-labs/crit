@@ -20,6 +20,10 @@
 !/api/
 !/.github/
 
+# Local copies of the case-study runs (case-studies/README.md): ignored by the allowlist above, and named here so
+# they stay out if it changes.
+/case-studies/
+
 # Python bytecode
 __pycache__/
 *.py[co]

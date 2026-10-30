@@ -4,6 +4,7 @@ from dataclasses import replace
 import hashlib
 import json
 import math
+import os
 import importlib.util
 from pathlib import Path
 import re
@@ -49,6 +50,51 @@ class Receipt:
 
     def done(self):
         return self.finished
+
+
+class LookupTableRowTests(unittest.TestCase):
+    def table(self, folder, rows=16, row_bytes=8, offset=4, **options):
+        m = load("lookup-table-rows", "table_rows.py")
+        path = Path(folder) / "table.bin"
+        path.write_bytes(b"H" * offset + b"".join(bytes([r]) * row_bytes for r in range(rows)))
+        return m, m.RowTable(m.TableRegion(str(path), offset, rows, row_bytes), **options)
+
+    def test_rows_come_back_in_request_order_and_duplicates_are_read_once(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _, table = self.table(folder, workers=4)
+            self.assertEqual(table.gather([3, 0, 3, 15]), [b"\x03" * 8, b"\x00" * 8, b"\x03" * 8, b"\x0f" * 8])
+            self.assertEqual((table.reads, table.bytes_read, table.hits), (3, 24, 0))
+            self.assertEqual(table.gather([]), [])
+            with self.assertRaises(IndexError):
+                table.gather([16])
+            if hasattr(os, "posix_fadvise"):
+                self.assertEqual(table.advice, "fadvise_random")
+            table.close()
+
+    def test_hot_rows_are_cached_least_recently_used_first_out(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _, table = self.table(folder, workers=1, cache_rows=2)
+            table.gather([1, 2])
+            table.gather([1])          # row 1 is now the most recent
+            table.gather([3])          # evicts row 2
+            self.assertEqual((table.reads, table.hits), (3, 1))
+            table.gather([1, 2])
+            self.assertEqual((table.reads, table.hits), (4, 2))
+            table.close()
+
+    def test_a_short_file_and_short_reads_are_refused(self):
+        with tempfile.TemporaryDirectory() as folder:
+            m, table = self.table(folder)
+            table.close()
+            with self.assertRaisesRegex(ValueError, "fewer bytes"):
+                m.RowTable(m.TableRegion(str(Path(folder) / "table.bin"), 4, 17, 8))
+            with self.assertRaises(ValueError):
+                m.RowTable(m.TableRegion(str(Path(folder) / "table.bin"), 4, 16, 8), workers=0)
+            _, table = self.table(folder, workers=1)
+            # A row past the file's end (the file changed under the table) reads short.
+            with self.assertRaisesRegex(OSError, "short read"):
+                table._read(99)
+            table.close()
 
 
 class ExpertExecutionTests(unittest.TestCase):
@@ -668,47 +714,6 @@ class TechniqueTests(unittest.TestCase):
         self.assertTrue(waiting.poll())
         self.assertEqual(waiting.owners, [])
 
-    def test_normalization_formula_modes_and_invalid_contracts(self):
-        m = load("rmsnorm-bf16", "reference.py")
-        self.assertEqual(m.normalize([[0, 0]], [1, 1], 1), ((0, 0),))
-        plain = m.normalize([[1, 1]], [2, 2], 1)[0]
-        offset = m.normalize([[1, 1]], [1, 1], 1, mode="unit_offset")[0]
-        self.assertEqual(plain, offset)
-        self.assertEqual(m.normalize([[1, 1]], [1, 1], 1, mode="gated", gate=[[0, 0]]), ((0, 0),))
-        with self.assertRaises(ValueError):
-            m.normalize([[1]], [1], 0)
-        with self.assertRaises(ValueError):
-            m.normalize([[1]], [1], 1, mode="gated")
-
-    def test_normalization_rounding_orders(self):
-        m = load("rmsnorm-bf16", "reference.py")
-        self.assertEqual([m.bf16(v) for v in (1 + 2**-8, 1 + 3 * 2**-8, 2**-130 + 2**-140, 3.4e38)],
-                         [1.0, 1 + 2**-6, 2**-130, float("inf")])
-        # x * r = 1.3887 for x = 3: once, x * r * 1.5 = 2.0831 -> 2.078125; Llama-style,
-        # bf16(x * r) = 1.390625 and 1.390625 * 1.5 = 2.0859375 ties to even -> 2.09375.
-        single = m.normalize([[1, 2, 3]], [1.5] * 3, 1e-6, rounding="single")[0]
-        first = m.normalize([[1, 2, 3]], [1.5] * 3, 1e-6, rounding="normalize_first")[0]
-        self.assertEqual(single, (0.6953125, 1.390625, 2.078125))
-        self.assertEqual(first, (0.6953125, 1.390625, 2.09375))
-        self.assertEqual(m.normalize([[1, 2, 3]], [0.5] * 3, 1e-6, mode="unit_offset", rounding="normalize_first"), (first,))
-        unrounded = m.normalize([[1, 2, 3]], [1.5] * 3, 1e-6)[0]
-        self.assertEqual(tuple(m.bf16(v) for v in unrounded), single)
-        with self.assertRaises(ValueError):
-            m.normalize([[1]], [1], 1, rounding="llama")
-
-    def test_split_partials_fold_in_fixed_order(self):
-        m = load("rmsnorm-bf16", "reference.py")
-        residual, partials = [[1e16, 1.0]], [[[1.0, 2.0]], [[-1e16, 3.0]]]
-        updated, normalized = m.fold_and_normalize(residual, partials, [1, 1], 1e-6)
-        # (1e16 + 1) - 1e16 rounds to 0 in this fixed order; another order gives 1.
-        self.assertEqual(updated, ((0.0, 6.0),))
-        self.assertEqual(normalized, m.normalize(updated, [1, 1], 1e-6))
-        self.assertEqual(m.fold_partials([[2.0]], []), ((2.0,),))
-        with self.assertRaises(ValueError):
-            m.fold_partials([[1.0, 2.0]], [[[1.0]]])
-
-
-
 class ChunkedPrefillTests(unittest.TestCase):
     def test_two_pass_chunks_equal_the_token_by_token_recurrence(self):
         import random
@@ -994,47 +999,6 @@ class Nvfp4CodecTests(unittest.TestCase):
                 self.assertAlmostEqual(y[t][n], math.fsum(a * b for a, b in zip(w.row(n), x)), places=9)
         with self.assertRaises(ValueError):
             m.project(w, [[0.0] * 31])
-
-
-class RotatedKvTests(unittest.TestCase):
-    def test_rotation_identities_and_outlier_fixture(self):
-        m = load("rotated-kv-quantization", "rotation.py")
-        s = m.signs(32, 3)
-        self.assertEqual(s, m.signs(32, 3))
-        self.assertTrue(all(v in (-1, 1) for v in s))
-        rng = __import__("random").Random(2)
-        x = [rng.gauss(0, 1) for _ in range(32)]
-        y = [rng.gauss(0, 1) for _ in range(32)]
-        self.assertLess(max(abs(a - b) for a, b in zip(m.fwht(m.fwht(x)), x)), 1e-12)
-        self.assertAlmostEqual(math.fsum(a * b for a, b in zip(m.rotate(x, s), m.rotate(y, s))), math.fsum(a * b for a, b in zip(x, y)))
-        codes, scales = m.quantize(x, 4)
-        self.assertTrue(all(-7 <= c <= 7 for c in codes))
-        self.assertLessEqual(max(abs(a - b) for a, b in zip(m.dequantize(codes, scales), x)), scales[0] / 2 + 1e-12)
-        keys = [[rng.gauss(0, 1) * (25 if j == 3 else 1) for j in range(32)] for _ in range(12)]
-        q = [rng.gauss(0, 0.1) for _ in range(32)]
-        exact = m.attention(q, keys, keys)
-        error = lambda out: sum((a - b) ** 2 for a, b in zip(out, exact))
-        self.assertLess(error(m.compressed_attention(q, keys, keys, s)), error(m.compressed_attention(q, keys, keys)))
-        for bad in (lambda: m.signs(24, 1), lambda: m.fwht([1.0] * 3), lambda: m.quantize([1.0] * 32, 6),
-                    lambda: m.quantize([1.0] * 20), lambda: m.rotate(x, s[:16])):
-            with self.assertRaises(ValueError):
-                bad()
-
-    def test_rotation_can_increase_quantization_error(self):
-        m = load("rotated-kv-quantization", "rotation.py")
-        dim = 128
-        s = m.signs(dim, 0)
-        for values in ([7.0, 1.0] + [0.0] * (dim - 2), [1.0] * dim):
-            with self.subTest(values=values[:3]):
-                # With one KV row, attention is exactly the stored value row.
-                q = [0.125] * dim
-                plain = m.compressed_attention(q, [values], [values], bits=4)
-                rotated = m.compressed_attention(q, [values], [values], s, bits=4)
-                self.assertEqual(plain, values)
-                mse = math.fsum((a - b) ** 2 for a, b in zip(rotated, values)) / dim
-                self.assertGreater(mse, 1e-6)
-        sparse = [7.0, 1.0] + [0.0] * (dim - 2)
-        self.assertLess(max(map(abs, m.rotate(sparse, s))), max(map(abs, sparse)))
 
 
 class DeviceExpertCacheTests(unittest.TestCase):

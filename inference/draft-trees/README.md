@@ -40,9 +40,8 @@ as -inf, and a candidate scoring -inf is never kept, so a row of NaN from the dr
 drafts nothing instead of an out-of-range token.
 
 **Verify.** One target pass over the `N` nodes at KV slots `frontier + i` and RoPE
-positions `frontier + depth[i]`, with the masks as attention trees (`Decode::tree` in
-[paged-attention](../paged-attention/README.md) and
-[fp8-kv-attention](../fp8-kv-attention/README.md)). Each node's prediction is the target's
+positions `frontier + depth[i]`, with the masks as attention trees (a decode attention kernel that takes a per-row
+ancestor mask). Each node's prediction is the target's
 argmax, or for a sampled request its own draw at output position `outputs + depth[i]`:
 [token-sampling](../token-sampling/README.md)'s `enqueue_sample` with `Rows::tree`, which
 also stages the path's tokens for penalties.

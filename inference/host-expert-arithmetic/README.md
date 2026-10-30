@@ -10,7 +10,11 @@ hook for checkpoint-specific scale encodings.
 ## When to use it
 
 Use it when [measured dispatch](../heterogeneous-expert-dispatch/README.md) puts part of an expert-routed
-step's misses on the CPU, and the output must not depend on that split. The split varies with cache state,
+step's misses on the CPU, and the output must not depend on that split. Measure that share from the first
+candidate of a model whose experts do not fit the device (recon's `sparse_device_host` scenario) whenever host
+memory reads faster than the host link copies (`crit eval probe`: `host_memory_gbs.read` above the pinned
+`host_to_device_gbs`), as it does on many desktop machines: recon's placement then prices misses computed on the
+CPU below misses copied over the link, so the CPU is a primary source of misses there, not a later refinement. The split varies with cache state,
 host load and request history, so greedy output stops repeating if host and device round differently. One
 engine saw decision forks from mixing CPU W4A8 with device W4A4.
 

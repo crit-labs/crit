@@ -90,7 +90,33 @@ class RunSettingsTest(unittest.TestCase):
         limits = self.limits(output)
         self.assertEqual((limits["kv_tokens"], limits["context"]["bound"]), (65536, "model"))
 
-    def test_the_wanted_context_defaults_to_262144_and_settings_context_tokens_changes_it(self):
+    def test_a_companion_drafter_is_kept_out_of_the_kv_cache(self):
+        model, drafter = self.project / "model", self.project / "drafter"
+        for folder, name, size in ((model, "lm_head.weight", 8192), (drafter, "layers.0.fc.weight", 2**20)):
+            folder.mkdir()
+            header = json.dumps({name: {"dtype": "BF16", "shape": [size // 2], "data_offsets": [0, size]}}).encode()
+            (folder / "model.safetensors").write_bytes(len(header).to_bytes(8, "little") + header + bytes(size))
+        (model / "config.json").write_text(json.dumps({"num_hidden_layers": 2, "num_attention_heads": 2, "num_key_value_heads": 1,
+                                                       "head_dim": 8, "max_position_embeddings": 1_048_576}), encoding="utf-8")
+        # 4 MiB for a 32-byte-per-token cache after a 1 GiB headroom and a 3 GiB reserve: 131,072 tokens
+        free = 4 * GIB + 4 * 2**20 + 8192
+        (self.project / "device.json").write_text(json.dumps({"device": "fixture gpu", "memory_free_bytes": free}),
+                                                  encoding="utf-8")
+        (self.project / "settings.toml").write_text('device = "device.json"\n', encoding="utf-8")
+        request = {key: value for key, value in json.loads(self.request.read_text(encoding="utf-8")).items() if key != "kv_tokens"}
+        found = {}
+        for drafters in ([], [str(drafter)]):
+            self.request.write_text(json.dumps(request | {"model_path": str(model), "drafters": drafters, "vram_headroom_gib": 1,
+                                                       "context_reserve_gib": 3}), encoding="utf-8")
+            code, output = self.create()
+            self.assertEqual(code, 0)
+            found[len(drafters)] = self.limits(output)
+        self.assertEqual(found[0]["context"]["bound"], "device")
+        self.assertEqual((found[0]["kv_tokens"], found[1]["kv_tokens"]), (131072, 98304))
+        self.assertEqual(found[1]["context"]["companion_drafter_bytes"], 2**20)
+        self.assertNotIn("companion_drafter_bytes", found[0]["context"])
+
+    def test_the_wanted_context_defaults_to_200000_and_settings_context_tokens_changes_it(self):
         model = self.project / "model"
         model.mkdir()
         header = json.dumps({"lm_head.weight": {"dtype": "BF16", "shape": [64, 64], "data_offsets": [0, 8192]}}).encode()
@@ -101,7 +127,7 @@ class RunSettingsTest(unittest.TestCase):
                                                   encoding="utf-8")
         request = {key: value for key, value in json.loads(self.request.read_text(encoding="utf-8")).items() if key != "kv_tokens"}
         self.request.write_text(json.dumps(request | {"model_path": str(model)}), encoding="utf-8")
-        for text, tokens in (('device = "device.json"\n', 262144), ('device = "device.json"\ncontext_tokens = 32768\n', 32768)):
+        for text, tokens in (('device = "device.json"\n', 200000), ('device = "device.json"\ncontext_tokens = 32768\n', 32768)):
             (self.project / "settings.toml").write_text(text, encoding="utf-8")
             code, output = self.create()
             self.assertEqual(code, 0)

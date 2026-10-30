@@ -110,11 +110,10 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
         (self.eval_data / "prepared.json").write_text(json.dumps(prepared))
         self.scored = []
 
-    def score(self, model, data, log, check=lambda: None, quality_mode="preserve"):
-        """The reference scores the texts as the engine does: the quality gate passes."""
+    def score(self, model, data, log, check=lambda: None):
+        """The reference scores the texts as the engine does: the quality gate passes (one run for every quality mode)."""
         check()
         self.scored.append((model, Path(data)))
-        self.modes = getattr(self, "modes", []) + [quality_mode]
         write_store(Path(data))
         return {"method": "scored", "positions": 1, "seconds": 0.0}
 
@@ -139,7 +138,7 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
         self.assertIsNotNone(lower["cases"]["chat"]["decode_tps"])
         self.assertTrue(result["context"]["points"])  # the long-context curve, served at the run's context
         self.assertEqual(result["requirements"]["exactness"], "reported")
-        self.assertEqual((result["requirements"]["quality_mode"], self.modes), ("preserve", ["preserve"]))
+        self.assertEqual(result["requirements"]["quality_mode"], "preserve")
         chat_case = result["speed"]["cases"]["chat"]
         self.assertEqual(chat_case["tokens"], prepare.token_ids(Text(), ("tides rise and fall " * 20)[:12]))
         # The reference scored the data's texts first; the candidate then scored them through crit serve.
@@ -155,11 +154,11 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
         log = attempt["logs"][0]
         self.assertEqual(log["path"], f"candidates/{self.candidate_id}/logs/eval-attempt-0001.log")
         logged = (self.directory / log["path"]).read_text()
-        # The run's context is built again in the resident host that served the lower context.
+        # Eval's stage 3 opens the lower context after the run's, in the same resident host.
         self.assertEqual([line for line in logged.splitlines() if line.startswith(("crit serve: loading",
                                                                                    "crit serve: reloading"))],
-                         [f"crit serve: loading {self.candidate_id} at 2,048 tokens of context",
-                          f"crit serve: reloading {self.candidate_id} at 8,192 tokens of context in the same host"])
+                         [f"crit serve: loading {self.candidate_id} at 8,192 tokens of context",
+                          f"crit serve: reloading {self.candidate_id} at 2,048 tokens of context in the same host"])
         self.assertEqual(result["context"]["engine_max_context"], 8192)
         self.assertEqual(logged.count("crit serve: stopped"), 1)
         self.assertFalse((self.root / "runtime/owner.json").exists())
@@ -194,7 +193,7 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
         # The reference checks the deadline between its layers and texts; past it, the attempt times out.
         layers = []
 
-        def score(model, data, log, check, quality_mode="preserve"):
+        def score(model, data, log, check):
             with patch.object(evaluation, "remaining", lambda deadline: 10 - len(layers)):
                 while len(layers) < 100:
                     check()

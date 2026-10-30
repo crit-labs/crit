@@ -58,7 +58,8 @@ def limit_causes(*families):
 
 def lever(lever_id="graphs", changes=None, group=None):
     return {"id": lever_id, "technique": "free text", "description": "What the lever builds",
-            "changes": changes if changes is not None else {"decode": {"change": 0.3, "source": "estimate"}}, "group": group, "confidence": "medium"}
+            "changes": changes if changes is not None else {"decode": {"change": 0.3, "source": "estimate"}}, "group": group, "confidence": "medium",
+            "provider": "lib:fixture"}
 
 
 def strategy():
@@ -680,6 +681,32 @@ class PlanRecordTests(PlanFixture, unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "gives a bare limit: in plan rules 2"):
                     self.store.plan(self.run_id, plan(parent, strategy=given,
                                                       estimated_limits={"decode": {"limit": 75.0, "derivation": "x"}}))
+        # tokens_per_round without the floor's facts: the refusal names the way left, not the bare limit refused above
+        with self.assertRaisesRegex(ValueError, "leave decode out of strategy.alternative.limits"):
+            self.store.plan(self.run_id, plan(parent, strategy=self.mtp(3.5, 3, "new"),
+                                              estimated_limits={"decode": {"limit": 75.0, "derivation": "x"}}))
+
+    def test_rules_2_price_a_companion_drafter_from_recon(self):
+        # A plain parent of a checkpoint without draft layers: Eval measured no draft floor, so a separate drafter's
+        # round floor comes from the drafter recon recorded (recon --drafter), one pass for a whole block of drafts.
+        parent = self.first()["candidate_id"]
+        result = headroom(tokens_per_round=(1.0, 1.0), decode_tps=62.2, bytes_per_pass=19.26e9, bandwidth_gbs=1437.7)
+        self.evaluated(parent, limitless_decode(status(decode=62.2, prefill=1340.0)), **result)
+        with self.assertRaisesRegex(ValueError, "record the drafter with recon"):
+            self.store.plan(self.run_id, plan(parent, strategy=self.mtp(2.0, 7, "new")))
+        recon = self.directory / "work" / "recon.json"
+        recon.parent.mkdir(parents=True, exist_ok=True)
+        recon.write_text(json.dumps({"drafters": [{"path": "/models/dflash2", "kind": "block", "drafts_per_pass": 7,
+                                                   "pass_bytes": 4.35e9}]}), encoding="utf-8")
+        entry = self.store.plan(self.run_id, plan(parent, strategy=self.mtp(2.0, 7, "new")))["inputs"]["alternative_limits"]["decode"]
+        # 2 tokens over 19.26 GB + one 4.35 GB drafter pass at 1,437.7 GB/s: ~121.8 tok/s
+        self.assertAlmostEqual(entry["limit"], 2.0 * 1000 / ((19.26e9 + 4.35e9) / 1437.7e6), places=3)
+        self.assertEqual(entry["computed_by"], "crit")
+        self.assertIn("recon companion drafter /models/dflash2", entry["inputs"]["draft_floor_ms"])
+        with self.assertRaisesRegex(ValueError, "companion names no drafter"):
+            given = self.mtp(2.0, 7, "new")
+            given["alternative"]["limits"]["decode"]["companion"] = "/models/other"
+            self.store.plan(self.run_id, plan(parent, strategy=given))
 
     def test_the_cleanroom_claims_meet_their_measured_acceptance(self):
         # Per case acceptance rates of cleanroom candidates 0027-0029 (Eval's acceptance-bound rates, 4 decimals): at
@@ -831,9 +858,9 @@ class PlanRecordTests(PlanFixture, unittest.TestCase):
 
     def test_plan_rules_need_computed_limits(self):
         spec = copy.deepcopy(self.run["spec"])
-        for broken in ({**spec, "plan_rules": 4}, {key: value for key, value in spec.items() if key != "plan_limits"}):
+        for broken in ({**spec, "plan_rules": 5}, {key: value for key, value in spec.items() if key != "plan_limits"}):
             with self.subTest(broken=broken.get("plan_rules")):
-                with self.assertRaisesRegex(ValueError, "plan_rules is 2 or 3 when present"):
+                with self.assertRaisesRegex(ValueError, "plan_rules is 2, 3 or 4 when present"):
                     validate_spec(broken)
 
     def test_without_the_round_floors_facts_the_plan_gives_the_alternatives_ceiling(self):
@@ -1003,6 +1030,128 @@ class PlanRules3Tests(PlanFixture, unittest.TestCase):
         self.evaluated(parent, value)
         with self.assertRaisesRegex(ValueError, "the engine declares no prompt_activations"):
             self.store.plan(self.run_id, with_fp8(quality("fp8", 1.1)))
+
+class PlanRules4Tests(PlanFixture, unittest.TestCase):
+    """Plan rules 4, the default of new runs: an objective per candidate, critique rounds naming the parent's two
+    weakest terms, and a +10% floor on p1 for candidates 2 to 5."""
+    plan_rules = 4
+
+    def test_new_runs_check_plans_with_rules_4(self):
+        from crit.run import records
+        self.assertEqual(records.NEW_RUN_PLAN_RULES, 4)
+        self.assertEqual(self.run["spec"]["plan_rules"], 4)
+
+    def next_candidate(self, parent, **updates):
+        recorded = self.store.plan(self.run_id, plan(parent, **updates))
+        candidate = self.candidate(parent_candidate_id=parent, plan_id=recorded["plan_id"])["candidate_id"]
+        self.evaluated(candidate, status())
+        return recorded, candidate
+
+    def evidence(self, name):
+        path = self.directory / "work" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+        return f"work/{name}"
+
+    def test_each_plan_records_its_candidates_objective(self):
+        first = self.store.plan(self.run_id, plan(levers=[], forecast=None))
+        self.assertEqual(first["inputs"]["objective"]["name"], "proof_of_concept")
+        self.assertEqual(first["inputs"]["objective"]["candidate"], 1)
+        parent = self.candidate(plan_id=first["plan_id"])["candidate_id"]
+        self.evaluated(parent, status())
+        second, parent = self.next_candidate(parent)
+        self.assertEqual((second["inputs"]["objective"]["name"], second["inputs"]["objective"]["min_gain"]),
+                         ("crit_round", 0.1))
+        third, parent = self.next_candidate(parent)
+        self.assertEqual(third["inputs"]["objective"]["candidate"], 3)
+        self.assertEqual(third["inputs"]["objective"]["name"], "crit_round")
+
+    def test_candidates_2_to_5_forecast_at_least_ten_percent_on_p1(self):
+        parent = self.first()["candidate_id"]
+        # Prefill at 25% of its limit is p1: +5% on it is refused however much decode gains.
+        small = plan(parent, forecast={**plan()["forecast"], "decode": {"low": 120.0, "expected": 160.0, "high": 180.0},
+                                       "prefill": {"low": 1000.0, "expected": 1050.0, "high": 1100.0}},
+                     forecast_justification="decode first")
+        with self.assertRaisesRegex(ValueError, "Candidate 2 forecasts \\+5.0% on p1 \\(prefill\\): candidates 2 to 5 "
+                                                "are planned for at least \\+10%"):
+            self.store.plan(self.run_id, small)
+        enough = plan(parent, forecast={**plan()["forecast"], "decode": {"low": 100.0, "expected": 105.0, "high": 110.0},
+                                        "prefill": {"low": 1050.0, "expected": 1100.0, "high": 1200.0}})
+        self.assertEqual(self.store.plan(self.run_id, enough)["inputs"]["objective"]["candidate"], 2)
+
+    def test_a_critique_round_names_the_parents_two_weakest_terms_and_other_levers(self):
+        parent = self.first()["candidate_id"]
+        for _ in range(2):
+            _, parent = self.next_candidate(parent)
+        trace = self.evidence("kernels-c3.json")
+        weakest = [{"kpi": "prefill", "term": "gated delta 927 ms vs 13 ms floor", "evidence": trace,
+                    "levers": ["chunked-prefill"]},
+                   {"kpi": "decode", "term": "verify pass 16.5 vs 13.4 ms floor", "evidence": trace, "levers": ["graphs"]}]
+        with self.assertRaisesRegex(ValueError, "Candidate 4 is a critique round: name the parent's two weakest terms"):
+            self.store.plan(self.run_id, plan(parent))
+        with self.assertRaisesRegex(ValueError, "add other levers beside the ones for its two weakest terms"):
+            self.store.plan(self.run_id, plan(parent, weakest=weakest))
+        levers = plan()["levers"] + [lever("fused-norms", {"decode": {"change": 0.1, "source": "estimate"}})]
+        with self.assertRaisesRegex(ValueError, "graphs is no speed lever of this plan that improves prefill"):
+            self.store.plan(self.run_id, plan(parent, levers=levers, weakest=[weakest[0], {**weakest[1], "kpi": "prefill"}]))
+        with self.assertRaisesRegex(ValueError, "is no file of this run"):
+            self.store.plan(self.run_id, plan(parent, levers=levers, weakest=[weakest[0], {**weakest[1], "evidence": "work/x"}]))
+        recorded = self.store.plan(self.run_id, plan(parent, levers=levers, weakest=weakest))
+        self.assertEqual(recorded["inputs"]["objective"]["name"], "critique_round")
+        self.assertEqual(recorded["weakest"], weakest)
+
+
+    def test_every_speed_lever_names_its_provider_and_own_code_its_yardstick(self):
+        parent = self.first()["candidate_id"]
+        bare = plan(parent)
+        bare["levers"] = [{k: v for k, v in row.items() if k != "provider"} if row["id"] == "graphs" else row
+                          for row in bare["levers"]]
+        with self.assertRaisesRegex(ValueError, "graphs names no provider: inference:, hub:, lib:, own"):
+            self.store.plan(self.run_id, bare)
+        with self.assertRaisesRegex(ValueError, "provider starts with inference:, hub:, lib:, own"):
+            self.store.plan(self.run_id, plan(parent, levers=[{**lever(), "provider": "somewhere"}, plan()["levers"][1]]))
+        own = {**lever(), "provider": "own: a warp-specialized NVFP4 GEMM"}
+        with self.assertRaisesRegex(ValueError, "is the engine's own code: give its yardstick"):
+            self.store.plan(self.run_id, plan(parent, levers=[own, plan()["levers"][1]]))
+        measured = {"evidence": self.evidence("cublaslt-fp4.json"), "detail": "cuBLASLt NVFP4 GEMM 1,050 TFLOPS on our shapes"}
+        recorded = self.store.plan(self.run_id, plan(parent, levers=[{**own, "yardstick": measured}, plan()["levers"][1]]))
+        self.assertEqual(recorded["levers"][0]["yardstick"], measured)
+        with self.assertRaisesRegex(ValueError, "is no file of this run"):
+            self.store.plan(self.run_id, plan(parent, levers=[{**own, "yardstick": {**measured, "evidence": "work/x"}},
+                                                              plan()["levers"][1]]))
+
+    def test_the_next_plan_reviews_the_parents_plan_against_its_measured_eval(self):
+        parent = self.first()["candidate_id"]
+        planned = self.store.plan(self.run_id, plan(parent))
+        child = self.candidate(parent_candidate_id=parent, plan_id=planned["plan_id"],
+                               lever_fates={"graphs": {"fate": "built"},
+                                            "chunked-prefill": {"fate": "deferred", "detail": "tiling variants slower"}})
+        child = child["candidate_id"]
+        # Decode 130 lands inside its forecast (110-150); prefill 1050 misses its low of 1100.
+        attempt = self.evaluated(child, status(decode=130.0, prefill=1050.0))
+        self.store.plan_outcome(self.run_id, child, attempt)
+        trace = self.evidence("kernels-c2.json")
+        with self.assertRaisesRegex(ValueError, f"Review {planned['plan_id']} first: .*\\(prefill\\)"):
+            self.store.plan(self.run_id, plan(child))
+        review = {"plan_id": planned["plan_id"], "lesson": "the prompt GEMM is the term to rewrite",
+                  "kpis": {"prefill": {"cause": "the GEMM stayed at 270 TFLOPS", "evidence": trace}},
+                  "levers": {"graphs": {"result": "decode +30%"}, "chunked-prefill": {"result": "deferred"}}}
+        with self.assertRaisesRegex(ValueError, "prefill missed its forecast"):
+            self.store.plan(self.run_id, plan(child, review={**review, "kpis": {}}))
+        with self.assertRaisesRegex(ValueError, "say what graphs of"):
+            self.store.plan(self.run_id, plan(child, review={**review, "levers": {"chunked-prefill": {"result": "-"}}}))
+        # chunked-prefill was the plan's largest p1 lever and was deferred: planned again, or rejected on a measurement
+        # of another structure.
+        without = [lever(), lever("attention", {"prefill": {"change": 0.3, "source": "estimate"}})]
+        with self.assertRaisesRegex(ValueError, "chunked-prefill was deferred, the largest p1 lever"):
+            self.store.plan(self.run_id, plan(child, levers=without, review=review))
+        rejected = {**review, "levers": {**review["levers"], "chunked-prefill": {
+            "result": "deferred", "evidence": trace, "structure": "cuBLASLt FP8 GEMM on the same shapes"}}}
+        recorded = self.store.plan(self.run_id, plan(child, levers=without, review=rejected))
+        self.assertEqual(recorded["inputs"]["review"]["missed"], ["prefill"])
+        self.assertEqual(recorded["inputs"]["review"]["largest_p1_lever"], "chunked-prefill")
+        self.assertEqual(self.store.plan(self.run_id, plan(child, review=review))["review"], review)
+
 
 class ReconPlanRules3Tests(PlanFixture, unittest.TestCase):
     """Plan rules 3 with a model folder: recon's plans are written before the first candidate."""

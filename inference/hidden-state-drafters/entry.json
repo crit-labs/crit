@@ -3,14 +3,14 @@
   "category": "speculation",
   "summary": "Published drafters that read the target's hidden states (EAGLE-3) or draft a block per pass (DFlash, DSpark): one Core description of every published format with one tap convention, and device glue for catch-up, block input, draft-vocabulary mapping and confidence truncation in the device speculative round",
   "implementation_status": "native_source",
-  "implementation_scope": "Core's crit_core.model.drafters reads speculators (eagle3, peagle, dflash, dflash2, dspark), native EAGLE-3, native DFlash and native DSpark configs into one Drafter with taps as residual-stream indices. A Python reference and CUDA reference kernels supply EAGLE-3 catch-up columns from the round's packed result and settled count, block-drafter input, d2t mapping, draft-law scatter to the target vocabulary and confidence truncation. flash-prefill-attention's causal = false runs a block drafter's non-causal block. Drafter arithmetic and the target's tap writes are engine supplied.",
+  "implementation_scope": "Core's crit_core.model.drafters reads speculators (eagle3, peagle, dflash, dflash2, dspark), native EAGLE-3, native DFlash and native DSpark configs into one Drafter with taps as residual-stream indices. A Python reference and CUDA reference kernels supply EAGLE-3 catch-up columns from the round's packed result and settled count, block-drafter input, d2t mapping, draft-law scatter to the target vocabulary and confidence truncation. An engine attention kernel with causal = false runs a block drafter's non-causal block. Drafter arithmetic and the target's tap writes are engine supplied.",
   "agent_guidance": {
     "use_when": "A drafter trained for the target is published (speculators, EAGLE-3, DFlash or DSpark checkpoints) and the target has no built-in draft head or its head accepts less",
     "avoid_when": "No published drafter matches the target (crit never trains one), the drafter needs another model family's state, or the measured tap writes and drafter passes cost more than the tokens they add",
     "provides": [
       "One Drafter description from every published config format, with taps as residual-stream indices and EAGLE-3's default taps",
       "EAGLE-3 catch-up columns (taps of column c with the c-th emitted token) over a fixed width from the device's settled count",
-      "Block-drafter input [anchor, mask...] at frontier positions, and non-causal block attention through flash-prefill-attention",
+      "Block-drafter input [anchor, mask...] at frontier positions, and non-causal block attention (an engine-supplied attention kernel with causal = false)",
       "Draft-vocabulary to target mapping through d2t, and draft-law scatter for rejection sampling",
       "Confidence truncation that stops a round at the first unlikely draft without a narrower graph"
     ],
@@ -78,7 +78,6 @@
     "mtp-decode",
     "token-sampling",
     "draft-vocabulary-subset",
-    "flash-prefill-attention",
     "draft-trees"
   ],
   "techniques": [

@@ -187,52 +187,6 @@ class PartitionedAttentionTests(unittest.TestCase):
         self.assertEqual(p.output, (2.,))
 
 
-class Fp8KvReferenceTests(unittest.TestCase):
-    def test_codes_round_trip_and_the_largest_element_maps_to_448(self):
-        m = load("fp8-kv-attention", "reference.py")
-        for code in range(256):
-            value = m.decode(code)
-            if not math.isnan(value) and value != 0.0:
-                self.assertEqual(m.decode(m.encode(value)), value)
-        self.assertEqual(m.encode(1000.0), m.encode(448.0))  # saturates
-        codes, scale = m.quantize([0.5, -3.0, 1.25])
-        self.assertAlmostEqual(scale, 3.0 / 448.0)
-        self.assertEqual(m.decode(codes[1]) * scale, -3.0)
-
-    def test_dequantized_values_stay_within_e4m3_precision(self):
-        m, rng = load("fp8-kv-attention", "reference.py"), random.Random(5)
-        vector = [rng.gauss(0.0, 1.0) for _ in range(256)]
-        codes, scale = m.quantize(vector)
-        for x, y in zip(vector, m.dequantize(codes, scale)):
-            self.assertLessEqual(abs(x - y), abs(x) / 15 + scale * 0.002)
-        self.assertEqual(m.quantize([0.0, 0.0])[1], 1.0)
-
-
-class PagedAttentionReferenceTests(unittest.TestCase):
-    def test_split_key_combine_equals_direct_softmax_over_paged_rows(self):
-        m, rng = load("paged-attention", "reference.py"), random.Random(9)
-        page_tokens, dim = 8, 4
-        storage = [([rng.gauss(0, 1) for _ in range(dim)], [rng.gauss(0, 1) for _ in range(dim)]) for _ in range(512)]
-        table = list(range(63, -1, -1))  # pages in reverse order
-        queries = [[rng.gauss(0, 1) for _ in range(dim)] for _ in range(2)]
-        for blocks in (1, 2, 5):
-            got = m.attend(storage, page_tokens, table, 400, queries, 0.5, blocks)
-            for i, q in enumerate(queries):
-                position = 400 - 2 + i
-                rows = [storage[m.physical_row(table, page_tokens, j)] for j in range(position + 1)]
-                scores = [0.5 * sum(a * b for a, b in zip(q, key)) for key, _ in rows]
-                top = max(scores)
-                weights = [math.exp(s - top) for s in scores]
-                want = [sum(w * value[d] for w, (_, value) in zip(weights, rows)) / sum(weights) for d in range(dim)]
-                for x, y in zip(got[i], want):
-                    self.assertAlmostEqual(x, y, places=12)
-
-    def test_queries_need_their_own_keys(self):
-        m = load("paged-attention", "reference.py")
-        with self.assertRaises(ValueError):
-            m.attend([([1.0], [1.0])] * 4, 4, [0], 1, [[1.0], [1.0]], 1.0)
-
-
 class BatchedEngineReferenceTests(unittest.TestCase):
     def test_split_plan_ignores_rows_and_covers_k(self):
         m = load("batched-reference-engine", "reference.py")
@@ -259,36 +213,6 @@ class GgufBlockReferenceTests(unittest.TestCase):
                "Q4_K": "f0c481aeb5d28f121f3c2a9debd69aed8a87478857898010cd185a0ce64e8fc0",
                "Q5_K": "8572635116b72c2c501bcc25e82c2273e5d54cfb76d91072a1b7bc1538e5feda",
                "Q6_K": "1517224025493bd0dee5259d7a4018aaad62949ea072dfc18cba6fe638824d9b"}
-
-    def test_decoded_blocks_equal_gguf_py(self):
-        import hashlib
-        import importlib.util
-        import struct
-        m = load("gguf-projections", "gguf_blocks.py")
-        reference = None
-        if importlib.util.find_spec("gguf") and importlib.util.find_spec("numpy"):
-            import numpy
-            from gguf import GGMLQuantizationType, quants
-            reference = (numpy, GGMLQuantizationType, quants)
-        for kind, digest in self.DIGESTS.items():
-            data = m.test_blocks(kind, 6, 0x5eed + len(kind))
-            values = m.dequantize(kind, data)
-            self.assertEqual(hashlib.sha256(struct.pack(f"<{len(values)}f", *values)).hexdigest(), digest, kind)
-            if reference:
-                numpy, types, quants = reference
-                size = m.FORMATS[kind][1]
-                expected = quants.dequantize(numpy.frombuffer(data, dtype=numpy.uint8).reshape(-1, size), getattr(types, kind))
-                self.assertEqual(expected.astype(numpy.float32).ravel().tobytes(), struct.pack(f"<{len(values)}f", *values), kind)
-
-    def test_block_bounds_and_projection(self):
-        m = load("gguf-projections", "gguf_blocks.py")
-        with self.assertRaises(ValueError):
-            m.dequantize("Q4_K", bytes(143))
-        data = m.test_blocks("Q8_0", 2, 7)
-        w = m.dequantize("Q8_0", data)
-        x = [0.5] * 32
-        self.assertEqual(m.project("Q8_0", data, 2, x), [sum(v * 0.5 for v in w[:32]), sum(v * 0.5 for v in w[32:])])
-
 
 class DenseOffloadPlannerTests(unittest.TestCase):
     def test_candidates_rank_by_prediction_and_respect_the_budget(self):
