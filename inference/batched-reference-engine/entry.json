@@ -1,7 +1,7 @@
 {
   "id": "batched-reference-engine",
   "category": "execution",
-  "summary": "A complete batched serving engine for a synthetic transformer: a Core ConcurrentModel with mixed batches whose steps run every request's rows through one GEMM per weight, StateCache pages with prefix reuse, paged-attention kernels, batch-invariant arithmetic and a native engine library served concurrently by crit serve",
+  "summary": "A complete batched serving engine for a synthetic transformer: a Core ConcurrentModel with mixed batches whose steps run every request's rows through one GEMM per weight, StateCache pages with prefix reuse, its own paged attention kernels, batch-invariant arithmetic and a native engine library served concurrently by crit serve",
   "implementation_status": "native_source",
   "implementation_scope": "CUDA and C++ source: synthetic decoder layers (RMSNorm, fused QKV with split-half rotary embedding, grouped-query paged attention, SiLU MLP, LM head) with seeded weights; a BF16 tensor-core GEMM with a K split fixed per weight shape and device and an ordered split reduction; row-local norm, rotary, SiLU and argmax kernels; a ConcurrentModel with execute() over mixed decode and prompt rows, StateCache prefix attach and reuse reporting, page-reserving admission, reuse hints, host sampling through Core's Sampler and device greedy argmax; make_engine() for a Core Engine; a native engine library with concurrent_requests; a throughput-versus-concurrency tool; a host model of the step layout, split plan and admission. A real model's weights, tokenizer, layer arithmetic and faster kernels are engine supplied.",
   "agent_guidance": {
@@ -43,10 +43,13 @@
     {"path": "inference/batched-reference-engine/code/engine.h", "purpose": "The ConcurrentModel: mixed steps, StateCache with prefix reuse, paged attention, admission, sampling; make_engine()"},
     {"path": "inference/batched-reference-engine/code/engine_library.cpp", "purpose": "Native engine library with concurrent requests, configured from JSON"},
     {"path": "inference/batched-reference-engine/code/throughput.cpp", "purpose": "Throughput against concurrency: completion tokens over each wave's wall time"},
+    {"path": "inference/batched-reference-engine/code/paged_attention.h", "purpose": "The synthetic engine's paged attention: page tables, write, prompt and decode interfaces"},
+    {"path": "inference/batched-reference-engine/code/paged_attention.cu", "purpose": "Paged KV write, prompt and decode attention kernels for the synthetic engine"},
+    {"path": "inference/batched-reference-engine/code/device_pages.h", "purpose": "Device page pool and batch tables the engine's attention reads"},
     {"path": "inference/batched-reference-engine/code/reference.py", "purpose": "Host model of the step layout, the GEMM split plan and admission"}
   ],
   "requires": {
-    "hardware": "CUDA C++20 on sm_80+ (BF16 mma.sync, ldmatrix, cp.async; paged-attention's requirements); builds checked for sm_80, sm_86, sm_89 and sm_120, runtime validation on sm_120 only; Python 3.11+ standard library for the reference",
+    "hardware": "CUDA C++20 on sm_80+ (BF16 mma.sync, ldmatrix, cp.async); builds checked for sm_80, sm_86, sm_89 and sm_120, runtime validation on sm_120 only; Python 3.11+ standard library for the reference",
     "model": "Dense decoder-only softmax attention with grouped-query heads, head dimension 64, 128 or 256 and dimensions in multiples of 64 (synthetic weights)",
     "workload": "Concurrent requests with mixed prompt and decode steps, prefix reuse and greedy or sampled decoding"
   },
@@ -59,7 +62,6 @@
   },
   "dependencies": [
     "crit::core and crit::cuda (Core's CUDA backend)",
-    "paged-attention (kernels, DevicePages, BatchTables)",
     "CUDA runtime with cuda_bf16.h",
     "Python standard library for the reference"
   ],
@@ -68,7 +70,6 @@
     "make_engine", "arrange", "split_dot", "pages_needed"
   ],
   "interactions": [
-    "paged-attention",
     "concurrent-request-execution",
     "session-scheduling",
     "attention-state",
@@ -76,7 +77,6 @@
   ],
   "techniques": [
     "batched-reference-engine",
-    "paged-attention",
     "concurrent-request-execution"
   ],
   "validation": {

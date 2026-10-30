@@ -36,6 +36,7 @@ reply = client.chat.completions.create(model="default", messages=[{"role": "user
 | --- | --- |
 | `--run ID`, `--candidate ID` | Which run and candidate to serve (default: the only run, its selected candidate) |
 | `--models PATH` | Serve several named models from several runs on one server |
+| `--engine OWNER/NAME` | Serve a crit-hub engine `crit pull` installed ([Installed engines](../docs/SERVING.md#installed-engines)) |
 | `--host`, `--port` | Listen address, default `127.0.0.1:8000` |
 | `--api-key KEY`, `--ssl-certfile PATH` | Require a bearer key; serve HTTPS |
 | `--idle-unload SECONDS` | Free the GPU when idle; the next request loads the engine again |

@@ -27,7 +27,7 @@ device = "device.json"              # crit eval probe result (relative: from CRI
 ram_headroom_gib = 2                # host memory free at the engine's peak (default 2)
 vram_headroom_gib = 1               # device memory free at the engine's peak (default 1)
 context_reserve_gib = 3             # device memory kept out of the KV cache (default 3)
-context_tokens = 262144             # the context wanted, prompt plus output (default 262,144)
+context_tokens = 200000             # the context wanted, prompt plus output (default 200,000)
 eval_packages = "/srv/crit/packages" # reference package source, a folder or https URL; unset: none
 ```
 
@@ -72,9 +72,10 @@ hashes; add them only where a field below requires one.
 | `correctness_criteria` | Required fixed criteria; gates are `arithmetic`, `functional`, `resources` |
 | `device` | A `crit eval probe` result. Without `kv_tokens`, `create` freezes Eval's [max context](https://github.com/crit-labs/crit-eval/blob/main/docs/CONTEXT.md) on it as `kv_tokens`, with the basis (limits, KV precision, memory, device file sha256) in `hardware_constraints.context` |
 | `kv_tokens` | Capacity for prompt + output; overrides the max context. One of `kv_tokens`, `device` is required |
-| `context_tokens` | The context the user wants (default 262,144, from `settings.toml` when the request omits it). With `device`, `kv_tokens` is the smaller of it, the model's positions and the KV cache that fits; `hardware_constraints.context` records `requested`, the `bound` (`requested`, `model` or `device`) and a `note` when the model or device allow less |
+| `context_tokens` | The context the user wants (default 200,000, from `settings.toml` when the request omits it). With `device`, `kv_tokens` is the smaller of it, the model's positions and the KV cache that fits; `hardware_constraints.context` records `requested`, the `bound` (`requested`, `model` or `device`) and a `note` when the model or device allow less |
 | `ram_headroom_gib`, `vram_headroom_gib` | Physical free-memory requirements; defaults 2 and 1 |
 | `context_reserve_gib` | Device memory kept out of the KV cache when deriving `kv_tokens` from `device`; default the protocol's 3 |
+| `drafters` | Up to 8 companion drafter folders (EAGLE-3, DFlash, DSpark) a candidate may load beside the model. With `device`, their stored weights are kept out of the KV cache too, so a speculating candidate still fits `kv_tokens`; `hardware_constraints.context` records `companion_drafter_bytes` and each drafter. Name the same folders to `recon --drafter` |
 | `candidate_budget`, `attempt_limit` | Segment bounds: candidates to build (default 3, 1–64) and attempts (default 64, 1–1000). `budget_minutes` is a safety window, default and maximum 43200 (30 days). `budget_minutes` without `candidate_budget` creates a legacy time-budget segment (1–180) |
 | `workload` | Defaults: prompt 512, output 128, concurrency 1, repetitions 3, warmups 1, mode `resident` |
 | `cases` | Optional 1–32 distinct `{case_id, workload}` objects with complete workloads |
@@ -82,9 +83,9 @@ hashes; add them only where a field below requires one.
 | `verification_level` | `reported` or `artifact_verified` (default) |
 | `targets` | Optional positive `decode_tps`, `prefill_tps`, `request_ms` thresholds |
 | `weights_policy` | Optional `as_stored` (supplied weights used as stored) or `transformable`; omitted means unspecified |
-| `quality_budget` | Optional drift budget against Eval's reference: any of `ppl_ratio_max` (≥ 1), `kld_mean_max`, `kld_p99_max` (≥ 0); defaults 1.05, 0.05, 0.5. Agents spend it on speed |
+| `quality_budget` | Optional drift budget against Eval's reference: any of `ppl_ratio_max` (≥ 1), `kld_mean_max`, `kld_p99_max` (≥ 0); defaults 1.05, 0.05, 0.5 (`as_quantized`: 1.1, 0.1, 1.0, Eval's own for that mode). Agents spend it on speed |
 | `exactness` | `reported` (default: speculative output may differ from plain greedy; the drift budget judges it) or `required` (any difference fails Eval's gate) |
-| `quality_mode` | `preserve` (default: Eval's quality reference keeps the activations exact, and prefill's limits are priced at 16-bit prompt activations) or `as_quantized` (the reference runs the checkpoint as quantized, its activations quantized as it declares, and prefill's limits are priced at its stored format); the user's choice, from the request or `settings.toml`'s `quality_mode`. `crit run ... eval` judges in it |
+| `quality_mode` | `preserve` (default: Eval's quality reference keeps the activations exact, and prefill's limits are priced at 16-bit prompt activations) or `as_quantized` (the same reference, each quality set's limits widened by the drift of the checkpoint's own activation quantization, crit-eval's allowance, and prefill's limits priced at its stored format); the user's choice, from the request or `settings.toml`'s `quality_mode`. `crit run ... eval` judges in it |
 | `eval_sampling` | Optional, the user's only: `{settings, approved_by}`, settings `temperature` (> 0, required) and any of `top_p`, `top_k`, `min_p`, as an object or `"temperature=0.6,top_p=0.95"`. Eval's sampled suite then measures at these settings instead of the model's `generation_config.json`: `crit run ... eval` requires data prepared with `crit eval prepare --sampling` and the same settings (and refuses overridden data without it), recon applies them to the served default, and results label them as an override |
 | `origin_engine` | Written by `create --from-engine`, never by hand: the crit-hub engine the run starts from ([origin engine](#origin-engine)) |
 
@@ -180,6 +181,8 @@ before any code. crit assigns `plan-0001`, `plan-0002`, ... (never recycled), st
 | `levers` | `[{id, technique, description, changes, group, confidence}]`. `technique` is an Inference entry name or free text; `changes` maps KPIs (`decode`, `prefill`, `ttft`, `context_decode`, `context_ttft`) to `{change, source}`: `change` is the projected relative change of that KPI's score in its improving direction (0.12 = 12% better, negative = worse), `source` is `eval-gap:<gap name>` or `estimate`. `group` is null or a name shared by levers that only pay together; `confidence` is `low`, `medium` or `high`. Optional `kind`: `speed` (the default) or `requirement`, work a rule or gate requires that Eval does not score, with `serves` naming that rule or gate (e.g. `AGENTS.md: sampled requests speculate`); its `changes` may be empty or 0 |
 | `rejected` | `[{name, reason}]`: alternatives considered and not planned |
 | `forecast_justification` | Optional (plan rules 3): why a forecast that expects more gain on p2 than on p1, or lets a p1 KPI fall, is worth building |
+| `weakest` | Plan rules 4, critique rounds: the parent's two weakest terms, `[{kpi, term, evidence, levers}]` ([plan rules 4](#plan-rules-4)) |
+| `review` | Plan rules 4: the review of the parent's plan against its outcome, `{plan_id, kpis, levers, lesson}` ([plan rules 4](#plan-rules-4)) |
 | `forecast` | `{KPI: {low, expected, high}}` in Eval's units (tok/s; ms for `ttft` and `context_ttft`) for `decode`, `prefill`, `ttft`, and `context_decode`, `context_ttft` when the parent's Eval measured them |
 | `gates` | How quality stays inside the budget and the required context is met |
 | `estimated_limits` | Optional: `{KPI: {limit, derivation}}`, the agent's estimate of a limit the parent's Eval does not give, in Eval's units (tok/s; ms for `ttft` and `context_ttft`), and how it was derived (for example a drafter's expected tokens per round over the pass floor) |
@@ -288,7 +291,11 @@ Runs with `"plan_rules": 2` check their plans with these changes to the rules ab
   - without a measured drafter (a plain baseline, or no per-round accepted counts) the physical bound
     applies, with a `note`.
   No row gives a bare `limit` in these runs: where crit cannot compute the round floor (no bandwidth or bytes
-  per pass), the alternative does not rank the families. Each entry keeps the `drafter`, the claim's
+  per pass), the alternative does not rank the families. Where the parent's Eval measured no draft floor and the
+  checkpoint has no draft layers, a separate drafter's draft cost comes from the companion drafter
+  `recon --drafter` recorded with its `pass_bytes` (what one drafter pass reads, its output head included):
+  ceil(k / drafts_per_pass) passes at the bandwidth, so a block drafter's one pass prices its whole block. With
+  several recorded, the row names one by its recorded path (`companion`). Each entry keeps the `drafter`, the claim's
   `implied_acceptance` (the constant rate a at which k draft steps emit its tokens per round), and the
   `acceptance_bound` (`tokens_per_round`, `draft_steps`, `widest`, `source`, and the `rates` or the `cap`)
   or the `acceptance_evidence`.
@@ -329,8 +336,41 @@ Runs created from this version on have `"plan_rules": 3`: the rules 2 above and 
   spread cannot give one. An engine that declares no prompt activations cannot mark prefill not needed
   there: Eval names neither the format in use nor the faster ones.
 - recon.md's `Drafting plan for both decode modes` and `Prefill arithmetic plan` are written, neither
-  missing nor starting with TODO, before the first candidate. The prefill plan gives each matrix group's
+  missing nor starting with TODO, before the first candidate, and its `Placement plan` too where
+  `recon.json` records a placement scenario (`gathered.placement`, from the request's device). The prefill plan gives each matrix group's
   prompt activation format and the quality measurement per group (`crit eval run --attribute-drift`).
+
+#### Plan rules 4
+
+Runs created from this version on have `"plan_rules": 4`: the rules 3 above and these. crit records each
+plan's `inputs.objective` (`crit.run.plans.objective`): the candidate's number in the run (the run's
+candidates so far plus one), its objective's name and rule, and `min_gain` where it applies.
+
+- Candidate 1, `proof_of_concept`: the first engine that works end to end (it serves, passes the
+  functional gates and the quality gate at the required context).
+- Candidates 2 and 3, `crit_round`: improve the parent as much as possible with crit's toolkit, Inference
+  techniques and Kernels Hub kernels, each measured against its floor and fixed or replaced where it trails.
+- Candidates 4 on, `critique_round` (check 13): the plan names the parent's two weakest terms in
+  `weakest`, `[{kpi, term, evidence, levers}]`: what is slow with its measured time and floor, a file in
+  the run that measured it, and the ids of the plan's speed levers that improve its KPI's family. The plan
+  has at least one other speed lever beside those.
+- Candidates 2 to 5 (check 13): the forecast's expected gain on some p1 KPI over the parent's Eval is at
+  least `MIN_GAIN` (10%); a plan below it is refused, with no justification that lets it pass.
+- Check 13, providers: every speed lever names what supplies its code in `provider`: `inference:ENTRY`,
+  `hub:ORG/NAME` (a Kernel Hub repository), `lib:NAME` (a library, [Kernels' sources](../kernels/SOURCES.md))
+  or `own: ...` (the engine's own code). An `own` lever carries `yardstick` `{evidence, detail}`: a file in the
+  run with the measurement of the best existing provider for the operation, or the providers it checked and why
+  none fits.
+- Check 14, the review: once the parent's plan has an outcome at the Eval attempt this plan freezes
+  (`plans/PLAN_ID/outcomes/ATTEMPT.json`, written by `crit run ... eval`), the plan reviews it in `review`:
+  `{plan_id, kpis, levers, lesson}`. `kpis` gives `{cause, evidence}` for every KPI the outcome measured
+  short of its forecast's low (above its high for a time), the evidence a file in the run; `levers` says
+  what each lever the parent's proposal built, pruned or deferred delivered (`{result}`); `lesson` what
+  this plan changes because of it. crit records what it checked in `inputs.review` (the outcome's path
+  and SHA-256, the missed KPIs, the levers by fate). The parent plan's largest p1 lever (its largest
+  forecast change on a p1 family), when pruned or deferred, is planned again under the same id or its
+  `levers` entry adds `evidence` and `structure`: the measurement of another kernel structure or a vendor
+  library at the same arithmetic that rejected it, never variants of one kernel.
 
 crit checks completeness and consistency with the frozen facts, never whether the reasoning is good,
 and refuses a plan with a message that says what to fix:
@@ -637,7 +677,10 @@ makes `DIR/replay-1` ... `DIR/replay-3`, each a run root holding a copy of `RUN_
 newest completed Eval attempt ended (its attempt's `ended_at`, the plan outcome crit wrote for it and five seconds of
 margin): every file written by then, nothing later. `--before PLAN` ends the copy where that plan's record was made
 instead, so it holds the work its agent did after the parent's Eval toward the plan (measurements, rejected tries),
-for a decision taken with that evidence. Records and candidates are copied whole; `work/` leaves out build products
+for a decision taken with that evidence. `--before` the run's first plan copies the run as it stood then: the recon
+and any work toward the first candidate, no candidate and no Eval, and no plan draft at all. Records and candidates are
+copied whole, except a later candidate whose record postdates the copy (its retained source can keep older file
+times); `work/` leaves out build products
 (shared libraries, objects, weights and files over 16 MiB) and drafts of the next plan (JSON with a plan's
 `parent_candidate_id`, `decision`, `needed` and `levers`, written after the parent's Eval). Work the agent kept
 outside the run folder, or only in its session, is not in any replay. `state.json` and the projections of unsealed

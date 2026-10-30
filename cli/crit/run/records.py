@@ -18,10 +18,14 @@ MAX_JSON_BYTES = 1_048_576
 MAX_CANDIDATES = 512
 MAX_FILES = 100_000
 WEIGHTS_POLICIES = {"as_stored", "transformable"}  # run: may candidates change stored weights?
-# Drift a run allows against the Eval reference, spent on speed; matches crit_eval/protocol.json.
+# Drift a run allows against the Eval reference, spent on speed; matches crit_eval/protocol.json (quality.thresholds,
+# and quality.mode_thresholds for as_quantized: twice preserve's, since 4-bit activation math swings KL far more).
 DEFAULT_QUALITY_BUDGET = {"ppl_ratio_max": 1.05, "kld_mean_max": 0.05, "kld_p99_max": 0.5}
+DEFAULT_QUALITY_BUDGETS = {"preserve": DEFAULT_QUALITY_BUDGET,
+                           "as_quantized": {"ppl_ratio_max": 1.1, "kld_mean_max": 0.1, "kld_p99_max": 1.0}}
 EXACTNESS_MODES = {"reported", "required"}  # must speculative output equal plain greedy?
-# What Eval judges quality against (crit-eval quality modes): the checkpoint with exact activations, or run as quantized.
+# How Eval judges quality (crit-eval quality modes): against the checkpoint with exact activations, or the same with
+# each set's limits widened by the drift of the checkpoint's own activation quantization.
 QUALITY_MODES = ("preserve", "as_quantized")
 # Runs created from this version on require a recorded plan (crit run ... plan) for every candidate; older runs
 # have no plans field and keep plan_id optional.
@@ -32,9 +36,9 @@ NEW_RUN_PLAN_LIMITS = "computed"
 # Runs created from this version on give every lever of a candidate's plan its fate in the proposal; older runs keep
 # fates optional.
 NEW_RUN_LEVER_FATES = "required"
-# Runs created from this version on check plans with the third version of the plan rules (crit.run.plans.rules);
+# Runs created from this version on check plans with the fourth version of the plan rules (crit.run.plans.rules);
 # older runs keep the rules they were created with.
-NEW_RUN_PLAN_RULES = 3
+NEW_RUN_PLAN_RULES = 4
 WEIGHTS = {"as_stored", "transformed"}             # candidate: did it change them?
 HASH_PARALLEL_BYTES = 256 * 1024 * 1024
 GIB = 1024 ** 3
@@ -196,9 +200,9 @@ def quality_mode(correctness):
 
 
 def quality_terms(correctness, amendments=()):
-    """The run's drift budget over the defaults, and its exactness mode, with each resume's
+    """The run's drift budget over its quality mode's defaults, and its exactness mode, with each resume's
     amendment applied in order."""
-    budget = {**DEFAULT_QUALITY_BUDGET, **correctness.get("quality_budget", {})}
+    budget = {**DEFAULT_QUALITY_BUDGETS[quality_mode(correctness)], **correctness.get("quality_budget", {})}
     exactness = correctness.get("exactness", "reported")
     for change in amendments:
         budget |= change.get("quality_budget", {})
@@ -424,10 +428,10 @@ def verify_inventory(root, rows, exclude=()):
         raise ValueError("Retained artifact bytes differ from manifest")
 
 
-def eval_max_context(model, device, vram_headroom_bytes, reserve_bytes=None, requested=None):
+def eval_max_context(model, device, vram_headroom_bytes, reserve_bytes=None, requested=None, drafters=()):
     """Eval's max context (crit_eval/limits/context.py) for MODEL on DEVICE, a `crit eval probe` result, capped at the
     requested context. reserve_bytes replaces the protocol's reserve (device memory kept out of the KV cache for
-    workspaces and speed techniques)."""
+    workspaces and speed techniques); drafters: companion drafter folders whose stored weights are kept out too."""
     from crit_eval import EVAL_DIR
     from crit_eval.limits.context import max_context
     protocol = EVAL_DIR / "protocol.json"
@@ -436,14 +440,15 @@ def eval_max_context(model, device, vram_headroom_bytes, reserve_bytes=None, req
     settings = json.loads(protocol.read_text(encoding="utf-8"))["context"]
     if reserve_bytes is not None:
         settings = {**settings, "reserve_gib": reserve_bytes / GIB}
-    return max_context(model, device, vram_headroom_bytes, settings, requested)
+    return max_context(model, device, vram_headroom_bytes, settings, requested, drafters=drafters)
 
 
 def kv_capacity(data, model, vram_headroom_bytes, reserve_bytes=None):
     """The run's KV capacity in tokens of prompt plus output, and what it rests on. An explicit kv_tokens
     is taken as given. Otherwise the request names its device (a `crit eval probe` result) and the run is
     built for Eval's max context: the context the user wants (context_tokens, from settings.toml; default 262,144),
-    capped by the model's positions and the KV cache that fits on the device."""
+    capped by the model's positions and the KV cache that fits on the device next to the companion drafters the
+    request names (drafters: folders a candidate may load beside the model)."""
     if "kv_tokens" in data:
         return number(data["kv_tokens"], "KV cache", 1, KV_TOKENS_MAX, integer=True), None
     if "device" not in data:
@@ -452,7 +457,14 @@ def kv_capacity(data, model, vram_headroom_bytes, reserve_bytes=None):
     device = Path(text(data["device"], "Device file")).expanduser().resolve()
     from crit_eval import DEFAULT_CONTEXT_TOKENS
     requested = number(data.get("context_tokens", DEFAULT_CONTEXT_TOKENS), "context_tokens", 1, KV_TOKENS_MAX, integer=True)
-    value = eval_max_context(model, read_json(device), vram_headroom_bytes, reserve_bytes, requested)
+    drafters = data.get("drafters", [])
+    if not isinstance(drafters, list) or len(drafters) > 8:
+        raise ValueError("drafters is a list of up to 8 companion drafter folders")
+    drafters = [Path(text(path, "Drafter folder")).expanduser().resolve() for path in drafters]
+    for path in drafters:
+        if not path.is_dir():
+            raise ValueError(f"Drafter folder {path} does not exist on this computer")
+    value = eval_max_context(model, read_json(device), vram_headroom_bytes, reserve_bytes, requested, drafters)
     if not value["tokens"]:
         raise ValueError("Eval cannot derive the max context: " + (value["reason"] or "; ".join(value["missing"])))
     tokens, bound = min(value["tokens"], KV_TOKENS_MAX), value["bound"] if value["tokens"] <= KV_TOKENS_MAX else "crit"
@@ -463,14 +475,15 @@ def kv_capacity(data, model, vram_headroom_bytes, reserve_bytes=None):
                "kv_precision": value["kv_precision"], "kv_bytes_per_token": value["kv_bytes_per_token"],
                **{key: basis[key] for key in ("device", "memory_free_bytes", "memory_total_bytes", "reserve_bytes",
                                               "resident_weight_bytes", "expert_bytes", "fixed_state_bytes",
-                                              "expert_bytes_in_device_memory_at_max") if key in basis},
+                                              "expert_bytes_in_device_memory_at_max", "companion_drafter_bytes",
+                                              "companion_drafters") if key in basis},
                "device_file": str(device), "device_sha256": file_sha(device)}
     return number(tokens, "Eval's max context", 1, KV_TOKENS_MAX, integer=True), context
 
 
 def request_spec(data):
     keys(data, {"model_path", "correctness_criteria"}, {"kv_tokens", "device", "vram_headroom_gib", "ram_headroom_gib",
-         "context_reserve_gib", "context_tokens",
+         "context_reserve_gib", "context_tokens", "drafters",
          "budget_minutes", "workload", "cases", "benchmark_protocol", "targets", "verification_level", "attempt_limit",
          "weights_policy", "candidate_budget", "quality_budget", "exactness", "quality_mode", "eval_sampling",
          "origin_engine"})
@@ -570,8 +583,8 @@ def validate_spec(value):
         raise ValueError("plan_limits is computed when present, in a run that requires plans")
     if value.get("lever_fates", "required") != "required" or ("lever_fates" in value and "plans" not in value):
         raise ValueError("lever_fates is required when present, in a run that requires plans")
-    if value.get("plan_rules", 2) not in (2, 3) or ("plan_rules" in value and value.get("plan_limits") != "computed"):
-        raise ValueError("plan_rules is 2 or 3 when present, in a run that computes plan limits")
+    if value.get("plan_rules", 2) not in (2, 3, 4) or ("plan_rules" in value and value.get("plan_limits") != "computed"):
+        raise ValueError("plan_rules is 2, 3 or 4 when present, in a run that computes plan limits")
     if "eval_sampling" in value and eval_sampling(value["eval_sampling"]) != value["eval_sampling"]:
         raise ValueError("eval_sampling is not in its validated form")
     if "origin_engine" in value:

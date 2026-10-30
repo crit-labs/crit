@@ -83,14 +83,15 @@ class ResidentChatTests(unittest.TestCase):
         def decode(ids, max_new_tokens, sampling, on_tokens, cancelled, plain=False):
             seen.append(plain)
             tokens, timing = Decoder.generate_tokens(engine, ids, max_new_tokens, sampling, on_tokens, cancelled)
-            return tokens, dict(timing, rounds=2, accepted=[1, 0], verify_ms=1.25, draft_ms=0.5)
+            return tokens, dict(timing, rounds=2, accepted=[1, 0], drafted=[3, 2], verify_ms=1.25, draft_ms=0.5)
         engine.generate_tokens = decode
         with self.assertRaisesRegex(ValueError, "does not decode plainly"):
             engine.generate(request(decode="plain"), threading.Event())
         engine.plain = True
         found = engine.generate(request(decode="plain"), threading.Event())["telemetry"]
         self.assertEqual(seen, [True])
-        self.assertEqual((found["accepted"], found["verify_ms"], found["draft_ms"]), ([1, 0], 1.25, 0.5))
+        self.assertEqual((found["accepted"], found["drafted"], found["verify_ms"], found["draft_ms"]),
+                         ([1, 0], [3, 2], 1.25, 0.5))
         engine.generate(request(), threading.Event())
         self.assertEqual(seen, [True, False])
         with self.assertRaisesRegex(ValueError, "decode must be plain"):

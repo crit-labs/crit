@@ -3,8 +3,8 @@
 `Routing` states how one token's router logits become selected expert IDs and weights:
 the scoring function and whether it runs before or after selection, an optional
 per-expert correction bias that only changes the selection, an optional group limit,
-renormalization and a routed scaling factor. `route` is the host reference that
-`crit::moe::route_down_cuda` implements for the same fields, and `routing_from_config`
+renormalization and a routed scaling factor. `route` is the host reference an engine's
+device routing kernel is checked against for the same fields, and `routing_from_config`
 maps the config.json fields Core parses onto it. A model's own values belong to its
 engine package; nothing here is chosen per model family.
 """

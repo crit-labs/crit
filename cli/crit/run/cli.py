@@ -141,6 +141,15 @@ def main(argv=None):
     sub.add_argument("--label")
     sub.add_argument("--seconds", type=float, help="Reservation length (default: to the segment's deadline; each "
                                                    "request is bounded by the rates the engine measured)")
+    sub.add_argument("--stage", choices=["1", "2", "3", "full"],
+                     help="How far Eval measures (crit-eval's protocol stages): by default as far as its budget allows "
+                          "at the candidate's measured rates; 1, 2 or 3 at most that far; full every part as before "
+                          "stages")
+    sub.add_argument("--certify", action="store_true",
+                     help="The candidate that will ship: stage 3 whatever the budget, then one request at the run's "
+                          "kv_tokens, which the resources check needs")
+    sub.add_argument("--budget-minutes", type=float, metavar="MINUTES",
+                     help="Eval's wall-clock budget, loads included (default: crit-eval's 45)")
     sub = subs.add_parser("serve", help="Serve a packaged candidate before it is sealed through crit serve, under a "
                                         "check attempt, until Ctrl+C: for the checks a candidate passes before sealing")
     sub.add_argument("--candidate", required=True)
@@ -264,7 +273,10 @@ def main(argv=None):
         elif args.action == "eval":
             from .evaluation import evaluate
             result = evaluate(store, args.id, args.candidate, args.data, args.only,
-                              read_json(args.baseline) if args.baseline else None, args.seconds, args.label)
+                              read_json(args.baseline) if args.baseline else None, args.seconds, args.label,
+                              stage=args.stage if args.stage in (None, "full") else int(args.stage),
+                              certify=args.certify,
+                              budget_seconds=args.budget_minutes * 60 if args.budget_minutes else None)
             from crit_eval.reports.status import render
             from .plans import extract, priorities, rules
             status = result.pop("status")

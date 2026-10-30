@@ -4,8 +4,8 @@
 //
 // A tree has N <= 64 nodes in topological order: node 0 is the round's pending token, node i > 0 a draft token whose
 // parent parents[i - 1] < i. masks[i] has bit j set for each node j on the root-to-i path (i included); depth[i] is
-// popcount - 1. The target verifies all nodes in one pass with these masks (paged-attention / fp8-kv-attention
-// Decode::tree, RoPE positions frontier + depth) and writes one prediction per node: its argmax, or for sampled
+// popcount - 1. The target verifies all nodes in one pass with these masks (an attention kernel's tree
+// masks, RoPE positions frontier + depth) and writes one prediction per node: its argmax, or for sampled
 // requests its own draw at the node's depth (token-sampling Rows::tree).
 #pragma once
 #include "greedy_accept.h"

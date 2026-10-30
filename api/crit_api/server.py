@@ -918,7 +918,7 @@ class Api:
             return None
         return {key: measured[key] for key in ("prompt_tokens", "output_tokens", "prefill_tokens", "prefill_ms",
                                                "decode_tokens", "decode_ms", "prefill_tps", "decode_tps", "ttft_ms",
-                                               "tokens_per_round", "accepted", "verify_ms", "draft_ms") if key in measured}
+                                               "tokens_per_round", "accepted", "drafted", "verify_ms", "draft_ms") if key in measured}
 
 
 class Handler(BaseHTTPRequestHandler):

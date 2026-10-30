@@ -38,6 +38,19 @@ Install from the repo root with `python -m pip install -e .`, then run `crit ...
   run a related checkpoint (a finetune, a re-quantization, a sibling model), `crit run --id RUN_ID
   recon --compare OTHER_MODEL` says what differs for it, and an equal fingerprint means the weight
   values differ only.
+- **Name the placement scenario before the first candidate.** With the request's `device`, recon
+  records in `recon.json` (`placement`) and `recon.md` where the weights fit at the required context:
+  `fits_device` (1), `sparse_device_host` (2: routed experts beyond device memory fit host memory),
+  `sparse_device_host_disk` (3: the rest of them on disk), `dense_device_host` (5: weights read on every
+  pass exceed device memory) or `beyond_host`; lookup tables (gathered embedding and n-gram rows) are a
+  modifier on any of them and go wherever room is left, down to the disk. It also gives one plain pass's
+  floor per expert source (on the device, misses over the host link, misses computed on the CPU from host
+  memory) from the probe's rates. Write recon.md's `Placement plan` from the scenario's starting design:
+  candidate 1 is a proof of concept of the scenario, not a placeholder below it. In `sparse_device_host`
+  that means a device expert cache and the checkpoint's drafter from candidate 1 on, with misses on the
+  faster of the link and the CPU; an engine that copies every expert over the link on every pass measures
+  neither lever. In `dense_device_host` and `beyond_host`, tell the user what speed to expect before
+  building.
 - **Start from a crit-hub engine when one exists for the model.** `create --from-engine ENGINE_DIR`
   (the engine's folder in a crit-hub checkout) records it as the run's origin: its source pin, the
   checkpoint it was measured on and its published Eval results under `captured/origin/`. Check the
@@ -56,7 +69,8 @@ Install from the repo root with `python -m pip install -e .`, then run `crit ...
   these settings before the first candidate.
 - **Build for both decode modes.** Eval scores both, on the same six speed cases.
   Greedy (temperature 0): speculative output must stay token-exact against plain greedy
-  (the exactness check). Sampled, at the Eval sampling: the headline decode, its goal and
+  (the exactness check; it runs only when the package declares plain decoding,
+  `capabilities(..., plain=True)` for `chat-plain-v1`, else Eval leaves exactness unmeasured). Sampled, at the Eval sampling: the headline decode, its goal and
   the stop record's decode; verify drafts by rejection sampling (accept a draft with
   probability min(1, p/q) under the processed target distribution p, sample from
   max(p - q, 0) on the first rejection; a greedy draft is q one-hot) so the output keeps the
@@ -84,10 +98,16 @@ Install from the repo root with `python -m pip install -e .`, then run `crit ...
   arithmetic, tokenizer and layouts.
 - **[Inference](inference/README.md):** read relevant techniques and their code; adapt,
   combine or fuse them, preserving correctness and ownership invariants. Nothing is mandatory.
-- **[Kernels](kernels/README.md):** search the Hugging Face Kernel Hub by operation
-  before writing optimized arithmetic. The Hub is part of crit's toolkit: only the run's
-  criteria can exclude it, and only by naming it. A request to build from crit alone (a
-  clean test of crit) keeps the Hub and excludes earlier results: past runs, earlier
+  Entries are techniques, not compute kernels.
+- **[Kernels](kernels/README.md):** search the Hugging Face Kernel Hub and the other providers
+  in [SOURCES.md](kernels/SOURCES.md) by operation before writing optimized arithmetic. Measure
+  each kernel the engine adopts on its own shapes against its floor (`crit eval status --kernels`)
+  and against the best other provider at the same arithmetic; where it trails, replace it.
+  A kernel the engine writes or adapts gets a workbench folder (`crit kernels new`) and is checked
+  and timed with `crit eval workbench`; its `bench.json` is the `yardstick` evidence of the lever.
+  These providers are part of crit's toolkit: only the run's criteria can exclude one, and
+  only by naming it. A request to build from crit alone (a clean test of crit) keeps them
+  and excludes earlier results: past runs, earlier
   engines for the model and records outside this run. Check operations, formats, shapes,
   OS/device, licenses, dependencies and the three checks Kernels lists.
 - **[Models](models/README.md):** only when the run's `weights_policy` is `transformable`:
@@ -143,7 +163,10 @@ Work in rounds, one candidate per round:
    to first token split into the engine's own time and the rest, the quality share with its
    spread over positions, the sampled cases' standard errors, and the device memory left free
    at the required context. `crit run ... check --candidate ID --from-eval` records the run's
-   arithmetic, functional and resources checks from the candidate's Eval result.
+   arithmetic, functional and resources checks from the candidate's Eval result. Eval measures
+   in stages within a 45-minute budget, as far as the candidate's own speed allows, and serves the
+   required context itself only with `--certify`: run `crit run ... eval --certify` on the
+   candidate you will propose, then record its checks from that result.
 5. **Revisit recon** when a result contradicts it, or when the engine switches behaviour
    at a threshold (prefetch, sparse attention, chunk sizes) Eval does not cross: update
    `recon.md` (and the frozen block if needed) and add a run case that crosses it
@@ -154,6 +177,12 @@ Work in rounds, one candidate per round:
    stop plan (`"decision": "stop"`) from the newest Eval, then stop with
    `search_exhausted`. On resume, re-measure first.
 
+- **Long jobs.** Downloads, `crit eval reference`, `crit run ... eval` and builds take minutes to
+  hours. Run each as a background command your harness tracks and wakes you on when it exits (never a
+  detached `nohup`, `setsid` or `wsl ... &` it cannot see, and never a sleep loop), and never end a
+  turn without such a wake pending. While one holds the GPU (Eval and the reference take the machine
+  lock), do the CPU work of the next round: read the result so far, write the next plan's code, build
+  it. A finished job nobody noticed is time the run loses.
 - **Strategy first.** Working baseline, measured bottlenecks, then compare strategies,
   not only settings. Reach the highest-ceiling strategy in working form before tuning
   kernels; sessions can end early and tuning does not transfer between strategies.
@@ -193,8 +222,17 @@ Work in rounds, one candidate per round:
   follows its needed flags like every other plan's. Near the limit (both families at 0.85 of
   it or above) a near tie puts only the lower one in p1, and a family marked not needed below
   0.85 answers why the rest of its limit is out of reach (`gaps` entry `limit`, answer `cause`).
-  In runs with plan rules 3 (new runs), a plan whose forecast gains more on p2 than on p1, or
-  lets a p1 KPI fall, says why (`forecast_justification`).
+  In runs with plan rules 3, a plan whose forecast gains more on p2 than on p1, or
+  lets a p1 KPI fall, says why (`forecast_justification`). In runs with plan rules 4 (new
+  runs) each candidate has an objective by its number (`inputs.objective`): 1 the proof of
+  concept, 2 and 3 crit rounds (crit's toolkit, each technique measured against its floor and
+  fixed or replaced where it trails), 4 on critique rounds that name the parent's two weakest
+  terms in `weakest` and improve them beside other levers; candidates 2 to 5 forecast at
+  least +10% on a p1 KPI. Every speed lever names its `provider` (`inference:`, `hub:`, `lib:` or
+  `own`), and the engine's own code carries a measured `yardstick` against the best existing one. Each plan after the parent's Eval reviews the parent's plan in
+  `review`: the cause and evidence of every KPI that missed its forecast, what each lever
+  delivered, the lesson; the parent's largest p1 lever, pruned or deferred, is planned again or
+  rejected on a measurement of another kernel structure or a vendor library.
   A kernel term is exhausted only when it runs near its floor at the arithmetic the engine
   already uses (`crit eval status --kernels`: each matmul's achieved TFLOPS and its gap at the
   rate of its own prompt activations) or when another kernel structure, or a vendor library
@@ -244,6 +282,10 @@ Work in rounds, one candidate per round:
   Prefill is bound by FLOPs at the GEMM rate per weight format, plus attention. Time
   to first token is at least the larger of the compute floor and one weight read.
   `crit eval probe` measures bandwidth and GEMM rates; status reports each term's floor.
+  Bytes that do not come from device memory have their own rates: host memory read (the CPU),
+  host-to-device copies (the link), and the disk. Recon's placement prices one plain pass per expert
+  source with them, and an engine that declares `host_bytes_per_pass` gets Eval's pass floor priced
+  the same way.
 - **Profile** each candidate with `crit eval kernels`; for the heaviest kernels per
   phase far from their floor, check Kernels before replacing them, and fix kernels
   that leave SMs idle. A kernel's share of its phase bounds what replacing it can gain
@@ -272,11 +314,12 @@ Work in rounds, one candidate per round:
   dependencies need a new candidate.
 - **Compare and select** on the same model and workload; explain missing metrics.
   Apply agreed criteria without relaxing them or demanding byte-identical output.
-  Spend the `quality_budget` (defaults: perplexity ratio 1.05, mean KL 0.05, p99 KL 0.5;
+  Spend the `quality_budget` (defaults: perplexity ratio 1.05, mean KL 0.05, p99 KL 0.5, twice that in `as_quantized`;
   [Run records](docs/RUN_RECORDS.md#request)) on speed; drift below it is no
   gain. The run's `quality_mode` is the user's: `preserve` judges against the checkpoint with
-  exact activations, `as_quantized` against it run as quantized (its own activation
-  quantization is then no drift, and prefill is measured against the stored format's rate).
+  exact activations, `as_quantized` against the same reference with each set's limits widened by the drift
+  of the checkpoint's own activation quantization (so running it as declared fits, and prefill is measured
+  against the stored format's rate).
   Never change it; the brief names it. Measure a precision change (activation quantization, a lower-precision KV cache
   or head) against the budget on the model, per group of layers, before building other
   levers on it: its cost depends on the model and decides how much of it fits. Do it in

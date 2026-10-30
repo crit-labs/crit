@@ -1,20 +1,18 @@
 {
   "id": "heterogeneous-expert-dispatch",
   "category": "experts",
-  "summary": "Measured CPU/device dispatch with host working-set admission, exact source plans, one routing description and native router/shared fusion",
+  "summary": "Measured CPU/device dispatch with host working-set admission, exact source plans and one routing description",
   "implementation_status": "native_source",
-  "implementation_scope": "Host placement, measured capacity-bounded prefix splits with immutable calibration identities and exact-count timing medians, and mixed-source plans; one Routing description (softmax/sigmoid before or after selection, selection-only correction bias, grouped top-k, renormalization, scaling) with its host reference and config mapping; compact-batch CUDA FP8 router/shared-SwiGLU entry and a routing/shared-down grid that implements the same Routing. Timing collection, allocation and routed-expert arithmetic remain external. Optional exact-identity HostMemoryCosts account for CPU scratch, loader bytes, pinned staging and additional file pages on CPU and upload paths; injected admission gates ranking and can be revalidated before allocation.",
+  "implementation_scope": "Host placement, measured capacity-bounded prefix splits with immutable calibration identities and exact-count timing medians, and mixed-source plans; one Routing description (softmax/sigmoid before or after selection, selection-only correction bias, grouped top-k, renormalization, scaling) with its host reference and config mapping. Device router and shared-expert kernels are engine supplied (fused MoE kernels through Kernels) and are checked against the host reference. Timing collection, allocation and routed-expert arithmetic remain external. Optional exact-identity HostMemoryCosts account for CPU scratch, loader bytes, pinned staging and additional file pages on CPU and upload paths; injected admission gates ranking and can be revalidated before allocation.",
   "agent_guidance": {
-    "use_when": "Compare placement or mixed-source dispatch, select CPU/device splits from measured workload-specific costs, or combine independent router/shared-expert branches for 1-8 tokens",
-    "avoid_when": "Dispatch adds no useful choice and branch launches are not a bottleneck; native fusion requires the declared FP8/BF16 layouts, SiLU product and a router expressible as a Routing; measured lane curves require comparable work geometry and explicit overlap, otherwise measure whole candidate implementations",
+    "use_when": "Compare placement or mixed-source dispatch, select CPU/device splits from measured workload-specific costs, or describe a model's router once for host reference and device kernel",
+    "avoid_when": "Dispatch adds no useful choice; measured lane curves require comparable work geometry and explicit overlap, otherwise measure whole candidate implementations",
     "provides": [
       "Feasible host-prefix/device-suffix plans including fixed bytes and headroom",
       "Occurrence-preserving split dispatch and weighted contribution combination",
       "Measured CPU/upload/device cost curves, exact identity checks and byte/occurrence-bounded prefix split ranking without interpolation",
       "Deduplicated exact miss demands, protected-source plan validation and one quantize/project handoff",
       "One routing description, its host reference and a fail-closed mapping from Core's parsed config fields",
-      "One-grid FP8 router and shared gate/up projection with BF16 SiLU product",
-      "One-grid deterministic routing under a Routing and independent BF16 shared-down projection",
       "Per-candidate anonymous/pinned/file working-set costs and admission reasons; fresh admission revalidation before submission"
     ],
     "engine_supplies": [
@@ -54,35 +52,22 @@
     {
       "path": "inference/heterogeneous-expert-dispatch/code/routing.py",
       "purpose": "Routing description, its host reference for one token and the mapping from Core's parsed config fields"
-    },
-    {
-      "path": "inference/heterogeneous-expert-dispatch/code/fused_moe.h",
-      "purpose": "Native router/shared branch geometry, Routing fields and ownership"
-    },
-    {
-      "path": "inference/heterogeneous-expert-dispatch/code/fused_moe.cu",
-      "purpose": "Fused compact-batch FP8 entry and independent routing/shared-down CUDA grid; the FP8/BF16 layout is one example instance"
-    },
-    {
-      "path": "inference/heterogeneous-expert-dispatch/code/CMakeLists.txt",
-      "purpose": "Native fusion library and FP8 dependency build"
     }
   ],
   "requires": {
-    "hardware": "Python 3.11+ and standard library for the host reference; backend hardware is an engine choice; C++/CUDA20 and SM80+ for the optional fused component",
+    "hardware": "Python 3.11+ and standard library for the host reference; backend hardware is an engine choice",
     "model": "Expert-routed execution with explicit route occurrences and compatible source representations",
-    "workload": "Memory-constrained placement or mixed-source routed projections; fixed/scratch capacities use different units; native router/shared fusion supports 1-8 tokens, 1-1024 experts and top-k up to 32"
+    "workload": "Memory-constrained placement or mixed-source routed projections; fixed/scratch capacities use different units"
   },
   "contract": {
-    "input": "Ordered routing occurrences; protected READY slot/generation snapshot, explicit capacity and disjoint scratch; static allocation groups and fixed/workspace/headroom byte extents; routing takes logits, top-k, a Routing and an optional correction bias; native fusion takes contiguous encoded matrices/activations and caller-owned output spans/stream; measured planning also takes current calibration identity, raw timing curves, complete upload extents and staging/route limits; optional HostMemoryCosts with exact route/upload tables and an injected admission callback",
-    "output": "Host/device partitions or a single exact cache/scratch/stock plan with deduplicated staging demands; one quantize/project submission through declared hooks; feasible static prefix plans; native router scores, BF16 shared activations, original expert IDs/weights under the Routing and unweighted FP32 shared output; feasible measured split candidates with missing-sample reasons and an optional best estimate; incremental host memory bytes and admission decisions/reasons retained for each candidate",
+    "input": "Ordered routing occurrences; protected READY slot/generation snapshot, explicit capacity and disjoint scratch; static allocation groups and fixed/workspace/headroom byte extents; routing takes logits, top-k, a Routing and an optional correction bias; measured planning also takes current calibration identity, raw timing curves, complete upload extents and staging/route limits; optional HostMemoryCosts with exact route/upload tables and an injected admission callback",
+    "output": "Host/device partitions or a single exact cache/scratch/stock plan with deduplicated staging demands; one quantize/project submission through declared hooks; feasible static prefix plans; original expert IDs/weights under the Routing; feasible measured split candidates with missing-sample reasons and an optional best estimate; incremental host memory bytes and admission decisions/reasons retained for each candidate",
     "ownership": "Caller retains leases for every source, route buffer, activation and result until completion. READY snapshots do not pin owners; scratch is reserved for the operation.",
     "failure": "Reject conflicting/duplicate occurrences, invalid weights, source-slot aliases, unprotected scratch overlap, invalid generations and fabricated demands. Scratch exhaustion preserves original stock expert IDs. Measured planning rejects identity mismatches and invalid samples; absent samples cannot win and no measured feasible plan returns best=None for caller fallback. Missing or rejected memory costs cannot win; failed revalidation requires replanning or exact fallback before allocation/submission.",
     "core_boundary": "Consumer owns partition policy/arithmetic; core owns physical services and producer quiescence."
   },
   "dependencies": [
-    "Python standard library",
-    "CUDA toolkit, CMake 3.28+ and the quantized-projections native component"
+    "Python standard library"
   ],
   "symbols": [
     "Route",
@@ -96,10 +81,6 @@
     "MixedSourcePlan",
     "mixed_source_plan",
     "execute_mixed",
-    "crit::moe::entry_cuda",
-    "crit::moe::route_down_cuda",
-    "crit::moe::Routing",
-    "crit::moe::Scoring",
     "Routing",
     "route",
     "routing_from_config",
@@ -126,11 +107,11 @@
   ],
   "validation": {
     "host": "Host fixtures and worked example cover budget feasibility, repeated routes, exact fallback, scratch separation and one activation preparation; measured policy fixtures check median/sparse/nonlinear costs, identity changes, explicit overlap, byte and occurrence limits, arbitrary widths, repeated expert uploads and weighted result preservation; RAM/commit/cgroup limits, unknown costs/observations, distinct experts and upload sources, fresh revalidation, zero incremental resident paths and route preservation; routing fixtures check hand-worked cases, the transformers router code of Mixtral, Qwen2/Qwen3-MoE, GPT-OSS, Llama 4, DeepSeek-V2/V3, GLM-4.5, MiniMax-M2, Ernie 4.5 and LongCat-Flash when installed, and the fail-closed config mapping",
-    "native": "RTX 5090 CUDA fixtures compare 24 router/shared fusion cases to host arithmetic and shared activations exactly to separate CUDA calls; selected softmax, ties and aliases are checked; 12 routing variants match expectations written by the host reference, and the default Routing was checked bit-identical to the previous kernel over 450 shapes. Mixed cache/stock expert kernels and complete model behavior remain consumer work",
+    "native": "Device routing and shared-expert kernels are engine supplied; compare them with the host Routing reference (routing.py) on the model's parameterization",
     "performance": "Unmeasured for a native engine; host fixture success is not a speed claim"
   },
   "native_integration": {
-    "status": "Native router/shared branch fusion supplied; mixed-source routed-expert arithmetic and physical cache staging remain engine services",
+    "status": "Router and shared-expert kernels, mixed-source routed-expert arithmetic and physical cache staging are engine services",
     "required_hooks": [
       "Route-preserving projection arithmetic and physical source/result ownership for the selected path",
       "One quantization and one source-aware projection hook when execute_mixed is selected",

@@ -3,7 +3,7 @@
   "category": "speculation",
   "summary": "Token trees for speculative decoding: EAGLE-2-style dynamic draft trees, ancestor-only verify masks, a device walk accepting the path the target agrees with (greedy or sampled), and compaction of the accepted rows",
   "implementation_status": "native_source",
-  "implementation_scope": "Python reference of candidate expansion, beam and kept-node selection, tree construction, the walk and compaction; CUDA reference kernels for top-branch expansion with log-softmax scores in a fixed candidate order, selection by score with index tie-break, tree build (tokens, parents, masks, depths, padding nodes), the tree walk with device-speculative-round's control and packed-result contract (run through RoundSteps::accept), and in-order row compaction with an idempotent settle. Verify masks are paged-attention / fp8-kv-attention Decode::tree; sampled predictions are token-sampling's Rows::tree. The drafter and target arithmetic are engine supplied.",
+  "implementation_scope": "Python reference of candidate expansion, beam and kept-node selection, tree construction, the walk and compaction; CUDA reference kernels for top-branch expansion with log-softmax scores in a fixed candidate order, selection by score with index tie-break, tree build (tokens, parents, masks, depths, padding nodes), the tree walk with device-speculative-round's control and packed-result contract (run through RoundSteps::accept), and in-order row compaction with an idempotent settle. Verify masks are an engine attention kernel's tree masks; sampled predictions are token-sampling's Rows::tree. The drafter and target arithmetic are engine supplied.",
   "agent_guidance": {
     "use_when": "A device chain round is correct, attention-only target state, batch-1 verify of a few dozen columns costs about one step, and the drafter's second or third choice is often right where its first is wrong",
     "avoid_when": "The target has recurrent layers (state per node is not implemented), verify is compute bound (large batches), drafts are sampled from the drafter's law (multi-draft rejection sampling is not implemented), or measured extra verify columns cost more than the extra accepted tokens",
@@ -80,8 +80,6 @@
   "interactions": [
     "device-speculative-round",
     "token-sampling",
-    "paged-attention",
-    "fp8-kv-attention",
     "mtp-decode"
   ],
   "techniques": [

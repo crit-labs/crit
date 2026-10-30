@@ -51,6 +51,11 @@ class DrafterFormatTests(unittest.TestCase):
         self.assertEqual(dspark.taps, spec.taps)
         self.assertEqual((native.kind, native.block_size, native.mask_token_id, native.causal), (BLOCK, 16, 151669, False))
         self.assertEqual(native.drafts_per_pass, 15)
+        # DFlash2 keeps block_size inside dflash_config, next to its taps and mask
+        dflash2 = read_drafter({"architectures": ["DFlash2DraftModel"], "num_hidden_layers": 3,
+                                "dflash_config": {"block_size": 8, "mask_token_id": 0, "target_layer_ids": [1, 25, 49]}},
+                               target_layers=52)
+        self.assertEqual((dflash2.block_size, dflash2.mask_token_id, dflash2.taps), (8, 0, (2, 26, 50)))
         self.assertTrue(dspark.confidence_head)
         anchor = read_drafter({"speculators_model_type": "dspark", "aux_hidden_state_layer_ids": [3], "mask_token_id": 1,
                                "block_size": 7, "sample_from_anchor": True})

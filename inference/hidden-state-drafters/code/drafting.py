@@ -14,7 +14,7 @@ base + n - 1 are materialized and the token after position base + c is e_c, so t
 the last pair; later draft steps of the same round feed the drafter's own output hidden state instead of target taps.
 
 **Block drafting.** A block drafter fills [anchor, mask x (block_size - 1)] at positions frontier .. frontier +
-block_size - 1 in one non-causal pass (flash-prefill-attention with causal = false over the block, the target's
+block_size - 1 in one non-causal pass (prompt attention with causal = false over the block, the target's
 context injected through its taps), where the anchor is the pending token. Positions 1 .. block_size - 1 give
 block_size - 1 drafts; with sample_from_anchor the anchor's row gives one more, first.
 """

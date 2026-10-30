@@ -1,11 +1,11 @@
 {
   "id": "quantized-projections",
   "category": "projections",
-  "summary": "Packed G32 integer CPU, row-scaled FP8 CUDA and reference NVFP4 projections",
+  "summary": "Packed G32 integer CPU projections, a row-scaled FP8 host codec and the reference NVFP4 codec",
   "implementation_status": "native_source",
-  "implementation_scope": "Grouped integer reference, native G32 signed 4/8-bit storage, scalar/optional AVX2 projections with optional dynamic int8 activations, plus row-scaled FP8 host/CUDA operators; NVFP4 codec (E2M1 codes, E4M3 block-16 scales, FP32 divisor, adjacent packing) with an FP64 Python oracle and a scalar C++ batched projection that decodes each block once per batch",
+  "implementation_scope": "Grouped integer reference, native G32 signed 4/8-bit storage, scalar/optional AVX2 projections with optional dynamic int8 activations, plus a row-scaled FP8 host codec and oracle; NVFP4 codec (E2M1 codes, E4M3 block-16 scales, FP32 divisor, adjacent packing) with an FP64 Python oracle and a scalar C++ batched projection that decodes each block once per batch",
   "agent_guidance": {
-    "use_when": "Use or adapt the grouped-integer codec or row-scaled FP8 projection with BF16 activations for 1-8 tokens",
+    "use_when": "Use or adapt the grouped-integer codec, the row-scaled FP8 codec or the NVFP4 codec as the host reference of a format",
     "avoid_when": "The artifact uses another block format or activation encoding; this is not a universal quantized tensor decoder",
     "provides": [
       "Symmetric group quantization with represented FP32 scales",
@@ -13,25 +13,24 @@
       "Host projection against finite unquantized activations and an optional backend hook",
       "Validated borrowed G32 packed rows, native scalar/AVX2 projection and dynamically quantized int8 activation groups",
       "Finite E4M3FN and BF16 word conversion, row-scale validation and independent host projection oracle",
-      "CUDA double-buffered code/activation staging, FP32 accumulation, tails and output alias validation",
       "NVFP4 encode/decode with stated ties-to-even and saturation, adjacent packing and a batched scalar projection reference"
     ],
     "engine_supplies": [
       "Actual artifact-format interpretation and any conversion",
-      "CPU feature dispatch and build flags for AVX2, other artifact codecs and native device integer kernels; validated immutable payloads and numerical/quality criteria",
+      "CPU feature dispatch and build flags for AVX2, other artifact codecs and device kernels for any of these formats; validated immutable payloads and numerical/quality criteria",
       "Owned buffers, readiness and chosen numerical/quality criteria"
     ],
     "preserve": [
       "Code packing, scale indexing and represented values agree",
       "Group divisibility and exact packed extent",
       "Arithmetic/rounding differences are explicit when porting or fusing",
-      "FP8 row scales are BF16 multipliers; the CUDA path keeps BF16 activations and applies scale once after the FP32 dot reduction",
+      "FP8 row scales are BF16 multipliers",
       "NVFP4 packing layout and the divisor convention are explicit; no layout inference from sizes"
     ],
     "adapt": [
-      "Kernel tiling, vectorization and fusion",
       "Storage/arithmetic format as a separately declared codec",
-      "Activation quantization and accumulation with appropriate validation"
+      "Activation quantization and accumulation with appropriate validation",
+      "The device kernel that runs a format, chosen through Kernels"
     ]
   },
   "path": "inference/quantized-projections/README.md",
@@ -54,22 +53,6 @@
       "purpose": "Portable BF16/E4M3FN codec, row conversion/validation and double projection oracle"
     },
     {
-      "path": "inference/quantized-projections/code/fp8_cuda.h",
-      "purpose": "Borrowed device projection views and shape/alias contract"
-    },
-    {
-      "path": "inference/quantized-projections/code/fp8_tile.cuh",
-      "purpose": "Shared two-stage code/activation pipeline with warp-local FP32 accumulation"
-    },
-    {
-      "path": "inference/quantized-projections/code/fp8_cuda.cu",
-      "purpose": "Validated CUDA compact-batch projection dispatch"
-    },
-    {
-      "path": "inference/quantized-projections/code/CMakeLists.txt",
-      "purpose": "Optional CUDA library build"
-    },
-    {
       "path": "inference/quantized-projections/code/nvfp4.py",
       "purpose": "NVFP4 codec and FP64 batched projection oracle"
     },
@@ -79,20 +62,20 @@
     }
   ],
   "requires": {
-    "hardware": "Python 3.11+ for the general integer reference; C++20 for native G32/FP8; optional CRIT_GROUPED_INT_AVX2 requires an AVX2 build and CPU; CUDA C++20 SM80+ for FP8",
+    "hardware": "Python 3.11+ for the general integer reference; C++20 for native G32/FP8; optional CRIT_GROUPED_INT_AVX2 requires an AVX2 build and CPU",
     "model": "Exact grouped-integer format or separately validated row-scaled E4M3FN/BF16 format; arbitrary artifact codecs need adaptation; NVFP4 with adjacent packing and a divisor global scale (convert other layouts explicitly)",
-    "workload": "Native G32 supports positive token batches, row-major tensors with width divisible by 32, FP32 or dynamic G32 int8 activations; FP8 CUDA supports 1-8 tokens"
+    "workload": "Native G32 supports positive token batches, row-major tensors with width divisible by 32, FP32 or dynamic G32 int8 activations"
   },
   "contract": {
-    "input": "Finite rectangular weight rows and a finite activation vector; FP8 uses contiguous E4M3FN rows, represented BF16 row scales and BF16 token-major activations",
-    "output": "QuantizedRows codes/scales and projected row values; native FP8 returns double host oracle values or enqueued token-major FP32 CUDA output",
+    "input": "Finite rectangular weight rows and a finite activation vector; FP8 uses contiguous E4M3FN rows and represented BF16 row scales",
+    "output": "QuantizedRows codes/scales and projected row values; native FP8 returns double host oracle values",
     "ownership": "Weight bytes and scales are immutable. An asynchronous backend must retain them and activations until its receipt settles.",
-    "failure": "Reject incomplete groups, invalid byte extents, nonfinite/unrepresentable scales and mismatched activation geometry. CUDA launch checks geometry/alignment/aliases; callers own payload validation, numerical overflow checks and physical settlement after partial failure.",
+    "failure": "Reject incomplete groups, invalid byte extents, nonfinite/unrepresentable scales and mismatched activation geometry. callers own payload validation, numerical overflow checks and physical settlement after partial failure.",
     "core_boundary": "Keep quantization, encoding and arithmetic in consumer code; use core-owned workspace and backend services."
   },
   "dependencies": [
     "Python standard library",
-    "C++20 for the native codec; CUDA toolkit and SM80+ for device projections"
+    "C++20 for the native codecs"
   ],
   "symbols": [
     "QuantizedRows",
@@ -102,7 +85,6 @@
     "crit::fp8::RowWeights",
     "crit::fp8::quantize",
     "crit::fp8::project",
-    "crit::fp8::project_cuda",
     "crit::quant::Rows",
     "crit::quant::PackedRows",
     "crit::quant::quantize",
@@ -116,17 +98,15 @@
     "crit::nvfp4::project"
   ],
   "interactions": [
-    "artifact-loading",
-    "rmsnorm-bf16"
+    "artifact-loading"
   ],
   "techniques": [
     "quantized-projections",
-    "artifact-loading",
-    "rmsnorm-bf16"
+    "artifact-loading"
   ],
   "validation": {
     "host": "Host fixtures and worked example cover signed/odd nibble packing, zero groups, scale representation and projection geometry; native tests cover every finite FP8 code, ties, zero/subnormal scales, odd extents and invalid words; native G32 fixture compares 108 scalar/SIMD projection profiles to independently reconstructed arithmetic, signed minimum codes, ties, invalid scales/extents and encoded-KV ownership; NVFP4 Python and native fixtures cover all E2M1 codes, every finite E4M3 code, ties, saturation, zero blocks, packing, error bounds and batched projection against FP64",
-    "native": "RTX 5090 CUDA fixtures cover 320 projection cases, 1-8 tokens, odd widths, tails, aliases and repeated graph replay against an independent double oracle; full-model quality and performance require consumer evidence",
+    "native": "The native codec fixtures above run on the host; device kernels for these formats are chosen and measured by the engine",
     "performance": "Kernel and model speed require matched consumer measurements; an AVX2 build alone establishes no speedup"
   }
 }

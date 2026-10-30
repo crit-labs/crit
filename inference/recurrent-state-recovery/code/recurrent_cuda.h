@@ -63,8 +63,8 @@ cudaError_t enqueue_verify_deferred(const DeviceGeometry&, float* state, DeviceS
 cudaError_t enqueue_record_accepted(const std::int32_t* accepted, std::uint32_t columns, std::int32_t* pending, cudaStream_t);
 // The same for `count` counts in each of `groups` groups `stride` ints apart, in one
 // launch: pending[g * stride + i] = clamp(*accepted, 0, columns). A deferred commit that
-// keeps a count per block (recurrent-layer-kernels' enqueue_conv_deferred and
-// enqueue_delta_columns_deferred) records all of a round's layers with one call.
+// keeps a count per block (an engine's deferred convolution and column scan)
+// records all of a round's layers with one call.
 cudaError_t enqueue_record_accepted(const std::int32_t* accepted, std::uint32_t columns, std::int32_t* pending,
                                     std::uint32_t count, std::uint32_t groups, std::size_t stride, cudaStream_t);
 }

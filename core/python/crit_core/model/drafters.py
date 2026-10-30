@@ -161,9 +161,10 @@ def read_drafter(config, source=CONFIG_NAME, target_layers=None):
             raise ConfigError(f"{source}: a block drafter needs target_layer_ids")
         taps = tuple(i + 1 for i in _ids(section["target_layer_ids"], source, "target_layer_ids"))
         mask = section.get("mask_token_id", config.get("mask_token_id"))
+        block = section.get("block_size", config.get("block_size"))
         drafter = Drafter(BLOCK, taps, _optional_int(config, "hidden_size", source, 1), _optional_int(config, "target_hidden_size", source, 1),
                           _optional_int(config, "draft_vocab_size", source, 1), _optional_int(config, "num_hidden_layers", source, 1),
-                          _optional_int(config, "block_size", source, 2),
+                          None if block is None else _int(block, source, "block_size", 2),
                           None if mask is None else _int(mask, source, "mask_token_id"),
                           _bool(section, "sample_from_anchor", source, _bool(config, "sample_from_anchor", source, False)),
                           _bool(section, "causal", source, False), _bool(config, "enable_confidence_head", source, False),

@@ -32,7 +32,7 @@ EVAL_JSON_BYTES = 256 * 1024 * 1024
 
 
 def rules(run):
-    """The version of the plan rules a run was created with: 2 or 3 from `"plan_rules"` in its spec, else 1."""
+    """The version of the plan rules a run was created with: 2 to 4 from `"plan_rules"` in its spec, else 1."""
     return run["spec"].get("plan_rules", 1)
 
 
@@ -162,17 +162,34 @@ def _draft_floor(result, model):
     return (found / (bandwidth * 1e9) * 1000, source) if found else (None, None)
 
 
+def _companion(root, row, name):
+    """The companion drafter whose draft cost an alternative's round floor takes where Eval measured none: the one
+    drafter work/recon.json records with its pass_bytes (recon --drafter), or the one the row names by its recorded
+    path (companion) when recon recorded several. None without one."""
+    path = root / "work" / "recon.json"
+    drafters = [d for d in ((read_json(path).get("drafters") or []) if path.is_file() else [])
+                if isinstance(d, dict) and d.get("pass_bytes") and d.get("drafts_per_pass")]
+    if "companion" in row:
+        found = [d for d in drafters if d.get("path") == row["companion"]]
+        if not found:
+            raise ValueError(f"{name}.companion names no drafter work/recon.json records with its pass bytes")
+        return found[0]
+    return drafters[0] if len(drafters) == 1 else None
+
+
 def _width(result):
     """The parent engine's draft width as Eval read it, or None (a plain engine, or a drafter that reports none)."""
     width = (result.get("headroom") or {}).get("draft_width")
     return width if type(width) is int and width >= 1 else None
 
 
-def alternative_limit(result, model, kpi, tokens_per_round, draft_steps, version=1):
+def alternative_limit(result, model, kpi, tokens_per_round, draft_steps, version=1, companion=None):
     """The alternative strategy's ceiling for decode or context_decode on the parent's Eval cases (points): the
     plan's tokens per round over a round floor crit computes, the pass floor plus draft_steps draft steps at their
-    bytes floor (rules 2: at Eval's draft floor, _draft_floor), geometric mean. None when the attempt and the model
-    files lack the pass floor's facts, or the draft step's."""
+    bytes floor (rules 2: at Eval's draft floor, _draft_floor), geometric mean. Rules 2 without a draft floor take a
+    companion drafter's (_companion: the one recon recorded): ceil(draft_steps / drafts_per_pass) drafter passes at
+    its pass_bytes over the bandwidth, a block drafter's one pass yielding its whole block. None when the attempt and
+    the model files lack the pass floor's facts, or the draft step's."""
     room = result.get("headroom") or {}
     bandwidth = _positive(room.get("bandwidth_gbs"))
     per_pass, source = _bytes_per_pass(room, model)
@@ -181,6 +198,10 @@ def alternative_limit(result, model, kpi, tokens_per_round, draft_steps, version
     kv = _positive(room.get("kv_bytes_per_token")) or 0
     if version >= 2:
         step_ms, draft_source = _draft_floor(result, model) if draft_steps else (None, None)
+        if draft_steps and step_ms is None and companion:
+            passes = math.ceil(draft_steps / companion["drafts_per_pass"])
+            step_ms = passes * companion["pass_bytes"] / (bandwidth * 1e9) * 1000 / draft_steps
+            draft_source = f"recon companion drafter {companion['path']} ({passes} pass x pass_bytes)"
         if draft_steps and step_ms is None:
             return None
         step_ms = step_ms or 0.0
@@ -510,7 +531,75 @@ FIELDS = {"parent_candidate_id", "decision", "needed", "gaps", "strategy", "leve
 CRIT_FIELDS = {"plan_id", "segment_id", "created_at", "request_sha256", "inputs", "priorities", "priorities_reason"}
 
 
-OPTIONAL = {"supersedes", "estimated_limits", "forecast_justification"}
+OPTIONAL = {"supersedes", "estimated_limits", "forecast_justification", "weakest", "review"}
+
+# Plan rules 4: what each candidate of a run is for, by its number in the run (objective()). The proof of concept
+# works end to end; the crit rounds raise it with crit's toolkit; each critique round names the parent's two weakest
+# terms and improves them, with other levers beside them.
+OBJECTIVES = {
+    "proof_of_concept": "the first engine that works end to end: it serves, passes the functional gates and the "
+                        "quality gate at the required context, built in its placement scenario's starting design "
+                        "(recon.md's placement plan)",
+    "crit_round": "improve the parent as much as possible with crit's toolkit: Inference techniques and Kernels Hub "
+                  "kernels, each measured against its floor and fixed or replaced where it trails",
+    "critique_round": "name the parent's two weakest terms (the largest measured distances to their floors, from Eval "
+                      "and the kernel trace) in weakest, improve both, and add other levers beside them",
+}
+CRIT_ROUNDS = 3        # candidates 2 and 3
+# Plan rules 4: what supplies a speed lever's code (`provider`): an Inference entry, a Kernel Hub repository, a library
+# (kernels/SOURCES.md), or the engine's own code, which carries a `yardstick`: the measurement of the best existing
+# provider for the operation, or the providers it checked and why none fits.
+PROVIDERS = ("inference:", "hub:", "lib:", "own")
+# Candidates 2 to FLOOR_UNTIL forecast at least MIN_GAIN of expected gain on a p1 KPI over the parent's Eval.
+MIN_GAIN, FLOOR_UNTIL = 0.10, 5
+
+
+def _missed(kpi, row):
+    """An outcome row whose measurement fell short of its forecast's low (above its high for a time)."""
+    measured = row.get("measured")
+    if measured is None:
+        return False
+    return measured > row["forecast"]["high"] if kpi in MS else measured < row["forecast"]["low"]
+
+
+def _largest(plan, p1):
+    """The id of the plan's speed lever with the largest forecast change on a p1 family, or None."""
+    best, found = 0.0, None
+    for lever in speed_levers(plan["levers"]):
+        change = max((row["change"] for kpi, row in lever["changes"].items() if FAMILY.get(kpi, kpi) in p1), default=0.0)
+        if change > best:
+            best, found = change, lever["id"]
+    return found
+
+
+def review_facts(root, run, parent, eval_ref):
+    """Plan rules 4, check 14: what the plan for the parent's child reviews: the parent's plan, its outcome at the Eval
+    attempt this plan freezes, the KPIs that missed their forecast and the levers built, pruned or deferred. None when
+    the parent has no plan or no outcome at that attempt."""
+    planned = [s for s in summaries(root, run) if s["candidate_id"] == parent]
+    if not planned or eval_ref is None:
+        return None
+    plan = load(root, run, planned[0]["plan_id"])
+    attempt = eval_ref["path"].rsplit("/", 1)[-1][:-len(".json")]
+    path = root / "plans" / plan["plan_id"] / "outcomes" / f"{attempt}.json"
+    if not path.is_file():
+        return None
+    outcome_value = read_json(path)
+    fates = {row["id"]: (row.get("fate") or {}).get("fate") for row in outcome_value["levers"]}
+    p1 = (plan.get("priorities") or {}).get("p1") or []
+    largest = _largest(plan, p1)
+    return {"plan_id": plan["plan_id"], "outcome": {"path": path.relative_to(root).as_posix(), "sha256": file_sha(path)},
+            "missed": sorted(kpi for kpi, row in outcome_value["kpis"].items() if _missed(kpi, row)),
+            "built": sorted(i for i, fate in fates.items() if fate == "built"),
+            "dropped": sorted(i for i, fate in fates.items() if fate in ("pruned", "deferred")),
+            "largest_p1_lever": largest, "largest_p1_fate": fates.get(largest) if largest else None}
+
+
+def objective(number):
+    """Plan rules 4: the objective of the run's candidate `number` (1 for the first)."""
+    name = ("proof_of_concept" if number == 1 else "crit_round" if number <= CRIT_ROUNDS else "critique_round")
+    return {"candidate": number, "name": name, "rule": OBJECTIVES[name],
+            **({"min_gain": MIN_GAIN} if 2 <= number <= FLOOR_UNTIL else {})}
 
 
 def _fields(data):
@@ -518,6 +607,36 @@ def _fields(data):
     keys(data, FIELDS, OPTIONAL)
     if "forecast_justification" in data:
         text(data["forecast_justification"], "forecast_justification", 8000)
+    if "review" in data:
+        review = data["review"]
+        keys(review, {"plan_id", "kpis", "levers", "lesson"})
+        ident(review["plan_id"], "plan")
+        text(review["lesson"], "review lesson (what this plan changes because of the review)", 8000)
+        if not isinstance(review["kpis"], dict) or not set(review["kpis"]) <= set(KPIS):
+            raise ValueError("review.kpis maps the KPIs that missed their forecast to {cause, evidence}")
+        for kpi, row in review["kpis"].items():
+            keys(row, {"cause", "evidence"})
+            text(row["cause"], f"review {kpi} cause (why it missed, from the profile)", 8000)
+            text(row["evidence"], f"review {kpi} evidence (a path in the run)", 400)
+        if not isinstance(review["levers"], dict):
+            raise ValueError("review.levers maps the parent plan's levers to what they delivered")
+        for lever_id, row in review["levers"].items():
+            keys(row, {"result"}, {"evidence", "structure"})
+            text(row["result"], f"review {lever_id} result (what it delivered, measured)", 8000)
+            for key in ("evidence", "structure"):
+                if key in row:
+                    text(row[key], f"review {lever_id} {key}", 400 if key == "evidence" else 4000)
+    if "weakest" in data:
+        if not isinstance(data["weakest"], list) or len(data["weakest"]) != 2:
+            raise ValueError("weakest names the parent's two weakest terms")
+        for row in data["weakest"]:
+            keys(row, {"kpi", "term", "evidence", "levers"})
+            if row["kpi"] not in KPIS:
+                raise ValueError("weakest entries name a KPI (" + ", ".join(KPIS) + ")")
+            text(row["term"], "weakest term (what is slow, with its measured time and floor)", 400)
+            text(row["evidence"], f"weakest evidence for {row['term']} (a path in the run)", 400)
+            if not isinstance(row["levers"], list) or not row["levers"] or not all(isinstance(i, str) for i in row["levers"]):
+                raise ValueError(f"weakest {row['term']}: levers lists the ids of the levers that improve it")
     if data["parent_candidate_id"] is not None:
         ident(data["parent_candidate_id"], "candidate")
     if data.get("supersedes") is not None:
@@ -556,7 +675,10 @@ def _fields(data):
                          "{tokens_per_round, draft_steps, derivation}, or {limit, derivation} where crit cannot "
                          "compute the round floor")
     for kpi, row in limits.items():
-        keys(row, {"derivation"}, {"tokens_per_round", "draft_steps", "limit", "drafter", "acceptance_evidence"})
+        keys(row, {"derivation"}, {"tokens_per_round", "draft_steps", "limit", "drafter", "acceptance_evidence",
+                                   "companion"})
+        if "companion" in row:
+            text(row["companion"], f"strategy.alternative.limits.{kpi}.companion (a drafter path recon recorded)", 1000)
         text(row["derivation"], f"strategy.alternative.limits.{kpi}.derivation", 8000)
         if row.get("drafter", "measured") not in DRAFTERS:
             raise ValueError(f"strategy.alternative.limits.{kpi}.drafter is measured (the drafter the parent's Eval "
@@ -572,7 +694,8 @@ def _fields(data):
     text(strategy["reason"], "strategy.reason", 8000)
     seen = set()
     for lever in data["levers"]:
-        keys(lever, {"id", "technique", "description", "changes", "group", "confidence"}, {"kind", "serves"})
+        keys(lever, {"id", "technique", "description", "changes", "group", "confidence"},
+             {"kind", "serves", "provider", "yardstick"})
         text(lever["id"], "lever id", 100)
         if lever.get("kind", "speed") not in LEVER_KINDS:
             raise ValueError(f"{lever['id']} kind is speed or requirement")
@@ -584,6 +707,14 @@ def _fields(data):
             raise ValueError(f"Lever id {lever['id']} appears twice")
         seen.add(lever["id"])
         text(lever["technique"], f"{lever['id']} technique", 400)
+        if "provider" in lever:
+            provider = text(lever["provider"], f"{lever['id']} provider", 200)
+            if not provider.startswith(PROVIDERS):
+                raise ValueError(f"{lever['id']} provider starts with " + ", ".join(PROVIDERS) + ": what supplies its code")
+        if "yardstick" in lever:
+            keys(lever["yardstick"], {"evidence", "detail"})
+            text(lever["yardstick"]["evidence"], f"{lever['id']} yardstick evidence (a path in the run)", 400)
+            text(lever["yardstick"]["detail"], f"{lever['id']} yardstick detail", 4000)
         text(lever["description"], f"{lever['id']} description", 8000)
         if lever["group"] is not None:
             text(lever["group"], f"{lever['id']} group", 100)
@@ -644,9 +775,16 @@ def _alternative(run, root, facts, result, data, sources):
                              "tokens (the drafts and the target's own token)")
         drafted = _drafter(run, root, data["parent_candidate_id"], result, kpi, row, steps)
         # Rules 2 charge the draft steps at Eval's draft floor, as computed_limits does: one cost model, Eval's.
-        computed = (alternative_limit(result, model, kpi, row["tokens_per_round"], steps, rules(run))
+        computed = (alternative_limit(result, model, kpi, row["tokens_per_round"], steps, rules(run),
+                                      _companion(root, row, name=f"strategy.alternative.limits.{kpi}"))
                     if "tokens_per_round" in row else None)
         if "tokens_per_round" in row and computed is None:
+            if rules(run) >= 2:  # a bare limit is refused there too (_drafter): say the one way that is left
+                raise ValueError(f"crit cannot compute the round floor for strategy.alternative.limits.{kpi} (no bytes "
+                                 "per pass, bandwidth or draft step cost: a separate drafter no Eval has measured is "
+                                 "priced from recon --drafter's pass bytes): record the drafter with recon, or in plan "
+                                 f"rules 2 leave {kpi} out of strategy.alternative.limits, so the alternative does not "
+                                 "rank it; its strategy, forecast and evidence still stand")
             raise ValueError(f"crit cannot compute the round floor for strategy.alternative.limits.{kpi} (no bytes per "
                              "pass, bandwidth or draft step bytes): give its limit and how it was derived instead")
         if "limit" in row and alternative_limit(result, model, kpi, 1.0, 0) is not None:
@@ -854,6 +992,9 @@ def build(root, run, bounds, data, status_for=None):
               **({"noise_default": dict(zip(("noise", "source"), noise_default(facts)))}
                  if version >= 2 and facts is not None else {})}
     decision = data["decision"]
+    if version >= 4:
+        # The run's candidates so far, this plan's candidate the next one (a revision plans the same one again).
+        inputs["objective"] = objective(len(candidates) + 1)
     # Check 3: the decision follows the needed flags (in rules 2 the run's first plan too).
     if not first or version >= 2:
         if decision == "stop" and any(needed.values()):
@@ -969,6 +1110,77 @@ def build(root, run, bounds, data, status_for=None):
         if inputs["forecast_checks"] and "forecast_justification" not in data:
             raise ValueError("The forecast " + "; ".join(inputs["forecast_checks"]) + ": give forecast_justification "
                              "(why this candidate is worth building anyway), which crit records, or plan for p1")
+    # Check 13 (rules 4): the objective's requirements.
+    if version >= 4 and decision == "build":
+        # Every speed lever names what supplies its code; the engine's own code is measured against what exists.
+        for lever in levers:
+            if "provider" not in lever:
+                raise ValueError(f"{lever['id']} names no provider: " + ", ".join(PROVIDERS) + " (kernels/SOURCES.md "
+                                 "lists where kernels come from)")
+            if lever["provider"].startswith("own"):
+                if "yardstick" not in lever:
+                    raise ValueError(f"{lever['id']} is the engine's own code: give its yardstick, the measured best "
+                                     "existing provider for the operation or the providers checked and why none fits")
+                _evidence_file(root, lever["yardstick"]["evidence"], f"{lever['id']} yardstick")
+        goal = inputs["objective"]
+        if goal["name"] == "critique_round":
+            if "weakest" not in data:
+                raise ValueError(f"Candidate {goal['candidate']} is a critique round: {goal['rule']}")
+            ids = {lever["id"]: lever for lever in levers}
+            for row in data["weakest"]:
+                _evidence_file(root, row["evidence"], f"weakest {row['term']}")
+                for lever_id in row["levers"]:
+                    lever = ids.get(lever_id)
+                    if lever is None or not any(change["change"] > 0 for kpi, change in lever["changes"].items()
+                                                if FAMILY.get(kpi, kpi) == FAMILY.get(row["kpi"], row["kpi"])):
+                        raise ValueError(f"weakest {row['term']}: {lever_id} is no speed lever of this plan that "
+                                         f"improves {row['kpi']}")
+            if not set(ids) - {i for row in data["weakest"] for i in row["levers"]}:
+                raise ValueError(f"Candidate {goal['candidate']} is a critique round: add other levers beside the ones "
+                                 "for its two weakest terms")
+        if "min_gain" in goal and forecast is not None and facts is not None and order is not None:
+            best = max((_gain(kpi, forecast[kpi]["expected"], (facts["kpis"].get(kpi) or {}).get("score"))
+                        for name in order["p1"] for kpi in FAMILIES.get(name, (name,)) if kpi in forecast), default=0.0)
+            if best < goal["min_gain"]:
+                raise ValueError(f"Candidate {goal['candidate']} forecasts {best:+.1%} on p1 ({', '.join(order['p1'])}): "
+                                 f"candidates 2 to {FLOOR_UNTIL} are planned for at least +{goal['min_gain']:.0%} on a "
+                                 "p1 KPI; plan the levers that close more of its gap")
+    elif "weakest" in data and version < 4:
+        raise ValueError("weakest belongs to plan rules 4 (critique rounds)")
+    # Check 14 (rules 4): the plan reviews its parent's plan against the parent's measured Eval.
+    facts_review = review_facts(root, run, parent, eval_ref) if version >= 4 and not first else None
+    if facts_review is not None:
+        inputs["review"] = facts_review
+        review = data.get("review")
+        if review is None:
+            raise ValueError(f"Review {facts_review['plan_id']} first: review gives its plan_id, the cause and evidence of "
+                             "each KPI that missed its forecast (" + (", ".join(facts_review["missed"]) or "none") + "), "
+                             "what each lever delivered (" + ", ".join(facts_review["built"] + facts_review["dropped"])
+                             + ") and the lesson this plan draws")
+        if review["plan_id"] != facts_review["plan_id"]:
+            raise ValueError(f"review names {review['plan_id']}: the parent's plan is {facts_review['plan_id']}")
+        for kpi in facts_review["missed"]:
+            if kpi not in review["kpis"]:
+                raise ValueError(f"review: {kpi} missed its forecast in {facts_review['outcome']['path']}: give its cause "
+                                 "and evidence")
+        for kpi, row in review["kpis"].items():
+            _evidence_file(root, row["evidence"], f"review {kpi}")
+        for lever_id in facts_review["built"] + facts_review["dropped"]:
+            if lever_id not in review["levers"]:
+                raise ValueError(f"review: say what {lever_id} of {facts_review['plan_id']} delivered")
+        # Gate: the parent's largest p1 lever, pruned or deferred, is planned again or rejected on a measurement of
+        # another kernel structure or a vendor library at the same arithmetic, never on variants of one kernel.
+        largest = facts_review["largest_p1_lever"]
+        if largest and facts_review["largest_p1_fate"] in ("pruned", "deferred") and \
+                largest not in {lever["id"] for lever in data["levers"]}:
+            row = review["levers"][largest]
+            if "evidence" not in row or "structure" not in row:
+                raise ValueError(f"{largest} was {facts_review['largest_p1_fate']}, the largest p1 lever of "
+                                 f"{facts_review['plan_id']}: plan it again (same id) or give review.levers.{largest} "
+                                 "evidence and structure: the other kernel structure or vendor library measured on it")
+            _evidence_file(root, row["evidence"], f"review {largest}")
+    elif "review" in data:
+        raise ValueError("review belongs to plan rules 4, once the parent's plan has an outcome")
     # Check 11: a revision replaces the newest plan of its chain before its candidate exists.
     if data.get("supersedes") is not None:
         old = load(root, run, data["supersedes"])

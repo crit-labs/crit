@@ -52,7 +52,7 @@ own output hidden state.
 
 **Block drafting.** The drafter fills `[anchor, mask x (block_size - 1)]` at positions
 `frontier .. frontier + block_size - 1` in one pass whose attention is non-causal inside the
-block ([flash-prefill-attention](../flash-prefill-attention/README.md) with `causal = false`),
+block (a prompt attention kernel with `causal = false`),
 with the target's taps injected as context. Positions `1 .. block_size - 1` give the drafts
 (all `block_size` with `sample_from_anchor`). One pass replaces `K` sequential draft steps,
 which at batch 1 are bound by launch latency more than by bytes.

@@ -4,7 +4,7 @@ A complete batched serving engine for a synthetic decoder-only transformer, show
 how the pieces fit: a Core `ConcurrentModel` with mixed batches runs the decode rows
 and prompt chunks of many requests as one step, every projection reads its weights
 once for all of the step's rows, KV lives in Core's StateCache pages with prefix
-reuse, attention runs on [paged-attention](../paged-attention/README.md)'s kernels,
+reuse, attention runs on the engine's own paged attention kernels (`code/paged_attention.cu`),
 and the engine is exported through the native engine ABI with `concurrent_requests`,
 so `crit serve` serves it to concurrent clients (`chat-concurrent-v1`). A request's
 output is bit for bit the same whether it runs alone or batched.
@@ -109,8 +109,7 @@ const auto result = a.wait();   // result.timing.reused_prompt_tokens reports pr
 
 ## Costs and validation
 
-The kernels need sm_80 or later (BF16 `mma.sync`, `ldmatrix`, `cp.async`, and
-paged-attention's requirements). They build for sm_80, sm_86, sm_89 and sm_120; the
+The kernels need sm_80 or later (BF16 `mma.sync`, `ldmatrix`, `cp.async`). They build for sm_80, sm_86, sm_89 and sm_120; the
 tests below ran on sm_120 only.
 
 `tests/inference/batched_engine_tests.cpp` checks the GEMM (with and without split K,

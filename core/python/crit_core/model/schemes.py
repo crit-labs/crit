@@ -273,7 +273,7 @@ class StoredMatrix:
     input_divides: bool = False
 
 
-# Schemes matrix_parts describes; the others are decoded (crit-eval) or converted (w4a16-projections) instead.
+# Schemes matrix_parts describes; the others are decoded (crit-eval) or converted by the engine instead.
 PART_SCHEMES = ("nvfp4", "fp8", "plain")
 
 

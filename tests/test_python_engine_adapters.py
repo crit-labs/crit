@@ -107,6 +107,21 @@ class PythonEngineAdapterTests(unittest.TestCase):
         engine.close()
         self.assertTrue(self.opened[0].closed)
 
+    def test_close_frees_an_engine_whose_parts_refer_to_each_other(self):
+        import weakref
+        engine = eval_engine({"model": "/m"}, self.open)
+        toy = self.opened.pop()
+        toy.drafter = types.SimpleNamespace(model=toy)   # a reference cycle, as a drafter and its model make
+        freed = weakref.ref(toy)
+        del toy
+        import gc
+        gc.disable()   # only close() may collect
+        try:
+            engine.close()
+            self.assertIsNone(freed())
+        finally:
+            gc.enable()
+
     def test_a_cancelled_request_never_reaches_the_engine(self):
         engine = native.PythonEngine(self.open, {})
         self.assertEqual(engine.generate([1], 2, cancelled=lambda: True), (None, {"cancelled": True}))

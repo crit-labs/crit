@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_inference VERSION 0.12.0 LANGUAGES CXX)
+project(crit_inference VERSION 0.13.0 LANGUAGES CXX)
 # Inference's native examples and fixtures. Inference uses Core only through its public SDK
 # (crit::core, crit::cuda); Core never builds or includes Inference code.
 find_package(Threads REQUIRED)
@@ -8,7 +8,7 @@ option(CRIT_INFERENCE_CUDA "Build Inference's CUDA reference kernels and their f
 option(CRIT_INFERENCE_INSTALLED_CORE "Use an installed Core SDK (CMAKE_PREFIX_PATH) instead of this checkout's core/" OFF)
 if(NOT TARGET crit::core)
   if(CRIT_INFERENCE_INSTALLED_CORE)
-    find_package(critCore 0.12.0 CONFIG REQUIRED)
+    find_package(critCore 0.13.0 CONFIG REQUIRED)
   else()
     if(CRIT_INFERENCE_CUDA)
       set(CRIT_CORE_CUDA ON CACHE BOOL "Build the explicit CUDA backend services" FORCE)
@@ -261,13 +261,6 @@ target_link_libraries(crit_hidden_drafters PUBLIC crit_device_round_kernels)
 crit_inference_executable(crit_hidden_drafter_tests SOURCES ${FIXTURES}/hidden_drafter_tests.cpp LINK crit_hidden_drafters)
 crit_inference_test(crit_hidden_drafters 60 crit_hidden_drafter_tests)
 
-crit_inference_kernels(crit_w4a16 ${INFERENCE}/w4a16-projections/code w4a16.cu)
-crit_inference_executable(crit_w4a16_tests SOURCES ${FIXTURES}/w4a16_tests.cpp LINK crit_w4a16)
-crit_inference_tests(crit_w4a16_tests crit_w4a16 180 formats products rejects)
-crit_inference_kernels(crit_latent_attention ${INFERENCE}/latent-attention/code latent_attention.cu)
-crit_inference_executable(crit_latent_attention_tests SOURCES ${FIXTURES}/latent_attention_tests.cpp LINK crit_latent_attention)
-crit_inference_test(crit_latent_attention 180 crit_latent_attention_tests)
-
 add_executable(crit_programmatic_launch_tests ${FIXTURES}/programmatic_launch_tests.cu)
 target_compile_features(crit_programmatic_launch_tests PRIVATE cxx_std_20 cuda_std_20)
 target_link_libraries(crit_programmatic_launch_tests PRIVATE crit::cuda)
@@ -275,23 +268,12 @@ crit_inference_test(crit_programmatic_launch 60 crit_programmatic_launch_tests)
 
 set(_recurrent_code ${INFERENCE}/recurrent-state-recovery/code)
 crit_inference_kernels(crit_recurrent_cuda ${_recurrent_code} recurrent_cuda.cu)
-# The deferred commit's counts are recorded by recurrent-state-recovery's enqueue_record_accepted.
-add_executable(crit_recurrent_kernels_tests ${FIXTURES}/recurrent_kernels_tests.cu ${INFERENCE}/recurrent-layer-kernels/code/recurrent_kernels.cu)
-target_include_directories(crit_recurrent_kernels_tests PRIVATE ${INFERENCE}/recurrent-layer-kernels/code)
-target_compile_features(crit_recurrent_kernels_tests PRIVATE cxx_std_20 cuda_std_20)
-target_link_libraries(crit_recurrent_kernels_tests PRIVATE CUDA::cudart crit_recurrent_cuda)
-crit_inference_test(crit_recurrent_kernels 300 crit_recurrent_kernels_tests)
-
 crit_inference_executable(crit_recurrent_cuda_tests SOURCES ${FIXTURES}/recurrent_cuda_tests.cpp LINK crit::cuda crit_recurrent_cuda)
 crit_inference_tests(crit_recurrent_cuda_tests crit_recurrent_cuda 120 oracle deferred rejects)
 
 crit_inference_kernels(crit_draft_subset ${INFERENCE}/draft-vocabulary-subset/code subset_argmax.cu)
 crit_inference_executable(crit_draft_subset_tests SOURCES ${FIXTURES}/draft_subset_tests.cpp LINK crit::cuda crit_draft_subset)
 crit_inference_test(crit_draft_subset 60 crit_draft_subset_tests)
-
-crit_inference_kernels(crit_rotated_kv ${INFERENCE}/rotated-kv-quantization/code rotated_kv.cu)
-crit_inference_executable(crit_rotated_kv_tests SOURCES ${FIXTURES}/rotated_kv_tests.cpp LINK crit::cuda crit_rotated_kv)
-crit_inference_test(crit_rotated_kv 60 crit_rotated_kv_tests)
 
 crit_inference_kernels(crit_device_expert_cache ${INFERENCE}/device-expert-cache/code device_cache.cu)
 crit_inference_executable(crit_device_expert_cache_tests SOURCES ${FIXTURES}/device_expert_cache_tests.cpp LINK crit_device_expert_cache)
@@ -307,34 +289,14 @@ crit_inference_executable(crit_sampled_round_tests SOURCES ${FIXTURES}/sampled_r
   LINK crit_token_sampling crit_device_round_kernels)
 crit_inference_test(crit_sampled_round 300 crit_sampled_round_tests)
 
-# python-bindings: one shared library of the C ABI over the CUDA entries, for engines that load it with ctypes.
-# Only the crit_* functions are exported.
-set(_bindings ${INFERENCE}/python-bindings/code)
-add_library(crit_inference_python SHARED ${_bindings}/crit_inference.cpp
-  ${INFERENCE}/stored-tile-gemm/code/stored_tile_gemm.cu ${INFERENCE}/stored-tile-gemm/code/stored_tile_bf16.cu
-  ${INFERENCE}/recurrent-layer-kernels/code/recurrent_kernels.cu ${_recurrent_code}/recurrent_cuda.cu
-  ${INFERENCE}/fp8-kv-attention/code/fp8_kv_attention.cu ${INFERENCE}/token-sampling/code/sampling.cu
-  ${_round_code}/greedy_accept.cu)
-target_include_directories(crit_inference_python PRIVATE ${_bindings} ${INFERENCE}/stored-tile-gemm/code
-  ${INFERENCE}/recurrent-layer-kernels/code ${_recurrent_code} ${INFERENCE}/fp8-kv-attention/code
-  ${INFERENCE}/token-sampling/code ${_round_code})
-target_compile_features(crit_inference_python PRIVATE cxx_std_20 cuda_std_20)
-target_link_libraries(crit_inference_python PRIVATE crit::core CUDA::cudart)
-set_target_properties(crit_inference_python PROPERTIES CXX_VISIBILITY_PRESET hidden CUDA_VISIBILITY_PRESET hidden
-  VISIBILITY_INLINES_HIDDEN ON)
-if(Python3_Interpreter_FOUND)
-  add_test(NAME crit_inference_python COMMAND "${Python3_EXECUTABLE}" -B
-    "${FIXTURES}/python_bindings_check.py" $<TARGET_FILE:crit_inference_python>)
-  set_tests_properties(crit_inference_python PROPERTIES TIMEOUT 120)
-endif()
-
 crit_inference_kernels(crit_host_mailbox ${INFERENCE}/host-work-mailbox/code mailbox.cu)
 add_library(crit_host_mailbox_fixture STATIC ${FIXTURES}/host_mailbox_fixture.cu)
 target_link_libraries(crit_host_mailbox_fixture PUBLIC crit_host_mailbox)
 crit_inference_executable(crit_host_mailbox_tests SOURCES ${FIXTURES}/host_mailbox_tests.cpp LINK crit_host_mailbox_fixture)
 crit_inference_test(crit_host_mailbox 300 crit_host_mailbox_tests)
 
-crit_inference_kernels(crit_paged_attention ${INFERENCE}/paged-attention/code paged_attention.cu)
+# The synthetic engine's own paged attention (part of the example engine, not a curated kernel).
+crit_inference_kernels(crit_paged_attention ${INFERENCE}/batched-reference-engine/code paged_attention.cu)
 target_link_libraries(crit_paged_attention PUBLIC crit::core)
 crit_inference_executable(crit_paged_attention_tests SOURCES ${FIXTURES}/paged_attention_tests.cpp
   INCLUDES ${INFERENCE}/attention-state/code LINK crit_paged_attention)
@@ -353,10 +315,6 @@ if(Python3_Interpreter_FOUND)
     "${FIXTURES}/batched_engine_serving_check.py" $<TARGET_FILE:crit_batched_engine_library>)
   set_tests_properties(crit_batched_engine_serving PROPERTIES TIMEOUT 300)
 endif()
-
-crit_inference_kernels(crit_gguf_projections ${INFERENCE}/gguf-projections/code gguf_cuda.cu)
-crit_inference_executable(crit_gguf_projections_tests SOURCES ${FIXTURES}/gguf_projections_tests.cpp LINK crit_gguf_projections crit::core)
-crit_inference_test(crit_gguf_projections 120 crit_gguf_projections_tests)
 
 set(_offload ${INFERENCE}/dense-layer-offload/code)
 add_library(crit_dense_offload STATIC ${_offload}/host_dense.cpp ${_offload}/offload_exec.cpp ${_offload}/synthetic_offload.cpp)

@@ -928,9 +928,10 @@ class RunStore:
         mode = quality_mode(run["spec"]["correctness"])
         mode_line = (" Quality mode preserve: Eval's reference keeps the activations exact, so quantizing them counts as "
                      "drift, and prefill's limits are priced at 16-bit prompt activations." if mode == "preserve" else
-                     " Quality mode as_quantized (the user's choice): Eval's reference runs the checkpoint as quantized, "
-                     "its activations quantized as the checkpoint declares, so the checkpoint's own activation "
-                     "quantization is no drift and prefill's limits are priced at its stored format.")
+                     " Quality mode as_quantized (the user's choice): Eval judges against the exact reference with "
+                     "each set's limits widened by the drift of the checkpoint's own activation quantization (its "
+                     "allowance), so running the checkpoint's activations as it declares fits the budget, and "
+                     "prefill's limits are priced at its stored format.")
         quality_line = (f"Quality budget: PPL ratio ≤ {quality_budget['ppl_ratio_max']}, mean KLD ≤ "
                         f"{quality_budget['kld_mean_max']}, p99 KLD ≤ {quality_budget['kld_p99_max']} against Eval's reference; "
                         f"speculative exactness {exactness}." + mode_line + " crit run ... eval applies them; pass them to "
@@ -1028,6 +1029,24 @@ class RunStore:
             plan_line += ("\nBefore the first candidate, recon.md's prefill arithmetic plan names each matrix group's\n"
                           "prompt activation format and its quality measurement (crit eval run --attribute-drift),\n"
                           "beside the drafting plan.")
+        if run["spec"].get("plan_rules", 1) >= 4:
+            plan_line += ("\nPlan rules 4: each candidate has an objective by its number in the run, which crit names in\n"
+                          "the plan's inputs.objective. Candidate 1 is the proof of concept: the first engine that works\n"
+                          "end to end, in its placement scenario's starting design (recon.md). Candidates 2 and 3 are crit rounds: improve the parent as much as possible with\n"
+                          "crit's toolkit (Inference techniques and Kernels Hub kernels), measuring each against its floor\n"
+                          "and fixing or replacing it where it trails. Candidates 4 on are critique rounds: the plan names\n"
+                          "the parent's two weakest terms (the largest measured distances to their floors, from Eval and\n"
+                          "the kernel trace) in weakest, each with its evidence and the levers that improve it, plus other\n"
+                          "levers beside them. Candidates 2 to 5 forecast at least +10% expected on a p1 KPI over the\n"
+                          "parent's Eval: a plan below that is refused, so plan the levers that close more of the gap.\n"
+                          "Every speed lever names its provider (inference:ENTRY, hub:ORG/NAME, lib:NAME from\n"
+                          "kernels/SOURCES.md, or own: ...), and the engine's own code carries a yardstick: the measured\n"
+                          "best existing provider for the operation, or the providers checked and why none fits.\n"
+                          "Each plan after the parent's Eval reviews the parent's plan (review): crit puts the parent's\n"
+                          "forecast next to its measurement; give the cause and evidence of every KPI that missed its\n"
+                          "forecast, what each lever delivered and the lesson. The parent's largest p1 lever, pruned or\n"
+                          "deferred, is planned again or rejected on a measurement of another kernel structure or a\n"
+                          "vendor library at the same arithmetic, never on variants of one kernel.")
         return f"""# crit run {run['run_id']}
 
 Repository: {self.project}

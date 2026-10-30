@@ -318,6 +318,23 @@ def main(argv=None):
     save.add_argument("--max-bytes", type=int, default=8 * 1024 ** 3)
     check = sub.add_parser("verify", help="Recheck a retained dependency's bytes and applicability")
     check.add_argument("directory", type=Path)
+    make = sub.add_parser("new", help="Scaffold a workbench folder for a kernel: reference, shapes, yardstick, harness "
+                                      "(measure it with crit eval workbench)")
+    make.add_argument("name")
+    make.add_argument("--op", required=True, help="gemv or gemm (a working start in bf16, fp8 or nvfp4), or any other "
+                                                   "operation name for a harness to fill in")
+    make.add_argument("--format", dest="fmt", help="bf16, fp8 or nvfp4 (NVFP4 weights against bf16 activations) for gemv and gemm")
+    make.add_argument("--shape", action="append", default=[], help="N,K (repeatable)")
+    make.add_argument("--model", type=Path, help="take the shapes from this checkpoint's matrices in the format")
+    make.add_argument("--columns", help="column (token) counts, comma-separated")
+    make.add_argument("--from", dest="source", type=Path, help="an existing kernel's source folder to start from")
+    make.add_argument("--yardstick", help="the provider to time beside the kernel (provider syntax of plan levers)")
+    make.add_argument("--column-invariant", choices=("yes", "no"))
+    make.add_argument("--tolerance", type=float)
+    make.add_argument("--root", type=Path, default=Path("work/kernels"))
+    make.add_argument("--starter", action="store_true", help="a simple, correct kernel to start from (gemv, gemm); "
+                                                              "allowed from a run's fourth candidate on")
+    make.add_argument("--run", type=Path, help="the run folder, for --starter")
     args = parser.parse_args(argv)
     try:
         if args.command is None:
@@ -342,8 +359,14 @@ def main(argv=None):
         elif args.command == "retain":
             result = retain(read_json(args.request), catalog(args.catalog), args.select, args.root,
                             args.destination, args.reason, args.max_bytes)
-        else:
+        elif args.command == "verify":
             result = verify(args.directory)
+        elif args.command == "new":
+            from .workbench import new
+            result = new(args.name, args.op, args.root, args.fmt, args.shape, args.model,
+                         [int(c) for c in args.columns.split(",")] if args.columns else None, args.source, args.yardstick,
+                         None if args.column_invariant is None else args.column_invariant == "yes", args.tolerance,
+                         args.starter, args.run)
         print(json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False))
         return 0
     except (ValueError, OSError, TypeError, KeyError, OverflowError, RecursionError) as exc:

@@ -37,6 +37,7 @@ reply = client.chat.completions.create(model="default", messages=[{"role": "user
 | `--model-name NAME` | Model ID reported for the default candidate |
 | `--reasoning-alias` | Return [reasoning](#reasoning) as `reasoning` as well as `reasoning_content`, for clients that read vLLM's and OpenRouter's name |
 | `--models PATH` | JSON catalog of named models from several runs; replaces `--workspace`, `--run`, `--candidate` and `--model-name` |
+| `--engine OWNER/NAME`, `--store PATH` | Serve an engine `crit pull` [installed](#installed-engines) (store default: `PROJECT/engines`); replaces `--workspace`, `--models`, `--run` and `--candidate` |
 | `--lenient` | Ignore, list and log the request parameters crit does not apply instead of answering 400 ([lenient requests](#lenient-requests)); never used by Eval |
 | `--timeout SECONDS` | Limit per request, from when the engine takes it; default 600. A request's `crit.timeout` can only lower it |
 | `--max-queue N` | Requests that may [wait](#a-busy-engine) while the engine is busy; default 64. One more is refused at once |
@@ -71,6 +72,46 @@ engines side by side can exhaust host RAM when weights live there. `CRIT_ENGINE_
 `crit-engine.lock` in the system temp directory), `CRIT_ENGINE_LOCK=off` disables it. Since file locks do not
 cross OS instances, the holder also keeps a lease that Windows and its WSL distributions both read
 (`CRIT_ENGINE_LEASE`, default `C:\ProgramData\crit\engine.lease`, `/mnt/c/ProgramData/crit/engine.lease` under WSL).
+
+### Installed engines
+
+`crit pull OWNER/NAME` installs a [crit-hub](https://github.com/crit-labs/crit-hub) engine, and
+`crit serve --engine OWNER/NAME` serves it without a run:
+
+```sh
+crit pull crit-labs/nvfp4-gemv-int8kv
+crit serve --engine crit-labs/nvfp4-gemv-int8kv
+```
+
+`crit pull` reads the engine's card from crit-hub's [index.json](https://crit-hub.dev/index.json) (`--hub PATH`
+reads a crit-hub checkout instead), then, stopping at the first step that fails, with nothing installed:
+
+1. Checks the card's `requirements` against this machine: the platform (Linux and WSL2 stand in for each other),
+   the GPU's architecture and memory from a `crit eval probe` result (`--device`, else `device` in
+   `settings.toml`, else a probe it runs into the store) and the CUDA toolkit (`nvcc`, else the probe's CUDA
+   runtime). `--ignore-requirements` installs anyway and records what was not met.
+2. Fetches the source at the commit the card pins, that commit only, into a cache in the store
+   (`--engines PATH` takes it from a crit-engines checkout that holds the commit), and checks its
+   `configuration.json` against the configuration the sealed run measured (`card.lock.json`'s provenance).
+3. Fetches the checkpoint at its pinned Hugging Face revision (with `huggingface_hub`) into `models/` of the
+   store, shared by the engines that run it, or takes a local copy with `--model PATH`, hard-linked into the store
+   (copied where links fail). Every file `card.lock.json` lists is checked by size and SHA-256; a checked folder is
+   stamped and not hashed again. `--checkpoint MODEL` picks one when the card measured several.
+4. Runs the card's `build` command in the source's `engine/` folder (a first argument `python` is crit's own
+   Python; `--build-timeout`, default 1800 s), keeping its output in `logs/build.log`, and reads the package's
+   capabilities from its adapter's `declared_capabilities`.
+5. Installs the package in the store with `install.json`, the card and its lock. The engine serves at the context
+   its card measured (on this GPU when the card measured on it; `--context` sets another) with the headroom in
+   `settings.toml`.
+
+The store (`--store`, default `PROJECT/engines`) holds `<owner>/<name>/` per engine and `models/` for the
+checkpoints. No record in it names an absolute path, so a store moved to another folder still serves. Runs stay
+the builder's record; installs are the user's. `crit pull` of an installed engine that still checks out does
+nothing (`--force` installs it again; a damaged install is installed again), and `crit pull --list` lists the
+installed engines. Card `downloads` (drafters, prebuilt artifacts) are not fetched yet: `crit pull` names them.
+
+`crit serve --engine` verifies the installed package byte for byte and its configuration before it loads, as for
+a sealed candidate, and reports the engine as `OWNER/NAME`; any model name a client sends reaches it.
 
 ### Several models on one server
 
@@ -220,8 +261,8 @@ phase's timed tokens and milliseconds as the engine reports them (`prefill_token
 [Response and telemetry](#response-and-telemetry)), the engine's prefill and decode
 rates, TTFT, and `tokens_per_round` (output tokens per target
 pass) when the engine reports its decode rounds, with `accepted` (drafts accepted in each of
-those rounds), `verify_ms` and `draft_ms` (device time in verify passes and draft steps) when
-it reports them. A stream's usage chunk carries both.
+those rounds), `drafted` (drafts made in each, from an engine whose draft width varies),
+`verify_ms` and `draft_ms` (device time in verify passes and draft steps) when it reports them. A stream's usage chunk carries both.
 Sampling overrides are validated before generation, including for streaming requests.
 Unknown parameters and unsupported generation controls return 400 rather than being
 silently ignored, unless the server runs with [`--lenient`](#lenient-requests). Only client metadata
@@ -1127,7 +1168,8 @@ or the first token from prefill); `ttft_ms` runs from admission to first emitted
 Optional `decode_rounds` counts target passes after prefill (a speculative engine's verify
 rounds, at most `output_tokens`); ResidentChat reports it from `generate_tokens`' timing
 `rounds`, and Core engine libraries report theirs. Optional `accepted` (one count of
-accepted drafts per decode round, as many as `decode_rounds`), `verify_ms` and `draft_ms`
+accepted drafts per decode round, as many as `decode_rounds`), `drafted` (the drafts made in
+each of those rounds, at least the accepted ones, for an engine whose draft width varies), `verify_ms` and `draft_ms`
 (non-negative milliseconds) pass through to `crit_telemetry`; ResidentChat takes them
 from `generate_tokens`' timing.
 Synchronize device work at phase boundaries, exclude startup and loading, and never

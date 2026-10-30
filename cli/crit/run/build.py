@@ -28,6 +28,11 @@ def build(store, run_id, candidate_id, recipe, seconds=None, drop=(), package=Tr
     command = recipe["build"]["command"]
     if not isinstance(command, list) or not command or not all(isinstance(arg, str) and arg for arg in command):
         raise ValueError("build.command must be a list of literal arguments")
+    if recipe.get("capabilities") == []:
+        # An empty list is a list the recipe names, so the adapter's would not be asked, and a package that declares
+        # nothing can be neither served nor evaluated.
+        raise ValueError("The recipe names no capabilities: leave capabilities out to take the adapter's "
+                         "declared_capabilities(model_path), or name them")
     reservation = store.reserve(run_id, candidate_id, "build", seconds)
     attempt = reservation["attempt_id"]
     work = safe_path(root, f"work/builds/{candidate_id}-{attempt}")

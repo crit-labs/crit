@@ -25,7 +25,7 @@ def _eval_generate(self, request, cancellation):
     if request['messages'][-1]['content'] != 'decode':
         return _generate(self, request, cancellation)
     response = self.response(request, json.dumps({'decode': request.get('decode')}), output_tokens=7, rounds=2)
-    response['telemetry'].update(accepted=[3, 2], verify_ms=4.0, draft_ms=1.5)
+    response['telemetry'].update(accepted=[3, 2], drafted=[4, 2], verify_ms=4.0, draft_ms=1.5)
     return response
 
 Engine.generate = _eval_generate
@@ -85,7 +85,7 @@ class EvalExtensionTests(Served, unittest.TestCase):
         self.assertEqual(response.status, 200, value)
         found = value["crit_telemetry"]
         self.assertEqual((found["accepted"], found["verify_ms"], found["draft_ms"]), ([3, 2], 4.0, 1.5))
-        self.assertEqual(found["tokens_per_round"], 3.5)
+        self.assertEqual((found["drafted"], found["tokens_per_round"]), ([4, 2], 3.5))
 
     def test_packed_scores_hold_the_json_rows(self):
         body = {"prompt_ids": [5, 6, 7], "continuation_ids": [8, 9], "top_logprobs": 2}
@@ -122,8 +122,10 @@ class TelemetryTests(unittest.TestCase):
         base = {"prompt_tokens": 5, "output_tokens": 7, "prefill_tokens": 5, "prefill_ms": 1.0, "decode_tokens": 6,
                 "decode_ms": 2.0, "ttft_ms": 1.0, "missing": {}, "decode_rounds": 2}
         self.assertEqual(telemetry({**base, "accepted": [3, 2], "draft_ms": 0.5}, request)["accepted"], [3, 2])
+        self.assertEqual(telemetry({**base, "accepted": [3, 2], "drafted": [4, 2]}, request)["drafted"], [4, 2])
         for bad in ({"accepted": [3]}, {"accepted": [3, -1]}, {"accepted": [3, 2.0]}, {"verify_ms": -1},
-                    {"accepted": [1, 1], "decode_rounds": None}):
+                    {"accepted": [1, 1], "decode_rounds": None}, {"drafted": [4, 2]},
+                    {"accepted": [3, 2], "drafted": [4]}, {"accepted": [3, 2], "drafted": [2, 2]}):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 telemetry({**base, **bad}, request)
 
@@ -142,6 +144,12 @@ class ResidentPlainTests(unittest.TestCase):
         Engine.plain = False   # facts alone do not make a resident engine decode plainly
         self.assertEqual(engine_facts(Engine.__new__(Engine))["plain"], False)
         self.assertIsNone(engine_facts(object()))
+        # Bytes a pass reads from host memory reach Eval as {"link", "cpu"}; anything else is dropped.
+        Engine.facts = {"draft_width": 2, "host_bytes_per_pass": {"link": 1.3e9, "cpu": 0}}
+        self.assertEqual(engine_facts(Engine.__new__(Engine))["host_bytes_per_pass"], {"link": 1.3e9, "cpu": 0})
+        for wrong in ({"disk": 1}, {"link": -1}, {"cpu": True}, {}, 5):
+            Engine.facts = {"draft_width": 2, "host_bytes_per_pass": wrong}
+            self.assertNotIn("host_bytes_per_pass", engine_facts(Engine.__new__(Engine)))
 
     def test_the_engines_declared_prompt_activations_reach_eval(self):
         class Engine(ResidentChat):

@@ -154,7 +154,7 @@ is not a memory cap.
 Python fixtures (`tests/test_reusable_techniques.py`, `tests/test_techniques.py`)
 cover proposals and verification. [Native fixtures](../../tests/inference/speculative_tests.cpp)
 cover multi-round repair, bonus, partial/zero commits, stops, stale rounds,
-cancellation, failures and poisoned mutation; the paged-attention fixture compares
+cancellation, failures and poisoned mutation; the paged-cache fixture compares
 2,400 generated tokens with ordinary decoding, `crit_speculative_matrix` runs each of
 these ways of proposing on its own (none, prompt copy with windows 1 and 3, a self
 draft, a stateful drafter model, always wrong and random drafts, with and without
@@ -240,6 +240,13 @@ same contract. Sparse rows cost O(S) storage; fallback costs O(V).
 delayed timings, take a ticket from `begin_observation(actual_width)` and call
 `observe(ticket, published, seconds)` after completion. `record_preparation(width,
 seconds)` resets a width after graph rebuilds.
+
+A budget that includes zero mixes speculative rounds and plain steps by acceptance,
+so a sampled request's time per round depends on its seed. Report the drafts each
+round made (`drafted` beside `accepted`; crit serve passes it in `crit_telemetry`):
+crit Eval then reads each repetition's time per round at the median drafts per round.
+Without it, Eval reads that spread across a sampled case's seeds as a disturbed device
+and stops the round (protocol `sampled_speed.disturbed`).
 
 `AcceptanceEstimator(positions)` predicts each draft's acceptance from the drafter's
 own confidence, for drafters without a confidence head: `p(k) = sigmoid(slope *

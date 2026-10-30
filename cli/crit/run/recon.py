@@ -21,8 +21,36 @@ from .records import file_sha, keys, now, read_json, record, safe_path, text, wr
 
 RECON_JSON = "work/recon.json"
 RECON_MD = "work/recon.md"
-# The recon.md sections a run with plan rules 3 needs written before its first candidate: decode's and prefill's plans.
+# The recon.md sections a run with plan rules 3 needs written before its first candidate: decode's and prefill's plans,
+# and the placement plan where recon.json records the placement scenario.
 PLANS = ("Drafting plan for both decode modes", "Prefill arithmetic plan")
+PLACEMENT_PLAN = "Placement plan"
+# Where candidate 1 starts in each placement scenario (crit_eval.limits.context.SCENARIOS): the design a proof of concept
+# of that scenario already has, so the first Eval measures the strategy and not a placeholder for it.
+STARTING_DESIGNS = {
+    "fits_device": "Keep every weight in device memory. Decode is bound by device bandwidth: the levers are "
+                   "speculation with the checkpoint's drafter and GEMV kernels near the bandwidth floor.",
+    "sparse_device_host": "Candidate 1 already has (1) routed experts in pinned host memory with a device expert cache "
+                          "over the device memory the KV cache leaves (Inference: expert-residency, device-expert-cache), "
+                          "so most expert reads stay on the device; (2) the checkpoint's drafter, so a pass emits several "
+                          "tokens (mtp-decode, device-speculative-round); (3) misses served by the faster source below, "
+                          "copied over the host link or computed on the CPU from host memory (host-expert-arithmetic, "
+                          "heterogeneous-expert-dispatch), with the split measured on this machine. An engine that copies "
+                          "every expert over the link on every pass, without a cache or a drafter, is not a proof of "
+                          "concept of this scenario: its Eval measures neither lever.",
+    "sparse_device_host_disk": "As sparse_device_host, plus the experts host memory cannot hold read from disk "
+                               "(ssd-expert-materialization) behind a host cache of the hot ones. Misses beyond host "
+                               "memory are bound by the disk's rate: measure it before choosing cache sizes.",
+    "dense_device_host": "The weights read on every pass do not fit device memory, so every token streams or computes "
+                         "the rest from host memory and decode is a few tokens per second at best (dense-layer-offload "
+                         "measures the plans). Tell the user before building and build only if they want it.",
+    "beyond_host": "The weights read on every pass exceed device and host memory together. Tell the user and stop: the "
+                   "model needs a smaller encoding or a larger machine.",
+}
+LOOKUP_TABLES = ("Lookup tables (gathered embedding and n-gram rows) go to {tier} memory: a pass reads a few rows of them "
+                 "per token, so they never need device memory a weight read on every pass could use. On disk, read only "
+                 "the rows a token needs, with random access and no read-ahead (Inference: lookup-table-rows); a cold "
+                 "row costs milliseconds, not the hundreds a read-ahead window costs.")
 FROZEN = ("sampling", "chat_template", "template_variables", "stop_token_ids", "stop_strings")
 # config.json fields that shape the engine, read at the top level and in the text section (crit_core.model's
 # TEXT_SECTION_KEYS: text_config, else llm_config).
@@ -108,8 +136,10 @@ def eval_sampling(generation, run):
     return {"settings": sampled_settings(generation), "source": sampling_source(generation)}
 
 
-def _drafters(paths, architecture):
-    """Each companion drafter as Core's reader describes it, with its config.json's digest."""
+def _drafters(paths, architecture, model=None):
+    """Each companion drafter as Core's reader describes it, with its config.json's digest and what it costs beside
+    the model (crit-eval's companion_drafter_bytes: weight_bytes held, pass_bytes one drafter pass reads; None where
+    Eval or the weight headers are missing)."""
     from crit_core.model.config import ConfigError
     from crit_core.model.drafters import read_drafter_file
     out = []
@@ -132,8 +162,44 @@ def _drafters(paths, architecture):
                     "layers": drafter.layers, "block_size": drafter.block_size, "mask_token_id": drafter.mask_token_id,
                     "sample_from_anchor": drafter.sample_from_anchor, "causal": drafter.causal,
                     "confidence_head": drafter.confidence_head, "speculative_tokens": drafter.speculative_tokens,
-                    "verifier": drafter.verifier, "format": drafter.source})
+                    "verifier": drafter.verifier, "format": drafter.source, **_drafter_bytes(path, model)})
     return out
+
+
+def _drafter_bytes(path, model):
+    try:
+        from crit_eval.limits.context import companion_drafter_bytes
+        found = companion_drafter_bytes(path, model) if model is not None else None
+    except Exception:  # no Eval checkout, or weights this host cannot read: unknown
+        found = None
+    return found or {"weight_bytes": None, "pass_bytes": None}
+
+
+def placement(run):
+    """The run's placement scenario (crit_eval.limits.context.placement) from the device file its context was derived
+    from, at its required context; {"scenario": None, "reason": ...} when the run names no device or Eval cannot size
+    the model."""
+    hardware = run["spec"]["hardware_constraints"]
+    basis = hardware.get("context") or {}
+    device = basis.get("device_file")
+    if not device or not Path(device).is_file():
+        return {"scenario": None, "reason": "the run names no device file: create it with the request's device "
+                                            "(a crit eval probe result) to record the placement scenario"}
+    try:
+        from crit_eval import EVAL_DIR
+        from crit_eval.limits.context import GIB, placement as where
+        settings = read_json(EVAL_DIR / "protocol.json")["context"]
+    except (ImportError, OSError, KeyError):
+        return {"scenario": None, "reason": "crit Eval is not installed beside crit"}
+    if basis.get("reserve_bytes") is not None:
+        settings = {**settings, "reserve_gib": basis["reserve_bytes"] / GIB}
+    drafters = [row["path"] for row in basis.get("companion_drafters") or []]
+    try:
+        found = where(run["spec"]["model_path"], read_json(Path(device)), hardware["vram_headroom_bytes"],
+                      hardware["ram_headroom_bytes"], settings, hardware["kv_tokens"], drafters)
+    except (OSError, ValueError, KeyError) as error:
+        return {"scenario": None, "reason": f"Eval cannot size the model on the run's device: {error}"}
+    return found or {"scenario": None, "reason": "Eval cannot size the model on the run's device"}
 
 
 def gather(model, run=None, drafters=()):
@@ -180,10 +246,11 @@ def gather(model, run=None, drafters=()):
         "model_card": MODEL_CARD if card is not None else None,
         # Files the weights' own metadata supplied (a GGUF without the base model's files beside it).
         "derived_files": list(source.derived_names),
-        "drafters": _drafters(drafters, architecture),
+        "drafters": _drafters(drafters, architecture, model),
     }
     if run is not None:
         gathered["eval_sampling"] = eval_sampling(generation, run)
+        gathered["placement"] = placement(run)
     override = (run or {}).get("spec", {}).get("eval_sampling")
     frozen = {
         "sampling": served_sampling(generation.sampling_defaults(), override and override["settings"]),
@@ -454,14 +521,36 @@ def _eval_sampling(found):
             "(below), and keep every other temperature correct: requests choose their own sampling.\n")
 
 
+def _placement(found):
+    if not found:
+        return "- not recorded (recon from before placement scenarios): run recon again with --force\n"
+    if not found.get("scenario"):
+        return f"- not recorded: {found.get('reason')}\n"
+    from crit_eval.limits.context import render_placement
+    lines = "```text\n" + render_placement(found) + "\n```\n\n"
+    lines += f"Starting design: {STARTING_DESIGNS[found['scenario']]}\n"
+    if found.get("lookup_tables"):
+        lines += "\n" + LOOKUP_TABLES.format(tier=found["lookup_tables"]["tier"]) + "\n"
+    floors = found.get("plain_pass_ceiling_tps") or {}
+    if "link" in floors or "cpu" in floors:
+        lines += ("\nThe plain-pass bounds assume routing spread evenly over the experts and one token per pass: a "
+                  "cache that holds the routes' hot experts and a drafter's tokens per pass both raise them. Compare "
+                  "the link and CPU bounds to choose where misses run first, then measure the split.\n")
+    return lines
+
+
 def unfinished(root):
-    """The PLANS sections of the run's recon.md that are missing or still start with TODO; [] without a recon.md."""
+    """The PLANS sections of the run's recon.md that are missing or still start with TODO, and the placement plan where
+    recon.json records a placement scenario; [] without a recon.md."""
     notes = safe_path(root, RECON_MD)
     if not notes.is_file():
         return []
     text_ = notes.read_text(encoding="utf-8")
-    found = []
-    for title in PLANS:
+    found, titles = [], PLANS
+    facts = safe_path(root, RECON_JSON)
+    if facts.is_file() and ((read_json(facts).get("gathered") or {}).get("placement") or {}).get("scenario"):
+        titles = PLANS + (PLACEMENT_PLAN,)
+    for title in titles:
         head = f"## {title}"
         if head not in text_:
             found.append(title)
@@ -545,6 +634,16 @@ source and its revision.
 
 TODO. The transformers modeling file and its revision: rope scaling, MTP or draft heads, norm and
 attention quirks. Cite file and line.
+
+## Placement scenario
+
+{_placement(g.get('placement'))}
+## {PLACEMENT_PLAN}
+
+TODO. Name the scenario this engine is built for and candidate 1's design in it: where each weight group lives
+(device, host memory, disk), the device expert cache and its size, how misses are served (host link or CPU, and how
+the split is measured), the drafter, and where the lookup tables go. Start from the scenario's starting design above;
+say why wherever candidate 1 leaves part of it out.
 
 ## Drafting plan for both decode modes
 

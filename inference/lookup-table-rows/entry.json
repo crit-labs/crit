@@ -1,0 +1,75 @@
+{
+  "id": "lookup-table-rows",
+  "category": "memory-and-loading",
+  "summary": "Gather rows of a file-backed embedding or n-gram table with random-access advice, exact positioned reads and a hot-row cache",
+  "implementation_status": "reference",
+  "implementation_scope": "Python reference: random-access advice on the table's file region (POSIX_FADV_RANDOM) or on a mapping (MADV_RANDOM), exact positioned reads of the rows a gather needs in a worker pool, duplicate rows read once, request order kept, an optional LRU of hot rows and counters for reads, bytes and hits. Native reads and the destination of the rows are engine choices.",
+  "agent_guidance": {
+    "use_when": "A gathered lookup table (token embeddings, hashed n-gram embeddings) stays in a file or mapping, as recon's placement scenario puts lookup tables on disk",
+    "avoid_when": "The table is loaded once into host or device memory, or it is small enough that its reads never show in a pass",
+    "provides": [
+      "Random-access advice for a file region or a mapping, reporting where the platform has none",
+      "Exact positioned row reads checked for length, with a locked seek-and-read fallback",
+      "Parallel reads of a gather's cold rows, duplicate rows read once, request order kept",
+      "An optional least-recently-used cache of hot rows and read, byte and hit counters"
+    ],
+    "engine_supplies": [
+      "The table's file, offset, row count and row size, and any per-row scales",
+      "Row ids per token from the model's own tokenization or n-gram hashing",
+      "Where gathered rows go next and their arithmetic",
+      "Worker count and cache size measured on the target disk and charged to host memory"
+    ],
+    "preserve": [
+      "No read-ahead on the table: advice, or reads of exactly one row",
+      "Every read checked for its full length",
+      "Rows returned in request order"
+    ],
+    "adapt": [
+      "Native reads (io_uring, overlapped I/O, Core's ReadOnlyFile mapping with random advice)",
+      "Batching a prompt's rows, pinned host caches and prefetching the next token's rows",
+      "Cache size and policy"
+    ]
+  },
+  "path": "inference/lookup-table-rows/README.md",
+  "code_path": "inference/lookup-table-rows/code",
+  "code_files": [
+    {
+      "path": "inference/lookup-table-rows/code/table_rows.py",
+      "purpose": "TableRegion, random-access advice for files and mappings, and RowTable's parallel exact row gather with a hot-row cache"
+    }
+  ],
+  "requires": {
+    "hardware": "Python 3.11+ standard library; any disk; file advice on POSIX systems",
+    "model": "A lookup table stored as contiguous fixed-size rows in a file",
+    "workload": "Decode and prefill that gather a few rows per token"
+  },
+  "contract": {
+    "input": "TableRegion (path, offset, rows, row_bytes) and row ids",
+    "output": "The bytes of each requested row in request order, with read, byte and hit counters",
+    "ownership": "RowTable owns its file descriptor, worker pool and cache until close(); returned rows are private copies",
+    "failure": "Rejects regions the file does not hold at open, rows outside the table and short reads",
+    "core_boundary": "Core's ReadOnlyFile maps files natively; this entry adds the random-access rule and the row gather the engine adapts"
+  },
+  "dependencies": [
+    "Python standard library"
+  ],
+  "symbols": [
+    "TableRegion",
+    "RowTable",
+    "advise_random",
+    "advise_mapping_random"
+  ],
+  "interactions": [
+    "ssd-expert-materialization",
+    "host-memory-admission"
+  ],
+  "techniques": [
+    "lookup-table-rows",
+    "ssd-expert-materialization"
+  ],
+  "validation": {
+    "host": "Python fixtures check request order, duplicates, cache hits and eviction, counters, rows outside the table, short files and short reads",
+    "native": "No native code; native engines adapt the rule to their own reads",
+    "performance": "Unmeasured here; one engine's 51 GB n-gram table went from 500-700 ms to 2-5 ms per token of cold rows with random-access advice"
+  }
+}

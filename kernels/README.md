@@ -1,9 +1,10 @@
 # crit Kernels
 
-Kernels helps agents find and adapt kernels from external providers for a complete engine.
-Start with the [Hugging Face Kernel Hub](https://huggingface.co/kernels), then choose the
-implementation that fits the engine's operations, representations and hardware. Existing
-backend libraries and kernels written for the candidate are equally valid.
+Kernels helps agents find and adapt kernels from external providers for a complete engine. crit
+hosts no compute kernels: [SOURCES.md](SOURCES.md) lists where they come from, starting with the
+[Hugging Face Kernel Hub](https://huggingface.co/kernels), then libraries such as cuBLASLt, CUTLASS,
+FlashInfer and flash-linear-attention. Choose the implementation that fits the engine's operations,
+representations and hardware; a kernel written for the candidate is equally valid when none fits.
 [Core](../core/README.md) supplies the runtime, [Inference](../inference/README.md) the
 techniques and [Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md) the common checks for the integrated engine.
 
@@ -19,8 +20,10 @@ environment and package.
    strides, aliases, and any fusion or recurrent state.
 2. Record the target: OS, device architecture, driver/toolkit and framework or native ABI. A
    matching model name is insufficient.
-3. Browse the Hub and inspect the kernel's source, builds, license and invocation contract
-   (workspace, streams, output readiness). Compare with what the engine's backend provides.
+3. Browse the Hub and the other providers in [SOURCES.md](SOURCES.md), and inspect each
+   candidate's source, builds, license and invocation contract (workspace, streams, output
+   readiness). Measure the best one on the engine's own shapes as the yardstick before adopting or
+   writing anything.
 4. Choose a compatible build, integrate or adapt source, or write the missing operation. Explain
    rejected or untested high-impact options in the candidate's rationale.
 
@@ -47,6 +50,36 @@ Worth searching for before writing: prompt and decode attention, matmuls in the 
 formats (FP8, FP4, integer groups), fused gated activations, RMSNorm and rotary embeddings, and
 for hybrid models chunked recurrent scans (gated delta, Mamba) and short causal convolutions.
 The [kernel profile](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md#kernel-profile) shows which cost most.
+
+## Write or adapt a kernel: the workbench
+
+When the engine writes a kernel, or adapts one a provider has, give it a workbench folder:
+
+```sh
+crit kernels new down_gemv --op gemv --format fp8 --model MODEL_DIR --root work/kernels
+crit eval workbench check work/kernels/down_gemv --python ENGINE_PYTHON
+crit eval workbench bench work/kernels/down_gemv --device device.json
+crit eval workbench profile work/kernels/down_gemv [--ncu NCU]
+```
+
+`new` writes `kernel.json` (the shapes, here every FP8 matrix of the checkpoint, the column counts, the tolerance,
+whether the kernel must be column invariant, the yardstick), `kernel.py` (inputs, an FP64 reference, the candidate
+and the yardstick: cuBLAS or cuBLASLt for gemv and gemm in bf16 or fp8), crit-eval's `harness.py` and `src/`.
+`--format nvfp4` takes NVFP4 weights as compressed-tensors stores them (E2M1 pairs, E4M3 scales per 16 inputs, an
+FP32 global divisor) against bf16 activations, the arithmetic of a decode GEMV on stored weights and of a `preserve`
+run's prompts; its yardstick is cuBLAS on the weights widened to BF16 once. For gemv and gemm `src/NAME.cu` is the
+binding with an empty kernel to write; any other operation (`--op attention`,
+`--op scan`, ...) gets the same harness with `kernel.py`'s functions to fill in. `--from DIR` copies an existing
+kernel's source, a Hub kernel or a library sample, into `src/` as the starting point; it needs the source's license
+file beside it, and a Hub kernel's `torch-ext` binding gets the `registration.h` its macros need. `--starter` writes a
+simple, correct kernel in plain CUDA that builds for any NVIDIA GPU instead of the empty one (bf16 and fp8); in a run it is allowed
+from the fourth candidate on (`--run RUN_FOLDER`), so the first three candidates find or write their kernels
+themselves.
+
+crit-eval measures the folder ([workbench](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md#kernel-workbench)):
+`check` compares the kernel with the reference on every shape and column count and requires the same bits on a
+repeat and, when declared, for each column alone; `bench` times it and the yardstick on inputs cycled past the L2,
+against the floor; its `bench.json` is the evidence an `own` lever's `yardstick` cites.
 
 ## Inspect and retain
 
