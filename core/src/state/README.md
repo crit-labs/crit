@@ -4,7 +4,8 @@
 [state.h](../../include/crit/state.h): a storage-agnostic ledger of KV pages and
 recurrent state slots for one engine. Core never touches state bytes. The engine
 owns storage, writes where a `Round` points and copies through `StateStorage`
-hooks (`copy_rows`, `copy_slot`, and `copy_window_rows` with window groups); the
+hooks (`copy_rows`, `copy_slot`, and `copy_window_rows` with window groups; `evicted`
+announces pages leaving the prefix cache); the
 cache decides which ids hold what, when ids may be reused and which committed pages
 a new prompt may share. One `PageId` indexes every full-attention layer; each
 sliding-window group has a PageId space of its own; slot ids are per component.
@@ -26,6 +27,9 @@ rules below.
 | `components` | Recurrent components: `slots`, a `RecurrentCommit` mode and, with the prefix cache, a `snapshots` quota each |
 | `windows` | Sliding-window groups: `pages` of their own and a `window` of rows each |
 | `hash` | Page hash; null selects `chain_hash` |
+| `retention_levels` | Prefix cache only: eviction levels, 1 (plain least recently released) to 16 |
+| `guard_page` | Reserve the last page id as a guard page no sequence is given ([debugging](#debugging-masked-reads)) |
+| `partial_reuse` | Prefix cache without components or window groups: also reuse the matching leading rows of the next page |
 
 Each component needs `slots >= sequences + scratch + snapshots`, where a round takes
 `max_round_rows` scratch slots in `column_checkpoints` mode, one in `recompute`
@@ -90,10 +94,54 @@ reuse, never correctness. Cap `max_reuse` at `prompt.size() - 1`, since reused r
 carry no logits. `attach` does the same on an empty sequence and returns the count
 for `Progress::reused_prompt_tokens`.
 
+With `partial_reuse`, reuse does not stop at the last whole page: `attach` also takes
+the leading rows of the indexed page that last continued that page, where the prompt
+matches them, copied (`copy_rows`) into a fresh page the sequence owns, and
+`reusable` counts them. A prompt that leaves a cached one inside a page then recomputes
+from where it differs instead of from the page's start, saving up to `page_tokens - 1`
+rows per request. Only the most recent continuation of a page is tried, and only
+without recurrent components or window groups, whose state at a row inside a page is
+not kept. [`state_partial`](../../../tests/core/state_tests.cpp) reuses 6 of a prompt's
+rows on 4-row pages where whole pages give 4.
+
+`open(scope)` puts a sequence in a reuse scope (0, the default, is shared): its pages'
+chain starts from the scope instead of 0 and record it, `attach` matches only pages
+written under the sequence's scope, `reusable(prompt, max_reuse, scope)` takes it, and
+a fork keeps its parent's. A server that serves several users or tenants passes a hash
+of each one's id, so none reuses another's prompts or learns from its own time to
+first token what another sent. A root page's scope is checked, not only hashed, so
+isolation holds even when page hashes collide ([`state_scopes`](../../../tests/core/state_tests.cpp)
+forces every hash equal). crit serve passes no scope yet; an engine that knows its
+users can.
+
 Indexed pages whose last owner leaves stay cached. Allocation takes free pages
 first, then evicts the least recently released cached page; `evict(n)` does it
 explicitly. Referenced pages are never evicted, and recomputing an evicted prefix
 repairs the index level by level.
+
+With `retention_levels` above 1, `retain(seq, rows, level)` sets the level of the
+pages holding the sequence's first `rows` committed rows (whole pages only) and of
+their linked window pages, including those that already left the window table. A
+cached page at a lower level leaves before any at a higher one, least recently released
+first within a level, so a shared system or tool prompt retained at level 1 survives a
+burst of one-off prompts that plain eviction would let flush it. A page keeps its level
+until it leaves the index; a window page takes its full-attention page's level when it
+is cached. [`state_retention`](../../../tests/core/state_tests.cpp) shows both cases:
+an 8-row prefix that plain eviction loses under three pages of pressure is still
+reusable at level 1, and so are the window pages its end reads. Levels say what to
+keep, not how long: an engine that wants a retention to expire lowers it again.
+
+Before an evicted page's id is handed out or freed, `StateStorage::evicted(EvictedPage)`
+names it: its chain hash (as `reusable` matches pages), its tokens, the slot holding
+each component's state after its last row (`no_slot` where none) and each window
+group's linked page with the same rows (`no_page` where none). An engine that keeps
+evicted pages in a lower tier copies them there, enqueued on its ordered queue so the
+copy reads the page, slots and window pages before any later write; a later prompt
+restores them in an ordinary round instead of recomputing them (the
+[host page tier](../../../inference/attention-state/README.md#host-page-tier) in
+`attention-state`). The hook must not throw, and the cache cannot be mutated from
+inside it (`evict` there returns 0). Free pages are never announced, nor is an
+orphaned index entry dropped for a linked copy of the same rows.
 
 ## Hybrid prefix reuse
 
@@ -120,6 +168,34 @@ that reuses its slot, and snapshots never take the slots that sequences and roun
 are guaranteed. `stats().snapshots` counts the pool (its slots count as live). A
 throwing snapshot copy in `commit` leaves the round pending and publishes nothing.
 
+### Where prompt rounds end
+
+A chunked prefill in `recompute` or `in_place` mode, or in `final_row` rounds,
+snapshots only the boundary after each chunk's last row. When the prompt's last
+chunk ends inside a page, the full pages it filled get no snapshot, and a later
+prompt that leaves this one right after its end (a chat template that drops the
+earlier turn's reasoning does) reuses only to the previous chunk's end: up to a
+whole chunk recomputed per turn. `snapshot_rows(seq, prompt, rows, states)` gives
+the rows a prompt round should stage instead:
+
+1. When the round crosses the deepest page boundary the prompt matches in the index
+   without a usable snapshot, the round ends there. That is where the prompt leaves
+   a cached prefix that reuse could not reach; the snapshot taken there goes to the
+   indexed page, so a later prompt sharing that prefix reuses up to it.
+2. Otherwise, when the round ends inside a page, it ends at the last page boundary
+   inside the round, and the remaining rows (fewer than `page_tokens`) follow as a
+   short round.
+3. Otherwise, and when every component keeps column checkpoints in an `every_row`
+   round, or without components or the prefix cache, `rows` unchanged.
+
+Call it for prompt rounds with the round's `RoundStates` and pass the result to
+`begin`; Core's prefill grant is a ceiling, so computing fewer prompt rows than
+granted is allowed. A cut costs one more short round per prompt; it never cuts a
+round that crosses no page boundary, so one-row decode rounds are unaffected.
+[`state_snapshot_rows`](../../../tests/core/state_tests.cpp) reproduces the
+two-turn case (reuse 8 of 14 prompt rows without the cut, 12 with it, on 4-row pages)
+and the fork case.
+
 ## Sliding-window groups
 
 Layers that attend to a window of `window` rows (a row's own included) keep their
@@ -140,6 +216,22 @@ after `n` rows needs, for every group, the window pages holding rows
 whose window pages are all present; `attach` references them and leaves the pages
 before the window as `no_page`. `window_stats(w)` reports a group's pages, with
 `indexed_pages` counting the linked ones.
+
+## Debugging masked reads
+
+A kernel that keeps masked block-table entries in range points them at some page,
+usually page 0, which belongs to whatever request holds it; a masking or length bug
+then reads a stranger's keys and values and returns plausible numbers. With
+`guard_page`, the cache never gives the last page id to a sequence (`guard_page()`
+names it; it counts as a live page, and `max_tokens` must fit the other pages): the
+engine fills it with a pattern such as NaN and points masked entries there. For rows
+inside a request's own pages, `StateStorage::fresh_page(page)` and
+`fresh_window_page(window, page)` announce every page handed out for new rows, before
+a shared tail is copied into it and before the engine writes it, so a debugging engine
+fills it with the pattern too; reused pages are not announced. Both are for debugging
+and cost a fill per new page. [`state_guard`](../../../tests/core/state_tests.cpp)
+checks that no sequence gets the guard page and which pages are announced;
+`attention-state`'s `StatePages::poison()` fills them with NaN.
 
 ## Failure atomicity, memory and threading
 
@@ -165,7 +257,8 @@ rejected.
 ## Limits
 
 Ids are 32-bit (at most `0xfffffffe` pages and slots per component). Reuse is
-page-granular, with one indexed page per hash; recurrent reuse is bounded by the
+page-granular (with `partial_reuse`, plus the leading rows of one more page), with one indexed page per hash; recurrent reuse is bounded by the
 snapshots taken at page boundaries, so a prefix filled inside a `recompute` or
-`in_place` round reuses only to its last snapshot. Cross-attention groups and
+`in_place` round reuses only to its last snapshot ([where prompt rounds end](#where-prompt-rounds-end)
+places them for prompts). Cross-attention groups and
 admission watermarks are not provided.

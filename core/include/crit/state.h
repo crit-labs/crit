@@ -43,7 +43,7 @@ struct StateComponent {
 struct WindowGroup {
     std::uint32_t pages = 0, window = 0;
 };
-// Page hash chain h_i = hash(h_{i-1}, identity, tokens of page i) with h_{-1} = 0. Every hit is verified by exact
+// Page hash chain h_i = hash(h_{i-1}, identity, tokens of page i) with h_{-1} the sequence's reuse scope (0 by default). Every hit is verified by exact
 // tokens and parent link (page id and generation), so a collision costs reuse, never correctness. chain_hash is the
 // default; not cryptographic.
 using PageHash = std::uint64_t (*)(std::uint64_t previous, std::uint64_t identity, std::span<const Token> tokens) noexcept;
@@ -64,10 +64,34 @@ struct StateCacheConfig {
     // the token rows that prefix reuse matches, even when no layer stores full-attention KV.
     std::vector<WindowGroup> windows = {};
     PageHash hash = nullptr;           // null selects chain_hash; a seam for collision tests
+    // Prefix cache only: eviction levels. A cached page at a lower level leaves before any at a higher one, least
+    // recently released first within a level; retain() sets a sequence's pages' level. 1 to 16; 1 is plain LRU.
+    std::uint32_t retention_levels = 1;
+    // Reserve the last page id (pages - 1) as a guard page no sequence is ever given (guard_page()): an engine points
+    // the block-table entries a mask hides at it, filled with a pattern such as NaN, instead of at a page another
+    // request holds, so a masking bug reads the pattern. It counts as a live page; max_tokens must fit the others.
+    bool guard_page = false;
+    // Prefix cache without recurrent components or window groups: after the last whole reused page, attach() also
+    // reuses the leading rows of the indexed page that last continued it, where the prompt matches them, by copying
+    // them (copy_rows) into a fresh page; a prompt that leaves a cached one inside a page then recomputes only from
+    // there. reusable() counts those rows too; attach() reuses them only when a page is free or cached.
+    bool partial_reuse = false;
 };
-// Engine hooks, called synchronously from begin/try_begin (copy_rows, copy_window_rows), fork and attach (copy_slot)
-// and commit (copy_slot, for prefix snapshots). Enqueue on the engine's ordered queue. A throw unwinds the call:
-// nothing is published and destination ids are returned.
+// A cached page leaving the prefix cache: allocation needs its id, or evict() frees it. What a lower tier needs to
+// restore it later: its chain hash (as reusable() matches pages), its tokens, the slot holding each component's state
+// after its last row (no_slot where none) and each window group's linked page with the same rows (no_page where none).
+// The spans stay valid only during the call.
+struct EvictedPage {
+    PageId page = no_page;
+    std::uint64_t hash = 0;
+    std::uint64_t scope = 0;                  // the reuse scope of the sequence that wrote it (open)
+    std::span<const Token> tokens = {};
+    std::span<const SlotId> snapshots = {};   // per component; empty without components
+    std::span<const PageId> windows = {};     // per window group; empty without windows
+};
+// Engine hooks, called synchronously from begin/try_begin (copy_rows, copy_window_rows, evicted), fork and attach
+// (copy_slot), commit (copy_slot, for prefix snapshots) and evict (evicted). Enqueue on the engine's ordered queue. A
+// throw unwinds the call: nothing is published and destination ids are returned.
 class StateStorage {
 public:
     virtual ~StateStorage() = default;
@@ -78,6 +102,15 @@ public:
     // The same as copy_rows for the layers of window group `window`, with that group's page ids. Required with
     // windows; the default throws logic_error.
     virtual void copy_window_rows(std::uint32_t window, PageId from, PageId to, std::uint32_t rows);
+    // Before an evicted page's id, its snapshot slots and window pages can be written again: copy what a lower tier
+    // keeps (enqueue the copies so they read before any later write). Must not throw; the default does nothing.
+    virtual void evicted(const EvictedPage&) noexcept {}
+    // A page (or window group `window`'s page) handed out to hold new rows, before the round's copy of a shared tail
+    // and before the engine writes it: a debugging engine fills it with a pattern, so a read of a row this request
+    // never wrote returns the pattern instead of a previous owner's values. Not called for reused pages. Must not
+    // throw; the defaults do nothing.
+    virtual void fresh_page(PageId) noexcept {}
+    virtual void fresh_window_page(std::uint32_t window, PageId) noexcept { (void)window; }
 };
 // A sequence record and the generation that makes closed ids stale.
 struct SequenceId {
@@ -125,8 +158,13 @@ public:
     StateCache(const StateCache&) = delete;
     StateCache& operator=(const StateCache&) = delete;
     const StateCacheConfig& config() const noexcept;
+    // The guard page's id with StateCacheConfig::guard_page, else no_page.
+    PageId guard_page() const noexcept;
     // An empty sequence with a fresh live slot per component, which the engine initializes before its first round.
-    SequenceId open();
+    // `scope` names whose prefixes it may reuse: its pages are indexed under it, and attach() and reusable() match
+    // only pages written under the same scope (a tenant's or user's id, hashed, so one cannot reuse, or time,
+    // another's prompts). 0 is the shared default; a fork keeps its parent's scope.
+    SequenceId open(std::uint64_t scope = 0);
     // Discards a pending round, then releases every page and slot at epoch(). False, with no change, for a stale
     // id or a call from inside a storage hook.
     bool close(SequenceId) noexcept;
@@ -135,11 +173,24 @@ public:
     // Prompt tokens attach() would reuse now: verified full pages, at most min(max_reuse, max_tokens) tokens, ending
     // at a page with every component's snapshot and every window group's pages. max_reuse is normally
     // prompt.size() - 1, because reused rows carry no logits.
-    std::uint32_t reusable(std::span<const Token> prompt, std::uint32_t max_reuse) const;
+    std::uint32_t reusable(std::span<const Token> prompt, std::uint32_t max_reuse, std::uint64_t scope = 0) const;
     // Empty sequences only: references the verified pages (and window pages) and commits their tokens; with
     // components, copies the last reused page's snapshots into the live slots (copy_slot), which the engine then must
     // not reinitialize. Returns reused tokens.
     std::uint32_t attach(SequenceId, std::span<const Token> prompt, std::uint32_t max_reuse);
+    // Sets the retention level of the pages holding the sequence's first `rows` committed rows (only whole pages, the
+    // ones the index can keep) and of their linked window pages: once cached, a page leaves only after every cached
+    // page at a lower level. Pages keep the level until they leave the index. invalid_argument for a level at or past
+    // retention_levels; out_of_range for rows past the committed rows. Returns the pages set.
+    std::uint32_t retain(SequenceId, std::uint32_t rows, std::uint32_t level);
+    // The rows a prompt round of `rows` rows should stage so that a snapshot lands where a later prompt needs one.
+    // With recurrent components under the prefix cache, a round snapshots only the boundary after its last row unless
+    // every component keeps column checkpoints in an every_row round; then, and without components or the prefix
+    // cache, this returns rows. Otherwise rows are cut to end at the deepest page boundary the prompt matches in the
+    // index without a snapshot, when the round crosses it (where the prompt leaves a cached prefix), else at the last
+    // page boundary inside the round when it ends inside a page. Rejects a stale id or a pending round.
+    std::uint32_t snapshot_rows(SequenceId, std::span<const Token> prompt, std::uint32_t rows,
+                                RoundStates states = RoundStates::final_row) const;
     // Pages a round of `rows` rows would acquire now, including a copy-on-write tail; advisory. Rejects what begin
     // rejects for the request itself (stale id, pending round, rows over max_round_rows or past max_tokens).
     std::uint32_t pages_needed(SequenceId, std::uint32_t rows) const;
@@ -175,7 +226,7 @@ public:
     std::uint64_t advance_epoch();
     void retire(std::uint64_t completed) noexcept;
     // Evicts up to `pages` cached pages, least recently released first; referenced pages are never evicted.
-    // Allocation does the same automatically when no free page remains.
+    // Allocation does the same automatically when no free page remains. Each eviction calls StateStorage::evicted.
     std::uint32_t evict(std::uint32_t pages) noexcept;
     StateCacheStats stats() const noexcept;
     // The page fields (free, cached, retiring, live; indexed = pages linked for reuse) of window group `window`.

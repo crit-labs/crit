@@ -101,12 +101,16 @@ struct Fake final : StateStorage {
     std::vector<std::vector<Value>> windows; // window groups x pages x page_tokens
     std::vector<std::array<std::uint32_t,3>> row_copies, slot_copies;
     std::vector<std::array<std::uint32_t,4>> window_copies;
+    // Evicted pages: page, hash, token count, first token, component 0's snapshot slot, window group 0's page.
+    std::vector<std::array<std::uint64_t,6>> evicted_pages;
+    std::function<void()> on_evicted;
     long calls = 0, fail_at = -1;
     explicit Fake(const StateCacheConfig& c)
         : page_tokens(c.page_tokens ? c.page_tokens : 1), rows(std::size_t(c.pages)*page_tokens,0) {
         for(const auto& component:c.components) slots.emplace_back(component.slots,0);
         for(const auto& group:c.windows) windows.emplace_back(std::size_t(group.pages)*page_tokens,0);
         row_copies.reserve(1 << 14); slot_copies.reserve(1 << 14); window_copies.reserve(1 << 12);
+        evicted_pages.reserve(1 << 12);
     }
     void copy_window_rows(std::uint32_t window, PageId from, PageId to, std::uint32_t count) override {
         hook();
@@ -116,6 +120,12 @@ struct Fake final : StateStorage {
         if(window_copies.size() < window_copies.capacity()) window_copies.push_back({window,from,to,count});
     }
     void hook() { if(calls++ == fail_at) throw std::runtime_error("injected storage failure"); }
+    void evicted(const EvictedPage& e) noexcept override {
+        if(evicted_pages.size() < evicted_pages.capacity())
+            evicted_pages.push_back({e.page,e.hash,e.tokens.size(),e.tokens.empty() ? 0u : std::uint64_t(e.tokens[0]),
+                                     e.snapshots.empty() ? no_slot : e.snapshots[0],e.windows.empty() ? no_page : e.windows[0]});
+        if(on_evicted) on_evicted();
+    }
     void copy_rows(PageId from, PageId to, std::uint32_t count) override {
         hook();
         require(from != to && count && count < page_tokens,"copy_rows needs a partial tail and a distinct page");
@@ -1771,9 +1781,10 @@ void metadata() {
         StateCache cache(c,storage,resources);
         bytes = cache.metadata_bytes();
         require(resources.usage(Memory::host).live == bytes,"metadata reservation differs from metadata_bytes");
-        // Every preallocated array, by element: per page, index entry, per sequence and per round row.
+        // Every preallocated array, by element: per page (its retention level included), index entry, the cached
+        // list of the one retention level (three 4-byte fields), per sequence and per round row.
         const std::size_t P = 64, S = 8, T = 64, R = 5, index = 128;
-        const auto expected = P*(4+1+1+8*4+4*4+16*sizeof(Token))+index*4+4+S*(8*3+1*3+4*4+T*4+R*sizeof(RowSlot));
+        const auto expected = P*(4+1+1+1+8*5+4*5+16*sizeof(Token))+index*4+4+12+S*(8*4+1*3+4*4+T*4+R*sizeof(RowSlot));
         require(bytes == expected,"metadata bytes differ from the documented arrays");
         StateCache second(c,storage,resources);
         require(resources.usage(Memory::host).live == 2*bytes,"each cache reserves its own metadata");
@@ -1788,8 +1799,8 @@ void metadata() {
     h.components = {component(RecurrentCommit::column_checkpoints,6)};
     StateCache hybrid(h,storage,resources);
     const std::size_t slots = 6, S = 2, C = 1, R = 2, T = 4, P = 4;
-    const auto expected = sizeof(StateComponent)*C+P*(4+1+1+8*4+4*4+2*sizeof(Token))+C*(1+4*4)+4+slots*(4+4+8)+
-                          S*(8*3+1*3+4*4+T*4+C*4*2+C*R*4+R*sizeof(RowSlot));
+    const auto expected = sizeof(StateComponent)*C+P*(4+1+1+1+8*5+4*5+2*sizeof(Token))+12+C*(1+4*4)+4+slots*(4+4+8)+
+                          S*(8*4+1*3+4*4+T*4+C*4*2+C*R*4+R*sizeof(RowSlot));
     require(hybrid.metadata_bytes() == expected,"hybrid metadata bytes differ from the documented arrays");
     // Spare capacity moved in with the components vector is not retained uncharged.
     auto spare = h;
@@ -2111,14 +2122,319 @@ void round_states() {
     cache.retire(cache.epoch());
 }
 
+// Snapshot boundaries for prompt rounds. A recompute (or in_place, or final_row) round snapshots only the boundary
+// after its last row, so a chunked prefill whose last chunk ends inside a page leaves the prompt's last full page
+// without a snapshot. A next turn that diverges right after the earlier prompt (a chat template that drops the
+// earlier reasoning) then reuses only to the previous chunk end. snapshot_rows cuts such a round at the last page
+// boundary inside it, and a round that crosses the deepest indexed page a prompt matches without a snapshot (where it
+// diverges from a cached prefix) at that page, so a snapshot lands there.
+void snapshot_rows() {
+    auto c = attention(32,4,3,64,8,true);
+    c.components = {component(RecurrentCommit::recompute,3+1+4)};
+    c.components[0].snapshots = 4;
+    const Tokens prompt = range(1,14);
+    Tokens next_turn = prompt;
+    next_turn.push_back(90); next_turn.push_back(91);
+    {   // Chunks of 8 rows: 0..7 ends on a boundary, 8..13 ends inside page 3, so page 2 (rows 8..11) gets no snapshot.
+        Sim sim(c);
+        auto& a = sim.open();
+        require(sim.cache.snapshot_rows(a.id,prompt,8) == 8,"a round ending on a boundary is kept");
+        sim.begin(a,Tokens(prompt.begin(),prompt.begin()+8)); sim.commit(a,8);
+        sim.begin(a,Tokens(prompt.begin()+8,prompt.end())); sim.commit(a,6);
+        require(sim.cache.reusable(next_turn,15) == 8,"without the cut, reuse ends at the previous chunk end");
+        sim.check();
+    }
+    Sim sim(c);
+    auto& cache = sim.cache;
+    auto& a = sim.open();
+    sim.begin(a,Tokens(prompt.begin(),prompt.begin()+8)); sim.commit(a,8);
+    const auto cut = cache.snapshot_rows(a.id,prompt,6);
+    require(cut == 4,"the last chunk is cut at the prompt's last page boundary");
+    sim.begin(a,Tokens(prompt.begin()+8,prompt.begin()+12)); sim.commit(a,cut);
+    require(cache.snapshot_rows(a.id,prompt,2) == 2,"a round that crosses no boundary is kept");
+    sim.begin(a,Tokens(prompt.begin()+12,prompt.end())); sim.commit(a,2);
+    require(cache.reusable(next_turn,15) == 12,"with the cut, reuse reaches the prompt's last page boundary");
+    sim.check();
+    auto& b = sim.open();
+    require(sim.attach(b,next_turn,15) == 12,"attach restores the state after 12 rows");
+    sim.begin(b,Tokens(next_turn.begin()+12,next_turn.end())); sim.commit(b,4);
+    sim.check();
+
+    // A prompt that diverges inside an indexed prefix: a's pages hold rows 0..11 with a snapshot only at 8 and 12; a
+    // fresh chain whose pages 0..2 lack the snapshot at 12 is made by d below.
+    sim.close(a); sim.close(b);
+    sim.retire(cache.epoch());
+    cache.evict(32);
+    auto& d = sim.open();
+    const Tokens shared = range(200,12);
+    Tokens first = shared;
+    for(Token t:range(300,6)) first.push_back(t);
+    sim.begin(d,Tokens(first.begin(),first.begin()+8)); sim.commit(d,8);
+    sim.begin(d,Tokens(first.begin()+8,first.begin()+14)); sim.commit(d,6);   // page 2 (rows 8..11) indexed, no snapshot
+    Tokens sibling = shared;
+    for(Token t:range(400,6)) sibling.push_back(t);
+    auto& e = sim.open();
+    require(sim.attach(e,sibling,17) == 8,"reuse stops at the last snapshot before the fork");
+    require(cache.snapshot_rows(e.id,sibling,8) == 4,"the round is cut where the sibling leaves the indexed prefix");
+    sim.begin(e,Tokens(sibling.begin()+8,sibling.begin()+12)); sim.commit(e,4);
+    Tokens third = shared;
+    third.push_back(500); third.push_back(501);
+    require(cache.reusable(third,13) == 12,"a later sibling reuses up to the fork");
+    require(cache.snapshot_rows(e.id,sibling,6) == 4,"past the fork, the last page boundary rule applies");
+    sim.check();
+
+    // No cut where every boundary gets a snapshot or none is kept, and the usual misuse checks.
+    auto columns = attention(16,4,2,32,8,true);
+    columns.components = {component(RecurrentCommit::column_checkpoints,2+8+2)};
+    columns.components[0].snapshots = 2;
+    Sim scan(columns);
+    auto& f = scan.open();
+    require(scan.cache.snapshot_rows(f.id,prompt,6,RoundStates::every_row) == 6,"a column scan snapshots every boundary");
+    require(scan.cache.snapshot_rows(f.id,prompt,6,RoundStates::final_row) == 4,"a final_row round of a column scan is cut");
+    Sim plain(attention(16,4,2,32,8,true));
+    auto& g = plain.open();
+    require(plain.cache.snapshot_rows(g.id,prompt,6) == 6,"without recurrent components nothing is cut");
+    require(plain.cache.snapshot_rows(g.id,prompt,0) == 0,"zero rows stay zero");
+    plain.begin(g,range(1,3));
+    rejects_as<std::logic_error>([&] { plain.cache.snapshot_rows(g.id,prompt,2); },"already pending");
+    plain.discard(g);
+    rejects_as<std::invalid_argument>([&] { plain.cache.snapshot_rows(g.id,Tokens{-1},1); },"nonnegative");
+    const auto stale = g.id;
+    plain.close(g);
+    rejects_as<std::logic_error>([&] { plain.cache.snapshot_rows(stale,prompt,1); },"stale");
+}
+
+// Every page leaving the prefix cache, by allocation or evict(), is announced before its id is reused: its chain hash,
+// tokens, snapshot slot and window page, so an engine can keep it in a lower tier. Free pages are not announced, and
+// the hook cannot evict again.
+void evicted_pages() {
+    auto c = attention(4,4,2,16,8,true);
+    c.components = {component(RecurrentCommit::recompute,2+1+2)};
+    c.components[0].snapshots = 2;
+    c.windows = {{8,6}};
+    Sim sim(c);
+    auto& cache = sim.cache;
+    auto& seen = sim.storage.evicted_pages;
+    auto& a = sim.open();
+    sim.begin(a,range(1,8)); sim.commit(a,8);   // two pages, a snapshot after the second
+    sim.close(a);
+    sim.retire(cache.epoch());
+    require(seen.empty() && cache.stats().cached_pages == 2,"nothing evicted yet");
+    std::uint32_t reentrant = 1;
+    sim.storage.on_evicted = [&] { reentrant = cache.evict(1); };
+    require(cache.evict(1) == 1 && seen.size() == 1 && reentrant == 0,"evict announces one page and the hook cannot evict");
+    const Tokens head = range(1,4), tail = range(5,4);
+    const auto h1 = chain_hash(chain_hash(0,c.identity,head),c.identity,tail);
+    require(seen[0][1] == h1 && seen[0][2] == 4 && seen[0][3] == 5,"the last page of the chain leaves first, with its hash and tokens");
+    require(seen[0][4] != no_slot && seen[0][5] != no_page,"its snapshot slot and window page are named");
+    sim.storage.on_evicted = nullptr;
+    auto& b = sim.open();
+    sim.begin(b,range(50,8)); sim.commit(b,8);    // two free pages, no announcement
+    require(seen.size() == 1,"free pages are not announced");
+    sim.begin(b,range(60,8)); sim.commit(b,8);    // the last free page, then the cached first page of a
+    require(seen.size() == 2 && seen[1][1] == chain_hash(0,c.identity,head) && seen[1][3] == 1 && seen[1][4] == no_slot,
+            "allocation announces the cached page it takes; that page has no snapshot");
+    sim.check();
+}
+
+// Retention levels: a cached page at a lower level leaves before any at a higher one. A shared prefix retained at
+// level 1 survives eviction pressure that plain LRU (one level) would take it under, for full-attention pages and
+// for the window pages reuse at its end needs.
+void retention() {
+    const Tokens system = range(1,8);
+    auto pressure = [&](std::uint32_t levels) {
+        auto c = attention(8,4,3,32,8,true);
+        c.retention_levels = levels;
+        Sim sim(c);
+        auto& a = sim.open();
+        sim.begin(a,system); sim.commit(a,8);
+        sim.begin(a,range(50,4)); sim.commit(a,4);
+        if(levels > 1) require(sim.cache.retain(a.id,8,1) == 2,"two whole pages retained");
+        sim.close(a);
+        sim.retire(sim.cache.epoch());
+        auto& b = sim.open();
+        sim.begin(b,range(100,8)); sim.commit(b,8);
+        sim.close(b);
+        sim.retire(sim.cache.epoch());
+        auto& d = sim.open();                        // 6 pages: 3 free, then 3 cached ones leave
+        sim.begin(d,range(200,8)); sim.commit(d,8);
+        sim.begin(d,range(300,8)); sim.commit(d,8);
+        sim.begin(d,range(400,8)); sim.commit(d,8);
+        sim.check();
+        Tokens next = system; next.push_back(9); next.push_back(10);
+        return sim.cache.reusable(next,9);
+    };
+    require(pressure(1) == 0,"plain LRU evicts the oldest prefix");
+    require(pressure(2) == 8,"the retained prefix outlives the level-0 pages");
+
+    auto windowed = [&](std::uint32_t levels) {
+        auto c = attention(8,4,2,32,8,true);
+        c.retention_levels = levels;
+        c.windows = {{5,4}};
+        Sim sim(c);
+        auto& a = sim.open();
+        sim.begin(a,system); sim.commit(a,8);
+        sim.begin(a,range(50,4)); sim.commit(a,4);
+        sim.retire(sim.cache.epoch());               // the window pages of rows 0..7 left the table: cached
+        if(levels > 1) sim.cache.retain(a.id,8,1);   // moves them, and marks the full pages
+        sim.close(a);
+        sim.retire(sim.cache.epoch());
+        auto& b = sim.open();                        // two rounds of window pages take three cached ones
+        sim.begin(b,range(100,8)); sim.commit(b,8);
+        sim.begin(b,range(200,8)); sim.commit(b,8);
+        sim.check();
+        Tokens next = system; next.push_back(9); next.push_back(10);
+        return sim.cache.reusable(next,9);
+    };
+    require(windowed(1) == 0,"plain LRU evicts the window pages the prefix's end reads");
+    require(windowed(2) == 8,"retained window pages outlive the level-0 ones");
+
+    auto c = attention(8,4,2,32,8,true);
+    c.retention_levels = 2;
+    Sim sim(c);
+    auto& a = sim.open();
+    sim.begin(a,range(1,6)); sim.commit(a,6);
+    require(sim.cache.retain(a.id,6,1) == 1,"only whole pages are retained");
+    rejects_as<std::invalid_argument>([&] { sim.cache.retain(a.id,4,2); },"retention level");
+    rejects_as<std::out_of_range>([&] { sim.cache.retain(a.id,7,1); },"committed");
+    for(std::uint32_t bad:{0u,17u})
+        rejects_as<std::invalid_argument>([&] { auto d = attention(8,4,2,32,8,true); d.retention_levels = bad; Sim s(d); },
+                                          "retention_levels");
+    rejects_as<std::invalid_argument>([&] { auto d = attention(8,4,2,32,8); d.retention_levels = 2; Sim s(d); },"prefix cache");
+}
+
+// A guard page is never given to a sequence; fresh pages (and fresh window pages) are announced before their rows are
+// copied or written, and reused pages are not.
+void guard_and_fresh() {
+    struct Recording final : StateStorage {
+        std::vector<PageId> fresh, fresh_windows;
+        Recording() { fresh.reserve(64); fresh_windows.reserve(64); }
+        void copy_rows(PageId, PageId, std::uint32_t) override {}
+        void copy_slot(std::uint32_t, SlotId, SlotId) override {}
+        void copy_window_rows(std::uint32_t, PageId, PageId, std::uint32_t) override {}
+        void fresh_page(PageId page) noexcept override { if(fresh.size() < fresh.capacity()) fresh.push_back(page); }
+        void fresh_window_page(std::uint32_t, PageId page) noexcept override {
+            if(fresh_windows.size() < fresh_windows.capacity()) fresh_windows.push_back(page);
+        }
+    };
+    auto c = attention(5,4,2,16,8,true);
+    c.guard_page = true;
+    c.windows = {{6,4}};
+    Recording storage;
+    Resources resources(std::size_t(1) << 20,0);
+    StateCache cache(c,storage,resources);
+    require(cache.guard_page() == 4 && cache.stats().free_pages == 4 && cache.stats().live_pages == 1,"page 4 is the guard");
+    const auto a = cache.open();
+    const Tokens prompt = range(1,16);
+    for(std::uint32_t chunk = 0; chunk < 2; ++chunk) {
+        const auto r = cache.begin(a,8);
+        cache.commit(a,r.id,std::span<const Token>(prompt).subspan(chunk*8,8));
+    }
+    const auto table = cache.block_table(a);
+    require(std::find(table.begin(),table.end(),cache.guard_page()) == table.end(),"no sequence holds the guard page");
+    require(storage.fresh == std::vector<PageId>({0,1,2,3}) && storage.fresh_windows.size() == 4,"each new page is announced");
+    cache.close(a);
+    cache.retire(cache.epoch());
+    const auto b = cache.open();
+    require(cache.attach(b,prompt,15) == 12 && storage.fresh.size() == 4,"reused pages are not announced");
+    cache.begin(b,4);   // the fourth row page: the cached last page leaves for it
+    require(storage.fresh.size() == 5 && storage.fresh.back() != cache.guard_page(),"a new page for the tail");
+    rejects_as<std::invalid_argument>([] {
+        auto d = attention(4,4,1,16,4); d.guard_page = true; Recording s; Resources r(std::size_t(1) << 20,0);
+        StateCache bad(d,s,r); },"guard page");
+    auto off = attention(4,4,1,16,4);
+    Recording plain;
+    StateCache none(off,plain,resources);
+    require(none.guard_page() == no_page,"no guard page by default");
+}
+
+// Reuse scopes: a sequence reuses only pages written under its own scope, even when every page hash collides; a fork
+// keeps its parent's scope.
+void scopes() {
+    for(bool colliding:{false,true}) {
+        auto c = attention(16,4,4,32,8,true);
+        if(colliding) c.hash = constant_hash;
+        Sim sim(c);
+        auto& cache = sim.cache;
+        const Tokens prompt = range(1,8);
+        Tokens longer = prompt; longer.push_back(90);
+        Sim::Seq a; a.id = cache.open(11);
+        sim.seqs.push_back(a);
+        auto& owner = sim.seqs.back();
+        sim.begin(owner,prompt); sim.commit(owner,8);
+        require(cache.reusable(longer,8,0) == 0 && cache.reusable(longer,8,22) == 0,"another scope reuses nothing");
+        require(colliding || cache.reusable(longer,8,11) == 8,"the scope's own prompt is reusable");
+        const auto other = cache.open(22);
+        require(cache.attach(other,longer,8) == 0,"attach in another scope reuses nothing");
+        const auto same = cache.open(11);
+        require(cache.attach(same,longer,8) == (colliding ? 4u : 8u),"attach in the same scope reuses");
+        const auto child = cache.fork(same);
+        const auto r = cache.begin(child,4);
+        cache.commit(child,r.id,range(90,4));
+        Tokens grown = prompt;
+        for(Token t:range(90,4)) grown.push_back(t);
+        grown.push_back(7);
+        require(colliding || cache.reusable(grown,12,11) == 12,"a fork writes under its parent's scope");
+        require(cache.reusable(grown,12,0) == 0,"and not under the default");
+        cache.close(other); cache.close(same); cache.close(child);
+        sim.close(owner);
+        sim.retire(cache.epoch());
+    }
+}
+
+// Partial-page reuse: a prompt that leaves a cached one inside a page reuses that page's matching leading rows,
+// copied into a page of its own, and writes on from there.
+void partial_reuse() {
+    auto c = attention(8,4,2,32,8,true);
+    c.partial_reuse = true;
+    Sim sim(c);
+    auto& cache = sim.cache;
+    auto& a = sim.open();
+    sim.begin(a,range(1,8)); sim.commit(a,8);
+    sim.begin(a,range(9,4)); sim.commit(a,4);   // pages hold 1..4, 5..8, 9..12
+    sim.close(a);
+    sim.retire(cache.epoch());
+    Tokens prompt = range(1,6);
+    prompt.push_back(99); prompt.push_back(98);   // leaves the cached prompt after row 5
+    require(cache.reusable(prompt,7) == 6 && cache.reusable(prompt,5) == 5,"four whole rows and the two matching ones");
+    const auto copies = sim.storage.row_copies.size();
+    const auto b = cache.open();
+    require(cache.attach(b,prompt,7) == 6 && cache.committed(b) == 6,"attach reuses six rows");
+    require(sim.storage.row_copies.size() == copies+1 && sim.storage.row_copies.back()[2] == 2,"two rows copied once");
+    const auto values = digests(prompt);
+    const auto table = cache.block_table(b);
+    for(std::size_t r = 0; r < 6; ++r)
+        require(sim.storage.rows[std::size_t(table[r/4])*4+r%4] == values[r],"a reused row holds its prefix's value");
+    const auto source = table[1];
+    const auto r = cache.begin(b,2);   // the sequence's own page: written in place, no copy
+    require(r.kv[0].page == source && r.kv[0].offset == 2 && sim.storage.row_copies.size() == copies+1,
+            "the partial page is the sequence's own");
+    cache.commit(b,r.id,std::span<const Token>(prompt).subspan(6,2));
+    Tokens original = range(1,12); original.push_back(50);
+    require(cache.reusable(original,12) == 12,"the cached prompt's pages stay intact");
+    cache.close(b);
+    cache.retire(cache.epoch());
+    auto off = attention(8,4,2,32,8,true);
+    Sim plain(off);
+    auto& d = plain.open();
+    plain.begin(d,range(1,8)); plain.commit(d,8);
+    require(plain.cache.reusable(prompt,7) == 4,"without partial reuse only whole pages");
+    rejects_as<std::invalid_argument>([] { auto e = attention(8,4,2,32,8,true); e.partial_reuse = true; e.windows = {{8,4}};
+                                           Sim s(e); },"partial reuse");
+    rejects_as<std::invalid_argument>([] { auto e = attention(8,4,2,32,8); e.partial_reuse = true; Sim s(e); },"partial reuse");
+}
+
 int main(int argc, char** argv) {
-    const std::array<std::pair<std::string_view,void(*)()>,23> cases{{
+    const std::array<std::pair<std::string_view,void(*)()>,29> cases{{
         {"state_config",config_rules},{"state_transactions",transactions},{"state_ownership",ownership},
         {"state_prefixes",prefixes},{"state_collisions",collisions},{"state_reuse",reuse},
         {"state_completeness",completeness},{"state_index",index_probing},{"state_lru",lru},{"state_epochs",epochs},
         {"state_forks",forks},{"state_recurrent",recurrent},{"state_hybrid",hybrid},{"state_failures",failures},
         {"state_randomized",randomized},{"state_capacity",capacity},{"state_layout",layout},{"state_metadata",metadata},
-        {"state_hot_path",hot_path},{"state_checkpoints",checkpoints},{"state_snapshots",snapshots},{"state_windows",windows},{"state_round_states",round_states}}};
+        {"state_hot_path",hot_path},{"state_checkpoints",checkpoints},{"state_snapshots",snapshots},{"state_windows",windows},{"state_round_states",round_states},
+        {"state_snapshot_rows",snapshot_rows},{"state_evicted",evicted_pages},
+        {"state_retention",retention},{"state_guard",guard_and_fresh},
+        {"state_scopes",scopes},{"state_partial",partial_reuse}}};
     try {
         const std::string_view name = argc > 1 ? argv[1] : "";
         bool found = false;

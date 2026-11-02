@@ -1,6 +1,8 @@
-// Host NVFP4 rows in a declared order: every ISA this CPU supports gives the scalar oracle's bits for every
-// order, shape, token mask and scale hook; any row split gives the same bits; values agree with crit::nvfp4's
-// projection; a different reduction order changes bits. Prints single-thread throughput per ISA (not asserted).
+// Host block-scaled rows in a declared order: every ISA this CPU supports gives the scalar oracle's bits for every
+// order, shape, token mask and scale hook, and the portable path does for every format (NVFP4, MXFP4, MXFP8 E4M3 and
+// E5M2, MXINT8, INT4); any row split gives the same bits; values agree with crit::nvfp4's projection and with a
+// double-precision reference for every format; a different reduction order changes bits. Prints single-thread
+// throughput per ISA (not asserted).
 #include "host_nvfp4.h"
 #include "nvfp4.h"
 
@@ -64,7 +66,7 @@ void decode_halved(const void* ctx, std::size_t row, float* out) {
 
 void parity() {
     std::mt19937 rng(20261019);
-    const std::vector<hn::Isa> isas{hn::Isa::avx2, hn::Isa::avx512};
+    const std::vector<hn::Isa> isas{hn::Isa::portable, hn::Isa::avx2, hn::Isa::avx512};
     int compared = 0;
     for(auto [rows, cols] : {std::pair<std::size_t, std::size_t>{33, 64}, {40, 1024}, {24, 2688}, {8, 4096}, {18, 640},
                              {11, 1040}}) {
@@ -184,7 +186,7 @@ void golden() {
     for(hn::Product product : {hn::Product::scaled_elements, hn::Product::block_dot})
     for(int lanes : {16, 32})
         for(hn::Reduce reduce : {hn::Reduce::halving, hn::Reduce::sequential}) {
-            for(hn::Isa isa : {hn::Isa::scalar, hn::Isa::avx2, hn::Isa::avx512}) {
+            for(hn::Isa isa : {hn::Isa::scalar, hn::Isa::portable, hn::Isa::avx2, hn::Isa::avx512}) {
                 if(!hn::supported(isa)) continue;
                 std::vector<float> out(rows);
                 hn::dot_rows(isa, {lanes, reduce, product}, c_view, hn::e4m3_scales(c_view), c.x.data(), cols, 1, 1u, 0, rows,
@@ -197,13 +199,91 @@ void golden() {
     std::cout << "golden: the Python reference's bits on every supported ISA\n";
 }
 
+// Every format on every path: the portable path (and any ISA the format reaches) gives the oracle's bits, and the
+// oracle's value is the format's value: within FP32 rounding of a double-precision sum of the decoded elements.
+struct Named {
+    const char* name;
+    hn::Format format;
+    bool e8m0;  // block scales as E8M0 bytes, else E4M3
+};
+void formats() {
+    std::mt19937 rng(20261101);
+    const Named all[] = {{"nvfp4", hn::nvfp4_format(), false},
+                         {"mxfp4", hn::mxfp4_format(), true},
+                         {"mxfp8-e4m3", hn::mxfp8_e4m3_format(), true},
+                         {"mxfp8-e5m2", hn::mxfp8_e5m2_format(), true},
+                         {"mxint8", hn::mxint8_format(), true},
+                         {"int4-g32-e4m3", {4, 32, hn::int4_values()}, false},
+                         {"int4-g16-e8m0", {4, 16, hn::int4_values()}, true}};
+    int compared = 0;
+    for(const Named& f : all) {
+        for(auto [rows, cols] : {std::pair<std::size_t, std::size_t>{17, 512}, {9, 2688}, {5, 1056}}) {
+            const std::size_t B = std::size_t(f.format.block);
+            if(cols % B) continue;
+            std::vector<std::uint8_t> codes(rows * cols * std::size_t(f.format.bits) / 8), scales(rows * cols / B);
+            std::vector<float> x(hn::kMaxTokens * cols);
+            std::uniform_int_distribution<int> byte(0, 255), e8m0(117, 137), e4m3(0x20, 0x5f);
+            std::normal_distribution<float> act(0.0f, 1.0f);
+            for(auto& b : codes) {
+                b = std::uint8_t(byte(rng));
+                // FP8 codes that decode to NaN or infinity are not weights
+                while(f.format.bits == 8 && !std::isfinite(f.format.values[b])) b = std::uint8_t(byte(rng));
+            }
+            for(auto& b : scales) b = std::uint8_t(f.e8m0 ? e8m0(rng) : (e4m3(rng) | (byte(rng) & 0x80)));
+            for(auto& v : x) v = act(rng);
+            hn::MatrixView v{codes.data(), scales.data(), rows, cols};
+            v.format = f.format;
+            const hn::ScaleDecoder d = f.e8m0 ? hn::e8m0_scales(v) : hn::e4m3_scales(v);
+            for(hn::Product product : {hn::Product::scaled_elements, hn::Product::block_dot})
+                for(int lanes : {16, 32})
+                    for(hn::Reduce reduce : {hn::Reduce::halving, hn::Reduce::sequential}) {
+                        if(product == hn::Product::scaled_elements && cols % std::size_t(lanes)) continue;
+                        const hn::Order order{lanes, reduce, product};
+                        auto run_on = [&](hn::Isa isa) {
+                            std::vector<float> out(hn::kMaxTokens * rows, -1.0f);
+                            hn::dot_rows(isa, order, v, d, x.data(), cols, 3, 5u, 0, rows, 0.5f, out.data(), rows);
+                            return out;
+                        };
+                        const auto oracle = run_on(hn::Isa::scalar);
+                        for(hn::Isa isa : {hn::Isa::portable, hn::Isa::avx2, hn::Isa::avx512}) {
+                            if(!hn::supported(isa)) continue;
+                            const auto got = run_on(isa);
+                            for(std::size_t i = 0; i < got.size(); ++i)
+                                require(bits(got[i]) == bits(oracle[i]), std::string(f.name) + " on " +
+                                        hn::isa_name(isa) + " differs from the oracle at " + std::to_string(i));
+                            ++compared;
+                        }
+                        // the value: a double sum of element * scale * x, within FP32 accumulation error
+                        std::vector<float> scale_row(cols / B);
+                        for(std::size_t r = 0; r < rows; ++r) {
+                            d.decode(d.context, r, scale_row.data());
+                            for(int t : {0, 2}) {
+                                double sum = 0, mag = 0;
+                                for(std::size_t k = 0; k < cols; ++k) {
+                                    const std::uint8_t* row = codes.data() + r * cols * std::size_t(f.format.bits) / 8;
+                                    const int code = f.format.bits == 8 ? row[k] : (k % 2 ? row[k / 2] >> 4 : row[k / 2] & 15);
+                                    const double term = double(f.format.values[code]) * scale_row[k / B] * x[std::size_t(t) * cols + k];
+                                    sum += term;
+                                    mag += std::fabs(term);
+                                }
+                                const double got = oracle[std::size_t(t) * rows + r];
+                                require(std::fabs(got - 0.5 * sum) <= 1e-5 * mag, std::string(f.name) +
+                                        ": the declared order does not compute the format's value");
+                            }
+                        }
+                    }
+        }
+    }
+    std::cout << "formats: " << compared << " runs of 7 formats bitwise equal to the oracle and to their values\n";
+}
+
 void throughput() {
     std::mt19937 rng(5);
     const Case c = make(1024, 4096, rng);  // 2 MiB of codes
     const hn::MatrixView c_view = c.view();
     const auto d = hn::e4m3_scales(c_view);
     std::vector<float> out(hn::kMaxTokens * c.rows);
-    for(hn::Isa isa : {hn::Isa::scalar, hn::Isa::avx2, hn::Isa::avx512}) {
+    for(hn::Isa isa : {hn::Isa::scalar, hn::Isa::portable, hn::Isa::avx2, hn::Isa::avx512}) {
         if(!hn::supported(isa)) continue;
         for(int tokens : {1, 4}) {
             const int reps = isa == hn::Isa::scalar ? 2 : 20;
@@ -217,6 +297,21 @@ void throughput() {
                       << " GB/s of weights, one thread\n";
         }
     }
+    // A format the hand-written paths do not cover runs the portable rows, compiled for each ISA.
+    std::vector<std::uint8_t> codes(1024 * 4096), scales(1024 * 4096 / 32);
+    for(auto& b : codes) b = std::uint8_t(rng() % 0x7e);  // finite E4M3
+    for(auto& b : scales) b = std::uint8_t(120 + rng() % 16);
+    hn::MatrixView v{codes.data(), scales.data(), 1024, 4096};
+    v.format = hn::mxfp8_e4m3_format();
+    const auto e8 = hn::e8m0_scales(v);
+    for(hn::Isa isa : {hn::Isa::portable, hn::Isa::avx2, hn::Isa::avx512}) {
+        if(!hn::supported(isa)) continue;
+        const auto t0 = std::chrono::steady_clock::now();
+        for(int i = 0; i < 5; ++i) hn::dot_rows(isa, {}, v, e8, c.x.data(), 4096, 1, 1u, 0, 1024, 1.0f, out.data(), 1024);
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::cout << "throughput mxfp8 " << hn::isa_name(isa) << " tokens=1: "
+                  << double(codes.size() + scales.size()) * 5 / s / 1e9 << " GB/s of weights, one thread\n";
+    }
 }
 }  // namespace
 
@@ -227,6 +322,7 @@ int main(int argc, char** argv) {
         semantics();
         orders_differ();
         golden();
+        formats();
         if(argc > 1 && std::string(argv[1]) == "--throughput") throughput();
         return 0;
     } catch(const std::exception& e) {

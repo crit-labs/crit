@@ -58,6 +58,7 @@
     "Python standard library"
   ],
   "symbols": [
+    "ConfidenceCut",
     "Drafter",
     "read_drafter",
     "read_drafter_file",

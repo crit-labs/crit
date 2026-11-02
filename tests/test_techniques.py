@@ -1061,6 +1061,234 @@ class DeviceExpertCacheTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 bad()
 
+    def test_admission_limits_bypass_misses_without_evicting(self):
+        m = load("device-expert-cache", "device_cache.py")
+        d = m.ClockDirectory(slots=8, groups=1, experts=16, admit_quota=1)
+        p = d.plan(0, [1, 2, 3])
+        self.assertEqual((p.misses, p.bypassed, p.slots), (3, 2, [0, "store", "store"]))
+        self.assertEqual(p.fills, [("store", 1, 0)])
+        self.assertEqual(d.plan(0, [1, 2]).hits, 1)  # the admitted miss is resident, the bypassed one is not
+        table = [-1] * 33
+        table[3] = 2
+        t = m.ClockDirectory(slots=8, groups=1, experts=16, admit_by_misses=table)
+        self.assertEqual(t.plan(0, [4, 5, 6]).slots, [0, 1, "store"])
+        self.assertEqual(t.plan(0, [7]).slots, [2])  # one miss: no quota in the table, admitted
+        s = m.ClockDirectory(slots=8, groups=1, experts=16, second_touch=True)
+        self.assertEqual(s.plan(0, [1, 2]).slots, ["store", "store"])
+        self.assertEqual(s.plan(0, [1, 3]).slots, [0, "store"])  # 1's second miss is admitted
+        self.assertEqual(s.slot_key[:2], [1, None])
+        with self.assertRaises(ValueError):
+            m.ClockDirectory(8, 1, 16, admit_by_misses=[1, 2])
+
+    def test_preload_fills_first_slots_and_keeps_adapting(self):
+        m = load("device-expert-cache", "device_cache.py")
+        d = m.ClockDirectory(slots=4, groups=2, experts=8)
+        self.assertEqual(d.preload([3, 3, 99, 9, 12, 1, 2]), [(3, 0), (9, 1), (12, 2), (1, 3)])
+        self.assertEqual((d.hand, d.slot_ref), (0, [0, 0, 0, 0]))
+        p = d.plan(1, [1, 5])  # key 9 hits; 13 misses and evicts the first unreferenced slot (3)
+        self.assertEqual((p.hits, p.slots), (1, [1, 0]))
+        self.assertNotIn(3, d.key_slot)
+
+    def test_residency_profile_build_check_and_load(self):
+        sys.path.insert(0, str(ROOT / "inference" / "device-expert-cache" / "code"))
+        m = load("device-expert-cache", "residency_profile.py")
+        tuning = [(g, [0, 1, (i % 3) + 2]) for i in range(30) for g in (0, 1)]
+        held = {"en": [(0, [0, 1, 4])] * 5, "de": [(1, [1, 0, 3])] * 5}
+        profile = m.build_profile(tuning, 2, 8, 4, "general web text, en/de, 1M tokens", held)
+        self.assertEqual(profile["keys"], [0, 1, 8, 9])
+        for name in held:
+            self.assertGreaterEqual(profile["held_out"][name]["profiled"], profile["held_out"][name]["cold"])
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "profile.json"
+            m.write_profile(path, profile)
+            self.assertEqual(m.load_profile(path, 2, 8, 3), [0, 1, 8])
+            with self.assertRaises(ValueError):
+                m.load_profile(path, 2, 16, 4)
+        for bad in (lambda: m.build_profile(tuning, 2, 8, 4, " ", held),
+                    lambda: m.build_profile(tuning, 2, 8, 4, "corpus", {"en": held["en"]}),
+                    lambda: m.build_profile([(0, [9])], 2, 8, 4, "corpus", held)):
+            with self.assertRaises(ValueError):
+                bad()
+
+    def test_the_profile_corpus_fetches_pages_caches_and_states_its_revisions(self):
+        sys.path.insert(0, str(ROOT / "inference" / "device-expert-cache" / "code"))
+        m = load("device-expert-cache", "corpus.py")
+        manifest = m.load_manifest()
+        self.assertGreaterEqual(len(manifest["held_out"]), 2)
+        tuned = {(s["dataset"], s["config"], s["split"], s["offset"]) for s in manifest["tuning"]}
+        self.assertFalse(tuned & {(s["dataset"], s["config"], s["split"], s["offset"]) for s in manifest["held_out"]})
+        small = {**manifest, "max_chars": 5, "tuning": [dict(manifest["tuning"][0], rows=150)]}
+        asked = []
+
+        class Response:
+            def __init__(self, value):
+                self.value = value
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps(self.value).encode("utf-8")
+
+        def opener(url):
+            asked.append(url)
+            if url.startswith(m.DATASETS):
+                return Response({"sha": "abcdef1234567890"})
+            length = int(url.split("length=")[1].split("&")[0])
+            return Response({"rows": [{"row": {"text": "0123456789"}}] * length})
+        with tempfile.TemporaryDirectory() as folder:
+            found = m.fetch(small, folder, open_url=opener)
+            self.assertEqual((len(found["web-en"]["texts"]), found["web-en"]["texts"][0]), (150, "01234"))
+            self.assertEqual(len(asked), 3)   # the revision, then pages of 100 and 50
+            self.assertIn("length=50", asked[-1])
+            m.fetch(small, folder, open_url=opener)
+            self.assertEqual(len(asked), 3)   # cached
+            self.assertIn("web-en HuggingFaceFW/fineweb-edu/default/train rows 0+150 @ abcdef123456",
+                          m.describe(small, found))
+        with tempfile.TemporaryDirectory() as folder:
+            bad = Path(folder) / "corpus.json"
+            bad.write_text(json.dumps({**manifest, "held_out": manifest["held_out"][:1]}), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                m.load_manifest(bad)
+
+    def test_the_expert_store_packs_one_bundle_per_key_and_is_reused(self):
+        import struct
+        sys.path.insert(0, str(ROOT / "core" / "python"))
+        sys.path.insert(0, str(ROOT / "inference" / "device-expert-cache" / "code"))
+        from crit_core.model.safetensors import inspect_model
+        m = load("device-expert-cache", "expert_store.py")
+
+        def write(path, tensors):   # {name: (dtype, shape, bytes)}
+            header, blob = {}, b""
+            for name, (dtype, shape, data) in tensors.items():
+                header[name] = {"dtype": dtype, "shape": list(shape), "data_offsets": [len(blob), len(blob) + len(data)]}
+                blob += data
+            raw = json.dumps(header).encode()
+            raw += b" " * (-len(raw) % 8)
+            path.write_bytes(struct.pack("<Q", len(raw)) + raw + blob)
+
+        def fill(tag, n):
+            return bytes((tag * 7 + i) % 251 for i in range(n))
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            tensors = {}
+            for g in range(2):   # per-expert down matrices (40 bytes) and stacked gate/up rows (3 experts x 24 bytes)
+                for e in range(3):
+                    tensors[f"layers.{g}.experts.{e}.down"] = ("U8", (5, 8), fill(10 * g + e, 40))
+                tensors[f"layers.{g}.experts.gate_up"] = ("U8", (3, 4, 6), fill(100 + g, 72))
+            write(folder / "model.safetensors", tensors)
+            checkpoint = inspect_model(folder / "model.safetensors")
+            components = [m.Component("gate_up", "layers.{group}.experts.gate_up"),
+                          m.Component("down", "layers.{group}.experts.{expert}.down")]
+            out = folder / "experts.store"
+            seen = []
+            index = m.build_store(checkpoint, components, 2, 3, out, align=64, progress=lambda g, n: seen.append(g))
+            self.assertEqual(index["components"], [
+                {"name": "gate_up", "offset": 0, "nbytes": 24, "dtype": "U8", "shape": [4, 6]},
+                {"name": "down", "offset": 32, "nbytes": 40, "dtype": "U8", "shape": [5, 8]}])
+            self.assertEqual((index["bundle_bytes"], out.stat().st_size, seen), (128, 6 * 128, [1, 2]))
+            store = m.open_store(out)
+            for g in range(2):
+                for e in range(3):
+                    key = g * 3 + e
+                    self.assertEqual(bytes(store.component(key, "down")), fill(10 * g + e, 40))
+                    self.assertEqual(bytes(store.component(key, "gate_up")), fill(100 + g, 72)[24 * e:24 * (e + 1)])
+            self.assertGreater(store.address(), 0)
+            store.close()
+            before = out.stat().st_mtime_ns
+            m.build_store(checkpoint, components, 2, 3, out, align=64)
+            self.assertEqual(out.stat().st_mtime_ns, before)   # same source and layout: kept
+            for bad in (lambda: m.build_store(checkpoint, [m.Component("x", "layers.{group}.nothing")], 2, 3, out),
+                        lambda: m.build_store(checkpoint, components, 2, 4, out),   # 4 experts are not stacked
+                        lambda: m.layout(checkpoint, components, 2, 3, align=24)):
+                with self.assertRaises(ValueError):
+                    bad()
+
+    def test_split_picks_the_fastest_measured_split_per_miss_count(self):
+        m = load("device-expert-cache", "split.py")
+        t = m.SplitTimings(link={0: 0.0, 1: 1.0, 2: 2.5}, cpu={0: 0.0, 1: 1.5, 2: 3.0}, both={(1, 1): 1.6},
+                           hit_rate=0.8)
+        self.assertEqual(m.best_split(t, 1), (1, 1.0))
+        self.assertEqual(m.best_split(t, 2), (1, 1.6))  # together slower than either alone, still the fastest
+        table = m.quota_table(t)
+        self.assertEqual((len(table), table[:4]), (33, [0, 1, 1, -1]))  # 3 misses: unmeasured, every miss admitted
+        tied = m.SplitTimings(link={1: 1.0}, cpu={1: 1.0})
+        self.assertEqual(m.best_split(tied, 1), (1, 1.0))  # a tie keeps the miss on the link
+        calls = []
+        timed = m.calibrate(lambda k: calls.append(("link", k)) or k * 1.0, lambda j: calls.append(("cpu", j)) or j * 2.0,
+                            lambda k, j: calls.append(("both", k, j)) or max(k, 2 * j) * 1.1, misses=[2], repeats=3,
+                            hit_rate=0.7)
+        self.assertEqual(m.quota_table(timed)[2], 2)
+        self.assertEqual(len(calls), 5 * 3)  # link 1 and 2, CPU 1 and 2, both (1, 1): three times each
+        self.assertFalse(m.needs_recalibration(timed, 0.72))
+        self.assertTrue(m.needs_recalibration(timed, 0.8))
+        for bad in (lambda: m.SplitTimings(link={40: 1.0}), lambda: m.SplitTimings(both={(0, 1): 1.0}),
+                    lambda: m.SplitTimings(cpu={1: -1.0}), lambda: m.calibrate(None, None, None, [0])):
+            with self.assertRaises(ValueError):
+                bad()
+
+
+
+class ExpertStreamedPrefillTests(unittest.TestCase):
+    def test_chunk_from_the_rate_curve_knee(self):
+        m = load("expert-streamed-prefill", "schedule.py")
+        curve = m.RateCurve({16: 100.0, 64: 400.0, 256: 800.0, 512: 850.0})
+        self.assertEqual((curve.knee(0.9), curve.knee(1.0)), (256, 512))
+        self.assertAlmostEqual(m.expected_touched(1, 8, 128), 8.0)
+        self.assertEqual(m.expected_touched(0, 8, 128), 0.0)
+        self.assertEqual(m.choose_chunk(curve, 8, 128, 16384), 4096)  # 4096 * 8 / ~128 = 256 rows per expert
+        self.assertEqual(m.choose_chunk(curve, 8, 128, 2048), 2048)  # the workspace bound wins
+        self.assertTrue(m.fetch_whole_layer(4096, 8, 128))
+        self.assertFalse(m.fetch_whole_layer(16, 8, 128))
+        self.assertEqual(m.staging_bytes(10, 4096, 8, 128, resident_share=0.25), 960)
+        for bad in (lambda: m.RateCurve({}), lambda: m.RateCurve({0: 1.0}), lambda: m.RateCurve({4: 0.0}),
+                    lambda: curve.knee(0), lambda: m.expected_touched(4, 9, 8), lambda: m.choose_chunk(curve, 8, 128, 100)):
+            with self.assertRaises(ValueError):
+                bad()
+
+    def test_the_cpu_reference_decodes_sorts_and_combines(self):
+        import struct
+        m = load("expert-streamed-prefill", "reference.py")
+        self.assertEqual((m.e4m3(0x38), m.e4m3(0x01), m.e4m3(0xB8)), (1.0, 2.0 ** -9, -1.0))
+        self.assertTrue(math.isnan(m.e4m3(0x7F)))
+        self.assertEqual(m.decode_matrix("bf16", bytes([0x80, 0x3F, 0x00, 0xC0]), None, 1, 2), [[1.0, -2.0]])
+        self.assertEqual(m.decode_matrix("fp8_e4m3_row", bytes([0x38, 0x40]), struct.pack("<f", 0.5), 1, 2), [[0.5, 1.0]])
+        nv = m.decode_matrix("nvfp4", bytes([0x2A] + [0] * 7), bytes([0x40]), 1, 16, post=0.5)
+        self.assertEqual(nv[0][:2], [-1.0, 1.0])   # E2M1 1.0 and -1.0, times scale 2, times post 0.5
+        mx = m.decode_matrix("mxfp4", bytes([0x07] + [0] * 15), bytes([126]), 1, 32)            # code 7 = 6, scale 2^-1
+        self.assertEqual(mx[0][0], 3.0)
+        self.assertEqual(m.route_order([[2, 0], [0, -1], [2, 5]], 3), [1, 2, 0, 4])
+        # one token, two experts: identity gate rows, so act = silu(x) * x per element
+        gu = {0: [[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]], 1: [[2.0, 0.0], [0.0, 2.0], [1.0, 0.0], [0.0, 1.0]]}
+        dn = {0: [[1.0, 0.0], [0.0, 1.0]], 1: [[1.0, 1.0], [0.0, 0.0]]}
+        out = m.moe_block([[1.0, -1.0]], [[0, 1]], [[0.25, 0.75]], gu.get, dn.get, 2)
+        a0 = [m.silu(1.0) * 1.0, m.silu(-1.0) * -1.0]
+        a1 = [m.silu(2.0) * 1.0, m.silu(-2.0) * -1.0]
+        want = [0.25 * a0[0] + 0.75 * (a1[0] + a1[1]), 0.25 * a0[1]]
+        for got, exp in zip(out[0], want):
+            self.assertAlmostEqual(got, exp, places=12)
+        with self.assertRaises(ValueError):
+            m.decode_matrix("int3", b"", None, 1, 1)
+
+    def test_double_buffered_timeline_and_estimate(self):
+        m = load("expert-streamed-prefill", "schedule.py")
+        # 1 GB/s: 1e6 bytes copy in 1 ms. Step 1's copy overlaps step 0's compute; step 2's waits for step 0's buffer.
+        total, steps = m.timeline([m.Step(3.0, 1_000_000), m.Step(1.0, 1_000_000), m.Step(1.0, 4_000_000)], 1.0)
+        self.assertEqual(steps[0], (1.0, 1.0, 4.0))
+        self.assertEqual(steps[1], (2.0, 4.0, 5.0))
+        self.assertEqual(steps[2], (8.0, 8.0, 9.0))  # copy starts at 4 (step 0 done), ends at 8
+        self.assertEqual(total, 9.0)
+        rate, ms, link = m.prefill_estimate(4096, 1024, 2, lambda n: 1.0, lambda n: 1_000_000, 1.0)
+        self.assertEqual((ms, link), (9.0, 8.0))  # 8 steps of 1 ms copies, the last step's compute after them
+        self.assertAlmostEqual(rate, 4096 / 0.009)
+        self.assertEqual(m.timeline([], 1.0), (0.0, []))
+        for bad in (lambda: m.timeline([m.Step(1.0, 1)], 0.0), lambda: m.timeline([m.Step(-1.0, 1)], 1.0),
+                    lambda: m.prefill_estimate(0, 1, 1, abs, abs, 1.0)):
+            with self.assertRaises(ValueError):
+                bad()
 
 
 class TokenSamplingTests(unittest.TestCase):

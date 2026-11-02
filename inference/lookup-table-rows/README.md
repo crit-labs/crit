@@ -34,12 +34,19 @@ an engine choice charged against host memory.
 | File | Supplies |
 | --- | --- |
 | [`table_rows.py`](code/table_rows.py) | `TableRegion`; `advise_random` (file) and `advise_mapping_random` (mapping); `RowTable` with `gather(rows)` in request order, a worker pool for cold rows, an LRU of hot rows, and `reads`, `bytes_read`, `hits` counters |
+| [`table_rows.h`](code/table_rows.h) | The same in C++20 for native engines: `Region`, `RowGather` (random-access advice, positioned reads by a persistent worker pool with the calling thread, rows asked for twice read once, an LRU of hot rows, `Counters`) writing rows in request order straight into the caller's buffer, and `StagingRing`, slots of pinned host memory a gather fills and the engine copies to the device, each reused only once its last copy has finished |
+
+**Into the device.** Gather each step's rows into a `StagingRing` slot over pinned host memory (a Core `HostBlock`
+registered with `cuda_pin_host_block`), copy the slot to the device on the step's stream, and record an event after
+the copy; the ring's `finished(slot)` is `cudaEventQuery` on that event, so a slot is overwritten only after its copy
+has read it. Two or three slots let the next step's gather run while the current copy is in flight.
 
 ## What the engine supplies
 
 - The table's layout: file, offset, row count and row size, including any per-row scales stored beside the codes.
 - The row ids per token (token ids, or hashed n-gram ids from the model's own hashing).
-- Where gathered rows go next (a pinned staging buffer, a device copy) and their arithmetic.
+- Where gathered rows go next and their arithmetic: the pinned memory behind the `StagingRing`, the device copy
+  and the event its `finished` test reads.
 - The worker count and cache size, measured on the target disk.
 
 ## Worked example

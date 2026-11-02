@@ -307,3 +307,60 @@ def rejection_predictions(target, drafts, draft_probs, uniforms, residual_unifor
         rejected = draw(residual, residual_uniforms[:, :width])
         predictions[:, :width] = torch.where(accept, drafts, rejected)
     return predictions
+
+
+def override_drafts(drafts, copies, counts, matched, threshold, draft_probs=None):
+    """In place: where a row's copy match covers at least `threshold` tokens, its first counts[row] drafts become the
+    copied tokens. drafts: [rows, width] a drafter's tokens; copies: [rows, >= width]; counts and matched: [rows].
+    draft_probs ([rows, width, vocabulary], for sampled rows) becomes one-hot at each copied token, the law a copy was
+    drawn from, so rejection_predictions stays exact; a draft kept after a shorter copy keeps its own law, which it was
+    still drawn from. Capture-safe."""
+    width = drafts.shape[1]
+    if not width:
+        return
+    columns = torch.arange(width, device=drafts.device)
+    use = (matched >= threshold)[:, None] & (columns[None, :] < counts[:, None])
+    copied = copies[:, :width]
+    drafts.copy_(torch.where(use, copied, drafts))
+    if draft_probs is not None:
+        one_hot = torch.zeros_like(draft_probs).scatter_(2, copied[..., None], 1.0)
+        draft_probs.copy_(torch.where(use[..., None], one_hot, draft_probs))
+
+
+class CopyDrafts:
+    """A copy drafter's tokens for overriding a neural drafter's, staged on the host between rounds and applied on the
+    device in the draft hook.
+
+    Before each launch, set(slot, tokens, matched) for every decoding row from its copy proposal (mtp-decode's
+    PromptCopyIndex.propose_matched over the row's accepted context), or clear(slot); the host buffers are pinned on a
+    CUDA device. In the draft hook, after the drafter wrote view.drafts, apply(view) copies them to the device and
+    overrides each row whose match covers at least `threshold` tokens (override_drafts); sampled rows pass their
+    draft_probs. Every buffer is allocated once, so apply runs inside a captured round. The drafter catches up from
+    the emitted tokens (view.catch_up_tokens) as always, never from an overridden draft."""
+
+    def __init__(self, rows, widest, device, threshold):
+        if rows < 1 or widest < 1 or threshold < 1:
+            raise ValueError("at least one row, a width of one and a threshold of one")
+        self.rows, self.widest, self.threshold = rows, widest, threshold
+        device = torch.device(device)
+        pinned = device.type == "cuda"
+        self.host = torch.zeros(rows, widest + 2, dtype=torch.long, pin_memory=pinned)   # tokens, count, matched
+        self.device = torch.zeros(rows, widest + 2, dtype=torch.long, device=device)
+
+    def set(self, slot, tokens, matched):
+        tokens = list(tokens)[:self.widest]
+        row = self.host[slot]
+        row.zero_()
+        if tokens:
+            row[:len(tokens)] = torch.tensor(tokens, dtype=torch.long)
+        row[self.widest], row[self.widest + 1] = len(tokens), int(matched)
+
+    def clear(self, slot):
+        self.host[slot].zero_()
+
+    def apply(self, view, draft_probs=None):
+        rows, width = view.rows, view.width
+        self.device[:rows].copy_(self.host[:rows], non_blocking=True)
+        staged = self.device[:rows]
+        override_drafts(view.drafts[:, :width], staged[:, :self.widest], staged[:, self.widest],
+                        staged[:, self.widest + 1], self.threshold, draft_probs)

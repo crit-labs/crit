@@ -22,9 +22,9 @@ context_reserve_gib = 3
 context_tokens = 200000
 
 # The quality mode new runs judge quality in, when the request names none: preserve (the default) against the
-# checkpoint with exact activations; as_quantized against the checkpoint run as quantized (its own activation
-# quantization, as serving stacks run NVFP4 and FP8 checkpoints), which trades the checkpoint's exact arithmetic for
-# its stored format's prefill speed.
+# checkpoint with exact activations; as_quantized, the mode for speed, against the same reference with a budget that
+# only keeps out a broken engine, so the engine runs the stored format's activations (as serving stacks run NVFP4 and
+# FP8 checkpoints) and any other precision it likes, for the stored format's prefill speed.
 # quality_mode = "preserve"
 
 # Where Eval fetches reference packages (a checkpoint's prepared data and reference scores): a folder

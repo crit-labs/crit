@@ -18,6 +18,7 @@ block_size - 1 in one non-causal pass (prompt attention with causal = false over
 context injected through its taps), where the anchor is the pending token. Positions 1 .. block_size - 1 give
 block_size - 1 drafts; with sample_from_anchor the anchor's row gives one more, first.
 """
+import math
 
 PAD = -1
 
@@ -63,3 +64,66 @@ def truncate(drafts, confidence, threshold):
         cut = cut or c < threshold
         out.append(PAD if cut else d)
     return out
+
+
+class ConfidenceCut:
+    """The truncate() threshold derived online from verified drafts, so a drafter with a confidence head keeps the
+    drafts likely to be accepted without a threshold tuned on someone's text.
+
+    Confidences fall into bins of `bin_width`, each holding decayed (tested, accepted) counts. observe() labels the
+    positions a round's verify actually tested: every kept draft up to and including the first mismatch, and, when
+    every kept draft was accepted and the round was cut, the first cut draft too, judged by the target's bonus
+    prediction at that position (without it the low bins would never be tested again). threshold() is the lower
+    edge of the lowest bin such that it and every bin above it with at least `min_count` labels accept at least
+    `target` of their drafts: -inf (keep everything) until `burn_in` labels arrived or while no bin is populated,
+    +inf when even the best populated bins fall short. decay_step(), once per round, lets the mapping follow the text
+    (prose against code) over a few hundred rounds."""
+
+    def __init__(self, target, *, bin_width=0.05, decay=0.995, min_count=8.0, burn_in=64.0):
+        if not 0.0 < target < 1.0:
+            raise ValueError("target acceptance must be in (0, 1)")
+        if bin_width <= 0 or not 0.0 < decay <= 1.0 or min_count <= 0 or burn_in < 0:
+            raise ValueError("bin_width and min_count must be positive, decay in (0, 1], burn_in non-negative")
+        self.target, self.bin_width, self.decay = target, bin_width, decay
+        self.min_count, self.burn_in = min_count, burn_in
+        self.bins = {}   # bin index -> [tested, accepted]
+        self.total = 0.0
+
+    def label(self, confidence, accepted):
+        counts = self.bins.setdefault(math.floor(confidence / self.bin_width), [0.0, 0.0])
+        counts[0] += 1.0
+        counts[1] += 1.0 if accepted else 0.0
+        self.total += 1.0
+
+    def observe(self, drafts, confidence, kept, predictions):
+        """One verified round: `drafts` and their `confidence` as drafted, `kept` of them verified (the rest cut),
+        `predictions` the target's token at each verify column (at least kept + 1 of them)."""
+        if not 0 <= kept <= len(drafts) or len(confidence) != len(drafts) or len(predictions) < kept + 1:
+            raise ValueError("kept drafts, confidences and predictions do not fit together")
+        for j in range(kept):
+            accepted = drafts[j] == predictions[j]
+            self.label(confidence[j], accepted)
+            if not accepted:
+                return
+        if kept < len(drafts):
+            self.label(confidence[kept], drafts[kept] == predictions[kept])
+
+    def decay_step(self):
+        for counts in self.bins.values():
+            counts[0] *= self.decay
+            counts[1] *= self.decay
+        self.total *= self.decay
+
+    def threshold(self):
+        if self.total < self.burn_in:
+            return -math.inf
+        cut, populated = math.inf, False
+        for index in sorted(self.bins, reverse=True):
+            tested, accepted = self.bins[index]
+            if tested < self.min_count:
+                continue
+            populated = True
+            if accepted / tested < self.target:
+                break
+            cut = index * self.bin_width
+        return cut if populated else -math.inf

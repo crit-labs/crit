@@ -37,6 +37,11 @@ generated-history matches require the longer `history_window`. The newest
 full-length candidate wins, otherwise the longest. Stops, vocabulary bounds and
 output budgets truncate it; no match returns an empty draft. `append` adds
 accepted tokens; `rewind` truncates and rebuilds, restoring evicted occurrences.
+`propose_matched(..., longest=64)` (C++ `propose_matched`, a `Proposal`) returns the
+same draft and how many accepted tokens before the copied continuation equal the
+context's last ones: at least `window`, at most `longest`, 0 without a draft. A long
+match is the evidence for letting a copy override another drafter's tokens
+([copied drafts](../device-speculative-round/README.md#copied-drafts)).
 
 For `D` draft tokens, `verify` consumes `D + 1` greedy target predictions.
 Prediction `i` must use the committed prefix plus the first `i` draft tokens.

@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 namespace crit::core {
 namespace {
@@ -65,6 +66,25 @@ std::uint32_t row_pages(std::uint64_t rows, std::uint32_t page_tokens) {
     const auto pages = rows / page_tokens + (rows % page_tokens ? 1 : 0);
     if(pages > std::numeric_limits<std::uint32_t>::max()) throw std::overflow_error("page count exceeds 2^32 - 1");
     return std::uint32_t(pages);
+}
+
+std::uint64_t peak_pages(std::span<const PageDemand> demands, std::uint32_t page_tokens, std::uint32_t verify_rows) {
+    if(!page_tokens || !verify_rows) throw std::invalid_argument("peak pages need page_tokens and verify_rows");
+    // At step s every request with remaining >= s holds held + s rows (plus the verify's extra rows); the peak comes at
+    // some s = remaining_k. With the requests sorted by remaining, longest first, the k of them still running at that
+    // step hold at most sum_i (held_i + s + extra + page_tokens - 1) / page_tokens pages.
+    std::vector<PageDemand> sorted(demands.begin(), demands.end());
+    std::sort(sorted.begin(), sorted.end(), [](const PageDemand& a, const PageDemand& b) {
+        return a.remaining_rows > b.remaining_rows;
+    });
+    const std::uint64_t extra = std::uint64_t(verify_rows) - 1 + page_tokens - 1;
+    std::uint64_t held = 0, peak = 0, maxima = 0;
+    for(std::size_t k = 0; k < sorted.size(); ++k) {
+        held += sorted[k].held_rows;
+        maxima += (std::uint64_t(sorted[k].held_rows) + sorted[k].remaining_rows + extra) / page_tokens;
+        peak = std::max(peak, (held + (k + 1) * (std::uint64_t(sorted[k].remaining_rows) + extra)) / page_tokens);
+    }
+    return std::min(peak, maxima);
 }
 
 PageReservations::PageReservations(Config config) : config_(config) {

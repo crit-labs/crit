@@ -87,6 +87,20 @@ private:
     std::uint32_t reserved_ = 0;
 };
 
+// A request's page demand for a projection: the rows it holds or has reserved (its prompt, computed or not, and the
+// output so far) and the output rows it may still stage.
+struct PageDemand {
+    std::uint32_t held_rows = 0, remaining_rows = 0;
+};
+// An upper bound on the pages `demands` hold at once while each stages at most one row per step and frees its pages
+// when its remaining rows run out: requests that finish early free their pages before the longer ones peak, so the
+// bound is often far below the sum of each request's maximum, which it never exceeds. verify_rows - 1 rows past the
+// last output count as for PageReservations. It holds only if no request advances faster than the others or starts
+// late (speculative rounds, prompts still prefilling): admit by it only with a fallback when pages run out, such as
+// Core's memory preemption (Profile.memory_preemption) or a pool margin. invalid_argument for zero page_tokens or
+// verify_rows.
+std::uint64_t peak_pages(std::span<const PageDemand> demands, std::uint32_t page_tokens, std::uint32_t verify_rows = 1);
+
 // One request's speculative round over its StateCache sequence, for batched verification: every request of a step
 // verifies its own drafts in its own decode item, accepts its own prefix and commits or rolls back its own rows.
 // begin() stages the pending token and K drafts as one round of K + 1 rows at positions committed .. committed + K (a

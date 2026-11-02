@@ -6,7 +6,8 @@
 
 namespace crit::techniques::host_isa {
 
-enum class Isa { scalar, avx2, avx512 };
+// portable: the compiler-vectorized path every CPU has (host_nvfp4.h).
+enum class Isa { scalar, portable, avx2, avx512 };
 const char* isa_name(Isa) noexcept;
 bool supported(Isa) noexcept;
 Isa best_isa() noexcept;

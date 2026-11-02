@@ -320,6 +320,32 @@ front; `truncate(keep)` applies a smaller count Core kept (a stop it knew, its o
 `commit` again. The hooks must be capture-safe: fixed shapes per (rows, width), no host synchronization.
 The readback is a copy to pinned memory, not mapped zero-copy, which torch does not allocate.
 
+### Copied drafts
+
+A neural drafter (an MTP head, EAGLE-3) guesses each token; a copy drafter that finds
+the context repeating earlier text (an edited file, a quoted tool result, an agent's
+recurring step) knows it. `CopyDrafts(rows, widest, device, threshold)` lets the copy
+win where it is likely right: before each launch the engine stages every row's copy
+proposal with `set(slot, tokens, matched)` (from mtp-decode's
+`PromptCopyIndex.propose_matched` over that row's accepted context; `clear(slot)`
+where there is none), and the draft hook calls `apply(view)` after the drafter wrote
+`view.drafts`. A row whose match covers at least `threshold` tokens takes the copied
+tokens for its first drafts (`override_drafts`); the others keep the drafter's.
+
+For sampled rows, pass the drafter's `draft_probs` to `apply`: each copied position's
+law becomes one-hot at the copied token, the law it came from, so
+`rejection_predictions` keeps the target's distribution; a draft kept after a shorter
+copy keeps its own law, which it was still drawn from. The drafter catches up from the
+emitted tokens as always, never from an overridden draft. The staged buffers are
+pinned on a CUDA device and copied inside the round, so `apply` runs in a captured
+round. [The round fixtures](../../tests/test_python_rounds.py) decode plain greedy
+output exactly with copies on and off, accept every draft on a row whose copies are
+right (width + 1 tokens per round) while a short-match row keeps its drafter, check
+the sampled law with and without an accepted copy over 60,000 draws, and give the
+same tokens from captured and eager rounds. No engine has measured it on a real model:
+how often copies win depends on the workload, so measure acceptance on the
+engine's own traffic before relying on it.
+
 [width_policy.py](code/width_policy.py) chooses the width per round: each row's per-depth acceptance
 a_d with decay, E(K) = 1 + a_1 + a_1 a_2 + ..., over the round's cost base + K x step fitted from measured
 rounds per row count, maximizing the rows' tokens per millisecond together among the captured widths.

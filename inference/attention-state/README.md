@@ -47,6 +47,12 @@ partial tail, the cache takes a new page and calls `StatePages::copy_rows` first
 full shared pages are untouched. `StateCache::pages_needed` gives the (advisory)
 admission cost.
 
+For debugging, `StatePages::poison(value)` (NaN by default) fills every page the cache
+hands out for new rows, so attention that reads a row the request never wrote, through
+a wrong length or mask, sees NaN instead of a previous owner's rows; `fill(page,
+value)` writes the pattern into Core's guard page (`StateCacheConfig::guard_page`) for
+masked block-table entries.
+
 `view(cache, sequence)` copies the committed block table; `view(cache, sequence,
 true)` adds staged rows and `prefix(n)` narrows either. Released pages stay
 readable until `retire()` covers the releasing epoch, so in-flight readers are
@@ -104,16 +110,69 @@ qualified by its [retained-provider workflow](../../kernels/examples/openblas/RE
 | [attention.h](code/attention.h) | `paged_attention`, `PagedAttentionPlan`/`BasicAttentionPlan`, masks, RoPE |
 | [rope_table.h](code/rope_table.h), [rope_table.py](code/rope_table.py) | `rope_table`, `rotary_dim`, `RopeTable`: rotary frequencies and attention factor from `config.json`'s rope parameters |
 | [batch_attention.h](code/batch_attention.h) | `BasicAttentionBatch<KVView>`, `PagedAttentionBatch` |
+| [host_page_tier.h](code/host_page_tier.h) | `HostPageTier`: a bounded host tier for the prefix pages Core's `StateCache` evicts ([below](#host-page-tier)) |
 
 `EncodedPages` needs K and V widths divisible by 32 and includes `grouped_int.h`
 from quantized-projections, so add both code folders to the include path and link
 `crit::core`. Inference keeps no page ledger; GPU pages, device attention and
-model projections are engine work.
+model projections are engine work. Device attention over paged KV comes from a provider
+([Kernels' sources](../../kernels/SOURCES.md)): FlashInfer's paged and ragged attention
+(BF16 and FP8 KV, prefill, decode and a verify's query block) or FlashAttention's paged KV,
+which read a block table like Core's `StateCache` gives (`view(...)` above). Store device
+pages in a format the provider reads (BF16 or FP8 rows per head); the INT8 G32 rows of
+`EncodedPages` are this entry's host codec, which no provider reads, so a device engine
+that wants them writes its own kernel and measures the provider on BF16 or FP8 pages as
+the yardstick. The [batched reference engine](../batched-reference-engine/README.md)'s
+paged attention kernels show crit's page layout on the device for BF16 and E4M3 pages; they
+are that example engine's own, not a provider.
 
 `PagedAttentionBatch` holds one plan per request (each with its own geometry,
 context and query rows) and returns results in key order; stale, duplicate or
 missing identities fail before arithmetic. Limits cover request count, query rows,
 workspace, output and metadata. It executes plans serially on the CPU.
+
+### Host page tier
+
+When the device page pool holds fewer pages than the prompts that keep coming back
+(several long conversations, an agent's tool loop), Core's prefix cache evicts the
+least recently released pages, and the next turn recomputes them. `HostPageTier(slots,
+config)` keeps evicted pages in `slots` host page slots instead, for the cache that
+`config` describes. It is a ledger like Core's: the engine owns the slots (pinned
+memory for a device engine) and every copy.
+
+1. In `StateStorage::evicted(page)`, call `admit(page)`. It returns the slot to copy
+   into (the least recently used page leaves when the tier is full), or nothing when
+   the tier holds that page already. Copy the page's rows, each component's state
+   where `page.snapshots` names a slot and each window group's rows where
+   `page.windows` names a page, enqueued on the engine's ordered queue so the copies
+   read before any later write to those ids.
+2. After `attach(seq, prompt, max_reuse)`, call `continuation(prompt, committed,
+   max_reuse, max_round_rows, scope)` (the sequence's reuse scope from `StateCache::open`;
+   pages written under another scope never match). It returns the kept pages that continue the prompt,
+   each verified by its chain hash and exact tokens, holding every window group's rows
+   (a window page a restore round left unwritten would be linked for reuse), ending at
+   the last page that holds every component's state, and fitting one round.
+3. Restore them in one round of `pages x page_tokens` rows with
+   `RoundStates::final_row`: copy each page's rows where `Round::kv` and
+   `Round::window_kv` point, the last page's state into `scratch[0]` (an `in_place`
+   component's into its live slot), and commit the pages' tokens. Core indexes the
+   pages again and snapshots the state at the round's end, as for computed rows.
+   Repeat from step 2 until it returns nothing, then compute the rest.
+
+A false hit needs two prefixes with the same chain hash whose page tokens also
+match; Core's own index rules that out with exact parent links, which a page outside
+the device cannot keep. The ledger allocates nothing after construction, so `admit`
+is safe in the noexcept hook. A device engine spills with an asynchronous device-to-host
+copy that the next write to those ids waits for (the same stream, or an event), since
+the hook runs inside `begin` and must not block, and restores with a host-to-device
+copy before the round's first reader. The tier costs `slots` pages of host memory,
+which belongs inside [host-memory admission](../host-memory-admission/README.md).
+The [tier fixtures](../../tests/inference/host_page_tier_tests.cpp) run a hybrid cache
+(one recurrent component, one sliding-window group) with ten device pages: a
+24-row conversation evicted by two other prompts is restored for its next turn
+(24 rows restored, 4 computed), and every KV row, window row and the live state equal
+what recomputing gives; the run rules, token verification under a constant hash and
+capacity are checked separately. Device copies and timing are not covered.
 
 ## What the engine supplies
 

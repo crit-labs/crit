@@ -1,24 +1,25 @@
 {
   "id": "host-expert-arithmetic",
   "category": "experts",
-  "summary": "NVFP4 expert rows on the CPU in a declared operation order that a device kernel reproduces bit for bit",
+  "summary": "Block-scaled expert rows (NVFP4, MXFP4, MXFP8, MXINT8, INT4 or an engine's own format) on any CPU in a declared operation order that a CUDA, HIP or Metal kernel reproduces bit for bit",
   "implementation_status": "native_source",
-  "implementation_scope": "C++20 scalar oracle plus AVX2 and AVX-512F paths selected at run time (cpuid/xgetbv), bitwise equal to the oracle, for 16- or 32-lane halving or sequential reductions over crit's NVFP4 layout with a scale-decode hook, 1-8 tokens per call; CUDA device function for the halving order; exact Python FP32 reference. Expert composition, activations, threading and the CPU share remain engine supplied.",
+  "implementation_scope": "C++20 scalar oracle; a portable vector path any compiler vectorizes for its CPU (Arm, x86, RISC-V), compiled again with AVX2 and AVX-512 on x86; hand-written AVX2 and AVX-512F paths for NVFP4; 4- or 8-bit codes, 16 or 32 per block, any element table, E4M3 and E8M0 scale decoders and a scale hook; 1-8 tokens per call; one device header for CUDA and HIP and a Metal version for both products; exact Python FP32 reference for NVFP4. Expert composition, activations, threading and the CPU share remain engine supplied.",
   "agent_guidance": {
-    "use_when": "Measured dispatch gives the CPU part of an expert-routed step's NVFP4 misses and output must not depend on where an expert ran",
+    "use_when": "Measured dispatch gives the CPU part of an expert-routed step's block-scaled misses and output must not depend on where an expert ran",
     "avoid_when": "All experts fit on the device, measurement gives the CPU no share on the target machine, or the device kernel's reduction order cannot be declared",
     "provides": [
-      "A declared row order: lane = k % lanes, fma(round(e2m1 * scale), x, lane), blocks in order, halving or sequential lane reduction, times post",
+      "A declared row order: lane = k % lanes, fma(round(value(code) * scale), x, lane), blocks in order, halving or sequential lane reduction, times post",
       "A second product form, block_dot: per block a sequential unscaled dot, then fma(dot, scale, lane) with blocks dealt over the lanes",
-      "Scalar oracle and AVX2 / AVX-512F paths bitwise equal to it, chosen by run-time CPU feature detection",
+      "Formats: 4- or 8-bit codes, 16 or 32 elements per block scale, any element table; NVFP4, MXFP4, MXFP8 E4M3 and E5M2, MXINT8 and INT4 tables",
+      "Scalar oracle, a portable compiler-vectorized path for every CPU and format, and AVX2 / AVX-512F paths for NVFP4, all bitwise equal, chosen by run-time CPU feature detection",
       "Row interleaving that keeps every row's arithmetic and any thread split bit-identical",
-      "Standard E4M3 scale decoder and a hook for checkpoint-specific scale encodings",
-      "CUDA dot_row_halving<16|32> and dot_row_block<16|32> with explicit rounding intrinsics and a matching shuffle tree",
+      "E4M3 and E8M0 scale decoders and a hook for checkpoint-specific scale encodings",
+      "dot_row_halving_format and dot_row_block_format<lanes, bits, block> for CUDA and HIP from one header, with explicit rounding intrinsics and a matching shuffle tree; the same functions in Metal",
       "Exact Python FP32 reference using crit's NVFP4 codec"
     ],
     "engine_supplies": [
       "Expert composition (projections, activation, routing weight) with activations that match bitwise on both processors",
-      "A device kernel declaring the same order, checked against the oracle",
+      "A device kernel declaring the same order, checked against the oracle on the target device (the HIP and Metal versions are not run in crit's tests)",
       "Its scale decoder and the post factor exactly as the device applies them",
       "Worker threads and a CPU share chosen by measured dispatch on the target machine"
     ],
@@ -30,8 +31,8 @@
     ],
     "adapt": [
       "Row interleaving, threading, token batch and scale caching",
-      "Additional ISAs that match the oracle bitwise",
-      "Additional declared orders added to oracle, SIMD paths, device function and fixtures together"
+      "Hand-written paths for other ISAs or formats that match the oracle bitwise",
+      "Additional declared orders added to oracle, portable path, SIMD paths, device functions and fixtures together"
     ]
   },
   "path": "inference/host-expert-arithmetic/README.md",
@@ -62,8 +63,16 @@
       "purpose": "AVX-512F path, bitwise equal to the oracle"
     },
     {
+      "path": "inference/host-expert-arithmetic/code/host_nvfp4_portable.inc",
+      "purpose": "Portable rows for any format, compiled for the baseline target and with AVX2 and AVX-512"
+    },
+    {
       "path": "inference/host-expert-arithmetic/code/host_nvfp4_device.cuh",
-      "purpose": "Device function for the halving order with explicit rounding intrinsics"
+      "purpose": "dot_row_halving_format and dot_row_block_format for any format, NVFP4 wrappers; one source for CUDA and HIP"
+    },
+    {
+      "path": "inference/host-expert-arithmetic/code/host_nvfp4_device.metal",
+      "purpose": "The device functions in the Metal Shading Language (build with fast math off)"
     },
     {
       "path": "inference/host-expert-arithmetic/code/implementation.py",
@@ -71,15 +80,15 @@
     }
   ],
   "requires": {
-    "hardware": "Any CPU for the scalar oracle; x86-64 with AVX2+FMA or AVX-512F for the SIMD paths (detected at run time); a CUDA device for the device function. Python 3.11+ for the reference",
-    "model": "Expert-routed models with NVFP4 block-scaled weights (one 8-bit scale per 16 values) in crit's layout; checkpoint scale encodings through the hook",
+    "hardware": "Any CPU (the portable path vectorizes for Arm, x86, RISC-V); x86-64 AVX2+FMA or AVX-512F for the hand-written NVFP4 paths (detected at run time); a CUDA, HIP or Metal GPU for the device functions. Python 3.11+ for the reference",
+    "model": "Expert-routed models with block-scaled weights (4- or 8-bit codes, 16 or 32 per scale); checkpoint scale encodings through the hook",
     "workload": "Decode or short prompt chunks whose misses measured dispatch splits between CPU and device"
   },
   "contract": {
-    "input": "Matrix view (codes, scales, rows, cols a multiple of the lanes, strides), scale decoder, declared order, FP32 activations for 1-8 tokens with a mask, row range and post factor",
+    "input": "Matrix view (codes, scales, rows, cols a multiple of the lanes and the block, strides, format), scale decoder, declared order, FP32 activations for 1-8 tokens with a mask, row range and post factor",
     "output": "FP32 row values for the masked tokens; bitwise equal across ISAs, thread splits and a device kernel declaring the same order",
     "ownership": "Views only; the caller owns weights, activations and outputs for the call",
-    "failure": "Invalid geometry, order or token count, and an ISA the CPU does not support, throw std::invalid_argument before any output is written",
+    "failure": "Invalid geometry, format, order or token count, and an ISA the CPU does not support, throw std::invalid_argument before any output is written",
     "core_boundary": "No Core change; engines call it from their own worker pools"
   },
   "dependencies": [
@@ -98,7 +107,21 @@
     "crit::techniques::host_nvfp4::dot_row_block",
     "crit::techniques::host_nvfp4::Product",
     "dot_row",
-    "fma32"
+    "fma32",
+    "crit::techniques::host_nvfp4::Format",
+    "crit::techniques::host_nvfp4::e8m0_scales",
+    "crit::techniques::host_nvfp4::e2m1_values",
+    "crit::techniques::host_nvfp4::int4_values",
+    "crit::techniques::host_nvfp4::e4m3_values",
+    "crit::techniques::host_nvfp4::e5m2_values",
+    "crit::techniques::host_nvfp4::int8_values",
+    "crit::techniques::host_nvfp4::nvfp4_format",
+    "crit::techniques::host_nvfp4::mxfp4_format",
+    "crit::techniques::host_nvfp4::mxfp8_e4m3_format",
+    "crit::techniques::host_nvfp4::mxfp8_e5m2_format",
+    "crit::techniques::host_nvfp4::mxint8_format",
+    "crit::techniques::host_nvfp4::dot_row_halving_format",
+    "crit::techniques::host_nvfp4::dot_row_block_format"
   ],
   "interactions": [
     "heterogeneous-expert-dispatch",
@@ -111,8 +134,8 @@
     "quantized-projections"
   ],
   "validation": {
-    "host": "Host fixture: AVX2 and AVX-512 bitwise equal to the oracle over 16/32 lanes, both reductions, standard and engine-style scale hooks, 1-8 token masks and 64-4096 columns; thread splits unchanged; agreement with crit::nvfp4::project; different orders change bits; every path reproduces the Python reference's known answers (MSVC/Windows and GCC/Linux). Worked example: exact FP32 reference, scale-hook equivalence",
-    "native": "CUDA fixture on an RTX 5090: dot_row_halving and dot_row_block match the host oracle and every host ISA on 1408 and 1152 rows (512-4096 columns, 16 and 32 lanes, block tails); a plainly written device loop differs on most. In one MoE engine with checkpoint-specific CSF scales, block_dot rows through the scale hook matched that engine's own device row arithmetic on 20480 rows of real expert weights",
-    "performance": "One Ryzen 5 9600 thread: about 8 GB/s of weights for one token on AVX-512. In one MoE engine (WSL2) replacing its own AVX-512 rows: token-identical output, decode within 3%, short-prompt first token about 16% slower"
+    "host": "Host fixture: AVX2 and AVX-512 bitwise equal to the oracle over 16/32 lanes, both reductions, standard and engine-style scale hooks, 1-8 token masks and 64-4096 columns; thread splits unchanged; agreement with crit::nvfp4::project; different orders change bits; every path reproduces the Python reference's known answers (MSVC/Windows and GCC/Linux). Worked example: exact FP32 reference, scale-hook equivalence; the portable path and every x86 path bitwise equal to the oracle for NVFP4, MXFP4, MXFP8 E4M3 and E5M2, MXINT8 and INT4, each within FP32 rounding of a double-precision sum of the format's values; the same suite on aarch64 (cross-built, run under qemu-user) passes with the portable path, the Python reference's known answers included",
+    "native": "CUDA fixture on an RTX 5090: dot_row_halving and dot_row_block match the host oracle and every host ISA on 1408 and 1152 rows (512-4096 columns, 16 and 32 lanes, block tails); a plainly written device loop differs on most. In one MoE engine with checkpoint-specific CSF scales, block_dot rows through the scale hook matched that engine's own device row arithmetic on 20480 rows of real expert weights; the format functions match the host oracle on 2560 rows of MXFP4, MXFP8 E4M3 and E5M2, MXINT8 and INT4 on the same GPU. HIP and Metal: written to the order, not compiled or run in crit's tests",
+    "performance": "One Ryzen 5 9600 thread: about 8 GB/s of weights for one token on AVX-512. In one MoE engine (WSL2) replacing its own AVX-512 rows: token-identical output, decode within 3%, short-prompt first token about 16% slower; MXFP8 on the portable path compiled with AVX-512 about 1.6 GB/s, on the baseline build about 0.7 GB/s (one thread, table decode bound)"
   }
 }

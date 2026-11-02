@@ -28,7 +28,8 @@ void rows_scalar(const std::uint16_t* w, std::size_t cols, const float* x, std::
 
 detail::RowsFn rows_for(Isa isa) {
     switch(isa) {
-    case Isa::scalar: return rows_scalar;
+    case Isa::scalar:
+    case Isa::portable: return rows_scalar;  // its loops are the compiler-vectorized form
 #if defined(CRIT_HOST_ISA_FILES)
     case Isa::avx2: return detail::rows_avx2;
     case Isa::avx512: return detail::rows_avx512;

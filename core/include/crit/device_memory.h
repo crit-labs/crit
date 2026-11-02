@@ -1,5 +1,6 @@
 #pragma once
 #include "crit/core.h"
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -94,5 +95,42 @@ public:
 private:
     std::uint64_t generation_;
     std::vector<MappedSpan> spans_;
+};
+
+// Skips host-to-device uploads of small per-step metadata (slot indices, lengths, page tables between page boundaries)
+// whose bytes the destination already holds: one host shadow per destination, the bytes last written through it.
+// upload(dst, src, copy) calls copy(dst, src) and remembers src unless dst received the same bytes last time. Only for
+// destinations nothing else writes (no kernel, no other copy): invalidate() after any other write, and forget() when
+// a destination is freed. Copies a graph records always run when it replays, so it serves eager launches between
+// graphs. Not thread-safe; allocates when it first sees a destination or a larger upload.
+class UploadShadow {
+public:
+    template<class Copy> bool upload(void* dst, std::span<const std::byte> src, Copy&& copy) {
+        auto& shadow = entry(dst);
+        if(shadow.valid && shadow.bytes.size() == src.size() &&
+           std::equal(src.begin(), src.end(), shadow.bytes.begin())) { ++skipped_; return false; }
+        copy(dst, src);
+        shadow.bytes.assign(src.begin(), src.end());
+        shadow.valid = true;
+        ++copied_;
+        return true;
+    }
+    void invalidate(const void* dst) noexcept {
+        for(auto& e:entries_) if(e.dst == dst) e.valid = false;
+    }
+    void forget(const void* dst) noexcept {
+        std::erase_if(entries_, [&](const Entry& e) { return e.dst == dst; });
+    }
+    std::uint64_t copied() const noexcept { return copied_; }
+    std::uint64_t skipped() const noexcept { return skipped_; }
+private:
+    struct Entry { const void* dst = nullptr; bool valid = false; std::vector<std::byte> bytes; };
+    Entry& entry(const void* dst) {
+        for(auto& e:entries_) if(e.dst == dst) return e;
+        entries_.push_back({dst, false, {}});
+        return entries_.back();
+    }
+    std::vector<Entry> entries_;
+    std::uint64_t copied_ = 0, skipped_ = 0;
 };
 }

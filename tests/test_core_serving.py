@@ -76,6 +76,33 @@ class ResidentChatTests(unittest.TestCase):
         cut = request(limits={"max_output_tokens": n - 1})
         self.assertEqual(engine.generate(cut, threading.Event())["finish"], "length")
 
+    def test_loop_stop_ends_a_reply_that_repeats_one_span(self):
+        class Looping(Decoder):
+            def generate_tokens(self, ids, max_new_tokens, sampling, on_tokens, cancelled):
+                cycle = self.text.tokenizer.encode(" and so on", add_special_tokens=False)
+                out = []
+                while len(out) < max_new_tokens and not cancelled():
+                    token = cycle[len(out) % len(cycle)]
+                    out.append(token)
+                    on_tokens([token])
+                if cancelled():
+                    return None, {"prefill_ms": 1.0, "decode_ms": 2.0, "first_token_ms": 1.5}
+                return out, {"prefill_ms": 1.0, "decode_ms": 2.0, "first_token_ms": 1.5}
+
+        long = request(limits={"max_output_tokens": 500, "kv_tokens": 4096, "timeout_seconds": 60})
+        engine = Looping(self.context, self.model)
+        self.assertEqual(engine.generate(long, threading.Event())["finish"], "length")   # off by default
+        engine.loop_stop = {"min_repeats": 4, "min_tokens": 60, "k": 3}
+        found = engine.generate(long, threading.Event())
+        self.assertEqual(found["finish"], "stop")
+        self.assertLess(found["telemetry"]["output_tokens"], 100)
+        self.assertTrue(found["assistant"].startswith(" and so on and so on"))
+        self.assertEqual(reply(found, long)[1]["finish"], "stop")   # crit serve accepts it
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaises(Exception):
+            engine.generate(long, cancelled)   # a real cancellation still cancels
+
     def test_plain_decoding_and_draft_telemetry_reach_the_decoder_and_the_telemetry(self):
         engine = Decoder(self.context, self.model)
         seen = []

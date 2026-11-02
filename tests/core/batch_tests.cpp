@@ -590,13 +590,65 @@ void speculative_requests() {
         else require(stats->largest == 1, "a serial engine verifies one request per step");
     }
 }
+
+// Projected peak pages: an upper bound on what lockstep requests hold at once, never above the sum of their maxima,
+// often far below it; and the case it does not cover, a request that starts late.
+void peak_rules() {
+    auto truth = [](const std::vector<PageDemand>& d, std::uint32_t pt, std::uint32_t v, std::uint32_t late = 0) {
+        std::uint64_t peak = 0, longest = 0;
+        for(const auto& x:d) longest = std::max<std::uint64_t>(longest, x.remaining_rows);
+        for(std::uint64_t s = 0; s <= longest + late; ++s) {
+            std::uint64_t pages = 0;
+            for(std::size_t i = 0; i < d.size(); ++i) {
+                const std::uint64_t start = i == 0 ? late : 0;   // with `late`, request 0 starts that many steps late
+                if(s > start + d[i].remaining_rows) continue;
+                const auto progress = s > start ? s - start : 0;
+                pages += row_pages(d[i].held_rows + progress + v - 1, pt);
+            }
+            peak = std::max(peak, pages);
+        }
+        return peak;
+    };
+    auto maxima = [](const std::vector<PageDemand>& d, std::uint32_t pt, std::uint32_t v) {
+        std::uint64_t pages = 0;
+        for(const auto& x:d) pages += row_pages(std::uint64_t(x.held_rows) + x.remaining_rows + v - 1, pt);
+        return pages;
+    };
+    std::uint64_t state = 0x5eed;
+    auto next = [&](std::uint32_t bound) {
+        state = state * 6364136223846793005ull + 1442695040888963407ull;
+        return std::uint32_t((state >> 33) % bound);
+    };
+    for(int trial = 0; trial < 300; ++trial) {
+        std::vector<PageDemand> d(1 + next(12));
+        for(auto& x:d) x = {next(300), next(400)};
+        const std::uint32_t pt = 1 + next(32), v = 1 + next(4);
+        const auto bound = peak_pages(d, pt, v);
+        require(bound >= truth(d, pt, v) && bound <= maxima(d, pt, v), "the bound covers the lockstep peak");
+    }
+    // One long reply and seven short ones: the short ones are gone before the long one grows.
+    std::vector<PageDemand> mixed{{100, 4000}};
+    for(int i = 0; i < 7; ++i) mixed.push_back({100, 50});
+    require(maxima(mixed, 16, 1) == 327 && peak_pages(mixed, 16, 1) == 257 && truth(mixed, 16, 1) == 257,
+            "a long reply dominates");
+    std::vector<PageDemand> chat(16, PageDemand{500, 2000});
+    for(std::size_t i = 0; i < chat.size(); ++i) chat[i].remaining_rows = std::uint32_t(100 + 120 * i);
+    require(peak_pages(chat, 16, 1) * 10 < maxima(chat, 16, 1) * 7, "staggered replies peak well below their sum");
+    // Not covered: a request that starts late (still prefilling) holds its pages past the projected step.
+    const std::vector<PageDemand> two{{16, 32}, {16, 512}};
+    require(peak_pages(two, 16, 1) == 33 && truth(two, 16, 1) == 33 && truth(two, 16, 1, 480) == 36,
+            "a short request that starts 480 steps late is still running when the long one peaks");
+    require(peak_pages({}, 16) == 0, "nothing to hold");
+    rejects_as<std::invalid_argument>([] { peak_pages({}, 0); }, "page tokens");
+    rejects_as<std::invalid_argument>([] { peak_pages({}, 16, 0); }, "verify rows");
+}
 }
 
 int main(int argc, char** argv) {
-    const std::array<std::pair<std::string_view, void (*)()>, 6> cases{{
+    const std::array<std::pair<std::string_view, void (*)()>, 7> cases{{
         {"batch_layout", layout_rules}, {"batch_items", item_rules}, {"batch_pages", page_rules},
         {"batch_engine", engine_requests}, {"batch_speculative_rows", speculative_rules},
-        {"batch_speculative_engine", speculative_requests}}};
+        {"batch_speculative_engine", speculative_requests}, {"batch_peak_pages", peak_rules}}};
     try {
         const std::string_view name = argc > 1 ? argv[1] : "";
         bool found = false;

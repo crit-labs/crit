@@ -18,6 +18,8 @@ _EXPORTS = {
     "ChatTemplate": "template", "ChatTemplates": "template", "environment": "template",
     "template_sources": "template", "chat_template_sources": "template", "shipped_template": "template",
     "IncrementalDetokenizer": "detokenize",
+    "PromptTokenCache": "prompt_cache",
+    "LoopDetector": "loops",
     "MarkerDecoder": "markers", "TokenText": "markers",
     "TextDelta": "stream", "TextStream": "stream",
     "ModelText": "model", "TextIdentity": "model", "load_model_text": "model",

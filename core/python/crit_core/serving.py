@@ -65,7 +65,7 @@ would pass it, the reply gets the format's closing marker and generate_prepared 
 reply so far, within the same output cap.
 """
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import array
 import base64
 import sys
@@ -471,7 +471,12 @@ class ResidentChat:
     keeps a reply to a grammar, so tool_choice "required" or a named function forces the calls (chat-tool-choice-v1)
     in a registered format; the model may reason first when the tokenizer spells the reasoning markers as text. A raw
     prompt (completion-v1) skips the template, tools and the reasoning split: the reply is all the text the model
-    writes, and its log-probabilities keep the stop token's row."""
+    writes, and its log-probabilities keep the stop token's row. `prompt_token_cache` True (the default): a chat
+    prompt that extends a recent one, as a conversation's next turn does, is encoded from near the seam
+    (crit_core.text.PromptTokenCache); False encodes every prompt in full. `loop_stop` True (or a dict of
+    crit_core.text.LoopDetector options) ends a reply that has settled into repeating one span exactly, through the
+    generator's cancelled(), as "stop" with the tokens so far; a grammar-constrained reply is never cut. Off (None)
+    by default."""
     sampling = ()
     logprobs = False
     scores = False
@@ -481,6 +486,8 @@ class ResidentChat:
     reasoning_format = None
     images = False
     max_concurrent_requests = 1
+    prompt_token_cache = True
+    loop_stop = None
 
     def create_request(self, request):
         """Return an independent ResidentChat sharing only safe model resources.
@@ -493,10 +500,13 @@ class ResidentChat:
     def __init__(self, context, model, *, configuration=None, stop_ids=None, capacity=None, template_variables=None):
         from crit_core.model import open_model
         from crit_core.text import load_model_text
+        from crit_core.text.prompt_cache import PromptTokenCache
         self.context = context
         self.configuration = dict(configuration if configuration is not None else (context.configuration or {}))
         # A folder's files, or those a lone GGUF's metadata derives.
         self.text = load_model_text(open_model(model).files, clock=None)
+        if self.prompt_token_cache and getattr(self.text, "prompt_tokens", False) is None:   # a ModelText without one
+            self.text = replace(self.text, prompt_tokens=PromptTokenCache(self.text.tokenizer))
         limits = getattr(context, "limits", {}) or {}
         self.capacity = int(capacity or limits.get("kv_tokens") or 0) or None
         self.stop_ids = set(self.text.generation.stop_token_ids if stop_ids is None else stop_ids)
@@ -786,7 +796,16 @@ class ResidentChat:
                     for part in stream.push([token]):
                         route(part)
 
+        detector = None
+        if self.loop_stop and grammar is None:
+            from crit_core.text.loops import LoopDetector
+            detector = LoopDetector(**(self.loop_stop if isinstance(self.loop_stop, dict) else {}))
+        step_tokens = []   # this generation's tokens, the reply when the detector stops it
+
         def on_tokens(tokens, logprobs=None):
+            step_tokens.extend(tokens)
+            if detector is not None:
+                detector.push(tokens)
             if rows is not None:
                 if logprobs is None or len(logprobs) != len(tokens):
                     raise ValueError("The engine returned tokens without their log-probabilities")
@@ -805,17 +824,24 @@ class ResidentChat:
         # the budget; the reply then gets the format's closing marker, as the model would write it, and the engine
         # continues from the prompt plus everything so far.
         tokens, timings, closed, step_prompt = [], [], False, prompt
+        looped = (lambda: detector.looped) if detector is not None else (lambda: False)
+
+        def stopped():
+            return cancellation.is_set() or looped()
         while True:
             left = output_tokens - len(tokens)
             unbounded = budget is None or closed or splitter.state in ("after", "text")
             step = left if unbounded else min(left, budget - reasoned)
-            got, timing = self.generate_prepared(step_prompt, step, sampling, on_tokens, cancellation.is_set, **options)
+            step_tokens.clear()
+            got, timing = self.generate_prepared(step_prompt, step, sampling, on_tokens, stopped, **options)
+            if got is None and looped() and not cancellation.is_set():
+                got = list(step_tokens)   # the detector stopped it: the reply is what it streamed
             if got is None:
                 cancellation.check()
                 raise RuntimeError("generation cancelled")
             tokens += got
             timings.append(timing)
-            if len(got) < step or len(tokens) >= output_tokens or (got and got[-1] in self.stop_ids):
+            if looped() or len(got) < step or len(tokens) >= output_tokens or (got and got[-1] in self.stop_ids):
                 break
             if splitter.state == "reasoning" and reasoned >= budget:
                 closing = splitter.format.closing
@@ -834,7 +860,7 @@ class ResidentChat:
             deliver(splitter.finish())
         calls = None
         if reply:
-            content, calls = reply.finish(cut=len(tokens) >= output_tokens)
+            content, calls = reply.finish(cut=len(tokens) >= output_tokens or looped())
             pieces = [content]
         n = len(tokens)
         decode = timing.get("decode_tokens", n - 1)
@@ -869,7 +895,8 @@ class ResidentChat:
             if prompt_rows is not None:
                 logprobs["prompt"] = prompt_rows
         # A reply that ends on a stop token finishes as stop even when that token is the last one the cap allows.
-        finish = "length" if n >= output_tokens and not (tokens and tokens[-1] in self.stop_ids) else "stop"
+        finish = ("length" if n >= output_tokens and not (tokens and tokens[-1] in self.stop_ids) and not looped()
+                  else "stop")
         return ("".join(pieces), telemetry, calls, "".join(reasoning), logprobs,
                 output_tokens if limits.get("fit_output") else None, echoed, finish)
 

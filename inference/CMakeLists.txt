@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_inference VERSION 0.15.0 LANGUAGES CXX)
+project(crit_inference VERSION 0.16.0 LANGUAGES CXX)
 # Inference's native examples and fixtures. Inference uses Core only through its public SDK
 # (crit::core, crit::cuda); Core never builds or includes Inference code.
 find_package(Threads REQUIRED)
@@ -8,7 +8,7 @@ option(CRIT_INFERENCE_CUDA "Build Inference's CUDA reference kernels and their f
 option(CRIT_INFERENCE_INSTALLED_CORE "Use an installed Core SDK (CMAKE_PREFIX_PATH) instead of this checkout's core/" OFF)
 if(NOT TARGET crit::core)
   if(CRIT_INFERENCE_INSTALLED_CORE)
-    find_package(critCore 0.15.0 CONFIG REQUIRED)
+    find_package(critCore 0.16.0 CONFIG REQUIRED)
   else()
     if(CRIT_INFERENCE_CUDA)
       set(CRIT_CORE_CUDA ON CACHE BOOL "Build the explicit CUDA backend services" FORCE)
@@ -198,12 +198,24 @@ endif()
 
 crit_inference_executable(crit_state_pages_tests SOURCES ${FIXTURES}/state_pages_tests.cpp
   INCLUDES ${INFERENCE}/attention-state/code LINK crit::core)
-crit_inference_tests(crit_state_pages_tests crit_state_pages 30 transactions prefixes numerics failures randomized)
+crit_inference_tests(crit_state_pages_tests crit_state_pages 30 transactions prefixes numerics failures randomized poison)
+crit_inference_executable(crit_host_page_tier_tests SOURCES ${FIXTURES}/host_page_tier_tests.cpp
+  INCLUDES ${INFERENCE}/attention-state/code LINK crit::core)
+crit_inference_tests(crit_host_page_tier_tests crit_host_page_tier 30 restore rules)
 crit_inference_executable(crit_paged_kv_example SOURCES ${INFERENCE}/attention-state/code/paged_example.cpp LINK crit::core)
 crit_inference_test(crit_paged_kv_example 30 crit_paged_kv_example)
 
 crit_inference_executable(crit_settled_slots_tests SOURCES ${FIXTURES}/settled_slots_tests.cpp INCLUDES ${INFERENCE}/expert-residency/code)
 crit_inference_test(crit_settled_slots 30 crit_settled_slots_tests)
+crit_inference_executable(crit_table_rows_tests SOURCES ${FIXTURES}/table_rows_tests.cpp INCLUDES ${INFERENCE}/lookup-table-rows/code
+  LINK Threads::Threads)
+crit_inference_test(crit_table_rows 30 crit_table_rows_tests)
+crit_inference_executable(crit_host_tier_tests SOURCES ${FIXTURES}/host_tier_tests.cpp
+  INCLUDES ${INFERENCE}/ssd-expert-materialization/code LINK crit::core Threads::Threads)
+crit_inference_test(crit_host_tier 30 crit_host_tier_tests)
+crit_inference_executable(crit_device_metadata_tests SOURCES ${FIXTURES}/device_metadata_tests.cpp
+  INCLUDES ${INFERENCE}/concurrent-request-execution/code LINK crit::core)
+crit_inference_test(crit_device_metadata 30 crit_device_metadata_tests)
 crit_inference_executable(crit_cache_loan_example SOURCES ${INFERENCE}/expert-residency/code/loan_example.cpp LINK crit::core)
 crit_inference_test(crit_cache_loan_example 30 crit_cache_loan_example)
 
@@ -253,9 +265,13 @@ crit_inference_test(crit_cuda_ahead 60 crit_cuda_ahead_example)
 include(CheckLinkerFlag)
 check_linker_flag(CXX "LINKER:--wrap=crit_link_probe" CRIT_INFERENCE_HAS_LINKER_WRAP)
 
-# crit_inference_kernels(target code_dir source): a static CUDA library exporting its code folder.
+# crit_inference_kernels(target code_dir source...): a static CUDA library exporting its code folder.
 function(crit_inference_kernels target code source)
-  add_library(${target} STATIC ${code}/${source})
+  set(_sources ${code}/${source})
+  foreach(_more IN LISTS ARGN)
+    list(APPEND _sources ${code}/${_more})
+  endforeach()
+  add_library(${target} STATIC ${_sources})
   target_include_directories(${target} PUBLIC ${code})
   target_compile_features(${target} PUBLIC cxx_std_20 cuda_std_20)
   target_link_libraries(${target} PUBLIC CUDA::cudart)
@@ -295,9 +311,12 @@ crit_inference_kernels(crit_draft_subset ${INFERENCE}/draft-vocabulary-subset/co
 crit_inference_executable(crit_draft_subset_tests SOURCES ${FIXTURES}/draft_subset_tests.cpp LINK crit::cuda crit_draft_subset)
 crit_inference_test(crit_draft_subset 60 crit_draft_subset_tests)
 
-crit_inference_kernels(crit_device_expert_cache ${INFERENCE}/device-expert-cache/code device_cache.cu)
+crit_inference_kernels(crit_device_expert_cache ${INFERENCE}/device-expert-cache/code device_cache.cu runtime.cu)
 crit_inference_executable(crit_device_expert_cache_tests SOURCES ${FIXTURES}/device_expert_cache_tests.cpp LINK crit_device_expert_cache)
 crit_inference_test(crit_device_expert_cache 120 crit_device_expert_cache_tests)
+crit_inference_executable(crit_expert_store_tests SOURCES ${FIXTURES}/expert_store_tests.cpp
+  INCLUDES ${INFERENCE}/device-expert-cache/code LINK crit::core CUDA::cudart)
+crit_inference_test(crit_expert_store 60 crit_expert_store_tests)
 
 crit_inference_kernels(crit_token_sampling ${INFERENCE}/token-sampling/code sampling.cu)
 target_link_libraries(crit_token_sampling PUBLIC crit::core)

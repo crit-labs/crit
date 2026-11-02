@@ -84,12 +84,24 @@ public:
 
     std::vector<Token> propose(std::size_t remaining, std::uint32_t vocabulary,
                                std::span<const Token> stops = {}) const {
+        return propose_matched(remaining, vocabulary, stops).tokens;
+    }
+    // propose()'s draft and how many accepted tokens before the copied continuation equal the history's last tokens:
+    // at least window with a draft, at most `longest`, 0 without one.
+    struct Proposal {
+        std::vector<Token> tokens;
+        std::size_t matched = 0;
+    };
+    Proposal propose_matched(std::size_t remaining, std::uint32_t vocabulary, std::span<const Token> stops = {},
+                             std::size_t longest = 64) const {
         if(!vocabulary) throw std::invalid_argument("positive vocabulary required");
+        if(!longest) throw std::invalid_argument("positive longest match required");
         const auto limit = std::min(remaining, limits_.max_draft);
         if(!limit || tokens_.size() <= limits_.window) return {};
         auto it = positions_.find(key(tokens_.size()));
         if(it == positions_.end()) return {};
         std::vector<Token> best;
+        std::size_t source = 0;
         std::size_t examined = 0;
         for(auto p = it->second.rbegin(); p != it->second.rend() && examined < limits_.max_matches; ++p, ++examined) {
             const auto end = *p + limits_.window;
@@ -106,10 +118,14 @@ public:
                 candidate.push_back(token);
                 if(std::find(stops.begin(), stops.end(), token) != stops.end()) break;
             }
-            if(candidate.size() > best.size()) best = std::move(candidate);
+            if(candidate.size() > best.size()) { best = std::move(candidate); source = end; }
             if(best.size() == limit) break;
         }
-        return best;
+        if(best.empty()) return {};
+        const auto size = tokens_.size();
+        auto matched = limits_.window;
+        while(matched < longest && matched < source && tokens_[source-matched-1] == tokens_[size-matched-1]) ++matched;
+        return {std::move(best), matched};
     }
 private:
     using Key = std::vector<Token>;

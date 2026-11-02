@@ -396,6 +396,7 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         self.assertIn("--quality-mode as_quantized", quantized)
         # Its default budget is Eval's for that mode, eight times preserve's.
         self.assertIn("PPL ratio ≤ 1.4, mean KLD ≤ 0.4, p99 KLD ≤ 4.0", quantized)
+        self.assertIn("output differences that part at near-ties pass", quantized)
 
     def test_resume_amends_quality_terms_for_later_segments(self):
         prompt = (self.directory / "agent_request.md").read_text(encoding="utf-8")

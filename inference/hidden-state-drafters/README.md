@@ -64,7 +64,16 @@ law rows scatter to the target vocabulary for
 
 **Confidence.** With a confidence head (DSpark) or the drafter's own top probability, drafts
 from the first one below a threshold become `-1`, which no prediction matches, so the round
-stops there without a narrower graph.
+stops there without a narrower graph. `ConfidenceCut(target)` ([drafting.py](code/drafting.py))
+derives the threshold online instead of from a tuned constant: decayed (tested, accepted)
+counts per confidence bin, labelled by `observe` from what each verify tested (the kept
+drafts up to the first mismatch, and the first cut draft by the target's bonus prediction
+when every kept draft was accepted, so low bins keep getting labels), and `threshold()` the
+lowest bin edge from which every populated bin accepts at least `target`. Until `burn_in`
+labels it keeps every draft. In the host fixtures a head whose drafts at confidence c are
+accepted with probability c settles at a cut near 0.55 for a target of 0.5, and one that
+overstates itself (accepted with probability c^2) near 0.75, where a constant tuned for
+the first would keep drafts accepted a quarter of the time.
 
 ## What the code supplies
 
@@ -122,8 +131,8 @@ convention), the EAGLE-3 alignment (taps at `p` with the token at `p + 1`), catc
 device's settled count, block positions from the frontier, `d2t` mapping before
 verification, and drafts beyond a confidence cut that no prediction can match. Adaptable:
 fusing the tap writes into the target's residual adds, the drafter's precision, the draft
-width up to the publisher's, and the confidence threshold (tuned on general text, never on
-Eval's prompts).
+width up to the publisher's, and the confidence threshold (`ConfidenceCut`'s target, or a
+constant tuned on general text, never on Eval's prompts).
 
 ## Costs and validation
 

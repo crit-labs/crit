@@ -1,11 +1,12 @@
-# Host arithmetic for NVFP4 experts
+# Host arithmetic for block-scaled experts
 
-Compute NVFP4 block-scaled expert rows on the CPU with exactly the arithmetic of the device kernel that would
-otherwise compute them. A row's dot product is fixed by a declared operation order: lanes, product rounding,
-block order, reduction tree and final multiply. A device kernel that declares the same order gives the same
-bits, so where an expert ran never changes the model's output. The entry supplies a portable scalar oracle,
-AVX2 and AVX-512 paths chosen by CPU feature detection, the matching CUDA device function and a scale-decode
-hook for checkpoint-specific scale encodings.
+Compute block-scaled expert rows (NVFP4, MXFP4, MXFP8, MXINT8, INT4 or an engine's own block format) on the CPU
+with exactly the arithmetic of the device kernel that would otherwise compute them. A row's dot product is fixed by
+a declared operation order: lanes, product rounding, block order, reduction tree and final multiply. A device kernel
+that declares the same order gives the same bits, so where an expert ran never changes the model's output. The
+entry supplies a portable scalar oracle, a portable vector path that any compiler vectorizes for its CPU (Arm NEON
+and SVE, x86 AVX, RISC-V V), hand-written AVX2 and AVX-512 paths for NVFP4, one device header for CUDA and HIP, the
+same functions for Metal, and a scale-decode hook for checkpoint-specific scale encodings.
 
 ## When to use it
 
@@ -16,7 +17,9 @@ memory reads faster than the host link copies (`crit eval probe`: `host_memory_g
 `host_to_device_gbs`), as it does on many desktop machines: recon's placement then prices misses computed on the
 CPU below misses copied over the link, so the CPU is a primary source of misses there, not a later refinement. The split varies with cache state,
 host load and request history, so greedy output stops repeating if host and device round differently. One
-engine saw decision forks from mixing CPU W4A8 with device W4A4.
+engine saw decision forks from mixing CPU W4A8 with device W4A4. In quality mode `as_quantized` Eval passes such
+forks when they part at near-ties ([forks](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#forks-in-quality-mode-as_quantized)), so there the exact rows are one option to measure against
+the host's own faster arithmetic, not a requirement.
 
 Don't use it when every expert fits on the device, or when measured dispatch gives the CPU no share on the
 target machine. That happens when host compute time exceeds the transfer it replaces. Don't use it either when
@@ -25,10 +28,12 @@ device side is changed to a declared order or the split is not exact.
 
 ## How it works
 
-**Format.** Weights use crit's NVFP4 layout from
-[quantized projections](../quantized-projections/README.md): codes `[rows][cols / 2]`, low nibble the even
-element, one 8-bit block scale per 16 values. The E2M1 and E4M3 values come from that entry's codec
-(`crit::nvfp4`, `nvfp4.py`), so the format has one definition in crit.
+**Format.** A `Format` names the block layout: 4-bit codes (two a byte, low nibble the even element) or 8-bit
+codes, 16 or 32 elements per block scale, and the element values by code. The default is crit's NVFP4 layout from
+[quantized projections](../quantized-projections/README.md) (`crit::nvfp4`, `nvfp4.py`): E2M1 codes
+`[rows][cols / 2]`, one E4M3 scale per 16 values. `mxfp4_format`, `mxfp8_e4m3_format`, `mxfp8_e5m2_format` and
+`mxint8_format` give the OCP microscaling layouts (32 per E8M0 scale, `e8m0_scales`), and `int4_values` an INT4
+table for a layout that names its own block. A table of its own covers any other element encoding.
 
 **Declared order.** For a row and one token's activations `x`:
 
@@ -51,7 +56,11 @@ device, [`dot_row_halving<L>`](code/host_nvfp4_device.cuh) and `dot_row_block<L>
 `__fmaf_rn` and a shuffle tree that pairs lanes the way the host's halving reduction does. A xor butterfly
 leaves lane 0 the same value.
 
-**Paths.** `rows_scalar` is the oracle. The AVX2 path (two YMM per 16 lanes) and the AVX-512F path (one ZMM
+**Paths.** `rows_scalar` is the oracle. The portable path (`Isa::portable`, what `best_isa()` returns on a CPU without
+the hand-written paths) runs the same operations with every inner loop over independent lanes and a fixed lane
+count, so the compiler vectorizes it for its target without changing any lane's order: it is the vector path on Arm,
+RISC-V and any other CPU, and for every format other than NVFP4 on x86, where it is compiled once more with AVX2 and
+with AVX-512 enabled. For NVFP4 on x86 the hand-written paths are faster. The AVX2 path (two YMM per 16 lanes) and the AVX-512F path (one ZMM
 per 16 lanes) perform each lane's operations in the same order. They interleave four rows so the FMA chains
 overlap, which leaves each row's arithmetic unchanged. `best_isa()` reads cpuid and xgetbv at run time, so one
 binary runs on any x86-64 CPU and uses the widest path the CPU and OS support. Rows are independent, so any
@@ -68,10 +77,12 @@ offset with a compensating `post` (for example halved scales against doubled E2M
 
 | File | Supplies |
 | --- | --- |
-| [`host_nvfp4.h`](code/host_nvfp4.h), [`host_nvfp4.cpp`](code/host_nvfp4.cpp) | `Order`, `MatrixView`, `ScaleDecoder` and `e4m3_scales`, `dot_rows` for 1 to 8 tokens with a mask; the scalar oracle |
+| [`host_nvfp4.h`](code/host_nvfp4.h), [`host_nvfp4.cpp`](code/host_nvfp4.cpp) | `Order`, `Format` and its tables, `MatrixView`, `ScaleDecoder` with `e4m3_scales` and `e8m0_scales`, `dot_rows` for 1 to 8 tokens with a mask; the scalar oracle |
 | [`host_isa.h`](code/host_isa.h), [`host_isa.cpp`](code/host_isa.cpp) | `Isa`, `supported`, `best_isa`: cpuid/xgetbv detection shared with other host paths that compile AVX2 and AVX-512 files (`crit_inference_isa_sources`) |
 | [`host_nvfp4_avx2.cpp`](code/host_nvfp4_avx2.cpp), [`host_nvfp4_avx512.cpp`](code/host_nvfp4_avx512.cpp) | The two SIMD paths, bitwise equal to the oracle |
-| [`host_nvfp4_device.cuh`](code/host_nvfp4_device.cuh) | `dot_row_halving<16 or 32>` and `dot_row_block<16 or 32>`, the device side of both products with the halving reduction |
+| [`host_nvfp4_portable.inc`](code/host_nvfp4_portable.inc) | The portable rows, compiled for the baseline target and again with AVX2 and AVX-512 |
+| [`host_nvfp4_device.cuh`](code/host_nvfp4_device.cuh) | `dot_row_halving_format` and `dot_row_block_format<lanes, bits, block>` for any format, and the NVFP4 `dot_row_halving` and `dot_row_block`: the device side of both products with the halving reduction, one source for CUDA and HIP |
+| [`host_nvfp4_device.metal`](code/host_nvfp4_device.metal) | The same functions in the Metal Shading Language, for a library built with fast math off |
 | [`implementation.py`](code/implementation.py) | Exact FP32 reference of the declared order (one rounding per operation), standard library only |
 
 ## What the engine supplies
@@ -85,8 +96,10 @@ offset with a compensating `post` (for example halved scales against doubled E2M
   contributions are summed also has to match: if the host returns a sum over its experts that the device adds
   to its own sum, the order depends on the split. Returning per-expert rows that the device sums in its plan
   order keeps it fixed.
-- **A device kernel that declares the same order**: `dot_row_halving` or `dot_row_block`, or its own kernel written to the same
-  rules and checked against `dot_rows` with the CUDA fixture's method.
+- **A device kernel that declares the same order**: `dot_row_halving_format` or `dot_row_block_format` (CUDA, HIP), their
+  Metal versions, or its own kernel written to the same rules and checked against `dot_rows` with the CUDA fixture's
+  method. The HIP and Metal versions are written to the order but not run in crit's tests (no AMD or Apple GPU in
+  them): check them on the target before relying on the split.
 - **Its scale decoder** when the checkpoint's scales are not plain E4M3 bytes, and `post` as the device
   computes it.
 - **Threads and the CPU share.** Split rows or experts over a worker pool, for example behind the

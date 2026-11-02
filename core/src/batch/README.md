@@ -55,6 +55,12 @@ follow each of them):
 - A verify of K drafts computes each of its K + 1 columns as a one-token step
   computes its column (column invariance, [device-speculative-round](../../../inference/device-speculative-round/README.md#column-invariant-arithmetic)).
 
+Column invariance serves only the greedy exactness check, which is a gate when a run
+requires exactness. In quality mode `as_quantized`, Eval passes an output difference
+that parts at a near-tie ([forks](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#forks-in-quality-mode-as_quantized)), so there every rule above is optional: a
+kernel that breaks one (a split chosen by the row count, regrouped tiles, chunk
+boundaries in its order) is fine when it measures faster.
+
 ## Page reservations
 
 `PageReservations({pages, page_tokens, max_tokens, verify_rows})` is page-reserving
@@ -77,6 +83,30 @@ or keeps a pool margin for pages still retiring. Credit for shared prefix pages
 would admit more requests but needs eviction or preemption when sharing ends
 ([incremental memory and recovery](../runtime/README.md#incremental-memory-and-recovery)).
 `row_pages(rows, page_tokens)` is the page count of `rows` rows.
+
+### Projected peak pages
+
+Reserving every request's maximum admits too few when replies are shorter than their
+caps: a request that finishes early frees its pages before a longer one peaks.
+`peak_pages(demands, page_tokens, verify_rows)` bounds what the requests hold at once,
+each a `PageDemand{held_rows, remaining_rows}` (its prompt, computed or not, and output
+so far; the output rows it may still stage). With the requests sorted by remaining
+rows, longest first, the k still running at step `remaining_k` hold at most
+`(held_1 + ... + held_k + k * (remaining_k + verify_rows - 1 + page_tokens - 1)) /
+page_tokens` pages; the bound is the largest of these, never above the sum of the
+maxima. An engine admits a request when the bound over the active requests and the
+candidate fits the pool.
+
+It is a projection, not a reservation: it holds while every request stages at most one
+row per step from now on. A request that advances faster (speculative rounds) or starts
+late (a prompt still prefilling) can hold its pages past the step the bound assumes, so
+admit by it only with a fallback when pages run out: Core's
+[memory preemption](../runtime/README.md#incremental-memory-and-recovery) or a pool
+margin. [`batch_peak_pages`](../../../tests/core/batch_tests.cpp) checks the bound
+against a step-by-step simulation of 300 random lockstep batches, and shows its gain
+and its limit: 16 requests holding 500 rows with 100 to 1,900 rows left need 1,504
+pages by their maxima and at most 835 by the bound (the simulation's peak is 830), while
+a short request that starts 480 steps late takes 36 pages where the bound says 33.
 
 ## Speculative rows
 

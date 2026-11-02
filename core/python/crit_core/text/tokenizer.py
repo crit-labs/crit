@@ -168,6 +168,15 @@ class Tokenizer:
         """Token ids of `text`. add_special_tokens=True applies the tokenizer.json post-processor (for example a
         BOS); chat text rendered from a template passes False. Control-token text inside `text` is parsed as
         the control token unless split_special_tokens (default: the constructor's flag) is True."""
+        return list(self._encoding(text, add_special_tokens, split_special_tokens).ids)
+
+    def encode_offsets(self, text, *, add_special_tokens, split_special_tokens=None):
+        """(ids, offsets) of `text` as encode() gives the ids; offsets[i] is the (start, end) character range of
+        `text` that token i came from, as the tokenizers library reports it."""
+        encoding = self._encoding(text, add_special_tokens, split_special_tokens)
+        return list(encoding.ids), list(encoding.offsets)
+
+    def _encoding(self, text, add_special_tokens, split_special_tokens):
         if not isinstance(text, str):
             raise TextError("text to encode must be a string")
         if not isinstance(add_special_tokens, bool):
@@ -178,7 +187,7 @@ class Tokenizer:
             raise TextError("split_special_tokens must be True or False")
         backend = self._split_backend() if split_special_tokens else self.backend
         try:
-            return list(backend.encode(text, add_special_tokens=add_special_tokens).ids)
+            return backend.encode(text, add_special_tokens=add_special_tokens)
         except Exception as error:  # lone surrogates and similar input the Rust side rejects
             raise TextError(f"tokenizer cannot encode the text: {error}") from None
 

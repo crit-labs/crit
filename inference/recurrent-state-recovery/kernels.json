@@ -1,0 +1,45 @@
+{
+  "kind": "crit-technique-kernels",
+  "technique": "recurrent-state-recovery",
+  "as_of": "2026-11-02",
+  "evidence": "provider documentation and crit-labs' own source; calls, formats and GPUs are as the providers state them, not measured by crit unless a kernel says so",
+  "operations": [
+    {
+      "id": "gated-delta",
+      "what": "the gated-delta recurrence over a prompt (chunked) and token by token (decode and a verify's columns): delta = beta (v - e^l S^T k); S' = e^l S + k delta^T; out = scale S'^T q",
+      "reference": {
+        "path": "inference/recurrent-state-recovery/code/chunked_prefill.py",
+        "symbol": "sequential (token by token), two_pass"
+      },
+      "verify": "on the target, run the kernel and sequential on the same 100-200 tokens of a real layer's inputs from the same state: outputs and final state within FP32 accumulation error (relative 1e-4); for verify, the state after each column against sequential's, or the accepted prefix replayed per this entry's commit strategy",
+      "kernels": [
+        {
+          "provider": "lib:flash-linear-attention",
+          "call": "fla.ops.gated_delta_rule: chunk_gated_delta_rule for prompts, fused_recurrent_gated_delta_rule for decode and verify (initial_state in, final state out)",
+          "formats": [
+            "fp32, bf16 or fp16 inputs; fp32 state"
+          ],
+          "archs": [
+            "any GPU Triton supports (NVIDIA sm_80 and newer, AMD ROCm)"
+          ],
+          "shapes": "the head dims the release supports (64 to 256); grouped value heads",
+          "notes": "returns the final state only: serves this entry's deferred (Strategy C) or recompute commit; per-column checkpoints need a scan that writes them"
+        },
+        {
+          "provider": "hub:crit-labs/recurrent-scans",
+          "published": false,
+          "local": "hub-kernels/recurrent-scans",
+          "call": "gated_delta_prefill(q, k, v, log_decay, beta, state, scale) and gated_delta_scan(..., checkpoints=...)",
+          "formats": [
+            "fp32"
+          ],
+          "archs": [
+            "NVIDIA sm_75 to sm_121 (built variants)"
+          ],
+          "shapes": "dk 64 or 128, dv a multiple of 64",
+          "notes": "column-invariant scan with per-token checkpoints, and Mamba-2 and a causal convolution beside it; its chunked prefill measured slower than flash-linear-attention's at one model's shapes on an RTX 5090 (crit, 2026-10-28)"
+        }
+      ]
+    }
+  ]
+}

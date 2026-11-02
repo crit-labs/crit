@@ -261,6 +261,82 @@ class PythonRoundTests(unittest.TestCase):
             self.assertEqual(found["tokens"][:3], toy.drafted[row])
             self.assertEqual(found["matched"], 3)
 
+    def test_copies_override_only_rows_whose_match_is_long_and_their_draft_law_becomes_one_hot(self):
+        drafts = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+        copies = torch.tensor([[11, 12, 13, 14], [21, 22, 23, 24], [31, 32, 33, 34]])
+        counts, matched = torch.tensor([3, 2, 3]), torch.tensor([6, 8, 3])
+        probs = torch.full((3, 3, 40), 1 / 40)
+        self.m.override_drafts(drafts, copies, counts, matched, 4, probs)
+        self.assertEqual(drafts.tolist(), [[11, 12, 13], [21, 22, 6], [7, 8, 9]])
+        self.assertEqual(probs[0, 1, 12].item(), 1.0)
+        self.assertEqual(probs[0, 1].sum().item(), 1.0)
+        self.assertAlmostEqual(probs[1, 2, 6].item(), 1 / 40)   # kept after a shorter copy: its own law
+        self.assertAlmostEqual(probs[2, 0, 7].item(), 1 / 40)   # match below the threshold: untouched
+
+    def test_copied_drafts_raise_acceptance_and_decoding_stays_plain_greedy(self):
+        """Over the mostly wrong n-gram drafter, a row whose copies are long matches (here the true continuation, as
+        a repeated passage gives) accepts every draft; a row whose match is short keeps its drafter. Both decode
+        exactly what plain greedy decoding does."""
+        m = self.m
+        prompts, counts, width = [[3, 1, 4, 1, 5], [9, 2, 6]], [40, 40], 4
+        truth = [plain(p, c + width) for p, c in zip(prompts, counts)]
+
+        class Copying(Toy):
+            def draft(self, view):
+                super().draft(view)
+                copies.apply(view)
+
+        for matched, slower in ((8, False), (2, True)):
+            toy = Copying(2, width, "cpu", drafter="ngram")
+            copies = m.CopyDrafts(2, width, "cpu", threshold=4)
+            rounds = m.SpeculativeRounds(toy, 2, width, "cpu")
+            outputs = []
+            for slot, prompt in enumerate(prompts):
+                rounds.start_row(slot, len(prompt), toy.prefill(slot, prompt), counts[slot] - 1)
+                outputs.append([truth[slot][0]])
+            cycles, done = 0, [None, None]
+            while any(len(o) < c for o, c in zip(outputs, counts)):
+                for slot, out in enumerate(outputs):
+                    copies.set(slot, truth[slot][len(out):len(out) + width], matched if slot == 0 else 2)
+                rounds.launch(2, width)
+                cycles += 1
+                for slot, found in enumerate(rounds.read()):
+                    outputs[slot] += found["tokens"]
+                    if done[slot] is None and len(outputs[slot]) >= counts[slot]:
+                        done[slot] = cycles
+                self.assertLess(cycles, 100)
+            for slot in range(2):
+                self.assertEqual(outputs[slot], truth[slot][:counts[slot]])
+            # Width + 1 tokens a round with every copy accepted; the n-gram drafter's rows take far more rounds.
+            if not slower:
+                self.assertEqual(done[0], -(-(counts[0] - 1) // (width + 1)))
+            else:
+                self.assertGreater(done[0], 20)
+            self.assertGreater(done[1], 20)
+
+    def test_copied_drafts_keep_the_target_distribution_in_sampled_rounds(self):
+        generator = torch.Generator().manual_seed(11)
+        rows, width = 60000, 2
+        p = torch.tensor([[0.5, 0.2, 0.2, 0.1], [0.1, 0.6, 0.2, 0.1], [0.25, 0.25, 0.25, 0.25]])
+        q = torch.tensor([[0.1, 0.1, 0.7, 0.1], [0.4, 0.2, 0.2, 0.2]])
+        drafts = torch.stack([torch.multinomial(q[j], rows, replacement=True, generator=generator) for j in range(width)], 1)
+        probs = q.expand(rows, -1, -1).clone()
+        copies = torch.full((rows, width), 3)
+        counts = torch.full((rows,), 1)
+        matched = torch.where(torch.arange(rows) % 2 == 0, 8, 0)   # half the rows take the copied first draft
+        self.m.override_drafts(drafts, copies, counts, matched, 4, probs)
+        self.assertTrue(bool((drafts[0::2, 0] == 3).all()))
+        predictions = self.m.rejection_predictions(p.expand(rows, -1, -1), drafts, probs,
+                                                   torch.rand(rows, width, generator=generator),
+                                                   torch.rand(rows, width + 1, generator=generator))
+        for subset in (slice(0, None, 2), slice(1, None, 2)):
+            first = torch.bincount(predictions[subset, 0], minlength=4).float() / (rows // 2)
+            self.assertLess((first - p[0]).abs().max().item(), 0.015)
+        # After an accepted copy, the kept neural draft is still judged by its own law: the target's again.
+        kept = (predictions[0::2, 0] == 3)
+        second = torch.bincount(predictions[0::2][kept, 1], minlength=4).float() / kept.sum()
+        self.assertLess((second - p[1]).abs().max().item(), 0.03)
+
     @unittest.skipIf(torch is None or not torch.cuda.is_available(), "no CUDA device")
     def test_captured_rounds_give_the_eager_rounds_tokens(self):
         prompts = [[1, 2, 3], [4, 5], [6]]
@@ -284,6 +360,39 @@ class PythonRoundTests(unittest.TestCase):
             results[graphs] = outputs
         self.assertEqual(results[True], results[False])
         self.assertEqual(results[False], [plain(p, c) for p, c in zip(prompts, counts)])
+
+    @unittest.skipIf(torch is None or not torch.cuda.is_available(), "no CUDA device")
+    def test_captured_rounds_apply_copied_drafts_staged_after_capture(self):
+        """CopyDrafts.apply inside a captured round reads what set() staged in pinned memory before each replay."""
+        m = self.m
+        prompts, counts, width = [[1, 2, 3], [4, 5]], [33, 25], 4
+        truth = [plain(p, c + width) for p, c in zip(prompts, counts)]
+        results = {}
+        for graphs in (False, True):
+            copies = m.CopyDrafts(2, width, "cuda", threshold=4)
+
+            class Copying(Toy):
+                def draft(self, view):
+                    super().draft(view)
+                    copies.apply(view)
+            toy = Copying(2, width, "cuda", drafter="ngram")
+            rounds = m.SpeculativeRounds(toy, 2, width, "cuda")
+            for slot, prompt in enumerate(prompts):
+                rounds.start_row(slot, len(prompt), toy.prefill(slot, prompt), counts[slot] - 1)
+            if graphs:
+                toy.reset_capture = lambda saved=toy.snapshot(), toy=toy: toy.restore(saved)
+                rounds.capture(2, width, "greedy")
+            outputs = [[truth[slot][0]] for slot in range(2)]
+            for _ in range(12):
+                for slot, out in enumerate(outputs):
+                    copies.set(slot, truth[slot][len(out):len(out) + width], 8 if slot == 0 else 1)
+                rounds.launch(2, width)
+                for row, result in enumerate(rounds.read()):
+                    outputs[row] += result["tokens"]
+            results[graphs] = outputs
+        self.assertEqual(results[True], results[False])
+        self.assertEqual(results[False][0][:33], truth[0][:33])
+        self.assertEqual(len(results[False][0]), 33)   # every copy accepted: 1 + 8 rounds x 5 tokens, capped at 33
 
 
 class WidthPolicyTests(unittest.TestCase):

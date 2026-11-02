@@ -128,7 +128,13 @@ is shared before folding it into one quantization per layer (MoE checkpoints oft
 experts of a layer one `input_scale`). Grouped block-scaled GEMMs reach their rate only with
 enough rows per expert, so measure the rate by rows per expert on the target device before
 choosing the prompt chunk size, and keep weight-only GEMVs for decode. Check the prompt's
-drift against the reference, since activations are quantized too. (For scale only: CUTLASS
+drift against the reference, since activations are quantized too. Both halves come from
+providers ([Kernels' sources](../../kernels/SOURCES.md)): FlashInfer's FP4 quantization
+writes the activations' E2M1 codes and E4M3 block scales from a global scale, in the
+swizzled scale layout cuBLASLt's block-scaled NVFP4 GEMM reads (16-element vector scales;
+the scale tensors are tiled, not row-major, so a plain `[rows][cols / 16]` array is the
+wrong input), and cuBLASLt or CUTLASS run the GEMM. Check the quantizer's codes and scales
+against this entry's NVFP4 codec on a few rows before trusting the layout. (For scale only: CUTLASS
 v4.7.1 SM120 ptr-array grouped GEMMs on an RTX 5090 ran at 260 TFLOPS at about 90 rows per
 expert and 720-940 at 352-1,408; on one 120B MoE the routed experts took a 64K-token prompt
 from 15.3 s to 9.4 s at a prompt KLD mean of 4e-3.)

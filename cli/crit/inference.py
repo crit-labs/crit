@@ -7,6 +7,11 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 GUIDANCE_TEXT = ("use_when", "avoid_when")
 GUIDANCE_LISTS = ("provides", "engine_supplies", "preserve", "adapt")
+# A technique's kernels.json: the provider kernels for each operation it needs, never code of crit's own.
+KERNELS_KIND = "crit-technique-kernels"
+KERNEL_PROVIDERS = ("lib:", "hub:")
+KERNEL_TEXT = ("provider", "call", "shapes")
+KERNEL_LISTS = ("formats", "archs")
 # Navigation metadata, not folders: every entry names one category; `list` groups by it in this order.
 CATEGORIES = ("attention", "projections", "experts", "speculation", "sampling-and-constraints",
               "execution", "memory-and-loading")
@@ -22,6 +27,78 @@ def under(root, relative):
     if not target.is_relative_to(root.resolve()):
         raise ValueError("path escapes the repository")
     return target
+
+
+def kernels(root, ident):
+    """The technique's kernels.json, or None when it has none (no device arithmetic of its own)."""
+    path = root / "inference" / ident / "kernels.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+
+
+def libraries(root):
+    """The provider names of kernels/SOURCES.md's table (each row's linked names)."""
+    import re
+    path = root / "kernels" / "SOURCES.md"
+    if not path.is_file():
+        return set()
+    rows = [line.split("|")[1] for line in path.read_text(encoding="utf-8").splitlines() if line.startswith("| [")]
+    return {name for row in rows for name in re.findall(r"\[([^\]]+)\]", row)}
+
+
+def check_kernels(root, ident, found):
+    """Errors in one kernels.json: every operation names its CPU reference (a file of the technique), at least one
+    provider kernel (lib: or hub:) with its exact call, formats, archs and shapes, and how to verify a kernel against
+    the reference on the target."""
+    errors, where = [], f"{ident}/kernels.json"
+    if found.get("kind") != KERNELS_KIND or found.get("technique") != ident:
+        return [f"{where}: kind {KERNELS_KIND} and technique {ident} required"]
+    for field in ("as_of", "evidence"):
+        if not isinstance(found.get(field), str) or not found[field].strip():
+            errors.append(f"{where}: {field} required")
+    operations = found.get("operations")
+    if not isinstance(operations, list) or not operations:
+        return errors + [f"{where}: operations required"]
+    seen = set()
+    for op in operations:
+        name = op.get("id") if isinstance(op, dict) else None
+        if not isinstance(name, str) or not name or name in seen:
+            errors.append(f"{where}: every operation needs a distinct id")
+            continue
+        seen.add(name)
+        label = f"{where} {name}"
+        for field in ("what", "verify"):
+            if not isinstance(op.get(field), str) or not op[field].strip():
+                errors.append(f"{label}: {field} required")
+        reference = op.get("reference")
+        if not isinstance(reference, dict) or not isinstance(reference.get("symbol"), str) or not reference["symbol"]:
+            errors.append(f"{label}: reference with path and symbol required")
+        else:
+            try:
+                path = under(root, reference.get("path"))
+                if not path.is_file() or not path.is_relative_to(under(root, "inference/" + ident)):
+                    errors.append(f"{label}: reference must be a file of the technique")
+            except ValueError as exc:
+                errors.append(f"{label}: reference path: {exc}")
+        listed = op.get("kernels")
+        if not isinstance(listed, list) or not listed:
+            errors.append(f"{label}: at least one provider kernel required")
+            continue
+        for kernel in listed:
+            if not isinstance(kernel, dict):
+                errors.append(f"{label}: kernels are objects")
+                continue
+            if any(not isinstance(kernel.get(f), str) or not kernel[f].strip() for f in KERNEL_TEXT):
+                errors.append(f"{label}: every kernel needs " + ", ".join(KERNEL_TEXT))
+            if any(not isinstance(kernel.get(f), list) or not kernel[f] for f in KERNEL_LISTS):
+                errors.append(f"{label}: every kernel lists its " + " and ".join(KERNEL_LISTS))
+            provider = kernel.get("provider") or ""
+            if not provider.startswith(KERNEL_PROVIDERS):
+                errors.append(f"{label}: provider {provider!r} must be lib:NAME or hub:ORG/NAME, never code in crit")
+            elif provider.startswith("lib:") and provider[4:] not in libraries(root):
+                errors.append(f"{label}: {provider} is not a provider of kernels/SOURCES.md")
+            if provider.startswith("hub:") and not isinstance(kernel.get("published"), bool):
+                errors.append(f"{label}: a hub kernel says whether it is published")
+    return errors
 
 
 def load(root=ROOT):
@@ -88,6 +165,13 @@ def check(root=ROOT):
         for path in under(root, entry["code_path"]).rglob("*"):
             if path.is_file() and path.suffix in {".py", ".cpp", ".cu", ".h"} and path.resolve() not in listed:
                 errors.append(f"{ident}: implementation file missing from metadata")
+        try:
+            found = kernels(root, ident)
+        except ValueError as exc:
+            errors.append(f"{ident}/kernels.json: {exc}")
+            found = None
+        if found is not None:
+            errors += check_kernels(root, ident, found)
     return errors
 
 
@@ -151,6 +235,17 @@ def main(argv=None, root=ROOT):
                         print("Code:")
                         for code in entry["code_files"]:
                             print("  " + code["path"])
+                        found = kernels(root, entry["id"])
+                        if found:
+                            print("Kernels (inference/" + entry["id"] + "/kernels.json; " + found["evidence"] + "):")
+                            for op in found["operations"]:
+                                print("  " + op["id"] + ": " + op["what"])
+                                print("    verify against " + op["reference"]["path"] + " " + op["reference"]["symbol"]
+                                      + ": " + op["verify"])
+                                for kernel in op["kernels"]:
+                                    print("    - " + kernel["provider"] + ": " + kernel["call"] + " (" + ", ".join(kernel["formats"])
+                                          + "; " + ", ".join(kernel["archs"]) + "; " + kernel["shapes"] + ")"
+                                          + ("" if kernel.get("published", True) else " [not published yet]"))
         return 0
     except (ValueError, OSError, KeyError, TypeError) as exc:
         print("ERROR: " + str(exc), file=sys.stderr)

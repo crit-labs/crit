@@ -1,0 +1,102 @@
+{
+  "kind": "crit-technique-kernels",
+  "technique": "quantized-projections",
+  "as_of": "2026-11-02",
+  "evidence": "provider documentation and crit-labs' own source; calls, formats and GPUs are as the providers state them, not measured by crit unless a kernel says so",
+  "operations": [
+    {
+      "id": "nvfp4-projection",
+      "what": "rows times NVFP4 weights (E2M1 codes, E4M3 scale per 16, one global scale): decode GEMVs with 16-bit activations, prompt GEMMs with 16-bit or NVFP4 activations",
+      "reference": {
+        "path": "inference/quantized-projections/code/nvfp4.py",
+        "symbol": "project"
+      },
+      "verify": "on the target, project a few rows of a real matrix with the kernel and with project (FP64): within FP16/BF16 accumulation error for 16-bit activations; with NVFP4 activations compare against project of the activations quantized by quantize_row, then judge the drift with crit eval's quality run. Same bits on a repeat",
+      "kernels": [
+        {
+          "provider": "lib:cuBLASLt",
+          "call": "cublasLtMatmul with A and B of type CUDA_R_4F_E2M1 and CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3 as both operands' scale mode (CUDA 12.8 and newer); the global scales fold into alpha",
+          "formats": [
+            "nvfp4 weights with nvfp4 activations"
+          ],
+          "archs": [
+            "sm_100",
+            "sm_120"
+          ],
+          "shapes": "prompt GEMMs; K a multiple of the scale block, N and K aligned as cuBLASLt's block-scaled GEMM requires",
+          "scale_layout": "the block scales of both operands in cuBLASLt's tiled block-scaling layout (128 x 4 tiles), not row-major: repack the weights' scales once at load and quantize activations straight into it"
+        },
+        {
+          "provider": "lib:CUTLASS",
+          "call": "CUTLASS's block-scaled GEMM for sm_100 / sm_120 (NVFP4 x NVFP4), or a mixed-input GEMM that widens the 4-bit weights inside the main loop for 16-bit activations",
+          "formats": [
+            "nvfp4 x nvfp4",
+            "nvfp4 weights with bf16 or fp16 activations (mixed input)"
+          ],
+          "archs": [
+            "sm_100, sm_120 (block-scaled)",
+            "sm_80 and newer (mixed input)"
+          ],
+          "shapes": "aligned as the chosen tile requires"
+        }
+      ]
+    },
+    {
+      "id": "nvfp4-activation-quantization",
+      "what": "16-bit activation rows to NVFP4 with the checkpoint's global input scale: E4M3 block scale e4m3(amax / 6 * gs) and E2M1 codes per 16, each row on its own",
+      "reference": {
+        "path": "inference/quantized-projections/code/nvfp4.py",
+        "symbol": "quantize_row"
+      },
+      "verify": "on the target, quantize a few real activation rows with the kernel and with quantize_row at the same global scale: identical codes and scale bytes once the kernel's scale layout is unswizzled, and the same bits on a repeat",
+      "kernels": [
+        {
+          "provider": "lib:FlashInfer",
+          "call": "flashinfer's fp4_quantize(input, global_scale, ...) with its swizzled scale-factor layout, the layout cuBLASLt's block-scaled GEMM reads",
+          "formats": [
+            "bf16 or fp16 in, nvfp4 out"
+          ],
+          "archs": [
+            "sm_100",
+            "sm_120 (where the FlashInfer release builds it)"
+          ],
+          "shapes": "row width a multiple of 16",
+          "scale_layout": "swizzled 128 x 4 tiles when its swizzle option is on; row-major otherwise"
+        }
+      ]
+    },
+    {
+      "id": "fp8-row-projection",
+      "what": "rows times FP8 E4M3 weights with one scale per row (and per-token FP8 activations for prompts)",
+      "reference": {
+        "path": "inference/quantized-projections/code/row_fp8.h",
+        "symbol": "fp8::project"
+      },
+      "verify": "on the target, project a few rows with the kernel and with the double-accumulating oracle: within FP32 accumulation error of the scaled products, the same bits on a repeat",
+      "kernels": [
+        {
+          "provider": "lib:PyTorch",
+          "call": "torch._scaled_mm(a_fp8, b_fp8, scale_a, scale_b, out_dtype=...) with row-wise scales (scale_a [M, 1], scale_b [1, N])",
+          "formats": [
+            "fp8_e4m3 x fp8_e4m3 with row-wise scales"
+          ],
+          "archs": [
+            "sm_89 and newer (row-wise scaling on sm_90 and newer)"
+          ],
+          "shapes": "K and N multiples of 16"
+        },
+        {
+          "provider": "lib:cuBLASLt",
+          "call": "cublasLtMatmul with CUDA_R_8F_E4M3 operands and per-tensor scale pointers (CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, ..._B_SCALE_POINTER); row scales through an outer-vector scale mode where the toolkit and GPU support it, else an epilogue",
+          "formats": [
+            "fp8_e4m3"
+          ],
+          "archs": [
+            "sm_89 and newer"
+          ],
+          "shapes": "aligned as cuBLASLt's FP8 GEMM requires (multiples of 16)"
+        }
+      ]
+    }
+  ]
+}

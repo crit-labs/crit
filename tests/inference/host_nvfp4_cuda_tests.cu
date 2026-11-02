@@ -5,6 +5,7 @@
 #include "host_nvfp4_device.cuh"
 #include "nvfp4.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -48,6 +49,19 @@ __global__ void block_rows_kernel(const std::uint8_t* codes, const float* scales
     if(threadIdx.x % L == 0) out[row] = v;
 }
 
+// Any format on the device: an 8-bit or 4-bit layout with its element table in device memory.
+template <int L, int Bits, int Block, bool BlockDot>
+__global__ void format_rows_kernel(const std::uint8_t* codes, const float* scales, const float* values, const float* x,
+                                   int rows, int cols, float post, float* out) {
+    const int row = (blockIdx.x * blockDim.x + threadIdx.x) / L;
+    if(row >= rows) return;
+    const std::uint8_t* c = codes + std::size_t(row) * cols * Bits / 8;
+    const float* s = scales + std::size_t(row) * cols / Block;
+    const float v = BlockDot ? hn::dot_row_block_format<L, Bits, Block>(c, s, values, x, cols, post)
+                             : hn::dot_row_halving_format<L, Bits, Block>(c, s, values, x, cols, post);
+    if(threadIdx.x % L == 0) out[row] = v;
+}
+
 // The same loop written plainly: nvcc may contract w * s + acc and reduce in its own order.
 __global__ void naive_kernel(const std::uint8_t* codes, const float* scales, const float* x, int rows, int cols,
                              float post, float* out) {
@@ -83,7 +97,7 @@ void check(std::size_t rows, std::size_t cols, int lanes, hn::Product product, s
     std::vector<float> host(rows);
     hn::dot_rows(hn::Isa::scalar, order, view, hn::e4m3_scales(view), x.data(), cols, 1, 1u, 0, rows, post, host.data(),
                  rows);
-    for(hn::Isa isa : {hn::Isa::avx2, hn::Isa::avx512}) {
+    for(hn::Isa isa : {hn::Isa::portable, hn::Isa::avx2, hn::Isa::avx512}) {
         if(!hn::supported(isa)) continue;
         std::vector<float> simd(rows);
         hn::dot_rows(isa, order, view, hn::e4m3_scales(view), x.data(), cols, 1, 1u, 0, rows, post, simd.data(), rows);
@@ -114,6 +128,55 @@ void check(std::size_t rows, std::size_t cols, int lanes, hn::Product product, s
     cudaFree(dx);
     cudaFree(dout);
 }
+template <int Bits, int Block>
+int check_format(const char* name, const float* table, int ntable, bool e8m0, std::mt19937& rng) {
+    const std::size_t rows = 128, cols = 2048;
+    std::vector<std::uint8_t> codes(rows * cols * Bits / 8), sbytes(rows * cols / Block);
+    std::vector<float> x(cols);
+    std::uniform_int_distribution<int> byte(0, 255), e8(117, 137), e4(0x20, 0x5f);
+    std::normal_distribution<float> act(0.f, 1.f);
+    for(auto& b : codes) {
+        b = std::uint8_t(byte(rng));
+        while(Bits == 8 && !std::isfinite(table[b])) b = std::uint8_t(byte(rng));
+    }
+    for(auto& b : sbytes) b = std::uint8_t(e8m0 ? e8(rng) : (e4(rng) | (byte(rng) & 0x80)));
+    for(auto& v : x) v = act(rng);
+    hn::MatrixView view{codes.data(), sbytes.data(), rows, cols};
+    view.format = {Bits, Block, table};
+    const hn::ScaleDecoder d = e8m0 ? hn::e8m0_scales(view) : hn::e4m3_scales(view);
+    std::vector<float> scales(rows * cols / Block);
+    for(std::size_t r = 0; r < rows; ++r) d.decode(d.context, r, scales.data() + r * (cols / Block));
+    std::uint8_t* dc = upload(codes);
+    float* ds = upload(scales);
+    float* dv = upload(std::vector<float>(table, table + ntable));
+    float* dx = upload(x);
+    float* dout = nullptr;
+    ok(cudaMalloc(&dout, rows * sizeof(float)), "malloc out");
+    int compared = 0;
+    for(bool block : {false, true})
+        for(int lanes : {16, 32}) {
+            const hn::Order order{lanes, hn::Reduce::halving, block ? hn::Product::block_dot : hn::Product::scaled_elements};
+            std::vector<float> host(rows), device(rows);
+            hn::dot_rows(hn::Isa::scalar, order, view, d, x.data(), cols, 1, 1u, 0, rows, 0.5f, host.data(), rows);
+            const int threads = 128, blocks = int((rows * std::size_t(lanes) + threads - 1) / threads);
+            if(lanes == 16 && !block) format_rows_kernel<16, Bits, Block, false><<<blocks, threads>>>(dc, ds, dv, dx, int(rows), int(cols), 0.5f, dout);
+            if(lanes == 32 && !block) format_rows_kernel<32, Bits, Block, false><<<blocks, threads>>>(dc, ds, dv, dx, int(rows), int(cols), 0.5f, dout);
+            if(lanes == 16 && block) format_rows_kernel<16, Bits, Block, true><<<blocks, threads>>>(dc, ds, dv, dx, int(rows), int(cols), 0.5f, dout);
+            if(lanes == 32 && block) format_rows_kernel<32, Bits, Block, true><<<blocks, threads>>>(dc, ds, dv, dx, int(rows), int(cols), 0.5f, dout);
+            ok(cudaGetLastError(), "launch format");
+            ok(cudaMemcpy(device.data(), dout, rows * sizeof(float), cudaMemcpyDeviceToHost), "download format");
+            for(std::size_t r = 0; r < rows; ++r)
+                require(bits(device[r]) == bits(host[r]), std::string(name) + ": device differs from the host at row " +
+                                                              std::to_string(r) + " lanes " + std::to_string(lanes));
+            compared += int(rows);
+        }
+    cudaFree(dc);
+    cudaFree(ds);
+    cudaFree(dv);
+    cudaFree(dx);
+    cudaFree(dout);
+    return compared;
+}
 }  // namespace
 
 int main() {
@@ -134,6 +197,14 @@ int main() {
         std::cout << "device: " << rows << " scaled_elements and " << block_rows
                   << " block_dot rows bitwise equal to the host oracle and every host ISA; a naive loop differs on "
                   << naive << " of them\n";
+        int formats = 0;
+        formats += check_format<4, 32>("mxfp4", hn::e2m1_values(), 16, true, rng);
+        formats += check_format<8, 32>("mxfp8-e4m3", hn::e4m3_values(), 256, true, rng);
+        formats += check_format<8, 32>("mxfp8-e5m2", hn::e5m2_values(), 256, true, rng);
+        formats += check_format<8, 32>("mxint8", hn::int8_values(), 256, true, rng);
+        formats += check_format<4, 16>("int4-g16", hn::int4_values(), 16, false, rng);
+        std::cout << "device formats: " << formats << " rows of MXFP4, MXFP8 E4M3 and E5M2, MXINT8 and INT4 bitwise "
+                  << "equal to the host oracle\n";
         return 0;
     } catch(const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << "\n";

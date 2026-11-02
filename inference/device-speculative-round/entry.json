@@ -24,7 +24,8 @@
       "A host check that a batched operator computes every column bitwise identically at any batch width, with fixed-order and width-dependent reference operators",
       "Python engines: SpeculativeRounds (python_round.py), the round for many rows at once in torch over three hooks (draft with catch-up, verify writing predictions, commit from the round's start), greedy, sampled, replay and forced modes, one CUDA graph per (rows, width, mode) captured at load, rows that join, leave and move between rounds, truncation to Core's count and one pinned readback per round",
       "rejection_predictions: per-column predictions under which the greedy accept rule is rejection sampling (accept with min(1, p/q), else draw from max(p - q, 0)), so a sampled verify needs no kernel of its own",
-      "WidthPolicy (width_policy.py): the draft width per round from each row's decayed per-depth acceptance over the fitted round cost, for the rows that decode together"
+      "WidthPolicy (width_policy.py): the draft width per round from each row's decayed per-depth acceptance over the fitted round cost, for the rows that decode together",
+      "Copied drafts for Python rounds: CopyDrafts stages a copy drafter's tokens and match lengths between rounds and override_drafts replaces a neural drafter's tokens where the match is long, with one-hot draft laws for sampled rows; capture-safe"
     ],
     "engine_supplies": [
       "Capture-safe draft, verify and commit_state device steps for the actual model",
@@ -113,7 +114,9 @@
     "RoundView",
     "rejection_predictions",
     "draw",
-    "WidthPolicy"
+    "WidthPolicy",
+    "override_drafts",
+    "CopyDrafts"
   ],
   "interactions": [
     "token-sampling",

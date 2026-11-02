@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_core VERSION 0.15.0 LANGUAGES CXX)
+project(crit_core VERSION 0.16.0 LANGUAGES CXX)
 find_package(Threads REQUIRED)
 function(crit_strict_warnings target)
   if(MSVC)
@@ -234,10 +234,10 @@ if(BUILD_TESTING AND PROJECT_IS_TOP_LEVEL)
     set_tests_properties(crit_core_concurrency_end_to_end PROPERTIES TIMEOUT 120)
   endif()
 
-  crit_core_cases(state_tests 120 state_config state_transactions state_ownership state_prefixes state_collisions state_reuse state_completeness state_index state_lru state_epochs state_forks state_recurrent state_hybrid state_failures state_randomized state_capacity state_layout state_metadata state_hot_path state_checkpoints state_snapshots state_windows state_round_states)
+  crit_core_cases(state_tests 120 state_config state_transactions state_ownership state_prefixes state_collisions state_reuse state_completeness state_index state_lru state_epochs state_forks state_recurrent state_hybrid state_failures state_randomized state_capacity state_layout state_metadata state_hot_path state_checkpoints state_snapshots state_windows state_round_states state_snapshot_rows state_evicted state_retention state_guard state_scopes state_partial)
 
   crit_core_cases(batch_tests 60 batch_layout batch_items batch_pages batch_engine batch_speculative_rows
-    batch_speculative_engine)
+    batch_speculative_engine batch_peak_pages)
 
   crit_core_cases(io_tests 120 json_valid json_rejects json_utf8 json_strings json_numbers json_nonfinite json_limits json_access json_file json_random sha256_vectors sha256_chunked file_identity file_change file_read_exact file_read_slots file_read_chunks file_read_errors file_map file_open_errors host_memory_v2 host_memory_v1 host_memory_malformed host_memory_admission host_memory_live)
 
@@ -262,7 +262,7 @@ if(BUILD_TESTING AND PROJECT_IS_TOP_LEVEL)
 
   crit_core_cases(device_memory_tests 30 memory_leases memory_lifetime memory_settle_failure memory_release_failure
     memory_backend_lifetime memory_close_allocation_failure
-    memory_threads mapped_contiguous mapped_discontinuous mapped_rejects mapped_generations host_block_pool)
+    memory_threads mapped_contiguous mapped_discontinuous mapped_rejects mapped_generations host_block_pool memory_upload_shadow)
 
   if(CRIT_CORE_CUDA)
     add_executable(crit_core_cuda_tests ../tests/core/cuda_tests.cpp)

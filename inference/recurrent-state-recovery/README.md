@@ -116,6 +116,21 @@ destinations and scratch until completion, reconstruct a boundary before
 overwriting its `H`, and order side-stream recovery between verification input
 production and the next target forward.
 
+### The scans themselves come from a provider
+
+The layer's prompt and decode arithmetic (the chunked prefill and the token-by-token scan
+of gated delta, Mamba-2 and the short convolution before them) is a provider's, not this
+entry's: [flash-linear-attention](https://github.com/fla-org/flash-linear-attention)
+(`fla.ops.gated_delta_rule`, chunked and fused-recurrent forms, and its Mamba-style ops;
+listed in [Kernels' sources](../../kernels/SOURCES.md)) runs them on any GPU Triton
+supports, and measures as the yardstick for any kernel of the engine's own. What this
+entry adds is the speculative part those kernels leave out: which state a verify keeps,
+and how the accepted prefix becomes the live state without a host read (below). A
+provider scan that returns only the final state serves Strategy C (deferred) as it is:
+verify from the live state with the stash, and let the next round apply the accepted
+prefix. Per-column checkpoints need a scan that writes the state after every column, or
+the recompute strategy.
+
 ### Device commit pattern
 
 On a GPU the accepted count comes from a device acceptance kernel, for example a

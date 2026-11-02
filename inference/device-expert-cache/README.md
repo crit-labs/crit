@@ -2,8 +2,15 @@
 
 Routed experts live in host memory and a device slot cache holds the hot ones. The
 cache directory lives on the device, so a whole decode step, including residency
-decisions and miss copies, runs as captured graphs with no host synchronization. A
-replay helper compares cache policies offline.
+decisions and miss copies, runs as captured graphs with no host synchronization.
+`ExpertCache` is the ready component: one call per routed layer, a warm start from a
+residency profile, admission limits that send part of the misses to the CPU at a split
+measured on the target, and the telemetry Eval reads. A replay helper compares cache
+policies offline. The kernels are one source for CUDA and
+HIP (built by hipcc, or with `CRIT_CORE_HIP`, through Core's `crit/gpu_runtime.h`), and
+`device_cache.metal` has them for Metal with the directory's arrays bound as buffers. The
+HIP and Metal versions are not compiled or run in crit's tests: check them against the
+replay on the target.
 
 ## When to use it
 
@@ -27,6 +34,29 @@ same victims as a serial scan). The victim is remapped and pinned and a copy job
 `store[key] -> slot` is written, or pool-to-slot if the lookahead pool holds the key.
 Because hits are pinned first, a miss never evicts a bundle the same layer reads. A
 copy kernel moves the bundles and the expert arithmetic reads `uses[i].bundle`.
+
+**The host store.** The cache copies whole bundles, so the store holds one contiguous bundle
+per key in key order. A checkpoint keeps an expert's matrices and scales as separate tensors,
+often over several shards, or stacks a layer's experts in one tensor.
+[expert_store.py](code/expert_store.py)'s `build_store` reads them once into one file: every
+bundle the same size, each component 16-byte aligned. Beside it goes an index with each
+component's offset and the checkpoint's fingerprint, so an unchanged source is not packed again.
+Name each component's tensor by a template over `{group}` and `{expert}`; a template without
+`{expert}` slices a stacked tensor. Pin the file instead of allocating pinned memory and
+copying into it. [expert_store.h](code/expert_store.h)'s `pin_store` registers Core's read-only
+mapping of the file in one call where the device allows read-only registration, and otherwise
+reads it with several threads into a Core `HostBlock`. `open_store(...).register()` does the
+same from Python through torch's cudart. (For scale only: on one machine, `cudaHostAlloc` of a
+68 GB store took about 8 minutes under WSL; registering a mapped file takes seconds.)
+
+**Feeding the expert arithmetic.** The routed experts' GEMMs come from a provider's grouped
+GEMM (CUTLASS's ptr-array grouped GEMM, `cublasGemmGroupedBatchedEx`, or a block-scaled grouped
+GEMM for 4-bit formats, from [Kernels' sources](../../kernels/SOURCES.md)), which takes device
+arrays of pointers. `enqueue_operands` writes them from a plan's `Use`s on the device, so a captured
+step goes from the plan to the GEMM with no host round trip. For each route it writes a pointer to
+each component inside the bundle (the offsets from the store's index), to the route's activation
+row and output row, and its routing weight. With `skip_bypassed`, the misses the admission
+limits send to the CPU get null operands, and the engine computes them there.
 
 **Lent capacity.** Device memory a request cannot use can hold slots: KV-cache
 positions beyond the request's length (revalidated when a request begins) and the
@@ -53,6 +83,24 @@ adaptivity for repeatable Eval numbers: Eval warms each case until consecutive r
 agree before it compares repetitions (crit-eval's `speed.steady_state`), so a cache that
 settles is measured at the speed it settles to, and one frozen early is measured cold.
 
+**Admission limits and the CPU/link split.** Two limits keep the link from becoming the
+step's bottleneck, and both run inside the plan, so the split needs no host round trip.
+`admit_quota` admits at most that many misses per plan in route order (routers list
+their experts by weight, so the heaviest misses take the link), and `admit_by_misses`
+gives that quota by the plan's miss count. `key_seen` turns on second-touch admission:
+a key's first miss is served without being admitted, so a one-off route does not evict a
+hot expert. A miss over the limits takes no victim; its `Use` names the store bundle
+(`Source::store`), and the engine computes it on the CPU from host memory, or reads it
+mapped. Those CPU misses are the split. Derive the quota table from measurements with
+[split.py](code/split.py): time one routed layer with k link misses alone, j CPU misses
+alone and both at once (`calibrate`). `quota_table` then picks the fastest measured split
+per miss count, never interpolating, and `needs_recalibration` says when the hit rate has
+moved far enough to measure again. (For scale only: on one RTX 5090 with a PCIe 4.0 link
+and a 6-core CPU, about 3 link misses per layer, overlapped with the CPU's, was fastest.)
+Under the batch invariance rules the CPU rows must give the device's bits, as
+[host expert arithmetic](../host-expert-arithmetic/README.md) does; in quality mode
+`as_quantized` they need not, and the CPU may use its own faster rows.
+
 **Starting warm: a residency profile.** A cold cache spends its first requests on misses.
 The package may ship a residency or routing profile, a file of the engine's own format
 (per-layer route counts, or the slots to fill), that the engine reads at start to fill
@@ -63,14 +111,29 @@ content-dependent choice under AGENTS.md's rule: build it from a general corpus
 unrelated to Eval (never Eval's prompts, pinned continuation, held-out prompts or
 look-alike text), state that corpus and a held-out check in several languages and
 domains in the proposal, and keep the cache adapting so a profile that misses still
-converges.
+converges. crit names such a corpus: [corpus.json](code/corpus.json) lists public web text in
+seven languages and code in three to tune on, plus held-out sources to check on (test splits,
+two languages and a programming language the tuning never sees, rows far from the tuning ones).
+[corpus.py](code/corpus.py) fetches it through the Hugging Face dataset viewer with the standard
+library, caches it and records each dataset's revision. A profile built from it, with its
+held-out check, meets the rule without a corpus of the build's own: state `describe(...)` as the
+corpus. The engine runs its own forward over each text and logs one plan per routed layer and
+token. [residency_profile.py](code/residency_profile.py) builds the profile from those logs.
+`build_profile` takes router logs of a tuning corpus (one plan per routed layer and
+token), keeps the most routed keys and records the corpus and a held-out check.
+`held_out_check` gives cold and preloaded hit rates on at least two held-out traces.
+`load_profile` checks the file against the engine's geometry. `enqueue_preload` (or
+`ExpertCache::preload`) maps the keys to the first slots, unreferenced, so a profile
+entry no route uses is the clock's first victim.
 
 **Lookahead prefetch.** The next group's router applied to the current input predicts
 many of its experts. A prefetch plan tags a pool half (by group parity, so the half
 being filled is never the one consumed) with nonresident predictions and writes
 store-to-pool copies, run on a side stream. Pool slots go to the valid, distinct,
 nonresident predictions in prediction order, so a resident prediction takes no slot and
-a list longer than the pool fills it. Prefetch never changes residency.
+a list longer than the pool fills it. Prefetch never changes residency. Measure it before
+keeping it (see Costs): the copies only pay off when they overlap the layer's arithmetic,
+and in one engine with the admission split above, lookahead prefetch made decode slower.
 
 **Offline policy replay.** Each policy starts empty and applies the same ordered
 groups of bundle keys, pinning every hit before admitting misses in order. If a bundle
@@ -95,11 +158,29 @@ unused prefetch bytes).
 ## What the code supplies
 
 - [device_cache.h](code/device_cache.h) / [device_cache.cu](code/device_cache.cu):
-  `Directory`, `Use`, `Fill`; `enqueue_plan`, `enqueue_fill` (bundles of any multiple
-  of 16 bytes) and `enqueue_prefetch_plan`. All are capturable: inputs and outputs are
-  device pointers and counts are read on the device.
+  `Directory` (with the admission limits), `Use`, `Source`, `Fill`; `enqueue_plan`,
+  `enqueue_fill` (bundles of any multiple of 16 bytes), `enqueue_prefetch_plan`,
+  `enqueue_preload`, and `enqueue_operands` with `OperandSpec` and `Operands` for a provider's
+  grouped GEMM. All are capturable: inputs and outputs are device pointers and counts
+  are read on the device.
+- [runtime.h](code/runtime.h) / [runtime.cu](code/runtime.cu): `ExpertCache`, the ready
+  component. It owns the directory and per-layer scratch around the engine's slots, pool
+  and store, and offers `init`, `set_admission`, `preload`, `plan_and_fetch` (one
+  capturable call per routed layer), `prefetch` and `telemetry`. The telemetry carries the
+  `expert_reads` and `expert_hits` that Eval prices the expert tiers with, plus bypassed
+  misses and the failure flag.
 - [device_cache.py](code/device_cache.py): `ClockDirectory`, the host reference of the
-  same rules (`plan`, `prefetch`), and `simulate` for hit rates of routing traces.
+  same rules (`plan` with the admission limits, `prefetch`, `preload`), and `simulate` for
+  hit rates of routing traces.
+- [residency_profile.py](code/residency_profile.py): `build_profile`, `held_out_check`,
+  `write_profile` and `load_profile`.
+- [split.py](code/split.py): `SplitTimings`, `calibrate`, `best_split`, `quota_table` and
+  `needs_recalibration`.
+- [corpus.json](code/corpus.json) / [corpus.py](code/corpus.py): the profile corpus,
+  `load_manifest`, `fetch` and `describe`.
+- [expert_store.py](code/expert_store.py) / [expert_store.h](code/expert_store.h): `Component`,
+  `layout`, `build_store`, `open_store` (`Store` with `bundle`, `component`, `register`) and
+  `pin_store` (`PinnedStore`, whose `device` is `Directory::store`).
 - [replay.py](code/replay.py): `Bundle`, the event types, `replay` and
   `compare_policies`. It does not reproduce the CUDA prefetch pool.
 
@@ -122,6 +203,28 @@ When a phase such as prefill plans on the host, copy the directory across at eac
 phase change and apply the same clock on both sides. Read `state[2]` when leaving the device phase: 1 means an invalid or duplicate
 route, 2 means a plan had more routes than free slots.
 
+## Recipe
+
+Bring a cache up in this order. Each step names what to measure before the next.
+
+1. **Build the store** with `build_store` and pin it with `pin_store` (or `Store.register`).
+   Measure the load time.
+2. **Size the slots** from the memory the engine can lend (KV positions beyond the
+   request, the prompt workspace), not a fixed count. Measure the free memory after the
+   load at the required context.
+3. **Serve misses from the store first.** Use `ExpertCache` with no limits and decode with
+   every miss admitted. Measure `expert_hits / expert_reads` and the step time against
+   the link floor.
+4. **Load a profile.** Build it with `residency_profile.py` from routes over `corpus.json`'s
+   tuning sources, and check that `held_out_check` raises the hit rate on its held-out ones. Measure the
+   first requests' decode speed with the profile and without it.
+5. **Measure the split.** Run `split.calibrate` with the engine's own layer timings at the
+   hit rate step 3 settles to, then `set_admission(-1, quota_table(...), ...)`. Measure
+   decode against step 2's, and calibrate again when `needs_recalibration` says so.
+6. **Try second-touch** when hot experts get evicted by one-off routes (`bypassed` rises,
+   and the hit rate falls between requests). Keep it only when decode improves.
+7. **Only then try lookahead prefetch.** Keep it only when the integrated step gets faster.
+
 ## Worked example
 
 ```python
@@ -133,6 +236,16 @@ print(d.prefetch(1, [5, 6]))            # [(13, 0), (14, 1)]: pool half 1 tagged
 p = d.plan(1, [5, 2])                   # 5 comes from the pool; 2 (key 10) is new too
 print(p.hits, p.misses, p.fills)        # 0 2 [(('pool', 0), 13, 3), ('store', 10, 0)]
 print(d.plan(0, [1, 2]).hits)           # 1: expert 2 survived, expert 1 was evicted
+
+limited = ClockDirectory(slots=8, groups=1, experts=16, admit_quota=1)
+print(limited.plan(0, [4, 5, 6]).slots)  # [0, 'store', 'store']: one link miss, two for the CPU
+warm = ClockDirectory(slots=4, groups=1, experts=16)
+print(warm.preload([7, 3]), warm.plan(0, [3, 9]).hits)  # [(7, 0), (3, 1)] 1
+
+from split import SplitTimings, quota_table
+
+timings = SplitTimings(link={1: 1.0, 2: 2.5}, cpu={1: 1.5, 2: 3.0}, both={(1, 1): 1.6})
+assert quota_table(timings)[2] == 1    # two misses: one over the link, one on the CPU
 
 from replay import Bundle, compare_policies, replay
 
@@ -186,8 +299,15 @@ engine: miss sizes, dispatch, copy contention and admission overhead can reverse
 (under `CRIT_INFERENCE_CUDA`) runs 600 random plans with lookahead prefetch on 24 and
 72 slots against a host replica, checking slots, counters, pool tags, bundle bytes,
 prediction lists longer than the pool, a resident prediction taking no pool slot,
-duplicate-route rejection and invalid launches. The host suite checks
-`ClockDirectory` pinning, victims and pool tags.
+duplicate-route rejection and invalid launches. It then runs `ExpertCache` on 20 and 40
+slots: a profile preload with a duplicate and an invalid key, then 400 plans under a
+quota table and second-touch. It checks slots, bypassed misses naming their store
+bundle, copied bytes and the telemetry against the replica, and the provider GEMM operands
+`enqueue_operands` writes. All of it passes on an RTX 5090.
+[expert_store_tests.cpp](../../tests/inference/expert_store_tests.cpp) pins a store file and reads it
+back through the device address `pin_store` returns. The host suite checks
+`ClockDirectory` pinning, victims, pool tags, admission limits and preload, plus the
+profile builder and the split table.
 [Measured policy fixtures](../../tests/test_measured_expert_policies.py) compare replay
 clock with `ClockDirectory`, check hindsight against an exhaustive oracle, and cover
 sizes, pins, bypass, warmup and the event types. None of these measure

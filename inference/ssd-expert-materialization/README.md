@@ -49,10 +49,19 @@ escapes. Cancellation is checked between regions and at 1 MiB boundaries.
   upload handoff, `quiesce()` and failed-upload retention; `HostExpertTier`, the bounded host
   tier with `retain()` for device evictions and hit, miss, eviction and refusal counts.
 - [mapped_gather.h](code/mapped_gather.h): the C++20 sparse gather above.
+- [host_tier.h](code/host_tier.h): the native host tier and its read queue. `HostTier` is a
+  ledger over pinned host slots the engine owns, one bundle each: `find` serves a committed hit,
+  `admit(key, protect)` hands out a free slot or the least recently used unprotected one (or
+  refuses), `commit` publishes a slot once its fill landed and `abandon` frees a failed one; it
+  counts hits, misses, admissions, evictions and refusals. `ReadQueue` fills such slots from the
+  file with a pool of positioned readers (Core's `ReadOnlyFile` read slots): demand reads before
+  read-ahead, one read per pending key (a demand for a queued read-ahead moves it first), and a
+  `Ticket` per read to wait on before `commit`.
 
-No route predictor, native storage queue, pinned staging pool, device copy or device cache
-manager; the host tier is a host reference (its native form keeps experts in pinned host slots);
-no model parsing; overlapping named regions are not rejected.
+No route predictor and no device copy: the engine copies a committed slot to the device cache
+(the slot is pinned, so a hit uploads directly) and copies an evicted device slot into an
+admitted one before committing it. No model parsing; overlapping named regions are not
+rejected.
 
 ## What the engine supplies
 

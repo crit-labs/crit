@@ -2,8 +2,8 @@
   "id": "lookup-table-rows",
   "category": "memory-and-loading",
   "summary": "Gather rows of a file-backed embedding or n-gram table with random-access advice, exact positioned reads and a hot-row cache",
-  "implementation_status": "reference",
-  "implementation_scope": "Python reference: random-access advice on the table's file region (POSIX_FADV_RANDOM) or on a mapping (MADV_RANDOM), exact positioned reads of the rows a gather needs in a worker pool, duplicate rows read once, request order kept, an optional LRU of hot rows and counters for reads, bytes and hits. Native reads and the destination of the rows are engine choices.",
+  "implementation_status": "native_source",
+  "implementation_scope": "Python reference and a native C++20 form (table_rows.h): random-access advice on the table's file region (POSIX_FADV_RANDOM) or on a mapping (MADV_RANDOM), exact positioned reads of the rows a gather needs in a worker pool, duplicate rows read once, request order kept, an optional LRU of hot rows and counters for reads, bytes and hits. Native reads and the destination of the rows are engine choices. The native RowGather writes rows into the caller's buffer and StagingRing hands out pinned slots for the device copy.",
   "agent_guidance": {
     "use_when": "A gathered lookup table (token embeddings, hashed n-gram embeddings) stays in a file or mapping, as recon's placement scenario puts lookup tables on disk",
     "avoid_when": "The table is loaded once into host or device memory, or it is small enough that its reads never show in a pass",
@@ -11,7 +11,8 @@
       "Random-access advice for a file region or a mapping, reporting where the platform has none",
       "Exact positioned row reads checked for length, with a locked seek-and-read fallback",
       "Parallel reads of a gather's cold rows, duplicate rows read once, request order kept",
-      "An optional least-recently-used cache of hot rows and read, byte and hit counters"
+      "An optional least-recently-used cache of hot rows and read, byte and hit counters",
+      "A native gather into pinned staging slots that the engine copies to the device, each slot reused only after its copy finished"
     ],
     "engine_supplies": [
       "The table's file, offset, row count and row size, and any per-row scales",
@@ -36,6 +37,10 @@
     {
       "path": "inference/lookup-table-rows/code/table_rows.py",
       "purpose": "TableRegion, random-access advice for files and mappings, and RowTable's parallel exact row gather with a hot-row cache"
+    },
+    {
+      "path": "inference/lookup-table-rows/code/table_rows.h",
+      "purpose": "Native RowGather (random-access advice, worker-pool positioned reads, hot-row LRU, request order into the caller's buffer) and StagingRing over pinned slots"
     }
   ],
   "requires": {
@@ -57,7 +62,11 @@
     "TableRegion",
     "RowTable",
     "advise_random",
-    "advise_mapping_random"
+    "advise_mapping_random",
+    "Region",
+    "RowGather",
+    "Counters",
+    "StagingRing"
   ],
   "interactions": [
     "ssd-expert-materialization",
@@ -68,8 +77,8 @@
     "ssd-expert-materialization"
   ],
   "validation": {
-    "host": "Python fixtures check request order, duplicates, cache hits and eviction, counters, rows outside the table, short files and short reads",
-    "native": "No native code; native engines adapt the rule to their own reads",
+    "host": "Python fixtures check request order, duplicates, cache hits and eviction, counters, rows outside the table, short files and short reads; native gather in request order with repeats, cache counters, one and four workers, refusals and the staging ring's waits (table_rows_tests.cpp)",
+    "native": "table_rows_tests.cpp on the host: the native gather in request order with repeats, its cache and workers, and the staging ring",
     "performance": "Unmeasured here; one engine's 51 GB n-gram table went from 500-700 ms to 2-5 ms per token of cold rows with random-access advice"
   }
 }

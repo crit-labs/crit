@@ -258,6 +258,14 @@ between two identical requests. A miss the host computes is not admitted to the
 device cache, so the miss rate rises with the host share; weigh that against the
 transfer it saves.
 
+**In quality mode `as_quantized` the split need not be exact.** Eval passes an output
+difference that parts at a near-tie there ([forks](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#forks-in-quality-mode-as_quantized)), which is all that rounding
+apart on two processors can cause. So host workers may compute misses with their own
+fastest rows (8-bit activations on integer dot products, for example, where the device
+runs 4-bit ones), and prompt chunks may put an expert on the host because it is not
+resident. Measure such a split against the exact one: it pays when the host's faster rows
+or the saved copies outweigh the drift, which the run's quality budget judges.
+
 **Host work inside a captured decode.** To run the host share mid-graph, post it
 through the [host-work mailbox](../host-work-mailbox/README.md), which supplies the
 doorbell protocol, measured join choice, release and failure answering, and the

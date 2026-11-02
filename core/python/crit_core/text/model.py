@@ -9,6 +9,7 @@ from crit_core.files import ModelFiles, file_name
 
 from .errors import TextError, model_files, read_json_object
 from .generation import GenerationConfig
+from .prompt_cache import PromptTokenCache
 from .stream import TextStream
 from .template import ChatTemplates, chat_template_sources
 from .tokenizer import Tokenizer
@@ -73,12 +74,14 @@ class TextIdentity:
 class ModelText:
     """Tokenizer, chat templates, generation config and identity of one model; immutable and thread-safe.
     template_origin says where the templates come from (crit_core.text.chat_template_sources): "model", "given",
-    "crit" or None (the model renders none)."""
+    "crit" or None (the model renders none). prompt_tokens, when set, is the PromptTokenCache encode_chat encodes
+    through (load_model_text(prompt_cache=True)); it is the one part that changes, and it is thread-safe."""
     tokenizer: Tokenizer
     templates: ChatTemplates
     generation: GenerationConfig
     identity: TextIdentity
     template_origin: str = None
+    prompt_tokens: PromptTokenCache = None
 
     def render(self, messages, *, template=None, tools=None, **variables):
         """Render with the selected chat template (ModelTextError when the model has none); see ChatTemplate.render."""
@@ -88,9 +91,11 @@ class ModelText:
         """Render, then encode with add_special_tokens=False as transformers' apply_chat_template does: a BOS comes
         only from the template. Control-token text is always parsed as control tokens, whatever the tokenizer's
         split_special_tokens default, so the template's own markers stay single tokens; control-token text inside
-        messages is parsed the same way, as in transformers. TextError when the ids start with two BOS tokens."""
-        ids = self.tokenizer.encode(self.render(messages, template=template, tools=tools, **variables),
-                                    add_special_tokens=False, split_special_tokens=False)
+        messages is parsed the same way, as in transformers. TextError when the ids start with two BOS tokens.
+        With prompt_tokens, a prompt that extends a recent one is encoded from near the seam (PromptTokenCache)."""
+        text = self.render(messages, template=template, tools=tools, **variables)
+        ids = (self.prompt_tokens.encode(text) if self.prompt_tokens is not None
+               else self.tokenizer.encode(text, add_special_tokens=False, split_special_tokens=False))
         bos = self.tokenizer.bos_token_id
         if bos is not None and len(ids) >= 2 and ids[0] == bos and ids[1] == bos:
             raise TextError(f"the encoded chat starts with two BOS tokens (id {bos}); the template or a message "
@@ -103,7 +108,7 @@ class ModelText:
         return TextStream(self.tokenizer, prompt_ids, **options)
 
 
-def load_model_text(model, *, clock=datetime.now, split_special_tokens=False, chat_template=None):
+def load_model_text(model, *, clock=datetime.now, split_special_tokens=False, chat_template=None, prompt_cache=False):
     """Load a model's text layer from a directory path, a DirectoryFiles or any ModelFiles (TypeError otherwise).
 
     tokenizer.json is required; tokenizer_config.json, special_tokens_map.json, chat_template.jinja,
@@ -111,7 +116,8 @@ def load_model_text(model, *, clock=datetime.now, split_special_tokens=False, ch
     present. A model whose files hold no chat template renders with `chat_template` (a template source) when given,
     else with the one crit ships for its config.json model_type (crit_core.text.chat_template_sources); without
     either it loads, and render() raises ModelTextError. `clock` drives the templates' strftime_now (None leaves it
-    undefined, for reproducible renders).
+    undefined, for reproducible renders). prompt_cache=True gives the ModelText a PromptTokenCache with its defaults,
+    so encode_chat re-encodes only the tail of a prompt that extends a recent one.
     """
     files = model_files(model)
     reader = _ReadNames(files)
@@ -124,4 +130,7 @@ def load_model_text(model, *, clock=datetime.now, split_special_tokens=False, ch
     records = [record for record in files.records if record.path in reader.read_names]
     template = None if origin in ("model", None) else {
         "origin": origin, "sha256": {name: templates[name].sha256 for name in templates}}
-    return ModelText(tokenizer, templates, generation, TextIdentity.of(records, library_versions(), template), origin)
+    if not isinstance(prompt_cache, bool):
+        raise TextError("prompt_cache must be True or False")
+    return ModelText(tokenizer, templates, generation, TextIdentity.of(records, library_versions(), template), origin,
+                     PromptTokenCache(tokenizer) if prompt_cache else None)

@@ -32,6 +32,8 @@ else:
 | [messages.py](messages.py) | `openai_messages` (OpenAI chat messages to template messages) |
 | [generation.py](generation.py) | `GenerationConfig`, `legacy_eos_ids`, `model_generation_view` |
 | [detokenize.py](detokenize.py) | `IncrementalDetokenizer` |
+| [prompt_cache.py](prompt_cache.py) | `PromptTokenCache` (standard library only, over a `Tokenizer`) |
+| [loops.py](loops.py) | `LoopDetector` (standard library only) |
 | [markers.py](markers.py) | `MarkerDecoder`, `TokenText`; delimiter provenance for reasoning and tool parsing |
 | [stops.py](stops.py) | `StopMatcher` (standard library only) |
 | [stream.py](stream.py) | `TextStream`, `TextDelta` |
@@ -73,12 +75,66 @@ files other than `tokenizer.json` follow the strict reader
   is required; True applies the post-processor (for example a BOS). Control-token
   text such as `<|im_end|>` is parsed as the control token, as in transformers;
   `split_special_tokens=True` splits it into ordinary pieces. `encode_chat`
-  always parses control tokens.
+  always parses control tokens. `encode_offsets` returns the same ids with each
+  token's `(start, end)` character range.
 - `decode(ids, *, skip_special_tokens=False)` keeps special tokens by default, as
   transformers does. `clean_up_tokenization_spaces` is not applied.
 - `validate`, `decode`, `id_to_token` and the detokenizer raise `TokenError` for
   anything but an integer in `[0, vocab_size)`. `token_to_id` returns None for
   unknown text.
+
+## Prompts that extend a recent one
+
+A conversation's next turn renders the previous prompt plus a short tail, and
+encoding the whole prompt again costs time in proportion to its length.
+`PromptTokenCache(tokenizer, *, entries=64, max_chars=64 << 20, min_chars=4096,
+overlap=64, resync=32, attempts=16)` keeps the ids of recent prompts. `encode(text)`
+returns what `encode(text, add_special_tokens=False, split_special_tokens=False)`
+returns. For a prompt that starts with a kept one, it backs off `overlap` tokens from
+the kept prompt's end, encodes the text from there and keeps the ids before it, but
+only when the first `resync` new ids equal the kept ids over the same span; a
+tokenizer that marks the first word of any text it encodes (a SentencePiece space
+marker) can miss at one token and meet at an earlier one, so up to `attempts`
+back-off points one token apart are tried before the whole prompt is encoded. Prompts
+under `min_chars` characters are encoded in full and not kept; a prompt that extends a
+kept one replaces it, so a conversation holds one entry; eviction is least recently
+used within `entries` and `max_chars` characters. `hits`, `misses` and
+`resync_failures` count what happened; it is thread-safe.
+
+The splice can differ from a full encode only where a token before the back-off
+point depends on text more than `overlap` tokens after it. A comparison over
+simulated conversations (40 per tokenizer, 12 turns each, up to 150,000 characters,
+tails from 1 character to 2,500 including CJK, emoji, whitespace runs and
+control-token text) found no difference from a full encode in 4,320 prompts on nine
+tokenizer.json files (seven byte-level BPEs, with and without NFC and regex or digit
+pre-splits, a Metaspace BPE and a WordPiece with a lowercasing normalizer) on
+`tokenizers` 0.23.3, and the cache took between a tenth and a sixth of the full
+encodes' time there. The fixtures in
+[test_core_text.py](../../../../tests/test_core_text.py) (`PromptTokenCacheTests`)
+check every turn against a full encode, including tokens that end inside a
+character.
+
+`load_model_text(..., prompt_cache=True)` gives the `ModelText` a cache with these
+defaults (`ModelText.prompt_tokens`), and `encode_chat` encodes through it.
+`ResidentChat` turns it on unless a package sets `prompt_token_cache = False`.
+
+## Replies that loop
+
+A model that falls into repeating itself (quantized engines do, and long reasoning
+can) runs to its output cap, holding its pages and a batch lane. `LoopDetector(*,
+min_repeats=8, min_tokens=1024, max_period=8192, k=8, candidates=8)` is fed a reply's
+tokens (`push`, True once it loops): a period p becomes a candidate when the last `k`
+tokens occurred p tokens earlier, and its run counts the consecutive trailing tokens
+equal to the token p before them. A run of at least max(min_tokens, min_repeats x p)
+is a loop (`period`, `run`). Only exact repetition counts: a list whose items differ
+by a number, a passage quoted a few times or varied text is not a loop. Its cost is
+O(k + candidates) per token and memory grows with the reply.
+
+`ResidentChat.loop_stop` (None by default) turns it on for a package: True, or a dict
+of `LoopDetector` options. The generator's `cancelled()` then also turns true when the
+reply loops, and the reply ends with what it streamed and `finish` "stop"; a request
+cancelled for real still raises. A grammar-constrained reply is never cut, since crit
+serve checks that a reply the engine ended conforms.
 
 ## Chat templates
 
