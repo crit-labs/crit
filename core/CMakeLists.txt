@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_core VERSION 0.13.0 LANGUAGES CXX)
+project(crit_core VERSION 0.14.0 LANGUAGES CXX)
 find_package(Threads REQUIRED)
 function(crit_strict_warnings target)
   if(MSVC)
@@ -12,8 +12,11 @@ function(crit_strict_warnings target)
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Werror)
   endif()
 endfunction()
-add_library(crit_core STATIC src/runtime/runtime.cpp src/runtime/trace.cpp src/runtime/operators.cpp src/runtime/native_engine.cpp src/memory/resources.cpp src/memory/host_memory.cpp src/memory/host_block.cpp
-  src/text/text.cpp src/sampling/sampling.cpp src/state/state_cache.cpp src/io/file.cpp src/io/sha256.cpp
+add_library(crit_core STATIC src/runtime/engine.cpp src/runtime/submit.cpp src/runtime/serial.cpp
+  src/runtime/admission.cpp src/runtime/batches.cpp src/runtime/concurrent.cpp src/runtime/scoring.cpp
+  src/runtime/progress.cpp src/runtime/frontend.cpp src/runtime/handle.cpp src/runtime/interfaces.cpp
+  src/runtime/trace.cpp src/runtime/operators.cpp src/runtime/native_engine.cpp src/runtime/step_engine.cpp src/memory/resources.cpp src/memory/host_memory.cpp src/memory/host_block.cpp
+  src/text/text.cpp src/sampling/sampling.cpp src/state/state_cache.cpp src/batch/batch.cpp src/io/file.cpp src/io/sha256.cpp
   src/io/json.cpp src/model/safetensors.cpp src/model/model_config.cpp src/constraints/constraints.cpp src/constraints/grammar.cpp
   src/backends/device_graph.cpp src/backends/device_memory.cpp)
 add_library(crit::core ALIAS crit_core)
@@ -43,6 +46,13 @@ target_link_libraries(crit_core PUBLIC Threads::Threads)
 crit_strict_warnings(crit_core)
 set(CRIT_CORE_SANITIZERS "" CACHE STRING "Optional compiler sanitizers, e.g. address,undefined")
 option(CRIT_CORE_CUDA "Build the explicit CUDA backend services" OFF)
+option(CRIT_CORE_HIP "Build the GPU backend services on ROCm's HIP runtime (crit::hip, the CUDA backend's sources)" OFF)
+if(CRIT_CORE_CUDA AND CRIT_CORE_HIP)
+  message(FATAL_ERROR "CRIT_CORE_CUDA and CRIT_CORE_HIP build the same backend sources: choose one per build")
+endif()
+set(CRIT_CORE_GPU_SOURCES src/backends/cuda/cuda.cpp src/backends/cuda/category_timer.cpp
+  src/backends/cuda/cuda_graph.cpp src/backends/cuda/cuda_memory.cpp src/backends/cuda/cuda_launch.cpp
+  src/backends/cuda/device_set.cpp)
 option(CRIT_CORE_NVTX "Build crit::trace::NvtxSink into crit_core (NVTX 3 headers) and define CRIT_TRACE_NVTX for consumers" OFF)
 if(CRIT_CORE_NVTX)
   find_package(CUDAToolkit QUIET)
@@ -67,25 +77,51 @@ endif()
 include(CTest)
 if(CRIT_CORE_CUDA)
   find_package(CUDAToolkit 13.1 REQUIRED)
-  add_library(crit_core_cuda STATIC src/backends/cuda/cuda.cpp src/backends/cuda/category_timer.cpp
-    src/backends/cuda/cuda_graph.cpp src/backends/cuda/cuda_memory.cpp src/backends/cuda/cuda_launch.cpp)
+  add_library(crit_core_cuda STATIC ${CRIT_CORE_GPU_SOURCES})
   add_library(crit::cuda ALIAS crit_core_cuda)
   set_target_properties(crit_core_cuda PROPERTIES EXPORT_NAME cuda POSITION_INDEPENDENT_CODE ON)
   target_link_libraries(crit_core_cuda PUBLIC crit_core CUDA::cudart)
   crit_strict_warnings(crit_core_cuda)
 endif()
+if(CRIT_CORE_HIP)
+  # The same backend on HIP: crit/gpu_runtime.h maps the CUDA runtime names it uses to HIP's under CRIT_CORE_HIP,
+  # which consumers inherit. The sources stay host C++; hip::host brings the HIP headers and runtime.
+  find_package(hip REQUIRED CONFIG)
+  add_library(crit_core_hip STATIC ${CRIT_CORE_GPU_SOURCES})
+  add_library(crit::hip ALIAS crit_core_hip)
+  set_target_properties(crit_core_hip PROPERTIES EXPORT_NAME hip POSITION_INDEPENDENT_CODE ON)
+  target_link_libraries(crit_core_hip PUBLIC crit_core hip::host)
+  target_compile_definitions(crit_core_hip PUBLIC CRIT_CORE_HIP)
+  crit_strict_warnings(crit_core_hip)
+endif()
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
+# Step engines for engines in other languages (crit/step_engine.h): the native engine ABI plus crit_engine_open_steps,
+# which crit_core.native.StepEngine loads (CRIT_CORE_STEP_LIBRARY or the engine's "step_library" fact names it).
+add_library(crit_core_steps SHARED src/runtime/step_library.cpp)
+target_link_libraries(crit_core_steps PRIVATE crit_core)
+crit_strict_warnings(crit_core_steps)
+install(TARGETS crit_core_steps LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS crit_core EXPORT critCoreTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
-install(FILES include/crit/core.h include/crit/text.h include/crit/sampling.h include/crit/state.h
+install(FILES include/crit/core.h include/crit/text.h include/crit/sampling.h include/crit/state.h include/crit/batch.h
   include/crit/json.h include/crit/file.h include/crit/sha256.h include/crit/host_memory.h include/crit/host_block.h
   include/crit/safetensors.h include/crit/model_config.h include/crit/constraints.h include/crit/trace.h
-  include/crit/device_graph.h include/crit/device_memory.h include/crit/native_engine.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/crit)
+  include/crit/device_graph.h include/crit/device_memory.h include/crit/native_engine.h include/crit/step_engine.h
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/crit)
+# core.h's parts.
+install(FILES include/crit/core/resources.h include/crit/core/profile.h include/crit/core/request.h
+  include/crit/core/model.h include/crit/core/concurrent.h include/crit/core/engine.h
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/crit/core)
 install(FILES ../LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/crit)
 if(CRIT_CORE_CUDA)
   install(TARGETS crit_core_cuda EXPORT critCoreTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
+if(CRIT_CORE_HIP)
+  install(TARGETS crit_core_hip EXPORT critCoreTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
+if(CRIT_CORE_CUDA OR CRIT_CORE_HIP)
   install(FILES include/crit/cuda.h include/crit/cuda_graph.h include/crit/cuda_memory.h include/crit/cuda_launch.h
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/crit)
+    include/crit/cuda_devices.h include/crit/gpu_runtime.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/crit)
 endif()
 configure_package_config_file(cmake/critCoreConfig.cmake.in
   ${CMAKE_CURRENT_BINARY_DIR}/critCoreConfig.cmake
@@ -160,9 +196,21 @@ if(BUILD_TESTING AND PROJECT_IS_TOP_LEVEL)
     add_test(NAME crit_core_native_engine COMMAND "${Python3_EXECUTABLE}" -B
       "${CMAKE_CURRENT_SOURCE_DIR}/../tests/core/native_engine_check.py" $<TARGET_FILE:crit_core_native_engine_fixture>)
     set_tests_properties(crit_core_native_engine PROPERTIES TIMEOUT 60)
+    # A Python step model through crit_core.native.StepEngine and Core's concurrent runtime (crit/step_engine.h).
+    add_test(NAME crit_core_step_engine COMMAND "${Python3_EXECUTABLE}" -B
+      "${CMAKE_CURRENT_SOURCE_DIR}/../tests/core/step_engine_check.py" $<TARGET_FILE:crit_core_steps>)
+    set_tests_properties(crit_core_step_engine PROPERTIES TIMEOUT 120)
+    # Concurrent requests end to end: a toy step model packaged, served by crit serve four requests at once and
+    # measured by crit run measure and crit Eval's concurrency part (crit_eval from the environment).
+    add_test(NAME crit_core_concurrency_end_to_end COMMAND "${Python3_EXECUTABLE}" -B
+      "${CMAKE_CURRENT_SOURCE_DIR}/../tests/core/concurrency_end_to_end_check.py" $<TARGET_FILE:crit_core_steps>)
+    set_tests_properties(crit_core_concurrency_end_to_end PROPERTIES TIMEOUT 120)
   endif()
 
   crit_core_cases(state_tests 120 state_config state_transactions state_ownership state_prefixes state_collisions state_reuse state_completeness state_index state_lru state_epochs state_forks state_recurrent state_hybrid state_failures state_randomized state_capacity state_layout state_metadata state_hot_path state_checkpoints state_snapshots state_windows state_round_states)
+
+  crit_core_cases(batch_tests 60 batch_layout batch_items batch_pages batch_engine batch_speculative_rows
+    batch_speculative_engine)
 
   crit_core_cases(io_tests 120 json_valid json_rejects json_utf8 json_strings json_numbers json_nonfinite json_limits json_access json_file json_random sha256_vectors sha256_chunked file_identity file_change file_read_exact file_read_slots file_read_chunks file_read_errors file_map file_open_errors host_memory_v2 host_memory_v1 host_memory_malformed host_memory_admission host_memory_live)
 
@@ -196,6 +244,13 @@ if(BUILD_TESTING AND PROJECT_IS_TOP_LEVEL)
     foreach(_test allocations ordering release partial engine timer readback stages retained spare)
       add_test(NAME crit_core_cuda_${_test} COMMAND crit_core_cuda_tests ${_test})
       set_tests_properties(crit_core_cuda_${_test} PROPERTIES TIMEOUT 45)
+    endforeach()
+    add_executable(crit_core_cuda_device_set_tests ../tests/core/cuda_device_set_tests.cpp)
+    target_link_libraries(crit_core_cuda_device_set_tests PRIVATE crit_core_cuda)
+    crit_strict_warnings(crit_core_cuda_device_set_tests)
+    foreach(_test members copies ordering barrier binding rejects)
+      add_test(NAME crit_core_cuda_device_set_${_test} COMMAND crit_core_cuda_device_set_tests ${_test})
+      set_tests_properties(crit_core_cuda_device_set_${_test} PROPERTIES TIMEOUT 45)
     endforeach()
     add_executable(crit_core_cuda_category_timer_tests ../tests/core/cuda_category_timer_tests.cpp)
     target_link_libraries(crit_core_cuda_category_timer_tests PRIVATE crit_core_cuda)
@@ -240,5 +295,24 @@ if(BUILD_TESTING AND PROJECT_IS_TOP_LEVEL)
     else()
       message(STATUS "Portable CUDA lifetime fixtures enabled; linker-injected failure fixtures require --wrap and are omitted.")
     endif()
+  endif()
+  if(CRIT_CORE_HIP)
+    # The CUDA backend's fixtures on HIP, through crit/gpu_runtime.h. Not here: the graph fixtures (cuBLAS) and the
+    # linker-injected failures (they wrap the CUDA runtime's symbols).
+    foreach(_fixture cuda_tests cuda_category_timer_tests cuda_memory_tests)
+      add_executable(crit_core_hip_${_fixture} ../tests/core/${_fixture}.cpp)
+      target_link_libraries(crit_core_hip_${_fixture} PRIVATE crit_core_hip)
+      crit_strict_warnings(crit_core_hip_${_fixture})
+    endforeach()
+    foreach(_test allocations ordering release partial engine timer readback stages retained spare)
+      add_test(NAME crit_core_hip_${_test} COMMAND crit_core_hip_cuda_tests ${_test})
+      set_tests_properties(crit_core_hip_${_test} PROPERTIES TIMEOUT 45)
+    endforeach()
+    add_test(NAME crit_core_hip_category_timer COMMAND crit_core_hip_cuda_category_timer_tests)
+    set_tests_properties(crit_core_hip_category_timer PROPERTIES TIMEOUT 45)
+    foreach(_test leases mapping host_block)
+      add_test(NAME crit_core_hip_memory_${_test} COMMAND crit_core_hip_cuda_memory_tests ${_test})
+      set_tests_properties(crit_core_hip_memory_${_test} PROPERTIES TIMEOUT 45)
+    endforeach()
   endif()
 endif()

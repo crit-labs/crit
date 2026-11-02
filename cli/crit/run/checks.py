@@ -17,7 +17,14 @@ GATES = {"arithmetic": ("quality", "sampling"),
 
 
 def eval_results(folder):
-    return sorted((folder / "eval").glob("attempt-*.json"))
+    """The candidate's Eval results whose attempt completed: an attempt that stopped keeps what it measured beside
+    its journal, but its result judges no gate (crit run ... eval --resume finishes it)."""
+    found = []
+    for path in sorted((folder / "eval").glob("attempt-*.json")):
+        outcome = folder / "attempts" / path.stem / "result.json"
+        if outcome.is_file() and read_json(outcome).get("outcome") == "completed":
+            found.append(path)
+    return found
 
 
 def from_eval(store, run_id, candidate_id, attempt=None):

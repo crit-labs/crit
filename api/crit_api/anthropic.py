@@ -246,13 +246,20 @@ def thinking(body):
     value, config = body.get("thinking"), body.get("output_config")
     effort = config.get("effort") if isinstance(config, dict) else None
     params = (["thinking"] if value is not None else []) + (["output_config.effort"] if effort is not None else [])
-    return {"params": params, "controls": lambda: thinking_controls(value, effort)} if params else None
+    if not params:
+        return None
+    controls = {"params": params, "controls": lambda: thinking_controls(value, effort)}
+    kind = value.get("type") if isinstance(value, dict) else None
+    if isinstance(kind, str) and THINKING.get(kind) and "budget_tokens" in value:
+        # A thinking-budget engine (chat-thinking-budget-v1) ends the reasoning there (server.thinking_budget).
+        controls.update(budget=value["budget_tokens"], budget_param="thinking.budget_tokens")
+    return controls
 
 
 def thinking_controls(value, effort):
     """(enabled, effort, unused parameters) for thinking ({type: one of THINKING}) and output_config.effort (EFFORTS).
-    Its other thinking fields, such as budget_tokens, are unused and listed, so each needs a name parameter_name
-    takes."""
+    Its other thinking fields are unused and listed, so each needs a name parameter_name takes; budget_tokens is
+    listed too unless a chat-thinking-budget-v1 engine applies it (server.thinking_budget)."""
     kind = value.get("type") if isinstance(value, dict) else None
     if value is not None and (not isinstance(kind, str) or kind not in THINKING):
         raise RequestError("thinking.type must be " + ", ".join(THINKING), param="thinking")

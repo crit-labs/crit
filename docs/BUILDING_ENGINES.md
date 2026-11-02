@@ -158,11 +158,16 @@ crit run --root RUN_ROOT --id RUN_ID check --candidate CANDIDATE_ID --record che
 Use the exact reservation path returned.
 `measure` serves the packaged candidate through `crit serve`, as `eval` does, and
 records one benchmark per case from what a chat client receives: each candidate's own
-greedy reply, memory of the resident host process and `crit serve`'s tokens per round.
-A `benchmark --record` payload remains for workloads `measure` does not cover (cold
-mode, concurrency above 1).
+greedy reply, memory of the resident host process and `crit serve`'s tokens per round; a case
+of concurrency above 1 sends its requests at once and adds their aggregate throughput
+([measured benchmarks](RUN_RECORDS.md#measured-benchmarks)). A `benchmark --record` payload
+remains for workloads `measure` does not cover (cold mode).
 The package holds runnable files, dependencies and notices, without
-`manifest.json` (crit creates it). Build/launch recipes are literal arguments, without
+`manifest.json` (crit creates it). Data the engine reads at start belongs in it too, such as
+a residency or routing profile that fills a device expert cache before the first request
+([device-expert-cache](../inference/device-expert-cache/README.md)); it is then part of the
+candidate's identity, and as a content-dependent choice it is built from a general corpus
+unrelated to Eval. Build/launch recipes are literal arguments, without
 shell expansion.
 
 | Check | What to retain |
@@ -191,6 +196,34 @@ the model's defaults ([Sampled speed](https://github.com/crit-labs/crit-eval/blo
 helps greedy requests leaves most requests at one token per pass. Verify sampled drafts with
 rejection sampling so the distribution stays exact, and sample on the device.
 
+### Serve concurrent requests
+
+Build the engine to serve several requests at once; one request at a time is the special case. Core's
+default stays one request (`Profile.max_concurrency` and `ModelInfo.max_concurrency` 1), so the engine opts
+in: a `ConcurrentModel` with a profile above one and [mixed batches](../core/src/runtime/README.md#mixed-token-work-batches)
+(`max_batch_tokens`), so that one step runs every scheduled request's decode rows and prompt chunks and reads
+each weight once. Core supplies what every batched engine needs:
+
+| Need | Core |
+| --- | --- |
+| A step's row layout and logits rows; a WorkItem's rows | [Batched steps](../core/src/batch/README.md): `StepLayout`, `step_item` |
+| Admission that keeps every admitted request able to finish | `PageReservations` |
+| Batched rows that keep their serial bits | The [batch invariance rules](../core/src/batch/README.md#batch-invariance) |
+| KV pages, prefix reuse, copy-on-write forks | [State cache](../core/src/state/README.md) |
+| Speculative rounds per request in a shared step | [Speculative rows](../core/src/batch/README.md#speculative-rows) |
+| Serving | An [engine library](../core/src/runtime/README.md#engine-libraries) with `concurrent_requests` and `chat-concurrent-v1`; a Python engine as a [step engine](../core/src/runtime/README.md#step-engines) |
+
+The [batched reference engine](../inference/batched-reference-engine/README.md) puts them together for a
+synthetic model, with its own paged attention kernels over the state cache's pages; an engine's attention kernels
+are its own or a provider's ([Kernels](../kernels/README.md)). A request's tokens must not depend on the requests sharing its steps: Eval's repeatable and
+request-history gates and the greedy exactness check compare replies across requests, so every kernel on the
+step path follows the invariance rules. Measure concurrency as a workload of its own: a case with
+`workload.concurrency` N, which `crit run measure` sends as N requests at once and records with each
+request's speed and their aggregate (`aggregate_tps`), and Eval's
+[concurrency](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#concurrency) part, which
+crit serve's `max_concurrent_requests` turns on: closed-loop levels of 1 to 64 clients against a batched
+ceiling, with whether batched replies equal serial ones.
+
 ### Run the common Eval suite
 
 Eval measures a candidate as a chat client gets it. `crit run ... eval --candidate ID
@@ -203,23 +236,43 @@ served). It applies the run's
 `quality_budget`, `exactness` and `kv_tokens` and retains the result as
 `candidates/ID/eval/ATTEMPT.json` for checks to reference. For a candidate built from a plan it
 writes the plan's [outcome](RUN_RECORDS.md#outcome), the forecast next to the measurement, and it
-prints the priorities the result's fractions give the next plan. The package therefore needs its
+prints the priorities the result's fractions give the next plan, and under them each KPI's fraction of its limit
+with its largest gaps ("decode 46.6 tok/s is 11% of its limit 419.5 tok/s; pass at 16% of its floor; largest gaps:
+..."): a low fraction is the next plan's room, not a result. Where recon's placement keeps weights off the
+device, Eval prices them at host memory's tier ([memory tiers](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#memory-tiers)),
+routed experts at the device cache's hit rate the engine reports (`expert_reads` and `expert_hits` in its decode
+telemetry; even routing without them), and keeps the all-on-device fraction beside it; the engine's facts declare
+`host_bytes_per_pass` (`{"link", "cpu"}` bytes a pass reads from host memory) to price its own path instead, and
+`crit run eval` notes which it was. The package therefore needs its
 [resident adapter](#4-make-the-package-servable-and-seal) with `chat-stream-v1`,
 `chat-logprobs-v1` and `chat-score-v1` from its first Eval on; `crit_core.serving.ResidentChat`
 provides them (`score_tokens` runs the engine's prefill at every position and its decode forced
 to a continuation; `crit_core.native.ResidentEngine` implements it for Core engines with query
 scoring and replay).
+Eval measures each speed case at steady state: before it compares repetitions, a request
+whose speed still moves away from the one before it is one more warmup, up to the
+protocol's bound, and the case records its warmups and drift (crit-eval's
+[`speed.steady_state`](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md)). An engine that
+adapts to what it serves, such as an expert cache, needs no freezing to pass the disturbed
+check; one still varying after the bound stops the round as before.
 Every candidate of a model uses the same prepared data, kept in the run workspace. `--only`
 runs some parts, `--baseline` shows KPI changes against an earlier result.
+
+Eval journals every request it serves beside the result (`candidates/ID/eval/ATTEMPT.journal.jsonl`). When an
+attempt stops before its end (interrupted, a session that ended, a failure, a disturbed device, a hung engine), do
+not start over: `crit run ... eval --candidate ID --data DIR --resume` goes on from its journal in a new attempt,
+answering the requests it measured at their recorded times and serving the candidate only for the rest. A fix to the
+candidate is a new package and a new Eval, not a resume. `crit eval journal FILE` says how far an attempt got.
 
 Eval measures in [stages](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md#stages) within a
 wall-clock budget (45 minutes by default, `--budget-minutes`): stage 1 (each speed case once, quality on the
 short texts, the request history, the memory the required context needs and decode projected to it) on every
 candidate, then the highest stage whose remaining requests fit the budget at the candidate's measured rates: stage 2
 adds the repetitions, the follow-up turns, the long quality text and the long-context curve's first point; stage 3
-the sampled suite, exactness, the follow-up turns again and the lower context. No stage serves the required context
-itself: `--certify`, for the candidate you will propose, runs stage 3 whatever the budget and one request at the
-run's `kv_tokens`, which the resources check needs. `--stage` caps how far a run goes, `--stage full` runs every
+the sampled suite, exactness and the follow-up turns again. No stage serves the required context itself or opens a
+second engine: `--certify`, for the candidate you will propose, runs stage 3 whatever the budget, one request at the
+run's `kv_tokens`, which the resources check needs, and the speed cases again on an engine opened at a lower context,
+which the lower-context gate needs (stage 3 ran it in crit-eval 0.4). `--stage` caps how far a run goes, `--stage full` runs every
 part as before stages.
 
 Use the reports crit-eval gives beyond the KPIs ([Measurements](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#limits)):
@@ -249,7 +302,9 @@ differences and `crit eval kernels` to start kernel work, checking
 [engine library](../core/src/runtime/README.md#engine-libraries) uses the stock adapters in
 `crit_core.native` for Eval and for serving; so does a Python engine that implements the library's
 interface (`info`, `generate`, `score`, `close`) and passes the function opening it in place of the
-library path ([Python engines](../core/src/runtime/README.md#python-engines)). Make the trace readable: class the engine's kernels in its
+library path ([Python engines](../core/src/runtime/README.md#python-engines)), or, to batch concurrent
+requests, a step (`open`, `step`, `commit`, `retire`) that Core's runtime schedules
+([step engines](../core/src/runtime/README.md#step-engines)). Make the trace readable: class the engine's kernels in its
 info's `kernel_work` (`{"match": NAME_PART, "term": matmul|attention|recurrent|other|draft, "format":
 nvfp4|fp8|bf16}`, or `crit eval kernels --work RULES` without engine changes) and keep the draft step's
 kernels distinctly named (`draft` in the name), so

@@ -36,9 +36,9 @@ NEW_RUN_PLAN_LIMITS = "computed"
 # Runs created from this version on give every lever of a candidate's plan its fate in the proposal; older runs keep
 # fates optional.
 NEW_RUN_LEVER_FATES = "required"
-# Runs created from this version on check plans with the fourth version of the plan rules (crit.run.plans.rules);
+# Runs created from this version on check plans with the fifth version of the plan rules (crit.run.plans.rules);
 # older runs keep the rules they were created with.
-NEW_RUN_PLAN_RULES = 4
+NEW_RUN_PLAN_RULES = 5
 WEIGHTS = {"as_stored", "transformed"}             # candidate: did it change them?
 HASH_PARALLEL_BYTES = 256 * 1024 * 1024
 GIB = 1024 ** 3
@@ -56,8 +56,12 @@ METRICS = {"prefill_tps": "tokens/second", "decode_tps": "tokens/second", "reque
            "load_ms": "milliseconds", "peak_vram_bytes": "bytes", "peak_ram_bytes": "bytes",
            "minimum_free_vram_bytes": "bytes", "minimum_free_ram_bytes": "bytes"}
 OPTIONAL_METRICS = {"ttft_ms": "milliseconds", "startup_ms": "milliseconds", "perplexity": "dimensionless",
-                    "kl_divergence": "nats/token", "accepted_tokens_per_round": "tokens/round"}
+                    "kl_divergence": "nats/token", "accepted_tokens_per_round": "tokens/round",
+                    # Completion tokens of a repetition's concurrent requests over its wall time (concurrency above 1).
+                    "aggregate_tps": "tokens/second"}
 ALL_METRICS = METRICS | OPTIONAL_METRICS
+# Metrics a benchmark samples per request: a case of concurrency N may record N samples per repetition.
+PER_REQUEST_METRICS = {"prefill_tps", "decode_tps", "request_ms", "ttft_ms", "accepted_tokens_per_round"}
 # Lowest valid sample: perplexity and accepted tokens per round are at least 1, rates are positive.
 METRIC_MINIMUM = {"perplexity": 1, "accepted_tokens_per_round": 1}
 
@@ -443,12 +447,26 @@ def eval_max_context(model, device, vram_headroom_bytes, reserve_bytes=None, req
     return max_context(model, device, vram_headroom_bytes, settings, requested, drafters=drafters)
 
 
-def kv_capacity(data, model, vram_headroom_bytes, reserve_bytes=None):
+def kv_need(workload):
+    """The KV tokens a workload's requests hold at once: prompt plus output for each of its concurrent requests."""
+    return workload.get("concurrency", 1) * (workload["prompt_tokens"] + workload["output_tokens"])
+
+
+def cases_need(data, workload):
+    """The most KV a request's cases (or its one workload) hold at once; 0 for cases its validation will refuse."""
+    try:
+        return max(kv_need(case["workload"]) for case in data["cases"]) if data.get("cases") else kv_need(workload)
+    except (KeyError, TypeError, ValueError):
+        return 0
+
+
+def kv_capacity(data, model, vram_headroom_bytes, reserve_bytes=None, need=0):
     """The run's KV capacity in tokens of prompt plus output, and what it rests on. An explicit kv_tokens
     is taken as given. Otherwise the request names its device (a `crit eval probe` result) and the run is
     built for Eval's max context: the context the user wants (context_tokens, from settings.toml; default 262,144),
     capped by the model's positions and the KV cache that fits on the device next to the companion drafters the
-    request names (drafters: folders a candidate may load beside the model)."""
+    request names (drafters: folders a candidate may load beside the model). need: the KV the workload's concurrent
+    requests hold at once (kv_need); a wanted context below it is raised to it, never past the model or device."""
     if "kv_tokens" in data:
         return number(data["kv_tokens"], "KV cache", 1, KV_TOKENS_MAX, integer=True), None
     if "device" not in data:
@@ -457,6 +475,7 @@ def kv_capacity(data, model, vram_headroom_bytes, reserve_bytes=None):
     device = Path(text(data["device"], "Device file")).expanduser().resolve()
     from crit_eval import DEFAULT_CONTEXT_TOKENS
     requested = number(data.get("context_tokens", DEFAULT_CONTEXT_TOKENS), "context_tokens", 1, KV_TOKENS_MAX, integer=True)
+    wanted, requested = requested, max(requested, min(int(need), KV_TOKENS_MAX))
     drafters = data.get("drafters", [])
     if not isinstance(drafters, list) or len(drafters) > 8:
         raise ValueError("drafters is a list of up to 8 companion drafter folders")
@@ -470,6 +489,7 @@ def kv_capacity(data, model, vram_headroom_bytes, reserve_bytes=None):
     tokens, bound = min(value["tokens"], KV_TOKENS_MAX), value["bound"] if value["tokens"] <= KV_TOKENS_MAX else "crit"
     basis = value.get("basis") or {}
     context = {"source": "eval", "bound": bound, "requested": requested,
+               **({"concurrency_tokens": requested, "context_tokens": wanted} if requested > wanted else {}),
                **({"note": value["note"]} if value.get("note") else {}), "model_limit": value["model_limit"],
                "model_limit_source": value["model_limit_source"], "device_limit": value["device_limit"],
                "kv_precision": value["kv_precision"], "kv_bytes_per_token": value["kv_bytes_per_token"],
@@ -478,6 +498,11 @@ def kv_capacity(data, model, vram_headroom_bytes, reserve_bytes=None):
                                               "expert_bytes_in_device_memory_at_max", "companion_drafter_bytes",
                                               "companion_drafters") if key in basis},
                "device_file": str(device), "device_sha256": file_sha(device)}
+    # A device file of several GPUs (crit eval probe --devices) names them: the engine runs on all of them.
+    from crit_eval.limits.devices import members
+    found = members(read_json(device))
+    if len(found) >= 2:
+        context["devices"] = [{"index": int(m.get("index", i)), "device": m.get("device")} for i, m in enumerate(found)]
     return number(tokens, "Eval's max context", 1, KV_TOKENS_MAX, integer=True), context
 
 
@@ -501,14 +526,17 @@ def request_spec(data):
                 for kind, default in (("vram", 1), ("ram", 2))}
     reserve = (round(number(data["context_reserve_gib"], "context reserve", 0, 65536) * GIB)
                if "context_reserve_gib" in data else None)
-    capacity, context = kv_capacity(data, path, headroom["vram_headroom_bytes"], reserve)
-    if capacity < workload["prompt_tokens"] + workload["output_tokens"]:
-        raise ValueError("KV capacity must cover prompt plus output")
+    capacity, context = kv_capacity(data, path, headroom["vram_headroom_bytes"], reserve, cases_need(data, workload))
+    if capacity < kv_need(workload):
+        raise ValueError("KV capacity must cover prompt plus output" + (
+            f" for each of the {workload['concurrency']} concurrent requests" if workload["concurrency"] > 1 else ""))
     targets = data.get("targets", {})
     keys(targets, set(), {"decode_tps", "prefill_tps", "request_ms"})
     for key, value in targets.items():
         if key != "extensions":
             number(value, key + " target", 0.000001, 1_000_000_000)
+    # as_quantized is chosen for memory and speed, so its run may re-encode stored weights unless the user says otherwise.
+    policy = data.get("weights_policy", "transformable" if data.get("quality_mode") == "as_quantized" else None)
     level = data.get("verification_level", "artifact_verified")
     if level not in {"reported", "artifact_verified"}:
         raise ValueError("Verification level requires reported or artifact_verified")
@@ -518,7 +546,7 @@ def request_spec(data):
             "benchmark_protocol": text(data.get("benchmark_protocol", "crit-matched-v1"), "Protocol", 200),
             "correctness": {"criteria": text(data["correctness_criteria"], "Correctness criteria", 8000),
                             "required_gates": ["arithmetic", "functional", "resources"],
-                            **({"weights_policy": data["weights_policy"]} if "weights_policy" in data else {}),
+                            **({"weights_policy": policy} if policy else {}),
                             **({"quality_budget": data["quality_budget"]} if "quality_budget" in data else {}),
                             **({"exactness": data["exactness"]} if "exactness" in data else {}),
                             **({"quality_mode": data["quality_mode"]} if "quality_mode" in data else {})},
@@ -583,8 +611,8 @@ def validate_spec(value):
         raise ValueError("plan_limits is computed when present, in a run that requires plans")
     if value.get("lever_fates", "required") != "required" or ("lever_fates" in value and "plans" not in value):
         raise ValueError("lever_fates is required when present, in a run that requires plans")
-    if value.get("plan_rules", 2) not in (2, 3, 4) or ("plan_rules" in value and value.get("plan_limits") != "computed"):
-        raise ValueError("plan_rules is 2, 3 or 4 when present, in a run that computes plan limits")
+    if value.get("plan_rules", 2) not in (2, 3, 4, 5) or ("plan_rules" in value and value.get("plan_limits") != "computed"):
+        raise ValueError("plan_rules is 2, 3, 4 or 5 when present, in a run that computes plan limits")
     if "eval_sampling" in value and eval_sampling(value["eval_sampling"]) != value["eval_sampling"]:
         raise ValueError("eval_sampling is not in its validated form")
     if "origin_engine" in value:
@@ -608,8 +636,9 @@ def validate_spec(value):
             raise ValueError("Duplicate case ID")
         seen.add(case["case_id"])
         validate_workload(case["workload"])
-        if hardware["kv_tokens"] < case["workload"]["prompt_tokens"] + case["workload"]["output_tokens"]:
-            raise ValueError("Case exceeds requested KV capacity")
+        if hardware["kv_tokens"] < kv_need(case["workload"]):
+            raise ValueError("Case exceeds requested KV capacity" + (
+                " (prompt plus output for each of its concurrent requests)" if case["workload"]["concurrency"] > 1 else ""))
     text(value["benchmark_protocol"], "protocol", 200)
     keys(value["correctness"], {"criteria", "required_gates"}, {"weights_policy", "quality_budget", "exactness",
                                                                   "quality_mode"})
@@ -966,7 +995,10 @@ def candidate_projection(root, run, candidate_id, overlay=None, *, candidate_roo
             if key == "extensions":
                 continue
             keys(metric, {"samples", "unit"})
-            if metric["unit"] != ALL_METRICS[key] or not isinstance(metric["samples"], list) or len(metric["samples"]) != case["workload"]["repetitions"]:
+            # One sample per repetition, or for a per-request metric one per request of each repetition.
+            counts = {case["workload"]["repetitions"]} | ({case["workload"]["repetitions"] * case["workload"]["concurrency"]}
+                                                          if key in PER_REQUEST_METRICS else set())
+            if metric["unit"] != ALL_METRICS[key] or not isinstance(metric["samples"], list) or len(metric["samples"]) not in counts:
                 raise ValueError("Metric units or repetition count differ from protocol")
             for sample in metric["samples"]:
                 number(sample, key, metric_minimum(key),

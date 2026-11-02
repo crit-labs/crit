@@ -44,7 +44,13 @@ Three checks catch most mismatches:
 - **Exactness across column counts.** When speculative output must equal plain greedy, a kernel
   used for one-token decode and multi-column verify must reduce in the same order for every
   column count. Split counts or tiling that depend on column count or context length change
-  greedy output; prefill-only kernels are judged by the quality budget.
+  greedy output; prefill-only kernels are judged by the quality budget. The same holds for the
+  whole decode step even when exactness is only reported: Eval's honesty check compares a served
+  reply's log-probabilities with the score call's replay of the same tokens, and a replay drafts
+  and verifies at other widths than the reply did. Library GEMMs choose their kernel by shape,
+  so a step whose width varies (plain steps, shorter verify passes near the end of a reply)
+  gives the same token other arithmetic. Running every decode step at one width, the unused
+  columns as padding, removes the dependence for every kernel in the step at once.
 
 Worth searching for before writing: prompt and decode attention, matmuls in the model's weight
 formats (FP8, FP4, integer groups), fused gated activations, RMSNorm and rotary embeddings, and

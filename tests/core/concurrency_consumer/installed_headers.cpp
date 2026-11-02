@@ -1,10 +1,17 @@
 // Independent installed-SDK consumer: includes every header the Core install ships and calls one symbol per
 // component, so a header missing from install(FILES ...), an installed header that includes one that is not
 // installed, or a strict warning inside an installed header fails this build. CMakeLists.txt checks that the
-// includes below name every installed crit/*.h header and that those are exactly the checkout's
+// includes below name every installed crit/*.h and crit/core/*.h header and that those are exactly the checkout's
 // core/include/crit headers (the cuda*.h headers are covered by the CUDA SDK consumer).
+#include <crit/batch.h>
 #include <crit/constraints.h>
 #include <crit/core.h>
+#include <crit/core/concurrent.h>
+#include <crit/core/engine.h>
+#include <crit/core/model.h>
+#include <crit/core/profile.h>
+#include <crit/core/request.h>
+#include <crit/core/resources.h>
 #include <crit/device_graph.h>
 #include <crit/device_memory.h>
 #include <crit/file.h>
@@ -17,6 +24,7 @@
 #include <crit/sampling.h>
 #include <crit/sha256.h>
 #include <crit/state.h>
+#include <crit/step_engine.h>
 #include <crit/text.h>
 #include <crit/trace.h>
 #include <array>
@@ -140,6 +148,18 @@ void check_state() {
     require(cache.committed(sequence) == 1 && cache.block_table(sequence).size() == 1, "state.h: commit");
 }
 
+// crit/batch.h
+void check_batch() {
+    const std::array<cc::StepItem, 2> items{{{{1, 1, 0}, cc::RowPhase::prefill, 3, 1}, {{2, 1, 1}, cc::RowPhase::decode, 1, 1}}};
+    cc::StepLayout layout;
+    layout.arrange(items);
+    require(layout.decode_rows() == 1 && layout.rows() == 4 && layout.logit_rows().size() == 2 && layout.logit_rows()[1] == 3,
+            "batch.h: decode rows first");
+    cc::PageReservations pages({4, 16, 64, 1});
+    const std::array<cc::Token, 20> prompt{};
+    require(pages.need({{1, 1, 0}, prompt, 12, nullptr}) == 2, "batch.h: page need");
+}
+
 // crit/json.h
 void check_json() {
     const auto document = cc::json::Document::parse(R"({"name":"crit","ids":[1,2]})", "inline");
@@ -226,6 +246,16 @@ void check_native_engine() {
             "native_engine.h: a failing factory");
 }
 
+// crit/step_engine.h
+void check_step_engine() {
+    cc::StepCallbacks callbacks;
+    try {
+        (void)cc::step_engine(R"({"engine":{"vocabulary":8,"context":16}})", callbacks);
+        throw std::runtime_error("step_engine.h: a step engine without callbacks must be refused");
+    } catch(const std::invalid_argument&) {
+    }
+}
+
 // crit/model_config.h
 void check_model_config(const std::filesystem::path& directory) {
     write_file(directory / "config.json", R"({"model_type":"llama","vocab_size":32,"hidden_size":64,)"
@@ -244,6 +274,7 @@ int main() {
         check_constraints();
         check_sampling();
         check_state();
+        check_batch();
         check_json();
         check_host_memory();
         check_host_block();
@@ -251,6 +282,7 @@ int main() {
         check_device_graph();
         check_device_memory();
         check_native_engine();
+        check_step_engine();
         const TemporaryDirectory directory;
         check_file(directory.path());
         check_safetensors(directory.path());

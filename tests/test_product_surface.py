@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "cli"))
 from crit import inference as store
 LAUNCHER = str(ROOT / "tests/run_crit.py")
-PRODUCT_FOLDERS = ("core", "inference", "kernels", "models", "eval", "api", "tests", "docs", "cli", ".github")
+PRODUCT_FOLDERS = ("core", "inference", "kernels", "models", "eval", "api", "mcp", "tests", "docs", "cli", ".github")
 
 
 class ProductTests(unittest.TestCase):
@@ -126,7 +126,7 @@ class ProductTests(unittest.TestCase):
 
     def test_whole_folders_include_unknown_extensions_and_exclude_local_roots(self):
         allowed = ["README.md", "CLAUDE.md", "inference/example/code/new.extension", "core/deep/data.json",
-                   "tests/fixture.raw", "docs/new.record", "cli/new.extension", "api/new.extension", "kernels/new.extension", "models/new.extension", ".github/workflows/ci.yml"]
+                   "tests/fixture.raw", "docs/new.record", "cli/new.extension", "api/new.extension", "mcp/new.extension", "kernels/new.extension", "models/new.extension", ".github/workflows/ci.yml"]
         ignored = ["scratch.txt", "tools/deep/source.anything", "private/source.py", "archive/history.json", "evidence/result.json", "build/output.cpp",
                    "dist/package.json", "runs/ledger.json", ".idea/workspace.xml", "research/source.cpp",
                    "temp/new-ui.py", "other-ui-proposal/source.py", "ui/radar.py"]
@@ -177,7 +177,7 @@ class ProductTests(unittest.TestCase):
 
     def test_native_build_source_and_test_paths_exist(self):
         cmake = (ROOT / "core/CMakeLists.txt").read_text(encoding="utf-8")
-        for path in ("src/runtime/runtime.cpp", "src/memory/resources.cpp", "src/backends/cuda/cuda.cpp",
+        for path in ("src/runtime/engine.cpp", "src/memory/resources.cpp", "src/backends/cuda/cuda.cpp",
                      "../tests/core/runtime_tests.cpp", "../tests/core/concurrency_tests.cpp", "../tests/core/cuda_tests.cpp"):
             self.assertIn(path, cmake)
             self.assertTrue((ROOT / "core" / path).is_file())
@@ -197,9 +197,10 @@ class ProductTests(unittest.TestCase):
     def test_cli_only_package_has_one_entrypoint_and_no_browser_sources(self):
         package = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertEqual(package["project"]["scripts"], {"crit": "crit.cli:main"})
-        self.assertEqual(package["tool"]["setuptools"]["packages"]["find"]["where"], ["cli", "api", "kernels", "models"])
+        self.assertEqual(package["tool"]["setuptools"]["packages"]["find"]["where"], ["cli", "api", "kernels", "models", "mcp"])
         self.assertEqual({p.name for p in (ROOT / "cli").iterdir() if p.is_dir()}, {"crit"})
         self.assertEqual({p.name for p in (ROOT / "api").iterdir() if p.is_dir()}, {"crit_api"})
+        self.assertEqual({p.name for p in (ROOT / "mcp").iterdir() if p.is_dir()}, {"crit_mcp"})
         self.assertEqual({p.name for p in (ROOT / "kernels").iterdir() if p.is_dir()}, {"crit_kernels", "examples"})
         self.assertEqual({p.name for p in (ROOT / "models").iterdir() if p.is_dir()}, {"crit_models"})
         assets = [p for folder in PRODUCT_FOLDERS for p in (ROOT / folder).rglob("*")

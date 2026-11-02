@@ -9,7 +9,8 @@ tensors under `base.` and the model's quantization config (quantization_config, 
                   block_structure), or base.weight_scale_inv per block (weight_block_size: DeepSeek and Qwen FP8)
     nvfp4         E2M1 pairs (low nibble first) with E4M3 group-16 scales and an FP32 global factor:
                   compressed-tensors (U8 base.weight_packed, base.weight_global_scale as a divisor) or ModelOpt
-                  (U8 base.weight, base.weight_scale_2 as a multiplier)
+                  (U8 base.weight, base.weight_scale_2 as a multiplier); ModelOpt's scales may be CSF-compressed
+                  (base.weight_scale.nvfp4_csf_fixed and .nvfp4_csf_exceptions, csf_scale_shape)
     int           compressed-tensors pack-quantized (I32 base.weight_packed) and int-quantized (I8 base.weight with
                   base.weight_scale)
     awq           AutoAWQ GEMM (base.qweight, base.qzeros, base.scales)
@@ -117,11 +118,27 @@ def _fp8_stored(tensors, base, quantization):
     return "fp8", math.prod(_shape(tensors, base + ".weight"))
 
 
+CSF_FIXED, CSF_EXCEPTIONS = ".weight_scale.nvfp4_csf_fixed", ".weight_scale.nvfp4_csf_exceptions"
+
+
+def csf_scale_shape(fixed_shape):
+    """The [rows, groups] E4M3 scale matrix that ModelOpt's CSF encoding (weight_scale_encoding "csf") compresses
+    into U8 base.weight_scale.nvfp4_csf_fixed of shape [rows / 16, 16 * (1 + groups / 2)]: per slab of 16 rows, one
+    base byte per row, then each row's 4-bit codes (low nibble first), scale = base + code; U32
+    base.weight_scale.nvfp4_csf_exceptions words (position row * groups + col in the low 24 bits, the scale byte in
+    the high 8) replace the scales outside a row's window."""
+    slabs, width = fixed_shape[-2:]
+    return tuple(fixed_shape[:-2]) + (slabs * 16, (width // 16 - 1) * 2)
+
+
 def _nvfp4_stored(tensors, base, quantization):
     for packed in (".weight_packed", ".weight"):
         shape, scale = _shape(tensors, base + packed), _shape(tensors, base + ".weight_scale")
-        if (_dtype(tensors, base + packed) == "U8" and _dtype(tensors, base + ".weight_scale") == "F8_E4M3"
-                and scale[-1] * 16 == shape[-1] * 2):
+        if scale is None and _dtype(tensors, base + CSF_FIXED) == "U8":
+            scale = csf_scale_shape(_shape(tensors, base + CSF_FIXED))
+        elif _dtype(tensors, base + ".weight_scale") != "F8_E4M3":
+            continue
+        if _dtype(tensors, base + packed) == "U8" and scale[-1] * 16 == shape[-1] * 2:
             return "nvfp4", math.prod(shape) * 2
     return None
 
@@ -258,7 +275,8 @@ class StoredMatrix:
     multiplier otherwise (ModelOpt weight_scale_2): weight = code * scale / global, or code * scale * global.
     `input_scale` names the static activation scale the checkpoint declares for its own inference, with
     `input_divides` alike (compressed-tensors input_global_scale divides, ModelOpt and FP8 input_scale multiply);
-    None for dynamic or unquantized activations. `layout` is "compressed-tensors", "modelopt" or None."""
+    None for dynamic or unquantized activations. `layout` is "compressed-tensors", "modelopt" or None.
+    `scale_encoding` "csf": `scales` names ModelOpt's CSF-compressed scales (csf_scale_shape), decoded to E4M3 first."""
     base: str
     scheme: str
     layout: str | None
@@ -271,6 +289,26 @@ class StoredMatrix:
     global_divides: bool = False
     input_scale: str | None = None
     input_divides: bool = False
+    scale_encoding: str | None = None
+
+
+def fp8_block(quantization, base, shape, scale_shape):
+    """The (rows, columns) block of FP8 block scales of shape `scale_shape` over a matrix of `shape`, or None when
+    they fit no block: the config's weight_block_size or compressed-tensors' block_structure, else 128 x 128 where
+    the scales have that grid, else the block that divides the matrix exactly into the scales' grid (modelopt's MXFP8
+    keeps one E8M0 scale per 32 inputs of each row, [rows, columns / 32], its group_size per layer)."""
+    rows, cols = shape[-2:]
+    grid = tuple(scale_shape[-2:])
+    quantization = quantization or {}
+    configured = quantization.get("weight_block_size") or ct_weight_args(quantization, base).get("block_structure")
+    if configured:
+        block = tuple(int(n) for n in configured)
+        return block if len(block) == 2 and grid == (-(-rows // block[0]), -(-cols // block[1])) else None
+    if grid == (-(-rows // 128), -(-cols // 128)):
+        return (128, 128)
+    if len(grid) == 2 and all(grid) and rows % grid[0] == 0 and cols % grid[1] == 0:
+        return (rows // grid[0], cols // grid[1])
+    return None
 
 
 # Schemes matrix_parts describes; the others are decoded (crit-eval) or converted by the engine instead.
@@ -306,9 +344,11 @@ def matrix_parts(tensors, base, quantization=None):
             raise SchemeError(f"{base}{global_scale}: expected one global scale, found shape "
                               f"{list(_shape(tensors, base + global_scale))}")
         shape = _shape(tensors, base + packed)
-        return StoredMatrix(base, name, layout, shape[:-1] + (shape[-1] * 2,), base + packed, base + ".weight_scale",
-                            "group16", None, base + global_scale, divides,
-                            base + input_scale if has(input_scale) else None, input_divides)
+        csf = not has(".weight_scale") and has(CSF_FIXED)
+        return StoredMatrix(base, name, layout, shape[:-1] + (shape[-1] * 2,), base + packed,
+                            base + (CSF_FIXED if csf else ".weight_scale"), "group16", None, base + global_scale,
+                            divides, base + input_scale if has(input_scale) else None, input_divides,
+                            "csf" if csf else None)
     # fp8: per tensor, per row or per block, a multiplier whatever its name (weight_scale_inv included)
     shape = _shape(tensors, base + ".weight")
     scale = ".weight_scale_inv" if has(".weight_scale_inv") else ".weight_scale"
@@ -321,12 +361,10 @@ def matrix_parts(tensors, base, quantization=None):
         granularity = "row"
     else:
         granularity = "block"
-        block = tuple(int(n) for n in (quantization.get("weight_block_size")
-                                       or ct_weight_args(quantization, base).get("block_structure") or (128, 128)))
-        if len(shape) < 2 or len(block) != 2 or scale_shape[-2:] != (-(-shape[-2] // block[0]),
-                                                                      -(-shape[-1] // block[1])):
+        block = fp8_block(quantization, base, shape, scale_shape) if len(shape) >= 2 else None
+        if block is None:
             raise SchemeError(f"{base}{scale}: shape {list(scale_shape)} is neither one scale, one per row nor one "
-                              f"per {list(block)} block of {list(shape)}")
+                              f"per block of {list(shape)}")
     layout = "compressed-tensors" if compressed else ("modelopt" if quant_method(quantization) == "modelopt" else None)
     return StoredMatrix(base, name, layout, shape, base + ".weight", base + scale, granularity, block,
                         input_scale=base + ".input_scale" if has(".input_scale") else None)

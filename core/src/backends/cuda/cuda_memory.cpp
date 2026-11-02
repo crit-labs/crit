@@ -1,4 +1,5 @@
 #include "crit/cuda_memory.h"
+#include "device_scope.h"
 #include <atomic>
 #include <stdexcept>
 #include <string>
@@ -16,7 +17,7 @@ public:
     CudaLeases(std::shared_ptr<CudaBackend> backend, Memory memory):backend_(std::move(backend)), memory_(memory) {}
     void* allocate(std::size_t bytes) override {
         if(!bytes) return nullptr;
-        backend_->bind_thread();
+        const detail::DeviceScope scope(backend_->device());
         void* pointer = nullptr;
         check(memory_ == Memory::device ? cudaMalloc(&pointer, bytes) : cudaMallocHost(&pointer, bytes), "CUDA lease allocation");
         return pointer;
@@ -24,7 +25,7 @@ public:
     void settle() override { backend_->drain(); }
     void release(void* physical, std::size_t) override {
         if(!physical) return;
-        backend_->bind_thread();
+        const detail::DeviceScope scope(backend_->device());
         check(memory_ == Memory::device ? cudaFree(physical) : cudaFreeHost(physical), "CUDA lease release");
     }
 private:
@@ -39,7 +40,7 @@ struct Registration {
 void unregister(Registration* registration) noexcept {
     try {
         registration->backend->drain();
-        registration->backend->bind_thread();
+        const detail::DeviceScope scope(registration->backend->device());
         if(cudaHostUnregister(registration->host) == cudaSuccess) { delete registration; return; }
     } catch(...) { /* unproven settlement: retain below */ }
     // Intrusive retention allocates nothing and keeps the registration and backend.
@@ -58,7 +59,7 @@ std::shared_ptr<LeaseBackend> cuda_lease_backend(std::shared_ptr<CudaBackend> ba
 MappedSpan cuda_map_host(std::shared_ptr<CudaBackend> backend, void* host, std::size_t bytes) {
     if(!backend || !host || !bytes) throw std::invalid_argument("CUDA host mapping requires a backend and host bytes");
     auto registration = std::make_unique<Registration>(Registration{backend, host});
-    backend->bind_thread();
+    const detail::DeviceScope scope(backend->device());
     check(cudaHostRegister(host, bytes, cudaHostRegisterMapped), "cudaHostRegister");
     // From here the owner unregisters, including when the alias query below fails.
     const std::shared_ptr<Registration> owner(registration.release(), unregister);

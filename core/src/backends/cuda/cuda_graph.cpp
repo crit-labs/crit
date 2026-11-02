@@ -1,4 +1,5 @@
 #include "crit/cuda_graph.h"
+#include "device_scope.h"
 #include <atomic>
 #include <stdexcept>
 #include <string>
@@ -36,7 +37,7 @@ struct CudaStagedGraph::Impl {
          retained(std::move(owners)), captures(phases.size()) {}
 
     void initialize() {
-        backend->bind_thread();
+        const detail::DeviceScope scope(backend->device());
         buffers.input_layout = plan.staged_input();
         buffers.output_layout = plan.staged_output();
         buffers.active_rows = plan.input().rows;
@@ -57,7 +58,7 @@ struct CudaStagedGraph::Impl {
         });
     }
     void destroy_captures() {
-        backend->bind_thread();
+        const detail::DeviceScope scope(backend->device());
         backend->drain();
         for(auto& capture : captures) {
             if(capture.executable) {
@@ -114,9 +115,10 @@ void CudaStagedGraph::replay(const MatrixView& input, const MatrixView& output,
     p.dependencies.assign(prerequisites.begin(), prerequisites.end());
     p.completion = std::make_unique<CudaEvent>(p.backend->event());
     const auto stream = p.backend->stream();
+    // Phase launches and the engine's bridges run with the graph's device current.
+    const detail::DeviceScope scope(p.backend->device());
     p.state.replay(p.captures.size(),
         [&] {
-            p.backend->bind_thread();
             for(const auto& event : p.dependencies) event->order(stream);
             p.backend->fill_async(p.buffers.input, 0);
             p.backend->fill_async(p.buffers.output, 0);

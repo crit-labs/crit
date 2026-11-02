@@ -13,7 +13,8 @@ with Core's stop rules. It ships as the `crit-core` distribution (`pip install c
 | [jsonfile.py](crit_core/jsonfile.py) | `loads`, `read`, `JsonError`: strict JSON | [crit/json.h](../include/crit/json.h) |
 | [model](crit_core/model/README.md) | `load_model_config`, `ModelConfig`, crit eval's config rules, `inspect_safetensors`, `inspect_model`, `TensorReader` (tensor bytes), `matrix_parts` and `layer_prefix` (stored weight matrices) | [crit/model_config.h](../include/crit/model_config.h), [crit/safetensors.h](../include/crit/safetensors.h) |
 | [text](crit_core/text/README.md) | `Tokenizer`, chat templates, `GenerationConfig`, `IncrementalDetokenizer`, `StopMatcher`, `TextStream`, `load_model_text` | [crit/text.h](../include/crit/text.h) |
-| [native.py](crit_core/native.py) | `NativeEngine` (ctypes over an [engine library](../src/runtime/README.md#engine-libraries)), the stock adapters `eval_engine` (eval-v1) and `resident_engine` (chat-resident-v1) over a library or a Python engine with its interface (`PythonEngine`) | [crit/native_engine.h](../include/crit/native_engine.h) |
+| [native.py](crit_core/native.py) | `NativeEngine` (ctypes over an [engine library](../src/runtime/README.md#engine-libraries)), the stock adapters `eval_engine` (eval-v1) and `resident_engine` (chat-resident-v1) over a library or a Python engine with its interface (`PythonEngine`), and `StepEngine`, a Python step model on Core's concurrent runtime ([step engines](../src/runtime/README.md#step-engines)) | [crit/native_engine.h](../include/crit/native_engine.h), [crit/step_engine.h](../include/crit/step_engine.h) |
+| [batch.py](crit_core/batch.py) | `StepLayout`, `step_item`, `row_pages`, `PageReservations`: a batched step's rows for Python engines | [crit/batch.h](../include/crit/batch.h) |
 | [constraints](crit_core/constraints) | `compile_language`, `CompilerCache`, `PreparationService`, `byte_vocabulary`, `matches`, `json_object_matches` ([guide](../src/constraints/README.md)) | [crit/constraints.h](../include/crit/constraints.h) |
 
 Everything but `crit_core.text` uses the standard library only. The text layer
@@ -54,4 +55,8 @@ suite in `tests/`. The text tests build tiny tokenizers in-process
 and `jinja2`; the model tests compare the config rules with crit-eval-v2's own
 ([eval_v2_rules.py](../../tests/eval_v2_rules.py)). `crit_core.native` is tested
 by Core's CTest against a toy engine library
-([native_engine_check.py](../../tests/core/native_engine_check.py)).
+([native_engine_check.py](../../tests/core/native_engine_check.py)) and, for
+`StepEngine`, a toy Python step model on `crit_core_steps`
+([step_engine_check.py](../../tests/core/step_engine_check.py));
+[test_core_batch.py](../../tests/test_core_batch.py) checks `crit_core.batch`
+against the C++ library's cases.

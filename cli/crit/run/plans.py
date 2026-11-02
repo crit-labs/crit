@@ -32,7 +32,7 @@ EVAL_JSON_BYTES = 256 * 1024 * 1024
 
 
 def rules(run):
-    """The version of the plan rules a run was created with: 2 to 4 from `"plan_rules"` in its spec, else 1."""
+    """The version of the plan rules a run was created with: 2 to 5 from `"plan_rules"` in its spec, else 1."""
     return run["spec"].get("plan_rules", 1)
 
 
@@ -95,6 +95,33 @@ def extract(status):
                            "fraction": fraction if type(fraction) in (int, float) and fraction > 0 else None}
                      for kpi, (score, limit, fraction) in rows.items()},
             "noise": {kpi: noise[kpi] for kpi in rows}, "untiered": untiered, "gaps": gaps}
+
+
+UNITS = {"decode": "tok/s", "prefill": "tok/s", "ttft": "ms", "context_decode": "tok/s", "context_ttft": "ms"}
+
+
+def standing(status, kpis=HEADLINE):
+    """Lines saying how far each of `kpis` stands from its limit in an Eval result's status, and its largest gaps: the
+    fraction a plan's priorities rank by, stated so a low one cannot be missed ("decode 46.6 tok/s is 11% of its limit
+    419.5 tok/s; pass at 16% of its floor; largest gaps: ..."). A KPI Eval gives no limit is left out."""
+    facts = extract(status)
+    decode = (status or {}).get("kpis", {}).get("decode_sampled") or (status or {}).get("kpis", {}).get("decode_greedy")         or (status or {}).get("kpis", {}).get("decode") or {}
+    lines = []
+    for kpi in kpis:
+        row = facts["kpis"].get(kpi) or {}
+        if not row.get("score") or not row.get("limit") or not row.get("fraction"):
+            continue
+        unit = UNITS[kpi]
+        line = (f"{kpi} {row['score']:,.1f} {unit} is {row['fraction']:.0%} of its "
+                f"{'floor' if unit == 'ms' else 'limit'} {row['limit']:,.1f} {unit}")
+        if kpi == "decode" and _positive(decode.get("pass_efficiency")):
+            line += f"; pass at {decode['pass_efficiency']:.0%} of its floor"
+        gaps = sorted((gap for gap in facts["gaps"] if gap["kpi"] == kpi and _positive(gap.get("projected_gain"))),
+                      key=lambda gap: -gap["projected_gain"])[:2]
+        if gaps:
+            line += "; largest gaps: " + ", ".join(f"{gap['name']} +{gap['projected_gain']:.0%}" for gap in gaps)
+        lines.append(line)
+    return lines
 
 
 # The KPIs whose limit crit computes when Eval states none, and an alternative strategy's ceiling may raise.
@@ -400,6 +427,9 @@ DEFAULT_NOISE = 0.05
 # gaps entry on it carries the evidence, an Eval gap answers rejected, and (prefill) every faster prompt activation
 # format Eval reports is rejected by a quality measurement outside the quality noise.
 MEASURED_ONLY = 0.5
+# Plan rules 5: a build plan whose forecast's best case leaves a needed family below this fraction of its limit says,
+# with a measurement in the run, what keeps the rest out of reach.
+REACH = 0.5
 # Plan rules 3: a gaps entry naming a prompt activation format Eval prices (crit-eval's ceilings by activation format).
 ACTIVATION_GAP = "activation:"
 
@@ -1110,6 +1140,9 @@ def build(root, run, bounds, data, status_for=None):
         if inputs["forecast_checks"] and "forecast_justification" not in data:
             raise ValueError("The forecast " + "; ".join(inputs["forecast_checks"]) + ": give forecast_justification "
                              "(why this candidate is worth building anyway), which crit records, or plan for p1")
+    # Check 15 (rules 5): the strategy's ceiling is the limit, not the engine's own measurement.
+    if version >= 5 and decision == "build" and forecast is not None and facts is not None:
+        inputs["reach"] = _reach(root, data, facts, computed, forecast, needed)
     # Check 13 (rules 4): the objective's requirements.
     if version >= 4 and decision == "build":
         # Every speed lever names what supplies its code; the engine's own code is measured against what exists.
@@ -1194,6 +1227,40 @@ def build(root, run, bounds, data, status_for=None):
             raise ValueError(f"{old['plan_id']} is already superseded by {summary['superseded_by']}")
     return {**data, "supersedes": data.get("supersedes"), "segment_id": bounds["segment_id"], "created_at": now(),
             "request_sha256": run["request_sha256"], "inputs": inputs, "priorities": order, "priorities_reason": reason}
+
+
+def _reach(root, data, facts, computed, forecast, needed):
+    """Plan rules 5, check 15: how far the forecast's best case reaches toward each needed family's limit (Eval's, else
+    the one crit computed), recorded beside the strategy as {limit, fraction, forecast_high, reach} with the limit's
+    source. Below REACH the plan answers why the rest is out of reach: a gaps entry `limit` (answer cause) with the
+    evidence, a file in the run that measured the bound; an engine's own speed alone is no bound."""
+    found = {}
+    causes = {row["kpi"]: row for row in data["gaps"] if row["gap"] == LIMIT_GAP}
+    for name, flag in needed.items():
+        row = facts["kpis"].get(name) or {}
+        limit, source = row.get("limit"), "eval"
+        if not limit and _positive(((computed or {}).get(name) or {}).get("limit")):
+            limit, source = computed[name]["limit"], "computed"
+        if not flag or not limit or name not in forecast:
+            continue
+        high = forecast[name]["high"]
+        found[name] = {"limit": limit, "source": source, "fraction": row.get("fraction"), "forecast_high": high,
+                       "reach": high / limit}
+        if high / limit >= REACH:
+            continue
+        cause = causes.get(name)
+        label = (f"The forecast's best case for {name} ({high:g}) is {high / limit:.0%} of its limit {limit:g}"
+                 + (f" (the parent's Eval measured {row['fraction']:.0%})" if row.get("fraction") else ""))
+        if cause is None or "evidence" not in cause:
+            raise ValueError(f"{label}, below {REACH:.0%}: the strategy's ceiling is that limit, not the engine's own "
+                             "measurement. Plan the levers that close more of it, or add a gaps entry {\"kpi\": "
+                             f"\"{name}\", \"gap\": \"{LIMIT_GAP}\", \"answer\": \"cause\", \"detail\": ..., "
+                             "\"evidence\": ...} naming the measured physical bound that keeps the rest out of reach (an "
+                             "engine reading weights from host memory: the floor Eval prices from its memory tiers at "
+                             "its expert cache hit rate, or from its declared host_bytes_per_pass), the evidence a file "
+                             "in the run")
+        found[name]["evidence"] = _evidence_file(root, cause["evidence"], label)
+    return found
 
 
 def _forecast_checks(order, forecast, facts):

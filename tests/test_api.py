@@ -245,6 +245,13 @@ class ApiTests(ServeFixture, unittest.TestCase):
                                     "messages": [{"role": "user", "content": content}], **options})
         return response, json.loads(data) if data and not options.get("stream") else data
 
+    def test_a_port_another_server_holds_is_refused(self):
+        # On Windows SO_REUSEADDR let a second server bind beside the first, so requests could reach either engine.
+        with self.assertRaises(OSError):
+            Server(self.server.server_address[:2], Api(self.served)).server_close()
+        response, _ = self.call("GET", "/v1/models")
+        self.assertEqual(response.status, 200)
+
     def test_models_list_every_sealed_resident_candidate_with_the_default_first_named(self):
         response, data = self.call("GET", "/v1/models")
         self.assertEqual(response.status, 200)

@@ -1,11 +1,13 @@
-"""Named sealed engines from several runs, sharing one resident runtime."""
+"""Named sealed engines from several runs, and engines crit pull installed, sharing one resident runtime."""
 from fnmatch import fnmatchcase
 from pathlib import Path
 import re
 
+from crit.pull.store import InstallStore, engine_id
 from crit.run.records import keys, read_json, text
 from crit.run.store import ROOT, RunStore
 from .engine import EngineError, ServedEngine
+from .installed import installed_spec
 
 # Names clients send: Ollama tags (name:tag), gateway paths (vendor/name), Vertex versions (name@date); * is a wildcard.
 ALIAS = r"[A-Za-z0-9*][A-Za-z0-9._:/@*-]{0,127}"
@@ -20,7 +22,10 @@ class ModelCatalog(ServedEngine):
             raise ValueError("Model catalog requires a nonempty models list")
         self.bindings, self.aliases, self.display_names = {}, {}, {}
         for row in value["models"]:
-            keys(row, {"name", "workspace", "run"}, {"candidate", "aliases", "display_name"})
+            if isinstance(row, dict) and "engine" in row:
+                keys(row, {"name", "engine"}, {"store", "aliases", "display_name"})
+            else:
+                keys(row, {"name", "workspace", "run"}, {"candidate", "aliases", "display_name"})
             name = row["name"]
             if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", name):
                 raise ValueError("Model names must be 1–128 letters, digits, dots, underscores or hyphens")
@@ -36,6 +41,14 @@ class ModelCatalog(ServedEngine):
                 self.aliases[alias] = name
             if "display_name" in row:
                 self.display_names[name] = text(row["display_name"], "Model display_name", 160)
+            if "engine" in row:
+                # An installed engine (crit pull): from the row's store, relative to the catalog, else PROJECT/engines.
+                if "store" in row and (not isinstance(row["store"], str) or not row["store"]):
+                    raise ValueError("Model store must be a path")
+                installs = InstallStore(path.parent / row["store"] if "store" in row else Path(project) / "engines")
+                installs.get(engine_id(row["engine"]))  # an engine that is not installed fails before the runtime starts
+                self.bindings[name] = (installs, None, row["engine"])
+                continue
             if not isinstance(row["workspace"], str) or not row["workspace"]:
                 raise ValueError("Model workspace must be a path")
             store = RunStore(path.parent / row["workspace"], project)
@@ -54,12 +67,17 @@ class ModelCatalog(ServedEngine):
             raise ValueError("Catalog fallback must name a configured model")
         self.fallback = value.get("fallback")
         store, run_id, _ = self.bindings[default]
-        super().__init__(store.root, run_id, default, project=project, **options)
+        if run_id is None:
+            super().__init__(None, "installed", default, project=project, **options)
+        else:
+            super().__init__(store.root, run_id, default, project=project, **options)
 
     def _verify(self, selector):
         if selector not in self.bindings:
             raise EngineError("Unknown model: " + str(selector), 404)
         store, run_id, candidate = self.bindings[selector]
+        if run_id is None:
+            return installed_spec(store, candidate, self.verify_model) | {"selector": selector}
         return super()._verify(candidate, store=store, run_id=run_id) | {"selector": selector}
 
     def candidates(self, refresh=False):

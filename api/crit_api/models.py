@@ -283,6 +283,7 @@ class ModelContext:
     """One engine's leases and arguments; mutable inference state stays in it."""
     def __init__(self, pool, configuration, arguments, progress=None):
         self.pool, self.configuration, self.arguments = pool, configuration, arguments
+        self.drafters = ()  # an installed engine's drafter downloads (crit pull), as folders
         self.leases, self.views = [], []
         self.progress = progress
 

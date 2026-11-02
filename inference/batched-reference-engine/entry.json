@@ -1,9 +1,9 @@
 {
   "id": "batched-reference-engine",
   "category": "execution",
-  "summary": "A complete batched serving engine for a synthetic transformer: a Core ConcurrentModel with mixed batches whose steps run every request's rows through one GEMM per weight, StateCache pages with prefix reuse, its own paged attention kernels, batch-invariant arithmetic and a native engine library served concurrently by crit serve",
+  "summary": "A complete batched serving engine for a synthetic transformer: a Core ConcurrentModel with mixed batches whose steps (Core's StepLayout) run every request's rows through one GEMM per weight, StateCache pages with prefix reuse, its own paged attention kernels with an FP64 host reference, page-reserving admission, batch-invariant arithmetic and a native engine library served concurrently by crit serve",
   "implementation_status": "native_source",
-  "implementation_scope": "CUDA and C++ source: synthetic decoder layers (RMSNorm, fused QKV with split-half rotary embedding, grouped-query paged attention, SiLU MLP, LM head) with seeded weights; a BF16 tensor-core GEMM with a K split fixed per weight shape and device and an ordered split reduction; row-local norm, rotary, SiLU and argmax kernels; a ConcurrentModel with execute() over mixed decode and prompt rows, StateCache prefix attach and reuse reporting, page-reserving admission, reuse hints, host sampling through Core's Sampler and device greedy argmax; make_engine() for a Core Engine; a native engine library with concurrent_requests; a throughput-versus-concurrency tool; a host model of the step layout, split plan and admission. A real model's weights, tokenizer, layer arithmetic and faster kernels are engine supplied.",
+  "implementation_scope": "CUDA and C++ source: synthetic decoder layers (RMSNorm, fused QKV with split-half rotary embedding, grouped-query paged attention, SiLU MLP, LM head) with seeded weights; a BF16 tensor-core GEMM with a K split fixed per weight shape and device (plan_gemm) and an ordered split reduction; row-local norm, rotary, SiLU and argmax kernels; a ConcurrentModel with execute() over mixed decode and prompt rows laid out by Core's StepLayout, its own paged attention (KV write, varlen prefill and decode/verify kernels over BF16 or E4M3 pages, device pages and batch tables) with a host half (page codecs, packed tables, host pages and an FP64 reference), StateCache prefix attach and reuse reporting, Core's page-reserving admission, reuse hints, host sampling through Core's Sampler and device greedy argmax; make_engine() for a Core Engine; a native engine library with concurrent_requests; a throughput-versus-concurrency tool; a host model of the step layout, split plan and admission. A real model's weights, tokenizer, layer arithmetic and faster kernels are engine supplied.",
   "agent_guidance": {
     "use_when": "An engine needs to serve several requests at once with shared steps, needs a working skeleton that combines Core's concurrent scheduler, the StateCache and paged attention, or a scheduler or kernel change must be measured under concurrency without a checkpoint",
     "avoid_when": "The engine serves one request at a time, the model is not a dense softmax-attention decoder, or a production model's quality matters (the weights are random)",
@@ -40,12 +40,14 @@
   "code_files": [
     {"path": "inference/batched-reference-engine/code/synthetic_model.h", "purpose": "Model shape and the GEMM, norm, rotary, SiLU, conversion and argmax interfaces"},
     {"path": "inference/batched-reference-engine/code/synthetic_model.cu", "purpose": "Batch-invariant kernels: seeded weights, split-K tensor-core GEMM with ordered reduction, row-local kernels"},
+    {"path": "inference/batched-reference-engine/code/paged_reference.h", "purpose": "Paged attention's host half: page format, BF16/E4M3 codecs, packed batch tables, HostPages and the FP64 reference attend()"},
+    {"path": "inference/batched-reference-engine/code/paged_reference.cpp", "purpose": "The host half's codecs, tables, host pages and FP64 reference"},
+    {"path": "inference/batched-reference-engine/code/paged_attention.h", "purpose": "The CUDA paged attention interface: write, prefill and decode/verify launches, DevicePages and BatchTables"},
+    {"path": "inference/batched-reference-engine/code/paged_attention.cu", "purpose": "Paged attention kernels: KV write, varlen causal prefill, decode and multi-column verify with windows, sinks, soft-cap and tree masks"},
+    {"path": "inference/batched-reference-engine/code/device_pages.cpp", "purpose": "Device KV pages behind the StateCache and the per-step device batch tables"},
     {"path": "inference/batched-reference-engine/code/engine.h", "purpose": "The ConcurrentModel: mixed steps, StateCache with prefix reuse, paged attention, admission, sampling; make_engine()"},
     {"path": "inference/batched-reference-engine/code/engine_library.cpp", "purpose": "Native engine library with concurrent requests, configured from JSON"},
     {"path": "inference/batched-reference-engine/code/throughput.cpp", "purpose": "Throughput against concurrency: completion tokens over each wave's wall time"},
-    {"path": "inference/batched-reference-engine/code/paged_attention.h", "purpose": "The synthetic engine's paged attention: page tables, write, prompt and decode interfaces"},
-    {"path": "inference/batched-reference-engine/code/paged_attention.cu", "purpose": "Paged KV write, prompt and decode attention kernels for the synthetic engine"},
-    {"path": "inference/batched-reference-engine/code/device_pages.h", "purpose": "Device page pool and batch tables the engine's attention reads"},
     {"path": "inference/batched-reference-engine/code/reference.py", "purpose": "Host model of the step layout, the GEMM split plan and admission"}
   ],
   "requires": {
@@ -58,7 +60,7 @@
     "output": "Generated tokens with Core's request timing (reused_prompt_tokens included); per-step logits rows on the device",
     "ownership": "Core's worker thread makes every model call; the model owns weights, pages, scratch and the StateCache; each step ends with the compute stream synchronized",
     "failure": "Invalid shapes and configurations throw at construction; requests longer than the context or larger than the page pool are infeasible; CUDA errors throw and fail the engine through Core",
-    "core_boundary": "No Core change: ConcurrentModel, StateCache, Sampler, CudaBackend and the native engine ABI as published"
+    "core_boundary": "Core's ConcurrentModel, batched steps (StepLayout, step_item, PageReservations), StateCache, Sampler, CudaBackend and the native engine ABI; paged attention is the engine's own"
   },
   "dependencies": [
     "crit::core and crit::cuda (Core's CUDA backend)",
@@ -67,7 +69,7 @@
   ],
   "symbols": [
     "Shape", "GemmPlan", "plan_gemm", "gemm", "embed", "rmsnorm", "qkv_rope", "silu_mul", "to_bf16", "argmax", "Config", "Stats", "Model",
-    "make_engine", "arrange", "split_dot", "pages_needed"
+    "make_engine", "arrange", "split_dot", "pages_needed", "Format", "Tables", "HostPages", "attend", "DevicePages", "BatchTables"
   ],
   "interactions": [
     "concurrent-request-execution",
@@ -81,7 +83,7 @@
   ],
   "validation": {
     "host": "The README example: the K split plan depends only on shape and device, a split dot product equals the plain one, a mixed step's row layout and logits rows, admission's page need",
-    "native": "GEMM against an FP64 host product (split and unsplit, stored and accumulated) and bitwise across row counts; norm, rotary, SiLU and argmax against host references (argmax equal to Core's greedy Sampler with ties); nine requests batched with other prompt chunking equal their serial runs token for token with BF16 and E4M3 pages, greedy and seeded sampling, with mixed steps of up to 9 requests and 48 reused prompt tokens reported for a repeated prompt; concurrent HTTP replies through crit serve equal solo replies",
+    "native": "GEMM against an FP64 host product (split and unsplit, stored and accumulated) and bitwise across row counts; norm, rotary, SiLU and argmax against host references (argmax equal to Core's greedy Sampler with ties); nine requests batched with other prompt chunking equal their serial runs token for token with BF16 and E4M3 pages, greedy and seeded sampling, with mixed steps of up to 9 requests and 48 reused prompt tokens reported for a repeated prompt; concurrent HTTP replies through crit serve equal solo replies; on the host, the page codecs on every code, the packed tables and the FP64 reference against a dense oracle over StateCache pages with forks and reused prefixes (crit_paged_reference_*); the kernels against that reference (crit_cuda_paged_*) and against attention-state's CPU reference (crit_paged_attention_*)",
     "performance": "RTX 5090, synthetic model of 0.98 GB BF16 weights (hidden 2,048, 8 layers, 16/4 heads of 128, FFN 5,632, vocabulary 32,000), 128-token prompts and outputs: 535 completion tokens/s for one request, 2,347 for 4, 8,351 for 16, 16,627 for 32 and 28,958 for 64 concurrent requests, with 540 to 590 tokens/s per request; no claim for other devices or models"
   }
 }

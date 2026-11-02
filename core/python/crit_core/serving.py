@@ -47,7 +47,7 @@ grammars=True), which adds chat-tool-choice-v1 where ResidentChat can write the 
 tool_choice "required" or a named function then reaches generate_tokens as grammar=artifact, the
 grammar of a reply that makes the forced calls (crit_core.text.tools.call_grammar). An engine keeps the facts Eval's
 headroom reads in `facts` (engine_facts), and generate_tokens' timing may add accepted (drafts accepted per round),
-verify_ms and draft_ms for crit serve's telemetry. Every ResidentChat fits a request's output to the context
+verify_ms and draft_ms, and expert_reads and expert_hits (its device expert cache's) for crit serve's telemetry. Every ResidentChat fits a request's output to the context
 (chat-fit-output-v1): with limits.fit_output it decodes at most the room the prompt leaves and names that cap in the
 response as max_output_tokens. A request carrying "continue_final_message" (chat-continue-v1, which capabilities()
 declares) ends with an assistant message: ResidentChat renders it left open with the chat template, and the reply is
@@ -58,7 +58,11 @@ PreparedPrompt(ids), without the chat template or prepare_prompt. Every Resident
 conversation to the ids a reply prefills (its template_kwargs and continue_final_message included) and detokenizes
 ids (chat-tokenize-v1, which capabilities() declares): crit serve's /tokenize, /detokenize, /apply-template and
 /v1/messages/count_tokens call tokenize(), render() and detokenize() on their own thread, beside generation, so they
-read only the tokenizer and the chat template.
+read only the tokenizer and the chat template. A ResidentChat whose replies reason (a reasoning format, from
+reasoning_format or the chat templates) ends the reasoning at a budget (chat-thinking-budget-v1, which capabilities()
+declares where the templates teach a format): with limits.thinking_tokens a generation stops where the reasoning
+would pass it, the reply gets the format's closing marker and generate_prepared continues from the prompt plus the
+reply so far, within the same output cap.
 """
 from pathlib import Path
 from contextlib import contextmanager
@@ -77,11 +81,14 @@ FIT_OUTPUT_CAPABILITY = "chat-fit-output-v1"
 CONTINUE_CAPABILITY = "chat-continue-v1"
 COMPLETION_CAPABILITY = "completion-v1"
 TOKENIZE_CAPABILITY = "chat-tokenize-v1"
+# A request with limits.thinking_tokens ends the reply's reasoning there with the format's closing marker.
+THINKING_BUDGET_CAPABILITY = "chat-thinking-budget-v1"
 # What a resident engine reports for Eval (crit serve's /v1/models engine_facts): whether it speculates and can decode
-# plainly, its draft width, the bytes one model pass and one draft step read, and the activation format of its
-# quantized matrices' prompt GEMMs (crit-eval's prefill ceilings by activation format).
+# plainly, its draft width, the bytes one model pass and one draft step read, the activation format of its
+# quantized matrices' prompt GEMMs (crit-eval's prefill ceilings by activation format), and prompt_cache false when it
+# keeps no prompt cache (crit-eval then sends it no follow-up turns).
 ENGINE_FACTS = ("speculative", "plain", "draft_width", "bytes_per_pass", "host_bytes_per_pass", "draft_bytes_per_step",
-                "draft_ms", "kv_bytes_per_token", "prompt_activations")
+                "draft_ms", "kv_bytes_per_token", "prompt_activations", "prompt_cache")
 # The activation formats crit-eval prices a quantized matrix group's prompt GEMMs at (its ceiling.ACTIVATIONS).
 PROMPT_ACTIVATIONS = ("bf16", "fp16_acc", "fp8", "stored")
 TOP_LOGPROBS = 20  # the most alternatives per token a request asks for (OpenAI's top_logprobs range)
@@ -125,6 +132,13 @@ def template_tool_format(text):
     return templates_tool_format(text.templates[name].source for name in text.templates)
 
 
+def template_reasoning(text):
+    """The registered reasoning format the model's chat templates use, or None (crit_core.text.reasoning)."""
+    from crit_core.text.reasoning import template_reasoning_format
+    sources = [text.templates[name].source for name in getattr(text, "templates", {})]
+    return template_reasoning_format(sources) if sources else None
+
+
 def special_marker_ids(text, markers):
     """The ids of the markers the tokenizer holds as single special tokens."""
     from crit_core.text.markers import marker_ids
@@ -150,9 +164,11 @@ def forces_calls(text, tool_format=None):
 
 def capabilities(text, sampling=(), *, stream=True, config=True, tool_format=None, images=False, concurrent=False,
                  logprobs=False, score=False, plain=False, grammars=False, continuation=True, completion=None,
-                 tokenize=True):
+                 tokenize=True, reasoning_format=None):
     """The serving capabilities a package built on ResidentChat declares, for a model's ModelText and the package's
-    own `tool_format` (ResidentChat.tool_format), if any. logprobs: the engine sets ResidentChat.logprobs; score:
+    own `tool_format` (ResidentChat.tool_format) and `reasoning_format` (ResidentChat.reasoning_format), if any; a
+    reasoning format, its own or the one the templates teach, declares chat-thinking-budget-v1, and False declares
+    none. logprobs: the engine sets ResidentChat.logprobs; score:
     it sets ResidentChat.scores and implements score_tokens(); plain: it sets ResidentChat.plain; grammars: it sets
     ResidentChat.grammars; continuation False: it renders its own prompt and does not continue a final assistant
     message; completion: raw prompts (completion-v1), which ResidentChat continues with any decoder, by default
@@ -177,6 +193,8 @@ def capabilities(text, sampling=(), *, stream=True, config=True, tool_format=Non
     if tool_format is not None or template_tool_format(text):
         result += ["chat-tools-v1"] + (["chat-tool-stream-v1"] if stream else [])
         result += ["chat-tool-choice-v1"] if grammars and forces_calls(text, tool_format) else []
+    if reasoning_format is not False and (reasoning_format is not None or template_reasoning(text)):
+        result += [THINKING_BUDGET_CAPABILITY]
     variables = template_kwargs(text)
     result += [TEMPLATE_KWARGS_CAPABILITY, *map(template_kwarg_capability, variables)] if variables else []
     return result + [sampling_capability(name) for name in SAMPLING if name in sampling]
@@ -184,7 +202,7 @@ def capabilities(text, sampling=(), *, stream=True, config=True, tool_format=Non
 
 def engine_facts(engine):
     """The ENGINE_FACTS a resident engine holds in its `facts` (crit_core.native's engines hold their info there):
-    booleans for speculative and plain, {"link", "cpu"} byte counts for host_bytes_per_pass, non-negative finite
+    booleans for speculative, plain and prompt_cache, {"link", "cpu"} byte counts for host_bytes_per_pass, non-negative finite
     numbers for the rest; plain only on a speculative engine that sets `plain`. None when it reports none."""
     import math
     found = getattr(engine, "facts", None)
@@ -196,7 +214,7 @@ def engine_facts(engine):
         if key == "prompt_activations":
             if prompt_activations(value):
                 out[key] = value
-        elif key in ("speculative", "plain"):
+        elif key in ("speculative", "plain", "prompt_cache"):
             if isinstance(value, bool):
                 out[key] = value
         elif key == "host_bytes_per_pass":
@@ -232,6 +250,18 @@ def prompt_activations(value):
                 or not math.isfinite(share) or share < 0 for key, share in mix.items()):
             return False
     return True
+
+
+def continued_timing(timings, tokens):
+    """The timing of a reply generated in several parts (a thinking budget's continuation): the first part's prefill
+    and first token, and every later part's time, including the prefill that read the reply so far, as decode time
+    over the reply's `tokens` after the first. Per-round counts are left out, since the parts' rounds do not sum to
+    one decode."""
+    first = timings[0]
+    later = sum(float(t["prefill_ms"]) + float(t.get("decode_ms") or 0) for t in timings[1:])
+    return {**{k: first[k] for k in ("prefill_tokens",) if k in first}, "prefill_ms": first["prefill_ms"],
+            "first_token_ms": first["first_token_ms"], "decode_ms": float(first.get("decode_ms") or 0) + later,
+            "decode_tokens": tokens - 1}
 
 
 def logprob_row(token, row, alternatives):
@@ -471,7 +501,8 @@ class ResidentChat:
         reply's bytes must keep to, applied as for response_format (a fresh GrammarMatcher over
         ByteGrammar::load(artifact) masking every position, a stop token only where the grammar is complete), so the
         reply is the calls (docs/SERVING.md). timing may add accepted (drafts accepted in each round), verify_ms and
-        draft_ms (device time in verify passes and draft steps), which crit serve reports in its telemetry."""
+        draft_ms (device time in verify passes and draft steps), and expert_reads and expert_hits (the decode's routed
+        expert reads and those the device's expert cache served), which crit serve reports in its telemetry."""
         raise NotImplementedError
 
     def score_tokens(self, ids, continuation, top_k, cancelled, prompt_rows):
@@ -685,6 +716,15 @@ class ResidentChat:
             boundaries.update(splitter.token_ids)
         if reply and choice != "auto":
             grammar = self._calls_grammar(request, calls_format, splitter)
+        budget = limits.get("thinking_tokens")
+        if budget is not None:
+            if type(budget) is not int or budget < 1:
+                raise ValueError("limits.thinking_tokens must be a positive integer")
+            if splitter is None:
+                raise RequestRejected("This model's chat template writes no reasoning for a thinking budget to end")
+            if prompt.inputs is not None or grammar is not None or alternatives is not None:
+                raise RequestRejected("A thinking budget applies to text prompts without logprobs or a forced tool "
+                                      "call")
         stream = MarkerDecoder(self.text.tokenizer, markers={v: k for k, v in boundaries.items()},
                                stream=self.text.text_stream(ids, skip_special_tokens=not kept))
         pieces, reasoning = [], []
@@ -707,6 +747,20 @@ class ResidentChat:
         def route(text):
             deliver(splitter.push(text) if splitter else [("text", text)])
 
+        reasoned = 0   # with a budget: the reply's tokens pushed while it was reasoning
+
+        def push(tokens):
+            nonlocal reasoned
+            if budget is None:
+                for part in stream.push([t for t in tokens if t not in dropped]):
+                    route(part)
+                return
+            for token in tokens:   # one at a time, so each is counted in the state the reply had when it came
+                reasoned += splitter.state == "reasoning"
+                if token not in dropped:
+                    for part in stream.push([token]):
+                        route(part)
+
         def on_tokens(tokens, logprobs=None):
             if rows is not None:
                 if logprobs is None or len(logprobs) != len(tokens):
@@ -715,19 +769,40 @@ class ResidentChat:
                 # past the prompt's.
                 rows.extend(logprob_row(token, row, alternatives) for token, row in zip(tokens, logprobs)
                             if raw or token not in self.stop_ids)
-            for part in stream.push([t for t in tokens if t not in dropped]):
-                route(part)
+            push(tokens)
 
         options = {} if alternatives is None else {"logprobs": alternatives}
         if plain:
             options["plain"] = True
         if grammar is not None:
             options["grammar"] = grammar
-        tokens, timing = self.generate_prepared(prompt, output_tokens, sampling, on_tokens, cancellation.is_set,
-                                                **options)
-        if tokens is None:
-            cancellation.check()
-            raise RuntimeError("generation cancelled")
+        # Without a budget the reply is one generation. With one, a generation ends where the reasoning would pass
+        # the budget; the reply then gets the format's closing marker, as the model would write it, and the engine
+        # continues from the prompt plus everything so far.
+        tokens, timings, closed, step_prompt = [], [], False, prompt
+        while True:
+            left = output_tokens - len(tokens)
+            unbounded = budget is None or closed or splitter.state in ("after", "text")
+            step = left if unbounded else min(left, budget - reasoned)
+            got, timing = self.generate_prepared(step_prompt, step, sampling, on_tokens, cancellation.is_set, **options)
+            if got is None:
+                cancellation.check()
+                raise RuntimeError("generation cancelled")
+            tokens += got
+            timings.append(timing)
+            if len(got) < step or len(tokens) >= output_tokens or (got and got[-1] in self.stop_ids):
+                break
+            if splitter.state == "reasoning" and reasoned >= budget:
+                closing = splitter.format.closing
+                ending = ([splitter.token_ids[closing]] if closing in splitter.token_ids
+                          else self.text.tokenizer.encode(closing, add_special_tokens=False))[:left - len(got)]
+                push(ending)
+                tokens += ending
+                closed = True
+                if len(tokens) >= output_tokens:
+                    break
+            step_prompt = PreparedPrompt(ids + tokens)
+        timing = timings[0] if len(timings) == 1 else continued_timing(timings, len(tokens))
         for part in stream.finish():
             route(part)
         if splitter:
@@ -754,6 +829,9 @@ class ResidentChat:
         if n > 1:
             telemetry.update({key: float(timing[key]) for key in ("verify_ms", "draft_ms")
                               if isinstance(timing.get(key), (int, float)) and not isinstance(timing[key], bool)})
+            # The decode's routed expert reads and those the device's expert cache served (Eval's memory tiers).
+            if type(timing.get("expert_reads")) is int and type(timing.get("expert_hits")) is int:
+                telemetry.update(expert_reads=timing["expert_reads"], expert_hits=timing["expert_hits"])
         logprobs = None
         if rows is not None:
             # Each token named once by its bytes, so the server can give clients token text and bytes.
@@ -848,8 +926,9 @@ class ResidentChat:
 
 __all__ = ["ResidentChat", "PreparedPrompt", "RequestRejected", "ContextExceeded", "SAMPLING", "LOGPROBS_CAPABILITY", "SCORE_CAPABILITY", "PLAIN_CAPABILITY",
            "COMPLETION_CAPABILITY", "CONTINUE_CAPABILITY", "FIT_OUTPUT_CAPABILITY", "TEMPLATE_KWARGS_CAPABILITY",
-           "TOKENIZE_CAPABILITY", "TEMPLATE_KWARGS", "ENGINE_FACTS", "TOP_LOGPROBS", "capabilities", "engine_facts",
+           "TOKENIZE_CAPABILITY", "THINKING_BUDGET_CAPABILITY",
+           "TEMPLATE_KWARGS", "ENGINE_FACTS", "TOP_LOGPROBS", "capabilities", "engine_facts",
            "forces_calls", "chat_prompt", "kept_special_ids", "logprob_row", "clamp_logprob", "ScoreRows",
            "packed_scores", "unpacked_scores", "special_marker_ids",
-           "sampling_capability", "template_kwarg_capability", "template_kwargs", "template_tool_format",
-           "template_value"]
+           "sampling_capability", "template_kwarg_capability", "template_kwargs", "template_reasoning",
+           "template_tool_format", "template_value", "continued_timing"]

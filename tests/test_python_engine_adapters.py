@@ -127,6 +127,28 @@ class PythonEngineAdapterTests(unittest.TestCase):
         self.assertEqual(engine.generate([1], 2, cancelled=lambda: True), (None, {"cancelled": True}))
         self.assertEqual(self.opened[0].calls, [])
 
+    def test_reserving_more_device_memory_than_the_device_holds_warns_once_under_wddm(self):
+        import contextlib
+        import io
+        from unittest import mock
+        reserved = [10 << 30]
+        cuda = types.SimpleNamespace(is_initialized=lambda: True, device_count=lambda: 1,
+                                     max_memory_reserved=lambda device: reserved[0],
+                                     get_device_properties=lambda device: types.SimpleNamespace(total_memory=32 << 30))
+        fake = types.SimpleNamespace(cuda=cuda)
+        for wddm, warned in ((False, 0), (True, 1)):
+            err = io.StringIO()
+            reserved[0] = 10 << 30
+            with mock.patch.dict(sys.modules, {"torch": fake}), mock.patch.object(native, "WDDM", wddm), \
+                    contextlib.redirect_stderr(err):
+                engine = native.PythonEngine(self.open, {})
+                engine.generate([1], 1)
+                self.assertEqual(err.getvalue(), "")
+                reserved[0] = 39 << 30   # past the device's 32 GiB: the driver spills the excess to system memory
+                engine.generate([1], 1)
+                engine.score([1, 2], 1)
+            self.assertEqual(err.getvalue().count("which holds 32.0 GiB"), warned)
+
     def test_requests_run_one_at_a_time_unless_the_engine_serves_several(self):
         inside, peak, lock = [0], [0], threading.Lock()
 

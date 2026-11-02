@@ -1,14 +1,15 @@
 // A batched serving engine for the synthetic transformer of synthetic_model.h: a Core ConcurrentModel with mixed
-// batches whose every step runs all rows (decode rows and prompt chunks of several requests) through one projection
-// GEMM per weight, keeps KV in StateCache pages with prefix reuse and attends with paged-attention's kernels.
+// batches whose every step runs all rows (decode rows and prompt chunks of several requests, laid out by Core's
+// StepLayout) through one projection GEMM per weight, keeps KV in StateCache pages with prefix reuse, admits by Core's
+// PageReservations and attends with its own paged attention kernels (paged_attention.h).
 //
 // Ownership: Core's worker thread makes every call; all device work goes to the backend's compute stream and each
 // step ends with that stream synchronized, so released pages are reusable at once (retire(epoch()) after a step).
 #pragma once
-#include "device_pages.h"
 #include "paged_attention.h"
 #include "synthetic_model.h"
 
+#include <crit/batch.h>
 #include <crit/core.h>
 #include <crit/cuda.h>
 #include <crit/sampling.h>
@@ -77,9 +78,11 @@ class Model final : public cc::ConcurrentModel {
     pa::DevicePages pages_;
     cc::Reservation page_reservation_;
     cc::StateCache cache_;
+    cc::PageReservations reservations_;
     pa::BatchTables decode_tables_, prefill_tables_;
     cc::Sampler sampler_;
-    std::uint32_t reserved_pages_ = 0;
+    std::vector<cc::StepItem> step_items_;
+    cc::StepLayout layout_;
     // Device memory
     __nv_bfloat16 *embedding_ = nullptr, *head_ = nullptr;
     struct Layer { __nv_bfloat16 *qkv, *o, *gate_up, *down; };
@@ -129,6 +132,7 @@ public:
           pages_(config.shape.layers, pages_for(config), config.page_tokens, config.shape.kv_heads, config.shape.head_dim, config.format, stream_),
           page_reservation_(services.resources.reserve(cc::Memory::device, pages_.bytes())),
           cache_(cache_config(config, rows_), pages_, services.resources),
+          reservations_({static_cast<std::uint32_t>(pages_for(config)), static_cast<std::uint32_t>(config.page_tokens), config.context, 1}),
           decode_tables_(static_cast<int>(config.max_concurrency), (static_cast<int>(config.context) + config.page_tokens - 1) / config.page_tokens,
                          static_cast<int>(config.max_concurrency)),
           prefill_tables_(static_cast<int>(config.max_concurrency), (static_cast<int>(config.context) + config.page_tokens - 1) / config.page_tokens, rows_),
@@ -198,16 +202,9 @@ public:
         i.scheduling_hints = config_.prefix_cache;
         return i;
     }
-    std::uint32_t pages_needed(const cc::RequestView& r) const {
-        return static_cast<std::uint32_t>((r.prompt.size() + r.output_tokens + config_.page_tokens - 1) / config_.page_tokens);
-    }
     // Admission reserves a request's whole page need (prompt plus output, no credit for shared pages), so a running
     // request never runs out of pages.
-    cc::Admission admission(const cc::RequestView& r) override {
-        if(r.prompt.empty() || r.prompt.size() + r.output_tokens > config_.context || pages_needed(r) > cache_.config().pages)
-            return cc::Admission::infeasible;
-        return reserved_pages_ + pages_needed(r) <= cache_.config().pages ? cc::Admission::ready : cc::Admission::deferred;
-    }
+    cc::Admission admission(const cc::RequestView& r) override { return reservations_.admission(r); }
     cc::SchedulingHint scheduling_hint(const cc::RequestView& r) override {
         cc::SchedulingHint hint;
         if(config_.prefix_cache && r.prompt.size() > 1)
@@ -221,8 +218,7 @@ public:
         auto session = std::make_unique<Session>(r, cache_, cc::resolve_sampling(r.options->sampling, defaults, static_cast<std::uint32_t>(config_.shape.vocab)));
         if(config_.prefix_cache && r.prompt.size() > 1)
             session->reused = cache_.attach(session->sequence, r.prompt, static_cast<std::uint32_t>(r.prompt.size() - 1));
-        session->reserved_pages = pages_needed(r);
-        reserved_pages_ += session->reserved_pages;
+        session->reserved_pages = reservations_.reserve(r);
         stats_->reused_tokens += session->reused;
         return session;
     }
@@ -230,45 +226,41 @@ public:
     std::vector<cc::RowProgress> execute(std::span<const cc::WorkItem> items) override {
         const Shape& s = config_.shape;
         // Rows: decode items first (one row each, read by the decode kernel), then prompt chunks (read by the varlen
-        // prefill kernel). The kernel follows the phase, never the row count, so a request's bits match a serial run.
-        std::vector<const cc::WorkItem*> order;
-        for(const auto& item : items) if(item.budget.prefill_complete) order.push_back(&item);
-        const std::size_t decoding = order.size();
-        for(const auto& item : items) if(!item.budget.prefill_complete) order.push_back(&item);
+        // prefill kernel), as Core's StepLayout places them. The kernel follows the phase, never the row count, so a
+        // request's bits match a serial run.
+        step_items_.clear();
+        for(const auto& item : items) {
+            const auto& session = static_cast<const Session&>(*item.session);
+            step_items_.push_back(cc::step_item(item, static_cast<std::uint32_t>(session.request.prompt.size()), cache_.committed(session.sequence)));
+        }
+        layout_.arrange(step_items_);
         decode_tables_.clear();
         prefill_tables_.clear();
-        std::vector<std::int32_t> tokens, positions, logit_rows;
+        std::vector<std::int32_t> tokens, positions;
         std::vector<cc::RowProgress> progress;
-        for(std::size_t i = 0; i < order.size(); ++i) {
-            const auto& item = *order[i];
-            auto& session = static_cast<Session&>(*item.session);
+        for(const auto& placement : layout_.placements()) {
+            auto& session = static_cast<Session&>(*items[placement.item].session);
+            const bool decoding = placement.phase == cc::RowPhase::decode;
             const std::uint32_t start = cache_.committed(session.sequence);
-            std::uint32_t n = 1;
-            if(!item.budget.prefill_complete) {
-                n = std::min<std::uint32_t>(item.budget.prefill_tokens, static_cast<std::uint32_t>(session.request.prompt.size()) - start);
-                if(item.budget.token_work) n = std::min(n, item.budget.token_work);
-            }
-            if(!n) throw std::logic_error("A prompt step without rows");
-            session.round = cache_.begin(session.sequence, n);
+            session.round = cache_.begin(session.sequence, placement.rows);
             session.inputs.clear();
-            for(std::uint32_t j = 0; j < n; ++j) {
-                const cc::Token t = item.budget.prefill_complete ? session.last : session.request.prompt[start + j];
+            for(std::uint32_t j = 0; j < placement.rows; ++j) {
+                const cc::Token t = decoding ? session.last : session.request.prompt[start + j];
                 session.inputs.push_back(t);
                 tokens.push_back(t);
                 positions.push_back(static_cast<std::int32_t>(start + j));
             }
-            auto& tables = i < decoding ? decode_tables_ : prefill_tables_;
+            auto& tables = decoding ? decode_tables_ : prefill_tables_;
             tables.add_slots(session.round->kv, config_.page_tokens);
             tables.add(cache_, session.sequence);
-            if(item.budget.prefill_complete || start + n == session.request.prompt.size())
-                logit_rows.push_back(static_cast<std::int32_t>(tokens.size() - 1));
         }
-        const int rows = static_cast<int>(tokens.size());
+        const auto logit_rows = layout_.logit_rows();
+        const int rows = static_cast<int>(layout_.rows());
         if(rows > rows_) throw std::length_error("Step exceeds the engine's row bound");
         ok(cudaMemcpyAsync(tokens_, tokens.data(), tokens.size() * 4, cudaMemcpyHostToDevice, stream_), "tokens");
         ok(cudaMemcpyAsync(positions_, positions.data(), positions.size() * 4, cudaMemcpyHostToDevice, stream_), "positions");
         if(!logit_rows.empty()) ok(cudaMemcpyAsync(logit_rows_, logit_rows.data(), logit_rows.size() * 4, cudaMemcpyHostToDevice, stream_), "logit rows");
-        const int decode_rows = decode_tables_.queries();
+        const int decode_rows = static_cast<int>(layout_.decode_rows());
         const pa::Batch decode_batch = decode_tables_.upload(stream_), prefill_batch = prefill_tables_.upload(stream_);
         forward(rows, decode_rows, decode_batch, prefill_batch, static_cast<int>(logit_rows.size()));
         // Plain greedy rows take the device argmax; rows with temperature, penalties or bias copy their logits and use
@@ -276,24 +268,22 @@ public:
         if(!logit_rows.empty()) {
             ok(argmax(logits_, static_cast<int>(logit_rows.size()), s.vocab, argmax_, stream_), "argmax");
             ok(cudaMemcpyAsync(host_argmax_.data(), argmax_, logit_rows.size() * 4, cudaMemcpyDeviceToHost, stream_), "argmax");
-            std::size_t row = 0;
-            for(const auto* item : order) {
-                const auto& session = static_cast<const Session&>(*item->session);
-                if(!item->budget.prefill_complete && cache_.committed(session.sequence) + session.inputs.size() != session.request.prompt.size()) continue;
-                if(!device_greedy(session.params))
-                    ok(cudaMemcpyAsync(host_logits_.data() + row * s.vocab, logits_ + row * s.vocab, s.vocab * sizeof(float), cudaMemcpyDeviceToHost, stream_), "logits");
-                ++row;
+            for(const auto& placement : layout_.placements()) {
+                const auto& session = static_cast<const Session&>(*items[placement.item].session);
+                if(!placement.logits || device_greedy(session.params)) continue;
+                const std::size_t row = placement.first_logit;
+                ok(cudaMemcpyAsync(host_logits_.data() + row * s.vocab, logits_ + row * s.vocab, s.vocab * sizeof(float), cudaMemcpyDeviceToHost, stream_), "logits");
             }
         }
         ok(cudaStreamSynchronize(stream_), "step");
-        std::size_t logit = 0;
-        for(const auto* item : order) {
+        for(const auto& placement : layout_.placements()) {
+            const auto* item = &items[placement.item];
             auto& session = static_cast<Session&>(*item->session);
             session.candidate.clear();
-            const auto n = static_cast<std::uint32_t>(session.inputs.size());
-            const bool logits = item->budget.prefill_complete || cache_.committed(session.sequence) + n == session.request.prompt.size();
+            const auto n = placement.rows;
+            const bool logits = placement.logits > 0;
             if(logits) {
-                const std::size_t row = logit++;
+                const std::size_t row = placement.first_logit;
                 if(device_greedy(session.params)) {
                     session.candidate.push_back(host_argmax_[row]);
                 } else {
@@ -316,7 +306,7 @@ public:
         }
         stats_->steps++;
         stats_->largest_batch = std::max<std::uint32_t>(stats_->largest_batch, static_cast<std::uint32_t>(items.size()));
-        if(decoding && decoding < order.size()) stats_->mixed_steps++;
+        if(layout_.decode_items() && layout_.decode_items() < items.size()) stats_->mixed_steps++;
         return progress;
     }
 
@@ -389,7 +379,7 @@ public:
         if(s.round) { cache_.discard(s.sequence, s.round->id); s.round.reset(); }
         cache_.close(s.sequence);
         cache_.retire(cache_.epoch());
-        reserved_pages_ -= std::exchange(s.reserved_pages, 0u);
+        reservations_.release(std::exchange(s.reserved_pages, 0u));
         return std::make_unique<Receipt>();
     }
     void quiesce() override {}  // no host producers; every step is synchronized before it returns

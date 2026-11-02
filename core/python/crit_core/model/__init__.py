@@ -13,8 +13,8 @@ from .source import FORMATS, ModelFormat, ModelSource, ModelSourceError, open_mo
 from .safetensors import (DTYPE_BITS, Checkpoint, IndexPolicy, Limits, SafetensorsError, ShardInfo, TensorInfo,
                           inspect_model, inspect_safetensors)
 from .tensors import TensorReader, open_tensors
-from .schemes import (PART_SCHEMES, RECOGNISERS, SchemeError, StoredMatrix, layer_prefix, matrix_parts,
-                      quantization_of, stored)
+from .schemes import (PART_SCHEMES, RECOGNISERS, SchemeError, StoredMatrix, csf_scale_shape, fp8_block,
+                      layer_prefix, matrix_parts, quantization_of, stored)
 from .onnx import OnnxError, OnnxModel, OnnxTensor, inspect_onnx
 from .torch_pickle import TorchCheckpoint, TorchFile, TorchFileError, inspect_torch, inspect_torch_model
 
@@ -25,8 +25,8 @@ __all__ = [
     "kv_elements_per_token", "layer_kinds", "load_model_config", "parse_model_config", "position_limit", "text_section",
     "DTYPE_BITS", "Checkpoint", "IndexPolicy", "Limits", "SafetensorsError", "ShardInfo", "TensorInfo",
     "inspect_model", "inspect_safetensors", "TensorReader", "open_tensors",
-    "PART_SCHEMES", "RECOGNISERS", "SchemeError", "StoredMatrix", "layer_prefix", "matrix_parts", "quantization_of",
-    "stored",
+    "PART_SCHEMES", "RECOGNISERS", "SchemeError", "StoredMatrix", "csf_scale_shape", "fp8_block", "layer_prefix",
+    "matrix_parts", "quantization_of", "stored",
     "GGML_TYPES", "GgufCheck", "GgufError", "GgufFile", "GgufModel", "check_gguf_folder", "find_gguf", "inspect_gguf",
     "inspect_gguf_model",
     "OnnxError", "OnnxModel", "OnnxTensor", "inspect_onnx",

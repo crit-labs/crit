@@ -3,7 +3,6 @@
 // dimensions 64, 128 and 256. Also: E4M3 writes equal a host encoder, decode columns alone equal the same columns in a
 // verify (also for every verify width at 2048 to 16384 keys), a sequence's result does not depend on its batch, captured graphs replay new tables and lengths, invalid
 // problems are rejected, and sequences whose device counts break the batch get NaN rows and a fault flag.
-#include "device_pages.h"
 #include "paged_attention.h"
 
 #include "attention.h"

@@ -1,4 +1,5 @@
 #include "crit/cuda.h"
+#include "device_scope.h"
 #include <chrono>
 #include <cstdio>
 #include <stdexcept>
@@ -29,7 +30,8 @@ struct CudaCategoryTimer::Impl {
     bool started = false;
     Impl(std::size_t capacity,int d):device(d),pairs(capacity) {}
     ~Impl() {
-        log_timer(cudaSetDevice(device),"bind for destruction");
+        const detail::DeviceScope scope(device,std::nothrow);
+        log_timer(scope.status(),"bind for destruction");
         for(auto& pair:pairs) {
             if(pair.start) log_timer(cudaEventDestroy(pair.start),"cudaEventDestroy");
             if(pair.stop) log_timer(cudaEventDestroy(pair.stop),"cudaEventDestroy");
@@ -39,7 +41,7 @@ struct CudaCategoryTimer::Impl {
     }
 };
 CudaCategoryTimer::CudaCategoryTimer(std::size_t capacity,int device):impl_(std::make_unique<Impl>(capacity,device)) {
-    check_timer(cudaSetDevice(device),"cudaSetDevice");
+    const detail::DeviceScope scope(device);
     for(auto& pair:impl_->pairs) {
         check_timer(cudaEventCreateWithFlags(&pair.start,cudaEventDefault),"cudaEventCreateWithFlags");
         check_timer(cudaEventCreateWithFlags(&pair.stop,cudaEventDefault),"cudaEventCreateWithFlags");
@@ -55,7 +57,7 @@ void CudaCategoryTimer::start(cudaStream_t stream) {
     if(!stream) throw std::invalid_argument("CUDA category timer needs an explicit stream");
     auto& s = *impl_;
     s.stream = stream; s.used = 0; s.dropped = 0; s.open = Impl::Open::none; s.started = false;
-    check_timer(cudaSetDevice(s.device),"cudaSetDevice");
+    const detail::DeviceScope scope(s.device);
     s.host_start = HostClock::now();
     check_timer(cudaEventRecord(s.span_start,stream),"cudaEventRecord");
     s.started = true;
@@ -87,7 +89,7 @@ CudaCategoryTimes CudaCategoryTimer::finish(std::uint32_t categories) {
     s.open = Impl::Open::none;
     s.started = false;
     const auto issued = HostClock::now();
-    check_timer(cudaSetDevice(s.device),"cudaSetDevice");
+    const detail::DeviceScope scope(s.device);
     check_timer(cudaEventRecord(s.span_stop,s.stream),"cudaEventRecord");
     check_timer(cudaEventSynchronize(s.span_stop),"cudaEventSynchronize");
     const auto done = HostClock::now();

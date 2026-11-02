@@ -41,6 +41,7 @@ reply = client.chat.completions.create(model="default", messages=[{"role": "user
 | `--lenient` | Ignore, list and log the request parameters crit does not apply instead of answering 400 ([lenient requests](#lenient-requests)); never used by Eval |
 | `--timeout SECONDS` | Limit per request, from when the engine takes it; default 600. A request's `crit.timeout` can only lower it |
 | `--max-queue N` | Requests that may [wait](#a-busy-engine) while the engine is busy; default 64. One more is refused at once |
+| `--max-concurrency N` | Run at most N requests at once, below the engine's declared capacity ([concurrent requests](#concurrent-requests)); default the engine's |
 | `--queue-timeout SECONDS` | Limit on a request's wait for the engine, after which it is refused; default none |
 | `--sse-ping-interval SECONDS` | [Keep-alive ping](#keep-alive-pings) on an OpenAI or Anthropic stream after this many seconds without output; default 15, 0 sends none |
 | `--load-timeout SECONDS` | Limit on loading the starting candidate; default 600 plus the model's bytes at 200 MB/s (50 MB/s with `--verify-model`) |
@@ -97,21 +98,53 @@ reads a crit-hub checkout instead), then, stopping at the first step that fails,
    store, shared by the engines that run it, or takes a local copy with `--model PATH`, hard-linked into the store
    (copied where links fail). Every file `card.lock.json` lists is checked by size and SHA-256; a checked folder is
    stamped and not hashed again. `--checkpoint MODEL` picks one when the card measured several.
-4. Runs the card's `build` command in the source's `engine/` folder (a first argument `python` is crit's own
+4. Fetches the card's drafter `downloads` the same way, each into `models/` at its pinned revision (and `path`,
+   the folder of the repository it names) and checked against the files `card.lock.json`'s `downloads` lists for
+   it, or against the SHA-256 of the one file the card pins. The engine receives their folders as
+   `context.drafters`, in card order ([model access](#model-access-and-allocation)).
+5. Runs the card's `build` command in the source's `engine/` folder (a first argument `python` is crit's own
    Python; `--build-timeout`, default 1800 s), keeping its output in `logs/build.log`, and reads the package's
-   capabilities from its adapter's `declared_capabilities`.
-5. Installs the package in the store with `install.json`, the card and its lock. The engine serves at the context
+   capabilities from its adapter's `declared_capabilities`. When one of the card's `artifact` downloads names a
+   `toolchain` this machine matches (its platform, GPU architecture, a driver that runs its CUDA version or a newer
+   one, and its Python version; for `backend: hip` the ROCm version), it fetches that archive instead, checks its
+   SHA-256 and unpacks it into `engine/` without building; an archive member that would replace a file of the
+   pinned source is refused. `--build-from-source` builds anyway.
+6. Installs the package in the store with `install.json`, the card and its lock. The engine serves at the context
    its card measured (on this GPU when the card measured on it; `--context` sets another) with the headroom in
    `settings.toml`.
+
+`--download REPOSITORY=PATH` (repeatable) takes a local copy of one of the card's downloads, a drafter's folder or
+an artifact's file, checked as a download is.
 
 The store (`--store`, default `PROJECT/engines`) holds `<owner>/<name>/` per engine and `models/` for the
 checkpoints. No record in it names an absolute path, so a store moved to another folder still serves. Runs stay
 the builder's record; installs are the user's. `crit pull` of an installed engine that still checks out does
 nothing (`--force` installs it again; a damaged install is installed again), and `crit pull --list` lists the
-installed engines. Card `downloads` (drafters, prebuilt artifacts) are not fetched yet: `crit pull` names them.
+installed engines.
 
 `crit serve --engine` verifies the installed package byte for byte and its configuration before it loads, as for
 a sealed candidate, and reports the engine as `OWNER/NAME`; any model name a client sends reaches it.
+
+#### Benchmark your machine
+
+```sh
+crit bench crit-labs/nvfp4-gemv-int8kv --data eval-data --out result.json
+crit hub report crit-labs/nvfp4-gemv-int8kv result.json --hub ../crit-hub --by <your GitHub account>
+```
+
+`crit bench` measures an installed engine with crit Eval on this machine and prints its card's stats beside the
+measured ones. It readies Eval's data for the installed checkpoint in `--data` when the folder holds none (a published
+reference package for the checkpoint, else `crit eval prepare`, at the sampling the card measured), serves the engine
+as `crit serve --engine` does and runs Eval over its chat API at the context it was installed at: the speed suite,
+and quality where the data holds the reference's scores (`--reference` scores them first, reading the whole
+checkpoint) and the package scores fixed text. `--stage`, `--budget-minutes` and `--parts` choose how far Eval goes,
+as for `crit eval run`; the result goes to `--out`, by default the engine's `bench/` folder in the store, labelled
+with the engine and its source commit.
+
+`crit hub report` adds that result to the engine's card in a crit-hub checkout (a fork, for a pull request) with
+crit-hub's own `tools/add_result.py`, after checking it measured this engine as installed at the commit the card pins:
+the file goes into the engine's `evidence/` unchanged, as a reproduction of the GPU and model the card measured or as
+a new result, which leaves the card's `supports`.
 
 ### Several models on one server
 
@@ -130,7 +163,10 @@ Create a catalog, for example `models.json`:
 
 Use actual retained run/candidate IDs. Workspace paths are relative to the catalog
 file (absolute paths also work). Omitting `candidate` selects that run's selected
-candidate at server startup. Names must be unique; `default` defaults to the first
+candidate at server startup. A row can name an engine `crit pull` installed instead
+of a run: `{"name": "fast", "engine": "crit-labs/nvfp4-gemv-int8kv", "store": "engines"}`,
+its `store` relative to the catalog (default `PROJECT/engines`); it takes `aliases`
+and `display_name` like any row. Names must be unique; `default` defaults to the first
 entry. Start with `crit serve --models models.json`. `--write-launchers` writes
 the scripts beside the catalog.
 
@@ -185,8 +221,8 @@ the lock still wait until the server stops.
 
 | Endpoint | Behavior |
 | --- | --- |
-| `GET /health` | `{"status": "ok", "ready": ..., "loaded": ..., "engine": ...}`; `loaded` is false while the engine is [unloaded](#unloading-the-engine), and so is `ready`. 503 when the runtime is blocked, and with `?ready=1` also while `ready` is false. No key needed |
-| `GET /v1/models`, `GET /v1/models/{id}` | The run's sealed resident candidates, or catalog names, with `label`, `display_name` (a catalog entry's, else the label), `context_length` (the candidate's `kv_tokens`) and `max_model_len` (the same, vLLM's name for it, which LiteLLM reads), `default`, `loaded` (its engine is the one loaded), package `capabilities`, `supported_sampling_parameters`, `limits` and `engine_facts` ([facts for Eval](#engine-facts-and-plain-decoding)) |
+| `GET /health` | `{"status": "ok", "ready": ..., "loaded": ..., "engine": ..., "max_concurrent_requests": ...}`; `loaded` is false while the engine is [unloaded](#unloading-the-engine), and so is `ready`; `max_concurrent_requests` is the default model's (as on its card). 503 when the runtime is blocked, and with `?ready=1` also while `ready` is false. No key needed |
+| `GET /v1/models`, `GET /v1/models/{id}` | The run's sealed resident candidates, or catalog names, with `label`, `display_name` (a catalog entry's, else the label), `context_length` (the candidate's `kv_tokens`) and `max_model_len` (the same, vLLM's name for it, which LiteLLM reads), `default`, `loaded` (its engine is the one loaded), package `capabilities`, `supported_sampling_parameters`, `limits`, `max_concurrent_requests` (crit's: the requests it runs at once, [concurrent requests](#concurrent-requests)) and `engine_facts` ([facts for Eval](#engine-facts-and-plain-decoding)) |
 | `POST /v1/chat/completions` | Chat completion, JSON or server-sent events |
 | `POST /v1/completions` | [Raw-prompt completions](#raw-prompt-completions) for packages declaring `completion-v1`, JSON or server-sent events |
 | `POST /v1/crit/score` | [Fixed-text scores](#fixed-text-scores) for packages declaring `chat-score-v1` |
@@ -239,6 +275,7 @@ refuses them ([a busy engine](#a-busy-engine): `--max-queue`, `--queue-timeout`)
 | `messages` | Optional leading `system`/`developer` messages (merged into one `system`), then user/assistant turns ending with user, or with the assistant message a request [continues](#continuing-the-final-message). Consecutive same-role turns are joined with a blank line. A `system` or `developer` message after the first turn becomes user text marked `System: ` in its place, joined to the user message after it (else the one before it), or a user turn of its own after an assistant reply or tool result; the adapter still receives at most one leading `system`. Content is a string or ordered `text`/`image_url` parts; images require `chat-images-v1` |
 | `continue_final_message`, `add_generation_prompt` | vLLM's fields: `true` with `false` [continues](#continuing-the-final-message) the final assistant message, for packages declaring `chat-continue-v1` (otherwise 400 `unsupported_parameter`). Their defaults, `false` and `true`, change nothing; `continue_final_message: true` without `add_generation_prompt: false`, or the reverse, is 400 |
 | `max_tokens`, `max_completion_tokens` | Output cap, 1 to `context_length - 1`; default 1024 or less to fit. At or above `context_length` it is [fitted](#fitted-output) for packages declaring `chat-fit-output-v1` |
+| `thinking_budget_tokens` | llama-server's: the reasoning tokens a reply may write, a positive integer, for packages declaring `chat-thinking-budget-v1` (otherwise 400 `unsupported_parameter`). At the budget the reasoning ends with the template's closing marker and the reply goes on within `max_tokens` ([thinking budget](#thinking-budget)) |
 | `stream`, `stream_options.include_usage` | SSE: role chunk, text chunks, finish chunk, optional usage chunk, `[DONE]`; `: ping` comments while the engine is quiet ([keep-alive pings](#keep-alive-pings)). Any other `stream_options` key is a 400 (ignored with `--lenient`) |
 | `stop` | Up to 16 strings of at most 256 UTF-8 bytes (Core's limits, in every dialect). Text before the first completed stop returns with `finish_reason: "stop"` (`crit_core.text.StopMatcher`); the turn is cancelled, the engine stays loaded. With tools, stops are matched in the text only ([tool calls](#tool-calls)) |
 | `include_stop_str_in_output` | vLLM's: `true` keeps the stop string that ended the reply at the end of its text, streamed as its last piece; default `false` |
@@ -262,7 +299,9 @@ phase's timed tokens and milliseconds as the engine reports them (`prefill_token
 rates, TTFT, and `tokens_per_round` (output tokens per target
 pass) when the engine reports its decode rounds, with `accepted` (drafts accepted in each of
 those rounds), `drafted` (drafts made in each, from an engine whose draft width varies),
-`verify_ms` and `draft_ms` (device time in verify passes and draft steps) when it reports them. A stream's usage chunk carries both.
+`verify_ms` and `draft_ms` (device time in verify passes and draft steps), and `expert_reads` and `expert_hits`
+(the decode's routed expert reads and those the device's expert cache served) when it reports them. A stream's usage
+chunk carries both.
 Sampling overrides are validated before generation, including for streaming requests.
 Unknown parameters and unsupported generation controls return 400 rather than being
 silently ignored, unless the server runs with [`--lenient`](#lenient-requests). Only client metadata
@@ -607,7 +646,7 @@ candidate's configuration freezes:
 | OpenAI | `chat_template_kwargs` | The variables it names, each a declared one with a value it takes |
 | OpenAI | `reasoning_effort` | `none` turns thinking off; `minimal` (as `low`), `low`, `medium`, `high` and `xhigh` (as `high`) turn it on at that effort |
 | OpenAI Responses | `reasoning.effort` | As `reasoning_effort`, which it becomes |
-| Anthropic | `thinking.type` | `enabled` and `adaptive` turn thinking on, `disabled` and `between_tools` off; `budget_tokens` and the other fields are not applied and are listed in `X-Crit-Ignored-Parameters` |
+| Anthropic | `thinking.type` | `enabled` and `adaptive` turn thinking on, `disabled` and `between_tools` off; with thinking on, `budget_tokens` is the [thinking budget](#thinking-budget) for packages declaring `chat-thinking-budget-v1`. Otherwise it and the other fields are not applied and are listed in `X-Crit-Ignored-Parameters` |
 | Anthropic | `output_config.effort` | `low`, `medium`, `high`, `xhigh` and `max` (both as `high`) turn thinking on at that effort |
 | Ollama | `think` | `true` and `false` turn thinking on and off; `low`, `medium` and `high` turn it on at that effort |
 
@@ -623,6 +662,19 @@ package does not declare (once its value is checked) and a control the template 
 turning off one that always thinks; a value no table above takes, and the two fields disagreeing, stay a
 400. A request without controls sets no variable, so Eval's requests render as they did.
 `/api/show` lists `thinking` among the capabilities of a package that declares a variable.
+
+### Thinking budget
+
+A reasoning model can think until `max_tokens` runs out and never answer. OpenAI's
+`thinking_budget_tokens` (llama-server's name) and Anthropic's `thinking.budget_tokens`, with thinking
+on, cap the reasoning for packages declaring `chat-thinking-budget-v1`. When the reasoning reaches the
+budget, the reply gets the reasoning format's closing marker, as the model would write it, and the engine
+goes on from the prompt plus the reply so far; the answer that follows still counts toward `max_tokens`,
+so leave it room. ResidentChat declares the capability where its chat templates teach a reasoning format
+(or the package sets its own), and takes the markers from that format, so crit holds no model's syntax.
+A reply that ends its reasoning first is one generation as before. ResidentChat applies a budget to text
+prompts without logprobs or a forced tool call, and refuses the others. The continuation reads the reply
+so far again, so its time counts as decode time in the reply's usage. Eval sends no budget.
 
 ### Token log-probabilities
 
@@ -695,8 +747,9 @@ the engine reports for Eval's headroom and exactness: `speculative` and `plain` 
 `kv_bytes_per_token` (non-negative numbers) and `prompt_activations` (the activation format of
 the quantized matrices' prompt GEMMs, `bf16`, `fp16_acc`, `fp8` or `stored`, for every quantized
 format, per stored format, or as shares of a format's FLOPs: crit-eval's prefill ceilings by
-activation format and their reachable limit), each only when the engine reports it in a valid
-form; `null` when the candidate is not loaded or reports none. A speculative engine that declares
+activation format and their reachable limit) and `prompt_cache` (a boolean; `false` when the
+engine keeps no prompt cache, so crit-eval sends it no follow-up turns), each only when the engine
+reports it in a valid form; `null` when the candidate is not loaded or reports none. A speculative engine that declares
 `chat-plain-v1` decodes a request carrying `"crit": {"decode": "plain"}` one token per
 target pass without drafting, which is how Eval compares speculative output with plain
 greedy on the served engine.
@@ -1023,6 +1076,16 @@ A package opts in with `chat-concurrent-v1` (or
 `max_concurrent_requests`, an integer from 1 to 1024, and
 `create_request(request)`. Capacity is the adapter's safe bound for the sealed
 configuration and memory limits; the host does not infer it from GPU or model names.
+`crit serve --max-concurrency N` runs at most N of them at once (the smaller of N and the
+declared capacity); the others wait in the [queue](#a-busy-engine).
+
+Clients read the capacity as `max_concurrent_requests`, a crit-specific field of each
+`/v1/models` card and of `/health` (the default model's): 1 for a package without
+`chat-concurrent-v1`, the loaded engine's declared capacity capped by `--max-concurrency` while it is
+the one loaded, and `null` until a concurrent package's engine loads, since it declares its capacity
+as it loads. [crit Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#concurrency)
+measures concurrent requests only when this is above 1, and `crit run measure` sends a case of
+`workload.concurrency` N as N requests at once ([measured benchmarks](RUN_RECORDS.md#measured-benchmarks)).
 
 The factory returns a distinct object implementing the same generation,
 streaming, `reset()` and `close()` methods. It may be a `ResidentChat` sharing
@@ -1044,7 +1107,9 @@ have unwound. This is the existing ownership guarantee applied to concurrent wor
 The contract permits an engine's scheduler to batch requests; it does not itself
 promise batched device arithmetic or a throughput gain. The
 [batched reference engine](../inference/batched-reference-engine/README.md) is a native
-library that does both: its steps run every request's rows through one GEMM per weight.
+library that does both: its steps run every request's rows through one GEMM per weight
+([serve concurrent requests](BUILDING_ENGINES.md#serve-concurrent-requests)). A Python
+engine gets the same scheduling as a [step engine](../core/src/runtime/README.md#step-engines).
 
 ### Model access and allocation
 
@@ -1053,6 +1118,7 @@ library that does both: its steps run every request's rows through one GEMM per 
 | `context.host("relative/model/file")` | Read-only memoryview of the model file, mapped in place after a size check (pageable). With `--verify-model`, of a hashed private copy (needs temporary disk) |
 | `context.model_file(name)` | Native-loader path of the model file when `chat-model-file-v1` is declared; no copy |
 | `context.limits` | Context and RAM/VRAM headroom; `kv_tokens` is the built context, `context` (when present) Eval's [basis](https://github.com/crit-labs/crit-eval/blob/main/docs/CONTEXT.md) |
+| `context.drafters` | Folders of an installed engine's drafter downloads, in card order ([crit pull](#installed-engines)); empty for a run's candidate, whose configuration names its drafter. An engine exported for crit-hub loads its drafter from here when it is given one |
 | `context.device(compatibility, nbytes, allocate, inputs=())` | Generation-bound lease; `lease.buffer` valid for the engine lifetime. `inputs` lists non-model files whose bytes enter the allocation |
 
 Model identity is the full frozen path/size/SHA-256 manifest; treat model files as
@@ -1118,6 +1184,11 @@ share the 65,536-character reply budget, and telemetry counts all generated toke
   return that cap as the response's `max_output_tokens`; raise `ContextExceeded` only when
   the prompt alone fills the context. ResidentChat does this, and `capabilities(text,
   sampling)` declares the capability.
+- `limits.thinking_tokens` reaches only a package declaring **`chat-thinking-budget-v1`**:
+  end the reply's reasoning after that many tokens with the reasoning format's closing marker
+  and continue the reply, all within `max_output_tokens`. ResidentChat does this where it has
+  a reasoning format (its own `reasoning_format` or the one its templates teach), and
+  `capabilities(text, sampling)` then declares the capability.
 - A `crit_core.serving.RequestRejected` (ContextExceeded is one) raised before generation
   starts refuses the request: the host reports it as rejected, crit serve answers 400 and the
   engine stays loaded. Any other exception fails the turn and retires the host.
@@ -1170,8 +1241,10 @@ rounds, at most `output_tokens`); ResidentChat reports it from `generate_tokens`
 `rounds`, and Core engine libraries report theirs. Optional `accepted` (one count of
 accepted drafts per decode round, as many as `decode_rounds`), `drafted` (the drafts made in
 each of those rounds, at least the accepted ones, for an engine whose draft width varies), `verify_ms` and `draft_ms`
-(non-negative milliseconds) pass through to `crit_telemetry`; ResidentChat takes them
-from `generate_tokens`' timing.
+(non-negative milliseconds), and `expert_reads` and `expert_hits` together (integers, hits at most reads: the decode's
+routed expert reads and those its device expert cache served, the hit rate crit Eval's
+[memory tiers](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#memory-tiers) price an
+offloading engine at) pass through to `crit_telemetry`; ResidentChat takes them from `generate_tokens`' timing.
 Synchronize device work at phase boundaries, exclude startup and loading, and never
 estimate tokens from characters.
 
@@ -1463,6 +1536,8 @@ timeout, shutdown or client death. After a crash, `crit serve --recover-runtime`
 verifies retirement before releasing admission; never delete the guard. A failed
 request's records (`requests/<request_id>/` in the runtime directory, the id its response's
 `X-Request-Id` carried) stay for diagnosis; nothing is written to the run folder.
+On Windows the engine's process opts out of power throttling (`crit_core.machine.keep_full_speed`), so it keeps its
+speed while `crit serve`'s or `crit run eval`'s window is behind another one; a refusal is printed once.
 
 The guardian and supervisor both retry a transient permission denial when reading
 the atomically replaced ownership record, for at most 250 ms. They always read

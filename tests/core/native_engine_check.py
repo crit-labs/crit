@@ -33,6 +33,13 @@ def abi(library):
             raise AssertionError("sampling options must never disappear in the ABI: " + str(options))
         except NativeError as error:
             expect("does not support a requested sampling option" in str(error), error)
+    # A token id past 2^31 - 1 is refused, never wrapped into another id (2^32 + 5 would be the stop token 5).
+    for options in ({"stop_tokens": [2 ** 32 + 5]}, {"replay": [2 ** 32 + 12]}):
+        try:
+            engine.generate([1, 2], 3, **options)
+            raise AssertionError("an out-of-range token id must be refused: " + str(options))
+        except NativeError as error:
+            expect("outside [0, 2^31)" in str(error), error)
 
     streamed = []
     tokens, result = engine.generate([1, 2, 3], 7, on_tokens=streamed.extend)

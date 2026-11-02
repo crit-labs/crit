@@ -21,6 +21,16 @@ an upload hook. The result retains source bytes, destination owner and readiness
 completion is distinct from read completion. If enqueue throws after possibly starting a
 transfer, the source bytes and upload callable are retained for explicit recovery.
 
+**Host tier.** When host memory holds only part of the experts, give the source a
+`HostExpertTier(capacity)`: a bounded host copy between the file and the device cache, least
+recently used first out. A demand read is served from it when it holds the expert, and an expert
+read from the file is held there. When the device cache evicts an expert, copy its slot to host
+memory and `retain(key, bytes, protected)` it instead of dropping it: the next miss then crosses
+the host link instead of rereading the file. Retained bytes are checked like a file read. An
+expert the current route selects (`protected`) is never evicted to make room, and an expert that
+cannot fit is refused (`False`), never half held. The capacity is part of the engine's
+[host-memory admission](../host-memory-admission/README.md), not memory beside it.
+
 **Native gather.** `MappedFile(path, maximum_bytes)` maps the file through
 `crit::core::ReadOnlyFile` ([Core files](../../core/src/io/README.md#read-only-files));
 `file()` exposes it for `identity()` and `verify_unchanged()`.
@@ -36,11 +46,13 @@ escapes. Cancellation is checked between regions and at 1 MiB boundaries.
 
 - [implementation.py](code/implementation.py): `ExpertRegion`, `FileExpertSource` and
   `Materialization` with checked demand reads, executor read-ahead, pending-read reuse,
-  upload handoff, `quiesce()` and failed-upload retention.
+  upload handoff, `quiesce()` and failed-upload retention; `HostExpertTier`, the bounded host
+  tier with `retain()` for device evictions and hit, miss, eviction and refusal counts.
 - [mapped_gather.h](code/mapped_gather.h): the C++20 sparse gather above.
 
-No route predictor, native storage queue, pinned staging pool, device copy or cache
-manager; no model parsing; overlapping named regions are not rejected.
+No route predictor, native storage queue, pinned staging pool, device copy or device cache
+manager; the host tier is a host reference (its native form keeps experts in pinned host slots);
+no model parsing; overlapping named regions are not rejected.
 
 ## What the engine supplies
 
@@ -48,8 +60,12 @@ Descriptors from trusted artifact metadata with the exact encoded extent, an exe
 `prefetch(key, executor)`, and an `upload(encoding, bytes)` hook returning
 `(owner, readiness)`. Hold the materialization until asynchronous reads finish and check
 destination success before use. Bound queued reads, staging bytes and outstanding
-transfers; the reference deduplicates only pending keys, so later demand can reread.
-Reserve staging for urgent demand and prioritize it over speculative queues.
+transfers; without a host tier the reference deduplicates only pending keys, so later demand
+rereads the file. Reserve staging for urgent demand and prioritize it over speculative queues.
+For device evictions into the host tier, enqueue the device-to-host copy of the evicted slot
+before anything overwrites it, retain only after that copy completed, and pass the experts the
+current token routes as `protected`. Hold the native tier in pinned host memory so a hit uploads
+directly.
 
 Native mapping needs a verified immutable artifact. Windows denies write/delete sharing
 while open; POSIX callers must prevent mutation and can detect it with
@@ -111,7 +127,14 @@ prepare likely misses, but speculation must never change which expert executes.
 
 Read-ahead pays off only if hidden latency repays wasted reads and staging; track useful
 and unused prefetched bytes, demand stall time and peak staging, not just prediction
-accuracy. Checksums are O(B) per region and the reference builds a complete `bytes`
+accuracy. A host tier costs its capacity in host memory and one device-to-host copy per
+eviction, which overlaps the main stream; it pays when misses would otherwise come from the
+file, since the host link is usually several times faster than storage. Track tier hits, bytes
+read from the file per token and refusals. For scale only: one llama.cpp-based engine serving
+Qwen3.8-Flash-Next from NVMe on an RTX 3060 12 GB with 16 GB of RAM read 44.7 and 39.7 MiB
+per generated token in two repeated requests without its 8 GiB tier and 35.4 and 12.4 MiB with
+it (13.9 and 14.3 against 16.3 and 22.0 tok/s); another engine measured fewer misses with
+identical tokens. Neither is a crit measurement. Checksums are O(B) per region and the reference builds a complete `bytes`
 object. Mapping size is not resident RAM, and warm results do not establish cold-source
 behavior. Common failures: unbounded futures holding large arrays, treating prefetch
 completion as device readiness, dropping staging after enqueue failure, and closing
@@ -120,5 +143,6 @@ files while producers can still submit.
 [Native fixtures](../../tests/inference/inference_io_codec_tests.cpp) check page
 boundaries, duplicate and overlapping regions, order, sequential/parallel equivalence,
 empty files, bounds and cancellation. Host fixtures cover exact bytes, pending reads,
-failures and ambiguous upload recovery. Storage throughput, pinned memory, transfer
+failures, ambiguous upload recovery, host-tier hits after the file changed, checked retention
+of evicted experts, and that the current route is never evicted. Storage throughput, pinned memory, transfer
 overlap and cache profitability remain unmeasured.

@@ -502,7 +502,8 @@ class PlanRecordTests(PlanFixture, unittest.TestCase):
         self.assertEqual(value["levers"][0]["changes"], {"decode": {"change": 0.3, "source": "estimate"}})
 
     def test_an_older_run_checks_fates_only_when_given(self):
-        with patch("crit.run.records.NEW_RUN_LEVER_FATES", None):
+        with patch("crit.run.records.NEW_RUN_LEVER_FATES", None), \
+                patch("crit.run.records.NEW_RUN_PLAN_RULES", self.plan_rules):
             self.view = self.store.create(self.data)
         self.run, self.run_id = self.view["run"], self.view["run"]["run_id"]
         self.directory = self.store.directory(self.run_id)
@@ -858,9 +859,9 @@ class PlanRecordTests(PlanFixture, unittest.TestCase):
 
     def test_plan_rules_need_computed_limits(self):
         spec = copy.deepcopy(self.run["spec"])
-        for broken in ({**spec, "plan_rules": 5}, {key: value for key, value in spec.items() if key != "plan_limits"}):
+        for broken in ({**spec, "plan_rules": 6}, {key: value for key, value in spec.items() if key != "plan_limits"}):
             with self.subTest(broken=broken.get("plan_rules")):
-                with self.assertRaisesRegex(ValueError, "plan_rules is 2, 3 or 4 when present"):
+                with self.assertRaisesRegex(ValueError, "plan_rules is 2, 3, 4 or 5 when present"):
                     validate_spec(broken)
 
     def test_without_the_round_floors_facts_the_plan_gives_the_alternatives_ceiling(self):
@@ -1032,13 +1033,11 @@ class PlanRules3Tests(PlanFixture, unittest.TestCase):
             self.store.plan(self.run_id, with_fp8(quality("fp8", 1.1)))
 
 class PlanRules4Tests(PlanFixture, unittest.TestCase):
-    """Plan rules 4, the default of new runs: an objective per candidate, critique rounds naming the parent's two
+    """Plan rules 4: an objective per candidate, critique rounds naming the parent's two
     weakest terms, and a +10% floor on p1 for candidates 2 to 5."""
     plan_rules = 4
 
-    def test_new_runs_check_plans_with_rules_4(self):
-        from crit.run import records
-        self.assertEqual(records.NEW_RUN_PLAN_RULES, 4)
+    def test_a_run_created_with_rules_4_keeps_them(self):
         self.assertEqual(self.run["spec"]["plan_rules"], 4)
 
     def next_candidate(self, parent, **updates):
@@ -1153,6 +1152,51 @@ class PlanRules4Tests(PlanFixture, unittest.TestCase):
         self.assertEqual(self.store.plan(self.run_id, plan(child, review=review))["review"], review)
 
 
+class PlanRules5Tests(PlanFixture, unittest.TestCase):
+    """Plan rules 5, the default of new runs: the strategy's ceiling is the limit, and a forecast whose best case stays
+    below half of a needed family's limit names the measured bound that keeps the rest out of reach."""
+    plan_rules = 5
+
+    def test_new_runs_check_plans_with_rules_5(self):
+        from crit.run import records
+        self.assertEqual(records.NEW_RUN_PLAN_RULES, 5)
+        self.assertEqual(self.run["spec"]["plan_rules"], 5)
+
+    def test_a_forecast_far_below_the_limit_names_the_measured_bound(self):
+        parent = PlanRules4Tests.first(self)["candidate_id"]
+        # The fixture's Eval: decode 100 of 200 tok/s, prefill 1,000 of 4,000. A prefill high of 1,800 is 45% of it.
+        with self.assertRaisesRegex(ValueError, "The forecast's best case for prefill \\(1800\\) is 45% of its limit "
+                                                "4000 \\(the parent's Eval measured 25%\\), below 50%: the strategy's "
+                                                "ceiling is that limit, not the engine's own measurement"):
+            self.store.plan(self.run_id, plan(parent))
+        cause = {"kpi": "prefill", "gap": "limit", "answer": "cause", "detail": "experts stream from host memory"}
+        with self.assertRaisesRegex(ValueError, "below 50%"):
+            self.store.plan(self.run_id, plan(parent, gaps=[cause]))   # a cause without its measurement
+        with self.assertRaisesRegex(ValueError, "is no file of this run"):
+            self.store.plan(self.run_id, plan(parent, gaps=[{**cause, "evidence": "work/none.json"}]))
+        measured = PlanRules4Tests.evidence(self, "host-bound.json")
+        recorded = self.store.plan(self.run_id, plan(parent, gaps=[{**cause, "evidence": measured}]))
+        reach = recorded["inputs"]["reach"]
+        self.assertEqual((reach["prefill"]["limit"], reach["prefill"]["source"], reach["prefill"]["fraction"]),
+                         (4000.0, "eval", 0.25))
+        self.assertAlmostEqual(reach["prefill"]["reach"], 0.45)
+        self.assertEqual(reach["prefill"]["evidence"]["path"], measured)
+        self.assertAlmostEqual(reach["decode"]["reach"], 0.75)   # 150 of 200: no cause asked
+        self.assertNotIn("evidence", reach["decode"])
+
+    def test_a_forecast_reaching_half_the_limit_needs_no_cause(self):
+        parent = PlanRules4Tests.first(self)["candidate_id"]
+        forecast = {**plan()["forecast"], "prefill": {"low": 1100.0, "expected": 1500.0, "high": 2000.0}}
+        recorded = self.store.plan(self.run_id, plan(parent, forecast=forecast))
+        self.assertEqual(sorted(recorded["inputs"]["reach"]), ["decode", "prefill"])
+        # A family marked not needed is not asked.
+        self.assertNotIn("prefill", self.store.plan(self.run_id, plan(parent, prefill=False, gaps=[
+            {"kpi": "prefill", "gap": "limit", "answer": "cause", "detail": "out of reach",
+             "evidence": PlanRules4Tests.evidence(self, "prefill.json")}], levers=[lever()],
+            forecast={**plan()["forecast"], "prefill": {"low": 1000.0, "expected": 1000.0, "high": 1000.0}}))
+            ["inputs"]["reach"])
+
+
 class ReconPlanRules3Tests(PlanFixture, unittest.TestCase):
     """Plan rules 3 with a model folder: recon's plans are written before the first candidate."""
     plan_rules = 3
@@ -1177,6 +1221,19 @@ class ReconPlanRules3Tests(PlanFixture, unittest.TestCase):
 
 
 class PriorityTests(unittest.TestCase):
+    def test_eval_states_each_kpis_fraction_of_its_limit_and_largest_gaps(self):
+        value = status(decode=22.0, gaps=(("decode", "model pass at its bandwidth floor", 0.7),
+                                          ("decode", "draft steps at their bandwidth floor", 0.01),
+                                          ("decode", "verify pass at the ordinary pass cost", 0.65)))
+        value["kpis"]["decode"]["pass_efficiency"] = 0.16
+        lines = plans.standing(value)
+        self.assertEqual(lines[0], "decode 22.0 tok/s is 11% of its limit 200.0 tok/s; pass at 16% of its floor; "
+                                   "largest gaps: model pass at its bandwidth floor +70%, "
+                                   "verify pass at the ordinary pass cost +65%")
+        self.assertEqual(lines[1], "prefill 1,000.0 tok/s is 25% of its limit 4,000.0 tok/s")
+        self.assertEqual(lines[2], "ttft 200.0 ms is 50% of its floor 100.0 ms")
+        self.assertEqual(len(plans.standing(limitless_decode(value))), 2)   # no limit, no line
+
     def facts(self, decode, prefill, noise=None, context=None):
         value = status(decode=decode * 200, prefill=prefill * 4000, noise=noise or 0, context=context)
         if noise is None:

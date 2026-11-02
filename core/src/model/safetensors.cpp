@@ -233,6 +233,14 @@ std::uint64_t extent(const SafetensorsFile& file) {
 bool lowercase_hex64(std::string_view text) {
     return text.size() == 64 && std::all_of(text.begin(), text.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
 }
+// A checkpoint file's manifest path: relative to the source's directory with '/', so a shard listed in a subfolder
+// (tensors/model-00001-of-00004.safetensors) keeps it.
+std::string manifest_path(const fs::path& file, const fs::path& directory) {
+    auto relative = file.lexically_relative(directory);
+    if(relative.empty()) relative = file.filename();
+    const auto text = relative.generic_u8string();
+    return std::string(text.begin(), text.end());
+}
 }
 
 std::string_view dtype_name(DType dtype) noexcept {
@@ -675,7 +683,7 @@ std::vector<Checkpoint::FileDigest> Checkpoint::digest_files(const ReadOptions& 
     std::vector<FileDigest> rows;
     rows.reserve(shards_.size() + 1);
     auto add = [&](const ReadOnlyFile& file) {
-        rows.push_back({display_path(file.path().filename()), file.identity().size, sha256_file(file, options)});
+        rows.push_back({manifest_path(file.path(), source_.parent_path()), file.identity().size, sha256_file(file, options)});
     };
     if(index_) add(*index_);
     for(const auto& shard:shards_) add(shard.file());
@@ -700,7 +708,7 @@ void Checkpoint::verify_digests(std::span<const FileDigest> expected, const Read
     std::sort(sorted.begin(), sorted.end(), ByPath{});
     std::vector<const FileDigest*> rows(files.size(), nullptr);
     for(std::size_t i = 0; i < files.size(); ++i) {
-        const auto path = display_path(files[i]->path().filename());
+        const auto path = manifest_path(files[i]->path(), source_.parent_path());
         const auto range = std::equal_range(sorted.begin(), sorted.end(), path, ByPath{});
         if(range.second - range.first > 1) throw std::invalid_argument("expected digests list " + shown(path) + " more than once");
         const auto display = display_path(files[i]->path());

@@ -83,7 +83,8 @@ class ResidentChatTests(unittest.TestCase):
         def decode(ids, max_new_tokens, sampling, on_tokens, cancelled, plain=False):
             seen.append(plain)
             tokens, timing = Decoder.generate_tokens(engine, ids, max_new_tokens, sampling, on_tokens, cancelled)
-            return tokens, dict(timing, rounds=2, accepted=[1, 0], drafted=[3, 2], verify_ms=1.25, draft_ms=0.5)
+            return tokens, dict(timing, rounds=2, accepted=[1, 0], drafted=[3, 2], verify_ms=1.25, draft_ms=0.5,
+                                expert_reads=40, expert_hits=30)
         engine.generate_tokens = decode
         with self.assertRaisesRegex(ValueError, "does not decode plainly"):
             engine.generate(request(decode="plain"), threading.Event())
@@ -92,6 +93,7 @@ class ResidentChatTests(unittest.TestCase):
         self.assertEqual(seen, [True])
         self.assertEqual((found["accepted"], found["drafted"], found["verify_ms"], found["draft_ms"]),
                          ([1, 0], [3, 2], 1.25, 0.5))
+        self.assertEqual((found["expert_reads"], found["expert_hits"]), (40, 30))
         engine.generate(request(), threading.Event())
         self.assertEqual(seen, [True, False])
         with self.assertRaisesRegex(ValueError, "decode must be plain"):
@@ -648,6 +650,80 @@ class RawPromptTests(unittest.TestCase):
         self.assertEqual(found["token_logprobs"][len(context):-1], [-0.25] * len(continuation))
         # A chat reply still leaves its stop token out.
         self.assertEqual(engine.generate(request(logprobs=1), threading.Event())["logprobs"]["tokens"], [])
+
+
+class Rambler(Decoder):
+    """Reasons without end (" step" per token) until its context ends with the closing marker, then answers."""
+    def generate_tokens(self, ids, max_new_tokens, sampling, on_tokens, cancelled):
+        self.calls.append((list(ids), max_new_tokens, dict(sampling)))
+        tokenizer = self.text.tokenizer
+        if tokenizer.decode(ids).endswith("</think>"):
+            reply = tokenizer.encode("\n\nDone", add_special_tokens=False) + [1]
+        else:
+            reply = self.reasoning(200)
+        reply = reply[:max_new_tokens]
+        for token in reply:
+            on_tokens([token])
+        return reply, {"prefill_ms": 2.0, "decode_ms": 3.0, "first_token_ms": 2.5}
+
+    def reasoning(self, tokens):
+        """The first `tokens` ids of the reasoning it writes."""
+        return (self.text.tokenizer.encode(" step", add_special_tokens=False) * tokens)[:tokens]
+
+
+class ThinkingBudgetTests(unittest.TestCase):
+    """chat-thinking-budget-v1: limits.thinking_tokens ends the reasoning with the format's closing marker."""
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.model = write_files(Path(temp.name) / "model", llama_files(**{"chat_template.jinja": THINK_TEMPLATE}))
+        self.plain = write_files(Path(temp.name) / "plain", llama_files(**{"chat_template.jinja": TEMPLATE}))
+        self.context = types.SimpleNamespace(configuration={}, limits={"kv_tokens": 4096})
+
+    def budget(self, tokens, output=64, **extra):
+        return request(limits={"max_output_tokens": output, "kv_tokens": 4096, "thinking_tokens": tokens}, **extra)
+
+    def test_reasoning_ends_at_the_budget_and_the_reply_continues_after_the_marker(self):
+        engine = Rambler(self.context, self.model)
+        tokenizer = engine.text.tokenizer
+        response = engine.generate(self.budget(5), threading.Event())
+        thought = engine.reasoning(5)
+        self.assertEqual((response["reasoning"], response["assistant"]), (tokenizer.decode(thought).strip(), "Done"))
+        (first, cap, _), (continued, rest, _) = engine.calls
+        closing = tokenizer.encode("</think>", add_special_tokens=False)
+        self.assertEqual(cap, 5)
+        self.assertEqual(continued, first + thought + closing)
+        self.assertEqual(rest, 64 - 5 - len(closing))
+        telemetry = response["telemetry"]
+        answer = tokenizer.encode("\n\nDone", add_special_tokens=False) + [1]
+        self.assertEqual(telemetry["output_tokens"], 5 + len(closing) + len(answer))
+        # The continuation's prefill and decode count as the reply's decode time; the prefill is the first part's.
+        self.assertEqual((telemetry["prefill_ms"], telemetry["ttft_ms"], telemetry["decode_ms"]), (2.0, 2.5, 8.0))
+        self.assertEqual(telemetry["decode_tokens"], telemetry["output_tokens"] - 1)
+
+    def test_without_a_budget_or_within_it_the_reply_is_one_generation(self):
+        for limits in ({"max_output_tokens": 16, "kv_tokens": 4096},
+                       {"max_output_tokens": 16, "kv_tokens": 4096, "thinking_tokens": 100}):
+            with self.subTest(limits=limits):
+                engine = Rambler(self.context, self.model)
+                response = engine.generate(request(limits=limits), threading.Event())
+                self.assertEqual([cap for _, cap, _ in engine.calls], [16])
+                self.assertEqual((response["assistant"], response["reasoning"]),
+                                 ("", engine.text.tokenizer.decode(engine.reasoning(16)).strip()))
+
+    def test_a_budget_the_reply_cannot_apply_is_refused(self):
+        with self.assertRaisesRegex(RequestRejected, "writes no reasoning"):
+            Rambler(self.context, self.plain).generate(self.budget(5), threading.Event())
+        with self.assertRaisesRegex(RequestRejected, "without logprobs"):
+            LogprobDecoder(self.context, self.model).generate(self.budget(5, logprobs=1), threading.Event())
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            Rambler(self.context, self.model).generate(self.budget(0), threading.Event())
+
+    def test_the_capability_follows_the_reasoning_format(self):
+        think, plain = Rambler(self.context, self.model).text, Rambler(self.context, self.plain).text
+        self.assertIn("chat-thinking-budget-v1", capabilities(think))
+        self.assertNotIn("chat-thinking-budget-v1", capabilities(plain))
+        self.assertNotIn("chat-thinking-budget-v1", capabilities(think, reasoning_format=False))
 
 
 class PackageGapTests(unittest.TestCase):

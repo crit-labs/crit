@@ -121,6 +121,15 @@ An observation reads a few small files or makes one system call. Another process
 take memory before the allocation, swapping pressure is not visible as a limit, and
 unlimited nested cgroups or hidden `/sys/fs/cgroup` report cgroup headroom as unknown.
 
+Pinned memory under WSL is a platform limit admission does not see. The GPU maps page-locked
+host memory into its address space through the Windows driver, and once a large share of the
+VM's memory is pinned a further pin can fail although the observed headroom admits it
+(`cudaHostAlloc` or `pin_memory()` returning out of memory, the driver logging "Failed to
+create GPU mapping"); the error is sticky and ends the process's CUDA context. Allocate every
+pinned buffer an engine needs (staging, row and upload buffers) up front, before the large
+resident pinned allocations, and reuse them instead of pinning per request. Seen on one RTX 5090
+machine under WSL2 with about 68 GB pinned in an 84 GB VM: a 21 MB pin then failed.
+
 [Python fixtures](../../tests/test_techniques.py) build synthetic trees covering enforced
 and unenforced commit, v2 ancestors with dirty, writeback and shmem pages, `memory.high`,
 v1 limits, malformed counters and limits, missing files, exact-fit admission and the unknown policy, and run a live observation on the

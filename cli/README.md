@@ -12,6 +12,7 @@ the checkout) and drives every part of crit. Each subcommand prints its own opti
 | `crit kernels` | Finds, inspects and retains external kernels for the target hardware | [Kernels](../kernels/README.md) |
 | `crit models` | Quantizes weights, distills draft heads and records each transform | [Models](../models/README.md) |
 | `crit inference` | Lists, searches, shows and checks the Inference techniques | [Inference](../inference/README.md) |
+| `crit mcp` | Serves these commands to an agent as MCP tools, long ones as jobs it waits on | [MCP](../mcp/README.md) |
 | `crit contracts` | Prints where Core's native contracts live | [Core](../core/README.md) |
 
 ## A run, start to finish

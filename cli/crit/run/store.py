@@ -770,6 +770,22 @@ class RunStore:
                 raise
         return value
 
+    def eval_started(self, run_id, reservation, journal, resumes=None):
+        """The run's event for an Eval attempt that starts measuring: its reservation, the journal it writes and the
+        earlier attempt's journal it resumes (crit run ... eval --resume)."""
+        root = self._recording(run_id)
+        with lease(root):
+            owner = f"candidates/{reservation['candidate_id']}/attempts/{reservation['attempt_id']}"
+            reserved = safe_path(root, owner + "/reservation.json")
+            resumed = None
+            if resumes is not None:
+                resumes = Path(resumes)
+                resumed = {"path": resumes.relative_to(root).as_posix(), "sha256": file_sha(resumes)}
+            self._event(root, "eval_resumed" if resumed else "eval_started", reservation["candidate_id"],
+                        detail={"attempt_id": reservation["attempt_id"],
+                                "journal": Path(journal).relative_to(root).as_posix(), "resumes": resumed},
+                        reference={"path": f"{owner}/reservation.json", "sha256": file_sha(reserved)})
+
     def _retract_reservation(self, root, candidate_id, owner, attempt_id, path):
         """Remove a reservation that reserve() could not finish publishing. No process was started for it, and
         an event that already references it keeps it (the reservation was observable)."""
@@ -919,10 +935,16 @@ class RunStore:
 
     def prompt(self, root, run, bounds):
         policy = run["spec"]["correctness"].get("weights_policy")
-        weights_note = (" This run requires the model's weights used as stored: declare weights in every proposal;"
-                        " transformed candidates are never eligible. Draft-only weights (a speculative drafter whose"
-                        " tokens the stored weights verify) and KV-cache precision are not covered; see"
-                        " docs/RUN_RECORDS.md.") if policy == "as_stored" else ""
+        weights_note = ((" This run requires the model's weights used as stored: declare weights in every proposal;"
+                         " transformed candidates are never eligible. Draft-only weights (a speculative drafter whose"
+                         " tokens the stored weights verify) and KV-cache precision are not covered; see"
+                         " docs/RUN_RECORDS.md.") if policy == "as_stored" else
+                        (" This run allows transformed weights: a candidate may re-encode stored 16-bit matrices into a"
+                         " lower-precision format as it loads them (for example BF16 to FP8 per channel), declaring"
+                         " weights transformed and configuration.re_encoding (matrix groups and formats), or use"
+                         " crit models for an unquantized source; the quality budget judges either. Where memory or"
+                         " bandwidth bounds decode, measure re-encoding the 16-bit matrices before other levers; see"
+                         " docs/RUN_RECORDS.md.") if policy == "transformable" else "")
         amended = amendments(root, bounds["segment_id"])
         quality_budget, exactness = quality_terms(run["spec"]["correctness"], amended)
         mode = quality_mode(run["spec"]["correctness"])
@@ -955,8 +977,8 @@ class RunStore:
                         f"requirement, not a lever: crit run ... eval applies it; pass --context {capacity} to crit eval run, pin, ab "
                         "and kernels, and plan "
                         "KV precision, tables and buffers for it, not for the longest Eval case. Speed must depend on the tokens "
-                        "a request holds, never on the capacity: Eval measures the speed cases again on an engine opened at a "
-                        "lower context and fails a candidate that is slower there. Device memory a lower context frees goes "
+                        "a request holds, never on the capacity: a certified Eval measures the speed cases again on an engine "
+                        "opened at a lower context and fails a candidate that is slower there. Device memory a lower context frees goes "
                         "where it makes the engine faster, such as the expert cache of a model whose experts spill to host "
                         "memory or disk.")
         origin = run["spec"].get("origin_engine")
@@ -1047,6 +1069,13 @@ class RunStore:
                           "forecast, what each lever delivered and the lesson. The parent's largest p1 lever, pruned or\n"
                           "deferred, is planned again or rejected on a measurement of another kernel structure or a\n"
                           "vendor library at the same arithmetic, never on variants of one kernel.")
+        if run["spec"].get("plan_rules", 1) >= 5:
+            plan_line += ("\nPlan rules 5: the strategy's ceiling is the limit Eval measures (or crit computes), not the\n"
+                          "engine's own speed. crit records how far each needed family's forecast reaches toward it\n"
+                          "(inputs.reach); a forecast whose high stays below half the limit is refused unless a gaps\n"
+                          "entry limit (answer cause) names the measured bound that keeps the rest out of reach, with\n"
+                          "its evidence in the run. An engine reading weights from host memory reports its expert\n"
+                          "cache hits (expert_reads, expert_hits), so Eval's limit is priced at its own hit rate.")
         return f"""# crit run {run['run_id']}
 
 Repository: {self.project}

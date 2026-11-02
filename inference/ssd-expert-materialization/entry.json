@@ -1,7 +1,7 @@
 {
   "id": "ssd-expert-materialization",
   "category": "experts",
-  "summary": "Checked expert reads and bounded native mapped gather with batched read-ahead",
+  "summary": "Checked expert reads, a bounded host tier fed by device evictions, and bounded native mapped gather with batched read-ahead",
   "implementation_status": "native_source",
   "implementation_scope": "Checked host expert reads/upload retention plus a native coalesced-advice, bounded parallel gather with task draining over Core's read-only file mapping (crit::core::ReadOnlyFile)",
   "agent_guidance": {
@@ -10,6 +10,7 @@
     "provides": [
       "Length/digest checked demand reads and executor-based read-ahead",
       "Reuse of pending reads and retained source/destination materializations",
+      "Bounded host tier in front of the file: serves rereads and holds device-cache evictions (retain) without evicting the current route",
       "Separate read quiescence and ambiguous-upload recovery boundary",
       "Native mapped-file region gather with request-order outputs, coalesced read-ahead and bounded workers",
       "Private output allocation, cancellation checks and join-before-release on worker/submission errors"
@@ -17,6 +18,7 @@
     "engine_supplies": [
       "Trusted encoded descriptors, verified artifact identity and immutable-file guarantees; native gather worker/output limits",
       "upload hook with destination ownership and physical readiness",
+      "Device-to-host copy of an evicted slot before it is overwritten, pinned host slots and the tier's capacity within host-memory admission",
       "Read-ahead prediction, staging limits and upload quiescence"
     ],
     "preserve": [
@@ -35,7 +37,7 @@
   "code_files": [
     {
       "path": "inference/ssd-expert-materialization/code/implementation.py",
-      "purpose": "Immutable region reads, deduplicated pending futures and upload-retention protocol; prediction and physical upload are external"
+      "purpose": "Immutable region reads, deduplicated pending futures, upload-retention protocol and the bounded host tier (HostExpertTier, retain); prediction and physical upload are external"
     },
     {
       "path": "inference/ssd-expert-materialization/code/mapped_gather.h",
@@ -62,6 +64,7 @@
     "ExpertRegion",
     "Materialization",
     "FileExpertSource",
+    "HostExpertTier",
     "crit::storage::MappedFile",
     "crit::storage::ByteRegion",
     "crit::storage::GatherLimits",
@@ -69,7 +72,9 @@
   ],
   "interactions": [
     "expert-residency",
-    "quantized-projections"
+    "quantized-projections",
+    "device-expert-cache",
+    "host-memory-admission"
   ],
   "techniques": [
     "ssd-expert-materialization",
@@ -77,9 +82,9 @@
     "quantized-projections"
   ],
   "validation": {
-    "host": "Host fixtures and worked example cover checked file reads, pending reuse, read failure and failed-upload retention/recovery",
+    "host": "Host fixtures and worked example cover checked file reads, pending reuse, read failure, failed-upload retention/recovery, host-tier hits, checked retention of evictions and route protection",
     "native": "Windows and Linux fixtures check mapped page boundaries, duplicates, coalescing, sequential/parallel equivalence, empty files, bounds, cancellation and retry; no storage-throughput or GPU-upload qualification",
-    "performance": "Unmeasured for a native engine; host fixture success is not a speed claim"
+    "performance": "Unmeasured for a crit engine; host fixture success is not a speed claim (an upstream engine's host tier measurement is cited in the README for scale only)"
   },
   "native_integration": {
     "status": "Native mapped gather supplied; physical upload, pinned staging and cache publication remain engine services",

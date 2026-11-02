@@ -349,5 +349,98 @@ finally:
                         process.wait(timeout=10)
 
 
+class DeviceMemoryTests(unittest.TestCase):
+    def test_without_nvidia_smi_an_amdgpu_cards_vram_counters_are_sampled(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as root:
+            self.assertIsNone(measure.amdgpu_vram(root))
+            device = Path(root) / "card1" / "device"
+            device.mkdir(parents=True)
+            (device / "mem_info_vram_used").write_text(str(6 << 30))
+            (device / "mem_info_vram_total").write_text(str(16 << 30))
+            (Path(root) / "card0").mkdir()   # a card without VRAM counters (an integrated or other vendor's GPU)
+            with patch.object(measure.shutil, "which", return_value=None), \
+                    patch.object(measure, "amdgpu_vram", return_value=measure.amdgpu_vram(root)):
+                sampler = measure.Sampler(None)
+                try:
+                    sampler.reset()
+                    window = sampler.window()
+                finally:
+                    sampler.stop()
+        self.assertEqual(window["minimum_free_vram_bytes"], 10 << 30)
+        self.assertEqual(window["peak_vram_bytes"], 6 << 30)
+
+    def test_device_memory_is_sampled_on_every_gpu_the_run_names_and_summed(self):
+        class Smi:
+            stdout = iter(["0, 1000, 32000\n", "1, 3000, 32000\n", "0, 2000, 32000\n"])
+            killed = False
+
+            def kill(self):
+                Smi.killed = True
+
+            def wait(self):
+                return 0
+        with patch.object(measure.shutil, "which", return_value="nvidia-smi"), \
+                patch.object(measure.subprocess, "Popen", return_value=Smi()) as popen:
+            sampler = measure.Sampler(None, gpus=[0, 1])
+            try:
+                time.sleep(.2)
+                window = sampler.window()
+            finally:
+                sampler.stop()
+        self.assertEqual(popen.call_args[0][0][1:3], ["--id=0,1", "--query-gpu=index,memory.used,memory.total"])
+        mib = 1 << 20
+        # The sum counts once both GPUs are read: (32000 - 1000) + (32000 - 3000), then (32000 - 2000) + 29000.
+        self.assertEqual(window["minimum_free_vram_bytes"], (30000 + 29000) * mib)
+        self.assertEqual(window["peak_vram_bytes"], 5000 * mib)
+
+
+# The same engine serving four requests at once: each request object shares the parent's weights.
+CONCURRENT_ADAPTER = ADAPTER + r'''
+
+class Request(Engine):
+    def __init__(self, parent):
+        self.weights = parent.weights
+
+Engine.max_concurrent_requests = 4
+Engine.create_request = lambda self, request: Request(self)
+'''
+
+
+class ConcurrentMeasureTests(MeasureFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        # A run whose case sends four requests at once: 4 x (512 + 64) tokens of KV within the run's 8,192.
+        self.view = self.store.create(self.data | {"workload": {"repetitions": 2, "warmup_runs": 0, "concurrency": 4,
+                                                                "output_tokens": 64}})
+        self.run, self.run_id = self.view["run"], self.view["run"]["run_id"]
+        self.directory = self.store.directory(self.run_id)
+
+    def test_a_concurrent_case_sends_each_repetition_as_requests_at_once(self):
+        candidate = self.served(CONCURRENT_ADAPTER, SERVED + ["chat-concurrent-v1"])
+        (record,) = measure.measure(self.store, self.run_id, candidate)
+        for key in ("prefill_tps", "decode_tps", "request_ms", "ttft_ms", "accepted_tokens_per_round"):
+            self.assertEqual(len(record["metrics"][key]["samples"]), 2 * 4, key)   # every request of each repetition
+        aggregate = record["metrics"]["aggregate_tps"]
+        self.assertEqual((aggregate["unit"], len(aggregate["samples"])), ("tokens/second", 2))
+        self.assertEqual(len(record["metrics"]["load_ms"]["samples"]), 2)
+        # Four replies decoding at once deliver well over one reply's tokens per second.
+        single = sorted(record["metrics"]["decode_tps"]["samples"])[4]
+        self.assertGreater(min(aggregate["samples"]), 1.5 * single)
+        self.assertEqual(record["extensions"]["concurrency"],
+                         {"clients": 4, "peak_concurrency": [4, 4], "max_concurrent_requests": 4})
+        self.assertEqual(record["extensions"]["output_tokens"], [64] * 8)
+        self.assertEqual(self.store.get(self.run_id)["errors"], [])
+
+    def test_a_concurrent_case_needs_kv_for_every_request(self):
+        with self.assertRaisesRegex(ValueError, "each of the 16 concurrent requests"):
+            self.store.create(self.data | {"workload": {"concurrency": 16}})
+        with self.assertRaisesRegex(ValueError, "prompt plus output for each of its concurrent requests"):
+            self.store.create(self.data | {"cases": [{"case_id": "case-0001", "workload": {
+                "prompt_tokens": 512, "output_tokens": 128, "concurrency": 16, "repetitions": 1, "warmup_runs": 0,
+                "mode": "resident"}}]})
+
+
 if __name__ == "__main__":
     unittest.main()

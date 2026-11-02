@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_inference VERSION 0.13.0 LANGUAGES CXX)
+project(crit_inference VERSION 0.14.0 LANGUAGES CXX)
 # Inference's native examples and fixtures. Inference uses Core only through its public SDK
 # (crit::core, crit::cuda); Core never builds or includes Inference code.
 find_package(Threads REQUIRED)
@@ -8,7 +8,7 @@ option(CRIT_INFERENCE_CUDA "Build Inference's CUDA reference kernels and their f
 option(CRIT_INFERENCE_INSTALLED_CORE "Use an installed Core SDK (CMAKE_PREFIX_PATH) instead of this checkout's core/" OFF)
 if(NOT TARGET crit::core)
   if(CRIT_INFERENCE_INSTALLED_CORE)
-    find_package(critCore 0.13.0 CONFIG REQUIRED)
+    find_package(critCore 0.14.0 CONFIG REQUIRED)
   else()
     if(CRIT_INFERENCE_CUDA)
       set(CRIT_CORE_CUDA ON CACHE BOOL "Build the explicit CUDA backend services" FORCE)
@@ -215,6 +215,17 @@ crit_inference_executable(crit_core_projection_example SOURCES ${INFERENCE}/exam
   INCLUDES ${INFERENCE}/quantized-projections/code LINK crit::core)
 crit_inference_test(crit_core_projection_example 30 crit_core_projection_example)
 
+# The batched reference engine's paged attention, host half: page format, codecs, batch tables, host pages and the FP64
+# reference its kernels follow.
+set(_batched ${INFERENCE}/batched-reference-engine/code)
+add_library(crit_paged_reference STATIC ${_batched}/paged_reference.cpp)
+target_include_directories(crit_paged_reference PUBLIC ${_batched})
+target_compile_features(crit_paged_reference PUBLIC cxx_std_20)
+target_link_libraries(crit_paged_reference PUBLIC crit::core)
+crit_inference_warnings(crit_paged_reference)
+crit_inference_executable(crit_paged_reference_tests SOURCES ${FIXTURES}/paged_reference_tests.cpp LINK crit_paged_reference)
+crit_inference_tests(crit_paged_reference_tests crit_paged_reference 120 codecs tables reference invariance rejects)
+
 if(NOT CRIT_INFERENCE_CUDA)
   return()
 endif()
@@ -295,19 +306,30 @@ target_link_libraries(crit_host_mailbox_fixture PUBLIC crit_host_mailbox)
 crit_inference_executable(crit_host_mailbox_tests SOURCES ${FIXTURES}/host_mailbox_tests.cpp LINK crit_host_mailbox_fixture)
 crit_inference_test(crit_host_mailbox 300 crit_host_mailbox_tests)
 
-# The synthetic engine's own paged attention (part of the example engine, not a curated kernel).
-crit_inference_kernels(crit_paged_attention ${INFERENCE}/batched-reference-engine/code paged_attention.cu)
-target_link_libraries(crit_paged_attention PUBLIC crit::core)
+# The synthetic engine's own paged attention (part of the example engine, not a curated kernel): the kernels and the
+# device pages, against attention-state's CPU reference and against the engine's FP64 host reference.
+crit_inference_kernels(crit_paged_attention ${_batched} paged_attention.cu)
+target_sources(crit_paged_attention PRIVATE ${_batched}/device_pages.cpp)
+target_link_libraries(crit_paged_attention PUBLIC crit_paged_reference crit::core)
+if(MSVC)
+  target_compile_options(crit_paged_attention PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/W4;/WX;/permissive->")
+else()
+  target_compile_options(crit_paged_attention PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic;-Werror>")
+endif()
 crit_inference_executable(crit_paged_attention_tests SOURCES ${FIXTURES}/paged_attention_tests.cpp
   INCLUDES ${INFERENCE}/attention-state/code LINK crit_paged_attention)
 crit_inference_tests(crit_paged_attention_tests crit_paged_attention 300 decode invariance widths graph rejects)
+crit_inference_executable(crit_cuda_paged_attention_tests SOURCES ${FIXTURES}/cuda_paged_attention_tests.cpp LINK crit_paged_attention)
+crit_inference_tests(crit_cuda_paged_attention_tests crit_cuda_paged 120 write attention invariance faults)
 
-crit_inference_kernels(crit_batched_engine ${INFERENCE}/batched-reference-engine/code synthetic_model.cu)
+crit_inference_kernels(crit_batched_engine ${_batched} synthetic_model.cu)
 target_link_libraries(crit_batched_engine PUBLIC crit_paged_attention crit::cuda)
 crit_inference_executable(crit_batched_engine_tests SOURCES ${FIXTURES}/batched_engine_tests.cpp LINK crit_batched_engine)
 crit_inference_tests(crit_batched_engine_tests crit_batched_engine 300 kernels batched e4m3)
 crit_inference_executable(crit_batched_engine_throughput SOURCES ${INFERENCE}/batched-reference-engine/code/throughput.cpp LINK crit_batched_engine)
 add_library(crit_batched_engine_library SHARED ${INFERENCE}/batched-reference-engine/code/engine_library.cpp)
+# The static libraries it links go into a shared object, so their objects must be position-independent.
+set_target_properties(crit_paged_reference crit_paged_attention crit_batched_engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(crit_batched_engine_library PRIVATE crit_batched_engine)
 crit_inference_warnings(crit_batched_engine_library)
 if(Python3_Interpreter_FOUND)

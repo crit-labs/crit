@@ -13,7 +13,8 @@ from .ownership import RETIREMENT_SECONDS, group_alive, process_identity
 
 
 class ProcessTree:
-    def __init__(self, command, cwd, log, job_name=None, env=None):
+    def __init__(self, command, cwd, log, job_name=None, env=None, errors=None):
+        """LOG takes the tree's output, and its errors too unless ERRORS names another file."""
         self.process = None
         self.closed = False
         self.identity = None
@@ -21,13 +22,13 @@ class ProcessTree:
         self.job_name = job_name
         self.guardian = None
         if os.name == "nt":
-            self._windows_start(command, cwd, log, env)
+            self._windows_start(command, cwd, log, env, errors)
         else:
-            self.process = subprocess.Popen(command, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
+            self.process = subprocess.Popen(command, cwd=cwd, stdout=log, stderr=errors or subprocess.STDOUT,
                                             stdin=subprocess.DEVNULL, start_new_session=True, env=env)
             self.identity = process_identity(self.process.pid)
 
-    def _windows_start(self, command, cwd, log, env):
+    def _windows_start(self, command, cwd, log, env, errors=None):
         import ctypes as c
         from ctypes import wintypes as w
 
@@ -73,7 +74,7 @@ class ProcessTree:
             if not api.SetInformationJobObject(self.job, 9, c.byref(limits), c.sizeof(limits)):
                 raise c.WinError(c.get_last_error())
             # CREATE_SUSPENDED prevents a launcher spawning children before assignment.
-            self.process = subprocess.Popen(command, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
+            self.process = subprocess.Popen(command, cwd=cwd, stdout=log, stderr=errors or subprocess.STDOUT,
                                             stdin=subprocess.DEVNULL, creationflags=0x4 | 0x08000000, env=env)
             handle = api.OpenProcess(0x0100 | 0x0001, False, self.process.pid)
             if not handle:

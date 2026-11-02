@@ -7,6 +7,16 @@ from .options import serving_capabilities
 from .residency import CAPABILITY as RESIDENT_CAPABILITY
 
 
+def installed_spec(installs, engine, verify_model=False):
+    """What crit serve loads for an installed engine: its verified spec, refused without a resident chat adapter."""
+    spec = installs.spec(engine)
+    if not {CAPABILITY, RESIDENT_CAPABILITY} <= set(spec["capabilities"]):
+        raise ValueError(f"{engine}'s package declares no resident chat adapter ({CAPABILITY}, "
+                         f"{RESIDENT_CAPABILITY}), so crit serve cannot load it")
+    return spec | dict(capabilities=serving_capabilities(spec["capabilities"]),
+                       signature=package_signature(spec["package_path"]), verify_model=verify_model)
+
+
 class InstalledEngine(ServedEngine):
     """One installed engine (crit.pull.store) behind the API, under its <owner>/<name>; any requested model name
     reaches it, as a single run's default does."""
@@ -21,12 +31,7 @@ class InstalledEngine(ServedEngine):
     def _verify(self, candidate_id, **_):
         if candidate_id != self.requested_candidate:
             raise EngineError("Unknown model: " + str(candidate_id), 404)
-        spec = self.installs.spec(candidate_id)
-        if not {CAPABILITY, RESIDENT_CAPABILITY} <= set(spec["capabilities"]):
-            raise ValueError(f"{candidate_id}'s package declares no resident chat adapter ({CAPABILITY}, "
-                             f"{RESIDENT_CAPABILITY}), so crit serve cannot load it")
-        return spec | dict(capabilities=serving_capabilities(spec["capabilities"]),
-                           signature=package_signature(spec["package_path"]), verify_model=self.verify_model)
+        return installed_spec(self.installs, candidate_id, self.verify_model)
 
     def candidates(self, refresh=False):
         return [{"candidate_id": self.requested_candidate, "label": self.spec(self.requested_candidate)["label"]}]

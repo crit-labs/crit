@@ -1,4 +1,5 @@
 #include "crit/cuda.h"
+#include "device_scope.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -37,10 +38,13 @@ struct CudaState {
     std::optional<Resources> resources;
     CudaState* retained_next = nullptr;
     explicit CudaState(int d):device(d) {}
+    // Makes the device current for the calling thread (Backend::bind_thread).
     void bind() const { check(cudaSetDevice(device),"cudaSetDevice"); }
+    // The device for one call; the caller's current device comes back when the call ends.
+    detail::DeviceScope scope() const { return detail::DeviceScope(device); }
     cudaError_t settle() const noexcept {
-        auto status = cudaSetDevice(device);
-        if(status != cudaSuccess) return status;
+        const detail::DeviceScope scope(device,std::nothrow);
+        if(scope.status() != cudaSuccess) return scope.status();
         // Attempt both streams even if the first reports an error.
         const auto first = compute ? cudaStreamSynchronize(compute) : cudaSuccess;
         const auto second = transfer ? cudaStreamSynchronize(transfer) : cudaSuccess;
@@ -55,7 +59,8 @@ struct CudaState {
         if(!s || (s != compute && s != transfer)) throw std::invalid_argument("foreign/null CUDA stream");
     }
     ~CudaState() {
-        log(cudaSetDevice(device),"bind backend destruction");
+        const detail::DeviceScope scope(device,std::nothrow);
+        log(scope.status(),"bind backend destruction");
         if(transfer) log(cudaStreamDestroy(transfer),"destroy transfer stream");
         if(compute) log(cudaStreamDestroy(compute),"destroy compute stream");
     }
@@ -114,7 +119,7 @@ void* CudaBuffer::device_address() const {
     if(!impl_) throw std::logic_error("empty CUDA buffer");
     const auto& storage = *impl_->storage;
     if(storage.memory == Memory::device || !storage.pointer) return storage.pointer;
-    storage.state->bind();
+    const auto scope = storage.state->scope();
     void* device = nullptr;
     check(cudaHostGetDevicePointer(&device,storage.pointer,0),"cudaHostGetDevicePointer");
     return device;
@@ -127,7 +132,7 @@ void CudaBuffer::upload(std::span<const std::byte> source,std::size_t offset,Que
     auto& state = *impl_->storage->state;
     auto staging = create(impl_->storage->state,Memory::host,source.size());
     std::memcpy(staging.data(),source.data(),source.size());
-    state.bind();
+    const auto scope = state.scope();
     const auto stream = state.stream(queue);
     check(cudaMemcpyAsync(static_cast<std::byte*>(data())+offset,staging.data(),source.size(),cudaMemcpyHostToDevice,stream),"cudaMemcpyAsync upload");
     check(cudaStreamSynchronize(stream),"upload synchronization");
@@ -139,7 +144,7 @@ void CudaBuffer::download(std::span<std::byte> destination,std::size_t offset,Qu
     if(!destination.data()) throw std::invalid_argument("null download destination");
     auto& state = *impl_->storage->state;
     auto staging = create(impl_->storage->state,Memory::host,destination.size());
-    state.bind();
+    const auto scope = state.scope();
     const auto stream = state.stream(queue);
     check(cudaMemcpyAsync(staging.data(),static_cast<std::byte*>(data())+offset,destination.size(),cudaMemcpyDeviceToHost,stream),"cudaMemcpyAsync download");
     check(cudaStreamSynchronize(stream),"download synchronization");
@@ -150,11 +155,12 @@ struct CudaEvent::Impl {
     cudaEvent_t event = nullptr;
     bool recorded = false, timing;
     Impl(std::shared_ptr<CudaState> s,bool time):state(std::move(s)),timing(time) {
-        state->bind();
+        const auto scope = state->scope();
         check(cudaEventCreateWithFlags(&event,time ? cudaEventDefault : cudaEventDisableTiming),"cudaEventCreateWithFlags");
     }
     ~Impl() {
-        log(cudaSetDevice(state->device),"bind event destruction");
+        const detail::DeviceScope scope(state->device,std::nothrow);
+        log(scope.status(),"bind event destruction");
         // CUDA defers event resource release while its recorded work is pending.
         if(event) log(cudaEventDestroy(event),"cudaEventDestroy");
     }
@@ -170,7 +176,7 @@ CudaEvent& CudaEvent::operator=(CudaEvent&&) noexcept = default;
 void CudaEvent::record(cudaStream_t stream) {
     if(!impl_) throw std::logic_error("empty CUDA event");
     impl_->state->require_stream(stream);
-    impl_->state->bind();
+    const auto scope = impl_->state->scope();
     check(cudaEventRecord(impl_->event,stream),"cudaEventRecord");
     impl_->recorded = true;
 }
@@ -178,13 +184,13 @@ void CudaEvent::order(cudaStream_t stream) const {
     if(!impl_) throw std::logic_error("empty CUDA event");
     impl_->require_recorded();
     impl_->state->require_stream(stream);
-    impl_->state->bind();
+    const auto scope = impl_->state->scope();
     check(cudaStreamWaitEvent(stream,impl_->event,0),"cudaStreamWaitEvent");
 }
 bool CudaEvent::ready() const {
     if(!impl_) throw std::logic_error("empty CUDA event");
     impl_->require_recorded();
-    impl_->state->bind();
+    const auto scope = impl_->state->scope();
     const auto status = cudaEventQuery(impl_->event);
     if(status == cudaErrorNotReady) return false;
     check(status,"cudaEventQuery");
@@ -193,7 +199,7 @@ bool CudaEvent::ready() const {
 void CudaEvent::wait() {
     if(!impl_) throw std::logic_error("empty CUDA event");
     impl_->require_recorded();
-    impl_->state->bind();
+    const auto scope = impl_->state->scope();
     check(cudaEventSynchronize(impl_->event),"cudaEventSynchronize");
 }
 CudaTimer::CudaTimer(CudaEvent start,CudaEvent stop,cudaStream_t stream)
@@ -206,7 +212,7 @@ void CudaTimer::record_stop() {
 float CudaTimer::elapsed_ms() const {
     if(!start_.impl_ || !stop_.impl_) throw std::logic_error("empty CUDA timer");
     start_.impl_->require_recorded(); stop_.impl_->require_recorded();
-    start_.impl_->state->bind();
+    const auto scope = start_.impl_->state->scope();
     float value = 0;
     check(cudaEventElapsedTime(&value,start_.impl_->event,stop_.impl_->event),"cudaEventElapsedTime");
     return value;
@@ -221,12 +227,13 @@ struct CudaStageTimer::Impl {
     Impl(std::shared_ptr<CudaState> s,std::size_t capacity)
         :state(std::move(s)),starts(capacity,nullptr),stops(capacity,nullptr),timings(capacity,DeviceTiming{DeviceStage::other}) {}
     ~Impl() {
-        log(cudaSetDevice(state->device),"bind stage timer destruction");
+        const detail::DeviceScope scope(state->device,std::nothrow);
+        log(scope.status(),"bind stage timer destruction");
         for(auto event:starts) if(event) log(cudaEventDestroy(event),"cudaEventDestroy");
         for(auto event:stops) if(event) log(cudaEventDestroy(event),"cudaEventDestroy");
     }
     void record(cudaEvent_t event) {
-        state->bind();
+        const auto scope = state->scope();
         auto capture = cudaStreamCaptureStatusNone;
         check(cudaStreamIsCapturing(state->compute,&capture),"cudaStreamIsCapturing");
         if(capture != cudaStreamCaptureStatusNone)
@@ -260,7 +267,7 @@ void CudaStageTimer::reset() {
 std::span<const DeviceTiming> CudaStageTimer::collect() {
     if(!impl_) throw std::logic_error("empty CUDA stage timer");
     if(impl_->open) throw std::logic_error("CUDA stage is still open");
-    impl_->state->bind();
+    const auto scope = impl_->state->scope();
     for(std::size_t i=0;i<impl_->count;++i) {
         const auto status = cudaEventQuery(impl_->stops[i]);
         if(status == cudaErrorNotReady) throw std::runtime_error("CUDA stage timings are not ready");
@@ -278,7 +285,7 @@ CudaBackend::CudaBackend(int device,SyncSchedule schedule) {
     check(cudaGetDeviceCount(&count),"cudaGetDeviceCount");
     if(device < 0 || device >= count) throw std::invalid_argument("invalid CUDA device");
     state_ = std::shared_ptr<CudaState>(new CudaState(device),release_state);
-    state_->bind();
+    const auto scope = state_->scope();
     check(cudaSetDeviceFlags(requested),"cudaSetDeviceFlags");
     check(cudaGetDeviceProperties(&state_->properties,device),"cudaGetDeviceProperties");
     check(cudaStreamCreateWithFlags(&state_->compute,cudaStreamNonBlocking),"create compute stream");
@@ -296,7 +303,7 @@ int CudaBackend::device() const noexcept {return state_->device;}
 cudaDeviceProp CudaBackend::properties() const {return state_->properties;}
 cudaStream_t CudaBackend::stream(Queue queue) const {return state_->stream(queue);}
 SyncSchedule CudaBackend::sync_schedule() const {
-    state_->bind();
+    const auto scope = state_->scope();
     unsigned value = 0;
     check(cudaGetDeviceFlags(&value),"cudaGetDeviceFlags");
     switch(value & cudaDeviceScheduleMask) {
@@ -310,6 +317,9 @@ SyncSchedule CudaBackend::sync_schedule() const {
 CudaBuffer CudaBackend::allocate(Memory memory,std::size_t bytes) {
     return CudaBuffer::create(state_,memory,bytes);
 }
+bool CudaBackend::owns(const CudaBuffer& buffer) const noexcept {
+    return buffer.impl_ && buffer.impl_->storage->state == state_;
+}
 std::size_t CudaBackend::spare_device_bytes(std::size_t margin) const {
     Usage usage;
     {
@@ -317,7 +327,7 @@ std::size_t CudaBackend::spare_device_bytes(std::size_t margin) const {
         if(!state_->resources) throw std::logic_error("CUDA backend has not been initialized");
         usage = state_->resources->usage(Memory::device);
     }
-    state_->bind();
+    const auto scope = state_->scope();
     std::size_t free = 0,total = 0;
     check(cudaMemGetInfo(&free,&total),"cudaMemGetInfo");
     const std::size_t available = std::min(free,usage.limit-usage.live);
@@ -338,7 +348,7 @@ CudaBuffer CudaBuffer::create(std::shared_ptr<CudaState> state,Memory memory,std
     std::unique_ptr<Storage,decltype(&release_storage)> storage(new Storage(state,std::move(reservation),memory,bytes),release_storage);
     auto impl = std::make_shared<CudaBuffer::Impl>(std::move(storage));
     if(bytes) {
-        state->bind();
+        const auto scope = state->scope();
         auto& pointer = impl->storage->pointer;
         check(memory == Memory::device ? cudaMalloc(&pointer,bytes) : cudaMallocHost(&pointer,bytes),"CUDA allocation");
     }
@@ -360,7 +370,7 @@ void CudaBackend::copy_async(const CudaBuffer& dst,std::size_t dst_offset,const 
     // Overlap within an aliased allocation is unsupported by CUDA memcpy.
     if(dst.impl_ == src.impl_ && dst_offset < src_offset+bytes && src_offset < dst_offset+bytes)
         throw std::invalid_argument("overlapping CUDA copy");
-    state_->bind();
+    const auto scope = state_->scope();
     const auto kind = s == Memory::host ? cudaMemcpyHostToDevice : d == Memory::host ? cudaMemcpyDeviceToHost : cudaMemcpyDeviceToDevice;
     check(cudaMemcpyAsync(static_cast<std::byte*>(dst.data())+dst_offset,static_cast<std::byte*>(src.data())+src_offset,bytes,kind,stream),"cudaMemcpyAsync");
 }
@@ -369,7 +379,7 @@ void CudaBackend::fill_async(const CudaBuffer& buffer,int value,Queue queue) {
     if(buffer.memory() != Memory::device) throw std::invalid_argument("fill requires device buffer");
     const auto stream = state_->stream(queue);
     if(!buffer.size()) return;
-    state_->bind();
+    const auto scope = state_->scope();
     check(cudaMemsetAsync(buffer.data(),value,buffer.size(),stream),"cudaMemsetAsync");
 }
 void CudaBackend::readback_async(const CudaBuffer& host_dst,std::size_t dst_offset,const CudaBuffer& device_src,std::size_t src_offset,std::size_t bytes,CudaEvent& completion) {
@@ -379,14 +389,14 @@ void CudaBackend::readback_async(const CudaBuffer& host_dst,std::size_t dst_offs
     if(host_dst.memory() != Memory::host) throw std::invalid_argument("readback requires pinned host destination");
     if(device_src.memory() != Memory::device) throw std::invalid_argument("readback requires device source");
     range(host_dst.size(),dst_offset,bytes); range(device_src.size(),src_offset,bytes);
-    state_->bind();
+    const auto scope = state_->scope();
     if(bytes) check(cudaMemcpyAsync(static_cast<std::byte*>(host_dst.data())+dst_offset,static_cast<std::byte*>(device_src.data())+src_offset,
                                     bytes,cudaMemcpyDeviceToHost,state_->compute),"cudaMemcpyAsync readback");
     completion.record(state_->compute);
 }
 CudaStageTimer CudaBackend::stage_timer(std::size_t capacity) {
     auto impl = std::make_unique<CudaStageTimer::Impl>(state_,capacity);
-    state_->bind();
+    const auto scope = state_->scope();
     for(std::size_t i=0;i<capacity;++i) {
         check(cudaEventCreateWithFlags(&impl->starts[i],cudaEventDefault),"cudaEventCreateWithFlags");
         check(cudaEventCreateWithFlags(&impl->stops[i],cudaEventDefault),"cudaEventCreateWithFlags");

@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
 import json
 import re
+import socket
 import sys
 import threading
 import time
@@ -16,7 +17,7 @@ import uuid
 
 from crit_core.constraints import UnsupportedConstraint, compile_language, json_object_matches, matches
 from crit_core.serving import (COMPLETION_CAPABILITY, CONTINUE_CAPABILITY, FIT_OUTPUT_CAPABILITY, LOGPROBS_CAPABILITY,
-                                SCORE_CAPABILITY, TOKENIZE_CAPABILITY, TOP_LOGPROBS)
+                                SCORE_CAPABILITY, THINKING_BUDGET_CAPABILITY, TOKENIZE_CAPABILITY, TOP_LOGPROBS)
 from crit_core.text import StopMatcher, TextError, message_content
 from crit_core.text.stops import MAX_STOP_BYTES, MAX_STOPS
 
@@ -67,7 +68,8 @@ GUIDED = {"guided_regex": "regex", "guided_choice": "choice", "guided_grammar": 
 KNOWN = {"model", "messages", "stream", "stream_options", "max_tokens", "max_completion_tokens", "stop", "n",
          "include_stop_str_in_output", "response_format", "structured_outputs", "tools", "tool_choice",
          "parallel_tool_calls", "logprobs", "top_logprobs", "crit", "chat_template_kwargs", "reasoning_effort",
-         "priority", "continue_final_message", "add_generation_prompt"} | set(GUIDED) | SAMPLING | set(EXTRA_SAMPLING)
+         "priority", "continue_final_message", "add_generation_prompt",
+         "thinking_budget_tokens"} | set(GUIDED) | SAMPLING | set(EXTRA_SAMPLING)
 # POST /v1/completions (completion-v1); suffix is refused until fill-in-the-middle exists.
 COMPLETION_KNOWN = {"model", "prompt", "suffix", "echo", "stream", "stream_options", "max_tokens", "stop", "n", "best_of",
                     "include_stop_str_in_output", "logprobs", "crit", "priority"} | SAMPLING | set(EXTRA_SAMPLING)
@@ -234,6 +236,25 @@ def thinking_template(thinking, capabilities, template, lenient=None):
     refused = None if lenient is None else []
     return (thinking_kwargs(capabilities, enabled, effort, thinking["params"][0], refused),
             set(unused) | set(thinking["params"] if refused else ()))
+
+
+def thinking_budget(body, thinking, capabilities, unapplied):
+    """The reasoning tokens a chat request allows its reply (chat-thinking-budget-v1), or None: llama-server's
+    thinking_budget_tokens, which needs the capability, else another dialect's budget (Anthropic's
+    thinking.budget_tokens) where its thinking controls applied, which drops it from `unapplied`; without the
+    capability that one stays ignored and listed."""
+    value, param = body.get("thinking_budget_tokens"), "thinking_budget_tokens"
+    if value is None and thinking is not None and thinking.get("budget") is not None:
+        value, param = thinking["budget"], thinking["budget_param"]
+        if THINKING_BUDGET_CAPABILITY not in capabilities or param not in unapplied:
+            return None
+        unapplied.discard(param)
+    if value is None:
+        return None
+    if type(value) is not int or value < 1:
+        raise RequestError(param + " must be a positive integer", param=param)
+    require(capabilities, THINKING_BUDGET_CAPABILITY, param)
+    return value
 
 
 def completion_prompt(value):
@@ -637,6 +658,7 @@ class Api:
         unknown += unknown_parameters(options, {"include_usage"}, self.lenient, prefix="stream_options.")
         ignored = {k for k in body if k in IGNORED} | set(unknown)
         template, unapplied = thinking_template(thinking, capabilities, template, lenient)
+        budget = thinking_budget(body, thinking, capabilities, unapplied)
         ignored = sorted(ignored | unapplied | set(lenient or ()))
         return {"candidate": candidate, "model": self.model if candidate == self.engine.default else self.engine.model_id(candidate),
                 "messages": messages, "max_tokens": limit, "fit_output": fit, "stream": bool(body.get("stream")),
@@ -644,7 +666,7 @@ class Api:
                 "include_stop": body.get("include_stop_str_in_output", False), "response_format": constraint,
                 "sampling": sampling, "tool_options": tools, "logprobs": logprobs, "decode": extension["decode"],
                 "timeout": extension["timeout"], "template_kwargs": template, "priority": body.get("priority") or 0,
-                "continue_final_message": continuing, "ignored": ignored}
+                "continue_final_message": continuing, "thinking_tokens": budget, "ignored": ignored}
 
     def prompt_request(self, body, thinking=None, param="prompt"):
         """A raw-prompt completion (completion-v1): POST /v1/completions, or an Ollama /api/generate with raw true as
@@ -737,6 +759,14 @@ class Api:
     def models(self):
         return [self.card(candidate) for candidate in self.engine.candidates()]
 
+    def capacity(self):
+        """The default model's max_concurrent_requests (ServedEngine.capacity), None when it cannot be told (no
+        default candidate yet, a package that does not verify)."""
+        try:
+            return self.engine.capacity()
+        except (ValueError, EngineError):
+            return None
+
     def card(self, candidate):
         """The /v1/models card of an engine.candidates() entry: its display_name (a catalog's) or label as display_name,
         its context as context_length and as max_model_len, vLLM's name, which LiteLLM reads, and the limits a request
@@ -755,6 +785,9 @@ class Api:
                 "limits": {"context_length": context, "max_output_tokens": context - 1, "max_body_bytes": MAX_BODY,
                            "max_stops": MAX_STOPS, "max_stop_bytes": MAX_STOP_BYTES, "max_tools": MAX_TOOLS,
                            "max_top_logprobs": TOP_LOGPROBS, "max_reply_characters": MAX_CONTENT},
+                # Requests it runs at once (crit-specific): 1 without chat-concurrent-v1, else the loaded engine's
+                # declared capacity capped by --max-concurrency, null until its engine loads.
+                "max_concurrent_requests": self.engine.capacity(candidate["candidate_id"]),
                 # What Eval's headroom and exactness read, while this candidate's engine is loaded.
                 "engine_facts": self.engine.facts(candidate["candidate_id"])}
 
@@ -863,6 +896,7 @@ class Api:
                                                                timeout=request.get("timeout"),
                                                                continue_final_message=request.get(
                                                                    "continue_final_message", False),
+                                                               thinking_tokens=request.get("thinking_tokens"),
                                                                prompt=request.get("prompt"),
                                                                echo=request.get("echo", False))
         except (ValueError, OSError) as exc:
@@ -918,7 +952,8 @@ class Api:
             return None
         return {key: measured[key] for key in ("prompt_tokens", "output_tokens", "prefill_tokens", "prefill_ms",
                                                "decode_tokens", "decode_ms", "prefill_tps", "decode_tps", "ttft_ms",
-                                               "tokens_per_round", "accepted", "drafted", "verify_ms", "draft_ms") if key in measured}
+                                               "tokens_per_round", "accepted", "drafted", "verify_ms", "draft_ms",
+                                               "expert_reads", "expert_hits") if key in measured}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1167,7 +1202,8 @@ class Handler(BaseHTTPRequestHandler):
             wanted = parse_qs(self.path.partition("?")[2]).get("ready", [""])[-1] in {"1", "true"}
             return self.send_json(200 if ok and (ready or not wanted) else 503,
                                   {"status": "ok" if ok else "unavailable", "ready": ready,
-                                   "loaded": bool(status.get("engine")), "engine": status})
+                                   "loaded": bool(status.get("engine")), "engine": status,
+                                   "max_concurrent_requests": self.api.capacity()})
         if path == "":
             return self.send_text(200, "Ollama is running")  # what Ollama clients probe first
         if path == "/api/version":
@@ -1838,13 +1874,21 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class Server(ThreadingHTTPServer):
-    """The HTTP server, or HTTPS with `tls`, an ssl.SSLContext holding the server's certificate."""
+    """The HTTP server, or HTTPS with `tls`, an ssl.SSLContext holding the server's certificate. A port another
+    socket holds is refused on every OS: on Windows SO_REUSEADDR would let this server bind beside it, so the bind
+    is exclusive there instead."""
     daemon_threads = True
+    allow_reuse_address = sys.platform != "win32"
 
     def __init__(self, address, api, tls=None):
         super().__init__(address, Handler)
         self.api = api
         self.tls = tls
+
+    def server_bind(self):
+        if sys.platform == "win32":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
     def get_request(self):
         request, address = super().get_request()

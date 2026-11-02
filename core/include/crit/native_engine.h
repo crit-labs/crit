@@ -13,8 +13,11 @@
 namespace crit::core {
 struct NativeEngine;
 using NativeFactory = NativeEngine (*)(std::string_view configuration_json);
+// A factory that also receives a context the caller passes through open_bound (for example step callbacks).
+using BoundFactory = NativeEngine (*)(std::string_view configuration_json, const void* context);
 namespace native_api {
 void* open(NativeFactory, const char* configuration_json) noexcept;
+void* open_bound(BoundFactory, const void* context, const char* configuration_json) noexcept;
 }
 // What an engine library builds from its configuration (a JSON object: the adapter's configuration plus "model",
 // the model directory, and "context_tokens", the context the engine must serve).
@@ -41,6 +44,7 @@ private:
     // Called by the bridge once after a successful factory return, before exposing the handle.
     void retain_owner() const noexcept;
     friend void* native_api::open(NativeFactory, const char*) noexcept;
+    friend void* native_api::open_bound(BoundFactory, const void*, const char*) noexcept;
 };
 
 // A generation whose drafts are verified against a fixed continuation (Eval's replay): the session accepts a
@@ -62,6 +66,8 @@ struct PlainDecoding final : RequestContext {
 
 namespace native_api {
 inline constexpr int abi_version = 2;
+// open() for a BoundFactory: the same checks and owner retention, with `context` passed to the factory.
+void* open_bound(BoundFactory, const void* context, const char* configuration_json) noexcept;
 // Called with each published token; nonzero cancels the request.
 using TokenCallback = int (*)(void* user, const std::int32_t* tokens, int count);
 // Called with each published token of a request opened with "logprobs": n, with its log-probability and its n most

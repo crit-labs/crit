@@ -18,12 +18,21 @@ def main(argv=None):
     if arguments and arguments[0] == "pull":
         from .pull.cli import main as pull_main
         return pull_main(arguments[1:])
+    if arguments and arguments[0] == "bench":
+        from .pull.bench import main as bench_main
+        return bench_main(arguments[1:])
+    if arguments and arguments[0] == "hub":
+        from .pull.report import main as hub_main
+        return hub_main(arguments[1:])
     if arguments and arguments[0] == "kernels":
         from crit_kernels import main as kernels_main
         return kernels_main(arguments[1:])
     if arguments and arguments[0] == "models":
         from crit_models import main as models_main
         return models_main(arguments[1:])
+    if arguments and arguments[0] == "mcp":
+        from crit_mcp.server import main as mcp_main
+        return mcp_main(arguments[1:])
     if arguments and arguments[0] == "eval":
         try:
             from crit_eval.cli import main as eval_main
@@ -40,8 +49,11 @@ def main(argv=None):
     subs.add_parser("models", help="Transform model weights (PTQ) and record how; use crit models --help")
     subs.add_parser("serve", help="Serve a sealed candidate as an OpenAI-compatible API; use crit serve --help")
     subs.add_parser("pull", help="Install a crit-hub engine for crit serve --engine; use crit pull --help")
+    subs.add_parser("bench", help="Measure an installed engine with crit Eval beside its card; use crit bench --help")
+    subs.add_parser("hub", help="Add a crit bench result to its crit-hub card (crit hub report); use crit hub --help")
     subs.add_parser("run", help="Publish retained run/candidate records; use crit run --help")
     subs.add_parser("eval", help="Run the common speed, quality and exactness suite (crit Eval); use crit eval --help")
+    subs.add_parser("mcp", help="Serve these commands to an agent as MCP tools over stdio; use crit mcp --help")
     sub = subs.add_parser("inference", help="Query or check the inference techniques")
     sub.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args(arguments)

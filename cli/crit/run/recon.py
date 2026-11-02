@@ -32,15 +32,21 @@ STARTING_DESIGNS = {
                    "speculation with the checkpoint's drafter and GEMV kernels near the bandwidth floor.",
     "sparse_device_host": "Candidate 1 already has (1) routed experts in pinned host memory with a device expert cache "
                           "over the device memory the KV cache leaves (Inference: expert-residency, device-expert-cache), "
-                          "so most expert reads stay on the device; (2) the checkpoint's drafter, so a pass emits several "
+                          "so most expert reads stay on the device. Reserve no fixed prompt workspace: prompt (prefill) "
+                          "buffers are lent from cache slots while a prompt runs and returned for decode, so the cache "
+                          "holds the size placement prints; (2) the checkpoint's drafter, so a pass emits several "
                           "tokens (mtp-decode, device-speculative-round); (3) misses served by the faster source below, "
                           "copied over the host link or computed on the CPU from host memory (host-expert-arithmetic, "
-                          "heterogeneous-expert-dispatch), with the split measured on this machine. An engine that copies "
+                          "heterogeneous-expert-dispatch), with the split measured on this machine; its decode "
+                          "telemetry reports expert_reads and expert_hits, so Eval prices its floors at the cache's "
+                          "own hit rate (its facts' host_bytes_per_pass prices its own path instead). An engine that copies "
                           "every expert over the link on every pass, without a cache or a drafter, is not a proof of "
                           "concept of this scenario: its Eval measures neither lever.",
     "sparse_device_host_disk": "As sparse_device_host, plus the experts host memory cannot hold read from disk "
-                               "(ssd-expert-materialization) behind a host cache of the hot ones. Misses beyond host "
-                               "memory are bound by the disk's rate: measure it before choosing cache sizes.",
+                               "(ssd-expert-materialization) behind a host cache of the hot ones, which also holds "
+                               "what the device cache evicts (copied back from the device, not reread from disk). "
+                               "Misses beyond host memory are bound by the disk's rate: measure it before choosing "
+                               "cache sizes.",
     "dense_device_host": "The weights read on every pass do not fit device memory, so every token streams or computes "
                          "the rest from host memory and decode is a few tokens per second at best (dense-layer-offload "
                          "measures the plans). Tell the user before building and build only if they want it.",
@@ -534,8 +540,11 @@ def _placement(found):
     floors = found.get("plain_pass_ceiling_tps") or {}
     if "link" in floors or "cpu" in floors:
         lines += ("\nThe plain-pass bounds assume routing spread evenly over the experts and one token per pass: a "
-                  "cache that holds the routes' hot experts and a drafter's tokens per pass both raise them. Compare "
-                  "the link and CPU bounds to choose where misses run first, then measure the split.\n")
+                  "cache that holds the routes' hot experts and a drafter's tokens per pass both raise them. Even "
+                  "routing is the pessimistic case, so the cache's hit rate under real routing is the main lever. "
+                  "Misses copied over the link and misses computed on the CPU both read host memory: together they "
+                  "come at most at its read rate, not the sum of the two. Measure each path's rate alone and both "
+                  "together on this machine, and set the split from those.\n")
     return lines
 
 

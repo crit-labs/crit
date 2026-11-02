@@ -32,13 +32,38 @@ copy kernel moves the bundles and the expert arithmetic reads `uses[i].bundle`.
 positions beyond the request's length (revalidated when a request begins) and the
 prompt workspace between prompts (invalidated while a prompt chunk runs). The gain
 grows with the context the engine is built for and shrinks as requests fill it, so
-size it from the engine's own KV capacity and workspace, not a fixed slot count. Keep
+size it from the engine's own KV capacity and workspace, not a fixed slot count. Do not
+reserve a fixed prompt workspace beside the cache: lend the prompt's (prefill) buffers
+from cache slots while a prompt runs and return them for decode, so decode never leaves
+that memory idle (recon's placement sizes the cache this way). Keep
 both kinds out of a prompt's plans while the memory is in use, and never let a lent
 slot back a key the current pass reads. Expert residency's
 [slot loans](../expert-residency/README.md#lending-owner-memory-to-the-cache) give the owner
 that reclaim lifecycle on the host. (For scale only: one engine on a 32 GB GPU
 with a 1M-token FP8 KV cache gained about 1,500 and 2,300-2,900 slots next to
 3,000-5,000 owned ones.)
+
+**Adapting during decode.** Keep the cache adapting while it decodes: admit the
+experts a miss fetches over the link into the cache instead of reading them around it,
+and keep the replacement policy running between requests rather than freezing the slots
+after a warmup. Set the split between misses computed on the CPU and misses copied over
+the link from speeds measured on the target machine, each path alone and both together
+(they read the same host memory), and revisit it as the hit rate changes. Do not trade
+adaptivity for repeatable Eval numbers: Eval warms each case until consecutive requests
+agree before it compares repetitions (crit-eval's `speed.steady_state`), so a cache that
+settles is measured at the speed it settles to, and one frozen early is measured cold.
+
+**Starting warm: a residency profile.** A cold cache spends its first requests on misses.
+The package may ship a residency or routing profile, a file of the engine's own format
+(per-layer route counts, or the slots to fill), that the engine reads at start to fill
+the cache before its first request; every file in the package folder is bound to it, so
+the profile is part of the candidate's identity. Load it at engine start, never per
+request, and keep adapting from it. Routing depends on content, so the profile is a
+content-dependent choice under AGENTS.md's rule: build it from a general corpus
+unrelated to Eval (never Eval's prompts, pinned continuation, held-out prompts or
+look-alike text), state that corpus and a held-out check in several languages and
+domains in the proposal, and keep the cache adapting so a profile that misses still
+converges.
 
 **Lookahead prefetch.** The next group's router applied to the current input predicts
 many of its experts. A prefetch plan tags a pool half (by group parity, so the half
