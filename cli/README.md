@@ -36,11 +36,15 @@ gives the full sequence and [AGENTS.md](../AGENTS.md) the rules an agent follows
 
 ## How it is built
 
-[cli.py](crit/cli.py) routes each subcommand to its package. [run/](crit/run/) holds the run records: a
+[cli.py](crit/cli.py) routes each subcommand to its package. Beside the packages, two leaf modules serve all of
+them: [records.py](crit/records.py), strict JSON records, SHA-256 identities, file inventories and canonical
+paths, and [lease.py](crit/lease.py), the single-writer lease the run coordinator and crit serve's runtime
+ownership take. [run/](crit/run/) holds the run records: a
 single-writer coordinator ([store.py](crit/run/store.py)) that writes every record and refuses an invalid
 one, strict record schemas ([records.py](crit/run/records.py)), candidate plans and their checks
 ([plans.py](crit/run/plans.py)), model reconnaissance ([recon.py](crit/run/recon.py)), captured case requests
-([capture.py](crit/run/capture.py)), builds under a build attempt ([build.py](crit/run/build.py)), checks from Eval
+([capture.py](crit/run/capture.py)), one way to reserve, log and settle an attempt of a candidate
+([attempt.py](crit/run/attempt.py)), builds under a build attempt ([build.py](crit/run/build.py)), checks from Eval
 results and the standard serving checks ([checks.py](crit/run/checks.py)), Eval and measurement
 through `crit serve` ([evaluation.py](crit/run/evaluation.py), [measure.py](crit/run/measure.py)) and build
 cost from the agent's transcripts ([cost.py](crit/run/cost.py)). [pull/](crit/pull/) installs crit-hub engines:

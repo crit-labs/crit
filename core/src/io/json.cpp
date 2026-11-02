@@ -1,4 +1,5 @@
 #include "crit/json.h"
+#include "shown.h"
 #include "crit/file.h"
 #include <algorithm>
 #include <bit>
@@ -35,19 +36,7 @@ const std::string empty_source;
 const Value null_value;
 std::string at_byte(std::size_t offset) { return "byte " + std::to_string(offset); }
 // Short, printable rendering of a key for diagnostics; never splits a UTF-8 sequence.
-std::string shown_key(std::string_view key) {
-    std::size_t cut = std::min<std::size_t>(key.size(), 64);
-    while(cut < key.size() && cut > 0 && (static_cast<unsigned char>(key[cut]) & 0xC0) == 0x80) --cut;
-    std::string out = "'";
-    for(char c:key.substr(0, cut)) {
-        const auto b = static_cast<unsigned char>(c);
-        if(b < 0x20 || b == 0x7F || c == '\'' || c == '\\') {
-            static const char hex[] = "0123456789abcdef";
-            out += "\\x"; out += hex[b >> 4]; out += hex[b & 15];
-        } else out += c;
-    }
-    return out + (cut < key.size() ? "'..." : "'");
-}
+std::string shown_key(std::string_view key) { return ::crit::core::detail::shown(key, 64); }
 void validate_limits(const Limits& limits) {
     if(limits.max_bytes == 0 || limits.max_depth == 0 || limits.max_nodes == 0)
         throw std::invalid_argument("json limits must be positive");

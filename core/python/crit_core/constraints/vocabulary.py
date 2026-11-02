@@ -27,11 +27,6 @@ class ByteVocabulary:
     eos: int
     identity: str
 
-    @property
-    def request_fields(self):
-        """Keyword arguments for make_compile_request, CompilerCache.compile and PreparationService.request."""
-        return {"tokenizer_identity": self.identity, "pieces": self.pieces, "eos": self.eos}
-
 
 def _identity(pieces, eos):
     digest = hashlib.sha256(b"crit-byte-vocabulary-v1\0%d\0%d\0" % (len(pieces), eos))

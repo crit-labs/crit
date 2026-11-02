@@ -39,7 +39,7 @@ crit models verify --record transform.json
    the server, then `crit models eval` verifies the output and writes the `models_evaluation`
    record. It refuses data prepared from another model and a result measured on other data or
    through an adapter, so quality is always the engine's own scores against the original's.
-   Pass `--baseline` with the same engine's result on the source to see the speed change.
+   `crit eval compare SOURCE_RESULT RESULT` shows the speed change against the same engine's result on the source.
 4. **Verify** re-hashes the output and source against the record.
 
 The source must be unquantized (BF16, F16 or F32 projections, no `quantization_config`).

@@ -393,6 +393,18 @@ reads weights from host memory is priced at their tier, at the expert cache hit 
 Refusing rather than warning follows the checks above: a plan that does not meet a rule is not recorded, and
 the message says what to add.
 
+#### Plan rules 6
+
+Runs created from this version on have `"plan_rules": 6`: the rules 5 above and check 16, in `as_quantized` runs
+only. A build plan declares `prompt_activations`, the formats its candidate's prompt GEMMs take per stored format,
+in the form an engine declares them to Eval (`bf16`, `fp16_acc`, `fp8` or `stored`, or per format a share of
+them). No quantized format starts at `bf16`: `as_quantized` judges quality against the checkpoint's own activation
+quantization, so a candidate reads prompts at the stored format (or `fp8` / `fp16_acc`) from candidate 1 on. A
+`bf16` share stands only beside a gaps entry `{"kpi": "prefill", "gap": "activation:stored", "answer":
+"rejected", "evidence", "detail"}` whose evidence is a crit-eval result that measured `stored` outside the quality
+noise; crit records it in `inputs.activation_evidence`. The next plan is refused when its parent's Eval reports
+other `prompt_activations` than the parent's plan declared, unless it carries that rejection.
+
 crit checks completeness and consistency with the frozen facts, never whether the reasoning is good,
 and refuses a plan with a message that says what to fix:
 

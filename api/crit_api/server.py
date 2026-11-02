@@ -1,6 +1,7 @@
 """OpenAI-compatible HTTP endpoints over one ServedEngine (standard library and crit_core only)."""
 import array
 import base64
+from collections import namedtuple
 from contextlib import ExitStack, contextmanager
 import functools
 import hashlib
@@ -16,7 +17,8 @@ from urllib.parse import parse_qs
 import uuid
 
 from crit_core.constraints import UnsupportedConstraint, compile_language, json_object_matches, matches
-from crit_core.serving import (COMPLETION_CAPABILITY, CONTINUE_CAPABILITY, FIT_OUTPUT_CAPABILITY, LOGPROBS_CAPABILITY,
+from crit_core.serving import (COMPLETION_CAPABILITY, CONSTRAINTS_CAPABILITY, CONTINUE_CAPABILITY, FIT_OUTPUT_CAPABILITY,
+                                GRAMMAR_CAPABILITY, IMAGES_CAPABILITY, LOGPROBS_CAPABILITY, REQUEST_FACTS,
                                 SCORE_CAPABILITY, THINKING_BUDGET_CAPABILITY, TOKENIZE_CAPABILITY, TOP_LOGPROBS)
 from crit_core.text import StopMatcher, TextError, message_content
 from crit_core.text.stops import MAX_STOP_BYTES, MAX_STOPS
@@ -26,8 +28,8 @@ from crit import __version__
 from . import anthropic, ollama, responses
 from .content import MAX_CONTENT
 from .disconnect import ClientDisconnect
-from .delivery import StreamDelivery
-from .engine import CONSTRAINTS_CAPABILITY, GRAMMAR_CAPABILITY, ContextLengthError, EngineError, Overloaded
+from .delivery import PING, StreamDelivery, sse_event
+from .engine import ContextLengthError, EngineError, Overloaded
 from .logprobs import completion_logprobs, logprob_options
 from .metrics import Metrics
 from .options import (EXTRA_SAMPLING, MAX_TOOLS, RequestError, SAMPLING, TEMPLATE_KWARGS_CAPABILITY, TOOLS_CAPABILITY,
@@ -53,7 +55,6 @@ NOT_SERVED = {"/v1/embeddings": EMBEDDINGS, "/v1/rerank": EMBEDDINGS, "/v2/reran
               "/v1/batches": ""}
 DEFAULT_MAX_TOKENS = 1024
 RETRY_AFTER = 1  # seconds a client the queue refused is asked to wait before it retries (Retry-After)
-PING = b": ping\n\n"  # an SSE comment: clients skip it, while proxies and idle timers see the stream is alive
 # Only non-generation metadata is accepted without applying it.
 IGNORED = {"user", "metadata", "store", "service_tier", "prompt_cache_key", "prompt_cache_retention",
            "safety_identifier"}
@@ -81,12 +82,12 @@ RENDERED = {"model", "messages", "tools", "tool_choice", "parallel_tool_calls", 
             "reasoning_effort", "continue_final_message", "add_generation_prompt"}
 
 
-def content_text(content, index, capabilities=()):
+def message_text(content, index, capabilities=()):
     param = f"messages[{index}].content"
     if content is None:
         raise RequestError("Message content must be a string or a list of parts", param=param)
     try:
-        return message_content(content, param, images="chat-images-v1" in capabilities)
+        return message_content(content, param, images=IMAGES_CAPABILITY in capabilities)
     except (TextError, ValueError) as exc:
         raise RequestError(str(exc), param=param) from None
 
@@ -142,7 +143,7 @@ def conversation(messages, capabilities=(), continuing=False):
                 or message["role"] not in {"system", "developer", "user", "assistant"}):
             raise RequestError("Each message needs a role of system, user or assistant", param=f"messages[{index}].role")
         role = "system" if message["role"] == "developer" else message["role"]
-        content = content_text(message.get("content"), index, capabilities)
+        content = message_text(message.get("content"), index, capabilities)
         if role == "system" and any(m["role"] != "system" for m in result):
             role, content = "user", late_system(content)
         if result and result[-1]["role"] == role:
@@ -177,7 +178,7 @@ def tool_conversation(messages, capabilities=(), continuing=False):
         if calls and role != "assistant":
             raise RequestError("Only assistant messages may contain tool_calls", param=param)
         content = message.get("content")
-        row = {"role": role, "content": "" if content is None and calls else content_text(content, index, capabilities)}
+        row = {"role": role, "content": "" if content is None and calls else message_text(content, index, capabilities)}
         if calls:
             try:
                 row["tool_calls"] = tool_calls(calls)
@@ -431,6 +432,12 @@ def conforms(constraint, text):
 def key_digest(key):
     """An API key's SHA-256, which the server keeps and compares in place of the key."""
     return hashlib.sha256(key.encode()).digest()
+
+
+# What Api.run returns: OpenAI's finish_reason, the engine's telemetry (None when a stop string ended the reply before
+# the engine's final record), the tool calls, the reasoning apart from the reply, OpenAI's logprobs content (or None)
+# and the stop string that ended the reply (or None).
+Ran = namedtuple("Ran", "finish measured calls reasoning logprobs stopped")
 
 
 class Api:
@@ -826,8 +833,8 @@ class Api:
     def run(self, request, emit, cancel, emit_tools=None, emit_reasoning=None, on_started=None, on_admitted=None,
             timing=None):
         """Generate; emit receives text, emit_tools indexed deltas, emit_reasoning reasoning text (apart from the
-        reply). Returns (finish_reason, measured, calls, reasoning, logprobs, stopped), logprobs being OpenAI's
-        logprobs content when the request asked for it and stopped the stop string that ended the reply, or None.
+        reply). Returns Ran(finish, measured, calls, reasoning, logprobs, stopped), logprobs being OpenAI's logprobs
+        content when the request asked for it and stopped the stop string that ended the reply, or None.
         on_admitted() runs once the engine takes the request from its queue (ServedEngine.generate).
         A raw prompt (prompt_request) with echo emits its prompt first, and its logprobs start with the prompt's.
         Stop strings follow
@@ -934,26 +941,114 @@ class Api:
                 if emit_tools and not tool_incremental:
                     emit_tools([dict(call, index=i) for i, call in enumerate(calls)])
                 # A call the output limit cut keeps the arguments written so far, and the reply finishes as cut.
-                return ("tool_calls" if complete_arguments(calls[-1]) else "length"), measured, calls, reasoning, logprobs, None
-            return finish, measured, [], reasoning, logprobs, scanner.stopped
+                return Ran("tool_calls" if complete_arguments(calls[-1]) else "length", measured, calls, reasoning, logprobs,
+                           None)
+            return Ran(finish, measured, [], reasoning, logprobs, scanner.stopped)
         if scanner.stopped is not None:
             if request.get("include_stop"):
                 emit(scanner.stopped)
             calls = finished()
             if calls:
-                return "tool_calls", None, calls, "".join(streamed), None, None
-            return "stop", None, [], "".join(streamed), None, scanner.stopped
+                return Ran("tool_calls", None, calls, "".join(streamed), None, None)
+            return Ran("stop", None, [], "".join(streamed), None, scanner.stopped)
         if status == "timed_out":
             raise EngineError("The engine did not finish within the request timeout", 504)
         raise EngineError("Request cancelled", 499)
+
+    def fingerprint(self, candidate):
+        """A reply's system_fingerprint: the start of its candidate's package hash."""
+        return self.engine.spec(candidate)["package_sha256"][:16]
 
     def telemetry(self, measured):
         if measured is None:
             return None
         return {key: measured[key] for key in ("prompt_tokens", "output_tokens", "prefill_tokens", "prefill_ms",
                                                "decode_tokens", "decode_ms", "prefill_tps", "decode_tps", "ttft_ms",
-                                               "tokens_per_round", "accepted", "drafted", "verify_ms", "draft_ms",
-                                               "expert_reads", "expert_hits") if key in measured}
+                                               "tokens_per_round", *REQUEST_FACTS) if key in measured}
+
+
+class OpenAIStream:
+    """Writes an OpenAI stream through `write(bytes)`: chunks as data events, the finish chunk with the reply's
+    logprobs, which come from the engine's final record, a usage chunk when stream_options.include_usage asks for one,
+    then data: [DONE].
+
+    Every dialect's stream (this one, anthropic.Stream, responses.Stream, ollama.Stream) is run by Handler.streamed:
+    it has a content_type and a ping that keeps it open (or None), start() runs once the engine takes the request,
+    text, tools and reasoning take what the engine streams (tools or reasoning None when the dialect does not stream
+    them), then finish(ran, telemetry) or fail(message, code, status, request_id) ends it."""
+    content_type, ping = "text/event-stream", PING
+    prefix = kind = param = None  # per stream: its id prefix, its chunks' object, the param an overflow names
+
+    def __init__(self, write, api, request):
+        self.write, self.api, self.request = write, api, request
+        self.ident, self.created = self.prefix + uuid.uuid4().hex, int(time.time())
+        self.fingerprint = api.fingerprint(request["candidate"])
+
+    def event(self, value):
+        self.write(sse_event(value))
+
+    def chunk(self, choice=None, usage=None, telemetry=None):
+        """A chunk with `choice`, or without one: the usage chunk."""
+        value = {"id": self.ident, "object": self.kind, "created": self.created, "model": self.request["model"],
+                 "system_fingerprint": self.fingerprint, "choices": [] if choice is None else [choice]}
+        if usage is not None or (self.request["include_usage"] and choice is None):
+            value["usage"] = usage
+        if telemetry is not None:
+            value["crit_telemetry"] = telemetry
+        return value
+
+    def start(self):
+        pass
+
+    def finish(self, ran, telemetry=None):
+        self.event(self.chunk(self.last(ran)))
+        if self.request["include_usage"]:
+            self.event(self.chunk(usage=self.api.usage(ran.measured), telemetry=telemetry))
+        self.write(b"data: [DONE]\n\n")
+
+    def fail(self, message, code=None, status=500, request_id=None):
+        self.event({"error": {"message": message, "type": "server_error" if status >= 500 else "invalid_request_error",
+                              "param": self.param if code else None, "code": code}, "request_id": request_id})
+        self.write(b"data: [DONE]\n\n")
+
+
+class ChatStream(OpenAIStream):
+    """A chat completion stream: the assistant's role first, then text, tool call and reasoning deltas."""
+    prefix, kind, param = "chatcmpl-", "chat.completion.chunk", "messages"
+
+    def choice(self, delta, finish=None, logprobs=None):
+        return {"index": 0, "delta": delta, "logprobs": None if logprobs is None else {"content": logprobs},
+                "finish_reason": finish}
+
+    def start(self):
+        self.event(self.chunk(self.choice({"role": "assistant", "content": ""})))
+
+    def text(self, piece):
+        self.event(self.chunk(self.choice({"content": piece})))
+
+    def tools(self, deltas):
+        self.event(self.chunk(self.choice({"tool_calls": deltas})))
+
+    def reasoning(self, piece):
+        self.event(self.chunk(self.choice(self.api.reasoning_fields(piece))))
+
+    def last(self, ran):
+        return self.choice({}, ran.finish, ran.logprobs)
+
+
+class TextStream(OpenAIStream):
+    """A raw prompt's completion stream (completion-v1): its text, without tool calls or reasoning."""
+    prefix, kind, param = "cmpl-", "text_completion", "prompt"
+    tools = reasoning = None
+
+    def choice(self, text, finish=None, logprobs=None):
+        return {"text": text, "index": 0, "logprobs": logprobs, "finish_reason": finish}
+
+    def text(self, piece):
+        self.event(self.chunk(self.choice(piece)))
+
+    def last(self, ran):
+        return self.choice("", ran.finish, None if ran.logprobs is None else completion_logprobs(ran.logprobs))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1440,32 +1535,23 @@ class Handler(BaseHTTPRequestHandler):
         if request["format"] == "packed":
             scored = {"format": "packed", **{part: packed_rows(scores) for part, scores in scored.items()}}
         self.send_json(200, {"object": "crit.score", "model": request["model"],
-                             "system_fingerprint": self.api.engine.spec(request["candidate"])["package_sha256"][:16],
+                             "system_fingerprint": self.api.fingerprint(request["candidate"]),
                              **scored, "crit_telemetry": telemetry})
 
-    def complete(self, request, cancel):
+    # Every dialect runs a request one of two ways: to its end as one reply (reply, given the dialect's answer), or as
+    # a stream (streamed, given the dialect's stream; OpenAIStream describes what a stream does).
+
+    def reply(self, dialect, request, cancel, answer):
+        """Run `request` to its end and send answer(text, ran), its reply in the dialect, or the engine's error."""
         pieces = []
         timing = self.api.metrics.begin()
         try:
-            finish, measured, calls, reasoning, logprobs, _ = self.api.run(request, pieces.append, cancel, timing=timing)
+            ran = self.api.run(request, pieces.append, cancel, timing=timing)
         except EngineError as exc:
-            self.measure("openai", timing, self.outcome(exc))
+            self.measure(dialect, timing, self.outcome(exc))
             return self.engine_error(exc)
-        self.measure("openai", timing, "completed", measured)
-        value = {"id": "chatcmpl-" + uuid.uuid4().hex, "object": "chat.completion", "created": int(time.time()),
-                 "model": request["model"], "system_fingerprint": self.api.engine.spec(request["candidate"])["package_sha256"][:16],
-                 "choices": [{"index": 0, "message": {"role": "assistant", "content": "".join(pieces)},
-                              "logprobs": None if logprobs is None else {"content": logprobs}, "finish_reason": finish}]}
-        if calls:
-            value["choices"][0]["message"].update(content="".join(pieces) or None, tool_calls=calls)
-        if reasoning:
-            value["choices"][0]["message"].update(self.api.reasoning_fields(reasoning))
-        usage = self.api.usage(measured)
-        if usage:
-            value["usage"] = usage
-        if measured:
-            value["crit_telemetry"] = self.api.telemetry(measured)
-        self.send_json(200, value, self.headers_for(request, measured))
+        self.measure(dialect, timing, "completed", ran.measured)
+        self.send_json(200, answer("".join(pieces), ran), self.headers_for(request, ran.measured))
 
     def start_stream(self, content_type, request, cancel):
         """A stream's status and headers, sent once the engine takes the request (Api.run's on_admitted), so a request
@@ -1483,273 +1569,117 @@ class Handler(BaseHTTPRequestHandler):
             cancel.set()  # The client went away: stop the engine.
         self.close_connection = True
 
-    def stream(self, request, cancel):
-        with StreamDelivery(self.connection, cancel, self.api.engine._stopping, self.api.engine.timeout) as delivery:
-            previous, self.wfile = self.wfile, delivery
+    def writer(self, cancel):
+        """write(data) for a stream: sent at once, and a client that went away stops the engine."""
+        def write(data):
             try:
-                self._stream(request, cancel, delivery)
-            finally:
-                self.wfile = previous
-
-    def _stream(self, request, cancel, delivery):
-        ident, created = "chatcmpl-" + uuid.uuid4().hex, int(time.time())
-        fingerprint = self.api.engine.spec(request["candidate"])["package_sha256"][:16]
-        opened, pings = False, ExitStack()
-
-        def event(value):
-            try:
-                self.wfile.write(b"data: " + json.dumps(value).encode("utf-8") + b"\n\n")
+                self.wfile.write(data)
                 self.wfile.flush()
             except OSError:
                 cancel.set()  # The client went away: stop the engine.
+        return write
 
-        def chunk(delta, finish=None, usage=None, choices=True, logprobs=None, telemetry=None):
-            value = {"id": ident, "object": "chat.completion.chunk", "created": created, "model": request["model"],
-                     "system_fingerprint": fingerprint,
-                     "choices": [{"index": 0, "delta": delta, "logprobs": None if logprobs is None else {"content": logprobs},
-                                  "finish_reason": finish}] if choices else []}
-            if usage is not None or (request["include_usage"] and not choices):
-                value["usage"] = usage
-            if telemetry is not None:
-                value["crit_telemetry"] = telemetry
-            return value
+    def streamed(self, dialect, request, cancel, stream):
+        """Run `request` as `stream`, its dialect's stream, which this connection delivers (StreamDelivery)."""
+        with StreamDelivery(self.connection, cancel, self.api.engine._stopping, self.api.engine.timeout) as delivery:
+            previous, self.wfile = self.wfile, delivery
+            try:
+                self._streamed(dialect, request, cancel, stream, delivery)
+            finally:
+                self.wfile = previous
+
+    def _streamed(self, dialect, request, cancel, stream, delivery):
+        opened, pings = False, ExitStack()
 
         def admitted():
             nonlocal opened
             opened = True
-            self.start_stream("text/event-stream", request, cancel)
-            event(chunk({"role": "assistant", "content": ""}))
-            # Pings keep proxies and idle clients from closing the open stream while the engine has nothing to send.
-            pings.enter_context(delivery.pinging(PING, self.api.ping_interval))
+            self.start_stream(stream.content_type, request, cancel)
+            stream.start()
+            if stream.ping is not None:
+                # Pings keep proxies and idle clients from closing the open stream while the engine has nothing to send.
+                pings.enter_context(delivery.pinging(stream.ping, self.api.ping_interval))
 
         timing = self.api.metrics.begin()
         try:
             with pings:  # they end before the closing events
-                finish, measured, _, _, logprobs, _ = self.api.run(request, lambda piece: event(chunk({"content": piece})),
-                    cancel, lambda deltas: event(chunk({"tool_calls": deltas})),
-                    lambda piece: event(chunk(self.api.reasoning_fields(piece))), on_started=delivery.set_deadline,
-                    on_admitted=admitted, timing=timing)
+                ran = self.api.run(request, stream.text, cancel, stream.tools, stream.reasoning,
+                                   on_started=delivery.set_deadline, on_admitted=admitted, timing=timing)
         except EngineError as exc:
-            self.measure("openai", timing, self.outcome(exc))
+            self.measure(dialect, timing, self.outcome(exc))
             if not opened:
                 return self.engine_error(exc)  # refused before the stream began, such as by a full queue
             message, code = self.error_words(exc)
-            event({"error": {"message": message, "type": "server_error" if exc.status >= 500 else "invalid_request_error",
-                             "param": "messages" if code else None, "code": code}, "request_id": self.request_id})
+            stream.fail(message, code, exc.status, self.request_id)
         else:
-            self.measure("openai", timing, "completed", measured)
-            # Text streams as the engine emits it; the reply's logprobs come from its final record, with the finish chunk.
-            event(chunk({}, finish, logprobs=logprobs))
-            if request["include_usage"]:
-                event(chunk({}, usage=self.api.usage(measured), choices=False, telemetry=self.api.telemetry(measured)))
-        try:
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        except OSError:
-            pass
+            self.measure(dialect, timing, "completed", ran.measured)
+            stream.finish(ran, self.api.telemetry(ran.measured))
+
+    # OpenAI chat completions
+
+    def openai_reply(self, request, ran, prefix, kind, choice):
+        """An OpenAI reply with its one choice, usage and crit telemetry."""
+        value = {"id": prefix + uuid.uuid4().hex, "object": kind, "created": int(time.time()), "model": request["model"],
+                 "system_fingerprint": self.api.fingerprint(request["candidate"]), "choices": [choice]}
+        usage = self.api.usage(ran.measured)
+        if usage:
+            value["usage"] = usage
+        if ran.measured:
+            value["crit_telemetry"] = self.api.telemetry(ran.measured)
+        return value
+
+    def complete(self, request, cancel):
+        def answer(text, ran):
+            message = {"role": "assistant", "content": text}
+            if ran.calls:
+                message.update(content=text or None, tool_calls=ran.calls)
+            if ran.reasoning:
+                message.update(self.api.reasoning_fields(ran.reasoning))
+            return self.openai_reply(request, ran, "chatcmpl-", "chat.completion",
+                                     {"index": 0, "message": message,
+                                      "logprobs": None if ran.logprobs is None else {"content": ran.logprobs},
+                                      "finish_reason": ran.finish})
+        self.reply("openai", request, cancel, answer)
+
+    def stream(self, request, cancel):
+        self.streamed("openai", request, cancel, ChatStream(self.writer(cancel), self.api, request))
 
     # OpenAI legacy completions of a raw prompt (completion-v1)
 
     def text_complete(self, request, cancel):
-        pieces = []
-        timing = self.api.metrics.begin()
-        try:
-            finish, measured, _, _, logprobs, _ = self.api.run(request, pieces.append, cancel, timing=timing)
-        except EngineError as exc:
-            self.measure("openai", timing, self.outcome(exc))
-            return self.engine_error(exc)
-        self.measure("openai", timing, "completed", measured)
-        value = {"id": "cmpl-" + uuid.uuid4().hex, "object": "text_completion", "created": int(time.time()),
-                 "model": request["model"], "system_fingerprint": self.api.engine.spec(request["candidate"])["package_sha256"][:16],
-                 "choices": [{"text": "".join(pieces), "index": 0,
-                              "logprobs": None if logprobs is None else completion_logprobs(logprobs),
-                              "finish_reason": finish}]}
-        usage = self.api.usage(measured)
-        if usage:
-            value["usage"] = usage
-        if measured:
-            value["crit_telemetry"] = self.api.telemetry(measured)
-        self.send_json(200, value, self.headers_for(request, measured))
+        self.reply("openai", request, cancel, lambda text, ran: self.openai_reply(
+            request, ran, "cmpl-", "text_completion",
+            {"text": text, "index": 0, "logprobs": None if ran.logprobs is None else completion_logprobs(ran.logprobs),
+             "finish_reason": ran.finish}))
 
     def text_stream(self, request, cancel):
-        with StreamDelivery(self.connection, cancel, self.api.engine._stopping, self.api.engine.timeout) as delivery:
-            previous, self.wfile = self.wfile, delivery
-            try:
-                self._text_stream(request, cancel, delivery)
-            finally:
-                self.wfile = previous
-
-    def _text_stream(self, request, cancel, delivery):
-        ident, created = "cmpl-" + uuid.uuid4().hex, int(time.time())
-        fingerprint = self.api.engine.spec(request["candidate"])["package_sha256"][:16]
-        opened, pings = False, ExitStack()
-
-        def event(value):
-            try:
-                self.wfile.write(b"data: " + json.dumps(value).encode("utf-8") + b"\n\n")
-                self.wfile.flush()
-            except OSError:
-                cancel.set()  # The client went away: stop the engine.
-
-        def chunk(text, finish=None, usage=None, choices=True, logprobs=None, telemetry=None):
-            value = {"id": ident, "object": "text_completion", "created": created, "model": request["model"],
-                     "system_fingerprint": fingerprint,
-                     "choices": [{"text": text, "index": 0, "logprobs": logprobs, "finish_reason": finish}] if choices else []}
-            if usage is not None or (request["include_usage"] and not choices):
-                value["usage"] = usage
-            if telemetry is not None:
-                value["crit_telemetry"] = telemetry
-            return value
-
-        def admitted():
-            nonlocal opened
-            opened = True
-            self.start_stream("text/event-stream", request, cancel)
-            # As in a chat stream, pings keep the open stream alive while the engine has nothing to send.
-            pings.enter_context(delivery.pinging(PING, self.api.ping_interval))
-
-        timing = self.api.metrics.begin()
-        try:
-            with pings:  # they end before the closing events
-                finish, measured, _, _, logprobs, _ = self.api.run(request, lambda piece: event(chunk(piece)), cancel,
-                                                                   on_started=delivery.set_deadline,
-                                                                   on_admitted=admitted, timing=timing)
-        except EngineError as exc:
-            self.measure("openai", timing, self.outcome(exc))
-            if not opened:
-                return self.engine_error(exc)  # refused before the stream began, such as by a full queue
-            message, code = self.error_words(exc)
-            event({"error": {"message": message, "type": "server_error" if exc.status >= 500 else "invalid_request_error",
-                             "param": "prompt" if code else None, "code": code}, "request_id": self.request_id})
-        else:
-            self.measure("openai", timing, "completed", measured)
-            # As in chat streams, the reply's logprobs come from the engine's final record, with the finish chunk.
-            event(chunk("", finish, logprobs=None if logprobs is None else completion_logprobs(logprobs)))
-            if request["include_usage"]:
-                event(chunk("", usage=self.api.usage(measured), choices=False, telemetry=self.api.telemetry(measured)))
-        try:
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        except OSError:
-            pass
+        self.streamed("openai", request, cancel, TextStream(self.writer(cancel), self.api, request))
 
     # Anthropic Messages (crit_api.anthropic)
 
     def anthropic_complete(self, request, cancel):
-        pieces = []
-        timing = self.api.metrics.begin()
-        try:
-            finish, measured, calls, reasoning, _, stopped = self.api.run(request, pieces.append, cancel, timing=timing)
-        except EngineError as exc:
-            self.measure("anthropic", timing, self.outcome(exc))
-            return self.engine_error(exc)
-        self.measure("anthropic", timing, "completed", measured)
-        value = anthropic.message(request["requested_model"] or request["model"], finish, measured, "".join(pieces), calls,
-                                  reasoning, stopped)
-        self.send_json(200, value, self.headers_for(request, measured))
+        model = request["requested_model"] or request["model"]
+        self.reply("anthropic", request, cancel, lambda text, ran: anthropic.message(
+            model, ran.finish, ran.measured, text, ran.calls, ran.reasoning, ran.stopped))
 
     def anthropic_stream(self, request, cancel):
-        with StreamDelivery(self.connection, cancel, self.api.engine._stopping, self.api.engine.timeout) as delivery:
-            previous, self.wfile = self.wfile, delivery
-            try:
-                self._anthropic_stream(request, cancel, delivery)
-            finally:
-                self.wfile = previous
-
-    def _anthropic_stream(self, request, cancel, delivery):
-        opened, pings = False, ExitStack()
-
-        def send(event, data):
-            try:
-                self.wfile.write(f"event: {event}\n".encode("utf-8") + b"data: " + json.dumps(data).encode("utf-8") + b"\n\n")
-                self.wfile.flush()
-            except OSError:
-                cancel.set()
-
-        stream = anthropic.Stream(send, request["requested_model"] or request["model"])
-
-        def admitted():
-            nonlocal opened
-            opened = True
-            self.start_stream("text/event-stream", request, cancel)
-            stream.start()
-            pings.enter_context(delivery.pinging(anthropic.PING, self.api.ping_interval))
-
-        timing = self.api.metrics.begin()
-        try:
-            with pings:
-                finish, measured, _, _, _, stopped = self.api.run(request, stream.text, cancel, stream.tools,
-                                                                 stream.thinking, on_started=delivery.set_deadline,
-                                                                 on_admitted=admitted, timing=timing)
-        except EngineError as exc:
-            self.measure("anthropic", timing, self.outcome(exc))
-            if not opened:
-                return self.engine_error(exc)
-            stream.error(self.error_words(exc)[0], exc.status, self.request_id)
-        else:
-            self.measure("anthropic", timing, "completed", measured)
-            stream.finish(finish, measured, stopped)
+        self.streamed("anthropic", request, cancel,
+                      anthropic.Stream(self.writer(cancel), request["requested_model"] or request["model"]))
 
     # OpenAI Responses (crit_api.responses)
 
     def responses_complete(self, request, cancel):
-        pieces = []
-        timing = self.api.metrics.begin()
-        try:
-            finish, measured, calls, reasoning, _, _ = self.api.run(request, pieces.append, cancel, timing=timing)
-        except EngineError as exc:
-            self.measure("responses", timing, self.outcome(exc))
-            return self.engine_error(exc)
-        self.measure("responses", timing, "completed", measured)
-        value = responses.reply(request["source"], request["model"], finish, measured, "".join(pieces), calls, reasoning)
-        if measured:
-            value["crit_telemetry"] = self.api.telemetry(measured)
-        self.send_json(200, value, self.headers_for(request, measured))
+        def answer(text, ran):
+            value = responses.reply(request["source"], request["model"], ran.finish, ran.measured, text, ran.calls,
+                                    ran.reasoning)
+            if ran.measured:
+                value["crit_telemetry"] = self.api.telemetry(ran.measured)
+            return value
+        self.reply("responses", request, cancel, answer)
 
     def responses_stream(self, request, cancel):
-        with StreamDelivery(self.connection, cancel, self.api.engine._stopping, self.api.engine.timeout) as delivery:
-            previous, self.wfile = self.wfile, delivery
-            try:
-                self._responses_stream(request, cancel, delivery)
-            finally:
-                self.wfile = previous
-
-    def _responses_stream(self, request, cancel, delivery):
-        opened, pings = False, ExitStack()
-
-        def send(event, data):
-            try:
-                self.wfile.write(f"event: {event}\n".encode("utf-8") + b"data: " + json.dumps(data).encode("utf-8") + b"\n\n")
-                self.wfile.flush()
-            except OSError:
-                cancel.set()
-
-        stream = responses.Stream(send, request["source"], request["model"])
-
-        def admitted():
-            nonlocal opened
-            opened = True
-            self.start_stream("text/event-stream", request, cancel)
-            stream.start()
-            # As in a chat stream, pings keep the open stream alive while the engine has nothing to send.
-            pings.enter_context(delivery.pinging(PING, self.api.ping_interval))
-
-        timing = self.api.metrics.begin()
-        try:
-            with pings:  # they end before the closing events
-                finish, measured, _, _, _, _ = self.api.run(request, stream.text, cancel, stream.tools, stream.reasoning,
-                                                             on_started=delivery.set_deadline, on_admitted=admitted,
-                                                             timing=timing)
-        except EngineError as exc:
-            self.measure("responses", timing, self.outcome(exc))
-            if not opened:
-                return self.engine_error(exc)  # refused before the stream began, such as by a full queue
-            # Clients read the code: context_length_exceeded to compact, server_error to retry.
-            message, code = self.error_words(exc)
-            stream.fail(message, code or ("server_error" if exc.status >= 500 else "invalid_prompt"), self.request_id)
-        else:
-            self.measure("responses", timing, "completed", measured)
-            stream.finish(finish, measured, self.api.telemetry(measured))
+        self.streamed("responses", request, cancel,
+                      responses.Stream(self.writer(cancel), request["source"], request["model"]))
 
     # Ollama (crit_api.ollama)
 
@@ -1803,74 +1733,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, ollama.show(card))
 
     def ollama_complete(self, request, cancel, generate=False):
-        pieces, thoughts = [], []
-        model = request["requested_model"] or request["model"]
-        started = time.perf_counter()
-        timing = self.api.metrics.begin()
-        try:
-            finish, measured, calls, reasoning, logprobs, _ = self.api.run(request, pieces.append, cancel, None,
-                                                                           thoughts.append, timing=timing)
-        except EngineError as exc:
-            self.measure("ollama", timing, self.outcome(exc))
-            return self.engine_error(exc)
-        self.measure("ollama", timing, "completed", measured)
-        seconds = time.perf_counter() - started
-        text = "".join(pieces)
-        if generate:
-            value = ollama.final(model, finish, measured, seconds, response=text, thinking=reasoning or None,
-                                 entries=logprobs)
-        else:
-            message = {"role": "assistant", "content": text}
-            if reasoning:
-                message["thinking"] = reasoning
-            if calls:
-                message["tool_calls"] = [ollama.tool_call(call) for call in calls]
-            value = ollama.final(model, finish, measured, seconds, message=message, entries=logprobs)
-        self.send_json(200, value, self.headers_for(request, measured))
+        model, started = request["requested_model"] or request["model"], time.perf_counter()
+        self.reply("ollama", request, cancel, lambda text, ran: ollama.reply(model, text, ran,
+                                                                             time.perf_counter() - started, generate))
 
     def ollama_stream(self, request, cancel, generate=False):
-        with StreamDelivery(self.connection, cancel, self.api.engine._stopping, self.api.engine.timeout) as delivery:
-            previous, self.wfile = self.wfile, delivery
-            try:
-                self._ollama_stream(request, cancel, delivery.set_deadline, generate)
-            finally:
-                self.wfile = previous
-
-    def _ollama_stream(self, request, cancel, on_started, generate):
-        model = request["requested_model"] or request["model"]
-        opened = False
-
-        def send(value):
-            try:
-                self.wfile.write(json.dumps(value).encode("utf-8") + b"\n")
-                self.wfile.flush()
-            except OSError:
-                cancel.set()
-
-        def admitted():
-            nonlocal opened
-            opened = True
-            self.start_stream("application/x-ndjson", request, cancel)
-
-        started = time.perf_counter()
-        timing = self.api.metrics.begin()
-        try:
-            finish, measured, calls, _, logprobs, _ = self.api.run(
-                request, lambda piece: send(ollama.chunk(model, piece, generate=generate)), cancel, None,
-                lambda piece: send(ollama.chunk(model, "", thinking=piece, generate=generate)), on_started=on_started,
-                on_admitted=admitted, timing=timing)
-        except EngineError as exc:
-            self.measure("ollama", timing, self.outcome(exc))
-            if not opened:
-                return self.engine_error(exc)
-            send(ollama.error_body(self.error_words(exc)[0], self.request_id))
-            return
-        self.measure("ollama", timing, "completed", measured)
-        if calls and not generate:
-            send(ollama.chunk(model, "", tool_calls=[ollama.tool_call(call) for call in calls]))
-        # As in the OpenAI stream, the reply's logprobs come from the engine's final record, with the last object.
-        send(ollama.final(model, finish, measured, time.perf_counter() - started, response="" if generate else None,
-                          entries=logprobs))
+        self.streamed("ollama", request, cancel,
+                      ollama.Stream(self.writer(cancel), request["requested_model"] or request["model"], generate))
 
 
 class Server(ThreadingHTTPServer):

@@ -8,6 +8,9 @@ import shutil
 import subprocess
 import sys
 
+# Where WSL2 keeps the Windows NVIDIA driver's Linux libraries and tools, which a WSL shell's PATH may leave out.
+WSL_DRIVER = "/usr/lib/wsl/lib"
+
 ARCH = re.compile(r"sm_(\d{1,2})(\d)([a-z]?)")
 
 
@@ -143,11 +146,19 @@ def version(value):
     return (int(found[1]), int(found[2])) if found else None
 
 
+def nvidia_smi():
+    """The NVIDIA driver's nvidia-smi: the one on PATH, else WSL2's copy of the Windows driver's; None without one."""
+    found = shutil.which("nvidia-smi")
+    if found is None and sys.platform != "win32" and os.path.isfile(WSL_DRIVER + "/nvidia-smi"):
+        found = WSL_DRIVER + "/nvidia-smi"
+    return found
+
+
 def driver_cuda():
     """The newest CUDA version the NVIDIA driver runs ("13.1"): cuDriverGetVersion from the driver library, else
     nvidia-smi's header; None without a driver."""
     import ctypes
-    for name in (["nvcuda.dll"] if sys.platform == "win32" else ["libcuda.so.1", "/usr/lib/wsl/lib/libcuda.so.1"]):
+    for name in (["nvcuda.dll"] if sys.platform == "win32" else ["libcuda.so.1", WSL_DRIVER + "/libcuda.so.1"]):
         try:
             library = ctypes.WinDLL(name) if sys.platform == "win32" else ctypes.CDLL(name)
             value = ctypes.c_int(0)
@@ -155,8 +166,11 @@ def driver_cuda():
                 return f"{value.value // 1000}.{value.value % 1000 // 10}"
         except (OSError, AttributeError):
             continue
+    smi = nvidia_smi()
+    if smi is None:
+        return None
     try:
-        output = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=30).stdout
+        output = subprocess.run([smi], capture_output=True, text=True, timeout=30).stdout
     except (OSError, subprocess.TimeoutExpired):
         return None
     found = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", output)

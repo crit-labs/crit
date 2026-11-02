@@ -15,8 +15,10 @@ struct NativeEngine;
 using NativeFactory = NativeEngine (*)(std::string_view configuration_json);
 // A factory that also receives a context the caller passes through open_bound (for example step callbacks).
 using BoundFactory = NativeEngine (*)(std::string_view configuration_json, const void* context);
+// Declared here, ahead of NativeEngine, which names them its friends; the rest of the C ABI follows it.
 namespace native_api {
 void* open(NativeFactory, const char* configuration_json) noexcept;
+// open() for a BoundFactory: the same checks and owner retention, with `context` passed to the factory.
 void* open_bound(BoundFactory, const void* context, const char* configuration_json) noexcept;
 }
 // What an engine library builds from its configuration (a JSON object: the adapter's configuration plus "model",
@@ -66,15 +68,12 @@ struct PlainDecoding final : RequestContext {
 
 namespace native_api {
 inline constexpr int abi_version = 2;
-// open() for a BoundFactory: the same checks and owner retention, with `context` passed to the factory.
-void* open_bound(BoundFactory, const void* context, const char* configuration_json) noexcept;
 // Called with each published token; nonzero cancels the request.
 using TokenCallback = int (*)(void* user, const std::int32_t* tokens, int count);
 // Called with each published token of a request opened with "logprobs": n, with its log-probability and its n most
 // likely alternatives (tokens and log-probabilities, ranked as TokenLogprob rows are); nonzero cancels the request.
 using OutputCallback = int (*)(void* user, std::int32_t token, float logprob, const std::int32_t* top_tokens,
                                const float* top_logprobs, int alternatives);
-void* open(NativeFactory, const char* configuration_json) noexcept;
 void close(void* engine) noexcept;
 int info(void* engine, char* out, int capacity) noexcept;
 int generate(void* engine, const std::int32_t* prompt, int count, int output_tokens, const char* options_json,
@@ -117,7 +116,9 @@ const char* last_error() noexcept;
 //   int   crit_engine_generate(handle, prompt, count, output_tokens, options_json, callback, user, out, result,
 //                              cap)             tokens written; -1 error, -2 cancelled. options_json: optional
 //                                               "stop_tokens" (array; [] disables), "temperature", "top_p",
-//                                               "top_k", "min_p", "seed", "replay" (token array), "plain"
+//                                               "top_k", "min_p", "seed", "repetition_penalty",
+//                                               "frequency_penalty", "presence_penalty", "logit_bias" ({"id":
+//                                               bias}), "min_tokens", "replay" (token array), "plain"
 //                                               (true: no drafting), "logprobs" (alternatives per token;
 //                                               requires token_logprobs, at most max_top_logprobs; wait with
 //                                               crit_engine_request_wait_output). result: JSON

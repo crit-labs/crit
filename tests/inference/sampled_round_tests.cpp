@@ -5,6 +5,7 @@
 // and truncated counts (control[commit_tokens]), taking nothing for a seed whose token is already in the history.
 #include "greedy_accept.h"
 #include "sampling.h"
+#include "device_buffer.h"
 
 #include <crit/sampling.h>
 
@@ -24,23 +25,9 @@ namespace dr = crit::techniques::device_round;
 
 namespace {
 void require(bool c, const std::string& m) { if(!c) throw std::runtime_error(m); }
-void ok(cudaError_t e, const char* what) { if(e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e)); }
+using crit::inference_tests::ok;
 
-template<class T> struct Device {
-    T* p = nullptr;
-    std::size_t n = 0;
-    explicit Device(std::size_t count) : n(count) { ok(cudaMalloc(&p, sizeof(T) * std::max<std::size_t>(count, 1)), "malloc"); }
-    explicit Device(const std::vector<T>& v) : Device(v.size()) { put(v); }
-    ~Device() { cudaFree(p); }
-    Device(const Device&) = delete;
-    Device& operator=(const Device&) = delete;
-    void put(const std::vector<T>& v) { ok(cudaMemcpy(p, v.data(), sizeof(T) * v.size(), cudaMemcpyHostToDevice), "upload"); }
-    std::vector<T> get() const {
-        std::vector<T> v(n);
-        ok(cudaMemcpy(v.data(), p, sizeof(T) * n, cudaMemcpyDeviceToHost), "download");
-        return v;
-    }
-};
+using crit::inference_tests::Device;
 
 // Core's law at one column (outputs committed, drafts staged), dense and in rank order.
 std::vector<double> law(cc::Sampler& host, std::span<const float> row, const cc::SamplingParams& rules,

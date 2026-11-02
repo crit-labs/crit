@@ -321,7 +321,8 @@ def read(server, reader, send, pool, answer):
                 pool.submit(answer, item)
 
 
-def main(argv=None):
+def parser():
+    """The arguments of crit mcp (crit mcp offers its tools from them)."""
     parser = argparse.ArgumentParser(prog="crit mcp", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--project", type=Path, help="crit repository the commands use, whose settings.toml gives the "
@@ -335,7 +336,12 @@ def main(argv=None):
                         help="How long a call waits for its command by default (default: %(default)s)")
     parser.add_argument("--only", action="append", choices=FAMILIES, metavar="FAMILY",
                         help=f"Offer only these command families' tools (repeatable; any of {', '.join(FAMILIES)})")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv=None):
+    command = parser()
+    args = command.parse_args(argv)
     # The protocol owns stdout: anything else printed goes to stderr.
     reader, writer = sys.stdin.buffer, sys.stdout.buffer
     sys.stdout = sys.stderr

@@ -1,16 +1,12 @@
 """Navigation, CLI and Inference regressions using temporary host fixtures."""
 import copy
-import hashlib
 import json
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
-import os
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]

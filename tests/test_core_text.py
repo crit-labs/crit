@@ -26,6 +26,7 @@ from crit_core.text import (ChatTemplate, ChatTemplates, GenerationConfig, Incre
 from crit_core.text import detokenize as detokenize_module, stops as stops_module  # noqa: E402
 from crit_core.text.stream import TextDelta  # noqa: E402
 import eval_v2_rules as v2  # noqa: E402  crit-eval-v2's stop_ids, the oracle legacy_eos_ids was ported from
+from support.files import unreadable_open  # noqa: E402
 
 FFFD = "�"
 CLOCK = datetime(2026, 10, 15, 9, 30)
@@ -689,29 +690,6 @@ class GenerationTests(unittest.TestCase):
             GenerationConfig.from_files(mapping({"config.json": {"text_config": [1]}}))
         with self.assertRaisesRegex(ModelTextError, "^config.json: eos_token_id must be a token id"):
             legacy_eos_ids(mapping({"config.json": '{"eos_token_id": NaN}'}))
-
-
-class _Unreadable:
-    """A file whose bytes must not be read (it can still be stat-ed)."""
-
-    def __init__(self, handle):
-        self.handle = handle
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *details):
-        self.handle.close()
-
-    def fileno(self):
-        return self.handle.fileno()
-
-    def read(self, *details):
-        raise AssertionError("read before the size check")
-
-
-def unreadable_open(file, mode="r", *details, **options):
-    return _Unreadable(open(file, mode, *details, **options))
 
 
 class CappedReads(MappingFiles):

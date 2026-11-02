@@ -1,5 +1,5 @@
 """crit run cost: agent transcripts attributed to the candidates built in their spans, priced at recorded rates."""
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import json
 from pathlib import Path
 import sys
@@ -10,7 +10,7 @@ for _folder in ("core/python", "api", "../crit-eval", "kernels", "cli", "tests")
 from crit.run import cost
 from crit.run.cli import main
 from crit.run.records import read_json
-from test_run_records import RunFixture
+from support.runs import RunFixture
 
 
 def iso(when):

@@ -1,7 +1,7 @@
 """Transform recipes and the plan they resolve to against a checkpoint's headers (standard library only)."""
 import re
 
-from crit.run.records import digest, number
+from crit.records import digest, number
 from crit_core.model.schemes import layer_prefix
 
 METHODS = ("ptq", "drafter")

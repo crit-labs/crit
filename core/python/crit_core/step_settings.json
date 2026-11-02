@@ -1,0 +1,4 @@
+{
+  "about": "The settings of a step engine's \"engine\" object (crit/step_engine.h): the keys Core's step engine reads to configure its runtime. The one copy both sides use: crit_core.native's StepEngine sends a step model's info keys named here as settings and the rest as facts, and core/CMakeLists.txt generates the C++ list that src/runtime/step_engine.cpp refuses any other key with.",
+  "settings": ["implementation", "vocabulary", "valid_vocabulary", "context", "prefill_chunk", "stop_tokens", "max_concurrency", "max_pending", "max_batch_tokens", "batch_policy", "max_row_tokens", "decode_token_work", "sampling", "token_logprobs", "max_top_logprobs", "scoring", "score_paths", "host_limit"]
+}

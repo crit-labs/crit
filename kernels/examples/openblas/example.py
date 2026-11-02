@@ -11,11 +11,11 @@ import time
 
 ROOT = Path(__file__).resolve().parents[3]
 if (ROOT / "cli/crit").is_dir():
-    sys.path[:0] = [str(ROOT / "cli"), str(ROOT / "kernels")]
+    sys.path[:0] = [str(ROOT / "cli"), str(ROOT / "kernels"), str(ROOT / "core" / "python")]
 import crit_kernels as kernels
 from crit.process.ownership import RuntimeOwnership
 from crit.process.tree import guarded_tree
-from crit.run.records import file_sha, inventory, read_json, safe_path, text, write_json
+from crit.records import file_sha, inventory, read_json, safe_path, text, write_json
 
 
 def invocation(value):

@@ -9,32 +9,10 @@ declares `"lineage": "origin-engine"` to say it is the imported source re-measur
 the run says which engine it derives from.
 """
 from pathlib import Path
-import re
 import shutil
 
-from .records import LINEAGE, ORIGIN_DIR, digest, file_sha, safe_path, sha, text
-
-CARD = "card.yaml"
-LOCK = "card.lock.json"
-COMMIT = re.compile(r"[0-9a-f]{40}")
-REPOSITORY = re.compile(r"https://[A-Za-z0-9.-]+(/[A-Za-z0-9_.~-]+)+/?")
-NAME = re.compile(r"[A-Za-z0-9_.-]+")
-
-
-def _yaml():
-    try:
-        import yaml
-    except ImportError:
-        raise ValueError("Reading a crit-hub card needs PyYAML (python -m pip install pyyaml), which crit-hub's own tools use") from None
-    return yaml
-
-
-def _read_json(path):
-    import json
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except ValueError as exc:
-        raise ValueError(f"{path}: not JSON: {exc}") from None
+from ..card import CARD, LOCK, NAME, REPOSITORY, check_source, read_folder
+from .records import ORIGIN_DIR, digest, file_sha, safe_path, sha, text
 
 
 def describe_engine(folder):
@@ -42,12 +20,7 @@ def describe_engine(folder):
     (`source`); store_evidence copies them into the run."""
     folder = Path(folder).expanduser().resolve()
     card_path, lock_path = folder / CARD, folder / LOCK
-    if not card_path.is_file() or not lock_path.is_file():
-        raise ValueError(f"{folder} is not a crit-hub engine folder: it needs {CARD} and {LOCK}")
-    card = _yaml().safe_load(card_path.read_text(encoding="utf-8"))
-    lock = _read_json(lock_path)
-    if not isinstance(card, dict) or not isinstance(lock, dict):
-        raise ValueError(f"{folder}: {CARD} and {LOCK} must hold objects")
+    card, lock = read_folder(folder)
     for key in ("title", "origin", "contributor", "source", "checkpoints", "results"):
         if key not in card:
             raise ValueError(f"{card_path}: missing {key}")
@@ -57,9 +30,7 @@ def describe_engine(folder):
     if not isinstance(contributor, dict) or not NAME.fullmatch(str(contributor.get("name", ""))) \
             or not REPOSITORY.fullmatch(str(contributor.get("repository", ""))):
         raise ValueError(f"{card_path}: contributor needs name and an https repository")
-    if not isinstance(source, dict) or not REPOSITORY.fullmatch(str(source.get("repository", ""))) \
-            or not COMMIT.fullmatch(str(source.get("revision", ""))):
-        raise ValueError(f"{card_path}: source needs an https repository and a full 40-character commit revision")
+    check_source(card, card_path)
     if folder.parent.parent.name == "engines":
         engine = f"{folder.parent.name}/{folder.name}"
     else:

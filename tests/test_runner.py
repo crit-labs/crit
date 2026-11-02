@@ -1,11 +1,10 @@
 """Record discovery and owned process trees; no real optimization agent."""
-from pathlib import Path
 import sys
 import time
 import unittest
 from unittest.mock import patch
 
-from test_run_records import ROOT, RunFixture
+from support.runs import RunFixture
 from crit.process.tree import ProcessTree
 from crit.run.store import RunStore
 

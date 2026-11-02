@@ -14,29 +14,7 @@ sys.path.insert(0, str(ROOT / "core/python"))
 from crit_core import jsonfile  # noqa: E402
 from crit_core.files import (CallableFiles, DirectoryFiles, MappingFiles, ModelFiles, ModelFilesError,  # noqa: E402
                              file_name, model_files)
-
-
-class _Unreadable:
-    """A file whose bytes must not be read (it can still be stat-ed)."""
-
-    def __init__(self, handle):
-        self.handle = handle
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *details):
-        self.handle.close()
-
-    def fileno(self):
-        return self.handle.fileno()
-
-    def read(self, *details):
-        raise AssertionError("read before the size check")
-
-
-def unreadable_open(file, mode="r", *details, **options):
-    return _Unreadable(open(file, mode, *details, **options))
+from support.files import unreadable_open  # noqa: E402
 
 
 def symlink_or_skip(test, target, link):

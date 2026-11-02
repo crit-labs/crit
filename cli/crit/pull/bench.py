@@ -15,15 +15,14 @@ import re
 import sys
 import threading
 
-from crit.run.records import GIB, read_json
+from crit.cli import default_project
+from crit.records import GIB, read_json
+from crit.run.served import QUALITY, SERVED
 from crit.run.store import ROOT
 
 from .cli import device_probe, log
 from .store import InstallStore, engine_id
 
-# What crit serve needs from the package to stream Eval's requests, and quality its scores and log-probabilities.
-SERVED = ("chat-json-v1", "chat-resident-v1", "chat-stream-v1")
-QUALITY = ("chat-score-v1", "chat-logprobs-v1")
 # The six headline stats, as crit-hub's cards name them.
 STATS = ("decode_tok_s", "prefill_tok_s", "ttft_ms", "ppl", "kld_mean", "context_tokens")
 
@@ -218,7 +217,8 @@ def bench(engine, store, data, out=None, project=ROOT, device=None, parts=None, 
     return result, (stated or {}).get("stats"), label, out
 
 
-def main(argv=None):
+def parser():
+    """The arguments of crit bench (crit mcp offers its tools from them)."""
     parser = argparse.ArgumentParser(prog="crit bench", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("engine", metavar="OWNER/NAME", help="An engine crit pull installed")
@@ -226,7 +226,7 @@ def main(argv=None):
                         help="crit Eval's data for the installed checkpoint: readied here when the folder holds none")
     parser.add_argument("--out", type=Path, help="The result file (default: the engine's bench/ folder in the store)")
     parser.add_argument("--store", type=Path, help="Engine store (default: PROJECT/engines)")
-    parser.add_argument("--project", type=Path, default=ROOT if (ROOT / "core/include/crit/core.h").is_file() else Path.cwd(),
+    parser.add_argument("--project", type=Path, default=default_project(),
                         help="crit repository, whose settings.toml gives the device and headroom (default: this checkout)")
     parser.add_argument("--device", type=Path, help="A crit eval probe result (default: settings.toml's device, else "
                                                      "the store's, else a probe run now)")
@@ -239,7 +239,12 @@ def main(argv=None):
                              "measured too (reads the whole checkpoint)")
     parser.add_argument("--quality-mode", choices=("preserve", "as_quantized"),
                         help="The quality mode (default: the card's result's)")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv=None):
+    command = parser()
+    args = command.parse_args(argv)
     try:
         store = InstallStore(args.store or args.project / "engines")
         stage = args.stage if args.stage in (None, "full") else int(args.stage)

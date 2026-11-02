@@ -21,13 +21,15 @@ def expect(condition, message):
 def abi(library):
     engine = NativeEngine(library, {"context_tokens": 256})
     facts = engine.info()
+    # The fixture's facts repeat "context" (1): Core's value stands, where a duplicate key would leave Python the last.
     expect(facts["implementation"] == "toy native engine" and facts["context"] == 256, facts)
     expect(facts["stop_tokens"] == [5] and facts["score_paths"] == ["prefill", "decode"], facts)
     expect(facts["speculative"] is True and facts["replay"] is True and facts["draft_width"] == 1, facts)
     expect(facts["sampling"]["penalties"] is False and facts["sampling"]["logit_bias"] is False, facts)
     # The bridge must forward these options to Core, which rejects them for this greedy-only model.
+    expect(facts["sampling"]["min_tokens"] is False, facts)
     for options in ({"frequency_penalty": .5}, {"presence_penalty": .5}, {"repetition_penalty": 1.1},
-                    {"logit_bias": {"12": -2}}):
+                    {"logit_bias": {"12": -2}}, {"min_tokens": 2}):
         try:
             engine.generate([1, 2], 3, sampling=options)
             raise AssertionError("sampling options must never disappear in the ABI: " + str(options))

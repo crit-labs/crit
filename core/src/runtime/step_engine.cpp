@@ -1,5 +1,6 @@
 #include "crit/step_engine.h"
 #include "crit/json.h"
+#include "json_text.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -15,72 +16,11 @@
 
 namespace crit::core {
 namespace {
-// Keys crit_engine_info writes itself; facts never repeat them.
-constexpr std::array<std::string_view, 17> info_keys{"implementation", "vocabulary", "valid_vocabulary", "context",
-    "prefill_chunk", "stop_tokens", "generation", "scoring", "query_scoring", "request_context", "token_logprobs",
-    "max_top_logprobs", "max_concurrency", "score_paths", "sampling", "request_handles", "max_concurrent_requests"};
-
-void quoted(std::string& out, std::string_view text) {
-    out += '"';
-    for(const char c:text) {
-        switch(c) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if(static_cast<unsigned char>(c) < 0x20) {
-                    char escape[8];
-                    std::snprintf(escape, sizeof escape, "\\u%04x", static_cast<unsigned>(static_cast<unsigned char>(c)));
-                    out += escape;
-                } else {
-                    out += c;
-                }
-        }
-    }
-    out += '"';
-}
-// A number as JSON text. A banned token's -inf logit bias is spelled as Python's json writes and reads it.
-void real(std::string& out, double value) {
-    if(!std::isfinite(value)) { out += std::isnan(value) ? "NaN" : value < 0 ? "-Infinity" : "Infinity"; return; }
-    char buffer[32];
-    std::snprintf(buffer, sizeof buffer, "%.17g", value);
-    out += buffer;
-}
-// A parsed value written back as JSON text (the facts object crit_engine_info merges).
-void write(std::string& out, const json::Value& value) {
-    switch(value.kind()) {
-        case json::Kind::null: out += "null"; break;
-        case json::Kind::boolean: out += value.boolean() ? "true" : "false"; break;
-        case json::Kind::integer:
-            if(value.exceeds_64_bits()) throw std::invalid_argument("step engine facts hold an integer beyond 64 bits");
-            out += value.i64() < 0 ? std::to_string(value.i64()) : std::to_string(value.u64());
-            break;
-        case json::Kind::real: real(out, value.real()); break;
-        case json::Kind::string: quoted(out, value.string()); break;
-        case json::Kind::array: {
-            out += '[';
-            bool first = true;
-            for(const auto& item:value.array()) { if(!first) out += ','; first = false; write(out, item); }
-            out += ']';
-            break;
-        }
-        case json::Kind::object: {
-            out += '{';
-            bool first = true;
-            for(const auto& member:value.object()) {
-                if(!first) out += ',';
-                first = false;
-                quoted(out, member.key);
-                out += ':';
-                write(out, member.value);
-            }
-            out += '}';
-            break;
-        }
-    }
-}
+using detail::quoted;
+using detail::real;
+// The settings an "engine" object may hold, from the table crit_core.native's StepEngine also reads
+// (python/crit_core/step_settings.json).
+#include "crit_step_settings.inc"
 
 struct Settings {
     ModelInfo info;
@@ -106,6 +46,10 @@ Settings settings(std::string_view configuration) {
     const auto* engine = root.find("engine");
     if(!engine || engine->kind() != json::Kind::object) throw std::invalid_argument("step engine configuration needs an \"engine\" object");
     const auto& e = *engine;
+    for(const auto& member:e.object())
+        if(std::find(step_settings.begin(), step_settings.end(), member.key) == step_settings.end())
+            throw std::invalid_argument("step engine setting \"" + std::string(member.key) +
+                                        "\" is not one of Core's (an engine's own facts go in \"facts\")");
     Settings s;
     auto& i = s.info;
     const auto* name = e.find("implementation");
@@ -155,17 +99,7 @@ Settings settings(std::string_view configuration) {
     p.device_limit = std::numeric_limits<std::size_t>::max();
     if(const auto* facts = root.find("facts"); facts && !facts->is_null()) {
         if(facts->kind() != json::Kind::object) throw std::invalid_argument("step engine facts must be a JSON object");
-        s.facts = "{";
-        bool first = true;
-        for(const auto& member:facts->object()) {
-            if(std::find(info_keys.begin(), info_keys.end(), member.key) != info_keys.end()) continue;
-            if(!first) s.facts += ',';
-            first = false;
-            quoted(s.facts, member.key);
-            s.facts += ':';
-            write(s.facts, member.value);
-        }
-        s.facts += '}';
+        s.facts = detail::facts_object(*facts);
     }
     return s;
 }

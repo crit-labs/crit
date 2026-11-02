@@ -8,8 +8,9 @@
 namespace crit::core {
 // A large page-aligned host block for weights the device reads through a mapping (host-resident experts,
 // embeddings). Fill it with the loader's threads first, then register it with the device (cuda_pin_host_block in
-// crit/cuda_memory.h): first-touch page faults run in parallel and the registration is one call. Under WSL2,
-// cudaMallocHost of 60 GB took about 90 s; anonymous pages filled by 12 threads and then registered took 35 s.
+// crit/cuda_memory.h): first-touch page faults run in parallel and the registration is one call. On one RTX 5090
+// machine under WSL2, cudaMallocHost of 60 GB took about 90 s; anonymous pages filled by 12 threads and then
+// registered took 35 s.
 class HostBlock {
 public:
     explicit HostBlock(std::size_t bytes);   // throws std::runtime_error when the pages cannot be reserved
@@ -19,7 +20,8 @@ public:
     std::byte* data() const noexcept { return data_; }
     std::size_t size() const noexcept { return bytes_; }
     // Reads one word of every page with `threads` threads. After a device registration under WSL2 the first CPU
-    // read of each page was slow (about 10 s over 60 GB on the first request); touching once at load moves that cost.
+    // read of each page was slow (about 10 s over 60 GB on the first request, on that machine); touching once at load
+    // moves that cost.
     void touch(int threads) const;
     // Owner released before the pages (a device registration). One attachment; attaching again replaces it.
     void attach(std::shared_ptr<const void> owner) { attachment_ = std::move(owner); }

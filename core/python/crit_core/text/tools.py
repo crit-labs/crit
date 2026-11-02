@@ -30,6 +30,7 @@ import re
 import uuid
 from typing import Callable, NamedTuple
 
+from ..jsonfile import reject_constant as _reject_constant, unique_pairs as _unique
 from .errors import TextError
 from .markers import MarkerBuffer, marker_ids
 
@@ -41,10 +42,6 @@ _PARAMETER_START = re.compile(r"<parameter=([^>\n]+)>\n?")
 _PARAMETER_END = "\n</parameter>"
 _NAME = re.compile(r'\A\s*\{\s*"name"\s*:\s*"([A-Za-z0-9_-]{1,64})"')
 _ARGUMENTS = re.compile(r'\s*,\s*"arguments"\s*:\s*\{')
-
-
-def _reject_constant(value):
-    raise ValueError("non-finite JSON number: " + value)
 
 
 def _json(text):
@@ -133,13 +130,6 @@ def _json_object(body, tools):
         except ValueError:
             return None
     return (value["name"], arguments) if isinstance(arguments, dict) else None
-
-
-def _unique(pairs):
-    value = dict(pairs)
-    if len(value) != len(pairs):
-        raise ValueError("a repeated key")
-    return value
 
 
 _DECODER = json.JSONDecoder(parse_constant=_reject_constant, object_pairs_hook=_unique)

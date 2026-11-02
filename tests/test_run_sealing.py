@@ -6,9 +6,10 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from test_run_records import ROOT, RunFixture
-from crit.run import records, store as run_store
-from crit.run.records import inventory
+from support.runs import ROOT, RunFixture
+from crit import records
+from crit.records import inventory
+from crit.run import store as run_store
 
 
 class SealRecoveryTests(RunFixture, unittest.TestCase):

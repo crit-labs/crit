@@ -29,7 +29,6 @@ else:
 | [errors.py](errors.py) | `TextError(ValueError)` and its subclasses `ModelTextError`, `TemplateError`, `TokenError`; read caps `MAX_FILE_BYTES` and `MAX_CONFIG_BYTES` |
 | [tokenizer.py](tokenizer.py) | `Tokenizer`, `AddedToken`, `SPECIAL_TOKEN_NAMES`, `special_tokens_from` |
 | [template.py](template.py) | `environment`, `ChatTemplate`, `ChatTemplates`, `template_sources`, `chat_template_sources`, `shipped_template`, `GenerationTag` |
-| [templates/](templates) | The chat templates crit ships for families whose checkpoints carry none: [deepseek-v4.jinja](templates/deepseek-v4.jinja) |
 | [messages.py](messages.py) | `openai_messages` (OpenAI chat messages to template messages) |
 | [generation.py](generation.py) | `GenerationConfig`, `legacy_eos_ids`, `model_generation_view` |
 | [detokenize.py](detokenize.py) | `IncrementalDetokenizer` |
@@ -110,17 +109,19 @@ the named template, else `tool_use` when tools are given and it exists, else
 `default`, else raises `ModelTextError`.
 
 Some families publish no chat template: DeepSeek V4 ships a Python encoder,
-`encoding_dsv4.py`, instead. For those crit ships one (`SHIPPED_TEMPLATES`, by
-`config.json` `model_type`; `shipped_template(model_type)` gives its file name
-and source). [deepseek-v4.jinja](templates/deepseek-v4.jinja) ports DeepSeek's
-encoder (MIT; the notice is in its header) and renders exactly what
-`encode_messages` does: thinking or `enable_thinking` (default off) picks thinking
-or chat mode, `drop_thinking` and `reasoning_effort` (`high`, `max`) are the
-encoder's, `tools` go to the first system message, tool-call arguments are a
-mapping, and `add_generation_prompt` adds what the encoder writes after the last
-message. `chat_template_sources(files, chat_template=None)` returns the origin,
-sources and shipped file name `load_model_text` renders with; a `chat_template`
-for a model that carries its own raises `ModelTextError`.
+`encoding_dsv4.py`, instead. A template for such a family is that family's own,
+so Core ships none: a package registers it in
+[crit_core.registry](../registry.py) (kind `chat_templates`: `config.json`
+`model_type` to the template file's path; at run time, or in an entry point of
+group `crit_core.chat_templates`), and `shipped_template(model_type)` gives its
+file name and source. crit ships DeepSeek V4's with crit-eval's architectures
+([deepseek-v4.jinja](https://github.com/crit-labs/crit-eval/blob/main/crit_eval/architectures/templates/deepseek-v4.jinja),
+a port of DeepSeek's encoder that renders exactly what `encode_messages` does),
+registered when `crit_eval` is imported (crit imports it).
+`chat_template_sources(files, chat_template=None)` returns the origin (`model`,
+`given`, `crit` for a registered one, or none), sources and registered file name
+`load_model_text` renders with; a `chat_template` for a model that carries its
+own raises `ModelTextError`.
 
 ## Messages
 

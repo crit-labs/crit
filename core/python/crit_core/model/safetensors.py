@@ -32,14 +32,9 @@ SHARD_DEPTH = 8     # path components of an index shard ("tensors/model-00001-of
 UNKNOWN_SHOWN = 8   # unknown index keys named in one error or note
 JSON_DEPTH = 64     # nesting limit of headers and indexes (the native reader's at both call sites)
 
-# Storage width in bits. Values are never decoded here; sub-byte dtypes must fill whole bytes.
-DTYPE_BITS = MappingProxyType({
-    "BOOL": 8, "U8": 8, "I8": 8, "F8_E4M3": 8, "F8_E5M2": 8, "F8_E8M0": 8,
-    "U16": 16, "I16": 16, "F16": 16, "BF16": 16,
-    "U32": 32, "I32": 32, "F32": 32,
-    "U64": 64, "I64": 64, "F64": 64,
-    "F4": 4, "F6_E2M3": 6, "F6_E3M2": 6,
-})
+# Storage width in bits. Values are never decoded here; sub-byte dtypes must fill whole bytes. safetensors_dtypes.json is
+# the one table this reader and the C++ reader share.
+DTYPE_BITS = MappingProxyType(dict(jsonfile.read(Path(__file__).with_name("safetensors_dtypes.json"))["dtypes"]))
 
 
 class SafetensorsError(ValueError):

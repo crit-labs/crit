@@ -3,7 +3,6 @@ import copy
 import http.client
 import json
 import threading
-import time
 import unittest
 
 import test_api

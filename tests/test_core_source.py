@@ -1,4 +1,5 @@
-"""Core's model source (crit_core.model.open_model) and the description files a GGUF derives (gguf_files).
+"""Core's model source (crit_core.model.open_model) and the description files a GGUF derives (gguf_files), with a
+config rule of the test's own for an architecture no package gives one (crit-eval's rules are tested in crit-eval).
 
 The tokenizer conformance tests tokenize the GGUF converter's vocabulary test sets (Hugging Face tokenizations of hard
 inputs) with the derived tokenizer.json; they need its checkout (CRIT_LLAMA_CPP) and `tokenizers`."""
@@ -13,19 +14,32 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("core/python", "tests"): sys.path.insert(0, str(ROOT / _folder))
+from crit_core import registry  # noqa: E402
 from crit_core.model import (GgufError, ModelSourceError, SafetensorsError, inspect_gguf_model,  # noqa: E402
                              open_model)
-from crit_core.model.gguf_files import (PRE_TOKENIZERS, decimal, derive_config, derive_generation,  # noqa: E402
-                                        derive_tokenizer)
+from crit_core.model.gguf_files import (PRE_TOKENIZERS, MetadataReader, base_config, decimal,  # noqa: E402
+                                        derive_config, derive_generation, derive_tokenizer, layer_flag)
 from gguf_writer import gguf_bytes  # noqa: E402
 
 LLAMA_CPP = os.environ.get("CRIT_LLAMA_CPP")
 HAS_TOKENIZERS = importlib.util.find_spec("tokenizers") is not None
 TOKENS = ["<|endoftext|>", "<|im_end|>", "<think>", "a", "b", "ab", "[PAD6]", "[PAD7]"]
 TYPES = [3, 3, 4, 1, 1, 1, 5, 5]
+ARCHITECTURE = "crit-test"   # no package gives it a config rule: rule() below is the test's
 
 
-def metadata(architecture="qwen3", **overrides):
+def rule(model, get):
+    """A config rule as packages give them (crit_core.registry gguf_config), on Core's generic keys."""
+    assert isinstance(get, MetadataReader)
+    config, layers, _ = base_config(model, get)
+    return {"model_type": "crit_test", **config,
+            "attention_bias": layer_flag(model, "attn_q.bias", layers, "attention bias")}
+
+
+registry.register("gguf_config", {ARCHITECTURE: rule})
+
+
+def metadata(architecture=ARCHITECTURE, **overrides):
     values = {"general.architecture": architecture, f"{architecture}.block_count": 2,
               f"{architecture}.embedding_length": 32, f"{architecture}.feed_forward_length": 64,
               f"{architecture}.attention.head_count": 4, f"{architecture}.attention.head_count_kv": 2,
@@ -110,10 +124,9 @@ class SourceTests(unittest.TestCase):
                                                 "tokenizer_config.json"))
         config = json.loads(source.files.read("config.json"))
         self.assertEqual({k: config[k] for k in ("model_type", "num_hidden_layers", "rms_norm_eps", "vocab_size",
-                                                 "tie_word_embeddings", "rope_parameters")},
-                         {"model_type": "qwen3", "num_hidden_layers": 2, "rms_norm_eps": 1e-06, "vocab_size": 8,
-                          "tie_word_embeddings": False,
-                          "rope_parameters": {"rope_type": "default", "rope_theta": 1000000.0}})
+                                                 "tie_word_embeddings", "attention_bias")},
+                         {"model_type": "crit_test", "num_hidden_layers": 2, "rms_norm_eps": 1e-06, "vocab_size": 8,
+                          "tie_word_embeddings": False, "attention_bias": False})
         self.assertEqual(json.loads(source.files.read("tokenizer_config.json"))["eos_token"], "<|im_end|>")
         # EOS, plus the control tokens the reference runtime ends generation on.
         self.assertEqual(json.loads(source.files.read("generation_config.json"))["eos_token_id"], [1, 0])
@@ -150,19 +163,21 @@ class DerivationTests(unittest.TestCase):
         self.assertEqual(decimal(struct.unpack("<f", struct.pack("<f", 0.1))[0]), 0.1)
 
     def test_per_layer_values_and_flags(self):
-        config = derive_config(self.model(metadata(**{"qwen3.attention.head_count_kv": [2, 2]})))
+        self.assertIs(registry.entries("gguf_config")[ARCHITECTURE], rule)
+        config = derive_config(self.model(metadata(**{f"{ARCHITECTURE}.attention.head_count_kv": [2, 2]})))
         self.assertEqual((config["num_key_value_heads"], config["attention_bias"]), (2, False))
         with self.assertRaisesRegex(GgufError, "differs between layers"):
-            derive_config(self.model(metadata(**{"qwen3.attention.head_count_kv": [2, 4]})))
+            derive_config(self.model(metadata(**{f"{ARCHITECTURE}.attention.head_count_kv": [2, 4]})))
         with self.assertRaisesRegex(GgufError, "only some layers have attn_q.bias"):
             derive_config(self.model(metadata(), TENSORS + [("blk.0.attn_q.bias", "F32", (32,))]))
 
-    def test_other_architectures_get_generic_keys_or_are_refused(self):
-        config = derive_config(self.model(metadata("granite")))
+    def test_architectures_without_rules_get_generic_keys_or_are_refused(self):
+        config = derive_config(self.model(metadata("unruled")))
         self.assertNotIn("model_type", config)
-        self.assertEqual((config["num_hidden_layers"], config["head_dim"]), (2, 8))
-        with self.assertRaisesRegex(GgufError, "'gemma3' has no config rules.*sliding_window"):
-            derive_config(self.model(metadata("gemma3", **{"gemma3.attention.sliding_window": 512})))
+        self.assertEqual((config["num_hidden_layers"], config["head_dim"], config["rope_parameters"]),
+                         (2, 8, {"rope_type": "default", "rope_theta": 1e6}))
+        with self.assertRaisesRegex(GgufError, "'unruled' has no config rule .*crit-test.*sliding_window"):
+            derive_config(self.model(metadata("unruled", **{"unruled.attention.sliding_window": 512})))
 
     def test_tokenizer_rules(self):
         tokenizer = derive_tokenizer(self.model(metadata()))

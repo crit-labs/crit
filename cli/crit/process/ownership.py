@@ -10,54 +10,9 @@ import tempfile
 import time
 import uuid
 
-from crit.run.records import keys, now, number, read_json, safe_path, write_json
-from crit.run.store import lease
-
-
-def process_identity(pid):
-    if not isinstance(pid, int) or pid <= 0:
-        return None
-    if os.name == "nt":
-        import ctypes as c
-        from ctypes import wintypes as w
-        api = c.WinDLL("kernel32", use_last_error=True)
-        api.OpenProcess.argtypes, api.OpenProcess.restype = [w.DWORD, w.BOOL, w.DWORD], w.HANDLE
-        api.GetProcessTimes.argtypes = [w.HANDLE] + [c.POINTER(w.FILETIME)] * 4
-        api.CloseHandle.argtypes = [w.HANDLE]
-        api.GetExitCodeProcess.argtypes = [w.HANDLE, c.POINTER(w.DWORD)]
-        handle = api.OpenProcess(0x1000, False, pid)
-        if not handle:
-            return None if c.get_last_error() in {87, 1168} else "unknown"
-        try:
-            code = w.DWORD()
-            if not api.GetExitCodeProcess(handle, c.byref(code)):
-                return "unknown"
-            if code.value != 259:
-                return None
-            values = [w.FILETIME() for _ in range(4)]
-            if not api.GetProcessTimes(handle, *(c.byref(v) for v in values)):
-                return "unknown"
-            return str((values[0].dwHighDateTime << 32) | values[0].dwLowDateTime)
-        finally:
-            api.CloseHandle(handle)
-    try:
-        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-        if fields[0] in {"Z", "X"}:
-            return None
-        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-        return boot + ":" + fields[19]
-    except FileNotFoundError:
-        if Path("/proc").is_dir():
-            return None
-    except (OSError, IndexError):
-        return "unknown"
-    try:
-        os.kill(pid, 0)
-        return "unknown"
-    except ProcessLookupError:
-        return None
-    except PermissionError:
-        return "unknown"
+from crit.lease import lease
+from crit.process.identity import process_identity
+from crit.records import keys, now, number, read_json, retry_denied, safe_path, write_json
 
 
 def group_alive(pgid):
@@ -116,14 +71,7 @@ def read_ownership(path):
     Both supervisor and guardian need this: Windows atomic replacement can briefly deny an open even while
     the owner remains alive. Missing/malformed records and an expired retry still fail closed.
     """
-    deadline = time.monotonic() + .25
-    while True:
-        try:
-            return read_json(path)
-        except PermissionError:
-            if time.monotonic() >= deadline:
-                raise
-            time.sleep(.005)
+    return retry_denied(lambda: read_json(path), any_denial=True)
 
 
 def default_directory():
@@ -146,15 +94,7 @@ def clean_snapshots(directory, runtime_id):
         # Job retirement can precede release of a mapped file's Windows handle.
         # Retry only transient sharing/permission errors on this checked private
         # directory; persistent failure must retain runtime ownership.
-        deadline = time.monotonic() + .25
-        while True:
-            try:
-                shutil.rmtree(root)
-                break
-            except PermissionError as exc:
-                if getattr(exc, "winerror", None) not in {5, 32, 33} or time.monotonic() >= deadline:
-                    raise
-                time.sleep(.005)
+        retry_denied(lambda: shutil.rmtree(root))
 
 
 class RuntimeOwnership:

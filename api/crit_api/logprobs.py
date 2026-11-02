@@ -4,7 +4,7 @@ OpenAI's legacy completions (completion-v1)."""
 import codecs
 import re
 
-from crit.run.records import MAX_JSON_BYTES, keys
+from crit.records import MAX_JSON_BYTES, keys
 from crit_core.serving import LOGPROBS_CAPABILITY, MIN_LOGPROB, TOP_LOGPROBS
 
 from .options import MAX_CHAT_RECORD, RequestError, require

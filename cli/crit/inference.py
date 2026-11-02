@@ -91,7 +91,8 @@ def check(root=ROOT):
     return errors
 
 
-def main(argv=None, root=ROOT):
+def parser():
+    """The arguments of crit inference (crit mcp offers its tools from them)."""
     parser = argparse.ArgumentParser(description=__doc__)
     subs = parser.add_subparsers(dest="command", required=True)
     for name, text in (("list", "List the techniques by category"),
@@ -102,7 +103,12 @@ def main(argv=None, root=ROOT):
             sub.add_argument("query")
         sub.add_argument("--json", action="store_true")
     subs.add_parser("check", help="Check the techniques' code against their metadata")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv=None, root=ROOT):
+    command = parser()
+    args = command.parse_args(argv)
     try:
         if args.command == "check":
             errors = check(root)

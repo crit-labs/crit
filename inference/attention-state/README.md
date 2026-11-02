@@ -66,6 +66,20 @@ operation in [attention.h](code/attention.h):
   KV rows hold all heads' keys followed by all heads' values.
 - `rotary` applies caller-supplied positions and frequencies, interleaved or
   split-half, with optional partial rotary dimensions.
+- `rope_table(rope, head_dim, max_position_embeddings, sequence_length)`
+  ([rope_table.h](code/rope_table.h)) gives those frequencies from the model's
+  `config.json`: the inverse frequency of each rotated pair (`rotary_dim(rope,
+  head_dim)` dimensions rotate) and the attention factor that scales cos and sin,
+  as Hugging Face's `ROPE_INIT_FUNCTIONS` derive them, for `default`, `mrope`,
+  `linear`, dynamic NTK, YaRN (with `mscale`, `attention_factor` and `truncate`),
+  `llama3` and `longrope`. `rope` is Core's `RopeConfig` (`load_model_config(...)
+  .rope`), `max_position_embeddings` the declared length dynamic NTK needs and
+  YaRN, Llama 3 and LongRoPE read when the rope object leaves factor or original
+  length out; `sequence_length` picks dynamic NTK's base and LongRoPE's long
+  factors past the original length. Other types and missing parameters are
+  refused. [rope_table.py](code/rope_table.py) is the Python twin (on
+  `crit_core.model`'s `RopeConfig`); `tests/test_rope_tables.py` checks it
+  against Transformers and `tests/inference/rope_oracle.py` checks the two agree.
 - `PagedAttentionPlan` retains one KV image and explicit logical query rows: full
   or chunked prefill, decode, unordered queries. GQA/MQA map
   `kv_head = query_head / (query_heads / kv_heads)`.
@@ -88,6 +102,7 @@ qualified by its [retained-provider workflow](../../kernels/examples/openblas/RE
 | [state_pages.h](code/state_pages.h) | `StatePages` (a `crit::core::StateStorage` of FP32 rows) and `StatePagesView` |
 | [encoded_kv.h](code/encoded_kv.h) | `EncodedPages`: signed int8 plus one FP32 scale per 32 values (1.125 bytes/value vs 4) |
 | [attention.h](code/attention.h) | `paged_attention`, `PagedAttentionPlan`/`BasicAttentionPlan`, masks, RoPE |
+| [rope_table.h](code/rope_table.h), [rope_table.py](code/rope_table.py) | `rope_table`, `rotary_dim`, `RopeTable`: rotary frequencies and attention factor from `config.json`'s rope parameters |
 | [batch_attention.h](code/batch_attention.h) | `BasicAttentionBatch<KVView>`, `PagedAttentionBatch` |
 
 `EncodedPages` needs K and V widths divisible by 32 and includes `grouped_int.h`

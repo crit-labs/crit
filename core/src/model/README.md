@@ -163,16 +163,11 @@ from `layer_types`, else every `full_attention_interval`-th layer full and the
 rest linear, else all full; and `position_limit(&source)`, crit eval's
 `model_limit`, which applies YaRN scaling (`original x factor`) when present.
 
-`rope_table(rope, head_dim, max_position_embeddings, sequence_length)` turns a
-`RopeConfig` into the rotary inverse frequencies (one per rotated pair of
-`rotary_dim(rope, head_dim)`) and the attention factor that scales cos and sin,
-as Hugging Face's `ROPE_INIT_FUNCTIONS` derive them: default and `mrope`,
-`linear`, `dynamic` NTK, `yarn` (`mscale`/`mscale_all_dim`, a declared
-`attention_factor` used as is, `truncate`), `llama3` and `longrope`. Engines read
-their table here instead of deriving it; the derivation is where serving stacks
-lose accuracy silently (a YaRN scale applied twice, `mscale` ignored).
-`crit_core.model.rope_table` is the Python twin; `tests/test_core_rope.py` checks it
-against Transformers and `tests/core/rope_oracle.py` checks the two agree.
+`RopeConfig` is data only: the rotary frequencies it implies are positional
+arithmetic, so Core does not compute them. attention-state's
+[rope_table](../../../inference/attention-state/README.md) turns a `RopeConfig`
+into the rotary inverse frequencies and attention factor as Hugging Face derives
+them, in C++ and Python.
 
 ### Differences from crit eval
 

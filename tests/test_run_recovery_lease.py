@@ -6,7 +6,8 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from test_run_records import RunFixture
+from support.runs import RunFixture
+from crit import lease as run_lease
 from crit.run import store as run_store
 
 
@@ -27,7 +28,7 @@ class RecoveryLeaseTests(RunFixture, unittest.TestCase):
         first_done = threading.Event()
         second_inside = threading.Event()
         overlaps, outcomes = [], {}
-        read_owner = run_store.read_lease_owner
+        read_owner = run_lease.read_lease_owner
         refresh = self.store._refresh
 
         def delayed_read(path):
@@ -58,7 +59,7 @@ class RecoveryLeaseTests(RunFixture, unittest.TestCase):
 
         first = threading.Thread(target=recover, args=("first",), name="first-recoverer")
         second = threading.Thread(target=recover, args=("second",), name="second-recoverer")
-        with patch.object(run_store, "read_lease_owner", side_effect=delayed_read), \
+        with patch.object(run_lease, "read_lease_owner", side_effect=delayed_read), \
              patch.object(self.store, "_refresh", side_effect=guarded_refresh):
             try:
                 first.start()

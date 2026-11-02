@@ -8,7 +8,7 @@ import threading
 import unittest
 from types import SimpleNamespace
 
-from test_chat_residency import ServeFixture
+from support.serve import ServeFixture
 from crit_api.engine import PackedScores, score_reply
 from crit_api.server import Api, Server
 from crit_core.serving import ResidentChat, ScoreRows, capabilities, logprob_row, packed_scores
@@ -109,6 +109,10 @@ class ScoreApiTests(ServeFixture, unittest.TestCase):
         self.assertEqual(response.status, 500, value)
         self.assertIn("invalid response", value["error"]["message"])
         self.assertEqual(value["request_id"], response.getheader("X-Request-Id"))
+        # Its records stay for diagnosis, as a failed reply's do.
+        folder = self.server.api.engine.runtime.root / "requests" / value["request_id"]
+        self.assertEqual(json.loads((folder / "request.json").read_text())["record_kind"], "score_request")
+        self.assertTrue((folder / "response.json").is_file())
 
     def test_metrics_count_score_requests_by_outcome(self):
         self.post({"prompt_ids": [5, 6, 7], "continuation_ids": [8], "top_logprobs": 1})

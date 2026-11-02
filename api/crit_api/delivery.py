@@ -1,10 +1,20 @@
 """Bounded socket delivery that cannot strand resident command supervision."""
 from contextlib import contextmanager
+import json
 import select
 import socket
 import ssl
 import threading
 import time
+
+PING = b": ping\n\n"  # an SSE comment: clients skip it, while proxies and idle timers see the stream is alive
+
+
+def sse_event(data, name=None):
+    """One server-sent event of JSON `data`, named `name` in the dialects that name their events (Anthropic's, the
+    Responses API's)."""
+    named = b"" if name is None else f"event: {name}\n".encode("utf-8")
+    return named + b"data: " + json.dumps(data).encode("utf-8") + b"\n\n"
 
 
 class StreamDelivery:

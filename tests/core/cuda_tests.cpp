@@ -1,4 +1,5 @@
 #include "crit/cuda.h"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -8,6 +9,7 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <vector>
 
 using namespace crit::core;
 namespace {
@@ -66,6 +68,32 @@ void allocations() {
     require(f.resources.usage(Memory::device).live==4096,"arena grew backing allocation");
     alias={}; host={};
     require(!f.resources.usage(Memory::device).live && !f.resources.usage(Memory::host).live,"allocation leak");
+}
+// A failed allocation throws and leaves no runtime error behind for the engine's next launch check, nor a charge.
+void allocation_error() {
+    Resources resources{1<<20,std::size_t(1)<<62};
+    CudaBackend backend;
+    backend.initialize(resources);
+    check(cudaGetLastError());
+    rejects([&]{backend.allocate(Memory::device,std::size_t(1)<<61);},"CUDA allocation");
+    require(cudaPeekAtLastError() == cudaSuccess,"a failed allocation left the runtime's last error set");
+    require(!resources.usage(Memory::device).live,"a failed allocation stays charged");
+}
+// A transfer larger than the host ledger stages in pieces that fit it, and leaves nothing charged.
+void staging() {
+    Resources resources{1<<20,16<<20};
+    CudaBackend backend;
+    backend.initialize(resources);
+    auto buffer = backend.allocate(Memory::device,8<<20);
+    std::vector<std::byte> in(8<<20), out(8<<20);
+    for(std::size_t i=0;i<in.size();++i) in[i] = std::byte(i*131 % 251);
+    buffer.upload(in);
+    buffer.download(out);
+    require(in==out,"a transfer past the host ledger came back changed");
+    std::vector<std::byte> part(3*(1<<20)+5);
+    buffer.download(part,1000);
+    require(std::equal(part.begin(),part.end(),in.begin()+1000),"an offset transfer in pieces");
+    require(!resources.usage(Memory::host).live && resources.usage(Memory::host).peak <= (1<<20),"staging stays within the ledger");
 }
 void ordering() {
     Fixture f;
@@ -228,17 +256,6 @@ void faults() {
     f.backend->drain(); // Injected statuses did not corrupt the actual CUDA context.
 }
 #endif
-void timer() {
-    Fixture f;
-    auto buffer=f.backend->allocate(Memory::device,4096);
-    auto timer=f.backend->timer();
-    rejects([&]{timer.record_stop();},"not been recorded");
-    timer.start(); f.backend->fill_async(buffer,5);
-    const auto elapsed=timer.stop_ms();
-    require(elapsed>=0 && elapsed<10000,"invalid CUDA timer result");
-    timer.start(); rejects([&]{timer.elapsed_ms();},"not been recorded");
-    timer.stop_ms();
-}
 void readback() {
     Fixture f;
     auto dev=f.backend->allocate(Memory::device,4096),host=f.backend->allocate(Memory::host,4096),other=f.backend->allocate(Memory::device,64);
@@ -354,8 +371,8 @@ int main(int argc,char** argv) {
     try {
         if(argc!=2) throw std::invalid_argument("one fixture name required");
         const std::pair<const char*,void(*)()> groups[]{
-            {"allocations",allocations},{"ordering",ordering},{"release",release},{"partial",partial},
-            {"engine",engine},{"timer",timer},{"readback",readback},{"stages",stages},{"retained",retained},{"spare",spare},
+            {"allocations",allocations},{"allocation_error",allocation_error},{"staging",staging},{"ordering",ordering},{"release",release},{"partial",partial},
+            {"engine",engine},{"readback",readback},{"stages",stages},{"retained",retained},{"spare",spare},
 #ifdef CRIT_TEST_LINKER_WRAP
             {"faults",faults},
 #endif

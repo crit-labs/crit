@@ -1,0 +1,6 @@
+{
+  "about": "The safetensors dtypes both readers know: each one's stored spelling and its storage width in bits, in the order of crit/safetensors.h's DType. The one copy both readers use: crit_core.model.safetensors loads it, core/CMakeLists.txt generates the C++ reader's table from it. A new dtype adds its row here and its enumerator to DType.",
+  "dtypes": [["BOOL", 8], ["U8", 8], ["I8", 8], ["U16", 16], ["I16", 16], ["U32", 32], ["I32", 32], ["U64", 64],
+             ["I64", 64], ["F8_E4M3", 8], ["F8_E5M2", 8], ["F8_E8M0", 8], ["F16", 16], ["BF16", 16], ["F32", 32],
+             ["F64", 64], ["F4", 4], ["F6_E2M3", 6], ["F6_E3M2", 6]]
+}

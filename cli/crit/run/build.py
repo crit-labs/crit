@@ -11,8 +11,8 @@ import subprocess
 import sys
 import types
 
-from .records import file_sha, ident, inventory, keys, load_run, now, read_json, safe_path, timestamp
-from .served import remaining
+from .attempt import Attempt, remaining, unsealed
+from .records import file_sha, inventory, keys, load_run, read_json, safe_path
 
 
 def build(store, run_id, candidate_id, recipe, seconds=None, drop=(), package=True, log=None):
@@ -20,9 +20,7 @@ def build(store, run_id, candidate_id, recipe, seconds=None, drop=(), package=Tr
     build folder (relative to the run) and the package manifest when packaged."""
     log = log or (lambda message: print(message, file=sys.stderr, flush=True))
     root = store.directory(run_id)
-    folder = safe_path(root, f"candidates/{ident(candidate_id, 'candidate')}")
-    if (folder / "seal.json").exists():
-        raise ValueError("Sealed candidate is immutable; allocate a new candidate")
+    folder = unsealed(root, candidate_id)
     keys(recipe, {"build", "launch"}, {"capabilities"})
     keys(recipe["build"], {"toolchain", "command"}, {"dependencies"})
     command = recipe["build"]["command"]
@@ -33,36 +31,19 @@ def build(store, run_id, candidate_id, recipe, seconds=None, drop=(), package=Tr
         # nothing can be neither served nor evaluated.
         raise ValueError("The recipe names no capabilities: leave capabilities out to take the adapter's "
                          "declared_capabilities(model_path), or name them")
-    reservation = store.reserve(run_id, candidate_id, "build", seconds)
-    attempt = reservation["attempt_id"]
-    work = safe_path(root, f"work/builds/{candidate_id}-{attempt}")
-    log_path = folder / "logs" / f"build-{attempt}.log"
-    outcome, failure, code, settled, interrupted = "completed", None, None, True, None
-    try:
+    attempt = Attempt(store, run_id, candidate_id, "build", seconds, "build", "Build", "The build", launch=True)
+    work = safe_path(root, f"work/builds/{candidate_id}-{attempt.id}")
+    with attempt.running(tee=False):
         if work.exists():
             shutil.rmtree(work)
         shutil.copytree(folder / "source", work)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
         log(f"crit run build: {' '.join(command)} in {work.relative_to(root).as_posix()}")
-        code, outcome, failure, settled = _run(command, work, log_path, reservation["deadline_at"])
-    except (KeyboardInterrupt, SystemExit) as exc:
-        outcome, failure, interrupted = "interrupted", "Interrupted", exc
-    except BaseException as exc:
-        outcome = "launch_failed" if isinstance(exc, OSError) else "failed"
-        failure = f"{type(exc).__name__}: {exc}"[:8000]
-    ended = now()
-    if outcome == "completed" and timestamp(ended, "ended") > timestamp(reservation["deadline_at"], "deadline"):
-        outcome, failure = "timed_out", "The build passed its reserved deadline"
-    logs = [{"path": log_path.relative_to(root).as_posix(), "sha256": file_sha(log_path)}] if log_path.is_file() else []
-    result = store.settle(run_id, reservation, {"outcome": outcome, "ended_at": ended, "exit_code": code,
-                                                "cleanup_settled": settled, "logs": logs, "failure": failure})
-    if interrupted is not None:
-        raise interrupted
+        attempt.end(*_run(command, work, attempt.log_path, attempt.deadline_at))
+    result = attempt.settle()
+    log_path = attempt.log_path
+    tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-20:] if log_path.is_file() else []
+    attempt.finish("\n" + "\n".join(tail) if tail else "")
     built = {"attempt": result, "build_folder": work.relative_to(root).as_posix()}
-    if outcome != "completed":
-        tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-20:] if log_path.is_file() else []
-        raise ValueError(f"Build {outcome}: {failure} (log {log_path.relative_to(root).as_posix()})"
-                         + ("\n" + "\n".join(tail) if tail else ""))
     for pattern in drop:
         for path in sorted(work.glob(pattern), reverse=True):
             shutil.rmtree(path) if path.is_dir() else path.unlink()
@@ -70,12 +51,12 @@ def build(store, run_id, candidate_id, recipe, seconds=None, drop=(), package=Tr
         shutil.rmtree(cache)
     if package:
         built["package"] = store.package(run_id, candidate_id, work, package_recipe(root, folder, work, recipe,
-                                                                                    attempt))
+                                                                                    attempt.id))
     return built
 
 
 def _run(command, cwd, log_path, deadline_at):
-    """The command's exit code, outcome, failure and whether its process tree was stopped."""
+    """The command's outcome, failure, whether its process tree was stopped, and its exit code (Attempt.end)."""
     from crit.process.tree import ProcessTree
     with log_path.open("ab") as stream:
         tree = ProcessTree(command, cwd, stream)
@@ -96,7 +77,7 @@ def _run(command, cwd, log_path, deadline_at):
                 settled = False
                 failure = failure or f"Build cleanup failed: {exc}"
                 outcome = outcome if outcome != "completed" else "failed"
-    return code, outcome, failure, settled
+    return outcome, failure, settled, code
 
 
 def package_recipe(root, folder, work, recipe, attempt):

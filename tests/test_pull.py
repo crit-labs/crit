@@ -16,7 +16,7 @@ from crit.pull import requirements as machine
 from crit.pull.cli import main, pull
 from crit.pull.store import InstallStore
 from crit.run.records import digest, file_sha, inventory, read_json, write_json
-from test_chat_residency import ADAPTER
+from support.serve import ADAPTER
 
 try:
     import yaml

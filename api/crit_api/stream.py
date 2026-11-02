@@ -1,12 +1,11 @@
 """Bounded provisional text for one isolated resident request, sent over the host's channel as it is emitted."""
 import threading
 
-from crit.run.records import keys
+from crit.records import keys
 from .content import content_size, content_text, response_content, tool_size
 from .options import validate_tool_reply
 from .tool_stream import ToolCallStream
 
-CAPABILITY = "chat-stream-v1"
 PARTS = ("text", "reasoning", "tool_calls")
 
 

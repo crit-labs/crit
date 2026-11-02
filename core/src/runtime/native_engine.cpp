@@ -1,8 +1,8 @@
 #include "crit/native_engine.h"
 #include "crit/json.h"
+#include "json_text.h"
 #include <algorithm>
 #include <charconv>
-#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <limits>
@@ -31,51 +31,23 @@ void fail(const char* what) noexcept {
     }
 }
 
-std::string json_string(std::string_view text) {
-    std::string out = "\"";
-    for(const char c:text) {
-        switch(c) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if(static_cast<unsigned char>(c) < 0x20) {
-                    char escape[8];
-                    std::snprintf(escape, sizeof escape, "\\u%04x", static_cast<unsigned>(static_cast<unsigned char>(c)));
-                    out += escape;
-                } else {
-                    out += c;
-                }
-        }
-    }
-    return out + "\"";
-}
-
-std::string number(double value) {
-    char buffer[32];
-    std::snprintf(buffer, sizeof buffer, "%.6f", value);
-    return buffer;
-}
-
 std::string tokens(std::span<const Token> values) {
     std::string out = "[";
     for(std::size_t i = 0; i < values.size(); ++i) out += (i ? "," : "") + std::to_string(values[i]);
     return out + "]";
 }
 
-// `base` is a JSON object; the members of the factory's object (validated) are appended to it.
+// `base` is a JSON object; the members of the factory's object (validated) are appended to it, less the keys `base`
+// holds already (detail::info_keys), so a fact never shadows Core's value.
 std::string merged(std::string base, const std::function<std::string()>& extra) {
     if(!extra) return base;
     const std::string text = extra();
     const auto document = json::Document::parse(text, "engine facts");
     if(document.root().kind() != json::Kind::object) throw std::runtime_error("engine facts must be a JSON object");
-    const auto open = text.find('{'), close = text.rfind('}');
-    const std::string members = text.substr(open + 1, close - open - 1);
-    if(members.find_first_not_of(" \t\r\n") == std::string::npos) return base;
+    const std::string facts = detail::facts_object(document.root());
+    if(facts == "{}") return base;
     base.pop_back();
-    return base + "," + members + "}";
+    return base + "," + facts.substr(1);
 }
 
 int copy(const std::string& text, char* out, int capacity) {
@@ -148,6 +120,11 @@ RequestOptions request_options(const char* options_json) {
             sampling.logit_bias.push_back({token, float(bias)});
         }
     }
+    if(const auto* v = root.find("min_tokens"); v && !v->is_null()) {
+        const auto n = v->u64();
+        if(n > std::numeric_limits<std::uint32_t>::max()) throw std::invalid_argument("min_tokens exceeds 2^32 - 1");
+        sampling.min_tokens = std::uint32_t(n);
+    }
     if(const auto* v = root.find("replay"); v && !v->is_null()) {
         auto replay = std::make_shared<ReplayContinuation>();
         replay->tokens = token_array(*v, "replay");
@@ -182,7 +159,7 @@ int settle(void* handle, std::int32_t* out, char* result, int capacity, Wait&& w
         } catch(const Cancelled&) {
             return -2;
         }
-        const auto ms = [](std::uint64_t ns) { return number(double(ns) / 1e6); };
+        const auto ms = [](std::uint64_t ns) { return detail::real(double(ns) / 1e6); };
         const auto& t = r.timing;
         std::string text = std::string("{\"finish\":\"") + finish_name(r.finish) + "\",\"timing\":{\"queued_ms\":" + ms(t.queued_ns) +
                            ",\"prefill_ms\":" + ms(t.prefill_ns) + ",\"first_token_ms\":" + ms(t.first_token_ns) +
@@ -257,7 +234,7 @@ int info(void* handle, char* out, int capacity) noexcept {
     try {
         auto& native = engine_of(handle);
         const ModelInfo i = native.engine->info();
-        std::string text = "{\"implementation\":" + json_string(i.implementation) +
+        std::string text = "{\"implementation\":" + detail::quoted(i.implementation) +
                            ",\"vocabulary\":" + std::to_string(i.vocabulary) +
                            ",\"valid_vocabulary\":" + std::to_string(i.valid_vocabulary ? i.valid_vocabulary : i.vocabulary) +
                            ",\"context\":" + std::to_string(i.context) + ",\"prefill_chunk\":" + std::to_string(i.prefill_chunk) +
@@ -267,13 +244,14 @@ int info(void* handle, char* out, int capacity) noexcept {
                            ",\"token_logprobs\":" + (i.token_logprobs ? "true" : "false") +
                            ",\"max_top_logprobs\":" + std::to_string(i.max_top_logprobs) +
                            ",\"max_concurrency\":" + std::to_string(i.max_concurrency) + ",\"score_paths\":[";
-        for(std::size_t p = 0; p < i.score_paths.size(); ++p) text += (p ? "," : "") + json_string(i.score_paths[p]);
+        for(std::size_t p = 0; p < i.score_paths.size(); ++p) text += (p ? "," : "") + detail::quoted(i.score_paths[p]);
         const auto& s = i.sampling;
         text += std::string("],\"sampling\":{\"temperature\":") + (s.temperature ? "true" : "false") + ",\"top_p\":" + (s.top_p ? "true" : "false") +
                 ",\"top_k\":" + (s.top_k ? "true" : "false") + ",\"seed\":" + (s.seed ? "true" : "false") +
                 ",\"min_p\":" + (s.min_p ? "true" : "false") +
                 ",\"penalties\":" + (s.penalties ? "true" : "false") +
-                ",\"logit_bias\":" + (s.logit_bias ? "true" : "false") + "}}";
+                ",\"logit_bias\":" + (s.logit_bias ? "true" : "false") +
+                ",\"min_tokens\":" + (s.min_tokens ? "true" : "false") + "}}";
         text = merged(std::move(text), native.info);
         const auto profile = native.engine->profile();
         text.pop_back();

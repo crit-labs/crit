@@ -7,23 +7,23 @@ import types
 import threading
 
 if __package__ in {None, ""}:
-    # Launched by path: make crit_api and, in a checkout, crit and crit_core importable.
+    # Launched by path: make crit_api and, in a checkout, crit, crit_core and the crit Eval checkout beside it
+    # importable (crit Eval gives Core the GGUF config rules a lone GGUF's model text needs).
     root = Path(__file__).resolve().parents[2]
-    for folder in (Path(__file__).resolve().parents[1], root / "cli", root / "core" / "python"):
-        if any((folder / name).is_dir() for name in ("crit_api", "crit", "crit_core")):
+    for folder in (Path(__file__).resolve().parents[1], root / "cli", root / "core" / "python",
+                   root.parent / "crit-eval"):
+        if any((folder / name).is_dir() for name in ("crit_api", "crit", "crit_core", "crit_eval")):
             sys.path.insert(0, str(folder))
-from crit.run.records import MAX_JSON_BYTES, digest, read_json, safe_path
+from crit.records import MAX_JSON_BYTES, digest, read_json, safe_path
 from crit_api import channel
 from crit_api.logprobs import RESPONDING, response_bytes
 from crit_api.models import ModelContext, ModelPool
-from crit_api.stream import CAPABILITY as STREAM_CAPABILITY, StreamWriter
-from crit_api.options import (MAX_CHAT_RECORD, TOOLS_CAPABILITY, STRICT_TOOLS_CAPABILITY, TOOL_CHOICE_CAPABILITY,
-                              TOOL_STREAM_CAPABILITY)
+from crit_api.stream import StreamWriter
+from crit_api.options import MAX_CHAT_RECORD
 from crit_core.machine import keep_full_speed
-from crit_core.serving import (LOGPROBS_CAPABILITY, SCORE_CAPABILITY, TOKENIZE_CAPABILITY, RequestRejected,
-                               engine_facts)
-
-CONFIG_CAPABILITY = "chat-config-v1"
+from crit_core.serving import (CONCURRENT_CAPABILITY, CONFIG_CAPABILITY, LOGPROBS_CAPABILITY, SCORE_CAPABILITY, STREAM_CAPABILITY,
+                               STRICT_TOOLS_CAPABILITY, TOKENIZE_CAPABILITY, TOOL_CHOICE_CAPABILITY,
+                               TOOL_STREAM_CAPABILITY, TOOLS_CAPABILITY, RequestRejected, engine_facts)
 
 
 def effective_configuration_problem(engine, configuration):
@@ -41,8 +41,6 @@ def effective_configuration_problem(engine, configuration):
         return ("Engine did not apply its frozen configuration (ignored: %s; changed: %s)"
                 % (", ".join(ignored) or "none", ", ".join(changed) or "none"))
     return None
-
-CAPABILITY = "chat-resident-v1"
 
 
 class Cancelled(Exception):
@@ -180,7 +178,7 @@ class Host:
                 raise ValueError("Resident engine must implement generate, reset and close")
             if STREAM_CAPABILITY in spec.get("capabilities", []) and not callable(getattr(self.engine, "generate_stream", None)):
                 raise ValueError("chat-stream-v1 requires generate_stream(request, cancellation, emit)")
-            self.concurrent = "chat-concurrent-v1" in capabilities
+            self.concurrent = CONCURRENT_CAPABILITY in capabilities
             self.capacity = getattr(self.engine, "max_concurrent_requests", 1) if self.concurrent else 1
             if type(self.capacity) is not int or not 1 <= self.capacity <= 1024:
                 raise ValueError("max_concurrent_requests must be an integer in [1, 1024]")

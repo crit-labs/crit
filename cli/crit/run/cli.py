@@ -6,8 +6,10 @@ import signal
 import sys
 import tomllib
 
+from crit.cli import default_project
+
 from .records import exploratory_reason, ineligibility, read_json, safe_path
-from .store import ROOT, RunStore
+from .store import RunStore
 
 SETTINGS = {"wsl_run_root": str, "ram_headroom_gib": (int, float), "vram_headroom_gib": (int, float),
             "context_reserve_gib": (int, float), "device": str, "context_tokens": int,
@@ -64,9 +66,10 @@ def json_argument(value, option):
     except json.JSONDecodeError as exc:
         raise ValueError(f"{option} is neither a file nor JSON: {exc}") from None
 
-def main(argv=None):
+def parser():
+    """The arguments of crit run (crit mcp offers its tools from them)."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project", type=Path, default=ROOT if (ROOT / "core/include/crit/core.h").is_file() else Path.cwd())
+    parser.add_argument("--project", type=Path, default=default_project())
     parser.add_argument("--root", type=Path, help="Run root; defaults to PROJECT/runs")
     parser.add_argument("--id", help="Existing run identity")
     subs = parser.add_subparsers(dest="action", required=True)
@@ -202,12 +205,17 @@ def main(argv=None):
     sub.add_argument("--collect", action="store_true", help="Instead: check and list the plans the replays under --out wrote")
     subs.add_parser("show", help="Print the run, its state and its candidates as JSON")
     subs.add_parser("recover", help="Explicit dead-owner lease recovery and projection rebuild; never resets attempts/deadlines")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv=None):
+    command = parser()
+    args = command.parse_args(argv)
     if hasattr(signal, "SIGTERM") and signal.getsignal(signal.SIGTERM) is signal.SIG_DFL:
         # A terminated command (for example a timeout) unwinds and releases its lease.
         signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
     if args.action != "create" and not args.id:
-        parser.error("--id is required for an existing run")
+        command.error("--id is required for an existing run")
     try:
         store = RunStore(args.root or args.project / "runs", args.project)
         payload = read_json(args.record) if getattr(args, "record", None) else None
@@ -233,7 +241,7 @@ def main(argv=None):
             print(render_collected(result), file=sys.stderr)
         elif args.action == "replay":
             if bool(args.at) == bool(args.before):
-                parser.error("replay needs --at CANDIDATE or --before PLAN (or --collect)")
+                command.error("replay needs --at CANDIDATE or --before PLAN (or --collect)")
             from .replay import collect, launch, make, render_collected
             result = make(store, args.id, args.at, args.out, args.count, args.before)
             if args.agent:
@@ -250,11 +258,11 @@ def main(argv=None):
             result = store.package(args.id, args.candidate, args.source, payload)
         elif args.action == "check" and args.from_eval:
             if args.record:
-                parser.error("check takes --record or --from-eval, not both")
+                command.error("check takes --record or --from-eval, not both")
             from .checks import from_eval
             result = from_eval(store, args.id, args.candidate, None if args.from_eval == "newest" else args.from_eval)
         elif args.action == "check" and not args.record:
-            parser.error("check needs --record or --from-eval")
+            command.error("check needs --record or --from-eval")
         elif args.action == "capture":
             from .capture import INSTRUCTION, capture
             result = capture(store, args.id, args.case,
@@ -280,32 +288,15 @@ def main(argv=None):
             for record in result:
                 warn_exploratory(store, args.id, args.candidate, record["benchmark_id"])
         elif args.action == "eval":
-            from .evaluation import evaluate
+            from .evaluation import evaluate, summary
             result = evaluate(store, args.id, args.candidate, args.data, args.only,
                               read_json(args.baseline) if args.baseline else None, args.seconds, args.label,
                               stage=args.stage if args.stage in (None, "full") else int(args.stage),
                               certify=args.certify,
                               budget_seconds=args.budget_minutes * 60 if args.budget_minutes else None,
                               resume=args.resume)
-            from crit_eval.reports.status import render
-            from .plans import extract, priorities, rules, standing
-            status = result.pop("status")
-            print(render(status), file=sys.stderr)
-            # Eval states the goals without an order; the run's priority rule orders them for the next plan.
-            order, reason = priorities({"decode": {"needed": True}, "prefill": {"needed": True}}, extract(status),
-                                       rules(store.get(args.id)["run"]))
-            print("priorities while decode and prefill are both needed: " + (
-                "; ".join(f"{tier} {', '.join(order[tier])}" for tier in ("p1", "p2", "p3") if order[tier])
-                if order else reason) + " (crit run ... plan computes them from the plan's needed flags)", file=sys.stderr)
-            # How far each prioritized KPI stands from its limit: a low fraction is the next plan's room, not a result.
-            for line in standing(status):
-                print("  " + line, file=sys.stderr)
-            from .evaluation import host_bytes_warning
-            path = (result.get("result") or {}).get("path")
-            root = store.directory(args.id)
-            warning = host_bytes_warning(root, read_json(safe_path(root, path))) if path else None
-            if warning:
-                print(warning, file=sys.stderr)
+            for line in summary(store, args.id, result):
+                print(line, file=sys.stderr)
         elif args.action == "serve":
             from .served import serve
             result = serve(store, args.id, args.candidate, args.host, args.port, args.seconds, check=args.check)

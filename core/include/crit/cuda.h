@@ -22,8 +22,10 @@ public:
     void* device_address() const;
     // Loading only, never per-step work: both synchronize the stream. Pageable
     // transfers use owned pinned staging, so a failed fence never leaves GPU work
-    // using the borrowed host span. In work loops use copy_async/readback_async
-    // with owned pinned buffers. The caller orders earlier uses on the other stream.
+    // using the borrowed host span: pieces of at most 64 MiB and of what the host
+    // ledger has left, so a large transfer pins and charges only that. In work loops
+    // use copy_async/readback_async with owned pinned buffers. The caller orders
+    // earlier uses on the other stream.
     void upload(std::span<const std::byte>, std::size_t offset = 0, Queue = Queue::transfer);
     void download(std::span<std::byte>, std::size_t offset = 0, Queue = Queue::transfer) const;
 private:
@@ -54,7 +56,6 @@ private:
     std::unique_ptr<Impl> impl_;
     explicit CudaEvent(std::unique_ptr<Impl>);
     friend class CudaBackend;
-    friend class CudaTimer;
 };
 // Fixed-capacity stage timings on the compute stream, with preallocated events
 // and no per-step allocation. Time around graph launches: recording inside a
@@ -74,18 +75,6 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     explicit CudaStageTimer(std::unique_ptr<Impl>);
-    friend class CudaBackend;
-};
-class CudaTimer {
-public:
-    void start();
-    void record_stop();
-    float elapsed_ms() const; // Explicitly wait on stop before asking for elapsed.
-    float stop_ms();
-private:
-    CudaEvent start_, stop_;
-    cudaStream_t stream_;
-    CudaTimer(CudaEvent, CudaEvent, cudaStream_t);
     friend class CudaBackend;
 };
 
@@ -117,7 +106,6 @@ public:
     // required state uses allocate().
     std::optional<CudaBuffer> allocate_spare(std::size_t bytes, std::size_t margin);
     CudaEvent event();
-    CudaTimer timer(Queue = Queue::compute);
     // Owners must belong to this backend. Async calls do not add host fences;
     // last-owner release protects pending accesses. Zero-byte calls are valid.
     void copy_async(const CudaBuffer& dst, std::size_t dst_offset,

@@ -26,6 +26,7 @@ from crit_core.files import DirectoryFiles, MappingFiles
 from crit_core.model import config as mc
 from crit_core.model import safetensors as st
 import eval_v2_rules as v2   # crit-eval-v2's rules, the oracle Core's config rules were ported from
+from support.files import unreadable_open
 
 AUDIT_LIMITS = st.Limits(max_header_bytes=1 << 20, max_index_bytes=1 << 20, max_tensors=8192, max_shards=32,
                          max_rank=8, max_dimension=(1 << 31) - 1, max_file_bytes=64 << 30,
@@ -167,30 +168,6 @@ def write_config(directory, config):
     path = Path(directory) / "config.json"
     path.write_text(json.dumps(config), encoding="utf-8")
     return path
-
-
-class _Unreadable:
-    """A file whose bytes must not be read (it can still be stat-ed); see unreadable_open."""
-
-    def __init__(self, handle):
-        self.handle = handle
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *details):
-        self.handle.close()
-
-    def fileno(self):
-        return self.handle.fileno()
-
-    def read(self, *details):
-        raise AssertionError("read before the size check")
-
-
-def unreadable_open(file, mode="r", *details, **options):
-    """Patched in for open() in crit_core.files and crit_core.jsonfile: opens the file but fails any read."""
-    return _Unreadable(open(file, mode, *details, **options))
 
 
 def eval_rules(directory, config):

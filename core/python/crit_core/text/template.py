@@ -5,13 +5,15 @@ The environment matches transformers: trim_blocks and lstrip_blocks, the loopcon
 passed through), `raise_exception` and `strftime_now`. The clock behind strftime_now is injectable; with no clock
 the global is undefined, so templates fall back to their own date. Template discovery and selection follow
 transformers too (see template_sources and ChatTemplates.select). For a model family whose checkpoints carry no chat
-template, crit ships one (SHIPPED_TEMPLATES, by config.json model_type; see chat_template_sources).
+template, a package gives one by config.json model_type (crit_core.registry chat_templates; crit ships them with
+crit-eval's architectures; see chat_template_sources).
 """
 from collections.abc import Mapping
 import contextvars
 from datetime import datetime
 import hashlib
 import json
+import os
 from pathlib import Path
 from types import MappingProxyType
 
@@ -21,6 +23,7 @@ from jinja2 import filters as jinja_filters
 import jinja2.nodes
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
+from .. import registry
 from .errors import (MAX_CONFIG_BYTES, ModelTextError, TemplateError, TextError, list_names, model_files,
                      read_json_object, read_text)
 
@@ -29,10 +32,6 @@ MAX_RENDER_CHARS = 1 << 26        # rendered text, and single results of the gua
 TEMPLATE_FILE = "chat_template.jinja"
 TEMPLATE_DIR = "additional_chat_templates/"
 LEGACY_TEMPLATE_FILE = "chat_template.json"
-SHIPPED_DIR = Path(__file__).resolve().parent / "templates"
-# The chat templates crit ships, by config.json model_type, for families whose checkpoints carry none: DeepSeek V4
-# publishes a Python encoder (encoding_dsv4.py) instead, which templates/deepseek-v4.jinja ports.
-SHIPPED_TEMPLATES = MappingProxyType({"deepseek_v4": "deepseek-v4.jinja"})
 
 _SPANS = contextvars.ContextVar("crit_core_text_generation_spans", default=None)
 
@@ -377,18 +376,22 @@ def template_sources(files, tokenizer_config=None):
 
 
 def shipped_template(model_type):
-    """(file name, source) of the chat template crit ships for config.json model_type `model_type`, or None."""
-    name = SHIPPED_TEMPLATES.get(model_type) if isinstance(model_type, str) else None
-    if name is None:
+    """(file name, source) of the chat template registered for config.json model_type `model_type` (crit_core.registry
+    chat_templates, whose values are template files' paths), or None."""
+    path = registry.entries("chat_templates").get(model_type) if isinstance(model_type, str) else None
+    if path is None:
         return None
-    return name, (SHIPPED_DIR / name).read_text(encoding="utf-8")
+    if not isinstance(path, (str, os.PathLike)):
+        raise TextError(f"the chat template registered for {model_type!r} is not a path ({type(path).__name__})")
+    path = Path(path)
+    return path.name, path.read_text(encoding="utf-8")
 
 
 def chat_template_sources(files, chat_template=None, tokenizer_config=None):
     """(origin, {name: source}, shipped file) of the chat templates a model renders with: its own (template_sources),
     origin "model"; for a model whose files hold none, `chat_template` (a template source), origin "given", else the
-    one crit ships for its config.json model_type (shipped_template), origin "crit", with its file name; else (None,
-    {}, None). A chat_template for a model that carries its own raises ModelTextError: engines serve the model's."""
+    one registered for its config.json model_type (shipped_template: those crit ships), origin "crit", with its file
+    name; else (None, {}, None). A chat_template for a model that carries its own raises ModelTextError: engines serve the model's."""
     files = model_files(files)
     if chat_template is not None and not isinstance(chat_template, str):
         raise TextError("chat_template must be a template source string")

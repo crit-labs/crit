@@ -502,7 +502,7 @@ class EvaluationTests(unittest.TestCase):
     def evaluate(self):
         from crit_models.evaluate import evaluate
         return evaluate(self.root / "transform.json", self.data, self.root / "result.json",
-                        self.root / "evaluation.json", log=lambda m: None)
+                        self.root / "evaluation.json")
 
     def test_eval_requires_data_prepared_from_the_source_model(self):
         with self.assertRaisesRegex(ValueError, "prepare it from the source"):

@@ -3,6 +3,7 @@
 // confidence truncation that leaves the captured width unchanged.
 #include "greedy_accept.h"
 #include "hidden_drafters.h"
+#include "device_buffer.h"
 
 #include <cuda_runtime.h>
 
@@ -17,23 +18,9 @@ namespace dr = crit::techniques::device_round;
 
 namespace {
 void require(bool c, const std::string& m) { if(!c) throw std::runtime_error(m); }
-void ok(cudaError_t e, const char* what) { if(e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e)); }
+using crit::inference_tests::ok;
 
-template<class T> struct Device {
-    T* p = nullptr;
-    std::size_t n = 0;
-    explicit Device(std::size_t count) : n(count) { ok(cudaMalloc(&p, sizeof(T) * (count ? count : 1)), "malloc"); }
-    explicit Device(const std::vector<T>& v) : Device(v.size()) { put(v); }
-    ~Device() { cudaFree(p); }
-    Device(const Device&) = delete;
-    Device& operator=(const Device&) = delete;
-    void put(const std::vector<T>& v) { ok(cudaMemcpy(p, v.data(), sizeof(T) * v.size(), cudaMemcpyHostToDevice), "upload"); }
-    std::vector<T> get() const {
-        std::vector<T> v(n);
-        ok(cudaMemcpy(v.data(), p, sizeof(T) * n, cudaMemcpyDeviceToHost), "download");
-        return v;
-    }
-};
+using crit::inference_tests::Device;
 }  // namespace
 
 int main() {

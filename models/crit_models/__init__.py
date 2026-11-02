@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import sys
 
-from crit.run.records import read_json
+from crit.records import read_json
 
 
 def _recipe(path):
@@ -16,9 +16,8 @@ def _recipe(path):
     return load_recipe(read_json(Path(path)))
 
 
-def main(argv=None):
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+def parser():
+    """The arguments of crit models (crit mcp offers its tools from them)."""
     parser = argparse.ArgumentParser(prog="crit models", description="Transform model weights (post-training "
                                      "quantization) and record recipe, calibration, seed, hashes and cost")
     subs = parser.add_subparsers(dest="command", required=True)
@@ -48,10 +47,16 @@ def main(argv=None):
     evaluation.add_argument("--result", required=True, help="crit eval run --url result of the engine serving the "
                                                             "output; stop the server first")
     evaluation.add_argument("--evaluation", required=True, help="New models_evaluation JSON")
-    evaluation.add_argument("--baseline", metavar="RESULT", help="Eval result of the engine on the source checkpoint")
     check = subs.add_parser("verify", help="Re-hash a transform's output and source against its record")
     check.add_argument("--record", required=True)
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv=None):
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    command = parser()
+    args = command.parse_args(argv)
     try:
         if args.command == "plan":
             from crit_core.model import inspect_model
@@ -98,8 +103,7 @@ def main(argv=None):
                 raise ValueError("crit models eval runs Eval from a crit checkout")
             from crit_eval.reports.status import render
             from .evaluate import evaluate
-            result = evaluate(args.record, args.data, args.result, args.evaluation,
-                              load_json(args.baseline) if args.baseline else None)
+            result = evaluate(args.record, args.data, args.result, args.evaluation)
             print(render(load_json(args.result)["status"]))
             print(f"wrote {args.evaluation} (gates: " + ", ".join(f"{k} {v}" for k, v in result["summary"]["gates"].items()) + ")")
             return 0

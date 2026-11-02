@@ -10,6 +10,8 @@ are all single bytes is a byte class, scanned as one terminal by both recognizer
 from dataclasses import dataclass
 import json
 
+from ..jsonfile import reject_constant
+
 RULE_LIMIT, PRODUCTION_LIMIT, SYMBOL_LIMIT, ARTIFACT_LIMIT = 4096, 16384, 262144, 4194304
 
 
@@ -163,9 +165,7 @@ def matches(language, data):
 def json_object_matches(data):
     """Whether bytes `data` are one JSON object with optional JSON whitespace around it: the native
     JsonObjectMatcher's language (strict UTF-8, no NaN/Infinity, no raw control characters in strings)."""
-    def constant(_):
-        raise ValueError("non-JSON constant")
     try:
-        return isinstance(json.loads(bytes(data).decode("utf-8"), parse_constant=constant), dict)
+        return isinstance(json.loads(bytes(data).decode("utf-8"), parse_constant=reject_constant), dict)
     except (UnicodeError, ValueError, RecursionError):
         return False

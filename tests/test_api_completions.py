@@ -6,7 +6,7 @@ import threading
 import unittest
 
 from test_api_score import SCORE_ADAPTER
-from test_chat_residency import ServeFixture
+from support.serve import ServeFixture
 from crit_api.logprobs import completion_logprobs
 from crit_api.server import Api, Server, completion_prompt
 from crit_api.options import RequestError

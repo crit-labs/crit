@@ -21,7 +21,7 @@ from crit_api.server import Api, Server
 from crit_eval.run import chat
 from crit_eval.run.deadline import Hung
 from test_api_cancellation import GATED_ADAPTER
-from test_chat_residency import ServeFixture
+from support.serve import ServeFixture
 from test_core_reasoning import ADAPTER as REASONING_ADAPTER
 from test_tool_stream import ADAPTER as TOOL_ADAPTER
 

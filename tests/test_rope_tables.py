@@ -1,5 +1,7 @@
-"""crit_core.model.rope_table against Hugging Face's ROPE_INIT_FUNCTIONS (when transformers is installed) and against
-fixed values, for default, linear, dynamic NTK, YaRN (with mscale and attention_factor), Llama 3 and LongRoPE."""
+"""attention-state's rope_table.py against Hugging Face's ROPE_INIT_FUNCTIONS (when transformers is installed) and
+against fixed values, for default, linear, dynamic NTK, YaRN (with mscale and attention_factor), Llama 3 and LongRoPE.
+tests/inference/rope_oracle.py checks its C++ twin, rope_table.h, against it on the same configs."""
+import importlib.util
 import math
 from pathlib import Path
 import sys
@@ -8,7 +10,18 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "core" / "python"))
 
-from crit_core.model import ConfigError, parse_model_config, rope_table  # noqa: E402
+from crit_core.model import ConfigError, parse_model_config  # noqa: E402
+
+
+def load_rope_tables():
+    path = ROOT / "inference" / "attention-state" / "code" / "rope_table.py"
+    spec = importlib.util.spec_from_file_location("crit_rope_table", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+rope_table = load_rope_tables().rope_table
 
 BASE = {"model_type": "llama", "hidden_size": 512, "num_attention_heads": 4, "num_hidden_layers": 2,
         "max_position_embeddings": 32768}

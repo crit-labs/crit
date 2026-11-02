@@ -17,11 +17,10 @@ A model split by gguf-split names its files NAME-00001-of-00003.gguf and records
 split.count; inspect_gguf_model joins the parts in order. Results are frozen dataclasses with absolute file
 offsets for each tensor; type names (TensorInfo.dtype) are ggml's (F32, BF16, Q4_K, IQ3_S, ...).
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import hashlib
 import math
 import mmap
-import os
 from pathlib import Path
 import re
 import struct

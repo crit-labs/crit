@@ -13,6 +13,8 @@ from itertools import islice
 import re
 import sys
 
+from ..jsonfile import JsonError, reject_constant, unique_pairs
+
 VERSION = "crit-language-compiler-2"
 MAX_SOURCE = 1048576
 
@@ -28,16 +30,10 @@ def _integer(value, name, maximum=1024):
 
 
 def _json(source):
-    def pairs(items):
-        result = {}
-        for k, v in items:
-            if k in result:
-                raise UnsupportedConstraint("duplicate JSON key")
-            result[k] = v
-        return result
-    def constant(_):
-        raise UnsupportedConstraint("nonfinite JSON constant")
-    return json.loads(source, object_pairs_hook=pairs, parse_constant=constant)
+    try:
+        return json.loads(source, object_pairs_hook=unique_pairs, parse_constant=reject_constant)
+    except JsonError as error:
+        raise UnsupportedConstraint(f"schema JSON: {error}") from None
 
 
 def _literal_json(value):

@@ -2,7 +2,7 @@
 scored on the source checkpoint."""
 from pathlib import Path
 
-from crit.run.records import file_sha, now, read_json, write_json
+from crit.records import file_sha, now, read_json, write_json
 
 from .ptq import verify
 
@@ -18,7 +18,7 @@ def load_record(path):
     return record
 
 
-def evaluate(record_path, data, result_path, evaluation_path, baseline=None, log=print):
+def evaluate(record_path, data, result_path, evaluation_path):
     """Verify the output against its record, check that `data` was prepared from the source checkpoint (so Eval's
     quality reference is the original model: crit eval reference --model SOURCE --data DATA before the round) and
     that the result at `result_path` (crit eval run --url on the engine serving the output, stopped since) was

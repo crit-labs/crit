@@ -18,7 +18,7 @@ machine still serves.
 from pathlib import Path
 import re
 
-from crit.run.records import digest, keys, number, read_json, safe_path, text, verify_inventory
+from crit.records import digest, keys, number, read_json, safe_path, text, verify_inventory
 
 ENGINE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 INSTALL = "install.json"

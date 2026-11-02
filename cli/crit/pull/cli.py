@@ -22,7 +22,9 @@ import tarfile
 import tempfile
 import urllib.request
 
-from crit.run.records import GIB, digest, file_sha, inventory, now, read_json, safe_path, write_json
+from crit.card import CARD, LOCK, check_source, read_folder
+from crit.cli import default_project
+from crit.records import GIB, digest, file_sha, inventory, now, read_json, safe_path, write_json
 from crit.run.store import ROOT
 
 from . import requirements as machine
@@ -41,14 +43,12 @@ def read_card(engine, hub=None, index=None):
     index.json gives the same fields as crit-hub's website carries them."""
     if hub is not None:
         folder = Path(hub).expanduser().resolve() / "engines" / engine
-        if not (folder / "card.yaml").is_file():
-            raise ValueError(f"{folder} holds no card.yaml: --hub names a crit-hub checkout with engines/{engine}/")
-        from crit.run.hub import _yaml
-        card = _yaml().safe_load((folder / "card.yaml").read_text(encoding="utf-8"))
-        lock = read_json(folder / "card.lock.json", max_bytes=16 << 20)
+        if not (folder / CARD).is_file():
+            raise ValueError(f"{folder} holds no {CARD}: --hub names a crit-hub checkout with engines/{engine}/")
+        card, lock = read_folder(folder)
         revision = subprocess.run(["git", "-C", str(folder), "rev-parse", "HEAD"], capture_output=True, text=True)
         origin = {"from": "crit-hub checkout", "revision": revision.stdout.strip() or None,
-                  "card_sha256": file_sha(folder / "card.yaml"), "lock_sha256": file_sha(folder / "card.lock.json")}
+                  "card_sha256": file_sha(folder / CARD), "lock_sha256": file_sha(folder / LOCK)}
     else:
         index = index or INDEX
         if index.startswith("https://"):
@@ -74,9 +74,7 @@ def read_card(engine, hub=None, index=None):
     if card.get("origin") != "crit":
         raise ValueError(f"{engine} was built with another toolkit (origin: {card.get('origin')}); crit pull installs "
                          "engines exported from crit, whose source has a crit serve adapter")
-    source = card.get("source") or {}
-    if not all(isinstance(source.get(k), str) for k in ("repository", "revision")):
-        raise ValueError(f"{engine}'s card pins no source repository and revision")
+    check_source(card, f"{engine}'s card")
     if not isinstance(lock.get("checkpoints"), dict) or not lock["checkpoints"]:
         raise ValueError(f"{engine}'s card.lock.json lists no checkpoint files")
     return card, lock, origin
@@ -337,14 +335,24 @@ def build(package, command, log_path, seconds):
         raise ValueError(f"The build needs {command[0]}, which is not on PATH")
     log(f"crit pull: building: {' '.join(command)}")
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    from crit.process.tree import ProcessTree
     with log_path.open("wb") as stream:
         try:
-            code = subprocess.run(command, cwd=package, stdout=stream, stderr=subprocess.STDOUT, timeout=seconds,
-                                  env=environment).returncode
-        except subprocess.TimeoutExpired:
-            code = "timed out after %g s" % seconds
+            tree = ProcessTree(command, package, stream, env=environment)
         except OSError as exc:
             code = f"could not start: {exc}"
+        else:
+            code = None
+            try:
+                code = tree.process.wait(timeout=seconds)
+            except subprocess.TimeoutExpired:
+                code = "timed out after %g s" % seconds
+            finally:
+                # The whole tree, as crit run build stops it: what the build left running, and a build that timed out.
+                try:
+                    tree.close()
+                except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+                    code = code or f"left processes that could not be stopped: {exc}"
     if code != 0:
         tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-20:]
         raise ValueError(f"The build failed ({code}); its log, kept at {log_path}:\n" + "\n".join(tail))
@@ -470,7 +478,8 @@ def pull(engine, store, project=ROOT, hub=None, index=None, checkout=None, model
     return record
 
 
-def main(argv=None):
+def parser():
+    """The arguments of crit pull (crit mcp offers its tools from them)."""
     parser = argparse.ArgumentParser(prog="crit pull", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("engine", nargs="?", metavar="OWNER/NAME", help="The crit-hub engine, such as crit-labs/nvfp4-gemv-int8kv")
@@ -488,7 +497,7 @@ def main(argv=None):
     parser.add_argument("--context", type=int, metavar="TOKENS",
                         help="Context the engine serves at (default: the context its card measured)")
     parser.add_argument("--store", type=Path, help="Engine store (default: PROJECT/engines)")
-    parser.add_argument("--project", type=Path, default=ROOT if (ROOT / "core/include/crit/core.h").is_file() else Path.cwd(),
+    parser.add_argument("--project", type=Path, default=default_project(),
                         help="crit repository, whose settings.toml gives the device and headroom (default: this checkout)")
     parser.add_argument("--force", action="store_true", help="Install again over an installed engine")
     parser.add_argument("--ignore-requirements", action="store_true",
@@ -501,15 +510,20 @@ def main(argv=None):
                         help="A local copy of one of the card's downloads (a drafter's folder, an artifact's file), "
                              "checked like a download (repeatable; default: fetch it from Hugging Face)")
     parser.add_argument("--list", action="store_true", help="List the installed engines instead")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv=None):
+    command = parser()
+    args = command.parse_args(argv)
     if bool(args.list) == bool(args.engine):
-        parser.error("name an engine, OWNER/NAME, or --list")
+        command.error("name an engine, OWNER/NAME, or --list")
     if args.hub and args.index:
-        parser.error("--hub and --index are two sources of the card; give one")
+        command.error("--hub and --index are two sources of the card; give one")
     if args.context is not None and args.context < 2:
-        parser.error("--context is at least 2 tokens")
+        command.error("--context is at least 2 tokens")
     if not all("=" in value and all(value.split("=", 1)) for value in args.download):
-        parser.error("--download is REPOSITORY=PATH, such as owner/drafter=./drafter")
+        command.error("--download is REPOSITORY=PATH, such as owner/drafter=./drafter")
     local = dict(value.split("=", 1) for value in args.download)
     try:
         store = InstallStore(args.store or args.project / "engines")

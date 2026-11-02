@@ -2,7 +2,7 @@
 from datetime import timedelta
 import unittest
 
-from test_run_records import RunFixture
+from support.runs import RunFixture
 from crit.run.records import candidate_projection, file_sha, read_json, record, timestamp, write_json
 
 
@@ -37,7 +37,7 @@ class AttemptFixture(RunFixture):
         write_json(path, value)
         try:
             with self.assertRaises(ValueError):
-                self.store._attempts(self.directory)
+                self.store.attempts(self.directory)
             with self.assertRaises(ValueError):
                 self.store.recover(self.run_id)
         finally:
@@ -134,7 +134,7 @@ class AttemptResultTests(AttemptFixture, unittest.TestCase):
                     self.assertEqual(recovered["errors"], [])
                     self.assertEqual(candidate_projection(self.directory, self.run, candidate["candidate_id"]), projection)
                     self.assertEqual({p: p.read_bytes() for p in before}, before)
-                    self.assertIn(reservation, self.store._attempts(self.directory))
+                    self.assertIn(reservation, self.store.attempts(self.directory))
 
 
 class AttemptReservationTests(AttemptFixture, unittest.TestCase):
@@ -168,7 +168,7 @@ class AttemptReservationTests(AttemptFixture, unittest.TestCase):
                     with self.assertRaises(ValueError):
                         candidate_projection(self.directory, self.run, original["candidate_id"])
                 with self.assertRaises(ValueError):
-                    self.store._attempts(self.directory)
+                    self.store.attempts(self.directory)
                 with self.assertRaises(ValueError):
                     self.store.recover(self.run_id)
         finally:
@@ -263,7 +263,7 @@ class AttemptReservationTests(AttemptFixture, unittest.TestCase):
         self.assertEqual(self.store.recover(self.run_id)["state"]["budget"]["attempts"], 5)
         self.assertEqual(candidate_projection(self.directory, self.run, candidate_id), projection)
         self.assertEqual({p: p.read_bytes() for p in paths}, retained)
-        self.assertCountEqual(self.store._attempts(self.directory), reservations)
+        self.assertCountEqual(self.store.attempts(self.directory), reservations)
 
 
 if __name__ == "__main__":

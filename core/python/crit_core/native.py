@@ -56,8 +56,9 @@ import json
 import sys
 from pathlib import Path
 
+from crit_core import jsonfile
 from crit_core.machine import under_wsl
-from crit_core.serving import SAMPLING, TOP_LOGPROBS, ResidentChat, ScoreRows
+from crit_core.serving import ENGINE_FACTS, EXPERT_FACTS, REQUEST_FACTS, SAMPLING, TOP_LOGPROBS, ResidentChat, ScoreRows
 
 ABI = 2
 RESULT_BYTES = 1 << 20  # a generation's result JSON: finish, timing and the engine's request facts
@@ -67,11 +68,12 @@ OUTPUT_CALLBACK = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int32
 PENALTY, PENALTIES = "penalties", {"repetition_penalty", "presence_penalty", "frequency_penalty"}
 # The penalties at the values that change nothing, for requests that must not take an engine's defaults (Eval's).
 NEUTRAL_PENALTIES = {"presence_penalty": 0.0, "frequency_penalty": 0.0, "repetition_penalty": 1.0}
-# Engine info facts the eval-v1 adapter passes on (crit-eval's docs/ADAPTER.md): headroom inputs, kernel classes, the
-# prompt GEMMs' activation formats, the configuration overrides of --attribute-drift and of a wider-draft probe, and
-# prompt_cache false for an engine without a prompt cache.
-FACTS = ("draft_width", "bytes_per_pass", "draft_bytes_per_step", "draft_ms", "kv_bytes_per_token", "kernel_work",
-         "prompt_activations", "exact_variants", "wider_draft", "prompt_cache")
+# Engine info facts the eval-v1 adapter passes on (crit-eval's docs/ADAPTER.md): crit serve's engine facts
+# (crit_core.serving.ENGINE_FACTS) but speculative and plain, which the adapter states itself, and what only an
+# in-process adapter reports: kernel classes and the configuration overrides of --attribute-drift and of a
+# wider-draft probe.
+FACTS = tuple(key for key in ENGINE_FACTS if key not in ("speculative", "plain")) + ("kernel_work", "exact_variants",
+                                                                                   "wider_draft")
 # NativeEngine.score per target: its log-probability, the query rows, the argmax and the engine's own ranked top_k
 # [(token, logprob), ...] (None for parts not asked for or not returned).
 Scores = namedtuple("Scores", "target query argmax top")
@@ -393,14 +395,10 @@ class PythonEngine(_Requests):
 
 # The crit_core_steps library (crit/step_engine.h) a StepEngine loads, when the model's info names no "step_library".
 STEP_LIBRARY = "CRIT_CORE_STEP_LIBRARY"
-# The settings of a step model's info that configure Core (crit/step_engine.h's "engine" object); the rest are facts.
-STEP_SETTINGS = ("implementation", "vocabulary", "valid_vocabulary", "context", "prefill_chunk", "stop_tokens",
-                 "max_concurrency", "max_pending", "max_batch_tokens", "batch_policy", "max_row_tokens",
-                 "decode_token_work", "sampling", "token_logprobs", "max_top_logprobs", "scoring", "score_paths",
-                 "host_limit")
+# The settings of a step model's info that configure Core (crit/step_engine.h's "engine" object), from the table Core's
+# step engine reads too (step_settings.json); the rest are facts.
+STEP_SETTINGS = tuple(jsonfile.read(Path(__file__).with_name("step_settings.json"))["settings"])
 FINISHES = ("length", "stop", "cancelled", "failed")
-SAMPLING_OPTIONS = ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty", "frequency_penalty",
-                    "presence_penalty", "logit_bias", "min_tokens")
 
 
 class _StepRequest(ctypes.Structure):
@@ -531,7 +529,7 @@ class StepEngine(NativeEngine):
         r = pointer.contents
         options = json.loads(r.options_json.decode("utf-8")) if r.options_json else {}
         return StepRequest((r.request, r.generation, r.lane), r.prompt[:r.prompt_tokens], r.output_tokens,
-                           {key: options[key] for key in SAMPLING_OPTIONS if key in options},
+                           {key: options[key] for key in SAMPLING if key in options},
                            options.get("stop_tokens", []), options.get("logprobs"), options.get("replay"),
                            bool(options.get("plain")))
 
@@ -643,6 +641,12 @@ def engine_times(result):
             if isinstance(timing.get(key), (int, float)) and not isinstance(timing[key], bool)}
 
 
+def request_facts(result, plain=False):
+    """The facts a generation's result reports beside its timing (crit_core.serving.REQUEST_FACTS), as crit serve's
+    telemetry and Eval read them: without the drafting ones when it decoded plainly, which drafts nothing."""
+    return {key: result[key] for key in (EXPERT_FACTS if plain else REQUEST_FACTS) if key in result}
+
+
 def decode_rounds(tokens, result, speculative):
     """Target passes after prefill: the engine's own count, else one per accepted entry, else Core's decode steps
     (which also count steps that run no target pass, such as seeding a drafter); one per token after the first
@@ -700,9 +704,7 @@ class EvalEngine:
         return info
 
     def _result(self, tokens, result):
-        out = {"tokens": tokens, "rounds": decode_rounds(tokens, result, self.speculative)}
-        out.update({key: result[key] for key in ("accepted", "drafted", "verify_ms", "draft_ms", "expert_reads",
-                                                 "expert_hits") if key in result})
+        out = {"tokens": tokens, "rounds": decode_rounds(tokens, result, self.speculative), **request_facts(result)}
         return {**out, **engine_times(result)}
 
     def generate(self, prompt_ids, max_new_tokens, on_tokens):
@@ -731,10 +733,11 @@ class EvalEngine:
         return out
 
     def _generate_plain(self, prompt_ids, max_new_tokens, on_tokens):
-        # One target pass per token after the first; the engine's request facts describe drafting, so none apply.
+        # One target pass per token after the first, and no drafting facts.
         tokens, result = self.native.generate(list(prompt_ids), int(max_new_tokens), stop_tokens=[], sampling=self.sampling,
                                               plain=True, on_tokens=on_tokens)
-        return {"tokens": tokens, "rounds": max(0, len(tokens) - 1), **engine_times(result)}
+        return {"tokens": tokens, "rounds": max(0, len(tokens) - 1), **request_facts(result, plain=True),
+                **engine_times(result)}
 
     def _score(self, prompt_ids, continuation_ids, top_k, prompt_rows=True):
         """Fixed text as crit serve scores it: every prompt token after the first by query scoring on the engine's
@@ -823,10 +826,8 @@ class ResidentEngine(ResidentChat):
         out = {"prefill_tokens": timing["prefill_tokens"] - timing["reused_prompt_tokens"],
                "prefill_ms": timing["prefill_ms"], "decode_ms": timing["decode_ms"],
                "first_token_ms": timing["first_token_ms"],
-               "rounds": decode_rounds(tokens, result, bool(self.facts.get("speculative")) and not plain)}
-        if not plain:
-            # The engine's request facts describe drafting, which plain decoding does none of.
-            out.update({key: result[key] for key in ("accepted", "drafted", "verify_ms", "draft_ms") if key in result})
+               "rounds": decode_rounds(tokens, result, bool(self.facts.get("speculative")) and not plain),
+               **request_facts(result, plain)}
         return tokens, out
 
     def score_tokens(self, ids, continuation, top_k, cancelled, prompt_rows):

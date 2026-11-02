@@ -18,6 +18,11 @@ rule that holds only for one model family, dtype or GPU architecture. What batch
 or speculative engines share enters Core as bookkeeping (scheduling, admission, state
 pages, row layout, acceptance); the arithmetic stays in the engine, an
 [Inference](../inference/README.md) entry or a kernel provider ([Kernels](../kernels/README.md)).
+Core also carries the protocol crit's own tools speak with an engine, so an engine
+needs nothing beyond Core to be measured and served: the stock eval-v1 and
+chat-resident-v1 adapters in `crit_core.native`, the package capabilities in
+`crit_core.serving`, and the request contexts Eval sends (`ReplayContinuation`,
+`PlainDecoding`).
 
 An engine integrates through the public Model/Session/Backend boundary: declare
 capabilities and resource needs, advance requests, expose ready progress, commit
@@ -97,10 +102,10 @@ cmake --build build/consumer
 ctest --test-dir build/consumer --output-on-failure
 ```
 
-The SDK is version 0.14.0. Include `<crit/core.h>` and link the installed target:
+The SDK is version 0.15.0. Include `<crit/core.h>` and link the installed target:
 
 ```cmake
-find_package(critCore 0.14.0 EXACT CONFIG REQUIRED)
+find_package(critCore 0.15.0 EXACT CONFIG REQUIRED)
 target_link_libraries(your_engine PRIVATE crit::core)
 ```
 

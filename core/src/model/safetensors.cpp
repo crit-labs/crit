@@ -1,4 +1,5 @@
 #include "crit/safetensors.h"
+#include "../io/shown.h"
 #include "crit/sha256.h"
 #include <algorithm>
 #include <array>
@@ -23,29 +24,17 @@ constexpr std::size_t listed_candidates = 8;
 constexpr std::size_t unknown_shown = 8;   // unknown index keys named in one error or note
 
 struct DTypeRow { std::string_view name; std::uint32_t bits; };
-constexpr std::array<DTypeRow, 19> dtype_rows{{   // in DType order
-    {"BOOL", 8}, {"U8", 8}, {"I8", 8}, {"U16", 16}, {"I16", 16}, {"U32", 32}, {"I32", 32}, {"U64", 64}, {"I64", 64},
-    {"F8_E4M3", 8}, {"F8_E5M2", 8}, {"F8_E8M0", 8}, {"F16", 16}, {"BF16", 16}, {"F32", 32}, {"F64", 64},
-    {"F4", 4}, {"F6_E2M3", 6}, {"F6_E3M2", 6}}};
+// The table crit_core.model.safetensors also reads (python/crit_core/model/safetensors_dtypes.json), generated in
+// DType order.
+#include "crit_safetensors_dtypes.inc"
+static_assert(dtype_rows.size() == std::size_t(DType::f6_e3m2) + 1, "safetensors_dtypes.json lists every DType in order");
 
 std::string str(std::uint64_t value) { return std::to_string(value); }
 bool ends_with(std::string_view text, std::string_view suffix) {
     return text.size() >= suffix.size() && text.substr(text.size() - suffix.size()) == suffix;
 }
 // Short printable rendering of a name for diagnostics; never splits a UTF-8 sequence.
-std::string shown(std::string_view text) {
-    std::size_t cut = std::min<std::size_t>(text.size(), 96);
-    while(cut < text.size() && cut > 0 && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80) --cut;
-    std::string out = "'";
-    for(char c:text.substr(0, cut)) {
-        const auto b = static_cast<unsigned char>(c);
-        if(b < 0x20 || b == 0x7F || c == '\'' || c == '\\') {
-            static const char hex[] = "0123456789abcdef";
-            out += "\\x"; out += hex[b >> 4]; out += hex[b & 15];
-        } else out += c;
-    }
-    return out + (cut < text.size() ? "'..." : "'");
-}
+std::string shown(std::string_view text) { return ::crit::core::detail::shown(text, 96); }
 std::string integer_text(const json::Value& value) {
     if(value.exceeds_64_bits()) return "an integer beyond 64 bits";
     try { return str(value.u64()); } catch(const FormatError&) {}

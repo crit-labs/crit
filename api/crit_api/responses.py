@@ -14,6 +14,7 @@ response.incomplete or response.failed, every event numbered by sequence_number.
 import time
 import uuid
 
+from .delivery import PING, sse_event
 from .options import RequestError, unknown_parameters
 
 KNOWN = {"model", "input", "instructions", "tools", "tool_choice", "parallel_tool_calls", "text", "max_output_tokens",
@@ -277,12 +278,14 @@ def reply(source, model, finish, measured, text, calls, reasoning):
 
 
 class Stream:
-    """Writes the Responses event stream for one request through `send(event, data)`, numbering the events by
-    sequence_number: output items open as reasoning, text or function calls arrive, in the order the engine produces
-    them; a reasoning or message item closes before the next kind, function calls at the end."""
+    """Writes the Responses event stream for one request through `write(bytes)` (server.Handler.streamed runs it),
+    numbering the events by sequence_number: output items open as reasoning, text or function calls arrive, in the
+    order the engine produces them; a reasoning or message item closes before the next kind, function calls at the
+    end. As in a chat stream, pings keep the open stream alive while the engine has nothing to send."""
+    content_type, ping = "text/event-stream", PING
 
-    def __init__(self, send, source, model):
-        self.send, self.source, self.model = send, source, model
+    def __init__(self, write, source, model):
+        self.write, self.source, self.model = write, source, model
         self.ident, self.created = "resp_" + uuid.uuid4().hex, int(time.time())
         self.sequence = 0
         self.output = []   # each output item once done, None while it is written
@@ -290,7 +293,7 @@ class Stream:
         self.calls = {}    # tool call index -> (output index, item id, call, argument pieces)
 
     def event(self, kind, **fields):
-        self.send(kind, {"type": kind, **fields, "sequence_number": self.sequence})
+        self.write(sse_event({"type": kind, **fields, "sequence_number": self.sequence}, kind))
         self.sequence += 1
 
     def response(self, status, measured=None, error=None):
@@ -383,10 +386,10 @@ class Stream:
         call = {"id": call["id"], "function": dict(call["function"], arguments=arguments)}
         self._done(index, call_item(ident, call, status))
 
-    def finish(self, finish, measured, telemetry=None):
-        """Close the open items in output order, the last one incomplete when the output cap cut the reply, then end
-        with the whole Response (an empty message when the engine wrote nothing)."""
-        incomplete = finish == "length"
+    def finish(self, ran, telemetry=None):
+        """Close the open items in output order, the last one incomplete when the output cap cut the reply (server.Ran),
+        then end with the whole Response (an empty message when the engine wrote nothing)."""
+        incomplete, measured = ran.finish == "length", ran.measured
         if not self.output:
             self._ensure("message")
         last = len(self.output) - 1
@@ -402,9 +405,10 @@ class Stream:
             value["crit_telemetry"] = telemetry
         self.event("response.incomplete" if incomplete else "response.completed", response=value)
 
-    def fail(self, message, code, request_id=None):
+    def fail(self, message, code=None, status=500, request_id=None):
         """End with the failed Response; its event carries crit's id of the request as request_id, as every dialect's
-        stream error does."""
+        stream error does. Clients read the code: context_length_exceeded to compact, server_error to retry."""
+        code = code or ("server_error" if status >= 500 else "invalid_prompt")
         fields = {} if request_id is None else {"request_id": request_id}
         self.event("response.failed", response=self.response("failed", error={"code": code, "message": message}),
                    **fields)

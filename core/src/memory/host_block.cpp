@@ -13,11 +13,22 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 namespace crit::core {
 namespace {
-constexpr std::size_t kPage = 4096;
+// The system's page size, so touch() reads a 16 KiB or 64 KiB page once rather than every 4 KiB.
+std::size_t page_bytes() {
+#ifdef _WIN32
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    return info.dwPageSize;
+#else
+    const long bytes = sysconf(_SC_PAGESIZE);
+    return bytes > 0 ? std::size_t(bytes) : 4096;
+#endif
+}
 }
 
 HostBlock::HostBlock(std::size_t bytes) : bytes_(bytes) {
@@ -42,13 +53,13 @@ HostBlock::~HostBlock() {
 }
 
 void HostBlock::touch(int threads) const {
-    const std::size_t pages = (bytes_ + kPage - 1) / kPage;
+    const std::size_t page = page_bytes(), pages = (bytes_ + page - 1) / page;
     if(threads < 1) threads = 1;
     std::atomic<unsigned long long> sink{0};
     auto work = [&](int i) {
         unsigned long long acc = 0;
         const auto* p = reinterpret_cast<const volatile unsigned char*>(data_);
-        for(std::size_t k = pages * i / threads; k < pages * (i + 1) / threads; ++k) acc += p[k * kPage];
+        for(std::size_t k = pages * i / threads; k < pages * (i + 1) / threads; ++k) acc += p[k * page];
         sink.fetch_add(acc, std::memory_order_relaxed);
     };
     std::vector<std::thread> pool;

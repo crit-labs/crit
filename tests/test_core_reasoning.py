@@ -19,7 +19,7 @@ from crit_core.text.reasoning import ReasoningFormat, ReasoningSplitter, templat
 from crit_api.host import Cancellation  # noqa: E402
 from crit_api.stream import StreamReader, StreamWriter  # noqa: E402
 import test_api  # noqa: E402,F401  (puts the checkout's packages on sys.path)
-from test_chat_residency import ServeFixture  # noqa: E402
+from support.serve import ServeFixture  # noqa: E402
 from crit_api.engine import ServedEngine, reply  # noqa: E402
 from crit_api.server import Api, Server  # noqa: E402
 from crit_api.cli import parser  # noqa: E402

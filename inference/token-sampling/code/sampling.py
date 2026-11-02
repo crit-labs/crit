@@ -21,7 +21,6 @@ target's own draw like the bonus.
 """
 import math
 
-MAX_TOP_K = 64   # the device's fast path (greedy rows and 1 <= top_k <= 64); results are Core's law
 _WORD = 0xFFFFFFFF
 SAMPLE, DRAFT, ACCEPT, RESIDUAL, BLOCK = 0, 1, 2, 3, 4   # crit::core::DrawPurpose
 

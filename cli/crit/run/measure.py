@@ -13,14 +13,16 @@ import functools
 import http.client
 import json
 import os
-import shutil
 import subprocess
 import sys
 import threading
 import time
 
-from .records import ALL_METRICS, digest, file_sha, ident, inputs, load_run, now, read_json, safe_path, timestamp
-from .served import Expired, SERVED, Served, remaining
+from crit.pull.requirements import nvidia_smi
+
+from .attempt import Attempt, packaged, remaining, unsealed
+from .records import ALL_METRICS, digest, inputs, load_run, now, read_json, safe_path
+from .served import SERVED, Served
 
 TIMED = ("prefill_tps", "decode_tps", "request_ms", "ttft_ms")
 PER_REQUEST = TIMED + ("accepted_tokens_per_round",)
@@ -94,17 +96,7 @@ def measure(store, run_id, candidate_id, seconds=None):
     root = store.directory(run_id)
     run = load_run(root)
     resolved = inputs(root, run)
-    folder = safe_path(root, f"candidates/{ident(candidate_id, 'candidate')}")
-    if (folder / "seal.json").exists():
-        raise ValueError("Sealed candidate is immutable; allocate a new candidate")
-    manifest_path = folder / "package" / "manifest.json"
-    if not manifest_path.is_file():
-        raise ValueError("Package the candidate before measuring it")
-    manifest = read_json(manifest_path)
-    missing = [c for c in SERVED if c not in manifest["capabilities"]]
-    if missing:
-        raise ValueError("crit run measure measures the candidate through crit serve: its package must declare "
-                         + ", ".join(missing) + " (docs/SERVING.md)")
+    manifest = packaged(unsealed(root, candidate_id), SERVED, "measuring", "crit run measure measures")
     cases = []
     for case in run["spec"]["cases"]:
         workload = case["workload"]
@@ -113,41 +105,13 @@ def measure(store, run_id, candidate_id, seconds=None):
         cases.append({"case_id": case["case_id"], "request": case_request(root, resolved["case_manifests"][case["case_id"]]),
                       **{key: workload[key] for key in ("prompt_tokens", "output_tokens", "warmup_runs", "repetitions",
                                                         "concurrency")}})
-    reservation = store.reserve(run_id, candidate_id, "benchmark", seconds)
-    attempt = reservation["attempt_id"]
-    log_path = folder / "logs" / f"measure-{attempt}.log"
-    outcome, failure, settled, interrupted = "completed", None, True, None
-    try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a", encoding="utf-8") as stream:
-            def log(message):
-                print(message, file=sys.stderr, flush=True)
-                stream.write(message + "\n")
-                stream.flush()
-            measured = _measure(store, run_id, candidate_id, attempt, reservation["deadline_at"],
-                                run["spec"]["hardware_constraints"]["kv_tokens"], cases, log)
-    except BaseException as exc:
-        settled = getattr(exc, "settled", True)
-        if isinstance(exc, (Expired, TimeoutError)):
-            outcome, failure = "timed_out", str(exc) or "The measurement passed its reserved deadline"
-        elif isinstance(exc, (KeyboardInterrupt, SystemExit)):
-            outcome, failure, interrupted = "interrupted", "Interrupted", exc
-        else:
-            outcome, failure = "failed", (type(exc).__name__ + ": " + str(exc))[:8000]
-    ended = now()
-    if outcome == "completed" and timestamp(ended, "ended") > timestamp(reservation["deadline_at"], "deadline"):
-        outcome, failure = "timed_out", "The measurement passed its reserved deadline"
-    # As for every attempt, the log is retained as evidence only once cleanup is proven.
-    logs = ([{"path": log_path.relative_to(root).as_posix(), "sha256": file_sha(log_path)}]
-            if settled and log_path.is_file() else [])
+    attempt = Attempt(store, run_id, candidate_id, "benchmark", seconds, "measure", "Measurement", "The measurement")
+    with attempt.running() as log:
+        measured = _measure(store, run_id, candidate_id, attempt.id, attempt.deadline_at,
+                            run["spec"]["hardware_constraints"]["kv_tokens"], cases, log)
     # The server ran in this process; the resident host's exit is part of the cleanup.
-    store.settle(run_id, reservation, {"outcome": outcome, "ended_at": ended,
-                                       "exit_code": 0 if outcome == "completed" else None,
-                                       "cleanup_settled": settled, "logs": logs, "failure": failure})
-    if interrupted is not None:
-        raise interrupted
-    if outcome != "completed":
-        raise ValueError(f"Measurement {outcome}: {failure} (log {log_path.relative_to(root).as_posix()})")
+    attempt.settle()
+    attempt.finish()
     recorded = []
     for case in run["spec"]["cases"]:
         result = measured[case["case_id"]]
@@ -160,7 +124,7 @@ def measure(store, run_id, candidate_id, seconds=None):
                    "workload": case["workload"], "metrics": result["metrics"], "missing_metrics": result["missing"],
                    "checks": [], "outcome": "completed", "started_at": result["started_at"],
                    "ended_at": result["ended_at"],
-                   "extensions": {"measured_by": "crit run measure", "served_by": "crit serve", "attempt_id": attempt,
+                   "extensions": {"measured_by": "crit run measure", "served_by": "crit serve", "attempt_id": attempt.id,
                                   "output_tokens": result["output_tokens"], "sampling": result["sampling"],
                                   **({"chat_template_kwargs": result["template_kwargs"]}
                                      if result.get("template_kwargs") else {}),
@@ -334,8 +298,9 @@ class Sampler:
             first = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip()
             gpus = [int(first) if first.isdigit() else 0]
         self.gpus, self.readings = [int(g) for g in gpus], {}
-        if shutil.which("nvidia-smi"):
-            self.smi = subprocess.Popen(["nvidia-smi", "--id=" + ",".join(map(str, self.gpus)),
+        smi = nvidia_smi()
+        if smi:
+            self.smi = subprocess.Popen([smi, "--id=" + ",".join(map(str, self.gpus)),
                                          "--query-gpu=index,memory.used,memory.total",
                                          "--format=csv,noheader,nounits", "-lms", "100"],
                                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
