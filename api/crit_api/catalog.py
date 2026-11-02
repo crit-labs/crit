@@ -4,7 +4,7 @@ from pathlib import Path
 import re
 
 from crit.pull.store import InstallStore, engine_id
-from crit.run.records import keys, read_json, text
+from crit.records import keys, read_json, text
 from crit.run.store import ROOT, RunStore
 from .engine import EngineError, ServedEngine
 from .installed import installed_spec

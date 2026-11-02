@@ -8,14 +8,13 @@ import uuid
 
 from crit.process.ownership import clean_snapshots
 from crit.process.tree import guarded_tree
-from crit.run.records import MAX_JSON_BYTES, write_json
+from crit.records import MAX_JSON_BYTES, write_json
 
 from .channel import Supervisor
 from .logprobs import RESPONDING, response_bytes
 from .options import MAX_CHAT_RECORD
 from .stream import StreamReader
 
-CAPABILITY = "chat-resident-v1"
 RESULT = {"kind", "command_id", "status", "error", "max_concurrent_requests", "cleanup_settled"}
 
 

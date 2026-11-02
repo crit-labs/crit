@@ -244,24 +244,34 @@ must carry the `split.no` and `split.count` its name says, and
 
 **Description files.** GGUF's converter writes the model's description
 into the GGUF's metadata, and [gguf_files.py](gguf_files.py) gives it back as
-the files the rest of crit reads: `config.json` (`derive_config`, by
-`CONFIG_RULES` per architecture: `llama`, `qwen2`, `qwen3`, `qwen3moe`,
-`qwen35`, `qwen35moe`, `deepseek4` (DeepSeek V4, in
-[gguf_deepseek4.py](gguf_deepseek4.py), in the keys of DeepSeek's released
-`config.json`), `qwen4exp` (Qwen3.8-Flash-Next, in
-[gguf_qwen4exp.py](gguf_qwen4exp.py): the seed, n-gram base and padding from
-which transformers computes the PLE hash constants and table rows the GGUF
-stores, each refused when none reproduces them), each the inverse of the converter's parameters for it,
-with what the reference runtime fixes for the architecture stated; another architecture
-gets the generic shape keys when its metadata needs nothing more, and is
-refused by name otherwise), `tokenizer.json` (`derive_tokenizer`: byte-level
+the files the rest of crit reads: `config.json` (`derive_config`, by the
+config rule registered for the GGUF's architecture, else the generic shape
+keys when its metadata needs nothing more, refused by name otherwise),
+`tokenizer.json` (`derive_tokenizer`: byte-level
 BPE with the pre-tokenizer regexes, normalizer and `ignore_merges` that
 `PRE_TOKENIZERS` gives `tokenizer.ggml.pre`), `tokenizer_config.json`, the
 chat templates (`chat_template.jinja` and `additional_chat_templates/`) and
 `generation_config.json` (BOS, padding, the end-of-generation ids and
 `general.sampling.*`). FLOAT32 values become the shortest decimal that rounds
-to them. A Llama 3 GGUF's `rope_freqs` factors become the released
-`llama3` RoPE parameters that reproduce every factor.
+to them.
+
+**Config rules.** What a converter writes for an architecture is that
+architecture's own, so Core holds no rule for one: a package registers them
+in [crit_core.registry](../registry.py) (kind `gguf_config`, by
+`general.architecture`; at run time with `register`, or in an entry point of
+group `crit_core.gguf_config`). A rule is `rule(model, get)` returning the
+config as a dict, where `get` is the `MetadataReader` over the model
+(`get(".key")` reads an architecture key, `get.one` the one value every layer
+shares, `get.require` a key the config needs); it builds on the generic keys
+(`base_config`, `expert_config`, and `layer_flag` for a tensor every layer
+has or none does) and adds what the converter's parameters say for the
+architecture, with what its reference runtime fixes stated. crit-eval gives
+the rules for `llama`, `qwen2`, `qwen3`, `qwen3moe`, `qwen35`, `qwen35moe`,
+`deepseek4` (DeepSeek V4) and `qwen4exp` (Qwen3.8-Flash-Next), next to the
+reference's layouts for the same architectures
+([crit_eval.architectures](https://github.com/crit-labs/crit-eval/blob/main/crit_eval/architectures/gguf_config.py)),
+registered when `crit_eval` is imported (crit imports it) and named in its
+entry point.
 
 **A GGUF beside the base model's files.** A folder's own `config.json` or
 tokenizer files are used instead of derived ones, and must agree with the

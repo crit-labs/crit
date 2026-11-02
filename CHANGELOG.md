@@ -9,6 +9,121 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-02
+
+### Overview
+
+crit 0.15.0 keeps Core model- and hardware-agnostic: Core holds no GGUF config rule, chat template or rotary table of
+its own. A lone GGUF's config rule and a model's fallback chat template come from Core's registry of model-family
+knowledge (`crit_core.registry`), which crit-eval fills for the architectures its reference reads, and the rotary table
+is attention-state's. In `as_quantized` runs, plan rules 6 start prompt GEMMs at the checkpoint's own activation format.
+crit serve reports device expert cache counts for engines on the stock adapter, `min_tokens` reaches engines, and Core's
+CUDA backend stages large copies in pinned pieces and leaves no error behind after a failed allocation. crit 0.15.0
+needs crit-eval 0.5.2.
+
+### Added
+
+- Plan rules 6, the default of new runs: in an `as_quantized` run every build plan declares `prompt_activations`, no
+  quantized format's prompt GEMMs start at BF16 unless a gaps entry `activation:stored` holds a crit-eval result
+  that measured the stored format outside the quality noise, and a plan is refused when its parent served other
+  prompt activations than its plan declared. Candidate 1 reads prompts at the checkpoint's own activation format.
+
+### Changed
+
+- crit pull, crit hub report and crit run create --from-engine read crit-hub cards with one reader (`crit/card.py`):
+  the card as YAML, the lock as strict JSON (it was plain `json.loads` for `--from-engine`), and one source check,
+  so crit pull now also requires the https repository and full commit that `--from-engine` required. Before, each
+  read the card its own way.
+- crit's generic record helpers (strict JSON, SHA-256 identities, file inventories, canonical paths, field checks)
+  are `crit/records.py`, the coordinator lease is `crit/lease.py` and a process's birth identity is
+  `crit/process/identity.py`: crit serve, process ownership, crit pull, Kernels and Models import them instead of
+  `crit.run.records` and `crit.run.store`, so the process layer no longer depends on the run coordinator.
+  `crit.run.records` and `crit.run.store` still name them. `RunStore.attempts` and `crit_core.machine.try_lock` and
+  `unlock` are public, where crit serve and the lease used their private names; the lease's dead-owner check reads
+  the process identity runtime ownership already used, so it now tells a PID the system cannot see from one that
+  exited.
+- Core's Python and C++ read two more tables from one source each, as they already did `config_keys.json`: the
+  safetensors dtypes (`crit_core/model/safetensors_dtypes.json`, generated into the C++ reader's table in DType
+  order and checked against the enum at compile time) and a step engine's settings (`crit_core/step_settings.json`,
+  which `crit_core.native.StepEngine` splits a model's info by and Core's step engine now checks its `"engine"`
+  object against, refusing a key that is not one of them). Before, each side kept its own copy.
+- Core's CUDA backend drops `CudaTimer` and `CudaBackend::timer()`: no engine, Inference entry or crit tool used it,
+  beside `CudaStageTimer` (device timings for the trace) and `CudaCategoryTimer` (device time by category), which
+  stay. Every event the backend creates now orders work without timing.
+- Core writes the JSON it hands an engine's caller with one writer (`core/src/runtime/json_text.h`):
+  `crit_engine_info`, a generation's result and a step engine's request options. A number is the shortest text
+  that reads back as the same double. Before, the engine library bridge had its own writer, which printed a
+  generation's timing with six decimals while step engines' options took 17 significant digits.
+- Strict JSON has one rule set: `crit_core.jsonfile` exposes its hooks (`unique_pairs`, `reject_constant`), and the
+  schema compiler, the JSON-object matcher, the tool-call parser and crit serve's tool-call checks use them, while
+  `crit run`'s records are read with `jsonfile.loads` itself (so a number that overflows a double is refused there
+  too). Before, five modules each rolled their own duplicate-key and NaN rules. A script that imports `crit.run`
+  or `crit.process` from a checkout now needs Core's Python package beside it, as an installed crit has; the
+  process guardian and the OpenBLAS example put it on their path.
+- Every package capability crit serve reads (`chat-json-v1`, `chat-resident-v1`, `chat-stream-v1`, the tool,
+  image, config, concurrency and constraint capabilities) is named once, in `crit_core.serving`, beside the ones it
+  already held; `crit_api`, `crit run` and `crit pull` import them, `crit_api.options` takes its sampling fields and
+  `sampling_capability` from there too, and the step-engine path reads the same sampling list. Before, the names
+  were defined in five modules and written out as strings in eight more.
+- `crit run`'s build, measure, eval and serve settle their attempts through one helper (`crit/run/attempt.py`):
+  the same candidate checks, outcome rules and evidence, where each command kept its own copy. A build's log is now
+  kept only once its process tree is proven stopped, as every other attempt's is, since a process left running may
+  still write to it.
+- Core holds no GGUF config rule of its own: a lone GGUF's `config.json` comes from the rule a package registers for
+  its architecture in Core's new registry of model-family knowledge, `crit_core.registry` (kind `gguf_config`, at run
+  time or in an entry point of group `crit_core.gguf_config`; [config rules](core/python/crit_core/model/README.md#gguf)).
+  crit-eval gives the rules for `llama`, `qwen2`, `qwen3`, `qwen3moe`, `qwen35`, `qwen35moe`, `deepseek4` and
+  `qwen4exp`, beside its reference's layouts for them (`crit_eval.architectures.gguf_config`, `gguf_deepseek4` and
+  `gguf_qwen4exp`), registered when `crit_eval` is imported; crit imports it, and crit serve's host finds a crit-eval
+  checkout beside crit's, so every crit command derives what it did. `crit_core.model.gguf_files` keeps the generic
+  keys, public for rules to build on (`MetadataReader`, `base_config`, `expert_config`, `layer_flag`);
+  `CONFIG_RULES`, `crit_core.model.gguf_deepseek4` and `crit_core.model.gguf_qwen4exp` are gone. Before, Core carried a code path per model family, against its own rule.
+- The rotary table leaves Core for attention-state: `rope_table`, `rotary_dim` and `RopeTable` (`crit/model_config.h`,
+  `crit_core.model`) are `crit::techniques` names in [rope_table.h](inference/attention-state/code/rope_table.h)
+  and its Python twin `rope_table.py`, the same tables from Core's `RopeConfig`, checked against Transformers and
+  against each other as before (`tests/test_rope_tables.py`, CTests `crit_rope_table_*`). Core keeps reading the
+  rope parameters; an engine that called its `rope_table` includes attention-state's. Before, Core computed
+  positional-encoding arithmetic, against its own rule.
+- Core ships no chat template: the one a model without its own renders with comes from the registry
+  (`crit_core.registry` kind `chat_templates`, by `config.json` `model_type`;
+  [chat templates](core/python/crit_core/text/README.md#chat-templates)), and crit-eval gives DeepSeek V4's, byte for
+  byte the one Core shipped, so prepared data and model identities are unchanged. `shipped_template` and
+  `chat_template_sources` read the registry; `SHIPPED_TEMPLATES` and `crit_core/text/templates/` are gone, and the
+  encoder's golden tests went to crit-eval with the template. Before, Core carried
+  one model family's template.
+
+### Fixed
+
+- crit serve reports `expert_reads` and `expert_hits` for engines on the stock adapter too:
+  `crit_core.native.resident_engine` passed on only an engine's drafting facts, so the device expert cache counts
+  never reached `crit_telemetry` for a native or Python engine served through it, while the eval-v1 adapter passed
+  them. One list in `crit_core.serving` (`REQUEST_FACTS`: `DRAFT_FACTS` and `EXPERT_FACTS`) now names a
+  generation's facts for both adapters and crit serve, and a plain decode keeps the expert cache counts while it
+  drops the drafting ones. Before, five hand-kept lists named them.
+- The eval-v1 adapter (`crit_core.native.eval_engine`) passes on `host_bytes_per_pass`, so crit-eval prices an
+  offloading engine's host reads in process as it does through crit serve. Its fact list is now crit serve's
+  `ENGINE_FACTS` plus what only an in-process adapter reports (`kernel_work`, `exact_variants`, `wider_draft`).
+  Before, the two lists were kept apart and the adapter's lacked it.
+- `crit models eval` takes no `--baseline`: the command loaded the result and never used it once quality scoring
+  left it (crit 0.5.0), while models/README.md still promised the speed change. `crit eval compare SOURCE_RESULT
+  RESULT` shows it.
+- A `crit run ... eval` or `crit run ... serve` that is terminated (crit run turns SIGTERM into SystemExit) settles
+  its attempt as interrupted and exits with the signal's status, as `measure` and `build` already did. Before, it
+  settled as failed with "SystemExit: 143" and exited 1.
+- `HostBlock::touch` reads one word per page of the system's page size instead of every 4 KiB, so a 16 KiB or
+  64 KiB page is read once.
+- A failed allocation in Core's CUDA backend no longer leaves the runtime's last error set: an engine's next
+  `cudaGetLastError()` after a launch reported it as the launch's.
+- A native engine's facts no longer shadow Core's keys in `crit_engine_info`: a fact named like one (`context`,
+  `sampling`, ...) is dropped, as a step engine's already was. Before, the info held the key twice and Python read
+  the engine's.
+- `min_tokens` reaches engines: the engine ABI parses it into Core's sampling options and `crit_engine_info`
+  says whether the model applies it, and crit serve forwards a request's `min_tokens` (vLLM's field: no stop token
+  before that many) to a package that declares `chat-sampling-min-tokens-v1`, as it does the other sampling fields.
+  Before, the ABI dropped it without a word and crit serve refused it.
+- `CudaBuffer::upload` and `download` stage in pinned pieces of at most 64 MiB and of what the host ledger has
+  left, so loading a large tensor no longer pins its whole size or needs a host limit above it.
+
 ## [0.14.0] - 2026-11-02
 
 ### Overview
@@ -2327,7 +2442,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/crit-labs/crit/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/crit-labs/crit/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/crit-labs/crit/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/crit-labs/crit/compare/v0.11.0...v0.12.0

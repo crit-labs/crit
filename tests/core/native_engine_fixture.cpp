@@ -165,7 +165,8 @@ NativeEngine make_toy(std::string_view configuration) {
     }
     native.engine = std::make_unique<Engine>(profile, std::static_pointer_cast<Backend>(std::static_pointer_cast<ToyBackend>(native.owner)),
                                              [](const Profile&, Services) { return std::make_unique<ToyModel>(); });
-    native.info = [] { return std::string(R"({"speculative": true, "draft_width": 1, "replay": true, "plain": true})"); };
+    // "context" repeats a key crit_engine_info writes itself: Core's value stands.
+    native.info = [] { return std::string(R"({"speculative": true, "draft_width": 1, "replay": true, "plain": true, "context": 1})"); };
     native.request = [] { return std::string(R"({"accepted": [1, 1]})"); };
     return native;
 }

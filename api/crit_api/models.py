@@ -15,7 +15,7 @@ import shutil
 import time
 import uuid
 
-from crit.run.records import digest, keys, number, safe_path, sha, text, file_sha
+from crit.records import digest, file_identity, file_sha, keys, number, safe_path, sha, text
 
 
 def locked_read(path):
@@ -85,8 +85,7 @@ class ModelPool:
 
     @staticmethod
     def fingerprint(path):
-        value = path.stat()
-        return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+        return file_identity(path.stat())
 
     def verify_sources(self):
         """Metadata only (device, inode, size and times), so it is cheap on every read."""

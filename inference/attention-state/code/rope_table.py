@@ -1,10 +1,11 @@
-"""Rotary inverse frequencies and the attention factor from a RopeConfig, derived as Hugging Face's ROPE_INIT_FUNCTIONS
-derive them (transformers.modeling_rope_utils), so an engine reads its rotary table instead of re-deriving YaRN, Llama 3
-or LongRoPE scaling. The C++ twin is crit::core::rope_table (crit/model_config.h); both compute in double."""
+"""Rotary inverse frequencies and the attention factor from a config's rope parameters (Core's RopeConfig,
+crit_core.model.parse_model_config(...).rope), derived as Hugging Face's ROPE_INIT_FUNCTIONS derive them
+(transformers.modeling_rope_utils), so an engine reads its rotary table instead of re-deriving YaRN, Llama 3 or
+LongRoPE scaling. The C++ twin is rope_table.h (crit::techniques::rope_table); both compute in double."""
 import math
 from typing import NamedTuple
 
-from .config import ConfigError
+from crit_core.model import ConfigError
 
 DEFAULT_THETA = 10000.0   # Hugging Face's default rope_theta when a config declares none
 TYPES = ("default", "mrope", "linear", "dynamic", "yarn", "llama3", "longrope")

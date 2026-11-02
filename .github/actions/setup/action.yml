@@ -1,0 +1,35 @@
+name: crit job setup
+description: >-
+  What every CI job of crit starts with after its checkout: Python, a canonical temporary directory, the pinned
+  runtime dependencies and crit Eval beside the checkout.
+inputs:
+  python-version:
+    description: The Python version the job runs on
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ inputs.python-version }}
+    - name: Use a canonical temporary directory
+      shell: bash
+      run: |
+        python - <<'PY'
+        import os
+        from pathlib import Path
+        temporary = (Path(os.environ['GITHUB_WORKSPACE']).resolve() / 'build' / 'ci-temp')
+        temporary.mkdir(parents=True, exist_ok=True)
+        temporary = temporary.resolve()
+        with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as environment:
+            for name in ('TMP', 'TEMP', 'TMPDIR'):
+                environment.write(f'{name}={temporary}\n')
+        print(f'Temporary fixtures: {temporary}')
+        PY
+    - name: Install pinned runtime dependencies
+      shell: bash
+      run: python -m pip install tokenizers==0.23.3 jinja2==3.1.6
+    - name: Install crit Eval from its repository
+      # crit eval and crit run's Eval steps import crit_eval, and crit's tests reuse its fixtures (tests/) beside this checkout.
+      shell: bash
+      run: git clone --depth 1 https://github.com/crit-labs/crit-eval ../crit-eval && python -m pip install --no-deps -e ../crit-eval

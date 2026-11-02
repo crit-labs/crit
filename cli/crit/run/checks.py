@@ -10,6 +10,8 @@ import http.client
 import json
 import time
 
+from crit_core.serving import LOGPROBS_CAPABILITY, TEMPLATE_KWARGS_CAPABILITY, TOOL_CHOICE_CAPABILITY, TOOLS_CAPABILITY
+
 from .records import digest, file_sha, ident, load_run, now, quality_terms, read_json, safe_path
 
 GATES = {"arithmetic": ("quality", "sampling"),
@@ -214,8 +216,8 @@ def serve_checks(port, capabilities, variables, timeout, log):
         return "passed", "a client disconnecting mid-reply cancelled it; the next request answered as before"
     check("cancel", cancel)
 
-    if "chat-tools-v1" in capabilities:
-        forced = "chat-tool-choice-v1" in capabilities
+    if TOOLS_CAPABILITY in capabilities:
+        forced = TOOL_CHOICE_CAPABILITY in capabilities
 
         def tool_call():
             question = [{"role": "user", "content": "What is the weather in Lisbon right now? Use the tool."}]
@@ -234,7 +236,7 @@ def serve_checks(port, capabilities, variables, timeout, log):
             return "passed", f"called get_weather({arguments}); answered the result with {len(reply)} characters"
         check("tool_call", tool_call)
 
-    if "chat-logprobs-v1" in capabilities:
+    if LOGPROBS_CAPABILITY in capabilities:
         def logprobs():
             data = client.chat({"messages": QUESTION, "logprobs": True, "top_logprobs": 2})
             rows = (data["choices"][0].get("logprobs") or {}).get("content") or []
@@ -244,7 +246,7 @@ def serve_checks(port, capabilities, variables, timeout, log):
         check("logprobs", logprobs)
 
     switches = {k: not v for k, v in variables.items() if isinstance(v, bool)}
-    if switches and "chat-template-kwargs-v1" in capabilities:
+    if switches and TEMPLATE_KWARGS_CAPABILITY in capabilities:
         def template_switch():
             client.chat({"messages": QUESTION, "chat_template_kwargs": switches, "max_tokens": 16})
             reply, _ = _reply(client.chat({"messages": QUESTION}))

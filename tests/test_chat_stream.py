@@ -12,7 +12,7 @@ for _folder in ("core/python", "api", "../crit-eval", "kernels", "cli"): sys.pat
 from crit_api.host import Cancellation
 from crit_api.stream import StreamReader, StreamWriter
 from crit_api.engine import EngineError
-from test_chat_residency import ADAPTER, ServeFixture
+from support.serve import ADAPTER, ServeFixture
 
 
 class StreamContractTests(unittest.TestCase):
@@ -251,7 +251,7 @@ class StreamingTests(StreamingFixture, unittest.TestCase):
     def test_consumer_failure_with_failed_retirement_blocks_reuse(self):
         engine = self.engine()
         self.addCleanup(engine._retire, "failed retirement regression cleanup")
-        root, tree = engine.runtime.root, engine.runtime.tree
+        tree = engine.runtime.tree
         error = RuntimeError("consumer failed")
 
         def consume(text):

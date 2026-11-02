@@ -473,7 +473,7 @@ def write(root, run, force=False, drafters=()):
     write_json(path, value)
     notes = safe_path(root, RECON_MD)
     if not notes.exists():
-        notes.write_text(scaffold({**value, "context": required_context(run, gathered)}), encoding="utf-8")
+        notes.write_text(scaffold({**value, "context": required_context(run)}), encoding="utf-8")
     return value
 
 
@@ -481,7 +481,7 @@ def _items(mapping):
     return "".join(f"- `{k}`: `{v}`\n" for k, v in mapping.items()) or "- none set\n"
 
 
-def required_context(run, gathered):
+def required_context(run):
     """The run's required context (kv_tokens) with how it came about and the KV cache it takes at the protocol's
     precision, for recon.md."""
     constraints = run["spec"]["hardware_constraints"]
@@ -674,7 +674,9 @@ format its prompt GEMMs take (bf16, fp16_acc, fp8 or stored, as crit-eval prices
 that allows it: `crit eval run --adapter A --only quality --attribute-drift`, the engine declaring
 `prompt_activations` and one `exact_variants` entry per group, each group's share of the budget read against the
 quality spread (`budget_spread`). Name the prefill ceiling crit-eval prices for this plan next to the stored-format
-one.
+one. In an as_quantized run (plan rules 6) candidate 1 already reads prompts at the checkpoint's own activation
+format for every quantized group (stored, or fp8 / fp16_acc), and each plan declares them in prompt_activations:
+BF16 is the starting point only for groups the checkpoint stores in BF16.
 
 ## Decisions
 

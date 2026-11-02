@@ -9,7 +9,7 @@ import platform
 import re
 import sys
 
-from crit.run.records import digest, file_sha, inventory, number, read_json, safe_path, sha, text, write_json
+from crit.records import digest, file_sha, inventory, number, read_json, safe_path, sha, text, write_json
 
 MAX_ENTRIES = 256
 MAX_ARTIFACTS = 4096
@@ -295,10 +295,8 @@ def verify(root):
             "qualification": "bytes and declared applicability verified; arithmetic/performance unqualified"}
 
 
-def main(argv=None):
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8")
+def parser():
+    """The arguments of crit kernels (crit mcp offers its tools from them)."""
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("target", help="Observe host OS/architecture; ABI remains explicit")
@@ -335,7 +333,15 @@ def main(argv=None):
     make.add_argument("--starter", action="store_true", help="a simple, correct kernel to start from (gemv, gemm); "
                                                               "allowed from a run's fourth candidate on")
     make.add_argument("--run", type=Path, help="the run folder, for --starter")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv=None):
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
+    command = parser()
+    args = command.parse_args(argv)
     try:
         if args.command is None:
             print("crit Kernels — kernel resources, local applicability checks and retained dependencies")

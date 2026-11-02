@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_inference VERSION 0.14.0 LANGUAGES CXX)
+project(crit_inference VERSION 0.15.0 LANGUAGES CXX)
 # Inference's native examples and fixtures. Inference uses Core only through its public SDK
 # (crit::core, crit::cuda); Core never builds or includes Inference code.
 find_package(Threads REQUIRED)
@@ -8,7 +8,7 @@ option(CRIT_INFERENCE_CUDA "Build Inference's CUDA reference kernels and their f
 option(CRIT_INFERENCE_INSTALLED_CORE "Use an installed Core SDK (CMAKE_PREFIX_PATH) instead of this checkout's core/" OFF)
 if(NOT TARGET crit::core)
   if(CRIT_INFERENCE_INSTALLED_CORE)
-    find_package(critCore 0.14.0 CONFIG REQUIRED)
+    find_package(critCore 0.15.0 CONFIG REQUIRED)
   else()
     if(CRIT_INFERENCE_CUDA)
       set(CRIT_CORE_CUDA ON CACHE BOOL "Build the explicit CUDA backend services" FORCE)
@@ -186,6 +186,15 @@ crit_inference_executable(crit_attention_tests SOURCES ${FIXTURES}/attention_tes
   INCLUDES ${INFERENCE}/attention-state/code ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/examples/openblas
   LINK crit::core ${CMAKE_DL_LIBS})
 crit_inference_tests(crit_attention_tests crit_attention 45 batches arithmetic rotary integration failures)
+crit_inference_executable(crit_rope_table_tests SOURCES ${FIXTURES}/rope_table_tests.cpp
+  INCLUDES ${INFERENCE}/attention-state/code LINK crit::core)
+crit_inference_tests(crit_rope_table_tests crit_rope_table 30 rules)
+if(Python3_Interpreter_FOUND)
+  # rope_table.h against its Python twin, rope_table.py, on the same configs.
+  add_test(NAME crit_rope_table_oracle COMMAND "${Python3_EXECUTABLE}" -B
+    "${FIXTURES}/rope_oracle.py" $<TARGET_FILE:crit_rope_table_tests>)
+  set_tests_properties(crit_rope_table_oracle PROPERTIES TIMEOUT 120)
+endif()
 
 crit_inference_executable(crit_state_pages_tests SOURCES ${FIXTURES}/state_pages_tests.cpp
   INCLUDES ${INFERENCE}/attention-state/code LINK crit::core)

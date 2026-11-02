@@ -17,7 +17,6 @@ _EXPORTS = {
     "AddedToken": "tokenizer", "Tokenizer": "tokenizer", "SPECIAL_TOKEN_NAMES": "tokenizer",
     "ChatTemplate": "template", "ChatTemplates": "template", "environment": "template",
     "template_sources": "template", "chat_template_sources": "template", "shipped_template": "template",
-    "SHIPPED_TEMPLATES": "template",
     "IncrementalDetokenizer": "detokenize",
     "MarkerDecoder": "markers", "TokenText": "markers",
     "TextDelta": "stream", "TextStream": "stream",

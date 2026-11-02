@@ -24,7 +24,8 @@ class ToyEngine:
         return {"implementation": "toy", "context": 4096, "stop_tokens": [1], "speculative": False,
                 "sampling": {"temperature": True}, "replay": True, "token_logprobs": True, "max_top_logprobs": 20,
                 "query_scoring": True, "score_paths": ["prefill"], "native_libraries": ["toy_kernels.so"],
-                "kernel_work": [{"match": "toy", "term": "matmul"}], "prompt_activations": {"nvfp4": "bf16"}}
+                "kernel_work": [{"match": "toy", "term": "matmul"}], "prompt_activations": {"nvfp4": "bf16"},
+                "host_bytes_per_pass": {"link": 1e9, "cpu": 2e9}}
 
     def generate(self, prompt, output_tokens, *, stop_tokens=None, sampling=None, replay=None, plain=False,
                  logprobs=None, on_tokens=None, cancelled=None):
@@ -73,6 +74,8 @@ class PythonEngineAdapterTests(unittest.TestCase):
         info = engine.info()
         self.assertEqual((info["name"], info["max_context"], info["native_libraries"], info["kernel_work"]),
                          ("toy", 4096, ["toy_kernels.so"], [{"match": "toy", "term": "matmul"}]))
+        # Every fact crit serve's engine facts carry reaches Eval in process too.
+        self.assertEqual(info["host_bytes_per_pass"], {"link": 1e9, "cpu": 2e9})
         out = engine.generate([5, 6], 3, lambda tokens: None)
         self.assertEqual((out["tokens"], out["prefill_ms"]), ([7, 8, 9], 1.0))
         self.assertEqual((toy.calls[-1]["stop_tokens"], toy.calls[-1]["sampling"]), ([], {"temperature": 0.0}))
@@ -106,6 +109,41 @@ class PythonEngineAdapterTests(unittest.TestCase):
         self.assertEqual((len(prompt), continuation), (1, [(-0.5, [(7, -0.5), (0, -2.0)])]))
         engine.close()
         self.assertTrue(self.opened[0].closed)
+
+    def test_both_adapters_pass_an_engines_request_facts(self):
+        """A generation's drafting and expert-cache facts reach crit serve's telemetry (chat-resident-v1) and Eval's
+        results (eval-v1); a plain decode keeps only the expert-cache counts, since it drafts nothing."""
+        facts = {"accepted": [1, 0, 2], "drafted": [2, 2, 2], "verify_ms": 1.25, "draft_ms": 0.5,
+                 "expert_reads": 40, "expert_hits": 30}
+
+        class Drafting(ToyEngine):
+            def info(self):
+                return {**super().info(), "speculative": True, "plain": True}
+
+            def generate(self, prompt, output_tokens, **options):
+                tokens, result = super().generate(prompt, output_tokens, **options)
+                return tokens, {**result, **facts}
+
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        model = write_files(Path(temp.name) / "model", llama_files())
+        context = types.SimpleNamespace(configuration={}, limits={"kv_tokens": 1024},
+                                        model_file=lambda name: str(model / name))
+        resident = resident_engine(context, Drafting)
+        self.addCleanup(resident.close)
+        request = {"request_id": "r", "candidate_id": "c", "package_sha256": "p", "limits": {"max_output_tokens": 4},
+                   "sampling": {"temperature": 0.0}, "messages": [{"role": "user", "content": "hi"}]}
+        telemetry = resident.generate(request, threading.Event())["telemetry"]
+        self.assertEqual({key: telemetry.get(key) for key in facts}, facts)
+        telemetry = resident.generate(dict(request, decode="plain"), threading.Event())["telemetry"]
+        self.assertEqual((telemetry["expert_reads"], telemetry["expert_hits"]), (40, 30))
+        self.assertFalse({"accepted", "drafted", "verify_ms", "draft_ms"} & set(telemetry))
+        evaluated = eval_engine({"model": "/m"}, Drafting)
+        self.addCleanup(evaluated.close)
+        self.assertEqual({key: evaluated.generate([5, 6], 3, lambda tokens: None).get(key) for key in facts}, facts)
+        plain = evaluated.generate_plain([5, 6], 3, lambda tokens: None)
+        self.assertEqual({key: plain.get(key) for key in facts},
+                         {**dict.fromkeys(facts), "expert_reads": 40, "expert_hits": 30})
 
     def test_close_frees_an_engine_whose_parts_refer_to_each_other(self):
         import weakref

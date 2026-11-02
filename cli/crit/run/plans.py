@@ -9,8 +9,9 @@ import json
 import math
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
-from .records import digest, file_sha, header, ident, keys, now, number, read_json, record, safe_path, text
+from .records import digest, file_sha, header, ident, keys, now, number, quality_mode, read_json, record, safe_path, text
 
 KPIS = ("decode", "prefill", "ttft", "context_decode", "context_ttft")
 HEADLINE = ("decode", "prefill", "ttft")
@@ -32,7 +33,7 @@ EVAL_JSON_BYTES = 256 * 1024 * 1024
 
 
 def rules(run):
-    """The version of the plan rules a run was created with: 2 to 5 from `"plan_rules"` in its spec, else 1."""
+    """The version of the plan rules a run was created with: 2 to 6 from `"plan_rules"` in its spec, else 1."""
     return run["spec"].get("plan_rules", 1)
 
 
@@ -561,7 +562,7 @@ FIELDS = {"parent_candidate_id", "decision", "needed", "gaps", "strategy", "leve
 CRIT_FIELDS = {"plan_id", "segment_id", "created_at", "request_sha256", "inputs", "priorities", "priorities_reason"}
 
 
-OPTIONAL = {"supersedes", "estimated_limits", "forecast_justification", "weakest", "review"}
+OPTIONAL = {"supersedes", "estimated_limits", "forecast_justification", "weakest", "review", "prompt_activations"}
 
 # Plan rules 4: what each candidate of a run is for, by its number in the run (objective()). The proof of concept
 # works end to end; the crit rounds raise it with crit's toolkit; each critique round names the parent's two weakest
@@ -635,6 +636,12 @@ def objective(number):
 def _fields(data):
     """Check 1: fields, types and text limits; unknown keys are refused."""
     keys(data, FIELDS, OPTIONAL)
+    if "prompt_activations" in data:
+        from crit_core.serving import prompt_activations
+        if not prompt_activations(data["prompt_activations"]):
+            raise ValueError("prompt_activations is what the planned engine declares to Eval: one of bf16, fp16_acc, fp8 "
+                             "or stored for every quantized format, or per stored format (fp8, nvfp4) one of them or "
+                             "{activation: share}")
     if "forecast_justification" in data:
         text(data["forecast_justification"], "forecast_justification", 8000)
     if "review" in data:
@@ -980,7 +987,8 @@ def _above(lever, noise):
 def build(root, run, bounds, data, status_for=None):
     """Validate a plan payload against the run's facts and return the record crit stores (without plan_id).
     status_for: the Eval status to judge the parent's result by, by its path in the run (a replay's statuses rendered
-    again, replay.status_for); by default the status stored in the result."""
+    again, replay.status_for); by default the status stored in the result. The plan passes CHECKS, those of the run's
+    plan rules and the ones before them."""
     _fields(data)
     version = rules(run)
     parent = data["parent_candidate_id"]
@@ -1021,21 +1029,41 @@ def build(root, run, bounds, data, status_for=None):
                   "alternative_limits": alternative} if run["spec"].get("plan_limits") == "computed" else {}),
               **({"noise_default": dict(zip(("noise", "source"), noise_default(facts)))}
                  if version >= 2 and facts is not None else {})}
-    decision = data["decision"]
     if version >= 4:
         # The run's candidates so far, this plan's candidate the next one (a revision plans the same one again).
         inputs["objective"] = objective(len(candidates) + 1)
-    # Check 3: the decision follows the needed flags (in rules 2 the run's first plan too).
-    if not first or version >= 2:
-        if decision == "stop" and any(needed.values()):
+    plan = SimpleNamespace(
+        root=root, run=run, bounds=bounds, data=data, version=version, parent=parent, first=first, eval_ref=eval_ref,
+        facts=facts, computed=computed, result=result, needed=needed, compared=compared, sources=sources,
+        estimated=estimated, inputs=inputs, decision=data["decision"], forecast=data["forecast"], order=None, reason=None,
+        # The noise checks 4, 6 and 9 use: in rules 2 an unknown noise takes its default.
+        noise=noises(facts, version),
+        # Requirement levers are exempt from checks 5 (a numeric change) and 6, and never count toward 7 or 8.
+        levers=speed_levers(data["levers"]))
+    for minimum, check in CHECKS:
+        if version >= minimum:
+            check(plan)
+    return {**data, "supersedes": data.get("supersedes"), "segment_id": bounds["segment_id"], "created_at": now(),
+            "request_sha256": run["request_sha256"], "inputs": inputs, "priorities": plan.order,
+            "priorities_reason": plan.reason}
+
+
+def _check_decision(plan):
+    """Check 3: the decision follows the needed flags (in rules 2 the run's first plan too)."""
+    if not plan.first or plan.version >= 2:
+        if plan.decision == "stop" and any(plan.needed.values()):
             raise ValueError("A stop plan requires both decode and prefill not needed: "
-                             + ", ".join(name for name, flag in needed.items() if flag) + " is marked needed")
-        if decision == "build" and not any(needed.values()):
+                             + ", ".join(name for name, flag in plan.needed.items() if flag) + " is marked needed")
+        if plan.decision == "build" and not any(plan.needed.values()):
             raise ValueError("neither decode nor prefill is needed: record a stop plan (decision stop)")
-    # The noise checks 4, 6 and 9 use: in rules 2 an unknown noise takes its default.
-    noise = noises(facts, version)
+
+
+def _check_gap_names(plan):
+    """Every gaps entry and every lever change sourced from an Eval gap names a gap the parent's Eval reports, beside
+    the entries rules 2 (limit) and 3 (activation:FORMAT) add."""
+    facts, version = plan.facts, plan.version
     gap_names = {(gap["kpi"], gap["name"]) for gap in (facts or {}).get("gaps") or []}
-    for row in data["gaps"]:
+    for row in plan.data["gaps"]:
         if version >= 3 and row["gap"].startswith(ACTIVATION_GAP):
             if row["kpi"] != "prefill" or row["answer"] != "rejected" or "evidence" not in row:
                 raise ValueError(f"gaps entry {row['gap']!r} names a prompt activation format: kpi prefill, answer "
@@ -1048,185 +1076,299 @@ def build(root, run, bounds, data, status_for=None):
             continue
         if facts is not None and (row["kpi"], row["gap"]) not in gap_names:
             raise ValueError(f"gaps names {row['kpi']} gap {row['gap']!r}, which the parent's Eval does not report")
-    for lever in data["levers"]:
+    for lever in plan.data["levers"]:
         for kpi, change in lever["changes"].items():
             if change["source"].startswith("eval-gap:") and (facts is None or (kpi, change["source"][9:]) not in gap_names):
                 raise ValueError(f"{lever['id']} {kpi} source {change['source']} names no {kpi} gap of the parent's Eval")
-    # Check 4: every gap above the noise on a KPI marked not needed is answered.
-    if not first and facts is not None:
-        answered = {(row["kpi"], row["gap"]) for row in data["gaps"]}
-        for name, flag in needed.items():
-            if flag:
-                continue
-            threshold = family(facts, name)[1]
-            for gap in facts["gaps"]:
-                gain = gap["projected_gain"]
-                # Rules 1 compare with the noise of the member that sets the family, rules 2 with the gap's own KPI.
-                limit = noise.get(gap["kpi"]) if version >= 2 else threshold
-                if FAMILY.get(gap["kpi"]) == name and type(gain) in (int, float) and gain > (limit or 0) \
-                        and (gap["kpi"], gap["name"]) not in answered:
-                    raise ValueError(f"{name} is marked not needed, but the {gap['kpi']} gap {gap['name']!r} "
-                                     f"(+{gain:.1%}) is above the noise: answer it in gaps with its physical cause or "
-                                     "its measured rejection")
-    # Check 4, rules 2: a family marked not needed below NEAR_LIMIT answers why its own limit is not reachable.
-    if version >= 2 and facts is not None:
-        limits = {row["kpi"] for row in data["gaps"] if row["gap"] == LIMIT_GAP}
-        for name, flag in needed.items():
-            fraction = family(facts, name, version)[0]
-            if not flag and fraction is not None and fraction < NEAR_LIMIT and name not in limits:
-                raise ValueError(f"{name} is marked not needed at {fraction:.0%} of its limit, below {NEAR_LIMIT:.0%}: "
-                                 f"add a gaps entry {{\"kpi\": \"{name}\", \"gap\": \"{LIMIT_GAP}\", \"answer\": "
-                                 "\"cause\", \"detail\": ...} with the physical cause that keeps the rest of the limit "
-                                 "out of reach")
-    if version >= 3 and facts is not None:
-        inputs["gap_evidence"] = _measured_only(root, data, facts, result, noise, needed, version)
-    order, reason = priorities(data["needed"], facts, version)
-    if order is not None:
+
+
+def _check_answered_gaps(plan):
+    """Check 4: every gap above the noise on a KPI marked not needed is answered."""
+    facts = plan.facts
+    if plan.first or facts is None:
+        return
+    answered = {(row["kpi"], row["gap"]) for row in plan.data["gaps"]}
+    for name, flag in plan.needed.items():
+        if flag:
+            continue
+        threshold = family(facts, name)[1]
+        for gap in facts["gaps"]:
+            gain = gap["projected_gain"]
+            # Rules 1 compare with the noise of the member that sets the family, rules 2 with the gap's own KPI.
+            limit = plan.noise.get(gap["kpi"]) if plan.version >= 2 else threshold
+            if FAMILY.get(gap["kpi"]) == name and type(gain) in (int, float) and gain > (limit or 0) \
+                    and (gap["kpi"], gap["name"]) not in answered:
+                raise ValueError(f"{name} is marked not needed, but the {gap['kpi']} gap {gap['name']!r} "
+                                 f"(+{gain:.1%}) is above the noise: answer it in gaps with its physical cause or "
+                                 "its measured rejection")
+
+
+def _check_limit_gaps(plan):
+    """Check 4, rules 2: a family marked not needed below NEAR_LIMIT answers why its own limit is not reachable."""
+    if plan.facts is None:
+        return
+    limits = {row["kpi"] for row in plan.data["gaps"] if row["gap"] == LIMIT_GAP}
+    for name, flag in plan.needed.items():
+        fraction = family(plan.facts, name, plan.version)[0]
+        if not flag and fraction is not None and fraction < NEAR_LIMIT and name not in limits:
+            raise ValueError(f"{name} is marked not needed at {fraction:.0%} of its limit, below {NEAR_LIMIT:.0%}: "
+                             f"add a gaps entry {{\"kpi\": \"{name}\", \"gap\": \"{LIMIT_GAP}\", \"answer\": "
+                             "\"cause\", \"detail\": ...} with the physical cause that keeps the rest of the limit "
+                             "out of reach")
+
+
+def _check_measured_only(plan):
+    """Rules 3: a family far below its limit is not needed only on measured rejections (_measured_only)."""
+    if plan.facts is not None:
+        plan.inputs["gap_evidence"] = _measured_only(plan.root, plan.data, plan.facts, plan.result, plan.needed,
+                                                     plan.version)
+
+
+def _prioritize(plan):
+    """The priorities the plan's needed flags give, with the estimates and limit sources the ranking rests on."""
+    plan.order, plan.reason = priorities(plan.data["needed"], plan.facts, plan.version)
+    if plan.order is not None:
         # The ranking rests on these estimates where it compares the families.
-        order["estimated"] = [kpi for kpi in estimated if kpi in compared]
-        if run["spec"].get("plan_limits") == "computed":
+        plan.order["estimated"] = [kpi for kpi in plan.estimated if kpi in plan.compared]
+        if plan.run["spec"].get("plan_limits") == "computed":
             # Where each compared fraction comes from: Eval's limit, crit's computed limit or the plan's estimate.
-            order["sources"] = {kpi: sources[kpi] for kpi in compared if kpi in sources}
-    # Requirement levers are exempt from checks 5 (a numeric change) and 6, and never count toward 7 or 8.
-    levers = speed_levers(data["levers"])
-    if decision == "build":
-        # Check 5: levers, each naming a KPI change.
-        if not levers and not first:
-            raise ValueError("A build plan names its levers: each with the KPIs it changes (requirement levers alone "
-                             "do not make a candidate)")
+            plan.order["sources"] = {kpi: plan.sources[kpi] for kpi in plan.compared if kpi in plan.sources}
+
+
+def _check_levers(plan):
+    """Checks 5 to 8 of a build plan: its levers name KPI changes above the noise (or pay in a group), one improves
+    more than time to first token, and every needed p1 family has one."""
+    if plan.decision != "build":
+        return
+    levers, noise, first, order = plan.levers, plan.noise, plan.first, plan.order
+    # Check 5: levers, each naming a KPI change.
+    if not levers and not first:
+        raise ValueError("A build plan names its levers: each with the KPIs it changes (requirement levers alone "
+                         "do not make a candidate)")
+    for lever in levers:
+        if not lever["changes"]:
+            raise ValueError(f"{lever['id']} names no KPI change")
+    # Check 6: a lever below the noise joins a group with one above it.
+    if not first:
+        paying = {lever["group"] for lever in levers if lever["group"] is not None and _above(lever, noise)}
         for lever in levers:
-            if not lever["changes"]:
-                raise ValueError(f"{lever['id']} names no KPI change")
-        # Check 6: a lever below the noise joins a group with one above it.
-        if not first:
-            paying = {lever["group"] for lever in levers if lever["group"] is not None and _above(lever, noise)}
-            for lever in levers:
-                if not _above(lever, noise) and (lever["group"] is None or lever["group"] not in paying
-                                                 or sum(other["group"] == lever["group"] for other in levers) < 2):
-                    raise ValueError(f"{lever['id']} changes no KPI by more than its noise: put it in a group with the "
-                                     "lever it pays together with, or leave it out")
-        # Check 8: no plan targets time to first token alone.
-        if levers and not any(row["change"] > 0 for lever in levers for kpi, row in lever["changes"].items() if kpi != "ttft"):
-            raise ValueError("No lever improves decode, prefill, context_decode or context_ttft: time to first token is "
-                             "never the reason for a candidate on its own")
-        # Check 7: every needed p1 KPI has a lever on its family.
-        if not first and order is not None:
-            for name in order["p1"]:
-                if needed.get(name) and not any(row["change"] > 0 for lever in levers
-                                                for kpi, row in lever["changes"].items() if FAMILY.get(kpi) == name):
-                    raise ValueError(f"{name} is p1 but no lever improves it ({', '.join(FAMILIES[name])})")
-    # Check 9: the forecast covers every KPI the parent's Eval measured and improves decode or prefill.
-    forecast = data["forecast"]
+            if not _above(lever, noise) and (lever["group"] is None or lever["group"] not in paying
+                                             or sum(other["group"] == lever["group"] for other in levers) < 2):
+                raise ValueError(f"{lever['id']} changes no KPI by more than its noise: put it in a group with the "
+                                 "lever it pays together with, or leave it out")
+    # Check 8: no plan targets time to first token alone.
+    if levers and not any(row["change"] > 0 for lever in levers for kpi, row in lever["changes"].items() if kpi != "ttft"):
+        raise ValueError("No lever improves decode, prefill, context_decode or context_ttft: time to first token is "
+                         "never the reason for a candidate on its own")
+    # Check 7: every needed p1 KPI has a lever on its family.
+    if not first and order is not None:
+        for name in order["p1"]:
+            if plan.needed.get(name) and not any(row["change"] > 0 for lever in levers
+                                                 for kpi, row in lever["changes"].items() if FAMILY.get(kpi) == name):
+                raise ValueError(f"{name} is p1 but no lever improves it ({', '.join(FAMILIES[name])})")
+
+
+def _check_forecast(plan):
+    """Check 9: the forecast covers every KPI the parent's Eval measured and improves decode or prefill."""
+    forecast, facts = plan.forecast, plan.facts
     measured = tuple(HEADLINE + (CONTEXT if facts is not None and "context_decode" in facts["kpis"] else ()))
     if forecast is None:
-        if decision == "build" and not first:
+        if plan.decision == "build" and not plan.first:
             raise ValueError("A build plan forecasts " + ", ".join(measured) + ": {low, expected, high} each")
-    else:
-        missing = [kpi for kpi in measured if kpi not in forecast]
-        if missing:
-            raise ValueError("forecast lacks " + ", ".join(missing))
-        extra = [kpi for kpi in forecast if kpi not in measured]
-        if extra:
-            raise ValueError("forecast names " + ", ".join(extra) + ", which the parent's Eval did not measure")
-        if decision == "build" and not first and facts is not None:
-            scored = [kpi for kpi in ("decode", "prefill") if facts["kpis"][kpi]["score"]]
-            if scored and not any(forecast[kpi]["expected"] / facts["kpis"][kpi]["score"] - 1 > (noise.get(kpi) or 0)
-                                  for kpi in scored):
-                raise ValueError("The forecast improves neither decode nor prefill beyond its noise over the parent's "
-                                 "Eval: a candidate is planned for at least one of them")
-    # Check 12 (rules 3): a forecast that puts its gain on p2 or lets a p1 KPI fall says why.
-    if version >= 3 and decision == "build" and forecast is not None and facts is not None and order is not None:
-        inputs["forecast_checks"] = _forecast_checks(order, forecast, facts)
-        if inputs["forecast_checks"] and "forecast_justification" not in data:
-            raise ValueError("The forecast " + "; ".join(inputs["forecast_checks"]) + ": give forecast_justification "
+        return
+    missing = [kpi for kpi in measured if kpi not in forecast]
+    if missing:
+        raise ValueError("forecast lacks " + ", ".join(missing))
+    extra = [kpi for kpi in forecast if kpi not in measured]
+    if extra:
+        raise ValueError("forecast names " + ", ".join(extra) + ", which the parent's Eval did not measure")
+    if plan.decision == "build" and not plan.first and facts is not None:
+        scored = [kpi for kpi in ("decode", "prefill") if facts["kpis"][kpi]["score"]]
+        if scored and not any(forecast[kpi]["expected"] / facts["kpis"][kpi]["score"] - 1 > (plan.noise.get(kpi) or 0)
+                              for kpi in scored):
+            raise ValueError("The forecast improves neither decode nor prefill beyond its noise over the parent's "
+                             "Eval: a candidate is planned for at least one of them")
+
+
+def _check_forecast_priorities(plan):
+    """Check 12 (rules 3): a forecast that puts its gain on p2 or lets a p1 KPI fall says why."""
+    if plan.decision == "build" and plan.forecast is not None and plan.facts is not None and plan.order is not None:
+        plan.inputs["forecast_checks"] = _forecast_checks(plan.order, plan.forecast, plan.facts)
+        if plan.inputs["forecast_checks"] and "forecast_justification" not in plan.data:
+            raise ValueError("The forecast " + "; ".join(plan.inputs["forecast_checks"]) + ": give forecast_justification "
                              "(why this candidate is worth building anyway), which crit records, or plan for p1")
-    # Check 15 (rules 5): the strategy's ceiling is the limit, not the engine's own measurement.
-    if version >= 5 and decision == "build" and forecast is not None and facts is not None:
-        inputs["reach"] = _reach(root, data, facts, computed, forecast, needed)
-    # Check 13 (rules 4): the objective's requirements.
-    if version >= 4 and decision == "build":
-        # Every speed lever names what supplies its code; the engine's own code is measured against what exists.
-        for lever in levers:
-            if "provider" not in lever:
-                raise ValueError(f"{lever['id']} names no provider: " + ", ".join(PROVIDERS) + " (kernels/SOURCES.md "
-                                 "lists where kernels come from)")
-            if lever["provider"].startswith("own"):
-                if "yardstick" not in lever:
-                    raise ValueError(f"{lever['id']} is the engine's own code: give its yardstick, the measured best "
-                                     "existing provider for the operation or the providers checked and why none fits")
-                _evidence_file(root, lever["yardstick"]["evidence"], f"{lever['id']} yardstick")
-        goal = inputs["objective"]
-        if goal["name"] == "critique_round":
-            if "weakest" not in data:
-                raise ValueError(f"Candidate {goal['candidate']} is a critique round: {goal['rule']}")
-            ids = {lever["id"]: lever for lever in levers}
-            for row in data["weakest"]:
-                _evidence_file(root, row["evidence"], f"weakest {row['term']}")
-                for lever_id in row["levers"]:
-                    lever = ids.get(lever_id)
-                    if lever is None or not any(change["change"] > 0 for kpi, change in lever["changes"].items()
-                                                if FAMILY.get(kpi, kpi) == FAMILY.get(row["kpi"], row["kpi"])):
-                        raise ValueError(f"weakest {row['term']}: {lever_id} is no speed lever of this plan that "
-                                         f"improves {row['kpi']}")
-            if not set(ids) - {i for row in data["weakest"] for i in row["levers"]}:
-                raise ValueError(f"Candidate {goal['candidate']} is a critique round: add other levers beside the ones "
-                                 "for its two weakest terms")
-        if "min_gain" in goal and forecast is not None and facts is not None and order is not None:
-            best = max((_gain(kpi, forecast[kpi]["expected"], (facts["kpis"].get(kpi) or {}).get("score"))
-                        for name in order["p1"] for kpi in FAMILIES.get(name, (name,)) if kpi in forecast), default=0.0)
-            if best < goal["min_gain"]:
-                raise ValueError(f"Candidate {goal['candidate']} forecasts {best:+.1%} on p1 ({', '.join(order['p1'])}): "
-                                 f"candidates 2 to {FLOOR_UNTIL} are planned for at least +{goal['min_gain']:.0%} on a "
-                                 "p1 KPI; plan the levers that close more of its gap")
-    elif "weakest" in data and version < 4:
-        raise ValueError("weakest belongs to plan rules 4 (critique rounds)")
-    # Check 14 (rules 4): the plan reviews its parent's plan against the parent's measured Eval.
-    facts_review = review_facts(root, run, parent, eval_ref) if version >= 4 and not first else None
-    if facts_review is not None:
-        inputs["review"] = facts_review
-        review = data.get("review")
-        if review is None:
-            raise ValueError(f"Review {facts_review['plan_id']} first: review gives its plan_id, the cause and evidence of "
-                             "each KPI that missed its forecast (" + (", ".join(facts_review["missed"]) or "none") + "), "
-                             "what each lever delivered (" + ", ".join(facts_review["built"] + facts_review["dropped"])
-                             + ") and the lesson this plan draws")
-        if review["plan_id"] != facts_review["plan_id"]:
-            raise ValueError(f"review names {review['plan_id']}: the parent's plan is {facts_review['plan_id']}")
-        for kpi in facts_review["missed"]:
-            if kpi not in review["kpis"]:
-                raise ValueError(f"review: {kpi} missed its forecast in {facts_review['outcome']['path']}: give its cause "
-                                 "and evidence")
-        for kpi, row in review["kpis"].items():
-            _evidence_file(root, row["evidence"], f"review {kpi}")
-        for lever_id in facts_review["built"] + facts_review["dropped"]:
-            if lever_id not in review["levers"]:
-                raise ValueError(f"review: say what {lever_id} of {facts_review['plan_id']} delivered")
-        # Gate: the parent's largest p1 lever, pruned or deferred, is planned again or rejected on a measurement of
-        # another kernel structure or a vendor library at the same arithmetic, never on variants of one kernel.
-        largest = facts_review["largest_p1_lever"]
-        if largest and facts_review["largest_p1_fate"] in ("pruned", "deferred") and \
-                largest not in {lever["id"] for lever in data["levers"]}:
-            row = review["levers"][largest]
-            if "evidence" not in row or "structure" not in row:
-                raise ValueError(f"{largest} was {facts_review['largest_p1_fate']}, the largest p1 lever of "
-                                 f"{facts_review['plan_id']}: plan it again (same id) or give review.levers.{largest} "
-                                 "evidence and structure: the other kernel structure or vendor library measured on it")
-            _evidence_file(root, row["evidence"], f"review {largest}")
-    elif "review" in data:
-        raise ValueError("review belongs to plan rules 4, once the parent's plan has an outcome")
-    # Check 11: a revision replaces the newest plan of its chain before its candidate exists.
-    if data.get("supersedes") is not None:
-        old = load(root, run, data["supersedes"])
-        summary = next(s for s in summaries(root, run) if s["plan_id"] == old["plan_id"])
-        if old["segment_id"] != bounds["segment_id"] or old["parent_candidate_id"] != parent:
-            raise ValueError(f"supersedes names {old['plan_id']}, a plan of another segment or parent")
-        if summary["candidate_id"] is not None:
-            raise ValueError(f"{old['plan_id']} is linked to {summary['candidate_id']}: change course with a new candidate "
-                             "and a new plan")
-        if summary["superseded_by"] is not None:
-            raise ValueError(f"{old['plan_id']} is already superseded by {summary['superseded_by']}")
-    return {**data, "supersedes": data.get("supersedes"), "segment_id": bounds["segment_id"], "created_at": now(),
-            "request_sha256": run["request_sha256"], "inputs": inputs, "priorities": order, "priorities_reason": reason}
+
+
+def _check_reach(plan):
+    """Check 15 (rules 5): the strategy's ceiling is the limit, not the engine's own measurement."""
+    if plan.decision == "build" and plan.forecast is not None and plan.facts is not None:
+        plan.inputs["reach"] = _reach(plan.root, plan.data, plan.facts, plan.computed, plan.forecast, plan.needed)
+
+
+def _check_objective(plan):
+    """Check 13 (rules 4): the objective's requirements."""
+    if plan.decision != "build":
+        return
+    root, data, levers, forecast, facts, order = plan.root, plan.data, plan.levers, plan.forecast, plan.facts, plan.order
+    # Every speed lever names what supplies its code; the engine's own code is measured against what exists.
+    for lever in levers:
+        if "provider" not in lever:
+            raise ValueError(f"{lever['id']} names no provider: " + ", ".join(PROVIDERS) + " (kernels/SOURCES.md "
+                             "lists where kernels come from)")
+        if lever["provider"].startswith("own"):
+            if "yardstick" not in lever:
+                raise ValueError(f"{lever['id']} is the engine's own code: give its yardstick, the measured best "
+                                 "existing provider for the operation or the providers checked and why none fits")
+            _evidence_file(root, lever["yardstick"]["evidence"], f"{lever['id']} yardstick")
+    goal = plan.inputs["objective"]
+    if goal["name"] == "critique_round":
+        if "weakest" not in data:
+            raise ValueError(f"Candidate {goal['candidate']} is a critique round: {goal['rule']}")
+        ids = {lever["id"]: lever for lever in levers}
+        for row in data["weakest"]:
+            _evidence_file(root, row["evidence"], f"weakest {row['term']}")
+            for lever_id in row["levers"]:
+                lever = ids.get(lever_id)
+                if lever is None or not any(change["change"] > 0 for kpi, change in lever["changes"].items()
+                                            if FAMILY.get(kpi, kpi) == FAMILY.get(row["kpi"], row["kpi"])):
+                    raise ValueError(f"weakest {row['term']}: {lever_id} is no speed lever of this plan that "
+                                     f"improves {row['kpi']}")
+        if not set(ids) - {i for row in data["weakest"] for i in row["levers"]}:
+            raise ValueError(f"Candidate {goal['candidate']} is a critique round: add other levers beside the ones "
+                             "for its two weakest terms")
+    if "min_gain" in goal and forecast is not None and facts is not None and order is not None:
+        best = max((_gain(kpi, forecast[kpi]["expected"], (facts["kpis"].get(kpi) or {}).get("score"))
+                    for name in order["p1"] for kpi in FAMILIES.get(name, (name,)) if kpi in forecast), default=0.0)
+        if best < goal["min_gain"]:
+            raise ValueError(f"Candidate {goal['candidate']} forecasts {best:+.1%} on p1 ({', '.join(order['p1'])}): "
+                             f"candidates 2 to {FLOOR_UNTIL} are planned for at least +{goal['min_gain']:.0%} on a "
+                             "p1 KPI; plan the levers that close more of its gap")
+
+
+def _check_rules_4_fields(plan):
+    """weakest (critique rounds) and review belong to plan rules 4."""
+    if plan.version < 4:
+        if "weakest" in plan.data:
+            raise ValueError("weakest belongs to plan rules 4 (critique rounds)")
+        if "review" in plan.data:
+            raise ValueError("review belongs to plan rules 4, once the parent's plan has an outcome")
+
+
+def _check_review(plan):
+    """Check 14 (rules 4): the plan reviews its parent's plan against the parent's measured Eval."""
+    root, data = plan.root, plan.data
+    facts_review = review_facts(root, plan.run, plan.parent, plan.eval_ref) if not plan.first else None
+    if facts_review is None:
+        if "review" in data:
+            raise ValueError("review belongs to plan rules 4, once the parent's plan has an outcome")
+        return
+    plan.inputs["review"] = facts_review
+    review = data.get("review")
+    if review is None:
+        raise ValueError(f"Review {facts_review['plan_id']} first: review gives its plan_id, the cause and evidence of "
+                         "each KPI that missed its forecast (" + (", ".join(facts_review["missed"]) or "none") + "), "
+                         "what each lever delivered (" + ", ".join(facts_review["built"] + facts_review["dropped"])
+                         + ") and the lesson this plan draws")
+    if review["plan_id"] != facts_review["plan_id"]:
+        raise ValueError(f"review names {review['plan_id']}: the parent's plan is {facts_review['plan_id']}")
+    for kpi in facts_review["missed"]:
+        if kpi not in review["kpis"]:
+            raise ValueError(f"review: {kpi} missed its forecast in {facts_review['outcome']['path']}: give its cause "
+                             "and evidence")
+    for kpi, row in review["kpis"].items():
+        _evidence_file(root, row["evidence"], f"review {kpi}")
+    for lever_id in facts_review["built"] + facts_review["dropped"]:
+        if lever_id not in review["levers"]:
+            raise ValueError(f"review: say what {lever_id} of {facts_review['plan_id']} delivered")
+    # Gate: the parent's largest p1 lever, pruned or deferred, is planned again or rejected on a measurement of
+    # another kernel structure or a vendor library at the same arithmetic, never on variants of one kernel.
+    largest = facts_review["largest_p1_lever"]
+    if largest and facts_review["largest_p1_fate"] in ("pruned", "deferred") and \
+            largest not in {lever["id"] for lever in data["levers"]}:
+        row = review["levers"][largest]
+        if "evidence" not in row or "structure" not in row:
+            raise ValueError(f"{largest} was {facts_review['largest_p1_fate']}, the largest p1 lever of "
+                             f"{facts_review['plan_id']}: plan it again (same id) or give review.levers.{largest} "
+                             "evidence and structure: the other kernel structure or vendor library measured on it")
+        _evidence_file(root, row["evidence"], f"review {largest}")
+
+
+def _check_supersedes(plan):
+    """Check 11: a revision replaces the newest plan of its chain before its candidate exists."""
+    if plan.data.get("supersedes") is None:
+        return
+    old = load(plan.root, plan.run, plan.data["supersedes"])
+    summary = next(s for s in summaries(plan.root, plan.run) if s["plan_id"] == old["plan_id"])
+    if old["segment_id"] != plan.bounds["segment_id"] or old["parent_candidate_id"] != plan.parent:
+        raise ValueError(f"supersedes names {old['plan_id']}, a plan of another segment or parent")
+    if summary["candidate_id"] is not None:
+        raise ValueError(f"{old['plan_id']} is linked to {summary['candidate_id']}: change course with a new candidate "
+                         "and a new plan")
+    if summary["superseded_by"] is not None:
+        raise ValueError(f"{old['plan_id']} is already superseded by {summary['superseded_by']}")
+
+
+# Plan rules 6: in an as_quantized run a prompt GEMM over quantized weights starts at a quantized activation format.
+EXACT_ACTIVATION = "bf16"
+STORED_GAP = ACTIVATION_GAP + "stored"
+
+
+def _bf16_formats(declared):
+    """The stored formats whose prompt activations `declared` (prompt_activations) puts at BF16, in part or whole;
+    "*" for a declaration that names no format."""
+    if isinstance(declared, str):
+        return ["*"] if declared == EXACT_ACTIVATION else []
+    found = []
+    for name, mix in (declared or {}).items():
+        if mix == EXACT_ACTIVATION or isinstance(mix, dict) and (mix.get(EXACT_ACTIVATION) or 0) > 0:
+            found.append(name)
+    return found
+
+
+def _check_activations(plan):
+    """Check 16, rules 6, as_quantized runs: a build plan declares the prompt activations its candidate takes, and
+    no quantized format's prompt GEMMs start at BF16. The checkpoint's own activation quantization is what
+    as_quantized judges against, so a candidate reads prompts at the stored format (or fp8 / fp16_acc) from the
+    first one on; BF16 stands only beside a gaps entry activation:stored whose evidence is a crit-eval result that
+    measured the stored format outside the quality noise (_quality_rejection). The parent must have served what
+    its plan declared."""
+    if plan.decision != "build" or quality_mode(plan.run["spec"]["correctness"]) != "as_quantized":
+        return
+    declared = plan.data.get("prompt_activations")
+    if declared is None:
+        raise ValueError("An as_quantized run's build plan declares prompt_activations, the formats its candidate's "
+                         "prompt GEMMs take per stored format (as the engine declares them to Eval), for example "
+                         "{\"nvfp4\": \"stored\", \"fp8\": \"fp8\"}")
+    rejected = next((row for row in plan.data["gaps"] if row["gap"] == STORED_GAP), None)
+    exact = _bf16_formats(declared)
+    if exact:
+        label = f"prompt_activations puts {', '.join(exact)} at bf16"
+        if rejected is None:
+            raise ValueError(f"{label}: in as_quantized a quantized format's prompt GEMMs start at the checkpoint's own "
+                             "activation format (stored), or fp8 / fp16_acc, from candidate 1 on. Declare that, or "
+                             "measure the stored format first (crit eval run --adapter A --only quality "
+                             "--attribute-drift) and add a gaps entry {\"kpi\": \"prefill\", \"gap\": "
+                             f"\"{STORED_GAP}\", \"answer\": \"rejected\", \"evidence\": <that result>, \"detail\": ...}}")
+        plan.inputs["activation_evidence"] = {
+            **_evidence_file(plan.root, rejected["evidence"], f"gaps entry {STORED_GAP}"),
+            "over_budget_sets": _quality_rejection(plan.root, rejected["evidence"], "stored", f"gaps entry {STORED_GAP}")}
+    if plan.first or plan.result is None:
+        return
+    parent_plan = next((plan_id for plan_id, candidate in links(plan.root).items() if candidate == plan.parent), None)
+    planned = load(plan.root, plan.run, parent_plan).get("prompt_activations") if parent_plan else None
+    served = (plan.result.get("engine") or {}).get("prompt_activations")
+    if planned is not None and served != planned and rejected is None:
+        raise ValueError(f"{plan.parent} served prompt activations {served!r}, its plan {parent_plan} declared "
+                         f"{planned!r}: build what the plan declares, or record the measurement that rejected it "
+                         f"(gaps entry {STORED_GAP})")
+
+
+# The checks build runs on a plan, in order, each with the first version of the plan rules it belongs to: a check
+# raises ValueError for a plan that breaks it, and may record what crit derived in the plan's inputs.
+CHECKS = ((1, _check_decision), (1, _check_gap_names), (1, _check_answered_gaps), (2, _check_limit_gaps),
+          (3, _check_measured_only), (1, _prioritize), (1, _check_levers), (1, _check_forecast),
+          (3, _check_forecast_priorities), (5, _check_reach), (4, _check_objective), (1, _check_rules_4_fields),
+          (4, _check_review), (6, _check_activations), (1, _check_supersedes))
 
 
 def _reach(root, data, facts, computed, forecast, needed):
@@ -1312,7 +1454,7 @@ def _quality_rejection(root, path, activation, name):
     return over
 
 
-def _measured_only(root, data, facts, result, noise, needed, version):
+def _measured_only(root, data, facts, result, needed, version):
     """Plan rules 3: a family marked not needed below MEASURED_ONLY of its limit stands only on measured rejections:
     every gaps entry on it names its evidence (a file in the run), every Eval gap on it answers rejected, and for
     prefill every prompt activation format Eval prices faster than the engine's own is rejected, by Eval's own quality
@@ -1369,7 +1511,7 @@ def check_fates(plan, fates, required):
     ids = [lever["id"] for lever in plan["levers"]]
     unknown = sorted(set(fates) - set(ids))
     if unknown:
-        raise ValueError(f"lever_fates names " + ", ".join(unknown) + f", which {plan['plan_id']} does not plan")
+        raise ValueError("lever_fates names " + ", ".join(unknown) + f", which {plan['plan_id']} does not plan")
     for lever_id, row in fates.items():
         keys(row, {"fate"}, {"detail"})
         if row["fate"] not in FATES:

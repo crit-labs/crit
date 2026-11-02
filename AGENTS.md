@@ -259,6 +259,9 @@ Work in rounds, one candidate per round:
   noise (`gap` `activation:FORMAT`).
   Recon writes a prefill arithmetic plan beside the drafting plan: each matrix group's prompt
   activation format and its quality measurement (`--attribute-drift`), before the first candidate.
+  In `as_quantized` runs (plan rules 6) every build plan declares `prompt_activations`, and no
+  quantized format starts at BF16: candidate 1 reads prompts at the checkpoint's own activation
+  format, and BF16 needs a measured rejection of it (`activation:stored`).
 - **Plans are checkable.** Each plan forecasts every KPI (low, expected, high), names the
   current strategy's ceiling and the best alternative's, groups levers that only pay
   together, and puts no lever below the noise into a candidate on its own. Work the rules

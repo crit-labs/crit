@@ -11,7 +11,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from test_chat_residency import ServeFixture
+from support.serve import ServeFixture
 from crit_api.server import Api, Server
 
 

@@ -4,13 +4,13 @@ from datetime import datetime, timedelta, timezone
 import os
 import json
 from pathlib import Path
-import platform
 import shutil
-import socket
 import tempfile
-import time
 import uuid
 
+# The coordinator lease each write takes (crit.lease); named from here as before.
+from ..lease import exclusive_lease, lease, lease_owner, read_lease_owner, release_dead_lease  # noqa: F401
+from ..records import retry_denied
 from .records import (
     HEADROOM_REASONS, LIFECYCLES, LINEAGE, MAX_CANDIDATES, SAFETY_WINDOW_MINUTES, STOP_REASONS, WEIGHTS, amendment,
     attempt_process_cap,
@@ -22,103 +22,10 @@ from .records import (
 from . import cost, hub, plans, recon, replay
 
 ROOT = Path(__file__).resolve().parents[3]
-
-
-def lease_owner():
-    """Identity written into the lease: a PID is only meaningful on its own host and OS."""
-    return {"pid": os.getpid(), "host": socket.gethostname(), "system": platform.system(), "started_at": now()}
-
-
-def read_lease_owner(path):
-    """Lease owner from the lock file; a legacy lock holds only the PID."""
-    raw = path.read_text(encoding="utf-8").strip()
-    if raw.isdigit():
-        return {"pid": int(raw), "host": None, "system": None, "started_at": None}
-    value = json.loads(raw)
-    keys(value, {"pid", "host", "system", "started_at"})
-    number(value["pid"], "lease owner PID", 1, 2 ** 32, integer=True)
-    return value
-
-
-@contextmanager
-def lease(root, *, recover=False):
-    """Pin ownership while checking/removing a dead lease and throughout every write."""
-    from crit_core.machine import _try_lock, _unlock
-    # Never unlink this guard: replacing its inode would split the kernel lock.
-    # The separate owner lease still excludes writers across Windows/WSL.
-    with safe_path(root, ".coordinator.guard").open("a+b") as guard:
-        if not _try_lock(guard):
-            raise ValueError("Run coordinator is busy; another writer or recoverer holds its guard")
-        try:
-            if recover:
-                release_dead_lease(root)
-            with exclusive_lease(root):
-                yield
-        finally:
-            _unlock(guard)
-
-
-@contextmanager
-def exclusive_lease(root):
-    """An abandoned exclusive lease blocks writers until explicit dead-owner recovery."""
-    path = safe_path(root, ".coordinator.lock")
-    try:
-        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        try:
-            owner = read_lease_owner(path)
-            held = f" (held by PID {owner['pid']}" + (f" on {owner['host']}, {owner['system']}, since {owner['started_at']})" if owner["host"] else ")")
-        except (OSError, ValueError):
-            held = ""
-        raise ValueError(f"Run coordinator is busy{held}; if that process has exited, run recover on the same host and OS") from None
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(json.dumps(lease_owner()))
-            stream.flush()
-            os.fsync(stream.fileno())
-        yield
-    finally:
-        path.unlink()
-
-
-def release_dead_lease(root):
-    """Called only while holding the persistent coordinator guard."""
-    lock_path = safe_path(root, ".coordinator.lock")
-    if not lock_path.exists():
-        return
-    owner = read_lease_owner(lock_path)
-    if owner["host"] is not None and (owner["host"], owner["system"]) != (socket.gethostname(), platform.system()):
-        # Another OS (for example WSL versus Windows) has its own PID space:
-        # a missing PID here proves nothing about the owner.
-        raise ValueError(f"Lease owner ran on {owner['host']} ({owner['system']}); recover from that host and OS")
-    pid = owner["pid"]
-    if os.name == "nt":
-        import ctypes
-        api = ctypes.WinDLL("kernel32", use_last_error=True)
-        api.OpenProcess.restype = ctypes.c_void_p
-        api.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
-        handle = api.OpenProcess(0x100000, False, pid)  # SYNCHRONIZE
-        if handle:
-            api.CloseHandle.argtypes = [ctypes.c_void_p]
-            api.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
-            api.WaitForSingleObject.restype = ctypes.c_ulong
-            try:
-                # An exited process can still be opened while another process
-                # retains its handle. Signalled state proves it has terminated.
-                if api.WaitForSingleObject(handle, 0) != 0:
-                    raise ValueError("Coordinator owner may still be alive; recovery blocked")
-            finally:
-                api.CloseHandle(handle)
-        elif ctypes.get_last_error() != 87:
-            raise ValueError("Cannot prove coordinator owner exited")
-    else:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            pass
-        else:
-            raise ValueError("Coordinator owner is still alive")
-    lock_path.unlink()
+# The folders the repository publishes (its .gitignore allowlist, which a test holds this to) and the ones it keeps
+# for retention: no run root lies inside them.
+PUBLISHED = ("core", "inference", "kernels", "models", "tests", "docs", "eval", "cli", "api", "mcp", ".github")
+PROTECTED = PUBLISHED + ("tools", "archive")
 
 
 def next_id(directory, kind, suffix=""):
@@ -167,17 +74,14 @@ def staging(root, kind):
             shutil.rmtree(path, ignore_errors=True)
 
 
+def share(fraction):
+    """A fraction of a limit as the run prompt words it: "half", else "40% of"."""
+    return "half" if fraction == .5 else f"{fraction:.0%} of"
+
+
 def publish_directory(source, destination):
     """The coordinator lease serializes publication; Windows readers may hold a handle."""
-    deadline = time.monotonic() + .25
-    while True:
-        try:
-            source.rename(destination)
-            return
-        except PermissionError as exc:
-            if getattr(exc, "winerror", None) not in {5, 32, 33} or time.monotonic() >= deadline:
-                raise
-            time.sleep(.005)
+    retry_denied(lambda: source.rename(destination))
 
 
 def amendments(root, segment_id):
@@ -200,12 +104,13 @@ def described(model_path):
 def serving_gaps(capabilities, model_path):
     """What a chat-resident-v1 package leaves out that crit serve clients rely on: per-request temperature, and
     tool calls when the model's chat template teaches a call format crit parses."""
-    if not isinstance(capabilities, list) or "chat-resident-v1" not in capabilities:
+    from crit_core.serving import RESIDENT_CAPABILITY, TOOL_TEMPLATE_CAPABILITY, TOOLS_CAPABILITY, sampling_capability
+    if not isinstance(capabilities, list) or RESIDENT_CAPABILITY not in capabilities:
         return []
     gaps = []
-    if "chat-sampling-temperature-v1" not in capabilities:
-        gaps.append("it must apply a request's temperature and declare chat-sampling-temperature-v1")
-    if not {"chat-tools-v1", "chat-tool-template-v1"} & set(capabilities) and described(model_path):
+    if sampling_capability("temperature") not in capabilities:
+        gaps.append(f"it must apply a request's temperature and declare {sampling_capability('temperature')}")
+    if not {TOOLS_CAPABILITY, TOOL_TEMPLATE_CAPABILITY} & set(capabilities) and described(model_path):
         from crit_core.model import open_model
         from crit_core.text import template_sources, templates_tool_format
         try:
@@ -214,7 +119,7 @@ def serving_gaps(capabilities, model_path):
             taught = None
         if taught:
             gaps.append("the model's chat template teaches tool calls, so it must render tools, parse the calls and "
-                        "declare chat-tools-v1")
+                        f"declare {TOOLS_CAPABILITY}")
     return gaps
 
 
@@ -227,8 +132,7 @@ class RunStore:
         if requested.resolve() != requested or requested.is_symlink():
             raise ValueError("Run root must not traverse symlinks/reparse points")
         self.root = requested.resolve()
-        if self.root == self.project or any(self.root.is_relative_to(self.project / name)
-               for name in ("docs", "tools", "tests", "core", "inference", "kernels", "eval", "api", "cli", ".github", "archive")):
+        if self.root == self.project or any(self.root.is_relative_to(self.project / name) for name in PROTECTED):
             raise ValueError("Runs belong outside publication and protected retention")
         self.root.mkdir(parents=True, exist_ok=True)
 
@@ -318,7 +222,7 @@ class RunStore:
         state["target_satisfied"] = bool(selected and selected["target_satisfied"])
         state["plans"] = plans.summaries(root, run)
         segments = sorted((root / "segments").glob("segment-*.json"))
-        attempts = self._attempts(root)
+        attempts = self.attempts(root)
         bounds = segment(root, run, state["current_segment_id"])
         state["budget"] = {"segments": len(segments), "attempts": len(attempts),
             "segment_attempts": sum(a["segment_id"] == bounds["segment_id"] for a in attempts),
@@ -404,13 +308,15 @@ class RunStore:
             raise ValueError("Segment is closed/expired; explicit Resume is required")
         return run, state, bounds
 
-    def _attempts(self, root):
+    def attempts(self, root):
+        """Every attempt reservation the run retains, validated against its segment, and its result where it settled
+        (crit serve checks them before it serves a candidate)."""
         paths = list((root / "candidates").glob("candidate-*/attempts/attempt-*/reservation.json"))
         paths += list((root / "segments").glob("segment-*/attempts/attempt-*/reservation.json"))
         result = []
+        run = load_run(root)
         for path in paths:
             safe_path(root, path.relative_to(root).as_posix())
-            run = load_run(root)
             value = validate_attempt_reservation(root, run, read_json(path))
             owner = f"candidates/{value['candidate_id']}" if value["candidate_id"] else f"segments/{value['segment_id']}"
             if path.relative_to(root).as_posix() != f"{owner}/attempts/{value['attempt_id']}/reservation.json":
@@ -420,7 +326,7 @@ class RunStore:
                 validate_attempt_result(root, run["run_id"], value, read_json(outcome_path))
             result.append(value)
         for segment_id in {value["segment_id"] for value in result}:
-            if sum(value["segment_id"] == segment_id for value in result) > segment(root, load_run(root), segment_id)["limits"]["attempt_limit"]:
+            if sum(value["segment_id"] == segment_id for value in result) > segment(root, run, segment_id)["limits"]["attempt_limit"]:
                 raise ValueError("Retained attempts exceed their authorized segment cap")
         return result
 
@@ -432,7 +338,7 @@ class RunStore:
         with lease(root):
             run = load_run(root)
             previous = read_json(root / "state.json")
-            for reservation in self._attempts(root):
+            for reservation in self.attempts(root):
                 owner = (f"candidates/{reservation['candidate_id']}" if reservation["candidate_id"] else f"segments/{reservation['segment_id']}")
                 path = safe_path(root, f"{owner}/attempts/{reservation['attempt_id']}/result.json")
                 if not path.exists() or read_json(path).get("cleanup_settled") is not True:
@@ -567,7 +473,7 @@ class RunStore:
                 raise ValueError(f"Run recon before the first candidate: crit run --id {run_id} recon writes "
                                  f"{recon.RECON_JSON}, then finish {recon.RECON_MD}")
             # Plan rules 3: decode's drafting plan and prefill's arithmetic plan are written before any candidate.
-            missing = recon.unfinished(root) if run["spec"].get("plan_rules", 1) >= 3 and frozen is not None else []
+            missing = recon.unfinished(root) if plans.rules(run) >= 3 and frozen is not None else []
             if missing:
                 raise ValueError(f"Finish {recon.RECON_MD} before the candidate: " + ", ".join(missing) + " (still TODO "
                                  "or missing). The prefill arithmetic plan names each matrix group's prompt activation "
@@ -715,7 +621,7 @@ class RunStore:
     def append(self, run_id, candidate_id, kind, data):
         root = self._recording(run_id)
         with lease(root):
-            run = load_run(root)  # Result publication grants no new process execution.
+            load_run(root)  # Result publication grants no new process execution.
             candidate = read_json(safe_path(root, f"candidates/{ident(candidate_id, 'candidate')}/candidate.json"))
             if kind not in {"check", "benchmark"}:
                 raise ValueError("Append requires check or benchmark")
@@ -742,7 +648,7 @@ class RunStore:
         with lease(root):
             run, _, bounds = self._active(root)
             cap = attempt_process_cap(bounds, candidate_id, operation)
-            if sum(a["segment_id"] == bounds["segment_id"] for a in self._attempts(root)) >= bounds["limits"]["attempt_limit"]:
+            if sum(a["segment_id"] == bounds["segment_id"] for a in self.attempts(root)) >= bounds["limits"]["attempt_limit"]:
                 raise ValueError("Segment attempt limit exhausted")
             window = (timestamp(bounds["deadline_at"], "deadline") - datetime.now(timezone.utc)).total_seconds()
             limit = window if cap is None else cap
@@ -1017,12 +923,12 @@ class RunStore:
                      "forecast next to the measurement. Stopping with candidates left in the budget (search_exhausted) needs\n"
                      "a stop plan from the newest Eval first."
                      if run["spec"].get("plans") == "required" else "")
-        # The second version of the plan rules, in runs created with it ("plan_rules": 2).
-        rules = run["spec"].get("plan_rules", 1) >= 2
-        if rules:
+        # The version of the plan rules the run was created with (plans.rules); their numbers come from plans.py.
+        version = plans.rules(run)
+        if version >= 2:
             plan_line += ("\nThe alternative strategy's tokens per round is at most its draft steps + 1: a round emits\n"
                           "its drafts and the target's own token. A noise Eval leaves unknown counts as the largest\n"
-                          "noise it knows (else 5%); a family's noise is the largest of its members'; the near tie\n"
+                          f"noise it knows (else {plans.DEFAULT_NOISE:.0%}); a family's noise is the largest of its members'; the near tie\n"
                           "combines both families' noise in quadrature; each gap and lever change is weighed against\n"
                           "its own KPI's noise. crit's computed limit and the alternative's ceiling follow Eval's\n"
                           "cost model: tokens per round over the pass floor plus the draft steps at Eval's draft floor.\n"
@@ -1031,11 +937,11 @@ class RunStore:
                           "draft width) unless the plan cites another candidate's Eval attempt that measured the new\n"
                           "drafter; it gives tokens_per_round and draft_steps, never a bare limit.\n"
                           "The first\n"
-                          "plan's decision follows its needed flags too. When both families are at 0.85 of their\n"
+                          f"plan's decision follows its needed flags too. When both families are at {plans.NEAR_LIMIT:g} of their\n"
                           "limits or above, a near tie puts only the lower one in p1; a family marked not needed\n"
-                          "below 0.85 needs a gaps entry for its limit (gap \"limit\", answer \"cause\") saying why the\n"
+                          f"below {plans.NEAR_LIMIT:g} needs a gaps entry for its limit (gap \"{plans.LIMIT_GAP}\", answer \"cause\") saying why the\n"
                           "rest of the limit is out of reach.")
-        if run["spec"].get("plan_rules", 1) >= 3:
+        if version >= 3:
             plan_line += ("\nPlan rules 3: a plan whose forecast gains more on p2 than on p1, or lets a p1 KPI fall, gives\n"
                           "forecast_justification.")
             plan_line += ("\nA kernel term is exhausted only when it runs near its floor at the arithmetic the engine\n"
@@ -1043,23 +949,23 @@ class RunStore:
                           "of its own prompt activations) or when another kernel structure, or a vendor library at the same\n"
                           "arithmetic as a yardstick, was measured on it; tiling, block and launch variants of one kernel\n"
                           "reject those variants, not the term.")
-            plan_line += ("\nBelow half its limit a family is not needed only on measured rejections: each gaps entry\n"
+            plan_line += (f"\nBelow {share(plans.MEASURED_ONLY)} its limit a family is not needed only on measured rejections: each gaps entry\n"
                           "names its evidence (a file in the run), an Eval gap answers rejected, and for prefill every\n"
                           "prompt activation format Eval prices faster than the engine's own needs a gaps entry\n"
-                          "activation:FORMAT whose evidence is a crit-eval result measuring it over the budget outside\n"
+                          f"{plans.ACTIVATION_GAP}FORMAT whose evidence is a crit-eval result measuring it over the budget outside\n"
                           "the quality spread.")
             plan_line += ("\nBefore the first candidate, recon.md's prefill arithmetic plan names each matrix group's\n"
                           "prompt activation format and its quality measurement (crit eval run --attribute-drift),\n"
                           "beside the drafting plan.")
-        if run["spec"].get("plan_rules", 1) >= 4:
+        if version >= 4:
             plan_line += ("\nPlan rules 4: each candidate has an objective by its number in the run, which crit names in\n"
                           "the plan's inputs.objective. Candidate 1 is the proof of concept: the first engine that works\n"
-                          "end to end, in its placement scenario's starting design (recon.md). Candidates 2 and 3 are crit rounds: improve the parent as much as possible with\n"
+                          f"end to end, in its placement scenario's starting design (recon.md). Candidates 2 and {plans.CRIT_ROUNDS} are crit rounds: improve the parent as much as possible with\n"
                           "crit's toolkit (Inference techniques and Kernels Hub kernels), measuring each against its floor\n"
-                          "and fixing or replacing it where it trails. Candidates 4 on are critique rounds: the plan names\n"
+                          f"and fixing or replacing it where it trails. Candidates {plans.CRIT_ROUNDS + 1} on are critique rounds: the plan names\n"
                           "the parent's two weakest terms (the largest measured distances to their floors, from Eval and\n"
                           "the kernel trace) in weakest, each with its evidence and the levers that improve it, plus other\n"
-                          "levers beside them. Candidates 2 to 5 forecast at least +10% expected on a p1 KPI over the\n"
+                          f"levers beside them. Candidates 2 to {plans.FLOOR_UNTIL} forecast at least +{plans.MIN_GAIN:.0%} expected on a p1 KPI over the\n"
                           "parent's Eval: a plan below that is refused, so plan the levers that close more of the gap.\n"
                           "Every speed lever names its provider (inference:ENTRY, hub:ORG/NAME, lib:NAME from\n"
                           "kernels/SOURCES.md, or own: ...), and the engine's own code carries a yardstick: the measured\n"
@@ -1069,13 +975,20 @@ class RunStore:
                           "forecast, what each lever delivered and the lesson. The parent's largest p1 lever, pruned or\n"
                           "deferred, is planned again or rejected on a measurement of another kernel structure or a\n"
                           "vendor library at the same arithmetic, never on variants of one kernel.")
-        if run["spec"].get("plan_rules", 1) >= 5:
+        if version >= 5:
             plan_line += ("\nPlan rules 5: the strategy's ceiling is the limit Eval measures (or crit computes), not the\n"
                           "engine's own speed. crit records how far each needed family's forecast reaches toward it\n"
-                          "(inputs.reach); a forecast whose high stays below half the limit is refused unless a gaps\n"
+                          f"(inputs.reach); a forecast whose high stays below {share(plans.REACH)} the limit is refused unless a gaps\n"
                           "entry limit (answer cause) names the measured bound that keeps the rest out of reach, with\n"
                           "its evidence in the run. An engine reading weights from host memory reports its expert\n"
                           "cache hits (expert_reads, expert_hits), so Eval's limit is priced at its own hit rate.")
+        if version >= 6 and quality_mode(run["spec"]["correctness"]) == "as_quantized":
+            plan_line += ("\nPlan rules 6 (as_quantized): every build plan declares prompt_activations, the formats its\n"
+                          "candidate's prompt GEMMs take per stored format, as the engine declares them to Eval. From\n"
+                          "candidate 1 on a quantized format starts at the checkpoint's own activation format (stored), or\n"
+                          "fp8 / fp16_acc, never bf16: bf16 stands only beside a gaps entry activation:stored whose\n"
+                          "evidence is a crit-eval result that measured stored outside the quality noise. The next plan\n"
+                          "is refused when its parent served other prompt activations than its plan declared.")
         return f"""# crit run {run['run_id']}
 
 Repository: {self.project}

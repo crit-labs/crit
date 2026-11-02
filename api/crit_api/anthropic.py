@@ -17,6 +17,7 @@ system, messages, tools, tool_choice and thinking, for packages declaring chat-t
 import json
 import uuid
 
+from .delivery import sse_event
 from .options import RequestError, complete_arguments, parameter_name, unknown_parameters
 
 KNOWN = {"model", "messages", "max_tokens", "system", "tools", "tool_choice", "stop_sequences", "stream", "temperature",
@@ -380,13 +381,15 @@ def message(model, finish, measured, text, calls, reasoning, stopped, ident=None
 
 
 class Stream:
-    """Writes the Messages event stream for one request through `send(event, data)`: one content block is open at a
-    time, text, thinking or a tool call's tool_use, opened as its content arrives in the order the engine produces
-    it and closed when the next one opens or at the end. Engines may interleave their calls' deltas, so a call's
-    block stays open until its arguments are whole JSON, and what arrives for other blocks meanwhile waits."""
+    """Writes the Messages event stream for one request through `write(bytes)` (server.Handler.streamed runs it): one
+    content block is open at a time, text, thinking or a tool call's tool_use, opened as its content arrives in the
+    order the engine produces it and closed when the next one opens or at the end. Engines may interleave their calls'
+    deltas, so a call's block stays open until its arguments are whole JSON, and what arrives for other blocks
+    meanwhile waits."""
+    content_type, ping = "text/event-stream", PING
 
-    def __init__(self, send, model):
-        self.send = send
+    def __init__(self, write, model):
+        self.write = write
         self.model = model
         self.ident = "msg_" + uuid.uuid4().hex
         self.next_index = 0
@@ -394,6 +397,9 @@ class Stream:
         self.calls = {}           # tool call index -> the call as its block received it
         self.held = []            # (kind, piece or tool-call delta) waiting for the open call's arguments
         self.started = False
+
+    def send(self, event, data):
+        self.write(sse_event(data, event))
 
     def start(self):
         self.started = True
@@ -453,7 +459,7 @@ class Stream:
     def text(self, piece):
         self._write("text", piece)
 
-    def thinking(self, piece):
+    def reasoning(self, piece):
         self._write("thinking", piece)
 
     def tools(self, deltas):
@@ -462,14 +468,16 @@ class Stream:
         for delta in deltas:
             self._write("tool_use", delta)
 
-    def finish(self, finish, measured, stopped):
+    def finish(self, ran, telemetry=None):
+        """The end of the reply, server.Ran (Messages carry no crit telemetry)."""
         while self.held:
             self._close()  # a call whose arguments the reply left unfinished, as a cut reply does
             self._release()
         self._close()
-        self.send("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop_reason(finish, stopped),
-                                                                       "stop_sequence": stopped}, "usage": usage(measured)})
+        self.send("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop_reason(ran.finish, ran.stopped),
+                                                                       "stop_sequence": ran.stopped},
+                                    "usage": usage(ran.measured)})
         self.send("message_stop", {"type": "message_stop"})
 
-    def error(self, message, status=500, request_id=None):
+    def fail(self, message, code=None, status=500, request_id=None):
         self.send("error", error_body(status, message, request_id))

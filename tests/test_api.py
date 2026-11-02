@@ -15,7 +15,7 @@ import time
 import unittest
 from unittest import mock
 
-from test_chat_residency import ServeFixture
+from support.serve import ServeFixture
 from crit_api.disconnect import ClientDisconnect
 from crit_api.engine import reply as engine_reply
 from crit_api.server import Api, RequestError, Server, continuation, conversation, stops, structured_outputs

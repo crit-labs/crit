@@ -10,27 +10,23 @@ import time
 import uuid
 
 from crit.process.ownership import RuntimeOwnership
-from crit.run.records import (digest, keys, now, number, read_json, record, safe_path, text,
-                              verification_scope, write_json)
+from crit.records import digest, keys, now, number, read_json, safe_path, text, verification_scope, write_json
+from crit.run.records import record
 from crit.run.store import ROOT, RunStore
 
-from crit_core.serving import (COMPLETION_CAPABILITY, CONTINUE_CAPABILITY, FIT_OUTPUT_CAPABILITY, MIN_LOGPROB,
-                               PLAIN_CAPABILITY, SCORE_CAPABILITY, THINKING_BUDGET_CAPABILITY, TOKENIZE_CAPABILITY,
-                               unpacked_scores)
+from crit_core.serving import (COMPLETION_CAPABILITY, CONCURRENT_CAPABILITY, CONSTRAINTS_CAPABILITY,
+                               CONTINUE_CAPABILITY, FIT_OUTPUT_CAPABILITY, GRAMMAR_CAPABILITY, IMAGES_CAPABILITY,
+                               JSON_CAPABILITY as CAPABILITY, MIN_LOGPROB, PLAIN_CAPABILITY, REQUEST_FACTS,
+                               RESIDENT_CAPABILITY, SCORE_CAPABILITY, STREAM_CAPABILITY, THINKING_BUDGET_CAPABILITY,
+                               TOKENIZE_CAPABILITY, unpacked_scores)
 
-from .residency import CAPABILITY as RESIDENT_CAPABILITY, ResidentRuntime
+from .residency import ResidentRuntime
 from .admission import Admission, Refused
 from .content import response_content, tool_size
 from .logprobs import logprob_entries, logprob_options, prompt_entries, response_bytes
-from .stream import CAPABILITY as STREAM_CAPABILITY
 from .options import (MAX_CHAT_RECORD, RequestError, TOOL_STREAM_CAPABILITY, sampling_options, serving_capabilities,
                       template_options, tool_options as validate_tool_options, validate_tool_reply)
 
-CAPABILITY = "chat-json-v1"
-# The adapter applies a request's response_format (crit_core.constraints / crit/constraints.h); see docs/SERVING.md.
-CONSTRAINTS_CAPABILITY = "chat-constraints-v1"
-# With it, also a response_format of type grammar: any compiled grammar (structured_outputs regex, choice, grammar).
-GRAMMAR_CAPABILITY = "chat-constraints-grammar-v1"
 MAX_CONVERSATION = 8 * 1024 * 1024
 LOAD_BYTES_PER_SECOND = 200e6  # model bytes per second assumed by the default load bound (the engine's own load)
 VERIFY_BYTES_PER_SECOND = 50e6  # with --verify-model: read, hash and copy every model file, then the engine load
@@ -94,8 +90,7 @@ def telemetry(value, request):
     headroom, and so do expert_reads and expert_hits (the decode's routed expert reads and those the device's expert
     cache served), which Eval's memory tiers price an offloading engine's floor at."""
     keys(value, {"prompt_tokens", "output_tokens", "prefill_tokens", "prefill_ms",
-                 "decode_tokens", "decode_ms", "ttft_ms", "missing"}, {"decode_rounds", "accepted", "drafted", "verify_ms",
-                                                                     "draft_ms", "expert_reads", "expert_hits"})
+                 "decode_tokens", "decode_ms", "ttft_ms", "missing"}, {"decode_rounds", *REQUEST_FACTS})
     prompt = number(value["prompt_tokens"], "prompt tokens", 1, request["limits"]["kv_tokens"], integer=True)
     output = number(value["output_tokens"], "output tokens", 1, request["limits"]["max_output_tokens"], integer=True)
     if prompt + output > request["limits"]["kv_tokens"]:
@@ -408,7 +403,7 @@ class ServedEngine:
         if not Path(view["run"]["spec"]["model_path"]).exists():
             raise ValueError("Model file is unavailable at its recorded path: " + view["run"]["spec"]["model_path"])
         # External agents cannot be stopped from here. Their recorded attempts must have settled cleanup.
-        for reservation in store._attempts(root):
+        for reservation in store.attempts(root):
             if (reservation["candidate_id"], reservation["attempt_id"]) == (candidate_id, self.attempt):
                 continue  # the attempt this engine is measured under settles after it stops
             owner = ("candidates/" + reservation["candidate_id"] if reservation["candidate_id"]
@@ -496,12 +491,7 @@ class ServedEngine:
             self.candidates(refresh=True)
             self.ownership.acquire()
             try:
-                result = self.runtime.call("load", {"spec": spec},
-                                           _CommandStop(stop or threading.Event(), self._stopping), self.load_seconds(spec))
-                if result["status"] != "completed":
-                    raise ValueError(result["error"] or "Engine loading failed")
-                self._loaded(self.default)
-                self.lock.configure(self.default, self.admitted(result.get("max_concurrent_requests", 1)))
+                self._load_default(spec, stop)
             except BaseException:
                 self._release()
                 raise
@@ -519,13 +509,15 @@ class ServedEngine:
                 raise ValueError("Engine is closed")
             self.context_tokens = kv_tokens
             self.specs.clear()
-            spec = self.spec()
-            result = self.runtime.call("load", {"spec": spec}, _CommandStop(stop or threading.Event(), self._stopping),
-                                       self.load_seconds(spec))
-            if result["status"] != "completed":
-                raise ValueError(result["error"] or "Engine loading failed")
-            self._loaded(self.default)
-            self.lock.configure(self.default, self.admitted(result.get("max_concurrent_requests", 1)))
+            self._load_default(self.spec(), stop)
+
+    def _load_default(self, spec, stop):
+        """Load the default candidate's engine, as open and reopen do: ValueError when it does not load."""
+        result = self.runtime.call("load", {"spec": spec}, _CommandStop(stop or threading.Event(), self._stopping),
+                                   self.load_seconds(spec))
+        if result["status"] != "completed":
+            raise ValueError(result["error"] or "Engine loading failed")
+        self._loaded(self.default, result)
 
     def admitted(self, declared):
         """The requests admission runs at once for an engine that declares `declared`: at most max_concurrency."""
@@ -540,7 +532,7 @@ class ServedEngine:
         if candidate_id is None and self.default is None:
             return None
         spec = self.spec(candidate_id)
-        if "chat-concurrent-v1" not in spec["capabilities"]:
+        if CONCURRENT_CAPABILITY not in spec["capabilities"]:
             return 1
         status = self.runtime.status()
         if not self.loaded(candidate_id, status):
@@ -639,44 +631,33 @@ class ServedEngine:
         candidate_id = candidate_id or self.default
         needs_load = self._admit(candidate_id, stop, priority)
         if needs_load is None:
-            if self._stopping.is_set():
-                raise EngineError("Engine is stopping", 503)
             return "cancelled", None, None
         try:
             if on_admitted:
                 on_admitted()
             if stop.is_set():
                 return "cancelled", None, None
-            if self._stopping.is_set():
-                raise EngineError("Engine is stopping", 503)
-            if self.ownership.blocked:
-                raise EngineError("Runtime cleanup is unresolved: " + self.ownership.blocked, 503)
+            self._check_running()
             spec = self.spec(candidate_id)
-            if image_input and "chat-images-v1" not in spec["capabilities"]:
-                raise EngineError("This engine package does not declare chat-images-v1", 400)
-            limits = spec["limits"]
+            capabilities, limits = spec["capabilities"], spec["limits"]
             if not 1 <= max_tokens < limits["kv_tokens"]:
                 raise EngineError("max_tokens must be between 1 and %d" % (limits["kv_tokens"] - 1), 400)
-            if response_format is not None and CONSTRAINTS_CAPABILITY not in spec["capabilities"]:
-                raise EngineError("This engine package does not declare " + CONSTRAINTS_CAPABILITY, 400)
-            if (response_format or {}).get("type") == "grammar" and GRAMMAR_CAPABILITY not in spec["capabilities"]:
-                raise EngineError("This engine package does not declare " + GRAMMAR_CAPABILITY, 400)
-            if decode is not None and (decode != "plain" or PLAIN_CAPABILITY not in spec["capabilities"]):
+            # Each option the request uses needs the capability that declares it.
+            for used, capability in ((image_input, IMAGES_CAPABILITY), (response_format is not None, CONSTRAINTS_CAPABILITY),
+                                     ((response_format or {}).get("type") == "grammar", GRAMMAR_CAPABILITY),
+                                     (decode is not None, PLAIN_CAPABILITY), (fit_output, FIT_OUTPUT_CAPABILITY),
+                                     (continue_final_message, CONTINUE_CAPABILITY),
+                                     (thinking_tokens is not None, THINKING_BUDGET_CAPABILITY),
+                                     (prompt is not None, COMPLETION_CAPABILITY),
+                                     (echo and logprobs is not None, SCORE_CAPABILITY)):
+                if used and capability not in capabilities:
+                    raise EngineError("This engine package does not declare " + capability, 400)
+            if decode not in (None, "plain"):
                 raise EngineError("This engine package does not declare " + PLAIN_CAPABILITY, 400)
-            if fit_output and FIT_OUTPUT_CAPABILITY not in spec["capabilities"]:
-                raise EngineError("This engine package does not declare " + FIT_OUTPUT_CAPABILITY, 400)
-            if continue_final_message and CONTINUE_CAPABILITY not in spec["capabilities"]:
-                raise EngineError("This engine package does not declare " + CONTINUE_CAPABILITY, 400)
-            if thinking_tokens is not None and THINKING_BUDGET_CAPABILITY not in spec["capabilities"]:
-                raise EngineError("This engine package does not declare " + THINKING_BUDGET_CAPABILITY, 400)
             if thinking_tokens is not None and (type(thinking_tokens) is not int or thinking_tokens < 1):
                 raise EngineError("thinking_tokens must be a positive integer", 400)
             if timeout is not None and (type(timeout) not in (int, float) or not 0 < timeout < float("inf")):
                 raise EngineError("timeout must be a positive number of seconds", 400)
-            if prompt is not None and COMPLETION_CAPABILITY not in spec["capabilities"]:
-                raise EngineError("This engine package does not declare " + COMPLETION_CAPABILITY, 400)
-            if echo and logprobs is not None and SCORE_CAPABILITY not in spec["capabilities"]:
-                raise EngineError("This engine package does not declare " + SCORE_CAPABILITY, 400)
             timeout = self.timeout if timeout is None else min(timeout, self.timeout)
             extra = {} if response_format is None else {"response_format": response_format}
             if decode is not None:
@@ -698,8 +679,7 @@ class ServedEngine:
                 extra["sampling"] = applied
             if stop.is_set():
                 return "cancelled", None, None
-            if self._stopping.is_set():
-                raise EngineError("Engine is stopping", 503)
+            self._check_stopping()
             if needs_load:
                 loaded = self._load(spec, candidate_id, stop)
                 if loaded is not None:
@@ -714,53 +694,75 @@ class ServedEngine:
                         **{k: v for k, v in limits.items() if k.endswith("headroom_bytes")},
                         **({"fit_output": True} if fit_output else {}),
                         **({"thinking_tokens": thinking_tokens} if thinking_tokens is not None else {})}, **extra)
-            streams = STREAM_CAPABILITY in spec["capabilities"]
-            try:
-                result = self.runtime.call("generate", {"spec": spec, "request": request},
-                    _CommandStop(stop, self._stopping), timeout,
-                    progress=on_text if streams and on_text else None, request=request,
-                    progress_tools=on_tools if TOOL_STREAM_CAPABILITY in spec["capabilities"] else None,
-                    progress_reasoning=on_reasoning if streams else None, on_started=on_started)
-            except BaseException as exc:
-                # Once the supervisor unwinds, no observer remains to forward
-                # cancellation. Retire even for consumer failures/interrupts,
-                # while the request lock still excludes another command.
-                self._keep(request)
-                self._retire(exc)
-                if isinstance(exc, (ValueError, OSError)):
-                    if self._stopping.is_set():
-                        raise EngineError("Engine is stopping", 503) from exc
-                    raise EngineError("Engine host failed: " + str(exc)) from exc
-                raise
-            if result["status"] in {"cancelled", "timed_out"}:
-                # Settled cooperative cancellation keeps the weights resident.
-                if self._stopping.is_set():
-                    raise EngineError("Engine is stopping", 503)
-                return result["status"], None, None
-            if result["status"] == "rejected":
-                raise rejected(result)  # refused before generating: the host settled and keeps the engine
-            if result["status"] != "completed":
-                self._keep(request)
-                self._retire(result["error"])
-                raise EngineError(result["error"] or "Engine failed the request")
-            try:
-                assistant, measured = reply(result["response"], request)
-                self._check_sealed(spec)
-            except (ValueError, OSError, KeyError, TypeError) as exc:
-                self._keep(request, result["response"])
-                self._retire(exc)
-                raise EngineError("Engine returned an invalid response: " + str(exc)) from exc
+            streams = STREAM_CAPABILITY in capabilities
+            status, replied = self._command("generate", spec, request, stop, timeout, reply,
+                                            progress=on_text if streams and on_text else None,
+                                            progress_tools=on_tools if TOOL_STREAM_CAPABILITY in capabilities else None,
+                                            progress_reasoning=on_reasoning if streams else None, on_started=on_started)
+            if status != "completed":
+                return status, None, None
+            assistant, measured = replied
             return "completed", assistant, measured
         finally:
             self.lock.release()
 
     def _admit(self, candidate_id, stop, priority=0):
         """Wait in the queue (Admission.admit), lower priority values first: whether the request must load, None when
-        cancelled."""
+        its client cancelled; EngineError 503 when the engine stops meanwhile."""
         try:
-            return self.lock.admit(candidate_id, _CommandStop(stop, self._stopping), priority)
+            needs_load = self.lock.admit(candidate_id, _CommandStop(stop, self._stopping), priority)
         except Refused as exc:
             raise Overloaded(str(exc)) from None
+        if needs_load is None:
+            self._check_stopping()
+        return needs_load
+
+    def _check_stopping(self):
+        if self._stopping.is_set():
+            raise EngineError("Engine is stopping", 503)
+
+    def _check_running(self):
+        """EngineError 503 while the engine stops or its runtime's cleanup is unresolved."""
+        self._check_stopping()
+        if self.ownership.blocked:
+            raise EngineError("Runtime cleanup is unresolved: " + self.ownership.blocked, 503)
+
+    def _command(self, command, spec, request, stop, timeout, parse, **options):
+        """Run a generate or score request on the host: ("completed", parse(response, request)), or (status, None) for
+        a request cancelled or timed out. A failure keeps the request's records (_keep), retires the host process and
+        raises EngineError; a request the host refused before running raises its RequestRejected."""
+        try:
+            result = self.runtime.call(command, {"spec": spec, "request": request}, _CommandStop(stop, self._stopping),
+                                       timeout, request=request, **options)
+        except BaseException as exc:
+            # Once the supervisor unwinds, no observer remains to forward
+            # cancellation. Retire even for consumer failures/interrupts,
+            # while the request lock still excludes another command.
+            self._keep(request)
+            self._retire(exc)
+            if isinstance(exc, (ValueError, OSError)):
+                if self._stopping.is_set():
+                    raise EngineError("Engine is stopping", 503) from exc
+                raise EngineError("Engine host failed: " + str(exc)) from exc
+            raise
+        if result["status"] in {"cancelled", "timed_out"}:
+            # Settled cooperative cancellation keeps the weights resident.
+            self._check_stopping()
+            return result["status"], None
+        if result["status"] == "rejected":
+            raise rejected(result)  # refused before running: the host settled and keeps the engine
+        if result["status"] != "completed":
+            self._keep(request)
+            self._retire(result["error"])
+            raise EngineError(result["error"] or "Engine failed the request")
+        try:
+            parsed = parse(result["response"], request)
+            self._check_sealed(spec)
+        except (ValueError, OSError, KeyError, TypeError) as exc:
+            self._keep(request, result["response"])
+            self._retire(exc)
+            raise EngineError("Engine returned an invalid response: " + str(exc)) from exc
+        return "completed", parsed
 
     def _load(self, spec, candidate_id, stop):
         """Load the candidate's engine on the host: None once loaded, else "cancelled" or "timed_out"."""
@@ -769,25 +771,25 @@ class ServedEngine:
                                        self.load_seconds(spec))
             if loaded["status"] in {"cancelled", "timed_out"}:
                 self.lock.invalidate()
-                if self._stopping.is_set():
-                    raise EngineError("Engine is stopping", 503)
+                self._check_stopping()
                 return loaded["status"]
             if loaded["status"] != "completed":
                 raise EngineError(loaded.get("error") or "Engine loading failed")
-            self._loaded(candidate_id)
-            self.lock.configure(candidate_id, self.admitted(loaded.get("max_concurrent_requests", 1)))
+            self._loaded(candidate_id, loaded)
         except BaseException as exc:
             if not self._stopping.is_set():
                 self._retire(exc)
             raise
         return None
 
-    def _loaded(self, candidate_id):
-        """Count a completed load for GET /metrics, before admission lets other requests in."""
+    def _loaded(self, candidate_id, loaded):
+        """A completed load: counted for GET /metrics, then admission runs as many of the candidate's requests at once
+        as the engine declares (admitted)."""
         if self.last_load not in (None, candidate_id):
             self.switches += 1
         self.loads += 1
         self.last_load = candidate_id
+        self.lock.configure(candidate_id, self.admitted(loaded.get("max_concurrent_requests", 1)))
 
     def load(self, stop, candidate_id=None):
         """Load the candidate's engine (default: the default candidate's) without generating, as a request would:
@@ -795,14 +797,9 @@ class ServedEngine:
         candidate_id = candidate_id or self.default
         needs_load = self._admit(candidate_id, stop)
         if needs_load is None:
-            if self._stopping.is_set():
-                raise EngineError("Engine is stopping", 503)
             return "cancelled"
         try:
-            if self._stopping.is_set():
-                raise EngineError("Engine is stopping", 503)
-            if self.ownership.blocked:
-                raise EngineError("Runtime cleanup is unresolved: " + self.ownership.blocked, 503)
+            self._check_running()
             loaded = self._load(self.spec(candidate_id), candidate_id, stop) if needs_load else None
             return loaded or "completed"
         finally:
@@ -819,10 +816,9 @@ class ServedEngine:
         elif not self.lock.acquire(blocking=False):
             return False
         try:
-            if self.closed or self._stopping.is_set():
+            if self.closed:
                 raise EngineError("Engine is stopping", 503)
-            if self.ownership.blocked:
-                raise EngineError("Runtime cleanup is unresolved: " + self.ownership.blocked, 503)
+            self._check_running()
             status = self.runtime.status()
             if (not status.get("engine") or (candidate_id is not None and not self.loaded(candidate_id, status))
                     or (idle is not None and time.monotonic() - self.lock.used < idle)):
@@ -871,16 +867,11 @@ class ServedEngine:
         candidate_id = candidate_id or self.default
         needs_load = self._admit(candidate_id, stop)
         if needs_load is None:
-            if self._stopping.is_set():
-                raise EngineError("Engine is stopping", 503)
             return "cancelled", None, None
         try:
             if stop.is_set():
                 return "cancelled", None, None
-            if self._stopping.is_set():
-                raise EngineError("Engine is stopping", 503)
-            if self.ownership.blocked:
-                raise EngineError("Runtime cleanup is unresolved: " + self.ownership.blocked, 503)
+            self._check_running()
             spec = self.spec(candidate_id)
             if SCORE_CAPABILITY not in spec["capabilities"]:
                 raise EngineError("This engine package does not declare " + SCORE_CAPABILITY, 400)
@@ -896,32 +887,11 @@ class ServedEngine:
                              prompt_ids=list(prompt_ids), continuation_ids=list(continuation_ids),
                              top_logprobs=top_logprobs, prompt_rows=bool(prompt_rows), format="packed",
                              limits={"kv_tokens": limits["kv_tokens"], "timeout_seconds": self.timeout})
-            try:
-                result = self.runtime.call("score", {"spec": spec, "request": request},
-                                           _CommandStop(stop, self._stopping), self.timeout, request=request,
+            status, scored = self._command("score", spec, request, stop, self.timeout,
+                                           lambda response, request: score_reply(response, request, packed),
                                            on_started=on_started)
-            except BaseException as exc:
-                self._retire(exc)
-                if isinstance(exc, (ValueError, OSError)):
-                    if self._stopping.is_set():
-                        raise EngineError("Engine is stopping", 503) from exc
-                    raise EngineError("Engine host failed: " + str(exc)) from exc
-                raise
-            if result["status"] in {"cancelled", "timed_out"}:
-                if self._stopping.is_set():
-                    raise EngineError("Engine is stopping", 503)
-                return result["status"], None, None
-            if result["status"] == "rejected":
-                raise rejected(result)
-            if result["status"] != "completed":
-                self._retire(result["error"])
-                raise EngineError(result["error"] or "Engine failed the request")
-            try:
-                scored = score_reply(result["response"], request, packed)
-                self._check_sealed(spec)
-            except (ValueError, OSError, KeyError, TypeError) as exc:
-                self._retire(exc)
-                raise EngineError("Engine returned an invalid response: " + str(exc)) from exc
+            if status != "completed":
+                return status, None, None
             return "completed", {"prompt": scored["prompt"], "continuation": scored["continuation"]}, scored["telemetry"]
         finally:
             self.lock.release()
@@ -935,8 +905,7 @@ class ServedEngine:
         client's disconnect) cancels that wait and load as a reply's, a 499. Returns TOKENIZED[operation]:
         {"tokens"}, {"prompt", "tokens"} or {"prompt"}."""
         candidate_id = candidate_id or self.default
-        if self._stopping.is_set():
-            raise EngineError("Engine is stopping", 503)
+        self._check_stopping()
         spec = self.spec(candidate_id)
         if TOKENIZE_CAPABILITY not in spec["capabilities"]:
             raise EngineError("This engine package does not declare " + TOKENIZE_CAPABILITY, 404)
@@ -951,16 +920,11 @@ class ServedEngine:
         # full queue refuses it as a reply (Overloaded).
         needs_load = self._admit(candidate_id, stop)
         if needs_load is None:
-            if self._stopping.is_set():
-                raise EngineError("Engine is stopping", 503)
             raise EngineError("Request cancelled", 499)
         try:
             if stop.is_set():
                 raise EngineError("Request cancelled", 499)
-            if self._stopping.is_set():
-                raise EngineError("Engine is stopping", 503)
-            if self.ownership.blocked:
-                raise EngineError("Runtime cleanup is unresolved: " + self.ownership.blocked, 503)
+            self._check_running()
             loaded = self._load(spec, candidate_id, stop) if needs_load else None
             if loaded == "timed_out":
                 raise EngineError("The engine did not load within its load timeout", 504)

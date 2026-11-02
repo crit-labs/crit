@@ -3,6 +3,7 @@
 // dense law, speculative verification equal to Core's own draws (greedy drafts) or the rejection rule (sampled
 // drafts), first-token frequencies equal to the target law for both, and device commits of counts and positions.
 #include "sampling.h"
+#include "device_buffer.h"
 
 #include <crit/sampling.h>
 
@@ -24,23 +25,9 @@ namespace ts = crit::techniques::token_sampling;
 
 namespace {
 void require(bool c, const std::string& m) { if(!c) throw std::runtime_error(m); }
-void ok(cudaError_t e, const char* what) { if(e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e)); }
+using crit::inference_tests::ok;
 
-template<class T> struct Device {
-    T* p = nullptr;
-    std::size_t n = 0;
-    explicit Device(std::size_t count) : n(count) { ok(cudaMalloc(&p, sizeof(T) * std::max<std::size_t>(count, 1)), "malloc"); }
-    explicit Device(const std::vector<T>& v) : Device(v.size()) { put(v); }
-    ~Device() { cudaFree(p); }
-    Device(const Device&) = delete;
-    Device& operator=(const Device&) = delete;
-    void put(const std::vector<T>& v) { ok(cudaMemcpy(p, v.data(), sizeof(T) * v.size(), cudaMemcpyHostToDevice), "upload"); }
-    std::vector<T> get() const {
-        std::vector<T> v(n);
-        ok(cudaMemcpy(v.data(), p, sizeof(T) * n, cudaMemcpyDeviceToHost), "download");
-        return v;
-    }
-};
+using crit::inference_tests::Device;
 
 // One request's processing on both sides: the device Request and Core's SamplingParams plus history.
 struct Case {

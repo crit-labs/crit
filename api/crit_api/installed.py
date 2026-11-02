@@ -2,9 +2,10 @@
 from crit.pull.store import InstallStore, engine_id
 from crit.run.store import ROOT
 
-from .engine import CAPABILITY, EngineError, ServedEngine, package_signature
+from crit_core.serving import JSON_CAPABILITY as CAPABILITY, RESIDENT_CAPABILITY
+
+from .engine import EngineError, ServedEngine, package_signature
 from .options import serving_capabilities
-from .residency import CAPABILITY as RESIDENT_CAPABILITY
 
 
 def installed_spec(installs, engine, verify_model=False):

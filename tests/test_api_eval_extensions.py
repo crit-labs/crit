@@ -8,7 +8,7 @@ import threading
 import unittest
 
 from test_api_score import SCORE_ADAPTER
-from test_chat_residency import ServeFixture
+from support.serve import ServeFixture
 from crit_api.engine import telemetry
 from crit_api.server import Api, Server
 from crit_core.serving import ResidentChat, capabilities, engine_facts

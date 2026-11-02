@@ -46,9 +46,10 @@ through a mapping. [host_block.h](../../include/crit/host_block.h) ([host_block.
 - `HostBlock(bytes)`: page-aligned anonymous pages (mmap / VirtualAlloc), not pinned. Fill it with the loader's
   threads, then pin it once with `cuda_pin_host_block(backend, block, touch_threads)` from
   [cuda_memory.h](../../include/crit/cuda_memory.h): page faults run in parallel during the fill and the
-  registration is one call. Under WSL2 `cudaMallocHost` of 60 GB took about 90 s; fill-then-register took 35 s.
-  `touch(threads)` reads every page once; after a registration under WSL2 the first CPU read of each page was slow
-  (about 10 s over 60 GB on an engine's first request), so pin it with touch threads when the CPU reads the block.
+  registration is one call. On one RTX 5090 machine under WSL2, `cudaMallocHost` of 60 GB took about 90 s;
+  fill-then-register took 35 s. `touch(threads)` reads every page once; after a registration there the first CPU
+  read of each page was slow (about 10 s over 60 GB on an engine's first request), so pin it with touch threads when
+  the CPU reads the block.
   The registration is attached to the block and ends before the pages are freed; spans must not outlive the block.
 - `HostBlockPool::process()`: blocks kept between engines opened one after another in one process (Eval rounds,
   serve switches). `acquire(key, bytes, keep, &reused, identity)` returns the cached block when key, size

@@ -11,8 +11,9 @@ from pathlib import Path
 import subprocess
 import sys
 
-from crit.run.records import read_json
-from crit.run.store import ROOT
+from crit.card import CARD, read_card
+from crit.cli import default_project
+from crit.records import read_json
 
 from .cli import log
 from .store import InstallStore, engine_id
@@ -24,10 +25,9 @@ def report(engine, result_path, hub, by, store, gpu=None, model=None):
     hub = Path(hub).expanduser().resolve()
     folder = hub / "engines" / engine
     tool = hub / "tools" / "add_result.py"
-    if not (folder / "card.yaml").is_file() or not tool.is_file():
+    if not (folder / CARD).is_file() or not tool.is_file():
         raise ValueError(f"{hub} is not a crit-hub checkout with engines/{engine}/ and tools/add_result.py")
-    from crit.run.hub import _yaml
-    card = _yaml().safe_load((folder / "card.yaml").read_text(encoding="utf-8"))
+    card = read_card(folder / CARD)
     install = store.get(engine)
     result = read_json(Path(result_path), max_bytes=256 << 20)
     revision = install["source"]["revision"]
@@ -45,7 +45,8 @@ def report(engine, result_path, hub, by, store, gpu=None, model=None):
     return subprocess.run(command, cwd=hub).returncode
 
 
-def main(argv=None):
+def parser():
+    """The arguments of crit hub (crit mcp offers its tools from them)."""
     parser = argparse.ArgumentParser(prog="crit hub", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -57,9 +58,14 @@ def main(argv=None):
     add.add_argument("--gpu", help="The GPU id, when the result's device does not name it (e.g. rtx5090)")
     add.add_argument("--model", help="The card's model id, when the result names no checkpoint")
     add.add_argument("--store", type=Path, help="Engine store (default: PROJECT/engines)")
-    add.add_argument("--project", type=Path, default=ROOT if (ROOT / "core/include/crit/core.h").is_file() else Path.cwd(),
+    add.add_argument("--project", type=Path, default=default_project(),
                      help="crit repository (default: this checkout)")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv=None):
+    command = parser()
+    args = command.parse_args(argv)
     try:
         code = report(args.engine, args.result, args.hub, args.by, InstallStore(args.store or args.project / "engines"),
                       args.gpu, args.model)

@@ -34,7 +34,7 @@ from types import MappingProxyType
 from crit_core.files import ModelFiles, _read_regular
 
 from .config import CONFIG_NAME, load_model_config, parse_model_config
-from .gguf import PROJECTOR, SUFFIX as GGUF_SUFFIX, GgufError, check_gguf_folder, inspect_gguf_model
+from .gguf import PROJECTOR, SUFFIX as GGUF_SUFFIX, check_gguf_folder, inspect_gguf_model
 from .gguf_files import GROUPS, derived_files
 from .safetensors import INDEX_SUFFIX, inspect_model, inspect_safetensors
 from . import onnx, torch_pickle

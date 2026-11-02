@@ -4,6 +4,7 @@ import json
 import threading
 import unittest
 import urllib.request
+from unittest.mock import patch
 
 from test_run_measure import MeasureFixture
 from crit.run import served
@@ -56,6 +57,15 @@ class RunServeTests(MeasureFixture, unittest.TestCase):
         self.assertEqual(out["result"], result)
         log = self.directory / result["logs"][0]["path"]
         self.assertIn("not sealed", log.read_text(encoding="utf-8"))
+
+    def test_a_terminated_serve_settles_as_interrupted_and_exits(self):
+        """crit run turns SIGTERM into SystemExit (run/cli.py): the check attempt settles as interrupted."""
+        candidate = self.served()
+        with patch.object(served.Served, "open", side_effect=SystemExit(143)):
+            with self.assertRaises(SystemExit):
+                served.serve(self.store, self.run_id, candidate, port=0)
+        result = self.attempt()
+        self.assertEqual((result["outcome"], result["cleanup_settled"]), ("interrupted", True))
 
     def test_refuses_a_sealed_or_unpackaged_candidate(self):
         unpackaged = self.candidate()["candidate_id"]

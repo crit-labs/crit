@@ -7,7 +7,7 @@ import sys
 import time
 import uuid
 
-from crit.run.records import keys, read_json, write_json
+from crit.records import keys, read_json, write_json
 
 from .ownership import RETIREMENT_SECONDS, group_alive, process_identity
 

@@ -4,14 +4,15 @@ the chat templates and generation_config.json, so a lone .gguf is a whole model 
 GGUF's reference converter writes everything a runtime needs into the GGUF: the shapes and hyperparameters under
 <architecture>.*, the vocabulary, merges and special tokens under tokenizer.ggml.*, the chat templates under
 tokenizer.chat_template*. Each file here is the Hugging Face form of exactly that, for the GGUF's meaning as
-its reference runtime defines it (where that runtime fixes a behaviour for an architecture, such as Qwen3 MoE always
-renormalising its top-k expert weights, the config states it):
+its reference runtime defines it:
 
-    config.json             CONFIG_RULES per general.architecture: the inverse of the converter's
-                            set_gguf_parameters for that architecture, with model_type and architectures for
-                            transformers. Another architecture gets the generic shape keys (layers, width, heads,
-                            head size, MLP width, experts, context, RoPE base, vocabulary) when its metadata holds
-                            nothing the generic keys cannot say (sliding windows, latent attention, recurrent
+    config.json             the config rule registered for general.architecture (crit_core.registry gguf_config:
+                            the inverse of the converter's set_gguf_parameters for that architecture, with
+                            model_type and architectures for transformers; crit-eval's architectures give the ones
+                            its reference reads), built on the generic keys below (base_config, expert_config,
+                            layer_flag). An architecture without a rule gets the generic shape keys (layers, width,
+                            heads, head size, MLP width, experts, context, RoPE base, vocabulary) when its metadata
+                            holds nothing the generic keys cannot say (sliding windows, latent attention, recurrent
                             layers, ...), and is refused otherwise.
     tokenizer.json          byte-level BPE (tokenizer.ggml.model "gpt2") with the pre-tokenizer PRE_TOKENIZERS
                             gives tokenizer.ggml.pre: the regex, normalizer and ignore_merges of the Hugging Face
@@ -23,13 +24,15 @@ renormalising its top-k expert weights, the config states it):
                             ends generation on) and general.sampling.* defaults.
 
 FLOAT32 values become the shortest decimal that rounds to the stored float, which is the decimal config.json held.
-Every derivation is tested against the original files of models converted by the reference converter, and the
-tokenizer against its own vocabulary test sets (Hugging Face tokenizations of hard inputs).
+Every derivation is tested against the original files of models converted by the reference converter (the config
+rules with them, in crit-eval), and the tokenizer against its own vocabulary test sets (Hugging Face tokenizations
+of hard inputs).
 """
 import json
 import math
 import struct
 
+from .. import registry
 from .gguf import GgufError
 
 # tokenizer.ggml.token_type values (the reference runtime's llama_token_type).
@@ -78,8 +81,9 @@ def decimal(value, value_type="FLOAT32"):
     return value
 
 
-class _Reader:
-    """The GGUF's metadata with its value types, read as config.json values."""
+class MetadataReader:
+    """The GGUF's metadata with its value types, read as config.json values: get(".key") is <architecture>.key,
+    get("key") the key as named. Config rules take one as `get`."""
 
     def __init__(self, model):
         self.model = model
@@ -119,78 +123,15 @@ class _Reader:
         return value
 
 
-def _tensor_f32(tensor):
-    """The values of a small F32 tensor (rope_freqs), read from its file."""
-    if tensor.dtype != "F32" or tensor.nbytes > 1 << 20:
-        raise GgufError(f"{tensor.name}: expected a small F32 tensor, found {tensor.dtype} of {tensor.nbytes} bytes")
-    with open(tensor.shard, "rb") as handle:
-        handle.seek(tensor.data_begin)
-        data = handle.read(tensor.nbytes)
-    if len(data) != tensor.nbytes:
-        raise GgufError(f"{tensor.name}: the file ends inside the tensor")
-    return struct.unpack(f"<{tensor.nbytes // 4}f", data)
-
-
-def _llama3_rope(factors, theta, head_dim):
-    """The rope_parameters of Llama 3's frequency scaling whose per-dimension factors (the GGUF's rope_freqs tensor,
-    written by LlamaModel.generate_extra_tensors) are `factors`: the factor is their largest value; the original
-    context and the low and high frequency factors are the released values that reproduce every factor."""
-    factor = max(factors)
-    freqs = [1.0 / (theta ** (i / head_dim)) for i in range(0, head_dim, 2)]
-    for original in (8192, 4096, 2048, 16384, 32768, 65536, 131072):
-        for low in (1.0, 2.0, 0.5):
-            for high in (4.0, 8.0, 2.0, 1.0):
-                if high <= low:
-                    continue
-                expected = []
-                for freq in freqs:
-                    wavelen = 2 * math.pi / freq
-                    if wavelen < original / high:
-                        expected.append(1.0)
-                    elif wavelen > original / low:
-                        expected.append(factor)
-                    else:
-                        smooth = (original / wavelen - low) / (high - low)
-                        expected.append(1 / ((1 - smooth) / factor + smooth))
-                if len(expected) == len(factors) and all(math.isclose(a, b, rel_tol=1e-5)
-                                                         for a, b in zip(expected, factors)):
-                    return {"rope_type": "llama3", "factor": decimal(factor), "low_freq_factor": low,
-                            "high_freq_factor": high, "original_max_position_embeddings": original}
-    raise GgufError("rope_freqs.weight holds frequency factors no Llama 3 rope scaling reproduces; the config rules "
-                    "cannot state them")
-
-
-def _rope(get, model, head_dim, rotary_dim=None):
-    """rope_parameters from <arch>.rope.*: the base, and linear, YaRN or (with a rope_freqs tensor) Llama 3 scaling."""
-    rope = {"rope_type": "default", "rope_theta": get(".rope.freq_base", 10000.0)}
-    kind = get(".rope.scaling.type")
-    if kind in ("linear", "yarn"):
-        rope.update(rope_type=kind, factor=get(".rope.scaling.factor"))
-        if kind == "yarn":
-            rope["original_max_position_embeddings"] = get(".rope.scaling.original_context_length")
-            for key, name in ((".rope.scaling.yarn_beta_fast", "beta_fast"), (".rope.scaling.yarn_beta_slow",
-                              "beta_slow"), (".rope.scaling.yarn_attn_factor", "attention_factor"),
-                              (".rope.scaling.yarn_ext_factor", "extrapolation_factor"),
-                              (".rope.scaling.yarn_truncate", "truncate")):
-                if get(key) is not None:
-                    rope[name] = get(key)
-    elif kind not in (None, "none"):
-        raise GgufError(f"{model.architecture}.rope.scaling.type {kind!r} has no config rule")
-    freqs = model.tensors.get("rope_freqs.weight")
-    if freqs is not None:
-        if kind not in (None, "none"):
-            raise GgufError("the GGUF has rope_freqs.weight and rope.scaling.type; the config rules take one of them")
-        rope.update(_llama3_rope(_tensor_f32(freqs), rope["rope_theta"], rotary_dim or head_dim))
-    return rope
-
-
 def _has(model, part, layers):
     """Whether every one of the `layers` blocks has tensor blk.<i>.<part>, or none does (None when only some do)."""
     found = {f"blk.{i}.{part}" in model.tensors for i in layers}
     return found.pop() if len(found) == 1 else None
 
 
-def _same(model, part, layers, label):
+def layer_flag(model, part, layers, label):
+    """Whether the `layers` blocks have tensor blk.<i>.<part> (such as attn_q.bias): every one or none, since
+    config.json has one `label` flag for every layer; GgufError when only some do."""
     flag = _has(model, part, layers)
     if flag is None:
         raise GgufError(f"only some layers have {part}; config.json has one {label} flag for every layer")
@@ -205,8 +146,9 @@ def _vocab_rows(model, get):
     return get(".vocab_size") or (len(tokens) if tokens else None)
 
 
-def _base(model, get):
-    """The keys every decoder config shares, from the GGUF's shape metadata."""
+def base_config(model, get):
+    """(config, text layers, draft layers): the keys every decoder config shares, from the GGUF's shape metadata, the
+    range of the blocks that are text layers and the count of draft (nextn) blocks after them."""
     drafts = get(".nextn_predict_layers") or 0
     blocks = get.require(".block_count", "block count")
     heads = get.require(".attention.head_count", "attention head count")
@@ -236,109 +178,14 @@ def _base(model, get):
     return {key: value for key, value in config.items() if value is not None}, range(blocks - drafts), drafts
 
 
-def _llama(model, get):
-    config, layers, _ = _base(model, get)
-    rotary = get(".rope.dimension_count")
-    if rotary is not None and rotary != config["head_dim"]:
-        raise GgufError(f"llama rotates {rotary} of {config['head_dim']} head dimensions; Llama rotates all")
-    return {"architectures": ["LlamaForCausalLM"], "model_type": "llama", **config,
-            "rope_parameters": _rope(get, model, config["head_dim"]),
-            "attention_bias": _same(model, "attn_q.bias", layers, "attention bias"),
-            "mlp_bias": _same(model, "ffn_up.bias", layers, "MLP bias")}
-
-
-def _qwen2(model, get):
-    config, layers, _ = _base(model, get)
-    if not _same(model, "attn_q.bias", layers, "attention bias"):
-        raise GgufError("a Qwen2 GGUF without query/key/value biases is not Qwen2 (its projections always have them)")
-    return {"architectures": ["Qwen2ForCausalLM"], "model_type": "qwen2", **config,
-            "rope_parameters": _rope(get, model, config["head_dim"]), "use_sliding_window": False}
-
-
-def _qwen3(model, get):
-    config, layers, _ = _base(model, get)
-    return {"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3", **config,
-            "rope_parameters": _rope(get, model, config["head_dim"]),
-            "attention_bias": _same(model, "attn_q.bias", layers, "attention bias"), "use_sliding_window": False}
-
-
-def _experts(model, get, layers):
-    """The routed-expert keys, and the dense (MLP-only) layers among `layers`."""
+def expert_config(model, get, layers):
+    """(keys, dense layers): the routed-expert keys, and the dense (MLP-only) layers among `layers`."""
     dense = [i for i in layers if f"blk.{i}.ffn_gate_inp.weight" not in model.tensors]
     return {"num_experts": get.require(".expert_count", "expert count"),
             "num_experts_per_tok": get.require(".expert_used_count", "experts per token"),
             "moe_intermediate_size": get.require(".expert_feed_forward_length", "expert MLP width")}, dense
 
 
-def _qwen3moe(model, get):
-    config, layers, _ = _base(model, get)
-    experts, dense = _experts(model, get, layers)
-    # The reference runtime's qwen3moe graph always renormalises the top-k weights (build_moe_ffn norm_w).
-    return {"architectures": ["Qwen3MoeForCausalLM"], "model_type": "qwen3_moe", **config, **experts,
-            "norm_topk_prob": True, "decoder_sparse_step": 1, "mlp_only_layers": dense,
-            "rope_parameters": _rope(get, model, config["head_dim"]),
-            "attention_bias": _same(model, "attn_q.bias", layers, "attention bias"), "use_sliding_window": False}
-
-
-def _qwen35(model, get, moe=False):
-    config, layers, drafts = _base(model, get)
-    count = config["num_hidden_layers"]
-    recurrent = get(".attention.recurrent_layers")
-    if recurrent is not None:
-        kinds = ["linear_attention" if flag else "full_attention" for flag in recurrent[:count]]
-    else:
-        interval = get(".full_attention_interval", 4)
-        kinds = ["full_attention" if (i + 1) % interval == 0 else "linear_attention" for i in range(count)]
-    state, value_heads = get.require(".ssm.state_size"), get.require(".ssm.time_step_rank")
-    inner = get.require(".ssm.inner_size")
-    rotary = get(".rope.dimension_count")
-    rope = _rope(get, model, config["head_dim"])
-    rope["partial_rotary_factor"] = rotary / config["head_dim"] if rotary else 0.25
-    sections = get(".rope.dimension_sections")
-    if sections:
-        rope["mrope_section"] = list(sections[:3])
-        rope["mrope_interleaved"] = True
-    out = {"architectures": ["Qwen3_5MoeForCausalLM" if moe else "Qwen3_5ForCausalLM"],
-           "model_type": "qwen3_5_moe_text" if moe else "qwen3_5_text", **config,
-           "layer_types": kinds, "full_attention_interval": get(".full_attention_interval", 4),
-           "linear_conv_kernel_dim": get.require(".ssm.conv_kernel"), "linear_key_head_dim": state,
-           "linear_value_head_dim": inner // value_heads, "linear_num_key_heads": get.require(".ssm.group_count"),
-           "linear_num_value_heads": value_heads, "rope_parameters": rope, "attn_output_gate": True,
-           "attention_bias": False, "mtp_num_hidden_layers": drafts}
-    if moe:
-        experts, dense = _experts(model, get, layers)
-        if dense:
-            raise GgufError(f"Qwen3.5 MoE layers {dense} have no router; every layer of the architecture has experts")
-        out.update(experts)
-        shared = get(".expert_shared_feed_forward_length")
-        if shared is not None:
-            out["shared_expert_intermediate_size"] = shared
-        out.pop("intermediate_size", None)
-    return out
-
-
-def _deepseek4(model, get):
-    from .gguf_deepseek4 import deepseek4_config
-    return deepseek4_config(model, get)
-
-
-def _qwen4exp(model, get):
-    from .gguf_qwen4exp import qwen4exp_config
-    return qwen4exp_config(model, get, _qwen35(model, get, moe=True))
-
-
-# general.architecture -> the inverse of the converter's set_gguf_parameters for it (crit_eval.architectures.gguf_layout holds
-# the inverse of its tensor transforms for the same architectures).
-CONFIG_RULES = {
-    "llama": _llama,
-    "qwen2": _qwen2,
-    "qwen3": _qwen3,
-    "qwen3moe": _qwen3moe,
-    "qwen35": _qwen35,
-    "qwen35moe": lambda model, get: _qwen35(model, get, moe=True),
-    "deepseek4": _deepseek4,
-    "qwen4exp": _qwen4exp,
-}
 # Metadata the generic keys cannot say: an architecture with any of it needs its own rule.
 _BEYOND_GENERIC = (".attention.sliding_window", ".attention.sliding_window_pattern", ".attention.kv_lora_rank",
                    ".attention.q_lora_rank", ".attention.recurrent_layers", ".full_attention_interval",
@@ -347,24 +194,26 @@ _BEYOND_GENERIC = (".attention.sliding_window", ".attention.sliding_window_patte
 
 
 def derive_config(model):
-    """config.json for a GgufModel (crit_core.model.gguf), as a dict."""
-    get = _Reader(model)
-    rule = CONFIG_RULES.get(model.architecture)
+    """config.json for a GgufModel (crit_core.model.gguf), as a dict: by the rule registered for its architecture
+    (crit_core.registry gguf_config), else from the generic keys."""
+    get = MetadataReader(model)
+    rules = registry.entries("gguf_config")
+    rule = rules.get(model.architecture)
     if rule is not None:
         return rule(model, get)
     beyond = [f"{model.architecture}{key}" for key in _BEYOND_GENERIC if get.has(key)]
     if beyond:
-        raise GgufError(f"GGUF architecture {model.architecture!r} has no config rules in crit_core.model.gguf_files "
-                        f"(supported: {', '.join(sorted(CONFIG_RULES))}) and its metadata needs them "
+        raise GgufError(f"GGUF architecture {model.architecture!r} has no config rule (crit_core.registry gguf_config; "
+                        f"registered: {', '.join(sorted(rules)) or 'none'}) and its metadata needs one "
                         f"({', '.join(beyond)}); put the base model's config.json beside the GGUF")
-    config, layers, _ = _base(model, get)
+    config, layers, _ = base_config(model, get)
     rotary = get(".rope.dimension_count")
     rope = {"rope_type": "default", "rope_theta": get(".rope.freq_base", 10000.0)}
     if rotary and rotary != config["head_dim"]:
         rope["partial_rotary_factor"] = rotary / config["head_dim"]
     config["rope_parameters"] = rope
     if get(".expert_count"):
-        config.update(_experts(model, get, layers)[0])
+        config.update(expert_config(model, get, layers)[0])
     return config
 
 
@@ -376,7 +225,7 @@ def _byte_level():
 
 def derive_tokenizer(model):
     """tokenizer.json for a GgufModel with a byte-level BPE vocabulary, as a dict."""
-    get = _Reader(model)
+    get = MetadataReader(model)
     kind = get("tokenizer.ggml.model")
     if kind != "gpt2":
         raise GgufError(f"tokenizer.json is derived for byte-level BPE vocabularies (tokenizer.ggml.model 'gpt2'); "
@@ -439,7 +288,7 @@ def _token(get, key):
 
 
 def derive_tokenizer_config(model):
-    get = _Reader(model)
+    get = MetadataReader(model)
     config = {"tokenizer_class": "PreTrainedTokenizerFast"}
     for key, name in (("bos", "bos_token"), ("eos", "eos_token"), ("padding", "pad_token"), ("unknown", "unk_token")):
         token = _token(get, f"tokenizer.ggml.{key}_token_id")
@@ -455,7 +304,7 @@ def derive_tokenizer_config(model):
 
 def derive_templates(model):
     """{file name: template source}: chat_template.jinja and additional_chat_templates/<name>.jinja."""
-    get = _Reader(model)
+    get = MetadataReader(model)
     out = {}
     if isinstance(get("tokenizer.chat_template"), str):
         out["chat_template.jinja"] = get("tokenizer.chat_template")
@@ -469,7 +318,7 @@ def derive_templates(model):
 
 
 def derive_generation(model):
-    get = _Reader(model)
+    get = MetadataReader(model)
     tokens = get("tokenizer.ggml.tokens") or ()
     types = get("tokenizer.ggml.token_type") or ()
     eos = [get(f"tokenizer.ggml.{key}_token_id") for key in ("eos", "eot", "eom")]

@@ -22,7 +22,8 @@ class SamplingValidationTests(unittest.TestCase):
                             ("min_p", float("nan")), ("repetition_penalty", 0),
                             ("frequency_penalty", float("inf")), ("presence_penalty", -3),
                             ("logit_bias", {"01": 1}), ("logit_bias", {"1": float("nan")}),
-                            ("logit_bias", {"1": True}), ("logit_bias", {"2147483648": 1})):
+                            ("logit_bias", {"1": True}), ("logit_bias", {"2147483648": 1}), ("min_tokens", -1),
+                            ("min_tokens", 2**32), ("min_tokens", 1.5), ("min_tokens", True)):
             with self.subTest(name=name, value=value), self.assertRaises(RequestError):
                 sampling_options({name: value}, caps)
         for name in SAMPLING:
@@ -122,8 +123,8 @@ class RequestOptionsTests(test_api.ApiTests):
     request_options = True
 
     def test_sampling_reaches_adapter_and_does_not_leak_to_next_turn_or_switch(self):
-        options = dict(temperature=.7, top_p=.9, top_k=12, min_p=.1, seed=42,
-                       presence_penalty=.5, frequency_penalty=-.5, repetition_penalty=1.1, logit_bias={"12": -2})
+        options = dict(temperature=.7, top_p=.9, top_k=12, min_p=.1, seed=42, presence_penalty=.5,
+                       frequency_penalty=-.5, repetition_penalty=1.1, logit_bias={"12": -2}, min_tokens=3)
         response, value = self.chat("echo-request", **options)
         self.assertEqual(response.status, 200, value)
         self.assertIsNone(response.getheader("X-Crit-Ignored-Parameters"))

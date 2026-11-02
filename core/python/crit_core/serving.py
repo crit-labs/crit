@@ -64,7 +64,6 @@ declares where the templates teach a format): with limits.thinking_tokens a gene
 would pass it, the reply gets the format's closing marker and generate_prepared continues from the prompt plus the
 reply so far, within the same output cap.
 """
-from pathlib import Path
 from contextlib import contextmanager
 from dataclasses import dataclass
 import array
@@ -72,7 +71,27 @@ import base64
 import sys
 
 SAMPLING = ("temperature", "top_p", "top_k", "min_p", "seed", "presence_penalty", "frequency_penalty",
-            "repetition_penalty", "logit_bias")
+            "repetition_penalty", "logit_bias", "min_tokens")
+# The package capabilities a resident package declares and crit serve reads (docs/SERVING.md), each named once here;
+# a request's sampling field `name` has its own, sampling_capability(name).
+JSON_CAPABILITY = "chat-json-v1"
+RESIDENT_CAPABILITY = "chat-resident-v1"
+STREAM_CAPABILITY = "chat-stream-v1"
+CONFIG_CAPABILITY = "chat-config-v1"
+IMAGES_CAPABILITY = "chat-images-v1"
+CONCURRENT_CAPABILITY = "chat-concurrent-v1"
+TOOLS_CAPABILITY = "chat-tools-v1"
+STRICT_TOOLS_CAPABILITY = "chat-tools-strict-v1"
+TOOL_STREAM_CAPABILITY = "chat-tool-stream-v1"
+TOOL_CHOICE_CAPABILITY = "chat-tool-choice-v1"   # tool_choice required or a named function: the adapter forces a call
+# Declared by packages sealed before crit 0.2.2 with the interim template tools. Their adapters are ResidentChats, which
+# now parse calls themselves, so it reads as chat-tools-v1 (and chat-tool-stream-v1 when the package streams), with
+# tool_choice auto or none.
+TOOL_TEMPLATE_CAPABILITY = "chat-tool-template-v1"
+# The adapter applies a request's response_format (crit_core.constraints / crit/constraints.h); see docs/SERVING.md.
+CONSTRAINTS_CAPABILITY = "chat-constraints-v1"
+# With it, also a response_format of type grammar: any compiled grammar (structured_outputs regex, choice, grammar).
+GRAMMAR_CAPABILITY = "chat-constraints-grammar-v1"
 LOGPROBS_CAPABILITY = "chat-logprobs-v1"
 SCORE_CAPABILITY = "chat-score-v1"
 PLAIN_CAPABILITY = "chat-plain-v1"
@@ -89,6 +108,12 @@ THINKING_BUDGET_CAPABILITY = "chat-thinking-budget-v1"
 # keeps no prompt cache (crit-eval then sends it no follow-up turns).
 ENGINE_FACTS = ("speculative", "plain", "draft_width", "bytes_per_pass", "host_bytes_per_pass", "draft_bytes_per_step",
                 "draft_ms", "kv_bytes_per_token", "prompt_activations", "prompt_cache")
+# What a generation's timing may report beside its phases, for crit serve's telemetry and an Eval adapter's results:
+# the drafting facts (drafts accepted and made per round, device time in verify passes and draft steps), which plain
+# decoding has none of, and the device expert cache's routed reads and hits, which every decode has.
+DRAFT_FACTS = ("accepted", "drafted", "verify_ms", "draft_ms")
+EXPERT_FACTS = ("expert_reads", "expert_hits")
+REQUEST_FACTS = DRAFT_FACTS + EXPERT_FACTS
 # The activation formats crit-eval prices a quantized matrix group's prompt GEMMs at (its ceiling.ACTIVATIONS).
 PROMPT_ACTIVATIONS = ("bf16", "fp16_acc", "fp8", "stored")
 TOP_LOGPROBS = 20  # the most alternatives per token a request asks for (OpenAI's top_logprobs range)
@@ -102,7 +127,7 @@ TEMPLATE_KWARGS = {"enable_thinking": (False, True), "thinking": (False, True),
 
 
 def sampling_capability(name):
-    """The package capability that lets crit serve forward request field `name` (same rule as crit_api.options)."""
+    """The package capability that lets crit serve forward request field `name`."""
     return "chat-sampling-" + name.replace("_", "-") + "-v1"
 
 
@@ -179,20 +204,20 @@ def capabilities(text, sampling=(), *, stream=True, config=True, tool_format=Non
     unknown = sorted(set(sampling) - set(SAMPLING))
     if unknown:
         raise ValueError("Unknown sampling fields: " + ", ".join(unknown))
-    result = ["chat-json-v1", "chat-resident-v1", FIT_OUTPUT_CAPABILITY]
-    result += ["chat-stream-v1"] if stream else []
-    result += ["chat-config-v1"] if config else []
+    result = [JSON_CAPABILITY, RESIDENT_CAPABILITY, FIT_OUTPUT_CAPABILITY]
+    result += [STREAM_CAPABILITY] if stream else []
+    result += [CONFIG_CAPABILITY] if config else []
     result += [CONTINUE_CAPABILITY] if continuation else []
     result += [COMPLETION_CAPABILITY] if (not images if completion is None else completion) else []
     result += [TOKENIZE_CAPABILITY] if tokenize else []
-    result += ["chat-images-v1"] if images else []
-    result += ["chat-concurrent-v1"] if concurrent else []
+    result += [IMAGES_CAPABILITY] if images else []
+    result += [CONCURRENT_CAPABILITY] if concurrent else []
     result += [LOGPROBS_CAPABILITY] if logprobs else []
     result += [SCORE_CAPABILITY] if score else []
     result += [PLAIN_CAPABILITY] if plain else []
     if tool_format is not None or template_tool_format(text):
-        result += ["chat-tools-v1"] + (["chat-tool-stream-v1"] if stream else [])
-        result += ["chat-tool-choice-v1"] if grammars and forces_calls(text, tool_format) else []
+        result += [TOOLS_CAPABILITY] + ([TOOL_STREAM_CAPABILITY] if stream else [])
+        result += [TOOL_CHOICE_CAPABILITY] if grammars and forces_calls(text, tool_format) else []
     if reasoning_format is not False and (reasoning_format is not None or template_reasoning(text)):
         result += [THINKING_BUDGET_CAPABILITY]
     variables = template_kwargs(text)
@@ -830,8 +855,8 @@ class ResidentChat:
             telemetry.update({key: float(timing[key]) for key in ("verify_ms", "draft_ms")
                               if isinstance(timing.get(key), (int, float)) and not isinstance(timing[key], bool)})
             # The decode's routed expert reads and those the device's expert cache served (Eval's memory tiers).
-            if type(timing.get("expert_reads")) is int and type(timing.get("expert_hits")) is int:
-                telemetry.update(expert_reads=timing["expert_reads"], expert_hits=timing["expert_hits"])
+            if all(type(timing.get(key)) is int for key in EXPERT_FACTS):
+                telemetry.update({key: timing[key] for key in EXPERT_FACTS})
         logprobs = None
         if rows is not None:
             # Each token named once by its bytes, so the server can give clients token text and bytes.
@@ -924,10 +949,15 @@ class ResidentChat:
         pass
 
 
-__all__ = ["ResidentChat", "PreparedPrompt", "RequestRejected", "ContextExceeded", "SAMPLING", "LOGPROBS_CAPABILITY", "SCORE_CAPABILITY", "PLAIN_CAPABILITY",
+__all__ = ["ResidentChat", "PreparedPrompt", "RequestRejected", "ContextExceeded", "SAMPLING", "JSON_CAPABILITY",
+           "RESIDENT_CAPABILITY", "STREAM_CAPABILITY", "CONFIG_CAPABILITY", "IMAGES_CAPABILITY", "CONCURRENT_CAPABILITY",
+           "TOOLS_CAPABILITY", "STRICT_TOOLS_CAPABILITY", "TOOL_STREAM_CAPABILITY", "TOOL_CHOICE_CAPABILITY",
+           "TOOL_TEMPLATE_CAPABILITY", "CONSTRAINTS_CAPABILITY", "GRAMMAR_CAPABILITY", "LOGPROBS_CAPABILITY",
+           "SCORE_CAPABILITY", "PLAIN_CAPABILITY",
            "COMPLETION_CAPABILITY", "CONTINUE_CAPABILITY", "FIT_OUTPUT_CAPABILITY", "TEMPLATE_KWARGS_CAPABILITY",
            "TOKENIZE_CAPABILITY", "THINKING_BUDGET_CAPABILITY",
-           "TEMPLATE_KWARGS", "ENGINE_FACTS", "TOP_LOGPROBS", "capabilities", "engine_facts",
+           "TEMPLATE_KWARGS", "ENGINE_FACTS", "DRAFT_FACTS", "EXPERT_FACTS", "REQUEST_FACTS", "TOP_LOGPROBS",
+           "capabilities", "engine_facts",
            "forces_calls", "chat_prompt", "kept_special_ids", "logprob_row", "clamp_logprob", "ScoreRows",
            "packed_scores", "unpacked_scores", "special_marker_ids",
            "sampling_capability", "template_kwarg_capability", "template_kwargs", "template_reasoning",

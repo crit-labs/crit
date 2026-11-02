@@ -9,7 +9,7 @@ import shutil
 import sys
 import time
 
-from crit.run.records import digest, file_sha, inventory, now, write_json
+from crit.records import digest, inventory, now, write_json
 
 from .recipe import plan as make_plan
 
@@ -30,6 +30,50 @@ def _inside(path, root):
         return True
     except ValueError:
         return False
+
+
+def check_paths(source, out, record_path):
+    """A transform's output, a new or empty directory, and its record, a new file, both apart from the source."""
+    if _inside(out, source) or _inside(source, out):
+        raise ValueError("the output and source directories must not contain each other")
+    if out.exists() and (not out.is_dir() or any(out.iterdir())):
+        raise ValueError(f"{out} must be a new or empty directory")
+    if record_path.exists() or _inside(record_path, out) or _inside(record_path, source):
+        raise ValueError("the record must be a new file outside the source and output directories")
+
+
+def start_device(torch, device, seed):
+    """The device a transform runs on (CUDA when there is one, unless named), seeded, its peak memory reset."""
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(seed)
+    if device != "cpu":
+        torch.cuda.reset_peak_memory_stats(device)
+    return device
+
+
+def transform_record(recipe, source, source_files, out, output_files, torch, clock, phases, device, started_at, *,
+                     calibration, plan, errors, copied=(), skipped=(), source_identity=None):
+    """The models_transform record of a transform of `source` into `out` by `recipe`, which started at `started_at`
+    (and perf_counter `clock`) and ran on `device`; Eval's identity of the source unless `source_identity` gives it."""
+    from crit import __version__
+    from crit_eval.quality.prepare import model_identity
+    return {
+        "schema_version": 1, "record_kind": "models_transform", "crit_version": __version__,
+        "recipe": recipe, "recipe_sha256": digest(recipe), "seed": recipe["seed"],
+        "source": {"path": str(source), "files": source_files, "manifest_sha256": digest(source_files),
+                   "eval_model_sha256": source_identity or model_identity(source)["sha256"]},
+        "calibration": calibration, "plan": plan,
+        "output": {"path": str(out), "files": output_files, "manifest_sha256": digest(output_files),
+                   "eval_model_sha256": model_identity(out)["sha256"], "copied_files": list(copied),
+                   "skipped_directories": list(skipped)},
+        "errors": errors,
+        "cost": {"wall_seconds": time.perf_counter() - clock, "phases": phases, "device": device,
+                 "device_name": torch.cuda.get_device_name(device) if device != "cpu" else platform.processor() or None,
+                 "peak_device_bytes": torch.cuda.max_memory_allocated(device) if device != "cpu" else None,
+                 "peak_host_bytes": peak_host_bytes()},
+        "environment": _environment(),
+        "started_at": started_at, "ended_at": now(),
+    }
 
 
 def _config_quantization(config):
@@ -249,26 +293,16 @@ def summarize(errors):
 def run_ptq(recipe, source, out, record_path, calibration=None, device=None, log=print):
     """Transform `source` into `out` by `recipe` and write the models_transform record to `record_path`."""
     import torch
-    from crit import __version__
-    from crit_eval.quality.prepare import model_identity
     from .calibration import load_calibration
     started_at, clock = now(), time.perf_counter()
     phases = {}
     out, record_path = Path(out).absolute(), Path(record_path).absolute()
     source, config, checkpoint = load_checkpoint(source)
-    if _inside(out, source) or _inside(source, out):
-        raise ValueError("the output and source directories must not contain each other")
-    if out.exists() and (not out.is_dir() or any(out.iterdir())):
-        raise ValueError(f"{out} must be a new or empty directory")
-    if record_path.exists() or _inside(record_path, out) or _inside(record_path, source):
-        raise ValueError("the record must be a new file outside the source and output directories")
+    check_paths(source, out, record_path)
     if (calibration is None) != (recipe["algorithm"] == "rtn"):
         raise ValueError("gptq needs --calibration; rtn takes none")
     plan = make_plan(recipe, checkpoint)
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(recipe["seed"])
-    if device != "cpu":
-        torch.cuda.reset_peak_memory_stats(device)
+    device = start_device(torch, device, recipe["seed"])
     log(f"{len(plan['targets'])} modules, {plan['stored_bytes'] / 2**30:.2f} GiB stored -> "
         f"{plan['transformed_bytes'] / 2**30:.2f} GiB {recipe['format']} ({recipe['algorithm']} on {device})")
     mark = time.perf_counter()
@@ -319,25 +353,11 @@ def run_ptq(recipe, source, out, record_path, calibration=None, device=None, log
     for name in copied:
         if unchanged.get(name) != next(r["sha256"] for r in output_files if r["path"] == name):
             raise ValueError(f"{name} changed while it was copied")
-    record = {
-        "schema_version": 1, "record_kind": "models_transform", "crit_version": __version__,
-        "recipe": recipe, "recipe_sha256": digest(recipe), "seed": recipe["seed"],
-        "source": {"path": str(source), "files": source_files, "manifest_sha256": digest(source_files),
-                   "eval_model_sha256": model_identity(source)["sha256"]},
-        "calibration": calibration_facts,
-        "plan": {k: plan[k] for k in ("prefix", "modules_sha256", "stored_bytes", "transformed_bytes",
-                                      "checkpoint_bytes")} | {"modules": len(plan["targets"])},
-        "output": {"path": str(out), "files": output_files, "manifest_sha256": digest(output_files),
-                   "eval_model_sha256": model_identity(out)["sha256"], "copied_files": copied,
-                   "skipped_directories": skipped},
-        "errors": summarize(errors),
-        "cost": {"wall_seconds": time.perf_counter() - clock, "phases": phases, "device": device,
-                 "device_name": torch.cuda.get_device_name(device) if device != "cpu" else platform.processor() or None,
-                 "peak_device_bytes": torch.cuda.max_memory_allocated(device) if device != "cpu" else None,
-                 "peak_host_bytes": peak_host_bytes()},
-        "environment": _environment(),
-        "started_at": started_at, "ended_at": now(),
-    }
+    record = transform_record(
+        recipe, source, source_files, out, output_files, torch, clock, phases, device, started_at,
+        calibration=calibration_facts, errors=summarize(errors), copied=copied, skipped=skipped,
+        plan={k: plan[k] for k in ("prefix", "modules_sha256", "stored_bytes", "transformed_bytes",
+                                   "checkpoint_bytes")} | {"modules": len(plan["targets"])})
     write_json(record_path, record, immutable=True)
     log(f"wrote {out} and {record_path} ({record['cost']['wall_seconds']:.1f}s)")
     return record
@@ -370,7 +390,3 @@ def verify(record):
             changed = sorted(p for p in recorded.keys() | actual.keys() if recorded.get(p) != actual.get(p))
             findings.append(f"{side} differs from the record: {', '.join(changed[:8])}")
     return findings
-
-
-def record_sha(path):
-    return file_sha(Path(path))

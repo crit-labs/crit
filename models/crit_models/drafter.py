@@ -18,14 +18,12 @@ still runs; models whose forward does more around their layers are outside this 
 import copy
 import json
 from pathlib import Path
-import platform
 import re
-import shutil
 import time
 
-from crit.run.records import digest, file_sha, inventory, now, write_json
+from crit.records import digest, inventory, now, write_json
 
-from .ptq import _directory, _environment, _inside, peak_host_bytes
+from .ptq import _directory, check_paths, start_device, transform_record
 
 KIND = "mtp-head"
 FORMAT_VERSION = "crit-drafter-v1"
@@ -235,7 +233,6 @@ def export(out, drafter, source, config, plan, recipe, record_pointer):
 def run_drafter(recipe, source, out, record_path, calibration, device=None, log=print):
     """Produce a drafter for `source` by `recipe` into `out` and write the models_transform record."""
     import torch
-    from crit import __version__
     from crit_core.model import inspect_model
     from crit_eval.quality.prepare import model_identity
     from crit_eval.quality.reference import StreamingReference
@@ -245,19 +242,11 @@ def run_drafter(recipe, source, out, record_path, calibration, device=None, log=
     out, record_path = Path(out).absolute(), Path(record_path).absolute()
     source = _directory(source, "source")
     config = json.loads((source / "config.json").read_text(encoding="utf-8"))
-    if _inside(out, source) or _inside(source, out):
-        raise ValueError("the output and source directories must not contain each other")
-    if out.exists() and (not out.is_dir() or any(out.iterdir())):
-        raise ValueError(f"{out} must be a new or empty directory")
-    if record_path.exists() or _inside(record_path, out) or _inside(record_path, source):
-        raise ValueError("the record must be a new file outside the source and output directories")
+    check_paths(source, out, record_path)
     if calibration is None:
         raise ValueError("a drafter needs --calibration: documents unrelated to Eval")
     plan = plan_drafter(recipe, inspect_model(source))
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(recipe["seed"])
-    if device != "cpu":
-        torch.cuda.reset_peak_memory_stats(device)
+    device = start_device(torch, device, recipe["seed"])
     mark = time.perf_counter()
     source_files = inventory(source)
     source_identity = model_identity(source)["sha256"]
@@ -287,26 +276,14 @@ def run_drafter(recipe, source, out, record_path, calibration, device=None, log=
     output_files = inventory(out)
     phases["export"] = time.perf_counter() - mark
     head_count = max(1, len(losses) // 10)
-    record = {
-        "schema_version": 1, "record_kind": "models_transform", "crit_version": __version__,
-        "recipe": recipe, "recipe_sha256": digest(recipe), "seed": recipe["seed"],
-        "source": {"path": str(source), "files": source_files, "manifest_sha256": digest(source_files),
-                   "eval_model_sha256": source_identity},
-        "calibration": facts,
-        "plan": {k: plan[k] for k in ("prefix", "layers", "init_layer", "parameters", "stored_bytes", "modules_sha256",
-                                      "checkpoint_bytes")} | {"kind": KIND, "format": FORMAT_VERSION, "tensors": names},
-        "output": {"path": str(out), "files": output_files, "manifest_sha256": digest(output_files),
-                   "eval_model_sha256": model_identity(out)["sha256"], "copied_files": [], "skipped_directories": []},
-        "errors": {"train_loss": {"start": sum(losses[:head_count]) / head_count, "end": sum(losses[-head_count:]) / head_count,
-                                  "steps": len(losses)},
-                   "heldout_before": before, "heldout": after},
-        "cost": {"wall_seconds": time.perf_counter() - clock, "phases": phases, "device": device,
-                 "device_name": torch.cuda.get_device_name(device) if device != "cpu" else platform.processor() or None,
-                 "peak_device_bytes": torch.cuda.max_memory_allocated(device) if device != "cpu" else None,
-                 "peak_host_bytes": peak_host_bytes()},
-        "environment": _environment(),
-        "started_at": started_at, "ended_at": now(),
-    }
+    record = transform_record(
+        recipe, source, source_files, out, output_files, torch, clock, phases, device, started_at,
+        source_identity=source_identity, calibration=facts,
+        plan={k: plan[k] for k in ("prefix", "layers", "init_layer", "parameters", "stored_bytes", "modules_sha256",
+                                   "checkpoint_bytes")} | {"kind": KIND, "format": FORMAT_VERSION, "tensors": names},
+        errors={"train_loss": {"start": sum(losses[:head_count]) / head_count,
+                               "end": sum(losses[-head_count:]) / head_count, "steps": len(losses)},
+                "heldout_before": before, "heldout": after})
     write_json(record_path, record, immutable=True)
     log(f"wrote {out} and {record_path}: held-out top-1 agreement {before['top1_agreement']:.3f} -> "
         f"{after['top1_agreement']:.3f}, KL {before['kl_mean']:.4f} -> {after['kl_mean']:.4f} "

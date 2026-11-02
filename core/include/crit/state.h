@@ -109,7 +109,8 @@ struct StateCacheStats {
     // Full prompt pages attach() reused or could not reuse (within its cap); cached pages dropped from the cache
     // (allocation pressure, evict(), or an orphaned entry replaced by a linked copy).
     std::uint64_t prefix_hits = 0, prefix_misses = 0, evictions = 0;
-    // Recurrent snapshots held for prefix reuse, summed over components (their slots count as live).
+    // Recurrent snapshot slots, summed over components: each component's pool for prefix reuse, the slots holding a
+    // snapshot and the spares an evicted or dropped one left (all count as live).
     std::uint64_t snapshots = 0;
 };
 // Errors: invalid_argument for bad input; logic_error for stale ids, overlapping rounds and misuse (including

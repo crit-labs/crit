@@ -2,7 +2,6 @@
 over a toy target with two different drafters decode exactly what plain greedy decoding does, at any widths, through
 stops, output limits, truncations and row changes; replay and forced rounds follow a fixed text; sampled rounds keep
 the target's distribution; and captured CUDA graphs give the eager rounds' tokens."""
-import random
 import unittest
 
 from test_techniques import load

@@ -104,6 +104,21 @@ void range(std::size_t size,std::size_t offset,std::size_t count) {
     if(offset > size || count > size-offset) throw std::out_of_range("CUDA buffer range exceeded");
 }
 }
+// upload() and download() stage a transfer in pinned pieces of at most this and of what the host ledger has left, so
+// loading a large tensor neither pins nor charges its whole size.
+constexpr std::size_t staging_bytes = std::size_t(64) << 20;
+std::size_t staging_size(CudaState& state, std::size_t transfer) {
+    std::size_t left = 0;
+    {
+        std::lock_guard lock(state.mutex);
+        if(state.resources) {
+            const auto usage = state.resources->usage(Memory::host);
+            left = usage.limit > usage.live ? usage.limit-usage.live : 0;
+        }
+    }
+    const std::size_t bytes = std::min({transfer,staging_bytes,left});
+    return bytes ? bytes : std::min(transfer,staging_bytes);   // nothing left: the reservation reports the ceiling
+}
 struct CudaBuffer::Impl {
     std::unique_ptr<Storage,decltype(&release_storage)> storage;
     explicit Impl(decltype(storage) s):storage(std::move(s)) {}
@@ -130,12 +145,16 @@ void CudaBuffer::upload(std::span<const std::byte> source,std::size_t offset,Que
     if(memory() != Memory::device) throw std::invalid_argument("upload requires device buffer");
     if(!source.data()) throw std::invalid_argument("null upload source");
     auto& state = *impl_->storage->state;
-    auto staging = create(impl_->storage->state,Memory::host,source.size());
-    std::memcpy(staging.data(),source.data(),source.size());
+    auto staging = create(impl_->storage->state,Memory::host,staging_size(state,source.size()));
     const auto scope = state.scope();
     const auto stream = state.stream(queue);
-    check(cudaMemcpyAsync(static_cast<std::byte*>(data())+offset,staging.data(),source.size(),cudaMemcpyHostToDevice,stream),"cudaMemcpyAsync upload");
-    check(cudaStreamSynchronize(stream),"upload synchronization");
+    for(std::size_t done = 0; done < source.size(); done += staging.size()) {
+        const std::size_t bytes = std::min(staging.size(),source.size()-done);
+        std::memcpy(staging.data(),source.data()+done,bytes);
+        check(cudaMemcpyAsync(static_cast<std::byte*>(data())+offset+done,staging.data(),bytes,cudaMemcpyHostToDevice,stream),
+              "cudaMemcpyAsync upload");
+        check(cudaStreamSynchronize(stream),"upload synchronization");
+    }
 }
 void CudaBuffer::download(std::span<std::byte> destination,std::size_t offset,Queue queue) const {
     range(size(),offset,destination.size());
@@ -143,20 +162,24 @@ void CudaBuffer::download(std::span<std::byte> destination,std::size_t offset,Qu
     if(memory() != Memory::device) throw std::invalid_argument("download requires device buffer");
     if(!destination.data()) throw std::invalid_argument("null download destination");
     auto& state = *impl_->storage->state;
-    auto staging = create(impl_->storage->state,Memory::host,destination.size());
+    auto staging = create(impl_->storage->state,Memory::host,staging_size(state,destination.size()));
     const auto scope = state.scope();
     const auto stream = state.stream(queue);
-    check(cudaMemcpyAsync(staging.data(),static_cast<std::byte*>(data())+offset,destination.size(),cudaMemcpyDeviceToHost,stream),"cudaMemcpyAsync download");
-    check(cudaStreamSynchronize(stream),"download synchronization");
-    std::memcpy(destination.data(),staging.data(),destination.size());
+    for(std::size_t done = 0; done < destination.size(); done += staging.size()) {
+        const std::size_t bytes = std::min(staging.size(),destination.size()-done);
+        check(cudaMemcpyAsync(staging.data(),static_cast<const std::byte*>(data())+offset+done,bytes,cudaMemcpyDeviceToHost,stream),
+              "cudaMemcpyAsync download");
+        check(cudaStreamSynchronize(stream),"download synchronization");
+        std::memcpy(destination.data()+done,staging.data(),bytes);
+    }
 }
 struct CudaEvent::Impl {
     std::shared_ptr<CudaState> state;
     cudaEvent_t event = nullptr;
-    bool recorded = false, timing;
-    Impl(std::shared_ptr<CudaState> s,bool time):state(std::move(s)),timing(time) {
+    bool recorded = false;
+    explicit Impl(std::shared_ptr<CudaState> s):state(std::move(s)) {
         const auto scope = state->scope();
-        check(cudaEventCreateWithFlags(&event,time ? cudaEventDefault : cudaEventDisableTiming),"cudaEventCreateWithFlags");
+        check(cudaEventCreateWithFlags(&event,cudaEventDisableTiming),"cudaEventCreateWithFlags");
     }
     ~Impl() {
         const detail::DeviceScope scope(state->device,std::nothrow);
@@ -202,22 +225,6 @@ void CudaEvent::wait() {
     const auto scope = impl_->state->scope();
     check(cudaEventSynchronize(impl_->event),"cudaEventSynchronize");
 }
-CudaTimer::CudaTimer(CudaEvent start,CudaEvent stop,cudaStream_t stream)
-    :start_(std::move(start)),stop_(std::move(stop)),stream_(stream) {}
-void CudaTimer::start() {start_.record(stream_); stop_.impl_->recorded = false;}
-void CudaTimer::record_stop() {
-    if(!start_.impl_) throw std::logic_error("empty CUDA timer");
-    start_.impl_->require_recorded(); stop_.record(stream_);
-}
-float CudaTimer::elapsed_ms() const {
-    if(!start_.impl_ || !stop_.impl_) throw std::logic_error("empty CUDA timer");
-    start_.impl_->require_recorded(); stop_.impl_->require_recorded();
-    const auto scope = start_.impl_->state->scope();
-    float value = 0;
-    check(cudaEventElapsedTime(&value,start_.impl_->event,stop_.impl_->event),"cudaEventElapsedTime");
-    return value;
-}
-float CudaTimer::stop_ms() {record_stop(); stop_.wait(); return elapsed_ms();}
 struct CudaStageTimer::Impl {
     std::shared_ptr<CudaState> state;
     std::vector<cudaEvent_t> starts, stops;
@@ -350,15 +357,14 @@ CudaBuffer CudaBuffer::create(std::shared_ptr<CudaState> state,Memory memory,std
     if(bytes) {
         const auto scope = state->scope();
         auto& pointer = impl->storage->pointer;
-        check(memory == Memory::device ? cudaMalloc(&pointer,bytes) : cudaMallocHost(&pointer,bytes),"CUDA allocation");
+        const auto status = memory == Memory::device ? cudaMalloc(&pointer,bytes) : cudaMallocHost(&pointer,bytes);
+        // The failure is reported here: it must not stay the runtime's last error for the engine's next launch check.
+        if(status != cudaSuccess) (void)cudaGetLastError();
+        check(status,"CUDA allocation");
     }
     return CudaBuffer(std::move(impl));
 }
-CudaEvent CudaBackend::event() {return CudaEvent(std::make_unique<CudaEvent::Impl>(state_,false));}
-CudaTimer CudaBackend::timer(Queue queue) {
-    return CudaTimer(CudaEvent(std::make_unique<CudaEvent::Impl>(state_,true)),
-                     CudaEvent(std::make_unique<CudaEvent::Impl>(state_,true)),stream(queue));
-}
+CudaEvent CudaBackend::event() {return CudaEvent(std::make_unique<CudaEvent::Impl>(state_));}
 void CudaBackend::copy_async(const CudaBuffer& dst,std::size_t dst_offset,const CudaBuffer& src,std::size_t src_offset,std::size_t bytes,Queue queue) {
     range(dst.size(),dst_offset,bytes); range(src.size(),src_offset,bytes);
     if(!dst.impl_ || !src.impl_ || dst.impl_->storage->state != state_ || src.impl_->storage->state != state_)

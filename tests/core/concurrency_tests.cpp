@@ -1482,9 +1482,11 @@ void pressure_reopens_admission() {
         require(std::chrono::steady_clock::now()<deadline,"the pressure never came");
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    // Counted from the submission: a test thread starved under load may see the oldest request step on before it.
+    const int submitted_at=model->oldest_steps;
     auto later=e.submit({1,2},2);
     require(blocked.wait().tokens.size()==2 && later.wait().tokens.size()==2 && oldest.wait().tokens.size()==60,"outputs");
-    require(model->steps_when_later_opened>=0 && model->steps_when_later_opened<30,
+    require(model->steps_when_later_opened>=submitted_at && model->steps_when_later_opened-submitted_at<30,
             "a request sent after the pressure waited for the oldest request to finish");
 }
 }

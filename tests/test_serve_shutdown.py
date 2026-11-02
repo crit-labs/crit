@@ -14,7 +14,7 @@ import unittest
 from unittest.mock import patch
 
 from test_api_cancellation import GATED_ADAPTER
-from test_chat_residency import ServeFixture
+from support.serve import ServeFixture
 from crit_api.engine import EngineError
 from crit_api.server import Api, Server
 from crit.process.ownership import RuntimeOwnership, process_identity

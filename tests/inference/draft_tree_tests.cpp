@@ -5,6 +5,7 @@
 // rank histograms over chain rounds.
 #include "draft_tree.h"
 #include "greedy_accept.h"
+#include "device_buffer.h"
 
 #include <cuda_runtime.h>
 
@@ -24,23 +25,9 @@ namespace dr = crit::techniques::device_round;
 
 namespace {
 void require(bool c, const std::string& m) { if(!c) throw std::runtime_error(m); }
-void ok(cudaError_t e, const char* what) { if(e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e)); }
+using crit::inference_tests::ok;
 
-template<class T> struct Device {
-    T* p = nullptr;
-    std::size_t n = 0;
-    explicit Device(std::size_t count) : n(count) { ok(cudaMalloc(&p, sizeof(T) * std::max<std::size_t>(count, 1)), "malloc"); }
-    explicit Device(const std::vector<T>& v) : Device(v.size()) { put(v); }
-    ~Device() { cudaFree(p); }
-    Device(const Device&) = delete;
-    Device& operator=(const Device&) = delete;
-    void put(const std::vector<T>& v) { ok(cudaMemcpy(p, v.data(), sizeof(T) * v.size(), cudaMemcpyHostToDevice), "upload"); }
-    std::vector<T> get() const {
-        std::vector<T> v(n);
-        ok(cudaMemcpy(v.data(), p, sizeof(T) * n, cudaMemcpyDeviceToHost), "download");
-        return v;
-    }
-};
+using crit::inference_tests::Device;
 
 struct Cand { int token, parent; double score; int depth; };
 
@@ -182,16 +169,16 @@ void case_build() {
     // row are never drafted.
     {
         constexpr int W = 40;
-        std::vector<float> rows(2 * W, std::numeric_limits<float>::quiet_NaN());
-        for(int t = 0; t < W; t += 2) rows[W + t] = 0.25f * float(t);  // odd tokens of row 1 stay NaN
-        Device<float> lg(rows);
+        std::vector<float> logits(2 * W, std::numeric_limits<float>::quiet_NaN());
+        for(int t = 0; t < W; t += 2) logits[W + t] = 0.25f * float(t);  // odd tokens of row 1 stay NaN
+        Device<float> lg(logits);
         Device<std::int32_t> cnt(std::vector<std::int32_t>{0, 0}), t1(8), p1(8), d1(8), root(std::vector<std::int32_t>{-1, -1});
         Device<float> s1(8);
         dt::Candidates nan_rows{t1.p, p1.p, s1.p, d1.p, cnt.p, 4};
         ok(dt::enqueue_expand(lg.p, W, W, root.p, 1, 3, nan_rows, 2, nullptr), "NaN expand");
-        Device<std::int32_t> kept(6);
-        ok(dt::enqueue_select(nan_rows, 0, 3, kept.p, 2, nullptr), "NaN select");
-        const auto tok = t1.get(), kk = kept.get();
+        Device<std::int32_t> nan_kept(6);
+        ok(dt::enqueue_select(nan_rows, 0, 3, nan_kept.p, 2, nullptr), "NaN select");
+        const auto tok = t1.get(), kk = nan_kept.get();
         const auto sc = s1.get();
         require(tok[0] == 0 && tok[1] == 1 && tok[2] == 2, "a NaN row drafts the lowest in-range tokens");
         require(std::isinf(sc[0]) && sc[0] < 0, "a NaN row scores -inf");

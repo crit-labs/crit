@@ -4,7 +4,7 @@ import json
 import threading
 import unittest
 
-from test_chat_residency import ServeFixture
+from support.serve import ServeFixture
 from crit_api.engine import reply
 from crit_api.logprobs import logprob_entries, logprob_options, response_bytes
 from crit_api.options import RequestError

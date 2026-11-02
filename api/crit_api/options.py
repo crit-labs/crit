@@ -5,22 +5,16 @@ import re
 from functools import lru_cache
 
 from crit_core.constraints import ByteGrammar, GrammarState, UnsupportedConstraint, compile_language, matches
-from crit_core.serving import (PLAIN_CAPABILITY, TEMPLATE_KWARGS, TEMPLATE_KWARGS_CAPABILITY, template_kwarg_capability,
-                               template_value)
+from crit_core.jsonfile import reject_constant as _reject_constant
+from crit_core.serving import SAMPLING as SAMPLING_FIELDS
+from crit_core.serving import (PLAIN_CAPABILITY, STREAM_CAPABILITY, STRICT_TOOLS_CAPABILITY, TEMPLATE_KWARGS,
+                               TEMPLATE_KWARGS_CAPABILITY, TOOL_CHOICE_CAPABILITY, TOOL_STREAM_CAPABILITY,
+                               TOOL_TEMPLATE_CAPABILITY, TOOLS_CAPABILITY, sampling_capability,
+                               template_kwarg_capability, template_value)
 
-TOOLS_CAPABILITY = "chat-tools-v1"
-STRICT_TOOLS_CAPABILITY = "chat-tools-strict-v1"
-TOOL_STREAM_CAPABILITY = "chat-tool-stream-v1"
-TOOL_CHOICE_CAPABILITY = "chat-tool-choice-v1"   # tool_choice required or a named function: the adapter forces a call
-# Declared by packages sealed before crit 0.2.2 with the interim template tools. Their adapters are ResidentChats, which
-# now parse calls themselves, so it reads as chat-tools-v1 (and chat-tool-stream-v1 when the package streams), with
-# tool_choice auto or none.
-TOOL_TEMPLATE_CAPABILITY = "chat-tool-template-v1"
-STREAM_CAPABILITY = "chat-stream-v1"
 MAX_CHAT_RECORD = 16 * 1024 * 1024  # bounded image data plus retained request metadata
 MAX_TOOLS = 128  # functions one request may offer
-SAMPLING = {"temperature", "top_p", "top_k", "min_p", "seed", "presence_penalty",
-            "frequency_penalty", "repetition_penalty", "logit_bias"}
+SAMPLING = frozenset(SAMPLING_FIELDS)   # the request fields crit's sampling law has, a capability each
 # Samplers crit's sampling law does not have, by llama.cpp's and Ollama's names: (the value that turns it off, range).
 # No engine applies them, so the off value is a no-op.
 EXTRA_SAMPLING = {"typical_p": (1, 0, 1), "tfs_z": (1, 0, 1), "mirostat": (0, 0, 2),
@@ -47,9 +41,6 @@ def serving_capabilities(declared):
                 result.append(capability)
     return result
 
-
-def sampling_capability(name):
-    return "chat-sampling-" + name.replace("_", "-") + "-v1"
 
 
 def require(capabilities, capability, param):
@@ -82,7 +73,8 @@ def sampling_options(body, capabilities, ignored=None):
     result = {}
     bounds = {"temperature": (0, 2), "top_p": (0, 1), "min_p": (0, 1),
               "frequency_penalty": (-2, 2), "presence_penalty": (-2, 2),
-              "repetition_penalty": (0, float("inf")), "top_k": (0, 2**32 - 1), "seed": (0, 2**64 - 1)}
+              "repetition_penalty": (0, float("inf")), "top_k": (0, 2**32 - 1), "seed": (0, 2**64 - 1),
+              "min_tokens": (0, 2**32 - 1)}
     for key in sorted(SAMPLING & body.keys()):
         value = body[key]
         if value is None:
@@ -97,7 +89,7 @@ def sampling_options(body, capabilities, ignored=None):
                     raise RequestError("logit_bias needs token-id keys and finite biases in [-100, 100]", param=key)
         else:
             low, high = bounds[key]
-            if (type(value) not in ((int,) if key in {"seed", "top_k"} else (int, float))
+            if (type(value) not in ((int,) if key in {"seed", "top_k", "min_tokens"} else (int, float))
                     or not low <= value <= high or (key in {"top_p", "repetition_penalty"} and value == 0)
                     or (type(value) is float and not math.isfinite(value))):
                 raise RequestError(f"Invalid {key}: expected a finite number in [{low}, {high}]"
@@ -278,9 +270,6 @@ def tool_options(body, capabilities):
         options["tool_grammars"] = grammars
     return options
 
-
-def _reject_constant(value):
-    raise ValueError("Non-finite JSON number: " + value)
 
 
 def tool_calls(value, truncated=False):

@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import sys
 
-import test_run_records as run_records
+from support.runs import RunFixture
 # Eval's server fixtures, from the crit-eval checkout beside this one.
 sys.path.append(str(Path(__file__).resolve().parents[2] / "crit-eval" / "tests"))
 from test_eval_server import Text, write_data, write_store
@@ -81,7 +81,7 @@ SERVED = ["prefill", "decode", "chat-json-v1", "chat-resident-v1", "chat-stream-
           "chat-logprobs-v1", "chat-score-v1"]
 
 
-class RunEvalTests(run_records.RunFixture, unittest.TestCase):
+class RunEvalTests(RunFixture, unittest.TestCase):
     capabilities = SERVED
 
     def setUp(self):
@@ -248,15 +248,26 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
 
     def test_the_command_prints_the_retained_result(self):
         from crit.run.cli import main
-        out = io.StringIO()
+        out, err = io.StringIO(), io.StringIO()
         with patch("crit_eval.quality.reference.score_data", self.score), contextlib.redirect_stdout(out), \
-                contextlib.redirect_stderr(io.StringIO()):
+                contextlib.redirect_stderr(err):
             code = main(["--root", str(self.store.root), "--id", self.run_id, "eval", "--candidate", self.candidate_id,
                          "--data", str(self.eval_data), "--only", "speed", "--label", "served"])
         self.assertEqual(code, 0)
         printed = json.loads(out.getvalue())
         self.assertEqual(printed["result"]["path"], f"candidates/{self.candidate_id}/eval/attempt-0001.json")
         self.assertEqual(read_json(self.directory / printed["result"]["path"])["label"], "served")
+        # Beside Eval's status, the priorities the run's rule gives (evaluation.summary).
+        self.assertIn("priorities while decode and prefill are both needed: ", err.getvalue())
+
+    def test_a_terminated_eval_settles_as_interrupted_and_exits(self):
+        """crit run turns SIGTERM into SystemExit (run/cli.py): the attempt settles as interrupted, as Ctrl+C does,
+        and the exit goes on."""
+        with patch.object(evaluation, "_measure", side_effect=SystemExit(143)):
+            with self.assertRaises(SystemExit):
+                self.evaluate()
+        attempt = read_json(self.folder / "attempts/attempt-0001/result.json")
+        self.assertEqual((attempt["outcome"], attempt["cleanup_settled"]), ("interrupted", True))
 
     def test_an_interrupted_eval_keeps_its_journal_and_resumes_where_it_stopped(self):
         from crit_eval.run import long_context
@@ -315,7 +326,7 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
         self.assertFalse((self.root / "runtime/owner.json").exists())
 
 
-class UnservableEvalTests(run_records.RunFixture, unittest.TestCase):
+class UnservableEvalTests(RunFixture, unittest.TestCase):
     def test_eval_needs_a_streaming_resident_package_that_scores_for_quality(self):
         candidate = self.candidate()["candidate_id"]
         package = self.root / "served-package"

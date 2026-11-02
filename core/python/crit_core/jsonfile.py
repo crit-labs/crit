@@ -25,7 +25,10 @@ class JsonError(ValueError):
     """Malformed, non-UTF-8 or oversize JSON in a model file."""
 
 
-def _pairs(pairs):
+def unique_pairs(pairs):
+    """object_pairs_hook for json.loads or json.JSONDecoder: an object's members as a dict, JsonError on a repeated key.
+    Readers that parse JSON text themselves (tool calls, schemas) take it with reject_constant, so every strict reader
+    shares one rule."""
     result = {}
     for key, value in pairs:
         if key in result:
@@ -34,7 +37,8 @@ def _pairs(pairs):
     return result
 
 
-def _constant(name):
+def reject_constant(name):
+    """parse_constant for json.loads or json.JSONDecoder: JsonError on NaN, Infinity and -Infinity."""
     raise JsonError(f"non-finite number {name}")
 
 
@@ -129,9 +133,9 @@ def loads(data, source="JSON", *, max_bytes=MAX_BYTES, allow_real=True, allow_no
             raise JsonError(f"{source}: text exceeds the {max_bytes}-byte limit")
     else:
         raise TypeError("JSON input must be bytes or str")
-    constant = (_NONFINITE.__getitem__ if allow_real else _integer_only) if allow_nonfinite else _constant
+    constant = (_NONFINITE.__getitem__ if allow_real else _integer_only) if allow_nonfinite else reject_constant
     try:
-        value = json.loads(text, object_pairs_hook=_pairs, parse_constant=constant,
+        value = json.loads(text, object_pairs_hook=unique_pairs, parse_constant=constant,
                            parse_float=_finite if allow_real else _integer_only)
     except JsonError as error:
         raise JsonError(f"{source}: {error}") from None

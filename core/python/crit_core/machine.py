@@ -39,7 +39,8 @@ def lock_path():
     return Path(value) if value else Path(tempfile.gettempdir()) / "crit-engine.lock"
 
 
-def _try_lock(handle):
+def try_lock(handle):
+    """Take an exclusive advisory lock on an open file without waiting: whether it was taken."""
     if os.name == "nt":
         import msvcrt
         try:
@@ -56,7 +57,8 @@ def _try_lock(handle):
         return False
 
 
-def _unlock(handle):
+def unlock(handle):
+    """Release try_lock's lock."""
     if os.name == "nt":
         import msvcrt
         handle.seek(0)
@@ -230,12 +232,12 @@ def engine_lock(label, wait=True, poll_s=2.0, log=None, deadline=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = open(path, "a+")
     try:
-        if not _try_lock(handle):
+        if not try_lock(handle):
             who = holder(path) or "another process"
             if not wait:
                 raise RuntimeError(f"another engine is loaded on this machine ({who}); {LOCK_ENV}={path}")
             log(f"waiting for the engine lock held by {who} ({path}); one engine-loading process at a time")
-            while not _try_lock(handle):
+            while not try_lock(handle):
                 time.sleep(remaining())
         shared = lease_path()
         lease = _Lease(shared, label) if shared else None
@@ -262,6 +264,6 @@ def engine_lock(label, wait=True, poll_s=2.0, log=None, deadline=None):
                 Path(str(path) + ".holder").write_text("", encoding="utf-8")
             except OSError:
                 pass
-            _unlock(handle)
+            unlock(handle)
     finally:
         handle.close()

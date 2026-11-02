@@ -4,13 +4,17 @@ Each subcommand becomes one tool (`crit run plan` is `crit_run_plan`) whose inpu
 options and those of the commands above it; a call turns the tool's arguments back into the command line."""
 import argparse
 import contextlib
+import importlib
 import io
 import json
 from pathlib import Path
 import uuid
 
-# The command families, in the order tools/list shows them, and how to reach each one's parser.
+from crit.cli import FAMILIES as COMMANDS
+
+# The command families, in the order tools/list shows them, and the module each one's parser comes from.
 FAMILIES = ("run", "eval", "pull", "serve", "kernels", "models", "inference")
+MODULES = {name: module for name, module, _ in COMMANDS} | {"inference": "crit.inference"}
 # Options a call may leave out that the server fills from its own settings: --project for every family that has
 # it, the run root for crit run, and crit serve's workspace (the folder of run-* directories, the same run root).
 DEFAULTED = {"project": "project", ("run", "root"): "root", ("serve", "workspace"): "root"}
@@ -42,28 +46,11 @@ def parser_of(main, *arguments):
 
 def family_parser(name):
     """The parser of one command family; ImportError when its package is not installed."""
-    if name == "run":
-        from crit.run.cli import main
-        return parser_of(main, [])
-    if name == "eval":
-        from crit_eval.cli import main
-        return parser_of(main, [])
-    if name == "pull":
-        from crit.pull.cli import main
-        return parser_of(main, [])
-    if name == "serve":
-        from crit_api.cli import parser
-        return parser()
-    if name == "kernels":
-        from crit_kernels import main
-        return parser_of(main, [])
-    if name == "models":
-        from crit_models import main
-        return parser_of(main, [])
-    if name == "inference":
-        from crit.inference import main
-        return parser_of(main, [])
-    raise ValueError(f"Unknown command family {name!r}; known: {', '.join(FAMILIES)}")
+    if name not in FAMILIES:
+        raise ValueError(f"Unknown command family {name!r}; known: {', '.join(FAMILIES)}")
+    module = importlib.import_module(MODULES[name])
+    # crit's own families expose parser(); crit Eval builds its parser inside main, caught as it starts parsing.
+    return module.parser() if hasattr(module, "parser") else parser_of(module.main, [])
 
 
 class Option:

@@ -4,7 +4,7 @@ import sys
 import unittest
 
 import test_run_measure as run_measure
-import test_run_records as run_records
+from support.runs import RunFixture
 from crit.run import served
 from crit.run.build import build
 from crit.run.capture import capture
@@ -13,7 +13,7 @@ from crit.run.measure import check_case_prompts
 from crit.run.records import digest, file_sha, now, read_json
 
 
-class CaptureTests(run_records.RunFixture, unittest.TestCase):
+class CaptureTests(RunFixture, unittest.TestCase):
     model_files = {"README.md": "# Fixture model\n"}
 
     def test_a_captured_case_renders_to_the_workload_and_resolves(self):
@@ -55,7 +55,7 @@ ADAPTER = """def declared_capabilities(model_path):
 """
 
 
-class BuildTests(run_records.RunFixture, unittest.TestCase):
+class BuildTests(RunFixture, unittest.TestCase):
     def built_candidate(self):
         if not (self.directory / "inputs.json").exists():
             self.resolve()
@@ -116,7 +116,7 @@ def gates(**states):
     return [{"name": n, "state": states.get(n, "pass"), "detail": n + " detail"} for n in names]
 
 
-class FromEvalTests(run_records.RunFixture, unittest.TestCase):
+class FromEvalTests(RunFixture, unittest.TestCase):
     def evaluated(self, gate_list, free=2 * 2**30, requirements=None):
         candidate = self.candidate()
         self.package(candidate)

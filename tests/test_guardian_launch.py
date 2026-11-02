@@ -100,9 +100,9 @@ class GuardianLaunchTests(unittest.TestCase):
             (Path(site) / "crit_venv_fixture.py").write_text("value = 'venv dependency'\n", encoding="utf-8")
             output = root / "result.json"
             client = r'''
-import json, sys
+import json, os, sys
 from pathlib import Path
-sys.path.insert(0, sys.argv[1])
+sys.path[:0] = sys.argv[1].split(os.pathsep)
 from crit.process.ownership import RuntimeOwnership
 from crit.process.tree import guarded_tree
 root = Path(sys.argv[2])
@@ -123,7 +123,9 @@ finally:
     if tree: tree.close()
     owner.release(settled=True)
 '''
-            completed = subprocess.run([str(python), "-B", "-c", client, str(ROOT / "cli"), str(root)],
+            # crit as installed: the CLI package with Core's Python package (a dependency of crit) beside it.
+            completed = subprocess.run([str(python), "-B", "-c", client,
+                                        os.pathsep.join((str(ROOT / "cli"), str(ROOT / "core" / "python"))), str(root)],
                 capture_output=True, text=True, timeout=25)
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr +
                              (root / "engine.log").read_text(encoding="utf-8"))

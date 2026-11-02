@@ -7,7 +7,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from test_chat_residency import ServeFixture
+from support.serve import ServeFixture
 from crit.run.records import write_json
 from crit_api.catalog import ModelCatalog
 from crit_api.server import Api, RequestError, Server

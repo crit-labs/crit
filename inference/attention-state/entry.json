@@ -11,13 +11,14 @@
       "Committed/pending KV transactions with partial acceptance, rollback and rewind (dense Python reference; native rounds through Core's StateCache)",
       "Host FP32 page storage behind Core's StateCache: StateStorage copy-on-write hook, checked row staging at Round::kv and block-table views for attention",
       "Single-query scalar paged attention, tiled MHA/GQA/MQA prefill/decode, causal/window/keep/bias masks and partial RoPE",
+      "Rotary frequency tables and attention factor from config.json's rope parameters (default, mrope, linear, dynamic NTK, YaRN, Llama 3, LongRoPE) as Hugging Face derives them, in C++ and Python",
       "Private bounded scratch with retained KV image, synchronous GEMM contract, cancellation and optional OpenBLAS integration",
       "Physically compressed G32 int8 page storage behind Core's StateCache with bounded head-range decoding into attention scratch",
       "Keyed ragged batches with retained private plans, aggregate resource limits and all-or-nothing result return; synthetic Core mixed-scheduling integration",
       "Integrated Core memory-pressure recovery with real page reclamation and replay of accepted history for the supplied attention reference"
     ],
     "engine_supplies": [
-      "Model projections, head geometry, RoPE frequencies/layout/position IDs, attention scale and allowed causal prefixes",
+      "Model projections, head geometry, RoPE layout/position IDs (frequencies from rope_table or its own), attention scale and allowed causal prefixes",
       "Core reservations for arena/scratch/result/metadata and provider overhead, request admission, one thread for StateCache calls and retire() after physical completion",
       "Device allocation/encoding, write readiness, optimized arithmetic and physical completion when adapting beyond CPU",
       "Complete state/representation identity and any logits, sampler or non-KV state needed for prefix reuse"
@@ -49,6 +50,14 @@
     {
       "path": "inference/attention-state/code/attention.h",
       "purpose": "Strided head views, rotary transforms, scalar paged attention and tiled paged CPU attention with masks, GQA/MQA, bounded private workspace and synchronous GEMM"
+    },
+    {
+      "path": "inference/attention-state/code/rope_table.h",
+      "purpose": "Rotary inverse frequencies and attention factor from Core's RopeConfig, as Hugging Face's ROPE_INIT_FUNCTIONS derive them"
+    },
+    {
+      "path": "inference/attention-state/code/rope_table.py",
+      "purpose": "Python twin of rope_table.h over crit_core.model's RopeConfig"
     },
     {
       "path": "inference/attention-state/code/attention_example.cpp",
@@ -100,6 +109,7 @@
     "C++20 standard library for native pages and attention",
     "Optional separately retained OpenBLAS provider via Kernels attention_gemm.h; no provider required for scalar execution",
     "Core's state cache (crit::core) for every native page storage, example and fixture",
+    "Core's config reader for rope_table: crit/model_config.h's RopeConfig in C++, crit_core.model's in Python",
     "Native encoded KV additionally includes quantized-projections/code/grouped_int.h; add both code directories to the include path"
   ],
   "symbols": [
@@ -107,6 +117,9 @@
     "paged_attention",
     "HeadTensorView",
     "rotary",
+    "rope_table",
+    "rotary_dim",
+    "RopeTable",
     "AttentionGeometry",
     "AttentionMask",
     "AttentionResult",
@@ -141,7 +154,7 @@
     "quantized-projections"
   ],
   "validation": {
-    "host": "Python fixtures retain the dense transaction/formula example; native StatePages fixtures cover row staging, partial commit, discard, rewind, fork copy-on-write, prefix reuse through StateCache, rejected rows and 5000 randomized transitions against a value oracle",
+    "host": "Python fixtures retain the dense transaction/formula example and check rope_table.py against Hugging Face's ROPE_INIT_FUNCTIONS (rope_table.h agrees with it to 1e-12 on the same configs, refusals included); native StatePages fixtures cover row staging, partial commit, discard, rewind, fork copy-on-write, prefix reuse through StateCache, rejected rows and 5000 randomized transitions against a value oracle",
     "native": "StatePages fixtures plus 2304 independent dense-reference attention cases, RoPE/prefill/decode/COW comparisons, varied continuation chunks and shared-prefix boundaries around page edges, cancellation, extreme logits and failed kernels; optional retained OpenBLAS profile repeats numerical/integration checks. Device fences and full-model behavior remain unqualified; native encoded KV fixture covers packed storage accounting, StateCache COW, rollback/rewind, invalid append, capacity rejection and generic attention against decoded KV; ragged batch fixture adds 74 dense comparisons, mixed geometry, permuted/stale/duplicate identities, aggregate limits, cancellation/reentrancy and later-row failure; encoded batch identity/results and 24 Core synthetic dense-generation comparisons on Core's StateCache with StatePages, plus a fork copy-on-write check",
     "performance": "No engine throughput/latency claim; page sharing and workspace bounds are functional properties, and synchronous CPU GEMM provider speed requires workload-specific measurement"
   }

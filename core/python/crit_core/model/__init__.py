@@ -8,7 +8,6 @@ from .config import (CONFIG_NAME, FULL_ATTENTION, LINEAR_ATTENTION, OTHER, SLIDI
                      text_section)
 from .gguf import (GGML_TYPES, GgufCheck, GgufError, GgufFile, GgufModel, check_gguf_folder, find_gguf,
                    inspect_gguf, inspect_gguf_model)
-from .rope import RopeTable, rope_table, rotary_dim
 from .source import FORMATS, ModelFormat, ModelSource, ModelSourceError, open_model
 from .safetensors import (DTYPE_BITS, Checkpoint, IndexPolicy, Limits, SafetensorsError, ShardInfo, TensorInfo,
                           inspect_model, inspect_safetensors)
@@ -31,6 +30,5 @@ __all__ = [
     "inspect_gguf_model",
     "OnnxError", "OnnxModel", "OnnxTensor", "inspect_onnx",
     "TorchCheckpoint", "TorchFile", "TorchFileError", "inspect_torch", "inspect_torch_model",
-    "RopeTable", "rope_table", "rotary_dim",
     "FORMATS", "ModelFormat", "ModelSource", "ModelSourceError", "open_model",
 ]

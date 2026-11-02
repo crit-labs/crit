@@ -23,11 +23,11 @@ hung engine stops the attempt.
 import contextlib
 import os
 from pathlib import Path
-import sys
 import time
 
-from .records import file_sha, ident, load_run, now, quality_mode, quality_terms, read_json, safe_path, timestamp
-from .served import Expired, SERVED, Served, remaining
+from .attempt import Attempt, Expired, packaged, remaining, unsealed
+from .records import file_sha, ident, load_run, now, quality_mode, quality_terms, read_json, safe_path
+from .served import QUALITY, SERVED, Served
 from .store import amendments
 
 # Allocator settings the reference may set for its own process (expandable segments) and that crit serve's resident
@@ -37,6 +37,28 @@ ALLOCATOR_ENV = ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
 
 # Placement scenarios (crit_eval.limits.context.SCENARIOS) in which a pass reads weights from host memory.
 OFF_DEVICE = ("sparse_device_host", "sparse_device_host_disk", "dense_device_host")
+
+
+def summary(store, run_id, outcome):
+    """What crit run ... eval prints once Eval has run (outcome: evaluate's, whose status it takes): Eval's status,
+    the priorities the run's rule gives while decode and prefill are both needed, how far each KPI stands from its
+    limit, and the host_bytes_warning."""
+    from crit_eval.reports.status import render
+    from .plans import extract, priorities, rules, standing
+    status = outcome.pop("status")
+    lines = [render(status)]
+    # Eval states the goals without an order; the run's priority rule orders them for the next plan.
+    order, reason = priorities({"decode": {"needed": True}, "prefill": {"needed": True}}, extract(status),
+                               rules(store.get(run_id)["run"]))
+    lines.append("priorities while decode and prefill are both needed: " + (
+        "; ".join(f"{tier} {', '.join(order[tier])}" for tier in ("p1", "p2", "p3") if order[tier])
+        if order else reason) + " (crit run ... plan computes them from the plan's needed flags)")
+    # How far each prioritized KPI stands from its limit: a low fraction is the next plan's room, not a result.
+    lines += ["  " + line for line in standing(status)]
+    path = (outcome.get("result") or {}).get("path")
+    root = store.directory(run_id)
+    warning = host_bytes_warning(root, read_json(safe_path(root, path))) if path else None
+    return lines + ([warning] if warning else [])
 
 
 def host_bytes_warning(root, result):
@@ -78,9 +100,6 @@ def own_allocator_env():
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
-
-# Quality needs the score call and, for its honesty check, every served token's log-probability.
-QUALITY = ("chat-score-v1", "chat-logprobs-v1")
 
 
 def check_sampling(run, prepared, data, model):
@@ -160,18 +179,9 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
     from crit_eval.run.runner import PARTS
     root = store.directory(run_id)
     run = load_run(root)
-    folder = safe_path(root, f"candidates/{ident(candidate_id, 'candidate')}")
-    if (folder / "seal.json").exists():
-        raise ValueError("Sealed candidate is immutable; allocate a new candidate")
-    manifest_path = folder / "package" / "manifest.json"
-    if not manifest_path.is_file():
-        raise ValueError("Package the candidate before measuring it")
+    folder = unsealed(root, candidate_id)
     parts = tuple(parts or PARTS)
-    declared = set(read_json(manifest_path)["capabilities"])
-    missing = [c for c in SERVED + (QUALITY if "quality" in parts else ()) if c not in declared]
-    if missing:
-        raise ValueError("Eval measures the candidate through crit serve: its package must declare "
-                         + ", ".join(missing) + " (docs/SERVING.md)")
+    packaged(folder, SERVED + (QUALITY if "quality" in parts else ()), "measuring", "Eval measures")
     model, data = run["spec"]["model_path"], data.absolute()
     if not (data / PREPARED).is_file():
         raise ValueError(f"{data} holds no {PREPARED}: prepare it from the run's model first "
@@ -188,8 +198,8 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
     settings = machine_settings()
     reserve = settings.get("context_reserve_gib")
     earlier = resumable(store, run_id, root, folder, None if resume is True else resume) if resume else None
-    reservation = store.reserve(run_id, candidate_id, "eval", seconds)
-    attempt = reservation["attempt_id"]
+    attempt = Attempt(store, run_id, candidate_id, "eval", seconds, "eval", "Eval", "Eval")
+    reservation = attempt.reservation
     budget, exactness = quality_terms(run["spec"]["correctness"], amendments(root, reservation["segment_id"]))
     options = dict(label=label, device=device, baseline=baseline, quality_budget=budget, exactness=exactness,
                    quality_mode=quality_mode(run["spec"]["correctness"]),
@@ -201,49 +211,22 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
                    identity={"run_id": run_id, "candidate_id": candidate_id, "package_sha256": reservation["package_sha256"],
                              "parts": sorted(parts), "label": label},
                    resume=earlier)
-    out = folder / "eval" / f"{attempt}.json"
+    out = folder / "eval" / f"{attempt.id}.json"
     journal = path_for(out)
-    log_path = folder / "logs" / f"eval-{attempt}.log"
     store.eval_started(run_id, reservation, journal, earlier)
-    outcome, failure, settled, interrupted = "completed", None, True, None
-    try:
+    with attempt.running() as log:
         out.parent.mkdir(parents=True, exist_ok=True)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a", encoding="utf-8") as stream:
-            def log(message):
-                print(message, file=sys.stderr, flush=True)
-                stream.write(message + "\n")
-                stream.flush()
-            result = _measure(store, run_id, candidate_id, attempt, reservation["deadline_at"], model, data, out,
-                              parts, options, log)
-    except BaseException as exc:
-        settled = getattr(exc, "settled", True)
-        if isinstance(exc, (Expired, TimeoutError)):
-            outcome, failure = "timed_out", str(exc) or "Eval passed its reserved deadline"
-        elif isinstance(exc, KeyboardInterrupt):
-            outcome, failure, interrupted = "interrupted", "Interrupted", exc
-        else:
-            outcome, failure = "failed", (type(exc).__name__ + ": " + str(exc))[:8000]
-    ended = now()
-    if outcome == "completed" and timestamp(ended, "ended") > timestamp(reservation["deadline_at"], "deadline"):
-        outcome, failure = "timed_out", "Eval passed its reserved deadline"
-    # The log, the journal and the result (complete, or what an attempt that stopped measured) are its evidence.
-    logs = ([{"path": path.relative_to(root).as_posix(), "sha256": file_sha(path)}
-             for path in (log_path, journal, out) if path.is_file()] if settled else [])
-    # Eval and the server ran in this process; the resident host's exit is part of the cleanup.
-    store.settle(run_id, reservation, {"outcome": outcome, "ended_at": ended,
-                                       "exit_code": 0 if outcome == "completed" else None,
-                                       "cleanup_settled": settled, "logs": logs, "failure": failure})
-    if interrupted is not None:
-        raise interrupted
-    if outcome != "completed":
-        kept = (f"; its journal keeps what it measured: crit run --id {run_id} eval --candidate {candidate_id} "
-                f"--resume {attempt} goes on from there" if journal.is_file() else "")
-        raise ValueError(f"Eval {outcome}: {failure} (log {log_path.relative_to(root).as_posix()}){kept}")
+        result = _measure(store, run_id, candidate_id, attempt.id, attempt.deadline_at, model, data, out, parts,
+                          options, log)
+    # Eval and the server ran in this process; the resident host's exit is part of the cleanup. The journal and the
+    # result (complete, or what an attempt that stopped measured) are evidence beside the log.
+    attempt.settle(evidence=(journal, out))
+    attempt.finish(f"; its journal keeps what it measured: crit run --id {run_id} eval --candidate {candidate_id} "
+                   f"--resume {attempt.id} goes on from there" if journal.is_file() else "")
     # A candidate created from a plan gets the plan's outcome: its forecast next to what Eval measured.
-    planned = store.plan_outcome(run_id, candidate_id, attempt)
+    planned = store.plan_outcome(run_id, candidate_id, attempt.id)
     return {"result": {"path": out.relative_to(root).as_posix(), "sha256": file_sha(out)}, "status": result["status"],
-            **({"plan_outcome": f"plans/{planned['plan_id']}/outcomes/{attempt}.json"} if planned else {})}
+            **({"plan_outcome": f"plans/{planned['plan_id']}/outcomes/{attempt.id}.json"} if planned else {})}
 
 
 class EvalEngines(Served):

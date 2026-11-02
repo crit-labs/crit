@@ -19,7 +19,7 @@ import re
 import time
 import uuid
 
-from crit_core.serving import TOP_LOGPROBS
+from crit_core.serving import IMAGES_CAPABILITY, TOOLS_CAPABILITY, TOP_LOGPROBS
 
 from .options import RequestError, parameter_name, template_variables, unknown_parameters
 
@@ -321,6 +321,51 @@ def chunk(model, content="", thinking=None, tool_calls=None, generate=False):
     return {"model": model, "created_at": now(), "message": message, "done": False}
 
 
+def reply(model, text, ran, seconds, generate=False):
+    """A whole reply (stream false) to /api/chat or /api/generate, from its text and server.Ran."""
+    if generate:
+        return final(model, ran.finish, ran.measured, seconds, response=text, thinking=ran.reasoning or None,
+                     entries=ran.logprobs)
+    message = {"role": "assistant", "content": text}
+    if ran.reasoning:
+        message["thinking"] = ran.reasoning
+    if ran.calls:
+        message["tool_calls"] = [tool_call(call) for call in ran.calls]
+    return final(model, ran.finish, ran.measured, seconds, message=message, entries=ran.logprobs)
+
+
+class Stream:
+    """Writes a streamed /api/chat or /api/generate reply through `write(bytes)` (server.Handler.streamed runs it):
+    one JSON object per line, text and thinking as they arrive, then the tool calls, which Ollama sends whole, and the
+    last object, whose logprobs come from the engine's final record as in the OpenAI stream."""
+    content_type, ping, tools = "application/x-ndjson", None, None
+
+    def __init__(self, write, model, generate=False):
+        self.write, self.model, self.generate = write, model, generate
+        self.started = time.perf_counter()
+
+    def send(self, value):
+        self.write(json.dumps(value).encode("utf-8") + b"\n")
+
+    def start(self):
+        pass
+
+    def text(self, piece):
+        self.send(chunk(self.model, piece, generate=self.generate))
+
+    def reasoning(self, piece):
+        self.send(chunk(self.model, "", thinking=piece, generate=self.generate))
+
+    def finish(self, ran, telemetry=None):
+        if ran.calls and not self.generate:
+            self.send(chunk(self.model, "", tool_calls=[tool_call(call) for call in ran.calls]))
+        self.send(final(self.model, ran.finish, ran.measured, time.perf_counter() - self.started,
+                        response="" if self.generate else None, entries=ran.logprobs))
+
+    def fail(self, message, code=None, status=500, request_id=None):
+        self.send(error_body(message, request_id))
+
+
 def model_card(card, created, digest=""):
     """An /api/tags entry for a /v1/models card; `digest` is its package's sha256."""
     return {"name": card["id"], "model": card["id"], "modified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(created)),
@@ -341,11 +386,11 @@ def loaded_card(card, created, digest, status, until=None):
 def show(card):
     """An /api/show reply: what a client reads to size its context and pick its features, and the card's limits."""
     capabilities = ["completion"]
-    if "chat-tools-v1" in card.get("capabilities", []):
+    if TOOLS_CAPABILITY in card.get("capabilities", []):
         capabilities.append("tools")
     if template_variables(card.get("capabilities", [])):
         capabilities.append("thinking")
-    if "chat-images-v1" in card.get("capabilities", []):
+    if IMAGES_CAPABILITY in card.get("capabilities", []):
         capabilities.append("vision")
     return {"modelfile": "", "parameters": "", "template": "", "details": model_card(card, time.time())["details"],
             "model_info": {"general.architecture": "crit", "crit.context_length": card["context_length"],

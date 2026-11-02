@@ -282,7 +282,7 @@ refuses them ([a busy engine](#a-busy-engine): `--max-queue`, `--queue-timeout`)
 | `n` | Must be 1; omitted or null keeps 1 |
 | `response_format` | `text`, `json_object` or `json_schema` ([structured output](#structured-output)); with tools only when `tool_choice` is `none` |
 | `structured_outputs` | vLLM's constraint: one of `regex`, `choice`, `grammar` or `json` ([structured output](#structured-output)); vLLM's earlier `guided_regex`, `guided_choice`, `guided_grammar` and `guided_json` too; with tools only when `tool_choice` is `none` |
-| `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias` | Per-request overrides when the package declares support for that field; otherwise 400 (ignored with `--lenient`). Omitted or null fields keep engine defaults |
+| `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`, `min_tokens` (vLLM's: no stop token before that many tokens) | Per-request overrides when the package declares support for that field; otherwise 400 (ignored with `--lenient`). Omitted or null fields keep engine defaults |
 | `typical_p`, `tfs_z`, `mirostat`, `dry_multiplier`, `xtc_probability` | llama.cpp's and Ollama's samplers, which crit's sampling law does not have: the value that turns one off (1, 1, 0, 0 and 0) is a no-op, any other valid value 400 (ignored with `--lenient`) |
 | `tools`, `tool_choice`, `parallel_tool_calls` | Function calls for packages declaring `chat-tools-v1`; `tool_choice` `auto` or `none`, and `required` or a named function for packages that also declare `chat-tool-choice-v1` (otherwise 400 `unsupported_parameter`; [ResidentChat](#forced-calls) declares it when its engine decodes to a grammar). Tool-result history is preserved |
 | `logprobs`, `top_logprobs` | [Token log-probabilities](#token-log-probabilities) for packages declaring `chat-logprobs-v1`: every token's own and up to 20 alternatives. Not with `stop` |
@@ -1370,21 +1370,22 @@ private to the turn.
 Declare individual capabilities only for fields the engine actually applies:
 `chat-sampling-temperature-v1`, `chat-sampling-top-p-v1`, `chat-sampling-top-k-v1`,
 `chat-sampling-min-p-v1`, `chat-sampling-seed-v1`, `chat-sampling-presence-penalty-v1`,
-`chat-sampling-frequency-penalty-v1`, `chat-sampling-repetition-penalty-v1`, and
-`chat-sampling-logit-bias-v1`. The request's optional `sampling` object contains
+`chat-sampling-frequency-penalty-v1`, `chat-sampling-repetition-penalty-v1`,
+`chat-sampling-logit-bias-v1`, and `chat-sampling-min-tokens-v1`. The request's optional `sampling` object contains
 only explicit, non-null overrides, using the original API field names.
 
 Apply overrides to fresh request options; never mutate the candidate configuration
 or resident defaults. Temperature is in `[0, 2]`, top-p in `(0, 1]`, min-p in `[0, 1]`, top-k is
 an unsigned 32-bit integer, seed an unsigned 64-bit integer, presence/frequency
-penalties in `[-2, 2]`, and repetition penalty strictly positive. All floats must
+penalties in `[-2, 2]`, repetition penalty strictly positive, and min-tokens an unsigned 32-bit
+integer. All floats must
 be finite. `logit_bias` maps canonical nonnegative decimal token-id strings to
 biases in `[-100, 100]`, at most 1024 entries; the engine must also validate ids
 against its vocabulary.
 
 `crit_core.native.ResidentEngine` forwards these overrides through the native ABI
 to Core's `RequestOptions.sampling` and checks `ModelInfo.sampling` support. Its
-native library must be rebuilt to forward penalties and logit bias. Only declare
+native library must be rebuilt to forward penalties, logit bias and min-tokens. Only declare
 capabilities implemented by that model, including speculative decoding paths.
 No request override changes Eval's greedy protocol or the sealed configuration.
 

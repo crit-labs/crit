@@ -9,9 +9,10 @@ import ssl
 import subprocess
 import sys
 
+from crit.cli import default_project
 from crit.process.ownership import RuntimeOwnership
-from crit.run.records import GIB
-from crit.run.store import ROOT, RunStore
+from crit.records import GIB
+from crit.run.store import RunStore
 
 from .engine import EngineError, ServedEngine, single_run
 from .catalog import ModelCatalog
@@ -74,7 +75,7 @@ def parser():
                              "loads it again (default: stay loaded)")
     result.add_argument("--resident-ram-gib", type=float, help="Optional cap on retained model bytes in host memory")
     result.add_argument("--resident-vram-gib", type=float, help="Optional cap on retained model bytes in device memory")
-    result.add_argument("--project", type=Path, default=ROOT if (ROOT / "core/include/crit/core.h").is_file() else Path.cwd(),
+    result.add_argument("--project", type=Path, default=default_project(),
                         help="crit repository (default: this checkout)")
     result.add_argument("--write-launchers", action="store_true",
                         help="Write serve.cmd and serve.sh into the run folder, which start this exact command, then exit")

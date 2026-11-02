@@ -1,5 +1,6 @@
-"""Compare crit::core::rope_table (crit_core_model_tests model_rope_print) with its Python twin on the configs of
-tests/test_core_rope.py, refusals included: equal tables to 1e-12 relative, and both refusing the same configs."""
+"""Compare attention-state's rope_table.h (crit_rope_table_tests print) with its Python twin, rope_table.py, on the
+configs of tests/test_rope_tables.py, refusals included: equal tables to 1e-12 relative, and both refusing the same
+configs."""
 import json
 import math
 from pathlib import Path
@@ -10,8 +11,8 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "core" / "python"), str(ROOT / "tests")]
 
-from crit_core.model import ConfigError, parse_model_config, rope_table  # noqa: E402
-from test_core_rope import BASE, CASES  # noqa: E402
+from crit_core.model import ConfigError, parse_model_config  # noqa: E402
+from test_rope_tables import BASE, CASES, rope_table  # noqa: E402
 
 REFUSED = [({"rope_scaling": {"rope_type": "su", "factor": 2.0}}, 128),
            ({"rope_scaling": {"rope_type": "llama3", "factor": 8.0}}, 128),
@@ -26,7 +27,7 @@ def main(executable):
         for keys, head_dim, length in runs:
             document = dict(BASE, **keys)
             (Path(folder) / "config.json").write_text(json.dumps(document), encoding="utf-8")
-            line = subprocess.run([executable, "model_rope_print", folder, str(head_dim), "-" if length is None else str(length)],
+            line = subprocess.run([executable, "print", folder, str(head_dim), "-" if length is None else str(length)],
                                   capture_output=True, text=True, check=True).stdout.strip()
             parsed = parse_model_config(document)
             try:
@@ -43,7 +44,7 @@ def main(executable):
             if len(native) != len(want) or not all(math.isclose(a, b, rel_tol=1e-12) for a, b in zip(native, want)):
                 raise SystemExit(f"tables differ for {keys} at length {length}")
             checked += 1
-    print(f"{checked} rotary tables agree with crit_core.model.rope_table")
+    print(f"{checked} rotary tables agree with rope_table.py")
 
 
 if __name__ == "__main__":

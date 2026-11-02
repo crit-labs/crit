@@ -11,7 +11,7 @@ import unittest
 
 from core_text_fixtures import llama_files, write_files
 from test_core_serving import Decoder, request
-from test_chat_residency import ServeFixture
+from support.serve import ServeFixture
 from crit_api.server import Api, Server, conversation
 from crit_api.options import RequestError
 from crit_core.serving import PreparedPrompt, capabilities, chat_prompt

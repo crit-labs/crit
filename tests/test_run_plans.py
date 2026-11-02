@@ -6,7 +6,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from test_run_records import RunFixture
+from support.runs import RunFixture
 from crit.run import plans
 from crit.run.cli import main
 from crit.run.records import file_sha, read_json, validate_spec, write_json
@@ -86,11 +86,15 @@ class PlanFixture(RunFixture):
     new_run_plans = "required"
     # The plan rules the fixture's runs are created with; PlanRules3Tests set 3, the default of new runs.
     plan_rules = 2
+    # The run's quality mode, when not the default preserve.
+    quality_mode = None
 
     def setUp(self):
         super().setUp()
         # A candidate-budget run, as runs are created by default.
         self.data = {key: value for key, value in self.data.items() if key != "budget_minutes"} | {"candidate_budget": 3}
+        if self.quality_mode:
+            self.data["quality_mode"] = self.quality_mode
         with patch("crit.run.records.NEW_RUN_PLAN_RULES", self.plan_rules):
             self.view = self.store.create(self.data)
         self.run = self.view["run"]
@@ -859,9 +863,9 @@ class PlanRecordTests(PlanFixture, unittest.TestCase):
 
     def test_plan_rules_need_computed_limits(self):
         spec = copy.deepcopy(self.run["spec"])
-        for broken in ({**spec, "plan_rules": 6}, {key: value for key, value in spec.items() if key != "plan_limits"}):
+        for broken in ({**spec, "plan_rules": 7}, {key: value for key, value in spec.items() if key != "plan_limits"}):
             with self.subTest(broken=broken.get("plan_rules")):
-                with self.assertRaisesRegex(ValueError, "plan_rules is 2, 3, 4 or 5 when present"):
+                with self.assertRaisesRegex(ValueError, "plan_rules is 2 to 6 when present"):
                     validate_spec(broken)
 
     def test_without_the_round_floors_facts_the_plan_gives_the_alternatives_ceiling(self):
@@ -1153,13 +1157,11 @@ class PlanRules4Tests(PlanFixture, unittest.TestCase):
 
 
 class PlanRules5Tests(PlanFixture, unittest.TestCase):
-    """Plan rules 5, the default of new runs: the strategy's ceiling is the limit, and a forecast whose best case stays
-    below half of a needed family's limit names the measured bound that keeps the rest out of reach."""
+    """Plan rules 5: the strategy's ceiling is the limit, and a forecast whose best case stays below half of a needed
+    family's limit names the measured bound that keeps the rest out of reach."""
     plan_rules = 5
 
-    def test_new_runs_check_plans_with_rules_5(self):
-        from crit.run import records
-        self.assertEqual(records.NEW_RUN_PLAN_RULES, 5)
+    def test_a_run_created_with_rules_5_keeps_them(self):
         self.assertEqual(self.run["spec"]["plan_rules"], 5)
 
     def test_a_forecast_far_below_the_limit_names_the_measured_bound(self):
@@ -1195,6 +1197,82 @@ class PlanRules5Tests(PlanFixture, unittest.TestCase):
              "evidence": PlanRules4Tests.evidence(self, "prefill.json")}], levers=[lever()],
             forecast={**plan()["forecast"], "prefill": {"low": 1000.0, "expected": 1000.0, "high": 1000.0}}))
             ["inputs"]["reach"])
+
+
+class PlanRules6Tests(PlanFixture, unittest.TestCase):
+    """Plan rules 6, the default of new runs: an as_quantized run's build plans declare prompt_activations, no quantized
+    format starts at BF16 without a measured rejection of the stored format, and a candidate serves what its plan
+    declared."""
+    plan_rules = 6
+    quality_mode = "as_quantized"
+    stored = {"nvfp4": "stored", "fp8": "fp8"}
+
+    def evidence(self, name, value):
+        return PlanRules3Tests.evidence(self, name, value)
+
+    def bf16_rejection(self, p05=1.1, activations="stored"):
+        sets = {"long-4096/prompt": {"budget_used": 1.3, "budget_spread": {"budget_used": {"p05": p05}}}}
+        path = self.evidence(f"stored-{p05}-{activations}.json",
+                             {"engine": {"prompt_activations": activations}, "quality": {"sets": sets}})
+        return {"kpi": "prefill", "gap": "activation:stored", "answer": "rejected", "evidence": path,
+                "detail": "NVFP4 prompt activations on the experts"}
+
+    def test_new_runs_check_plans_with_rules_6(self):
+        from crit.run import records
+        self.assertEqual(records.NEW_RUN_PLAN_RULES, 6)
+        self.assertEqual(self.run["spec"]["plan_rules"], 6)
+
+    def test_candidate_1_starts_at_the_checkpoints_activation_format(self):
+        first = plan(levers=[], forecast=None)
+        with self.assertRaisesRegex(ValueError, "build plan declares prompt_activations"):
+            self.store.plan(self.run_id, first)
+        for exact in ("bf16", {"nvfp4": "bf16", "fp8": "fp8"}, {"nvfp4": {"stored": 0.5, "bf16": 0.5}}):
+            with self.subTest(exact=exact):
+                with self.assertRaisesRegex(ValueError, "at bf16: in as_quantized a quantized format's prompt GEMMs "
+                                                        "start at the checkpoint's own activation format"):
+                    self.store.plan(self.run_id, {**first, "prompt_activations": exact})
+        with self.assertRaisesRegex(ValueError, "prompt_activations is what the planned engine declares"):
+            self.store.plan(self.run_id, {**first, "prompt_activations": {"nvfp4": "int4"}})
+        recorded = self.store.plan(self.run_id, {**first, "prompt_activations": self.stored})
+        self.assertEqual(recorded["prompt_activations"], self.stored)
+        self.assertNotIn("activation_evidence", recorded["inputs"])
+
+    def test_bf16_stands_on_a_measured_rejection_of_the_stored_format(self):
+        first = {**plan(levers=[], forecast=None), "prompt_activations": {"nvfp4": "bf16", "fp8": "bf16"}}
+        with self.assertRaisesRegex(ValueError, "inside the quality noise, so not a rejection"):
+            self.store.plan(self.run_id, {**first, "gaps": [self.bf16_rejection(p05=0.9)]})
+        with self.assertRaisesRegex(ValueError, "measured prompt activations 'fp8', not 'stored'"):
+            self.store.plan(self.run_id, {**first, "gaps": [self.bf16_rejection(activations="fp8")]})
+        rejection = self.bf16_rejection()
+        recorded = self.store.plan(self.run_id, {**first, "gaps": [rejection]})
+        self.assertEqual(recorded["inputs"]["activation_evidence"]["path"], rejection["evidence"])
+        self.assertEqual(recorded["inputs"]["activation_evidence"]["over_budget_sets"], ["long-4096/prompt"])
+
+    def test_a_candidate_serves_what_its_plan_declared(self):
+        recorded = self.store.plan(self.run_id, {**plan(levers=[], forecast=None), "prompt_activations": self.stored})
+        parent = self.candidate(plan_id=recorded["plan_id"])["candidate_id"]
+        self.evaluated(parent, status(), engine={"prompt_activations": {"nvfp4": "bf16", "fp8": "bf16"}})
+        forecast = {**plan()["forecast"], "prefill": {"low": 1100.0, "expected": 1500.0, "high": 2000.0}}
+        follow = {**plan(parent, forecast=forecast), "prompt_activations": self.stored}
+        with self.assertRaisesRegex(ValueError, f"{parent} served prompt activations .*bf16.*, its plan plan-0001 "
+                                                "declared .*stored"):
+            self.store.plan(self.run_id, follow)
+        self.evaluated(parent, status(), engine={"prompt_activations": self.stored})
+        self.assertEqual(self.store.plan(self.run_id, follow)["prompt_activations"], self.stored)
+
+
+class PlanRules6PreserveTests(PlanRules6Tests):
+    """Check 16 asks only as_quantized runs."""
+    quality_mode = None
+
+    def test_a_preserve_run_is_not_asked(self):
+        recorded = self.store.plan(self.run_id, {**plan(levers=[], forecast=None), "prompt_activations": "bf16"})
+        self.assertEqual(recorded["prompt_activations"], "bf16")
+        self.assertEqual(self.store.plan(self.run_id, plan(levers=[], forecast=None))["plan_id"], "plan-0002")
+
+    test_candidate_1_starts_at_the_checkpoints_activation_format = None
+    test_bf16_stands_on_a_measured_rejection_of_the_stored_format = None
+    test_a_candidate_serves_what_its_plan_declared = None
 
 
 class ReconPlanRules3Tests(PlanFixture, unittest.TestCase):

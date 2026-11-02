@@ -1,6 +1,7 @@
 """crit run measure: the run's cases measured on a packaged candidate through crit serve, under a benchmark
 reservation."""
 import contextlib
+from datetime import timedelta
 import ctypes
 import io
 import json
@@ -12,10 +13,10 @@ import time
 import unittest
 from unittest.mock import patch
 
-import test_run_records as run_records
-from test_run_records import ROOT
+from support.runs import RunFixture, timestamp_for_test
+from support.runs import ROOT
 from crit.process.ownership import process_identity
-from crit.run import measure
+from crit.run import attempt as run_attempt, measure
 from crit.run.records import file_sha, read_json
 
 # A resident chat adapter whose prompt is one token per character of its messages and whose greedy reply is one "x"
@@ -63,7 +64,7 @@ def create_engine(context):
 SERVED = ["prefill", "decode", "chat-json-v1", "chat-resident-v1", "chat-stream-v1", "chat-sampling-temperature-v1"]
 
 
-class MeasureFixture(run_records.RunFixture):
+class MeasureFixture(RunFixture):
     content = "x" * 512  # the case's message: the workload's 512 prompt tokens
 
     def setUp(self):
@@ -221,9 +222,9 @@ class RunMeasureTests(MeasureFixture, unittest.TestCase):
 
         def after_deadline():
             reservation = read_json(self.folder / "attempts/attempt-0001/reservation.json")
-            return (run_records.timestamp_for_test(reservation["deadline_at"])
-                    + run_records.timedelta(seconds=1)).isoformat()
-        with patch.object(measure, "now", after_deadline):
+            return (timestamp_for_test(reservation["deadline_at"])
+                    + timedelta(seconds=1)).isoformat()
+        with patch.object(run_attempt, "now", after_deadline):   # the attempt settles at this time
             with self.assertRaisesRegex(ValueError, "timed_out"):
                 measure.measure(self.store, self.run_id, candidate)
         self.assertEqual((self.attempt()["outcome"], self.attempt()["cleanup_settled"]), ("timed_out", True))
@@ -298,7 +299,9 @@ class MeasureCliTests(MeasureFixture, unittest.TestCase):
                 # The engine never finishes loading: the command is interrupted while crit serve loads it.
                 candidate = self.served("import json, os, time\nfrom pathlib import Path\n"
                                         "def create_engine(context):\n"
-                                        f"    Path({str(marker)!r}).write_text(json.dumps({{'pid': os.getpid()}}))\n"
+                                        # Written whole, then renamed: the test reads it the moment it exists.
+                                        f"    Path({str(marker) + '.part'!r}).write_text(json.dumps({{'pid': os.getpid()}}))\n"
+                                        f"    os.replace({str(marker) + '.part'!r}, {str(marker)!r})\n"
                                         "    time.sleep(60)\n")
                 options = {}
                 if os.name == "nt":
@@ -360,7 +363,7 @@ class DeviceMemoryTests(unittest.TestCase):
             (device / "mem_info_vram_used").write_text(str(6 << 30))
             (device / "mem_info_vram_total").write_text(str(16 << 30))
             (Path(root) / "card0").mkdir()   # a card without VRAM counters (an integrated or other vendor's GPU)
-            with patch.object(measure.shutil, "which", return_value=None), \
+            with patch.object(measure, "nvidia_smi", return_value=None), \
                     patch.object(measure, "amdgpu_vram", return_value=measure.amdgpu_vram(root)):
                 sampler = measure.Sampler(None)
                 try:
@@ -381,7 +384,7 @@ class DeviceMemoryTests(unittest.TestCase):
 
             def wait(self):
                 return 0
-        with patch.object(measure.shutil, "which", return_value="nvidia-smi"), \
+        with patch.object(measure, "nvidia_smi", return_value="nvidia-smi"), \
                 patch.object(measure.subprocess, "Popen", return_value=Smi()) as popen:
             sampler = measure.Sampler(None, gpus=[0, 1])
             try:

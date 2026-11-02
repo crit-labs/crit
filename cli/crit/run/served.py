@@ -4,25 +4,21 @@ behind its chat API. One engine is served at a time, and the reservation's deadl
 in flight.
 """
 from contextlib import contextmanager
-from datetime import datetime, timezone
-import sys
 import threading
 import time
 
-from .records import file_sha, ident, load_run, now, read_json, safe_path, timestamp
+from crit_core.serving import (JSON_CAPABILITY, LOGPROBS_CAPABILITY, RESIDENT_CAPABILITY, SCORE_CAPABILITY,
+                               STREAM_CAPABILITY)
+
+from .attempt import Attempt, Expired, packaged, remaining, unsealed
+from .records import file_sha, load_run, now, read_json
 
 # What crit serve needs from a package to serve it for a measurement: a resident chat adapter that streams. Every
 # resident package declares the temperature (crit run package), which greedy decoding sets.
-SERVED = ("chat-json-v1", "chat-resident-v1", "chat-stream-v1")
-
-
-class Expired(Exception):
-    """The reservation's deadline passed while the candidate was served."""
-
-
-def remaining(deadline_at):
-    """Seconds left before the reservation's deadline."""
-    return (timestamp(deadline_at, "deadline") - datetime.now(timezone.utc)).total_seconds()
+SERVED = (JSON_CAPABILITY, RESIDENT_CAPABILITY, STREAM_CAPABILITY)
+# What Eval's quality needs beside them: the score call and, for its honesty check, every served token's
+# log-probability.
+QUALITY = (SCORE_CAPABILITY, LOGPROBS_CAPABILITY)
 
 
 class Served:
@@ -133,70 +129,42 @@ def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None
     keeps their report as candidates/ID/logs/serve-check-ATTEMPT.json and records a functional check per case.
     Settles the attempt and returns its result; crit serve serves the candidate once it is sealed."""
     root = store.directory(run_id)
-    folder = safe_path(root, f"candidates/{ident(candidate_id, 'candidate')}")
-    if (folder / "seal.json").exists():
-        raise ValueError("The candidate is sealed: serve it with crit serve")
-    manifest_path = folder / "package" / "manifest.json"
-    if not manifest_path.is_file():
-        raise ValueError("Package the candidate before serving it")
-    manifest = read_json(manifest_path)
-    missing = [c for c in SERVED if c not in manifest["capabilities"]]
-    if missing:
-        raise ValueError("crit serve needs the package to declare " + ", ".join(missing) + " (docs/SERVING.md)")
+    folder = unsealed(root, candidate_id, "The candidate is sealed: serve it with crit serve")
+    manifest = packaged(folder, SERVED, "serving", "crit run serve serves")
     kv_tokens = load_run(root)["spec"]["hardware_constraints"]["kv_tokens"]
-    reservation = store.reserve(run_id, candidate_id, "check", seconds)
-    attempt = reservation["attempt_id"]
-    log_path = folder / "logs" / f"serve-{attempt}.log"
-    outcome, failure, settled, interrupted, report = "completed", None, True, None, None
-    try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a", encoding="utf-8") as stream:
-            def log(message):
-                print(message, file=sys.stderr, flush=True)
-                stream.write(message + "\n")
-                stream.flush()
-            served = Served(store, run_id, candidate_id, attempt, kv_tokens, log, "crit run serve", address=(host, port))
-            with served.until(reservation["deadline_at"]):
-                _, _, bound = served.open()
-                log(f"Serving {run_id}/{candidate_id} (not sealed, {attempt}) at http://{host}:{bound}/v1; Ctrl+C stops")
-                if ready is not None:
-                    ready(bound)
-                if check:
-                    from .checks import serve_checks
-                    variables = (read_json(folder / "candidate.json")["configuration"].get("recon") or {}).get(
-                        "template_variables") or {}
-                    report = serve_checks(bound, manifest["capabilities"], variables, served.timeout, log)
-                    log("crit run serve --check: stopping the engine")
-                try:
-                    while not check and not served.expired and not (stop is not None and stop.wait(.25)):
-                        if stop is None:
-                            time.sleep(.25)
-                except KeyboardInterrupt:
-                    log("crit run serve: interrupted, stopping the engine")
-    except BaseException as exc:
-        settled = getattr(exc, "settled", True)
-        if isinstance(exc, (Expired, TimeoutError)):
-            outcome, failure = "timed_out", str(exc) or "crit run serve passed its reserved deadline"
-        elif isinstance(exc, KeyboardInterrupt):
-            outcome, failure, interrupted = "interrupted", "Interrupted", exc
-        else:
-            outcome, failure = "failed", (type(exc).__name__ + ": " + str(exc))[:8000]
-    logs = ([{"path": log_path.relative_to(root).as_posix(), "sha256": file_sha(log_path)}]
-            if settled and log_path.is_file() else [])
+    # The engine is served until the reservation's deadline: reaching it is how a serve without --check ends.
+    attempt = Attempt(store, run_id, candidate_id, "check", seconds, "serve", "crit run serve", "crit run serve",
+                      deadline=False)
+    report = None
+    with attempt.running() as log:
+        served = Served(store, run_id, candidate_id, attempt.id, kv_tokens, log, "crit run serve", address=(host, port))
+        with served.until(attempt.deadline_at):
+            _, _, bound = served.open()
+            log(f"Serving {run_id}/{candidate_id} (not sealed, {attempt.id}) at http://{host}:{bound}/v1; Ctrl+C stops")
+            if ready is not None:
+                ready(bound)
+            if check:
+                from .checks import serve_checks
+                variables = (read_json(folder / "candidate.json")["configuration"].get("recon") or {}).get(
+                    "template_variables") or {}
+                report = serve_checks(bound, manifest["capabilities"], variables, served.timeout, log)
+                log("crit run serve --check: stopping the engine")
+            try:
+                while not check and not served.expired and not (stop is not None and stop.wait(.25)):
+                    if stop is None:
+                        time.sleep(.25)
+            except KeyboardInterrupt:
+                log("crit run serve: interrupted, stopping the engine")
     if report is not None:
-        report.append({"name": "stop_engine", "state": "passed" if outcome == "completed" else "failed",
-                       "detail": "the engine stopped and its resident host exited, as on Ctrl+C" if outcome == "completed"
-                       else f"stopping the engine: {failure}"})
-    result = store.settle(run_id, reservation, {"outcome": outcome, "ended_at": now(),
-                                                "exit_code": 0 if outcome == "completed" else None,
-                                                "cleanup_settled": settled, "logs": logs, "failure": failure})
+        completed = attempt.outcome == "completed"
+        report.append({"name": "stop_engine", "state": "passed" if completed else "failed",
+                       "detail": "the engine stopped and its resident host exited, as on Ctrl+C" if completed
+                       else f"stopping the engine: {attempt.failure}"})
+    result = attempt.settle()
     if report is not None:
-        result = {"attempt": result, "checks": _record_serve_checks(store, run_id, candidate_id, root, folder, attempt,
-                                                                     manifest, report, logs)}
-    if interrupted is not None:
-        raise interrupted
-    if outcome != "completed":
-        raise ValueError(f"crit run serve {outcome}: {failure} (log {log_path.relative_to(root).as_posix()})")
+        result = {"attempt": result, "checks": _record_serve_checks(store, run_id, candidate_id, root, folder, attempt.id,
+                                                                     manifest, report, result["logs"])}
+    attempt.finish()
     return result
 
 

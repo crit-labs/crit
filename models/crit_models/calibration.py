@@ -8,7 +8,7 @@ from pathlib import Path
 import random
 import re
 
-from crit.run.records import digest, file_sha
+from crit.records import digest, file_sha
 
 MAX_BYTES = 1 << 30
 EXCERPT = 64

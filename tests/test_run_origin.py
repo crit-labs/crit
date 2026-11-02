@@ -1,6 +1,5 @@
 """crit run create --from-engine: a run that starts from a crit-hub engine records its origin, keeps its evidence,
 checks the checkpoint at resolve and lets the first candidate declare its lineage."""
-import json
 from pathlib import Path
 import sys
 import unittest
@@ -10,7 +9,7 @@ for _folder in ("core/python", "api", "../crit-eval", "kernels", "cli", "tests")
 from crit.run import hub
 from crit.run.cli import main
 from crit.run.records import LINEAGE, digest, file_sha, inventory, read_json, write_json
-from test_run_records import RunFixture
+from support.runs import RunFixture
 
 try:
     import yaml
