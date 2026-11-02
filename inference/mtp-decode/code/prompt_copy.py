@@ -75,6 +75,13 @@ class PromptCopyIndex:
             self._add_window(end)
 
     def propose(self, remaining=None, *, vocabulary=None, stop_tokens=()):
+        return self.propose_matched(remaining, vocabulary=vocabulary, stop_tokens=stop_tokens)[0]
+
+    def propose_matched(self, remaining=None, *, vocabulary=None, stop_tokens=(), longest=64):
+        """(propose()'s draft, matched): how many accepted tokens before the copied continuation equal the context's
+        last tokens, at least `window` with a draft and at most `longest`, 0 without one. A long match is evidence
+        the copy continues, for overriding another drafter's tokens (device-speculative-round's CopyDrafts)."""
+        _integer(longest, "longest", 1)
         limit = self.max_draft if remaining is None else min(
             self.max_draft, _integer(remaining, "remaining"))
         if vocabulary is not None:
@@ -82,9 +89,9 @@ class PromptCopyIndex:
         stops = frozenset(_tokens(stop_tokens))
         length, width = len(self._tokens), self.window
         if not limit or length <= width:
-            return ()
+            return (), 0
         suffix = tuple(self._tokens[-width:])
-        best = ()
+        best, source = (), 0
         for start in reversed(self._positions.get(suffix, ())):
             end = start + width
             if end >= length:  # The suffix itself has no known continuation.
@@ -103,10 +110,16 @@ class PromptCopyIndex:
                 if token in stops:
                     break
             if len(candidate) > len(best):
-                best = tuple(candidate)
+                best, source = tuple(candidate), end
             if len(best) == limit:
                 break
-        return best
+        if not best:
+            return (), 0
+        matched = width
+        while (matched < longest and matched < source
+               and self._tokens[source - matched - 1] == self._tokens[length - matched - 1]):
+            matched += 1
+        return best, matched
 
 
 @dataclass(frozen=True)

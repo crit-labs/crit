@@ -50,6 +50,8 @@ public:
 class StatePages final : public crit::core::StateStorage {
   std::size_t pages_, page_rows_, key_width_, value_width_, row_width_;
   std::vector<float> data_;
+  bool poison_ = false;
+  float pattern_ = 0.f;
   static std::size_t checked(std::size_t a, std::size_t b) {
     if (b && a > std::numeric_limits<std::size_t>::max() / b) throw std::length_error("KV extent overflow");
     return a * b;
@@ -125,6 +127,17 @@ public:
   }
   void copy_slot(std::uint32_t, crit::core::SlotId, crit::core::SlotId) override {
     throw std::logic_error("StatePages holds no recurrent state slots");
+  }
+  // Debugging: fill every page the cache hands out for new rows with `value` (NaN by default), so attention that
+  // reads a row this request never wrote, through a wrong mask or length, sees the pattern rather than a previous
+  // owner's keys and values. fill() writes it into one page, for StateCache::guard_page().
+  void poison(float value = std::numeric_limits<float>::quiet_NaN()) noexcept { poison_ = true; pattern_ = value; }
+  void fill(crit::core::PageId page, float value) {
+    check_page(page);
+    std::fill_n(row(page, 0), page_rows_ * row_width_, value);
+  }
+  void fresh_page(crit::core::PageId page) noexcept override {
+    if (poison_ && page < pages_) std::fill_n(row(page, 0), page_rows_ * row_width_, pattern_);
   }
   // rows: the sequence's committed rows, plus its staged rows when a round should read them.
   StatePagesView view(std::span<const crit::core::PageId> block_table, std::size_t rows) const {

@@ -21,6 +21,17 @@ class PromptCopyTests(unittest.TestCase):
         self.assertEqual(index.propose(2, stop_tokens=(3,)), (3,))
         self.assertEqual(index.propose(3, vocabulary=4), (3,))
 
+    def test_a_proposal_reports_how_long_its_match_is(self):
+        m = load("mtp-decode", "prompt_copy.py")
+        index = m.PromptCopyIndex((5, 6, 7, 8, 1, 2, 3, 9, 7, 8, 1, 2), window=2, history_window=2)
+        # "1 2" was last seen after "7 8", as now: four tokens match before the copied "3 9".
+        self.assertEqual(index.propose_matched(2), ((3, 9), 4))
+        self.assertEqual(index.propose_matched(2, longest=3), ((3, 9), 3))
+        self.assertEqual(index.propose(2), (3, 9))
+        self.assertEqual(m.PromptCopyIndex((1, 2, 3), window=2).propose_matched(), ((), 0))
+        with self.assertRaises(ValueError):
+            index.propose_matched(longest=0)
+
     def test_newest_bucket_does_not_count_the_current_suffix(self):
         m = load("mtp-decode", "prompt_copy.py")
         index = m.PromptCopyIndex((1, 2, 3, 1, 2), window=2, history_window=2, max_matches=1)

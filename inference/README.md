@@ -31,11 +31,12 @@ leaves to the engine.
 | Audit imported model metadata | [model-import-audit](model-import-audit/README.md) | Safetensors header/index checks, tensor roles, shard geometry |
 | Reuse serialized state | [checkpoint-storage](checkpoint-storage/README.md) | Complete manifests, prefix coordination, paced transfers, leased tiers |
 | Recover speculative recurrence | [recurrent-state-recovery](recurrent-state-recovery/README.md) | Gated-delta verification, accepted-prefix repair, chunked prefill reference |
-| Share KV and execute attention | [attention-state](attention-state/README.md) | FP32/int8 COW pages for Core's state cache, tiled CPU attention, GQA, masks, RoPE |
+| Share KV and execute attention | [attention-state](attention-state/README.md) | FP32/int8 COW pages for Core's state cache, a host tier for evicted pages, tiled CPU attention, GQA, masks, RoPE |
 | Partition a long attention sequence | [partitioned-attention](partitioned-attention/README.md) | Interleaved ownership, stable partial reduction, head-major scatter |
 | Execute low-bit projections | [quantized-projections](quantized-projections/README.md) | G32 W4/W8 and dynamic A8 on the CPU, row-scaled FP8 and NVFP4 host codecs |
 | Reuse expert weights, lend cache memory or borrow idle KV and workspace memory | [expert-residency](expert-residency/README.md) | Byte-cache leases, complete bundles, C++ region loans and owner slot loans |
-| Plan expert residency inside decode graphs | [device-expert-cache](device-expert-cache/README.md) | CUDA directory, miss copies, prefetch, offline policy replay |
+| Plan expert residency inside decode graphs | [device-expert-cache](device-expert-cache/README.md) | Ready `ExpertCache`: CUDA directory, miss copies, admission limits and the CPU/link split, profile warm start, prefetch, offline policy replay |
+| Read prompts through routed experts kept in host memory | [expert-streamed-prefill](expert-streamed-prefill/README.md) | Chunk size from the measured rate curve, layer double-buffered expert copies, the FP64 reference and the provider grouped projections (`kernels.json`) |
 | Choose expert execution sources | [heterogeneous-expert-dispatch](heterogeneous-expert-dispatch/README.md) | Placement plans, measured CPU/device splits, one routing description with its host reference |
 | Compute NVFP4 experts on the CPU with the device's bits | [host-expert-arithmetic](host-expert-arithmetic/README.md) | Declared row order, scalar oracle, AVX2/AVX-512 paths, matching CUDA function, scale hook |
 | Join asynchronous contributions | [async-expert-contributions](async-expert-contributions/README.md) | Receipt-based join, source retention, ordered reduction |
@@ -89,6 +90,20 @@ in [inference.py](../cli/crit/inference.py) and to this table.
 | `sampling-and-constraints` | Token sampling and constrained output |
 | `execution` | Scheduling, batching, graph reuse and recorded execution choices |
 | `memory-and-loading` | Artifact loading, import checks, host/device memory and serialized state |
+
+**Kernels for a technique: `kernels.json`.** Crit ships no compute kernels. A technique whose
+operations run on the device lists the kernels that do them in `kernels.json` beside its
+README: per operation (`id`, `what`), the technique's CPU reference to check a kernel against
+(`reference`: a file of the technique and its symbol), how to check it on the target before
+trusting it (`verify`), and the candidate kernels, each with its `provider` (`lib:NAME`, a
+library from [Kernels' sources](../kernels/SOURCES.md), or `hub:ORG/NAME`, a Kernel Hub
+repository), the exact `call`, the `formats`, GPU `archs` and `shapes` it covers, and where it
+matters its `scale_layout` and `notes`. A `hub:` kernel says whether it is `published`; crit-labs'
+own kernels live in `hub-kernels/` (`local`) until they are. `crit inference show ID` prints them
+and `crit inference check` validates the file. A technique with no device arithmetic of its own
+(bookkeeping, scheduling, host formulas) has none. Run each candidate against the reference on the
+target GPU and checkpoint, keep the fastest that passes, and drop one that fails: a kernel that
+only covers some GPUs or shapes says so here instead of breaking a build.
 
 Read the mechanism (units, identities, arithmetic, state transitions) before
 porting; the Python object model is a reference, not a required interface. To

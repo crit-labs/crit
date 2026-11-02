@@ -1,5 +1,5 @@
 """crit: run records, Kernels, Eval dispatch and the serving API's command line."""
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 
 try:
     # crit Eval gives Core the model-family knowledge Core holds none of (crit_core.registry): the GGUF config rules

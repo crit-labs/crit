@@ -15,7 +15,8 @@
       "Private bounded scratch with retained KV image, synchronous GEMM contract, cancellation and optional OpenBLAS integration",
       "Physically compressed G32 int8 page storage behind Core's StateCache with bounded head-range decoding into attention scratch",
       "Keyed ragged batches with retained private plans, aggregate resource limits and all-or-nothing result return; synthetic Core mixed-scheduling integration",
-      "Integrated Core memory-pressure recovery with real page reclamation and replay of accepted history for the supplied attention reference"
+      "Integrated Core memory-pressure recovery with real page reclamation and replay of accepted history for the supplied attention reference",
+      "A host page tier for evicted prefix pages: admission from StateStorage::evicted, LRU capacity, continuation of a prompt verified by chain hash and exact tokens, restored in one final_row round with window rows and recurrent state"
     ],
     "engine_supplies": [
       "Model projections, head geometry, RoPE layout/position IDs (frequencies from rope_table or its own), attention scale and allowed causal prefixes",
@@ -90,6 +91,10 @@
     {
       "path": "inference/attention-state/code/recoverable_engine.h",
       "purpose": "Core memory-pressure adapter with transactional page reservation, physical page release and complete continuation replay for the supplied attention model"
+    },
+    {
+      "path": "inference/attention-state/code/host_page_tier.h",
+      "purpose": "HostPageTier: a bounded host tier for prefix pages Core's StateCache evicts (admit from StateStorage::evicted, continuation verified by chain hash and tokens for a restore round)"
     }
   ],
   "requires": {
@@ -136,7 +141,8 @@
     "BasicAttentionBatch",
     "PagedAttentionBatch",
     "StatePages",
-    "StatePagesView"
+    "StatePagesView",
+    "HostPageTier"
   ],
   "interactions": [
     "mtp-decode",
@@ -155,7 +161,7 @@
   ],
   "validation": {
     "host": "Python fixtures retain the dense transaction/formula example and check rope_table.py against Hugging Face's ROPE_INIT_FUNCTIONS (rope_table.h agrees with it to 1e-12 on the same configs, refusals included); native StatePages fixtures cover row staging, partial commit, discard, rewind, fork copy-on-write, prefix reuse through StateCache, rejected rows and 5000 randomized transitions against a value oracle",
-    "native": "StatePages fixtures plus 2304 independent dense-reference attention cases, RoPE/prefill/decode/COW comparisons, varied continuation chunks and shared-prefix boundaries around page edges, cancellation, extreme logits and failed kernels; optional retained OpenBLAS profile repeats numerical/integration checks. Device fences and full-model behavior remain unqualified; native encoded KV fixture covers packed storage accounting, StateCache COW, rollback/rewind, invalid append, capacity rejection and generic attention against decoded KV; ragged batch fixture adds 74 dense comparisons, mixed geometry, permuted/stale/duplicate identities, aggregate limits, cancellation/reentrancy and later-row failure; encoded batch identity/results and 24 Core synthetic dense-generation comparisons on Core's StateCache with StatePages, plus a fork copy-on-write check",
+    "native": "StatePages fixtures plus 2304 independent dense-reference attention cases, RoPE/prefill/decode/COW comparisons, varied continuation chunks and shared-prefix boundaries around page edges, cancellation, extreme logits and failed kernels; optional retained OpenBLAS profile repeats numerical/integration checks. Device fences and full-model behavior remain unqualified; native encoded KV fixture covers packed storage accounting, StateCache COW, rollback/rewind, invalid append, capacity rejection and generic attention against decoded KV; ragged batch fixture adds 74 dense comparisons, mixed geometry, permuted/stale/duplicate identities, aggregate limits, cancellation/reentrancy and later-row failure; encoded batch identity/results and 24 Core synthetic dense-generation comparisons on Core's StateCache with StatePages, plus a fork copy-on-write check; host page tier fixtures restore an evicted 24-row hybrid conversation (recurrent component and sliding window) for its next turn and compare every KV row, window row and the live state with recomputation",
     "performance": "No engine throughput/latency claim; page sharing and workspace bounds are functional properties, and synchronous CPU GEMM provider speed requires workload-specific measurement"
   }
 }

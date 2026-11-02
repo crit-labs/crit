@@ -3,6 +3,7 @@ EAGLE-3, native DFlash and DSpark, and crit's own crit models drafter heads) wit
 reference's catch-up, block, mapping and truncation rules."""
 import importlib.util
 import json
+import math
 from pathlib import Path
 import sys
 import tempfile
@@ -105,6 +106,47 @@ class DraftingRuleTests(unittest.TestCase):
             m.block_input(1, 2, 1)
         with self.assertRaises(ValueError):
             m.eagle_inputs([1, 2, 3], 2)
+
+
+class ConfidenceCutTests(unittest.TestCase):
+    def simulate(self, accept_of, rounds=3000, width=6, seed=3):
+        """Rounds of a drafter whose draft at confidence c is accepted with probability accept_of(c), cut by the
+        current threshold: the cut converges to where acceptance reaches the target."""
+        import random
+        m = drafting()
+        rng, cut = random.Random(seed), m.ConfidenceCut(0.5)
+        for _ in range(rounds):
+            confidence = [rng.random() for _ in range(width)]
+            drafts = list(range(1, width + 1))
+            threshold = cut.threshold()
+            kept = next((j for j, c in enumerate(confidence) if c < threshold), width)
+            predictions = [d if rng.random() < accept_of(c) else 0 for d, c in zip(drafts, confidence)] + [0]
+            cut.observe(drafts, confidence, kept, predictions)
+            cut.decay_step()
+        return cut.threshold()
+
+    def test_the_cut_follows_the_drafters_own_calibration(self):
+        self.assertAlmostEqual(self.simulate(lambda c: c), 0.5, delta=0.1)
+        # A head that overstates its confidence (accepted with probability c^2) is cut higher, near sqrt(0.5).
+        self.assertAlmostEqual(self.simulate(lambda c: c * c), 0.71, delta=0.1)
+
+    def test_burn_in_bonus_labels_and_limits(self):
+        m = drafting()
+        cut = m.ConfidenceCut(0.6, burn_in=4, min_count=2)
+        self.assertEqual(cut.threshold(), -math.inf)
+        # Kept drafts up to the first mismatch are labelled, nothing after it.
+        cut.observe([5, 6, 7], [0.9, 0.9, 0.2], 3, [5, 1, 7, 0])
+        self.assertEqual(cut.total, 2.0)
+        # Every kept draft accepted and the round cut: the first cut draft is judged by the bonus prediction.
+        cut.observe([5, 6, 7], [0.9, 0.9, 0.12], 2, [5, 6, 7])
+        self.assertEqual(cut.total, 5.0)
+        self.assertEqual(cut.bins[2], [1.0, 1.0])
+        self.assertEqual(cut.threshold(), 0.9)   # the 0.9 bin accepts 3 of 4; the low bin has too few labels
+        for bad in ({"target": 0}, {"target": 1.5}, {"target": 0.5, "decay": 0}):
+            with self.subTest(options=bad), self.assertRaises(ValueError):
+                m.ConfidenceCut(**bad)
+        with self.assertRaises(ValueError):
+            cut.observe([1, 2], [0.5, 0.5], 2, [1, 2])   # one prediction short
 
 
 if __name__ == "__main__":

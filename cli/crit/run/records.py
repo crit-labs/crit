@@ -23,8 +23,8 @@ WORKLOAD_MODES = ("resident", "cold")
 TARGETS = ("decode_tps", "prefill_tps", "request_ms")  # a run's speed objectives, each a positive number
 VERIFICATION_LEVELS = ("reported", "artifact_verified")
 EXACTNESS_MODES = {"reported", "required"}  # must speculative output equal plain greedy?
-# How Eval judges quality (crit-eval quality modes): against the checkpoint with exact activations, or the same with
-# each set's limits widened by the drift of the checkpoint's own activation quantization.
+# How Eval judges quality (crit-eval quality modes): against the checkpoint with exact activations, or, the mode for
+# speed, the same with a budget that only keeps out a broken engine and near-tie output differences allowed.
 QUALITY_MODES = ("preserve", "as_quantized")
 # Runs created from this version on require a recorded plan (crit run ... plan) for every candidate; older runs
 # have no plans field and keep plan_id optional.
@@ -147,7 +147,7 @@ def quality_mode(correctness):
 @functools.cache
 def default_quality_budgets():
     """Eval's quality thresholds by quality mode, a run's budget unless it sets its own: crit_eval/protocol.json's
-    quality.thresholds for preserve and quality.mode_thresholds for the others (as_quantized's are twice preserve's,
+    quality.thresholds for preserve and quality.mode_thresholds for the others (as_quantized's are eight times preserve's,
     since 4-bit activation math swings KL far more)."""
     try:
         from crit_eval import EVAL_DIR

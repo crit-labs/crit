@@ -1,4 +1,5 @@
 """Core text layer: tokenizer, chat templates, generation config, detokenizer, stop strings and streams (offline)."""
+import dataclasses
 from datetime import datetime
 import json
 import os
@@ -24,6 +25,8 @@ from crit_core.text import (ChatTemplate, ChatTemplates, GenerationConfig, Incre
                             ModelTextError, StopMatcher, TemplateError, TextError, TextStream, TokenError, Tokenizer,
                             legacy_eos_ids, load_model_text, openai_messages, template_sources)
 from crit_core.text import detokenize as detokenize_module, stops as stops_module  # noqa: E402
+from crit_core.text.prompt_cache import PromptTokenCache  # noqa: E402
+from crit_core.text.loops import LoopDetector  # noqa: E402
 from crit_core.text.stream import TextDelta  # noqa: E402
 import eval_v2_rules as v2  # noqa: E402  crit-eval-v2's stop_ids, the oracle legacy_eos_ids was ported from
 from support.files import unreadable_open  # noqa: E402
@@ -1389,6 +1392,154 @@ class ModelTextTests(unittest.TestCase):
         self.assertEqual((delta.text, delta.stop, delta.finish_reason), ("Hello", 4, "stop"))
         unstopped = model.text_stream(prompt, stop_token_ids=(), stop_strings=["lo"])
         self.assertEqual(unstopped.push(tokenizer.encode("Hello", add_special_tokens=False)).text, "Hel")
+
+
+class PromptTokenCacheTests(unittest.TestCase):
+    """PromptTokenCache splices a cached prompt's ids with a re-encoded tail; every result must equal a full encode."""
+
+    @staticmethod
+    def full(tokenizer, text):
+        return tokenizer.encode(text, add_special_tokens=False, split_special_tokens=False)
+
+    def conversations(self, tokenizer, text_of, cache, rng, turns=10):
+        specials = sorted(token.content for token in tokenizer.added_tokens.values())
+        for _ in range(12):
+            text = "".join(text_of(rng) for _ in range(rng.randint(4, 12)))
+            for _ in range(turns):
+                tail = text_of(rng)
+                if specials and rng.random() < 0.3:
+                    tail = rng.choice(specials) + tail
+                text += tail
+                self.assertEqual(cache.encode(text), self.full(tokenizer, text))
+
+    def test_every_turn_equals_a_full_encode_and_extensions_are_spliced(self):
+        for name, make, text_of in TOKENIZERS:
+            with self.subTest(tokenizer=name):
+                tokenizer = make()
+                cache = PromptTokenCache(tokenizer, min_chars=16, overlap=8, resync=4, attempts=4)
+                self.conversations(tokenizer, text_of, cache, random.Random(5))
+                self.assertGreater(cache.hits, 0)
+                self.assertEqual(cache.hits + cache.misses, 12 * 10)
+
+    def test_one_back_off_point_falls_back_to_a_full_encode_when_the_tokenizer_stays_out_of_step(self):
+        # The SentencePiece fixture prepends its space marker to whatever text it encodes, so a tail encoded from
+        # inside a word starts with a different token: the splice is refused and the whole prompt encoded instead.
+        tokenizer = sp_tokenizer()
+        cache = PromptTokenCache(tokenizer, min_chars=16, overlap=8, resync=4, attempts=1)
+        self.conversations(tokenizer, corpus_text, cache, random.Random(9))
+        self.assertGreater(cache.resync_failures, 0)
+        more = PromptTokenCache(tokenizer, min_chars=16, overlap=8, resync=4, attempts=8)
+        self.conversations(tokenizer, corpus_text, more, random.Random(9))
+        self.assertLess(more.resync_failures, cache.resync_failures)
+
+    def test_short_prompts_bypass_the_cache_and_a_conversation_keeps_one_entry(self):
+        tokenizer = byte_tokenizer()
+        cache = PromptTokenCache(tokenizer, min_chars=64, overlap=4, resync=2)
+        self.assertEqual(cache.encode("Hello world"), self.full(tokenizer, "Hello world"))
+        self.assertEqual((len(cache), cache.hits, cache.misses), (0, 0, 0))
+        text = " ".join(fx.CORPUS)
+        for turn in range(5):
+            text += f" turn {turn}: " + fx.CORPUS[turn]
+            self.assertEqual(cache.encode(text), self.full(tokenizer, text))
+            self.assertEqual(len(cache), 1)
+        self.assertEqual((cache.hits, cache.misses), (4, 1))
+        with self.assertRaises(TypeError):
+            cache.encode(b"bytes")
+
+    def test_entries_and_characters_bound_what_is_kept(self):
+        tokenizer = byte_tokenizer()
+        texts = [f"{index} " + " ".join(fx.CORPUS) for index in range(5)]
+        by_count = PromptTokenCache(tokenizer, min_chars=16, overlap=4, resync=2, entries=2)
+        by_chars = PromptTokenCache(tokenizer, min_chars=16, overlap=4, resync=2, max_chars=len(texts[0]) * 3)
+        for text in texts:
+            by_count.encode(text)
+            by_chars.encode(text)
+        self.assertEqual((len(by_count), len(by_chars)), (2, 3))
+        by_count.encode(texts[0] + " again")   # evicted: encoded in full
+        self.assertEqual(by_count.hits, 0)
+        by_count.encode(texts[-1] + " again")  # kept: spliced
+        self.assertEqual(by_count.hits, 1)
+
+    def test_options_are_checked(self):
+        tokenizer = byte_tokenizer()
+        for options in ({"entries": 0}, {"min_chars": -1}, {"overlap": True}, {"resync": 1.5}, {"attempts": 0},
+                        {"overlap": 4, "resync": 5}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                PromptTokenCache(tokenizer, **options)
+
+    def test_concurrent_conversations_stay_exact(self):
+        tokenizer = byte_tokenizer()
+        cache = PromptTokenCache(tokenizer, min_chars=16, overlap=8, resync=4)
+        errors = []
+
+        def converse(seed):
+            rng = random.Random(seed)
+            text = f"conversation {seed} " + " ".join(fx.CORPUS)
+            for _ in range(20):
+                text += corpus_text(rng)
+                if cache.encode(text) != self.full(tokenizer, text):
+                    errors.append(seed)
+        threads = [threading.Thread(target=converse, args=(seed,)) for seed in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertGreater(cache.hits, 0)
+
+    def test_encode_chat_through_the_cache_equals_encode_chat_without_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fx.write_files(directory, fx.llama_files())
+            plain = load_model_text(directory, clock=None)
+            cached = load_model_text(directory, clock=None, prompt_cache=True)
+            self.assertIsNone(plain.prompt_tokens)
+            self.assertIsInstance(cached.prompt_tokens, PromptTokenCache)
+            with self.assertRaises(TextError):
+                load_model_text(directory, clock=None, prompt_cache="yes")
+        cached = dataclasses.replace(cached, prompt_tokens=PromptTokenCache(cached.tokenizer, min_chars=16))
+        rng = random.Random(3)
+        messages = [{"role": "system", "content": " ".join(fx.CORPUS)}]
+        for _ in range(6):
+            messages.append({"role": "user", "content": corpus_text(rng)})
+            self.assertEqual(cached.encode_chat(messages, add_generation_prompt=True),
+                             plain.encode_chat(messages, add_generation_prompt=True))
+            messages.append({"role": "assistant", "content": corpus_text(rng)})
+        self.assertGreater(cached.prompt_tokens.hits, 0)
+
+
+class LoopDetectorTests(unittest.TestCase):
+    def test_an_exact_repetition_is_found_once_it_spans_the_repeats_and_the_tokens(self):
+        rng = random.Random(4)
+        prefix = [rng.randrange(1000) for _ in range(300)]
+        span = [rng.randrange(1000) for _ in range(37)]
+        detector = LoopDetector(min_repeats=8, min_tokens=400, k=6)
+        tokens = prefix + span * 30
+        found = next(i for i in range(len(tokens)) if detector.push([tokens[i]]))
+        # The run starts one period into the repetition; it must cover max(400, 8 x 37) = 400 tokens.
+        self.assertEqual((detector.period, detector.run), (37, 400))
+        self.assertEqual(found, len(prefix) + 37 + 400 - 1)
+        self.assertTrue(detector.push([1, 2, 3]))   # stays looped
+
+    def test_varied_text_and_short_or_inexact_repeats_are_not_loops(self):
+        rng = random.Random(5)
+        varied = [rng.randrange(50) for _ in range(20000)]
+        self.assertFalse(LoopDetector(min_repeats=4, min_tokens=200).push(varied))
+        block = [rng.randrange(1000) for _ in range(300)]
+        twice = [rng.randrange(1000) for _ in range(100)] + block + block + block   # a quoted passage, three times
+        self.assertFalse(LoopDetector(min_repeats=8, min_tokens=400).push(twice))
+        counted = []
+        for item in range(400):   # a numbered list: the same line with a changing number
+            counted += [10, 11, 12, 1000 + item, 13]
+        self.assertFalse(LoopDetector(min_repeats=8, min_tokens=400).push(counted))
+        for options in ({"min_repeats": 0}, {"k": True}, {"max_period": -2}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                LoopDetector(**options)
+
+    def test_a_period_longer_than_max_period_is_not_followed(self):
+        rng = random.Random(6)
+        span = [rng.randrange(1000) for _ in range(60)]
+        self.assertFalse(LoopDetector(min_repeats=4, min_tokens=100, max_period=50).push(span * 20))
+        self.assertTrue(LoopDetector(min_repeats=4, min_tokens=100, max_period=60).push(span * 20))
 
 
 if __name__ == "__main__":

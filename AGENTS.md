@@ -50,7 +50,9 @@ run the same commands as tools through `crit mcp` ([MCP](mcp/README.md)), the lo
   candidate 1 is a proof of concept of the scenario, not a placeholder below it. In `sparse_device_host`
   that means a device expert cache and the checkpoint's drafter from candidate 1 on, with misses on the
   faster of the link and the CPU; an engine that copies every expert over the link on every pass measures
-  neither lever. In `dense_device_host` and `beyond_host`, tell the user what speed to expect before
+  neither lever. Start from `device-expert-cache`'s `ExpertCache` and its recipe, and read prompts with
+  `expert-streamed-prefill` (chunks at the grouped projection's rate knee, expert copies overlapped layer by
+  layer) rather than re-sending experts for every small chunk. In `dense_device_host` and `beyond_host`, tell the user what speed to expect before
   building.
 - **Start from a crit-hub engine when one exists for the model.** `create --from-engine ENGINE_DIR`
   (the engine's folder in a crit-hub checkout) records it as the run's origin: its source pin, the
@@ -258,10 +260,13 @@ Work in rounds, one candidate per round:
   prices faster than the engine's own is rejected by a quality measurement outside the quality
   noise (`gap` `activation:FORMAT`).
   Recon writes a prefill arithmetic plan beside the drafting plan: each matrix group's prompt
-  activation format and its quality measurement (`--attribute-drift`), before the first candidate.
-  In `as_quantized` runs (plan rules 6) every build plan declares `prompt_activations`, and no
-  quantized format starts at BF16: candidate 1 reads prompts at the checkpoint's own activation
-  format, and BF16 needs a measured rejection of it (`activation:stored`).
+  activation format and, in `preserve`, its quality measurement (`--attribute-drift`), before the
+  first candidate. In `as_quantized` runs (plan rules 6) every build plan declares
+  `prompt_activations`, and no quantized format starts at BF16: candidate 1 reads prompts at the
+  checkpoint's own activation format, and BF16 needs a measured rejection of it (`activation:stored`).
+  `as_quantized` is the mode for speed: the stored format's activations, FP8 or 4-bit KV, an FP8
+  head and requantized dense weights are the starting arithmetic, not levers to justify group by
+  group; the candidate's Eval judges them together.
 - **Plans are checkable.** Each plan forecasts every KPI (low, expected, high), names the
   current strategy's ceiling and the best alternative's, groups levers that only pay
   together, and puts no lever below the noise into a candidate on its own. Work the rules
@@ -287,7 +292,9 @@ Work in rounds, one candidate per round:
   prompts and the long-context curve at lengths each run draws (80-100% of nominal), so a
   graph, tile or chunk fitted to one prompt length shows as a slower held-out score. A content-dependent choice needs a general
   corpus unrelated to Eval and a held-out check in several languages and domains, both
-  stated in the proposal; when in doubt keep the general option (the full draft head).
+  stated in the proposal; when in doubt keep the general option (the full draft head). A residency
+  profile built from `device-expert-cache`'s `corpus.json` and checked on its held-out sources meets
+  this; name its `describe(...)` statement in the proposal.
   Pass `--baseline` (the run's first candidate) so Eval's generality gate applies, and
   check each candidate against its parent (`crit eval status RESULT --baseline PARENT_RESULT`).
 - **Never train or fine-tune a drafter.** Use the checkpoint's drafter, a published
@@ -313,7 +320,9 @@ Work in rounds, one candidate per round:
   case), and declare `host_bytes_per_pass` (`{"link", "cpu"}` bytes per pass, in the engine's facts)
   where the engine's own path differs from the faster of the link and the CPU.
 - **Profile** each candidate with `crit eval kernels`; for the heaviest kernels per
-  phase far from their floor, check Kernels before replacing them, and fix kernels
+  phase far from their floor, check Kernels before replacing them (first the technique's
+  `kernels.json`: its candidates with their formats, GPUs and shapes, each checked against the
+  technique's CPU reference on this GPU and checkpoint before it is trusted), and fix kernels
   that leave SMs idle. A kernel's share of its phase bounds what replacing it can gain
   (share x (1 - 1/speedup)): size and order kernel work by that bound, and a lever whose
   bound is below its KPI's noise follows the plan rule for levers below the noise. A
@@ -329,7 +338,13 @@ Work in rounds, one candidate per round:
   (Eval's `repeatable` and `request_history` gates), is a bug until a root cause is
   demonstrated: the differing kernel or state located and the difference reproduced.
   Never attribute it to rounding, FP8 KV or accumulation order without that evidence,
-  even when exactness is only reported.
+  even when exactness is only reported. In `as_quantized` runs, Eval judges each difference
+  itself ([forks](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#forks-in-quality-mode-as_quantized)):
+  one that parts at a near-tie is rounding by construction and needs no root cause, and
+  neither does a drop in plain-greedy equality. A fork Eval calls decisive is a bug as above.
+  So an `as_quantized` engine may let its arithmetic depend on what it served before: experts
+  on the CPU or the device by residency, CPU rows in a faster order than the device's,
+  kernels with atomics or splits chosen by the workload.
 - **Record through `crit run`:** freeze inputs, create candidates, retain source and
   packages, publish each case's checks, then benchmark with `crit run measure`, which
   streams each case's chat request to the candidate served through `crit serve`; seal
@@ -340,14 +355,14 @@ Work in rounds, one candidate per round:
   dependencies need a new candidate.
 - **Compare and select** on the same model and workload; explain missing metrics.
   Apply agreed criteria without relaxing them or demanding byte-identical output.
-  Spend the `quality_budget` (defaults: perplexity ratio 1.05, mean KL 0.05, p99 KL 0.5, twice that in `as_quantized`;
-  [Run records](docs/RUN_RECORDS.md#request)) on speed; drift below it is no
+  Spend the `quality_budget` (defaults: perplexity ratio 1.05, mean KL 0.05, p99 KL 0.5 in `preserve`; 1.4, 0.4
+  and 4.0 in `as_quantized`; [Run records](docs/RUN_RECORDS.md#request)) on speed; drift below it is no
   gain. The run's `quality_mode` is the user's: `preserve` judges against the checkpoint with
-  exact activations, `as_quantized` against the same reference with each set's limits widened by the drift
-  of the checkpoint's own activation quantization (so running it as declared fits, and prefill is measured
+  exact activations, `as_quantized`, the mode for speed, against the same reference with a budget that only keeps
+  out a broken engine (so running the checkpoint as declared fits with room to spare, and prefill is measured
   against the stored format's rate).
-  Never change it; the brief names it. Measure a precision change (activation quantization, a lower-precision KV cache
-  or head) against the budget on the model, per group of layers, before building other
+  Never change it; the brief names it. In `preserve`, measure a precision change (activation quantization, a
+  lower-precision KV cache or head) against the budget on the model, per group of layers, before building other
   levers on it: its cost depends on the model and decides how much of it fits. Do it in
   process during development: `crit eval run --adapter A --only quality` (development
   evidence, never the gate) with the engine declaring `prompt_activations` and `exact_variants`

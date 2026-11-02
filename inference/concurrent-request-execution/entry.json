@@ -15,7 +15,8 @@
       "Exact-base delta validation, atomic host apply and independently ordered row gathers",
       "Real asynchronous host batch execution with private result storage and retained owners",
       "Portable recurrent execution with private sampling histories, bounded dependent steps and complete-state snapshots under memory pressure",
-      "CUDA recurrence example with retained device state and events, private readback slots and demonstrated successor computation before predecessor readback"
+      "CUDA recurrence example with retained device state and events, private readback slots and demonstrated successor computation before predecessor readback",
+      "A native device replica of per-request metadata: changed rows only, pinned double-buffered staging, the order skipped when unchanged"
     ],
     "engine_supplies": [
       "Active request/generation mapping and model execution",
@@ -57,6 +58,10 @@
     {
       "path": "inference/concurrent-request-execution/code/cuda_ahead_example.cu",
       "purpose": "Runnable synthetic CUDA recurrence with device-carried accepted tokens, event dependencies, retained operation slots, ordered publication and cancellation"
+    },
+    {
+      "path": "inference/concurrent-request-execution/code/device_metadata.h",
+      "purpose": "Native MetadataTable, snapshot/diff and DeviceReplica: changed rows staged in pinned halves and copied into the device table, the gather order uploaded only when it changed"
     }
   ],
   "requires": {
@@ -87,7 +92,10 @@
     "MetadataTable",
     "MetadataReplica",
     "OwnedBatchRow",
-    "HostBatch"
+    "HostBatch",
+    "DeviceReplica",
+    "diff",
+    "Delta"
   ],
   "interactions": [
     "session-scheduling",
@@ -100,7 +108,7 @@
   ],
   "validation": {
     "host": "Host fixtures and worked example cover row compaction, copies, budgets, failed commit and independent retirement; 500 metadata mutation/gather comparisons, stale deltas, slot rebinding, immutable old readers and invalid-patch non-publication",
-    "native": "C++ CPU fixtures cover independent overlap, ordered output, cancellation, refill, failures, stale membership, cleanup, quarantine, notifications and tracing. Dependent-step fixtures compare seeded output with depth one, cover variable accepted widths, stops, limits, eligibility, private-state recovery and nonrecoverable pressure. Native HTTP fixtures cover concurrent streaming/buffered clients and cancellation during prefill. The optional CUDA recurrence fixture checks device-carried dependencies against a host oracle and cancellation while predecessor readback is gated; full-model device behavior remains unqualified",
+    "native": "C++ CPU fixtures cover independent overlap, ordered output, cancellation, refill, failures, stale membership, cleanup, quarantine, notifications and tracing. Dependent-step fixtures compare seeded output with depth one, cover variable accepted widths, stops, limits, eligibility, private-state recovery and nonrecoverable pressure. Native HTTP fixtures cover concurrent streaming/buffered clients and cancellation during prefill. The optional CUDA recurrence fixture checks device-carried dependencies against a host oracle and cancellation while predecessor readback is gated; full-model device behavior remains unqualified; device_metadata_tests.cpp on the host with a memcpy device: 300 random mutations, the device table equal to the host rows after each, order uploads skipped, refused patches",
     "performance": "Unmeasured for a native engine; host fixture success is not a speed claim"
   }
 }

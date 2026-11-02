@@ -84,9 +84,9 @@ hashes; add them only where a field below requires one.
 | `verification_level` | `reported` or `artifact_verified` (default) |
 | `targets` | Optional positive `decode_tps`, `prefill_tps`, `request_ms` thresholds |
 | `weights_policy` | Optional `as_stored` (supplied weights used as stored) or `transformable`; omitted means `transformable` when `quality_mode` is `as_quantized`, else unspecified |
-| `quality_budget` | Optional drift budget against Eval's reference: any of `ppl_ratio_max` (≥ 1), `kld_mean_max`, `kld_p99_max` (≥ 0); defaults 1.05, 0.05, 0.5 (`as_quantized`: 1.1, 0.1, 1.0, Eval's own for that mode). Agents spend it on speed |
+| `quality_budget` | Optional drift budget against Eval's reference: any of `ppl_ratio_max` (≥ 1), `kld_mean_max`, `kld_p99_max` (≥ 0); defaults 1.05, 0.05, 0.5 (`as_quantized`: 1.4, 0.4, 4.0, Eval's own for that mode). Agents spend it on speed |
 | `exactness` | `reported` (default: speculative output may differ from plain greedy; the drift budget judges it) or `required` (any difference fails Eval's gate) |
-| `quality_mode` | `preserve` (default: Eval's quality reference keeps the activations exact, and prefill's limits are priced at 16-bit prompt activations) or `as_quantized` (the same reference, each quality set's limits widened by the drift of the checkpoint's own activation quantization, crit-eval's allowance, and prefill's limits priced at its stored format); the user's choice, from the request or `settings.toml`'s `quality_mode`. `crit run ... eval` judges in it |
+| `quality_mode` | `preserve` (default: Eval's quality reference keeps the activations exact, and prefill's limits are priced at 16-bit prompt activations) or `as_quantized`, the mode for speed (the same reference with a budget that keeps out broken engines, output differences that part at near-ties allowed, and prefill's limits priced at its stored format); the user's choice, from the request or `settings.toml`'s `quality_mode`. `crit run ... eval` judges in it |
 | `eval_sampling` | Optional, the user's only: `{settings, approved_by}`, settings `temperature` (> 0, required) and any of `top_p`, `top_k`, `min_p`, as an object or `"temperature=0.6,top_p=0.95"`. Eval's sampled suite then measures at these settings instead of the model's `generation_config.json`: `crit run ... eval` requires data prepared with `crit eval prepare --sampling` and the same settings (and refuses overridden data without it), recon applies them to the served default, and results label them as an override |
 | `origin_engine` | Written by `create --from-engine`, never by hand: the crit-hub engine the run starts from ([origin engine](#origin-engine)) |
 
@@ -398,8 +398,8 @@ the message says what to add.
 Runs created from this version on have `"plan_rules": 6`: the rules 5 above and check 16, in `as_quantized` runs
 only. A build plan declares `prompt_activations`, the formats its candidate's prompt GEMMs take per stored format,
 in the form an engine declares them to Eval (`bf16`, `fp16_acc`, `fp8` or `stored`, or per format a share of
-them). No quantized format starts at `bf16`: `as_quantized` judges quality against the checkpoint's own activation
-quantization, so a candidate reads prompts at the stored format (or `fp8` / `fp16_acc`) from candidate 1 on. A
+them). No quantized format starts at `bf16`: `as_quantized` is the mode for speed and its budget fits the checkpoint's own
+activation quantization, so a candidate reads prompts at the stored format (or `fp8` / `fp16_acc`) from candidate 1 on. A
 `bf16` share stands only beside a gaps entry `{"kpi": "prefill", "gap": "activation:stored", "answer":
 "rejected", "evidence", "detail"}` whose evidence is a crit-eval result that measured `stored` outside the quality
 noise; crit records it in `inputs.activation_evidence`. The next plan is refused when its parent's Eval reports

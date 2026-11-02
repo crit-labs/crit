@@ -80,6 +80,9 @@ class WorkbenchTests(unittest.TestCase):
         for function in ("inputs", "select", "reference", "candidate", "yardstick", "work"):
             self.assertIn(f"def {function}(", kernel)
         self.assertEqual((spec["columns"], spec["column_invariant"], spec["rate"]), ([1, 4], True, None))
+        self.assertTrue(spec["repeatable"])
+        scatter = workbench.new("expert_scatter", "custom", self.root, shapes=["64,32"], repeatable=False)
+        self.assertFalse(scatter["repeatable"])   # atomics: the check judges repeats within the tolerance
 
     def test_shapes_come_from_the_checkpoints_matrices_in_the_format(self):
         model = self.root / "model"

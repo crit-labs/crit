@@ -1,5 +1,7 @@
 // Core shared device allocation protocol on the host: leases charged once through Resources, settled final
 // release with failure retention, and mapped-source resolution. Backend hooks are host fakes; no device call.
+#include <cstring>
+#include <array>
 #include <crit/device_memory.h>
 #include <crit/host_block.h>
 #include "allocation_failure.h"
@@ -297,6 +299,34 @@ void host_block_pool() {
     require(pool.cached_bytes() == 0 && d->size() == 4096, "clear");
 }
 
+
+// Unchanged uploads are skipped per destination; a changed byte, a different size, invalidate() and forget() copy again.
+void upload_shadow() {
+    UploadShadow shadow;
+    std::array<std::byte, 8> device_a{}, device_b{};
+    int copies = 0;
+    auto copy = [&](void* dst, std::span<const std::byte> src) { ++copies; std::memcpy(dst, src.data(), src.size()); };
+    std::array<std::byte, 8> slots{};
+    for(std::size_t i = 0; i < slots.size(); ++i) slots[i] = std::byte(i);
+    require(shadow.upload(device_a.data(), slots, copy) && copies == 1, "first upload copies");
+    require(!shadow.upload(device_a.data(), slots, copy) && copies == 1, "the same bytes again are skipped");
+    require(shadow.upload(device_b.data(), slots, copy) && copies == 2, "another destination has its own shadow");
+    slots[3] = std::byte(99);
+    require(shadow.upload(device_a.data(), slots, copy) && copies == 3 && device_a[3] == std::byte(99), "a changed byte copies");
+    require(shadow.upload(device_a.data(), std::span<const std::byte>(slots).first(4), copy) && copies == 4, "a shorter upload copies");
+    require(!shadow.upload(device_a.data(), std::span<const std::byte>(slots).first(4), copy), "and is then skipped");
+    shadow.invalidate(device_a.data());
+    require(shadow.upload(device_a.data(), std::span<const std::byte>(slots).first(4), copy) && copies == 5,
+            "after another write the next upload copies");
+    shadow.forget(device_b.data());
+    require(shadow.upload(device_b.data(), slots, copy) && copies == 6, "a forgotten destination copies");
+    require(shadow.copied() == 6 && shadow.skipped() == 2, "counts");
+    bool threw = false;
+    try { shadow.upload(device_a.data(), slots, [](void*, std::span<const std::byte>) { throw std::runtime_error("copy failed"); }); }
+    catch(const std::runtime_error&) { threw = true; }
+    require(threw && shadow.upload(device_a.data(), slots, copy), "a failed copy is not remembered");
+}
+
 int main(int argc, char** argv) {
     try {
         const std::string test = argc > 1 ? argv[1] : "all";
@@ -306,7 +336,8 @@ int main(int argc, char** argv) {
             {"memory_backend_lifetime", memory_backend_lifetime}, {"memory_close_allocation_failure", memory_close_allocation_failure},
             {"memory_threads", memory_threads}, {"mapped_contiguous", mapped_contiguous},
             {"mapped_discontinuous", mapped_discontinuous}, {"mapped_rejects", mapped_rejects},
-            {"mapped_generations", mapped_generations}, {"host_block_pool", host_block_pool}};
+            {"mapped_generations", mapped_generations}, {"host_block_pool", host_block_pool},
+            {"memory_upload_shadow", upload_shadow}};
         bool found = false;
         for(const auto& [name, run] : tests) if(test == "all" || test == name) {
             run();

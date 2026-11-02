@@ -1,0 +1,26 @@
+{
+  "kind": "device-expert-cache-corpus",
+  "purpose": "General text unrelated to crit-eval's suite for building residency profiles: English educational web text, web text in six other languages and source code in three languages to tune on; the test splits of those languages, two languages and one programming language it never tunes on, and code far from the tuning rows to check on",
+  "max_chars": 4000,
+  "tuning": [
+    {"name": "web-en", "dataset": "HuggingFaceFW/fineweb-edu", "config": "default", "split": "train", "field": "text", "offset": 0, "rows": 400, "license": "odc-by"},
+    {"name": "web-de", "dataset": "HuggingFaceFW/fineweb-2", "config": "deu_Latn", "split": "train", "field": "text", "offset": 0, "rows": 100, "license": "odc-by"},
+    {"name": "web-fr", "dataset": "HuggingFaceFW/fineweb-2", "config": "fra_Latn", "split": "train", "field": "text", "offset": 0, "rows": 100, "license": "odc-by"},
+    {"name": "web-es", "dataset": "HuggingFaceFW/fineweb-2", "config": "spa_Latn", "split": "train", "field": "text", "offset": 0, "rows": 100, "license": "odc-by"},
+    {"name": "web-zh", "dataset": "HuggingFaceFW/fineweb-2", "config": "cmn_Hani", "split": "train", "field": "text", "offset": 0, "rows": 100, "license": "odc-by"},
+    {"name": "web-ja", "dataset": "HuggingFaceFW/fineweb-2", "config": "jpn_Jpan", "split": "train", "field": "text", "offset": 0, "rows": 100, "license": "odc-by"},
+    {"name": "web-ru", "dataset": "HuggingFaceFW/fineweb-2", "config": "rus_Cyrl", "split": "train", "field": "text", "offset": 0, "rows": 100, "license": "odc-by"},
+    {"name": "code-python", "dataset": "codeparrot/github-code-clean", "config": "Python-all", "split": "train", "field": "code", "offset": 0, "rows": 100, "license": "per file, as the dataset records it"},
+    {"name": "code-javascript", "dataset": "codeparrot/github-code-clean", "config": "JavaScript-all", "split": "train", "field": "code", "offset": 0, "rows": 100, "license": "per file, as the dataset records it"},
+    {"name": "code-cpp", "dataset": "codeparrot/github-code-clean", "config": "C++-all", "split": "train", "field": "code", "offset": 0, "rows": 100, "license": "per file, as the dataset records it"}
+  ],
+  "held_out": [
+    {"name": "web-de-test", "dataset": "HuggingFaceFW/fineweb-2", "config": "deu_Latn", "split": "test", "field": "text", "offset": 0, "rows": 50, "license": "odc-by"},
+    {"name": "web-zh-test", "dataset": "HuggingFaceFW/fineweb-2", "config": "cmn_Hani", "split": "test", "field": "text", "offset": 0, "rows": 50, "license": "odc-by"},
+    {"name": "web-ar", "dataset": "HuggingFaceFW/fineweb-2", "config": "arb_Arab", "split": "test", "field": "text", "offset": 0, "rows": 50, "license": "odc-by"},
+    {"name": "web-hi", "dataset": "HuggingFaceFW/fineweb-2", "config": "hin_Deva", "split": "test", "field": "text", "offset": 0, "rows": 50, "license": "odc-by"},
+    {"name": "web-en-far", "dataset": "HuggingFaceFW/fineweb-edu", "config": "default", "split": "train", "field": "text", "offset": 500000, "rows": 50, "license": "odc-by"},
+    {"name": "code-java", "dataset": "codeparrot/github-code-clean", "config": "Java-all", "split": "train", "field": "code", "offset": 0, "rows": 50, "license": "per file, as the dataset records it"},
+    {"name": "code-python-far", "dataset": "codeparrot/github-code-clean", "config": "Python-all", "split": "train", "field": "code", "offset": 100000, "rows": 50, "license": "per file, as the dataset records it"}
+  ]
+}

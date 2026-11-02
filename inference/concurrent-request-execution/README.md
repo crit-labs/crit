@@ -41,7 +41,13 @@ release them after their readers settle.
   generations are positive, tokens nonnegative 32-bit, and every staged row has at least
   one candidate.
 - [metadata.py](code/metadata.py): `MetadataTable`, `MetadataSnapshot`,
-  `MetadataReplica` (host only; no device upload or pinned pool).
+  `MetadataReplica`, the host reference.
+- [device_metadata.h](code/device_metadata.h): the native form with the device upload. `MetadataTable`
+  (stable slots, lowest free slot reused, unchanged payloads changing nothing), `snapshot`, `diff`
+  (rows removed, rows new or changed, the gather order), and `DeviceReplica`. The replica stages the
+  changed rows in pinned host memory and has the engine copy each into its slot of the device table;
+  it uploads the order only when it changed (Core's `UploadShadow`). It alternates two staging
+  halves and reuses a half only after the copies that read it have finished.
 - [host_batch.h](code/host_batch.h): `HostBatch`, described below.
 
 ## What the engine supplies

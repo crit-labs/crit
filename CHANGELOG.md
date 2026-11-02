@@ -9,6 +9,141 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-02
+
+### Overview
+
+crit 0.16.0 makes quality mode `as_quantized` the mode for speed end to end: its default budget is crit-eval's wider
+one, output differences that part at near-ties pass, and kernels may be declared non-repeatable. The device expert cache
+becomes a ready component with its host store, residency corpus and provider grouped GEMM operands, and
+`expert-streamed-prefill` reads prompts through experts kept in host memory. Core's prefix cache gains recurrent
+snapshot placement for hybrid models, eviction notices with a host page tier, retention levels, reuse scopes,
+partial-page reuse and a guard page for masked reads. Techniques name the provider kernels they run (`kernels.json`),
+and expert arithmetic covers any block-scaled format on any CPU. crit 0.16.0 needs crit-eval 0.5.2.
+
+### Added
+
+- `kernels.json` beside a technique lists the provider kernels for each operation it runs on the device: the exact
+  call, formats, GPU architectures, shapes and scale layout, the technique's CPU reference to check a kernel against
+  on the target, and how. `crit inference check` validates it and `crit inference show` prints it. attention-state,
+  quantized-projections, recurrent-state-recovery, partitioned-attention, token-sampling and expert-streamed-prefill
+  have one. crit-labs' own kernels are named `hub:crit-labs/NAME` and kept in `hub-kernels/` until they are published.
+- `device-expert-cache`'s `enqueue_operands` writes a provider grouped GEMM's pointer arrays from a plan's `Use`s on
+  the device: each component inside the route's bundle, its activation and output rows and its routing weight, with
+  bypassed misses optionally left null for the CPU. The expert GEMMs stay the provider's.
+- Techniques name the provider for their arithmetic instead of leaving it unsaid: `recurrent-state-recovery` takes its
+  scans from flash-linear-attention and says which commit strategy a final-state-only scan serves, `attention-state`
+  points device attention at FlashInfer and FlashAttention over BF16 or FP8 pages (its INT8 G32 rows are a host
+  codec), and `quantized-projections` names FlashInfer's FP4 quantization and cuBLASLt's block-scaled GEMM, with the
+  tiled scale layout they share.
+- `concurrent-request-execution` gets the device side of its metadata replica (`device_metadata.h`): a native
+  `MetadataTable` with snapshots and deltas, and `DeviceReplica`, which stages only the changed rows in pinned
+  double-buffered memory, has the engine copy them into the device table and uploads the gather order only when it
+  changed.
+- `ssd-expert-materialization` gets its native host tier and read queue (`host_tier.h`): `HostTier` keeps experts in
+  pinned host slots the engine owns (least recently used out, the current route's experts protected, refusal instead
+  of a half-held expert, fills published only once landed), and `ReadQueue` fills them from the file with several
+  positioned readers, demand reads before read-ahead, one read per pending key.
+- `lookup-table-rows` has a native form, `table_rows.h`: `RowGather` reads a step's rows with random-access advice and
+  positioned reads by a persistent worker pool, reads repeated rows once, keeps an LRU of hot rows and writes them in
+  request order into the caller's buffer, and `StagingRing` hands out pinned slots for the device copy, each reused only
+  after its copy finished.
+- `device-expert-cache` builds and pins its host store: `expert_store.py` packs a checkpoint's expert tensors (per expert,
+  or stacked along the first axis) into one contiguous bundle per key with an index and the checkpoint's fingerprint,
+  reused while the source is unchanged; `expert_store.h`'s `pin_store` registers Core's read-only file mapping as mapped
+  pinned memory where the device allows it, else reads the file with several threads into a pinned `HostBlock`.
+- `device-expert-cache` names a general corpus for residency profiles (`corpus.json`): public web text in seven
+  languages and code in three to tune on, and held-out test splits, unseen languages and far rows to check on.
+  `corpus.py` fetches it through the Hugging Face dataset viewer with the standard library and records each dataset's
+  revision. A profile built from it, with its held-out check, meets AGENTS.md's rule for content-dependent choices.
+- Quality mode `as_quantized` is the mode for speed, end to end. Its default budget is crit-eval's new one (PPL ratio
+  1.4, mean KLD 0.4, p99 KLD 4.0), and output differences that part at near-ties pass Eval's repeatability gates. AGENTS.md
+  and the agent brief now treat the stored format's activations, lower-precision KV, heads and dense weights as the
+  starting arithmetic instead of levers to justify group by group, and no longer ask for a root cause of near-tie
+  differences. `heterogeneous-expert-dispatch`, `host-expert-arithmetic`, Core's batch invariance rules and
+  `recorded-selection` say which of their exactness rules are optional there: inexact CPU expert rows, residency-based
+  prompt splits, row-count-dependent kernels and per-process tactic choices.
+- `crit kernels new --repeatable no` declares a kernel that may round differently on a repeat (atomics, a split the
+  workload chooses); crit-eval's workbench check then judges its repeats against the reference within the tolerance
+  instead of bit for bit. For engines in quality mode `as_quantized`.
+- `expert-streamed-prefill`, a new Inference entry for prefill through routed experts kept in host memory. Its
+  schedule (`schedule.py`) picks the prompt chunk at the knee of the grouped projection's measured rate curve, so each
+  non-resident expert crosses the link once per chunk instead of once per small chunk, and double-buffers each layer's
+  expert copies behind the layer before it. `reference.py` is the FP64 routed SwiGLU block (stable route order,
+  BF16 / FP8 row / NVFP4 / MXFP4 decoders) a grouped projection is checked against; the projection itself is a
+  provider's, listed in its `kernels.json`.
+- `device-expert-cache` is a ready component: `ExpertCache` (`runtime.h`) owns the directory and per-layer scratch
+  and gives one capturable `plan_and_fetch` per routed layer, `preload`, `set_admission`, `prefetch` and telemetry
+  with `expert_reads` / `expert_hits`. The planner gains admission limits (a quota per plan, a quota by miss count,
+  second-touch); a miss over them takes no victim and its `Use` names the store bundle for the CPU or a mapped read
+  (CUDA/HIP, Metal and the Python reference). `enqueue_preload` and `residency_profile.py` warm the cache from a
+  profile built on a general corpus with a held-out check; `split.py` turns link, CPU and combined layer timings
+  measured on the target into the quota table. The README gains a recipe in the order a build should follow. The
+  CUDA fixture passes on an RTX 5090, runtime and operands included, and `pin_store` reads a registered store file back
+  through its device address.
+- `UploadShadow` (`crit/device_memory.h`) skips a host-to-device upload whose bytes the destination already holds,
+  for per-step metadata between graph launches; backend-agnostic (the engine passes its copy). Host-checked only;
+  the saving per step is not measured.
+- `StateCacheConfig::partial_reuse`: after the last whole reused page, `attach` also reuses the matching leading rows
+  of the page that last continued it, copied into the sequence's own page, so a prompt that leaves a cached one inside
+  a page recomputes only from where it differs (6 of 8 rows instead of 4 on the 4-row fixture). For caches without
+  recurrent components or window groups.
+- Reuse scopes in Core's prefix cache: `StateCache::open(scope)` indexes a sequence's pages under its scope, and
+  `attach` / `reusable` match only the same scope (checked on the root page, so it holds under hash collisions),
+  so a server keeps one tenant from reusing, or timing, another's prompts. The host page tier keeps scopes too.
+- Debugging masked KV reads: `StateCacheConfig::guard_page` reserves a page no sequence is given, for masked
+  block-table entries, and `StateStorage::fresh_page` / `fresh_window_page` announce pages handed out for new rows;
+  `StatePages::poison()` fills them with NaN, so a read of a row the request never wrote shows up instead of
+  returning another request's values.
+- `hidden-state-drafters` gets `ConfidenceCut`: the confidence threshold for truncating drafts, derived online from
+  what verification tested (bonus predictions label the first cut draft), for a target acceptance, instead of a
+  constant tuned on general text.
+- `peak_pages(demands, page_tokens, verify_rows)` in Core's batched steps bounds the pages requests hold at once
+  when early finishers free theirs before longer ones peak: 835 pages instead of the 1,504 their maxima reserve for
+  16 staggered replies on the fixture. A projection for admission with memory preemption as the fallback, since a
+  request that advances faster or starts late can exceed it.
+- `crit_core.text.LoopDetector` finds a reply that repeats one span exactly (at least `min_repeats` periods and
+  `min_tokens` tokens), and `ResidentChat.loop_stop` ends such a reply through the generator's `cancelled()` with
+  finish "stop" instead of letting it run to its cap; off by default, never for grammar-constrained replies.
+- Retention levels in Core's prefix cache (`StateCacheConfig::retention_levels`, `StateCache::retain`): a cached page
+  at a lower level leaves before any at a higher one, so an engine keeps a shared system or tool prompt (and the
+  window pages its end needs) through bursts of one-off prompts. On the state fixture an 8-row prefix that plain
+  least-recently-released eviction loses stays reusable at level 1.
+- Copied drafts override a neural drafter's where they are likely right: mtp-decode's prompt copy reports how long
+  its match is (`propose_matched`, in Python and C++), and `device-speculative-round`'s `CopyDrafts` stages each
+  row's copy and match length between rounds and replaces the drafter's tokens on the device where the match covers
+  a threshold (`override_drafts`), with one-hot draft laws for sampled rows so rejection sampling stays exact, inside
+  captured rounds. Before, prompt copy and a neural drafter could only run one at a time. Checked on the toy target:
+  exact greedy output, every copied draft accepted on a row whose copies are right, the sampled law over 60,000 draws.
+- `inference/attention-state` gets a host page tier, `HostPageTier`: pages the prefix cache evicts are copied to
+  host slots from `StateStorage::evicted`, and a later prompt restores them in one `final_row` round, verified by
+  chain hash and exact tokens, with window rows and recurrent state, instead of recomputing them. On a hybrid fixture
+  (one recurrent component, one sliding window, ten device pages) a conversation evicted by two other prompts gets
+  all 24 earlier rows back for its next turn and computes only the 4 new ones, every value equal to recomputation.
+  Device copies are the engine's and are not covered by the tests.
+- `StateStorage::evicted(EvictedPage)`: before the prefix cache hands out or frees an evicted page, Core names its
+  chain hash, tokens, component snapshot slots and window pages, so an engine can copy it to a lower tier instead of
+  losing it. Before, an evicted page was simply dropped.
+- `crit_core.text.PromptTokenCache`: a prompt that extends a recent one, as a conversation's next turn does, is
+  encoded from near the seam instead of from its start, and the splice is used only when the tokenizer agrees with
+  the kept ids after the back-off point; otherwise the prompt is encoded in full. `load_model_text(prompt_cache=True)`
+  routes `encode_chat` through it, and `ResidentChat` turns it on (`prompt_token_cache = False` turns it off).
+  Over 4,320 simulated turns on nine tokenizers it matched a full encode every time, in a tenth to a sixth of the
+  time. `Tokenizer.encode_offsets` returns ids with their character ranges.
+- `StateCache::snapshot_rows(seq, prompt, rows, states)` says where a prompt round of a hybrid model should end so a
+  recurrent snapshot lands where a later prompt needs one: at the deepest indexed page the prompt matches without a
+  snapshot (where it leaves a cached prefix), else at the last page boundary inside a round that ends inside a page.
+  Before, a chunked prefill whose last chunk ended inside a page left the prompt's last full pages without a snapshot,
+  so a next turn diverging after the earlier prompt reused only to the previous chunk end (8 of 14 rows on the 4-row
+  page fixture, 12 with the cut).
+- Hardware-agnostic expert arithmetic and cache: `host-expert-arithmetic` computes any block-scaled format (4- or
+  8-bit codes, 16 or 32 per scale, any element table; NVFP4, MXFP4, MXFP8 E4M3 and E5M2, MXINT8 and INT4 tables,
+  E4M3 and E8M0 scale decoders) in its declared order, with a portable path every compiler vectorizes for its CPU
+  (`Isa::portable`, what `best_isa()` returns without AVX2), one device header for CUDA and HIP, and the same
+  functions in Metal. `device-expert-cache` builds for HIP through `crit/gpu_runtime.h` and has its kernels in
+  Metal. Checked bitwise on x86, on aarch64 under qemu and on CUDA; the HIP and Metal sources are not run in the
+  tests.
+
 ## [0.15.0] - 2026-11-02
 
 ### Overview
@@ -2442,7 +2577,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/crit-labs/crit/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/crit-labs/crit/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/crit-labs/crit/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/crit-labs/crit/compare/v0.12.0...v0.13.0

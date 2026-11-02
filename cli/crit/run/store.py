@@ -856,10 +856,12 @@ class RunStore:
         mode = quality_mode(run["spec"]["correctness"])
         mode_line = (" Quality mode preserve: Eval's reference keeps the activations exact, so quantizing them counts as "
                      "drift, and prefill's limits are priced at 16-bit prompt activations." if mode == "preserve" else
-                     " Quality mode as_quantized (the user's choice): Eval judges against the exact reference with "
-                     "each set's limits widened by the drift of the checkpoint's own activation quantization (its "
-                     "allowance), so running the checkpoint's activations as it declares fits the budget, and "
-                     "prefill's limits are priced at its stored format.")
+                     " Quality mode as_quantized (the user's choice), the mode for speed: Eval judges against the "
+                     "exact reference with a budget that only keeps out a broken engine, so the checkpoint's own "
+                     "activations, lower-precision KV, heads and dense weights are the starting arithmetic, not levers "
+                     "to justify group by group; output differences that part at near-ties pass its repeatability "
+                     "gates, so the engine's arithmetic may depend on what it served before (experts on the CPU or "
+                     "the device, faster inexact CPU rows); prefill's limits are priced at its stored format.")
         quality_line = (f"Quality budget: PPL ratio ≤ {quality_budget['ppl_ratio_max']}, mean KLD ≤ "
                         f"{quality_budget['kld_mean_max']}, p99 KLD ≤ {quality_budget['kld_p99_max']} against Eval's reference; "
                         f"speculative exactness {exactness}." + mode_line + " crit run ... eval applies them; pass them to "
@@ -1042,8 +1044,9 @@ Read every report crit eval status gives before a plan: with --kernels KERNELS e
 and a round's verify pass against its draft steps; the prefill ceilings by prompt activation format with the
 reachable limit (declare the engine's prompt_activations); the time to first token by part; the quality share with
 its spread over positions; the sampled cases' standard errors; the device memory left free at the required context.
-Measure a precision change in process with crit eval run --adapter A --only quality (development evidence, never the
-gate) and --attribute-drift with the engine's exact_variants: each matrix group's share of the drift budget.
+In quality mode preserve, measure a precision change in process with crit eval run --adapter A --only quality
+(development evidence, never the gate) and --attribute-drift with the engine's exact_variants: each matrix group's
+share of the drift budget.
 Use the record coordinator: crit run --project "{self.project}" --root "{self.root}" --id {run['run_id']} --help
 Before the first candidate, run recon (required for a model folder; crit run ... --id {run['run_id']} recon): it writes work/recon.json from the
 model's generation_config.json, tokenizer files, chat templates and config.json, and scaffolds work/recon.md. Finish

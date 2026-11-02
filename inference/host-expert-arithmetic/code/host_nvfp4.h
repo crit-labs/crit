@@ -1,4 +1,4 @@
-// Host arithmetic for NVFP4 block-scaled rows that reproduces a device kernel bit for bit.
+// Host arithmetic for block-scaled rows (NVFP4 by default) that reproduces a device kernel bit for bit.
 //
 // A row dot is defined by a declared operation order, not by "the same math": element k of the row goes to
 // accumulator lane k % lanes; each term is fma(e2m1(code) * scale[k / 16], x[k], lane) with the product rounded
@@ -12,9 +12,16 @@
 // fma(e2m1(code), x, d) over its 16 elements from 0, then lane = fma(d, scale[b], lane) with block b going to
 // lane b % lanes; the same reductions and post multiply follow.
 //
-// Weights use crit's NVFP4 layout (inference/quantized-projections, crit::nvfp4): codes [rows][cols / 2], low
-// nibble = even element, one 8-bit block scale per 16 values. Block scales go through a decode hook, so
-// checkpoint-specific scale encodings stay in the engine; the standard hook reads E4M3 bytes.
+// Weights default to crit's NVFP4 layout (inference/quantized-projections, crit::nvfp4): codes [rows][cols / 2], low
+// nibble = even element, one 8-bit block scale per 16 values. A Format names any other block-scaled layout the same
+// order covers: 4-bit codes (two per byte, low nibble first) or 8-bit codes (one per byte), 16 or 32 elements per
+// block scale, and a table of the element values by code (E2M1, INT4, E4M3, E5M2, INT8 or an engine's own). Block
+// scales go through a decode hook, so checkpoint-specific scale encodings stay in the engine; the standard hooks
+// read E4M3 (NVFP4) or E8M0 (the OCP microscaling formats) bytes.
+//
+// Paths: the scalar oracle; the portable path, plain C++ whose lanes are independent loops any compiler vectorizes
+// for its target (NEON and SVE on Arm, AVX on x86, RVV), so every CPU gets a vector path for every format with the
+// oracle's bits; and hand-written AVX2 and AVX-512 paths for the NVFP4 layout.
 #pragma once
 #include "host_isa.h"
 
@@ -23,8 +30,30 @@
 
 namespace crit::techniques::host_nvfp4 {
 
-constexpr std::size_t kBlock = 16;
+constexpr std::size_t kBlock = 16;  // NVFP4's block; Format::block names a matrix's own
 constexpr int kMaxTokens = 8;
+
+// A block-scaled element layout. bits: 4 (two codes per byte, low nibble the even element) or 8 (one per byte).
+// block: elements per scale, 16 or 32. values: the 2^bits element values by code; null is E2M1 (NVFP4, MXFP4).
+struct Format {
+    int bits = 4;
+    int block = 16;
+    const float* values = nullptr;
+};
+// Element value tables (static, [16] or [256]): E2M1 (code 8 is -0.0), INT4 two's complement, OCP E4M3FN, OCP E5M2,
+// INT8 two's complement. NaN and infinity codes decode to their IEEE values.
+const float* e2m1_values();
+const float* int4_values();
+const float* e4m3_values();
+const float* e5m2_values();
+const float* int8_values();
+// Common formats: NVFP4 (E2M1, 16 per E4M3 scale), MXFP4 (E2M1, 32 per E8M0 scale), MXFP8 (E4M3 or E5M2, 32 per
+// E8M0 scale), MXINT8 (INT8, 32 per E8M0 scale); an INT4 layout names its own block.
+Format nvfp4_format();
+Format mxfp4_format();
+Format mxfp8_e4m3_format();
+Format mxfp8_e5m2_format();
+Format mxint8_format();
 
 enum class Reduce { halving, sequential };
 enum class Product { scaled_elements, block_dot };
@@ -34,15 +63,16 @@ struct Order {
     Product product = Product::scaled_elements;
 };
 
-// A view of one matrix. Strides in bytes; defaults (0) are cols / 2 and cols / 16.
+// A view of one matrix. Strides in bytes; defaults (0) are cols * bits / 8 and cols / block.
 struct MatrixView {
     const std::uint8_t* codes = nullptr;
     const std::uint8_t* scales = nullptr;
     std::size_t rows = 0, cols = 0;
     std::size_t code_stride = 0, scale_stride = 0;
+    Format format{};
 };
 
-// Writes the cols / 16 block scales of `row` as the exact floats the device multiplies by.
+// Writes the cols / block scales of `row` as the exact floats the device multiplies by.
 // A decoder that is a pure byte -> float table also sets byte_table; the kernels then look scales up inline
 // instead of decoding each row first (same floats, so the same bits).
 struct ScaleDecoder {
@@ -50,8 +80,10 @@ struct ScaleDecoder {
     const void* context = nullptr;
     const float* byte_table = nullptr;  // optional [256], indexed by matrix.scales bytes
 };
-// The standard decoder: E4M3FN bytes of `matrix.scales` through crit::nvfp4::e4m3. `matrix` must outlive it.
+// The standard decoders: E4M3FN bytes of `matrix.scales` through crit::nvfp4::e4m3, or E8M0 bytes (2^(byte - 127),
+// 255 NaN) as the microscaling formats store them. `matrix` must outlive them.
 ScaleDecoder e4m3_scales(const MatrixView& matrix);
+ScaleDecoder e8m0_scales(const MatrixView& matrix);
 
 // The ISA files this build compiled in and the CPU and the OS report (host_isa.h).
 using Isa = host_isa::Isa;
@@ -82,6 +114,14 @@ void rows_avx2(const float*, const Order&, const MatrixView&, const float*, cons
                std::size_t, std::size_t, float, float*, std::size_t);
 void rows_avx512(const float*, const Order&, const MatrixView&, const float*, const float*, const float*, const float*, std::size_t, int, std::uint32_t,
                  std::size_t, std::size_t, float, float*, std::size_t);
+// The portable path: any Format, lanes as independent loops the compiler vectorizes; `values` the element table.
+void rows_portable(const float*, const Order&, const MatrixView&, const float*, const float*, const float*, const float*, std::size_t, int, std::uint32_t,
+                   std::size_t, std::size_t, float, float*, std::size_t);
+// The same portable source compiled with AVX2 or AVX-512 enabled: every format other than NVFP4's on those CPUs.
+void rows_portable_avx2(const float*, const Order&, const MatrixView&, const float*, const float*, const float*, const float*, std::size_t, int, std::uint32_t,
+                        std::size_t, std::size_t, float, float*, std::size_t);
+void rows_portable_avx512(const float*, const Order&, const MatrixView&, const float*, const float*, const float*, const float*, std::size_t, int, std::uint32_t,
+                          std::size_t, std::size_t, float, float*, std::size_t);
 }  // namespace detail
 
 }  // namespace crit::techniques::host_nvfp4

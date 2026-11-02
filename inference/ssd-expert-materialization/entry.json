@@ -13,13 +13,14 @@
       "Bounded host tier in front of the file: serves rereads and holds device-cache evictions (retain) without evicting the current route",
       "Separate read quiescence and ambiguous-upload recovery boundary",
       "Native mapped-file region gather with request-order outputs, coalesced read-ahead and bounded workers",
-      "Private output allocation, cancellation checks and join-before-release on worker/submission errors"
+      "Private output allocation, cancellation checks and join-before-release on worker/submission errors",
+      "A native host tier over pinned slots and a read queue that fills them from the file, demand reads first"
     ],
     "engine_supplies": [
       "Trusted encoded descriptors, verified artifact identity and immutable-file guarantees; native gather worker/output limits",
       "upload hook with destination ownership and physical readiness",
-      "Device-to-host copy of an evicted slot before it is overwritten, pinned host slots and the tier's capacity within host-memory admission",
-      "Read-ahead prediction, staging limits and upload quiescence"
+      "Read-ahead prediction, staging limits and upload quiescence",
+      "The pinned memory behind the HostTier's slots and the copies between them and the device cache"
     ],
     "preserve": [
       "Exact encoded identity and complete reads",
@@ -42,6 +43,10 @@
     {
       "path": "inference/ssd-expert-materialization/code/mapped_gather.h",
       "purpose": "Bounded native immutable mapping and sparse region gather with prefetch hints, private output and worker draining"
+    },
+    {
+      "path": "inference/ssd-expert-materialization/code/host_tier.h",
+      "purpose": "Native HostTier ledger over pinned slots (LRU, protected experts, refusal, fill commit/abandon, counters) and ReadQueue (positioned readers, demand before read-ahead, deduplicated pending keys, tickets)"
     }
   ],
   "requires": {
@@ -68,7 +73,12 @@
     "crit::storage::MappedFile",
     "crit::storage::ByteRegion",
     "crit::storage::GatherLimits",
-    "crit::storage::GatherResult"
+    "crit::storage::GatherResult",
+    "HostTier",
+    "TierCounters",
+    "ReadQueue",
+    "Read",
+    "Ticket"
   ],
   "interactions": [
     "expert-residency",
@@ -83,7 +93,7 @@
   ],
   "validation": {
     "host": "Host fixtures and worked example cover checked file reads, pending reuse, read failure, failed-upload retention/recovery, host-tier hits, checked retention of evictions and route protection",
-    "native": "Windows and Linux fixtures check mapped page boundaries, duplicates, coalescing, sequential/parallel equivalence, empty files, bounds, cancellation and retry; no storage-throughput or GPU-upload qualification",
+    "native": "Windows and Linux fixtures check mapped page boundaries, duplicates, coalescing, sequential/parallel equivalence, empty files, bounds, cancellation and retry; no storage-throughput or GPU-upload qualification; host_tier_tests.cpp: tier hits, LRU eviction, protection and refusal, fill commit and abandon; read queue with four readers, demand priority, pending dedupe and a failing read",
     "performance": "Unmeasured for a crit engine; host fixture success is not a speed claim (an upstream engine's host tier measurement is cited in the README for scale only)"
   },
   "native_integration": {

@@ -136,10 +136,39 @@ class ProductTests(unittest.TestCase):
             actual = {p.decode() for p in result.stdout.split(b"\0") if p}
             self.assertEqual(actual, set(ignored))
 
+    def test_kernels_json_names_providers_references_and_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            (root / "kernels").mkdir()
+            (root / "kernels/SOURCES.md").write_text("| [FlashInfer](https://example.invalid) | x | y | z |\n", encoding="utf-8")
+            (root / "inference/example/code/reference.py").write_text("def ref():\n    return 0\n", encoding="utf-8")
+            good = {"kind": "crit-technique-kernels", "technique": "example", "as_of": "2026-11-02", "evidence": "docs",
+                    "operations": [{"id": "op", "what": "an operation", "verify": "against ref on the target",
+                                    "reference": {"path": "inference/example/code/reference.py", "symbol": "ref"},
+                                    "kernels": [{"provider": "lib:FlashInfer", "call": "f()", "formats": ["bf16"],
+                                                 "archs": ["sm_80"], "shapes": "any"},
+                                                {"provider": "hub:crit-labs/x", "call": "g()", "formats": ["bf16"],
+                                                 "archs": ["sm_80"], "shapes": "any", "published": False}]}]}
+            self.assertEqual(store.check_kernels(root, "example", good), [])
+            for change, expected in (
+                    (lambda d: d["operations"][0]["kernels"][0].update(provider="own: mine"), "never code in crit"),
+                    (lambda d: d["operations"][0]["kernels"][0].update(provider="lib:Nowhere"), "not a provider"),
+                    (lambda d: d["operations"][0]["kernels"][1].pop("published"), "says whether it is published"),
+                    (lambda d: d["operations"][0]["kernels"][0].update(archs=[]), "archs"),
+                    (lambda d: d["operations"][0]["reference"].update(path="cli/crit/inference.py"), "file of the technique"),
+                    (lambda d: d["operations"][0].pop("verify"), "verify required"),
+                    (lambda d: d.update(technique="other"), "technique example required")):
+                bad = copy.deepcopy(good)
+                change(bad)
+                with self.subTest(expected=expected):
+                    self.assertTrue(any(expected in e for e in store.check_kernels(root, "example", bad)),
+                                    store.check_kernels(root, "example", bad))
+
     def test_real_inference_entries_are_generic_local_implementations(self):
         self.assertEqual(store.check(), [])
         entries = store.load()["entries"]
-        self.assertEqual(len(entries), 28)
+        self.assertEqual(len(entries), 29)
         for entry in entries:
             self.assertNotIn("donors", entry)
             self.assertNotIn("code_locations", entry)

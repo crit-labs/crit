@@ -10,7 +10,9 @@ different text, and a single-process repeat check cannot see it.
 ## When to use it
 
 Use it whenever several candidates exist for an operation. It is unnecessary when every
-candidate is bitwise identical for the engine's inputs or only one is ever used.
+candidate is bitwise identical for the engine's inputs or only one is ever used, and optional
+in quality mode `as_quantized`: there Eval passes an output difference that parts at a
+near-tie ([forks](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#forks-in-quality-mode-as_quantized)), which is what two processes' near-tie choices produce.
 Physical batch limits are candidates too: the
 [speculative batch example](../mtp-decode/README.md#physical-batch-size-is-independent-of-proposal-width)
 records a draft cap from timed synthetic runs and replays it. Bind such caps and all

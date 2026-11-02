@@ -12,7 +12,7 @@ template<class F> static void rejects(F action) {
 // Independent reverse scan; bounds are held tokens, never configured capacity.
 static std::vector<Token> oracle(const std::vector<Token>& h, std::size_t prompt_end,
                                 Index::Limits l, std::size_t limit, std::uint32_t vocabulary,
-                                std::span<const Token> stops) {
+                                std::span<const Token> stops, std::size_t* source=nullptr) {
     limit=std::min(limit,l.max_draft);
     if(!limit || h.size()<=l.window) return {};
     std::vector<Token> best;
@@ -29,10 +29,16 @@ static std::vector<Token> oracle(const std::vector<Token>& h, std::size_t prompt
             candidate.push_back(h[i]);
             if(std::find(stops.begin(),stops.end(),h[i])!=stops.end()) break;
         }
-        if(candidate.size()>best.size()) best=candidate;
+        if(candidate.size()>best.size()) { best=candidate; if(source) *source=end; }
         if(best.size()==limit) break;
     }
     return best;
+}
+// The match behind a draft, counted token by token from the source's end backwards.
+static std::size_t oracle_matched(const std::vector<Token>& h, std::size_t source, std::size_t longest) {
+    std::size_t k=0;
+    while(k<longest && k<source && h[source-1-k]==h[h.size()-1-k]) ++k;
+    return k;
 }
 int main() {
     try {
@@ -55,8 +61,16 @@ int main() {
                 require(std::vector<Token>(index.tokens().begin(),index.tokens().end())==history);
                 require(index.indexed_windows()==(history.size()>2 ? history.size()-2 : 0));
                 const std::vector<Token> stop{2};
-                for(auto limit:{0U,1U,5U,9U}) for(auto vocabulary:{3U,10U})
-                    require(index.propose(limit,vocabulary,stop)==oracle(history,prompt_end,limits,limit,vocabulary,stop));
+                for(auto limit:{0U,1U,5U,9U}) for(auto vocabulary:{3U,10U}) {
+                    std::size_t source=0;
+                    const auto expected=oracle(history,prompt_end,limits,limit,vocabulary,stop,&source);
+                    require(index.propose(limit,vocabulary,stop)==expected);
+                    for(std::size_t longest:{2U,5U,64U}) {
+                        const auto found=index.propose_matched(limit,vocabulary,stop,longest);
+                        require(found.tokens==expected);
+                        require(found.matched==(expected.empty() ? 0 : std::max(limits.window,oracle_matched(history,source,longest))));
+                    }
+                }
             }
             const auto before=std::vector<Token>(index.tokens().begin(),index.tokens().end());
             const std::vector<Token> invalid{-1};

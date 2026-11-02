@@ -4,6 +4,9 @@
 
 #include <immintrin.h>
 
+#include <cmath>
+#include <vector>
+
 namespace crit::techniques::host_nvfp4::detail {
 namespace {
 
@@ -192,5 +195,9 @@ void rows_avx2(const float* e2m1, const Order& order, const MatrixView& m, const
     if(order.lanes == 32) by_tokens<32>(e2m1, order, m, scales, table, xt, x, ldx, tokens, mask, row0, row1, post, out, ldo);
     else by_tokens<16>(e2m1, order, m, scales, table, xt, x, ldx, tokens, mask, row0, row1, post, out, ldo);
 }
+
+#define CRIT_PORTABLE_ROWS rows_portable_avx2
+#include "host_nvfp4_portable.inc"
+#undef CRIT_PORTABLE_ROWS
 
 }  // namespace crit::techniques::host_nvfp4::detail

@@ -57,6 +57,7 @@ const char* isa_name(Isa isa) noexcept {
     switch(isa) {
         case Isa::avx512: return "avx512";
         case Isa::avx2: return "avx2";
+        case Isa::portable: return "portable";
         default: return "scalar";
     }
 }
@@ -67,7 +68,8 @@ bool supported(Isa isa) noexcept {
         case Isa::avx512: return features().avx512;
         case Isa::avx2: return features().avx2;
 #endif
-        case Isa::scalar: return true;
+        case Isa::scalar:
+        case Isa::portable: return true;
         default: return false;
     }
 }
@@ -75,7 +77,7 @@ bool supported(Isa isa) noexcept {
 Isa best_isa() noexcept {
     if(supported(Isa::avx512)) return Isa::avx512;
     if(supported(Isa::avx2)) return Isa::avx2;
-    return Isa::scalar;
+    return Isa::portable;
 }
 
 }  // namespace crit::techniques::host_isa

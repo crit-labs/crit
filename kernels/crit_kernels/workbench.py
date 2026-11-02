@@ -71,8 +71,10 @@ def starter_allowed(run):
 
 
 def new(name, op, root, fmt=None, shapes=(), model=None, columns=None, source=None, yardstick=None,
-        column_invariant=None, tolerance=None, starter=False, run=None):
-    """Scaffold the workbench folder root/NAME. Returns the kernel.json it wrote."""
+        column_invariant=None, tolerance=None, starter=False, run=None, repeatable=True):
+    """Scaffold the workbench folder root/NAME. Returns the kernel.json it wrote. repeatable False: the kernel may give
+    other bits on a repeat (atomics, a split the workload chooses), for engines in quality mode as_quantized; the check
+    then judges each repeat against the reference within the tolerance."""
     if not NAME.fullmatch(name):
         raise ValueError("NAME is lower-case letters, digits and _, starting with a letter")
     if starter:
@@ -129,6 +131,7 @@ def new(name, op, root, fmt=None, shapes=(), model=None, columns=None, source=No
             "shapes": found, "columns": columns or MATMUL_OPS.get(op, [1]),
             "tolerance": tolerance if tolerance is not None else (1e-2 if fmt == "bf16" else 1e-3 if matmul else 1e-3),
             "column_invariant": bool(op == "gemv" if column_invariant is None else column_invariant),
+            "repeatable": bool(repeatable),
             "rate": MATMUL_FORMATS[fmt][1] if matmul else None, "yardstick": values["yardstick"],
             "from": {"path": str(source), "files": copied} if source is not None else None,
             "starter": bool(starter)}

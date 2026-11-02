@@ -1,6 +1,8 @@
 #include "attention.h"
 #include "state_pages_fixture.h"
 #include <array>
+#include <cmath>
+#include <limits>
 #include <iostream>
 #include <optional>
 #include <random>
@@ -248,6 +250,31 @@ void randomized() {
   kv.settle();
   require(kv.cache.stats().live_pages == 0, "Randomized teardown leaked pages");
 }
+// Debugging fills: a poisoned page reads NaN where this request wrote nothing, even after another request used it,
+// and the guard page holds the pattern for masked table entries.
+void poison() {
+  auto config = PagedState::config(3, 4, 8, 2, false);
+  config.guard_page = true;
+  cc::Resources resources(std::size_t{1} << 20, 0);
+  StatePages pages(3, 4, 1, 1);
+  pages.poison();
+  cc::StateCache cache(config, pages, resources);
+  pages.fill(cache.guard_page(), std::numeric_limits<float>::quiet_NaN());
+  const auto a = cache.open();
+  auto round = pages.stage(cache, a, std::array{1.f, 2.f, 3.f, 4.f}, std::array{10.f, 20.f, 30.f, 40.f});
+  cache.commit(a, round.id, std::array<cc::Token, 4>{});
+  cache.close(a);
+  cache.retire(cache.epoch());
+  const auto b = cache.open();   // gets a page another request filled
+  round = pages.stage(cache, b, std::array{5.f}, std::array{50.f});
+  cache.commit(b, round.id, std::array<cc::Token, 1>{});
+  const auto table = cache.block_table(b);
+  StatePagesView past = pages.view(table, 4);   // a wrong length reads three rows b never wrote
+  require(past.value(0)[0] == 50.f, "the written row");
+  for (std::size_t r = 1; r < 4; ++r) require(std::isnan(past.value(r)[0]) && std::isnan(past.key(r)[0]), "unwritten rows read NaN");
+  StatePagesView guard = pages.view(std::span<const cc::PageId>(std::array{cache.guard_page()}), 4);
+  for (std::size_t r = 0; r < 4; ++r) require(std::isnan(guard.value(r)[0]), "the guard page holds the pattern");
+}
 int main(int argc, char** argv) {
   try {
     if (argc != 2) throw std::invalid_argument("Expected a test case");
@@ -257,6 +284,7 @@ int main(int argc, char** argv) {
     else if (test == "numerics") numerics();
     else if (test == "failures") failures();
     else if (test == "randomized") randomized();
+    else if (test == "poison") poison();
     else throw std::invalid_argument("Unknown test case");
     std::cout << "State pages " << test << " passed\n";
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

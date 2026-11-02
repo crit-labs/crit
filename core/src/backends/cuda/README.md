@@ -169,6 +169,20 @@ touches its pages. Fixtures:
 [device_memory_tests.cpp](../../../../tests/core/device_memory_tests.cpp) (host) and
 [cuda_memory_tests.cpp](../../../../tests/core/cuda_memory_tests.cpp) (device).
 
+### Unchanged uploads
+
+A decode step uploads small metadata (slot indices, lengths, page tables between page
+boundaries) whose values often did not change since the last step, each upload a copy
+serialized between the step's launches. `UploadShadow` ([device_memory.h](../../../include/crit/device_memory.h))
+keeps the bytes last written through it per destination: `upload(dst, src, copy)`
+calls `copy` (`cudaMemcpyAsync` on the engine's stream, say) only when `dst` did not
+receive the same bytes last time, and `copied()` / `skipped()` count both. It is for
+destinations nothing else writes; `invalidate(dst)` after another write, `forget(dst)`
+when freeing it. A captured graph's copies always run on replay, so it serves the
+eager uploads between graphs. The fixture (`memory_upload_shadow`) checks the skip
+rules on the host; the saving is a few small copies per step and is not measured on a
+GPU, so measure a decode step before relying on it.
+
 ## Device sets
 
 [cuda_devices.h](../../../include/crit/cuda_devices.h) `CudaDeviceSet(devices)` gives one engine several GPUs: one

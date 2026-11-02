@@ -8,7 +8,7 @@
 
 ### Why wait for someone to optimize an LLM for your GPU when an AI agent can build a specialized inference engine in a few hours?
 
-[![Version 0.15.0](docs/assets/badge-version.svg)](CHANGELOG.md)
+[![Version 0.16.0](docs/assets/badge-version.svg)](CHANGELOG.md)
 [![License Apache-2.0](docs/assets/badge-license.svg)](LICENSE)
 [![crit-hub engines](docs/assets/badge-crit-hub.svg)](https://github.com/crit-labs/crit-hub)
 [![CI](https://github.com/crit-labs/crit/actions/workflows/ci.yml/badge.svg)](https://github.com/crit-labs/crit/actions/workflows/ci.yml)
@@ -224,8 +224,10 @@ from a chat question to a 14K-token agent session; Eval decodes each engine's ow
 `crit` judges an engine's quality in one of two modes, chosen per run. `preserve`, the default, holds it
 to the checkpoint's own arithmetic with exact activations, within a 5% drift budget: the weights are
 used as stored, but the prompt's activations stay in 16 bits unless quality shows they can go lower.
-`as_quantized` holds it to the checkpoint run the way it was quantized, with 4-bit and 8-bit
-activations where the checkpoint declares them, within a 10% budget. We built Qwen3.8-27B on one RTX
+`as_quantized` is the mode for speed: 4-bit and 8-bit activations where the checkpoint declares them, and
+whatever other precision the engine picks, within a budget that only keeps out a broken engine (mean KLD 0.4);
+output differences that part at near-ties are allowed. (The two engines below were built when that budget was
+10%.) We built Qwen3.8-27B on one RTX
 5090 once in each mode: [`mtp4-nvfp4-mma`](https://github.com/crit-labs/crit-hub/tree/main/engines/crit-labs/mtp4-nvfp4-mma)
 from the case study above, and
 [`mtp-adaptive-width`](https://github.com/crit-labs/crit-hub/tree/main/engines/crit-labs/mtp-adaptive-width),

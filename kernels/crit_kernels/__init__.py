@@ -328,6 +328,9 @@ def parser():
     make.add_argument("--from", dest="source", type=Path, help="an existing kernel's source folder to start from")
     make.add_argument("--yardstick", help="the provider to time beside the kernel (provider syntax of plan levers)")
     make.add_argument("--column-invariant", choices=("yes", "no"))
+    make.add_argument("--repeatable", choices=("yes", "no"), default="yes",
+                      help="no: the kernel may give other bits on a repeat (atomics, a split the workload chooses); "
+                           "the check judges repeats within the tolerance. For quality mode as_quantized engines")
     make.add_argument("--tolerance", type=float)
     make.add_argument("--root", type=Path, default=Path("work/kernels"))
     make.add_argument("--starter", action="store_true", help="a simple, correct kernel to start from (gemv, gemm); "
@@ -372,7 +375,7 @@ def main(argv=None):
             result = new(args.name, args.op, args.root, args.fmt, args.shape, args.model,
                          [int(c) for c in args.columns.split(",")] if args.columns else None, args.source, args.yardstick,
                          None if args.column_invariant is None else args.column_invariant == "yes", args.tolerance,
-                         args.starter, args.run)
+                         args.starter, args.run, repeatable=args.repeatable == "yes")
         print(json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False))
         return 0
     except (ValueError, OSError, TypeError, KeyError, OverflowError, RecursionError) as exc:

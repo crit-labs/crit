@@ -16,6 +16,11 @@ environment and package.
 
 ## Find an implementation
 
+Start from the technique: its `kernels.json` ([Inference](../inference/README.md#read-and-adapt-an-entry)) lists
+the provider kernels for each operation it needs, with the exact call, formats, GPUs, shapes and scale layout, and
+the CPU reference to check them against. crit-labs' own kernels sit in `hub-kernels/` until they are published to
+the Kernel Hub, each with an applicability card; a technique names them as `hub:crit-labs/NAME`. Otherwise:
+
 1. Describe the operation: formula, input/output types, quantization and scales, dimensions and
    strides, aliases, and any fusion or recurrent state.
 2. Record the target: OS, device architecture, driver/toolkit and framework or native ABI. A
@@ -84,7 +89,9 @@ themselves.
 
 crit-eval measures the folder ([workbench](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md#kernel-workbench)):
 `check` compares the kernel with the reference on every shape and column count and requires the same bits on a
-repeat and, when declared, for each column alone; `bench` times it and the yardstick on inputs cycled past the L2,
+repeat and, when declared, for each column alone (`--repeatable no` declares a kernel that may round differently on a
+repeat, such as atomics or a split the workload chooses: its repeats are then judged within the tolerance, which
+suits an engine in quality mode `as_quantized`, where Eval passes output differences that part at near-ties); `bench` times it and the yardstick on inputs cycled past the L2,
 against the floor; its `bench.json` is the evidence an `own` lever's `yardstick` cites.
 
 ## Inspect and retain
