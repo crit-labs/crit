@@ -53,6 +53,9 @@ def parser():
     result.add_argument("--max-queue", type=int, default=64,
                         help="Requests that may wait while the engine is busy; one more is refused at once with 429 "
                              "(Anthropic 529, Ollama 503) and Retry-After (default: 64)")
+    result.add_argument("--max-concurrency", type=int, metavar="N",
+                        help="Run at most N requests at once, below the engine's declared capacity "
+                             "(max_concurrent_requests; default: the engine's)")
     result.add_argument("--queue-timeout", type=float,
                         help="Seconds a request may wait for the engine before it is refused the same way "
                              "(default: no limit; --timeout starts when the engine takes the request)")
@@ -195,7 +198,8 @@ def _serve(args, keys, tls):
         options = dict(project=args.project, host_limit=gib(args.resident_ram_gib),
                        device_limit=gib(args.resident_vram_gib), timeout=args.timeout,
                        load_timeout=args.load_timeout, verify_model=args.verify_model, max_queue=args.max_queue,
-                       queue_timeout=args.queue_timeout, idle_unload=args.idle_unload)
+                       queue_timeout=args.queue_timeout, idle_unload=args.idle_unload,
+                       max_concurrency=args.max_concurrency)
         if args.engine:
             from .installed import InstalledEngine
             engine = InstalledEngine(args.store or args.project / "engines", args.engine, **options)
@@ -211,7 +215,11 @@ def _serve(args, keys, tls):
         api = Api(engine, args.model_name, keys, args.cors_origin,
                   log=lambda line: print(line, file=sys.stderr, flush=True), reasoning_alias=args.reasoning_alias,
                   lenient=args.lenient, ping_interval=args.sse_ping_interval)
-        server = Server((args.host, args.port), api, tls)
+        try:
+            server = Server((args.host, args.port), api, tls)
+        except OSError as exc:
+            print("error: cannot listen on %s:%d: %s" % (args.host, args.port, exc.strerror or exc), file=sys.stderr)
+            return 2
         host, port = server.server_address[:2]
         # Ctrl+C, and SIGTERM from a supervisor, unload the engine and release ownership. A shell's background job
         # starts with SIGINT ignored, so restore Python's handler for it too.

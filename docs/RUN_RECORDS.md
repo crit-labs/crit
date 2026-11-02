@@ -50,7 +50,7 @@ and speed techniques; a larger one trades context for that room.
 | `check`, `benchmark` | `--candidate ID --record payload.json`; appends evidence. `check --candidate ID --from-eval [ATTEMPT]` instead records every case's arithmetic, functional and resources check from the candidate's retained Eval result (default its newest; [Check](#check)) |
 | `measure` | `--candidate ID [--seconds N]`; reserves a benchmark attempt, serves the packaged candidate through `crit serve`, streams every resident case's chat request to it, settles it and records one benchmark per case ([measured benchmarks](#measured-benchmarks)) |
 | `serve` | `--candidate ID [--host HOST] [--port 8000] [--seconds N]`; reserves a check attempt, serves the packaged, not yet sealed candidate through `crit serve` at `http://HOST:PORT/v1` until Ctrl+C or the reservation's deadline, for the checks a candidate passes before sealing, and settles the attempt (log `logs/serve-ATTEMPT.log`); with `--check` crit runs the standard serving checks itself (consecutive greedy requests, a system message, streaming, a stop string, a client cancelling, a tool call and its result, log-probabilities, a template switch, each where declared, and stopping the engine), keeps their report as `logs/serve-check-ATTEMPT.json` and records a functional check per case; `crit serve` serves the candidate once it is sealed |
-| `eval` | `--candidate ID --data EVAL_DATA_DIR [--only PART] [--baseline RESULT] [--label TEXT] [--seconds N]`; reserves a benchmark attempt, serves the packaged candidate through `crit serve`, scores the data's quality texts on the run's model unless stored, runs Eval over the chat API with the run's quality terms and `kv_tokens`, settles it and retains the result as `candidates/ID/eval/ATTEMPT.json` ([Eval evidence](#eval-evidence)); for a candidate created from a plan it writes the plan's [outcome](#outcome), and it prints the priorities the result's fractions give |
+| `eval` | `--candidate ID --data EVAL_DATA_DIR [--only PART] [--baseline RESULT] [--label TEXT] [--seconds N] [--resume [ATTEMPT]]`; reserves a benchmark attempt, serves the packaged candidate through `crit serve`, scores the data's quality texts on the run's model unless stored, runs Eval over the chat API with the run's quality terms and `kv_tokens`, settles it and retains the result as `candidates/ID/eval/ATTEMPT.json` beside its journal `ATTEMPT.journal.jsonl` ([Eval evidence](#eval-evidence)); for a candidate created from a plan it writes the plan's [outcome](#outcome), and it prints the priorities the result's fractions give. `--resume` goes on from an attempt that stopped (default the newest with a journal) in a new attempt |
 | `seal` | `--candidate ID --lifecycle STATE [--failure TEXT]`; closes the candidate |
 | `select` | `--candidate ID`; selects a sealed eligible candidate |
 | `stop` | `--record stop.json` |
@@ -76,13 +76,14 @@ hashes; add them only where a field below requires one.
 | `ram_headroom_gib`, `vram_headroom_gib` | Physical free-memory requirements; defaults 2 and 1 |
 | `context_reserve_gib` | Device memory kept out of the KV cache when deriving `kv_tokens` from `device`; default the protocol's 3 |
 | `drafters` | Up to 8 companion drafter folders (EAGLE-3, DFlash, DSpark) a candidate may load beside the model. With `device`, their stored weights are kept out of the KV cache too, so a speculating candidate still fits `kv_tokens`; `hardware_constraints.context` records `companion_drafter_bytes` and each drafter. Name the same folders to `recon --drafter` |
+| (devices) | A `device` file of several GPUs (`crit eval probe --devices`) sizes `kv_tokens` from their memory together, and `hardware_constraints.context.devices` names them (`index`, `device`); `crit run measure` samples device memory on every one of them |
 | `candidate_budget`, `attempt_limit` | Segment bounds: candidates to build (default 3, 1–64) and attempts (default 64, 1–1000). `budget_minutes` is a safety window, default and maximum 43200 (30 days). `budget_minutes` without `candidate_budget` creates a legacy time-budget segment (1–180) |
 | `workload` | Defaults: prompt 512, output 128, concurrency 1, repetitions 3, warmups 1, mode `resident` |
 | `cases` | Optional 1–32 distinct `{case_id, workload}` objects with complete workloads |
 | `benchmark_protocol` | Fixed protocol identity; default `crit-matched-v1` |
 | `verification_level` | `reported` or `artifact_verified` (default) |
 | `targets` | Optional positive `decode_tps`, `prefill_tps`, `request_ms` thresholds |
-| `weights_policy` | Optional `as_stored` (supplied weights used as stored) or `transformable`; omitted means unspecified |
+| `weights_policy` | Optional `as_stored` (supplied weights used as stored) or `transformable`; omitted means `transformable` when `quality_mode` is `as_quantized`, else unspecified |
 | `quality_budget` | Optional drift budget against Eval's reference: any of `ppl_ratio_max` (≥ 1), `kld_mean_max`, `kld_p99_max` (≥ 0); defaults 1.05, 0.05, 0.5 (`as_quantized`: 1.1, 0.1, 1.0, Eval's own for that mode). Agents spend it on speed |
 | `exactness` | `reported` (default: speculative output may differ from plain greedy; the drift budget judges it) or `required` (any difference fails Eval's gate) |
 | `quality_mode` | `preserve` (default: Eval's quality reference keeps the activations exact, and prefill's limits are priced at 16-bit prompt activations) or `as_quantized` (the same reference, each quality set's limits widened by the drift of the checkpoint's own activation quantization, crit-eval's allowance, and prefill's limits priced at its stored format); the user's choice, from the request or `settings.toml`'s `quality_mode`. `crit run ... eval` judges in it |
@@ -100,7 +101,11 @@ plan a fate; runs without it keep fates optional, checked when given. With `"pla
 
 Workload keys: `prompt_tokens`, `output_tokens` (1–1,000,000), `concurrency` (1–256),
 `repetitions` (1–100), `warmup_runs` (0–100), `mode` (`resident`/`cold`). KV capacity
-is 1–2,000,000 tokens and must cover every case. Per-process ceilings: discovery 180 s,
+is 1–2,000,000 tokens and must cover every case: `concurrency` x (`prompt_tokens` +
+`output_tokens`), the KV its concurrent requests hold at once. With `device`, `create`
+raises a wanted context below that to it (`hardware_constraints.context` records
+`concurrency_tokens` and the `context_tokens` asked for), never past the model's positions or the
+device's KV. Per-process ceilings: discovery 180 s,
 build 1800 s, check 3600 s, benchmark 1800 s, configured agent 10800 s, all clipped to
 the remaining segment window and requested cap. An `eval` attempt (`crit run eval`) has
 no fixed cap: Eval's work scales with the model and the device, so it may run to the
@@ -119,7 +124,9 @@ Provider spend limits are the caller's responsibility.
 In an `as_stored` run, a candidate declaring `transformed` weights (requantized,
 pruned or changed) is measured but never eligible. In a `transformable` run, [Models](../models/README.md)
 produces transformed weights with a record of recipe, calibration data, seed, hashes and
-cost. The coordinator cannot inspect
+cost, or the engine re-encodes stored 16-bit matrices as it loads them (the route for an
+already-quantized checkpoint) and names the matrix groups and formats in
+`configuration.re_encoding`; the quality budget judges both. The coordinator cannot inspect
 weights; declare honestly. `as_stored` covers the target weights that compute every
 published token. It does not cover draft-only weights (a drafter may use any encoding
 when stored target weights verify every token; declare `as_stored` and record the
@@ -372,6 +379,20 @@ candidates so far plus one), its objective's name and rule, and `min_gain` where
   `levers` entry adds `evidence` and `structure`: the measurement of another kernel structure or a vendor
   library at the same arithmetic that rejected it, never variants of one kernel.
 
+#### Plan rules 5
+
+Runs created from this version on have `"plan_rules": 5`: the rules 4 above and check 15, the reach. A
+strategy's ceiling is the limit the parent's Eval measures (or crit computes, `computed_limits`), not the
+engine's own measurement: crit records in `inputs.reach`, per needed family, the limit and its source, the
+fraction the parent's Eval measured, the forecast's high and its share of the limit. A build plan whose
+forecast high stays below `REACH` (half) of a needed family's limit is refused unless its `gaps` has an entry
+`{"kpi": FAMILY, "gap": "limit", "answer": "cause", "detail", "evidence"}` naming the measured physical bound
+that keeps the rest out of reach, the evidence a file in the run (recorded beside the reach). An engine that
+reads weights from host memory is priced at their tier, at the expert cache hit rate it reports (or by its declared
+`host_bytes_per_pass`), so the limit Eval prices is one it can reach.
+Refusing rather than warning follows the checks above: a plan that does not meet a rule is not recorded, and
+the message says what to add.
+
 crit checks completeness and consistency with the frozen facts, never whether the reasoning is good,
 and refuses a plan with a message that says what to fix:
 
@@ -477,7 +498,9 @@ candidate cannot be selected.
 A sealed candidate cannot be fixed, so `benchmark` and `seal` warn, and `select` names
 what blocks eligibility.
 
-Each metric is `{unit, samples}` with exactly the declared repetitions:
+Each metric is `{unit, samples}` with exactly the declared repetitions; a per-request metric
+(`prefill_tps`, `decode_tps`, `request_ms`, `ttft_ms`, `accepted_tokens_per_round`) of a case of
+concurrency N may instead hold one sample per request, N per repetition, as `crit run measure` records:
 
 | Metric | Unit / boundary |
 | --- | --- |
@@ -490,6 +513,7 @@ Each metric is `{unit, samples}` with exactly the declared repetitions:
 | `perplexity` (optional) | `dimensionless`, ≥ 1; fixed corpus/tokenization/scoring |
 | `kl_divergence` (optional) | `nats/token`, ≥ 0; mean KL from a fixed reference's next-token distributions over a fixed corpus |
 | `accepted_tokens_per_round` (optional) | `tokens/round`, ≥ 1; emitted tokens per verify round |
+| `aggregate_tps` (optional) | `tokens/second`; a repetition's concurrent requests' completion tokens over its wall time (concurrency above 1) |
 
 Absent required metrics need reasons in `missing_metrics`; missing is never zero.
 Keep metrics paired and every sample. The reader computes medians grouped by exact
@@ -525,6 +549,17 @@ memory of `crit serve`'s resident host process, where the engine runs, and free 
 memory from `nvidia-smi` for GPU 0. Device memory is the driver's whole-GPU view, and
 metrics a host cannot measure go to `missing_metrics`.
 
+A case of `concurrency` N sends each warmup and repetition as N copies of its request started
+together, one per client thread, to an engine `crit serve` runs several requests of at once
+(a package declaring `chat-concurrent-v1`; [concurrent requests](SERVING.md#concurrent-requests)).
+Every request's timings are samples of its metrics, N per repetition, and `aggregate_tps` is the
+repetition's completion tokens over its wall time, from the first request sent to the last reply
+piece. `extensions.concurrency` records the clients, the requests in flight at once at each
+repetition's peak (`peak_concurrency`) and the engine's `max_concurrent_requests`; a peak below N
+means the requests did not overlap, and an engine running fewer at once queues the rest.
+Memory is one window per repetition. crit Eval measures concurrency on its own suite as well
+([concurrency](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#concurrency)).
+
 The resident host runs under `crit serve`'s launch guardian and runtime ownership,
 which retire its process tree on completion, failure, the reservation's deadline and
 interruption. The attempt settles once the server has stopped; a failed engine cleanup
@@ -553,6 +588,21 @@ candidate. Publish benchmark samples only under cases and a protocol frozen for 
 an Eval case cannot be relabelled as a run workload, and Eval's model identity differs
 from the run's manifest hash. Report skipped cases and overrides. Eval does not measure
 physical memory, and an Eval pass passes no run gate.
+
+Every Eval attempt journals its round beside its result (`candidates/ID/eval/ATTEMPT.journal.jsonl`, crit-eval's
+[journal](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md#journal-and-resume)): each engine it opens,
+part it starts and request it serves, synced as it completes. The run's events record each attempt's start
+(`eval_started`, or `eval_resumed` with the journal it resumes) beside its settlement. An attempt that stops for any
+reason (interrupted, failed, timed out, a disturbed device or a hung engine) is settled with its log, its journal and
+what it measured (the result, marked `aborted`) as its evidence. A disturbed device is judged on the repetitions
+after a case reached steady state (crit-eval's `speed.steady_state`, recorded per case as `steady_state` with its
+warmups and drift), so an engine that adapts between requests is not stopped for it; only a completed attempt's result judges gates
+(`check --from-eval`, plans). `eval --resume [ATTEMPT]` measures in a new attempt from the journal of the
+candidate's newest stopped attempt (or ATTEMPT's): the journal answers the requests it holds at their recorded
+times and the candidate is served only for the rest. It must be the same package, data and options. An attempt
+whose process ended without settling (killed, its session or the machine stopped) is settled `interrupted` by
+`--resume` once the machine's engine lock, which Eval holds while it measures, is free and its journal has been
+untouched for a minute; with the lock off, settle it first.
 
 ### Stop
 

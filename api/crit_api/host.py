@@ -19,6 +19,7 @@ from crit_api.models import ModelContext, ModelPool
 from crit_api.stream import CAPABILITY as STREAM_CAPABILITY, StreamWriter
 from crit_api.options import (MAX_CHAT_RECORD, TOOLS_CAPABILITY, STRICT_TOOLS_CAPABILITY, TOOL_CHOICE_CAPABILITY,
                               TOOL_STREAM_CAPABILITY)
+from crit_core.machine import keep_full_speed
 from crit_core.serving import (LOGPROBS_CAPABILITY, SCORE_CAPABILITY, TOKENIZE_CAPABILITY, RequestRejected,
                                engine_facts)
 
@@ -166,6 +167,7 @@ class Host:
         module_spec.loader.exec_module(module)
         self.context = ModelContext(self.pool, spec["configuration"], spec["launch"][1:], progress=loading)
         self.context.limits = spec.get('limits', {})
+        self.context.drafters = tuple(spec.get('drafters') or ())
         try:
             capabilities = spec.get("capabilities", [])
             if ({STRICT_TOOLS_CAPABILITY, TOOL_STREAM_CAPABILITY, TOOL_CHOICE_CAPABILITY} & set(capabilities)
@@ -360,6 +362,11 @@ def main():
         hard = resource.getrlimit(resource.RLIMIT_CORE)[1]
         if hard == resource.RLIM_INFINITY or hard >= 1:
             resource.setrlimit(resource.RLIMIT_CORE, (1, hard))
+    # The engine runs in this process: it keeps its speed while crit serve's or crit run eval's window is behind
+    # another one.
+    if not keep_full_speed():
+        print("crit serve: Windows refused full-speed scheduling; the engine slows while its window is in the "
+              "background", file=sys.stderr, flush=True)
     config = read_json(Path(sys.argv[1]))
     link = channel.connect(config["port"], config["token"])
     host = Host(Path(config["root"]), config["host_limit"], config["device_limit"], link.send)

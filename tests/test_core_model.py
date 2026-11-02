@@ -2056,6 +2056,36 @@ class TensorReaderTests(SafetensorsFixture):
             reader.read("w", out)
             self.assertEqual(out.tobytes(), bytes(reader.map("w")))
 
+    def test_threads_read_and_map_one_shard_at_once(self):
+        # A loader's pool reads a shard's tensors on several threads; on Windows each read seeks the reader's one
+        # descriptor, so the reads of one shard must not interleave their seeks.
+        import threading
+        from crit_core.model import open_tensors
+        names = [f"t{i}" for i in range(4)]
+        path = self.payload([(name, "U8", (1 << 20,)) for name in names])
+        wrong = []
+        with open_tensors(path) as reader:
+            expected = {name: self.expected(reader.checkpoint.tensors[name]) for name in names}
+
+            def work(name):
+                out = bytearray(1 << 20)
+                for _ in range(12):
+                    try:
+                        reader.read(name, out)
+                        mapped = bytes(reader.map(name))
+                    except Exception as error:   # a seek raced by another thread reads past the end
+                        wrong.append(f"{name}: {error}")
+                        return
+                    if bytes(out) != expected[name] or mapped != expected[name]:
+                        wrong.append(name)
+                        return
+            threads = [threading.Thread(target=work, args=(names[i % len(names)],)) for i in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        self.assertEqual(wrong, [])
+
 
 class StoredSchemeTests(unittest.TestCase):
     """crit_core.model.schemes: header-only recognition (shared with crit-eval) and the parts engines load."""
@@ -2078,6 +2108,12 @@ class StoredSchemeTests(unittest.TestCase):
             "m.weight_scale_2", False, None, False))
         with self.assertRaisesRegex(ValueError, "without m.weight_scale_2"):
             matrix_parts({k: v for k, v in mo.items() if k != "m.weight_scale_2"}, "m")
+        # ModelOpt's CSF-compressed scales: 16-row slabs of [16 bases | 16 x groups / 2 code bytes] plus exceptions
+        csf = self.headers((("m.weight", "U8", (32, 64)), ("m.weight_scale.nvfp4_csf_fixed", "U8", (2, 16 * 5)),
+                            ("m.weight_scale.nvfp4_csf_exceptions", "U32", (3,)), ("m.weight_scale_2", "F32", ())))
+        self.assertEqual(stored(csf, "m", {"quant_method": "modelopt"}), ("nvfp4", "nvfp4", 32 * 128))
+        found = matrix_parts(csf, "m", {"quant_method": "modelopt"})
+        self.assertEqual((found.scales, found.scale_encoding), ("m.weight_scale.nvfp4_csf_fixed", "csf"))
 
     def test_fp8_granularities(self):
         from crit_core.model import matrix_parts
@@ -2096,6 +2132,10 @@ class StoredSchemeTests(unittest.TestCase):
                          ("m.weight_scale_inv", "block", "m.input_scale"))
         with self.assertRaisesRegex(ValueError, "neither one scale"):
             matrix_parts(self.headers((weight, ("m.weight_scale", "F32", (5, 5)))), "m")
+        # modelopt MXFP8: one E8M0 byte per 32 inputs of each row, no block size in the config
+        mx = matrix_parts(self.headers((("m.weight", "F8_E4M3", (256, 320)), ("m.weight_scale", "U8", (256, 10)))),
+                          "m", {"quant_method": "modelopt"})
+        self.assertEqual((mx.scale_granularity, mx.block), ("block", (1, 32)))
         with self.assertRaisesRegex(ValueError, "without m.weight_scale"):
             matrix_parts(self.headers((weight,)), "m")
 

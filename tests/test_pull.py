@@ -27,6 +27,17 @@ CAPABILITIES = ["prefill", "decode", "chat-json-v1", "chat-resident-v1", "chat-s
 ENGINE = "someone/fast-engine"
 DEVICE = {"device": "NVIDIA GeForce RTX 5090", "compute_capability": "12.0", "cuda_runtime": 13010,
           "memory_total_bytes": 34190458880}
+# The fixture engine answers "drafters" with the drafter.fixture of every drafter folder crit serve gave it.
+DRAFTERS = r'''
+_generate = Engine.generate
+def generate(self, request, cancellation):
+    if request['messages'][-1]['content'] == 'drafters':
+        return self.response(request, json.dumps([open(os.path.join(d, 'drafter.fixture')).read()
+                                                  for d in self.context.drafters]))
+    return _generate(self, request, cancellation)
+Engine.generate = generate
+'''
+PYTHON = f"{sys.version_info[0]}.{sys.version_info[1]}"
 
 
 def git(folder, *arguments):
@@ -58,8 +69,8 @@ class PullTests(unittest.TestCase):
         repository = self.root / "crit-engines"
         engine = repository / "fast-engine" / "engine"
         engine.mkdir(parents=True)
-        (engine / "adapter.py").write_text(ADAPTER + f"\ndef declared_capabilities(model_path):\n    return {CAPABILITIES!r}\n",
-                                           encoding="utf-8")
+        (engine / "adapter.py").write_text(ADAPTER + DRAFTERS + f"\ndef declared_capabilities(model_path):\n"
+                                           f"    return {CAPABILITIES!r}\n", encoding="utf-8")
         (engine / "configuration.json").write_text(json.dumps(self.configuration, indent=2, sort_keys=True) + "\n",
                                                    encoding="utf-8")
         (engine / "build.py").write_text("from pathlib import Path\nPath('built.txt').write_text('built')\n",
@@ -70,7 +81,7 @@ class PullTests(unittest.TestCase):
         git(repository, "-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit", "--quiet", "-m", "fixture")
         return git(repository, "rev-parse", "HEAD")
 
-    def hub_card(self, **changes):
+    def hub_card(self, lock_downloads=None, **changes):
         folder = self.hub / "engines" / ENGINE
         folder.mkdir(parents=True, exist_ok=True)
         card = {
@@ -90,8 +101,34 @@ class PullTests(unittest.TestCase):
         write_json(folder / "card.lock.json", {
             "checkpoints": {"fixture@BF16": {"repository": "fixture/model", "revision": "f" * 40, "files": rows}},
             "provenance": {"run_id": "run-20261023T011625Z-3141e655", "candidate_id": "candidate-0007",
-                           "configuration_sha256": digest(self.configuration)}})
+                           "configuration_sha256": digest(self.configuration)},
+            **({"downloads": lock_downloads} if lock_downloads is not None else {})})
         return card
+
+    def drafter(self):
+        """A drafter folder, its card download (a folder of a Hugging Face repository) and its card.lock.json rows."""
+        folder = self.root / "drafter"
+        folder.mkdir(exist_ok=True)
+        (folder / "drafter.fixture").write_text("synthetic drafter", encoding="utf-8")
+        download = {"kind": "drafter", "repository": "someone/drafter", "revision": "d" * 40, "path": "eagle"}
+        rows = {"repository": "someone/drafter", "revision": "d" * 40, "path": "eagle", "files": inventory(folder)}
+        return folder, download, rows
+
+    def artifact(self, files=None, **toolchain):
+        """A prebuilt artifact: a tar.gz of what the build adds to engine/, and its card download."""
+        import tarfile
+        archive = self.root / "prebuilt.tar.gz"
+        staged = Path(tempfile.mkdtemp(dir=self.root))
+        with tarfile.open(archive, "w:gz") as tar:
+            for name, text in (files or {"built.txt": "prebuilt", "lib/kernels.so": "binary"}).items():
+                path = staged / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+                tar.add(path, arcname=name)
+        built = {"platforms": [machine.platform()], "gpu_arch": ["sm_120a"], "cuda": "13.1", "python": PYTHON}
+        return archive, {"kind": "artifact", "repository": "someone/prebuilt", "revision": "a" * 40,
+                         "file": "fast-engine-sm120a.tar.gz", "sha256": file_sha(archive),
+                         "toolchain": built | toolchain}
 
     def install(self, **options):
         defaults = dict(hub=self.hub, checkout=self.root / "crit-engines", model=self.model, device=self.device,
@@ -193,6 +230,100 @@ class PullTests(unittest.TestCase):
         self.assertEqual(record["card"]["from"], str(index))
         self.assertEqual(record["build"]["outputs"], ["built.txt"])
 
+    def serve(self, engine):
+        environment = patch.dict("os.environ", {"CRIT_RUNTIME_DIRECTORY": str(self.root / "runtime-owner")})
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.addCleanup(engine.close)
+        engine.open()
+        return engine
+
+    def test_drafter_downloads_are_checked_into_the_store_and_reach_the_engine(self):
+        folder, download, rows = self.drafter()
+        self.hub_card(downloads=[download], lock_downloads=[rows])
+        record = self.install(downloads={"someone/drafter": folder})
+        self.assertEqual(record["downloads"], [{
+            "kind": "drafter", "repository": "someone/drafter", "revision": "d" * 40, "path": "eagle",
+            "folder": f"models/someone--drafter@{'d' * 40}/eagle", "files_sha256": digest(rows["files"]),
+            "from": "local folder"}])
+        self.assertEqual(self.store.spec(ENGINE)["drafters"], [str(self.store.root / record["downloads"][0]["folder"])])
+        from crit_api.installed import InstalledEngine
+        engine = self.serve(InstalledEngine(self.store.root, ENGINE, host_limit=1 << 20, device_limit=1 << 20))
+        status, assistant, _ = engine.generate([{"role": "user", "content": "drafters"}], 16, threading.Event())
+        self.assertEqual((status, json.loads(assistant)), ("completed", ["synthetic drafter"]))
+
+    def test_a_drafter_that_differs_from_the_lock_or_is_not_locked_is_refused(self):
+        folder, download, rows = self.drafter()
+        self.hub_card(downloads=[download], lock_downloads=[rows])
+        (folder / "drafter.fixture").write_text("another drafter", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "drafter.fixture: (SHA-256 differs|missing)"):
+            self.install(downloads={"someone/drafter": folder})
+        self.hub_card(downloads=[download])
+        with self.assertRaisesRegex(ValueError, "card.lock.json lists no files of the drafter someone/drafter"):
+            self.install(downloads={"someone/drafter": folder})
+        with self.assertRaisesRegex(ValueError, "--download names other/repo, which"):
+            self.install(downloads={"other/repo": folder})
+        self.assertEqual(self.store.list(), [])
+
+    def test_a_prebuilt_artifact_that_matches_this_machine_replaces_the_build(self):
+        archive, download = self.artifact()
+        self.hub_card(downloads=[download])
+        with patch("crit.pull.requirements.driver_cuda", return_value="13.2"):
+            record = self.install(downloads={"someone/prebuilt": archive})
+            folder = self.store.folder(ENGINE)
+            self.assertEqual((folder / "package/built.txt").read_text(), "prebuilt")
+            self.assertFalse((folder / "logs/build.log").exists(), "nothing was built")
+            self.assertEqual(record["build"]["artifact"], {k: download[k] for k in ("repository", "revision", "file", "sha256")}
+                             | {"from": "local file"})
+            self.assertEqual(record["build"]["outputs"], ["built.txt", "lib/kernels.so"])
+            self.assertTrue(all(row["met"] for row in record["build"]["toolchain"]))
+            self.assertEqual(read_json(folder / "package/manifest.json")["build"]["artifact"]["sha256"], download["sha256"])
+            self.store.spec(ENGINE)
+            record = self.install(force=True, from_source=True, downloads={"someone/prebuilt": archive})
+            self.assertEqual(record["build"]["command"], ["python", "build.py"])
+            self.assertEqual((self.store.folder(ENGINE) / "package/built.txt").read_text(), "built")
+
+    def test_an_artifact_for_another_toolchain_is_left_for_the_build(self):
+        for built, driver in (({"gpu_arch": ["sm_90a"]}, "13.1"), ({}, "12.8"), ({"python": "3.9"}, "13.1")):
+            with self.subTest(built=built, driver=driver):
+                archive, download = self.artifact(**built)
+                self.hub_card(downloads=[download])
+                with patch("crit.pull.requirements.driver_cuda", return_value=driver), patch("sys.stderr"):
+                    record = self.install(force=True)
+                self.assertEqual(record["build"]["command"], ["python", "build.py"])
+                self.assertEqual((self.store.folder(ENGINE) / "package/built.txt").read_text(), "built")
+
+    def test_an_artifact_is_checked_by_its_sha256_and_never_replaces_the_source(self):
+        archive, download = self.artifact()
+        self.hub_card(downloads=[download | {"sha256": "0" * 64}])
+        with patch("crit.pull.requirements.driver_cuda", return_value="13.1"):
+            with self.assertRaisesRegex(ValueError, "not the artifact the card pins"):
+                self.install(downloads={"someone/prebuilt": archive})
+            archive, download = self.artifact({"adapter.py": "replaced"})
+            self.hub_card(downloads=[download])
+            with self.assertRaisesRegex(ValueError, "adapter.py would replace a file of the engine's pinned source"):
+                self.install(downloads={"someone/prebuilt": archive})
+        self.assertEqual(self.store.list(), [])
+
+    def test_a_model_catalog_serves_an_installed_engine_by_name(self):
+        self.install()
+        from crit_api.catalog import ModelCatalog
+        catalog = self.root / "models.json"
+        write_json(catalog, {"models": [{"name": "fast", "engine": ENGINE, "store": "store", "aliases": ["gpt-*"],
+                                         "display_name": "Fast engine"}]})
+        engine = self.serve(ModelCatalog(catalog, host_limit=1 << 20, device_limit=1 << 20))
+        self.assertEqual(engine.resolve_model("gpt-4o"), "fast")
+        self.assertEqual(engine.candidates(), [{"candidate_id": "fast", "label": "fast-engine", "display_name": "Fast engine"}])
+        status, assistant, _ = engine.generate([{"role": "user", "content": "hello"}], 16, threading.Event(),
+                                               candidate_id="fast")
+        self.assertEqual((status, json.loads(assistant)["weights"]), ("completed", "synthetic input, not a model"))
+        write_json(catalog, {"models": [{"name": "other", "engine": "someone/missing", "store": "store"}]})
+        with self.assertRaisesRegex(ValueError, "someone/missing is not installed"):
+            ModelCatalog(catalog)
+        write_json(catalog, {"models": [{"name": "other", "engine": ENGINE, "run": "run-0001"}]})
+        with self.assertRaisesRegex(ValueError, "run"):
+            ModelCatalog(catalog)
+
     def test_an_engine_built_elsewhere_is_not_pulled(self):
         self.hub_card(origin="external")
         with self.assertRaisesRegex(ValueError, "crit pull installs engines exported from crit"):
@@ -229,6 +360,30 @@ class RequirementTests(unittest.TestCase):
         rows = machine.check({"platforms": ["wsl2"], "gpu_arch": ["sm_120a"], "gpu_memory_gb": 32, "cuda": "13.1"},
                              DEVICE, cuda="13.1", here="windows")
         self.assertEqual(machine.unmet(rows), ["platform: needs ['wsl2'], this machine has windows"])
+
+    def test_an_artifacts_toolchain_needs_its_architecture_a_driver_as_new_and_its_python(self):
+        built = {"platforms": ["linux"], "gpu_arch": ["sm_120a"], "cuda": "13.1", "python": "3.12"}
+        self.assertEqual(machine.unmet(machine.toolchain(built, DEVICE, driver="13.1", here="wsl2", python="3.12")), [])
+        self.assertEqual(machine.unmet(machine.toolchain(built, DEVICE, driver="14.0", here="linux", python="3.12")), [])
+        self.assertEqual(machine.unmet(machine.toolchain(built, DEVICE, driver="13.0", here="linux", python="3.13")),
+                         ["cuda: needs 13.1, this machine has 13.0", "python: needs 3.12, this machine has 3.13"])
+        self.assertEqual(machine.unmet(machine.toolchain(built, DEVICE | {"compute_capability": "12.1"}, driver="13.1",
+                                                         here="windows", python="3.12")),
+                         ["platform: needs ['linux'], this machine has windows",
+                          "gpu_arch: needs ['sm_120a'], this machine has NVIDIA GeForce RTX 5090 (compute capability 12.1)"])
+        self.assertTrue(machine.unmet(machine.toolchain({}, DEVICE, driver="13.1", here="linux")), "no toolchain, no match")
+
+    def test_a_hip_card_needs_a_hip_device_of_its_architecture_and_rocm(self):
+        card = {"platforms": ["linux"], "backend": "hip", "gpu_arch": ["gfx1201"], "gpu_memory_gb": 16, "rocm": "6.4"}
+        rdna4 = {"backend": "hip", "device": "AMD Radeon RX 9070 XT", "arch": "gfx1201", "runtime_version": 60443483,
+                 "memory_total_bytes": 17_163_091_968}
+        self.assertEqual(machine.hip_version(60443483), "6.4")
+        self.assertEqual(machine.unmet(machine.check(card, rdna4, here="linux")), [])
+        older = rdna4 | {"runtime_version": 60342134}
+        self.assertEqual(machine.unmet(machine.check(card, older, here="linux")), ["rocm: needs 6.4, this machine has 6.3"])
+        self.assertIn("gpu_arch", machine.unmet(machine.check(card, DEVICE, here="linux"))[0])   # a CUDA device
+        metal = machine.check(card | {"backend": "metal", "metal": "3.2"}, rdna4, here="linux")
+        self.assertEqual([row["requirement"] for row in metal if not row["met"]], ["backend"])
 
 
 if __name__ == "__main__":

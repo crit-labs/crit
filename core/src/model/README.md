@@ -120,7 +120,9 @@ raises `SIGBUS`; pair `map` with `verify_unchanged()` and controlled storage.
 ## Digests
 
 `digest_files(options)` returns run-record manifest rows `{path, bytes, sha256}`
-for the index and every shard and extra file, sorted by path.
+for the index and every shard and extra file, sorted by path. A path is relative
+to the source's directory with `/`, so a shard in a subfolder keeps it
+(`tensors/model-00001-of-00004.safetensors`).
 `verify_digests(expected, options)` requires one row per checkpoint file (others
 are ignored), checks presence and sizes before hashing, and throws `FormatError`
 naming the file on any mismatch.

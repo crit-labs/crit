@@ -33,9 +33,19 @@ place of the library path:
 The adapters then treat both alike, so a Python engine writes no adapter code and cannot drift from what Eval and
 crit serve expect. Its generations and scores run one at a time unless its info declares max_concurrent_requests
 above 1, and close() waits for those in flight.
+
+A Python engine that batches concurrent requests implements a step instead of generate(): a step model (StepEngine)
+opens a session per request and computes one row per scheduled request in step(rows), and Core's concurrent runtime
+(crit/step_engine.h, through the crit_core_steps library) schedules, admits, cancels and retires its requests:
+
+    def open_engine(configuration):
+        return MyStepModel(configuration)   # info(), open(request), step(rows), commit(...), retire(...), close()
+
+The same eval_engine and resident_engine serve it, max_concurrent_requests at once.
 """
 import array
 import ctypes
+import os
 from collections import namedtuple
 import copy
 import gc
@@ -46,6 +56,7 @@ import json
 import sys
 from pathlib import Path
 
+from crit_core.machine import under_wsl
 from crit_core.serving import SAMPLING, TOP_LOGPROBS, ResidentChat, ScoreRows
 
 ABI = 2
@@ -57,12 +68,17 @@ PENALTY, PENALTIES = "penalties", {"repetition_penalty", "presence_penalty", "fr
 # The penalties at the values that change nothing, for requests that must not take an engine's defaults (Eval's).
 NEUTRAL_PENALTIES = {"presence_penalty": 0.0, "frequency_penalty": 0.0, "repetition_penalty": 1.0}
 # Engine info facts the eval-v1 adapter passes on (crit-eval's docs/ADAPTER.md): headroom inputs, kernel classes, the
-# prompt GEMMs' activation formats, and the configuration overrides of --attribute-drift and of a wider-draft probe.
+# prompt GEMMs' activation formats, the configuration overrides of --attribute-drift and of a wider-draft probe, and
+# prompt_cache false for an engine without a prompt cache.
 FACTS = ("draft_width", "bytes_per_pass", "draft_bytes_per_step", "draft_ms", "kv_bytes_per_token", "kernel_work",
-         "prompt_activations", "exact_variants", "wider_draft")
+         "prompt_activations", "exact_variants", "wider_draft", "prompt_cache")
 # NativeEngine.score per target: its log-probability, the query rows, the argmax and the engine's own ranked top_k
 # [(token, logprob), ...] (None for parts not asked for or not returned).
 Scores = namedtuple("Scores", "target query argmax top")
+
+
+# Whether CUDA runs under the Windows display driver model: native Windows, or WSL's paravirtualized GPU.
+WDDM = sys.platform == "win32" or under_wsl()
 
 
 class NativeError(RuntimeError):
@@ -105,6 +121,13 @@ class NativeEngine(_Requests):
     """One engine opened from a library exported with CRIT_EXPORT_ENGINE."""
 
     def __init__(self, library, configuration):
+        self._load(library)
+        handle = self.lib.crit_engine_open(json.dumps(configuration).encode("utf-8"))
+        if not handle:
+            raise NativeError("opening the engine failed: " + self._error())
+        self._attach(handle)
+
+    def _load(self, library):
         self.path = Path(library).resolve()
         lib = ctypes.CDLL(str(self.path))
         lib.crit_engine_abi.restype = ctypes.c_int
@@ -137,15 +160,16 @@ class NativeEngine(_Requests):
             function.argtypes = [ctypes.c_void_p, callback, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
                                  ctypes.c_char_p, ctypes.c_int]
         self.lib = lib
-        self.handle = lib.crit_engine_open(json.dumps(configuration).encode("utf-8"))
-        if not self.handle:
-            raise NativeError("opening the engine failed: " + self._error())
+
+    def _attach(self, handle):
+        """Adopts an opened engine handle and reads its facts."""
+        self.handle = handle
         size = 1 << 16
         buffer = ctypes.create_string_buffer(size)
-        length = lib.crit_engine_info(self.handle, buffer, size)
+        length = self.lib.crit_engine_info(self.handle, buffer, size)
         if length >= size:
             buffer = ctypes.create_string_buffer(length + 1)
-            length = lib.crit_engine_info(self.handle, buffer, length + 1)
+            length = self.lib.crit_engine_info(self.handle, buffer, length + 1)
         if length < 0:
             raise NativeError("engine info failed: " + self._error())
         self.facts = json.loads(buffer.value.decode("utf-8"))
@@ -305,6 +329,8 @@ class PythonEngine(_Requests):
         self.engine = opener(dict(configuration))
         self.facts = dict(self.engine.info())
         self._start_requests()
+        self._oversubscribed = set()
+        self._check_device_memory()
 
     def _usable(self):
         return self.engine is not None
@@ -316,11 +342,39 @@ class PythonEngine(_Requests):
         with self._lease():
             if options.get("cancelled") and options["cancelled"]():
                 return None, {"cancelled": True}
-            return self.engine.generate(list(prompt), int(output_tokens), **options)
+            try:
+                return self.engine.generate(list(prompt), int(output_tokens), **options)
+            finally:
+                self._check_device_memory()
 
     def score(self, ids, first_target, path="", queries=None, top_k=0, packed=False):
         with self._lease():
-            return self.engine.score(list(ids), int(first_target), path, queries=queries, top_k=top_k, packed=packed)
+            try:
+                return self.engine.score(list(ids), int(first_target), path, queries=queries, top_k=top_k,
+                                         packed=packed)
+            finally:
+                self._check_device_memory()
+
+    def _check_device_memory(self):
+        """Warn once per device when torch has reserved more than the device holds. Under the Windows display driver
+        (WDDM, native Windows and WSL) such allocations do not fail: the driver moves the excess to system memory, and
+        every kernel that reads it slows down by the host link's bandwidth, so the engine only gets slower."""
+        if not WDDM:
+            return
+        torch = sys.modules.get("torch")
+        if torch is None or not torch.cuda.is_initialized():
+            return
+        for device in range(torch.cuda.device_count()):
+            if device in self._oversubscribed:
+                continue
+            peak, total = torch.cuda.max_memory_reserved(device), torch.cuda.get_device_properties(device).total_memory
+            if peak > total:
+                self._oversubscribed.add(device)
+                sys.stderr.write(
+                    f"crit_core: the engine reserved {peak / 2**30:.1f} GiB on cuda:{device}, which holds "
+                    f"{total / 2**30:.1f} GiB; under WDDM the excess runs from system memory and slows every kernel "
+                    "that reads it: keep the engine's peak (weights, caches, prompt activations) below the device's "
+                    "memory\n")
 
     def close(self):
         with self._condition:
@@ -337,9 +391,248 @@ class PythonEngine(_Requests):
                     torch.cuda.empty_cache()
 
 
+# The crit_core_steps library (crit/step_engine.h) a StepEngine loads, when the model's info names no "step_library".
+STEP_LIBRARY = "CRIT_CORE_STEP_LIBRARY"
+# The settings of a step model's info that configure Core (crit/step_engine.h's "engine" object); the rest are facts.
+STEP_SETTINGS = ("implementation", "vocabulary", "valid_vocabulary", "context", "prefill_chunk", "stop_tokens",
+                 "max_concurrency", "max_pending", "max_batch_tokens", "batch_policy", "max_row_tokens",
+                 "decode_token_work", "sampling", "token_logprobs", "max_top_logprobs", "scoring", "score_paths",
+                 "host_limit")
+FINISHES = ("length", "stop", "cancelled", "failed")
+SAMPLING_OPTIONS = ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty", "frequency_penalty",
+                    "presence_penalty", "logit_bias", "min_tokens")
+
+
+class _StepRequest(ctypes.Structure):
+    _fields_ = [("request", ctypes.c_uint64), ("generation", ctypes.c_uint64), ("lane", ctypes.c_uint32),
+                ("prompt_tokens", ctypes.c_uint32), ("prompt", ctypes.POINTER(ctypes.c_int32)),
+                ("output_tokens", ctypes.c_uint32), ("reserved", ctypes.c_uint32), ("options_json", ctypes.c_char_p)]
+
+
+class _StepRow(ctypes.Structure):
+    _fields_ = [("session", ctypes.c_uint64), ("prefill_tokens", ctypes.c_uint32), ("output_tokens", ctypes.c_uint32),
+                ("token_work", ctypes.c_uint32), ("prefill_complete", ctypes.c_int32)]
+
+
+class _StepProgress(ctypes.Structure):
+    _fields_ = [("prompt_tokens", ctypes.c_uint32), ("reused_prompt_tokens", ctypes.c_uint32),
+                ("token_work", ctypes.c_uint32), ("tokens", ctypes.c_uint32), ("prefill_complete", ctypes.c_int32),
+                ("reserved", ctypes.c_int32)]
+
+
+class _StepDecision(ctypes.Structure):
+    _fields_ = [("session", ctypes.c_uint64), ("accepted", ctypes.c_uint32), ("terminal", ctypes.c_int32),
+                ("cancelled", ctypes.c_int32), ("discard", ctypes.c_int32)]
+
+
+_I32, _F32 = ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float)
+_ADMISSION = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(_StepRequest))
+_OPEN = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(_StepRequest), ctypes.POINTER(ctypes.c_uint64))
+_STEP = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(_StepRow), ctypes.c_uint32,
+                         ctypes.POINTER(_StepProgress), _I32, _F32, _I32, _F32)
+_COMMIT = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(_StepDecision), ctypes.c_uint32)
+_RETIRE = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int)
+_RELEASE = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint64)
+_SCORE = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, _I32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_char_p, _I32,
+                          ctypes.c_uint32, ctypes.c_uint32, _F32, _F32, _I32, _I32, _I32, _F32)
+_ERROR = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int)
+
+
+class _StepCallbacks(ctypes.Structure):
+    _fields_ = [("user", ctypes.c_void_p), ("admission", _ADMISSION), ("open", _OPEN), ("step", _STEP),
+                ("commit", _COMMIT), ("retire", _RETIRE), ("release", _RELEASE), ("score", _SCORE), ("error", _ERROR)]
+
+
+# What a step model's open() and admission() receive: the request's key (request, generation, lane), prompt and output
+# limit; the sampling fields it set; the effective stop tokens; alternatives per token (None: no log-probabilities); a
+# forced continuation (replay) or plain decoding (crit/native_engine.h's ReplayContinuation and PlainDecoding).
+StepRequest = namedtuple("StepRequest", "key prompt output_tokens sampling stop_tokens logprobs replay plain")
+# One scheduled row of a step: the session open() returned and its WorkBudget (crit/core.h).
+StepRow = namedtuple("StepRow", "session prefill_tokens output_tokens token_work prefill_complete")
+# What step() returns per row, in the rows' order: prompt tokens consumed (reused ones included), the tokens produced
+# (at most max_row_tokens), whether prefill is complete, the reused prefix, the token work computed (0: the prompt
+# tokens computed, or one per token) and, for requests asking for them, one (logprob, [(token, logprob), ...]) per token.
+StepResult = namedtuple("StepResult", "prompt_tokens tokens prefill_complete reused_prompt_tokens token_work logprobs",
+                        defaults=(0, (), False, 0, 0, None))
+# Core's decision for a row of the last step: the tokens it kept, whether the request ends, was cancelled, or the row is
+# discarded.
+StepDecision = namedtuple("StepDecision", "session accepted terminal cancelled discard")
+
+
+class StepEngine(NativeEngine):
+    """A Python step model served by Core's concurrent runtime (crit/step_engine.h, core/src/runtime/README.md "Python
+    engines"): Core schedules its requests in mixed prefill/decode steps, admits, applies stop tokens and output
+    limits, cancels and retires them, and runs scores as exclusive barriers; the model implements
+
+        info()                 facts as a Python engine's (implementation, stop_tokens, sampling, speculative, replay,
+                               ...) plus Core's settings: "vocabulary" and "context" (required), "max_concurrency",
+                               "max_pending", "max_batch_tokens", "prefill_chunk", "batch_policy", "max_row_tokens",
+                               "token_logprobs", "max_top_logprobs", "scoring" (STEP_SETTINGS)
+        open(request)          a session for a StepRequest
+        step(rows)             one StepResult per StepRow, computed together
+        commit(decisions)      optional: Core's StepDecision per row of the last step
+        retire(session, finish) optional: "length", "stop", "cancelled" or "failed"
+        admission(request)     optional: "ready", "deferred" or "infeasible"
+        score(ids, first_target, path, queries, top_k)  with "scoring": Scores, as NativeEngine.score returns them
+        close()
+
+    on Core's one engine worker, never two at once. It generates and scores through NativeEngine's interface, with
+    max_concurrent_requests (max_concurrency + max_pending) requests at once. `library` is crit_core_steps, else the
+    info's "step_library", else CRIT_CORE_STEP_LIBRARY."""
+
+    def __init__(self, model, library=None):
+        self.model = model
+        info = dict(model.info())
+        library = library or info.pop("step_library", None) or os.environ.get(STEP_LIBRARY)
+        info.pop("step_library", None)
+        if not library:
+            raise NativeError("a step engine needs Core's crit_core_steps library: build Core (core/README.md) and set "
+                              f"{STEP_LIBRARY} to it, or name it in the model's info as step_library")
+        self._load(library)
+        self.library, self.path = self.path, None   # Eval takes it from the facts' native_libraries
+        self.lib.crit_engine_open_steps.restype = ctypes.c_void_p
+        self.lib.crit_engine_open_steps.argtypes = [ctypes.c_char_p, ctypes.POINTER(_StepCallbacks)]
+        settings = {key: info[key] for key in STEP_SETTINGS if key in info}
+        facts = {key: value for key, value in info.items() if key not in STEP_SETTINGS}
+        facts["native_libraries"] = [str(self.library)] + list(facts.get("native_libraries") or [])
+        self._row_tokens = int(settings.get("max_row_tokens", 1))
+        self._top = int(settings.get("max_top_logprobs", 0))
+        self._logprobs = bool(settings.get("token_logprobs"))
+        self._sessions, self._next, self._failure = {}, 1, ""
+        optional = lambda name, kind, method: kind(method) if callable(getattr(model, name, None)) else kind()
+        self._callbacks = _StepCallbacks(
+            None, optional("admission", _ADMISSION, self._admission), _OPEN(self._open), _STEP(self._step),
+            optional("commit", _COMMIT, self._commit), _RETIRE(self._retire), _RELEASE(self._release),
+            _SCORE(self._score) if settings.get("scoring") else _SCORE(), _ERROR(self._error_message))
+        handle = self.lib.crit_engine_open_steps(json.dumps({"engine": settings, "facts": facts}).encode("utf-8"),
+                                                 ctypes.byref(self._callbacks))
+        if not handle:
+            raise NativeError("opening the step engine failed: " + self._error())
+        self._attach(handle)
+
+    def _guard(self, run):
+        """Runs a callback body; an exception is kept for error() and fails the engine (never unwinds through C)."""
+        try:
+            result = run()
+            return 0 if result is None else result
+        except BaseException as error:
+            self._failure = f"{type(error).__name__}: {error}"
+            return -1
+
+    def _error_message(self, _user, out, capacity):
+        if capacity < 1:
+            return 0
+        data = self._failure.encode("utf-8", "replace")[:capacity - 1]
+        ctypes.memmove(out, data + b"\0", len(data) + 1)
+        return len(data)
+
+    @staticmethod
+    def _request(pointer):
+        r = pointer.contents
+        options = json.loads(r.options_json.decode("utf-8")) if r.options_json else {}
+        return StepRequest((r.request, r.generation, r.lane), r.prompt[:r.prompt_tokens], r.output_tokens,
+                           {key: options[key] for key in SAMPLING_OPTIONS if key in options},
+                           options.get("stop_tokens", []), options.get("logprobs"), options.get("replay"),
+                           bool(options.get("plain")))
+
+    def _admission(self, _user, request):
+        def run():
+            answer = self.model.admission(self._request(request))
+            if answer not in ("ready", "deferred", "infeasible"):
+                raise ValueError(f"admission must answer ready, deferred or infeasible, not {answer!r}")
+            return ("ready", "deferred", "infeasible").index(answer)
+        return self._guard(run)
+
+    def _open(self, _user, request, session):
+        def run():
+            handle = self._next
+            self._sessions[handle] = self.model.open(self._request(request))
+            self._next += 1
+            session[0] = handle
+        return self._guard(run)
+
+    def _step(self, _user, rows, count, progress, tokens, logprobs, top_ids, top_logprobs):
+        def run():
+            scheduled = [StepRow(self._sessions[rows[i].session], rows[i].prefill_tokens, rows[i].output_tokens,
+                                 rows[i].token_work, bool(rows[i].prefill_complete)) for i in range(count)]
+            results = list(self.model.step(scheduled))
+            if len(results) != count:
+                raise ValueError(f"step returned {len(results)} results for {count} rows")
+            width, top = self._row_tokens, self._top
+            for i, result in enumerate(results):
+                result = StepResult(*result) if not isinstance(result, StepResult) else result
+                produced = list(result.tokens)
+                if len(produced) > width:
+                    raise ValueError(f"a row produced {len(produced)} tokens, more than max_row_tokens {width}")
+                p = progress[i]
+                p.prompt_tokens, p.reused_prompt_tokens = int(result.prompt_tokens), int(result.reused_prompt_tokens)
+                p.token_work, p.tokens, p.prefill_complete = int(result.token_work), len(produced), int(bool(result.prefill_complete))
+                for j, token in enumerate(produced):
+                    tokens[i * width + j] = int(token)
+                if self._logprobs and result.logprobs is not None:
+                    for j, (logprob, alternatives) in enumerate(list(result.logprobs)[:len(produced)]):
+                        logprobs[i * width + j] = float(logprob)
+                        for a, (token, value) in enumerate(list(alternatives)[:top]):
+                            top_ids[(i * width + j) * top + a] = int(token)
+                            top_logprobs[(i * width + j) * top + a] = float(value)
+        return self._guard(run)
+
+    def _commit(self, _user, decisions, count):
+        def run():
+            self.model.commit([StepDecision(self._sessions[d.session], d.accepted, bool(d.terminal), bool(d.cancelled),
+                                            bool(d.discard)) for d in (decisions[i] for i in range(count))])
+        return self._guard(run)
+
+    def _retire(self, _user, session, finish):
+        def run():
+            if callable(getattr(self.model, "retire", None)):
+                self.model.retire(self._sessions[session], FINISHES[finish])
+        return self._guard(run)
+
+    def _release(self, _user, session):
+        self._sessions.pop(session, None)
+
+    def _score(self, _user, ids, count, first_target, path, queries, per_target, top_k, target, query, argmax,
+               has_argmax, top_ids, top_logprobs):
+        def run():
+            targets = count - first_target
+            rows = ([[queries[t * per_target + j] for j in range(per_target)] for t in range(targets)]
+                    if per_target else None)
+            scored = self.model.score(ids[:count], first_target, (path or b"").decode("utf-8"), queries=rows, top_k=top_k)
+            if len(scored.target) != targets:
+                raise ValueError(f"score returned {len(scored.target)} targets, expected {targets}")
+            for t, value in enumerate(scored.target):
+                target[t] = float(value)
+            for t, row in enumerate(scored.query or []):
+                for j, value in enumerate(row):
+                    query[t * per_target + j] = float(value)
+            has_argmax[0] = int(scored.argmax is not None)
+            for t, token in enumerate(scored.argmax or []):
+                argmax[t] = int(token)
+            for t, row in enumerate((scored.top or []) if top_k else []):
+                for a, (token, value) in enumerate(row):
+                    top_ids[t * top_k + a] = int(token)
+                    top_logprobs[t * top_k + a] = float(value)
+        return self._guard(run)
+
+    def close(self):
+        super().close()
+        if self.model is not None:
+            if callable(getattr(self.model, "close", None)):
+                self.model.close()
+            self.model = None
+            self._sessions.clear()
+
+
 def open_engine(engine, configuration):
-    """NativeEngine for a library path, PythonEngine for a callable that opens a Python engine."""
-    return PythonEngine(engine, configuration) if callable(engine) else NativeEngine(engine, configuration)
+    """NativeEngine for a library path; for a callable that opens a Python engine, a StepEngine when the engine is a
+    step model (it has step()), else a PythonEngine."""
+    if not callable(engine):
+        return NativeEngine(engine, configuration)
+    opened = engine(dict(configuration))
+    if callable(getattr(opened, "step", None)):
+        return StepEngine(opened)
+    return PythonEngine(lambda _configuration: opened, configuration)
 
 
 def engine_times(result):
@@ -408,7 +701,8 @@ class EvalEngine:
 
     def _result(self, tokens, result):
         out = {"tokens": tokens, "rounds": decode_rounds(tokens, result, self.speculative)}
-        out.update({key: result[key] for key in ("accepted", "drafted", "verify_ms", "draft_ms") if key in result})
+        out.update({key: result[key] for key in ("accepted", "drafted", "verify_ms", "draft_ms", "expert_reads",
+                                                 "expert_hits") if key in result})
         return {**out, **engine_times(result)}
 
     def generate(self, prompt_ids, max_new_tokens, on_tokens):
@@ -582,5 +876,5 @@ def resident_engine(context, library, defaults=None):
     return ResidentEngine(context, library, defaults)
 
 
-__all__ = ["NativeEngine", "NativeError", "PythonEngine", "EvalEngine", "ResidentEngine", "eval_engine", "open_engine",
-           "resident_engine"]
+__all__ = ["NativeEngine", "NativeError", "PythonEngine", "StepEngine", "StepRequest", "StepRow", "StepResult",
+           "StepDecision", "EvalEngine", "ResidentEngine", "eval_engine", "open_engine", "resident_engine"]

@@ -70,8 +70,13 @@ def main(argv=None):
     parser.add_argument("--root", type=Path, help="Run root; defaults to PROJECT/runs")
     parser.add_argument("--id", help="Existing run identity")
     subs = parser.add_subparsers(dest="action", required=True)
-    for name in ("create", "resolve", "plan", "check", "benchmark", "stop"):
-        sub = subs.add_parser(name)
+    for name, text in (("create", "Create a run and its first segment from a request"),
+                       ("resolve", "Freeze the verified model and input identities"),
+                       ("plan", "Record the next candidate's plan"),
+                       ("check", "Append a case's check evidence to a candidate"),
+                       ("benchmark", "Append a case's benchmark evidence to a candidate"),
+                       ("stop", "Stop the run with its reason, critique, headroom and cleanup")):
+        sub = subs.add_parser(name, help=text)
         sub.add_argument("--record", type=Path, required=name != "check")
         if name in {"check", "benchmark"}:
             sub.add_argument("--candidate", required=True)
@@ -87,7 +92,7 @@ def main(argv=None):
     subs.choices["create"].add_argument("--from-engine", type=Path, metavar="ENGINE_DIR",
                                         help="Start from a crit-hub engine: its engines/<owner>/<name>/ folder (card.yaml, "
                                              "card.lock.json, evidence/) is recorded as the run's origin_engine")
-    sub = subs.add_parser("candidate")
+    sub = subs.add_parser("candidate", help="Allocate a candidate ID and retain its source and proposal")
     sub.add_argument("--source", type=Path, required=True)
     sub.add_argument("--record", type=Path, required=True, help="label, rationale, strategy, configuration, store_decisions, parent/origin IDs")
     sub = subs.add_parser("recon", help="Gather the model's sampling, stop tokens, chat template and config into work/recon.json")
@@ -117,15 +122,15 @@ def main(argv=None):
     sub.add_argument("--drop", action="append", default=[], metavar="GLOB",
                      help="Remove these build-folder paths (intermediates) before packaging; repeatable")
     sub.add_argument("--no-package", action="store_true", help="Build and settle only")
-    sub = subs.add_parser("package")
+    sub = subs.add_parser("package", help="Package a candidate's runnable files and manifest")
     sub.add_argument("--candidate", required=True)
     sub.add_argument("--source", type=Path, required=True)
     sub.add_argument("--record", type=Path, required=True, help="build, launch and capabilities")
-    sub = subs.add_parser("reserve")
+    sub = subs.add_parser("reserve", help="Consume an attempt before a launch")
     sub.add_argument("--candidate", help="Candidate owner; omit only for discovery")
     sub.add_argument("--operation", choices=("discovery", "build", "check", "benchmark"), required=True)
     sub.add_argument("--seconds", type=float)
-    sub = subs.add_parser("settle")
+    sub = subs.add_parser("settle", help="Settle a reserved attempt: exit, logs, cleanup")
     sub.add_argument("--reservation", required=True, help="Reservation path relative to run")
     sub.add_argument("--record", type=Path, required=True)
     sub = subs.add_parser("measure", help="Benchmark the run's cases on a packaged candidate through crit serve")
@@ -150,6 +155,10 @@ def main(argv=None):
                           "kv_tokens, which the resources check needs")
     sub.add_argument("--budget-minutes", type=float, metavar="MINUTES",
                      help="Eval's wall-clock budget, loads included (default: crit-eval's 45)")
+    sub.add_argument("--resume", nargs="?", const=True, metavar="ATTEMPT",
+                     help="Go on from an Eval attempt that stopped (interrupted, failed, timed out, a disturbed or hung "
+                          "engine): its journal's requests are answered again, the engine loads for the requests left; "
+                          "default the candidate's newest journal")
     sub = subs.add_parser("serve", help="Serve a packaged candidate before it is sealed through crit serve, under a "
                                         "check attempt, until Ctrl+C: for the checks a candidate passes before sealing")
     sub.add_argument("--candidate", required=True)
@@ -159,13 +168,13 @@ def main(argv=None):
     sub.add_argument("--check", action="store_true", help="Run the standard serving checks (consecutive requests, "
                      "system message, streaming, stop string, cancelling, tool call, logprobs, template switch, "
                      "stopping), keep their report and record a functional check per case, then stop")
-    sub = subs.add_parser("seal")
+    sub = subs.add_parser("seal", help="Close a candidate (sealed candidates are immutable)")
     sub.add_argument("--candidate", required=True)
     sub.add_argument("--lifecycle", required=True)
     sub.add_argument("--failure", help="Retained failure message")
-    sub = subs.add_parser("select")
+    sub = subs.add_parser("select", help="Select a sealed eligible candidate")
     sub.add_argument("--candidate", required=True)
-    sub = subs.add_parser("resume")
+    sub = subs.add_parser("resume", help="Open a new segment for more candidates, optionally amending the quality terms")
     sub.add_argument("--candidates", type=int, help="Candidates this segment builds (no working time budget)")
     sub.add_argument("--minutes", type=int, help="Time-budget segment instead, or the safety window with --candidates")
     sub.add_argument("--attempt-limit", type=int, default=64)
@@ -191,7 +200,7 @@ def main(argv=None):
     sub.add_argument("--agent", metavar="CMD", help="Start an agent on every replay at once with this command (any "
                      "harness; {brief}, {folder}, {root} and {number} name the replay's), wait for all, then collect")
     sub.add_argument("--collect", action="store_true", help="Instead: check and list the plans the replays under --out wrote")
-    subs.add_parser("show")
+    subs.add_parser("show", help="Print the run, its state and its candidates as JSON")
     subs.add_parser("recover", help="Explicit dead-owner lease recovery and projection rebuild; never resets attempts/deadlines")
     args = parser.parse_args(argv)
     if hasattr(signal, "SIGTERM") and signal.getsignal(signal.SIGTERM) is signal.SIG_DFL:
@@ -276,9 +285,10 @@ def main(argv=None):
                               read_json(args.baseline) if args.baseline else None, args.seconds, args.label,
                               stage=args.stage if args.stage in (None, "full") else int(args.stage),
                               certify=args.certify,
-                              budget_seconds=args.budget_minutes * 60 if args.budget_minutes else None)
+                              budget_seconds=args.budget_minutes * 60 if args.budget_minutes else None,
+                              resume=args.resume)
             from crit_eval.reports.status import render
-            from .plans import extract, priorities, rules
+            from .plans import extract, priorities, rules, standing
             status = result.pop("status")
             print(render(status), file=sys.stderr)
             # Eval states the goals without an order; the run's priority rule orders them for the next plan.
@@ -287,6 +297,15 @@ def main(argv=None):
             print("priorities while decode and prefill are both needed: " + (
                 "; ".join(f"{tier} {', '.join(order[tier])}" for tier in ("p1", "p2", "p3") if order[tier])
                 if order else reason) + " (crit run ... plan computes them from the plan's needed flags)", file=sys.stderr)
+            # How far each prioritized KPI stands from its limit: a low fraction is the next plan's room, not a result.
+            for line in standing(status):
+                print("  " + line, file=sys.stderr)
+            from .evaluation import host_bytes_warning
+            path = (result.get("result") or {}).get("path")
+            root = store.directory(args.id)
+            warning = host_bytes_warning(root, read_json(safe_path(root, path))) if path else None
+            if warning:
+                print(warning, file=sys.stderr)
         elif args.action == "serve":
             from .served import serve
             result = serve(store, args.id, args.candidate, args.host, args.port, args.seconds, check=args.check)

@@ -1,6 +1,6 @@
 #pragma once
 #include "crit/core.h"
-#include <cuda_runtime_api.h>
+#include "crit/gpu_runtime.h"
 #include <optional>
 
 namespace crit::core {
@@ -91,7 +91,10 @@ private:
 
 // One backend belongs to one engine/ledger. Buffers and events retain the CUDA
 // state even after this facade dies. Extensions must submit all work to its two
-// streams; no device-global synchronization is imposed in the work loop.
+// streams; no device-global synchronization is imposed in the work loop. Calls on
+// the backend, its buffers, events and timers bind its device only while they run
+// and leave the calling thread's current device as they found it; bind_thread()
+// makes the device current for the engine's own launches.
 class CudaBackend final : public Backend {
 public:
     explicit CudaBackend(int device = 0, SyncSchedule = SyncSchedule::spin);
@@ -104,6 +107,8 @@ public:
     cudaStream_t stream(Queue = Queue::compute) const;
     SyncSchedule sync_schedule() const;
     CudaBuffer allocate(Memory, std::size_t bytes);
+    // Whether `buffer` was allocated by this backend (a CudaDeviceSet checks its members' buffers with it).
+    bool owns(const CudaBuffer& buffer) const noexcept;
     // Device memory still usable for optional work: the smaller of the device's free memory and this engine's
     // remaining device budget, less margin (zero below it). An engine built for a required context uses what a
     // smaller context leaves for speedups such as faster weight layouts, draft copies or device-resident tables.

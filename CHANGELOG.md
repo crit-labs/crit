@@ -9,6 +9,299 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-02
+
+### Overview
+
+crit 0.14.0 makes concurrent requests the normal path: Core's request runtime serves Python engines as step engines,
+crit serve reports and caps its concurrency, and `crit run measure` and Eval's concurrency part measure requests at
+once. Core's GPU backend builds on ROCm's HIP runtime and gets device sets for several GPUs, and a run on several GPUs
+sizes its context from their memory together. `crit pull` fetches a card's drafters and prebuilt artifacts, `crit bench`
+and `crit hub report` measure an installed engine against its card, and `crit mcp` serves crit's commands to an agent as
+MCP tools. Engines on Windows opt out of power throttling, and crit serve gains a thinking budget. crit 0.14.0 needs
+crit-eval 0.5.2.
+
+### Added
+
+- A run on several GPUs: a `device` file from `crit eval probe --devices` sizes the run's context from their memory
+  together, `hardware_constraints.context.devices` names them, and `crit run measure` samples device memory on
+  every one of them, summed (nvidia-smi `--id` of each). Checked with host tests on one GPU.
+- Core's CUDA backend gets device sets (`crit/cuda_devices.h`, [device sets](core/src/backends/cuda/README.md#device-sets)):
+  `CudaDeviceSet(devices)` holds one `CudaBackend` per GPU with its own streams, allocations and ledger, enables peer
+  access where the hardware allows it, and orders work between members without a host fence: `copy_async` between
+  members' device buffers (peer copies, the source kept alive until done), `order` (one member's stream after
+  another's work), `barrier` (every member after every other) and a category timer per member;
+  `CudaBackend::owns(buffer)` names a buffer's member. Checked on one RTX 5090 with a set that lists it twice; the
+  two-device case is in the test and has not run on two GPUs. Before, nothing in Core knew a second device.
+- `inference/device-speculative-round` gets a round driver for Python engines, `python_round.py`: in torch, one
+  speculative round for every row a Python engine decodes at once (a Core step engine's `step()`, or one request),
+  over three engine hooks (draft after catching up on the previous round, verify writing each column's prediction,
+  commit from the round's start). Acceptance, stops, output limits, truncation to Core's count and the packed
+  readback (one pinned copy, one event per round) stay on the device, and a round of (rows, width, mode) is one CUDA
+  graph captured at load; modes greedy, sampled (`rejection_predictions` turns the verify into rejection sampling
+  under the same accept rule), replay and forced (scoring a fixed text in columns). `width_policy.py` picks the
+  width per round from each row's decayed per-depth acceptance over the fitted round cost. Checked over a toy target
+  with two different drafters against plain greedy decoding, and its CUDA graphs against eager rounds on an RTX
+  5090; no engine runs it on a real model yet. Before, every Python MTP or EAGLE engine wrote this driver itself.
+- `crit bench OWNER/NAME` measures an engine `crit pull` installed with crit Eval on this machine and prints its
+  card's stats beside the measured ones ([benchmark your machine](docs/SERVING.md#benchmark-your-machine)): it readies
+  Eval's data for the installed checkpoint (a published reference package, else `crit eval prepare` at the card's
+  sampling), serves the engine through crit serve and runs Eval's speed suite at the installed context, and quality
+  where the data holds the reference's scores (`--reference` scores them). `crit hub report OWNER/NAME RESULT --hub
+  CHECKOUT --by ACCOUNT` then adds the result to the card in a crit-hub checkout with crit-hub's `tools/add_result.py`,
+  as a reproduction of a GPU and model the card measured or as a new result, after checking that it measured this
+  engine at the commit the card pins. Before, reproducing a card's numbers meant replaying the whole run flow, and a
+  card had no place for them.
+- An engine's decode telemetry can count its device expert cache: `expert_reads` and `expert_hits` (the routed expert
+  reads and those the cache served, together, hits at most reads) pass through crit serve's `crit_telemetry`, from
+  ResidentChat's `generate_tokens` timing and an engine library's request facts, and crit Eval's memory tiers price
+  an offloading engine's floor at that hit rate ([telemetry](docs/SERVING.md#response-and-telemetry)). Before, nothing reported
+  how often a device expert cache hit, so Eval could only assume even routing.
+- `crit mcp`, a Model Context Protocol server over stdio ([MCP](mcp/README.md)): every subcommand of `crit run`,
+  `crit eval`, `crit kernels`, `crit models` and `crit inference`, and `crit pull` and `crit serve`, is a tool whose
+  input schema is read from the command's own parser when the server starts, so it never drifts from the command
+  line. A `record` option takes the JSON object itself. Each call runs its command as a job, an owned process tree
+  with its output and errors in files: the call returns the result (the JSON output parsed) when the command ends
+  within `wait_seconds`, else the job, which `crit_job_wait`, `crit_job_output` and `crit_job_stop` (Ctrl+C, so
+  crit settles the attempt as interrupted) follow; the server stops its jobs when the client closes it.
+  `crit_serve_status` reads a running server's `/health` and `/v1/models`, and AGENTS.md and the guides it links are
+  `crit://` resources. `ProcessTree` can send a tree's errors to their own file. The `crit run` actions and
+  `crit inference` subcommands that had no help line have one.
+- `crit pull` fetches a card's `downloads` ([installed engines](docs/SERVING.md#installed-engines)). A drafter goes
+  into the store's `models/` beside the checkpoint, checked file by file against card.lock.json's `downloads` (or by
+  the SHA-256 of its one file), and the engine receives its folder as `context.drafters`, in card order, so an
+  installed engine never needs a path from the builder's machine. A prebuilt artifact, a tar archive of what the
+  build adds to `engine/`, names the toolchain it was built with and for (crit-hub's new `toolchain`: platforms,
+  GPU architecture, CUDA or ROCm version, Python): `crit pull` unpacks the first artifact this machine matches (a
+  driver that runs that CUDA version or a newer one; no nvcc) instead of running the build, after checking its
+  SHA-256, and never lets it replace a file of the pinned source. `--build-from-source` builds anyway and
+  `--download REPOSITORY=PATH` takes a local copy of a download. Before, `crit pull` only named the downloads.
+- A `crit serve --models` catalog row can name an installed engine, `{"name", "engine": "OWNER/NAME", "store"}`
+  (the store relative to the catalog, default `PROJECT/engines`), served beside run candidates under its name and
+  aliases ([several models on one server](docs/SERVING.md#several-models-on-one-server)). Before, only
+  `--engine` served an installed engine, and only alone.
+- `inference/ssd-expert-materialization` gets a host tier for file-backed experts: `HostExpertTier(capacity)`, a
+  bounded host copy between the file and the device cache, least recently used first out. `FileExpertSource` serves
+  a demand read from it and holds what it reads there, and `retain(key, bytes, protected)` holds an expert the
+  device cache evicts, from its device copy, so its next miss crosses the host link instead of rereading the file.
+  Retained bytes are checked like a file read, and an expert the current route selects is never evicted to make
+  room. Before, the reference deduplicated only pending reads, and every later miss reread the file. Two other
+  engines measured the gain (one serving Qwen3.8-Flash-Next from NVMe on an RTX 3060 read 12.4 instead of 39.7 MiB
+  per token on a repeated request); crit has not measured it. Recon's disk scenario names the eviction path.
+- `crit run measure` measures resident cases of concurrency above 1: each warmup and repetition sends N copies of the
+  case's request at once, one per client thread, every request's timings are samples of the per-request metrics (N
+  per repetition), and the new metric `aggregate_tps` (tokens/second) is the repetition's completion tokens over its
+  wall time; `extensions.concurrency` records the clients, each repetition's peak in flight and the engine's
+  `max_concurrent_requests` ([measured benchmarks](docs/RUN_RECORDS.md#measured-benchmarks)). A case's KV must cover
+  concurrency x (prompt + output), and `create` raises a wanted context below that for the cases. Before, measure
+  refused concurrency above 1 and such a case needed a self-recorded `benchmark --record`.
+- `crit serve` reports how many requests the engine runs at once: `max_concurrent_requests` on each `/v1/models`
+  card and in `GET /health` (the default model's), a crit-specific field that is 1 for a package without
+  `chat-concurrent-v1`, the loaded engine's declared capacity while it is loaded and `null` until a concurrent
+  package's engine loads. `crit serve --max-concurrency N` caps the requests run at once at the smaller of N and that
+  capacity ([concurrent requests](docs/SERVING.md#concurrent-requests)). Clients such as crit Eval's concurrency part
+  read it to know whether a server batches.
+- A thinking budget in `crit serve` (`chat-thinking-budget-v1`): OpenAI's `thinking_budget_tokens` and
+  Anthropic's `thinking.budget_tokens` with thinking on cap a reply's reasoning. At the budget the reply
+  gets the reasoning format's closing marker and the engine continues from the prompt plus the reply so far, within
+  `max_tokens`. ResidentChat implements it (`limits.thinking_tokens`) and `capabilities()` declares it where the
+  chat templates teach a reasoning format, or for a package's own `reasoning_format`, so the markers come from the
+  format, never from a model table. Before, Anthropic's `budget_tokens` was ignored and listed, and a model could
+  reason until `max_tokens` ran out. It applies to text prompts without logprobs or a forced tool call; Eval sends
+  none. docs/SERVING.md, Thinking budget.
+- An engine may report `prompt_cache: false` in its info when it keeps no prompt cache: crit serve publishes it among
+  the `engine_facts` and the eval-v1 adapter passes it on, and crit-eval then sends it no
+  follow-up turns, which would be fresh prefills, and passes its prompt_cache gate. docs/SERVING.md, Engine facts.
+- Plan rules 5, the default of new runs (docs/RUN_RECORDS.md, Plan rules 5): a strategy's ceiling is the limit the
+  parent's Eval measures (or crit computes), not the engine's own speed. crit records per needed family the limit,
+  the fraction Eval measured and how far the forecast's high reaches toward it (`inputs.reach`), and refuses a build
+  plan whose forecast high stays below half of a needed family's limit unless a `gaps` entry `limit` (answer cause)
+  names the measured bound that keeps the rest out of reach, with its evidence in the run. Before, a plan could give
+  its own in-process speed as the ceiling and forecast around it, and its outcome then read as on target with
+  decode at 11% of Eval's limit. Refused rather than warned, as the other plan checks are. Runs created before keep
+  their rules.
+- device-expert-cache describes adapting during decode and starting warm: keep the cache adapting (admit
+  link-fetched experts, no freezing after a warmup), set the CPU/link split from both paths measured alone and
+  together, and optionally ship a residency or routing profile in the package that the engine loads at start, built
+  from a general corpus unrelated to Eval like any content-dependent choice. Before, an engine whose cache adapted
+  between Eval's repetitions failed the disturbed check, so an agent froze its cache to pass it and decoded from a
+  cold one. Eval now measures at steady state (crit-eval's `speed.steady_state`, its next release);
+  docs/BUILDING_ENGINES.md and docs/RUN_RECORDS.md describe it.
+- Core's GPU backend builds on AMD GPUs: `CRIT_CORE_HIP=ON` compiles the CUDA backend's sources on ROCm's HIP
+  runtime as `crit::hip`, through `crit/gpu_runtime.h`, which maps the CUDA runtime names the backend uses to HIP's
+  under `CRIT_CORE_HIP`. Engines keep the same classes and stream types; `launch()` is an ordinary launch on HIP.
+  The backend, timer and memory fixtures build against it. Written against ROCm 6.4 and not yet built on an AMD
+  toolchain; the CUDA build is unchanged. core/src/backends/cuda/README.md, HIP.
+- `crit pull` checks crit-hub cards with `backend: hip` (the hub's new field): the probed device's `gfx`
+  architecture against `gpu_arch`, its memory, and ROCm's version from the probe's HIP runtime against `rocm`.
+  Cards for metal or vulkan read as unmet.
+- `crit run` samples an AMD GPU's memory from the amdgpu driver's VRAM counters
+  (`/sys/class/drm/card*/device/mem_info_vram_*`) when `nvidia-smi` is missing.
+- Building engines and Core's guide treat serving concurrent requests as the normal path for an engine: a new
+  [serve concurrent requests](docs/BUILDING_ENGINES.md#serve-concurrent-requests) section maps what a batched engine
+  needs to Core's pieces (batched steps, page reservations, the invariance rules, the state cache, speculative
+  rows, concurrent engine libraries and step engines). Core's default stays one request.
+- Batched speculative decoding has a CPU reference in Core: `SpeculativeRow` (`crit/batch.h`,
+  [speculative rows](core/src/batch/README.md#speculative-rows)) stages one request's pending token and drafts as a
+  StateCache round, accepts by Core's greedy rule and commits exactly the rows Core kept, rolling the rest back in the
+  pages, so every request of a step verifies its own drafts at its own width. A toy speculative engine through a Core
+  `Engine` decodes exactly the plain greedy tokens alone and six requests at once (`crit_core_batch_speculative_*`).
+- Python engines get Core's concurrent runtime by implementing a step instead of `generate()`: `crit/step_engine.h`
+  makes a `ConcurrentModel` of C callbacks (admission, open, step, commit, retire, score), the new `crit_core_steps`
+  library exports the engine ABI plus `crit_engine_open_steps`, and `crit_core.native.StepEngine` serves a Python step
+  model on it ([step engines](core/src/runtime/README.md#step-engines)). Core then schedules the model's requests in
+  mixed prefill/decode steps and handles admission, request options, stop tokens, cancellation, retirement and the
+  scoring barrier; `open_engine` picks it for any opened engine with `step()`, so `eval_engine` and `resident_engine`
+  serve it with `max_concurrent_requests` above 1. `crit_core.batch` is the Python twin of `crit/batch.h`. A toy step
+  model decodes the same tokens batched as one at a time (`crit_core_step_engine`). Before, a Python engine served
+  concurrent requests only by merging concurrent `generate()` threads itself.
+- The batched reference engine's own paged attention gains a host half and a device page store
+  ([paged attention](inference/batched-reference-engine/README.md#paged-attention)): `paged_reference.h` (target
+  `crit_paged_reference`, no CUDA) holds the KV page format (BF16, or E4M3 codes with one scale per row and key/value
+  head), `Tables` packing a step's block tables, lengths, query starts and write slots into the words the kernels
+  read, BF16 and E4M3 codecs matching the device conversions, `HostPages` (a StateStorage in the kernels' layout) and
+  `attend`, an FP64 reference with sliding windows, sinks, a soft-cap and tree masks; `paged_attention.h` (target
+  `crit_paged_attention`) adds `DevicePages` and `BatchTables` beside the kernels, which dense-layer-offload uses too.
+  `crit_paged_reference_*` checks the host half against a dense oracle over StateCache pages with reused prefixes
+  and copy-on-write forks, and `crit_cuda_paged_*` compares the kernels with it (needs a GPU). Paged attention is
+  model and device arithmetic, so it stays in the engine: Core ships none.
+- Core ships the bookkeeping of a batched step (`crit/batch.h`, [batched steps](core/src/batch/README.md)), which
+  every engine serving concurrent requests needs: `StepLayout` lays out one mixed step's rows, decode items first and
+  then prompt chunks, with the step row of every logits row for one gathered head pass; `step_item` derives an item's
+  rows from a `WorkItem` within its grants (a verify's columns cut to its token work); and `PageReservations` is page-reserving admission over a StateCache pool (prompt, output and verify columns, no credit
+  for shared prefix pages). They generalize the batched reference engine's step layout and admission. A toy paged
+  engine through a Core `Engine` decodes the same tokens batched as alone (`crit_core_batch_engine`).
+- Eval attempts journal their round and resume where they stopped: `crit run ... eval` keeps crit-eval's journal
+  beside the result (`candidates/ID/eval/ATTEMPT.journal.jsonl`), and `--resume [ATTEMPT]` measures in a new attempt
+  from the newest stopped attempt's journal (or ATTEMPT's), answering the requests it holds at their recorded times
+  and serving the candidate only for the rest. An attempt that stops for any reason settles with its log, journal
+  and partial result (marked `aborted`) as evidence, and the run's events record `eval_started` and `eval_resumed`.
+  `--resume` settles an attempt whose process died without settling as `interrupted` once the machine's engine lock
+  is free and its journal untouched for a minute. Before, an interrupted Eval kept nothing: a Qwen3.8-Flash-Next
+  candidate's, stopped an hour in and minutes before its end, had to start over. Needs crit-eval's next release
+  (its journal). docs/RUN_RECORDS.md, Eval evidence.
+- A Python engine that reserves more device memory than the device holds is warned once per device under WDDM
+  (native Windows and WSL): `crit_core.native.PythonEngine` compares torch's peak reservation with the device's
+  memory after opening and after each generation and score. There the driver does not fail such allocations; it
+  moves the excess to system memory, and every kernel reading it slows down. A Qwen3.8-Flash-Next engine reserving
+  39 GiB on a 32 GiB RTX 5090 under WSL ran its weight GEMMs about 7x slower without any error.
+  `crit_core.machine.under_wsl()` is now public for the check.
+
+### Changed
+
+- Core's README states the rule Core is held to: it stays model- and hardware-agnostic, with no layer arithmetic,
+  no kernels or device code beyond the backends' runtime services, and no number or rule true for only one model
+  family, dtype or GPU architecture. What batched or speculative engines share enters Core as bookkeeping; their
+  arithmetic stays in the engine, an Inference entry or a kernel provider, which is why paged attention and the GEMM
+  split went back to the batched reference engine.
+- An offloading engine no longer has to declare `host_bytes_per_pass` for a reachable floor:
+  Eval prices the weights recon's placement keeps off the device at host memory's tier, routed experts at the
+  expert cache hit rate the engine reports (`expert_reads`, `expert_hits`), so `crit run eval` notes how it priced
+  them instead of warning, and AGENTS.md, building engines, run records, recon's scenario note and the reach
+  check ask for the hit rate first. It still warns when Eval could not place the model.
+- Core's interface and request runtime are split by concern: `crit/core.h` includes its parts from `crit/core/`
+  (resources, profile, request, model, concurrent and engine), which the SDK installs beside it, and
+  `core/src/runtime/runtime.cpp` became one file per part of the runtime ([request runtime](core/src/runtime/README.md)).
+  The interface and `#include <crit/core.h>` are unchanged.
+
+- AGENTS.md says shape tuning must hold for every prompt length: Eval measures the held-out
+  prompts and the long-context curve below the required context at lengths each run draws (80-100% of nominal),
+  so a CUDA graph, tile or prefill chunk fitted to one length shows as a slower held-out score.
+- An engine of an off-device placement is asked for its host bytes: `crit run eval` warns when recon's placement keeps
+  weights off the device (`sparse_device_host`, `sparse_device_host_disk`, `dense_device_host`) and the candidate
+  declares no `host_bytes_per_pass`, whose absence prices Eval's pass floor as if every weight were on the device
+  (`crit.run.evaluation.host_bytes_warning`; crit-eval's next release also lists it under `headroom.missing`).
+  Recon's `sparse_device_host` starting design, AGENTS.md and docs/BUILDING_ENGINES.md say to declare it from the
+  first candidate.
+
+- `crit run ... eval` prints, under the priorities, each headline KPI's fraction of its limit and its two largest
+  gaps (`decode 46.6 tok/s is 11% of its limit 419.5 tok/s; pass at 16% of its floor; largest gaps: ...`;
+  `crit.run.plans.standing`). Before, the closing lines gave only the order of the priorities, and a decode at
+  11% of its ceiling could be presented as good.
+
+- Recon's placement plan reserves no fixed prompt workspace beside a device expert cache: the starting design for
+  `sparse_device_host` says prompt (prefill) buffers are lent from cache slots while a prompt runs and returned for
+  decode, and the cache size it prints, crit-eval's placement, counts the reserve as cache (needs crit-eval's next
+  release). Before, the reserve sat idle during decode. The plain-pass bounds add misses split between the CPU and
+  the host link, bounded by host memory's read rate, which both paths read, and say even routing is the pessimistic
+  case and the cache's hit rate under real routing the main lever. device-expert-cache, heterogeneous-expert-dispatch
+  and host-expert-arithmetic say the same: lend prompt buffers from slots, time the CPU and link lanes together.
+
+- Kernels' exactness check covers the whole decode step: Eval's honesty check compares a served reply's
+  log-probabilities with the score call's replay, which drafts and verifies at other widths, and library GEMMs pick
+  their kernel by shape, so a token's arithmetic must not depend on the step's width even where exactness is only
+  reported. Running every decode step at one width (padding columns) is the general fix (kernels/README.md). Found
+  in a Qwen3.8-Flash-Next run whose candidate failed honesty at 0.44 and passed with a fixed width (0.0).
+- host-memory-admission names WSL's pinned-memory limit: past a large pinned share, a further pin fails with a
+  sticky CUDA error although headroom admits it, so engines allocate their pinned buffers up front.
+
+- An `as_quantized` run allows transformed weights unless the request says `weights_policy: as_stored`: the default
+  `weights_policy` is now `transformable` in that mode (still unspecified in `preserve`). A candidate may re-encode
+  stored 16-bit matrices as it loads them (for example BF16 to FP8 per channel), declaring `weights: "transformed"`
+  and `configuration.re_encoding`; the quality budget judges it. That is the route for an already-quantized
+  checkpoint, which `crit models ptq` refuses. The agent brief says so and asks to measure it first where memory or
+  bandwidth bounds decode, and AGENTS.md leaves `weights_policy` to the user. Before, every run request written so
+  far said `as_stored`, so a Qwen3.8-Flash-Next NVFP4 engine kept about 8.5 GB of BF16 attention and shared-expert
+  weights on a 32 GB GPU, leaving its expert cache 14% of the experts per layer.
+
+### Fixed
+
+- Engines keep their speed on Windows while `crit serve`'s or `crit run eval`'s window is in the background. Windows
+  11 lowers a background process's quality of service unless it opts out: its threads can move to efficiency cores
+  at lower clocks and its timer-resolution requests are ignored, so a short sleep lasts a timer tick. Another engine
+  measured its CPU expert pool's decode falling from 66 to 4 tok/s that way; crit's engines run host expert threads
+  and a host-work-mailbox thread that sleeps 50 µs when idle. The resident host now opts out at start
+  (`crit_core.machine.keep_full_speed`, `SetProcessInformation(ProcessPowerThrottling)`), from execution speed alone
+  where Windows knows no timer-resolution throttling (before Windows 11, Server 2022), and prints a line if Windows
+  refuses; elsewhere nothing changes. docs/SERVING.md, Ownership and recovery.
+- `crit serve` refuses a port another socket holds on Windows too. Python's HTTP server sets `SO_REUSEADDR`, which
+  on Windows lets a second server bind the same port without an error, so a stale `crit serve` and a new one could
+  share a port and a request reach either engine. The bind is exclusive there now (`SO_EXCLUSIVEADDRUSE`), and a
+  port in use ends `crit serve` with one line naming it instead of a traceback.
+- `crit run ... eval` leaves the served engine the allocator environment it was started with:
+  `PYTORCH_ALLOC_CONF` and `PYTORCH_CUDA_ALLOC_CONF` are restored after the reference scores the quality texts, so
+  crit serve's resident host no longer inherits the expandable segments crit-eval's reference exported for its own
+  process (crit-eval 0.4.1 and before). An engine that captures CUDA graphs at load broke under them.
+- `crit_core.model` reads two ModelOpt MIXED_PRECISION layouts (nvidia/Qwen3.8-Flash-Next-FP4-Local): MXFP8 block
+  scales, one E8M0 byte per 32 inputs of each row with the group size per layer, take their block from the scales'
+  shape (`fp8_block`: the configured block, else 128 x 128 where the scales have that grid, else the block that
+  divides the matrix exactly) instead of assuming 128 x 128; and NVFP4 scales stored CSF-compressed
+  (`weight_scale.nvfp4_csf_fixed` and `.nvfp4_csf_exceptions`) are recognised as NVFP4 (`csf_scale_shape`,
+  `StoredMatrix.scale_encoding` "csf").
+- `crit run ... check --from-eval` reads only Eval attempts that completed. Before, the newest result file was taken
+  whatever its attempt's outcome, so a disturbed round's partial result (no status) gave every gate unmeasured.
+- Core's `SpeculativeRow::commit` keeps a round the state cache keeps pending. When a commit's prefix snapshot copy
+  throws, the cache leaves the round pending (crit/state.h), but the row forgot it: `discard()` no longer ended it
+  and the sequence could never stage again ("state round already pending"). The row now stays staged until
+  `discard()` or a retried commit ends the round.
+- `Checkpoint::digest_files` names a shard in a subfolder by its path relative to the index
+  (`tensors/model-00001-of-00004.safetensors`), as crit's run-record rows and `crit_core.files` do. It named the
+  file alone, so shards of one name in two subfolders gave two equal rows, which `verify_digests` refused as its own
+  input.
+- `crit_core.model.TensorReader` reads and maps on several threads at once, as the native reader's const members may.
+  On Windows a read seeks the reader's one descriptor, so concurrent reads of one shard returned another tensor's
+  bytes or a spurious "truncated" error (4 of 8 threads in a check); a descriptor or mapping opened on first use
+  could also be opened twice. Linux reads were unaffected (`preadv`).
+- A step engine hands a banned token's logit bias (-inf) to its callbacks as `-Infinity`, which a Python step model's
+  `json.loads` reads. It wrote `-inf`, which is not JSON, so the request's open failed the whole engine. Only C++
+  callers of the step engine can send a ban: the engine ABI keeps biases within ±100.
+- The engine ABI refuses a token id outside [0, 2^31) in `stop_tokens` and `replay` (and in a step engine's
+  configured stop tokens) and a `top_k` past 2^32 - 1, where it wrapped the value into another one: `stop_tokens`
+  [2^32 + 5] stopped on token 5.
+- Core's concurrent admission calls the model's `admission()`, `scheduling_hint()` and `open()` without the scheduler
+  lock. With it held, an engine whose batch notification comes from its device queue (a host function) deadlocked
+  when `open()` waited for that queue, as `cudaFree` or a synchronous copy does: the notification waited for the
+  lock and `open()` for the notification, and no timeout fired. `submit()` and `cancel()` also waited for every
+  `open()`.
+- One memory-pressure event no longer closes concurrent admission until the oldest request finishes. A blocked row
+  held new admissions until the oldest resident retired, so requests sent meanwhile failed with "pending request
+  deadline expired" after `pending_timeout_ms`, with lanes free and the pressure long over. Admissions now resume
+  once the blocked request gets a step prepared (a restored request, its first new step) or retires.
+- Core's CUDA backend and device sets leave the calling thread's current device as they found it. Every call bound
+  its own device and kept it, so after a `CudaDeviceSet` copy, order or barrier an engine's next kernel launch into
+  another member's stream failed: a launch needs its stream's device current. `bind_thread()` still makes a
+  backend's device current. Checked on one RTX 5090; the two-device case is in the test and has not run on two GPUs.
+
 ## [0.13.0] - 2026-10-30
 
 ### Overview
@@ -2034,7 +2327,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/crit-labs/crit/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/crit-labs/crit/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/crit-labs/crit/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/crit-labs/crit/compare/v0.10.0...v0.11.0

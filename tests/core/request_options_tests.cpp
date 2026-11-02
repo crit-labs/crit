@@ -1,5 +1,7 @@
 // Synthetic per-session sampling: validates Core forwarding, not model quality.
 #include <crit/core.h>
+#include <crit/json.h>
+#include <crit/step_engine.h>
 #include <algorithm>
 #include <atomic>
 #include <functional>
@@ -447,11 +449,35 @@ void legacy_open_refusal() {
     RequestOptions stops; stops.stop_tokens=std::vector<Token>{};
     require(missing->submit({1},2,stops).wait().tokens==std::vector<Token>({2,3}) && s->opens==1,"legacy stop tokens refused");
 }
+// A step engine hands a request's options to its callbacks as JSON a Python step model reads with json.loads, a
+// banned token's -inf bias included (as Python spells it, -Infinity).
+std::string step_options;
+int step_open(void*,const StepRequest* request,std::uint64_t* session) {step_options=request->options_json; *session=1; return 0;}
+int step_rows(void*,const StepRow* rows,std::uint32_t count,StepProgress* progress,std::int32_t* tokens,float*,std::int32_t*,float*) {
+    for(std::uint32_t i=0;i<count;++i) {
+        progress[i]={};
+        progress[i].prompt_tokens=rows[i].prefill_complete ? 0 : rows[i].prefill_tokens;
+        progress[i].prefill_complete=1; progress[i].tokens=1; tokens[i]=2;
+    }
+    return 0;
+}
+void step_engine_option_forwarding() {
+    StepCallbacks callbacks; callbacks.open=step_open; callbacks.step=step_rows;
+    auto native=step_engine(R"({"engine":{"vocabulary":8,"context":64,"sampling":{"temperature":true,"logit_bias":true}}})",callbacks);
+    RequestOptions o; o.sampling.temperature=0.5;
+    o.sampling.logit_bias={{3,-std::numeric_limits<float>::infinity()},{4,1.5F}};
+    require(native.engine->submit({1,2},1,o).wait().tokens==std::vector<Token>({2}),"step engine output");
+    const auto document=json::Document::parse(step_options,"step options",{.allow_nonfinite=true});
+    const auto* bias=document.root().find("logit_bias");
+    require(bias && bias->find("3") && bias->find("3")->real()==-std::numeric_limits<double>::infinity() && bias->find("4")->real()==1.5 &&
+            document.root().find("temperature")->real()==0.5,"step engine options as JSON with a banned token");
+}
 }
 int main() {
     try {
         stopping(); sampling_and_ownership(); validation(); missing_hook_and_failed_drain();
         adapter_option_validation(); adapter_option_forwarding(); legacy_open_refusal(); concurrent_padding_target();
+        step_engine_option_forwarding();
         std::cout<<"Core request option contracts passed\n";
     }
     catch(const std::exception& e) {std::cerr<<e.what()<<'\n';return 1;}

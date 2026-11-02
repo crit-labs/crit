@@ -5,9 +5,12 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <limits>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace crit::core::native_api {
 namespace {
@@ -101,10 +104,16 @@ NativeEngine& engine_of(void* handle) {
     return native;
 }
 
+// Token ids are checked here: a cast alone would wrap an id past 2^31 - 1 into another, valid one.
 std::vector<Token> token_array(const json::Value& value, const char* name) {
     if(value.kind() != json::Kind::array) throw std::invalid_argument(std::string(name) + " must be an array of token ids");
     std::vector<Token> out;
-    for(const auto& item:value.array()) out.push_back(Token(item.i64()));
+    for(const auto& item:value.array()) {
+        const auto id = item.i64();
+        if(id < 0 || id > std::numeric_limits<Token>::max())
+            throw std::invalid_argument(std::string(name) + " holds a token id outside [0, 2^31)");
+        out.push_back(Token(id));
+    }
     return out;
 }
 
@@ -118,7 +127,11 @@ RequestOptions request_options(const char* options_json) {
     auto& sampling = options.sampling;
     if(const auto* v = root.find("temperature"); v && !v->is_null()) sampling.temperature = v->real();
     if(const auto* v = root.find("top_p"); v && !v->is_null()) sampling.top_p = v->real();
-    if(const auto* v = root.find("top_k"); v && !v->is_null()) sampling.top_k = std::uint32_t(v->u64());
+    if(const auto* v = root.find("top_k"); v && !v->is_null()) {
+        const auto k = v->u64();
+        if(k > std::numeric_limits<std::uint32_t>::max()) throw std::invalid_argument("top_k exceeds 2^32 - 1");
+        sampling.top_k = std::uint32_t(k);
+    }
     if(const auto* v = root.find("min_p"); v && !v->is_null()) sampling.min_p = v->real();
     if(const auto* v = root.find("seed"); v && !v->is_null()) sampling.seed = v->u64();
     if(const auto* v = root.find("repetition_penalty"); v && !v->is_null()) sampling.repetition_penalty = v->real();
@@ -194,12 +207,32 @@ int settle(void* handle, std::int32_t* out, char* result, int capacity, Wait&& w
 }
 }  // namespace
 
+namespace {
+std::unique_ptr<NativeEngine> checked(NativeEngine built) {
+    auto native = std::make_unique<NativeEngine>(std::move(built));
+    if(!native->engine) throw std::runtime_error("the engine factory returned no engine");
+    if(native->concurrent_requests && native->request)
+        throw std::invalid_argument("concurrent native engines require request-owned result facts");
+    return native;
+}
+}  // namespace
+
 void* open(NativeFactory factory, const char* configuration_json) noexcept {
     try {
-        auto native = std::make_unique<NativeEngine>(factory(configuration_json ? configuration_json : "{}"));
-        if(!native->engine) throw std::runtime_error("the engine factory returned no engine");
-        if(native->concurrent_requests && native->request)
-            throw std::invalid_argument("concurrent native engines require request-owned result facts");
+        auto native = checked(factory(configuration_json ? configuration_json : "{}"));
+        native->retain_owner();
+        return native.release();
+    } catch(const std::exception& error) {
+        fail(error.what());
+    } catch(...) {
+        fail("unknown engine factory failure");
+    }
+    return nullptr;
+}
+
+void* open_bound(BoundFactory factory, const void* context, const char* configuration_json) noexcept {
+    try {
+        auto native = checked(factory(configuration_json ? configuration_json : "{}", context));
         native->retain_owner();
         return native.release();
     } catch(const std::exception& error) {

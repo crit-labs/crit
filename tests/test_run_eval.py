@@ -117,12 +117,13 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
         write_store(Path(data))
         return {"method": "scored", "positions": 1, "seconds": 0.0}
 
-    def evaluate(self, parts=("speed", "heldout", "history", "quality", "context")):
+    def evaluate(self, parts=("speed", "heldout", "history", "quality", "context"), certify=False):
         with patch("crit_eval.quality.reference.score_data", self.score):
-            return evaluation.evaluate(self.store, self.run_id, self.candidate_id, self.eval_data, parts)
+            return evaluation.evaluate(self.store, self.run_id, self.candidate_id, self.eval_data, parts,
+                                       certify=certify)
 
     def test_eval_measures_the_packaged_candidate_through_crit_serve_and_its_quality(self):
-        measured = self.evaluate()
+        measured = self.evaluate(certify=True)   # certified: the lower-context gate is a certified run's
         path = self.directory / measured["result"]["path"]
         self.assertEqual(measured["result"], {"path": f"candidates/{self.candidate_id}/eval/attempt-0001.json",
                                               "sha256": file_sha(path)})
@@ -154,7 +155,7 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
         log = attempt["logs"][0]
         self.assertEqual(log["path"], f"candidates/{self.candidate_id}/logs/eval-attempt-0001.log")
         logged = (self.directory / log["path"]).read_text()
-        # Eval's stage 3 opens the lower context after the run's, in the same resident host.
+        # A certified Eval opens the lower context after the run's, in the same resident host.
         self.assertEqual([line for line in logged.splitlines() if line.startswith(("crit serve: loading",
                                                                                    "crit serve: reloading"))],
                          [f"crit serve: loading {self.candidate_id} at 8,192 tokens of context",
@@ -165,6 +166,45 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
         self.store.seal(self.run_id, self.candidate_id, "built")  # the result is part of the sealed inventory
         self.assertIn(measured["result"]["path"].split("/", 2)[2],
                       {row["path"] for row in read_json(self.folder / "seal.json")["files"]})
+
+    def test_an_off_device_placement_without_host_bytes_is_warned(self):
+        from crit.run.recon import RECON_JSON
+        facts = self.directory / RECON_JSON
+        facts.parent.mkdir(parents=True, exist_ok=True)
+        facts.write_text(json.dumps({"gathered": {"placement": {"scenario": "sparse_device_host"}}}))
+        warning = evaluation.host_bytes_warning(self.directory, {"engine": {"host_bytes_per_pass": None}})
+        self.assertIn("recon's placement is sparse_device_host", warning)
+        self.assertIn("declares no host_bytes_per_pass", warning)
+        self.assertIsNone(evaluation.host_bytes_warning(self.directory, {"engine": {"host_bytes_per_pass": {"cpu": 1}}}))
+        # Eval priced the floors by the placement's memory tiers: a note, not a warning.
+        tiered = {"engine": {}, "headroom": {"host_pass": {"source": "placement", "hit_rate": 0.27,
+                                                          "hit_rate_source": "even routing"}}}
+        note = evaluation.host_bytes_warning(self.directory, tiered)
+        self.assertTrue(note.startswith("NOTE: "), note)
+        self.assertIn("27% expert cache hit rate (even routing)", note)
+        self.assertIn("expert_reads and expert_hits", note)
+        facts.write_text(json.dumps({"gathered": {"placement": {"scenario": "fits_device"}}}))
+        self.assertIsNone(evaluation.host_bytes_warning(self.directory, {"engine": {}}))
+        facts.unlink()
+        self.assertIsNone(evaluation.host_bytes_warning(self.directory, {"engine": {}}))
+
+    def test_the_reference_leaves_the_served_engine_its_allocator_environment(self):
+        from crit_eval.run import runner
+        seen, measure = [], runner.run
+
+        def score(model, data, log, check=lambda: None):
+            os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"   # as a reference exporting it did
+            return self.score(model, data, log, check)
+
+        def run(*args, **options):
+            seen.append({key: os.environ.get(key) for key in evaluation.ALLOCATOR_ENV})
+            return measure(*args, **options)
+        os.environ.pop("PYTORCH_ALLOC_CONF", None)
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "the user's own"
+        self.addCleanup(os.environ.pop, "PYTORCH_CUDA_ALLOC_CONF", None)
+        with patch("crit_eval.quality.reference.score_data", score), patch.object(runner, "run", run):
+            evaluation.evaluate(self.store, self.run_id, self.candidate_id, self.eval_data, ("speed", "quality"))
+        self.assertEqual(seen, [{"PYTORCH_ALLOC_CONF": None, "PYTORCH_CUDA_ALLOC_CONF": "the user's own"}])
 
     def test_a_sealed_candidate_or_other_data_is_refused_before_any_reservation(self):
         other = json.loads((self.eval_data / "prepared.json").read_text())
@@ -217,6 +257,52 @@ class RunEvalTests(run_records.RunFixture, unittest.TestCase):
         printed = json.loads(out.getvalue())
         self.assertEqual(printed["result"]["path"], f"candidates/{self.candidate_id}/eval/attempt-0001.json")
         self.assertEqual(read_json(self.directory / printed["result"]["path"])["label"], "served")
+
+    def test_an_interrupted_eval_keeps_its_journal_and_resumes_where_it_stopped(self):
+        from crit_eval.run import long_context
+        measured = long_context.run_context
+
+        def interrupted(*args, **kwargs):
+            raise KeyboardInterrupt
+        with patch.object(long_context, "run_context", interrupted), \
+                patch("crit_eval.run.runner.run_context", interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                self.evaluate()
+        attempt = read_json(self.folder / "attempts/attempt-0001/result.json")
+        self.assertEqual((attempt["outcome"], attempt["cleanup_settled"]), ("interrupted", True))
+        # Its log, journal and what it measured are the attempt's evidence; the result judges no gate.
+        self.assertEqual([Path(ref["path"]).name for ref in attempt["logs"]],
+                         ["eval-attempt-0001.log", "attempt-0001.journal.jsonl", "attempt-0001.json"])
+        partial = read_json(self.folder / "eval/attempt-0001.json")
+        self.assertEqual(partial["aborted"]["reason"], "interrupted")
+        self.assertIn("chat", partial["speed"]["cases"])
+        self.assertNotIn("status", partial)
+        with self.assertRaisesRegex(ValueError, "has no retained Eval result"):
+            from crit.run.checks import from_eval
+            from_eval(self.store, self.run_id, self.candidate_id)
+        with patch("crit_eval.run.runner.run_context", measured):
+            with patch("crit_eval.quality.reference.score_data", self.score):
+                resumed = evaluation.evaluate(self.store, self.run_id, self.candidate_id, self.eval_data,
+                                              ("speed", "heldout", "history", "quality", "context"), resume=True)
+        result = read_json(self.directory / resumed["result"]["path"])
+        self.assertEqual(resumed["result"]["path"], f"candidates/{self.candidate_id}/eval/attempt-0002.json")
+        self.assertEqual(result["journal"]["resumed"]["path"], "attempt-0001.journal.jsonl")
+        self.assertGreater(result["journal"]["replayed_calls"], 0)
+        self.assertIsNone(result["journal"]["diverged"])
+        # The speed cases are the interrupted attempt's own measurements, read back from its journal.
+        def measured(case):   # host load is unmeasured over requests the journal answered
+            return {key: value for key, value in case.items() if key != "host_other_cpu_cores"}
+        self.assertEqual(measured(result["speed"]["cases"]["chat"]), measured(partial["speed"]["cases"]["chat"]))
+        self.assertTrue(result["context"]["points"])
+        self.assertEqual({g["name"]: g["state"] for g in resumed["status"]["gates"]}["quality"], "pass")
+        events = [read_json(p) for p in sorted((self.directory / "events").glob("event-*.json"))]
+        started = [e for e in events if e["event_type"] in ("eval_started", "eval_resumed")]
+        self.assertEqual([e["event_type"] for e in started], ["eval_started", "eval_resumed"])
+        self.assertEqual(started[1]["detail"]["resumes"]["path"],
+                         f"candidates/{self.candidate_id}/eval/attempt-0001.journal.jsonl")
+        # A completed attempt has nothing left to resume.
+        with self.assertRaisesRegex(ValueError, "completed: its result stands"):
+            evaluation.evaluate(self.store, self.run_id, self.candidate_id, self.eval_data, resume="attempt-0002")
 
     def test_a_failing_engine_settles_its_attempt_as_failed(self):
         engine = self.folder / "package/engine.py"

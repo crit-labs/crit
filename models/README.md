@@ -7,8 +7,10 @@ the weights. The transforms are post-training quantization (PTQ) and
 decoding. Pruning and quantization-aware distillation will reuse the same workflow and records.
 
 A run allows transformed weights only with `weights_policy: transformable`
-([Run records](../docs/RUN_RECORDS.md#request)); its `quality_budget` is the drift
-the transform and the engine may spend together.
+([Run records](../docs/RUN_RECORDS.md#request)), the default of an `as_quantized` run; its
+`quality_budget` is the drift the transform and the engine may spend together. PTQ starts
+from an unquantized checkpoint; for one already quantized, an engine re-encodes its 16-bit
+matrices as it loads them instead ([Run records](../docs/RUN_RECORDS.md#request)).
 
 ## Workflow
 

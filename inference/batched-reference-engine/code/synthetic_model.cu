@@ -235,7 +235,8 @@ cudaError_t fill_uniform(__nv_bfloat16* out, std::size_t count, float bound, std
 GemmPlan plan_gemm(int n, int k, int multiprocessors) {
     GemmPlan p{n, k, 1, k / kTile};
     const int tiles_n = n / kTile, ktiles = k / kTile;
-    // Split K until the column tiles alone cover the multiprocessors once: decode steps have one row tile.
+    // Split K until the column tiles alone cover the multiprocessors once: decode steps have one row tile. The plan
+    // depends on the weight shape and the device only, never on the step's rows, so every row sums in the same order.
     const int want = std::max(1, std::min(ktiles, multiprocessors / std::max(1, tiles_n)));
     p.tiles_per_split = (ktiles + want - 1) / want;
     p.splits = (ktiles + p.tiles_per_split - 1) / p.tiles_per_split;

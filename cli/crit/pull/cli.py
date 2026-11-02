@@ -4,8 +4,10 @@ It reads the engine's card (from a crit-hub checkout with --hub, else crit-hub's
 requirements against this machine (a crit eval probe result, and nvcc), fetches the engine's source at the commit
 the card pins (from a crit-engines checkout with --engines, else its repository), checks its configuration against
 the sealed run's in card.lock.json, fetches the checkpoint at its pinned Hugging Face revision (or takes a local
-folder with --model) and checks every file against card.lock.json, runs the card's build command, and installs the
-built package in the engine store (crit.pull.store). Nothing is installed until every step has passed.
+folder with --model) and checks every file against card.lock.json, fetches and checks the card's drafter downloads
+the same way, runs the card's build command (or unpacks a prebuilt artifact whose toolchain matches this machine
+instead), and installs the built package in the engine store (crit.pull.store). Nothing is installed until every
+step has passed.
 """
 import argparse
 import hashlib
@@ -170,35 +172,37 @@ def unpack(archive, path, target):
 
 
 def verified(folder, rows):
-    """Files of `rows` that `folder` lacks or holds with other bytes."""
+    """Files of `rows` that `folder` lacks or holds with other bytes (a row without bytes is checked by SHA-256)."""
     bad = []
     for row in rows:
         path = safe_path(folder, row["path"])
-        if not path.is_file() or path.stat().st_size != row["bytes"]:
-            bad.append(f"{row['path']}: missing or {row['bytes']} bytes expected")
+        if not path.is_file() or ("bytes" in row and path.stat().st_size != row["bytes"]):
+            bad.append(f"{row['path']}: missing" + (f" or {row['bytes']} bytes expected" if "bytes" in row else ""))
         elif file_sha(path) != row["sha256"]:
             bad.append(f"{row['path']}: SHA-256 differs")
     return bad
 
 
-def fetch_checkpoint(store, entry, local=None):
+def fetch_checkpoint(store, entry, local=None, path=None):
     """The checkpoint's folder in the store with every file card.lock.json lists, checked by size and SHA-256: taken
     from `local` (hard-linked, else copied) or downloaded at the pinned revision. A folder already checked keeps its
-    stamp (sizes and modification times) and is not hashed again."""
+    stamp (sizes and modification times) and is not hashed again. With `path` the files are that folder of the
+    repository (a drafter download's), and the folder returned is it."""
     rows = entry["files"]
-    relative = checkpoint_folder(entry["repository"], entry["revision"])
-    folder = store.root / relative
-    stamp = store.root / (relative + ".verified.json")
+    relative = checkpoint_folder(entry["repository"], entry.get("revision") or "sha256-" + rows[0]["sha256"][:16])
+    within = relative + "/" + path.strip("/") if path else relative
+    folder = store.root / within
+    stamp = store.root / (within + ".verified.json")
     def stat(row):
         info = (folder / row["path"]).stat()
         return [row["path"], info.st_size, info.st_mtime_ns]
     if stamp.is_file() and folder.is_dir():
         try:
             if read_json(stamp) == {"files_sha256": digest(rows), "files": [stat(r) for r in rows]}:
-                return relative, "already in the store"
+                return within, "already in the store"
         except (OSError, ValueError):
             pass
-    name = f"{entry['repository']}@{entry['revision']}"
+    name = f"{entry['repository']}@{entry.get('revision') or 'its pinned file'}" + (f"/{path}" if path else "")
     if local is not None:
         local = Path(local).expanduser().resolve()
         log(f"crit pull: checking {local} against {name} ({len(rows)} files)")
@@ -222,16 +226,103 @@ def fetch_checkpoint(store, entry, local=None):
         except ImportError:
             raise ValueError("Fetching the checkpoint needs huggingface_hub (python -m pip install huggingface_hub); "
                              "or pass a local copy with --model") from None
-        log(f"crit pull: downloading {name} ({sum(r['bytes'] for r in rows) / GIB:.1f} GiB) into {folder}")
-        snapshot_download(repo_id=entry["repository"], revision=entry["revision"], local_dir=str(folder),
-                          allow_patterns=[row["path"] for row in rows])
+        size = sum(r.get("bytes", 0) for r in rows) / GIB
+        log(f"crit pull: downloading {name}" + (f" ({size:.1f} GiB)" if size else "") + f" into {folder}")
+        prefix = path.strip("/") + "/" if path else ""
+        snapshot_download(repo_id=entry["repository"], revision=entry.get("revision"), local_dir=str(store.root / relative),
+                          allow_patterns=[prefix + row["path"] for row in rows])
         found = "Hugging Face"
     log(f"crit pull: checking {name} against card.lock.json")
     bad = verified(folder, rows)
     if bad:
         raise ValueError(f"{folder} is not {name}:\n  " + "\n  ".join(bad))
     write_json(stamp, {"files_sha256": digest(rows), "files": [stat(r) for r in rows]})
-    return relative, found
+    return within, found
+
+
+def drafter_files(download, lock):
+    """The files a drafter download is checked against: card.lock.json's rows for it (pinned by revision), else the
+    one file the card pins by its SHA-256."""
+    key = (download["repository"], download.get("revision"), download.get("path"))
+    for entry in lock.get("downloads") or []:
+        if (entry.get("repository"), entry.get("revision"), entry.get("path")) == key and entry.get("files"):
+            return entry["files"]
+    if download.get("file") and download.get("sha256"):
+        return [{"path": download["file"], "sha256": download["sha256"]}]
+    raise ValueError(f"card.lock.json lists no files of the drafter {download['repository']}"
+                     + (f"@{download['revision'][:12]}" if download.get("revision") else "")
+                     + ", and the card pins no file of it by its SHA-256")
+
+
+def fetch_drafters(store, card, lock, local):
+    """Every drafter download in the store, checked like the checkpoint: one record per drafter, in card order, whose
+    folder (relative to the store) the engine receives as context.drafters. `local` maps a repository to a local copy."""
+    records = []
+    for download in card.get("downloads") or []:
+        if download.get("kind") != "drafter":
+            continue
+        rows = drafter_files(download, lock)
+        entry = {"repository": download["repository"], "revision": download.get("revision"), "files": rows}
+        folder, found = fetch_checkpoint(store, entry, local.get(download["repository"]), download.get("path"))
+        records.append({"kind": "drafter", **{k: download.get(k) for k in ("repository", "revision", "path")},
+                        "folder": folder, "files_sha256": digest(rows), "from": found})
+    return records
+
+
+def choose_artifact(card, device):
+    """The first artifact download whose toolchain this machine matches and its rows, else (None, rows of each one
+    that does not)."""
+    missed = []
+    for download in card.get("downloads") or []:
+        if download.get("kind") != "artifact":
+            continue
+        rows = machine.toolchain(download.get("toolchain") or {}, device)
+        if not machine.unmet(rows):
+            return download, rows
+        missed.append((download, rows))
+    return None, missed
+
+
+def fetch_artifact(store, download, local=None):
+    """The artifact's file, checked by its SHA-256: `local`, else downloaded from its Hugging Face repository (at its
+    revision, when the card pins one) into a cache under the store."""
+    if not download.get("file") or not download.get("sha256"):
+        raise ValueError(f"The artifact {download['repository']} names no file and SHA-256 to check it by")
+    if local is not None:
+        path, found = Path(local).expanduser().resolve(), "local file"
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError:
+            raise ValueError("Fetching the prebuilt artifact needs huggingface_hub (python -m pip install "
+                             "huggingface_hub); or pass a local copy with --download, or --build-from-source") from None
+        name = (download["path"].strip("/") + "/" if download.get("path") else "") + download["file"]
+        log(f"crit pull: downloading the prebuilt {download['repository']}/{name}")
+        path = Path(hf_hub_download(repo_id=download["repository"], filename=name, revision=download.get("revision"),
+                                    local_dir=str(store.root / ".artifacts" / download["sha256"])))
+        found = "Hugging Face"
+    if not path.is_file() or file_sha(path) != download["sha256"]:
+        raise ValueError(f"{path} is not the artifact the card pins: its SHA-256 differs")
+    return path, found
+
+
+def unpack_artifact(archive, package):
+    """A prebuilt artifact (a tar archive, compressed or not, of what the build adds to engine/) unpacked into the
+    package: regular files and folders only, none of them replacing a file of the pinned source. Returns the files."""
+    added = []
+    with tarfile.open(archive, "r:*") as tar:
+        for member in tar.getmembers():
+            if member.isdir():
+                continue
+            if not member.isfile():
+                raise ValueError(f"The artifact holds {member.name}, which is not a regular file")
+            destination = safe_path(package, member.name)
+            if destination.exists():
+                raise ValueError(f"The artifact's {member.name} would replace a file of the engine's pinned source")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(tar.extractfile(member).read())
+            added.append(Path(member.name).as_posix())
+    return sorted(added)
 
 
 def build(package, command, log_path, seconds):
@@ -262,8 +353,11 @@ def build(package, command, log_path, seconds):
 
 
 def pull(engine, store, project=ROOT, hub=None, index=None, checkout=None, model=None, checkpoint=None, device=None,
-         context=None, force=False, ignore_requirements=False, build_seconds=BUILD_SECONDS):
-    """Install the engine; returns its install record."""
+         context=None, force=False, ignore_requirements=False, build_seconds=BUILD_SECONDS, downloads=None,
+         from_source=False):
+    """Install the engine; returns its install record. `downloads` maps a download's repository to a local copy (a
+    drafter's folder, an artifact's file); `from_source` builds even when a prebuilt artifact matches this machine."""
+    downloads = dict(downloads or {})
     engine = engine_id(engine)
     if not force:
         try:
@@ -283,9 +377,14 @@ def pull(engine, store, project=ROOT, hub=None, index=None, checkout=None, model
     for row in rows:
         if not row["met"]:
             log(f"crit pull: warning: {row['requirement']} needs {row['required']}, this machine has {row['found']}")
-    if card.get("downloads"):
-        log("crit pull: warning: the card lists downloads crit pull does not fetch yet: "
-            + ", ".join(f"{d.get('kind')} {d.get('repository')}" for d in card["downloads"]))
+    unknown = sorted(set(downloads) - {d.get("repository") for d in card.get("downloads") or []})
+    if unknown:
+        raise ValueError(f"--download names {', '.join(unknown)}, which {engine}'s card does not download")
+    artifact, toolchain = (None, []) if from_source else choose_artifact(card, probe)
+    if artifact is None:
+        for download, missed in toolchain:
+            log(f"crit pull: the prebuilt {download['repository']} does not match this machine ("
+                + "; ".join(machine.unmet(missed)) + "); building from source")
     from crit.run.cli import load_settings
     settings = load_settings(project)
     limits = {"kv_tokens": context_tokens(card, model_id, probe, context),
@@ -312,8 +411,18 @@ def pull(engine, store, project=ROOT, hub=None, index=None, checkout=None, model
                              "configuration its sealed run measured (card.lock.json provenance)")
         sources = {row["path"]: row["sha256"] for row in inventory(package)}
         model_folder, model_from = fetch_checkpoint(store, entry, model)
+        drafters = fetch_drafters(store, card, lock, downloads)
         command = (card.get("build") or {}).get("command")
-        if command:
+        built = None
+        if artifact is not None:
+            path, found = fetch_artifact(store, artifact, downloads.get(artifact["repository"]))
+            log(f"crit pull: the prebuilt {artifact['repository']} matches this machine; unpacking it instead of "
+                "building")
+            unpack_artifact(path, package)
+            built = {"artifact": {k: artifact.get(k) for k in ("repository", "revision", "path", "file", "sha256")
+                                  if artifact.get(k)} | {"from": found}, "toolchain": toolchain}
+            command = None
+        elif command:
             build(package, command, folder / "logs" / "build.log", build_seconds)
         files = inventory(package)
         outputs = [row["path"] for row in files if sources.get(row["path"]) != row["sha256"]]
@@ -324,7 +433,8 @@ def pull(engine, store, project=ROOT, hub=None, index=None, checkout=None, model
         files = inventory(package)
         manifest = {"schema_version": 1, "record_kind": "installed_package", "engine": engine, "files": files,
                     "launch": [ENTRY], "capabilities": capabilities,
-                    "build": {"command": command, "outputs": outputs} if command else None,
+                    "build": ({"command": command, "outputs": outputs} if command else
+                              {"artifact": built["artifact"], "outputs": outputs} if built else None),
                     "configuration_sha256": digest(configuration)}
         write_json(package / MANIFEST, manifest)
         from crit import __version__
@@ -337,7 +447,9 @@ def pull(engine, store, project=ROOT, hub=None, index=None, checkout=None, model
                   "package": {"sha256": digest(manifest), "files": len(files)},
                   "limits": limits,
                   "requirements": {"checks": rows, "ignored": bool(ignore_requirements)},
-                  "build": {"command": command, "log": "logs/build.log", "outputs": outputs} if command else None}
+                  "build": ({"command": command, "log": "logs/build.log", "outputs": outputs} if command else
+                            built | {"outputs": outputs} if built else None),
+                  "downloads": drafters}
         write_json(folder / "card.json", card)
         write_json(folder / "card.lock.json", lock, max_bytes=16 << 20)
         write_json(folder / INSTALL, record)
@@ -383,6 +495,11 @@ def main(argv=None):
                         help="Install even when this machine does not meet the card's requirements")
     parser.add_argument("--build-timeout", type=float, default=BUILD_SECONDS, metavar="SECONDS",
                         help="Seconds the build may take (default: %(default)s)")
+    parser.add_argument("--build-from-source", action="store_true",
+                        help="Build even when one of the card's prebuilt artifacts matches this machine")
+    parser.add_argument("--download", action="append", default=[], metavar="REPOSITORY=PATH",
+                        help="A local copy of one of the card's downloads (a drafter's folder, an artifact's file), "
+                             "checked like a download (repeatable; default: fetch it from Hugging Face)")
     parser.add_argument("--list", action="store_true", help="List the installed engines instead")
     args = parser.parse_args(argv)
     if bool(args.list) == bool(args.engine):
@@ -391,6 +508,9 @@ def main(argv=None):
         parser.error("--hub and --index are two sources of the card; give one")
     if args.context is not None and args.context < 2:
         parser.error("--context is at least 2 tokens")
+    if not all("=" in value and all(value.split("=", 1)) for value in args.download):
+        parser.error("--download is REPOSITORY=PATH, such as owner/drafter=./drafter")
+    local = dict(value.split("=", 1) for value in args.download)
     try:
         store = InstallStore(args.store or args.project / "engines")
         if args.list:
@@ -398,7 +518,7 @@ def main(argv=None):
             return 0
         record = pull(args.engine, store, args.project, args.hub, args.index, args.engines, args.model,
                       args.checkpoint, args.device, args.context, args.force, args.ignore_requirements,
-                      args.build_timeout)
+                      args.build_timeout, local, args.build_from_source)
     except (ValueError, OSError, KeyError, TypeError) as exc:
         print("error: " + str(exc), file=sys.stderr)
         return 1

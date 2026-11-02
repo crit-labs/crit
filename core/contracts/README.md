@@ -1,7 +1,8 @@
 # Native core contracts
 
-The authoritative native interface is [crit/core.h](../include/crit/core.h);
-the current source version is 0.13.0. [CONTRACTS.json](CONTRACTS.json) records
+The authoritative native interface is [crit/core.h](../include/crit/core.h)
+with the parts it includes from [crit/core/](../include/crit/core);
+the current source version is 0.14.0. [CONTRACTS.json](CONTRACTS.json) records
 its ownership responsibilities and those of the
 [component libraries](#component-libraries); it is documentation, not a wire ABI.
 
@@ -65,6 +66,8 @@ sessions call the others:
 | --- | --- |
 | [Sampling](../src/sampling/README.md) | Sessions apply request sampling with `crit/sampling.h` or a device path that follows its rules; the runtime never samples. Draws depend only on seed, position, stream and purpose, so rollback needs no generator state. |
 | [State cache](../src/state/README.md) | Page and slot bookkeeping; the engine owns storage and copies; ids are reused only after their epoch retires. |
+| [Batched steps](../src/batch/README.md) | Decode rows first, then prompt chunks; admission reserves every row a request can stage. |
+| [Step engines](../src/runtime/README.md#step-engines) | Callbacks run on the engine worker and finish their work before returning; a failing callback fails the engine. |
 | [Files](../src/io/README.md), [model checkpoints](../src/model/README.md) | Readers that never decode tensor values; weight encodings and loading stay the engine's. |
 | [Operator ranges](../src/runtime/README.md#operator-ranges) | Compile out without `CRIT_TRACE_ENABLED`; bounded, add no device fences; work counts are estimates. |
 | [Structured output](../src/constraints/README.md) | A request-private `TokenMatcher` follows accepted output; a dead end fails the request, never falls back to unconstrained output. |

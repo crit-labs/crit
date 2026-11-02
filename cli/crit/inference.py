@@ -94,12 +94,14 @@ def check(root=ROOT):
 def main(argv=None, root=ROOT):
     parser = argparse.ArgumentParser(description=__doc__)
     subs = parser.add_subparsers(dest="command", required=True)
-    for name in ("list", "search", "show"):
-        sub = subs.add_parser(name)
+    for name, text in (("list", "List the techniques by category"),
+                       ("search", "The techniques whose metadata holds every word of the query"),
+                       ("show", "One technique's guidance, symbols and files")):
+        sub = subs.add_parser(name, help=text)
         if name != "list":
             sub.add_argument("query")
         sub.add_argument("--json", action="store_true")
-    subs.add_parser("check")
+    subs.add_parser("check", help="Check the techniques' code against their metadata")
     args = parser.parse_args(argv)
     try:
         if args.command == "check":

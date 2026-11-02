@@ -188,10 +188,24 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         prompt = (self.store.directory(view["run"]["run_id"]) / "agent_request.md").read_text(encoding="utf-8")
         self.assertIn("every candidate serves 99,328 tokens of prompt plus output, Eval's max context", prompt)
         self.assertIn("--context 99328", prompt)
+        # Sixteen concurrent requests of 512 + 128 tokens hold 10,240 tokens of KV at once: a wanted context of 8,192
+        # is raised to it, within what the device holds.
+        sized = self.store.create(data | {"device": str(device), "context_tokens": 8192,
+                                          "workload": {"concurrency": 16}})["run"]["spec"]["hardware_constraints"]
+        self.assertEqual(sized["kv_tokens"], 10240)
+        self.assertEqual((sized["context"]["concurrency_tokens"], sized["context"]["context_tokens"],
+                          sized["context"]["bound"]), (10240, 8192, "requested"))
         # An explicit capacity is taken as given.
         explicit = self.store.create(data | {"device": str(device), "kv_tokens": 65536})["run"]["spec"]["hardware_constraints"]
         self.assertEqual(explicit["kv_tokens"], 65536)
         self.assertNotIn("context", explicit)
+        # A device file of two GPUs (crit eval probe --devices) names them, and their memory holds more context.
+        one = {"device": "fixture gpu", "memory_free_bytes": 4 * GIB + 8192 + 32 * 100000}
+        device.write_text(json.dumps({**one, "devices": [{**one, "index": 0}, {**one, "index": 1}]}), encoding="utf-8")
+        pair = self.store.create(data | {"device": str(device)})["run"]["spec"]["hardware_constraints"]
+        self.assertEqual(pair["context"]["devices"], [{"index": 0, "device": "fixture gpu"},
+                                                      {"index": 1, "device": "fixture gpu"}])
+        self.assertGreater(pair["kv_tokens"], hardware["kv_tokens"])
         device.write_text(json.dumps({"memory_free_bytes": 4 * GIB}), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "Eval cannot derive the max context: the weights read on every pass"):
             self.store.create(data | {"device": str(device)})
@@ -246,6 +260,13 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         self.store.select(self.run_id, kept["candidate_id"])
         with self.assertRaises(ValueError):
             self.store.create(dict(self.data, weights_policy="sometimes"))
+
+    def test_as_quantized_runs_default_to_transformable_weights(self):
+        view = self.store.create(dict(self.data, quality_mode="as_quantized"))
+        self.assertEqual(view["run"]["spec"]["correctness"]["weights_policy"], "transformable")
+        kept = self.store.create(dict(self.data, quality_mode="as_quantized", weights_policy="as_stored"))
+        self.assertEqual(kept["run"]["spec"]["correctness"]["weights_policy"], "as_stored")
+        self.assertNotIn("weights_policy", self.store.create(dict(self.data))["run"]["spec"]["correctness"])
 
     def test_parallel_inventory_matches_sequential_hashing(self):
         folder = self.root / "artifact"

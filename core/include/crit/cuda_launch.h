@@ -1,5 +1,8 @@
 #pragma once
+#include "crit/gpu_runtime.h"
+#if !defined(CRIT_CORE_HIP)
 #include <cuda_runtime.h>
+#endif
 #include <cstddef>
 #include <utility>
 
@@ -30,6 +33,12 @@ struct LaunchShape {
 // `programmatic` is set and the stream's device supports it. Returns the launch's error.
 template <class... Params, class... Args>
 cudaError_t launch(void (*kernel)(Params...), const LaunchShape& shape, cudaStream_t stream, bool programmatic, Args&&... args) {
+#if defined(CRIT_CORE_HIP)
+    // HIP has no programmatic stream serialization: always an ordinary launch (hipcc translation units only).
+    static_cast<void>(programmatic);
+    hipLaunchKernelGGL(kernel, shape.grid, shape.block, static_cast<unsigned>(shape.shared), stream, std::forward<Args>(args)...);
+    return hipGetLastError();
+#else
     cudaLaunchAttribute attribute[1];
     cudaLaunchConfig_t config{};
     config.gridDim = shape.grid;
@@ -43,11 +52,12 @@ cudaError_t launch(void (*kernel)(Params...), const LaunchShape& shape, cudaStre
         config.numAttrs = 1;
     }
     return cudaLaunchKernelEx(&config, kernel, std::forward<Args>(args)...);
+#endif
 }
 
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
 // Waits until every grid this one depends on through programmatic serialization has completed and its memory
-// operations are visible. A no-op for ordinary launches and below sm_90.
+// operations are visible. A no-op for ordinary launches, below sm_90 and on HIP.
 __device__ __forceinline__ void wait_for_prior_grid() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.wait;" ::: "memory");

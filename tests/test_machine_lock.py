@@ -141,3 +141,40 @@ class EngineLockTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+READ_THROTTLING = """
+import ctypes, sys
+from ctypes import wintypes
+sys.path.insert(0, sys.argv[1])
+from crit_core.machine import POWER_THROTTLING_CLASS, keep_full_speed
+
+class State(ctypes.Structure):
+    _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG), ("StateMask", wintypes.ULONG)]
+
+kernel32 = ctypes.WinDLL("kernel32")
+kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+state = State(1, 0, 0)
+read = kernel32.GetProcessInformation(wintypes.HANDLE(kernel32.GetCurrentProcess()), POWER_THROTTLING_CLASS,
+                                      ctypes.byref(state), ctypes.sizeof(state))
+print(keep_full_speed())
+kernel32.GetProcessInformation(wintypes.HANDLE(kernel32.GetCurrentProcess()), POWER_THROTTLING_CLASS,
+                               ctypes.byref(state), ctypes.sizeof(state))
+print(bool(read), state.ControlMask, state.StateMask)
+"""
+
+
+class FullSpeedTest(unittest.TestCase):
+    def test_a_process_opts_out_of_background_throttling(self):
+        if sys.platform != "win32":
+            self.assertTrue(machine.keep_full_speed())
+            return
+        out = subprocess.run([sys.executable, "-I", "-c", READ_THROTTLING, str(ROOT / "core/python")],
+                             capture_output=True, text=True, timeout=60, check=True).stdout.split()
+        self.assertEqual(out[0], "True")
+        if out[1] == "True":   # Windows Server accepts the setting but does not always read it back
+            # Execution speed (and timer resolution where Windows knows it) is controlled by the process, and
+            # nothing is throttled.
+            self.assertIn(int(out[2]), (machine.THROTTLE_EXECUTION_SPEED | machine.THROTTLE_IGNORE_TIMER_RESOLUTION,
+                                        machine.THROTTLE_EXECUTION_SPEED))
+            self.assertEqual(int(out[3]), 0)

@@ -92,7 +92,9 @@ offset with a compensating `post` (for example halved scales against doubled E2M
 - **Threads and the CPU share.** Split rows or experts over a worker pool, for example behind the
   [host-work mailbox](../host-work-mailbox/README.md). Leave the share to measured dispatch with the host
   lane timed on the target machine. Host time per expert grows with its weight bytes until the workers
-  saturate host DRAM, and the device pays each miss's transfer at the measured host-to-device rate. Past the
+  saturate host DRAM, and the device pays each miss's transfer at the measured host-to-device rate. Link copies
+  read the same host DRAM, so with both paths busy each runs below its rate alone: time the lanes concurrently
+  before setting the share. Past the
   share where host time exceeds the transfer it replaces, decode slows down. That point depends on cores,
   memory bandwidth, the link and the expert size, so no share carries over between machines.
 

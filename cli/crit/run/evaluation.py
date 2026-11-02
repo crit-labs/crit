@@ -8,13 +8,20 @@ data. When the data holds none yet, the run's model scores the texts first (crit
 candidate is served. The result is retained under the candidate's eval/ folder for checks to reference; it
 publishes no check or benchmark.
 
-Every part runs in one attempt on one loaded engine (the lower-context gate opens its own, at its context). Eval
+Every part runs in one attempt on one loaded engine (the lower-context gate opens its own, at its context). The
+attempt journals every engine it opens and every request served beside its result (eval/attempt-N.journal.jsonl,
+crit-eval's crit_eval.run.journal), each line synced as it completes; an attempt that stops for any reason
+(interrupted, failed, past its deadline, a disturbed or hung engine) keeps its journal and what it measured
+(eval/attempt-N.json, `aborted`), and `--resume` measures in a new attempt from where it stopped: the journal's
+requests are answered again at their recorded times, the engine loads only for the requests left. Eval
 measures in stages (crit-eval's protocol stages): as far as its budget allows at the candidate's measured rates,
 and the run's kv_tokens itself only with certify, for the candidate that will ship. The attempt has no fixed process
 cap, since Eval's work scales with the model and the device: it may run to the
 segment's deadline, and each request is bounded by the rates the engine measured in it (crit_eval.run.deadline), so a
 hung engine stops the attempt.
 """
+import contextlib
+import os
 from pathlib import Path
 import sys
 import time
@@ -22,6 +29,55 @@ import time
 from .records import file_sha, ident, load_run, now, quality_mode, quality_terms, read_json, safe_path, timestamp
 from .served import Expired, SERVED, Served, remaining
 from .store import amendments
+
+# Allocator settings the reference may set for its own process (expandable segments) and that crit serve's resident
+# host, started from this process, must not inherit: the engine runs under the allocator its user started crit with.
+ALLOCATOR_ENV = ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
+
+
+# Placement scenarios (crit_eval.limits.context.SCENARIOS) in which a pass reads weights from host memory.
+OFF_DEVICE = ("sparse_device_host", "sparse_device_host_disk", "dense_device_host")
+
+
+def host_bytes_warning(root, result):
+    """What crit run eval prints when recon's placement keeps weights off the device and the Eval result's engine
+    declares no host_bytes_per_pass: a note when Eval priced its floors by the placement's memory tiers (crit-eval's
+    headroom.tiers), which assume even routing until the engine reports its expert cache's hits, else a warning that
+    Eval priced its pass floor as if every byte came from device memory, a floor it cannot reach. None otherwise."""
+    from .recon import RECON_JSON
+    facts = safe_path(root, RECON_JSON)
+    scenario = (((read_json(facts).get("gathered") or {}).get("placement") or {}).get("scenario")
+                if facts.is_file() else None)
+    declared = ((result or {}).get("engine") or {}).get("host_bytes_per_pass")
+    if scenario not in OFF_DEVICE or isinstance(declared, dict) and (declared.get("link") or declared.get("cpu")):
+        return None
+    priced = (((result or {}).get("headroom") or {}).get("host_pass") or {})
+    if priced.get("source") == "placement":
+        return (f"NOTE: recon's placement is {scenario} and the candidate declares no host_bytes_per_pass, so Eval priced "
+                f"its floors by the placement's memory tiers at a {priced.get('hit_rate') or 0:.0%} expert cache hit rate "
+                f"({priced.get('hit_rate_source')}). Report expert_reads and expert_hits in the decode telemetry for the "
+                "cache's own hit rate, or host_bytes_per_pass ({\"link\", \"cpu\"} bytes per pass) for the engine's own "
+                "path.")
+    return (f"WARNING: recon's placement is {scenario} (weights read from host memory), but the candidate declares no "
+            "host_bytes_per_pass, so Eval priced its pass floor as if every weight were on the device. Report "
+            "{\"link\": bytes copied over the host link, \"cpu\": bytes the CPU computes from} per pass in the "
+            "engine's facts: Eval then prices a reachable floor by source and keeps the all-on-device fraction "
+            "(fixed_decode) beside it.")
+
+
+@contextlib.contextmanager
+def own_allocator_env():
+    """Restore ALLOCATOR_ENV as it was when the block began: a reference that exports them (crit-eval before its
+    allocator change) leaves the served engine's environment as it found it."""
+    before = {key: os.environ.get(key) for key in ALLOCATOR_ENV}
+    try:
+        yield
+    finally:
+        for key, value in before.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 # Quality needs the score call and, for its honesty check, every served token's log-probability.
 QUALITY = ("chat-score-v1", "chat-logprobs-v1")
@@ -42,14 +98,65 @@ def check_sampling(run, prepared, data, model):
                          "--sampling")
 
 
+def resumable(store, run_id, root, folder, attempt=None):
+    """The journal of the candidate's Eval attempt a new attempt resumes: `attempt`'s, else the newest that has one.
+    An attempt that completed has nothing left to measure."""
+    from crit_eval.run.journal import SUFFIX
+    found = sorted((folder / "eval").glob("attempt-*" + SUFFIX))
+    if attempt is not None:
+        found = [p for p in found if p.name == ident(attempt, "attempt") + SUFFIX]
+    if not found:
+        raise ValueError(f"{folder.name} has no Eval journal" + (f" for {attempt}" if attempt else "")
+                         + " to resume: run crit run ... eval without --resume")
+    path = found[-1]
+    name = path.name[:-len(SUFFIX)]
+    outcome = folder / "attempts" / name / "result.json"
+    if not outcome.is_file():
+        settle_abandoned(store, run_id, root, folder, name, path)
+    if read_json(outcome)["outcome"] == "completed":
+        raise ValueError(f"{name} completed: its result stands, nothing is left to resume")
+    return path
+
+
+# How long a journal stays untouched before an unsettled attempt's process counts as gone (with the lock free).
+QUIET_SECONDS = 60
+
+
+def settle_abandoned(store, run_id, root, folder, name, journal):
+    """Settle an Eval attempt whose process ended without settling it (killed, its session or the machine stopped) as
+    interrupted, with its journal and what it measured as evidence. Eval holds the machine's engine lock while it
+    measures: the lock free and the journal untouched for a minute prove no process measures for the attempt any more."""
+    from crit_core.machine import engine_lock, lock_path
+    if lock_path() is None:
+        raise ValueError(f"{name} is not settled and the machine's engine lock is off, so nothing proves its process "
+                         "ended: settle it (crit run ... settle) before resuming its journal")
+    if time.time() - journal.stat().st_mtime < QUIET_SECONDS:
+        raise ValueError(f"{name} is not settled and its journal was written in the last minute: its Eval may still "
+                         "run; wait for it, or stop it")
+    try:
+        with engine_lock(f"crit run eval --resume {name}", wait=False):
+            pass
+    except RuntimeError as busy:
+        raise ValueError(f"{name} is not settled and {busy}: its Eval may still run; stop it first") from None
+    reservation = read_json(folder / "attempts" / name / "reservation.json")
+    kept = [folder / "logs" / f"eval-{name}.log", journal, folder / "eval" / f"{name}.json"]
+    store.settle(run_id, reservation, {
+        "outcome": "interrupted", "ended_at": now(), "exit_code": None, "cleanup_settled": True,
+        "logs": [{"path": p.relative_to(root).as_posix(), "sha256": file_sha(p)} for p in kept if p.is_file()],
+        "failure": "The Eval process ended without settling its attempt (settled by --resume: the machine's engine "
+                   "lock was free and the journal untouched)"})
+
+
 def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, seconds=None, label=None, stage=None,
-             certify=False, budget_seconds=None):
+             certify=False, budget_seconds=None, resume=None):
     """Reserve, score the data's quality texts on the run's model unless stored, serve the candidate, run Eval on it
     over the chat API, stop the server and settle. stage, certify and budget_seconds: how far Eval measures
-    (crit_eval.run.runner.run). Returns the retained result (path relative to the run, sha256)
-    and its status."""
+    (crit_eval.run.runner.run). resume: True or an attempt id: go on from that Eval attempt's journal (the newest's
+    with True), which must have measured this package with the same options. Returns the retained result (path
+    relative to the run, sha256) and its status."""
     from crit_eval import load_json, machine_settings
     from crit_eval.quality.prepare import PREPARED, model_identity, prepared_template
+    from crit_eval.run.journal import path_for
     from crit_eval.run.runner import PARTS
     root = store.directory(run_id)
     run = load_run(root)
@@ -80,6 +187,7 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
     device = read_json(probe) if probe and probe.is_file() and file_sha(probe) == basis["device_sha256"] else None
     settings = machine_settings()
     reserve = settings.get("context_reserve_gib")
+    earlier = resumable(store, run_id, root, folder, None if resume is True else resume) if resume else None
     reservation = store.reserve(run_id, candidate_id, "eval", seconds)
     attempt = reservation["attempt_id"]
     budget, exactness = quality_terms(run["spec"]["correctness"], amendments(root, reservation["segment_id"]))
@@ -88,9 +196,15 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
                    context_tokens=constraints["kv_tokens"], context_basis=basis,
                    vram_headroom_bytes=round(settings.get("vram_headroom_gib", 1.0) * (1 << 30)),
                    context_reserve_bytes=round(reserve * (1 << 30)) if reserve is not None else None,
-                   stage=stage, certify=certify, budget_seconds=budget_seconds)
+                   stage=stage, certify=certify, budget_seconds=budget_seconds,
+                   # What makes this attempt's measurements the ones a resumed attempt may answer from.
+                   identity={"run_id": run_id, "candidate_id": candidate_id, "package_sha256": reservation["package_sha256"],
+                             "parts": sorted(parts), "label": label},
+                   resume=earlier)
     out = folder / "eval" / f"{attempt}.json"
+    journal = path_for(out)
     log_path = folder / "logs" / f"eval-{attempt}.log"
+    store.eval_started(run_id, reservation, journal, earlier)
     outcome, failure, settled, interrupted = "completed", None, True, None
     try:
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -113,8 +227,9 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
     ended = now()
     if outcome == "completed" and timestamp(ended, "ended") > timestamp(reservation["deadline_at"], "deadline"):
         outcome, failure = "timed_out", "Eval passed its reserved deadline"
-    logs = ([{"path": log_path.relative_to(root).as_posix(), "sha256": file_sha(log_path)}]
-            if settled and log_path.is_file() else [])
+    # The log, the journal and the result (complete, or what an attempt that stopped measured) are its evidence.
+    logs = ([{"path": path.relative_to(root).as_posix(), "sha256": file_sha(path)}
+             for path in (log_path, journal, out) if path.is_file()] if settled else [])
     # Eval and the server ran in this process; the resident host's exit is part of the cleanup.
     store.settle(run_id, reservation, {"outcome": outcome, "ended_at": ended,
                                        "exit_code": 0 if outcome == "completed" else None,
@@ -122,7 +237,9 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
     if interrupted is not None:
         raise interrupted
     if outcome != "completed":
-        raise ValueError(f"Eval {outcome}: {failure} (log {log_path.relative_to(root).as_posix()})")
+        kept = (f"; its journal keeps what it measured: crit run --id {run_id} eval --candidate {candidate_id} "
+                f"--resume {attempt} goes on from there" if journal.is_file() else "")
+        raise ValueError(f"Eval {outcome}: {failure} (log {log_path.relative_to(root).as_posix()}){kept}")
     # A candidate created from a plan gets the plan's outcome: its forecast next to what Eval measured.
     planned = store.plan_outcome(run_id, candidate_id, attempt)
     return {"result": {"path": out.relative_to(root).as_posix(), "sha256": file_sha(out)}, "status": result["status"],
@@ -173,7 +290,8 @@ def _measure(store, run_id, candidate_id, attempt, deadline_at, model, data, out
             if source() is not None and (not (data / STORE / "index.json").is_file()
                                          or mode == "as_quantized" and not (data / STORE / ALLOWANCE).is_file()):
                 fetch(model, data, source(), log)
-            how = score_data(model, data, log, check)
+            with own_allocator_env():
+                how = score_data(model, data, log, check)
             log(f"quality: reference scores of {how['positions']:,} positions {how['method']}"
                 + (f" in {how['seconds']:.0f} s" if how["method"] == "scored" else ""))
         with served.until(deadline_at):

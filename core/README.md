@@ -11,31 +11,51 @@ config, host-memory admission and optional structured output, plus a Python
 package. Model semantics, kernels and their logits, tensor and state layouts,
 device work and native tokenization (a `TextFrontend`) belong to the engine.
 
+Core stays model- and hardware-agnostic: it holds no layer arithmetic (attention,
+projections, normalization, positional encodings), no kernels or device code beyond
+the backends' runtime services (streams, memory, graphs, launches), and no number or
+rule that holds only for one model family, dtype or GPU architecture. What batched
+or speculative engines share enters Core as bookkeeping (scheduling, admission, state
+pages, row layout, acceptance); the arithmetic stays in the engine, an
+[Inference](../inference/README.md) entry or a kernel provider ([Kernels](../kernels/README.md)).
+
 An engine integrates through the public Model/Session/Backend boundary: declare
 capabilities and resource needs, advance requests, expose ready progress, commit
 accepted output and drain owned work. Its execution strategy (dense or
-expert-routed, CPU or accelerator, caches, graph capture) stays internal. CUDA,
-concurrent requests and Inference techniques are opt-in. Concurrent adapters can
-use [mixed prefill/decode batches](src/runtime/README.md#mixed-token-work-batches),
-reuse-aware admission and an [asynchronous batch pipeline](src/runtime/README.md#asynchronous-batch-pipeline);
-active capacity goes up to 4096 lanes, subject to memory admission. The SDK covers
+expert-routed, CPU or accelerator, caches, graph capture) stays internal.
+
+Serving concurrent requests is the normal path. A `ConcurrentModel` runs
+[mixed prefill/decode batches](src/runtime/README.md#mixed-token-work-batches) with
+reuse-aware admission and an optional [asynchronous batch pipeline](src/runtime/README.md#asynchronous-batch-pipeline);
+active capacity goes up to 4096 lanes, subject to memory admission. Beside the
+scheduler Core ships what batched engines share: [batched steps](src/batch/README.md)
+(the step's row layout, page-reserving admission, speculative rows, batch-invariance
+rules) and [step engines](src/runtime/README.md#step-engines), which give a
+Python engine Core's scheduler. The [batched reference engine](../inference/batched-reference-engine/README.md)
+combines them with its own paged attention kernels. Core's default stays one request (`Profile.max_concurrency` 1): an
+engine opts in through its profile and model declaration
+([building engines](../docs/BUILDING_ENGINES.md#serve-concurrent-requests)). CUDA and
+Inference techniques are opt-in. The SDK covers
 generation (with optional log-probabilities, request text and stop strings) and
 scoring, with capability-checked [request options](src/runtime/README.md#request-options).
 Each integration must validate its own model/backend combination.
 
-Public headers are in `include/crit/`, C++ sources and their guides in `src/`,
-the Python package in `python/` and the [contracts](contracts/README.md) in
-`contracts/`; `CMakeLists.txt` builds and installs the SDK.
+Public headers are in `include/crit/` (`core.h` includes its parts by concern
+from `include/crit/core/`), C++ sources and their guides in `src/`, the Python
+package in `python/` and the [contracts](contracts/README.md) in `contracts/`;
+`CMakeLists.txt` builds and installs the SDK.
 
 | Part | Responsibility | Header |
 | --- | --- | --- |
 | [Runtime](src/runtime/README.md) | Requests, bounded scheduling, readiness, commit/publication, cancellation, retirement | [core.h](include/crit/core.h) |
 | [Engine libraries](src/runtime/README.md#engine-libraries) | C ABI for an engine shared library; stock Eval and serve adapters in `crit_core.native` | [native_engine.h](include/crit/native_engine.h) |
+| [Step engines](src/runtime/README.md#step-engines) | A `ConcurrentModel` over C step callbacks (`crit_core_steps`), so a Python engine gets Core's scheduler, admission, cancellation and retirement (`crit_core.native.StepEngine`) | [step_engine.h](include/crit/step_engine.h) |
 | [Tracing](src/runtime/README.md#lifecycle-tracing) | Bounded lifecycle trace and [operator ranges](src/runtime/README.md#operator-ranges), optional NVTX sink | [trace.h](include/crit/trace.h) |
 | [Memory](src/memory/README.md) | Resource budgets, reservations, [host-memory admission](src/memory/README.md#host-memory-admission) | [host_memory.h](include/crit/host_memory.h) |
 | [Text](src/text/README.md) | Stop strings, reply text streams, incremental decoding over `detokenize()` | [text.h](include/crit/text.h) |
 | [Sampling](src/sampling/README.md) | Counter-based draws, sampling rules, penalties, log-probabilities, greedy acceptance | [sampling.h](include/crit/sampling.h) |
 | [State cache](src/state/README.md) | KV page and recurrent slot bookkeeping without touching state bytes | [state.h](include/crit/state.h) |
+| [Batched steps](src/batch/README.md) | Step row layout and logits rows, page-reserving admission, speculative rows, batch-invariance rules | [batch.h](include/crit/batch.h) |
 | [Files](src/io/README.md) | Strict JSON, read-only files, chunked and mapped reads, SHA-256 | [json.h](include/crit/json.h), [file.h](include/crit/file.h), [sha256.h](include/crit/sha256.h) |
 | [Model](src/model/README.md) | Safetensors checkpoints, typed `config.json` and `generation_config.json`, stop ids | [safetensors.h](include/crit/safetensors.h), [model_config.h](include/crit/model_config.h) |
 | [Structured output](src/constraints/README.md) | Optional token matchers for choices, JSON and compiled grammars, masked sampling | [constraints.h](include/crit/constraints.h) |
@@ -52,7 +72,8 @@ For a small engine built directly from this checkout, start with the
 [Core + Inference walkthrough](../inference/examples/core-projection/README.md).
 
 Use CMake 3.28+ and a C++20 compiler (GCC, Clang or MSVC). Warnings are errors.
-CUDA is off by default; enable `CRIT_CORE_CUDA` with Toolkit 13.1+.
+CUDA is off by default; enable `CRIT_CORE_CUDA` with Toolkit 13.1+. On AMD GPUs, `CRIT_CORE_HIP` builds the same
+backend on ROCm's HIP runtime as `crit::hip` ([HIP](src/backends/cuda/README.md#hip)).
 `CRIT_CORE_SANITIZERS` accepts GCC/Clang driver flags only (see
 [request release](src/runtime/README.md#request-release) for a known `thread`
 false positive).
@@ -76,10 +97,10 @@ cmake --build build/consumer
 ctest --test-dir build/consumer --output-on-failure
 ```
 
-The SDK is version 0.13.0. Include `<crit/core.h>` and link the installed target:
+The SDK is version 0.14.0. Include `<crit/core.h>` and link the installed target:
 
 ```cmake
-find_package(critCore 0.13.0 EXACT CONFIG REQUIRED)
+find_package(critCore 0.14.0 EXACT CONFIG REQUIRED)
 target_link_libraries(your_engine PRIVATE crit::core)
 ```
 

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 project(crit_concurrency_consumer LANGUAGES CXX)
-find_package(critCore 0.13.0 EXACT CONFIG REQUIRED)
+find_package(critCore 0.14.0 EXACT CONFIG REQUIRED)
 add_executable(crit_concurrency_consumer main.cpp)
 target_link_libraries(crit_concurrency_consumer PRIVATE crit::core)
 if(MSVC)
@@ -13,8 +13,8 @@ target_link_libraries(crit_frontend_consumer PRIVATE crit::core)
 # Every installed header, compiled as ordinary (not system) includes under strict warnings, with one call per
 # component. The checkout's core/include/crit headers, the installed crit headers and the includes in
 # installed_headers.cpp must be the same set, so a public header missing from Core's install(FILES ...), or one
-# installed without updating this consumer, fails here. The cuda*.h headers are installed only with CRIT_CORE_CUDA and
-# are built by the CUDA SDK consumer.
+# installed without updating this consumer, fails here. The cuda*.h headers and gpu_runtime.h are installed only with
+# CRIT_CORE_CUDA or CRIT_CORE_HIP and are built by the CUDA SDK consumer.
 get_filename_component(_crit_public_dir "${CMAKE_CURRENT_SOURCE_DIR}/../../../core/include/crit" ABSOLUTE)
 if(NOT IS_DIRECTORY "${_crit_public_dir}")
   message(FATAL_ERROR "this consumer builds from a crit checkout: ${_crit_public_dir} is missing")
@@ -28,7 +28,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_crit_source}"
 file(STRINGS "${_crit_source}" _crit_included REGEX "^#include <crit/[a-z0-9_/]+\\.h>")
 list(TRANSFORM _crit_included REPLACE "^#include <crit/([a-z0-9_/]+\\.h)>.*$" "\\1")
 foreach(_crit_list IN ITEMS _crit_public _crit_installed)
-  list(FILTER ${_crit_list} EXCLUDE REGEX "^cuda.*\\.h$")
+  list(FILTER ${_crit_list} EXCLUDE REGEX "^(cuda.*|gpu_runtime)\\.h$")
   list(SORT ${_crit_list})
 endforeach()
 list(SORT _crit_included)

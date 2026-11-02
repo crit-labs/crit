@@ -624,6 +624,40 @@ class TechniqueTests(unittest.TestCase):
             self.assertTrue(source.closed)
             self.assertEqual(source.pending, {})
 
+    def test_file_expert_host_tier_serves_rereads_and_device_evictions(self):
+        m = load("ssd-expert-materialization")
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "fixture.bin"
+            path.write_bytes(b"aaaabbbbcccc")
+            regions = {k: m.ExpertRegion(4 * i, 4, "packed", hashlib.sha256(v).hexdigest())
+                       for i, (k, v) in enumerate(((1, b"aaaa"), (2, b"bbbb"), (3, b"cccc")))}
+            tier = m.HostExpertTier(8)   # room for two experts
+            source = m.FileExpertSource(path, regions, tier)
+            self.assertEqual(source.read(1), b"aaaa")   # from the file, then held
+            # The device cache evicts expert 3: its device copy is held instead of being reread later.
+            self.assertTrue(source.retain(3, b"cccc"))
+            with self.assertRaises(ValueError):
+                source.retain(2, b"BBBB")   # only the exact encoded expert is held
+            path.write_bytes(b"xxxxxxxxxxxx")   # the file can no longer serve them; the tier still does
+            self.assertEqual((source.read(1), source.read(3)), (b"aaaa", b"cccc"))
+            self.assertEqual((tier.stats["hits"], tier.held), (2, 8))
+            with self.assertRaises(ValueError):
+                source.read(2)
+            self.assertFalse(m.FileExpertSource(path, regions).retain(3, b"cccc"))   # no tier, nothing held
+
+    def test_host_tier_never_evicts_the_current_route_to_make_room(self):
+        m = load("ssd-expert-materialization")
+        tier = m.HostExpertTier(8)
+        self.assertTrue(tier.admit(1, b"aaaa") and tier.admit(2, b"bbbb"))
+        tier.get(1)   # 2 is now the least recently used
+        self.assertTrue(tier.admit(3, b"cccc", protected={2}))   # 1 goes, though 2 is older
+        self.assertEqual(list(tier.entries), [2, 3])
+        self.assertFalse(tier.admit(4, b"dddd", protected={2, 3}))
+        self.assertFalse(tier.admit(5, b"too large"))
+        self.assertEqual((tier.stats["evicted"], tier.stats["refused"], tier.held), (1, 2, 8))
+        with self.assertRaises(ValueError):
+            m.HostExpertTier(0)
+
     def test_checkpoint_empty_payload_exact_bytes_and_longest_prefix(self):
         m = load("checkpoint-storage")
         with tempfile.TemporaryDirectory() as d:

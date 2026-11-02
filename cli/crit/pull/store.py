@@ -9,7 +9,8 @@ A store (default PROJECT/engines) holds one folder per engine and the checkpoint
     <owner>/<name>/card.lock.json    its lock: every checkpoint file and the sealed run's provenance
     <owner>/<name>/package/          the engine's source as built, with manifest.json (its files, launch, capabilities)
     <owner>/<name>/logs/build.log    the build's output
-    models/<org>--<repo>@<revision>/ a checkpoint, shared by the engines that run it
+    models/<org>--<repo>@<revision>/ a checkpoint or a drafter download, shared by the engines that run it
+    .artifacts/<sha256>/             a prebuilt artifact as downloaded, before it was unpacked into a package
 
 No record holds an absolute path: every location is relative to the store, so a store moved to another folder or
 machine still serves.
@@ -57,7 +58,7 @@ class InstallStore:
                              "installs it")
         value = read_json(path)
         keys(value, {"schema_version", "record_kind", "engine", "title", "installed_at", "card", "source", "checkpoint",
-                     "package", "limits", "requirements", "build"}, {"crit_version"})
+                     "package", "limits", "requirements", "build"}, {"crit_version", "downloads"})
         if value["schema_version"] != 1 or value["record_kind"] != "engine_install" or value["engine"] != engine:
             raise ValueError(f"{path} is not {engine}'s install record")
         return value
@@ -102,7 +103,14 @@ class InstallStore:
         limits = install["limits"]
         keys(limits, {"kv_tokens", "vram_headroom_bytes", "ram_headroom_bytes"})
         number(limits["kv_tokens"], "installed context", 2, 1 << 24, integer=True)
+        drafters = []
+        for download in install.get("downloads") or []:
+            drafter = safe_path(self.root, download["folder"])
+            if not drafter.is_dir():
+                raise ValueError(f"{engine}'s drafter {download['repository']} is missing from {self.root / 'models'}; "
+                                 f"crit pull {engine} --force fetches it again")
+            drafters.append(str(drafter))
         return dict(run_id="installed", candidate_id=engine, selector=engine, package_sha256=digest(manifest),
                     package_path=str(package), model_path=str(model), model_manifest=rows, configuration=configuration,
                     launch=manifest["launch"], capabilities=manifest["capabilities"], limits=dict(limits),
-                    label=text(install["title"], "engine title", 400))
+                    drafters=drafters, label=text(install["title"], "engine title", 400))

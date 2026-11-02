@@ -159,6 +159,8 @@ Reference code, not tuned for performance:
 | [toy_model.h](code/toy_model.h), [toy_model.cu](code/toy_model.cu), [toy_example.cpp](code/toy_example.cpp) | Synthetic target (attention over a device KV cache, a gated-delta layer from [recurrent-state-recovery](../recurrent-state-recovery/README.md), output head) and a bigram drafter through a real Core `Engine` |
 | [catch_up.py](code/catch_up.py) | `catch_up_plan` and a `PositionalDrafter` toy for stateful drafters |
 | [round_budget.h](code/round_budget.h), [round_budget.py](code/round_budget.py) | `RoundBudget`: tokens per round, round/step ratio, speedup `tokens_per_round / ratio`, pass/fail at 1.3 |
+| [python_round.py](code/python_round.py) | `SpeculativeRounds`, the round for Python engines over many rows at once with torch ([Python engines](#python-engines)): `start_row`, `release`, `move`, `capture(rows, width, mode)`, `launch`, `read`, `truncate`; `RoundView` for the engine's hooks; `rejection_predictions` and `draw` for sampled rounds |
+| [width_policy.py](code/width_policy.py) | `WidthPolicy`: the draft width per round from each row's per-depth acceptance (decayed) over the measured round cost, for the rows that decode together |
 
 ## What the engine supplies
 
@@ -283,6 +285,50 @@ cmake -S inference -B build/inference-cuda -DCRIT_INFERENCE_CUDA=ON -DCMAKE_BUIL
 cmake --build build/inference-cuda --config Release
 ctest --test-dir build/inference-cuda -C Release -R "crit_device_round|crit_toy_round" --output-on-failure
 ```
+
+## Python engines
+
+A Python engine runs the same round with [python_round.py](code/python_round.py), in torch, for every
+request it decodes at once: a Core step engine's `step()` (`crit_core.native.StepEngine`, where Core
+schedules the requests) or a single request's loop with one row. `SpeculativeRounds(hooks, rows, widest,
+device)` holds each row's pending token, frontier, output allowance, stop ids and the previous round's
+emitted tokens on the device. One round of the first `rows` rows at width K:
+
+1. `hooks.draft(view)`: the drafter catches up on `view.catch_up_tokens` (the previous round's tokens, at
+   the fixed width widest + 1 with junk past `view.catch_up_count`, as [catch_up.py](code/catch_up.py)
+   plans) and writes `view.drafts[:, :K]`.
+2. `hooks.verify(view)`: the target runs `view.columns()` (the pending token, then the drafts) at
+   positions `view.frontier + column` and writes the token each column predicts into
+   `view.predictions[:, :K + 1]`: its argmax for greedy rows, `rejection_predictions` (accept a draft with
+   probability min(1, p/q), else draw from max(p - q, 0); the last column draws from p) for sampled rows,
+   and `view.logprobs` when the driver keeps them.
+3. Acceptance for every row on the device: the drafts that match, then the correction or bonus token,
+   bounded by the row's allowance and ending after a stop token; frontier, allowance and pending token
+   advance by the count.
+4. `hooks.commit(view)`: the engine keeps each row's state after column `view.n_emitted - 1`, from the
+   round's start (so it holds after a truncation too).
+5. One block (count, matched drafts, frontier, tokens) is copied to pinned host memory; `read()` waits on
+   one event and returns each row's tokens.
+
+Every buffer is allocated once, so `capture(rows, width, mode)` records a round as one CUDA graph at load,
+per width, row count and mode, and `launch` replays it; a round without a graph runs eagerly (and on the
+CPU for host tests). Modes: `greedy`, `sampled`, `replay` (a fixed continuation is the prediction, crit
+Eval's replay) and `forced` (the continuation is the draft too: scoring K + 1 positions of a fixed text per
+pass). `start_row` seeds a row after its prefill (the drafter's first catch-up ingests the prefill's
+token); `release` and `move` let rows join and leave between rounds while the decoding rows stay at the
+front; `truncate(keep)` applies a smaller count Core kept (a stop it knew, its output limit) and calls
+`commit` again. The hooks must be capture-safe: fixed shapes per (rows, width), no host synchronization.
+The readback is a copy to pinned memory, not mapped zero-copy, which torch does not allocate.
+
+[width_policy.py](code/width_policy.py) chooses the width per round: each row's per-depth acceptance
+a_d with decay, E(K) = 1 + a_1 + a_1 a_2 + ..., over the round's cost base + K x step fitted from measured
+rounds per row count, maximizing the rows' tokens per millisecond together among the captured widths.
+
+The hook boundary (draft, verify, commit) is checked with two different drafters over one toy target: a
+stateful one that catches up from the previous round's column features, as an MTP head from the target's
+hidden states, and a stateless one that proposes from the pending token, as n-gram lookup does. No engine
+has run it on a real model yet; an MTP and an EAGLE-3 engine would show whether real drafters need more
+than these three hooks.
 
 ## Adapting it
 

@@ -414,6 +414,52 @@ class UndeclaredThinkingTests(ThinkingFixture, unittest.TestCase):
         response, data = self.call("POST", "/api/show", {"model": "default"})
         self.assertNotIn("thinking", json.loads(data)["capabilities"])
 
+    def test_a_thinking_budget_needs_the_capability(self):
+        response, value = self.sent("/v1/chat/completions", thinking_budget_tokens=64)
+        self.assertEqual((response.status, value["error"]["param"], value["error"]["code"]),
+                         (400, "thinking_budget_tokens", "unsupported_parameter"))
+        self.assertIn("chat-thinking-budget-v1", value["error"]["message"])
+
+
+class ThinkingBudgetTests(ThinkingFixture, unittest.TestCase):
+    """A package that ends reasoning at a budget (chat-thinking-budget-v1) and reads enable_thinking."""
+    extra_capabilities = ("chat-template-kwargs-v1", "chat-template-enable-thinking-v1", "chat-thinking-budget-v1")
+
+    def budget(self, path, **options):
+        """(response, the thinking_tokens the engine's limits held) for an echo request."""
+        turn = [{"role": "user", "content": "echo-request"}]
+        body = {"model": "default", "stream": False, "messages": turn,
+                **({"max_tokens": 4096} if path == "/v1/messages" else {}), **options}
+        response, data = self.call("POST", path, body)
+        value = json.loads(data)
+        if response.status != 200:
+            return response, value
+        text = value["choices"][0]["message"]["content"] if path == "/v1/chat/completions" else value["content"][0]["text"]
+        return response, json.loads(text)["limits"].get("thinking_tokens")
+
+    def test_openai_and_anthropic_budgets_reach_the_engine(self):
+        for path, options, expected, listed in (
+                ("/v1/chat/completions", {}, None, None),
+                ("/v1/chat/completions", {"thinking_budget_tokens": 64}, 64, None),
+                ("/v1/messages", {"thinking": {"type": "enabled", "budget_tokens": 2048}}, 2048, None),
+                ("/v1/messages", {"thinking": {"type": "adaptive", "budget_tokens": 1024}}, 1024, None),
+                # Thinking off: the budget has nothing to end, so it stays ignored and listed.
+                ("/v1/messages", {"thinking": {"type": "disabled", "budget_tokens": 2048}}, None,
+                 "thinking.budget_tokens")):
+            with self.subTest(path=path, options=options):
+                response, sent = self.budget(path, **options)
+                self.assertEqual((response.status, sent, response.getheader("X-Crit-Ignored-Parameters")),
+                                 (200, expected, listed))
+        for path, options, param in (("/v1/chat/completions", {"thinking_budget_tokens": 0}, "thinking_budget_tokens"),
+                                     ("/v1/chat/completions", {"thinking_budget_tokens": True}, "thinking_budget_tokens"),
+                                     ("/v1/messages", {"thinking": {"type": "enabled", "budget_tokens": "lots"}},
+                                      "thinking.budget_tokens")):
+            with self.subTest(path=path, options=options):
+                response, value = self.budget(path, **options)
+                self.assertEqual(response.status, 400)
+                # Anthropic's errors carry no param: its message names it.
+                self.assertIn(param, value["error"].get("param") or value["error"]["message"])
+
 
 class ThinkingSwitchTests(ThinkingFixture, unittest.TestCase):
     """A package whose chat template reads enable_thinking, as Qwen3's does."""

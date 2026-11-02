@@ -10,6 +10,17 @@ live outside the core. The backend is opt-in through `CRIT_CORE_CUDA` and
 requires CUDA Toolkit 13.1. See the [Core build guide](../../../README.md) and
 [ownership contracts](../../../contracts/README.md).
 
+## HIP
+
+`CRIT_CORE_HIP=ON` (instead of `CRIT_CORE_CUDA`) builds these sources on ROCm's HIP runtime as `crit::hip`, found
+through `find_package(hip)`. [gpu_runtime.h](../../../include/crit/gpu_runtime.h) maps every CUDA runtime name the
+backend uses to its HIP equivalent under `CRIT_CORE_HIP`, which `crit::hip` defines for its consumers, so the
+classes keep their names (`CudaBackend`, `cudaStream_t`) and an engine's hipified kernels run on its streams. On
+HIP, `launch()` is always an ordinary launch (`programmatic_launch_supported` is false) and the device functions of
+[cuda_launch.h](../../../include/crit/cuda_launch.h) are no-ops. The backend, timer and memory fixtures build
+against `crit::hip` too; the graph fixtures (cuBLAS) and the linker-injected failures do not. Written against ROCm
+6.4 and not yet built on an AMD toolchain.
+
 Rules that apply everywhere:
 
 - `CudaEvent::order` needs a recording that belongs to the current operation; a
@@ -157,3 +168,21 @@ retains it, `quarantined_cuda_mappings()`); `cuda_pin_host_block(backend, block,
 touches its pages. Fixtures:
 [device_memory_tests.cpp](../../../../tests/core/device_memory_tests.cpp) (host) and
 [cuda_memory_tests.cpp](../../../../tests/core/cuda_memory_tests.cpp) (device).
+
+## Device sets
+
+[cuda_devices.h](../../../include/crit/cuda_devices.h) `CudaDeviceSet(devices)` gives one engine several GPUs: one
+`CudaBackend` per member with its own two streams, allocations and resource ledger (`member(i).initialize(...)` with
+that device's budget), peer access enabled between every pair of distinct devices that supports it (`peer(reader,
+owner)` says whether a member's kernels can read another's memory in place), and stream work between members with no
+host fence: `copy_async` copies a device buffer of one member into another's (`cudaMemcpyPeerAsync`) after the source
+member's compute work and keeps the source buffer alive until the copy is done; `order(waiter, queue, source, queue)`
+makes one member's stream wait for another's work so far; `barrier(queue)` makes every member's stream wait for every
+other's (the step between an all-reduce's halves or a pipeline's stages); `category_timer(i, capacity)` times
+categories on member i's device. `CudaBackend::owns(buffer)` says which member a buffer belongs to. Every call
+binds the devices it acts on only while it runs and leaves the calling thread's current device as it found it (so do
+the backend's own calls), since a kernel launch needs its stream's device current: bind a member
+(`member(i).bind_thread()`) before launching into its streams. A device listed twice is two members on one device. Partitioning the model, collectives and the schedule stay the engine's.
+[cuda_device_set_tests.cpp](../../../../tests/core/cuda_device_set_tests.cpp) checks members, copies, ordering, the
+barrier and rejections on a set of the first device twice and, on a machine with two GPUs, of devices 0 and 1; only the
+first runs on a one-GPU machine.

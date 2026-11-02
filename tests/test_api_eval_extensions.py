@@ -17,7 +17,7 @@ from crit_core.serving import ResidentChat, capabilities, engine_facts
 # decode mode with a reply of seven tokens in two rounds and their draft telemetry.
 EVAL_ADAPTER = SCORE_ADAPTER + r'''
 Engine.facts = {'speculative': True, 'plain': True, 'draft_width': 3, 'bytes_per_pass': 1000,
-                'kv_bytes_per_token': 64, 'implementation': 'fixture', 'draft_ms': float('nan')}
+                'kv_bytes_per_token': 64, 'implementation': 'fixture', 'draft_ms': float('nan'), 'prompt_cache': False}
 Engine.plain = True
 _generate = Engine.generate
 
@@ -25,7 +25,8 @@ def _eval_generate(self, request, cancellation):
     if request['messages'][-1]['content'] != 'decode':
         return _generate(self, request, cancellation)
     response = self.response(request, json.dumps({'decode': request.get('decode')}), output_tokens=7, rounds=2)
-    response['telemetry'].update(accepted=[3, 2], drafted=[4, 2], verify_ms=4.0, draft_ms=1.5)
+    response['telemetry'].update(accepted=[3, 2], drafted=[4, 2], verify_ms=4.0, draft_ms=1.5, expert_reads=48,
+                                 expert_hits=36)
     return response
 
 Engine.generate = _eval_generate
@@ -63,7 +64,8 @@ class EvalExtensionTests(Served, unittest.TestCase):
         loaded = next(card for card in value["data"] if card["default"])
         # Numbers and booleans of the known facts only: the implementation name and a NaN draft time stay out.
         self.assertEqual(loaded["engine_facts"], {"speculative": True, "plain": True, "draft_width": 3,
-                                                  "bytes_per_pass": 1000, "kv_bytes_per_token": 64})
+                                                  "bytes_per_pass": 1000, "kv_bytes_per_token": 64,
+                                                  "prompt_cache": False})
         self.assertIsNone(cards[self.b]["engine_facts"])   # not loaded
 
     def test_plain_decoding_reaches_the_adapter_only_when_asked(self):
@@ -86,6 +88,7 @@ class EvalExtensionTests(Served, unittest.TestCase):
         found = value["crit_telemetry"]
         self.assertEqual((found["accepted"], found["verify_ms"], found["draft_ms"]), ([3, 2], 4.0, 1.5))
         self.assertEqual((found["drafted"], found["tokens_per_round"]), ([4, 2], 3.5))
+        self.assertEqual((found["expert_reads"], found["expert_hits"]), (48, 36))   # Eval's memory tiers price them
 
     def test_packed_scores_hold_the_json_rows(self):
         body = {"prompt_ids": [5, 6, 7], "continuation_ids": [8, 9], "top_logprobs": 2}
@@ -126,6 +129,17 @@ class TelemetryTests(unittest.TestCase):
         for bad in ({"accepted": [3]}, {"accepted": [3, -1]}, {"accepted": [3, 2.0]}, {"verify_ms": -1},
                     {"accepted": [1, 1], "decode_rounds": None}, {"drafted": [4, 2]},
                     {"accepted": [3, 2], "drafted": [4]}, {"accepted": [3, 2], "drafted": [2, 2]}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                telemetry({**base, **bad}, request)
+
+    def test_expert_cache_hits_go_with_their_reads_and_never_exceed_them(self):
+        request = {"limits": {"kv_tokens": 100, "max_output_tokens": 10, "timeout_seconds": 60}}
+        base = {"prompt_tokens": 5, "output_tokens": 7, "prefill_tokens": 5, "prefill_ms": 1.0, "decode_tokens": 6,
+                "decode_ms": 2.0, "ttft_ms": 1.0, "missing": {}}
+        found = telemetry({**base, "expert_reads": 48, "expert_hits": 36}, request)
+        self.assertEqual((found["expert_reads"], found["expert_hits"]), (48, 36))
+        for bad in ({"expert_reads": 48}, {"expert_hits": 1}, {"expert_reads": 4, "expert_hits": 5},
+                    {"expert_reads": 4.0, "expert_hits": 1}, {"expert_reads": -1, "expert_hits": 0}):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 telemetry({**base, **bad}, request)
 

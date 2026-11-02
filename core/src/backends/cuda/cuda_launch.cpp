@@ -4,12 +4,19 @@
 #include <atomic>
 
 namespace crit::core {
+#if !defined(CRIT_CORE_HIP)
 namespace {
 // Per device: 0 unknown, 1 unsupported, 2 supported. Devices past the table are queried every time.
 std::array<std::atomic<int>, 64> known{};
 }
+#endif
 
 bool programmatic_launch_supported(int device) noexcept {
+#if defined(CRIT_CORE_HIP)
+    // HIP has no programmatic dependent launch, and its compute capability is the GCN version (9 on gfx9xx).
+    static_cast<void>(device);
+    return false;
+#else
     if(device >= 0 && device < int(known.size())) {
         const int cached = known[std::size_t(device)].load(std::memory_order_relaxed);
         if(cached) return cached == 2;
@@ -23,6 +30,7 @@ bool programmatic_launch_supported(int device) noexcept {
     const bool supported = major >= 9;
     if(device >= 0 && device < int(known.size())) known[std::size_t(device)].store(supported ? 2 : 1, std::memory_order_relaxed);
     return supported;
+#endif
 }
 
 bool programmatic_launch_supported(cudaStream_t stream) noexcept {

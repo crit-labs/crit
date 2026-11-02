@@ -238,6 +238,55 @@ class ConcurrentTests(ShutdownFixture, unittest.TestCase):
             self.ask(other, "badfactory")
         self.assertIsNone(other.runtime.tree)
 
+    def serve(self, engine):
+        server = Server(("127.0.0.1", 0), Api(engine))
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.shutdown)
+        return server
+
+    def get(self, server, path):
+        client = http.client.HTTPConnection(*server.server_address, timeout=20)
+        try:
+            client.request("GET", path)
+            response = client.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            client.close()
+
+    def test_health_and_models_report_the_loaded_engines_capacity(self):
+        engine = self.engine(open=False)
+        self.assertIsNone(engine.capacity(), "a concurrent engine declares its capacity when it loads")
+        engine.open()
+        server = self.serve(engine)
+        status, health = self.get(server, "/health")
+        self.assertEqual((status, health["max_concurrent_requests"]), (200, 2))
+        _, models = self.get(server, "/v1/models")
+        cards = {card["id"]: card for card in models["data"]}
+        default = next(card for card in cards.values() if card["default"])
+        self.assertEqual(default["max_concurrent_requests"], 2)
+        # A candidate whose engine is not the loaded one has not declared its capacity yet.
+        self.assertTrue(all(card["max_concurrent_requests"] is None for card in cards.values() if not card["loaded"]))
+
+    def test_max_concurrency_caps_admission_below_the_declared_capacity(self):
+        engine = self.engine(max_concurrency=1)
+        self.assertEqual(engine.capacity(), 1)
+        server = self.serve(engine)
+        self.assertEqual(self.get(server, "/health")[1]["max_concurrent_requests"], 1)
+        first, second = self.turn(engine, "first"), self.turn(engine, "second")
+        self.started(first)
+        self.assertFalse(second[2][1].wait(.15))
+        self.assertFalse(second[0].with_suffix(".started").exists(), "the cap holds the second request back")
+        self.assertEqual(engine.status()["active_requests"], 1)
+        self.assertEqual(engine.status()["max_concurrent_requests"], 2, "the engine still declares its own capacity")
+        self.release(first)
+        self.started(second)
+        self.release(second)
+        with self.assertRaises(ValueError):
+            self.engine(open=False, max_concurrency=0)
+
     def test_http_clients_overlap_with_independent_streaming_and_json_responses(self):
         engine = self.engine()
         server = Server(("127.0.0.1", 0), Api(engine))
@@ -293,3 +342,11 @@ class ConcurrentTests(ShutdownFixture, unittest.TestCase):
         self.assertIsNone(process_identity(pid))
         self.assertFalse(turn[0].with_suffix(".closed").exists())
         self.assertNotEqual(self.ask(engine)["pid"], pid)
+
+
+class SerialCapacityTests(ShutdownFixture, unittest.TestCase):
+    def test_a_package_without_chat_concurrent_v1_reports_one_request_at_once(self):
+        engine = self.engine()
+        api = Api(engine)
+        self.assertEqual(engine.capacity(), 1)
+        self.assertEqual({card["max_concurrent_requests"] for card in api.models()}, {1})

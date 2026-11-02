@@ -1,11 +1,29 @@
 # Request runtime
 
-[runtime.cpp](runtime.cpp) implements the Engine/Session lifecycle: serial and
-opt-in bounded concurrent requests, rotating chunked prefill, grouped
-commit/publication, readiness, cancellation and independent retirement polling.
-The public interface is [core.h](../../include/crit/core.h); model computation
-comes through the public Model/Session interfaces. See
+The runtime implements the Engine/Session lifecycle: serial and opt-in bounded
+concurrent requests, rotating chunked prefill, grouped commit/publication,
+readiness, cancellation and independent retirement polling. The public
+interface is [core.h](../../include/crit/core.h), which includes its parts by
+concern from [crit/core/](../../include/crit/core); model computation comes
+through the public Model/Session interfaces. See
 [current contracts](../../contracts/README.md).
+
+| File | Part of the runtime |
+| --- | --- |
+| [engine.cpp](engine.cpp) | Construction and model declaration checks, shutdown and quarantine, request completion |
+| [submit.cpp](submit.cpp) | Request option checks, storage accounting, `Engine::submit` and `submit_score` |
+| [serial.cpp](serial.cpp) | The serial worker: one request at a time through `Model`/`Session` |
+| [admission.cpp](admission.cpp) | Concurrent admission: FIFO with lookahead, or reuse-aware selection |
+| [batches.cpp](batches.cpp) | Concurrent step groups (decode, prefill, mixed token work), the asynchronous pipeline, group publication |
+| [concurrent.cpp](concurrent.cpp) | The concurrent worker loop, retirement, memory-pressure suspension and recovery, engine failure |
+| [scoring.cpp](scoring.cpp) | Scoring, query scoring and the concurrent scoring barrier |
+| [progress.cpp](progress.cpp) | Progress and log-probability checks, the trim rule and output staging, shared by both paths |
+| [frontend.cpp](frontend.cpp) | Text frontend access, decoders that own their frontend, request text streams |
+| [handle.cpp](handle.cpp) | Request handles: waiting, streaming sinks, release of a consumed request |
+| [interfaces.cpp](interfaces.cpp) | Defaults of the `Model`, `Session` and `ConcurrentModel` interfaces |
+
+[engine.h](engine.h) declares the engine's private state (`Engine::Impl`) and
+[request.h](request.h) its request record and the request rules these files share.
 
 `Profile.max_concurrency` and `ModelInfo.max_concurrency` admit up to
 `max_request_concurrency` (4096) active generation lanes. This bounds scheduler
@@ -381,7 +399,9 @@ readiness before notifying and join notifications in `quiesce`/destruction.
 
 While operations run, Core admits requests and submits other eligible lanes up to
 the bound, by default at most one operation per lane; shared model inspection must be safe
-alongside execution. `batch_timeout_ms` (default 30000) bounds a pending
+alongside execution. Core calls `admission`, `scheduling_hint` and `open` without its
+scheduler lock, so a notification may come from the engine's own device queue (a host
+function) while `open` waits for that queue. `batch_timeout_ms` (default 30000) bounds a pending
 operation: expiry fails the engine. Failure or shutdown calls every operation's
 idempotent `quiesce`, then model quiescence and backend drain. Commit must hand
 newly launched state work to the sessions before the operation is destroyed. The
@@ -438,9 +458,10 @@ fail the engine. Pressure describes actual pools, not interchangeable byte total
 including shared pages and copy-on-write, all recurrent/draft state and scratch.
 
 Core favors the oldest resident request and considers younger settled victims.
-It holds new admissions during pressure, retries blocked rows after capacity or
-work changes, and restores suspended requests oldest first with no other resident
-requests. This conservative recovery policy reserves a solo route through replay
+It holds new admissions while pressure lasts, until the blocked request gets a step
+prepared (a restored request, its first new step) or retires, retries blocked rows
+after capacity or work changes, and restores suspended requests oldest first with
+no other resident requests; admissions also wait while any request is suspended. This conservative recovery policy reserves a solo route through replay
 and useful new work; it does not optimize the cost of preemption. A request that
 cannot progress alone fails individually. If all residents are blocked with no
 reclaimable victim or pending work, one blocked request fails to release capacity
@@ -536,7 +557,8 @@ path. `crit_core.native` refuses a library of another ABI version: rebuild it ag
 this crit's headers. Each
 generation's result carries Core's [request timing](#request-timing) in
 milliseconds, merged with `NativeEngine::request` (per-request facts such as
-`accepted`, `verify_ms` and `draft_ms`). Eval counts one round per `accepted`
+`accepted`, `verify_ms` and `draft_ms`, and `expert_reads` and `expert_hits` from an engine with a device expert
+cache). Eval counts one round per `accepted`
 entry; report `rounds` when target passes differ from that, because Core's
 `decode_steps` also counts steps without a target pass (seeding a drafter, for
 example). Errors return -1 with the message from
@@ -581,3 +603,45 @@ returning `Scores`, and `close()`, with the arguments and results `NativeEngine`
 cancelled never reaches the engine, generations and scores run one at a time unless the info
 declares `max_concurrent_requests` above 1, and `close()` waits for those in flight. Eval and crit
 serve then see a Python engine exactly as they see a library, through one code path.
+
+A Python engine that serves concurrent requests should not merge concurrent `generate()` threads
+itself: it implements a [step](#step-engines) instead, and the same `open_engine` serves it.
+
+### Step engines
+
+[crit/step_engine.h](../../include/crit/step_engine.h) makes a `ConcurrentModel` out of C
+callbacks, for engines whose model code is in another language. Core keeps the scheduler with
+[mixed batches](#mixed-token-work-batches), admission, request options, stop tokens, output
+limits, cancellation, retirement and the [scoring](#scoring) barrier; the engine implements a step
+over one row per scheduled request ([step_engine.cpp](step_engine.cpp)). The `crit_core_steps`
+shared library exports the [engine ABI](#engine-libraries) plus `crit_engine_open_steps(configuration,
+callbacks)`; [step_library.cpp](step_library.cpp) builds it.
+
+`crit_core.native.StepEngine(model)` loads it (the model's `step_library` fact, else
+`CRIT_CORE_STEP_LIBRARY`) and serves a Python step model, and `open_engine` picks it whenever the
+opened engine has `step()`, so `eval_engine` and `resident_engine` serve it with
+`max_concurrent_requests` (`max_concurrency + max_pending`) requests at once:
+
+| Model method | Called with | Returns |
+| --- | --- | --- |
+| `info()` | | Python-engine facts plus Core's settings: `vocabulary` and `context` (required), `max_concurrency` (8), `max_pending`, `max_batch_tokens` (mixed batches; 0 separates prefill and decode steps), `prefill_chunk`, `batch_policy`, `max_row_tokens` (most tokens a row reports), `sampling`, `token_logprobs`, `max_top_logprobs`, `scoring`, `score_paths` |
+| `open(request)` | `StepRequest`: key, prompt, output limit, set sampling fields, effective stop tokens, `logprobs`, `replay`, `plain` | A session object |
+| `step(rows)` | One `StepRow` per scheduled request: session, prefill grant, output allowance, token work, prefill complete | One `StepResult` per row: prompt tokens consumed, tokens produced, prefill complete, reused prefix, token work, log-probability rows |
+| `commit(decisions)` | Optional: Core's `StepDecision` per row of the last step (tokens kept, terminal, cancelled, discard) | |
+| `retire(session, finish)` | Optional: `length`, `stop`, `cancelled` or `failed` | |
+| `admission(request)` | Optional | `ready`, `deferred` or `infeasible` |
+| `score(ids, first_target, path, queries, top_k)` | With `scoring`: a fixed-text score, as an exclusive barrier | `Scores` |
+
+Every method runs on Core's one engine worker, never two at once, so a model needs no locks of its
+own. Core trims stop tokens and the output limit and publishes only what it kept; the model keeps
+its state in step with `commit`. [crit_core.batch](../../python/crit_core/batch.py) lays a step's
+rows out as [batched steps](../batch/README.md) do, so a Python engine whose arithmetic is row local
+decodes the same tokens batched as alone. A failing callback fails the engine, with the Python
+exception in every request's error. The [step engine check](../../../tests/core/step_engine_check.py)
+drives a toy step model: batched and serial runs equal, mixed steps, cancellation and retirement,
+page-reserving admission, log-probabilities, replay, stops, scoring, a failing step, and the stock
+adapters. The [concurrency end-to-end check](../../../tests/core/concurrency_end_to_end_check.py)
+packages one with `chat-concurrent-v1`, serves it through `crit serve` four requests at once and
+measures it with `crit run measure` at concurrency 4 and with crit Eval's concurrency part: the
+aggregate grows with the requests in flight, the peak equals the clients and batched replies equal
+serial ones.

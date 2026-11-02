@@ -3,6 +3,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
+#include <deque>
 #include <functional>
 #include <future>
 #include <iostream>
@@ -1319,6 +1321,173 @@ void queued_release_on_failure() {
     require(settled(*e),"failed requests kept their charges after their waits");
     rejects([&]{e->submit({20},1);},"unavailable");
 }
+namespace {
+// Rows of a toy async step: a prompt chunk that ends the prompt emits token 1, a decode row token 2.
+struct StepSession final:ConcurrentSession { std::uint32_t prompt=0, frontier=0; void close(Finish) noexcept override {} };
+struct StepRows {
+    std::vector<WorkItem> items;
+    std::vector<RowProgress> rows;
+    std::vector<std::vector<Token>> tokens;
+    explicit StepRows(std::span<const WorkItem> work):items(work.begin(),work.end()) {}
+    void compute() {
+        rows.clear(); tokens.assign(items.size(),{});
+        for(std::size_t i=0;i<items.size();++i) {
+            const auto& s=*static_cast<StepSession*>(items[i].session);
+            Progress p;
+            if(!items[i].budget.prefill_complete) {
+                p.prompt_tokens=std::min(items[i].budget.prefill_tokens,s.prompt-s.frontier);
+                p.prefill_complete=s.frontier+p.prompt_tokens==s.prompt; p.token_work=p.prompt_tokens;
+                if(p.prefill_complete) tokens[i]={1};
+            } else { p.prefill_complete=true; p.token_work=1; tokens[i]={2}; }
+            rows.push_back({items[i].key,p,items[i].step});
+        }
+        for(std::size_t i=0;i<rows.size();++i) rows[i].progress.tokens=tokens[i];
+    }
+    void commit(std::span<const CommitDecision> decisions) {
+        for(std::size_t i=0;i<decisions.size();++i)
+            if(!decisions[i].discard) static_cast<StepSession*>(items[i].session)->frontier+=rows[i].progress.prompt_tokens;
+    }
+};
+// A device-like queue: tasks run in order on one thread, as on a CUDA stream whose host function notifies Core.
+struct DeviceQueue {
+    std::mutex mutex; std::condition_variable changed;
+    std::deque<std::function<void()>> tasks; bool running=false, stop=false;
+    std::thread thread{[this]{
+        std::unique_lock lock(mutex);
+        for(;;) {
+            changed.wait(lock,[&]{return stop || !tasks.empty();});
+            if(tasks.empty()) return;
+            auto task=std::move(tasks.front()); tasks.pop_front(); running=true;
+            lock.unlock(); task(); lock.lock();
+            running=false; changed.notify_all();
+        }
+    }};
+    void push(std::function<void()> task) { { std::lock_guard lock(mutex); tasks.push_back(std::move(task)); } changed.notify_all(); }
+    void synchronize() { std::unique_lock lock(mutex); changed.wait(lock,[&]{return tasks.empty() && !running;}); }
+    ~DeviceQueue() { { std::lock_guard lock(mutex); stop=true; } changed.notify_all(); thread.join(); }
+};
+// Batches notify from the queue once they settled; open() synchronizes the queue, as cudaFree or a synchronous copy
+// waits for the device.
+struct QueueModel final:ConcurrentModel {
+    DeviceQueue queue;
+    std::atomic<int> batches{0};
+    struct Batch final:BatchExecution {
+        DeviceQueue& queue; StepRows rows; std::atomic<bool> done{false};
+        Batch(DeviceQueue& q,std::span<const WorkItem> items):queue(q),rows(items) {}
+        void submit(Notify notify) override {
+            queue.push([this,notify]{
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                rows.compute(); done=true;   // Core may retire the operation from here on
+                notify();
+            });
+        }
+        bool ready() override { return done; }
+        std::vector<RowProgress> progress() override { return rows.rows; }
+        void commit(std::span<const CommitDecision> decisions) override { rows.commit(decisions); }
+        void quiesce() override { queue.synchronize(); }
+    };
+    ModelInfo info() const override {
+        ModelInfo i; i.implementation="queue"; i.vocabulary=8; i.context=64; i.prefill_chunk=64; i.max_concurrency=4;
+        i.mixed_batches=true; i.async_batches=true; return i;
+    }
+    std::unique_ptr<ConcurrentSession> open(const RequestView& view) override {
+        auto session=std::make_unique<StepSession>(); session->prompt=std::uint32_t(view.prompt.size());
+        queue.push([]{}); queue.synchronize();
+        return session;
+    }
+    RowProgress prefill(const WorkItem&) override { throw std::logic_error("mixed only"); }
+    std::vector<RowProgress> decode(std::span<const WorkItem>) override { throw std::logic_error("mixed only"); }
+    std::unique_ptr<BatchExecution> prepare_batch(std::span<const WorkItem> items) override { ++batches; return std::make_unique<Batch>(queue,items); }
+    void commit(std::span<const CommitDecision>) override {}
+    std::unique_ptr<Retirement> retire(RequestKey,ConcurrentSession&,Finish) override { return std::make_unique<Settled>(); }
+    void quiesce() override { queue.synchronize(); }
+};
+// Admission calls the model without the scheduler lock: a request opened while a batch is in flight waits for the
+// queue, whose batch notification takes that lock, and both finish (with the lock held around open(), they hung).
+void admission_unlocked() {
+    Profile profile{64,64,64u<<20,1u<<20,2,2}; profile.max_batch_tokens=64; profile.max_inflight_batches=1;
+    QueueModel* model=nullptr;
+    Engine e(profile,std::make_shared<OutputHost>(),[&](const Profile&,Services) {
+        auto made=std::make_unique<QueueModel>(); model=made.get(); return made;
+    });
+    auto first=e.submit({1,2,3,4},3);
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(3);
+    while(model->batches.load()<1) {
+        require(std::chrono::steady_clock::now()<deadline,"the first batch was never prepared");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(30)); // the queue is inside the first batch now
+    auto second=e.submit({1,2,3},2);
+    auto waited=std::async(std::launch::async,[&]{return second.wait();});
+    if(waited.wait_for(std::chrono::seconds(10))!=std::future_status::ready) {
+        std::cerr<<"admission_unlocked: open() waiting for the queue deadlocked with the batch notification\n";
+        std::_Exit(1); // a deadlocked engine cannot be torn down
+    }
+    require(waited.get().tokens==std::vector<Token>({1,2}) && first.wait().tokens==std::vector<Token>({1,2,2}),"outputs");
+}
+// One request's step finds its pool full once; the next attempt fits. Admissions resume once it is prepared, not
+// when the oldest request (which runs much longer) retires.
+struct Pressure final:MemoryPressure {};
+struct PressureModel final:ConcurrentModel {
+    std::atomic<bool> pressured{false};
+    bool armed=true;
+    std::atomic<int> oldest_steps{0}, steps_when_later_opened{-1};
+    struct Batch final:BatchExecution {
+        PressureModel& model; StepRows rows; bool done=false;
+        Batch(PressureModel& m,std::span<const WorkItem> items):model(m),rows(items) {}
+        void submit(Notify notify) override {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            rows.compute(); done=true;
+            for(const auto& item:rows.items) if(item.key.request==1) ++model.oldest_steps;
+            notify();
+        }
+        bool ready() override { return done; }
+        std::vector<RowProgress> progress() override { return rows.rows; }
+        void commit(std::span<const CommitDecision> decisions) override { rows.commit(decisions); }
+        void quiesce() override {}
+    };
+    ModelInfo info() const override {
+        ModelInfo i; i.implementation="pressure"; i.vocabulary=8; i.context=128; i.prefill_chunk=64; i.max_concurrency=3;
+        i.mixed_batches=true; i.async_batches=true; i.memory_preemption=true; return i;
+    }
+    std::unique_ptr<ConcurrentSession> open(const RequestView& view) override {
+        if(view.key.request==3) steps_when_later_opened=oldest_steps.load();
+        auto session=std::make_unique<StepSession>(); session->prompt=std::uint32_t(view.prompt.size()); return session;
+    }
+    RowProgress prefill(const WorkItem&) override { throw std::logic_error("mixed only"); }
+    std::vector<RowProgress> decode(std::span<const WorkItem>) override { throw std::logic_error("mixed only"); }
+    BatchPreparation prepare_incremental(std::span<const WorkItem> items) override {
+        if(armed) for(const auto& item:items) if(item.key.request==2) {
+            armed=false; pressured=true;
+            return {Admission::deferred,{},item.key,std::make_shared<Pressure>()};
+        }
+        return {Admission::ready,std::make_unique<Batch>(*this,items),{},{}};
+    }
+    bool reclaimable(const MemoryPressure&,const ContinuationView&,const ConcurrentSession&) override { return false; }
+    void commit(std::span<const CommitDecision>) override {}
+    std::unique_ptr<Retirement> retire(RequestKey,ConcurrentSession&,Finish) override { return std::make_unique<Settled>(); }
+    void quiesce() override {}
+};
+void pressure_reopens_admission() {
+    Profile profile{128,64,64u<<20,1u<<20,3,3}; profile.max_batch_tokens=64; profile.max_inflight_batches=1;
+    profile.memory_preemption=true;
+    PressureModel* model=nullptr;
+    Engine e(profile,std::make_shared<OutputHost>(),[&](const Profile&,Services) {
+        auto made=std::make_unique<PressureModel>(); model=made.get(); return made;
+    });
+    auto oldest=e.submit({1,2,3,4},60);
+    auto blocked=e.submit({1,2,3,4},2);
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(3);
+    while(!model->pressured) {
+        require(std::chrono::steady_clock::now()<deadline,"the pressure never came");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    auto later=e.submit({1,2},2);
+    require(blocked.wait().tokens.size()==2 && later.wait().tokens.size()==2 && oldest.wait().tokens.size()==60,"outputs");
+    require(model->steps_when_later_opened>=0 && model->steps_when_later_opened<30,
+            "a request sent after the pressure waited for the oldest request to finish");
+}
+}
 int main(int argc,char** argv) {
     try {
         const std::string only=argc>1 ? argv[1] : "";
@@ -1351,7 +1520,8 @@ int main(int argc,char** argv) {
             {"drain_quarantine",[]{retirement_timeout(false,true);}},{"tracing",concurrent_tracing},
             {"logprobs",concurrent_logprobs},{"logprob_faults",concurrent_logprob_faults},{"text",concurrent_text},
             {"wait_output",concurrent_wait_output},{"release_race",concurrent_release_race},
-            {"queued_release_on_failure",queued_release_on_failure}};
+            {"queued_release_on_failure",queued_release_on_failure},
+            {"admission_unlocked",admission_unlocked},{"pressure_reopens_admission",pressure_reopens_admission}};
         bool found=false;
         for(const auto& [name,run]:tests) if(only.empty() || only==name) {
             run(); found=true; std::cout<<"crit concurrent contract passed: "<<name<<std::endl;

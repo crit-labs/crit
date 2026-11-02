@@ -2,9 +2,10 @@
 
 A complete batched serving engine for a synthetic decoder-only transformer, showing
 how the pieces fit: a Core `ConcurrentModel` with mixed batches runs the decode rows
-and prompt chunks of many requests as one step, every projection reads its weights
+and prompt chunks of many requests as one step (laid out by Core's
+[batched steps](../../core/src/batch/README.md)), every projection reads its weights
 once for all of the step's rows, KV lives in Core's StateCache pages with prefix
-reuse, attention runs on the engine's own paged attention kernels (`code/paged_attention.cu`),
+reuse, attention runs on the engine's own [paged attention](#paged-attention) kernels (`code/paged_attention.cu`),
 and the engine is exported through the native engine ABI with `concurrent_requests`,
 so `crit serve` serves it to concurrent clients (`chat-concurrent-v1`). A request's
 output is bit for bit the same whether it runs alone or batched.
@@ -12,8 +13,8 @@ output is bit for bit the same whether it runs alone or batched.
 ## When to use it
 
 As the skeleton of a real engine that serves several requests at once: replace the
-synthetic weights and layer with the model's, keep the step layout, the batch
-invariance rules, the page ownership and the admission. Also as a fixture for
+synthetic weights and layer with the model's, keep Core's step layout, the batch
+invariance rules, the page ownership and Core's page-reserving admission. Also as a fixture for
 measuring a scheduler, attention kernels or serving changes under concurrency
 without a checkpoint. Not a model: its weights are seeded random values, and its
 kernels are plain baselines (one tensor-core GEMM, no graphs, no fused epilogues).
@@ -26,13 +27,14 @@ grouped-query attention, an FP32 residual stream and BF16 projections. Weights a
 uniform with variance 1 / fan-in from `(seed, tensor, index)`, so every device builds
 the same model.
 
-**One step.** Core hands `execute` the step's work items. Decode items stage one row
-each (the request's last token), prompt items stage their granted chunk; all rows are
-concatenated (decode rows first) and each projection is one GEMM over all of them, so
-a step's weight bytes are read once however many requests it holds. Each row's key
+**One step.** Core hands `execute` the step's work items and Core's `StepLayout`
+places them (`step_item`): decode items stage one row each (the request's last
+token), prompt items stage their granted chunk; all rows are concatenated (decode
+rows first) and each projection is one GEMM over all of them, so a step's weight
+bytes are read once however many requests it holds. Each row's key
 and value go to the pages its `Round::kv` names; decode rows attend through the
 decode kernel and prompt rows through the varlen prefill kernel. Only rows that end a
-prompt or decode produce logits (one gathered head GEMM). Plain greedy rows take a
+prompt or decode produce logits (`logit_rows()`, one gathered head GEMM). Plain greedy rows take a
 device argmax; rows with temperature, penalties or bias copy their logits and use
 Core's `Sampler`.
 
@@ -41,7 +43,8 @@ chunking:
 
 - every row kernel (norm, rotary, SiLU, argmax) reads only its row, and the GEMM's K
   split depends on the weight shape and the multiprocessor count, never on the row
-  count (row tiles of 64 rows share each weight tile; zero rows fill short tiles);
+  count (`plan_gemm`; row tiles of 64 rows share each weight tile; zero rows fill short
+  tiles);
 - the attention kernel follows the row's phase, not the step's row count, and both
   kernels give a query results that depend only on its position (the prefill kernel
   walks absolute 32-key tiles, so chunk boundaries change nothing; decode uses a
@@ -53,14 +56,59 @@ verified full pages (at most `prompt - 1` tokens, since reused rows carry no log
 and the first prompt step reports them as `reused_prompt_tokens`. Commit keeps the
 staged rows and indexes full pages; every step ends with the stream synchronized, so
 `retire(epoch())` after commit and retirement makes released pages reusable at once.
-Admission reserves a request's whole page need (prompt plus output, with no credit
-for shared pages), so a running request never runs out; `scheduling_hint` reports
+Core's `PageReservations` reserves a request's whole page need (prompt plus output,
+with no credit for shared pages), so a running request never runs out; `scheduling_hint` reports
 reusable tokens for reuse-aware admission.
 
 **Serving.** [engine_library.cpp](code/engine_library.cpp) builds the engine from the
 adapter's JSON configuration and exports it with `CRIT_EXPORT_ENGINE`;
 `crit_core.native.resident_engine` turns it into a resident adapter that serves
 `max_concurrency` requests at once.
+
+## Paged attention
+
+The engine's own attention over its StateCache pages, part of the example engine and
+not a curated kernel: a real engine takes its attention kernels from a provider
+[Kernels](../../kernels/README.md) lists, or writes them.
+[paged_attention.cu](code/paged_attention.cu) and [device_pages.cpp](code/device_pages.cpp)
+implement [paged_attention.h](code/paged_attention.h) (target `crit_paged_attention`):
+the KV write kernel, varlen causal prefill, decode and multi-column verify,
+`DevicePages` (a `StateStorage` over device memory, one 2-D copy per array for a
+copy-on-write tail) and `BatchTables` (a step's packed tables in one device buffer).
+[paged_reference.cpp](code/paged_reference.cpp) implements
+[paged_reference.h](code/paged_reference.h), the host half (target
+`crit_paged_reference`, no CUDA): the page format, the packed batch tables, BF16 and
+E4M3 codecs matching the device conversions, `HostPages` (a host `StateStorage` in the
+kernels' layout) and `attend`, an FP64 reference of the kernels.
+
+Row `r` of page `p` is physical row `p * page_tokens + r`, laid out
+`[row][kv_heads][head_dim]`, one array per layer for keys and one for values. `bf16`
+pages store BF16 values; `e4m3` pages store one OCP E4M3 code per element with one
+FP32 scale per row and key/value head (max \|x\| over the head vector / 448, 1 for an
+all-zero vector), read as `bf16(code * scale)`. Head dimensions are 64, 128 or 256.
+`Tables(max_seqs, max_pages, max_rows)` packs one step into the int32 words the
+kernels read: block tables, lengths, query starts and write slots (`add(cache,
+sequence)` queries a sequence's staged rows, `add_idle()` pads a captured batch size,
+`add_slots(round.kv, page_tokens)` lists where the new rows go); filling never
+allocates.
+
+Sequence `s` holds `kv_len` keys and its newest `n` rows are its queries: query `i`
+sits at position `p = kv_len - n + i` and sees keys `0 .. p`, its own included, so a
+step writes its keys first; query head `h` reads key/value head `h / (heads / kv_heads)`.
+A sliding `window`, per-head `sinks` in the softmax denominator, a `softcap` and, for
+decode and verify, `tree` masks (bit `j` of column `i`'s mask: column `i` sees column
+`j` of its round; with a window, the window exceeds 64 keys) shape what a query sees.
+
+The launch shape depends only on host counts (sequences, blocks, the largest query
+count), never on lengths or page ids, so one captured graph serves every length and
+table; upload the tables before each replay. Decode splits each sequence's keys into
+`blocks` interleaved 128-key pieces combined in block order and prefill walks absolute
+32-key tiles, so a query's result depends only on its position: a verify column equals
+the same column decoded alone and a sequence's result does not depend on its batch. A
+sequence whose device counts break the launch (more queries than
+`max_columns`/`max_queries` or than its keys, or keys beyond its table) is not
+attended: its rows are NaN and the optional `Batch::fault` flag is set. `DevicePages`
+allocates with `cudaMalloc`; reserve its `bytes()` in Core `Resources`.
 
 ## Worked example
 
@@ -82,8 +130,10 @@ assert logits == [0, 1, 4]   # b, d and the last row of a's prompt
 assert pages_needed(prompt=53, output=24, page_tokens=16) == 5
 ```
 
-The C++ engine ([engine.h](code/engine.h), kernels in
-[synthetic_model.cu](code/synthetic_model.cu)):
+`reference.py` is the host model of those rules; Core implements the step layout and
+admission in [batch.h](../../core/include/crit/batch.h), and the split is the engine's
+(`plan_gemm` in [synthetic_model.cu](code/synthetic_model.cu)). The C++ engine ([engine.h](code/engine.h),
+kernels in [synthetic_model.cu](code/synthetic_model.cu)):
 
 ```cpp
 namespace be = crit::batched_engine;
@@ -124,6 +174,19 @@ prompt reports 48 reused tokens with an unchanged reply.
 `tests/inference/batched_engine_serving_check.py` serves the library through crit
 serve's resident host: four concurrent HTTP requests run at once and each reply
 equals the same request served alone.
+
+`tests/inference/paged_reference_tests.cpp` (no GPU) checks the host half: the codecs
+on every BF16 value and every E4M3 code (round trips, ties to even, saturation,
+subnormals), the packed tables and their bounds, and `attend` against an independent
+dense oracle over StateCache pages with reused prefix pages, a fork's copy-on-write
+tail and rows crossing pages, grouped heads, head dimensions 64 and 128, BF16 and E4M3
+pages and every variant above; a verify's columns equal the same columns attended
+alone and a sequence's result does not depend on its batch.
+`tests/inference/cuda_paged_attention_tests.cpp` compares the kernels with it (write
+bytes and E4M3 scales equal to `HostPages`, prefill, decode, verify and tree masks
+within BF16 probability rounding, bit-equal columns and batches, fault rows), and
+`tests/inference/paged_attention_tests.cpp` checks them against attention-state's CPU
+reference at every verify width up to 16,384 keys and under graph replay.
 
 Measured with `crit_batched_engine_throughput` on an RTX 5090 (one model of hidden
 size 2,048, 8 layers, 16/4 heads of 128, FFN 5,632, vocabulary 32,000: 0.98 GB of

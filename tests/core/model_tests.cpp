@@ -649,6 +649,22 @@ void model_index() {
         require(checkpoint.tensors().size() == 2 && checkpoint.shards().size() == 2 &&
                 checkpoint.shards()[1].file().path().filename() == "second.safetensors", "index shards in a subfolder");
     }
+    // Digest rows name shards by their path relative to the index's directory, so shards of one name in two
+    // subfolders get a row each and verify_digests takes the rows digest_files gives.
+    TempDir twins;
+    fs::create_directories(twins.path / "a");
+    fs::create_directories(twins.path / "b");
+    write_tensors(twins.path / "a" / "model.safetensors", {{"x", "U8", {4}}});
+    write_tensors(twins.path / "b" / "model.safetensors", {{"y", "U8", {4}}}, {}, 9);
+    const auto twin = Checkpoint::open(write_index(twins.path, R"({"weight_map":{"x":"a/model.safetensors","y":"b/model.safetensors"}})"));
+    const auto rows = twin.digest_files();
+    require(rows.size() == 3 && rows[0].path == "a/model.safetensors" && rows[1].path == "b/model.safetensors" &&
+            rows[2].path == "model.safetensors.index.json" && rows[0].sha256 == reference_sha256(read_file(twins.path / "a" / "model.safetensors")),
+            "digest rows of subfolder shards");
+    twin.verify_digests(rows);
+    auto renamed = rows;
+    renamed[1].path = "model.safetensors";
+    rejects_as<FormatError>([&] { twin.verify_digests(renamed); }, "digest: absent from the expected digests");
 }
 
 void model_extra_files() {

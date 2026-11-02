@@ -26,7 +26,8 @@
       "Side-stream fork after the group's own fill and the join before the next plan",
       "Checking the failure flag before trusting a step",
       "Complete demand groups, content/representation-keyed bundle extents, measured miss costs where available, held-out traces and actual execution validation",
-      "Faithful phase/traffic events, explicit lifetime pins valid for each policy, and actual capacity/aging schedules"
+      "Faithful phase/traffic events, explicit lifetime pins valid for each policy, and actual capacity/aging schedules",
+      "Optionally a residency or routing profile shipped in the package and loaded at engine start, built from a general corpus unrelated to Eval"
     ],
     "preserve": [
       "Every route of a plan is pinned against that plan's admissions",
@@ -35,13 +36,15 @@
       "Host and device apply the same replacement rule when both plan",
       "Replay misses always retain exact demand identity; unknown costs stay unknown; hindsight results and additive miss costs are not online throughput evidence",
       "Accepted and rejected draft labels use identical online replacement decisions; hindsight is confined to farthest-next-use",
-      "Refused capacity shrink does not partially evict live content or change the budget"
+      "Refused capacity shrink does not partially evict live content or change the budget",
+      "The cache keeps adapting during decode: link-fetched experts are admitted, and replacement is not frozen after a warmup or profile load"
     ],
     "adapt": [
       "Replacement policy that respects pins, bundle layout and copy granularity",
       "Blocks per copy, prefetch width and predictor",
       "Mapped reads versus DMA copies, and graph capture boundaries",
-      "Offline byte budgets, replacement/admission policies and warmup; native policy changes still require host/device parity and lifetime validation"
+      "Offline byte budgets, replacement/admission policies and warmup; native policy changes still require host/device parity and lifetime validation",
+      "The CPU/link miss split, set from both paths' speeds measured alone and together on the target machine (they share host memory)"
     ]
   },
   "path": "inference/device-expert-cache/README.md",

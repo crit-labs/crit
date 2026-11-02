@@ -5,7 +5,8 @@ comparisons and a working OpenAI-compatible API (`crit serve`). You own the work
 investigation to delivery. Changes to crit itself must meet [what belongs in crit](docs/CONTRIBUTION_CRITERIA.md)
 (general interfaces for any model and any CUDA hardware, never one model's or machine's code) and follow
 [Contributing](docs/CONTRIBUTING.md).
-Install from the repo root with `python -m pip install -e .`, then run `crit ...`.
+Install from the repo root with `python -m pip install -e .`, then run `crit ...`. A harness that speaks MCP can
+run the same commands as tools through `crit mcp` ([MCP](mcp/README.md)), the long ones as jobs it waits on.
 
 ## 1. Set up the project
 
@@ -77,8 +78,9 @@ Install from the repo root with `python -m pip install -e .`, then run `crit ...
   model's distribution (the `sampling` gate), and sample on the device inside the decode
   graph rather than copying logits to the host for every token
   ([token-sampling](inference/token-sampling/README.md)'s `enqueue_verify` feeds
-  [device-speculative-round](inference/device-speculative-round/README.md); its host
-  oracle is [mtp-decode](inference/mtp-decode/README.md)). A drafter that only helps
+  [device-speculative-round](inference/device-speculative-round/README.md), whose
+  `python_round.py` runs the round for a Python engine's rows at once over its draft, verify
+  and commit; its host oracle is [mtp-decode](inference/mtp-decode/README.md)). A drafter that only helps
   greedy requests leaves the headline at one token per pass. Requests at other settings
   must stay correct too.
 - Create the run per [Building engines](docs/BUILDING_ENGINES.md) in the user's
@@ -113,7 +115,14 @@ Install from the repo root with `python -m pip install -e .`, then run `crit ...
 - **[Models](models/README.md):** only when the run's `weights_policy` is `transformable`:
   quantize the source with `crit models ptq`, measure the served output with
   `crit eval run --url` against the source's Eval data, bind the result with
-  `crit models eval`, and keep both records with the candidate.
+  `crit models eval`, and keep both records with the candidate. In a `transformable` run an
+  engine may instead re-encode stored 16-bit matrices into a lower format as it loads them
+  (for example BF16 to FP8 per channel; the only route for a checkpoint that is already
+  quantized, which `ptq` refuses): declare `weights: "transformed"` and
+  `configuration.re_encoding` (matrix groups and their formats). Where memory or bandwidth
+  bounds decode, measure re-encoding the 16-bit matrices before other levers: it frees device
+  memory for caches and cuts the bytes of every pass. `weights_policy` is the user's, like the
+  context: set it only when the user asks; an `as_quantized` run defaults to `transformable`.
 - **[Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md):** measure each candidate with `crit run ... eval`: it
   scores the data's fixed quality texts on the model's checkpoint once (`crit eval
   reference`), serves the packaged candidate through `crit serve` and runs Eval over the
@@ -182,7 +191,9 @@ Work in rounds, one candidate per round:
   detached `nohup`, `setsid` or `wsl ... &` it cannot see, and never a sleep loop), and never end a
   turn without such a wake pending. While one holds the GPU (Eval and the reference take the machine
   lock), do the CPU work of the next round: read the result so far, write the next plan's code, build
-  it. A finished job nobody noticed is time the run loses.
+  it. A finished job nobody noticed is time the run loses. An Eval that stopped before its end (its
+  session ended, an interrupt, a failure) resumes with `crit run ... eval --resume`; never measure the
+  same package again from the start.
 - **Strategy first.** Working baseline, measured bottlenecks, then compare strategies,
   not only settings. Reach the highest-ceiling strategy in working form before tuning
   kernels; sessions can end early and tuning does not transfer between strategies.
@@ -223,8 +234,8 @@ Work in rounds, one candidate per round:
   it or above) a near tie puts only the lower one in p1, and a family marked not needed below
   0.85 answers why the rest of its limit is out of reach (`gaps` entry `limit`, answer `cause`).
   In runs with plan rules 3, a plan whose forecast gains more on p2 than on p1, or
-  lets a p1 KPI fall, says why (`forecast_justification`). In runs with plan rules 4 (new
-  runs) each candidate has an objective by its number (`inputs.objective`): 1 the proof of
+  lets a p1 KPI fall, says why (`forecast_justification`). In runs with plan rules 4 (and
+  5) each candidate has an objective by its number (`inputs.objective`): 1 the proof of
   concept, 2 and 3 crit rounds (crit's toolkit, each technique measured against its floor and
   fixed or replaced where it trails), 4 on critique rounds that name the parent's two weakest
   terms in `weakest` and improve them beside other levers; candidates 2 to 5 forecast at
@@ -232,7 +243,10 @@ Work in rounds, one candidate per round:
   `own`), and the engine's own code carries a measured `yardstick` against the best existing one. Each plan after the parent's Eval reviews the parent's plan in
   `review`: the cause and evidence of every KPI that missed its forecast, what each lever
   delivered, the lesson; the parent's largest p1 lever, pruned or deferred, is planned again or
-  rejected on a measurement of another kernel structure or a vendor library.
+  rejected on a measurement of another kernel structure or a vendor library. In runs with plan
+  rules 5 (new runs) the strategy's ceiling is Eval's limit, not the engine's own speed: a
+  forecast whose high stays below half of a needed family's limit is refused unless a `gaps`
+  entry `limit` names, with its measured evidence, the bound that keeps the rest out of reach.
   A kernel term is exhausted only when it runs near its floor at the arithmetic the engine
   already uses (`crit eval status --kernels`: each matmul's achieved TFLOPS and its gap at the
   rate of its own prompt activations) or when another kernel structure, or a vendor library
@@ -256,7 +270,9 @@ Work in rounds, one candidate per round:
   flagged there, outside the priorities.
 - **The context is a requirement.** Build every candidate for `kv_tokens` and pass it to
   Eval as `--context`. Beyond weights and KV cache the engine gets `context_reserve_gib`
-  (default 3 GiB) for activations, workspaces, graphs and speed techniques. Speed must
+  (default 3 GiB) for activations, workspaces, graphs and speed techniques; a device expert
+  cache lends the prompt's buffers from its slots instead of holding that memory idle during
+  decode (recon's placement plan sizes the cache so). Speed must
   depend on the tokens held, not the capacity: Eval fails a candidate that is slower
   when opened at a lower context.
 - **Never fit the engine to Eval's suite.** Forbidden: sizing or choosing anything
@@ -264,7 +280,9 @@ Work in rounds, one candidate per round:
   caches, acceptance thresholds, per-content routing) by its Eval score; building such
   a choice from Eval's prompts, pinned continuation, held-out prompts or look-alike
   text; special-casing Eval's token ids, lengths or cases. Hardware/shape tuning (GEMM
-  tables, tiles, launch geometry) is fine. A content-dependent choice needs a general
+  tables, tiles, launch geometry) is fine, for every length: Eval measures the held-out
+  prompts and the long-context curve at lengths each run draws (80-100% of nominal), so a
+  graph, tile or chunk fitted to one prompt length shows as a slower held-out score. A content-dependent choice needs a general
   corpus unrelated to Eval and a held-out check in several languages and domains, both
   stated in the proposal; when in doubt keep the general option (the full draft head).
   Pass `--baseline` (the run's first candidate) so Eval's generality gate applies, and
@@ -284,8 +302,13 @@ Work in rounds, one candidate per round:
   `crit eval probe` measures bandwidth and GEMM rates; status reports each term's floor.
   Bytes that do not come from device memory have their own rates: host memory read (the CPU),
   host-to-device copies (the link), and the disk. Recon's placement prices one plain pass per expert
-  source with them, and an engine that declares `host_bytes_per_pass` gets Eval's pass floor priced
-  the same way.
+  source with them, and Eval prices the same tiers in its decode, prefill, first-token and
+  long-context floors: the bytes the placement keeps off the device at host memory's tier, routed
+  experts by the share a token activates at the device cache's hit rate. Where the placement keeps
+  weights off the device, report that hit rate from the first candidate (`expert_reads` and
+  `expert_hits` in the decode telemetry; without them Eval assumes even routing, the pessimistic
+  case), and declare `host_bytes_per_pass` (`{"link", "cpu"}` bytes per pass, in the engine's facts)
+  where the engine's own path differs from the faster of the link and the CPU.
 - **Profile** each candidate with `crit eval kernels`; for the heaviest kernels per
   phase far from their floor, check Kernels before replacing them, and fix kernels
   that leave SMs idle. A kernel's share of its phase bounds what replacing it can gain

@@ -12,8 +12,12 @@ Use it when routed experts do not all fit on the device and the engine must
 decide placement, split work between host and device, or read some experts from a
 cache and others from their original source. Recon's placement scenario prices one
 plain pass per miss source from the probe (misses copied over the host link, misses
-computed on the CPU from host memory); where the CPU's bound is the lower one, plan
-the host share from the first candidate and measure the split on the target machine. Choose by actual memory pressure and
+computed on the CPU from host memory, and the two split, which share host memory's
+read rate rather than add up); where the CPU's bound is the lower one, plan
+the host share from the first candidate and measure the split on the target machine:
+each path alone and both running together, since a link copy and the CPU's arithmetic
+read the same host memory. Those bounds assume even routing, the pessimistic case: the
+cache's hit rate under real routing moves decode more than the split does. Choose by actual memory pressure and
 operation costs: static placement can be simple and effective, a cache may adapt
 better to route locality, and a source-aware projection avoids duplicated work
 from splitting an operation.

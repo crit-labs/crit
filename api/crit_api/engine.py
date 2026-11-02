@@ -15,7 +15,8 @@ from crit.run.records import (digest, keys, now, number, read_json, record, safe
 from crit.run.store import ROOT, RunStore
 
 from crit_core.serving import (COMPLETION_CAPABILITY, CONTINUE_CAPABILITY, FIT_OUTPUT_CAPABILITY, MIN_LOGPROB,
-                               PLAIN_CAPABILITY, SCORE_CAPABILITY, TOKENIZE_CAPABILITY, unpacked_scores)
+                               PLAIN_CAPABILITY, SCORE_CAPABILITY, THINKING_BUDGET_CAPABILITY, TOKENIZE_CAPABILITY,
+                               unpacked_scores)
 
 from .residency import CAPABILITY as RESIDENT_CAPABILITY, ResidentRuntime
 from .admission import Admission, Refused
@@ -90,9 +91,11 @@ def telemetry(value, request):
     passes after prefill (a speculative engine's verify rounds), gives tokens_per_round: output tokens per round.
     Optional accepted (drafts accepted in each of those rounds), drafted (drafts made in each, for an engine whose
     draft width varies), verify_ms and draft_ms (device time in verify passes and draft steps) pass through for Eval's
-    headroom."""
+    headroom, and so do expert_reads and expert_hits (the decode's routed expert reads and those the device's expert
+    cache served), which Eval's memory tiers price an offloading engine's floor at."""
     keys(value, {"prompt_tokens", "output_tokens", "prefill_tokens", "prefill_ms",
-                 "decode_tokens", "decode_ms", "ttft_ms", "missing"}, {"decode_rounds", "accepted", "drafted", "verify_ms", "draft_ms"})
+                 "decode_tokens", "decode_ms", "ttft_ms", "missing"}, {"decode_rounds", "accepted", "drafted", "verify_ms",
+                                                                     "draft_ms", "expert_reads", "expert_hits"})
     prompt = number(value["prompt_tokens"], "prompt tokens", 1, request["limits"]["kv_tokens"], integer=True)
     output = number(value["output_tokens"], "output tokens", 1, request["limits"]["max_output_tokens"], integer=True)
     if prompt + output > request["limits"]["kv_tokens"]:
@@ -137,6 +140,11 @@ def telemetry(value, request):
     for key in ("verify_ms", "draft_ms"):
         if key in value:
             number(value[key], key.replace("_ms", " milliseconds"), 0, request["limits"]["timeout_seconds"] * 1000)
+    if ("expert_reads" in value) != ("expert_hits" in value):
+        raise ValueError("Expert reads and hits go together")
+    if "expert_reads" in value:
+        reads = number(value["expert_reads"], "expert reads", 0, 1 << 62, integer=True)
+        number(value["expert_hits"], "expert hits", 0, reads, integer=True)
     return value | rates
 
 
@@ -338,7 +346,8 @@ class ServedEngine:
     at a lower context than the run's (Eval's lower-context gate).
 
     Requests the engine cannot take yet wait in its queue: `max_queue` of them at most, each for `queue_timeout`
-    seconds at most (None: no bound); past either a request raises Overloaded.
+    seconds at most (None: no bound); past either a request raises Overloaded. `max_concurrency` (crit serve
+    --max-concurrency) caps the requests run at once below the engine's declared capacity.
 
     The server owns the machine's crit runtime while it runs, also while its engine is unloaded: no other crit process
     can load an engine. With `idle_unload` (crit serve --idle-unload) the engine unloads after that many seconds
@@ -346,7 +355,7 @@ class ServedEngine:
     """
     def __init__(self, workspace, run_id=None, candidate_id=None, project=ROOT, runtime_directory=None,
                  host_limit=None, device_limit=None, timeout=600, load_timeout=None, verify_model=False, attempt=None,
-                 kv_tokens=None, max_queue=None, queue_timeout=None, idle_unload=None):
+                 kv_tokens=None, max_queue=None, queue_timeout=None, idle_unload=None, max_concurrency=None):
         # No workspace: a subclass that serves engines from elsewhere (crit_api.installed) verifies its own.
         self.store = RunStore(workspace, project) if workspace is not None else None
         self.run_id = run_id or single_run(self.store)
@@ -361,6 +370,8 @@ class ServedEngine:
         self.load_timeout = None if load_timeout is None else number(load_timeout, "load timeout", .01, 7 * 86400)
         self.verify_model = bool(verify_model)
         self.idle_unload = None if idle_unload is None else number(idle_unload, "idle unload", .01, 7 * 86400)
+        self.max_concurrency = (None if max_concurrency is None
+                                else number(max_concurrency, "max concurrency", 1, 1024, integer=True))
         self.ownership = RuntimeOwnership(runtime_directory)
         self.runtime = ResidentRuntime(self.ownership, host_limit, device_limit)
         self.lock = Admission(
@@ -490,7 +501,7 @@ class ServedEngine:
                 if result["status"] != "completed":
                     raise ValueError(result["error"] or "Engine loading failed")
                 self._loaded(self.default)
-                self.lock.configure(self.default, result.get("max_concurrent_requests", 1))
+                self.lock.configure(self.default, self.admitted(result.get("max_concurrent_requests", 1)))
             except BaseException:
                 self._release()
                 raise
@@ -514,7 +525,27 @@ class ServedEngine:
             if result["status"] != "completed":
                 raise ValueError(result["error"] or "Engine loading failed")
             self._loaded(self.default)
-            self.lock.configure(self.default, result.get("max_concurrent_requests", 1))
+            self.lock.configure(self.default, self.admitted(result.get("max_concurrent_requests", 1)))
+
+    def admitted(self, declared):
+        """The requests admission runs at once for an engine that declares `declared`: at most max_concurrency."""
+        declared = int(declared or 1)
+        return declared if self.max_concurrency is None else min(declared, self.max_concurrency)
+
+    def capacity(self, candidate_id=None):
+        """The max_concurrent_requests clients see for `candidate_id` (default: the default candidate): 1 for a package
+        without chat-concurrent-v1; the loaded engine's declared capacity, capped by max_concurrency, while it is the
+        one loaded; None while a concurrent package's engine is not loaded (it declares its capacity as it loads), or
+        before a default candidate is chosen."""
+        if candidate_id is None and self.default is None:
+            return None
+        spec = self.spec(candidate_id)
+        if "chat-concurrent-v1" not in spec["capabilities"]:
+            return 1
+        status = self.runtime.status()
+        if not self.loaded(candidate_id, status):
+            return None
+        return self.admitted(status.get("max_concurrent_requests", 1))
 
     def load_seconds(self, spec):
         """Bound on loading a candidate: --load-timeout, else 600 s plus the model's bytes at 200 MB/s, which the
@@ -570,7 +601,7 @@ class ServedEngine:
     def generate(self, messages, max_tokens, stop, on_text=None, candidate_id=None, response_format=None,
                  sampling=None, tool_options=None, on_tools=None, on_reasoning=None, on_started=None, logprobs=None,
                  decode=None, template_kwargs=None, fit_output=False, on_admitted=None, priority=0, request_id=None,
-                 timeout=None, continue_final_message=False, prompt=None, echo=False):
+                 timeout=None, continue_final_message=False, prompt=None, echo=False, thinking_tokens=None):
         """Run one request. `on_text(text)` receives each piece of accepted text as the adapter streams it.
         `response_format` (from crit_api.server.response_format or structured_outputs) goes into the request record
         for adapters that declare chat-constraints-v1, and also chat-constraints-grammar-v1 for type grammar.
@@ -579,7 +610,8 @@ class ServedEngine:
         one token per target pass; template_kwargs set the chat-template variables a chat-template-kwargs-v1 adapter
         declares; fit_output asks a chat-fit-output-v1 adapter to cut max_tokens to the room the prompt leaves in the
         context, and the telemetry then carries the cap it applied as max_output_tokens; continue_final_message asks
-        a chat-continue-v1 adapter to continue the final assistant message, its reply only what follows it.
+        a chat-continue-v1 adapter to continue the final assistant message, its reply only what follows it;
+        thinking_tokens asks a chat-thinking-budget-v1 adapter to end the reply's reasoning after that many tokens.
         `prompt`, {"text"} or {"ids"} in place of messages (None), asks a completion-v1 adapter to continue a raw
         prompt without the chat template; with `echo` the reply also returns the prompt, and with logprobs its rows
         (from a chat-score-v1 adapter's score path).
@@ -635,6 +667,10 @@ class ServedEngine:
                 raise EngineError("This engine package does not declare " + FIT_OUTPUT_CAPABILITY, 400)
             if continue_final_message and CONTINUE_CAPABILITY not in spec["capabilities"]:
                 raise EngineError("This engine package does not declare " + CONTINUE_CAPABILITY, 400)
+            if thinking_tokens is not None and THINKING_BUDGET_CAPABILITY not in spec["capabilities"]:
+                raise EngineError("This engine package does not declare " + THINKING_BUDGET_CAPABILITY, 400)
+            if thinking_tokens is not None and (type(thinking_tokens) is not int or thinking_tokens < 1):
+                raise EngineError("thinking_tokens must be a positive integer", 400)
             if timeout is not None and (type(timeout) not in (int, float) or not 0 < timeout < float("inf")):
                 raise EngineError("timeout must be a positive number of seconds", 400)
             if prompt is not None and COMPLETION_CAPABILITY not in spec["capabilities"]:
@@ -676,7 +712,8 @@ class ServedEngine:
                 model_manifest=spec["model_manifest"], configuration=spec["configuration"], **text,
                 limits={"max_output_tokens": max_tokens, "kv_tokens": limits["kv_tokens"], "timeout_seconds": timeout,
                         **{k: v for k, v in limits.items() if k.endswith("headroom_bytes")},
-                        **({"fit_output": True} if fit_output else {})}, **extra)
+                        **({"fit_output": True} if fit_output else {}),
+                        **({"thinking_tokens": thinking_tokens} if thinking_tokens is not None else {})}, **extra)
             streams = STREAM_CAPABILITY in spec["capabilities"]
             try:
                 result = self.runtime.call("generate", {"spec": spec, "request": request},
@@ -738,7 +775,7 @@ class ServedEngine:
             if loaded["status"] != "completed":
                 raise EngineError(loaded.get("error") or "Engine loading failed")
             self._loaded(candidate_id)
-            self.lock.configure(candidate_id, loaded.get("max_concurrent_requests", 1))
+            self.lock.configure(candidate_id, self.admitted(loaded.get("max_concurrent_requests", 1)))
         except BaseException as exc:
             if not self._stopping.is_set():
                 self._retire(exc)

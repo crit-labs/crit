@@ -66,7 +66,43 @@ def _unlock(handle):
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _under_wsl():
+# SetProcessInformation's ProcessPowerThrottling class and its PROCESS_POWER_THROTTLING_STATE masks.
+POWER_THROTTLING_CLASS = 4
+POWER_THROTTLING_VERSION = 1
+THROTTLE_EXECUTION_SPEED = 0x1
+THROTTLE_IGNORE_TIMER_RESOLUTION = 0x4
+
+
+def keep_full_speed():
+    """Opt this process out of Windows' power throttling, so a measurement keeps its speed while its window is in the
+    background. Windows 11 lowers a background process's quality of service unless it opts out: its threads can move
+    to efficiency cores at lower clocks, and its timer-resolution requests are ignored, so short sleeps last a timer
+    tick. A CPU expert pool slowed one engine's decode from 66 to 4 tok/s that way while its console was behind
+    another window. True when the OS took the setting, and elsewhere, where nothing slows a process for its window."""
+    if sys.platform != "win32":
+        return True
+    import ctypes
+    from ctypes import wintypes
+
+    class State(ctypes.Structure):
+        _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG), ("StateMask", wintypes.ULONG)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.SetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    kernel32.SetProcessInformation.restype = wintypes.BOOL
+    # The process controls both kinds of throttling (ControlMask) and turns both off (StateMask 0). Windows before
+    # 11 and Server 2022 know no timer-resolution throttling and refuse the pair: execution speed alone then.
+    for mask in (THROTTLE_EXECUTION_SPEED | THROTTLE_IGNORE_TIMER_RESOLUTION, THROTTLE_EXECUTION_SPEED):
+        state = State(POWER_THROTTLING_VERSION, mask, 0)
+        if kernel32.SetProcessInformation(kernel32.GetCurrentProcess(), POWER_THROTTLING_CLASS, ctypes.byref(state),
+                                          ctypes.sizeof(state)):
+            return True
+    return False
+
+
+def under_wsl():
+    """Whether this process runs in a WSL distribution."""
     if os.environ.get("WSL_DISTRO_NAME"):
         return True
     try:
@@ -87,7 +123,7 @@ def lease_path():
         return Path(lock + ".lease")
     if os.name == "nt":
         return Path(os.environ.get("ProgramData") or "C:/ProgramData") / "crit" / "engine.lease"
-    if _under_wsl() and Path("/mnt/c").is_dir():
+    if under_wsl() and Path("/mnt/c").is_dir():
         return Path("/mnt/c/ProgramData/crit/engine.lease")
     return None
 
@@ -117,7 +153,7 @@ class _Lease:
     def __init__(self, path, label):
         self.path, self.stop, self.thread = path, threading.Event(), None
         self.lease = {"id": uuid.uuid4().hex, "pid": os.getpid(), "label": label,
-                      "system": "wsl" if _under_wsl() else os.name}
+                      "system": "wsl" if under_wsl() else os.name}
 
     def other(self):
         """The fresh lease another holder keeps, or None."""

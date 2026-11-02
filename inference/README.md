@@ -41,11 +41,11 @@ leaves to the engine.
 | Join asynchronous contributions | [async-expert-contributions](async-expert-contributions/README.md) | Receipt-based join, source retention, ordered reduction |
 | Run device-decided host work inside a captured graph | [host-work-mailbox](host-work-mailbox/README.md) | Device-reset doorbells, measured stream-wait or poll join, release and failure answering |
 | Serve a dense model larger than device memory | [dense-layer-offload](dense-layer-offload/README.md) | Measured planner, host AVX2/AVX-512 layers, double-buffered weight streaming, measured plan selection |
-| Fetch file-backed experts | [ssd-expert-materialization](ssd-expert-materialization/README.md) | Checked reads, bounded gather, read-ahead, upload handoff |
+| Fetch file-backed experts | [ssd-expert-materialization](ssd-expert-materialization/README.md) | Checked reads, a host tier fed by device evictions, bounded gather, read-ahead, upload handoff |
 | Read embedding or n-gram table rows from disk | [lookup-table-rows](lookup-table-rows/README.md) | Random-access advice, exact parallel row reads, hot-row cache |
 | Bound prefill, physical batches and scratch | [session-scheduling](session-scheduling/README.md) | Transactional cursor, latency chunk policy, physical caps and workspace sizing |
 | Batch independent requests | [concurrent-request-execution](concurrent-request-execution/README.md) | Ready-row compaction, metadata patches, retirement barrier |
-| Serve concurrent requests with batched steps end to end | [batched-reference-engine](batched-reference-engine/README.md) | Synthetic-model ConcurrentModel: one GEMM per weight per step, StateCache prefix reuse, paged attention, native library for crit serve |
+| Serve concurrent requests with batched steps end to end | [batched-reference-engine](batched-reference-engine/README.md) | Synthetic-model ConcurrentModel on Core's batched steps: one GEMM per weight per step, StateCache prefix reuse, its own paged attention with an FP64 host reference, native library for crit serve |
 | Execute speculative rounds | [mtp-decode](mtp-decode/README.md) | Token-history proposals, greedy/sampled verification, repair, adaptive budgets |
 | Sample tokens on the device, and verify sampled drafts | [token-sampling](token-sampling/README.md) | Core's whole law over the full vocabulary (penalties, top-k/p, min-p), rejection-sampling verify predictions; Core's Sampler as oracle |
 | Keep structured output exact under speculation | [token-constraints](token-constraints/README.md) | [Core](../core/src/constraints/README.md) matchers in sampled speculation, private forks and rewinds |
