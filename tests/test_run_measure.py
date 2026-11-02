@@ -317,11 +317,13 @@ class MeasureCliTests(MeasureFixture, unittest.TestCase):
                         "--root", str(self.store.root), "--id", self.run_id, "measure", "--candidate", candidate],
                         stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, **options)
                     try:
-                        end = time.monotonic() + 15
-                        while not marker.exists() and process.poll() is None and time.monotonic() < end:
-                            time.sleep(.01)
-                        self.assertTrue(marker.exists(), (self.root / "cli.log").read_text())
-                        pid = json.loads(marker.read_text())["pid"]
+                        end, pid = time.monotonic() + 15, None
+                        while pid is None and process.poll() is None and time.monotonic() < end:
+                            try:
+                                pid = json.loads(marker.read_text())["pid"]
+                            except (OSError, ValueError):   # not there yet, or Windows still holds the rename
+                                time.sleep(.01)
+                        self.assertIsNotNone(pid, (self.root / "cli.log").read_text())
                         if os.name == "nt":
                             helper = """
 import ctypes,sys,time

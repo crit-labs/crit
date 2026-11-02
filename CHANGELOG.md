@@ -9,6 +9,16 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-11-02
+
+### Fixed
+
+- A release reaches PyPI only once main's CI passed on the tagged commit: the release workflow waits for that run
+  (job `main-ci`) and stops on a failed one, before the `pypi` environment asks for approval.
+- crit needs crit-eval 0.5.3 (`crit-eval==0.5.3`): a resumed Eval round replays a served engine's request deadline
+  as the engine observed each request, so it no longer leaves the journal early when the engine's own timings and
+  the token arrivals differ.
+
 ## [0.16.0] - 2026-11-02
 
 ### Overview
@@ -2577,7 +2587,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.16.1...HEAD
+[0.16.1]: https://github.com/crit-labs/crit/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/crit-labs/crit/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/crit-labs/crit/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/crit-labs/crit/compare/v0.13.0...v0.14.0

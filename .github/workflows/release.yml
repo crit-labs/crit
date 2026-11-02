@@ -1,7 +1,7 @@
 name: Release to PyPI
 
 # A pushed vX.Y.Z tag builds crit X.Y.Z and crit-core X.Y.Z (core/python) and publishes both through PyPI trusted
-# publishing (no token). crit-eval releases from its own repository.
+# publishing (no token) once main's CI passed on the tagged commit. crit-eval releases from its own repository.
 on:
   push:
     tags: ['v*']
@@ -58,9 +58,42 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  main-ci:
+    name: Main's CI passed on this commit
+    # PyPI gets only a commit main's CI ("Host and installed SDK", ci.yml) passed on: the tag must be on a commit main
+    # ran, and this job waits while that run is going. After a failed run, rerun its failed jobs, then this one.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Wait for main's CI run on the tagged commit
+        run: |
+          for attempt in $(seq 1 85); do
+            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=main&event=push&head_sha=$GITHUB_SHA" \
+                    --jq '.workflow_runs | max_by(.run_number) // empty | "\(.status) \(.conclusion) \(.html_url)"')
+            if [ -z "$run" ]; then
+              # main's run starts with the merge; a tag on a commit main never ran gets none.
+              [ "$attempt" -ge 10 ] && { echo "::error::main's CI has no run on $GITHUB_SHA: tag a commit on main"; exit 1; }
+            else
+              read -r status conclusion url <<< "$run"
+              echo "main's CI: $status $conclusion $url"
+              if [ "$status" = completed ]; then
+                [ "$conclusion" = success ] && exit 0
+                echo "::error::main's CI $conclusion on $GITHUB_SHA ($url): rerun its failed jobs, then this job"
+                exit 1
+              fi
+            fi
+            sleep 60
+          done
+          echo "::error::main's CI did not finish within 85 minutes"
+          exit 1
+
   publish:
     name: Publish to PyPI
-    needs: build
+    needs: [build, main-ci]
     runs-on: ubuntu-24.04
     environment:
       name: pypi

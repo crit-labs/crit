@@ -1,6 +1,7 @@
 """Core's registry of model-family knowledge (crit_core.registry): sources registered at run time or named by entry
 points, imported only when their kind is first read, the first source that gives a key keeping it."""
 from pathlib import Path
+import importlib
 import sys
 import tempfile
 import unittest
@@ -63,6 +64,9 @@ class RegistryTests(unittest.TestCase):
     def module(self, name, source):
         (self.folder / f"{name}.py").write_text(source, encoding="utf-8")
         self.modules.append(name)
+        # The import system caches each folder's listing by its timestamp, which a file written in the same tick
+        # leaves unchanged on Windows.
+        importlib.invalidate_caches()
 
     def test_sources_load_when_their_kind_is_first_read(self):
         self.module("crit_test_rules", "RULES = {'arch': 'from a module'}\n")
