@@ -8,6 +8,10 @@ memory are sampled on the resident host process during every request, and tokens
 telemetry. A case of concurrency N sends each repetition as N requests started together, one per client: every
 request's timings are its samples, and aggregate_tps is the wave's completion tokens over its wall time. The attempt
 settles once the server has stopped, then one benchmark is recorded per case.
+
+A benchmark qualifies only on the checks published before it, and a candidate with a benchmark that does not qualify
+is never eligible, so measure refuses a candidate whose checks would leave it exploratory (unqualified) before it
+reserves anything; --exploratory measures it anyway.
 """
 import functools
 import http.client
@@ -21,8 +25,8 @@ import time
 from crit.pull.requirements import nvidia_smi
 
 from .attempt import Attempt, packaged, remaining, unsealed
-from .records import ALL_METRICS, digest, inputs, load_run, now, read_json, safe_path
-from .served import SERVED, Served
+from .records import ALL_METRICS, digest, inputs, load_run, now, read_json, safe_path, series_gates
+from .served import Served
 
 TIMED = ("prefill_tps", "decode_tps", "request_ms", "ttft_ms")
 PER_REQUEST = TIMED + ("accepted_tokens_per_round",)
@@ -90,13 +94,65 @@ def check_case_prompts(root, run, case_manifests, variables):
                              "the request's chat_template_kwargs")
 
 
-def measure(store, run_id, candidate_id, seconds=None):
+def unqualified(root, run, candidate_id):
+    """What keeps a benchmark crit run measure records now from qualifying, by the candidate's published records:
+    {"lasting": [...], "missing": [...], "failed": {gates}}. A benchmark binds each case's latest check of every gate
+    (RunStore._case_checks) and qualifies only when those pass every required gate at the run's evidence level and
+    the candidate's own gates pass (records._series and candidate_gates). `lasting` is what no later record undoes and
+    keeps every benchmark of the candidate exploratory: a required check that did not pass (failed, unverified,
+    not_applicable; `failed` names the gates of the failed ones) or an earlier benchmark's free memory below the run's
+    headroom. `missing` is what publishing the checks puts right: a case with no check of a required gate, or whose
+    latest passed one is only reported where the run requires artifact_verified evidence. This measurement's own free
+    memory is judged once it is recorded."""
+    folder = safe_path(root, f"candidates/{candidate_id}")
+    telemetry = read_json(folder / "telemetry.json")
+    checks = [read_json(path) for path in sorted((folder / "checks").glob("check-*.json"))]
+    found = {"lasting": [], "missing": [], "failed": set()}
+    for gate in run["spec"]["correctness"]["required_gates"]:
+        own = [check for check in checks if check["gate"] == gate]
+        for check in own:
+            if check["status"] != "passed":
+                found["lasting"].append(f"{gate} check {check['check_id']} ({check['case_id']}) {check['status']}")
+                found["failed"] |= {gate} if check["status"] == "failed" else set()
+        found["missing"] += [f"{case['case_id']} has no {gate} check" for case in run["spec"]["cases"]
+                             if not any(check["case_id"] == case["case_id"] for check in own)]
+    # The run's memory rule as a series judges it: resources fails below either headroom (series_gates).
+    found["lasting"] += [f"{series['benchmark_id']} ({series['case_id']}) failed resources: its free memory is below "
+                         "the run's headroom or unmeasured" for series in telemetry["series"]
+                         if series_gates(run, [], series["metrics"])["resources"] == "failed"]
+    if run["spec"]["objectives"]["verification_level"] != "reported":
+        for case in run["spec"]["cases"]:
+            latest = {check["gate"]: check for check in checks if check["case_id"] == case["case_id"]}
+            found["missing"] += [f"{gate} check {check['check_id']} ({case['case_id']}) is {check['evidence_level']}, "
+                                 "the run requires artifact_verified evidence" for gate, check in latest.items()
+                                 if check["status"] == "passed" and check["evidence_level"] != "artifact_verified"]
+    return found
+
+
+def refusal(candidate_id, found):
+    """Why crit run measure refuses a candidate whose benchmarks could not qualify (unqualified), and what to do."""
+    if found["lasting"]:
+        what = (f" No later record undoes that, so {candidate_id} cannot become eligible: build the fix as a new "
+                "candidate" + (" (its plan repairs a failed check with a requirement lever serving "
+                               + ", ".join(f"check:{gate}" for gate in sorted(found["failed"])) + ")"
+                               if found["failed"] else "") + ".")
+    else:
+        what = (f" Record its checks first: crit run ... check --candidate {candidate_id} --from-eval records the "
+                "arithmetic, functional and resources checks of every case from its completed Eval (crit run ... eval "
+                f"--candidate {candidate_id}), then measure.")
+    return (f"crit run measure refuses {candidate_id}: its benchmarks would stay exploratory, since "
+            + "; ".join(found["lasting"] + found["missing"]) + "." + what + " To measure it anyway (telemetry, memory), "
+            f"pass --exploratory: a benchmark that does not qualify keeps {candidate_id} from ever being eligible")
+
+
+def measure(store, run_id, candidate_id, seconds=None, exploratory=False):
     """Reserve, serve the candidate, measure every case through crit serve, stop the server and settle, then record
-    one benchmark per case."""
+    one benchmark per case. A candidate whose published checks would leave its benchmarks exploratory (unqualified)
+    is refused before the reservation, unless `exploratory` measures it anyway."""
     root = store.directory(run_id)
     run = load_run(root)
     resolved = inputs(root, run)
-    manifest = packaged(unsealed(root, candidate_id), SERVED, "measuring", "crit run measure measures")
+    manifest = packaged(unsealed(root, candidate_id), "measuring", "crit run measure measures")
     cases = []
     for case in run["spec"]["cases"]:
         workload = case["workload"]
@@ -105,8 +161,14 @@ def measure(store, run_id, candidate_id, seconds=None):
         cases.append({"case_id": case["case_id"], "request": case_request(root, resolved["case_manifests"][case["case_id"]]),
                       **{key: workload[key] for key in ("prompt_tokens", "output_tokens", "warmup_runs", "repetitions",
                                                         "concurrency")}})
+    found = unqualified(root, run, candidate_id)
+    reasons = found["lasting"] + found["missing"]
+    if reasons and not exploratory:
+        raise ValueError(refusal(candidate_id, found))
     attempt = Attempt(store, run_id, candidate_id, "benchmark", seconds, "measure", "Measurement", "The measurement")
     with attempt.running() as log:
+        if reasons:
+            log("crit run measure --exploratory: the benchmarks stay exploratory, since " + "; ".join(reasons))
         measured = _measure(store, run_id, candidate_id, attempt.id, attempt.deadline_at,
                             run["spec"]["hardware_constraints"]["kv_tokens"], cases, log)
     # The server ran in this process; the resident host's exit is part of the cleanup.
@@ -152,14 +214,18 @@ def _measure(store, run_id, candidate_id, attempt, deadline_at, kv_tokens, cases
                 sampler.stop()
 
 
+def case_body(case):
+    """The streamed chat request a case sends: greedy unless the captured request names its own sampling."""
+    return {"temperature": 0, **case["request"], "max_tokens": case["output_tokens"], "stream": True,
+            "stream_options": {"include_usage": True}}
+
+
 def _case(port, case, load_ms, sampler, timeout, log, capacity=None):
     """A case's warmups and repetitions: its metrics and missing metrics as a benchmark records them. A repetition of
     a case of concurrency N is a wave of N requests started together (_wave); capacity: the requests the served engine
     runs at once (crit serve's max_concurrent_requests)."""
     from crit_eval.reports.metrics import speed_sample
-    # Greedy unless the captured request names its own sampling.
-    body = {"temperature": 0, **case["request"], "max_tokens": case["output_tokens"], "stream": True,
-            "stream_options": {"include_usage": True}}
+    body = case_body(case)
     clients = case.get("concurrency", 1)
     samples = {name: [] for name in PER_REQUEST + MEMORY + (("aggregate_tps",) if clients > 1 else ())}
     outputs, peaks, begun = [], [], now()

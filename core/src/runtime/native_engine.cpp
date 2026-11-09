@@ -130,7 +130,21 @@ RequestOptions request_options(const char* options_json) {
         replay->tokens = token_array(*v, "replay");
         options.context = std::move(replay);
     }
-    if(const auto* v = root.find("plain"); v && !v->is_null() && v->boolean()) {
+    const auto* plain = root.find("plain");
+    const bool is_plain = plain && !plain->is_null() && plain->boolean();
+    const auto* constrained = root.find("constrained");
+    const bool is_constrained = constrained && !constrained->is_null() && constrained->boolean();
+    if(const auto* v = root.find("attachment"); v && !v->is_null()) {
+        if(options.context) throw std::invalid_argument("an attachment and replay exclude each other");
+        auto attachment = std::make_shared<HostAttachment>();
+        attachment->attachment = v->u64();
+        if(!attachment->attachment) throw std::invalid_argument("attachment must be a positive id");
+        attachment->constrained = is_constrained;
+        attachment->plain = is_plain;
+        options.context = std::move(attachment);
+    } else if(is_constrained) {
+        throw std::invalid_argument("constrained needs the attachment holding its constraint");
+    } else if(is_plain) {
         if(options.context) throw std::invalid_argument("plain and replay exclude each other");
         options.context = std::make_shared<PlainDecoding>();
     }
@@ -193,19 +207,6 @@ std::unique_ptr<NativeEngine> checked(NativeEngine built) {
     return native;
 }
 }  // namespace
-
-void* open(NativeFactory factory, const char* configuration_json) noexcept {
-    try {
-        auto native = checked(factory(configuration_json ? configuration_json : "{}"));
-        native->retain_owner();
-        return native.release();
-    } catch(const std::exception& error) {
-        fail(error.what());
-    } catch(...) {
-        fail("unknown engine factory failure");
-    }
-    return nullptr;
-}
 
 void* open_bound(BoundFactory factory, const void* context, const char* configuration_json) noexcept {
     try {
@@ -292,9 +293,17 @@ void request_close(void* request) noexcept { delete static_cast<NativeRequest*>(
 int request_wait(void* handle, TokenCallback callback, void* user, std::int32_t* out,
                  char* result, int capacity) noexcept {
     return settle(handle, out, result, capacity, [&](NativeRequest& request, auto&& keep) {
-        return request.handle.wait([&](Token token) {
-            keep(token);
-            if(callback && callback(user, &token, 1)) throw Cancelled{};
+        if(!callback) {
+            // Nobody listens: the waiter sleeps until the request ends and takes its tokens then, instead of waking
+            // for each token the engine publishes.
+            auto r = request.handle.wait();
+            for(const auto token:r.tokens) keep(token);
+            return r;
+        }
+        // The tokens a step published reach the callback together.
+        return request.handle.wait_tokens([&](std::span<const Token> tokens) {
+            for(const auto token:tokens) keep(token);
+            if(callback(user, tokens.data(), int(tokens.size()))) throw Cancelled{};
         });
     });
 }

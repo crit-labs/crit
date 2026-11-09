@@ -1,7 +1,7 @@
 {
   "id": "device-expert-cache",
   "category": "experts",
-  "summary": "Ready device expert cache (ExpertCache): capturable per-layer planning and copies, residency-profile warm start, admission limits that split misses between the link and the CPU at a measured split, telemetry, and portable policy replay",
+  "summary": "Ready device expert cache: the directory on the device (capture-safe layer plans and fills from a mapped bundle store), a prompt staging ring that never admits, KV lending, residency-profile warm start, admission limits that send misses to a CPU tier, ranked background swaps, telemetry, and portable policy replay",
   "implementation_status": "native_source",
   "implementation_scope": "CUDA/HIP warp planner with pinned clock replacement, admission limits (quota, quota by miss count, second-touch) that bypass misses to the store, bundle copies, lookahead prefetch and profile preload; ExpertCache runtime owning the directory and per-layer scratch with one capturable plan_and_fetch per routed layer and telemetry (expert_reads, expert_hits, bypassed); Metal versions of the kernels; Python directory reference; residency profile builder with a held-out check; CPU/link split table from measured layer times. Independent portable replay compares LRU/LFU/clock/hindsight eviction and optional second-touch admission over arbitrary byte-sized bundles. Expert arithmetic (device and CPU), the predictor and phase switching remain engine supplied.",
   "agent_guidance": {
@@ -25,7 +25,13 @@
       "A quota table by miss count from link, CPU and combined layer timings measured on the target, never interpolated, with a recalibration check on the hit rate",
       "A named general corpus for residency profiles (corpus.json): web text in seven languages and code in three to tune on, held-out sources to check on, fetched with revisions recorded",
       "The host store: per-expert tensors (or stacked ones) packed once into one contiguous bundle per key with an index and the checkpoint's fingerprint, then pinned by registering the mapped file",
-      "A provider grouped GEMM's pointer arrays (per-component matrices inside each bundle, activation and output rows, routing weights) written on the device from a plan's Uses, bypassed misses optionally left to the CPU"
+      "A provider grouped GEMM's pointer arrays (per-component matrices inside each bundle, activation and output rows, routing weights) written on the device from a plan's Uses, bypassed misses optionally left to the CPU",
+      "Background ranked residency: route counts on the device, a policy ranking decayed counts of every layer together, swaps begun at a fixed window boundary on a side stream and committed at the next, so the cache adapts off the step's critical path and one request history always gives the same placement",
+      "Device form (experts:cache): ExpertCache.plan(layer, ids) over a step's routes, one plan launch then one fill launch, capture-safe; slot tables of slots, -1 not routed and -2 the CPU tier",
+      "A prompt ring: long chunks stage every non-resident expert of a layer by the copy engine, the next layer under the current one, events guarding each segment; short chunks copy their routed misses into ring slots",
+      "KV lending: the KV pool's pages no sequence holds are slots of the same store tensor, reclaimed before the pool hands them out",
+      "BundleStore (experts:store): bundles in registered host memory with a device view, read-only registration of a store file",
+      "CSF-compressed NVFP4 scales kept compressed in the store (csf_layout, csf_bundle) and decoded into the slot layout by the fill (a program of component copies and slab decodes), plus csf_decode / csf_encode on the host or the device"
     ],
     "engine_supplies": [
       "Initial directory contents and the switch to and from host planning phases",
@@ -74,7 +80,7 @@
     },
     {
       "path": "inference/device-expert-cache/code/device_cache.py",
-      "purpose": "Host reference of the directory rules and a trace hit-rate simulator"
+      "purpose": "Host reference of the directory rules (ClockDirectory, and LayerDirectory: the device form's layer and prompt plans, unavailable slots, the CPU tier) and a trace hit-rate simulator"
     },
     {
       "path": "inference/device-expert-cache/code/replay.py",
@@ -102,16 +108,44 @@
     },
     {
       "path": "inference/device-expert-cache/code/expert_store.py",
-      "purpose": "The host store: checkpoint experts packed into one contiguous bundle per key with an index and fingerprint; mapped and registered from Python"
+      "purpose": "The host store: checkpoint experts packed into one contiguous bundle per key with an index and fingerprint, mapped and registered from Python; BundleStore, the experts:store a device cache fills from (put, region, address, read)"
     },
     {
       "path": "inference/device-expert-cache/code/expert_store.h",
       "purpose": "pin_store: the store file mapped and registered read-only, or read into a pinned HostBlock"
+    },
+    {
+      "path": "inference/device-expert-cache/code/ranked_residency.h",
+      "purpose": "Background ranked residency policy: decayed route counts ranked across layers, swaps at fixed window boundaries"
+    },
+    {
+      "path": "inference/device-expert-cache/code/ranked_residency.py",
+      "purpose": "Python twin of the ranked policy and a schedule that drives ClockDirectory window by window"
+    },
+    {
+      "path": "inference/device-expert-cache/code/device_directory.py",
+      "purpose": "The device form's directory in device tensors: the layer plan, the prompt plan and the fill (directory_ops.cu, or torch ops with the same rule), and the host-driven changes (slots unavailable or available, preload, swaps)"
+    },
+    {
+      "path": "inference/device-expert-cache/code/directory_ops.cu",
+      "purpose": "The device form's plan of one routed layer (route-order distinct experts, pinned hits, quota and second touch to the CPU tier, windowed clock victims as LayerDirectory's scan), its prompt plan into ring slots and the bundle fill from a device-readable store; built at load through torch's extension builder; the program fill that rebuilds slots from a store in another layout (CSF scales decoded a slab of 16 rows per block, then the exception words)"
+    },
+    {
+      "path": "inference/device-expert-cache/code/native.py",
+      "purpose": "Builds directory_ops.cu at load (hashed name, the device's architecture), None where it does not build"
+    },
+    {
+      "path": "inference/device-expert-cache/code/expert_cache.py",
+      "purpose": "ExpertCache, the device form (experts:cache): one store tensor of slots, plan and fill per routed layer, the prompt ring staged by the copy engine, KV lending, preload, ranked swaps, per-row counters and telemetry"
+    },
+    {
+      "path": "inference/device-expert-cache/code/host_memory.py",
+      "purpose": "Host memory a device reads: files mapped read-only or anonymous memory, registered mapped through the CUDA runtime (ctypes), their device addresses and CUDA views through __cuda_array_interface__"
     }
   ],
   "requires": {
-    "hardware": "CUDA C++20 with device-readable host memory for the store; Python 3.11+ standard library for the reference; portable replay uses only Python's standard library and needs no device; HIP (AMD) and Metal (Apple) sources beside the CUDA one, not run in crit's tests",
-    "model": "Routed experts with at most 32 distinct routes per group and fixed-size bundles (a multiple of 16 bytes); offline replay instead accepts arbitrary complete bundle sizes and group widths",
+    "hardware": "CUDA C++20 with device-readable host memory for the store; Python 3.11+ standard library for the reference; portable replay uses only Python's standard library and needs no device; HIP (AMD) and Metal (Apple) sources of the C++ component beside the CUDA one, not run in crit's tests. The device form needs torch: directory_ops.cu built at load for the device's architecture (all of sm_80..121a compile; CUDA only, torch's builder would hipify it on ROCm, untested), the torch ops anywhere torch runs (CPU included)",
+    "model": "Routed experts as fixed-size bundles (a multiple of 16 bytes); the C++ component plans at most 32 distinct routes per call, the device form any routes of a step (duplicates and -1 allowed) of up to a few thousand experts a layer (9 bytes of shared memory per expert); offline replay accepts arbitrary complete bundle sizes and group widths",
     "workload": "Decode steps where host planning latency per routed layer is significant and expert reuse is high; replay also supports recorded grouped accesses under byte pressure independently of CUDA geometry"
   },
   "contract": {
@@ -170,7 +204,30 @@
     "PinnedStore",
     "enqueue_operands",
     "OperandSpec",
-    "Operands"
+    "Operands",
+    "RankedOptions",
+    "RankedPolicy",
+    "RankedSchedule",
+    "Swap",
+    "kReserved",
+    "enqueue_swap_begin",
+    "enqueue_swap_commit",
+    "RESERVED",
+    "LayerDirectory",
+    "LayerPlan",
+    "UNAVAILABLE",
+    "DeviceDirectory",
+    "BundleStore",
+    "directory_ops",
+    "map_file",
+    "map_anonymous",
+    "register",
+    "device_tensor",
+    "csf_decode",
+    "csf_encode",
+    "csf_layout",
+    "csf_bundle",
+    "Program"
   ],
   "interactions": [
     "expert-residency",
@@ -181,8 +238,8 @@
     "device-expert-cache"
   ],
   "validation": {
-    "host": "ClockDirectory pins hits before admissions, chooses clock victims, copies predicted misses from the pool, rejects duplicates and out-of-range routes; byte replay checks variable sizes, grouped pins, second-touch, warmup and missing costs; randomized clock comparison against ClockDirectory and exhaustive equal-size single-demand mandatory-admission hindsight oracle; capacity/pin atomicity and ownership, growth, aging, phase isolation, warmup control boundaries and speculative outcome independence; admission quota, quota table and second-touch bypasses without eviction; preload order, skips and clock start; profile key order, held-out check and geometry checks; split choice, ties, unmeasured counts and calibration calls; corpus manifest disjointness, paged fetch, cache and corpus statement; store packing of per-expert and stacked tensors, alignment, reuse on an unchanged source and refusals",
-    "native": "600 random plans with lookahead prefetch on 24 and 72 slots against a host replica: identical slots, hit/miss/pool counters, complete bundle bytes, duplicate-route flag and rejected launches; ExpertCache on 20 and 40 slots: preload, 400 plans under a quota table and second-touch, bypassed store bundles, bytes and telemetry against the replica; enqueue_operands: component, activation and output pointers and weights from a plan's Uses, bypassed routes null; expert_store_tests.cpp: a store file pinned and read back through its device address. Passes on an RTX 5090",
+    "host": "ClockDirectory pins hits before admissions, chooses clock victims, copies predicted misses from the pool, rejects duplicates and out-of-range routes; byte replay checks variable sizes, grouped pins, second-touch, warmup and missing costs; randomized clock comparison against ClockDirectory and exhaustive equal-size single-demand mandatory-admission hindsight oracle; capacity/pin atomicity and ownership, growth, aging, phase isolation, warmup control boundaries and speculative outcome independence; admission quota, quota table and second-touch bypasses without eviction; preload order, skips and clock start; profile key order, held-out check and geometry checks; split choice, ties, unmeasured counts and calibration calls; corpus manifest disjointness, paged fetch, cache and corpus statement; store packing of per-expert and stacked tensors, alignment, reuse on an unchanged source and refusals; ranked residency: ties by key, empty slots first, bursts, decay, reserved slots never victims, commits that find the key resident elsewhere, and a schedule whose hit rate recovers after a topic change with no admission on the step's path",
+    "native": "600 random plans with lookahead prefetch on 24 and 72 slots against a host replica: identical slots, hit/miss/pool counters, complete bundle bytes, duplicate-route flag and rejected launches; ExpertCache on 20 and 40 slots: preload, 400 plans under a quota table and second-touch, bypassed store bundles, bytes and telemetry against the replica; enqueue_operands: component, activation and output pointers and weights from a plan's Uses, bypassed routes null; expert_store_tests.cpp: a store file pinned and read back through its device address; ranked residency on 16 and 40 slots: route counts, swaps, slots and bundle bytes at every boundary against the replica driven by a second policy, every miss bypassed, the hit rate climbing after a topic change. Passes on an RTX 5090; the device form (tests/test_device.py): the directory's CUDA ops and torch ops against LayerDirectory bit for bit over random route streams (duplicates, -1, invalid routes, unavailable slots, quotas, quota by miss count, second touch, failures, per-row counters), prompt plans, slots byte-exact against the store, a captured plan and fill replayed, prompt chunks reading staged bundles under a slow consumer, preload, the CPU tier quota, ranked swaps and KV lending over attention-state's pool; tests/test_csf.py: csf_decode against csf_encode and an independent encoder, on the host and the device; a CSF store's slots byte-exact in the slot layout through the CUDA program fill and the torch ops, in plans, a captured plan, a prompt chunk and a preload",
     "performance": "No throughput claim"
   }
 }

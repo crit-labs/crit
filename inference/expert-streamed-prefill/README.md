@@ -7,8 +7,8 @@ Small chunks therefore re-send the same experts again and again, and run the exp
 projections at a handful of rows per expert. The entry supplies a schedule that picks the
 chunk from the grouped projection's measured rate curve and overlaps each layer's expert
 copies with the layer before it, and a CPU reference that any grouped projection is
-checked against before an engine trusts it. The projection itself is a provider's:
-[kernels.json](kernels.json) names the candidates, each with its formats, GPUs and shapes.
+checked against before an engine trusts it. The projection itself comes from a library or the kernel registry
+([Kernels](../../kernels/README.md)); [operations.json](operations.json) states what it computes and how to verify it.
 
 ## When to use it
 
@@ -51,10 +51,11 @@ prompt workspace from slots (`staging_bytes` sizes one buffer).
 routed rows, runs every expert's gate/up and down projections with SwiGLU between them, and
 sums each token's expert outputs with its routing weights. A grouped GEMM that takes one
 pointer per expert reads each expert wherever it sits: a cache slot, a staging buffer or
-device-visible host memory. [kernels.json](kernels.json) lists the providers for it:
-CUTLASS's ptr-array grouped GEMM (block-scaled for 4-bit formats on GPUs that have it),
-cuBLAS's grouped batched GEMM for 16-bit weights, and crit-labs' `grouped-experts` Hub
-kernel, a baseline for every format on any NVIDIA GPU from sm_70 (not published yet).
+device-visible host memory. [operations.json](operations.json) states the operation such a
+kernel computes and how it is checked; the kernels come from libraries and the kernel registry
+([Kernels](../../kernels/README.md)), crit-labs' `grouped-experts` registry kernel among them
+(not published yet), which the [grouped-experts](../grouped-experts/README.md) plugin loads:
+every format on BF16 tensor cores from sm_80, over expert bundles in a slot store.
 `reference.py` gives the order a stable route sort produces (`route_order`) and the block's
 FP64 result (`moe_block`, from weights decoded with `decode_matrix`).
 
@@ -70,15 +71,30 @@ two chunk sizes.
 - [schedule.py](code/schedule.py): `RateCurve`, `expected_touched`,
   `rows_per_active_expert`, `choose_chunk`, `fetch_whole_layer`, `Step`, `timeline`,
   `prefill_estimate` and `staging_bytes`.
+- [streamed.py](code/streamed.py): the schedule on the device. `rate_curve` measures an experts
+  plugin's `forward_bundles` (the experts:bundles device form, e.g.
+  [grouped-experts](../grouped-experts/README.md)) at the engine's shapes by rows per active
+  expert (`rows_per_active_expert`, the measure `choose_chunk` compares with the knee), timed with
+  CUDA events on a GPU and the host clock on the CPU (`None` for a store it cannot time), and
+  `Streamed` takes the chunk at the curve's knee (`choose_chunk`; without a curve, chunks of
+  `max_tokens`) and runs a prompt's routed layer chunk by chunk: `stage(layer, ids)` returns the
+  store and slot table holding the chunk's routed experts (a residency cache's prompt staging
+  ring, its slots, or the plugin's own bundles), where the grouped kernel reads them. A timing may
+  choose only between bit-identical paths, so `Streamed` takes a curve only from an experts plugin
+  whose facts say a route keeps its bits whatever rows share its call (`experts` `row_invariance`
+  `prompt_rows`, as grouped-experts' do; `row_invariant` reads it): the chunk then changes no
+  token. For any other kernel it refuses the curve, and the chunk is a stated value (no curve,
+  `max_tokens` the chunk). No plugin of the library runs it yet: the plugin that stages a
+  prompt's experts measures the curve at its load and runs its prompt layers through `Streamed`.
 - [reference.py](code/reference.py): `decode_matrix` (BF16, FP8 E4M3 with row scales, NVFP4,
   MXFP4), `route_order` and `moe_block`, the FP64 reference a projection is checked against.
-- [kernels.json](kernels.json): the provider kernels for the grouped projection, with their
-  calls, formats, GPUs, shapes and how to check each against `moe_block`.
+- [operations.json](operations.json): the grouped projection's contract, what it computes and how a kernel is
+  checked against `moe_block`.
 
 ## What the engine supplies
 
-The router and its top-k ids and weights per chunk, the grouped projection (from
-kernels.json, checked against `moe_block` on the target), the expert pointer table (which
+The router and its top-k ids and weights per chunk, the grouped projection (from a
+library or the kernel registry, checked against `moe_block` on the target), the expert pointer table (which
 slot, staging buffer or host address holds each expert this step), the staging buffers and
 the copy-engine copies into them with their events, the attention and dense layers, and the
 measurements: the projection's rate by rows per expert, each step's time at the chosen
@@ -114,8 +130,8 @@ assert large[0] > 2 * small[0]
 Preserve: no reduction split by the row count and no atomics in a token's sum, so chunk
 sizes can follow the schedule; a staging buffer refilled only after its last step has
 finished computing; every routed expert of a step resident, staged or readable before
-the projection reads it. Free to change: the projection (any kernel from kernels.json, or
-the engine's own, measured against them), fusing the SwiGLU and the combine into it, the
+the projection reads it. Free to change: the projection (any kernel that passes
+operations.json's check, measured against the others), fusing the SwiGLU and the combine into it, the
 chunk policy and threshold, and computing a few rarely routed experts on the CPU instead of
 copying them, by a measured split. FP8 or FP4 activations follow the run's quality mode
 and are measured as such.
@@ -123,7 +139,8 @@ and are measured as such.
 ## Costs and validation
 
 The host suite checks the schedule's knee, chunk choice, touched experts, the
-double-buffered timeline and the estimate, and the reference's decoders, route order and
+double-buffered timeline and the estimate, `Streamed`'s refusal of a curve for an experts
+plugin whose facts do not say `prompt_rows`, and the reference's decoders, route order and
 block on hand-computed cases. None of this measures performance. A provider's projection
 earns its place only on the target: within its arithmetic's tolerance of `moe_block` on a
 few tokens of real routes and weights, and at the rate the schedule's curve was measured

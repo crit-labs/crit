@@ -11,8 +11,53 @@ different text, and a single-process repeat check cannot see it.
 
 Use it whenever several candidates exist for an operation. It is unnecessary when every
 candidate is bitwise identical for the engine's inputs or only one is ever used, and optional
-in quality mode `as_quantized`: there Eval passes an output difference that parts at a
-near-tie ([forks](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#forks-in-quality-mode-as_quantized)), which is what two processes' near-tie choices produce.
+in quality mode `speed`: there Eval passes an output difference that parts at a
+near-tie ([forks](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#forks-in-quality-mode-speed)), which is what two processes' near-tie choices produce.
+A prompt GEMM takes one choice for every row count. A prompt's rows never depend on how long
+the prompt is, and [crit smoke](../../smoke/README.md#tolerances)'s `causal` tests hold every
+engine to it: a kernel that cuBLAS's heuristics pick by row count, or a padded bucket with a
+choice of its own, moves a short prompt's rows (on a Qwen3.8-27B NVFP4 engine on an RTX 5090, one
+bf16 ulp in one small GEMM moved a 17-token prompt's rows by 0.25 nats on average). Key prompt
+operations without a width bucket: record one split-K-free
+algorithm per GEMM shape and run it for every row count, which gives a row the same bits at any
+prompt length at about the heuristics' speed. `torch._scaled_mm` and `torch.matmul` take no
+algorithm, so call [pinned_gemm](code/pinned_gemm.py): record each prompt GEMM shape once per device
+and cuBLASLt version (`record(n, k, format)`) into a `GemmTable` kept in the frozen configuration,
+load it at engine load and replay with `pinned_mm(a, b, table.entry(n, k, format))`; a table from
+another device or cuBLASLt version is refused, so record it again there. A row's bits only have
+to be the same at every length, not to come from one algorithm, so `record` also keeps, per
+power-of-two bucket of up to 64 rows, a faster split-K-free algorithm whose output equals the
+entry's bit for bit (in the cases below, the same cuBLASLt algorithm with another tile or stage
+count). Check the result with `crit smoke --only causal`. On an RTX 5090 (cuBLASLt 130101)
+with random BF16 and FP8 inputs, the pinned GEMMs of shapes (N, K) = (5120, 5120), (17408, 5120)
+and (5120, 17408) took 0.82 to 1.24 times the time of torch's heuristic-picked kernels at 128 to
+4,096 rows and, at 2 to 64 rows, 0.92 to 1.43 times in BF16 and 0.98 to 1.36 times in FP8 for
+(17408, 5120), whose 17-row product a bucket's algorithm took from 111 to 59 µs. In FP8 at
+(5120, 5120) and (5120, 17408) the faster short-prompt candidates give other bits, so the pinned
+GEMM stayed 1.5 to 4.5 times slower there. Fixed row slabs are exact too but slow: 128-row slabs took
+13% of the Qwen3.8-27B engine's prefill on 512-token prompts.
+
+A format is `INPUTS[-SCALE]:OUTPUT` with FP32 accumulation, output `bf16`, `fp16` or `fp32`:
+
+| Inputs | Scales | cuBLASLt needs |
+| --- | --- | --- |
+| `fp16`, `bf16`, `fp32` (no TF32) | none | any CUDA GPU |
+| `fp8e4m3`, `fp8e5m2`, pairs such as `fp8e4m3xfp8e5m2` | none, `-tensorscale` or `-rowscale` | compute capability 8.9 or later |
+| `mxfp8` (e4m3), `mxfp4` (e2m1) | one UE8M0 scale per 32 elements along K | compute capability 10.0 or later (Blackwell) |
+| `nvfp4` (e2m1) | one UE4M3 scale per 16 elements, and an FP32 global scale passed as `alpha` | compute capability 10.0 or later (Blackwell) |
+
+A pair names a's type, then b's; e5m2 with e5m2 is not offered. `-tensorscale` takes one FP32
+scalar per operand and `-rowscale` FP32 vectors over a's rows and b's output channels, for
+row-scaled heads and dynamic per-token FP8, where cuBLASLt offers outer-vector scaling.
+FP4 is packed two per byte (the first element in the low nibble). Block scales are passed in
+cuBLASLt's blocked layout (128-row by 4-column tiles, rows padded to 128): `blocked_scales()` lays
+out row-major scales for any row count, so a prompt prefix `a[:m]` takes
+`blocked_scales(row_scales[:m])`. `bf16` and `fp8` still name `bf16:bf16` and
+`fp8e4m3-tensorscale:bf16` under their old keys, so existing tables load. When cuBLASLt offers no
+algorithm for a format on the device, `record` raises `UnsupportedFormat` naming the format, the
+device and the cuBLASLt version. On the RTX 5090 with cuBLASLt 130101 that is the case for
+`-rowscale`, e5m2 with e5m2 and `mxfp4`; the other formats are row-exact there. Integer GEMMs need
+no pin: int32 accumulation is exact in any order, so any algorithm gives a row the same bits.
 Physical batch limits are candidates too: the
 [speculative batch example](../mtp-decode/README.md#physical-batch-size-is-independent-of-proposal-width)
 records a draft cap from timed synthetic runs and replays it. Bind such caps and all
@@ -62,6 +107,15 @@ Core's [graph capture harness](../../core/src/backends/cuda/README.md#graph-capt
 - [repeatability.py](code/repeatability.py): `first_difference`, `compare` and a runner
   (`--runs`, `--timeout`, `--report`) exiting 0 identical, 1 different, 2 a run failed.
 - [replay.py](code/replay.py): the replay-mode selector above.
+- [pinned_gemm.py](code/pinned_gemm.py) and [pinned_gemm.cpp](code/pinned_gemm.cpp): prompt GEMMs with
+  one recorded split-K-free cuBLASLt algorithm for every row count, for each format above: a [M, K]
+  times b [N, K] transposed. `record(n, k, format, rows)` keeps the row-exact candidates and takes the fastest by mean time per
+  row, and `short_buckets` adds per short row bucket (`bucket()` widths up to 64) a faster
+  algorithm with the same bits; an entry without buckets runs its algorithm everywhere.
+  `GemmTable` keys entries with `key()` (width bucket 0: every row count), stores the
+  cuBLASLt version and device and refuses others; `pinned_mm(a, b, entry, scale_a, scale_b, alpha)`
+  replays, checking each new row count once and raising for one the algorithm cannot run.
+  Importing needs no CUDA; the extension builds once with `torch.utils.cpp_extension`.
 
 ## What the engine supplies
 
@@ -133,5 +187,8 @@ reporting and the runner in fresh processes. The
 [native fixture](../../tests/inference/selection_tests.cpp) covers the same rules, the
 JSON round trip and malformed tables. [Portable policy fixtures](../../tests/test_portable_mechanisms.py)
 check capture amortization, memory limits, padding permission, partial fallback and
-stale identities. The speed and determinism of each candidate are the engine's
-measurements.
+stale identities. [Pinned GEMM tests](tests/test_pinned_gemm.py) check the table's keys, file
+round trip, refusals, format parsing and the blocked scale layout's padding without CUDA, and with
+CUDA, for every format the GPU takes (the others are skipped with the reason), that every row is
+bit-identical across prompt lengths and matches `torch.matmul` or `torch._scaled_mm` where torch
+has the format, else the FP32 dequantized product. The speed and determinism of each candidate are the engine's measurements.

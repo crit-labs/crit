@@ -1,0 +1,77 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "toy-vision",
+  "title": "A toy batched step model on the CPU that takes images",
+  "fills": [
+    "model"
+  ],
+  "devices": [
+    "cpu"
+  ],
+  "options": {
+    "concurrency": {
+      "type": "int",
+      "default": 4,
+      "min": 1,
+      "max": 64
+    },
+    "prefill_chunk": {
+      "type": "int",
+      "default": 8,
+      "min": 1,
+      "max": 4096
+    },
+    "vocabulary": {
+      "type": "int",
+      "default": 1000,
+      "min": 2,
+      "max": 1048576
+    },
+    "context": {
+      "type": "int",
+      "default": 4096,
+      "min": 16,
+      "max": 16777216
+    },
+    "step_ms": {
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 1000
+    },
+    "pending": {
+      "type": "int",
+      "default": 16,
+      "min": 0,
+      "max": 1024
+    },
+    "skip": {
+      "type": "choice",
+      "default": "none",
+      "choices": [
+        "none",
+        "placement",
+        "projections",
+        "attention",
+        "masks"
+      ],
+      "description": "a slot the toy never calls, or masks: it never hands a row's allowed set to its sampler, for the loader's checks"
+    },
+    "image_token": {
+      "type": "int",
+      "default": 5,
+      "min": 0,
+      "max": 1048575,
+      "description": "the placeholder the chat template writes for an image"
+    }
+  },
+  "sources": {
+    "toy_model": "../toy-model"
+  },
+  "entry": "plugin.py:create",
+  "provides": [
+    "inputs:images",
+    "taps:hidden"
+  ],
+  "description": "toy-model's step model taking images: prepare() puts as many positions as an image has bytes (up to 3) in place of its placeholder, and those positions read the image's bytes, so what it writes depends on the image."
+}

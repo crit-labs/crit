@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta"
 # crit Core's Python package on its own: crit and crit Eval (https://github.com/crit-labs/crit-eval) both depend on it.
 [project]
 name = "crit-core"
-version = "0.16.1"
-description = "crit Core's Python side: model inspection, tokenizers and chat templates, machine locks, native engines"
+version = "0.17.0"
+description = "crit Core's Python side: model inspection, tokenizers and chat templates, machine locks, native engines, plugins"
 license = "Apache-2.0"
 # A copy of the root LICENSE (CI compares them): license files must sit inside the project directory.
 license-files = ["LICENSE"]
@@ -17,7 +17,7 @@ dependencies = ["tokenizers>=0.22,<0.24", "jinja2>=3.1.4,<4"]
 Repository = "https://github.com/crit-labs/crit"
 
 [tool.setuptools.packages.find]
-include = ["crit_core*"]
+include = ["crit_core*", "crit_plugins*"]
 
 [tool.setuptools.package-data]
 crit_core = ["step_settings.json", "model/config_keys.json", "model/safetensors_dtypes.json"]

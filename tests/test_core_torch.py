@@ -65,7 +65,7 @@ class TorchReaderTests(unittest.TestCase):
         legacy.write_bytes(b"\x80\x02\x8a\x0a\x6c\xfc\x9c\x46\xf9\x20\x6a\xa8\x50\x19" + pickle_bytes(1))
         with self.assertRaisesRegex(TorchFileError, "legacy format"):
             inspect_torch(legacy)
-        engine = self.root / "model.bin"   # another program's weights (CTranslate2 names its file model.bin)
+        engine = self.root / "model.bin"   # another program's weights (some engines name their file model.bin)
         engine.write_bytes(b"\x02\x00\x00\x00" + bytes(60))
         with self.assertRaisesRegex(TorchFileError, "not a file torch.save wrote"):
             inspect_torch(engine)

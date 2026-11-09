@@ -2,7 +2,7 @@
 
 The authoritative native interface is [crit/core.h](../include/crit/core.h)
 with the parts it includes from [crit/core/](../include/crit/core);
-the current source version is 0.16.1. [CONTRACTS.json](CONTRACTS.json) records
+the current source version is 0.17.0. [CONTRACTS.json](CONTRACTS.json) records
 its ownership responsibilities and those of the
 [component libraries](#component-libraries); it is documentation, not a wire ABI.
 

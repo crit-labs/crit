@@ -1,0 +1,12 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "toy-drafter",
+  "title": "The toy's chain drafter",
+  "fills": [
+    "drafter"
+  ],
+  "devices": [
+    "host"
+  ],
+  "entry": "plugin.py:create"
+}

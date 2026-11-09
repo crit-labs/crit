@@ -30,6 +30,19 @@ def completion_request(capabilities, **body):
     return Api(engine).completion_request({"messages": [{"role": "user", "content": "x"}], **body})
 
 
+# OpenSSL's X509_V_FLAG_NO_CHECK_TIME. The test certificate is made a moment before it is used, and a virtual machine's
+# wall clock steps back by up to a second (WSL's does), which would make it "not yet valid": these tests are about the
+# connections, so their clients check the chain and the host name, not the validity window.
+NO_CHECK_TIME = 0x200000
+
+
+def trusting(cert):
+    """A client context that trusts the test certificate (its chain and host name, not its validity window)."""
+    context = ssl.create_default_context(cafile=str(cert))
+    context.verify_flags |= NO_CHECK_TIME
+    return context
+
+
 def certificate(folder):
     """(certificate, key) PEM files of a self-signed certificate for 127.0.0.1, made with the openssl command."""
     cert, key = folder / "cert.pem", folder / "key.pem"
@@ -548,7 +561,7 @@ class StructuredOutputTests(ApiTests):
                 response, value = self.chat("reply:" + other, structured_outputs=outputs)
                 self.assertEqual(response.status, 500, value)
                 self.assertIn("does not match response_format", value["error"]["message"])
-        # The engine receives a grammar; vLLM's earlier guided_* fields name the same constraints.
+        # The engine receives a grammar; the earlier guided_* fields name the same constraints.
         response, value = self.chat(structured_outputs={"regex": "\\{.*\\}"})
         self.assertEqual(json.loads(value["choices"][0]["message"]["content"])["format"], "grammar")
         response, value = self.chat("reply:yes", guided_choice=["yes", "no"])
@@ -742,7 +755,7 @@ class HttpsTests(ServeFixture, unittest.TestCase):
         cert, key = certificate(self.root)
         tls = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         tls.load_cert_chain(cert, key)
-        self.trusted = ssl.create_default_context(cafile=str(cert))
+        self.trusted = trusting(cert)
         self.logged = []
         self.api = Api(self.engine(), api_keys=["secret"], log=self.logged.append)
         self.server = SmallBufferServer(("127.0.0.1", 0), self.api, tls)
@@ -843,7 +856,7 @@ class HttpsTests(ServeFixture, unittest.TestCase):
                 sockets.append(connection.sock)
         self.assertEqual(len(set(sockets)), 1)
         self.assertEqual(self.api.metrics.requests,
-                         {("openai", "completed"): 2, ("anthropic", "completed"): 1, ("ollama", "completed"): 1,
+                         {("openai", "completed"): 2, ("anthropic", "completed"): 1, ("api_chat", "completed"): 1,
                           ("responses", "completed"): 1})
 
 
@@ -871,7 +884,7 @@ class CommandTests(ServeFixture, unittest.TestCase):
         keys = self.root / "keys.txt"
         keys.write_text("# shared on the LAN\nfiled\n", encoding="utf-8")
         arguments = ["--api-key-file", str(keys), "--ssl-certfile", str(cert), "--ssl-keyfile", str(key)]
-        self.serve_and_stop(signal.SIGTERM, arguments, ssl.create_default_context(cafile=str(cert)), "filed")
+        self.serve_and_stop(signal.SIGTERM, arguments, trusting(cert), "filed")
         from crit_api.cli import main
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(main(["--workspace", str(self.store.root), *arguments, "--write-launchers"]), 0)

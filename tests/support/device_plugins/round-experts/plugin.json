@@ -1,0 +1,26 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "round-experts",
+  "title": "A test stand-in for an experts block inside captured rounds, over experts-reference",
+  "description": "The package's experts-reference plugin with its device form run without reading the routes back to the host: each token's routes through the expert matrices gathered by the route ids on the device, one token at a time, summed in route order, the reference's arithmetic. For the round driver's tests of a mixture-of-experts model; experts-reference provides its own round form.",
+  "fills": [
+    "experts"
+  ],
+  "needs": [
+    "experts:source"
+  ],
+  "provides": [
+    "rounds:experts"
+  ],
+  "devices": [
+    "cuda"
+  ],
+  "options": {
+    "inner": {
+      "type": "str",
+      "default": "experts-reference",
+      "description": "the package's experts plugin this stands in for"
+    }
+  },
+  "entry": "plugin.py:create"
+}

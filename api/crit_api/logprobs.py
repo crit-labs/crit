@@ -14,7 +14,7 @@ from .options import MAX_CHAT_RECORD, RequestError, require
 ROW_BYTES = 1024
 # Resident commands whose result carries the engine's response record: a chat turn, a score (chat-score-v1), whose
 # rows hold [id, logprob] pairs without a bytes table, and a tokenize (chat-tokenize-v1), at most MAX_CHAT_RECORD.
-RESPONDING = ("generate", "score", "tokenize")
+RESPONDING = ("generate", "score", "tokenize", "telemetry")
 SCORE_PAIR_BYTES = 64
 # An echoed prompt's text in the response record: a JSON-escaped character takes at most 6 bytes per UTF-8 byte, and
 # a token's text at most the 1024 bytes the bytes table allows.
@@ -38,7 +38,7 @@ def logprob_options(body, capabilities):
 
 def response_bytes(request):
     """The largest response record a request may produce."""
-    if request.get("record_kind") == "tokenize_request":
+    if request.get("record_kind") in ("tokenize_request", "telemetry_request"):
         return MAX_CHAT_RECORD
     if request.get("record_kind") == "score_request":
         positions = len(request["prompt_ids"]) + len(request["continuation_ids"])

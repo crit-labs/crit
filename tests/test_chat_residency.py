@@ -423,7 +423,7 @@ class ModelPoolTests(unittest.TestCase):
     def test_native_file_lease_avoids_copy_and_holds_source_until_close(self):
         pool = ModelPool(self.root / 'native', 4, 8)
         pool.load(self.source, self.manifest, native_files=True)
-        context = ModelContext(pool, {}, [])
+        context = ModelContext(pool, {})
         self.assertEqual(context.model_file('weights'), self.source)
         self.assertEqual(bytes(context.host('weights')), b'four')
         self.assertFalse(any(p.is_file() for p in pool.root.rglob('*')))
@@ -439,7 +439,7 @@ class ModelPoolTests(unittest.TestCase):
         with patch('crit_api.models.hashlib') as hashing:
             self.assertTrue(pool.load(self.source, self.manifest))
         hashing.sha256.assert_not_called()  # no model file is read or hashed by default
-        context = ModelContext(pool, {}, [])
+        context = ModelContext(pool, {})
         self.assertEqual(bytes(context.host('weights')), b'four')
         self.assertEqual(context.model_file('weights'), self.source)
         self.assertFalse(any(p.is_file() for p in pool.root.rglob('*')))  # no private copy
@@ -511,7 +511,7 @@ class ModelPoolTests(unittest.TestCase):
         self.pool.close()
 
     def test_host_snapshot_is_readonly_bounded_content_verified_and_source_checked(self):
-        context = ModelContext(self.pool, {}, [])
+        context = ModelContext(self.pool, {})
         view = context.host('weights')
         self.assertEqual(bytes(view), b'four')
         with self.assertRaises(TypeError):
@@ -613,7 +613,7 @@ class ModelPoolTests(unittest.TestCase):
 
     def test_a_verified_copy_keeps_serving_its_bytes_without_rehashing_the_source(self):
         frozen = self.pool.fingerprint(self.source)
-        context = ModelContext(self.pool, {}, [])
+        context = ModelContext(self.pool, {})
         try:
             with patch.object(self.pool, 'fingerprint', return_value=frozen), \
                     patch('crit_api.models.file_sha', side_effect=AssertionError('no re-hash per read')):

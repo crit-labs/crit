@@ -1,0 +1,36 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "expert-residency",
+  "title": "A byte-bounded expert cache with leases and settled-only eviction",
+  "description": "expert-residency's ExpertCache keyed by ExpertKey (revision, layer, expert, encoding): a plan acquires a lease on each expert, admitting a miss by evicting the least recently acquired expert that is unpinned and settled; an expert that finds every candidate pinned is not resident. The plan's leases close when it returns; an engine keeps them until its kernel completes. slots * expert_bytes is the capacity, expert_bytes an expert's encoded extent.",
+  "fills": [
+    "expert_residency"
+  ],
+  "provides": [
+    "experts:residency"
+  ],
+  "options": {
+    "slots": {
+      "type": "int",
+      "default": 64,
+      "min": 1
+    },
+    "expert_bytes": {
+      "type": "int",
+      "default": 1,
+      "min": 1
+    },
+    "revision": {
+      "type": "str",
+      "default": "model"
+    },
+    "encoding": {
+      "type": "str",
+      "default": "bundle"
+    }
+  },
+  "sources": {
+    "residency": "code"
+  },
+  "entry": "plugin.py:create"
+}

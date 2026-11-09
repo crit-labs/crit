@@ -2,9 +2,11 @@
 // the table opened for random access (POSIX_FADV_RANDOM; FILE_FLAG_RANDOM_ACCESS on Windows), exactly the rows a step
 // needs read with positioned reads by a persistent worker pool, rows asked for twice read once, an optional
 // least-recently-used cache of hot rows, and the rows written in request order straight into the caller's buffer: a
-// slot of a StagingRing over pinned host memory, which the engine then copies to the device.
+// slot of a StagingRing over pinned host memory, which the engine then copies to the device. RowPrefetch starts a
+// token's rows as soon as the token exists and lets the step that reads them wait only for rows still in flight.
 #pragma once
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -161,6 +163,7 @@ public:
     const char* advice() const noexcept { return advice_; }
     const Counters& counters() const noexcept { return counters_; }
     std::size_t row_bytes() const noexcept { return region_.row_bytes; }
+    std::uint64_t rows() const noexcept { return region_.rows; }
 
     // Writes row ids[i] at dst + i * row_bytes, for every i; dst holds ids.size() rows.
     void gather(std::span<const std::uint64_t> ids, std::byte* dst) {
@@ -296,6 +299,131 @@ private:
     int slots_, next_ = 0;
     std::function<bool(int)> finished_;
     std::vector<bool> used_;
+};
+
+// Draft-time prefetch: start a token's rows the moment the token exists (a draft step's output, a sampled token) and let
+// the step that reads them (a verify pass) wait only for rows still in flight. A service thread takes every queued
+// request at once and gathers their rows in one batch, so the rows of consecutive draft tokens share the disk's queue
+// depth instead of queueing behind each other. Requests finish in order. The RowGather is this prefetcher's alone
+// while it lives (one gather at a time).
+class RowPrefetch {
+public:
+    using Ticket = std::uint64_t;
+    struct Stats {
+        std::uint64_t requests = 0, batches = 0, rows = 0;
+        std::uint64_t ready_when_waited = 0;   // waits that found their rows already there
+        double waited_ms = 0.0;                // time callers spent blocked in wait()
+    };
+
+    explicit RowPrefetch(RowGather& gather) : gather_(gather), thread_([this] { serve(); }) {}
+    RowPrefetch(const RowPrefetch&) = delete;
+    RowPrefetch& operator=(const RowPrefetch&) = delete;
+    ~RowPrefetch() {
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        wake_.notify_all();
+        thread_.join();
+    }
+
+    // Rows ids[i] are written at dst + i * row_bytes, after this returns; dst must stay valid until wait(ticket)
+    // returns. Rows outside the table throw here, not later.
+    Ticket start(std::span<const std::uint64_t> ids, std::byte* dst) {
+        for(const auto r : ids)
+            if(r >= gather_.rows()) throw std::out_of_range("table_rows: row outside the table");
+        const std::lock_guard<std::mutex> lock(mutex_);
+        const Ticket t = ++issued_;
+        queue_.push_back({t, std::vector<std::uint64_t>(ids.begin(), ids.end()), dst});
+        stats_.requests += 1;
+        stats_.rows += ids.size();
+        wake_.notify_all();
+        return t;
+    }
+    bool ready(Ticket t) const {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return t <= finished_;
+    }
+    // Blocks until ticket t's rows are written; rethrows its batch's read failure.
+    void wait(Ticket t) {
+        const auto start = std::chrono::steady_clock::now();
+        std::unique_lock<std::mutex> lock(mutex_);
+        if(t > issued_) throw std::invalid_argument("table_rows: no such prefetch");
+        if(t <= finished_) stats_.ready_when_waited += 1;
+        done_.wait(lock, [&] { return t <= finished_; });
+        stats_.waited_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        auto failed = failures_.find(t);
+        if(failed != failures_.end()) {
+            const auto error = failed->second;
+            failures_.erase(failed);
+            std::rethrow_exception(error);
+        }
+    }
+    void wait_all() { wait(last_issued()); }
+    Ticket last_issued() const {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return issued_;
+    }
+    Stats stats() const {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return stats_;
+    }
+
+private:
+    struct Request {
+        Ticket ticket;
+        std::vector<std::uint64_t> ids;
+        std::byte* dst;
+    };
+    void serve() {
+        std::vector<Request> batch;
+        std::vector<std::uint64_t> ids;
+        std::vector<std::byte> rows;
+        for(;;) {
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                wake_.wait(lock, [this] { return stop_ || !queue_.empty(); });
+                if(queue_.empty()) return;   // stopping with nothing left
+                batch.swap(queue_);
+                stats_.batches += 1;
+            }
+            // One gather for every queued request: row ids concatenated, then each request's rows copied out.
+            ids.clear();
+            for(const auto& r : batch) ids.insert(ids.end(), r.ids.begin(), r.ids.end());
+            const std::size_t n = gather_.row_bytes();
+            rows.resize(ids.size() * n);
+            std::exception_ptr error;
+            try {
+                gather_.gather(ids, rows.data());
+                std::size_t at = 0;
+                for(const auto& r : batch) {
+                    if(!r.ids.empty()) std::memcpy(r.dst, rows.data() + at * n, r.ids.size() * n);
+                    at += r.ids.size();
+                }
+            } catch(...) {
+                error = std::current_exception();
+            }
+            {
+                const std::lock_guard<std::mutex> lock(mutex_);
+                for(const auto& r : batch) {
+                    if(error) failures_[r.ticket] = error;
+                    finished_ = std::max(finished_, r.ticket);
+                }
+            }
+            done_.notify_all();
+            batch.clear();
+        }
+    }
+
+    RowGather& gather_;
+    mutable std::mutex mutex_;
+    std::condition_variable wake_, done_;
+    std::vector<Request> queue_;
+    std::unordered_map<Ticket, std::exception_ptr> failures_;
+    Ticket issued_ = 0, finished_ = 0;
+    Stats stats_;
+    bool stop_ = false;
+    std::thread thread_;
 };
 
 } // namespace crit::techniques::table_rows

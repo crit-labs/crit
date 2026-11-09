@@ -52,6 +52,20 @@ class RunSettingsTest(unittest.TestCase):
         self.assertEqual(limits["ram_headroom_bytes"], 8 * GIB)
         self.assertEqual(limits["vram_headroom_bytes"], 3 * GIB)
 
+    def test_settings_quality_mode_fills_the_request_and_names_a_mode_crit_knows(self):
+        for text, expected in (("", "speed"), ('quality_mode = "preserve"\n', "preserve")):
+            (self.project / "settings.toml").write_text(text, encoding="utf-8")
+            code, output = self.create()
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output)["run"]["spec"]["correctness"]["quality_mode"], expected)
+        # A mode no longer named is refused like any unknown one.
+        (self.project / "settings.toml").write_text('quality_mode = "as_quantized"\n', encoding="utf-8")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = main(["--project", str(self.project), "create", "--record", str(self.request)])
+        self.assertNotEqual(code, 0)
+        self.assertIn("quality_mode requires preserve or speed", err.getvalue())
+
     def test_the_example_file_lists_every_setting_with_the_codes_defaults(self):
         import re
         import shutil

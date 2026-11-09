@@ -69,7 +69,7 @@ class Metrics:
                 self.queue.observe(timing["dispatched"] - timing["begun"])
 
     def end(self, dialect, outcome, measured=None, timing=None):
-        """Record one finished request: its dialect (openai, responses, anthropic, ollama, crit for scores), outcome
+        """Record one finished request: its dialect (openai, responses, anthropic, api_chat, crit for scores), outcome
         (OUTCOMES), the engine's telemetry when it completed, and its timing from begin()."""
         with self.lock:
             self._count(dialect, outcome)

@@ -30,6 +30,7 @@ def _eval_generate(self, request, cancellation):
     return response
 
 Engine.generate = _eval_generate
+Engine.telemetry = lambda self: {"kv": {"pages": 4, "free_pages": 2}, "core": {"steps": 9}}
 '''
 
 
@@ -67,6 +68,14 @@ class EvalExtensionTests(Served, unittest.TestCase):
                                                   "bytes_per_pass": 1000, "kv_bytes_per_token": 64,
                                                   "prompt_cache": False})
         self.assertIsNone(cards[self.b]["engine_facts"])   # not loaded
+
+    def test_health_asks_the_loaded_engine_for_its_telemetry(self):
+        response, value = self.chat("hello")
+        self.assertEqual(response.status, 200, value)
+        response, health = self.call("GET", "/health")
+        self.assertEqual(response.status, 200, health)
+        self.assertEqual(health["engine_telemetry"], {"kv": {"pages": 4, "free_pages": 2}, "core": {"steps": 9}})
+        self.assertNotIn("engine_telemetry", health["engine"], "a request's end asks no plugin for telemetry")
 
     def test_plain_decoding_reaches_the_adapter_only_when_asked(self):
         response, value = self.chat("decode", crit={"decode": "plain"})
@@ -117,6 +126,32 @@ class WithoutPlainTests(Served, unittest.TestCase):
         self.assertEqual((value["error"]["param"], value["error"]["code"]), ("crit.decode", "unsupported_parameter"))
         _, models = self.call("GET", "/v1/models")
         self.assertTrue(all(card["engine_facts"] is None for card in models["data"]))
+
+
+class HostTelemetryTests(unittest.TestCase):
+    def test_a_failing_telemetry_report_is_none_and_fails_nothing(self):
+        import contextlib
+        import io
+        import tempfile
+        from pathlib import Path
+        from crit_api.host import Host, Unloaded
+
+        class Failing:
+            def telemetry(self):
+                raise KeyError("a plugin's counter")
+        with tempfile.TemporaryDirectory() as temp:
+            host = Host(Path(temp), 1 << 30, 1 << 30, lambda message: None)
+            request = {"request_id": "r", "run_id": "run", "candidate_id": "c", "package_sha256": "0" * 64}
+            with self.assertRaises(Unloaded):
+                host.telemetry(request)
+            host.identity = {"run_id": "run", "candidate_id": "c", "package_sha256": "0" * 64}
+            host.engine = Failing()
+            with contextlib.redirect_stderr(io.StringIO()) as logged:
+                found = host.telemetry(request)
+            self.assertIsNone(found["engine_telemetry"])
+            self.assertIn("KeyError", logged.getvalue())
+            self.assertFalse(host.blocked)
+            self.assertEqual(host.texts, 0)
 
 
 class TelemetryTests(unittest.TestCase):

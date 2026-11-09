@@ -1,5 +1,5 @@
 """Routing descriptions: the host reference against hand-worked cases and, when installed, the
-Hugging Face transformers router code each parameterization reproduces; config mapping from
+Hugging Face transformers router class each parameterization reproduces; config mapping from
 Core's parsed fields."""
 from dataclasses import replace
 import importlib.util
@@ -146,31 +146,33 @@ class TransformersRoutingTests(unittest.TestCase):
         self.compare(r.Routing(scoring="sigmoid"), selected, experts=16, top=1)
 
     def test_deepseek_v3_family_sigmoid_bias_groups(self):
-        from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE
-        from transformers.models.glm4_moe.modeling_glm4_moe import Glm4MoeMoE
+        from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3TopkRouter
+        from transformers.models.glm4_moe.modeling_glm4_moe import Glm4MoeTopkRouter
         # DeepSeek-V3 (8 groups, best 4, 2.5x), and the single-group GLM-4.5 / Kimi K2 form.
-        for cls, groups, selected, scale in ((DeepseekV3MoE, 8, 4, 2.5), (Glm4MoeMoE, 1, 1, 2.5),
-                                             (DeepseekV3MoE, 1, 1, 2.827)):
-            def reference(x, bias, cls=cls, groups=groups, selected=selected, scale=scale):
-                owner = SimpleNamespace(gate=SimpleNamespace(e_score_correction_bias=bias), n_group=groups,
-                                        n_routed_experts=64, topk_group=selected, top_k=8, norm_topk_prob=True,
-                                        routed_scaling_factor=scale)
-                return cls.route_tokens_to_experts(owner, x)
+        for cls, groups, selected, scale in ((DeepseekV3TopkRouter, 8, 4, 2.5), (Glm4MoeTopkRouter, 1, 1, 2.5),
+                                             (DeepseekV3TopkRouter, 1, 1, 2.827)):
+            router = self.identity(cls(SimpleNamespace(num_experts_per_tok=8, num_local_experts=64, hidden_size=64,
+                                                       routed_scaling_factor=scale, n_group=groups,
+                                                       topk_group=selected, norm_topk_prob=True)), 64)
+
+            def reference(x, bias, router=router):
+                router.e_score_correction_bias = bias
+                return router(x)[2:0:-1]
             routing = r.Routing(scoring="sigmoid", score_before_selection=True, correction_bias=True, groups=groups,
                                 selected_groups=selected, group_score_top=2 if groups > 1 else 1, renormalize=True,
                                 renormalize_epsilon=1e-20, scaling=scale)
             self.compare(routing, reference, top=8, bias=True)
 
     def test_deepseek_v2_group_limited_greedy(self):
-        from transformers.models.deepseek_v2.modeling_deepseek_v2 import DeepseekV2Moe
+        from transformers.models.deepseek_v2.modeling_deepseek_v2 import DeepseekV2TopkRouter
+        # Eight groups declared both times: greedy ignores them.
         for method, groups in (("group_limited_greedy", 8), ("greedy", 1)):
-            def reference(x, _, method=method, groups=groups):
-                owner = SimpleNamespace(topk_method=method, top_k=6, num_group=groups, topk_group=3,
-                                        num_experts=64, routed_scaling_factor=16.0)
-                return DeepseekV2Moe.route_tokens_to_experts(owner, x.view(1, *x.shape))
+            router = self.identity(DeepseekV2TopkRouter(SimpleNamespace(
+                num_experts_per_tok=6, num_experts=64, hidden_size=64, routed_scaling_factor=16.0, topk_method=method,
+                n_group=8, topk_group=3)), 64)
             routing = r.Routing(score_before_selection=True, groups=groups, selected_groups=min(3, groups),
                                 scaling=16.0)
-            self.compare(routing, reference)
+            self.compare(routing, lambda x, _, router=router: router(x)[2:0:-1])
 
     def test_minimax_ernie_longcat_bias_forms(self):
         from transformers.models.minimax_m2.modeling_minimax_m2 import MiniMaxM2TopKRouter
@@ -180,21 +182,22 @@ class TransformersRoutingTests(unittest.TestCase):
                                                                      hidden_size=64)), 64)
         self.compare(r.Routing(scoring="sigmoid", score_before_selection=True, correction_bias=True, renormalize=True),
                      lambda x, bias: minimax(x, bias)[2:0:-1], top=8, bias=True)
-        ernie = self.identity(Ernie4_5_MoeTopKRouter(SimpleNamespace(moe_num_experts=64, hidden_size=64, moe_k=6,
-                                                                       moe_norm_min=1e-12)), 64)
+        ernie = self.identity(Ernie4_5_MoeTopKRouter(SimpleNamespace(num_experts=64, hidden_size=64,
+                                                                       num_experts_per_tok=6, moe_norm_min=1e-12)), 64)
 
         def ernie_reference(x, bias):
             ernie.moe_statics.e_score_correction_bias.data = bias.view(1, -1)
-            return ernie(x)[1:]
+            return ernie(x)[2:0:-1]
         self.compare(r.Routing(score_before_selection=True, correction_bias=True, renormalize=True,
                                renormalize_floor=1e-12), ernie_reference, bias=True)
-        longcat = LongcatFlashTopkRouter(SimpleNamespace(n_routed_experts=64, zero_expert_num=0, moe_topk=6,
+        longcat = LongcatFlashTopkRouter(SimpleNamespace(num_experts_per_tok=6, num_local_experts=64,
+                                                         n_routed_experts=64, zero_expert_num=0,
                                                          routed_scaling_factor=6.0, router_bias=False, hidden_size=64))
         self.identity(longcat.classifier, 64)
 
         def longcat_reference(x, bias):
             longcat.e_score_correction_bias = bias
-            return longcat(x)[::-1]
+            return longcat(x)[2:0:-1]
         self.compare(r.Routing(score_before_selection=True, correction_bias=True, scaling=6.0), longcat_reference,
                      bias=True)
 

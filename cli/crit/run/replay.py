@@ -9,7 +9,9 @@ candidates' projections are rebuilt from the copied records. The Eval status of 
 from today's reports at that point of the run. `--before PLAN` replays the run as it stood just before that plan was
 recorded instead: with the work its agent did after the parent's Eval toward it; before the run's first plan, the run
 as it stood then (recon and any work toward the first candidate), with no Eval yet. Drafts of the next plan (work/ JSON
-with a plan's fields, written after the parent's Eval or, from the start, at all) are always left out.
+with a plan's fields, written after the parent's Eval or, from the start, at all) are always left out. A file's time is
+the wall clock's, which steps back (records.CLOCK_SLACK), so a file counts as written before a moment only when it is
+dated at least CLOCK_SLACK before it: nothing written later passes for older.
 
 A replay builds nothing: crit refuses every command that records or changes a record in it (refuse). Its agent reads
 replay/agent_request.md, writes the plan it would record next to replay/plan.json, checks it with `plan --check`, and
@@ -23,7 +25,7 @@ import shlex
 import shutil
 import subprocess
 
-from .records import file_sha, ident, load_run, now, read_json, safe_path, timestamp, write_json
+from .records import CLOCK_SLACK, file_sha, ident, load_run, now, read_json, safe_path, timestamp, write_json
 
 MARKER = "replay.json"     # in a replay's run folder: what it replays
 FOLDER = "replay"          # the replay's own files: brief, statuses rendered again, the agent's plan and notes
@@ -87,16 +89,18 @@ def _draft(path):
 
 def _kept(relative, path, limit, drafts_after):
     """Whether a file of the run belongs in a replay at `limit` (a POSIX timestamp); plan drafts written after
-    `drafts_after` (the parent's Eval) stay out."""
+    `drafts_after` (the parent's Eval) stay out. Records are dated by a clock that never steps back (records.utc_now)
+    and files by the wall clock, which does, by up to CLOCK_SLACK: a file written just after a moment can be dated
+    before it, so a file counts as before a moment only when dated at least CLOCK_SLACK earlier."""
     parts = relative.split("/")
     if any(part.startswith(".") for part in parts) or relative == REBUILT:
         return False
-    stat = path.stat()
-    if stat.st_mtime > limit:
+    stat, slack = path.stat(), CLOCK_SLACK.total_seconds()
+    if stat.st_mtime > limit - slack:
         return False
     if parts[0] == "work" and (stat.st_size > MAX_WORK_BYTES or path.suffix.lower() in BUILD_SUFFIXES):
         return False
-    if parts[0] == "work" and stat.st_mtime > drafts_after and _draft(path):
+    if parts[0] == "work" and stat.st_mtime > drafts_after - slack and _draft(path):
         return False
     return True
 

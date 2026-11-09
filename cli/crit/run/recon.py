@@ -35,9 +35,14 @@ STARTING_DESIGNS = {
                           "so most expert reads stay on the device. Reserve no fixed prompt workspace: prompt (prefill) "
                           "buffers are lent from cache slots while a prompt runs and returned for decode, so the cache "
                           "holds the size placement prints; (2) the checkpoint's drafter, so a pass emits several "
-                          "tokens (mtp-decode, device-speculative-round); (3) misses served by the faster source below, "
-                          "copied over the host link or computed on the CPU from host memory (host-expert-arithmetic, "
-                          "heterogeneous-expert-dispatch), with the split measured on this machine; its decode "
+                          "tokens (mtp-decode, device-speculative-round); (3) misses served by the faster source below: "
+                          "where the CPU expert lane (or the split) beats the link, computed on the CPU by the ready CPU "
+                          "expert tier (host-expert-tier: integer rows with the device's bits, a pinned pool, a mailbox "
+                          "payload) beside link copies, else copied over the host link, with the split measured on this "
+                          "machine (device-expert-cache admission from split.py); (4) the cache warmed from a routing "
+                          "profile built from crit's corpus (device-expert-cache residency_profile.py) and kept "
+                          "adapting, off the step's path where the CPU tier serves misses (device-expert-cache's "
+                          "background ranked residency); its decode "
                           "telemetry reports expert_reads and expert_hits, so Eval prices its floors at the cache's "
                           "own hit rate (its facts' host_bytes_per_pass prices its own path instead). An engine that copies "
                           "every expert over the link on every pass, without a cache or a drafter, is not a proof of "
@@ -670,13 +675,15 @@ Companion drafters read (Inference's hidden-state-drafters entry wires them):
 
 TODO. How the engine prefills fast inside the drift budget, as the drafting plan says for decode. For each matrix
 group of the checkpoint (attention projections, MLP, recurrent projections, ...) by its stored format: the activation
-format its prompt GEMMs take (bf16, fp16_acc, fp8 or stored, as crit-eval prices them) and the quality measurement
-that allows it: `crit eval run --adapter A --only quality --attribute-drift`, the engine declaring
+format its prompt GEMMs take (bf16, fp16_acc, fp8 or stored, as crit-eval prices them) and, in a preserve run, the
+quality measurement that allows it:
+`crit eval run --package P --only quality --quality-mode preserve --attribute-drift`, the engine declaring
 `prompt_activations` and one `exact_variants` entry per group, each group's share of the budget read against the
 quality spread (`budget_spread`). Name the prefill ceiling crit-eval prices for this plan next to the stored-format
-one. In an as_quantized run (plan rules 6) candidate 1 already reads prompts at the checkpoint's own activation
-format for every quantized group (stored, or fp8 / fp16_acc), and each plan declares them in prompt_activations:
-BF16 is the starting point only for groups the checkpoint stores in BF16.
+one. In a speed run (plan rules 6), candidate 1 already reads prompts at
+the stored format's activations for every quantized group (stored, or fp8 / fp16_acc), and each plan declares them
+in prompt_activations; groups the checkpoint stores in 16 bits start at bf16 or fp16_acc, and where the run allows
+transformed weights, re-encoding them (FP8 per channel) is their lever to measure.
 
 ## Decisions
 

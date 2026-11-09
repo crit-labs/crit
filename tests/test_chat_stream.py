@@ -12,7 +12,7 @@ for _folder in ("core/python", "api", "../crit-eval", "kernels", "cli"): sys.pat
 from crit_api.host import Cancellation
 from crit_api.stream import StreamReader, StreamWriter
 from crit_api.engine import EngineError
-from support.serve import ADAPTER, ServeFixture
+from support.serve import ADAPTER, RECIPE, ServeFixture, scripted_package
 
 
 class StreamContractTests(unittest.TestCase):
@@ -109,8 +109,9 @@ class StreamingEngine(Engine):
             emit(chunk)
             time.sleep(.06)
         if self.mode == 'hold':
-            (Path(self.context.arguments[0]) / 'holding').touch()
-            while not (Path(self.context.arguments[0]) / 'release').exists():
+            control = Path(Path(__file__).with_name('control.txt').read_text())
+            (control / 'holding').touch()
+            while not (control / 'release').exists():
                 cancellation.check()
                 time.sleep(.01)
         response['assistant'] = ''.join(chunks)
@@ -144,14 +145,14 @@ class StreamingFixture(ServeFixture):
         package = self.root / ("stream-package-" + candidate["candidate_id"])
         package.mkdir(exist_ok=True)
         source = ADAPTER + "\ndel Engine.generate_stream\n" if candidate["configuration"].get("missing_stream") else STREAM_ADAPTER
-        (package / "engine.py").write_text(source, encoding="utf-8")
         self.control = self.root / "stream-control"
         self.control.mkdir(exist_ok=True)
-        return self.store.package(self.run_id, candidate["candidate_id"], package,
-            {"build": {"toolchain": {"fixture": "host-python"}, "dependencies": [], "command": ["fixture"]},
-             "launch": ["engine.py", str(self.control)],
-             "capabilities": ["prefill", "decode", "chat-json-v1", "chat-resident-v1", "chat-stream-v1",
-                              "chat-sampling-temperature-v1"]})
+        # The folder the engine signals in, which a launch argument named before plugin packages.
+        (package / "control.txt").write_text(str(self.control), encoding="utf-8")
+        return self.store.package(self.run_id, candidate["candidate_id"], scripted_package(package, source), RECIPE)
+
+    def capabilities(self):
+        return ["chat-json-v1", "chat-resident-v1", "chat-stream-v1", "chat-sampling-temperature-v1"]
 
     def streaming(self, engine, message, stop=None, candidate=None):
         """Generate in a thread, collecting the pieces of text the engine streams."""

@@ -1,0 +1,37 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "token-constraints",
+  "title": "Structured-output sampling: constrained laws, acceptance and repair under an allowed set",
+  "description": "token-constraints' laws (mask first, then filter) with Core's draws from token-sampling: the law of a row under a matcher's allowed set, a sampled draft accepted with min(1, p/q) and repaired from max(p - q, 0) inside the language. Equals token-sampling on rows masked to the allowed set. Its device form masks each constrained row's logits to its allowed set before token-sampling's device law (sample), or in buffers at fixed addresses filled from the host's bitmask words before the launch, for a step captured in a CUDA graph (staged); inside captured decode rounds (rounds:sampler) token-sampling's round form with each slot's mask staged beside its rules, a constrained slot's logits masked and its drafts cut (one token a round). Core decodes constrained requests one token per step, so sampled verification under a constraint stays the host form.",
+  "fills": [
+    "sampler"
+  ],
+  "provides": [
+    "sampler:core-law",
+    "sampler:constraints",
+    "rounds:sampler"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "options": {
+    "rounds": {
+      "type": "choice",
+      "default": "native",
+      "choices": [
+        "native",
+        "torch"
+      ],
+      "description": "what samples inside captured decode rounds (rounds:sampler): token-sampling's native round form (its code/sampling.cu built for the device at load; where it does not build, the torch law, with a warning) or its torch law"
+    }
+  },
+  "reference": [
+    "token-sampling"
+  ],
+  "sources": {
+    "constraints": "code",
+    "token_sampling": "../token-sampling/code"
+  },
+  "entry": "plugin.py:create"
+}

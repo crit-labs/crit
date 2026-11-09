@@ -11,5 +11,8 @@ enum class Isa { scalar, portable, avx2, avx512 };
 const char* isa_name(Isa) noexcept;
 bool supported(Isa) noexcept;
 Isa best_isa() noexcept;
+// AVX-512 BW and VNNI beside AVX-512F (vpdpbusd), for integer paths that need them; false where the ISA files are not
+// built.
+bool avx512_vnni() noexcept;
 
 }  // namespace crit::techniques::host_isa

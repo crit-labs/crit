@@ -60,6 +60,7 @@ __global__ void plan_kernel(Directory d, int group, const std::int32_t* experts,
             if(s_key[q] == key) { d.state[2] = 1; key = -1; }
     CRIT_CACHE_SYNC();
     s_key[r] = key;
+    if(key >= 0 && d.route_counts) atomicAdd(d.route_counts + key, 1u);
     if(key >= 0) {
         slot = d.key_slot[key];
         if(slot >= 0) { d.slot_ref[slot] = 1; d.slot_pin[slot] = stamp; }
@@ -104,7 +105,7 @@ __global__ void plan_kernel(Directory d, int group, const std::int32_t* experts,
             const int hand = s_hand;
             const int c = (hand + r) % d.slots;
             const bool active = r < window;
-            const bool pinned = active && d.slot_pin[c] == stamp;
+            const bool pinned = active && (d.slot_pin[c] == stamp || d.slot_key[c] == kReserved);
             const bool referenced = active && d.slot_ref[c] != 0;
             const unsigned free_mask = CRIT_CACHE_BALLOT(active && !pinned && !referenced);
             const int first = free_mask ? __ffs(free_mask) - 1 : window;
@@ -185,6 +186,39 @@ __global__ void prefetch_kernel(Directory d, int group, const std::int32_t* pred
     d.counters[3] += n;
 }
 
+// Background swaps: begin unmaps and reserves each slot and writes its copy; commit maps the keys.
+__global__ void swap_begin_kernel(Directory d, const Swap* swaps, int count, Fill* fills, int* fill_count) {
+    if(threadIdx.x != 0) return;
+    int n = 0;
+    for(int i = 0; i < count; ++i) {
+        const Swap w = swaps[i];
+        if(w.slot < 0 || w.slot >= d.slots || w.key < 0 || w.key >= d.groups * d.experts) { d.state[2] = 1; continue; }
+        const int old = d.slot_key[w.slot];
+        if(old >= 0) d.key_slot[old] = -1;
+        d.slot_key[w.slot] = kReserved;
+        d.slot_ref[w.slot] = 0;
+        fills[n++] = Fill{reinterpret_cast<const uint4*>(d.store + std::size_t(w.key) * d.bundle_bytes),
+                          reinterpret_cast<uint4*>(d.slots_base + std::size_t(w.slot) * d.bundle_bytes)};
+    }
+    *fill_count = n;
+}
+
+__global__ void swap_commit_kernel(Directory d, const Swap* swaps, int count) {
+    if(threadIdx.x != 0) return;
+    for(int i = 0; i < count; ++i) {
+        const Swap w = swaps[i];
+        if(w.slot < 0 || w.slot >= d.slots || w.key < 0 || w.key >= d.groups * d.experts) continue;
+        if(d.slot_key[w.slot] != kReserved) continue;
+        if(d.key_slot[w.key] >= 0) {
+            d.slot_key[w.slot] = -1;   // resident elsewhere meanwhile: the slot stays empty
+            continue;
+        }
+        d.slot_key[w.slot] = w.key;
+        d.key_slot[w.key] = w.slot;
+        d.slot_ref[w.slot] = 0;
+    }
+}
+
 // Warm start from a residency profile: the first valid, distinct keys take slots 0, 1, ... unreferenced.
 __global__ void preload_kernel(Directory d, const std::int32_t* keys, int count, Fill* fills, int* fill_count) {
     if(threadIdx.x != 0) return;
@@ -254,6 +288,19 @@ cudaError_t enqueue_preload(const Directory& d, const std::int32_t* keys, int co
                             cudaStream_t stream) {
     if(!valid(d) || !keys || !fills || !fill_count || count < 0) return cudaErrorInvalidValue;
     preload_kernel<<<1, 32, 0, stream>>>(d, keys, count, fills, fill_count);
+    return cudaGetLastError();
+}
+
+cudaError_t enqueue_swap_begin(const Directory& d, const Swap* swaps, int count, Fill* fills, int* fill_count,
+                               cudaStream_t stream) {
+    if(!valid(d) || !swaps || !fills || !fill_count || count < 0) return cudaErrorInvalidValue;
+    swap_begin_kernel<<<1, 32, 0, stream>>>(d, swaps, count, fills, fill_count);
+    return cudaGetLastError();
+}
+
+cudaError_t enqueue_swap_commit(const Directory& d, const Swap* swaps, int count, cudaStream_t stream) {
+    if(!valid(d) || !swaps || count < 0) return cudaErrorInvalidValue;
+    swap_commit_kernel<<<1, 32, 0, stream>>>(d, swaps, count);
     return cudaGetLastError();
 }
 

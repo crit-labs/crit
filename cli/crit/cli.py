@@ -12,6 +12,8 @@ FAMILIES = (
     ("eval", "crit_eval.cli", "Run the common speed, quality and exactness suite (crit Eval); use crit eval --help"),
     ("serve", "crit_api.cli", "Serve a sealed candidate as an OpenAI-compatible API; use crit serve --help"),
     ("pull", "crit.pull.cli", "Install a crit-hub engine for crit serve --engine; use crit pull --help"),
+    ("smoke", "crit_smoke.cli", "Check a served engine's quality components in seconds; use crit smoke --help"),
+    ("plugins", "crit.plugins", "List, check and test an engine's plugins; use crit plugins --help"),
     ("bench", "crit.pull.bench", "Measure an installed engine with crit Eval beside its card; use crit bench --help"),
     ("hub", "crit.pull.report", "Add a crit bench result to its crit-hub card (crit hub report); use crit hub --help"),
     ("kernels", "crit_kernels", "Inspect kernel applicability and retain verified dependency bytes"),
@@ -53,12 +55,12 @@ def main(argv=None):
     sub = subs.add_parser("inference", help="Query or check the inference techniques")
     sub.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args(arguments)
+    if args.command == "inference":   # crit's plugin library, which an installed crit carries as a checkout does
+        from . import inference
+        return inference.main(args.arguments)
     repository = default_project()
     if not (repository / "core/include/crit/core.h").is_file():
         parser.error("Run repository maintenance commands from the crit repository")
-    if args.command == "inference":
-        from . import inference
-        return inference.main(args.arguments, repository)
     print("core/include/crit/core.h\ncore/include/crit/cuda.h\ncore/contracts/README.md")
     return 0
 

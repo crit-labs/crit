@@ -47,6 +47,10 @@
     {
       "path": "inference/ssd-expert-materialization/code/host_tier.h",
       "purpose": "Native HostTier ledger over pinned slots (LRU, protected experts, refusal, fill commit/abandon, counters) and ReadQueue (positioned readers, demand before read-ahead, deduplicated pending keys, tickets)"
+    },
+    {
+      "path": "inference/ssd-expert-materialization/code/bundle_file.py",
+      "purpose": "FileBundleStore, the file tier of experts:store: bundles in one file read on demand by a row reader behind the bounded host tier, no device-readable region"
     }
   ],
   "requires": {
@@ -78,7 +82,8 @@
     "TierCounters",
     "ReadQueue",
     "Read",
-    "Ticket"
+    "Ticket",
+    "FileBundleStore"
   ],
   "interactions": [
     "expert-residency",
@@ -93,7 +98,7 @@
   ],
   "validation": {
     "host": "Host fixtures and worked example cover checked file reads, pending reuse, read failure, failed-upload retention/recovery, host-tier hits, checked retention of evictions and route protection",
-    "native": "Windows and Linux fixtures check mapped page boundaries, duplicates, coalescing, sequential/parallel equivalence, empty files, bounds, cancellation and retry; no storage-throughput or GPU-upload qualification; host_tier_tests.cpp: tier hits, LRU eviction, protection and refusal, fill commit and abandon; read queue with four readers, demand priority, pending dedupe and a failing read",
+    "native": "Windows and Linux fixtures check mapped page boundaries, duplicates, coalescing, sequential/parallel equivalence, empty files, bounds, cancellation and retry; no storage-throughput or GPU-upload qualification; host_tier_tests.cpp: tier hits, LRU eviction, protection and refusal, fill commit and abandon; read queue with four readers, demand priority, pending dedupe and a failing read; the bundle file (tests/test_store.py): bundles byte-exact through the native reader and positioned reads, repeats from the host tier, a file reopened without puts, a device expert cache filled from it",
     "performance": "Unmeasured for a crit engine; host fixture success is not a speed claim (an upstream engine's host tier measurement is cited in the README for scale only)"
   },
   "native_integration": {

@@ -1,0 +1,72 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "topk-router",
+  "title": "Top-k expert routing from one routing description (heterogeneous-expert-dispatch)",
+  "description": "heterogeneous-expert-dispatch's Routing and its host reference: softmax or sigmoid scores before or after selection, a per-expert correction bias that only changes the selection, group limits, renormalization and scaling, ties to the lower expert id. The reference a device routing kernel is checked against; its device form runs the same rule over a step's router logits, through the registry kernel crit-labs/topk-routing (one launch, a warp per token row) where it loads and the rule has no group limit, in torch otherwise; capture-safe (no host synchronization; a captured round's or prompt chunk's junk rows of NaN logits still pick valid distinct experts, with weights 0: rounds:router, prompts:router).",
+  "fills": [
+    "router"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "provides": [
+    "rounds:router",
+    "prompts:router"
+  ],
+  "options": {
+    "scoring": {
+      "type": "choice",
+      "default": "softmax",
+      "choices": [
+        "softmax",
+        "sigmoid"
+      ]
+    },
+    "score_before_selection": {
+      "type": "bool",
+      "default": false
+    },
+    "renormalize": {
+      "type": "bool",
+      "default": false
+    },
+    "scaling": {
+      "type": "float",
+      "default": 1.0,
+      "min": 0.0
+    },
+    "groups": {
+      "type": "int",
+      "default": 1,
+      "min": 1
+    },
+    "selected_groups": {
+      "type": "int",
+      "default": 1,
+      "min": 1
+    },
+    "group_score_top": {
+      "type": "int",
+      "default": 1,
+      "min": 1
+    },
+    "kernel": {
+      "type": "bool",
+      "default": true,
+      "description": "select through the registry kernel crit-labs/topk-routing where it loads (rules without a group limit); false: torch"
+    }
+  },
+  "kernels": [
+    {
+      "name": "crit-labs/topk-routing",
+      "version": 1,
+      "revision": null,
+      "fallback": "the same rule in torch (softmax or sigmoid, a stable sort for the selection): capture-safe, about fifteen launches a call"
+    }
+  ],
+  "sources": {
+    "dispatch": "../../heterogeneous-expert-dispatch/code"
+  },
+  "entry": "plugin.py:create"
+}

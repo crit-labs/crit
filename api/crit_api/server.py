@@ -25,7 +25,7 @@ from crit_core.text.stops import MAX_STOP_BYTES, MAX_STOPS
 
 from crit import __version__
 
-from . import anthropic, ollama, responses
+from . import anthropic, api_chat, responses
 from .content import MAX_CONTENT
 from .disconnect import ClientDisconnect
 from .delivery import PING, StreamDelivery, sse_event
@@ -41,8 +41,8 @@ MAX_BODY = 8 * 1024 * 1024
 BODY_SIZE = "The request body must be between 1 byte and 8 MiB"
 TLS_HANDSHAKE_SECONDS = 10
 GET_PATHS = {"", "/health", "/api/version", "/v1/models", "/metrics", "/api/tags", "/api/ps"}
-# Tokenizer and chat template of the engine (chat-tokenize-v1): vLLM's /tokenize and /detokenize, llama-server's
-# /apply-template and Anthropic's token count.
+# Tokenizer and chat template of the engine (chat-tokenize-v1): /tokenize, /detokenize and /apply-template in the
+# shapes other servers answer, and Anthropic's token count.
 TOKENIZE_PATHS = ("/tokenize", "/detokenize", "/apply-template", "/v1/messages/count_tokens")
 POST_PATHS = {"/v1/chat/completions", "/v1/completions", "/v1/crit/score", "/v1/crit/abort", "/v1/crit/load",
               "/v1/crit/unload", "/v1/messages", "/v1/responses", "/api/chat", "/api/generate", "/api/show",
@@ -64,7 +64,7 @@ UNSUPPORTED = {"functions": "legacy function calls (use tools)",
 # What --lenient ignores of UNSUPPORTED: without them the reply is still the one asked for.
 HINTS = {"prediction"}
 STRUCTURED_OUTPUTS = ("regex", "choice", "grammar", "json")
-# vLLM's earlier names for one structured_outputs field.
+# The earlier names for one structured_outputs field.
 GUIDED = {"guided_regex": "regex", "guided_choice": "choice", "guided_grammar": "grammar", "guided_json": "json"}
 KNOWN = {"model", "messages", "stream", "stream_options", "max_tokens", "max_completion_tokens", "stop", "n",
          "include_stop_str_in_output", "response_format", "structured_outputs", "tools", "tool_choice",
@@ -108,7 +108,7 @@ def late_system(content):
 
 
 def continuation(body, capabilities):
-    """Whether the request continues its final assistant message: vLLM's continue_final_message true with
+    """Whether the request continues its final assistant message: continue_final_message true with
     add_generation_prompt false, for a package that declares chat-continue-v1. Their defaults change nothing."""
     for key in ("continue_final_message", "add_generation_prompt"):
         if body.get(key) is not None and type(body[key]) is not bool:
@@ -194,7 +194,7 @@ def tool_conversation(messages, capabilities=(), continuing=False):
                 raise RequestError("tool_call_id must reference an unanswered assistant call", param=param)
             pending.remove(ident)
             row["tool_call_id"] = ident
-        # reasoning is vLLM's and OpenRouter's name for reasoning_content; their replies give null when there is none.
+        # reasoning is another name for reasoning_content; other servers' replies give null when there is none.
         for key in ("name", "reasoning_content", "reasoning"):
             if key in message and not (key == "reasoning" and message[key] is None):
                 if not isinstance(message[key], str):
@@ -240,7 +240,7 @@ def thinking_template(thinking, capabilities, template, lenient=None):
 
 
 def thinking_budget(body, thinking, capabilities, unapplied):
-    """The reasoning tokens a chat request allows its reply (chat-thinking-budget-v1), or None: llama-server's
+    """The reasoning tokens a chat request allows its reply (chat-thinking-budget-v1), or None:
     thinking_budget_tokens, which needs the capability, else another dialect's budget (Anthropic's
     thinking.budget_tokens) where its thinking controls applied, which drops it from `unapplied`; without the
     capability that one stays ignored and listed."""
@@ -279,9 +279,9 @@ def completion_prompt(value):
 def output_limit(value, kv_tokens, fits=False):
     """(max_tokens, fit_output) for a request's output cap: 1 to kv_tokens - 1, by default DEFAULT_MAX_TOKENS or less
     to fit. A package declaring chat-fit-output-v1 (`fits`) fits a cap at or above its context: the engine stops where
-    the prompt leaves no room (Ollama's num_predict -1 and -2, ollama.FILL_CONTEXT, ask for that), so the request
+    the prompt leaves no room (/api/chat's num_predict -1 and -2, api_chat.FILL_CONTEXT, ask for that), so the request
     sends kv_tokens - 1 with fit_output. A cap below the context stays exact."""
-    if value is ollama.FILL_CONTEXT:
+    if value is api_chat.FILL_CONTEXT:
         value = kv_tokens if fits else None
     if value is None:
         value = min(DEFAULT_MAX_TOKENS, kv_tokens - 1)
@@ -345,9 +345,9 @@ def response_format(value):
 
 
 def structured_outputs(body):
-    """(constraint, param) for vLLM's structured_outputs, or (None, None) without one: exactly one of regex (Core's
+    """(constraint, param) for structured_outputs, or (None, None) without one: exactly one of regex (Core's
     byte regex over the whole reply), choice (the reply is one of the strings), grammar (Core's line EBNF) or json (a
-    JSON schema, as response_format's), compiled with Core's constraint compiler. vLLM's earlier guided_regex,
+    JSON schema, as response_format's), compiled with Core's constraint compiler. The earlier guided_regex,
     guided_choice, guided_grammar and guided_json name one the same way. Null fields count as absent.
 
     regex, choice and grammar reach the engine as {"type": "grammar", "language", "source", "grammar"}, the
@@ -614,7 +614,7 @@ class Api:
             raise RequestError("This engine returns one choice per request", param="n")
         if "stream" in body and type(body["stream"]) is not bool:
             raise RequestError("stream must be a boolean", param="stream")
-        # vLLM's extension: lower values leave the queue for the engine first (Admission.admit).
+        # An extension to the OpenAI API: lower values leave the queue for the engine first (Admission.admit).
         if body.get("priority") is not None and type(body["priority"]) is not int:
             raise RequestError("priority must be an integer", param="priority")
         if type(body.get("include_stop_str_in_output", False)) is not bool:
@@ -676,13 +676,14 @@ class Api:
                 "continue_final_message": continuing, "thinking_tokens": budget, "ignored": ignored}
 
     def prompt_request(self, body, thinking=None, param="prompt"):
-        """A raw-prompt completion (completion-v1): POST /v1/completions, or an Ollama /api/generate with raw true as
-        ollama.generate_body translates it (param "raw", the field that asked for it). One prompt, text or token ids,
+        """A raw-prompt completion (completion-v1): POST /v1/completions, or an /api/generate with raw true as
+        api_chat.generate_body translates it (param "raw", the field that asked for it). One prompt, text or token ids,
         continued without the chat template; logprobs n gives each token n alternatives, and echo returns the prompt
         before the reply, with logprobs its rows from a chat-score-v1 engine's score path. Without completion-v1,
-        /v1/completions is a 404 not_supported and Ollama's raw a 400. max_tokens, stop, include_stop_str_in_output,
-        priority, crit and --lenient apply as to a chat request (completion_request); `thinking`, another dialect's
-        thinking controls, sets template variables a raw prompt never renders, so its params are ignored and listed."""
+        /v1/completions is a 404 not_supported and /api/generate's raw a 400. max_tokens, stop,
+        include_stop_str_in_output, priority, crit and --lenient apply as to a chat request (completion_request);
+        `thinking`, another dialect's thinking controls, sets template variables a raw prompt never renders, so its
+        params are ignored and listed."""
         if not isinstance(body, dict):
             raise RequestError("The request body must be a JSON object")
         candidate = self.candidate(body.get("model"))
@@ -740,7 +741,7 @@ class Api:
                 "ignored": sorted(ignored | set(lenient or ()))}
 
     def generate_request(self, body, thinking=None):
-        """An Ollama /api/generate request as ollama.generate_body translates it: a raw prompt (raw true) is a
+        """An /api/generate request as api_chat.generate_body translates it: a raw prompt (raw true) is a
         completion-v1 request, any other a chat turn."""
         if "prompt" in body:
             return self.prompt_request(body, thinking, "raw")
@@ -776,7 +777,7 @@ class Api:
 
     def card(self, candidate):
         """The /v1/models card of an engine.candidates() entry: its display_name (a catalog's) or label as display_name,
-        its context as context_length and as max_model_len, vLLM's name, which LiteLLM reads, and the limits a request
+        its context as context_length and as max_model_len, the name LiteLLM reads, and the limits a request
         to it is held to."""
         default = candidate["candidate_id"] == self.engine.default
         spec = self.engine.spec(candidate["candidate_id"])
@@ -798,13 +799,13 @@ class Api:
                 # What Eval's headroom and exactness read, while this candidate's engine is loaded.
                 "engine_facts": self.engine.facts(candidate["candidate_id"])}
 
-    def ollama_card(self, candidate, status=None):
+    def api_chat_card(self, candidate, status=None):
         """The /api/tags entry of an engine.candidates() entry, its digest the package's; with the engine's status,
         its /api/ps entry."""
         card, digest = self.card(candidate), self.engine.spec(candidate["candidate_id"])["package_sha256"]
         if status is None:
-            return ollama.model_card(card, self.created, digest)
-        return ollama.loaded_card(card, self.created, digest, status, self.engine.unloads_at())
+            return api_chat.model_card(card, self.created, digest)
+        return api_chat.loaded_card(card, self.created, digest, status, self.engine.unloads_at())
 
     def usage(self, measured):
         """OpenAI usage; prompt_tokens_details.cached_tokens counts the prompt tokens the engine did not compute
@@ -819,7 +820,7 @@ class Api:
 
     def reasoning_fields(self, text):
         """Reasoning apart from the reply as a message or delta carries it: reasoning_content, and with
-        reasoning_alias the same text as reasoning too, the name vLLM and OpenRouter use."""
+        reasoning_alias the same text as reasoning too, for clients that read that field."""
         return {"reasoning_content": text, "reasoning": text} if self.reasoning_alias else {"reasoning_content": text}
 
     def finish_reason(self, stopped, measured, limit):
@@ -972,7 +973,7 @@ class OpenAIStream:
     logprobs, which come from the engine's final record, a usage chunk when stream_options.include_usage asks for one,
     then data: [DONE].
 
-    Every dialect's stream (this one, anthropic.Stream, responses.Stream, ollama.Stream) is run by Handler.streamed:
+    Every dialect's stream (this one, anthropic.Stream, responses.Stream, api_chat.Stream) is run by Handler.streamed:
     it has a content_type and a ping that keeps it open (or None), start() runs once the engine takes the request,
     text, tools and reasoning take what the engine streams (tools or reasoning None when the dialect does not stream
     them), then finish(ran, telemetry) or fail(message, code, status, request_id) ends it."""
@@ -1121,14 +1122,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def dialect(self):
         """The API dialect a path belongs to: anthropic (/v1/messages), responses (/v1/responses, OpenAI's errors),
-        ollama (/api/...), else openai."""
+        api_chat (/api/...), else openai."""
         path = self.path.split("?", 1)[0].rstrip("/")
         if path.startswith("/v1/messages"):
             return "anthropic"
         if path == "/v1/responses" or path.startswith("/v1/responses/"):
             return "responses"
         if path.startswith("/api/") or path == "":
-            return "ollama"
+            return "api_chat"
         return "openai"
 
     def fail(self, status, message, kind="invalid_request_error", param=None, code=None, headers=()):
@@ -1136,8 +1137,8 @@ class Handler(BaseHTTPRequestHandler):
         dialect = self.dialect()
         if dialect == "anthropic":
             return self.send_json(status, anthropic.error_body(status, message, self.request_id), headers)
-        if dialect == "ollama":
-            return self.send_json(status, ollama.error_body(message, self.request_id), headers)
+        if dialect == "api_chat":
+            return self.send_json(status, api_chat.error_body(message, self.request_id), headers)
         return self.error(status, message, kind, param, code, headers)
 
     def text_completion(self):
@@ -1152,7 +1153,7 @@ class Handler(BaseHTTPRequestHandler):
         dialect = self.dialect()
         if dialect == "anthropic":
             return anthropic.context_message(exc.prompt_tokens, exc.output_tokens, exc.capacity), None
-        if dialect == "ollama":
+        if dialect == "api_chat":
             return str(exc), None
         if self.text_completion():
             return (f"This model's maximum context length is {exc.capacity} tokens, however you requested "
@@ -1174,9 +1175,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def busy(self, exc):
         """A request the queue refused, as each dialect says the server is busy: OpenAI's rate limit (429, its type
-        requests and code rate_limit_exceeded), Anthropic's overloaded_error (529) and Ollama's 503, with Retry-After,
-        which clients wait before retrying."""
-        status = {"anthropic": 529, "ollama": 503}.get(self.dialect(), 429)
+        requests and code rate_limit_exceeded), Anthropic's overloaded_error (529) and /api/chat's 503, with
+        Retry-After, which clients wait before retrying."""
+        status = {"anthropic": 529, "api_chat": 503}.get(self.dialect(), 429)
         return self.fail(status, str(exc), "requests", code="rate_limit_exceeded",
                          headers=[("Retry-After", str(RETRY_AFTER))])
 
@@ -1298,11 +1299,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(200 if ok and (ready or not wanted) else 503,
                                   {"status": "ok" if ok else "unavailable", "ready": ready,
                                    "loaded": bool(status.get("engine")), "engine": status,
-                                   "max_concurrent_requests": self.api.capacity()})
+                                   "max_concurrent_requests": self.api.capacity(),
+                                   # Asked of the loaded engine now, beside any generation
+                                   # (docs/PLUGINS.md, Facts and telemetry).
+                                   "engine_telemetry": self.api.engine.telemetry() if ready else None})
         if path == "":
-            return self.send_text(200, "Ollama is running")  # what Ollama clients probe first
+            return self.send_text(200, "crit is running")  # what /api/chat clients probe first
         if path == "/api/version":
-            return self.send_json(200, {"version": ollama.OLLAMA_COMPAT_VERSION, "crit_version": __version__})
+            return self.send_json(200, {"version": api_chat.COMPAT_VERSION, "crit_version": __version__})
         if not self.authorized():
             return
         if path == "/v1/models":
@@ -1317,11 +1321,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/metrics":
             return self.send_text(200, self.api.metrics.render(self.api.engine), "text/plain; version=0.0.4; charset=utf-8")
         if path == "/api/tags":
-            return self.send_json(200, {"models": [self.api.ollama_card(c) for c in self.api.engine.candidates()]})
+            return self.send_json(200, {"models": [self.api.api_chat_card(c) for c in self.api.engine.candidates()]})
         if path == "/api/ps":
             status = self.api.engine.status()
             loaded = [c for c in self.api.engine.candidates() if self.api.engine.loaded(c["candidate_id"], status)]
-            return self.send_json(200, {"models": [self.api.ollama_card(c, status) for c in loaded]})
+            return self.send_json(200, {"models": [self.api.api_chat_card(c, status) for c in loaded]})
         self.unknown(path)
 
     def do_POST(self):
@@ -1364,11 +1368,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/responses":
             return self.dispatch(raw, responses.chat_body, self.responses_complete, self.responses_stream)
         if path == "/api/chat":
-            return self.ollama_chat(raw)
+            return self.api_chat_post(raw)
         if path == "/api/generate":
-            return self.ollama_chat(raw, generate=True)
+            return self.api_chat_post(raw, generate=True)
         if path == "/api/show":
-            return self.ollama_show(raw)
+            return self.api_chat_show(raw)
         if path in TOKENIZE_PATHS:
             return self.tokenized(raw, path)
         if path.startswith("/api/") and not_served(path) is None:
@@ -1681,32 +1685,33 @@ class Handler(BaseHTTPRequestHandler):
         self.streamed("responses", request, cancel,
                       responses.Stream(self.writer(cancel), request["source"], request["model"]))
 
-    # Ollama (crit_api.ollama)
+    # /api/chat and /api/generate (crit_api.api_chat)
 
-    def ollama_chat(self, raw, generate=False):
+    def api_chat_post(self, raw, generate=False):
         """/api/chat, or /api/generate. Without messages (or a prompt) the request loads its model and answers
         done_reason "load", with keep_alive 0 unloads it and answers "unload"; keep_alive 0 on a reply unloads the model
-        once the reply is sent, as Ollama expires its runner."""
+        once the reply is sent, as keep_alive 0 asks."""
         try:
             body = json.loads(raw)
-            action = ollama.lifecycle(body, generate, self.api.lenient)
+            action = api_chat.lifecycle(body, generate, self.api.lenient)
             candidate = self.api.candidate(body.get("model")) if action else None
         except (ValueError, UnicodeDecodeError) as exc:
-            self.api.metrics.count("ollama", "rejected")
+            self.api.metrics.count("api_chat", "rejected")
             return self.fail(400, "Invalid JSON body: " + str(exc))
         except RequestError as exc:
-            self.api.metrics.count("ollama", self.outcome(exc))
+            self.api.metrics.count("api_chat", self.outcome(exc))
             return self.fail(exc.status, str(exc))
         if action is None:
-            request = self.dispatch(raw, ollama.generate_body if generate else ollama.chat_body, self.ollama_complete,
-                                    self.ollama_stream, validate=self.api.generate_request if generate else None,
-                                    parsed=body, generate=generate)
-            if request is not None and ollama.unloads(body.get("keep_alive")):
+            request = self.dispatch(raw, api_chat.generate_body if generate else api_chat.chat_body,
+                                    self.api_chat_complete, self.api_chat_stream,
+                                    validate=self.api.generate_request if generate else None, parsed=body,
+                                    generate=generate)
+            if request is not None and api_chat.unloads(body.get("keep_alive")):
                 # In the background: the client has its reply and must not wait for the requests the unload drains.
                 threading.Thread(target=self.unload_quietly, args=(request["candidate"],), daemon=True).start()
             return None
-        self.lifecycle(action, candidate, lambda outcome: ollama.done(body.get("model") or self.api.model, action,
-                                                                      generate))
+        self.lifecycle(action, candidate, lambda outcome: api_chat.done(body.get("model") or self.api.model, action,
+                                                                        generate))
 
     def unload_quietly(self, candidate):
         """Unload `candidate`'s engine if it is still the loaded one; a failure is the next request's to report."""
@@ -1715,7 +1720,7 @@ class Handler(BaseHTTPRequestHandler):
         except EngineError:
             pass
 
-    def ollama_show(self, raw):
+    def api_chat_show(self, raw):
         try:
             body = json.loads(raw)
             if not isinstance(body, dict):
@@ -1730,16 +1735,16 @@ class Handler(BaseHTTPRequestHandler):
         card = next((c for c in self.api.models() if c["id"] == wanted or (candidate == self.api.engine.default and c["default"])), None)
         if card is None:
             return self.fail(404, f"model '{name}' not found")
-        self.send_json(200, ollama.show(card))
+        self.send_json(200, api_chat.show(card))
 
-    def ollama_complete(self, request, cancel, generate=False):
+    def api_chat_complete(self, request, cancel, generate=False):
         model, started = request["requested_model"] or request["model"], time.perf_counter()
-        self.reply("ollama", request, cancel, lambda text, ran: ollama.reply(model, text, ran,
-                                                                             time.perf_counter() - started, generate))
+        self.reply("api_chat", request, cancel,
+                   lambda text, ran: api_chat.reply(model, text, ran, time.perf_counter() - started, generate))
 
-    def ollama_stream(self, request, cancel, generate=False):
-        self.streamed("ollama", request, cancel,
-                      ollama.Stream(self.writer(cancel), request["requested_model"] or request["model"], generate))
+    def api_chat_stream(self, request, cancel, generate=False):
+        self.streamed("api_chat", request, cancel,
+                      api_chat.Stream(self.writer(cancel), request["requested_model"] or request["model"], generate))
 
 
 class Server(ThreadingHTTPServer):

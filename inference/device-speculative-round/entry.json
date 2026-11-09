@@ -3,7 +3,7 @@
   "category": "speculation",
   "summary": "GPU-resident speculative round: draft, verify, device accept and frontier advance in two CUDA graphs with one readback, for greedy requests and for sampled requests verified by rejection sampling",
   "implementation_status": "native_source",
-  "implementation_scope": "CUDA reference greedy-accept, truncation, seed, readback-block and allowance kernels, a single-row C++20 round controller over Core CudaBackend with Forward/Finish graph capture per draft width (chosen per round up to the widest), one readback per round of a block with the tokens, matched count, frontier and optional log-probabilities (a copy, or zero copy through mapped pinned memory) and stage timing, a C++/Python round/step budget, and a composed toy (synthetic attention plus gated-delta target, bigram drafter) through a real Core Engine. Sampled requests reuse the accept kernel on predictions from token-sampling's enqueue_verify (the target's own draws for greedy drafts, rejection sampling for sampled drafts, Core's counter-based draws), with a sampled-round fixture through both kernels. Engine draft, verify and state steps are supplied callables; no tuned or model-specific kernels. A torch round driver for Python engines over many rows at once (python_round.py: the same accept, truncation and pack over engine hooks, one CUDA graph per row count, width and mode, replay and forced modes, rejection-sampling predictions) and an adaptive width policy (width_policy.py).",
+  "implementation_scope": "CUDA reference greedy-accept, truncation, seed, readback-block and allowance kernels, a single-row C++20 round controller over Core CudaBackend with Forward/Finish graph capture per draft width (chosen per round up to the widest), one readback per round of a block with the tokens, matched count, frontier and optional log-probabilities (a copy, or zero copy through mapped pinned memory) and stage timing, a C++/Python round/step budget, and a composed toy (synthetic attention plus gated-delta target, bigram drafter) through a real Core Engine. Sampled requests reuse the accept kernel on predictions from token-sampling's enqueue_verify (the target's own draws for greedy drafts, rejection sampling for sampled drafts, Core's counter-based draws), with a sampled-round fixture through both kernels. Engine draft, verify and state steps are supplied callables; no tuned or model-specific kernels. For Python engines, whose rounds run on Core's round driver (crit_plugins.rounds: the same accept, truncation and pack over engine hooks or the library's device forms, one CUDA graph per row count, width and mode, replay and forced modes), the technique's rejection-sampling predictions and copied drafts (python_round.py) and an adaptive width policy (width_policy.py).",
   "agent_guidance": {
     "use_when": "A synchronous speculative loop is correct but host round trips, per-token readbacks or host acceptance dominate the round, for greedy or sampled requests",
     "avoid_when": "Verifying K+1 columns costs about K+1 ordinary steps, or the engine cannot keep per-column state for prefix selection; or routed experts stream from host memory, where every verify column adds its own expert misses",
@@ -22,7 +22,7 @@
       "RoundBudget tokens per round, round/step ratio, implied speedup and pass/fail at a default 1.3 threshold",
       "Fixed-width catch-up plan for stateful drafters, so the draft step's launch shape never depends on the device-held emitted count",
       "A host check that a batched operator computes every column bitwise identically at any batch width, with fixed-order and width-dependent reference operators",
-      "Python engines: SpeculativeRounds (python_round.py), the round for many rows at once in torch over three hooks (draft with catch-up, verify writing predictions, commit from the round's start), greedy, sampled, replay and forced modes, one CUDA graph per (rows, width, mode) captured at load, rows that join, leave and move between rounds, truncation to Core's count and one pinned readback per round",
+      "Python engines: rounds on Core's round driver (crit_plugins.rounds, SpeculativeRounds over three hooks: draft with catch-up, verify writing predictions, commit from the round's start), greedy, sampled, replay and forced modes, one CUDA graph per (rows, width, mode) captured at load, rows that join, leave and move between rounds, truncation to Core's count and one pinned readback per round",
       "rejection_predictions: per-column predictions under which the greedy accept rule is rejection sampling (accept with min(1, p/q), else draw from max(p - q, 0)), so a sampled verify needs no kernel of its own",
       "WidthPolicy (width_policy.py): the draft width per round from each row's decayed per-depth acceptance over the fitted round cost, for the rows that decode together",
       "Copied drafts for Python rounds: CopyDrafts stages a copy drafter's tokens and match lengths between rounds and override_drafts replaces a neural drafter's tokens where the match is long, with one-hot draft laws for sampled rows; capture-safe"
@@ -61,13 +61,13 @@
     {"path": "inference/device-speculative-round/code/device_round.h", "purpose": "Single-row device round controller interface, engine step contract and round configuration"},
     {"path": "inference/device-speculative-round/code/device_round.cpp", "purpose": "Forward/Finish capture, launch with stage timing, one readback_async, validated tokens and device truncation on commit"},
     {"path": "inference/device-speculative-round/code/toy_model.h", "purpose": "Synthetic toy target dimensions, weights/state views and reference kernel launch interfaces"},
-    {"path": "inference/device-speculative-round/code/toy_model.cu", "purpose": "Reference attention, gated-delta input, head (with optional log-probabilities and ranked alternatives), round-input, bigram-draft and commit kernels for the toy target"},
+    {"path": "inference/device-speculative-round/code/toy_model.cu", "purpose": "Reference attention, gated-delta input and a serial gated-delta verify with per-column checkpoints (fixture arithmetic), head (with optional log-probabilities and ranked alternatives), round-input and bigram-draft kernels for the toy target; its commit is recurrent-state-recovery's select_accepted"},
     {"path": "inference/device-speculative-round/code/toy_example.cpp", "purpose": "Core Engine adapter running one device round per advance with ordinary-greedy (tokens and log-probabilities), readback, trace and round/step checks"},
     {"path": "inference/device-speculative-round/code/round_budget.h", "purpose": "C++ round/step ratio, tokens per round and threshold check from Core DeviceTiming"},
     {"path": "inference/device-speculative-round/code/round_budget.py", "purpose": "Python round/step budget reference and worked example"},
     {"path": "inference/device-speculative-round/code/catch_up.py", "purpose": "Fixed-width catch-up position plan for stateful drafters and a toy positional drafter"},
     {"path": "inference/device-speculative-round/code/column_invariance.py", "purpose": "Column-invariance check for batched operators with fixed-order and width-dependent reference dot products"},
-    {"path": "inference/device-speculative-round/code/python_round.py", "purpose": "Batched torch round driver for Python engines: device state, accept, truncate, pack, CUDA graph capture, replay and forced modes, rejection-sampling predictions"},
+    {"path": "inference/device-speculative-round/code/python_round.py", "purpose": "Rejection-sampling predictions and copied drafts for rounds on Core's round driver (crit_plugins.rounds)"},
     {"path": "inference/device-speculative-round/code/width_policy.py", "purpose": "Adaptive draft width per round from per-depth acceptance over the measured round cost"}
   ],
   "requires": {
@@ -110,8 +110,6 @@
     "check",
     "fixed_order_dot",
     "width_split_dot",
-    "SpeculativeRounds",
-    "RoundView",
     "rejection_predictions",
     "draw",
     "WidthPolicy",

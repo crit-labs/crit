@@ -1,0 +1,16 @@
+{
+  "kind": "crit-technique-operations",
+  "technique": "token-sampling",
+  "operations": [
+    {
+      "id": "sampling",
+      "what": "a token drawn from a row's processed law (temperature, top-k, top-p, min-p) on the device",
+      "reference": {
+        "path": "inference/token-sampling/code/sampling.py",
+        "symbol": "law, select"
+      },
+      "verify": "on the target, draw many tokens from fixed rows with the kernel and compare their frequencies with law's probabilities (a chi-square or the sampling check crit eval runs); provider draws use their own random stream, so they are not bit-equal to Core's counter-based Philox draws that this entry's kernels reproduce",
+      "invariance": "a row's draw independent of the rows beside it"
+    }
+  ]
+}

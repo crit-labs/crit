@@ -130,7 +130,7 @@ struct JoinSupport {
     bool mapped = false, stream_wait = false, stream_wait_captured = false;
     std::string detail;
 };
-JoinSupport probe_joins(int device);
+JoinSupport probe_joins(int device);   // on `device`; the caller's current device is left as it was
 
 // Cost of one post plus join with an empty handler, inside a captured graph replayed `replays` times (median of
 // per-replay means), for every supported capturable join. Microseconds; empty when unsupported.

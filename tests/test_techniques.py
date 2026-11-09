@@ -22,9 +22,12 @@ class DescriptionExamples(unittest.TestCase):
                 blocks = re.findall(r"^```python\n(.*?)^```$",
                                     description.read_text(encoding="utf-8"), re.M | re.S)
                 self.assertEqual(len(blocks), 1, "one runnable mechanism example per entry")
+                # The entry's code beside Core's Python package (crit_plugins), as an installed crit has it.
+                core = str(Path(__file__).resolve().parents[1] / "core" / "python")
+                path = os.pathsep.join(filter(None, [core, os.environ.get("PYTHONPATH")]))
                 result = subprocess.run([sys.executable, "-B", "-c", blocks[0]],
                                         cwd=description.parent / "code", capture_output=True,
-                                        text=True, timeout=20)
+                                        text=True, timeout=20, env={**os.environ, "PYTHONPATH": path})
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -94,6 +97,34 @@ class LookupTableRowTests(unittest.TestCase):
             # A row past the file's end (the file changed under the table) reads short.
             with self.assertRaisesRegex(OSError, "short read"):
                 table._read(99)
+            table.close()
+
+    def test_prefetched_rows_arrive_per_token_and_queued_tokens_share_a_batch(self):
+        with tempfile.TemporaryDirectory() as folder:
+            m, table = self.table(folder, workers=4)
+            prefetch = m.RowPrefetch(table)
+            tickets = [prefetch.start([t % 16, (t * 5) % 16, 15]) for t in range(10)]   # one per draft token
+            for t, ticket in enumerate(tickets):
+                self.assertEqual(prefetch.wait(ticket), [bytes([t % 16]) * 8, bytes([(t * 5) % 16]) * 8, b"\x0f" * 8])
+                self.assertTrue(prefetch.ready(ticket))
+            self.assertEqual(prefetch.requests, 10)
+            self.assertLessEqual(prefetch.batches, 10)
+            with self.assertRaises(KeyError):
+                prefetch.wait(tickets[0])      # each ticket's rows are handed out once
+            with self.assertRaises(IndexError):
+                prefetch.start([16])
+            prefetch.close()
+            table.close()
+
+    def test_a_failed_prefetch_raises_in_its_wait(self):
+        with tempfile.TemporaryDirectory() as folder:
+            m, table = self.table(folder, workers=1)
+            table._read = lambda row: (_ for _ in ()).throw(OSError("disk gone"))
+            prefetch = m.RowPrefetch(table)
+            ticket = prefetch.start([1, 2])
+            with self.assertRaisesRegex(OSError, "disk gone"):
+                prefetch.wait(ticket)
+            prefetch.close()
             table.close()
 
 
@@ -1080,6 +1111,56 @@ class DeviceExpertCacheTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             m.ClockDirectory(8, 1, 16, admit_by_misses=[1, 2])
 
+    def test_ranked_residency_swaps_at_boundaries_and_follows_a_topic_change(self):
+        sys.path.insert(0, str(ROOT / "inference" / "device-expert-cache" / "code"))
+        m = load("device-expert-cache", "device_cache.py")
+        r = load("device-expert-cache", "ranked_residency.py")
+        policy = r.RankedPolicy(keys=16, slots=4, options=r.RankedOptions(period=2, max_swaps=1, burst_swaps=3))
+        self.assertEqual([policy.boundary(w) for w in range(5)], [False, False, True, False, True])
+        counts = [0] * 16
+        for k, c in ((5, 9), (6, 9), (7, 4), (2, 1)):
+            counts[k] = c
+        # ties rank by key; empty slots are taken first; three of four top keys missing is a burst
+        self.assertEqual(policy.decide(counts, [None, 3, None, None]), [(0, 5), (2, 6), (3, 7)])
+        self.assertEqual(policy.bursts, 1)
+        later = list(counts)
+        later[3] = 30          # key 3 (resident) jumps; key 2 decays below the top
+        self.assertEqual(policy.decide(later, [5, 3, 6, 7]), [])
+        twin = r.RankedPolicy(keys=16, slots=4, options=r.RankedOptions(period=2, max_swaps=1, burst_swaps=3))
+        self.assertEqual(twin.decide(counts, [None, 3, None, None]), [(0, 5), (2, 6), (3, 7)])  # counts alone decide
+        # the directory: reserved slots are never victims, a commit maps the key, a key resident meanwhile is kept
+        d = m.ClockDirectory(slots=3, groups=1, experts=8, count_routes=True)
+        d.plan(0, [0, 1, 2])
+        self.assertEqual(d.begin_swaps([(0, 5)]), [(5, 0)])
+        self.assertEqual(d.slot_key[0], m.RESERVED)
+        self.assertNotIn(0, d.key_slot)
+        p = d.plan(0, [0, 6])       # 0 misses now; the clock must not evict the reserved slot
+        self.assertNotIn(0, p.slots)
+        self.assertEqual(d.slot_key[0], m.RESERVED)
+        d.commit_swaps([(0, 5)])
+        self.assertEqual((d.slot_key[0], d.key_slot[5]), (5, 0))
+        self.assertEqual(d.route_counts[0], 2)
+        e = m.ClockDirectory(slots=2, groups=1, experts=8, count_routes=True)
+        e.begin_swaps([(0, 4)])
+        e.plan(0, [4])              # admitted into slot 1 meanwhile
+        e.commit_swaps([(0, 4)])
+        self.assertEqual((e.slot_key[0], e.key_slot[4]), (None, 1))
+        # the schedule: no admission on the step's path, the hit rate recovers after a topic change
+        rng = __import__("random").Random(3)
+        directory = m.ClockDirectory(slots=24, groups=2, experts=32, admit_quota=0, count_routes=True)
+        schedule = r.RankedSchedule(r.RankedPolicy(64, 24, r.RankedOptions(max_swaps=8, burst_swaps=24)), directory)
+        rates = []
+        for w in range(60):
+            topic = range(0, 12) if w < 30 else range(16, 28)
+            h0, m0 = schedule.hits, schedule.misses
+            schedule.run_window([(g, rng.sample(list(topic), 4)) for _ in range(2) for g in range(2)])
+            rates.append((schedule.hits - h0) / ((schedule.hits - h0) + (schedule.misses - m0)))
+        self.assertGreater(sum(rates[22:30]) / 8, 0.6)
+        self.assertLess(rates[30], 0.2)
+        self.assertGreater(sum(rates[52:60]) / 8, 0.6)
+        with self.assertRaises(ValueError):
+            r.RankedSchedule(policy, m.ClockDirectory(4, 1, 8))
+
     def test_preload_fills_first_slots_and_keeps_adapting(self):
         m = load("device-expert-cache", "device_cache.py")
         d = m.ClockDirectory(slots=4, groups=2, experts=8)
@@ -1289,6 +1370,94 @@ class ExpertStreamedPrefillTests(unittest.TestCase):
                     lambda: m.prefill_estimate(0, 1, 1, abs, abs, 1.0)):
             with self.assertRaises(ValueError):
                 bad()
+
+
+    def test_prompt_layers_run_in_chunks_at_the_knee_over_staged_bundles(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch")
+        sys.path.insert(0, str(ROOT / "inference" / "expert-streamed-prefill" / "code"))
+        self.addCleanup(sys.path.remove, str(ROOT / "inference" / "expert-streamed-prefill" / "code"))
+        m = load("expert-streamed-prefill", "streamed.py")
+        calls = []
+
+        class Experts:   # an experts plugin with forward_bundles whose facts say a route keeps its bits in any call
+            def forward_bundles(self, layer, x, ids, weights, store, slots, format):
+                calls.append((layer, x.shape[0], store, format))
+                return x.float() * 2 + ids.sum(-1, keepdim=True).float() + store
+
+            def facts(self):
+                return {"experts": {"row_invariance": {"rows": True, "prompt_rows": True}}}
+
+        curve = m.RateCurve({1: 10.0, 2: 50.0, 4: 100.0, 8: 101.0})
+        prefill = m.Streamed(Experts(), curve, top=2, experts_count=64, max_tokens=4096, granularity=64)
+        self.assertEqual(prefill.chunk, 128)   # the fewest tokens (of 64s) whose routes reach 4 rows per touched expert
+        x = torch.randn(500, 8)
+        ids = torch.randint(0, 64, (500, 2))
+        staged = []
+
+        def stage(layer, chunk_ids):
+            staged.append(chunk_ids.shape[0])
+            return torch.tensor(float(len(staged))), None
+
+        out = prefill.layer(3, x, ids, torch.ones(500, 2), stage, "nvfp4")
+        self.assertEqual(staged, [128, 128, 128, 116])
+        self.assertEqual([c[1] for c in calls], [128, 128, 128, 116])
+        self.assertEqual({c[3] for c in calls}, {"nvfp4"})
+        # The fake experts add chunk k's store, k + 1, once: so does the expected value (adding k, then 1, rounds twice
+        # in FP32 and parts from it by an ulp for about one draw in 50).
+        expected = torch.cat([x[i:i + 128] * 2 + ids[i:i + 128].sum(-1, keepdim=True) + (k + 1)
+                              for k, i in enumerate(range(0, 500, 128))])
+        self.assertTrue(torch.equal(out, expected.float()))
+
+        class Timed:
+            def forward_bundles(self, layer, x, ids, weights, store, slots, format):
+                return x.float() @ store
+
+        # Points keyed by rows per active expert, what choose_chunk compares with the knee: 56 tokens of top 2 over
+        # 64 experts touch about 53 of them, 2.1 rows each (not 56 * 2 // 64 = 1).
+        for device in ("cpu", "cuda") if torch.cuda.is_available() else ("cpu",):
+            store = torch.randn(8, 8, device=device)
+            measured = m.rate_curve(Timed(), 0, store, None, "bf16", hidden=8, inter=8, top=2, experts_count=64,
+                                    tokens=(16, 56, 256), repeats=2)
+            self.assertEqual(sorted(measured.points), [1, 2, 8], device)
+            self.assertTrue(all(rate > 0 for rate in measured.points.values()))
+        untimed = m.rate_curve(Timed(), 0, torch.empty(8, 8, device="meta"), None, "bf16", hidden=8, inter=8, top=2,
+                               experts_count=64, tokens=(16,))
+        self.assertIsNone(untimed)   # a store nothing here can time: one chunk of the largest size
+        self.assertEqual(m.Streamed(Experts(), None, top=2, experts_count=64, max_tokens=1000, granularity=64).chunk,
+                         960)
+
+    def test_a_timed_chunk_needs_an_experts_kernel_whose_rows_keep_their_bits(self):
+        sys.path.insert(0, str(ROOT / "inference" / "expert-streamed-prefill" / "code"))
+        self.addCleanup(sys.path.remove, str(ROOT / "inference" / "expert-streamed-prefill" / "code"))
+        m = load("expert-streamed-prefill", "streamed.py")
+        curve = m.RateCurve({1: 10.0, 2: 50.0, 4: 100.0, 8: 101.0})
+
+        class Experts:
+            def __init__(self, facts):
+                self.declared = facts
+
+            def facts(self):
+                return self.declared
+
+        class Undeclared:   # forward_bundles without facts
+            pass
+
+        invariant = Experts({"experts": {"row_invariance": {"rows": True, "prompt_rows": True}}})
+        self.assertTrue(m.row_invariant(invariant))
+        self.assertEqual(m.Streamed(invariant, curve, top=2, experts_count=64, max_tokens=4096, granularity=64).chunk,
+                         128)
+        for experts in (Undeclared(), Experts({}), Experts({"experts": {"row_invariance": {"rows": True}}}),
+                        Experts({"experts": {"row_invariance": {"rows": True, "prompt_rows": False}}}),
+                        Experts({"row_invariance": {"prompt_rows": True}})):   # projections' place, not experts'
+            self.assertFalse(m.row_invariant(experts))
+            with self.assertRaisesRegex(ValueError, "state the chunk"):
+                m.Streamed(experts, curve, top=2, experts_count=64, max_tokens=4096, granularity=64)
+            # The stated chunk serves any kernel: no curve, chunks of max_tokens.
+            self.assertEqual(m.Streamed(experts, None, top=2, experts_count=64, max_tokens=1000, granularity=64).chunk,
+                             960)
 
 
 class TokenSamplingTests(unittest.TestCase):

@@ -5,6 +5,17 @@ device and manages their replacement safely. This entry supplies three storage
 and ownership implementations (choose the one closest to the engine) and optional
 host planners for admission, bank sizing and copy grouping.
 
+**What it is, and what serves.** This entry is a host planning tool: its directories are the eviction and
+publication state machines (leases, settled-only eviction, generations, slot loans) and its planners size banks and
+group copies, all on the host, with no device memory and no copies of their own. Its plugin (`LeasedExpertCache`)
+answers the expert_residency slot's host form with `ExpertCache` and fake loads, and names no devices: it is a host
+reference, which no engine serves. The device cache an engine serves is
+[device-expert-cache](../device-expert-cache/README.md)'s `ExpertCache` (its "experts:cache" device form: the directory,
+plans and fills on the device, a prompt ring, KV lending through attention-state's pool). Use this entry's code when
+an engine writes its own residency manager and wants these lifecycles checked on the host first; its
+[slot loans](#lending-owner-memory-to-the-cache) describe the reclaim lifecycle that device-expert-cache's lending
+implements on the device (slots made unavailable before the pool's pages are handed out, and back once they are free).
+
 ## When to use it
 
 Use it when the full routed weight set is expensive to keep on the preferred
@@ -133,12 +144,12 @@ loan while it uses its memory:
 
 Every transition invalidates `binding()`. A device directory has to mirror `on_loan(slot)`: it drops the slot's
 key, keeps the slot out of victim selection and settles its readers before the owner's first write is enqueued,
-and makes the slot selectable again only after `reclaim_loan`. [device-expert-cache](../device-expert-cache/README.md)
-does not do this yet. Its clock skips only slots pinned by the current plan, and it addresses slots as one
-contiguous `slots_base` array. An engine that lends memory to it adds a per-slot valid flag that the plan kernel's
-victim search honors (cleared on loan, set after reclaim), clears `key_slot`/`slot_key` for the lent slots, and,
-if the lent memory is not contiguous with the owned slots, a per-slot address table. The owner keeps the memory
-charged once; the cache gains logical capacity, not memory.
+and makes the slot selectable again only after `reclaim_loan`. [device-expert-cache](../device-expert-cache/README.md)'s
+device form does this with attention-state's KV pool: the pool's pages and the cache's own slots are one allocation,
+so every slot is a row of one store tensor; a slot under pages in use is unavailable (its key dropped, no victim
+search takes it), made so before the pool hands those pages out, and empty again once they are free. Its C++
+component (device_cache.cu) still skips only slots pinned by the current plan. The owner keeps the memory charged
+once; the cache gains logical capacity, not memory.
 
 ### Bundle publication
 

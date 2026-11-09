@@ -155,6 +155,8 @@ cudaError_t enqueue_sample(const Rows&, crit::core::DrawPurpose purpose, std::in
 //                  positive, else the dense draft_probabilities row when given; a draft without either
 //                  (count -1 and no dense rows) takes the target's own draw, the greedy-draft rule,
 //                  which keeps the law at a lower acceptance;
+//   a draft its law gives no mass (q_c(d) = 0 in its sparse or dense law: no draft was drawn from that law): the
+//                  target's own draw, as for greedy drafts;
 //   a cut column (draft id outside [0, vocab), e.g. a drafter's confidence cut writing -1, or an empty
 //                  sparse law): verified against p_c alone, the target's own draw with u_sample like the
 //                  bonus column, whatever its q holds, so a round whose drafter stopped after j drafts

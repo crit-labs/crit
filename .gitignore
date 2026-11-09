@@ -19,6 +19,7 @@
 !/cli/
 !/api/
 !/mcp/
+!/smoke/
 !/.github/
 
 # Local copies of the case-study runs (case-studies/README.md): ignored by the allowlist above, and named here so

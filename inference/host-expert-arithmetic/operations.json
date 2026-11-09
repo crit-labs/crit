@@ -1,0 +1,16 @@
+{
+  "kind": "crit-technique-operations",
+  "technique": "host-expert-arithmetic",
+  "operations": [
+    {
+      "id": "integer-block-rows",
+      "what": "expert or dense rows of 4-bit weights (E2M1 or INT4 codes, E4M3 scale per 16) against activations quantized per block (E2M1 x 2 or INT8) in host_int.h's declared integer order: exact block sums, lane b % 16 = fma(sum, weight scale * activation scale, lane), the halving tree, post; decode rows for 1 to 8 tokens a matrix and a prompt GEMM, the same bits as the CPU rows",
+      "reference": {
+        "path": "inference/host-expert-arithmetic/code/host_int.cpp",
+        "symbol": "detail::int_rows_scalar, quantize_e2m1x2, quantize_int8, swiglu_declared"
+      },
+      "verify": "on the target, run the kernel and dot_rows_int (Isa::scalar) on the same matrices and quantized activations: every output bit for bit, and the device quantizers and SwiGLU against quantize_e2m1x2, quantize_int8 and swiglu_declared bit for bit (tests/inference/host_int_cuda_tests.cu shows how). Any difference means a contracted FMA or another order: keep only a kernel that matches",
+      "invariance": "every output bit for bit equal to the CPU rows (dot_rows_int), decode rows and prompt GEMM alike, whatever tokens share a call"
+    }
+  ]
+}

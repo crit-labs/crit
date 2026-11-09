@@ -23,8 +23,7 @@ def parser():
     result = argparse.ArgumentParser(prog="crit serve", description=__doc__)
     result.add_argument("--workspace", type=Path, help="Folder containing the run-* project directories")
     result.add_argument("--models", type=Path, help="JSON catalog of named models from sealed runs (docs/SERVING.md)")
-    result.add_argument("--engine", metavar="OWNER/NAME", help="Serve an engine crit pull installed, such as "
-                        "crit-labs/nvfp4-gemv-int8kv")
+    result.add_argument("--engine", metavar="OWNER/NAME", help="Serve an engine crit pull installed, as OWNER/NAME")
     result.add_argument("--store", type=Path, help="Installed-engine store --engine reads (default: PROJECT/engines, "
                                                    "where crit pull installs)")
     result.add_argument("--run", help="Run ID (default: the workspace's only run)")
@@ -43,8 +42,8 @@ def parser():
     result.add_argument("--cors-origin", help="Allow browser requests from this origin, for example http://localhost:3000 or *")
     result.add_argument("--model-name", help="Model ID reported to clients (default: RUN_ID/CANDIDATE_ID)")
     result.add_argument("--reasoning-alias", action="store_true",
-                        help='Return reasoning under "reasoning" as well as "reasoning_content", the name vLLM and '
-                             "OpenRouter clients read (off by default: a client that joins every field of a delta, "
+                        help='Return reasoning under "reasoning" as well as "reasoning_content", for clients that '
+                             "read the field reasoning (off by default: a client that joins every field of a delta, "
                              "as crit Eval does, would read it twice)")
     result.add_argument("--lenient", action="store_true",
                         help="Ignore request parameters crit does not apply (unknown ones, sampling fields the package "
@@ -53,7 +52,7 @@ def parser():
     result.add_argument("--timeout", type=float, default=600, help="Seconds one request may run (default: 600)")
     result.add_argument("--max-queue", type=int, default=64,
                         help="Requests that may wait while the engine is busy; one more is refused at once with 429 "
-                             "(Anthropic 529, Ollama 503) and Retry-After (default: 64)")
+                             "(Anthropic 529, /api/chat 503) and Retry-After (default: 64)")
     result.add_argument("--max-concurrency", type=int, metavar="N",
                         help="Run at most N requests at once, below the engine's declared capacity "
                              "(max_concurrent_requests; default: the engine's)")

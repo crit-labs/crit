@@ -3,19 +3,20 @@
   "category": "experts",
   "summary": "Prefill through host-resident routed experts: chunk size from the grouped projection's measured rate curve, layer double-buffered expert copies, and the FP64 reference any grouped projection is checked against",
   "implementation_status": "reference",
-  "implementation_scope": "Python schedule: rate-curve knee, chunk choice, expected touched experts, whole-layer copy decision, double-buffered step timeline, prefill estimate and staging size; Python FP64 reference of the routed SwiGLU block (stable route order, BF16/FP8 row/NVFP4/MXFP4 decoders, moe_block). The grouped projection is a provider's (kernels.json); the router, copies, events, attention and dense layers are the engine's.",
+  "implementation_scope": "Python schedule: rate-curve knee, chunk choice, expected touched experts, whole-layer copy decision, double-buffered step timeline, prefill estimate and staging size; the schedule on the device (streamed.py: the experts plugin's grouped kernel measured by rows per expert, the chunk at its knee, a prompt's routed layer run chunk by chunk over bundles a staging source supplies); Python FP64 reference of the routed SwiGLU block (stable route order, BF16/FP8 row/NVFP4/MXFP4 decoders, moe_block). The grouped projection comes from a library or the kernel registry (operations.json states its contract; the grouped-experts plugin runs one over the registry kernel crit-labs/grouped-experts); the router, copies, events, attention and dense layers are the engine's.",
   "agent_guidance": {
     "use_when": "Prefill of an expert-routed model whose routed experts live mostly in host memory, so a prompt chunk's time is dominated by copying non-resident experts and the prefill rate grows with the chunk size",
     "avoid_when": "Every expert fits on the device (measure a provider's grouped GEMM for the format first), or decode steps that route a few tokens (device-expert-cache and GEMV-shaped rows instead)",
     "provides": [
       "Chunk choice at the knee of the measured rate curve under the workspace bound, expected touched experts per layer and the whole-layer copy decision",
       "A double-buffered step timeline and a prefill estimate with its copy-only floor, and staging buffer sizes",
+      "streamed.py: the grouped kernel's rate curve measured on the target (rate_curve) and a prompt's routed layer run in chunks at its knee over a staging source's bundles (Streamed)",
       "An FP64 reference of the routed SwiGLU block (stable route order, the formats' decoders, moe_block) to check any grouped projection against on the target",
-      "kernels.json: the provider grouped projections with their calls, formats, GPUs and shapes"
+      "operations.json: the grouped projection's contract (what it computes, how a kernel is checked)"
     ],
     "engine_supplies": [
       "Router ids and weights per chunk, the attention and dense layers and the residual add",
-      "The grouped projection from kernels.json (or its own), checked against moe_block on the target",
+      "The grouped projection from a library or the kernel registry (or its own), checked against moe_block on the target",
       "The expert pointer table per step and the staging buffers, taken from memory decode leaves unused while a prompt runs",
       "Copy-engine copies into the staging buffers with the events that order them against compute",
       "Measured rates by rows per expert on the target, step times at the chosen chunk and non-resident bytes per layer"
@@ -27,7 +28,7 @@
       "Measured points only: no interpolated rates or times"
     ],
     "adapt": [
-      "The projection: any kernel from kernels.json or the engine's own, measured against them, with SwiGLU and the combine fused or not",
+      "The projection: any kernel that passes operations.json's check, or the engine's own, measured against the others, with SwiGLU and the combine fused or not",
       "Chunk policy, knee fraction and the whole-layer copy threshold",
       "A measured CPU share for rarely routed experts instead of copying them"
     ]
@@ -40,12 +41,16 @@
       "purpose": "Rate-curve knee, chunk choice, touched experts, whole-layer copies, double-buffered timeline, prefill estimate and staging size"
     },
     {
+      "path": "inference/expert-streamed-prefill/code/streamed.py",
+      "purpose": "The schedule on the device: rate_curve measures an experts plugin's forward_bundles by rows per expert, Streamed picks the chunk at the knee and runs a prompt's routed layer chunk by chunk over a staging source's store and slot table"
+    },
+    {
       "path": "inference/expert-streamed-prefill/code/reference.py",
       "purpose": "FP64 reference of the routed SwiGLU block: decoders, stable route order, moe_block"
     }
   ],
   "requires": {
-    "hardware": "Python 3.11+ standard library; the grouped projection's GPU as kernels.json lists",
+    "hardware": "Python 3.11+ standard library; the grouped projection's GPU as its kernel declares",
     "model": "Expert-routed layers with top-k routing, gate/up/down experts and SwiGLU; projection output widths a multiple of 64 and input widths a multiple of 32",
     "workload": "Prompts long enough for chunks to touch most experts of a layer, with routed experts mostly off the device"
   },
@@ -69,11 +74,14 @@
     "timeline",
     "prefill_estimate",
     "staging_bytes",
+    "rate_curve",
+    "Streamed",
     "decode_matrix",
     "route_order",
     "moe_block"
   ],
   "interactions": [
+    "grouped-experts",
     "device-expert-cache",
     "heterogeneous-expert-dispatch",
     "expert-residency",
@@ -83,7 +91,7 @@
     "expert-streamed-prefill"
   ],
   "validation": {
-    "host": "Rate-curve knee, chunk choice and its workspace bound, touched experts, whole-layer copy decision, double-buffered timeline ordering, the estimate's copy-only floor, and the reference's decoders, route order and block on hand-computed cases",
+    "host": "Rate-curve knee, chunk choice and its workspace bound, touched experts, whole-layer copy decision, double-buffered timeline ordering, the estimate's copy-only floor, and the reference's decoders, route order and block on hand-computed cases; the streamed layer's chunking at the knee and its stage calls with a stand-in experts plugin, and rate_curve's points on a GPU",
     "native": "None: the grouped projection is a provider's, checked against moe_block on the target",
     "performance": "No throughput claim"
   }

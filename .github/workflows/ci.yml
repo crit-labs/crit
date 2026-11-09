@@ -38,6 +38,13 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           python-version: ${{ matrix.python }}
+      - name: Build Core's step runtime
+        # Core's loader runs every engine on crit_core_steps: the host tests load the toy engine's plugin package on it.
+        run: |
+          cmake -S core -B build/core-steps -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/core-steps --config Release --target crit_core_steps --parallel 2
+          library=$(find build/core-steps \( -name 'libcrit_core_steps.so' -o -name 'crit_core_steps.dll' \) | head -n 1)
+          echo "CRIT_CORE_STEP_LIBRARY=$(python -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' "$library")" >> "$GITHUB_ENV"
       - name: Host contracts and chat processes
         # One process per test module, four at a time: most tests wait on served engines' processes.
         run: python -B tests/run_parallel.py --jobs 4
@@ -52,6 +59,9 @@ jobs:
           cd build/ci-temp
           crit --version
           crit kernels
+          # The plugin library ships in the wheel: the installed crit lists and checks its own copy.
+          crit plugins list
+          crit inference check
       - name: Verify source stayed unchanged
         run: git diff --exit-code
 

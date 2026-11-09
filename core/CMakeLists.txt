@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_core VERSION 0.16.1 LANGUAGES CXX)
+project(crit_core VERSION 0.17.0 LANGUAGES CXX)
 find_package(Threads REQUIRED)
 function(crit_strict_warnings target)
   if(MSVC)
@@ -127,10 +127,12 @@ if(CRIT_CORE_HIP)
 endif()
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
-# Step engines for engines in other languages (crit/step_engine.h): the native engine ABI plus crit_engine_open_steps,
-# which crit_core.native.StepEngine loads (CRIT_CORE_STEP_LIBRARY or the engine's "step_library" fact names it).
-add_library(crit_core_steps SHARED src/runtime/step_library.cpp)
-target_link_libraries(crit_core_steps PRIVATE crit_core)
+# Core's concurrent runtime for a model plugin (crit/step_engine.h): the engine ABI with crit_engine_open_steps, which
+# crit_core.native.StepEngine loads for Core's loader (CRIT_CORE_STEP_LIBRARY names it), and the structured-output
+# matchers with which it masks constrained requests.
+add_library(crit_core_steps SHARED src/runtime/step_library.cpp src/runtime/constraint_library.cpp
+  src/backends/cuda/driver_rounds.cpp)
+target_link_libraries(crit_core_steps PRIVATE crit_core ${CMAKE_DL_LIBS})
 crit_strict_warnings(crit_core_steps)
 install(TARGETS crit_core_steps LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS crit_core EXPORT critCoreTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
@@ -216,19 +218,12 @@ if(BUILD_TESTING AND PROJECT_IS_TOP_LEVEL)
         "${CMAKE_CURRENT_SOURCE_DIR}/../tests/core/${_oracle}_constraint_oracle.py" $<TARGET_FILE:crit_core_constraints_tests>)
       set_tests_properties(crit_core_constraint_${_oracle}_oracle PROPERTIES TIMEOUT 120)
     endforeach()
-    # The engine C ABI (crit/native_engine.h) through crit_core.native's stock adapters, against a toy engine.
-    add_library(crit_core_native_engine_fixture SHARED ../tests/core/native_engine_fixture.cpp)
-    target_link_libraries(crit_core_native_engine_fixture PRIVATE crit_core)
-    crit_strict_warnings(crit_core_native_engine_fixture)
-    add_test(NAME crit_core_native_engine COMMAND "${Python3_EXECUTABLE}" -B
-      "${CMAKE_CURRENT_SOURCE_DIR}/../tests/core/native_engine_check.py" $<TARGET_FILE:crit_core_native_engine_fixture>)
-    set_tests_properties(crit_core_native_engine PROPERTIES TIMEOUT 60)
     # A Python step model through crit_core.native.StepEngine and Core's concurrent runtime (crit/step_engine.h).
     add_test(NAME crit_core_step_engine COMMAND "${Python3_EXECUTABLE}" -B
       "${CMAKE_CURRENT_SOURCE_DIR}/../tests/core/step_engine_check.py" $<TARGET_FILE:crit_core_steps>)
     set_tests_properties(crit_core_step_engine PROPERTIES TIMEOUT 120)
-    # Concurrent requests end to end: a toy step model packaged, served by crit serve four requests at once and
-    # measured by crit run measure and crit Eval's concurrency part (crit_eval from the environment).
+    # Concurrent requests end to end: the toy engine's plugin package, served by crit serve four requests at once
+    # and measured by crit run measure and crit Eval's concurrency part (crit_eval from the environment).
     add_test(NAME crit_core_concurrency_end_to_end COMMAND "${Python3_EXECUTABLE}" -B
       "${CMAKE_CURRENT_SOURCE_DIR}/../tests/core/concurrency_end_to_end_check.py" $<TARGET_FILE:crit_core_steps>)
     set_tests_properties(crit_core_concurrency_end_to_end PROPERTIES TIMEOUT 120)
@@ -262,7 +257,8 @@ if(BUILD_TESTING AND PROJECT_IS_TOP_LEVEL)
 
   crit_core_cases(device_memory_tests 30 memory_leases memory_lifetime memory_settle_failure memory_release_failure
     memory_backend_lifetime memory_close_allocation_failure
-    memory_threads mapped_contiguous mapped_discontinuous mapped_rejects mapped_generations host_block_pool memory_upload_shadow)
+    memory_threads mapped_contiguous mapped_discontinuous mapped_rejects mapped_generations host_block_pool memory_upload_shadow
+    memory_buffer_plan memory_buffer_arena)
 
   if(CRIT_CORE_CUDA)
     add_executable(crit_core_cuda_tests ../tests/core/cuda_tests.cpp)

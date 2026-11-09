@@ -35,17 +35,19 @@ void Handle::Impl::settle(std::unique_lock<std::mutex>& lock) noexcept {
     lock.unlock();
     if(!retained) held->release();
 }
-// Waits for completion and moves the result out. With `streaming`, each published token is copied under the
-// request lock by `copy(result, index)` and delivered outside it by `deliver()`, in order on this thread. A
-// throwing delivery cancels the request, waits for it to finish, settles and rethrows; the handle stays consumed.
+// Waits for completion and moves the result out. With `streaming`, the published tokens are copied under the request
+// lock by `copy(result, index)`, which takes the tokens from `index` on (one, or every token published so far) and
+// returns how many it took, and delivered outside it by `deliver()`, in order on this thread. A throwing delivery
+// cancels the request, waits for it to finish, settles and rethrows; the handle stays consumed.
 template<class Copy, class Deliver> Result Handle::Impl::consume(bool streaming, Copy copy, Deliver deliver) {
     const auto held = request; // Outlives the lock on its mutex.
     std::size_t consumed = 0;
     std::unique_lock lock(held->mutex);
+    held->streaming = streaming;
     for(;;) {
         held->cv.wait(lock,[&]{return held->done || (streaming && consumed < held->result.tokens.size());});
         if(streaming && consumed < held->result.tokens.size()) {
-            copy(std::as_const(held->result),consumed++);
+            consumed += copy(std::as_const(held->result),consumed);
             lock.unlock();
             try { deliver(); } catch(...) {
                 // Rethrown from this handler: std::current_exception() is empty for a foreign exception, and
@@ -84,7 +86,17 @@ Result Handle::wait(TokenSink sink) {
     if(!impl_ || !impl_->request) throw std::logic_error("request handle is empty/consumed");
     auto state = std::move(impl_);
     Token token = 0;
-    return state->consume(bool(sink),[&](const Result& r,std::size_t i){token = r.tokens[i];},[&]{sink(token);});
+    return state->consume(bool(sink),[&](const Result& r,std::size_t i){token = r.tokens[i]; return std::size_t(1);},
+                          [&]{sink(token);});
+}
+Result Handle::wait_tokens(TokensSink sink) {
+    if(!impl_ || !impl_->request) throw std::logic_error("request handle is empty/consumed");
+    auto state = std::move(impl_);
+    std::vector<Token> tokens;
+    return state->consume(bool(sink),[&](const Result& r,std::size_t i) {
+        tokens.assign(r.tokens.begin()+std::ptrdiff_t(i),r.tokens.end());
+        return tokens.size();
+    },[&]{sink(std::span<const Token>(tokens));});
 }
 Result Handle::wait_output(OutputSink sink) {
     if(!impl_ || !impl_->request) throw std::logic_error("request handle is empty/consumed");
@@ -108,6 +120,7 @@ Result Handle::wait_output(OutputSink sink) {
             const std::size_t begin = i ? r.text_ends[i-1] : 0;
             piece.assign(r.text,begin,r.text_ends[i]-begin);
         }
+        return std::size_t(1);
     },[&]{
         event.top_logprobs = top; event.text = piece;
         sink(std::as_const(event));

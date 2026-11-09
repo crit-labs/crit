@@ -1,0 +1,15 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "toy-projections",
+  "title": "Dense toy matrices",
+  "fills": [
+    "projections"
+  ],
+  "devices": [
+    "cpu"
+  ],
+  "provides": [
+    "prompts:projections"
+  ],
+  "entry": "plugin.py:create"
+}

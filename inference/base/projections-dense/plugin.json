@@ -1,0 +1,21 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "projections-dense",
+  "title": "Dense FP64 projection",
+  "description": "The plain projection every projections plugin is compared with: y = W x with exact sums. On the device, a BF16 matrix multiplied by torch.",
+  "fills": [
+    "projections"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "provides": [
+    "rounds:projections"
+  ],
+  "conflicts": [
+    "stored:nvfp4",
+    "stored:fp8"
+  ],
+  "entry": "plugin.py:create"
+}

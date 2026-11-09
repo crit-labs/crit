@@ -1,0 +1,114 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "partitioned-attention",
+  "title": "Sequence-partitioned attention: interleaved ownership, partials and their stable merge",
+  "description": "partitioned-attention's ownership (position mod world) and reduction: each rank attends its own rows into a partial with its log normalizer, and the merge of the partials equals attention over the whole sequence. The host form of a long sequence split across devices. Its device form is the technique on one GPU: attention-state's device form with the registry's split-KV reader for decode and verify windows (each row's keys split over KV partitions, piece i to partition i mod P, partials merged by their log-sum-exps, in captured rounds too), its log-sum-exps on request (lse) and merge() for partials from other devices. A captured prompt chunk (prompts:attention) reads the staged prompt table on the device, as softmax-attention's device form does.",
+  "fills": [
+    "attention"
+  ],
+  "needs": [
+    "kv:rows",
+    "kv:pages"
+  ],
+  "provides": [
+    "rounds:attention",
+    "attention:blocks",
+    "attention:tree",
+    "attention:lse",
+    "prompts:attention"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "reference": [
+    "softmax-attention"
+  ],
+  "test_with": [
+    "attention-state"
+  ],
+  "options": {
+    "world": {
+      "type": "int",
+      "default": 2,
+      "min": 1,
+      "max": 64,
+      "description": "Ranks of the host form's interleaved ownership (position mod world)"
+    },
+    "page_size": {
+      "type": "int",
+      "default": 256,
+      "min": 1,
+      "max": 65536,
+      "description": "Positions per local page of the host form's ranks"
+    },
+    "partitions": {
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 1024,
+      "description": "KV partitions of the device form's split-KV reader (0: from the GPU's SM count, the KV heads and the page kind); a row's bits depend on it"
+    },
+    "piece": {
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 128,
+      "description": "Positions per piece of the split-KV reader (0: the kernel's default from the head width and the page kind); a row's bits depend on it"
+    },
+    "kernels": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "torch"
+      ],
+      "description": "auto: the registry's paged-kv-attention kernels where they load (FlashInfer for 16-bit and FP8 prompt rows); torch: every row in torch"
+    },
+    "workspace_mib": {
+      "type": "int",
+      "default": 128,
+      "min": 1,
+      "max": 65536,
+      "description": "MiB of partials the split-KV reader allocates when the plugin is made (memory() declares them): a launch reads as many rows as they hold"
+    },
+    "flashinfer": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "off"
+      ],
+      "description": "auto: FlashInfer's paged prefill for prompt rows of 16-bit and FP8 pages where it is installed, its workspaces allocated when the plugin is made; off: none (a model whose KV pages FlashInfer cannot read, fp8:row or INT8, allocates nothing for it)"
+    },
+    "flashinfer_mib": {
+      "type": "int",
+      "default": 128,
+      "min": 16,
+      "max": 65536,
+      "description": "MiB of FlashInfer's scheduling workspace, allocated when the plugin is made where FlashInfer serves (memory() declares it with its wrappers' own workspaces)"
+    },
+    "prompt_reader": {
+      "type": "choice",
+      "default": "prefill",
+      "choices": [
+        "prefill",
+        "decode"
+      ],
+      "description": "prefill: prompt rows through a prompt reader (FlashInfer's prefill or the registry's), fastest, another reduction than decode rows' (a scored token may differ from the served one by more than 0.001 nats); decode: prompt rows (a step's and a captured chunk's) in the decode's reduction, the split-KV reader as window rows of up to 64 columns (each program folding its partitions as the merge does) or its torch fallback over the page tables: a scored token equals the same token served, bit for bit, over every page type (window rows through the split-KV reader too, no FlashInfer)"
+    }
+  },
+  "kernels": [
+    {
+      "name": "crit-labs/paged-kv-attention",
+      "version": 1,
+      "revision": null,
+      "fallback": "each row's partitions merged in a masked FP32 softmax over the pool's page tables in torch, prompt rows by torch's SDPA"
+    }
+  ],
+  "sources": {
+    "partitioned": "code",
+    "state": "../attention-state/code"
+  },
+  "entry": "plugin.py:create"
+}

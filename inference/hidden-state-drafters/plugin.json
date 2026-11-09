@@ -1,0 +1,34 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "hidden-state-drafters",
+  "title": "EAGLE-3 style drafts: draft-vocabulary mapping and an online confidence cut",
+  "description": "hidden-state-drafters' host rules over the engine's drafter (which reads the target's taps): each draft step's draft-vocabulary token mapped to the target's id by the head's d2t table, and drafts below a confidence threshold learned from verified rounds (ConfidenceCut) cut to PAD, which no prediction matches. Inside captured decode rounds the drafts, the d2t mapping and the cut run on the device, the cut learned from each round's emitted tokens without the host (draft:device, code/device_drafting.py); in sampled rounds the device form samples its drafts (the sampler's draft draws over the draft vocabulary), the host form drafts greedily.",
+  "fills": [
+    "drafter"
+  ],
+  "devices": [
+    "host",
+    "cuda"
+  ],
+  "provides": [
+    "draft:device"
+  ],
+  "needs": [
+    "draft:head",
+    "draft:head-device",
+    "taps:hidden-states"
+  ],
+  "options": {
+    "cut_target": {
+      "type": "float",
+      "default": 0.0,
+      "min": 0.0,
+      "max": 0.99,
+      "description": "acceptance a kept draft must reach; 0 keeps every draft"
+    }
+  },
+  "sources": {
+    "drafters": "code"
+  },
+  "entry": "plugin.py:create"
+}

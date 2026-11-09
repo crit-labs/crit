@@ -1,0 +1,16 @@
+{
+  "kind": "crit-technique-operations",
+  "technique": "recurrent-state-recovery",
+  "operations": [
+    {
+      "id": "gated-delta",
+      "what": "the gated-delta recurrence over a prompt (chunked) and token by token (decode and a verify's columns): delta = beta (v - e^l S^T k); S' = e^l S + k delta^T; out = scale S'^T q",
+      "reference": {
+        "path": "inference/recurrent-state-recovery/code/chunked_prefill.py",
+        "symbol": "sequential (token by token), two_pass"
+      },
+      "verify": "on the target, run the kernel and sequential on the same 100-200 tokens of a real layer's inputs from the same state: outputs and final state within FP32 accumulation error (relative 1e-4); for verify, the state after each column against sequential's, or the accepted prefix replayed per this entry's commit strategy",
+      "invariance": "a verify column's state equal to the state after decoding the same tokens one by one, within the tolerance"
+    }
+  ]
+}

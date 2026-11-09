@@ -547,7 +547,7 @@ std::shared_ptr<State> native_owner_state;
 std::shared_ptr<std::atomic<int>> native_owner_destroyed;
 Handle native_owner_request;
 bool native_owner_submit = false;
-NativeEngine borrowed_native_factory(std::string_view) {
+NativeEngine borrowed_native_factory(std::string_view, const void*) {
     NativeEngine native;
     native.owner = std::make_shared<NativeOwner>(native_owner_state,native_owner_destroyed);
     native.engine = engine(native_owner_state);
@@ -558,7 +558,7 @@ void native_owner_lifetime() {
     for(const bool permanent:{false,true}) {
         native_owner_state = std::make_shared<State>();
         native_owner_destroyed = std::make_shared<std::atomic<int>>(0);
-        auto* native = native_api::open(borrowed_native_factory,"{}");
+        auto* native = native_api::open_bound(borrowed_native_factory,nullptr,"{}");
         require(native != nullptr,"native fixture failed to open");
         native_owner_state->drain_failures = permanent ? -1 : 1;
         Token prompt = 1, output = 0;
@@ -577,7 +577,7 @@ void native_owner_lifetime() {
     native_owner_destroyed = std::make_shared<std::atomic<int>>(0);
     native_owner_state->gate = std::make_shared<Gate>();
     native_owner_submit = true;
-    auto* native = native_api::open(borrowed_native_factory,"{}");
+    auto* native = native_api::open_bound(borrowed_native_factory,nullptr,"{}");
     native_owner_submit = false;
     require(native != nullptr,"native active fixture failed to open");
     native_owner_state->gate->observed();

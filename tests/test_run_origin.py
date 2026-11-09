@@ -23,8 +23,9 @@ REVISION = "0123456789abcdef0123456789abcdef01234567"
 class OriginTests(RunFixture, unittest.TestCase):
     model_files = {"README.md": "# Fixture model\n"}
 
-    def hub_engine(self, owner="someone", name="fast-engine", files=None):
-        """A crit-hub engine folder for the fixture model: card.yaml, card.lock.json and one evidence file."""
+    def hub_engine(self, owner="someone", name="fast-engine", files=None, quality_mode="speed"):
+        """A crit-hub engine folder for the fixture model: card.yaml, card.lock.json and one evidence file, its result
+        judged in `quality_mode` (None: a result that states none)."""
         folder = self.root / "hub" / "engines" / owner / name
         (folder / "evidence").mkdir(parents=True)
         evidence = folder / "evidence/crit-eval.json"
@@ -37,6 +38,7 @@ class OriginTests(RunFixture, unittest.TestCase):
             "requirements": {"platforms": ["linux"], "gpu_arch": ["sm_120a"], "gpu_memory_gb": 32, "cuda": "13.1"},
             "checkpoints": {"fixture@BF16": {"repository": "fixture/model", "revision": REVISION}},
             "results": [{"gpu": "rtx5090", "model": "fixture@BF16", "measured_with": "crit-eval-v7", "measured_on": "2026-10-23",
+                         **({"quality_mode": quality_mode} if quality_mode else {}),
                          "stats": {"decode_tok_s": 100.0}, "evidence": [{"file": "evidence/crit-eval.json", "sha256": file_sha(evidence)}]}],
             "readme": {"intro": "An engine."},
         }
@@ -68,7 +70,7 @@ class OriginTests(RunFixture, unittest.TestCase):
         self.assertEqual(len(origin["checkpoints"]["fixture@BF16"]["files"]), len(inventory(self.model)))
         self.assertEqual(origin["evidence"], [{"file": "evidence/crit-eval.json", "sha256": file_sha(folder / "evidence/crit-eval.json"),
                                                "measured_with": "crit-eval-v7", "gpu": "rtx5090", "model": "fixture@BF16",
-                                               "path": "captured/origin/crit-eval.json"}])
+                                               "quality_mode": "speed", "path": "captured/origin/crit-eval.json"}])
         copied = self.directory / "captured/origin/crit-eval.json"
         self.assertEqual(file_sha(copied), origin["evidence"][0]["sha256"])
         self.assertEqual(digest(self.run["spec"]), self.run["request_sha256"], "the stored origin is part of the frozen request")
@@ -76,7 +78,8 @@ class OriginTests(RunFixture, unittest.TestCase):
         self.assertIn("Origin engine: this run starts from the crit-hub engine someone/fast-engine", request)
         self.assertIn(REVISION, request)
         self.assertIn(f'"lineage": "{LINEAGE}"', request)
-        self.assertIn("captured/origin/crit-eval.json (crit-eval-v7, rtx5090, fixture@BF16)", request)
+        self.assertIn("captured/origin/crit-eval.json (crit-eval-v7, rtx5090, fixture@BF16, quality mode speed)", request)
+        self.assertNotIn("are not judged in this run's", request)
         self.assertEqual(self.store.get(self.run_id)["run"]["spec"]["origin_engine"]["engine"], "someone/fast-engine")
 
     def test_resolve_says_whether_the_model_is_the_measured_checkpoint(self):
@@ -123,6 +126,24 @@ class OriginTests(RunFixture, unittest.TestCase):
         self.run = read_json(self.directory / "run.json")
         with self.assertRaisesRegex(ValueError, "needs a run created with --from-engine"):
             self.candidate(lineage=LINEAGE)
+
+    def test_results_judged_in_another_quality_mode_are_flagged_and_one_stating_none_is_refused(self):
+        # The run is in speed (the default); the origin's results were judged in preserve.
+        self.start(self.hub_engine(quality_mode="preserve"))
+        request = (self.directory / "segments/segment-0001/agent_request.md").read_text(encoding="utf-8")
+        self.assertIn("(crit-eval-v7, rtx5090, fixture@BF16, quality mode preserve)", request)
+        self.assertIn("Results judged in quality mode preserve are not judged in this run's, speed: their numbers do "
+                      "not compare with this run's Evals", request)
+        for stated in (None, "as_quantized"):
+            with self.subTest(stated=stated):
+                with self.assertRaisesRegex(ValueError, "a result states the quality mode it was judged in"):
+                    hub.describe_engine(self.hub_engine(name=f"engine-{stated}", quality_mode=stated))
+        # A run record whose origin evidence states no mode is refused like any record without a mode.
+        from crit.run import records
+        origin = dict(self.run["spec"]["origin_engine"])
+        origin["evidence"] = [{k: v for k, v in e.items() if k != "quality_mode"} for e in origin["evidence"]]
+        with self.assertRaisesRegex(ValueError, "Missing required fields: quality_mode"):
+            records.validate_origin(origin)
 
     def test_a_damaged_or_incomplete_hub_folder_is_refused(self):
         folder = self.hub_engine()

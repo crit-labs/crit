@@ -4,7 +4,8 @@ A decode pass reads a few rows of such a table per token, so the table can stay 
 rows: a page fault or a buffered read on a file the kernel thinks is read sequentially pulls in its whole read-ahead
 window (often several MB) per row. This module opens the table for random access (POSIX_FADV_RANDOM on the file, or
 MADV_RANDOM on a mapping), reads only the rows asked for with positioned reads in parallel, keeps an optional LRU of
-hot rows, and returns them in request order with counters for what it read.
+hot rows, and returns them in request order with counters for what it read. RowPrefetch starts a token's rows
+as soon as the token exists and lets the step that reads them wait only for rows still in flight.
 """
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -12,6 +13,8 @@ from dataclasses import dataclass
 import mmap
 import os
 import threading
+
+from crit_plugins.files import pread
 
 
 @dataclass(frozen=True)
@@ -65,7 +68,7 @@ class RowTable:
     def _read(self, row):
         at, size = self.region.offset + row * self.region.row_bytes, self.region.row_bytes
         if hasattr(os, "pread"):
-            data = os.pread(self._fd, size, at)
+            data = pread(self._fd, size, at)
         else:
             with self._lock:
                 os.lseek(self._fd, at, os.SEEK_SET)
@@ -103,3 +106,78 @@ class RowTable:
         if self._pool:
             self._pool.shutdown()
         os.close(self._fd)
+
+
+class RowPrefetch:
+    """Draft-time prefetch over a RowTable: start(rows) begins reading a token's rows the moment the token exists (a
+    draft step's output) and returns a ticket; wait(ticket) returns the rows, blocking only for rows still in flight.
+    One service thread takes every queued request at once and gathers them in one batch, so consecutive draft tokens
+    share the disk's parallelism. Requests finish in order; the table is this prefetcher's alone while it lives."""
+
+    def __init__(self, table):
+        self.table = table
+        self._cv = threading.Condition()
+        self._queue, self._done, self._failed = [], {}, {}
+        self._issued = self._finished = 0
+        self._stop = False
+        self.requests = self.batches = self.ready_when_waited = 0
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def start(self, rows):
+        rows = list(rows)
+        if any(not 0 <= r < self.table.region.rows for r in rows):
+            raise IndexError("row outside the table")
+        with self._cv:
+            self._issued += 1
+            self._queue.append((self._issued, rows))
+            self.requests += 1
+            self._cv.notify_all()
+            return self._issued
+
+    def ready(self, ticket):
+        with self._cv:
+            return ticket <= self._finished
+
+    def wait(self, ticket):
+        """The ticket's rows in request order; raises its batch's read error."""
+        with self._cv:
+            if ticket > self._issued or (ticket <= self._finished and ticket not in self._done
+                                          and ticket not in self._failed):
+                raise KeyError("no such prefetch, or already waited for")
+            if ticket <= self._finished:
+                self.ready_when_waited += 1
+            self._cv.wait_for(lambda: ticket <= self._finished)
+            if ticket in self._failed:
+                raise self._failed.pop(ticket)
+            return self._done.pop(ticket)
+
+    def _serve(self):
+        while True:
+            with self._cv:
+                self._cv.wait_for(lambda: self._stop or self._queue)
+                if not self._queue:
+                    return
+                batch, self._queue = self._queue, []
+                self.batches += 1
+            try:
+                rows = self.table.gather([r for _, ids in batch for r in ids])
+                error = None
+            except Exception as e:  # noqa: BLE001 - handed to the waiter
+                rows, error = [], e
+            with self._cv:
+                at = 0
+                for ticket, ids in batch:
+                    if error is None:
+                        self._done[ticket] = rows[at:at + len(ids)]
+                    else:
+                        self._failed[ticket] = error
+                    at += len(ids)
+                    self._finished = max(self._finished, ticket)
+                self._cv.notify_all()
+
+    def close(self):
+        with self._cv:
+            self._stop = True
+            self._cv.notify_all()
+        self._thread.join()

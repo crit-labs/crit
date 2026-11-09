@@ -1,0 +1,12 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "toy-sampler",
+  "title": "The toy's greedy draw",
+  "fills": [
+    "sampler"
+  ],
+  "devices": [
+    "cpu"
+  ],
+  "entry": "plugin.py:create"
+}

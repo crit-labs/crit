@@ -1,0 +1,16 @@
+{
+  "kind": "crit-technique-operations",
+  "technique": "attention-state",
+  "operations": [
+    {
+      "id": "paged-attention",
+      "what": "causal attention of query rows (prefill chunk, decode row or a verify's block) over paged KV with grouped query heads, softmax scale and masks",
+      "reference": {
+        "path": "inference/attention-state/code/attention.h",
+        "symbol": "paged_attention, PagedAttentionPlan (double accumulation)"
+      },
+      "verify": "on the target, attend a few query rows over a real prompt's pages with the kernel and with PagedAttentionPlan on the same pages (FP8 pages decoded the same way): within BF16 probability rounding, a decode row equal to the same row inside a verify block when the build needs exactness, and the same bits on a repeat",
+      "invariance": "a decode row's result equal to the same row inside a verify block (the same position, the same keys) where the build needs exactness; the same bits on a repeat"
+    }
+  ]
+}

@@ -4,14 +4,21 @@ import json
 from pathlib import Path, PurePosixPath
 import sys
 
-ROOT = Path(__file__).resolve().parents[2]
+# crit's plugin library, LIBRARY (inference/), and ROOT, the folder holding it, which the entries' paths (inference/ID/...)
+# are relative to: the checkout's, beside the cli/ folder this crit runs from (installed editable or not), else the copy
+# crit's wheel ships as package data, crit/library/inference (pyproject.toml).
+CHECKOUT = Path(__file__).resolve().parents[2]
+ROOT = CHECKOUT if (CHECKOUT / "inference").is_dir() else Path(__file__).resolve().parent / "library"
+LIBRARY = ROOT / "inference"
 GUIDANCE_TEXT = ("use_when", "avoid_when")
 GUIDANCE_LISTS = ("provides", "engine_supplies", "preserve", "adapt")
-# A technique's kernels.json: the provider kernels for each operation it needs, never code of crit's own.
-KERNELS_KIND = "crit-technique-kernels"
-KERNEL_PROVIDERS = ("lib:", "hub:")
-KERNEL_TEXT = ("provider", "call", "shapes")
-KERNEL_LISTS = ("formats", "archs")
+# A technique's operations.json: per operation it needs on a device, what it computes, its CPU reference and how a
+# kernel is verified against it. No kernel lists: kernels come from libraries and the kernel registry (kernels/SOURCES.md);
+# a plugin declares the registry kernels it loads in its plugin.json.
+OPERATIONS_KIND = "crit-technique-operations"
+OPERATIONS_FILE = "operations.json"
+OPERATION_TEXT = ("what", "verify")
+OPERATION_FIELDS = {"id", "what", "reference", "verify", "invariance"}
 # Navigation metadata, not folders: every entry names one category; `list` groups by it in this order.
 CATEGORIES = ("attention", "projections", "experts", "speculation", "sampling-and-constraints",
               "execution", "memory-and-loading")
@@ -29,76 +36,89 @@ def under(root, relative):
     return target
 
 
-def kernels(root, ident):
-    """The technique's kernels.json, or None when it has none (no device arithmetic of its own)."""
-    path = root / "inference" / ident / "kernels.json"
+def operations(root, ident):
+    """The technique's operations.json, or None when it has none (no device arithmetic of its own)."""
+    path = root / "inference" / ident / OPERATIONS_FILE
     return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
 
 
-def libraries(root):
-    """The provider names of kernels/SOURCES.md's table (each row's linked names)."""
+def plugins(root, ident):
+    """[(id, title, folder)] of the technique's own plugin (its plugin.json), then of the other plugins of crit's
+    library that import its code (their manifests' sources: other techniques and base plugins), read as data."""
+    inference = root / "inference"
+    code = (inference / ident / "code").resolve()
+    own, others = [], []
+    for path in sorted([*inference.glob("*/plugin.json"), *inference.glob("base/*/plugin.json")]):
+        manifest, folder = json.loads(path.read_text(encoding="utf-8")), path.parent.relative_to(root).as_posix()
+        if path.parent == inference / ident:
+            own.append((manifest["id"], manifest["title"], folder))
+        elif any((path.parent / source).resolve() == code for source in manifest.get("sources", {}).values()):
+            others.append((manifest["id"], manifest["title"], folder))
+    return own + others
+
+
+def reference_symbols_missing(path, symbol):
+    """The names of a reference's symbol text ("a, b::c (a note)": comma-separated, parenthesized notes aside, the last
+    part of a qualified name) that the file does not contain as a word."""
     import re
-    path = root / "kernels" / "SOURCES.md"
-    if not path.is_file():
-        return set()
-    rows = [line.split("|")[1] for line in path.read_text(encoding="utf-8").splitlines() if line.startswith("| [")]
-    return {name for row in rows for name in re.findall(r"\[([^\]]+)\]", row)}
+    text = path.read_text(encoding="utf-8", errors="replace")
+    names = [n.strip() for n in re.sub(r"\([^)]*\)", "", symbol).split(",") if n.strip()]
+    return [n for n in names if not re.search(r"\b" + re.escape(re.split(r"::|\.", n)[-1]) + r"\b", text)]
 
 
-def check_kernels(root, ident, found):
-    """Errors in one kernels.json: every operation names its CPU reference (a file of the technique), at least one
-    provider kernel (lib: or hub:) with its exact call, formats, archs and shapes, and how to verify a kernel against
-    the reference on the target."""
-    errors, where = [], f"{ident}/kernels.json"
-    if found.get("kind") != KERNELS_KIND or found.get("technique") != ident:
-        return [f"{where}: kind {KERNELS_KIND} and technique {ident} required"]
-    for field in ("as_of", "evidence"):
-        if not isinstance(found.get(field), str) or not found[field].strip():
-            errors.append(f"{where}: {field} required")
-    operations = found.get("operations")
-    if not isinstance(operations, list) or not operations:
+def check_operations(root, ident, found):
+    """Errors in one operations.json: every operation says what it computes, names its CPU reference (a file of the
+    technique) and how to verify a kernel against it (tolerance; invariance where it promises one), and nothing else:
+    no lists of kernels, providers or kernel source paths."""
+    errors, where = [], f"{ident}/{OPERATIONS_FILE}"
+    if not isinstance(found, dict) or found.get("kind") != OPERATIONS_KIND or found.get("technique") != ident:
+        return [f"{where}: kind {OPERATIONS_KIND} and technique {ident} required"]
+    extra = sorted(set(found) - {"kind", "technique", "operations"})
+    if extra:
+        errors.append(f"{where}: unknown fields {', '.join(extra)} (an operation's contract only: no kernel lists)")
+    listed = found.get("operations")
+    if not isinstance(listed, list) or not listed:
         return errors + [f"{where}: operations required"]
     seen = set()
-    for op in operations:
+    for op in listed:
         name = op.get("id") if isinstance(op, dict) else None
         if not isinstance(name, str) or not name or name in seen:
             errors.append(f"{where}: every operation needs a distinct id")
             continue
         seen.add(name)
         label = f"{where} {name}"
-        for field in ("what", "verify"):
+        unknown = sorted(set(op) - OPERATION_FIELDS)
+        if unknown:
+            errors.append(f"{label}: unknown fields {', '.join(unknown)}: a technique keeps no kernel lists or kernel "
+                          "source paths (kernels come from libraries and the kernel registry, kernels/SOURCES.md)")
+        for field in OPERATION_TEXT:
             if not isinstance(op.get(field), str) or not op[field].strip():
                 errors.append(f"{label}: {field} required")
+        if "invariance" in op and (not isinstance(op["invariance"], str) or not op["invariance"].strip()):
+            errors.append(f"{label}: invariance is a line of text when given")
         reference = op.get("reference")
         if not isinstance(reference, dict) or not isinstance(reference.get("symbol"), str) or not reference["symbol"]:
             errors.append(f"{label}: reference with path and symbol required")
+        elif set(reference) != {"path", "symbol"}:
+            errors.append(f"{label}: reference is {{path, symbol}}, not {sorted(reference)}")
         else:
             try:
                 path = under(root, reference.get("path"))
                 if not path.is_file() or not path.is_relative_to(under(root, "inference/" + ident)):
                     errors.append(f"{label}: reference must be a file of the technique")
+                else:
+                    missing = reference_symbols_missing(path, reference["symbol"])
+                    if missing:
+                        errors.append(f"{label}: reference symbols {', '.join(missing)} are not in {reference['path']}")
             except ValueError as exc:
                 errors.append(f"{label}: reference path: {exc}")
-        listed = op.get("kernels")
-        if not isinstance(listed, list) or not listed:
-            errors.append(f"{label}: at least one provider kernel required")
-            continue
-        for kernel in listed:
-            if not isinstance(kernel, dict):
-                errors.append(f"{label}: kernels are objects")
-                continue
-            if any(not isinstance(kernel.get(f), str) or not kernel[f].strip() for f in KERNEL_TEXT):
-                errors.append(f"{label}: every kernel needs " + ", ".join(KERNEL_TEXT))
-            if any(not isinstance(kernel.get(f), list) or not kernel[f] for f in KERNEL_LISTS):
-                errors.append(f"{label}: every kernel lists its " + " and ".join(KERNEL_LISTS))
-            provider = kernel.get("provider") or ""
-            if not provider.startswith(KERNEL_PROVIDERS):
-                errors.append(f"{label}: provider {provider!r} must be lib:NAME or hub:ORG/NAME, never code in crit")
-            elif provider.startswith("lib:") and provider[4:] not in libraries(root):
-                errors.append(f"{label}: {provider} is not a provider of kernels/SOURCES.md")
-            if provider.startswith("hub:") and not isinstance(kernel.get("published"), bool):
-                errors.append(f"{label}: a hub kernel says whether it is published")
     return errors
+
+
+def leftover_kernel_lists(root):
+    """Errors for a kernels.json left in a base plugin's folder (a technique's is checked with its entry)."""
+    return [f"{p.parent.relative_to(root / 'inference').as_posix()}/kernels.json: a plugin keeps no kernel lists; "
+            "the kernels it loads are its plugin.json's \"kernels\"" for p in sorted((root / "inference").glob("base/*/kernels.json"))]
 
 
 def load(root=ROOT):
@@ -165,14 +185,17 @@ def check(root=ROOT):
         for path in under(root, entry["code_path"]).rglob("*"):
             if path.is_file() and path.suffix in {".py", ".cpp", ".cu", ".h"} and path.resolve() not in listed:
                 errors.append(f"{ident}: implementation file missing from metadata")
+        if (root / "inference" / ident / "kernels.json").exists():
+            errors.append(f"{ident}/kernels.json: a technique keeps no kernel lists; its per-operation contracts go in "
+                          f"{OPERATIONS_FILE}")
         try:
-            found = kernels(root, ident)
+            found = operations(root, ident)
         except ValueError as exc:
-            errors.append(f"{ident}/kernels.json: {exc}")
+            errors.append(f"{ident}/{OPERATIONS_FILE}: {exc}")
             found = None
         if found is not None:
-            errors += check_kernels(root, ident, found)
-    return errors
+            errors += check_operations(root, ident, found)
+    return errors + leftover_kernel_lists(root)
 
 
 def parser():
@@ -190,10 +213,17 @@ def parser():
     return parser
 
 
+def missing(library):
+    """What a crit whose plugin library is gone says: its install is broken."""
+    return f"crit's plugin library is missing ({library} is no folder): this crit install is broken; reinstall crit"
+
+
 def main(argv=None, root=ROOT):
     command = parser()
     args = command.parse_args(argv)
     try:
+        if not (root / "inference").is_dir():
+            raise ValueError(missing(root / "inference"))
         if args.command == "check":
             errors = check(root)
             if errors:
@@ -235,17 +265,22 @@ def main(argv=None, root=ROOT):
                         print("Code:")
                         for code in entry["code_files"]:
                             print("  " + code["path"])
-                        found = kernels(root, entry["id"])
+                        built = plugins(root, entry["id"])
+                        if built:
+                            print("Plugins (crit plugins add ENGINE/plugins ID copies one into an engine):")
+                            for plugin_id, title, folder in built:
+                                where = "this technique" if folder == "inference/" + entry["id"] else folder
+                                print("  " + plugin_id + " (" + where + "): " + title)
+                        found = operations(root, entry["id"])
                         if found:
-                            print("Kernels (inference/" + entry["id"] + "/kernels.json; " + found["evidence"] + "):")
+                            print("Operations (inference/" + entry["id"] + "/" + OPERATIONS_FILE + "; kernels for them: "
+                                  "kernels/SOURCES.md and the kernel registry):")
                             for op in found["operations"]:
                                 print("  " + op["id"] + ": " + op["what"])
                                 print("    verify against " + op["reference"]["path"] + " " + op["reference"]["symbol"]
                                       + ": " + op["verify"])
-                                for kernel in op["kernels"]:
-                                    print("    - " + kernel["provider"] + ": " + kernel["call"] + " (" + ", ".join(kernel["formats"])
-                                          + "; " + ", ".join(kernel["archs"]) + "; " + kernel["shapes"] + ")"
-                                          + ("" if kernel.get("published", True) else " [not published yet]"))
+                                if op.get("invariance"):
+                                    print("    invariance: " + op["invariance"])
         return 0
     except (ValueError, OSError, KeyError, TypeError) as exc:
         print("ERROR: " + str(exc), file=sys.stderr)

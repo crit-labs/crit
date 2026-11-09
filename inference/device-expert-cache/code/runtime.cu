@@ -88,7 +88,68 @@ void ExpertCache::release() {
     free_device(fills_);
     free_device(pool_fills_);
     free_device(fill_counts_);
+    free_device(d_.route_counts);
+    free_device(swaps_);
+    free_device(swap_fills_);
+    free_device(swap_count_);
+    if(begun_) cudaEventDestroy(begun_);
+    if(copied_) cudaEventDestroy(copied_);
+    begun_ = copied_ = nullptr;
+    max_swaps_ = pending_ = 0;
     d_ = Directory{};
+}
+
+cudaError_t ExpertCache::enable_route_counts(int max_swaps, cudaStream_t stream) {
+    if(!d_.state || max_swaps < 1 || d_.route_counts) return cudaErrorInvalidValue;
+    const std::size_t keys = std::size_t(d_.groups) * d_.experts;
+    std::uint32_t* counts = nullptr;
+    cudaError_t e = allocate(counts, keys);
+    auto step = [&](cudaError_t r) { if(e == cudaSuccess) e = r; };
+    step(allocate(swaps_, std::size_t(max_swaps)));
+    step(allocate(swap_fills_, std::size_t(max_swaps)));
+    step(allocate(swap_count_, 1));
+    step(cudaEventCreateWithFlags(&begun_, cudaEventDisableTiming));
+    step(cudaEventCreateWithFlags(&copied_, cudaEventDisableTiming));
+    step(cudaMemsetAsync(counts, 0, keys * sizeof(std::uint32_t), stream));
+    if(e != cudaSuccess) {
+        free_device(counts);
+        return e;
+    }
+    d_.route_counts = counts;
+    max_swaps_ = max_swaps;
+    return cudaSuccess;
+}
+
+cudaError_t ExpertCache::read_route_counts(std::uint32_t* host, cudaStream_t stream) const {
+    if(!d_.route_counts || !host) return cudaErrorInvalidValue;
+    return cudaMemcpyAsync(host, d_.route_counts, std::size_t(d_.groups) * d_.experts * sizeof(std::uint32_t),
+                           cudaMemcpyDeviceToHost, stream);
+}
+
+cudaError_t ExpertCache::begin_swaps(const Swap* swaps, int count, int blocks_per_bundle, cudaStream_t main,
+                                     cudaStream_t side) {
+    if(!d_.route_counts || count < 0 || count > max_swaps_ || pending_ || blocks_per_bundle < 1)
+        return cudaErrorInvalidValue;
+    if(count == 0) return cudaSuccess;
+    if(!swaps) return cudaErrorInvalidValue;
+    // A pageable source: the copy returns once the bytes are staged, so the caller may reuse its array.
+    cudaError_t e = cudaMemcpyAsync(swaps_, swaps, std::size_t(count) * sizeof(Swap), cudaMemcpyHostToDevice, main);
+    if(e == cudaSuccess) e = enqueue_swap_begin(d_, swaps_, count, swap_fills_, swap_count_, main);
+    if(e == cudaSuccess) e = cudaEventRecord(begun_, main);
+    if(e == cudaSuccess) e = cudaStreamWaitEvent(side, begun_, 0);
+    if(e == cudaSuccess) e = enqueue_fill(swap_fills_, swap_count_, count, d_.bundle_bytes, blocks_per_bundle, side);
+    if(e == cudaSuccess) e = cudaEventRecord(copied_, side);
+    if(e == cudaSuccess) pending_ = count;
+    return e;
+}
+
+cudaError_t ExpertCache::commit_swaps(cudaStream_t main) {
+    if(!d_.route_counts) return cudaErrorInvalidValue;
+    if(!pending_) return cudaSuccess;
+    cudaError_t e = cudaStreamWaitEvent(main, copied_, 0);
+    if(e == cudaSuccess) e = enqueue_swap_commit(d_, swaps_, pending_, main);
+    if(e == cudaSuccess) pending_ = 0;
+    return e;
 }
 
 cudaError_t ExpertCache::set_admission(int quota, const std::int32_t* table, bool second_touch, cudaStream_t stream) {

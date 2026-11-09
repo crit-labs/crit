@@ -77,6 +77,8 @@ struct Result {
     std::vector<std::uint32_t> text_ends = {};
 };
 using TokenSink = std::function<void(Token)>;
+// The tokens published since the last call, in order; the span is valid only during the call.
+using TokensSink = std::function<void(std::span<const Token>)>;
 // One published token. Spans and text are valid only during the sink call.
 struct OutputEvent {
     std::size_t index = 0;
@@ -102,6 +104,8 @@ public:
     // released as seen from this thread; a quarantined runtime keeps them instead. Whatever leaves a sink (an
     // exception, a foreign exception or forced unwinding) cancels the request and propagates unchanged after that.
     Result wait(TokenSink sink = {});
+    // Like wait(), with every token published since the last call in one call: a step's (or a round's) tokens at once.
+    Result wait_tokens(TokensSink sink);
     // Like wait(), with log-probabilities and text per published token.
     Result wait_output(OutputSink sink);
 private:

@@ -12,7 +12,8 @@
       "EAGLE-3 catch-up columns (taps of column c with the c-th emitted token) over a fixed width from the device's settled count",
       "Block-drafter input [anchor, mask...] at frontier positions, and non-causal block attention (an engine-supplied attention kernel with causal = false)",
       "Draft-vocabulary to target mapping through d2t, and draft-law scatter for rejection sampling",
-      "Confidence truncation that stops a round at the first unlikely draft without a narrower graph"
+      "Confidence truncation that stops a round at the first unlikely draft without a narrower graph",
+      "Drafting inside captured rounds on the device (code/device_drafting.py): d2t-mapped drafts, FP64 confidences, truncation and the confidence cut learned from each round's emitted tokens without the host"
     ],
     "engine_supplies": [
       "The drafter's arithmetic as published (fc over fused taps, decoder layer, head; block layers with context injection)",
@@ -37,7 +38,8 @@
   "code_files": [
     {"path": "inference/hidden-state-drafters/code/drafting.py", "purpose": "Host reference: catch-up columns, block input and drafts, d2t mapping, law scatter and confidence truncation"},
     {"path": "inference/hidden-state-drafters/code/hidden_drafters.h", "purpose": "Launch interfaces over device-speculative-round's control block and packed result"},
-    {"path": "inference/hidden-state-drafters/code/hidden_drafters.cu", "purpose": "Reference CUDA kernels for catch-up, block input, mapping, scatter and truncation"}
+    {"path": "inference/hidden-state-drafters/code/hidden_drafters.cu", "purpose": "Reference CUDA kernels for catch-up, block input, mapping, scatter and truncation"},
+    {"path": "inference/hidden-state-drafters/code/device_drafting.py", "purpose": "drafting.py's d2t mapping, confidences, truncation and ConfidenceCut (bins, labels, threshold) over device tensors for captured rounds"}
   ],
   "requires": {
     "hardware": "CUDA C++20 and device-speculative-round's greedy_accept.h; Python 3.11+ for Core's reader and the reference",

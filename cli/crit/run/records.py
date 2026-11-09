@@ -1,4 +1,5 @@
 """Strict first-class run records and deterministic candidate projections."""
+from datetime import timedelta
 import functools
 import hashlib
 import json
@@ -12,6 +13,11 @@ from ..records import (GIB, HASH_PARALLEL_BYTES, MAX_FILES, MAX_JSON_BYTES, dige
                        verify_inventory, write_json)
 
 MAX_CANDIDATES = 512
+# How far a record's time may read before one it follows when two processes stamped them (a segment's start and the
+# candidate a later command created, a reservation and the attempt's end): a virtual machine's wall clock kept in step
+# with its host's (WSL's) steps back by up to a second at times. Within one process crit's clock never steps back
+# (crit.records.utc_now); the times a record must end by are kept exactly.
+CLOCK_SLACK = timedelta(seconds=2)
 WEIGHTS_POLICIES = {"as_stored", "transformable"}  # run: may candidates change stored weights?
 # The limits of a quality budget, the drift a run allows against the Eval reference, spent on speed (Eval's
 # thresholds by default: default_quality_budgets).
@@ -23,9 +29,14 @@ WORKLOAD_MODES = ("resident", "cold")
 TARGETS = ("decode_tps", "prefill_tps", "request_ms")  # a run's speed objectives, each a positive number
 VERIFICATION_LEVELS = ("reported", "artifact_verified")
 EXACTNESS_MODES = {"reported", "required"}  # must speculative output equal plain greedy?
-# How Eval judges quality (crit-eval quality modes): against the checkpoint with exact activations, or, the mode for
-# speed, the same with a budget that only keeps out a broken engine and near-tie output differences allowed.
-QUALITY_MODES = ("preserve", "as_quantized")
+# The quality modes (crit-eval's): how much output drift from the checkpoint the user selected the engine may trade
+# for speed, never how that checkpoint is quantized or stored. Both are judged against the same reference, that
+# checkpoint's stored weights with exact activations. speed: a budget that only keeps out a broken engine, near-tie
+# output differences allowed; preserve: a budget that keeps the output close to the checkpoint's, every precision
+# change measured against it. Every run record states its mode.
+QUALITY_MODES = ("preserve", "speed")
+# The quality mode of a run whose request (and settings.toml) names none.
+DEFAULT_QUALITY_MODE = "speed"
 # Runs created from this version on require a recorded plan (crit run ... plan) for every candidate; older runs
 # have no plans field and keep plan_id optional.
 NEW_RUN_PLANS = "required"
@@ -35,9 +46,16 @@ NEW_RUN_PLAN_LIMITS = "computed"
 # Runs created from this version on give every lever of a candidate's plan its fate in the proposal; older runs keep
 # fates optional.
 NEW_RUN_LEVER_FATES = "required"
-# Runs created from this version on check plans with the fifth version of the plan rules (crit.run.plans.rules);
+# Runs created from this version on check plans with the seventh version of the plan rules (crit.run.plans.rules);
 # older runs keep the rules they were created with.
-NEW_RUN_PLAN_RULES = 6
+NEW_RUN_PLAN_RULES = 7
+# Runs created from this version on spend a segment's candidate budget on the candidate ladder (crit.run.ladder): each
+# candidate's number says how far it goes, from candidate 1's build, plugin tests and serve check with no Eval to the
+# full Eval from candidate 5 on, and one that fails before its rung's measurement (a draft) is fixed as a new
+# candidate from the same plan at no cost. Runs created before it with "evaluated" spend it on candidates that go
+# through Eval, and older runs count every candidate they create.
+NEW_RUN_BUDGET_COUNTS = "ladder"
+BUDGET_COUNTS = ("evaluated", "ladder")
 WEIGHTS = {"as_stored", "transformed"}             # candidate: did it change them?
 
 RUN_ID = r"run-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}"
@@ -68,7 +86,8 @@ def metric_minimum(key):
 
 # A candidate-budget segment has no working time budget; its deadline is only a safety window.
 SAFETY_WINDOW_MINUTES = 43200
-DEFAULT_CANDIDATE_BUDGET = 3
+# The candidate ladder's five rungs (crit.run.ladder.RUNGS).
+DEFAULT_CANDIDATE_BUDGET = 5
 HEADROOM_REASONS = {"search_exhausted", "budget_exhausted"}
 STOP_KPIS = ("decode", "prefill", "ttft")  # a stop's headroom accounts for each
 CONTEXT_KPIS = ("context_decode", "context_ttft")  # and for these when Eval measured the required context
@@ -82,9 +101,9 @@ HTTPS_REPOSITORY = r"https://[A-Za-z0-9.-]+(/[A-Za-z0-9_.~-]+)+/?"
 
 
 def validate_origin(value, stored=None):
-    """A run's origin_engine (hub.describe_engine): the crit-hub engine it starts from. Evidence entries name their
-    source file before the run exists (`source`) and their copy under captured/origin/ once it does (`path`);
-    `stored` True or False requires one form, None accepts either."""
+    """A run's origin_engine (hub.describe_engine): the crit-hub engine it starts from. Evidence entries name the
+    quality mode their result was judged in, and their source file before the run exists (`source`) and their copy
+    under captured/origin/ once it does (`path`); `stored` True or False requires one form, None accepts either."""
     keys(value, {"engine", "title", "origin", "summary", "contributor", "source", "card", "lock", "checkpoints",
                  "provenance", "evidence"})
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", str(value["engine"])):
@@ -126,8 +145,10 @@ def validate_origin(value, stored=None):
     if not isinstance(value["evidence"], list):
         raise ValueError("origin_engine.evidence is a list")
     for ref in value["evidence"]:
-        keys(ref, {"file", "sha256", "measured_with", "gpu", "model"}, {"source", "path"})
+        keys(ref, {"file", "sha256", "measured_with", "gpu", "model", "quality_mode"}, {"source", "path"})
         text(ref["file"], "origin evidence file", 512)
+        if ref["quality_mode"] not in QUALITY_MODES:
+            raise ValueError(f"origin_engine.evidence quality_mode requires {' or '.join(QUALITY_MODES)}")
         sha(ref["sha256"], "origin evidence sha256")
         has_path, has_source = "path" in ref, "source" in ref
         if has_path == has_source:
@@ -140,15 +161,15 @@ def validate_origin(value, stored=None):
 
 
 def quality_mode(correctness):
-    """The run's quality mode (QUALITY_MODES): preserve unless the request chose as_quantized."""
-    return correctness.get("quality_mode", "preserve")
+    """The run's quality mode (QUALITY_MODES), which every run record states (validate_spec)."""
+    return correctness["quality_mode"]
 
 
 @functools.cache
 def default_quality_budgets():
     """Eval's quality thresholds by quality mode, a run's budget unless it sets its own: crit_eval/protocol.json's
-    quality.thresholds for preserve and quality.mode_thresholds for the others (as_quantized's are eight times preserve's,
-    since 4-bit activation math swings KL far more)."""
+    quality.thresholds for preserve and quality.mode_thresholds for the others (speed's are eight times
+    preserve's: a floor that keeps out a broken engine, the same for every checkpoint however it is stored)."""
     try:
         from crit_eval import EVAL_DIR
     except ImportError:
@@ -170,7 +191,11 @@ def quality_budget(budget):
 def quality_terms(correctness, amendments=()):
     """The run's drift budget over its quality mode's defaults, and its exactness mode, with each resume's
     amendment applied in order."""
-    budget = {**default_quality_budgets()[quality_mode(correctness)], **correctness.get("quality_budget", {})}
+    mode, budgets = quality_mode(correctness), default_quality_budgets()
+    if mode not in budgets:
+        raise ValueError(f"crit Eval's protocol has no budget for quality mode {mode}: install the crit Eval this crit "
+                         "works with (python -m pip install -e ../crit-eval)")
+    budget = {**budgets[mode], **correctness.get("quality_budget", {})}
     exactness = correctness.get("exactness", "reported")
     for change in amendments:
         budget |= change.get("quality_budget", {})
@@ -338,8 +363,13 @@ def request_spec(data):
         raise ValueError("KV capacity must cover prompt plus output" + (
             f" for each of the {workload['concurrency']} concurrent requests" if workload["concurrency"] > 1 else ""))
     targets = validate_targets(data.get("targets", {}))
-    # as_quantized is chosen for memory and speed, so its run may re-encode stored weights unless the user says otherwise.
-    policy = data.get("weights_policy", "transformable" if data.get("quality_mode") == "as_quantized" else None)
+    # Every new run records its quality mode, speed unless the request names one.
+    mode = data.get("quality_mode", DEFAULT_QUALITY_MODE)
+    if mode not in QUALITY_MODES:
+        raise ValueError(f"quality_mode requires {' or '.join(QUALITY_MODES)}")
+    # The weights policy is a separate choice: what the engine may do to the stored target weights. A run in quality
+    # mode speed may re-encode them (one way to spend its budget) unless the user says otherwise.
+    policy = data.get("weights_policy", "transformable" if mode == "speed" else None)
     level = validate_level(data.get("verification_level", "artifact_verified"))
     spec = {"model_path": str(path), "hardware_constraints": {"kv_tokens": capacity, **headroom,
                                                               **({"context": context} if context else {})},
@@ -350,7 +380,7 @@ def request_spec(data):
                             **({"weights_policy": policy} if policy else {}),
                             **({"quality_budget": data["quality_budget"]} if "quality_budget" in data else {}),
                             **({"exactness": data["exactness"]} if "exactness" in data else {}),
-                            **({"quality_mode": data["quality_mode"]} if "quality_mode" in data else {})},
+                            "quality_mode": mode},
             "objectives": {"targets": targets, "verification_level": level},
             "resource_limits": resource_limits(data),
             **({"eval_sampling": eval_sampling(data["eval_sampling"])} if "eval_sampling" in data else {}),
@@ -358,7 +388,8 @@ def request_spec(data):
             **({"plans": NEW_RUN_PLANS} if NEW_RUN_PLANS else {}),
             **({"plan_limits": NEW_RUN_PLAN_LIMITS} if NEW_RUN_PLANS and NEW_RUN_PLAN_LIMITS else {}),
             **({"lever_fates": NEW_RUN_LEVER_FATES} if NEW_RUN_PLANS and NEW_RUN_LEVER_FATES else {}),
-            **({"plan_rules": NEW_RUN_PLAN_RULES} if NEW_RUN_PLANS and NEW_RUN_PLAN_LIMITS and NEW_RUN_PLAN_RULES else {})}
+            **({"plan_rules": NEW_RUN_PLAN_RULES} if NEW_RUN_PLANS and NEW_RUN_PLAN_LIMITS and NEW_RUN_PLAN_RULES else {}),
+            **({"budget_counts": NEW_RUN_BUDGET_COUNTS} if NEW_RUN_BUDGET_COUNTS else {})}
     validate_spec(spec)
     return spec
 
@@ -420,15 +451,17 @@ def validate_level(value):
 
 def validate_spec(value):
     keys(value, {"model_path", "hardware_constraints", "cases", "benchmark_protocol", "correctness", "objectives", "resource_limits"},
-         {"eval_sampling", "origin_engine", "plans", "plan_limits", "lever_fates", "plan_rules"})
+         {"eval_sampling", "origin_engine", "plans", "plan_limits", "lever_fates", "plan_rules", "budget_counts"})
+    if value.get("budget_counts", "evaluated") not in BUDGET_COUNTS:
+        raise ValueError("budget_counts is evaluated or ladder when present")
     if value.get("plans", "required") != "required":
         raise ValueError("plans is required when present")
     if value.get("plan_limits", "computed") != "computed" or ("plan_limits" in value and "plans" not in value):
         raise ValueError("plan_limits is computed when present, in a run that requires plans")
     if value.get("lever_fates", "required") != "required" or ("lever_fates" in value and "plans" not in value):
         raise ValueError("lever_fates is required when present, in a run that requires plans")
-    if "plan_rules" in value and (value["plan_rules"] not in (2, 3, 4, 5, 6) or value.get("plan_limits") != "computed"):
-        raise ValueError("plan_rules is 2 to 6 when present, in a run that computes plan limits")
+    if "plan_rules" in value and (value["plan_rules"] not in (2, 3, 4, 5, 6, 7) or value.get("plan_limits") != "computed"):
+        raise ValueError("plan_rules is 2 to 7 when present, in a run that computes plan limits")
     if "eval_sampling" in value and eval_sampling(value["eval_sampling"]) != value["eval_sampling"]:
         raise ValueError("eval_sampling is not in its validated form")
     if "origin_engine" in value:
@@ -464,8 +497,8 @@ def validate_spec(value):
     quality_budget(value["correctness"].get("quality_budget", {}))
     if value["correctness"].get("exactness", "reported") not in EXACTNESS_MODES:
         raise ValueError("exactness requires reported or required")
-    if quality_mode(value["correctness"]) not in QUALITY_MODES:
-        raise ValueError("quality_mode requires preserve or as_quantized")
+    if value["correctness"].get("quality_mode") not in QUALITY_MODES:
+        raise ValueError(f"quality_mode requires {' or '.join(QUALITY_MODES)}: every run states its quality mode")
     if value["correctness"]["required_gates"] != ["arithmetic", "functional", "resources"]:
         raise ValueError("Fixed arithmetic, functional and resource gates required")
     keys(value["objectives"], {"targets", "verification_level"})
@@ -572,7 +605,7 @@ def validate_attempt_reservation(root, run, value, *, bounds=None):
     cap = attempt_process_cap(bounds, value["candidate_id"], value["operation"])
     start = timestamp(value["reserved_at"], "reservation")
     deadline = timestamp(value["deadline_at"], "attempt deadline")
-    if not (timestamp(bounds["started_at"], "segment start") <= start <= deadline
+    if not (timestamp(bounds["started_at"], "segment start") - CLOCK_SLACK <= start <= deadline
             <= timestamp(bounds["deadline_at"], "segment deadline")):
         raise ValueError("Reservation exceeds fixed segment bounds")
     if cap is not None and (deadline - start).total_seconds() > cap:
@@ -593,7 +626,7 @@ def validate_attempt_result(root, run_id, reservation, value):
             or type(value["cleanup_settled"]) is not bool):
         raise ValueError("Invalid attempt outcome/settlement")
     ended = timestamp(value["ended_at"], "ended_at")
-    if ended < timestamp(reservation["reserved_at"], "reserved_at"):
+    if ended < timestamp(reservation["reserved_at"], "reserved_at") - CLOCK_SLACK:
         raise ValueError("Attempt ended before reservation")
     if value["outcome"] == "completed" and ended > timestamp(reservation["deadline_at"], "deadline_at"):
         raise ValueError("Completed attempt exceeded deadline")
@@ -653,7 +686,7 @@ def candidate_projection(root, run, candidate_id, overlay=None, *, candidate_roo
     candidate = _candidate(records, root, run, folder, candidate_id)
     bounds = segment(root, run, candidate["segment_id"])
     created = timestamp(candidate["created_at"], "candidate time")
-    if not timestamp(bounds["started_at"], "segment start") <= created <= timestamp(bounds["deadline_at"], "segment deadline"):
+    if not timestamp(bounds["started_at"], "segment start") - CLOCK_SLACK <= created <= timestamp(bounds["deadline_at"], "segment deadline"):
         raise ValueError("Candidate lies outside its segment")
     resolved = inputs(root, run)
     if candidate["inputs_manifest_sha256"] != resolved["manifest_sha256"]:
@@ -745,29 +778,24 @@ def _source(records, run, folder, candidate):
 
 
 def _package(records, run, folder, package_root, candidate):
-    """The package manifest's digest once the candidate has one (its bytes, build and launch recipe checked), else
-    None."""
+    """The package manifest's digest once the candidate has one (its bytes and build recipe checked), else None. A
+    manifest of a run from before plugin packages names its launch entry and capabilities: it stays readable as
+    history, and crit serve refuses to run it."""
     package_path = safe_path(folder, "package/manifest.json")
     if not records.exists(package_path):
         return None
     package = records.read(package_path)
-    header(package, "package_manifest", run["run_id"], {"candidate_id", "source_manifest_sha256", "configuration_sha256", "files", "build", "launch", "capabilities"})
+    header(package, "package_manifest", run["run_id"], {"candidate_id", "source_manifest_sha256", "configuration_sha256", "files", "build"},
+           {"launch", "capabilities"})
     if (package["candidate_id"] != candidate["candidate_id"] or package["source_manifest_sha256"] != candidate["source_manifest_sha256"] or
             package["configuration_sha256"] != digest(candidate["configuration"])):
         raise ValueError("Package identity differs from frozen source/configuration")
     verify_inventory(package_root, package["files"], {"manifest.json"})
     keys(package["build"], {"toolchain", "dependencies", "command"})
-    if not isinstance(package["launch"], list) or not package["launch"] or not all(isinstance(s, str) for s in package["launch"]):
-        raise ValueError("Package launch recipe requires literal arguments")
-    executable = safe_path(package_root, package["launch"][0])
-    if not executable.is_file():
-        raise ValueError("Package launch entry must be a retained file")
     if not isinstance(package["build"]["toolchain"], dict) or not package["build"]["toolchain"] or not isinstance(package["build"]["dependencies"], list):
         raise ValueError("Build recipe requires toolchain identity and dependency list")
     if not isinstance(package["build"]["command"], list) or not package["build"]["command"] or not all(isinstance(arg, str) for arg in package["build"]["command"]):
         raise ValueError("Build command requires literal arguments")
-    if not isinstance(package["capabilities"], list) or not all(isinstance(capability, str) for capability in package["capabilities"]):
-        raise ValueError("Package capabilities require a list")
     for dependency in package["build"]["dependencies"]:
         keys(dependency, {"name", "version", "path", "sha256"})
         text(dependency["name"], "dependency name", 200)
@@ -795,7 +823,7 @@ def _attempts(records, root, run, folder, candidate, bounds, resolved, created, 
             raise ValueError("Attempt input identity mismatch")
         if reservation["operation"] != "build" and reservation["package_sha256"] != package_sha:
             raise ValueError("Attempt package identity mismatch")
-        if timestamp(reservation["reserved_at"], "reservation") < created:
+        if timestamp(reservation["reserved_at"], "reservation") < created - CLOCK_SLACK:
             raise ValueError("Attempt precedes candidate creation")
         attempt_view = {"attempt_id": attempt.name, "operation": reservation["operation"], "deadline_at": reservation["deadline_at"],
                         "reservation": f"candidates/{candidate_id}/attempts/{attempt.name}/reservation.json", "outcome": None}
@@ -835,8 +863,9 @@ def _checks(records, root, run, folder, candidate, bounds, resolved, created, pa
         if check["status"] not in {"passed", "failed", "unverified", "not_applicable"} or check["evidence_level"] not in {"reported", "artifact_verified"}:
             raise ValueError("Invalid check verdict/evidence level")
         text(check["rationale"], "check rationale", 8000)
-        if not created <= timestamp(check["recorded_at"], "check time") <= timestamp(bounds["deadline_at"], "segment deadline"):
-            raise ValueError("Check outside segment")
+        if not created - CLOCK_SLACK <= timestamp(check["recorded_at"], "check time") <= timestamp(bounds["deadline_at"], "segment deadline"):
+            raise ValueError(f"Check outside segment: recorded at {check['recorded_at']}, the candidate created at "
+                             f"{candidate['created_at']}, the segment's deadline {bounds['deadline_at']}")
         if not isinstance(check["evidence"], list) or (check["status"] == "passed" and not check["evidence"]):
             raise ValueError("Passed check requires retained evidence")
         for ref in check["evidence"]:
@@ -863,8 +892,11 @@ def _series(records, root, run, path, folder, candidate, bounds, resolved, creat
     if (bench["identities"] != expected or bench["workload"] != case["workload"] or bench["case_sha256"] != digest(case) or
             bench["protocol_sha256"] != digest(run["spec"]["benchmark_protocol"])):
         raise ValueError("Benchmark comparison identities changed")
-    if not created <= timestamp(bench["started_at"], "benchmark start") <= timestamp(bench["ended_at"], "benchmark end") <= timestamp(bounds["deadline_at"], "segment deadline"):
-        raise ValueError("Benchmark outside segment")
+    started, ended = timestamp(bench["started_at"], "benchmark start"), timestamp(bench["ended_at"], "benchmark end")
+    if not (created - CLOCK_SLACK <= started and started - CLOCK_SLACK <= ended
+            and ended <= timestamp(bounds["deadline_at"], "segment deadline")):
+        raise ValueError(f"Benchmark outside segment: from {bench['started_at']} to {bench['ended_at']}, the candidate "
+                         f"created at {candidate['created_at']}, the segment's deadline {bounds['deadline_at']}")
     if bench["outcome"] not in {"completed", "failed", "cancelled", "timed_out", "interrupted"}:
         raise ValueError("Invalid benchmark outcome")
     keys(bench["metrics"], set(), ALL_METRICS)
@@ -957,11 +989,20 @@ def _outcome(records, run, folder, candidate_id, attempts, unresolved, package_s
         raise ValueError(f"Unsettled attempt cannot be sealed ({pending}); record its actual outcome and cleanup with "
                          "`crit run ... settle` first")
     lifecycle, failure = outcome["lifecycle"], outcome["failure"]
-    if lifecycle == "completed" and (not package_sha or not series):
-        raise ValueError("Completed candidate requires package and measurement")
+    if lifecycle == "completed" and (not package_sha or not (series or _evaluated(records, folder, attempts))):
+        raise ValueError("Completed candidate requires package and measurement (a benchmark series or a completed "
+                         "Eval attempt)")
     if lifecycle == "built" and not package_sha:
         raise ValueError("Built candidate requires a runnable package")
     return lifecycle, failure
+
+
+def _evaluated(records, folder, attempts):
+    """Whether a completed Eval attempt of the candidate retained its result (`crit run ... eval`): Eval
+    measures the packaged candidate as `measure` does, so a candidate measured only by Eval seals as completed
+    (a closed segment refuses `measure`, and Resume needs every candidate sealed)."""
+    return any(a["operation"] in ("eval", "benchmark") and a["outcome"] == "completed"
+               and records.exists(safe_path(folder, f"eval/{a['attempt_id']}.json")) for a in attempts)
 
 
 def exploratory_reason(item):
@@ -1007,6 +1048,23 @@ def ineligibility(run, candidate):
     if candidate["lifecycle"] != "completed":
         reasons.append(f"the candidate was sealed {candidate['lifecycle']}, not completed")
     return reasons
+
+
+def counts_evaluated(run):
+    """Whether the run's candidate budget counts the candidates that went through Eval (budget_counts), not every
+    candidate it creates."""
+    return run["spec"].get("budget_counts") == "evaluated"
+
+
+def evaluated_candidates(root):
+    """candidate_id -> the segment of its first Eval attempt, for every candidate an Eval attempt was reserved for:
+    the candidates a run with budget_counts evaluated has spent its budget on."""
+    found = {}
+    for path in sorted(safe_path(root, "candidates").glob("candidate-*/attempts/attempt-*/reservation.json")):
+        value = read_json(path)
+        if value.get("operation") == "eval":
+            found.setdefault(path.parents[2].name, value.get("segment_id"))
+    return found
 
 
 def read_candidates(root, run):

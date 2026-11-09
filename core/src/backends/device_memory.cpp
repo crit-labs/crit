@@ -4,6 +4,7 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace crit::core {
@@ -173,5 +174,83 @@ ResolvedSource MappedSource::resolve(std::uintptr_t host_address, std::size_t by
         if(cursor == end) return result;
     }
     throw std::invalid_argument("source extent has a mapped coverage gap");
+}
+namespace {
+bool power_of_two(std::size_t v) { return v && !(v & (v - 1)); }
+std::size_t align_up(std::size_t v, std::size_t a) {
+    if(v > std::numeric_limits<std::size_t>::max() - (a - 1)) throw std::overflow_error("buffer plan size overflow");
+    return (v + a - 1) / a * a;
+}
+std::size_t add(std::size_t a, std::size_t b) {
+    if(b > std::numeric_limits<std::size_t>::max() - a) throw std::overflow_error("buffer plan size overflow");
+    return a + b;
+}
+}
+const PlannedBuffer& BufferPlan::buffer(std::string_view name) const {
+    for(const auto& b : buffers) if(b.name == name) return b;
+    throw std::out_of_range("buffer plan has no buffer " + std::string(name));
+}
+BufferPlan plan_buffers(std::span<const BufferRequest> requests, const BufferBudget& budget) {
+    BufferPlan plan;
+    std::size_t at = 0;
+    for(const auto& r : requests) {
+        if(r.name.empty()) throw std::invalid_argument("buffer plan: a buffer needs a name");
+        if(!r.bytes) throw std::invalid_argument("buffer plan: " + r.name + " has no bytes");
+        if(!power_of_two(r.alignment)) throw std::invalid_argument("buffer plan: " + r.name + "'s alignment is not a power of two");
+        for(const auto& b : plan.buffers)
+            if(b.name == r.name) throw std::invalid_argument("buffer plan: " + r.name + " is named twice");
+        at = align_up(at, r.alignment);
+        plan.buffers.push_back({r.name, at, r.bytes});
+        at = add(at, r.bytes);
+    }
+    if(!power_of_two(budget.slot_alignment)) throw std::invalid_argument("buffer plan: slot alignment is not a power of two");
+    if(budget.min_slots > budget.max_slots) throw std::invalid_argument("buffer plan: min_slots above max_slots");
+    if(budget.scratch_bytes) {
+        at = align_up(at, 256);
+        plan.scratch_offset = at;
+        plan.scratch_bytes = budget.scratch_bytes;
+        at = add(at, budget.scratch_bytes);
+    }
+    plan.reserve_bytes = budget.reserve;
+    const std::size_t room = budget.available > budget.reserve ? budget.available - budget.reserve : 0;
+    plan.slot_bytes = budget.slot_bytes;
+    if(budget.slot_bytes) {
+        at = align_up(at, budget.slot_alignment);
+        plan.slots_offset = at;
+        plan.slot_stride = align_up(budget.slot_bytes, budget.slot_alignment);
+        plan.slots = room > at ? std::min(budget.max_slots, (room - at) / plan.slot_stride) : 0;
+    } else {
+        plan.slots_offset = at;
+    }
+    const std::size_t needed = add(at, budget.slot_bytes ? budget.min_slots * plan.slot_stride : 0);
+    if(needed > room)
+        throw std::runtime_error("buffer plan: " + std::to_string(needed) + " bytes of buffers, scratch and slots do not fit "
+                                 + std::to_string(room) + " bytes (available less reserve); short by " +
+                                 std::to_string(needed - room));
+    plan.total_bytes = add(at, plan.slots * plan.slot_stride);
+    plan.unused_bytes = room - plan.total_bytes;
+    return plan;
+}
+BufferArena::BufferArena(BufferService& service, BufferPlan plan) : plan_(std::move(plan)) {
+    if(!plan_.total_bytes) throw std::invalid_argument("buffer arena: an empty plan");
+    lease_ = service.allocate(plan_.total_bytes);
+    if(plan_.scratch_bytes) scratch_.emplace(static_cast<std::byte*>(lease_.data()) + plan_.scratch_offset, plan_.scratch_bytes);
+}
+std::span<std::byte> BufferArena::buffer(std::string_view name) const {
+    const auto& b = plan_.buffer(name);
+    return {static_cast<std::byte*>(lease_.data()) + b.offset, b.bytes};
+}
+std::span<std::byte> BufferArena::slot(std::size_t i) const {
+    if(i >= plan_.slots) throw std::out_of_range("buffer arena: slot " + std::to_string(i) + " past " + std::to_string(plan_.slots));
+    return {static_cast<std::byte*>(lease_.data()) + plan_.slots_offset + i * plan_.slot_stride, plan_.slot_bytes};
+}
+Arena& BufferArena::scratch() {
+    if(!scratch_) throw std::logic_error("buffer arena: the plan has no scratch region");
+    return *scratch_;
+}
+void* BufferArena::data() const { return lease_.data(); }
+void BufferArena::close() {
+    scratch_.reset();
+    lease_.close();
 }
 }

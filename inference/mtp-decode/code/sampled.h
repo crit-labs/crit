@@ -575,7 +575,7 @@ public:
 };
 
 // Online estimate of each draft's acceptance from the drafter's own confidence, for drafters without a confidence
-// head (vLLM's adaptive verification estimator): p(k) = sigmoid(slope * logit(q_max) + intercept[k]), where q_max
+// head (an adaptive verification estimator): p(k) = sigmoid(slope * logit(q_max) + intercept[k]), where q_max
 // is the draft law's largest probability at draft position k, the slope is shared and each position has its own
 // intercept. observe() records each verified draft's feature and outcome in a bounded window; refit() runs Newton
 // steps over it, where the shared slope makes the Hessian an arrowhead, so each step is a scalar solve. A draft is

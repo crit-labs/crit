@@ -1,0 +1,86 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "attention-state",
+  "title": "Transactional causal KV state: staged rows, commit of an accepted prefix, rollback",
+  "description": "attention-state's KVState per sequence as the host form: rows staged after the committed ones stay pending until commit keeps the accepted prefix (a speculative suffix is dropped), fork shares the committed rows. Its device form is a paged pool of every sequence's keys and values in torch (code/pages.py): BF16, FP16, FP32, FP8 E4M3 pages with per-layer scales, FP8 E4M3 or INT8 pages with a scale per position and KV head, copy-on-write pages for forks, a valid length per sequence that a verify's accepted rows set; static FP8 scales per layer (kv:scales: set_scales), pools of keys only (value_dim 0) and rows read and placed at chosen slots (kv:keys: rows_at, slots_at), and for captured rounds (rounds:kv_cache) a sequence bound to a round slot with its pages reserved up to its capacity, its slots computed and its length committed on the device. For captured prompt chunks (prompts:kv_cache) stage_prompt(batch) puts a chunk's KV slots and page table in fixed buffers before each replay (the padding's slots at the dump page) and commit_prompt(batch) its length after. Over FP8 and INT8 pages a prompt chunk's keys and values are kept fresh (16-bit, fresh_mib) for its prompt rows' own attention (fresh_rows: a row, or a captured chunk, of more than `window` tokens).",
+  "fills": [
+    "kv_cache"
+  ],
+  "provides": [
+    "kv:rows",
+    "kv:pages",
+    "kv:scales",
+    "kv:keys",
+    "rounds:kv_cache",
+    "prompts:kv_cache"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "options": {
+    "page": {
+      "type": "int",
+      "default": 16,
+      "min": 1,
+      "max": 4096,
+      "description": "Tokens per KV page"
+    },
+    "step_rows": {
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 256,
+      "description": "Window rows (decode tokens, verify windows) a step may hold in the device pool's step buffers, at fixed addresses for CUDA graphs (0: no step buffers)"
+    },
+    "step_tokens": {
+      "type": "int",
+      "default": 8192,
+      "min": 1,
+      "max": 1048576,
+      "description": "Tokens a step may hold with step buffers"
+    },
+    "window": {
+      "type": "int",
+      "default": 16,
+      "min": 1,
+      "max": 64,
+      "description": "Most tokens of a row read as a window row (decode tokens, verify windows, short prompt pieces: the attention plugins' split-KV reader, and the step buffers' rows); a longer row is a prompt row"
+    },
+    "round_rows": {
+      "type": "int",
+      "default": 8,
+      "min": 0,
+      "max": 256,
+      "description": "Round slots a captured round may bind sequences to (rounds:kv_cache)"
+    },
+    "fresh_mib": {
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 4096,
+      "description": "MiB of 16-bit keys and values of a prompt chunk, made when the plugin is made on a CUDA engine (memory() declares them): over FP8 and INT8 pages a prompt row (more than `window` tokens) attends its own chunk as the projections gave it and the earlier positions from the pages (a step past the buffer, or 0, reads its own chunk from the pages). Off by default: fresh reads make a scored continuation part from the served decode by up to the pages' quantization (a 27B engine's served and scored alternatives 3.2 nats apart, past speed's 2.0 honesty bound), so an engine turns it on only where its honesty bound and quality measured with it allow"
+    },
+    "kernels": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "torch"
+      ],
+      "description": "auto: pages written by the registry's paged-kv-attention kernels where they load; torch: in torch"
+    }
+  },
+  "kernels": [
+    {
+      "name": "crit-labs/paged-kv-attention",
+      "version": 1,
+      "revision": null,
+      "fallback": "keys and values encoded and written with torch ops (index_copy_), the same codes and scales"
+    }
+  ],
+  "sources": {
+    "state": "code"
+  },
+  "entry": "plugin.py:create"
+}

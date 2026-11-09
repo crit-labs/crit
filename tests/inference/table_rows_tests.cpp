@@ -1,5 +1,7 @@
 // Native lookup-table rows: request order, rows asked for twice, the hot-row cache and its counters, workers against a
-// single reader, a table past the file's end, rows outside the table, and the staging ring waiting on its copies.
+// single reader, a table past the file's end, rows outside the table, the staging ring waiting on its copies, and the
+// prefetcher: requests started one after another (as draft tokens appear) arrive in order with their own rows, queued
+// ones share a batch, and a wait blocks only until its own rows are written.
 #include "table_rows.h"
 
 #include <filesystem>
@@ -66,6 +68,36 @@ int main() {
             require(slot == i % 3 && span.data() == pinned.data() + slot * 64 && span.size() == 64, "ring order");
         }
         require(polls[0] == 4 && polls[1] == 3 && polls[2] == 3, "a reused slot waits for its copy, a fresh one does not");
+        {
+            tr::RowGather table(region, 4, 0);
+            tr::RowPrefetch prefetch(table);
+            std::vector<std::vector<std::uint64_t>> asked;
+            std::vector<std::vector<std::byte>> dst;
+            std::vector<tr::RowPrefetch::Ticket> tickets;
+            for(int token = 0; token < 40; ++token) {   // 16 rows a draft token, some shared with earlier tokens
+                std::vector<std::uint64_t> ids;
+                for(int i = 0; i < 16; ++i) ids.push_back(rng() % rows);
+                asked.push_back(ids);
+                dst.emplace_back(ids.size() * row_bytes);
+                tickets.push_back(prefetch.start(ids, dst.back().data()));
+            }
+            for(std::size_t k = 0; k < tickets.size(); ++k) {
+                prefetch.wait(tickets[k]);
+                require(prefetch.ready(tickets[k]), "a waited ticket is ready");
+                for(std::size_t i = 0; i < asked[k].size(); ++i)
+                    for(std::size_t b = 0; b < row_bytes; ++b)
+                        require(dst[k][i * row_bytes + b] == value(asked[k][i], b), "prefetched rows in request order");
+            }
+            prefetch.wait_all();
+            const auto s = prefetch.stats();
+            require(s.requests == 40 && s.rows == 640 && s.batches >= 1 && s.batches <= 40, "prefetch counters");
+            const std::uint64_t outside[] = {rows};
+            bool refused = false;
+            try { (void)prefetch.start(outside, dst[0].data()); } catch(const std::out_of_range&) { refused = true; }
+            require(refused, "a prefetch outside the table refused at start");
+            std::cout << "prefetch: 40 draft tokens of 16 rows in " << s.batches << " batch(es), " << s.ready_when_waited
+                      << " ready when waited\n";
+        }
         std::filesystem::remove(path);
         return 0;
     } catch(const std::exception& e) {

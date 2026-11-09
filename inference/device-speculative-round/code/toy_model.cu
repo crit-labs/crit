@@ -1,4 +1,6 @@
-// Reference kernels for the synthetic toy target, not for performance.
+// Reference kernels for the synthetic toy target, not for performance. Its gated-delta layer is a fixture's arithmetic,
+// not a library kernel: a plain serial per-token loop with per-column checkpoints (gdn_verify below, test-only and not
+// crit API), committed by recurrent-state-recovery's select_accepted, as a device round commits a recurrent layer.
 #include "toy_model.h"
 #include "greedy_accept.h"
 #include "recurrent_cuda.h"
@@ -8,6 +10,36 @@ namespace crit::techniques::device_round::toy {
 namespace {
 namespace rc = crit::techniques::recurrent::cuda;
 constexpr unsigned threads = 128;
+
+// The toy's gated-delta verify: one thread per value column v of the one head walks the columns in order, from `start`,
+// writing the state after each column to checkpoints[t] and its output. G = e^l H; delta = beta (v - k^T G);
+// H' = G + k delta; out = scale q^T H', keys and queries L2-normalized.
+__device__ float gdn_inverse_norm(const float* x, std::uint32_t n, float epsilon) {
+    float sum = epsilon;
+    for(std::uint32_t i = 0; i < n; ++i) sum += x[i] * x[i];
+    return 1.0f / sqrtf(sum);
+}
+
+__global__ void gdn_verify(State s, std::uint32_t columns, float query_scale) {
+    const auto v = threadIdx.x;
+    if(v >= values) return;
+    const float* in = s.gdn_start;
+    for(std::uint32_t t = 0; t < columns; ++t) {
+        float* out = s.gdn_checkpoints + std::size_t(t) * keys * values;
+        const float* key = s.k + std::size_t(t) * keys;
+        const float* query = s.q + std::size_t(t) * keys;
+        const float key_scale = gdn_inverse_norm(key, keys, 1e-6f), decay = expf(s.log_decay[t]);
+        float residual = s.v[std::size_t(t) * values + v];
+        for(std::uint32_t k = 0; k < keys; ++k) residual -= key[k] * key_scale * (in[k * values + v] * decay);
+        residual *= s.beta[t];
+        for(std::uint32_t k = 0; k < keys; ++k) out[k * values + v] = in[k * values + v] * decay + key[k] * key_scale * residual;
+        const float query_norm = gdn_inverse_norm(query, keys, 1e-6f);
+        float sum = 0.0f;
+        for(std::uint32_t k = 0; k < keys; ++k) sum += query[k] * query_norm * out[k * values + v];
+        s.gdn_out[std::size_t(t) * values + v] = query_scale * sum;
+        in = out;
+    }
+}
 
 __device__ float dot(const float* a, const float* b, std::uint32_t n) {
     float sum = 0.0f;
@@ -112,7 +144,6 @@ __global__ void bigram(const std::int32_t* table, const std::int32_t* control, s
 __global__ void set(std::int32_t* target, std::int32_t value) { *target = value; }
 
 rc::DeviceGeometry geometry() { return {1, keys, values, 1e-6f, 1.0f / std::sqrt(float(keys)), true, true}; }
-rc::DeviceSteps steps(const State& s) { return {s.q, s.k, s.v, s.log_decay, s.beta}; }
 }
 
 cudaError_t enqueue_forward(const Weights& w, const State& s, const std::int32_t* inputs, const std::int32_t* frontier,
@@ -123,7 +154,7 @@ cudaError_t enqueue_forward(const Weights& w, const State& s, const std::int32_t
     attention<<<1, threads, 0, stream>>>(w, s, inputs, frontier, columns);
     gdn_inputs<<<columns, threads, 0, stream>>>(w, s);
     if(auto e = cudaPeekAtLastError(); e != cudaSuccess) return e;
-    if(auto e = rc::enqueue_verify(geometry(), s.gdn_start, steps(s), columns, s.gdn_out, s.gdn_checkpoints, nullptr, stream); e != cudaSuccess) return e;
+    gdn_verify<<<1, values, 0, stream>>>(s, columns, geometry().query_scale);
     head<<<columns, threads, 0, stream>>>(w, s, predictions, lp);
     return cudaPeekAtLastError();
 }

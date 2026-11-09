@@ -1,0 +1,24 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "round-sampler",
+  "title": "A test stand-in for a sampler's greedy round predictions, over token-sampling",
+  "description": "The package's token-sampling plugin with greedy predictions for a captured round (each column's argmax) and each round slot's staged rules. For the round driver's tests; token-sampling provides its own round form.",
+  "fills": [
+    "sampler"
+  ],
+  "provides": [
+    "sampler:core-law",
+    "rounds:sampler"
+  ],
+  "devices": [
+    "cuda"
+  ],
+  "options": {
+    "inner": {
+      "type": "str",
+      "default": "token-sampling",
+      "description": "the package's sampler plugin this stands in for"
+    }
+  },
+  "entry": "plugin.py:create"
+}

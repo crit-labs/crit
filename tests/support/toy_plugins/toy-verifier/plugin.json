@@ -1,0 +1,12 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "toy-verifier",
+  "title": "The toy's chain verifier",
+  "fills": [
+    "verifier"
+  ],
+  "devices": [
+    "host"
+  ],
+  "entry": "plugin.py:create"
+}

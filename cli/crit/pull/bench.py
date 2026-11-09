@@ -17,6 +17,7 @@ import threading
 
 from crit.cli import default_project
 from crit.records import GIB, read_json
+from crit.run.records import DEFAULT_QUALITY_MODE, QUALITY_MODES
 from crit.run.served import QUALITY, SERVED
 from crit.run.store import ROOT
 
@@ -70,6 +71,17 @@ def card_result(card, gpu, model):
     """The card's result for this GPU and model, else its result for the model on another GPU, else None."""
     results = [r for r in card.get("results") or [] if r.get("model") == model]
     return next((r for r in results if r.get("gpu") == gpu), results[0] if results else None)
+
+
+def card_mode(stated):
+    """The quality mode to measure in so the result compares with the card's: its result's quality_mode, which every
+    crit-hub result states; with no result for this model, crit's default."""
+    if stated is None:
+        return DEFAULT_QUALITY_MODE
+    if stated.get("quality_mode") not in QUALITY_MODES:
+        raise ValueError(f"the card's result states quality_mode {stated.get('quality_mode')!r}: crit-hub cards state "
+                         f"{' or '.join(QUALITY_MODES)}")
+    return stated["quality_mode"]
 
 
 def gpu_of(card, device):
@@ -126,9 +138,10 @@ def comparison(card_stats, stats, label):
     """The card's stats and the measured ones side by side, one line per stat."""
     names = {"decode_tok_s": "decode tok/s", "prefill_tok_s": "prefill tok/s", "ttft_ms": "time to first token ms",
              "ppl": "perplexity vs reference", "kld_mean": "mean KL divergence", "context_tokens": "context tokens"}
-    lines = [f"{'':<26}{label:>18}{'this machine':>16}"]
+    width = max(18, len(label) + 2)
+    lines = [f"{'':<26}{label:>{width}}{'this machine':>16}"]
     for key in STATS:
-        lines.append(f"{names[key]:<26}{shown(key, (card_stats or {}).get(key)):>18}{shown(key, stats.get(key)):>16}")
+        lines.append(f"{names[key]:<26}{shown(key, (card_stats or {}).get(key)):>{width}}{shown(key, stats.get(key)):>16}")
     return "\n".join(lines)
 
 
@@ -157,7 +170,9 @@ def ready_data(model, data, sampling=None):
 
 def bench(engine, store, data, out=None, project=ROOT, device=None, parts=None, stage=None, budget_minutes=None,
           reference=False, quality_mode=None):
-    """Measure the installed engine; returns (result, the card's stats it compares with, their label)."""
+    """Measure the installed engine; returns (result, the card's stats it compares with, their label, the result
+    file). The card's stats compare only when its result was judged in the quality mode measured here: with
+    quality_mode naming another, they are left out (None) and the label says the card's mode."""
     from crit_core.machine import engine_lock
     from crit_eval import load_json
     from crit_eval.quality.fixed import STORE
@@ -165,7 +180,8 @@ def bench(engine, store, data, out=None, project=ROOT, device=None, parts=None, 
     from crit_eval.run.runner import run as run_eval
     from crit.run.cli import load_settings
     engine = engine_id(engine)
-    spec = store.spec(engine)   # the package and checkpoint as installed, verified
+    from crit_api.installed import installed_spec
+    spec = installed_spec(store, engine)   # the package and checkpoint as installed, verified, with what Core serves
     install, folder = store.get(engine), store.folder(engine)
     card = read_json(folder / "card.json")
     model, model_id = Path(spec["model_path"]), install["checkpoint"]["model"]
@@ -201,7 +217,7 @@ def bench(engine, store, data, out=None, project=ROOT, device=None, parts=None, 
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out = Path(out).expanduser().absolute() if out else folder / "bench" / f"{stamp}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
-    mode = quality_mode or (stated or {}).get("quality_mode") or "preserve"
+    mode = quality_mode or card_mode(stated)
     engines = InstalledEngines(store, engine, load_json(data / PREPARED), kv_tokens)
     source = install["source"]
     try:
@@ -213,8 +229,13 @@ def bench(engine, store, data, out=None, project=ROOT, device=None, parts=None, 
                               identity={"engine": engine, "package_sha256": spec["package_sha256"]}, log=log)
     finally:
         engines.stop()
-    label = f"card ({stated['gpu']})" if stated else "card"
-    return result, (stated or {}).get("stats"), label, out
+    if not stated:
+        return result, None, "card", out
+    if card_mode(stated) != mode:
+        log(f"crit bench: the card's result was judged in quality mode {card_mode(stated)}, this measurement in "
+            f"{mode}: their numbers do not compare, so the card's are left out")
+        return result, None, f"card ({card_mode(stated)})", out
+    return result, stated.get("stats"), f"card ({stated['gpu']}, {mode})", out
 
 
 def parser():
@@ -237,8 +258,9 @@ def parser():
     parser.add_argument("--reference", action="store_true",
                         help="Score the reference on the checkpoint first when the data holds no scores, so quality is "
                              "measured too (reads the whole checkpoint)")
-    parser.add_argument("--quality-mode", choices=("preserve", "as_quantized"),
-                        help="The quality mode (default: the card's result's)")
+    parser.add_argument("--quality-mode", choices=QUALITY_MODES,
+                        help="How much drift from the checkpoint the engine is judged to trade for speed (default: the "
+                             f"card's result's mode, else {DEFAULT_QUALITY_MODE})")
     return parser
 
 

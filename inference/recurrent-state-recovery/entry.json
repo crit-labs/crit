@@ -1,9 +1,9 @@
 {
   "id": "recurrent-state-recovery",
   "category": "speculation",
-  "summary": "Output-only gated-delta verification, atomic accepted-prefix recurrent recovery and a CUDA device commit reference",
+  "summary": "Speculative recurrent-state recovery: output-only gated-delta verification, atomic accepted-prefix recovery, the device commit of a captured round's accepted prefix (deferred, checkpoints or recompute) and a pooled device form",
   "implementation_status": "native_source",
-  "implementation_scope": "Bounded C++20 FP64 host gated-delta chain, physical accepted-node mapping, after-token checkpoints and private sibling commit; Python formula; generic FP32 CUDA reference verify with per-column checkpoints, recompute or deferred replay and device-count accepted-state selection. Model projections, casts and tuned kernels remain external; a pure-Python two-pass chunked prefill (chunk-parallel triangular solve, then a sequential matrix-product pass) checked against the token-by-token recurrence",
+  "implementation_scope": "Bounded C++20 FP64 host gated-delta chain, physical accepted-node mapping, after-token checkpoints and private sibling commit; Python formula; the CUDA device commit (select_accepted from per-column checkpoints, record_accepted for a deferred commit) from a device-held count; the recurrence slot's device form (device_states.py): a pool of every sequence's FP32 state and causal-convolution window, step rows with a host accept and captured-round rows with commit_round by strategy, over crit-labs' recurrent-scans pool kernels from the kernel registry or a capture-safe torch formula; a pure-Python two-pass chunked prefill (chunk-parallel triangular solve, then a sequential matrix-product pass) checked against the token-by-token recurrence. The scans themselves (column scan, chunked prefill, convolution) are recurrent-scans', not this entry's",
   "agent_guidance": {
     "use_when": "A short speculative accepted prefix can be reconstructed more cheaply than retaining a full recurrent matrix after every proposed token",
     "avoid_when": "Recovery work outweighs state-storage savings, recurrence/cast semantics differ, or complete continuation state cannot be restored",
@@ -12,14 +12,14 @@
       "Recovery from retained initial state and per-node inputs without per-token matrix snapshots",
       "Absolute after-token checkpoint semantics and accepted ordinal to physical-node mapping",
       "Single-use atomic partial/zero commit, private sibling hook, cancellation and standalone native example",
-      "Generic FP32 CUDA reference verify and device-side accepted-state commit by per-column checkpoints, recompute from saved inputs, or deferred replay at the next verify, selected from a device-held accepted count",
-      "One-launch record of the accepted count into many per-block counts (an engine's deferred column scan and convolution)",
+      "Device commit from a device-held accepted count: select the state after the accepted columns from per-column checkpoints, or record the count for a deferred commit (one launch for many per-block counts)",
+      "A device state pool for the recurrence slot: decode and verify rows of many sequences, their causal-convolution windows, host accept for step rows and commit_round for captured rounds by strategy (deferred, checkpoints, recompute), capture-safe",
       "Two-pass chunked prefill: state-independent T, W, Ub and decayed q.k per chunk in parallel, then a sequential pass of matrix products only"
     ],
     "engine_supplies": [
       "Model projections, gates, head mappings, activation/state cast rules and sampler acceptance",
-      "All convolution, index, target/draft and other continuation siblings",
-      "Native kernels, source/destination reservations, producer ordering and failure settlement",
+      "Index, target/draft and other continuation siblings beyond the state and convolution window",
+      "The scan kernels (a provider's or crit-labs' recurrent-scans), source/destination reservations, producer ordering and failure settlement",
       "Materialization of correction or bonus tokens and full-model qualification"
     ],
     "preserve": [
@@ -33,40 +33,101 @@
       "Head batching, tensor layout, supported shapes, representations and recurrence kernels",
       "Output-only verification versus full-state snapshots",
       "Owned graph staging and side-stream recovery with explicit readiness joins",
-      "Device strategy: per-column checkpoints (memory), recompute from the start state (repeated steps) or deferred replay (no start copy, scalar commit)"
+      "Device strategy: per-column checkpoints (memory per round row and column), recompute from the kept start state (one more state pass at commit) or deferred replay (no start copy, scalar commit, the replay folded into the next row)"
     ]
   },
   "path": "inference/recurrent-state-recovery/README.md",
   "code_path": "inference/recurrent-state-recovery/code",
   "code_files": [
-    {"path": "inference/recurrent-state-recovery/code/recurrent_recovery.h", "purpose": "Bounded native host recurrence and atomic private recovery; after-token checkpoint mapping from Core (crit::core::checkpoint_node)"},
-    {"path": "inference/recurrent-state-recovery/code/reference.py", "purpose": "Immutable FP64 formula and chain recovery worked example"},
-    {"path": "inference/recurrent-state-recovery/code/example.cpp", "purpose": "Standalone native nonsequential-path and partial-checkpoint POC"},
-    {"path": "inference/recurrent-state-recovery/code/CMakeLists.txt", "purpose": "Native example and independent recurrent regression build against Core (installed SDK or this checkout)"},
-    {"path": "inference/recurrent-state-recovery/code/recurrent_cuda.h", "purpose": "FP32 CUDA reference interface for multi-head verify and checkpoint, recompute or deferred commit from a device accepted count"},
-    {"path": "inference/recurrent-state-recovery/code/recurrent_cuda.cu", "purpose": "Reference one-block-per-head, one-thread-per-value-column gated-delta kernels, not for performance"},
-    {"path": "inference/recurrent-state-recovery/code/stochastic_round.h", "purpose": "Unbiased stochastic rounding of FP32 state to BF16 storage with replayable draws keyed by seed, position, layer and element"},
-    {"path": "inference/recurrent-state-recovery/code/chunked_prefill.py", "purpose": "Two-pass chunked gated-delta prefill and the token-by-token recurrence for comparison"}
+    {
+      "path": "inference/recurrent-state-recovery/code/recurrent_recovery.h",
+      "purpose": "Bounded native host recurrence and atomic private recovery; after-token checkpoint mapping from Core (crit::core::checkpoint_node)"
+    },
+    {
+      "path": "inference/recurrent-state-recovery/code/reference.py",
+      "purpose": "Immutable FP64 formula and chain recovery worked example"
+    },
+    {
+      "path": "inference/recurrent-state-recovery/code/example.cpp",
+      "purpose": "Standalone native nonsequential-path and partial-checkpoint POC"
+    },
+    {
+      "path": "inference/recurrent-state-recovery/code/CMakeLists.txt",
+      "purpose": "Native example and independent recurrent regression build against Core (installed SDK or this checkout)"
+    },
+    {
+      "path": "inference/recurrent-state-recovery/code/recurrent_cuda.h",
+      "purpose": "The device commit's interface: select the accepted state from per-column checkpoints, or record the accepted count for a deferred commit, from a device-held count"
+    },
+    {
+      "path": "inference/recurrent-state-recovery/code/recurrent_cuda.cu",
+      "purpose": "The device commit's kernels: a count-selected copy and the count record (mechanism, no recurrence arithmetic)"
+    },
+    {
+      "path": "inference/recurrent-state-recovery/code/stochastic_round.h",
+      "purpose": "Unbiased stochastic rounding of FP32 state to BF16 storage with replayable draws keyed by seed, position, layer and element"
+    },
+    {
+      "path": "inference/recurrent-state-recovery/code/chunked_prefill.py",
+      "purpose": "Two-pass chunked gated-delta prefill and the token-by-token recurrence for comparison"
+    },
+    {
+      "path": "inference/recurrent-state-recovery/code/device_states.py",
+      "purpose": "The recurrence slot's device form: a pool of every sequence's state and convolution window, step and captured-round rows, host accept and commit_round by strategy, over recurrent-scans' pool kernels or a torch formula"
+    }
   ],
   "requires": {
-    "hardware": "Python 3.11+ standard library for formula; CMake 3.28+, C++20 and Core (crit::core) for native host POC; CUDA C++20 with Core CRIT_CORE_CUDA for the device reference",
+    "hardware": "Python 3.11+ standard library for formula; CMake 3.28+, C++20 and Core (crit::core) for native host POC; CUDA C++20 with Core CRIT_CORE_CUDA for the device commit; torch for the device form (CUDA or CPU), optionally crit-labs' recurrent-scans and fla",
     "model": "Declared gated-delta recurrence with caller-supplied projected/gated step inputs and complete sibling restoration",
     "workload": "One rooted verification chain per round; bounded physical nodes, outputs, state, siblings and positions"
   },
   "contract": {
     "input": "Explicit geometry/limits, owned FP64 starting matrix at an absolute after-token count, topologically numbered nodes and a selected physical path",
-    "output": "Provisional verification outputs, then a complete accepted snapshot and optional exact boundary checkpoint; on the device, outputs plus a live state selected from the accepted count",
-    "ownership": "The loop owns input copies and private snapshots; sibling callbacks touch private bytes and settle all work; accesses are serialized. Device kernels borrow caller-owned start, live, checkpoint, work and step buffers on the caller stream",
+    "output": "Provisional verification outputs, then a complete accepted snapshot and optional exact boundary checkpoint; on the device, outputs plus a live state (and convolution window) selected or recorded from the accepted count",
+    "ownership": "The loop owns input copies and private snapshots; sibling callbacks touch private bytes and settle all work; accesses are serialized. The device commit borrows caller-owned start, live, checkpoint and count buffers on the caller stream; the pool owns its states, stashes, windows, counts and round scratch, allocated once",
     "failure": "Reject invalid gates/layouts/paths/bounds and numerical overflow; failed/cancelled commit consumes its round while preserving committed state",
     "core_boundary": "After-token checkpoint selection is Core's checkpoint_node, and slot bookkeeping (live, round-start, per-column or recompute scratch, in-place) is Core's StateCache with RecurrentCommit column_checkpoints, recompute or in_place; this entry keeps the recurrence arithmetic, the private recovery transaction and the device kernels. Use Core resource/readiness/publication/lifetime contracts without model-specific Core semantics"
   },
-  "dependencies": ["Python standard library", "CMake 3.28+, C++20 standard library and Core's state header (crit::core)", "CUDA runtime for the device reference"],
-  "symbols": ["Recovery", "Geometry", "Limits", "Snapshot", "Node", "checkpoint_node", "verify_chain", "DeviceGeometry", "DeviceSteps", "enqueue_verify", "enqueue_select_accepted", "enqueue_recompute_accepted", "DeferredStash", "enqueue_verify_deferred", "enqueue_record_accepted", "prepare_chunk", "apply_chunk", "two_pass", "sequential"],
-  "interactions": ["mtp-decode", "checkpoint-storage", "attention-state", "device-speculative-round"],
-  "techniques": ["recurrent-state-recovery", "mtp-decode", "checkpoint-storage"],
+  "dependencies": [
+    "Python standard library",
+    "CMake 3.28+, C++20 standard library and Core's state header (crit::core)",
+    "CUDA runtime for the device commit", "torch for the device form; optionally crit-labs' recurrent-scans and fla"
+  ],
+  "symbols": [
+    "Recovery",
+    "Geometry",
+    "Limits",
+    "Snapshot",
+    "Node",
+    "checkpoint_node",
+    "verify_chain",
+    "DeviceGeometry",
+    "enqueue_select_accepted",
+    "enqueue_record_accepted",
+    "StatePool",
+    "forward",
+    "convolve",
+    "commit_round",
+    "prepare_chunk",
+    "apply_chunk",
+    "two_pass",
+    "sequential"
+  ],
+  "interactions": [
+    "mtp-decode",
+    "checkpoint-storage",
+    "attention-state",
+    "device-speculative-round"
+  ],
+  "techniques": [
+    "recurrent-state-recovery",
+    "mtp-decode",
+    "checkpoint-storage"
+  ],
   "validation": {
     "host": "Independent long-double matrix-transition oracle, all accepted lengths, absolute boundary/tree mapping, varied chunk decomposition and boundary-adjacent continuation, zero-step rounds after acceptance, exact sibling frontiers, private sibling failures, zero/partial/cancelled/stale commits and finite limits; two-pass chunked prefill equals the token-by-token recurrence for several chunk sizes, normalizations and partial last chunks",
-    "native": "C++20 host example and regressions; CUDA reference against the FP64 host oracle over 96 geometries for outputs and every accepted count within 2e-5 + 2e-5*|ref|, with bitwise agreement of checkpoint and recompute commits, and 96 multi-round deferred commits (including truncation reruns) bitwise equal to checkpoint commits, with the pending count consumed once across flushes and abandoned rounds; the many-count record writes every group's counts and nothing else. Engine casts, asynchronous ordering and model continuation remain unqualified",
-    "performance": "Unmeasured; retained state is bounded independently of speculative matrix snapshot count"
+    "native": "C++20 host example and regressions; the CUDA device commit selects the start or the accepted checkpoint for every count (clamped below 0 and above the columns) bit for bit, and the many-count record writes every group's counts and nothing else. The reference scans that wrote checkpoints and stashes for the strategies' oracle test moved to recurrent-scans with their fixture",
+    "performance": "Unmeasured; retained state is bounded independently of speculative matrix snapshot count",
+    "device": "Device form (plugin tests, on CPU, on CUDA with recurrent-scans and with the torch formula): decode and verify rows against an FP64 recurrence within 1e-5 + 1e-4|x| over grouped keys and strong decays; a row's bits independent of the rows beside it; a verify window rolled back to every accepted count continues bit for bit as the serial decode, state and convolution window, by every strategy; a commit rerun with a smaller count equals the smaller commit; captured rounds replay as they run; prompt rows through fla or the two-pass prefill within 2e-3 + 2e-2|x|"
   }
 }

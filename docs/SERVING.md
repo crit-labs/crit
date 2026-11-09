@@ -2,15 +2,16 @@
 
 `crit serve` loads one sealed candidate, keeps it resident and answers
 OpenAI-compatible chat requests until stopped, so any OpenAI client (the `openai`
-SDKs, LangChain, Open WebUI, curl) can use the engine. Packages implement the
-[adapter contract](#adapter-contract). `crit run ... eval` serves a packaged candidate
+SDKs, LangChain, Open WebUI, curl) can use the engine. A package is a plugin package, which Core's loader runs
+([engines](#cores-resident-adapter)): the package writes no adapter. `crit run ... eval` serves a packaged candidate
 the same way before it is sealed, for Eval over the chat API
 ([Building engines](BUILDING_ENGINES.md#run-the-common-eval-suite)), and `crit run ... serve`
 serves it for the checks a candidate passes before sealing, until Ctrl+C.
 
 ## Start the server
 
-After `python -m pip install .` (or `-e .` in a checkout):
+After `python -m pip install .` (or `-e .` in a checkout; the wheel carries the plugin library too, so it builds
+engines' plugins as a checkout does, [Contributing](CONTRIBUTING.md#source-snapshots)):
 
 ```sh
 crit serve --workspace /path/to/runs
@@ -35,7 +36,7 @@ reply = client.chat.completions.create(model="default", messages=[{"role": "user
 | `--ssl-certfile PATH`, `--ssl-keyfile PATH` | Serve HTTPS with this PEM certificate chain and its private key (default: the key in the certificate file); the printed URL starts with `https://` |
 | `--cors-origin ORIGIN` | Allow browser requests from this origin, or `*` |
 | `--model-name NAME` | Model ID reported for the default candidate |
-| `--reasoning-alias` | Return [reasoning](#reasoning) as `reasoning` as well as `reasoning_content`, for clients that read vLLM's and OpenRouter's name |
+| `--reasoning-alias` | Return [reasoning](#reasoning) as `reasoning` as well as `reasoning_content`, for clients that read the field `reasoning` |
 | `--models PATH` | JSON catalog of named models from several runs; replaces `--workspace`, `--run`, `--candidate` and `--model-name` |
 | `--engine OWNER/NAME`, `--store PATH` | Serve an engine `crit pull` [installed](#installed-engines) (store default: `PROJECT/engines`); replaces `--workspace`, `--models`, `--run` and `--candidate` |
 | `--lenient` | Ignore, list and log the request parameters crit does not apply instead of answering 400 ([lenient requests](#lenient-requests)); never used by Eval |
@@ -80,8 +81,8 @@ cross OS instances, the holder also keeps a lease that Windows and its WSL distr
 `crit serve --engine OWNER/NAME` serves it without a run:
 
 ```sh
-crit pull crit-labs/nvfp4-gemv-int8kv
-crit serve --engine crit-labs/nvfp4-gemv-int8kv
+crit pull OWNER/NAME
+crit serve --engine OWNER/NAME
 ```
 
 `crit pull` reads the engine's card from crit-hub's [index.json](https://crit-hub.dev/index.json) (`--hub PATH`
@@ -103,8 +104,8 @@ reads a crit-hub checkout instead), then, stopping at the first step that fails,
    it, or against the SHA-256 of the one file the card pins. The engine receives their folders as
    `context.drafters`, in card order ([model access](#model-access-and-allocation)).
 5. Runs the card's `build` command in the source's `engine/` folder (a first argument `python` is crit's own
-   Python; `--build-timeout`, default 1800 s), keeping its output in `logs/build.log`, and reads the package's
-   capabilities from its adapter's `declared_capabilities`. When one of the card's `artifact` downloads names a
+   Python; `--build-timeout`, default 1800 s), keeping its output in `logs/build.log`, and checks that the package is
+   a plugin package Core's loader runs (`crit_core.engine.check_package`); what it serves is Core's to say. When one of the card's `artifact` downloads names a
    `toolchain` this machine matches (its platform, GPU architecture, a driver that runs its CUDA version or a newer
    one, and its Python version; for `backend: hip` the ROCm version), it fetches that archive instead, checks its
    SHA-256 and unpacks it into `engine/` without building; an archive member that would replace a file of the
@@ -128,8 +129,8 @@ a sealed candidate, and reports the engine as `OWNER/NAME`; any model name a cli
 #### Benchmark your machine
 
 ```sh
-crit bench crit-labs/nvfp4-gemv-int8kv --data eval-data --out result.json
-crit hub report crit-labs/nvfp4-gemv-int8kv result.json --hub ../crit-hub --by <your GitHub account>
+crit bench OWNER/NAME --data eval-data --out result.json
+crit hub report OWNER/NAME result.json --hub ../crit-hub --by <your GitHub account>
 ```
 
 `crit bench` measures an installed engine with crit Eval on this machine and prints its card's stats beside the
@@ -164,7 +165,7 @@ Create a catalog, for example `models.json`:
 Use actual retained run/candidate IDs. Workspace paths are relative to the catalog
 file (absolute paths also work). Omitting `candidate` selects that run's selected
 candidate at server startup. A row can name an engine `crit pull` installed instead
-of a run: `{"name": "fast", "engine": "crit-labs/nvfp4-gemv-int8kv", "store": "engines"}`,
+of a run: `{"name": "fast", "engine": "OWNER/NAME", "store": "engines"}`,
 its `store` relative to the catalog (default `PROJECT/engines`); it takes `aliases`
 and `display_name` like any row. Names must be unique; `default` defaults to the first
 entry. Start with `crit serve --models models.json`. `--write-launchers` writes
@@ -184,7 +185,7 @@ the alias it equals, else of the matching pattern with the most characters besid
 `*` (the earlier one in the catalog on a tie), else the `fallback`; omitting it
 chooses the default. Names match case-sensitively. Without a `fallback` an unknown
 name returns 404, rather than silently generating with another model. OpenAI replies
-name the configured model, Anthropic and Ollama replies the requested one. Each
+name the configured model, Anthropic and `/api/chat` replies the requested one. Each
 binding uses its own capabilities, context limit, sealed configuration and model
 identity.
 
@@ -210,7 +211,7 @@ with `"object": "crit.load"`; it waits in the [queue](#a-busy-engine) as a reque
 but counts toward neither limit. Both need the API key when one is set. `crit serve --idle-unload SECONDS` unloads the
 engine once no request has used it for that many seconds. `/health` and each `/v1/models` card report `loaded`,
 `/health` reports `ready` false (`/health?ready=1` is a 503) and `/api/ps` lists no model while the engine is
-unloaded. Ollama clients unload and preload through
+unloaded. `/api/chat` clients unload and preload through
 [`keep_alive` and requests without a prompt](#other-api-dialects).
 
 The resident host process stays, with whatever the engine's `close()` does not release (its CUDA context, for
@@ -221,8 +222,8 @@ the lock still wait until the server stops.
 
 | Endpoint | Behavior |
 | --- | --- |
-| `GET /health` | `{"status": "ok", "ready": ..., "loaded": ..., "engine": ..., "max_concurrent_requests": ...}`; `loaded` is false while the engine is [unloaded](#unloading-the-engine), and so is `ready`; `max_concurrent_requests` is the default model's (as on its card). 503 when the runtime is blocked, and with `?ready=1` also while `ready` is false. No key needed |
-| `GET /v1/models`, `GET /v1/models/{id}` | The run's sealed resident candidates, or catalog names, with `label`, `display_name` (a catalog entry's, else the label), `context_length` (the candidate's `kv_tokens`) and `max_model_len` (the same, vLLM's name for it, which LiteLLM reads), `default`, `loaded` (its engine is the one loaded), package `capabilities`, `supported_sampling_parameters`, `limits`, `max_concurrent_requests` (crit's: the requests it runs at once, [concurrent requests](#concurrent-requests)) and `engine_facts` ([facts for Eval](#engine-facts-and-plain-decoding)) |
+| `GET /health` | `{"status": "ok", "ready": ..., "loaded": ..., "engine": ..., "max_concurrent_requests": ..., "engine_telemetry": ...}`; `loaded` is false while the engine is [unloaded](#unloading-the-engine), and so is `ready`; `max_concurrent_requests` is the default model's (as on its card); `engine_telemetry` is the loaded engine's work so far by section, asked of it beside any generation (its plugins' `telemetry()` and Core's counters, [facts and telemetry](PLUGINS.md#facts-and-telemetry)), None while it is not ready or reports none. 503 when the runtime is blocked, and with `?ready=1` also while `ready` is false. No key needed |
+| `GET /v1/models`, `GET /v1/models/{id}` | The run's sealed resident candidates, or catalog names, with `label`, `display_name` (a catalog entry's, else the label), `context_length` (the candidate's `kv_tokens`) and `max_model_len` (the same, under the name LiteLLM reads), `default`, `loaded` (its engine is the one loaded), package `capabilities`, `supported_sampling_parameters`, `limits`, `max_concurrent_requests` (crit's: the requests it runs at once, [concurrent requests](#concurrent-requests)) and `engine_facts` ([facts for Eval](#engine-facts-and-plain-decoding)) |
 | `POST /v1/chat/completions` | Chat completion, JSON or server-sent events |
 | `POST /v1/completions` | [Raw-prompt completions](#raw-prompt-completions) for packages declaring `completion-v1`, JSON or server-sent events |
 | `POST /v1/crit/score` | [Fixed-text scores](#fixed-text-scores) for packages declaring `chat-score-v1` |
@@ -231,7 +232,7 @@ the lock still wait until the server stops.
 | `POST /tokenize`, `/detokenize`, `/apply-template`, `/v1/messages/count_tokens` | The engine's [tokenizer and chat template](#tokenizing) for packages declaring `chat-tokenize-v1` |
 | `POST /v1/messages` | The same engine through the [Anthropic Messages API](#other-api-dialects) |
 | `POST /v1/responses` | The same engine through the [OpenAI Responses API](#other-api-dialects), statelessly |
-| `GET /`, `/api/version`, `/api/tags`, `/api/ps`; `POST /api/chat`, `/api/generate`, `/api/show` | The same engine through the [Ollama API](#other-api-dialects) |
+| `GET /`, `/api/version`, `/api/tags`, `/api/ps`; `POST /api/chat`, `/api/generate`, `/api/show` | The same engine through the [`/api/chat` API](#other-api-dialects) |
 | `GET /metrics` | [Prometheus metrics](#metrics) of the server |
 
 `HEAD` on any `GET` path returns the `GET` response's status and headers without the body, for
@@ -273,22 +274,22 @@ refuses them ([a busy engine](#a-busy-engine): `--max-queue`, `--queue-timeout`)
 | Field | Behavior |
 | --- | --- |
 | `messages` | Optional leading `system`/`developer` messages (merged into one `system`), then user/assistant turns ending with user, or with the assistant message a request [continues](#continuing-the-final-message). Consecutive same-role turns are joined with a blank line. A `system` or `developer` message after the first turn becomes user text marked `System: ` in its place, joined to the user message after it (else the one before it), or a user turn of its own after an assistant reply or tool result; the adapter still receives at most one leading `system`. Content is a string or ordered `text`/`image_url` parts; images require `chat-images-v1` |
-| `continue_final_message`, `add_generation_prompt` | vLLM's fields: `true` with `false` [continues](#continuing-the-final-message) the final assistant message, for packages declaring `chat-continue-v1` (otherwise 400 `unsupported_parameter`). Their defaults, `false` and `true`, change nothing; `continue_final_message: true` without `add_generation_prompt: false`, or the reverse, is 400 |
+| `continue_final_message`, `add_generation_prompt` | Extensions to the OpenAI API: `true` with `false` [continues](#continuing-the-final-message) the final assistant message, for packages declaring `chat-continue-v1` (otherwise 400 `unsupported_parameter`). Their defaults, `false` and `true`, change nothing; `continue_final_message: true` without `add_generation_prompt: false`, or the reverse, is 400 |
 | `max_tokens`, `max_completion_tokens` | Output cap, 1 to `context_length - 1`; default 1024 or less to fit. At or above `context_length` it is [fitted](#fitted-output) for packages declaring `chat-fit-output-v1` |
-| `thinking_budget_tokens` | llama-server's: the reasoning tokens a reply may write, a positive integer, for packages declaring `chat-thinking-budget-v1` (otherwise 400 `unsupported_parameter`). At the budget the reasoning ends with the template's closing marker and the reply goes on within `max_tokens` ([thinking budget](#thinking-budget)) |
+| `thinking_budget_tokens` | An extension to the OpenAI API: the reasoning tokens a reply may write, a positive integer, for packages declaring `chat-thinking-budget-v1` (otherwise 400 `unsupported_parameter`). At the budget the reasoning ends with the template's closing marker and the reply goes on within `max_tokens` ([thinking budget](#thinking-budget)) |
 | `stream`, `stream_options.include_usage` | SSE: role chunk, text chunks, finish chunk, optional usage chunk, `[DONE]`; `: ping` comments while the engine is quiet ([keep-alive pings](#keep-alive-pings)). Any other `stream_options` key is a 400 (ignored with `--lenient`) |
 | `stop` | Up to 16 strings of at most 256 UTF-8 bytes (Core's limits, in every dialect). Text before the first completed stop returns with `finish_reason: "stop"` (`crit_core.text.StopMatcher`); the turn is cancelled, the engine stays loaded. With tools, stops are matched in the text only ([tool calls](#tool-calls)) |
-| `include_stop_str_in_output` | vLLM's: `true` keeps the stop string that ended the reply at the end of its text, streamed as its last piece; default `false` |
+| `include_stop_str_in_output` | An extension to the OpenAI API: `true` keeps the stop string that ended the reply at the end of its text, streamed as its last piece; default `false` |
 | `n` | Must be 1; omitted or null keeps 1 |
 | `response_format` | `text`, `json_object` or `json_schema` ([structured output](#structured-output)); with tools only when `tool_choice` is `none` |
-| `structured_outputs` | vLLM's constraint: one of `regex`, `choice`, `grammar` or `json` ([structured output](#structured-output)); vLLM's earlier `guided_regex`, `guided_choice`, `guided_grammar` and `guided_json` too; with tools only when `tool_choice` is `none` |
-| `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`, `min_tokens` (vLLM's: no stop token before that many tokens) | Per-request overrides when the package declares support for that field; otherwise 400 (ignored with `--lenient`). Omitted or null fields keep engine defaults |
-| `typical_p`, `tfs_z`, `mirostat`, `dry_multiplier`, `xtc_probability` | llama.cpp's and Ollama's samplers, which crit's sampling law does not have: the value that turns one off (1, 1, 0, 0 and 0) is a no-op, any other valid value 400 (ignored with `--lenient`) |
+| `structured_outputs` | A constraint, an extension to the OpenAI API: one of `regex`, `choice`, `grammar` or `json` ([structured output](#structured-output)); the earlier names `guided_regex`, `guided_choice`, `guided_grammar` and `guided_json` too; with tools only when `tool_choice` is `none` |
+| `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`, `min_tokens` (an extension: no stop token before that many tokens) | Per-request overrides when the package declares support for that field; otherwise 400 (ignored with `--lenient`). Omitted or null fields keep engine defaults |
+| `typical_p`, `tfs_z`, `mirostat`, `dry_multiplier`, `xtc_probability` | Samplers other servers offer, which crit's sampling law does not have: the value that turns one off (1, 1, 0, 0 and 0) is a no-op, any other valid value 400 (ignored with `--lenient`) |
 | `tools`, `tool_choice`, `parallel_tool_calls` | Function calls for packages declaring `chat-tools-v1`; `tool_choice` `auto` or `none`, and `required` or a named function for packages that also declare `chat-tool-choice-v1` (otherwise 400 `unsupported_parameter`; [ResidentChat](#forced-calls) declares it when its engine decodes to a grammar). Tool-result history is preserved |
 | `logprobs`, `top_logprobs` | [Token log-probabilities](#token-log-probabilities) for packages declaring `chat-logprobs-v1`: every token's own and up to 20 alternatives. Not with `stop` |
 | `chat_template_kwargs`, `reasoning_effort` | [Thinking controls](#thinking-controls) for packages declaring `chat-template-kwargs-v1`: the chat-template variables the package declares (`enable_thinking`, `thinking`, `reasoning_effort`), and `reasoning_effort` `none`, `minimal`, `low`, `medium`, `high` or `xhigh` mapped onto them; otherwise 400 `unsupported_parameter` (ignored with `--lenient`) |
 | `crit` | crit's own extension: `{"decode": "plain"}` decodes the reply one token per target pass, without drafting, for packages declaring `chat-plain-v1` ([plain decoding](#engine-facts-and-plain-decoding)); `{"timeout": SECONDS}`, a positive number, limits this request's turn as `--timeout` does, at most `--timeout` (a larger value keeps it): a turn that runs out is a 504 and a cooperative engine stays loaded |
-| `priority` | vLLM's extension: an integer, default 0 (also when null). Requests waiting for the engine go lower values first, then in arrival order, and are reordered only among requests for the same model: a request never moves ahead of a queued model switch, nor a switch ahead of requests queued before it, so priority adds no model loads. A running request is never preempted, and a higher value waits while lower ones keep arriving. Anthropic and Ollama requests, whose APIs have no such field, and fixed-text scores wait at 0 |
+| `priority` | An extension to the OpenAI API: an integer, default 0 (also when null). Requests waiting for the engine go lower values first, then in arrival order, and are reordered only among requests for the same model: a request never moves ahead of a queued model switch, nor a switch ahead of requests queued before it, so priority adds no model loads. A running request is never preempted, and a higher value waits while lower ones keep arriving. Anthropic and `/api/chat` requests, whose APIs have no such field, and fixed-text scores wait at 0 |
 
 Responses carry `usage` when measured and `crit_telemetry`: prompt and output tokens, the
 prompt tokens the engine did not compute (`usage.prompt_tokens_details.cached_tokens`: its
@@ -370,10 +371,10 @@ adapter that applies and declares them. Never edit a sealed package's manifest.
 
 ### Lenient requests
 
-Chat UIs often send fields an engine does not apply: sampling presets, llama.cpp's samplers, newer
+Chat UIs often send fields an engine does not apply: sampling presets, extra samplers, newer
 OpenAI options. `crit serve --lenient` ignores them instead of answering 400: unknown top-level keys (on
 `/v1/responses`, `/v1/messages`, `/api/chat` and `/api/generate` too), unknown `stream_options` keys and
-unknown Ollama `options`, `prediction`, sampling fields the package does not declare, the extra samplers when not off,
+unknown `/api/chat` `options`, `prediction`, sampling fields the package does not declare, the extra samplers when not off,
 and the [thinking controls](#thinking-controls) the package cannot apply: `reasoning_effort` and
 `chat_template_kwargs` without `chat-template-kwargs-v1`, and with it a template variable crit does not
 set or the package does not declare and a control its template cannot take.
@@ -384,7 +385,7 @@ such a name among the `output_config` settings and `thinking` fields `/v1/messag
 knows are still checked: `top_p: 1.5` or `mirostat: 3` is still a 400. Features that change what the
 reply is stay refused: `functions`, `function_call`, `audio`, `modalities`, `n` above 1, tools, images,
 `logprobs`, `response_format` and a forced `tool_choice` without the package's capability, Anthropic's
-`mcp_servers` and `container`, and Ollama's `raw` without `completion-v1`, `suffix`, `template` and
+`mcp_servers` and `container`, and `/api/generate`'s `raw` without `completion-v1`, `suffix`, `template` and
 `context`. `POST /v1/crit/score` stays strict. Strict is the default, and `crit run ... eval` and `crit run
 measure` always serve strictly; Eval sends only the sampling fields `/v1/models` lists as applied, so a
 lenient server measures the same.
@@ -393,7 +394,7 @@ lenient server measures the same.
 
 Agent clients (Claude Code, Cline, Aider) send the largest output budget a model allows. For a
 package declaring `chat-fit-output-v1` (ResidentChat packages declare it), a `max_tokens` at or
-above `context_length` is fitted instead of refused, in every dialect (Ollama's `num_predict` -1
+above `context_length` is fitted instead of refused, in every dialect (`/api/chat`'s `num_predict` -1
 and -2 ask for exactly this): the engine generates at most the room its prompt leaves in the
 context and finishes with `length` when it fills it. A reply crit serve fitted carries
 `X-Crit-Max-Tokens-Applied`, the cap the engine applied (`context_length` minus the prompt's
@@ -410,7 +411,7 @@ Requests the engine cannot take yet wait in a queue, in arrival order or by `pri
 first, among requests for the same model). A request that finds `--max-queue` requests already waiting (64 by default), or that waits longer than `--queue-timeout` (no limit by
 default), is refused before the engine sees it, in the words each API uses for a busy server: OpenAI
 clients and `/v1/crit/score` get a 429 (`type` `requests`, `code` `rate_limit_exceeded`), Anthropic
-clients a 529 `overloaded_error` and Ollama clients a 503 `{"error"}`, each with `Retry-After: 1`,
+clients a 529 `overloaded_error` and `/api/chat` clients a 503 `{"error"}`, each with `Retry-After: 1`,
 which the OpenAI and Anthropic SDKs wait before they retry (Claude Code retries a 529 too). The engine
 stays loaded and the queue moves on. A stream sends its status and headers only once the engine takes
 the request, so a refused stream gets the same status. `--timeout` starts when the engine takes the
@@ -428,8 +429,8 @@ Pings start after the role chunk, `response.in_progress` or `message_start`, whi
 the engine takes the request: a request still [waiting for the engine](#a-busy-engine) has no status
 yet, so it gets none, and `--queue-timeout` bounds that wait instead. Pings go out only between whole
 events, and stop before the finish chunk and `[DONE]`, the closing Responses events, or `message_delta`
-and `message_stop`; `--sse-ping-interval 0` turns them off. Ollama's newline-delimited JSON has no such
-line, so Ollama streams get none. Pings are `crit serve`'s alone:
+and `message_stop`; `--sse-ping-interval 0` turns them off. The newline-delimited JSON of `/api/chat` has no such
+line, so its streams get none. Pings are `crit serve`'s alone:
 `crit run ... eval` and `measure` serve their candidate without them, and Eval's [request
 bound](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md#engines-behind-a-server) counts a ping as no answer, so a request whose engine
 stalls still stops Eval as hung, `--url` included.
@@ -438,7 +439,7 @@ stalls still stops Eval as hung, `--url` included.
 
 Every response carries `X-Request-Id`, crit's own id of the request (32 hex digits, a new one for
 each request on a connection). Error bodies carry the same id as a top-level `request_id` in each
-dialect's shape (Anthropic's API has the field; the OpenAI and Ollama shapes gain it), and so does a
+dialect's shape (Anthropic's API has the field; the OpenAI and `/api/chat` shapes gain it), and so does a
 stream's error event. A chat request the engine failed keeps its records under
 `requests/<request_id>/` in the runtime directory ([ownership and recovery](#ownership-and-recovery)),
 so a client's failure can be matched to them. A client's own `X-Request-Id` (1 to 128 visible ASCII
@@ -446,7 +447,7 @@ characters) is written to the server log next to crit's id and can name its requ
 never names records. With `--cors-origin`, browsers may send `X-Request-Id` and read the response's.
 
 `POST /v1/crit/abort` (behind the API key when one is set) cancels chat and score requests in flight,
-[loads](#unloading-the-engine) (`POST /v1/crit/load`, an Ollama request without a prompt) and
+[loads](#unloading-the-engine) (`POST /v1/crit/load`, an `/api/chat` request without a prompt) and
 [tokenize requests](#tokenizing) waiting to load their candidate, one by `{"request_id": ID}` or every
 one by `{"all": true}`. `ID` is crit's id, which a stream's
 headers carry before its first event, or the `X-Request-Id` the client sent, which names a request
@@ -474,6 +475,16 @@ request record; it does not fetch URLs or open client-supplied file paths.
 The HTTP body remains bounded at 8 MiB. Request records containing images allow
 16 MiB including metadata; ordinary run records retain their 1 MiB bound.
 Unsupported engines return 400. Tool history and image order are preserved.
+
+Core's adapter declares `chat-images-v1` for an engine whose model plugin takes images: it provides
+`inputs:images` (`crit_plugins.IMAGES`) and implements `prepare(ids, images, cancelled)`
+([crit plugins](PLUGINS.md#the-model-plugin)). The adapter renders the checkpoint's template, decodes each image's
+base64 `data:` URL (`crit_core.engine.request_images`; it fetches no URL, so an HTTP(S) source is refused with 400),
+and calls the model plugin's `prepare` on the request's thread with the rendered ids and the images in order
+(`crit_plugins.Image`: bytes, media type, detail). `prepare` returns the ids the engine prefills, each image's
+positions in place of its placeholder, and the request's inputs, which reach the model plugin's `open()` with the
+request (`StepRequest.inputs`); the vision arithmetic runs in the request's prompt rows. The contract below is the
+one that adapter keeps.
 
 A `ResidentChat` engine sets `images = True` and declares
 `capabilities(text, sampling, images=True)`. Its `prepare_prompt(request,
@@ -525,22 +536,22 @@ calls to match the stream exactly. An invalid final call, or an incomplete one i
 `max_tokens` did not cut, produces an SSE error and `[DONE]`, without a successful finish chunk. Clients should assemble
 calls by index and only act on a successfully completed turn.
 
-Stop strings (`stop`, Anthropic `stop_sequences`, Ollama `options.stop`) are matched in the reply's
+Stop strings (`stop`, Anthropic `stop_sequences`, `/api/chat` `options.stop`) are matched in the reply's
 text, never in a call's arguments. One that completes ends the turn there: the reply keeps the text
 before it and the calls the model wrote before it (`finish_reason: "tool_calls"`, else `"stop"`),
 and a call written after it is dropped. A stop never cuts a call, not even in a stream: a
 `chat-tool-stream-v1` package streams text and calls in the order the model wrote them and each call
-whole before the text after it ([adapter contract](#strict-and-streaming-tools-for-adapters)), and a
+whole before the text after it ([Core's resident adapter](#strict-and-streaming-tools-in-cores-adapter)), and a
 turn with text inside an unfinished call fails. While calls may be made (`tool_choice` other than
 `none`) a stop therefore needs `chat-tool-stream-v1` (ResidentChat declares it when the package
 streams); for any other package a stop with tools is a 400 `unsupported_parameter`. A
 `response_format` (Anthropic `output_config.format`) or `structured_outputs` applies to a tool
 request only with `tool_choice: "none"`, when the reply holds no calls; with calls possible it is
-a 400, and so is Ollama's `format` with `tools`, since Ollama has no `tool_choice`.
+a 400, and so is `/api/chat`'s `format` with `tools`, since that API has no `tool_choice`.
 
 ### Tool calls from the chat template
 
-Adapters built on `crit_core.serving.ResidentChat` (and Core's `resident_engine`) offer
+Core's resident adapter, a `crit_core.serving.ResidentChat`, offers
 tool calls without model-specific code in crit. ResidentChat renders the request's
 `tools` (unless `tool_choice` is `none`) and the tool history with the model's own chat
 template, splits the reply into content and calls with `crit_core.text.ToolCallParser`,
@@ -578,14 +589,15 @@ still receive text and define their own syntax and escaping rules.
 
 #### Forced calls
 
-An engine whose decoder keeps a reply to a `crit-byte-grammar-v1` grammar, as an adapter applies
-`response_format` ([structured output for adapters](#structured-output-for-adapters)), sets
-`ResidentChat.grammars = True` and declares `capabilities(text, sampling, grammars=True)`. That adds
+An engine whose decoder keeps a reply to a `crit-byte-grammar-v1` grammar, as Core's adapter applies
+`response_format` ([structured output in Core's adapter](#structured-output-in-cores-adapter)), sets
+`ResidentChat.grammars = True` and declares `capabilities(text, sampling, grammars=True)`; Core's adapter does for
+every engine whose tokenizer's bytes Core can match (`crit_core.engine.constrains`). That adds
 `chat-tool-choice-v1` when crit registers the call syntax and the tokenizer spells its markers as
 text, since a grammar cannot write a special token (`crit_core.serving.forces_calls`). ResidentChat
 then answers `tool_choice` `required`, a named function, and Anthropic's `any` and `tool` by
-passing `generate_tokens` a `grammar`, a `crit-byte-grammar-v1` artifact from
-`crit_core.text.tools.call_grammar` of a reply that is nothing but calls, written as the template
+passing `generate_tokens` `constraint={"type": "grammar", "grammar": artifact}`, a `crit-byte-grammar-v1` artifact
+from `crit_core.text.tools.call_grammar` of a reply that is nothing but calls, written as the template
 writes them:
 
 - calls to an offered function, or only to the named one; one call, or with `parallel_tool_calls`
@@ -601,11 +613,11 @@ writes them:
   prompt that opens the reasoning makes the reply close it before calling; when a grammar cannot
   write that closing marker, ResidentChat refuses the request with `RequestRejected`.
 
-Without `grammars`, and for a package's own `ToolFormat`, whose syntax crit cannot write, the
-package does not declare `chat-tool-choice-v1`: crit serve answers those choices with a 400 before
-the request reaches the engine, and ResidentChat refuses them with `RequestRejected`; Core's
-`resident_engine` does not apply grammars. The grammar covers the whole reply, reasoning included,
-so budget the matcher's limits for it.
+Without `grammars`, and for a format whose syntax crit cannot write, the package does not declare
+`chat-tool-choice-v1`: crit serve answers those choices with a 400 before the request reaches the
+engine, and ResidentChat refuses them with `RequestRejected`. The grammar covers the whole reply,
+reasoning included; Core's matcher budgets a whole reply (1 MiB of output, the chart states
+`crit_core.constraints.GrammarState` allows).
 
 ### Reasoning
 
@@ -624,11 +636,11 @@ only. A package whose model writes other markers sets `ResidentChat.reasoning_fo
 to a `crit_core.text.ReasoningFormat`, and `False` leaves the reasoning in the reply.
 
 With `--reasoning-alias` the message and each reasoning delta carry the same text as
-`reasoning` too, the name vLLM and OpenRouter use. It is off by default: a client that
+`reasoning` too, the field some clients read. It is off by default: a client that
 reads both names, or joins every text field of a delta as crit Eval does, would read the
 reasoning twice. In a tool conversation an assistant message may give its reasoning as
 `reasoning_content` or `reasoning`; the adapter receives it as `reasoning_content`. A
-`"reasoning": null`, which those servers' replies carry when there is none, is ignored,
+`"reasoning": null`, which other servers' replies carry when there is none, is ignored,
 and a message giving both with different text is a 400.
 
 ### Thinking controls
@@ -637,7 +649,7 @@ Hybrid reasoning models turn thinking on or off, or set its effort, through a va
 template: `enable_thinking` (Qwen3, GLM) or `thinking` (DeepSeek-V3.1, Granite), booleans, and
 `reasoning_effort` (gpt-oss), `low`, `medium` or `high`. A package declares `chat-template-kwargs-v1` and,
 for each variable its templates read, `chat-template-enable-thinking-v1`, `chat-template-thinking-v1` or
-`chat-template-reasoning-effort-v1` ([ResidentChat](#chat-template-variables-for-adapters) declares them
+`chat-template-reasoning-effort-v1` ([ResidentChat](#chat-template-variables-in-cores-adapter) declares them
 from the templates). Each dialect's control then sets them for one request, over the variables the
 candidate's configuration freezes:
 
@@ -648,14 +660,14 @@ candidate's configuration freezes:
 | OpenAI Responses | `reasoning.effort` | As `reasoning_effort`, which it becomes |
 | Anthropic | `thinking.type` | `enabled` and `adaptive` turn thinking on, `disabled` and `between_tools` off; with thinking on, `budget_tokens` is the [thinking budget](#thinking-budget) for packages declaring `chat-thinking-budget-v1`. Otherwise it and the other fields are not applied and are listed in `X-Crit-Ignored-Parameters` |
 | Anthropic | `output_config.effort` | `low`, `medium`, `high`, `xhigh` and `max` (both as `high`) turn thinking on at that effort |
-| Ollama | `think` | `true` and `false` turn thinking on and off; `low`, `medium` and `high` turn it on at that effort |
+| `/api/chat` | `think` | `true` and `false` turn thinking on and off; `low`, `medium` and `high` turn it on at that effort |
 
 Turning thinking on or off sets the switch (`enable_thinking` or `thinking`); an effort also sets
 `reasoning_effort` when the template reads it. A template with `reasoning_effort` and no switch always
 thinks, so turning thinking off there is a 400. So are a variable the package does not declare, a value
 it or the table above does not take, and `reasoning_effort` and `chat_template_kwargs` setting one
 variable differently. Without `chat-template-kwargs-v1`, OpenAI's two fields (and the Responses API's
-`reasoning.effort`) are a 400 `unsupported_parameter`, and Anthropic's and Ollama's controls are ignored
+`reasoning.effort`) are a 400 `unsupported_parameter`, and the Anthropic and `/api/chat` controls are ignored
 and listed whatever they hold, as before. [`--lenient`](#lenient-requests) ignores and lists, instead of refusing, OpenAI's two fields
 without `chat-template-kwargs-v1` (whatever they hold) and, with it, a variable crit does not set or the
 package does not declare (once its value is checked) and a control the template cannot take, such as
@@ -666,7 +678,7 @@ turning off one that always thinks; a value no table above takes, and the two fi
 ### Thinking budget
 
 A reasoning model can think until `max_tokens` runs out and never answer. OpenAI's
-`thinking_budget_tokens` (llama-server's name) and Anthropic's `thinking.budget_tokens`, with thinking
+`thinking_budget_tokens` (an extension) and Anthropic's `thinking.budget_tokens`, with thinking
 on, cap the reasoning for packages declaring `chat-thinking-budget-v1`. When the reasoning reaches the
 budget, the reply gets the reasoning format's closing marker, as the model would write it, and the engine
 goes on from the prompt plus the reply so far; the answer that follows still counts toward `max_tokens`,
@@ -690,7 +702,7 @@ log-probability is natural-log, of the raw logits before temperature, penalties,
 and constraints; a zero probability reads as -9999. When streaming, the entries arrive
 with the finish chunk, since the engine reports them in its final response. A request
 with `stop` strings is refused, since its turn is cancelled where a stop completes,
-before the engine reports its tokens. The Ollama API returns the same entries as its
+before the engine reports its tokens. The `/api/chat` API returns the same entries as its
 `logprobs` ([other API dialects](#other-api-dialects)).
 
 ### Fixed-text scores
@@ -744,11 +756,16 @@ Request ids, aborts, a busy queue's 429 and the metrics are those of the OpenAI 
 While a candidate's engine is loaded, its `/v1/models` card carries `engine_facts`, what
 the engine reports for Eval's headroom and exactness: `speculative` and `plain` (booleans),
 `draft_width`, `bytes_per_pass`, `draft_bytes_per_step`, `draft_ms` and
-`kv_bytes_per_token` (non-negative numbers) and `prompt_activations` (the activation format of
+`kv_bytes_per_token` (non-negative numbers; `kv_bytes_per_token` the device bytes one more token of
+context takes in the engine's KV pools, which the kv_cache plugin's facts give), `host_bytes_per_pass`
+(`{"link", "cpu"}` bytes a pass reads from host memory), `prompt_activations` (the activation format of
 the quantized matrices' prompt GEMMs, `bf16`, `fp16_acc`, `fp8` or `stored`, for every quantized
 format, per stored format, or as shares of a format's FLOPs: crit-eval's prefill ceilings by
-activation format and their reachable limit) and `prompt_cache` (a boolean; `false` when the
-engine keeps no prompt cache, so crit-eval sends it no follow-up turns), each only when the engine
+activation format and their reachable limit), `prompt_cache` (a boolean; `false` when the
+engine keeps no prompt cache, so crit-eval sends it no follow-up turns), `plugins` (an engine
+built from [plugins](PLUGINS.md): the plugin filling each slot) and `kernels` (the registry kernels
+its plugins asked for, each with the source it came from, `local`, `hub` or `fallback`, its revision and,
+for a fallback, why: [kernels and plugins](PLUGINS.md#kernels-and-plugins)), each only when the engine
 reports it in a valid form; `null` when the candidate is not loaded or reports none. A speculative engine that declares
 `chat-plain-v1` decodes a request carrying `"crit": {"decode": "plain"}` one token per
 target pass without drafting, which is how Eval compares speculative output with plain
@@ -757,12 +774,12 @@ greedy on the served engine.
 ### Continuing the final message
 
 A conversation may end with an assistant message that the model continues instead of starting
-a new reply: a prefilled start, or a reply a client wants to resume. The request carries vLLM's
+a new reply: a prefilled start, or a reply a client wants to resume. The request carries the extensions
 `continue_final_message: true` with `add_generation_prompt: false`; a final assistant message
 without them is a 400. The [Anthropic](#other-api-dialects) prefill (a final assistant
-message) and an Ollama chat that ends with an assistant message are continued without a flag, as
+message) and an `/api/chat` request that ends with an assistant message are continued without a flag, as
 those APIs do. It needs a package declaring `chat-continue-v1`, which
-[ResidentChat](#continuing-the-final-message-for-adapters) packages do; otherwise it is a 400
+[ResidentChat](#continuing-the-final-message-in-cores-adapter) packages do; otherwise it is a 400
 `unsupported_parameter`. The model's chat template renders the message left open (Core's
 `continue_final_message`) where the generation prompt would start a new reply. The response holds
 only the continuation, which may be empty when the message was already complete; `max_tokens`,
@@ -778,9 +795,9 @@ adapters) expose the engine's own tokenizer and chat template, so a client can c
 
 | Endpoint | Body | Reply |
 | --- | --- | --- |
-| `POST /tokenize` | `prompt` with `add_special_tokens` (default true: the tokenizer's own special tokens, such as a BOS), or `messages` with the chat request's `tools`, `tool_choice`, `parallel_tool_calls`, `chat_template_kwargs`, `reasoning_effort`, `continue_final_message` and `add_generation_prompt` | `{"tokens", "count", "max_model_len"}`, as vLLM answers |
+| `POST /tokenize` | `prompt` with `add_special_tokens` (default true: the tokenizer's own special tokens, such as a BOS), or `messages` with the chat request's `tools`, `tool_choice`, `parallel_tool_calls`, `chat_template_kwargs`, `reasoning_effort`, `continue_final_message` and `add_generation_prompt` | `{"tokens", "count", "max_model_len"}`, as other servers answer |
 | `POST /detokenize` | `tokens` | `{"prompt"}`, special tokens included |
-| `POST /apply-template` | `messages` and the same chat request fields | `{"prompt"}`, the chat template's text, as llama-server answers |
+| `POST /apply-template` | `messages` and the same chat request fields | `{"prompt"}`, the chat template's text, as other servers answer |
 | `POST /v1/messages/count_tokens` | An Anthropic Messages request's `model`, `system`, `messages`, `tools`, `tool_choice` and `thinking` | `{"input_tokens"}`, which Claude Code reads |
 
 `model` selects the candidate as for a chat request. Messages, tools, [thinking
@@ -855,7 +872,7 @@ limit: P + O > N, ..." when only the output does not fit), and the engine stays 
 
 **OpenAI Responses** (`POST /v1/responses`, [crit_api/responses.py](../api/crit_api/responses.py)): the
 API Codex CLI, the OpenAI Agents SDK and the Responses modes of LangChain and LibreChat speak, served
-statelessly, as Ollama serves it. `instructions` becomes the leading system message and `input`
+statelessly. `instructions` becomes the leading system message and `input`
 (a string, or a list of items) the conversation: `message` items (`user`, `assistant`, `system` and
 `developer`, with `input_text`, `input_image` by `image_url`, and `output_text` parts; a `system` or
 `developer` message after the first turn becomes marked user text, as in the OpenAI API), `function_call`
@@ -895,10 +912,10 @@ on); other errors use
 OpenAI's shape, a context overflow the 400 `context_length_exceeded` of `/v1/chat/completions`, and the
 engine stays loaded.
 
-**Ollama** (`GET /` answers "Ollama is running", `/api/version`, `/api/tags`, `/api/ps`; `POST
-/api/chat`, `/api/generate`, `/api/show`; [crit_api/ollama.py](../api/crit_api/ollama.py)): the API the
-local chat UIs look for. `/api/version` reports Ollama release `0.12.0` (clients compare it with the
-Ollama version a feature needs) and crit's own as `crit_version`. Models are listed under the ids `/v1/models` shows (and the default name; a catalog's aliases are not listed but select their model),
+**`/api/chat`** (`GET /` answers the plain text `crit is running`, `/api/version`, `/api/tags`, `/api/ps`; `POST
+/api/chat`, `/api/generate`, `/api/show`; [crit_api/api_chat.py](../api/crit_api/api_chat.py)): the API the
+local chat UIs look for. `/api/version` reports version `0.12.0` (clients compare it with the
+server version a feature needs, not crit's) and crit's own as `crit_version`. Models are listed under the ids `/v1/models` shows (and the default name; a catalog's aliases are not listed but select their model),
 each with its package's sha256 as `digest`; `/api/ps` lists the one whose engine is loaded, matched by run, candidate
 and package, with its `context_length`, `size_vram` (device bytes) and an `expires_at` of `2318-01-01T00:00:00Z`, since
 it stays loaded until it is unloaded or the server stops (with `--idle-unload`, the time it unloads unless a request
@@ -906,7 +923,7 @@ uses it). A request to `/api/generate` without a `prompt`, or to `/api/chat` wit
 answers one object with `done_reason` `load`; with `keep_alive` 0 (`0`, `"0"`, `"0s"`) it [unloads](#unloading-the-engine)
 the engine instead and answers `done_reason` `unload`. `keep_alive` 0 on a request with a prompt unloads the engine
 once the reply is sent.
-`/api/chat` takes Ollama's messages (`images` as bare base64, their type read from the bytes; assistant
+`/api/chat` takes messages (`images` as bare base64, their type read from the bytes; assistant
 `tool_calls` with arguments as objects, given ids when they have none; `tool` messages matched to the
 latest assistant's calls in order; a `system` message after the first turn becomes marked user text, as
 in the OpenAI API), `tools`, `format` (`"json"`, or a JSON schema) and `options`:
@@ -914,10 +931,10 @@ in the OpenAI API), `tools`, `format` (`"json"`, or a JSON schema) and `options`
 until the context is full, are [fitted](#fitted-output) like a cap at or above the context for packages
 declaring `chat-fit-output-v1`, and otherwise keep the default cap of 1024 or less to fit, as 0 and other
 negative values do), `stop`,
-`repeat_penalty`, `presence_penalty` and `frequency_penalty` apply; Ollama's runtime settings
+`repeat_penalty`, `presence_penalty` and `frequency_penalty` apply; server runtime settings
 (`num_ctx`, `num_gpu`, `num_thread`, `mirostat`, ...) and a `keep_alive` other than 0 are ignored and
 listed; an unknown option is 400 (ignored with `--lenient`). `think` is a [thinking control](#thinking-controls).
-A chat that ends with an assistant message is [continued](#continuing-the-final-message), as Ollama does.
+A chat that ends with an assistant message is [continued](#continuing-the-final-message), as this API does.
 `/api/generate` renders `prompt` (and `system`) as one user turn through the model's chat template.
 With `raw: true` it continues the prompt as written instead, as a
 [raw-prompt completion](#raw-prompt-completions) without the template or a system message: `system`,
@@ -930,10 +947,10 @@ stream by default as newline-delimited JSON objects (`message.content`, `message
 engine's own phase times, `prompt_eval_count`, `prompt_eval_cached_count` (the prompt tokens the engine did not
 compute: its telemetry's prompt tokens minus `prefill_tokens`, when it reports them) and `eval_count`; `stream: false`
 returns one object. With `logprobs: true` (and `top_logprobs`, 0 to 20) the last object carries the reply's
-[token log-probabilities](#token-log-probabilities) as `logprobs`, one Ollama `{token, logprob, bytes, top_logprobs}`
+[token log-probabilities](#token-log-probabilities) as `logprobs`, one `{token, logprob, bytes, top_logprobs}`
 with `crit_token_id` per token (`top_logprobs` left out when none were asked for), in a stream too, since the
 engine reports them in its final response; they need a package declaring `chat-logprobs-v1` and are refused with
-`options.stop`. As in Ollama, `top_logprobs` without `logprobs` is ignored (and listed).
+`options.stop`. As this API does, crit ignores (and lists) `top_logprobs` without `logprobs`.
 `/api/show` reports the context length as `model_info["crit.context_length"]`, the
 `capabilities` (`completion`, `tools`, `thinking`, `vision`) the package declares and the model card's
 `limits`. Errors are `{"error": message}` (a context overflow with status 400, or as a stream's last line);
@@ -945,10 +962,10 @@ that says to run a separate embedding server.
 `GET /metrics` serves the Prometheus text format (behind the API key when one is set):
 `crit_serve_requests_total` counts every chat request (`/v1/chat/completions`, `/v1/responses`,
 `/v1/messages`, `/api/chat`, `/api/generate`) and every `/v1/crit/score` request whose body was read and
-whose API key was accepted, by dialect (`openai`, `responses`, `anthropic`, `ollama`, and `crit` for
+whose API key was accepted, by dialect (`openai`, `responses`, `anthropic`, `api_chat` for `/api/chat` and `/api/generate`, and `crit` for
 scores) and outcome:
 `completed`, `rejected` (a 4xx: the request failed validation, or the engine refused it, such as a
-prompt over the context or a [full queue](#a-busy-engine), which Anthropic and Ollama clients get as a
+prompt over the context or a [full queue](#a-busy-engine), which Anthropic and `/api/chat` clients get as a
 529 or 503), `cancelled` (the client disconnected), `timed_out` (504) or `error` (any other failure).
 A request refused for its API key or its body size, and the other endpoints, are not counted. Beside
 it come the chat and score requests in flight, the prompt, cached-prompt and completion tokens of
@@ -988,7 +1005,7 @@ declaring `chat-constraints-v1`; otherwise it returns 400. With `tools` it needs
   (`format`, overlapping `oneOf`, `allOf`, open objects) returns 400 with
   `param: "response_format"`, `code: "unsupported_schema"` and the reason. Always strict.
 
-`structured_outputs`, vLLM's field (OpenAI dialect only), takes exactly one of:
+`structured_outputs`, an extension to the OpenAI API (OpenAI dialect only), takes exactly one of:
 
 - `regex`: Core's byte regex over the whole reply (optional `^` and `$`; groups, `|`, `?`,
   `*`, `+`, `{m,n}`, `\d`, `\w`, `\s`, `\xHH` and classes of ASCII characters; no
@@ -997,14 +1014,14 @@ declaring `chat-constraints-v1`; otherwise it returns 400. With `tools` it needs
 - `grammar`: Core's line EBNF, one `name ::= expression` per line with a required `root`:
   JSON-quoted literals, rule names, byte classes, groups, `|`, `?`, `*`, `+`, `{m,n}` and
   `#` comments. It reads like GBNF but is not GBNF (one line per rule, classes match bytes),
-  so llama.cpp's top-level `grammar` is not taken (an unknown parameter).
+  so a top-level GBNF `grammar` field is not taken (an unknown parameter).
 - `json`: a JSON schema, or its JSON text, compiled as `json_schema` above.
 
 `regex`, `choice` and `grammar` need a package declaring `chat-constraints-grammar-v1` and
 `chat-constraints-v1`, `json` only `chat-constraints-v1`; otherwise 400
 `unsupported_parameter`. A source Core cannot compile returns 400 with the field as
 `param` (`"structured_outputs.regex"`), `code: "unsupported_constraint"` and the
-compiler's reason. vLLM's earlier `guided_regex`, `guided_choice`, `guided_grammar` and
+compiler's reason. The earlier names `guided_regex`, `guided_choice`, `guided_grammar` and
 `guided_json` name the same fields. A request takes one constraint: two fields, or one
 with a `response_format` other than `text`, are a 400. Like `response_format` it needs
 `tool_choice: "none"` with `tools` and cannot carry a [continued](#continuing-the-final-message)
@@ -1017,39 +1034,34 @@ logits). crit serve re-checks every reply the engine ended itself (`finish_reaso
 loaded. Replies cut by the cap or a stop string are returned as cut. When streaming, a
 failed final check becomes an error event.
 
-## Adapter contract
+## Core's resident adapter
 
-A package is servable when it declares **`chat-json-v1` and `chat-resident-v1`** and
-`launch[0]` is a retained Python module exporting `create_engine(context)`. Build the
-adapter on **`crit_core.serving.ResidentChat`**: it renders the conversation, tools and
-tool history with the model's chat template (for a family whose checkpoints carry none, the
-one crit ships, such as DeepSeek V4's: [Core's text layer](../core/python/crit_core/text/README.md#chat-templates)),
-forwards the request's sampling fields that
-the engine lists in `sampling`, streams text without stop tokens, honors cancellation and
-reports Core's phase telemetry, so the engine supplies only `generate_tokens(ids,
-max_new_tokens, sampling, on_tokens, cancelled)`. Declare
-`crit_core.serving.capabilities(text, sampling)`; an adapter that exports
-`declared_capabilities(model_path)` returning that list lets `crit run build` fill the recipe's
-capabilities from it. A Core engine library exported with
-`CRIT_EXPORT_ENGINE` can return `crit_core.native.resident_engine(context, library,
-defaults)`, a ResidentChat over the library (see
-[engine libraries](../core/src/runtime/README.md#engine-libraries)); a Python engine with the
-library's interface passes the function that opens it in place of `library`
-([Python engines](../core/src/runtime/README.md#python-engines)).
+crit serve runs one kind of package: a plugin package, its `plugins/` and the `configuration.json` whose `plugins`
+selection fills every slot an engine fills ([crit plugins](PLUGINS.md#the-engine)). The resident host never imports a
+package's code: it hands the package to Core's resident adapter, `crit_core.engine.resident(context, package)`, which
+assembles the selection through Core's loader, runs the model plugin on Core's concurrent runtime and serves it as
+chat-resident-v1. What the engine serves is Core's to say, from the selection and the model's chat templates
+(`crit_core.engine.capabilities`): every engine serves concurrent requests (`chat-concurrent-v1`), streams
+(`chat-stream-v1`), token log-probabilities (`chat-logprobs-v1`), fixed-text scores (`chat-score-v1`), Core's sampling
+fields, tool calls where the template teaches a call format crit parses, and plain decoding on request when it drafts
+(`chat-plain-v1`). A package that is not a plugin package, or whose selection does not assemble as a whole engine, is
+refused before anything loads.
 
-`crit run package` refuses a resident package that does not declare
-`chat-sampling-temperature-v1`, or that does not declare `chat-tools-v1` while the
-model's chat template teaches a tool-call format crit parses: agent clients send both on
-every turn.
-Serving works with failed or missing checks and
-never changes benchmark evidence or passes a gate. [Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/ADAPTER.md) uses a
-separate `eval-v1` adapter (`create_eval_engine(context)`); both can wrap one engine.
+Core's adapter is a `crit_core.serving.ResidentChat`: it renders the conversation, tools and tool history with the
+model's chat template (for a family whose checkpoints carry none, the one crit ships, such as DeepSeek V4's:
+[Core's text layer](../core/python/crit_core/text/README.md#chat-templates)), forwards the request's sampling fields,
+streams text without stop tokens, honors cancellation and reports Core's phase telemetry, over the model plugin's
+batched steps. The sections below are the chat-resident-v1 contract between crit serve's host and that adapter:
+crit serve and Core implement both sides, and an engine meets it by being a plugin package whose model plugin
+declares what Core asks of it (`crit_core.engine.serving_problems`). Serving works with failed or missing checks and
+never changes benchmark evidence or passes a gate. [Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/ADAPTER.md)
+reaches the same engine through Core's eval-v1 adapter (`crit eval run --package DIR`).
 
 ### Factory and lifetimes
 
-`context.configuration` is the frozen configuration, `context.arguments` the remaining
-literal launch arguments. Relative helper imports use a content-specific package
-namespace. Load weights in the factory. The returned engine implements:
+`context.configuration` is the frozen configuration (the candidate's, an ablation's variant over it), which Core's
+loader passes to every plugin with the model files and device leases of the host's model pool (the plugins'
+`context.serving`). The plugins load their weights when the engine is built. Core's adapter implements:
 
 | Method | Contract |
 | --- | --- |
@@ -1105,10 +1117,9 @@ adapter failure or request that ignores cancellation requires retiring the share
 host process; other active requests fail too, and no new work enters until they
 have unwound. This is the existing ownership guarantee applied to concurrent work.
 The contract permits an engine's scheduler to batch requests; it does not itself
-promise batched device arithmetic or a throughput gain. The
-[batched reference engine](../inference/batched-reference-engine/README.md) is a native
-library that does both: its steps run every request's rows through one GEMM per weight
-([serve concurrent requests](BUILDING_ENGINES.md#serve-concurrent-requests)). A Python
+promise batched device arithmetic or a throughput gain. A model plugin with mixed batches
+batches the arithmetic too: one step runs every scheduled request's rows and reads each
+weight once ([serve concurrent requests](BUILDING_ENGINES.md#serve-concurrent-requests)). A Python
 engine gets the same scheduling as a [step engine](../core/src/runtime/README.md#step-engines).
 
 ### Model access and allocation
@@ -1151,10 +1162,10 @@ run/chat/request/candidate IDs, canonical `package_sha256`, UTC creation time, m
 locator and frozen manifest, package path, configuration, `limits`, and
 `messages: [{role, content}, ...]` (optional first `system`, then alternating
 user/assistant ending with user, or with assistant when the request carries
-`"continue_final_message": true`, [chat-continue-v1](#continuing-the-final-message-for-adapters)). With
+`"continue_final_message": true`, [chat-continue-v1](#continuing-the-final-message-in-cores-adapter)). With
 `chat-template-kwargs-v1` it may carry `template_kwargs`
-([chat-template variables](#chat-template-variables-for-adapters)). A
-[raw prompt](#raw-prompts-for-adapters) carries `prompt` in place of `messages`.
+([chat-template variables](#chat-template-variables-in-cores-adapter)). A
+[raw prompt](#raw-prompts-in-cores-adapter) carries `prompt` in place of `messages`.
 
 With `chat-tools-v1`, messages also preserve assistant `tool_calls`, tool messages
 with `tool_call_id`, and optional `name`/`reasoning_content` (a client's `reasoning`
@@ -1199,7 +1210,7 @@ share the 65,536-character reply budget, and telemetry counts all generated toke
 
 Return real identities and measured values (numbers illustrative); the host writes the
 record. Replies are at most 65,536 characters, responses UTF-8 JSON under 1 MiB, plus
-1 KiB per output token and alternative with [log-probabilities](#token-log-probabilities-for-adapters).
+1 KiB per output token and alternative with [log-probabilities](#token-log-probabilities-in-cores-adapter).
 
 ```json
 {
@@ -1237,8 +1248,8 @@ generated tokens;
 `prefill_*`/`decode_*` count tokens actually timed per phase (excluding a reused prefix
 or the first token from prefill); `ttft_ms` runs from admission to first emitted token.
 Optional `decode_rounds` counts target passes after prefill (a speculative engine's verify
-rounds, at most `output_tokens`); ResidentChat reports it from `generate_tokens`' timing
-`rounds`, and Core engine libraries report theirs. Optional `accepted` (one count of
+rounds, at most `output_tokens`); Core's resident adapter reports it from the engine's `rounds`, its `accepted`
+entries or Core's decode steps. Optional `accepted` (one count of
 accepted drafts per decode round, as many as `decode_rounds`), `drafted` (the drafts made in
 each of those rounds, at least the accepted ones, for an engine whose draft width varies), `verify_ms` and `draft_ms`
 (non-negative milliseconds), and `expert_reads` and `expert_hits` together (integers, hits at most reads: the decode's
@@ -1289,7 +1300,15 @@ runtime's ownership token and its process id; it carries commands, cancellations
 and results as messages, so serving adds no polling delay to the first token or
 between tokens (about a millisecond of dispatch and delivery in all).
 
-### Structured output for adapters
+### Structured output in Core's adapter
+
+Core's adapter applies `response_format` for every engine whose tokenizer's bytes Core can match
+(`crit_core.engine.constrains`: a tokenizer.json decoder `crit_core.constraints.byte_vocabulary` reads, and a stop
+token to end the reply) and declares `chat-constraints-v1` and `chat-constraints-grammar-v1`: ResidentChat passes
+the request's `response_format` to `generate_tokens` as `constraint`, Core's runtime matches it with the native
+matchers below over the model's byte vocabulary (built on the first constrained request, its EOS the tokenizer's
+when that is a stop token, else the lowest stop token), and the model plugin's sampler applies each row's mask
+([crit plugins](PLUGINS.md#the-model-plugin)). The contract below is the one that adapter keeps.
 
 Declare **`chat-constraints-v1`** when the engine applies `response_format`:
 
@@ -1301,8 +1320,9 @@ Declare **`chat-constraints-v1`** when the engine applies `response_format`:
 
 Declare **`chat-constraints-grammar-v1`** as well when the engine applies any compiled
 grammar, whatever language it came from: crit serve then sends `structured_outputs`
-regex, choice and grammar constraints as type `grammar`. ResidentChat applies no
-constraint and declares neither.
+regex, choice and grammar constraints as type `grammar`. ResidentChat itself applies no
+constraint: its decoder does, and it sets `constraints = True` and declares both with
+`capabilities(..., constraints=True)`.
 
 Build one `crit::core::ByteVocabulary` per model from every token's exact decoded bytes
 (`crit_core.constraints.byte_vocabulary(tokenizer, eos)` from a
@@ -1314,7 +1334,7 @@ or template text. When `allowed()` throws, fail the request; never generate
 unconstrained text. Budget completion room within `max_output_tokens` and the matcher's
 limits. Full-vocabulary per-token masks need the native matchers or an equivalent device mask.
 
-### Strict and streaming tools for adapters
+### Strict and streaming tools in Core's adapter
 
 Declare **`chat-tool-choice-v1`** alongside `chat-tools-v1` only when the adapter
 forces a call for `tool_choice` `required` (at least one call) or a named function (calls to that function only),
@@ -1365,7 +1385,7 @@ turn even if swallowed by the adapter. Cancelled or failed partial calls are nev
 committed to a later request. Sampling, constraints and parser state must remain
 private to the turn.
 
-### Per-request sampling for adapters
+### Per-request sampling in Core's adapter
 
 Declare individual capabilities only for fields the engine actually applies:
 `chat-sampling-temperature-v1`, `chat-sampling-top-p-v1`, `chat-sampling-top-k-v1`,
@@ -1389,7 +1409,7 @@ native library must be rebuilt to forward penalties, logit bias and min-tokens. 
 capabilities implemented by that model, including speculative decoding paths.
 No request override changes Eval's greedy protocol or the sealed configuration.
 
-### Chat-template variables for adapters
+### Chat-template variables in Core's adapter
 
 Declare **`chat-template-kwargs-v1`** when the adapter renders a request's chat-template variables, and with
 it the capability of each variable of `crit_core.serving.TEMPLATE_KWARGS` the model's templates read
@@ -1402,14 +1422,14 @@ only. ResidentChat does: `capabilities(text, sampling)` declares the variables i
 configuration `recon`) and refuses any other with `RequestRejected`. An adapter that overrides
 `prepare_prompt` keeps this by rendering through `self.prompt_ids(request)`.
 
-### Token log-probabilities for adapters
+### Token log-probabilities in Core's adapter
 
 Declare **`chat-logprobs-v1`** (`capabilities(text, sampling, logprobs=True)`) when the
 engine reports, for every generated token, its log-probability and its 20 most likely
 alternatives, and set `logprobs = True` on the engine object; the host refuses to load
 the package otherwise. A request that asks for them carries `"logprobs": n`, the
 alternatives per token (0 to 20). The response then carries one row per generated
-token but stop tokens (which a [raw prompt](#raw-prompts-for-adapters)'s rows keep), and every
+token but stop tokens (which a [raw prompt](#raw-prompts-in-cores-adapter)'s rows keep), and every
 row's token and alternatives named by their bytes (lowercase hex), so crit serve needs no
 tokenizer:
 
@@ -1427,12 +1447,11 @@ with `logprobs = True` it passes `logprobs=n` to `generate_tokens` (and
 `(logprob, [(token, logprob), ...])` row per token. It drops a chat reply's stop tokens,
 clamps -inf and Core's rounding tolerance into the range and reads the bytes from the
 tokenizer.
-`crit_core.native.ResidentEngine` sets `logprobs` when the library exports
-`crit_engine_request_wait_output` and its `ModelInfo` declares `token_logprobs` with
-`max_top_logprobs` of at least 20 (see
-[engine libraries](../core/src/runtime/README.md#engine-libraries)).
+Core's resident adapter (`crit_core.engine.ResidentEngine`) serves them for every engine, whose model plugin declares
+`token_logprobs` with `max_top_logprobs` of at least 20, which Core's loader requires (see the
+[engine ABI](../core/src/runtime/README.md#engine-abi)).
 
-### Fixed-text scores for adapters
+### Fixed-text scores in Core's adapter
 
 Declare **`chat-score-v1`** (`capabilities(text, sampling, score=True)`) when the engine
 scores fixed text through its serving paths, set `scores = True` and implement
@@ -1456,7 +1475,7 @@ path when it names none), which must run the engine's prefill kernels at every p
 the continuation by a replay generation with log-probabilities. The replay prefills the prompt
 again, so its `prefill_ms` counts both prefills.
 
-### Raw prompts for adapters
+### Raw prompts in Core's adapter
 
 Declare **`completion-v1`** when the adapter continues a raw prompt; `capabilities(text,
 sampling)` declares it unless `completion=False`, since ResidentChat continues one with any
@@ -1479,7 +1498,7 @@ cannot encode and a prompt of no tokens are a RequestRejected), `generate_tokens
 without `prepare_prompt` or the reasoning split, and echo's rows come from `score_tokens(ids,
 [], n, cancelled, True)`, which needs `chat-score-v1`.
 
-### Engine facts and plain decoding for adapters
+### Engine facts and plain decoding in Core's adapter
 
 An engine keeps its facts for Eval in `facts`, a dictionary (`crit_core.native`'s engines
 hold their `ModelInfo` there); the host publishes the known ones
@@ -1489,7 +1508,7 @@ plain=True)`) and sets `plain = True`: a request with `"decode": "plain"` then r
 `generate_tokens` as `plain=True`. `crit_core.native.ResidentEngine` sets `plain` when its
 facts declare `speculative` and `plain`.
 
-### Continuing the final message for adapters
+### Continuing the final message in Core's adapter
 
 Declare **`chat-continue-v1`** when the adapter continues a final assistant message. A request
 carrying `"continue_final_message": true` ends with one and has no `tools` or `response_format`;
@@ -1501,7 +1520,7 @@ changes or drops the final message cannot leave it open, and ResidentChat refuse
 `RequestRejected`, as it does one with tools or without a final assistant message, so the engine
 stays loaded.
 
-### Tokenizing for adapters
+### Tokenizing in Core's adapter
 
 Declare **`chat-tokenize-v1`** when the engine implements `tokenize(text, add_special_tokens)` (the
 text's ids, with the tokenizer's own special tokens when asked), `render(request)` (`(text, ids)` of

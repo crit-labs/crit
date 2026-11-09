@@ -1,8 +1,11 @@
 """{name}: y[columns, N] = x[columns, K] @ w[N, K]^T in {format} ({op}), on the workbench (see harness.py).
 
-candidate() runs src/{name}.cu, a correct but slow starting point when no provider was given (`--from`): replace it
-with the kernel you are writing, keep inputs() and reference() as the contract, and keep yardstick() on the best
-existing provider for the same arithmetic.
+candidate() builds src/, a kernel-builder project (kernel-builder's template, or the project --from copied: crit-kernels'
+workbench-starter is a correct, slow starting point), with torch's extension builder and calls its op run_{format}:
+register that op in src/torch-ext/torch_binding.cpp (bf16: run_bf16(Tensor x, Tensor w) -> Tensor; fp8:
+run_fp8(Tensor x, Tensor x_scale, Tensor w, Tensor w_scale) -> Tensor; nvfp4: run_nvfp4(Tensor x, Tensor w, Tensor
+w_scale, Tensor w_global) -> Tensor, FP32 out). Keep inputs() and reference() as the contract, and keep yardstick() on
+the best existing provider for the same arithmetic. The same project builds for the Hub with kernel-builder.
 """
 from pathlib import Path
 
@@ -14,13 +17,20 @@ _ext = None
 
 
 def ext():
-    """The kernel, compiled once with torch's extension builder into build/."""
+    """The kernel's ops (torch.ops.{module}): src/'s CUDA and C++ sources (not its tests or benchmarks) compiled once
+    with torch's extension builder into build/, CUDA_KERNEL defined as kernel-builder defines it."""
     global _ext
     if _ext is None:
         from torch.utils.cpp_extension import load
+        src = HERE / "src"
+        skip = {"tests", "benchmarks", "build", "result"}
+        sources = sorted(str(p) for p in src.rglob("*") if p.suffix in (".cu", ".cpp")
+                         and not skip & set(p.relative_to(src).parts))
+        includes = sorted({str(src), str(src / "torch-ext")} | {str(Path(p).parent) for p in sources})
         (HERE / "build").mkdir(exist_ok=True)
-        _ext = load(name="{module}", sources=[str(HERE / "src" / "{name}.cu")], build_directory=str(HERE / "build"),
-                    extra_cuda_cflags=["-O3"], verbose=False)
+        load(name="{module}", sources=sources, extra_include_paths=includes, build_directory=str(HERE / "build"),
+             extra_cflags=["-DCUDA_KERNEL"], extra_cuda_cflags=["-O3", "-DCUDA_KERNEL"], verbose=False)
+        _ext = getattr(torch.ops, "{module}")
     return _ext
 
 
@@ -89,10 +99,11 @@ def reference(data):
 
 def candidate(data):
     if FORMAT == "nvfp4":
-        return ext().run(data["x"], data["w"], data["w_scale"], data["w_global"])
+        return ext().run_nvfp4(data["x"], data["w"], data["w_scale"], data["w_global"])
     if FORMAT == "fp8":
-        return ext().run(data["x"], data["x_scale"], data["w"], data["w_scale"])
-    return ext().run(data["x"], data["w"])
+        return ext().run_fp8(data["x"], data["x_scale"].reshape(-1).contiguous(), data["w"],
+                             data["w_scale"].reshape(-1).contiguous())
+    return ext().run_bf16(data["x"], data["w"])
 
 
 def yardstick(data):

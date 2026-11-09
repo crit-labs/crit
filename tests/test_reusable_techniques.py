@@ -198,25 +198,6 @@ class PartitionedAttentionTests(unittest.TestCase):
         self.assertEqual(p.output, (2.,))
 
 
-class BatchedEngineReferenceTests(unittest.TestCase):
-    def test_split_plan_ignores_rows_and_covers_k(self):
-        m = load("batched-reference-engine", "reference.py")
-        for n, k, sms in ((64, 64, 1), (128, 4096, 170), (11264, 2048, 170), (256, 640, 7)):
-            splits, per = m.plan_gemm(n, k, sms)
-            self.assertGreaterEqual(splits * per, k // 64)
-            self.assertLess((splits - 1) * per, k // 64)
-        with self.assertRaises(ValueError):
-            m.plan_gemm(100, 64, 8)
-
-    def test_decode_rows_come_first_and_logits_follow_phases(self):
-        m = load("batched-reference-engine", "reference.py")
-        layout, decode_rows, logits = m.arrange([("p", "prefill", 2, False), ("d", "decode", 1, False)])
-        self.assertEqual((decode_rows, logits), (1, [0]))
-        self.assertEqual(layout, [("d", "decode"), ("p", "prefill"), ("p", "prefill")])
-        with self.assertRaises(ValueError):
-            m.arrange([("d", "decode", 2, False)])
-
-
 class GgufBlockReferenceTests(unittest.TestCase):
     # SHA-256 of the FP32 values of test_blocks(kind, 6, 0x5eed + len(kind)) as gguf 0.19.0's quants.dequantize returns them.
     DIGESTS = {"Q4_0": "52a944d0347e56eeb04f2dbd96e806d71f7ab3cdf242c1a88f92369aee862dc0",

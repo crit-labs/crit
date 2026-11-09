@@ -16,7 +16,9 @@ from crit.pull import requirements as machine
 from crit.pull.cli import main, pull
 from crit.pull.store import InstallStore
 from crit.run.records import digest, file_sha, inventory, read_json, write_json
-from support.serve import ADAPTER
+from support.engines import selection
+from support.runs import with_plugins
+from support.serve import ADAPTER, SCRIPTED, scripted_serving
 
 try:
     import yaml
@@ -56,7 +58,8 @@ class PullTests(unittest.TestCase):
         self.model.mkdir()
         (self.model / "model.fixture").write_text("synthetic input, not a model", encoding="utf-8")
         (self.model / "README.md").write_text("# Fixture model\n", encoding="utf-8")
-        self.configuration = {"batch": 1}
+        self.configuration = {"batch": 1, "plugins": selection()}
+        scripted_serving(self, CAPABILITIES)
         self.revision = self.engines_repository()
         self.hub = self.root / "hub"
         self.card = self.hub_card()
@@ -65,12 +68,13 @@ class PullTests(unittest.TestCase):
         self.store = InstallStore(self.root / "store")
 
     def engines_repository(self):
-        """A crit-engines checkout with fast-engine/: an adapter, its configuration and a build script."""
+        """A crit-engines checkout with fast-engine/: a plugin package (the toy engine's plugins and the configuration
+        that selects them), the scripted engine its resident host runs in these tests, and a build script."""
         repository = self.root / "crit-engines"
         engine = repository / "fast-engine" / "engine"
         engine.mkdir(parents=True)
-        (engine / "adapter.py").write_text(ADAPTER + DRAFTERS + f"\ndef declared_capabilities(model_path):\n"
-                                           f"    return {CAPABILITIES!r}\n", encoding="utf-8")
+        with_plugins(engine)
+        (engine / SCRIPTED).write_text(ADAPTER + DRAFTERS, encoding="utf-8")
         (engine / "configuration.json").write_text(json.dumps(self.configuration, indent=2, sort_keys=True) + "\n",
                                                    encoding="utf-8")
         (engine / "build.py").write_text("from pathlib import Path\nPath('built.txt').write_text('built')\n",
@@ -93,7 +97,8 @@ class PullTests(unittest.TestCase):
             "build": {"command": ["python", "build.py"]},
             "checkpoints": {"fixture@BF16": {"repository": "fixture/model", "revision": "f" * 40}},
             "results": [{"gpu": "rtx5090", "model": "fixture@BF16", "measured_with": "crit-eval-v0.2.1",
-                         "stats": {"decode_tok_s": 100.0, "context_tokens": 4096}, "evidence": []}],
+                         "quality_mode": "preserve", "stats": {"decode_tok_s": 100.0, "context_tokens": 4096},
+                         "evidence": []}],
             "readme": {"intro": "An engine."},
         } | changes
         (folder / "card.yaml").write_text(yaml.safe_dump(card, sort_keys=False), encoding="utf-8")
@@ -148,8 +153,8 @@ class PullTests(unittest.TestCase):
         self.assertEqual((folder / "package/built.txt").read_text(), "built")
         self.assertTrue((folder / "THIRD_PARTY.md").is_file())
         manifest = read_json(folder / "package/manifest.json")
-        self.assertEqual(manifest["capabilities"], CAPABILITIES)
-        self.assertEqual(manifest["launch"], ["adapter.py"])
+        self.assertFalse({"launch", "capabilities"} & set(manifest))   # Core's loader runs it and says what it serves
+        self.assertTrue((folder / "package/plugins/toy-model/plugin.json").is_file())
         self.assertEqual(file_sha(self.store.root / record["checkpoint"]["folder"] / "model.fixture"),
                          file_sha(self.model / "model.fixture"))
         for path in folder.rglob("*.json"):
@@ -180,7 +185,7 @@ class PullTests(unittest.TestCase):
     def test_a_second_pull_keeps_a_sound_install_and_a_changed_package_fails_to_serve(self):
         first = self.install()
         self.assertEqual(self.install()["installed_at"], first["installed_at"])
-        (self.store.folder(ENGINE) / "package/adapter.py").write_text("changed", encoding="utf-8")
+        (self.store.folder(ENGINE) / "package" / SCRIPTED).write_text("changed", encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "differ"):
             self.store.spec(ENGINE)
         self.assertNotEqual(self.install()["installed_at"], first["installed_at"], "a broken install is pulled again")
@@ -299,9 +304,9 @@ class PullTests(unittest.TestCase):
         with patch("crit.pull.requirements.driver_cuda", return_value="13.1"):
             with self.assertRaisesRegex(ValueError, "not the artifact the card pins"):
                 self.install(downloads={"someone/prebuilt": archive})
-            archive, download = self.artifact({"adapter.py": "replaced"})
+            archive, download = self.artifact({SCRIPTED: "replaced"})
             self.hub_card(downloads=[download])
-            with self.assertRaisesRegex(ValueError, "adapter.py would replace a file of the engine's pinned source"):
+            with self.assertRaisesRegex(ValueError, f"{SCRIPTED} would replace a file of the engine's pinned source"):
                 self.install(downloads={"someone/prebuilt": archive})
         self.assertEqual(self.store.list(), [])
 

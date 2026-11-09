@@ -46,8 +46,9 @@ and AVX-512 files are compiled with their own flags and share no inline code wit
 rest), with 8 or 16 FP32 lanes per activation row. Rows are
 independent, so results do not depend on the thread split. `host_block` composes one
 pre-norm block from it: RMSNorm, QKV, split-half rotary embedding, a host KV append,
-grouped-query attention, O, the SiLU product and down, rounding to BF16 wherever the
-device kernels do.
+grouped-query attention, O, the SiLU product and down, rounding to BF16 where a BF16
+device layer stores its intermediates (the normed input, rotated Q and K, V, the
+attention output and the SiLU product).
 
 ## Worked example
 
@@ -83,9 +84,8 @@ od::WeightStream stream(largest_layer_bytes, copy_stream);
 od::run_layers(plan, store, runner, &stream, compute_stream);         // each step; runner is the engine's LayerRunner
 ```
 
-[synthetic_offload.h](code/synthetic_offload.h) is one complete `LayerRunner`: the
-batched reference engine's synthetic transformer, with device layers on its kernels and
-paged attention, and host layers on `host_block`.
+The engine supplies the `LayerRunner`: each layer's device form on its own kernels and
+its host form, for which `host_block` gives a pre-norm layer.
 
 ## Invariants
 
@@ -100,18 +100,22 @@ paged attention, and host layers on `host_block`.
 ## Costs and validation
 
 `tests/inference/dense_offload_tests.cpp` checks the planner's candidates and
-predictions (and that measured selection overrides the predicted order), every host
+predictions (and that measured selection overrides the predicted order), and every host
 GEMV path the CPU supports against an FP64 product (within 1e-5) and bit for bit across
-thread splits, and a six-layer synthetic model run under resident, streamed, host and
-mixed placements over a 13-token prompt and six decode steps: streamed layers give the
-resident run's logits bit for bit with the two slots recycled, and host layers stay
-within 2% of the logits' magnitude (summation order and exact host softmax against
-BF16 device probabilities; at most 1.3% with all six layers on the host on sm_120).
-`test_reusable_techniques.py` checks the Python planner on the same scenario.
+thread splits. Its `host_block` case runs a grouped-query block over a host KV cache: bit
+for bit across thread splits, three tokens in one call within 1e-5 of three single-token
+calls, and the cache holding exactly the positions written. On a CUDA device its `stream`
+case runs `run_layers` with a recording `LayerRunner` over six layers placed device,
+stream, stream, host, stream, device: the calls come in step order with the host run
+between `to_host` and `to_device`, each device or streamed layer reads its own bytes
+(the third streamed layer reusing the first one's slot of the two-slot `WeightStream`),
+and the measurement helpers return positive rates. The fixture has no model, so it
+checks what each layer is handed, not a model's output. `test_reusable_techniques.py`
+checks the Python planner on the same scenario.
 
-Measured with `crit_dense_offload_bench` on one machine (RTX 5090, 12 host threads with
-AVX-512) for a synthetic model of 16 layers of 436 MB (7 GB of BF16 weights) with the
-device budget set to part of the weights to exercise the planner: device 1,131 GB/s
+Measured with an earlier fixture's synthetic model, on one machine (RTX 5090, 12 host
+threads with AVX-512), with 16 layers of 436 MB (7 GB of BF16 weights) and the device budget
+set to part of the weights to exercise the planner: device 1,131 GB/s
 (from an all-resident run), upload 28.8 GB/s, host GEMV 35 GB/s, activation round trip
 21 us. With a quarter of the weights resident, host execution of 12 layers was predicted
 at 147 ms per decode step and measured at 171 ms, streaming 14 layers predicted at

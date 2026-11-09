@@ -1,0 +1,16 @@
+{
+  "kind": "crit-technique-operations",
+  "technique": "expert-streamed-prefill",
+  "operations": [
+    {
+      "id": "grouped-expert-projection",
+      "what": "per routed layer of a prompt chunk: the routes sorted by expert, each expert's rows times its gate/up and down matrices in their stored format with SwiGLU between, each token's expert outputs summed with its routing weights; one weight pointer per expert, wherever the expert sits",
+      "reference": {
+        "path": "inference/expert-streamed-prefill/code/reference.py",
+        "symbol": "moe_block, route_order, decode_matrix"
+      },
+      "verify": "on the target, run the kernel and moe_block on the same 8-16 tokens of a real chunk (their routes, routing weights and expert weights, decoded with decode_matrix): the largest difference within the kernel's arithmetic (5e-3 of the largest output for BF16 operands with FP32 sums; W4A4 activations within 3e-2, the quality mode's drift), the same bits on a repeat, and a token's output unchanged when its chunk is cut differently. Keep the fastest kernel that passes; drop one that fails",
+      "invariance": "a token's output independent of how its chunk is cut and of the other tokens routed to its experts, the same function for decode rows and prompt chunks; the same bits on a repeat"
+    }
+  ]
+}

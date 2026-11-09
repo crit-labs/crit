@@ -1,6 +1,6 @@
 """Single-writer run coordinator; records are data, never executable recipes."""
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 import os
 import json
 from pathlib import Path
@@ -10,21 +10,22 @@ import uuid
 
 # The coordinator lease each write takes (crit.lease); named from here as before.
 from ..lease import exclusive_lease, lease, lease_owner, read_lease_owner, release_dead_lease  # noqa: F401
-from ..records import retry_denied
+from ..records import retry_denied, utc_now
 from .records import (
     HEADROOM_REASONS, LIFECYCLES, LINEAGE, MAX_CANDIDATES, SAFETY_WINDOW_MINUTES, STOP_REASONS, WEIGHTS, amendment,
     attempt_process_cap,
-    candidate_projection, quality_mode, quality_terms, digest, evidence, file_sha, header, headroom_record, ident,
+    candidate_projection, counts_evaluated, evaluated_candidates, quality_mode, quality_terms, digest, evidence, file_sha,
+    header, headroom_record, ident,
     ineligibility, inputs, inventory, keys, load_run, now, number, read_candidates, read_json, record,
     request_spec, safe_path, segment, text, timestamp, validate_attempt_reservation, validate_attempt_result,
     validate_spec, verify_inventory, write_json,
 )
-from . import cost, hub, plans, recon, replay
+from . import cost, hub, ladder, plans, recon, replay
 
 ROOT = Path(__file__).resolve().parents[3]
 # The folders the repository publishes (its .gitignore allowlist, which a test holds this to) and the ones it keeps
 # for retention: no run root lies inside them.
-PUBLISHED = ("core", "inference", "kernels", "models", "tests", "docs", "eval", "cli", "api", "mcp", ".github")
+PUBLISHED = ("core", "inference", "kernels", "models", "tests", "docs", "eval", "cli", "api", "mcp", "smoke", ".github")
 PROTECTED = PUBLISHED + ("tools", "archive")
 
 
@@ -101,26 +102,24 @@ def described(model_path):
     return source.folder is not None or bool(source.derived)
 
 
-def serving_gaps(capabilities, model_path):
-    """What a chat-resident-v1 package leaves out that crit serve clients rely on: per-request temperature, and
-    tool calls when the model's chat template teaches a call format crit parses."""
-    from crit_core.serving import RESIDENT_CAPABILITY, TOOL_TEMPLATE_CAPABILITY, TOOLS_CAPABILITY, sampling_capability
-    if not isinstance(capabilities, list) or RESIDENT_CAPABILITY not in capabilities:
-        return []
-    gaps = []
-    if sampling_capability("temperature") not in capabilities:
-        gaps.append(f"it must apply a request's temperature and declare {sampling_capability('temperature')}")
-    if not {TOOLS_CAPABILITY, TOOL_TEMPLATE_CAPABILITY} & set(capabilities) and described(model_path):
-        from crit_core.model import open_model
-        from crit_core.text import template_sources, templates_tool_format
-        try:
-            taught = templates_tool_format(template_sources(open_model(model_path).files).values())
-        except Exception:
-            taught = None
-        if taught:
-            gaps.append("the model's chat template teaches tool calls, so it must render tools, parse the calls and "
-                        f"declare {TOOLS_CAPABILITY}")
-    return gaps
+def plugin_package(folder, model_path, configuration, what, device_file=None):
+    """Refuse `folder` unless it is an engine Core's loader runs: plugins/ and a configuration whose plugins selection
+    fills every slot an engine fills, checked without running any of its code (crit_core.engine.check_package),
+    against the run's device (its crit eval probe device file, else the machine's)."""
+    from crit_core.engine import check_package
+    from crit_plugins import PluginError
+    probe = read_json(Path(device_file)) if device_file and Path(device_file).is_file() else None
+    try:
+        check_package(folder, model_path, configuration, probe=probe)
+    except PluginError as exc:
+        raise ValueError(f"{what} is no engine Core can load: {exc}. An engine is Core plus a plugin selection: "
+                         "the package holds plugins/ and configuration.plugins names the plugin of each slot "
+                         "(docs/PLUGINS.md)") from None
+
+
+def run_device_file(run):
+    """The crit eval probe device file the run's context was derived from, if any."""
+    return ((run["spec"].get("hardware_constraints") or {}).get("context") or {}).get("device_file")
 
 
 class RunStore:
@@ -182,7 +181,7 @@ class RunStore:
         state["target_satisfied"] = bool(selected and selected["target_satisfied"])
         if state["stopping_reason"] == "satisfied" and not state["target_satisfied"]:
             errors.append({"file": "state.json", "error": "Selected artifact no longer satisfies this run"})
-        remaining = max(0, (timestamp(bounds["deadline_at"], "deadline") - datetime.now(timezone.utc)).total_seconds())
+        remaining = max(0, (timestamp(bounds["deadline_at"], "deadline") - utc_now()).total_seconds())
         state["budget"]["remaining_seconds"] = round(remaining)
         if not remaining and state["phase"] in {"awaiting_agent", "running", "discovering", "building", "checking", "benchmarking"}:
             state["phase"] = "expired"
@@ -226,7 +225,7 @@ class RunStore:
         bounds = segment(root, run, state["current_segment_id"])
         state["budget"] = {"segments": len(segments), "attempts": len(attempts),
             "segment_attempts": sum(a["segment_id"] == bounds["segment_id"] for a in attempts),
-            "remaining_seconds": max(0, round((timestamp(bounds["deadline_at"], "deadline") - datetime.now(timezone.utc)).total_seconds()))}
+            "remaining_seconds": max(0, round((timestamp(bounds["deadline_at"], "deadline") - utc_now()).total_seconds()))}
         state["revision"] += 1
         state["updated_at"] = now()
         write_json(path, state)
@@ -255,7 +254,7 @@ class RunStore:
             limits |= {"budget_minutes": number(minutes, "Budget", 1, 180, integer=True)}
         limits["attempt_limit"] = number(attempt_limit, "Attempt limit", 1, 1000, integer=True)
         segment_id = next_id(root / "segments", "segment", ".json")
-        started = datetime.now(timezone.utc)
+        started = utc_now()
         bounds = record("segment", run["run_id"], segment_id=segment_id, action=action, started_at=started.isoformat(),
             deadline_at=(started + timedelta(minutes=minutes)).isoformat(), request_sha256=run["request_sha256"],
             limits=limits, dependency_scope="Local construction dependencies; preserve source, notices and exact identities outside publication",
@@ -280,7 +279,7 @@ class RunStore:
             data = {**data, "origin_engine": hub.describe_engine(origin)}
         spec = request_spec(data)
         while True:
-            run_id = "run-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:8]
+            run_id = "run-" + utc_now().strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:8]
             root = self.root / run_id
             try:
                 root.mkdir()
@@ -304,7 +303,7 @@ class RunStore:
         run = load_run(root)
         state = read_json(root / "state.json")
         bounds = segment(root, run, state["current_segment_id"])
-        if state["stopping_reason"] or datetime.now(timezone.utc) >= timestamp(bounds["deadline_at"], "deadline"):
+        if state["stopping_reason"] or utc_now() >= timestamp(bounds["deadline_at"], "deadline"):
             raise ValueError("Segment is closed/expired; explicit Resume is required")
         return run, state, bounds
 
@@ -427,8 +426,22 @@ class RunStore:
 
     @staticmethod
     def _segment_candidates(root, run, bounds):
+        """The candidates the segment's budget has spent: those on the candidate ladder in it (budget_counts ladder),
+        those whose first Eval it reserved (budget_counts evaluated), or in older runs every candidate created in
+        it."""
+        if ladder.ladder(run):
+            return sum(found == bounds["segment_id"] for found in ladder.counted(root).values())
+        if counts_evaluated(run):
+            return sum(found == bounds["segment_id"] for found in evaluated_candidates(root).values())
         candidates, _ = read_candidates(root, run)
         return sum(c.get("segment_id") == bounds["segment_id"] for c in candidates)
+
+    @staticmethod
+    def _spent(run, budget):
+        """The refusal once the segment's candidate budget is used."""
+        return ValueError(f"This segment's candidate budget ({budget}) is used" + (
+            " (candidates on the candidate ladder)" if ladder.ladder(run) else
+            " (candidates through Eval)" if counts_evaluated(run) else "") + "; stop, or Resume with more candidates")
 
     def candidate(self, run_id, source, proposal):
         root = self._recording(run_id)
@@ -460,7 +473,7 @@ class RunStore:
                 raise ValueError("Candidate limit exceeded")
             budget = bounds["limits"].get("candidate_budget")
             if budget is not None and self._segment_candidates(root, run, bounds) >= budget:
-                raise ValueError(f"This segment's candidate budget ({budget}) is used; stop, or Resume with more candidates")
+                raise self._spent(run, budget)
             source = Path(source).absolute()
             if root.is_relative_to(source):
                 raise ValueError("Source folder must not contain its run")
@@ -477,13 +490,16 @@ class RunStore:
             if missing:
                 raise ValueError(f"Finish {recon.RECON_MD} before the candidate: " + ", ".join(missing) + " (still TODO "
                                  "or missing). The prefill arithmetic plan names each matrix group's prompt activation "
-                                 "format and the quality measurement per group (crit eval run --attribute-drift)")
+                                 "format and, in preserve, its quality measurement (crit eval run --quality-mode "
+                                 "preserve --attribute-drift)")
             configuration, extensions = proposal["configuration"], proposal.get("extensions", {})
             if frozen is not None:
                 if not isinstance(configuration, dict) or configuration.get("recon", frozen) != frozen:
                     raise ValueError(f"configuration.recon differs from {recon.RECON_JSON}; change its frozen block, with "
                                      f"the reason in {recon.RECON_MD}, before the candidate")
                 configuration, extensions = {**configuration, "recon": frozen}, {**extensions, "recon": recon_ref}
+            plugin_package(source, run["spec"]["model_path"], configuration, "The candidate's source",
+                           run_device_file(run))
             candidate_id = next_id(root / "candidates", "candidate")
             folder = root / "candidates" / candidate_id
             # Validate complete staged records and source before publishing the candidate ID.
@@ -578,17 +594,15 @@ class RunStore:
             if (folder / "seal.json").exists():
                 raise ValueError("Sealed candidate is immutable")
             candidate = read_json(folder / "candidate.json")
-            keys(recipe, {"build", "launch", "capabilities"})
+            keys(recipe, {"build"})
             source = Path(source).absolute()
             if root.is_relative_to(source):
                 raise ValueError("Package folder must not contain its run")
             rows = inventory(source)
             if any(r["path"] == "manifest.json" for r in rows):
                 raise ValueError("Package input must not contain coordinator manifest.json")
-            gaps = serving_gaps(recipe.get("capabilities"), run["spec"]["model_path"])
-            if gaps:
-                raise ValueError("The resident chat adapter is incomplete: " + "; ".join(gaps)
-                                 + ". crit_core.serving.ResidentChat provides all of it (docs/SERVING.md)")
+            plugin_package(source, run["spec"]["model_path"], candidate["configuration"], "The package",
+                           run_device_file(run))
             # The package carries the candidate's configuration so exports and launches
             # can read it; a supplied copy must be exactly that configuration.
             supplied = source / "configuration.json"
@@ -650,13 +664,24 @@ class RunStore:
             cap = attempt_process_cap(bounds, candidate_id, operation)
             if sum(a["segment_id"] == bounds["segment_id"] for a in self.attempts(root)) >= bounds["limits"]["attempt_limit"]:
                 raise ValueError("Segment attempt limit exhausted")
-            window = (timestamp(bounds["deadline_at"], "deadline") - datetime.now(timezone.utc)).total_seconds()
+            # The candidate ladder: a candidate's rung says whether Eval measures it at all.
+            if operation == "eval" and candidate_id and ladder.ladder(run) and ladder.scope_of(root, candidate_id) == "none":
+                raise ValueError(f"{candidate_id} is on the candidate ladder's first rung: {ladder.SCOPES['none']}")
+            # budget_counts evaluated (and ladder): a candidate's first Eval spends one of the segment's budgeted
+            # candidates unless it already counts; later Evals of it (a resume, a partial rerun) cost nothing more.
+            budget = bounds["limits"].get("candidate_budget")
+            spent = (ladder.counted(root) if ladder.ladder(run) else evaluated_candidates(root)
+                     if counts_evaluated(run) else None)
+            if (operation == "eval" and budget is not None and spent is not None
+                    and candidate_id not in spent and self._segment_candidates(root, run, bounds) >= budget):
+                raise self._spent(run, budget)
+            window = (timestamp(bounds["deadline_at"], "deadline") - utc_now()).total_seconds()
             limit = window if cap is None else cap
             seconds = limit if seconds is None else number(seconds, "Process deadline", .001, max(.001, limit))
             owner = f"candidates/{ident(candidate_id, 'candidate')}" if candidate_id else f"segments/{bounds['segment_id']}"
             directory = safe_path(root, owner + "/attempts")
             attempt_id = next_id(directory, "attempt")
-            reserved = datetime.now(timezone.utc)
+            reserved = utc_now()
             package_path = safe_path(root, owner + "/package/manifest.json")
             value = record("attempt_reservation", run_id, segment_id=bounds["segment_id"], candidate_id=candidate_id, attempt_id=attempt_id,
                 operation=operation, reserved_at=reserved.isoformat(), deadline_at=min(reserved + timedelta(seconds=seconds), timestamp(bounds["deadline_at"], "deadline")).isoformat(),
@@ -739,6 +764,19 @@ class RunStore:
                 self._event(root, "agent_settled", detail={"outcome": value["outcome"], "cleanup_settled": value["cleanup_settled"]})
         return value
 
+    def _unmeasured_cases(self, root, folder, candidate_id):
+        """While the segment runs, a completed seal waits for a benchmark of every run case: `select` needs one, and a
+        sealed candidate takes no new measurement. A stopped segment refuses `measure`, so there an Eval alone seals."""
+        if read_json(root / "state.json").get("stopping_reason") is not None:
+            return
+        measured = {s.get("case_id") for s in read_json(folder / "telemetry.json").get("series") or []}
+        missing = [c["case_id"] for c in load_run(root)["spec"]["cases"] if c["case_id"] not in measured]
+        if missing:
+            raise ValueError(f"Measure {', '.join(missing)} before sealing {candidate_id} as completed (crit run ... "
+                             f"check --candidate {candidate_id} --from-eval, then crit run ... measure --candidate "
+                             f"{candidate_id}): select needs every case's benchmark, and a sealed candidate takes no "
+                             "new measurement")
+
     def seal(self, run_id, candidate_id, lifecycle, failure=None):
         root = self._recording(run_id)
         with lease(root):
@@ -750,6 +788,8 @@ class RunStore:
                 if digest({key: outcome[key] for key in ("lifecycle", "failure")}) != digest({"lifecycle": lifecycle, "failure": failure}):
                     raise ValueError("Candidate outcome already exists with different lifecycle/failure")
             else:
+                if lifecycle == "completed":
+                    self._unmeasured_cases(root, folder, candidate_id)
                 outcome = record("candidate_outcome", run_id, candidate_id=candidate_id, lifecycle=lifecycle, failure=failure, closed_at=now())
             if seal_path.exists():
                 # A retry repairs only run projections/history, never a sealed inventory.
@@ -805,7 +845,11 @@ class RunStore:
             if budget is not None:
                 used = self._segment_candidates(root, run, bounds)
                 if reason == "budget_exhausted" and used < budget:
-                    raise ValueError(f"Only {used} of {budget} budgeted candidates exist; build the next one-shot candidate")
+                    raise ValueError(f"Only {used} of {budget} budgeted candidates are on the candidate ladder; build "
+                                     "the next rung's candidate" if ladder.ladder(run) else
+                                     f"Only {used} of {budget} budgeted candidates went through Eval; build and evaluate "
+                                     "the next one-shot candidate" if counts_evaluated(run) else
+                                     f"Only {used} of {budget} budgeted candidates exist; build the next one-shot candidate")
                 # Stopping early is itself a plan: neither decode nor prefill is needed any more.
                 if reason == "search_exhausted" and used < budget and run["spec"].get("plans") == "required":
                     plans.require_stop_plan(root, run, bounds)
@@ -843,7 +887,7 @@ class RunStore:
         policy = run["spec"]["correctness"].get("weights_policy")
         weights_note = ((" This run requires the model's weights used as stored: declare weights in every proposal;"
                          " transformed candidates are never eligible. Draft-only weights (a speculative drafter whose"
-                         " tokens the stored weights verify) and KV-cache precision are not covered; see"
+                         " tokens the stored weights verify, below) and KV-cache precision are not covered; see"
                          " docs/RUN_RECORDS.md.") if policy == "as_stored" else
                         (" This run allows transformed weights: a candidate may re-encode stored 16-bit matrices into a"
                          " lower-precision format as it loads them (for example BF16 to FP8 per channel), declaring"
@@ -854,14 +898,24 @@ class RunStore:
         amended = amendments(root, bounds["segment_id"])
         quality_budget, exactness = quality_terms(run["spec"]["correctness"], amended)
         mode = quality_mode(run["spec"]["correctness"])
-        mode_line = (" Quality mode preserve: Eval's reference keeps the activations exact, so quantizing them counts as "
-                     "drift, and prefill's limits are priced at 16-bit prompt activations." if mode == "preserve" else
-                     " Quality mode as_quantized (the user's choice), the mode for speed: Eval judges against the "
-                     "exact reference with a budget that only keeps out a broken engine, so the checkpoint's own "
-                     "activations, lower-precision KV, heads and dense weights are the starting arithmetic, not levers "
-                     "to justify group by group; output differences that part at near-ties pass its repeatability "
-                     "gates, so the engine's arithmetic may depend on what it served before (experts on the CPU or "
-                     "the device, faster inexact CPU rows); prefill's limits are priced at its stored format.")
+        # The quality mode says how much output drift from the selected checkpoint the engine may trade for speed;
+        # both modes judge against the same reference, whatever format the checkpoint is stored in.
+        mode_line = (" Quality mode preserve (the run's; never change it): the budget keeps the engine's output close "
+                     "to the selected checkpoint's, judged against Eval's exact reference (its stored weights, exact "
+                     "activations), so every precision change (activation quantization, whatever format the checkpoint "
+                     "declares, a lower-precision KV cache or head) is drift to measure against it, and prefill's "
+                     "limits are priced at 16-bit prompt activations." if mode == "preserve" else
+                     " Quality mode speed (the run's; never change it): how much output "
+                     "drift from the selected checkpoint the engine may trade for speed, whatever format that "
+                     "checkpoint is stored in. Eval judges against the same exact reference with a budget that only "
+                     "keeps out a broken engine, so lower-precision activations (the stored format's own, FP8), KV, "
+                     "heads and, where the run's weights_policy allows, re-encoded dense weights are the starting "
+                     "arithmetic, not levers to justify group by group; "
+                     "output differences that part at near-ties pass its repeatability gates, so the engine's "
+                     "arithmetic may depend on what it served before (experts on the CPU or the device, faster inexact "
+                     "CPU rows); prefill's limits are priced at the fastest prompt activations the mode admits on the "
+                     "quantized matrices (the stored format's own, FP8 or 16-bit, as the device runs them), or a "
+                     "faster arithmetic quality shows passing.")
         quality_line = (f"Quality budget: PPL ratio ≤ {quality_budget['ppl_ratio_max']}, mean KLD ≤ "
                         f"{quality_budget['kld_mean_max']}, p99 KLD ≤ {quality_budget['kld_p99_max']} against Eval's reference; "
                         f"speculative exactness {exactness}." + mode_line + " crit run ... eval applies them; pass them to "
@@ -894,7 +948,13 @@ class RunStore:
         if origin:
             source = origin["source"]
             where = f"{source['repository']} at commit {source['revision']}" + (f", folder {source['path']}" if source["path"] else "")
-            evidence = ", ".join(f"{e['path']} ({e['measured_with']}, {e['gpu']}, {e['model']})" for e in origin["evidence"]) or "none published"
+            evidence = ", ".join(f"{e['path']} ({e['measured_with']}, {e['gpu']}, {e['model']}, quality mode "
+                                 f"{e['quality_mode']})" for e in origin["evidence"]) or "none published"
+            # A result judged in another quality mode was judged by another budget, forks and prefill limits.
+            other = sorted({e["quality_mode"] for e in origin["evidence"]} - {mode})
+            other_mode = (f" Results judged in quality mode {' and '.join(other)} are not judged in this run's, {mode}: "
+                          "their numbers do not compare with this run's Evals, so the first candidate's Eval, in this "
+                          "run's mode, is the baseline to compare against." if other else "")
             origin_line = (
                 f"\nOrigin engine: this run starts from the crit-hub engine {origin['engine']} ({origin['title']}), contributed by "
                 f"{origin['contributor']['name']} and measured on checkpoint(s) {', '.join(origin['checkpoints'])}. Its source is "
@@ -902,7 +962,7 @@ class RunStore:
                 f"the first candidate: candidate --source <its engine folder> --record proposal.json with \"lineage\": "
                 f"\"{LINEAGE}\" in the proposal, then build, package and measure it before changing anything, so it is the "
                 f"baseline every later Eval compares against (--baseline). Its published Eval results are retained in this run as "
-                f"{evidence}: the numbers before your work. resolve records in inputs.json (origin_checkpoint) whether this "
+                f"{evidence}: the numbers before your work.{other_mode} resolve records in inputs.json (origin_checkpoint) whether this "
                 f"run's model is the exact checkpoint the engine was measured on; when it is not, read recon.md's Fingerprint "
                 f"section and run crit run ... recon --compare <the origin's checkpoint> if you have it: every section that "
                 f"differs is work the first candidate must absorb before it runs.\n")
@@ -912,6 +972,38 @@ class RunStore:
                        "when its candidates are built, when neither decode nor prefill is needed any more (even with "
                        "candidates left), when its target is met, or when it is blocked." if budget is not None else
                        f"Segment: {bounds['segment_id']}; hard deadline UTC: {bounds['deadline_at']}")
+        if budget is not None and counts_evaluated(run):
+            budget_line = (
+                f"Segment: {bounds['segment_id']}; candidate budget: {budget} candidates through Eval. There is no working "
+                "time budget: each candidate is an ambitious one-shot at the best engine you can build, and the segment "
+                f"ends when {budget} candidates have gone through Eval, when neither decode nor prefill is needed any more "
+                "(even with candidates left), when its target is met, or when it is blocked. A candidate spends the budget "
+                "when its first Eval starts (crit run ... eval), not when it is created: one that fails to build, package "
+                "or pass crit run ... serve --check before that is a draft. Seal the draft with what stopped it "
+                "(build_failed or check_failed, with the failure) and build the fix as a new candidate from the same "
+                "plan_id at no cost; the segment's attempt limit bounds the builds.")
+        if budget is not None and ladder.ladder(run):
+            budget_line = (
+                f"Segment: {bounds['segment_id']}; candidate budget: {budget} candidates on the candidate ladder. There is no "
+                "working time budget: each candidate is an ambitious one-shot at the best engine you can build, and its\n"
+                "number in the run says how far it goes (the plan's inputs.objective names its rung):\n"
+                "- Candidate 1: build it, pass its plugins' tests (crit plugins test) and crit run ... serve --check, then\n"
+                "  seal it built. No Eval: crit run ... eval refuses it.\n"
+                "- Candidate 2: as candidate 1, with every plugin crit's library and crit-hub offer that fits the\n"
+                "  checkpoint and the GPU (crit plugins list --model MODEL --device cuda), each plugin's tests passing;\n"
+                "  crit run ... ablate says which pays. At most a small Eval: crit run ... eval measures Eval's stage 1.\n"
+                "- Candidates 3 and 4: as candidate 2, improved with crit's toolkit. At most a medium Eval: crit run ...\n"
+                "  eval measures up to Eval's stage 2.\n"
+                f"- Candidate {ladder.RUNGS} on, and the segment's last budgeted candidate: as candidate 4, with the full\n"
+                "  Eval: crit run ... eval certifies it (the required context and the lower-context gate), which\n"
+                "  qualification needs.\n"
+                "A candidate below the full Eval that skips its Eval is sealed built once its serve check passed. The\n"
+                f"segment ends when {budget} candidates are on the ladder, when neither decode nor prefill is needed any more\n"
+                "(even with candidates left), when its target is met, or when it is blocked. A candidate is on the ladder\n"
+                "once its first Eval starts, or, below the full Eval, once it is sealed built or completed with a passed\n"
+                "crit run ... serve --check: one that fails to build, package or pass serve --check before that is a\n"
+                "draft. Seal the draft with what stopped it (build_failed or check_failed, with the failure) and build the\n"
+                "fix as a new candidate from the same plan_id at no cost; the segment's attempt limit bounds the builds.")
         plan_line = ("\nPlan each candidate before any code: after the parent's Eval, crit run ... plan --record plan.json\n"
                      "records whether decode and prefill are needed and the evidence, the current strategy's ceiling and\n"
                      "the best alternative's, the levers with each KPI's projected change (levers that only pay together\n"
@@ -925,6 +1017,9 @@ class RunStore:
                      "forecast next to the measurement. Stopping with candidates left in the budget (search_exhausted) needs\n"
                      "a stop plan from the newest Eval first."
                      if run["spec"].get("plans") == "required" else "")
+        if plan_line and ladder.ladder(run):
+            plan_line += ("\nOn the candidate ladder a plan starts from a parent on it: after its Eval, or, when its rung\n"
+                          "skipped Eval, once it is sealed built; without the parent's Eval the plan freezes none.")
         # The version of the plan rules the run was created with (plans.rules); their numbers come from plans.py.
         version = plans.rules(run)
         if version >= 2:
@@ -957,10 +1052,35 @@ class RunStore:
                           f"{plans.ACTIVATION_GAP}FORMAT whose evidence is a crit-eval result measuring it over the budget outside\n"
                           "the quality spread.")
             plan_line += ("\nBefore the first candidate, recon.md's prefill arithmetic plan names each matrix group's\n"
-                          "prompt activation format and its quality measurement (crit eval run --attribute-drift),\n"
-                          "beside the drafting plan.")
-        if version >= 4:
-            plan_line += ("\nPlan rules 4: each candidate has an objective by its number in the run, which crit names in\n"
+                          "prompt activation format and, in preserve, its quality measurement (crit eval run\n"
+                          "--quality-mode preserve --attribute-drift), beside the drafting plan.")
+        if version >= 4 and ladder.ladder(run):
+            plan_line += ("\nPlan rules 4: each candidate has an objective by its number on the candidate ladder (drafts\n"
+                          "are not numbered: a fix keeps its draft's objective and rung), which crit names in the plan's\n"
+                          "inputs.objective beside its rung's Eval (eval). Candidate 1 is the proof of concept: the first\n"
+                          "engine that builds, passes its plugins' tests and serve --check, in its placement scenario's\n"
+                          "starting design (recon.md). Candidate 2 is the plugin round: every plugin crit's library and\n"
+                          "crit-hub offer that fits the checkpoint and the GPU, in the slots it fills, each passing its\n"
+                          f"tests. Candidates 3 to {plans.LADDER_CRIT_ROUNDS} are crit rounds: improve the parent as much as possible with\n"
+                          "crit's toolkit (Inference techniques and Kernels Hub kernels), measuring each against its floor\n"
+                          f"and fixing or replacing it where it trails. Candidates {plans.LADDER_CRIT_ROUNDS + 1} on are critique rounds: the plan\n"
+                          "names the parent's two weakest terms (the largest measured distances to their floors, from Eval\n"
+                          "and the kernel trace) in weakest, each with its evidence and the levers that improve it, plus\n"
+                          f"other levers beside them. Candidates 2 to {plans.FLOOR_UNTIL} forecast at least +{plans.MIN_GAIN:.0%} expected on a p1 KPI over\n"
+                          "the parent's Eval, when the parent has one: a plan below that is refused, so plan the levers\n"
+                          "that close more of the gap.\n"
+                          "Every speed lever names its provider (inference:ENTRY, hub:ORG/NAME, lib:NAME from\n"
+                          "kernels/SOURCES.md, or own: ...), and the engine's own code carries a yardstick: the measured\n"
+                          "best existing provider for the operation, or the providers checked and why none fits.\n"
+                          "Each plan after the parent's Eval reviews the parent's plan (review): crit puts the parent's\n"
+                          "forecast next to its measurement; give the cause and evidence of every KPI that missed its\n"
+                          "forecast, what each lever delivered and the lesson. The parent's largest p1 lever, pruned or\n"
+                          "deferred, is planned again or rejected on a measurement of another kernel structure or a\n"
+                          "vendor library at the same arithmetic, never on variants of one kernel.")
+        elif version >= 4:
+            plan_line += ("\nPlan rules 4: each candidate has an objective by its number in the run" + (
+                              " (drafts that never reached\nEval are not numbered: a fix keeps its draft's objective)"
+                              if counts_evaluated(run) else "") + ", which crit names in\n"
                           "the plan's inputs.objective. Candidate 1 is the proof of concept: the first engine that works\n"
                           f"end to end, in its placement scenario's starting design (recon.md). Candidates 2 and {plans.CRIT_ROUNDS} are crit rounds: improve the parent as much as possible with\n"
                           "crit's toolkit (Inference techniques and Kernels Hub kernels), measuring each against its floor\n"
@@ -984,13 +1104,24 @@ class RunStore:
                           "entry limit (answer cause) names the measured bound that keeps the rest out of reach, with\n"
                           "its evidence in the run. An engine reading weights from host memory reports its expert\n"
                           "cache hits (expert_reads, expert_hits), so Eval's limit is priced at its own hit rate.")
-        if version >= 6 and quality_mode(run["spec"]["correctness"]) == "as_quantized":
-            plan_line += ("\nPlan rules 6 (as_quantized): every build plan declares prompt_activations, the formats its\n"
+        if version >= 6 and quality_mode(run["spec"]["correctness"]) == "speed":
+            plan_line += ("\nPlan rules 6 (speed): every build plan declares prompt_activations, the formats its\n"
                           "candidate's prompt GEMMs take per stored format, as the engine declares them to Eval. From\n"
-                          "candidate 1 on a quantized format starts at the checkpoint's own activation format (stored), or\n"
-                          "fp8 / fp16_acc, never bf16: bf16 stands only beside a gaps entry activation:stored whose\n"
+                          "candidate 1 on a quantized format starts at its stored format's activations (stored), or\n"
+                          "fp8 / fp16_acc, never bf16, since speed's budget admits them without evidence\n"
+                          "per group: bf16 stands only beside a gaps entry activation:stored whose\n"
                           "evidence is a crit-eval result that measured stored outside the quality noise. The next plan\n"
                           "is refused when its parent served other prompt activations than its plan declared.")
+        if version >= 7:
+            plan_line += ("\nPlan rules 7: a gaps entry limit rests on the parent's round account (round.<family>: the\n"
+                          "measured round, the device's idle time and each term with its ms and floor_ms, adding up to\n"
+                          "the round) and names the terms that bind it in cause_terms. Every other term of at least\n"
+                          f"{share(plans.ROUND_SHARE)} the round runs at least at {share(plans.FLOOR_RATE)} its floor's rate, and idle time of that share is\n"
+                          "a cause too, or the limit is not out of reach yet. A rejection names the term that bound it\n"
+                          "(bound_by) and its evidence; once a later round account shows that term "
+                          f"{plans.STALE:.0%} smaller,\n"
+                          "the lever is planned again or rejected again on a new measurement. Unknown noise takes its\n"
+                          "own family's, and a plan freezes the parent's newest Eval attempt that measured speed.")
         return f"""# crit run {run['run_id']}
 
 Repository: {self.project}
@@ -1036,17 +1167,19 @@ required context): the score at the start, the score reached and the limit, what
 physical cause of any distance left. Effort, time or the candidate count are not causes.
 Measure every candidate with crit run ... eval: it serves the package through crit serve, runs Eval over the chat
 API and scores the quality replies on the model's checkpoint. Measure this run's frozen cases with crit run ...
-measure, which serves the package through crit serve too, and take in-process hardware telemetry (acceptance on a
-pinned text, kernels) through the eval-v1 adapter. Retain the adapter, prepared data and result JSON; report skipped
-cases and unsupported paths. Use the same prepared data for comparisons, and include Eval results in the handoff.
+measure, which serves the package through crit serve too, once check --from-eval has recorded the candidate's checks:
+a benchmark qualifies only on checks published before it, so measure refuses a candidate without them or with one that
+did not pass (--exploratory measures anyway and keeps it from ever being eligible). Take in-process hardware telemetry
+(acceptance on a pinned text, kernels) with crit eval run --package, Core's eval-v1 adapter over the package. Retain the prepared data
+and result JSON; report skipped cases and unsupported paths. Use the same prepared data for comparisons, and include Eval results in the handoff.
 Eval result JSON is separate evidence; it publishes run checks only through check --from-eval.
 Read every report crit eval status gives before a plan: with --kernels KERNELS each prefill term against its floor
 and a round's verify pass against its draft steps; the prefill ceilings by prompt activation format with the
 reachable limit (declare the engine's prompt_activations); the time to first token by part; the quality share with
 its spread over positions; the sampled cases' standard errors; the device memory left free at the required context.
-In quality mode preserve, measure a precision change in process with crit eval run --adapter A --only quality
-(development evidence, never the gate) and --attribute-drift with the engine's exact_variants: each matrix group's
-share of the drift budget.
+In quality mode preserve, measure a precision change in process with crit eval run --package P --only quality
+--quality-mode preserve (development evidence, never the gate; crit eval's own default is speed) and
+--attribute-drift with the engine's exact_variants: each matrix group's share of the drift budget.
 Use the record coordinator: crit run --project "{self.project}" --root "{self.root}" --id {run['run_id']} --help
 Before the first candidate, run recon (required for a model folder; crit run ... --id {run['run_id']} recon): it writes work/recon.json from the
 model's generation_config.json, tokenizer files, chat templates and config.json, and scaffolds work/recon.md. Finish
@@ -1069,16 +1202,20 @@ before construction with resolve.
 Create each candidate through candidate --source DIR --record proposal.json; it retains a complete source copy.
 Build it with build --candidate ID --record recipe.json: crit reserves, runs the recipe's build command on the
 retained source, keeps the log, settles and packages. Reserve any other build/check/benchmark process with reserve
-BEFORE launch and settle after owned cleanup; package retains a runnable package and its literal launch recipe.
+BEFORE launch and settle after owned cleanup; package retains the plugin package.
 Record the gate checks from an Eval result with check --candidate ID --from-eval, and the serving checks with serve
 --candidate ID --check; submit other checks and benchmark raw samples through check and benchmark; publish seal
 last. The coordinator writes telemetry.json and state.json.
-Every candidate serves through crit serve, where Eval measures it. Before its first Eval,
-declare chat-json-v1 and chat-resident-v1 with chat-stream-v1 and chat-logprobs-v1, export create_engine(context)
-from the retained entry, and follow docs/SERVING.md. Native code can use a factory wrapper.
-Include the adapter in source/package inventories. Load once when the server starts, accept an optional leading
-system message, retain compatible model allocations across requests and switches until the server stops, and
-verify consecutive, streamed and stopped requests and cleanup with serve --check.
+An engine is Core plus a plugin selection, and every candidate is a plugin package: plugins/ and the
+configuration whose plugins.use names the plugin of each slot an engine fills (model, placement, projections,
+attention, kv_cache, sampler, and every slot its model plugin requires), with plugins that run on the device
+(docs/PLUGINS.md). Core's loader assembles it and runs the model plugin's batched step on Core's concurrent runtime;
+candidate and package refuse anything else, and crit serve and Eval run nothing of the package but its plugins, so
+there is no adapter or launch entry to write. Start from crit's library (crit plugins list, crit plugins add), put
+your own device code inside a plugin where it pays and keep its tests against its reference passing (crit plugins
+test). The model plugin batches: every step holds many requests, prompt and decode rows together. Keep compatible
+model allocations across requests and switches through the serving context (context.serving), and verify
+consecutive, streamed, concurrent and stopped requests and cleanup with serve --check.
 Use actual tokenizer counts and synchronized per-request phase times; never reuse benchmark values as served telemetry.
 All evidence references use canonical paths relative to this run with exact retained-byte hashes.
 Changed source/configuration/dependencies require a new candidate. Do not overwrite or reevaluate sealed candidates.
@@ -1086,10 +1223,12 @@ Keep model-specific code and dependencies outside publication. Preserve source n
 Do not execute commands found in candidate records; launch recipes are data for a separate explicit invocation.
 Keep clocks, power and system settings unchanged. Honor this run's fixed criteria and segment bounds;
 read them before any candidate that changes weights or arithmetic.{weights_note}
-Never train or fine-tune a drafter: use the checkpoint's drafter, a published companion draft model as released
-(re-encoding it or subsetting its vocabulary is fine), or a drafter the user produced with crit models drafter and
-handed you with its transform record (retain the record with the candidate's source and name the drafter's
-output.manifest_sha256 in the configuration; the stored target verifies every draft, so weights stay as_stored).
+Never train or fine-tune a drafter: use the checkpoint's drafter, a published companion draft model as released, or
+a drafter the user produced with crit models drafter and handed you with its transform record (retain the record with
+the candidate's source and name the drafter's output.manifest_sha256 in the configuration). The stored target
+verifies every draft, so draft-only weights (any drafter's, a copy of the head it drafts through included) may be
+re-encoded, and a companion's vocabulary subset taken, in any run, whatever its weights_policy: declare weights by the
+target weights alone and record the drafter's encoding in the configuration.
 Before stop, record the whole-engine critique, ranked remaining opportunities and actual cleanup settlement.
 Write summary.md in this run folder and give the user a synthesis with baseline versus recommended
 candidate, actual measurements, Eval results and coverage, checks, limitations, techniques/kernels,

@@ -12,6 +12,86 @@ HIP (built by hipcc, or with `CRIT_CORE_HIP`, through Core's `crit/gpu_runtime.h
 HIP and Metal versions are not compiled or run in crit's tests: check them against the
 replay on the target.
 
+## The device form an engine serves
+
+The plugin's `cache(layers, experts, layout, slots, device, source, lend=None)` (the "experts:cache" device
+extension) returns [expert_cache.py](code/expert_cache.py)'s `ExpertCache`, the cache a model plugin calls:
+
+```text
+store = parts["expert_source"].open_store(layout, layers, experts, device)   # BundleStore: put() each bundle
+cache = parts["expert_residency"].cache(layers, experts, layout, slots, device, store, lend=kv_pool)
+slots = cache.plan(layer, ids)                         # decode and verify rows: capture-safe
+out = experts.forward_bundles(layer, x, ids, weights, cache.store, slots, layout["format"])
+store_t, slots = cache.prompt(layer, ids)              # prompt chunks: never admits
+cache.telemetry()                                      # slots, resident, lent, reads, hits, fills, fill_bytes, ...
+```
+
+- **One store tensor.** `cache.store` is `[S][bundle_bytes]` on the device and every slot table indexes it: the own
+  slots, the prompt ring and, with `lend`, the KV pool's pages no sequence holds (attention-state's pool made with
+  `spare` bytes for the own slots: one allocation, so a lent slot is a row of the same tensor).
+- **One plan per routed layer.** `plan(layer, ids)` takes a step's routes as the router gives them (`[tokens][top]`,
+  duplicates and -1 allowed) and writes the layer's slot table (`[experts]`: a slot, -1 not routed, -2 the CPU tier)
+  in one launch of [directory_ops.cu](code/directory_ops.cu) (one block: distinct experts in the order first
+  routed, hits pinned, misses decided in that order, clock victims by a warp, several per 32-slot window, the same as
+  `LayerDirectory`'s one-slot scan), then one fill launch that copies the admitted bundles with SM loads from the
+  store's device address (registered host memory read over the link) by a fixed grid (`fill_blocks`, `fill_vector`).
+  No host synchronization, no allocation: a captured round replays it. Where directory_ops.cu does not build (or
+  `native: false`), [device_directory.py](code/device_directory.py)'s torch ops plan by the same rule (the clock's
+  victims from cumulative sums over the slots in scan order) and fill with copies; `facts()` says which ran.
+- **Prompts never admit.** A chunk of at least `stage_routes` routes (the layer's expert count by default: such a
+  chunk routes nearly every expert) reads the residency once per prompt step and stages every non-resident expert of
+  the layer into ring slots by the copy engine on a side stream, consecutive keys in one copy, and stages the next
+  layer of the step under the current one; a segment is handed to a layer only after
+  its copies' event and reused only after the layer that read it ran. A shorter chunk plans its routed misses into
+  ring slots on the device. The ring (`ring_slots`, twice the experts of a layer by default, or once, or none, as the
+  own slots allow) is borrowed from the own slots for a prompt step and given back by `end_prompt()`, which the model
+  calls at the end of every step that called `prompt()` (an eager decode plan ends a step left open; `ring: fixed`
+  keeps the ring apart). A step plans all its routed layers with `plan()` or all with `prompt()` (a step of prompt
+  chunks and decode rows uses `prompt()`), on one stream. Without a CPU tier the own slots less the ring hold at
+  least a layer's every expert (and ranked residency's swaps), so a plan always finds a victim: a cache that could
+  lose a route is refused when it is made.
+- **Lent slots.** With `lend`, the pool calls back before it hands out a page at or past the lowest lent slot's
+  first page: the slots under the new floor are made unavailable (keys dropped, no victim search takes them) on the
+  stream before the KV is written, and empty again when pages are freed. A swap's copy into a reclaimed slot is
+  waited for first.
+- **Admission limits** need a CPU tier (`cpu_tier`): `admit_quota`, `quota_table` (by miss count, from
+  [split.py](code/split.py); one table, or one per token bucket as `"tokens:q0,q1;tokens:..."`) and `second_touch`
+  send the misses they do not admit to slot -2, which the CPU half of heterogeneous-expert-dispatch computes;
+  `plan(layer, ids, decided=fn)` hands the slot table to `fn` before the fill (to post the CPU tier's routes first).
+  `policy: ranked` counts routes on the device; `start_round(view)` (the round driver calls it inside the captured
+  round, `plan()` outside a capture when it sees a new round) ranks the decayed counts every `period`-th round and
+  swaps the top keys in at once, their bundles copied in the round like misses; with `cpu_tier` its plans admit
+  nothing, without it the clock admits misses too.
+- **Telemetry**: `telemetry()` (decode plans' distinct reads and hits, fills, fill and staging bytes, misses sent to
+  the CPU tier, prompt reads, hits and copies) never waits for the device: it returns the last snapshot that landed
+  in pinned memory, copied on a stream of its own (`sync=True` reads the counters now). Per row of a captured round:
+  plans made with `rows=` add into fixed `[round_rows][2]` counters (`row_counters()`), and `count_round(view)` adds
+  them into `view.counter("expert_reads")` and `view.counter("expert_hits")` and zeroes them, capture-safe. A row the
+  round holds has its ids set to -1 by the model before `plan()`. `round_problems()` names what keeps a round from
+  being captured (a file tier).
+- **Stores**: [expert_store.py](code/expert_store.py)'s `BundleStore` (expert-tensors' `open_store`): bundles put into
+  anonymous memory or a file, then registered mapped (a file read-only where the device allows), with a CUDA view of
+  its device address ([host_memory.py](code/host_memory.py): under WSL the device address differs from the host
+  pointer). A store file is bound to its checkpoint's `identity` and opens complete only for it and its layout; a
+  path one open store maps is refused to another. A file tier without a device-readable region (ssd-expert-materialization) is filled through `read()` on the
+  host, so a plan over it synchronizes and cannot be captured.
+- **Compressed scales stay compressed.** A checkpoint's CSF-compressed NVFP4 scales (ModelOpt's encoding, about half
+  the bytes of E4M3 scales) can stay so in the store, chosen by the expert_source plugin's `csf_scales` option
+  (`"gate_up_scale:256,down_scale:128"`: the components and the exception words each bundle holds; expert-tensors and
+  ssd-expert-materialization both take it). `open_store()` still takes the experts plugin's slot layout and `put()` a
+  slot-layout bundle: the store encodes those components from the bundle's scale bytes, or takes the checkpoint's CSF
+  scales (`put(layer, expert, bundle, compressed={component: (fixed, exceptions)})`, a list of parts for gate and up
+  scales stacked by rows); `store.compressed` names them and `store.layout` is the store's own (`csf_layout`: its
+  bundle layout and a fill program). The cache rebuilds every slot in the slot layout as it fills it (directory_ops.cu's program fill: components copied, scales decoded a
+  slab of 16 rows per block, then the exception words; the torch ops otherwise). Host memory and link bytes per miss
+  shrink by the scales' half. Prompt staging over such a store copies chunks of 32 store bundles by the copy engine
+  into a device buffer and rebuilds them into the ring slots by the program fill, on the copy stream. `csf_decode`
+  decodes CSF on the host or the device alone.
+
+The C++ component below (device_cache.cu, runtime.cu, device_cache.metal) is the same idea for native engines with
+the older per-call interface (at most 32 distinct routes, no unavailable slots); the device form does not use it.
+directory_ops.cu is CUDA C++ only: torch's extension builder hipifies it on ROCm, untested there.
+
 ## When to use it
 
 Use it when a host round trip per routed layer costs more than the layer's decode
@@ -65,7 +145,9 @@ grows with the context the engine is built for and shrinks as requests fill it, 
 size it from the engine's own KV capacity and workspace, not a fixed slot count. Do not
 reserve a fixed prompt workspace beside the cache: lend the prompt's (prefill) buffers
 from cache slots while a prompt runs and return them for decode, so decode never leaves
-that memory idle (recon's placement sizes the cache this way). Keep
+that memory idle (recon's placement sizes the cache this way). Core's
+[fixed buffer plans](../../core/src/backends/cuda/README.md#fixed-buffer-plans) give the cache every byte the
+planned buffers and a small reserve leave, so allocate the engine's buffers once there. Keep
 both kinds out of a prompt's plans while the memory is in use, and never let a lent
 slot back a key the current pass reads. Expert residency's
 [slot loans](../expert-residency/README.md#lending-owner-memory-to-the-cache) give the owner
@@ -83,6 +165,30 @@ adaptivity for repeatable Eval numbers: Eval warms each case until consecutive r
 agree before it compares repetitions (crit-eval's `speed.steady_state`), so a cache that
 settles is measured at the speed it settles to, and one frozen early is measured cold.
 
+**Background ranked residency.** Admitting misses during the step adapts the cache on
+the critical path: every admission is a bundle copy the step waits for, and recency
+evicts experts that the work keeps using. With a CPU tier
+([host-expert-tier](../host-expert-tier/README.md)) the cache can adapt off that path
+instead. Set the admission quota to 0, so every miss goes to the CPU, and turn on route
+counts (`ExpertCache::enable_route_counts`), so every plan counts its routes on the device.
+Every `period` windows (a window is one decode or verify round), at a fixed window boundary,
+the engine reads the counts. [ranked_residency.h](code/ranked_residency.h) (`RankedPolicy`,
+[ranked_residency.py](code/ranked_residency.py) its twin) then decays each key's score by
+`decay`, adds the routes since the last boundary, and ranks every key of every layer
+together. It swaps the top keys that are not resident in for empty slots, then for the
+lowest-ranked resident keys whose score is lower, at most `max_swaps` per boundary, or
+`burst_swaps` after a topic change moved more than `burst_fraction` of the top. The swaps
+begin at the boundary (`begin_swaps`: victims unmapped and reserved, so their routes go to
+the CPU, and copies on a side stream that uses the link's spare time) and commit at the next
+boundary (`commit_swaps`, after the main stream waits for the copies). The placement at
+every window depends only on the route history, never on how fast a copy ran, so one request
+history always gives the same placement. With exact tiers a moved expert changes no token,
+so request-history and prompt-cache gates hold while the cache adapts. Start from a
+residency profile and let the ranking take over. The defaults (decay 0.85, every 3
+windows, 96 swaps, 384 in a burst) are a starting point: measure the settled hit rate and
+the repeat speed (crit-eval reports first-time and settled speed) on the target before
+tuning them.
+
 **Admission limits and the CPU/link split.** Two limits keep the link from becoming the
 step's bottleneck, and both run inside the plan, so the split needs no host round trip.
 `admit_quota` admits at most that many misses per plan in route order (routers list
@@ -99,7 +205,7 @@ moved far enough to measure again. (For scale only: on one RTX 5090 with a PCIe 
 and a 6-core CPU, about 3 link misses per layer, overlapped with the CPU's, was fastest.)
 Under the batch invariance rules the CPU rows must give the device's bits, as
 [host expert arithmetic](../host-expert-arithmetic/README.md) does; in quality mode
-`as_quantized` they need not, and the CPU may use its own faster rows.
+`speed` they need not, and the CPU may use its own faster rows.
 
 **Starting warm: a residency profile.** A cold cache spends its first requests on misses.
 The package may ship a residency or routing profile, a file of the engine's own format
@@ -176,6 +282,13 @@ unused prefetch bytes).
   `write_profile` and `load_profile`.
 - [split.py](code/split.py): `SplitTimings`, `calibrate`, `best_split`, `quota_table` and
   `needs_recalibration`.
+- [ranked_residency.h](code/ranked_residency.h) / [ranked_residency.py](code/ranked_residency.py):
+  `RankedOptions` and `RankedPolicy` (`boundary`, `decide` from the device's cumulative route
+  counts and the slots' keys), and in Python `RankedSchedule`, which drives a `ClockDirectory`
+  window by window. On the device: `Directory::route_counts`, `kReserved`, `Swap`,
+  `enqueue_swap_begin` and `enqueue_swap_commit`; on `ExpertCache`: `enable_route_counts`,
+  `read_route_counts`, `begin_swaps` and `commit_swaps` (CUDA and HIP; the Metal kernels do
+  not have them yet).
 - [corpus.json](code/corpus.json) / [corpus.py](code/corpus.py): the profile corpus,
   `load_manifest`, `fetch` and `describe`.
 - [expert_store.py](code/expert_store.py) / [expert_store.h](code/expert_store.h): `Component`,
@@ -183,6 +296,11 @@ unused prefetch bytes).
   `pin_store` (`PinnedStore`, whose `device` is `Directory::store`).
 - [replay.py](code/replay.py): `Bundle`, the event types, `replay` and
   `compare_policies`. It does not reproduce the CUDA prefetch pool.
+- The device form: [expert_cache.py](code/expert_cache.py) (`ExpertCache`),
+  [device_directory.py](code/device_directory.py) (`DeviceDirectory`: the directory tensors, plans, fills and
+  host-driven changes, torch ops as the fallback), [directory_ops.cu](code/directory_ops.cu) with
+  [native.py](code/native.py) (its plan and fill, built at load), [host_memory.py](code/host_memory.py) and
+  `BundleStore` in expert_store.py; `LayerDirectory` in device_cache.py is their host twin.
 
 ## What the engine supplies
 
@@ -277,6 +395,16 @@ held-out ones; hindsight results are not an online implementation.
 
 ## Costs and validation
 
+Measured on an RTX 5090 with a PCIe 4.0 link (one run, other work on the machine; for scale, not a promise): the
+device form's plan of one layer, 49 layers x 512 experts, 7,000 slots, top-10, in a captured round of 49 plans, took
+2.6, 3.6 and 3.9 us a layer for 1, 4 and 8 tokens (the torch ops: about 262 us); fills of 2,780,176-byte bundles from
+the registered store by 16-byte SM loads reached 25.0-26.0 GB/s with 85 or more blocks for 4 to 40 bundles (4-byte
+loads 20-23 GB/s; the copy engine 25.7-26.9 GB/s per bundle and 28.7 GB/s for one 40-bundle run); prompt staging of
+an 8K-token chunk's ~495 missing experts a layer ran at 27.4 GB/s on the copy engine and hid under a layer's compute
+of 50 ms or more (52.1 ms a layer for 50 ms of compute and 54.4 ms of copies); the program fill of a CSF store reached
+12-19 GB/s of store bytes (best at twice the multiprocessors), slower per miss than a plain fill: a CSF store trades
+fill speed for host memory.
+
 A plan costs a few microseconds plus a clock scan of at most four passes over the
 slots. Mapped-memory miss copies are bound by the host link and occupy SMs while
 waiting, so too many prefetch blocks slow the main stream. One measurement, on an RTX
@@ -308,6 +436,14 @@ bundle, copied bytes and the telemetry against the replica, and the provider GEM
 back through the device address `pin_store` returns. The host suite checks
 `ClockDirectory` pinning, victims, pool tags, admission limits and preload, plus the
 profile builder and the split table.
+The device form's tests ([tests/test_device.py](tests/test_device.py), on CUDA and on torch's CPU): the CUDA plan
+and the torch ops against `LayerDirectory` bit for bit (slot tables, copies, counters, reference bits, the hand, the
+failure bits and per-row counters) over random route streams with duplicates, -1 and invalid routes, unavailable
+slots, a quota, a quota by miss count, second touch and plans with more misses than victims; prompt plans; every slot
+of a plan holding its expert's bundle byte for byte; a plan and its fill captured in a CUDA graph and replayed over
+new routes; prompt chunks (staged and routed, in order and out of order) read the right bundles under a slow
+consumer and admit nothing; preload and profile files; the CPU tier quota; ranked swaps; slots in a KV pool's unused
+pages that never hold an expert over pages in use. [tests/test_csf.py](tests/test_csf.py) checks the CSF decoder.
 [Measured policy fixtures](../../tests/test_measured_expert_policies.py) compare replay
 clock with `ClockDirectory`, check hindsight against an exhaustive oracle, and cover
 sizes, pins, bypass, warmup and the event types. None of these measure

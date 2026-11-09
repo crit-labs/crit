@@ -7,9 +7,9 @@ from .compiler import (VERSION, CompileRequest, CompiledConstraint, CompilerCach
                        compile_language, make_compile_request)
 from .grammar import ByteGrammar, GrammarError, GrammarState, json_object_matches, matches
 from .preparation import Preparation, PreparationFailed, PreparationPending, PreparationService, PreparedMatcher
-from .vocabulary import ByteVocabulary, byte_vocabulary, from_pieces
+from .vocabulary import ByteVocabulary, byte_vocabulary, constrainable, from_pieces
 
 __all__ = ["VERSION", "ByteGrammar", "ByteVocabulary", "CompileRequest", "CompiledConstraint", "CompilerCache",
            "GrammarError", "GrammarState", "Preparation", "PreparationFailed", "PreparationPending",
            "PreparationService", "PreparedMatcher", "UnsupportedConstraint", "byte_vocabulary", "compile_language",
-           "from_pieces", "json_object_matches", "make_compile_request", "matches"]
+           "constrainable", "from_pieces", "json_object_matches", "make_compile_request", "matches"]

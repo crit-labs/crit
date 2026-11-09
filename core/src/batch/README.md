@@ -41,9 +41,7 @@ are two contiguous ranges it can compute by phase.
 A request's tokens must not depend on the requests sharing its steps or on how its
 prompt was chunked; batched output then equals serial output token for token, which
 Eval's `repeatable` and `request_history` gates and the greedy exactness check rely
-on. The rules for the engine's arithmetic on the step path (the
-[batched reference engine](../../../inference/batched-reference-engine/README.md)'s kernels
-follow each of them):
+on. The rules for the engine's arithmetic on the step path:
 
 - Work local to a row reads only that row, in a fixed order.
 - A reduction a row takes part in is split by the operation's shape and the device,
@@ -56,8 +54,8 @@ follow each of them):
   computes its column (column invariance, [device-speculative-round](../../../inference/device-speculative-round/README.md#column-invariant-arithmetic)).
 
 Column invariance serves only the greedy exactness check, which is a gate when a run
-requires exactness. In quality mode `as_quantized`, Eval passes an output difference
-that parts at a near-tie ([forks](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#forks-in-quality-mode-as_quantized)), so there every rule above is optional: a
+requires exactness. In quality mode `speed`, Eval passes an output difference
+that parts at a near-tie ([forks](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#forks-in-quality-mode-speed)), so there every rule above is optional: a
 kernel that breaks one (a split chosen by the row count, regrouped tiles, chunk
 boundaries in its order) is fine when it measures faster.
 

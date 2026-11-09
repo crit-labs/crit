@@ -1,0 +1,58 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "recurrent-state-recovery",
+  "title": "Speculative recurrent-state recovery with a two-pass chunked prefill",
+  "description": "recurrent-state-recovery's two_pass as the host form: pass 1 computes each chunk's part that does not depend on its start state, for every chunk at once; pass 2 walks the chunks in order with matrix products only (no triangular solve), the shape tensor cores suit; equal to the token-by-token recurrence up to rounding. On the device every sequence's state and causal-convolution window in a pool (code/device_states.py): verify windows keep their accepted prefix by the technique's strategy (commit: deferred replay from a stash at the next row, per-column checkpoints with one selected, or recompute from the kept start state), prompt chunks through the column scan up to exact_rows tokens (the configuration's, default 512) and through recurrent-scans' two-pass chunked prefill past it. The scans are recurrent-scans' from the kernel registry where it is installed, a torch formula otherwise.",
+  "fills": [
+    "recurrence"
+  ],
+  "provides": [
+    "rounds:recurrence",
+    "prompts:recurrence"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "reference": [
+    "sequential-recurrence"
+  ],
+  "options": {
+    "chunk_size": {
+      "type": "int",
+      "default": 64,
+      "min": 1,
+      "description": "the host form's chunk"
+    },
+    "exact_rows": {
+      "type": "int",
+      "default": 512,
+      "min": 0,
+      "max": 4096,
+      "description": "prompt rows of at most this many tokens run the exact column scan (one launch a layer, the bits of decoding the tokens one by one), longer ones the two-pass prefill (another summation order), in an eager call and in a captured prompt bucket alike; 0: every prompt row the two-pass prefill. The two give other bits, so the configuration states the value and nothing measures it at load. The default, 512, is the largest of crit_plugins.prompt_graphs' default buckets (see sequential-recurrence's exact_rows); device_states.scan_rows() measures where the two-pass prefill gets faster on a shape and device, to recommend a value"
+    },
+    "commit": {
+      "type": "choice",
+      "default": "deferred",
+      "choices": ["deferred", "checkpoints", "recompute"],
+      "description": "how a captured round keeps its accepted prefix: deferred (record the count; the next row replays it from a stash), checkpoints (the state after every column, one selected) or recompute (the start state kept, the prefix replayed at commit)"
+    },
+    "kernels": {
+      "type": "bool",
+      "default": true,
+      "description": "run rows through recurrent-scans from the kernel registry where it is installed; false: the torch formula"
+    }
+  },
+  "kernels": [
+    {
+      "name": "crit-labs/recurrent-scans",
+      "version": 1,
+      "revision": null,
+      "fallback": "the column scan, its commit replay and the causal convolution in torch (code/device_states.py), capture-safe, a row at a time; prompt rows through the scan"
+    }
+  ],
+  "sources": {
+    "recurrence": "code"
+  },
+  "entry": "plugin.py:create"
+}

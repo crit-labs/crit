@@ -8,13 +8,12 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from support.runs import ROOT, RunFixture
+from support.runs import ROOT, RunFixture, with_plugins
 from crit.run import store as run_store
 from crit.run.records import digest, inventory, read_json
 
 
-RECIPE = {"build": {"toolchain": {"identity": "host fixture"}, "dependencies": [], "command": ["fixture"]},
-          "launch": ["engine.fixture"], "capabilities": ["prefill", "decode"]}
+RECIPE = {"build": {"toolchain": {"identity": "host fixture"}, "dependencies": [], "command": ["fixture"]}}
 
 
 class PackagePublicationTests(RunFixture, unittest.TestCase):
@@ -23,7 +22,7 @@ class PackagePublicationTests(RunFixture, unittest.TestCase):
         source = self.root / "package-input"
         source.mkdir()
         (source / "engine.fixture").write_text("runnable fixture bytes", encoding="utf-8")
-        return candidate["candidate_id"], source
+        return candidate["candidate_id"], with_plugins(source)
 
     def publish(self, candidate_id, source, recipe=RECIPE):
         return self.store.package(self.run_id, candidate_id, source, recipe)
@@ -47,27 +46,28 @@ class PackagePublicationTests(RunFixture, unittest.TestCase):
 
     def test_rejected_recipe_does_not_strand_the_package_destination(self):
         candidate_id, source = self.prepare()
-        with self.assertRaisesRegex(ValueError, "launch entry"):
+        with self.assertRaisesRegex(ValueError, "Unknown fields; use extensions: launch"):
             self.publish(candidate_id, source, RECIPE | {"launch": ["absent.fixture"]})
         self.publish(candidate_id, source)
         self.assertEqual(self.store.get(self.run_id)["errors"], [])
 
     def test_entire_work_directory_can_be_packaged_without_copying_into_itself(self):
         candidate = self.candidate()
-        source = self.directory / "work"
+        source = with_plugins(self.directory / "work")
         (source / "engine.fixture").write_text("package from work", encoding="utf-8")
         copytree = shutil.copytree
         calls = []
 
         def bounded_copy(*args, **kwargs):
             calls.append(args)
-            if len(calls) > 5:
+            if sum(Path(call[0]) == source for call in calls) > 1:
                 raise OSError("recursive copy of staging into itself")
             return copytree(*args, **kwargs)
 
         with patch.object(shutil, "copytree", side_effect=bounded_copy):
             package = self.publish(candidate["candidate_id"], source)
-        self.assertEqual({row["path"] for row in package["files"]}, {"engine.fixture", "configuration.json"})
+        self.assertEqual({row["path"] for row in package["files"] if not row["path"].startswith("plugins/")},
+                         {"engine.fixture", "configuration.json"})
         self.assertEqual(self.store.get(self.run_id)["errors"], [])
 
     def test_copy_must_match_the_input_inventory_before_adding_configuration(self):

@@ -71,6 +71,9 @@ struct Request {
     Result result;
     std::exception_ptr error;
     bool done = false;
+    // Whether the waiter takes each token as it is published (a streaming sink), under the lock: a waiter that takes
+    // its tokens at completion is woken only then.
+    bool streaming = true;
     // Generation text (RequestOptions::text or stop_strings): the stream is worker-private after submission;
     // result.text grows only inside its charged capacity.
     bool text = false;

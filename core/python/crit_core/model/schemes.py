@@ -36,12 +36,12 @@ class SchemeError(ValueError):
 
 def quantization_of(config):
     """The quantization config of a crit_core.model.ModelConfig as plain data: quantization_config, else MLX's
-    quantization (mlx-lm writes both, alike), else {}."""
+    quantization (MLX checkpoints carry both, alike), else {}."""
     root = config.to_dict()
     return root.get("quantization_config") or root.get("quantization") or {}
 
 
-# Schemes whose only decoders are exllama's CUDA kernels, so the reference has no CPU dequantization to match, and
+# Schemes whose only decoders are CUDA kernels, so the reference has no CPU dequantization to match, and
 # the tensor each stores per matrix in place of .weight.
 UNREAD = {"exl2": ".q_weight", "exl3": ".trellis"}
 
@@ -53,7 +53,7 @@ def refuse_unread(quantization, names=()):
     if method not in UNREAD:
         method = next((m for m, suffix in UNREAD.items() for name in names if name.endswith(suffix)), None)
     if method:
-        raise SchemeError(f"{method.upper()} weights are not read: exllama decodes them only in CUDA kernels, so "
+        raise SchemeError(f"{method.upper()} weights are not read: they are decoded only in CUDA kernels, so "
                           "there is no CPU dequantization to check crit's reference against; use the base model or "
                           "another quantization of it")
 

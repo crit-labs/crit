@@ -15,7 +15,8 @@
       "Correctness argument: full-head verification keeps greedy output; the subset argmax equals the target whenever the target is inside",
       "Draft-head cost formula, coverage bound and expected tokens per round",
       "Reference CUDA gather-argmax kernel with optional logits, also usable as the full-head argmax",
-      "Subset size chosen from measured tokens per round and round time at each candidate size, not from coverage"
+      "Subset size chosen from measured tokens per round and round time at each candidate size, not from coverage",
+      "A subset the model's device head reads as head.rows, device counts of emitted tokens and the subset re-chosen between rounds"
     ],
     "engine_supplies": [
       "Head encoding and row decoder shared by draft and verification",

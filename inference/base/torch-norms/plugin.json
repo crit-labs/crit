@@ -1,0 +1,22 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "torch-norms",
+  "title": "Normalization, rotary positions and gated products in plain torch ops",
+  "description": "The plain norms plugin: fused-norms' host form (rows of numbers in FP64, the slot's oracle) and its device form in torch ops (fused-norms' code/torch_norms.py): RMSNorm with an offset weight, a residual added in place and a chosen output dtype, query/key head norms, the head norm with rotary positions, gated RMSNorm, rotary positions (half or interleaved pairs, partial, inverse frequencies or a cos|sin table), SiLU, GELU and sigmoid products, L2 norms, the sum of several residual streams (gated, weighted or plain) and one row added into every stream, a norm weight per stream or head. FP32 inside, one rounding; every reduction through torch's fused rms_norm, so each row's bits are independent of the rows beside it; capture-safe. A chain of small torch kernels per operation: the reference fused-norms is compared with, and what an engine falls back to. The fused forms (norms:fused) are the separate calls in sequence, softplus_decay torch's softplus and sigmoid.",
+  "fills": [
+    "norms"
+  ],
+  "provides": [
+    "rounds:norms",
+    "prompts:norms",
+    "norms:fused"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "sources": {
+    "norms": "../../fused-norms/code"
+  },
+  "entry": "plugin.py:create"
+}

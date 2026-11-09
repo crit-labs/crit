@@ -1,0 +1,31 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "round-router",
+  "title": "A test stand-in for a router's form inside captured rounds, over topk-router",
+  "description": "The package's topk-router plugin with its device selection run without reading the logits back to the host (topk-router checks them finite on the host first), so it runs inside a captured round. For the round driver's tests of a mixture-of-experts model; topk-router provides its own round form.",
+  "fills": [
+    "router"
+  ],
+  "provides": [
+    "rounds:router"
+  ],
+  "devices": [
+    "cuda"
+  ],
+  "options": {
+    "inner": {
+      "type": "str",
+      "default": "topk-router",
+      "description": "the package's router plugin this stands in for"
+    },
+    "score_before_selection": {
+      "type": "bool",
+      "default": false
+    },
+    "renormalize": {
+      "type": "bool",
+      "default": false
+    }
+  },
+  "entry": "plugin.py:create"
+}

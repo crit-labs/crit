@@ -57,6 +57,22 @@ and only then replaces the committed target. Any prefix may be committed,
 including zero, so Core can truncate at a stop. A failed commit consumes the round;
 `discard(id)` rejects it. Stale IDs and duplicate commits are errors.
 
+## On the device inside captured rounds
+
+The plugin's device form (`draft:device`, [device_drafts.py](code/device_drafts.py)) keeps each round slot's tokens
+(prompt and outputs, the pending token last) in a ring on the device and computes `PromptCopyIndex.propose_matched`'s
+copy for every row at once in torch: the longest continuation of the context's last `window` tokens among their 64 most
+recent occurrences (outputs needing `history_window` matching tokens), the most recent of equally long ones, and how
+far back the match goes, over the ring's last `capacity - (widest + 1)` positions (a round's commit writes up to
+`widest + 1` positions past its frontier, and fewer again after a truncation, never into the searched span). A slot's history starts at `seed(slot, tokens)` (the prompt and the first output token),
+which the model calls after the round driver binds the slot. `commit_round` writes the round's emitted tokens into the ring from the device's counts, so
+copies need no host between rounds (Core's native rounds). The copies equal the host index's wherever the sequence
+fits that span (`capacity`, default 16,384 tokens). With `override` the model's draft head drafts the chain
+(`head_chain`) and a copy matching at least `override` tokens replaces its first drafts. A copied draft is drawn from no
+law: in sampled rounds its column's law is cleared and the verify takes the target's own draw there.
+[device_verify.py](code/device_verify.py) is this entry's verify for every row of a round (chain-verifier's
+`verify:device`): it writes each row's emitted tokens and counts, and the round driver advances its own state.
+
 ## What the code supplies
 
 | File | Supplies |
@@ -266,7 +282,7 @@ budget is the engine's to measure, for example against `AdaptiveDraftBudget`'s s
 per published token. Before `minimum_samples` outcomes it predicts 1 and cuts nothing.
 A cut drops drafts only, so the output law is the verification rule's. The native check
 recovers a simulated law (slope 1.3, intercepts 0.5 to -1) from 4,096 drafts to 1.34
-and within 0.06. It is the estimator vLLM uses for adaptive verification without a
+and within 0.06. It is an estimator for adaptive verification without a
 head; a drafter that publishes a confidence head uses
 [confidence cuts](../hidden-state-drafters/README.md) instead.
 

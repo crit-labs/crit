@@ -2,20 +2,16 @@
 from crit.pull.store import InstallStore, engine_id
 from crit.run.store import ROOT
 
-from crit_core.serving import JSON_CAPABILITY as CAPABILITY, RESIDENT_CAPABILITY
-
-from .engine import EngineError, ServedEngine, package_signature
-from .options import serving_capabilities
+from .engine import EngineError, ServedEngine, package_capabilities, package_signature
 
 
 def installed_spec(installs, engine, verify_model=False):
-    """What crit serve loads for an installed engine: its verified spec, refused without a resident chat adapter."""
+    """What crit serve loads for an installed engine: its verified spec, with what Core serves for its plugin
+    package (package_capabilities)."""
     spec = installs.spec(engine)
-    if not {CAPABILITY, RESIDENT_CAPABILITY} <= set(spec["capabilities"]):
-        raise ValueError(f"{engine}'s package declares no resident chat adapter ({CAPABILITY}, "
-                         f"{RESIDENT_CAPABILITY}), so crit serve cannot load it")
-    return spec | dict(capabilities=serving_capabilities(spec["capabilities"]),
-                       signature=package_signature(spec["package_path"]), verify_model=verify_model)
+    capabilities = package_capabilities(spec["package_path"], spec["model_path"], spec["configuration"])
+    return spec | dict(capabilities=capabilities, signature=package_signature(spec["package_path"]),
+                       verify_model=verify_model)
 
 
 class InstalledEngine(ServedEngine):

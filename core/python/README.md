@@ -7,14 +7,25 @@ with Core's stop rules. It ships as the `crit-core` distribution (`pip install c
 `pip install crit` brings it along), and `crit_core.__version__` is crit's version. From a checkout, put
 `core/python` on `sys.path`.
 
+`crit_plugins`, in the same distribution, is the contract every engine loads with, since every engine is Core plus
+plugins: plugin manifests, crit's slots and their interfaces (the required ones and the model plugin, Core's step
+model), the slots' device forms and the device extensions plugins provide (`device`), the assembly that checks a
+selection as a whole engine, creates its plugins and measures their memory, the registry kernel loader (`kernels`),
+Core's round driver for captured decode rounds (`rounds`) and captured prompt chunks (`prompt_graphs`), the helpers a
+plugin's own tests use and the variants an ablation serves ([crit plugins](../../docs/PLUGINS.md)). Core's loader,
+`crit_core.engine`, assembles a package with it and runs the result. It holds no technique and no arithmetic: the
+plugins are crit's [Inference](../../inference/README.md) techniques and an engine's own.
+
 | Module | Contents | Native counterpart |
 | --- | --- | --- |
 | [files.py](crit_core/files.py) | `ModelFiles` sources (`DirectoryFiles`, `MappingFiles`, `CallableFiles`), `model_files`, `FileRecord`, `ModelFilesError` | `ReadOnlyFile` ([io](../src/io/README.md)) |
 | [jsonfile.py](crit_core/jsonfile.py) | `loads`, `read`, `JsonError`: strict JSON | [crit/json.h](../include/crit/json.h) |
 | [model](crit_core/model/README.md) | `load_model_config`, `ModelConfig`, crit eval's config rules, `inspect_safetensors`, `inspect_model`, `TensorReader` (tensor bytes), `matrix_parts` and `layer_prefix` (stored weight matrices) | [crit/model_config.h](../include/crit/model_config.h), [crit/safetensors.h](../include/crit/safetensors.h) |
 | [text](crit_core/text/README.md) | `Tokenizer`, chat templates, `GenerationConfig`, `IncrementalDetokenizer`, `PromptTokenCache`, `StopMatcher`, `TextStream`, `load_model_text` | [crit/text.h](../include/crit/text.h) |
-| [native.py](crit_core/native.py) | `NativeEngine` (ctypes over an [engine library](../src/runtime/README.md#engine-libraries)), the stock adapters `eval_engine` (eval-v1) and `resident_engine` (chat-resident-v1) over a library or a Python engine with its interface (`PythonEngine`), and `StepEngine`, a Python step model on Core's concurrent runtime ([step engines](../src/runtime/README.md#step-engines)) | [crit/native_engine.h](../include/crit/native_engine.h), [crit/step_engine.h](../include/crit/step_engine.h) |
-| [batch.py](crit_core/batch.py) | `StepLayout`, `step_item`, `row_pages`, `PageReservations`: a batched step's rows for Python engines | [crit/batch.h](../include/crit/batch.h) |
+| [engine.py](crit_core/engine.py) | Core's engine loader, the one way an engine runs: `load` (a plugin package assembled as a whole engine and run on Core's concurrent runtime), `check_package`, `capabilities`, `serving_problems`, `LoadContext`, and Core's adapters over it, `resident` (chat-resident-v1, crit serve) and `eval_v1` (eval-v1, crit-eval's `--package`, through [eval_adapter.py](crit_core/eval_adapter.py)) ([crit plugins](../../docs/PLUGINS.md#the-engine)) | |
+| [native.py](crit_core/native.py) | `StepEngine`: a model plugin's step model on Core's concurrent runtime, the `crit_core_steps` library ([step engines](../src/runtime/README.md#step-engines)), with `NativeRounds` for decode rounds Core launches itself | [crit/native_engine.h](../include/crit/native_engine.h), [crit/step_engine.h](../include/crit/step_engine.h) |
+| [batch.py](crit_core/batch.py) | `StepLayout`, `step_item`, `row_pages`, `PageReservations`: a batched step's rows for a model plugin | [crit/batch.h](../include/crit/batch.h) |
+| [buffers.py](crit_core/buffers.py) | `plan_buffers`, `BufferRequest`, `BufferPlan` (views, slots and scratch as slices of one allocation), `ScratchArena`: [fixed buffer plans](../src/backends/cuda/README.md#fixed-buffer-plans) | [crit/device_memory.h](../include/crit/device_memory.h) |
 | [constraints](crit_core/constraints) | `compile_language`, `CompilerCache`, `PreparationService`, `byte_vocabulary`, `matches`, `json_object_matches` ([guide](../src/constraints/README.md)) | [crit/constraints.h](../include/crit/constraints.h) |
 
 Everything but `crit_core.text` uses the standard library only. The text layer
@@ -53,10 +64,9 @@ exist only in Python; a native engine tokenizes through its `TextFrontend`
 suite in `tests/`. The text tests build tiny tokenizers in-process
 ([core_text_fixtures.py](../../tests/core_text_fixtures.py)) and need `tokenizers`
 and `jinja2`; the model tests compare the config rules with crit-eval-v2's own
-([eval_v2_rules.py](../../tests/eval_v2_rules.py)). `crit_core.native` is tested
-by Core's CTest against a toy engine library
-([native_engine_check.py](../../tests/core/native_engine_check.py)) and, for
-`StepEngine`, a toy Python step model on `crit_core_steps`
-([step_engine_check.py](../../tests/core/step_engine_check.py));
+([eval_v2_rules.py](../../tests/eval_v2_rules.py)). `crit_core.native`'s `StepEngine` is
+tested by Core's CTest with a toy step model on `crit_core_steps`
+([step_engine_check.py](../../tests/core/step_engine_check.py)), and `crit_core.engine` with the toy engine's
+plugin package through Core's loader and adapters ([test_core_engine.py](../../tests/test_core_engine.py));
 [test_core_batch.py](../../tests/test_core_batch.py) checks `crit_core.batch`
-against the C++ library's cases.
+against the C++ library's cases, and [test_core_buffers.py](../../tests/test_core_buffers.py) `crit_core.buffers`.

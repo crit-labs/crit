@@ -1,0 +1,32 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "memory-table-rows",
+  "title": "Lookup-table rows held in memory",
+  "description": "The plain embeddings plugin: the table kept in memory, rows indexed by id. The reference for file-backed tables; its device form's store() returns a table handle (lookup(ids), close(); any number of tables, NVFP4 rows too, as lookup-table-rows' store() gives them) indexing a table on the device, or with host: true keeping it in registered host memory and gathers a step's rows over the link (no device memory for the table). Either lookup captures in a CUDA graph (rounds:embeddings, and prompts:embeddings: a padded prompt bucket's lookup reads the batch's token ids alone, the padding row 0).",
+  "fills": [
+    "embeddings"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "provides": [
+    "rounds:embeddings",
+    "prompts:embeddings"
+  ],
+  "options": {
+    "host": {
+      "type": "bool",
+      "default": false,
+      "description": "device form: store() keeps the table in registered host memory, gathered over the link (lookup-table-rows' HostRows), not on the device"
+    }
+  },
+  "sources": {
+    "rows": "../../lookup-table-rows/code",
+    "memory": "../../device-expert-cache/code"
+  },
+  "entry": "plugin.py:create",
+  "test_with": [
+    "lookup-table-rows"
+  ]
+}

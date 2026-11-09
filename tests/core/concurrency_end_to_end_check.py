@@ -1,22 +1,25 @@
-"""Concurrent requests end to end on the CPU: a toy Python step model (crit_core.native.StepEngine over crit_core_steps)
-packaged with chat-concurrent-v1, served by crit serve four requests at once, measured by `crit run measure` at
-concurrency 4 and by crit Eval's concurrency part. Both see the aggregate grow with the requests in flight and a peak
+"""Concurrent requests end to end on the CPU: the toy engine's plugin package (tests/support/toy_plugins), which Core's
+loader runs on Core's concurrent runtime (crit_core_steps), served by crit serve four requests at once, measured by
+`crit run measure` at concurrency 4 and by crit Eval's concurrency part. Both see the aggregate grow with the requests in flight and a peak
 of as many requests as clients, and every batched reply equals the serial one. crit_eval is the one on PYTHONPATH (an
 installed one, else the checkout beside this one)."""
-import shutil
+import os
 import sys
 import threading
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-LIBRARY = Path(sys.argv[1]).resolve()
+# Core's runtime, which the resident host's loader opens the toy model on.
+os.environ["CRIT_CORE_STEP_LIBRARY"] = str(Path(sys.argv[1]).resolve())
 sys.path.insert(0, str(ROOT / "core" / "python"))
 sys.path.append(str(ROOT.parent / "crit-eval"))
 import crit_eval  # noqa: E402,F401  imported before crit's fixtures put the checkout beside this one first on sys.path
 
 sys.path.insert(0, str(ROOT / "tests"))
-from test_run_measure import SERVED, MeasureFixture  # noqa: E402
+from test_run_measure import MeasureFixture  # noqa: E402
+from support.engines import selection  # noqa: E402
+from support.runs import with_plugins  # noqa: E402
 from crit.run import measure  # noqa: E402
 from crit_api.engine import ServedEngine  # noqa: E402
 from crit_api.server import Api, Server  # noqa: E402
@@ -24,66 +27,10 @@ from crit_eval import EVAL_DIR, load_json  # noqa: E402
 from crit_eval.run.chat import ChatEngine, Server as ChatServer, load_text  # noqa: E402
 from crit_eval.run.concurrency import run_concurrency  # noqa: E402
 
-# The package's adapter: each next token is a hash of every token its row has seen, so a row decodes the same tokens
-# in a batch as alone, and every step takes 4 ms however many rows it holds, as a memory-bound decode step does.
-ENGINE = r'''
-import time
-from pathlib import Path
-
-from crit_core.batch import DECODE, step_item
-from crit_core.native import StepResult, resident_engine
-
-VOCAB, STEP_SECONDS = 64, 0.004
-
-
-def successor(seen):
-    h = 1469598103934665603
-    for position, token in enumerate(seen):
-        h = ((h ^ ((token + 1) * (position + 1))) * 1099511628211) % 2 ** 64
-    return h % VOCAB
-
-
-class Session:
-    def __init__(self, request):
-        self.prompt, self.seen, self.pending = list(request.prompt), [], None
-
-
-class Model:
-    def __init__(self, configuration):
-        self.context = int(configuration["context_tokens"])
-
-    def info(self):
-        return {"implementation": "toy step model", "vocabulary": VOCAB, "context": self.context, "prefill_chunk": 256,
-                "max_concurrency": 4, "max_pending": 0, "stop_tokens": [], "sampling": {"temperature": True},
-                "speculative": False, "step_library": str(Path(__file__).with_name(LIBRARY))}
-
-    def open(self, request):
-        return Session(request)
-
-    def step(self, rows):
-        time.sleep(STEP_SECONDS)
-        results = []
-        for row in rows:
-            s = row.session
-            item = step_item(row, len(s.prompt), len(s.seen))
-            if item.phase == DECODE:
-                s.seen.append(s.pending)
-                s.pending = successor(s.seen)
-                results.append(StepResult(0, [s.pending], True, 0, 1))
-            else:
-                s.seen += s.prompt[len(s.seen):len(s.seen) + item.rows]
-                done = len(s.seen) == len(s.prompt)
-                s.pending = successor(s.seen) if done else None
-                results.append(StepResult(item.rows, [s.pending] if done else [], done, 0, item.rows))
-        return results
-
-    def close(self):
-        pass
-
-
-def create_engine(context):
-    return resident_engine(context, Model)
-'''
+# The package: the toy engine's plugins (tests/support/toy_plugins), whose model's next token is a hash of every token
+# its row has seen, so a row decodes the same tokens in a batch as alone, and whose every step takes 4 ms however many
+# rows it holds, as a memory-bound decode step does. Four rows a step, no requests waiting beyond them.
+OPTIONS = {"toy-model": {"step_ms": 4, "prefill_chunk": 256, "concurrency": 4, "pending": 0}}
 VOCAB = {f"t{i}": i for i in range(64)}
 
 
@@ -116,14 +63,13 @@ class ConcurrencyEndToEnd(MeasureFixture, unittest.TestCase):
         self.store.recon(self.run_id)
 
     def served(self):
-        candidate = self.candidate()["candidate_id"]
-        package = self.root / ("package-" + candidate)
-        package.mkdir()
-        shutil.copy2(LIBRARY, package / LIBRARY.name)
-        (package / "engine.py").write_text(f"LIBRARY = {LIBRARY.name!r}\n" + ENGINE, encoding="utf-8")
-        self.store.package(self.run_id, candidate, package,
-                           {"build": {"toolchain": {"fixture": "host-python"}, "dependencies": [], "command": ["fixture"]},
-                            "launch": ["engine.py"], "capabilities": SERVED + ["chat-concurrent-v1"]})
+        record = self.candidate(configuration={"plugins": selection(options=OPTIONS)})
+        candidate = record["candidate_id"]
+        package = with_plugins(self.root / ("package-" + candidate))
+        manifest = self.store.package(self.run_id, candidate, package,
+                                      {"build": {"toolchain": {"fixture": "host-python"}, "dependencies": [],
+                                                 "command": ["fixture"]}})
+        self.checks(record, manifest)   # recorded before measure, as check --from-eval records them
         return candidate
 
     def serve(self, candidate):

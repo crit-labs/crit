@@ -156,10 +156,10 @@ Reference code, not tuned for performance:
 | --- | --- |
 | [greedy_accept.h](code/greedy_accept.h) / [.cu](code/greedy_accept.cu) | `control` layout, `result_width(K)`, batched `AcceptRows`, `enqueue_greedy_accept` (one thread per row), `enqueue_truncate`, `enqueue_seed`, `PackedLayout`/`PackRows`/`enqueue_pack` (the readback block), `enqueue_set_budget` (zero copy); unused result slots are -1 |
 | [device_round.h](code/device_round.h) / [.cpp](code/device_round.cpp) | `DeviceSpeculativeRound`, a single-row controller: `start()` or `seed()`, `prepare([K])` captures Forward and Finish (`RoundConfig::graphs = false` runs eagerly), `launch(output_tokens[, K])` with K up to the configured widest over one set of buffers, `tokens()`, `matched()`, `logprobs()`/`top_logprobs()` (`RoundConfig::logprobs`, `set_top_logprobs`), `RoundConfig::zero_copy`, `commit(accepted)`, `timings()` (`DeviceStage::forward`/`accept`) |
-| [toy_model.h](code/toy_model.h), [toy_model.cu](code/toy_model.cu), [toy_example.cpp](code/toy_example.cpp) | Synthetic target (attention over a device KV cache, a gated-delta layer from [recurrent-state-recovery](../recurrent-state-recovery/README.md), output head) and a bigram drafter through a real Core `Engine` |
+| [toy_model.h](code/toy_model.h), [toy_model.cu](code/toy_model.cu), [toy_example.cpp](code/toy_example.cpp) | Synthetic target (attention over a device KV cache, a gated-delta layer of its own committed by [recurrent-state-recovery](../recurrent-state-recovery/README.md)'s `select_accepted`, output head) and a bigram drafter through a real Core `Engine` |
 | [catch_up.py](code/catch_up.py) | `catch_up_plan` and a `PositionalDrafter` toy for stateful drafters |
 | [round_budget.h](code/round_budget.h), [round_budget.py](code/round_budget.py) | `RoundBudget`: tokens per round, round/step ratio, speedup `tokens_per_round / ratio`, pass/fail at 1.3 |
-| [python_round.py](code/python_round.py) | `SpeculativeRounds`, the round for Python engines over many rows at once with torch ([Python engines](#python-engines)): `start_row`, `release`, `move`, `capture(rows, width, mode)`, `launch`, `read`, `truncate`; `RoundView` for the engine's hooks; `rejection_predictions` and `draw` for sampled rounds |
+| [python_round.py](code/python_round.py) | The technique's pieces for rounds on Core's round driver (`crit_plugins.rounds`, [Python engines](#python-engines)): `rejection_predictions` and `draw` for sampled rounds, `override_drafts` and `CopyDrafts` for copied drafts |
 | [width_policy.py](code/width_policy.py) | `WidthPolicy`: the draft width per round from each row's per-depth acceptance (decayed) over the measured round cost, for the rows that decode together |
 
 ## What the engine supplies
@@ -288,11 +288,14 @@ ctest --test-dir build/inference-cuda -C Release -R "crit_device_round|crit_toy_
 
 ## Python engines
 
-A Python engine runs the same round with [python_round.py](code/python_round.py), in torch, for every
-request it decodes at once: a Core step engine's `step()` (`crit_core.native.StepEngine`, where Core
-schedules the requests) or a single request's loop with one row. `SpeculativeRounds(hooks, rows, widest,
-device)` holds each row's pending token, frontier, output allowance, stop ids and the previous round's
-emitted tokens on the device. One round of the first `rows` rows at width K:
+A model plugin runs the same round in torch, for every request it decodes at once, through Core's round
+driver ([crit_plugins.rounds](../../core/python/crit_plugins/rounds.py); [python_round.py](code/python_round.py)
+holds this technique's pieces for it: rejection sampling and copied drafts). `Rounds` composes the library's device
+forms into the round (the drafter's `draft:device`, the model's `verify(view, batch)` over a `RoundBatch`, the sampler's
+`rounds:sampler` predictions, each pool's `commit_round`), refusing to capture a selection whose plugins lack
+those facts; `SpeculativeRounds(hooks, rows, widest, device)`, below, runs it over an engine's own three hooks.
+Both hold each row's pending token, frontier, output allowance, stop ids and the previous round's emitted
+tokens on the device. One round of the first `rows` rows at width K:
 
 1. `hooks.draft(view)`: the drafter catches up on `view.catch_up_tokens` (the previous round's tokens, at
    the fixed width widest + 1 with junk past `view.catch_up_count`, as [catch_up.py](code/catch_up.py)
@@ -307,8 +310,9 @@ emitted tokens on the device. One round of the first `rows` rows at width K:
    advance by the count.
 4. `hooks.commit(view)`: the engine keeps each row's state after column `view.n_emitted - 1`, from the
    round's start (so it holds after a truncation too).
-5. One block (count, matched drafts, frontier, tokens) is copied to pinned host memory; `read()` waits on
-   one event and returns each row's tokens.
+5. One block (count, matched drafts, frontier, tokens, then each row's telemetry words: accepted drafts,
+   routed expert reads and hits) is copied to pinned host memory; `read()` waits on one event and returns each
+   row's tokens.
 
 Every buffer is allocated once, so `capture(rows, width, mode)` records a round as one CUDA graph at load,
 per width, row count and mode, and `launch` replays it; a round without a graph runs eagerly (and on the
@@ -316,9 +320,19 @@ CPU for host tests). Modes: `greedy`, `sampled`, `replay` (a fixed continuation 
 Eval's replay) and `forced` (the continuation is the draft too: scoring K + 1 positions of a fixed text per
 pass). `start_row` seeds a row after its prefill (the drafter's first catch-up ingests the prefill's
 token); `release` and `move` let rows join and leave between rounds while the decoding rows stay at the
-front; `truncate(keep)` applies a smaller count Core kept (a stop it knew, its output limit) and calls
-`commit` again. The hooks must be capture-safe: fixed shapes per (rows, width), no host synchronization.
+front; `launch(rows, width, mode, hold=...)` lets rows a step does not schedule sit a round out;
+`truncate(keep)` applies a smaller count Core kept (a stop it knew, its output limit) and calls `commit` again. The hooks must be capture-safe: fixed shapes per (rows, width), no host synchronization.
 The readback is a copy to pinned memory, not mapped zero-copy, which torch does not allocate.
+
+Served by Core's step engine, the rounds need no Python per decode step: a model's
+`native_rounds(library)` returns `SpeculativeRounds.native_rounds(library, widths)` (one width per row
+count, each captured first), binds each decoding row's slot to its session (`bind(slot, session)` after
+`start_row`, again after a `move`, `unbind` after `release`), and calls `adopt(*rounds.last[:2])` in its
+`commit` when `last` says the round ran natively, before any `truncate`. Core then launches the
+captured graph, reads the block and commits the tokens itself
+([native decode rounds](../../core/src/runtime/README.md#native-decode-rounds)); the model's `step()`
+sees only prompt chunks and steps it gave no width. Launch every round on the stream that was current
+when `native_rounds` was called.
 
 ### Copied drafts
 
@@ -345,6 +359,18 @@ the sampled law with and without an accepted copy over 60,000 draws, and give th
 same tokens from captured and eager rounds. No engine has measured it on a real model:
 how often copies win depends on the workload, so measure acceptance on the
 engine's own traffic before relying on it.
+
+### Table rows of draft tokens
+
+A model that reads per-token rows from a table on disk (hashed n-gram or embedding rows,
+[lookup-table-rows](../lookup-table-rows/README.md)) needs every verify column's rows before verify reads them. Read
+after drafting, they leave the GPU idle for a whole round of disk reads. Start each draft token's rows the moment the
+token exists instead, with `RowPrefetch.start` under the next draft step. A host drafter (prompt lookup, copied
+drafts, n-gram tables) knows its tokens at once. A device drafter writes each step's token to mapped pinned memory
+that a host thread polls (the [host-work-mailbox](../host-work-mailbox/README.md) pattern), or the engine drafts a
+step ahead. Before the step that reads the rows, `wait` on that round's tickets copies only what is still in flight,
+and a rejected draft's rows stay in the hot-row cache. Put the wait time in the round account: `RowPrefetch.stats()`
+says how much of it the table still costs.
 
 [width_policy.py](code/width_policy.py) chooses the width per round: each row's per-depth acceptance
 a_d with decay, E(K) = 1 + a_1 + a_1 a_2 + ..., over the round's cost base + K x step fitted from measured

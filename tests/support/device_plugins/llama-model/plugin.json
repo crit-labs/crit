@@ -1,0 +1,82 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "llama-model",
+  "title": "A Llama-layout decoder on the GPU, over the library's device plugins",
+  "description": "The device engine tests' model plugin: a LlamaForCausalLM checkpoint's tensors, its matrices in the projections slot, its KV in the kv_cache slot's pool, attention, the norms, rotary positions and SiLU product, and sampling by their slots, every step of many sequences one batch; with rounds, its greedy requests decode through Core's captured rounds, drafting from a stub draft head where the selection drafts.",
+  "fills": [
+    "model"
+  ],
+  "needs": [
+    "model_type:llama"
+  ],
+  "requires": [
+    "norms"
+  ],
+  "devices": [
+    "cuda"
+  ],
+  "options": {
+    "concurrency": {
+      "type": "int",
+      "default": 4,
+      "min": 2,
+      "max": 64
+    },
+    "prefill_chunk": {
+      "type": "int",
+      "default": 64,
+      "min": 1,
+      "max": 4096
+    },
+    "context": {
+      "type": "int",
+      "default": 512,
+      "min": 16,
+      "max": 1048576
+    },
+    "unplanned_mib": {
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 65536,
+      "description": "MiB the model holds on the device outside its placement plan"
+    },
+    "temporary_mib": {
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 65536,
+      "description": "MiB of device temporaries the factory makes and drops last, left in torch's cache"
+    },
+    "rounds": {
+      "type": "bool",
+      "default": false,
+      "description": "greedy requests decode through Core's round driver once their prompt is in"
+    },
+    "width": {
+      "type": "int",
+      "default": 3,
+      "min": 0,
+      "max": 8,
+      "description": "drafts per round when the selection drafts"
+    },
+    "draft_miss": {
+      "type": "int",
+      "default": 5,
+      "min": 0,
+      "max": 64,
+      "description": "the stub draft head drafts its second choice at positions p with p % draft_miss == 2 (0: never)"
+    },
+    "round_rows": {
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 64,
+      "description": "round slots (0: concurrency)"
+    }
+  },
+  "entry": "plugin.py:create",
+  "provides": [
+    "draft:head-device"
+  ]
+}

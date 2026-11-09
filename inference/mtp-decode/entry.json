@@ -19,7 +19,8 @@
       "Canonical duplicate-merging sparse supports, exact dense fallback, sparse sampling/acceptance/correction and synchronized target/draft repair",
       "Explicit supported budgets, issued producing-width/configuration tickets, stale/replay rejection and separately recorded preparation costs",
       "Native incremental exact-window accepted-history index with bounded occurrence search, rollback and context-capacity-independent lookup",
-      "Executable independent physical batch integration with actual host scratch, fixed logical draft width, private state recovery and recorded cap replay"
+      "Executable independent physical batch integration with actual host scratch, fixed logical draft width, private state recovery and recorded cap replay",
+      "Copy proposals from round slots' token history rings on the device (no host between rounds), a chain over a model's device draft head, long copies over it, and the chain verify of every row of a captured round with acceptance by depth kept on the device (code/device_drafts.py, code/device_verify.py)"
     ],
     "engine_supplies": [
       "Exact target arithmetic and causal D+1 predictions; native target fork, append and rewind restoring logits and non-KV state",
@@ -81,6 +82,14 @@
     {
       "path": "inference/mtp-decode/code/physical_batches_example.cpp",
       "purpose": "Complete synthetic greedy host integration of independent physical caps, real scratch allocation, ordered draft catch-up, failure recovery and measured recorded selection"
+    },
+    {
+      "path": "inference/mtp-decode/code/device_drafts.py",
+      "purpose": "Drafting inside a captured round in torch: the chain over a model's device draft head, prompt_copy's copy proposals from each round slot's token history ring, and override_drafts' copies over a chain"
+    },
+    {
+      "path": "inference/mtp-decode/code/device_verify.py",
+      "purpose": "verify for every row of a captured round in torch (matched drafts, correction or bonus, stops, allowance) and the acceptance-by-depth telemetry kept on the device"
     }
   ],
   "requires": {

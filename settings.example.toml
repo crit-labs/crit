@@ -21,11 +21,12 @@ context_reserve_gib = 3
 # positions and the device's free memory may allow less; the run record says which bound applied.
 context_tokens = 200000
 
-# The quality mode new runs judge quality in, when the request names none: preserve (the default) against the
-# checkpoint with exact activations; as_quantized, the mode for speed, against the same reference with a budget that
-# only keeps out a broken engine, so the engine runs the stored format's activations (as serving stacks run NVFP4 and
-# FP8 checkpoints) and any other precision it likes, for the stored format's prefill speed.
-# quality_mode = "preserve"
+# The quality mode of new runs whose request names none: how much output drift from the checkpoint you select the
+# engine may trade for speed, whatever format that checkpoint is stored in. Both modes judge against the same
+# reference (the checkpoint's stored weights with exact activations). speed (the default):
+# a budget that only keeps out a broken engine, so 4-bit or 8-bit activations, a lower-precision KV cache and the
+# like are the engine's to use; preserve: a budget that keeps the output close to the checkpoint's.
+# quality_mode = "speed"
 
 # Where Eval fetches reference packages (a checkpoint's prepared data and reference scores): a folder
 # or an https base URL. With one, crit eval run and crit run eval fetch them instead of scoring here.

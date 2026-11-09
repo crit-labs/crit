@@ -169,6 +169,29 @@ touches its pages. Fixtures:
 [device_memory_tests.cpp](../../../../tests/core/device_memory_tests.cpp) (host) and
 [cuda_memory_tests.cpp](../../../../tests/core/cuda_memory_tests.cpp) (device).
 
+### Fixed buffer plans
+
+A framework allocator hands out temporaries as a step needs them and keeps freed blocks for reuse, so an engine
+built on one needs gigabytes of free device memory as headroom: on one RTX 5090 under WSL2 an engine stalled its
+served requests with a 4.8 GiB reserve while its temporaries came from PyTorch's caching allocator, and an engine
+with every buffer allocated once at load ran on the same machine with 0.7 GiB. That difference is cache slots.
+`plan_buffers(requests, budget)` ([device_memory.h](../../../include/crit/device_memory.h)) lays out every named
+buffer (`BufferRequest`: name, bytes, alignment) in request order, then a scratch region for per-step temporaries,
+then as many equal slots of `budget.slot_bytes` (expert slots, cache pages) as fit `available - reserve`, between
+`min_slots` and `max_slots`. It is arithmetic only, and throws with the shortfall when the buffers, scratch and
+`min_slots` do not fit. `BufferArena(service, plan)` allocates the plan as one `BufferService` lease, charged once,
+and hands out `buffer(name)`, `slot(i)` and `scratch()`, an `Arena` the engine rewinds every step (its `peak()`
+sizes the next plan's scratch).
+
+Plan again when the engine reopens with other limits: bytes a lower context no longer needs (fewer KV pages) become
+slots instead of idle memory, and a plan that does not fit says so before any allocation. The reserve is what
+lies outside the plan: the driver, captured graphs, and anything a library allocates for itself. Size it from
+driver readings at peak (see [spare device memory](#spare-device-memory)). `crit_core.buffers` is the Python twin
+(`plan_buffers`, `BufferPlan.view` / `slot` / `scratch` as slices of one tensor, `ScratchArena`), so a PyTorch
+engine allocates one `torch.uint8` block and carves it. The fixtures (`memory_buffer_plan`, `memory_buffer_arena`;
+[test_core_buffers.py](../../../../tests/test_core_buffers.py)) check the layout, freed bytes becoming slots, the
+refusals, one charged allocation and the scratch region.
+
 ### Unchanged uploads
 
 A decode step uploads small metadata (slot indices, lengths, page tables between page

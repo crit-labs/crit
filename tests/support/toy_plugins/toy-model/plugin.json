@@ -1,0 +1,76 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "toy-model",
+  "title": "A toy batched step model on the CPU",
+  "fills": [
+    "model"
+  ],
+  "devices": [
+    "cpu"
+  ],
+  "options": {
+    "concurrency": {
+      "type": "int",
+      "default": 4,
+      "min": 1,
+      "max": 64
+    },
+    "prefill_chunk": {
+      "type": "int",
+      "default": 8,
+      "min": 1,
+      "max": 4096
+    },
+    "vocabulary": {
+      "type": "int",
+      "default": 1000,
+      "min": 2,
+      "max": 1048576
+    },
+    "context": {
+      "type": "int",
+      "default": 4096,
+      "min": 16,
+      "max": 16777216
+    },
+    "step_ms": {
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 1000
+    },
+    "pending": {
+      "type": "int",
+      "default": 16,
+      "min": 0,
+      "max": 1024
+    },
+    "skip": {
+      "type": "choice",
+      "default": "none",
+      "choices": [
+        "none",
+        "placement",
+        "projections",
+        "attention",
+        "masks"
+      ],
+      "description": "a slot the toy never calls, or masks: it never hands a row's allowed set to its sampler, for the loader's checks"
+    },
+    "prompt_graphs": {
+      "type": "choice",
+      "default": "off",
+      "choices": [
+        "off",
+        "on",
+        "skip"
+      ],
+      "description": "on (with CUDA): each step's projection work runs as a captured prompt chunk (crit_plugins.prompt_graphs) of its rows, so a request reaches the projections plugin through replays only; skip: the captured chunk multiplies without the plugin, for the loader's checks"
+    }
+  },
+  "entry": "plugin.py:create",
+  "provides": [
+    "taps:hidden"
+  ],
+  "description": "A batched step model on the CPU for tests of the loader, serving and ablation: the next token is a hash of every token its row sees, rows batch, a drafter makes its decode rounds emit several tokens. It provides the hidden-state taps a drafter reads."
+}

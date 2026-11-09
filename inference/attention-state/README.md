@@ -122,14 +122,19 @@ which read a block table like Core's `StateCache` gives (`view(...)` above). Sto
 pages in a format the provider reads (BF16 or FP8 rows per head); the INT8 G32 rows of
 `EncodedPages` are this entry's host codec, which no provider reads, so a device engine
 that wants them writes its own kernel and measures the provider on BF16 or FP8 pages as
-the yardstick. The [batched reference engine](../batched-reference-engine/README.md)'s
-paged attention kernels show crit's page layout on the device for BF16 and E4M3 pages; they
-are that example engine's own, not a provider.
+the yardstick.
 
 `PagedAttentionBatch` holds one plan per request (each with its own geometry,
 context and query rows) and returns results in key order; stale, duplicate or
 missing identities fail before arithmetic. Limits cover request count, query rows,
 workspace, output and metadata. It executes plans serially on the CPU.
+
+**Lending the pool's unused pages.** The device pool ([pages.py](code/pages.py) `KVPool`) keeps its page tensors in
+one allocation, with `spare` bytes after them for a borrower, and takes the lowest free page first, so every page at
+or past its `floor` holds no KV. A device expert cache borrows that memory: `lendable()` gives the allocation, each
+page tensor's place in it, the spare bytes and the floor, and `on_reserve(callback)` calls the borrower before a page
+at or past the bound it returned is handed out (it reclaims the slots under the new floor first) and after the floor
+falls (pages freed). Readers see the same tensors as without a borrower.
 
 ### Host page tier
 
@@ -208,6 +213,71 @@ On a GPU, a speculative round can keep the KV frontier on the device: verify
 writes K+1 rows at `frontier..frontier+K`, acceptance advances the frontier by
 `n_accepted` without a host read, and the next round overwrites rejected rows.
 See [device-speculative-round](../device-speculative-round/README.md).
+
+## On the device
+
+The plugin's device form is a paged pool in torch ([pages.py](code/pages.py)):
+every layer's keys and values in pages of `page` positions, each sequence's
+page table, copy-on-write forks, and page types BF16, FP16, FP32, FP8 E4M3 with
+the layer's key and value scales (`fp8`), FP8 E4M3 with an FP32 scale per
+position and KV head (`fp8:row`: the row's absolute maximum over 448, the
+quotient rounded to the nearest E4M3 value) and INT8 with an FP32 scale per
+position and KV head (`int8`: over 127, rounded to the nearest code, ties to
+even). `fp8_rows` and `int8_rows` are the encoding rules; the registry kernel
+`crit-labs/paged-kv-attention` writes a step's keys and values in one launch
+with the same codes and scales, and torch writes them where it does not load.
+
+Captured decode rounds bind a sequence to a round slot (`rounds:kv_cache`):
+`bind(slot, sequence, capacity)` takes its pages up to `capacity` positions
+(prompt, output limit and the widest verify window) and puts its page table at
+a fixed device address (`round_tables`), copying a page a fork still shares;
+`reserve(RoundBatch)` then computes every token's slot on the device from those
+tables and the batch's positions, so a captured round never allocates or waits
+for the host; a round wider than the pool's `round_rows` is refused. A token
+outside every bound capacity (an unbound slot, a position past the capacity)
+and a write's slot below 0 go to the dump page, one page past the sequences'
+that no table holds for a sequence and no borrower is lent; every unused entry
+of a round's or a step's page table points there. `start_round(view)` notes
+each slot's length as the round finds it, and `commit_round(view)` sets it to
+the round's frontier where the row emitted and keeps the noted one where it
+emitted nothing (a held row, or a `keep()` between rounds), on the device; with
+a tree verifier's accepted nodes (`view.tree_path`) it first moves their keys
+and values to consecutive positions, once a round. `unbind(slot)` reads the
+length back (one wait) and frees the pages past it; `move(source, target)`
+keeps the decoding rows packed at the front.
+
+Captured prompt chunks (`prompts:kv_cache`, crit_plugins.prompt_graphs):
+`stage_prompt(batch)`, outside the graph before each replay, takes the
+chunk's pages up to its end and puts its real tokens' KV slots and its page
+table in fixed buffers (`prompt_slots`, `prompt_table`), the padding's slots at
+the dump page; `reserve(batch)` inside the graph returns those slots, and
+`commit_prompt(batch)` sets the length after. A chunk of padding alone (a
+capture's warm-up) takes no page. The attention plugins read the prompt table
+on the device: the registry's prompt reader at a position read on the device
+(one graph for every frontier), else the bucket as window rows through the
+split-KV reader or its torch fallback; no FlashInfer plan runs in a capture.
+
+[device_attention.py](code/device_attention.py) is the attention slot's device
+form over this pool, which softmax-attention and partitioned-attention share:
+FlashInfer's paged prefill over 16-bit and FP8 pages first for prompt rows (and
+its decode for a step's window rows with softmax-attention's `decode:
+flashinfer`), then the registry's
+paged-kv-attention kernels (a split-KV reader of decode and verify windows over
+every page type, whose partitions walk each row's own length read on the
+device, with tree masks and block-sparse lists, tiles every GPU multiplies
+with mma.sync and one partition count per pool, so a column's bits are the same
+alone, in a window, in a step and in a round; and a prompt reader), then
+torch: rows gathered and multiplied by SDPA, or a masked FP32 softmax over the
+page tables that captures in a CUDA graph (in a capture it reads every position
+the tables hold, so its cost follows the pool's capacity; in an eager step only
+the positions its rows reach). The pool's `window` option (16 tokens) is the one
+knob of what is a window row: a longer row is a prompt row.
+
+The plugin's `facts()` report `kv_bytes_per_token`: the device bytes one token's
+slot takes in every page tensor of the pools the plugin made (keys, values and an
+INT8 or row-scaled pool's scales, every layer), summed over the pools. The engine's
+facts carry it to crit serve's `engine_facts` and to Eval, which sizes the KV cache
+and prices the KV term of its floors by it.
 
 ## Worked example
 

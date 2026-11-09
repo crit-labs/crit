@@ -85,9 +85,12 @@ drafts up to the first column whose prediction differs, then that prediction:
   of [Leviathan, Kalman and Matias](https://arxiv.org/abs/2211.17192). It accepts more often
   at high temperature (`1 - TV(p, q)` instead of `p(argmax q)`). `q` is a dense row or a
   `SparseLaw`, the kept (token, probability) pairs a fast-path draft row writes in place of
-  a vocabulary-sized row; a draft whose law has no sparse form (count -1: a full-law row)
-  falls back to its dense row, or, without one, to the target's own draw, the greedy-draft
-  rule, which keeps the law at a lower acceptance.
+  a vocabulary-sized row; a draft whose law has no sparse form (count -1: a full-law row, or
+  a fast-path row keeping more than 64 tokens) falls back to its dense row, or, without one,
+  to the target's own draw, the greedy-draft rule, which keeps the law at a lower acceptance.
+  So does a draft its law gives no mass (`q(d) = 0`: an empty law, count 0, or a token the
+  law does not keep), such as a copied draft a drafter cleared the law of: the rejection
+  rule's residual is the law of a draft drawn from `q`, which that one was not.
 - *Cut drafts* (a draft id outside the vocabulary, such as the -1 a drafter's
   [confidence cut](../hidden-state-drafters/README.md) writes): the column is the target's own
   draw with `u_sample`, like the bonus column, whatever its `q` row still holds. No draft was
@@ -146,6 +149,31 @@ tokens the history has still to take in (the emitted count after any Core trunca
 after a seed round whose token the engine already committed), before a law of the new round
 is computed.
 
+## Inside captured rounds: rounds:sampler
+
+The plugin's `rounds:sampler` extension ([device_rounds.py](code/device_rounds.py)) runs this law inside a captured
+decode round with no host value inside: `reserve(rows, widest, vocab, device, logprobs)` allocates every buffer once,
+`stage(slot, params)` writes a request's rules as its slot's `Request` row, and each round rewrites the rows' draw
+positions on the device from the round's output counts (`view.out_count`), so draft `d` draws at `out_count + d` with
+the `draft` purpose and verify column `c` at `out_count + c`. `draft_device(view, logits, depth, targets)` is a
+drafter's draw (argmax in greedy rounds and for greedy rows) with its law kept sparse (`SparseLaw`, at most 64 kept
+pairs; `targets` maps a draft vocabulary or a subset to target ids; a sampled round without `view.draft_laws` is
+refused), `laws(rows, widest)` the round's laws a drafter writes, and `predictions_device(view, logits, draft_laws)`
+writes every verify column's prediction by the rules above. After the accept, the round driver asks
+`logprobs_device(view, logits, tokens)` for Core's log-probabilities and ranked alternatives of the emitted tokens (the
+logits rows in emitted order, a tree's gathered along its path), so a round computes them once, of the tokens it
+keeps. A round over a token tree (`view.tree_depths`, draft-trees) predicts each node's own draw at
+`out_count + depth` through `Rows::tree`. A second `reserve` keeps the rules staged before, and the plugin's facts
+name the kernel the rounds run (`round_sampling`: `native` or `torch`). The launches are
+`sampling.cu`'s through [sampling_torch.cpp](code/sampling_torch.cpp), built at load through torch's extension builder
+(a name hashed from the sources); where it does not build, with the `rounds` option `torch`, and on the CPU the same
+rules run in torch over sorted rows in FP64 with dense laws (slower, exact up to cumulative sums in a parallel order).
+The tokens equal the host form's `predictions` for the same rows, drafts and laws wherever the fast path settles the
+row (greedy, `top_k <= 64`, or a kept set closing within the top 64); full-law rows keep their FP32 boundary caveat.
+A draft law of more than 64 kept tokens has no sparse form: its column is verified by the target's own draw, on the
+device as by the host form given no law (`None`) for that column, which keeps the target's law at a lower acceptance
+than the rejection rule.
+
 ## What the code supplies
 
 [sampling.h](code/sampling.h) / [sampling.cu](code/sampling.cu), linking `crit::core`:
@@ -159,6 +187,10 @@ is computed.
 | `Verify`, `enqueue_verify` | Verify predictions for the device greedy accept kernel: the target's draws for greedy drafts, accept/residual/bonus for sampled drafts against dense or sparse `q`; `VerifyRule::block` for block verification |
 | `Logprobs`, `enqueue_logprobs`, `logprob_scratch_bytes` | Core's `TokenLogprob` values on the device: chosen tokens' log-probabilities and ranked alternatives of raw rows, standalone or fused into `enqueue_sample` / `enqueue_verify` (a device round's `RoundView::logprob` rows) |
 | `enqueue_commit` | Counts and positions after publication, from a device-held emitted count |
+
+[sampling_torch.cpp](code/sampling_torch.cpp) binds the launches for torch tensors (host code), and
+[device_rounds.py](code/device_rounds.py) is the rounds:sampler extension over them, with the torch law as its
+fallback.
 
 [sampling.py](code/sampling.py) mirrors the processing, law, draw and verification in FP64
 with Core's bit-identical draw. The host oracle is `crit::core::Sampler`.

@@ -87,7 +87,7 @@ class TokenizeApiTests(TokenizeFixture, unittest.TestCase):
     adapter_suffix = TOKENIZE_ADAPTER
     request_options = True  # tools
 
-    def test_tokenize_detokenize_and_apply_template_answer_in_vllm_and_llama_server_shapes(self):
+    def test_tokenize_detokenize_and_apply_template_answer_in_the_shapes_clients_read(self):
         response, value = self.call("/tokenize", {"model": "default", "prompt": "hi"})
         self.assertEqual((response.status, value), (200, {"tokens": [1, 104, 105], "count": 3,
                                                           "max_model_len": 8192}))

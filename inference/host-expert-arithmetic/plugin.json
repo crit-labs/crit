@@ -1,0 +1,75 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "host-expert-arithmetic",
+  "title": "Block-scaled rows on the CPU in the device's declared order",
+  "description": "host-expert-arithmetic's declared row orders. Host form: every product, lane FMA and reduction step rounded once to FP32 in the order the options declare, within FP32 rounding of quantized-projections in its nvfp4 format. Device form on the CPU: a checkpoint's stored NVFP4 or INT4 matrices (E4M3 scale per 16) weight only in the 16-lane FP32 order, or W4A4 / W4A8 in the integer block order (activations quantized per row by the declared quantizers), 16-bit matrices a row at a time through torch; every row's bits those of the row alone at any row count (row_invariance prompt_rows). The native rows (C++ with AVX2 and AVX-512 paths, built at load) or the same orders in torch where they do not build.",
+  "fills": [
+    "projections"
+  ],
+  "reference": [
+    "quantized-projections"
+  ],
+  "options": {
+    "lanes": {
+      "type": "choice",
+      "default": 16,
+      "choices": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ]
+    },
+    "reduce": {
+      "type": "choice",
+      "default": "halving",
+      "choices": [
+        "halving",
+        "sequential"
+      ]
+    },
+    "product": {
+      "type": "choice",
+      "default": "scaled_elements",
+      "choices": [
+        "scaled_elements",
+        "block_dot"
+      ]
+    },
+    "activations": {
+      "type": "choice",
+      "default": "fp32",
+      "choices": [
+        "fp32",
+        "e2m1x2",
+        "int8"
+      ],
+      "description": "device form, nvfp4 matrices: what they multiply: FP32 activations (weight only, the 16-lane FP32 order), E2M1 x 2 per 16 under the matrix's input_scale (W4A4) or INT8 per 32 (W4A8), the integer block order; int4 matrices always W4A8 or W4A4"
+    },
+    "native": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "on",
+        "off"
+      ],
+      "description": "device form: the native rows built at load (on: refuse to load without them), or the same orders in torch (off)"
+    },
+    "threads": {
+      "type": "int",
+      "default": -1,
+      "min": -1,
+      "description": "device form: threads a matrix's rows are split over (-1: physical cores)"
+    }
+  },
+  "sources": {
+    "arithmetic": "code",
+    "quantized": "../quantized-projections/code"
+  },
+  "entry": "plugin.py:create",
+  "devices": [
+    "cpu"
+  ]
+}

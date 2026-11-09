@@ -1,7 +1,7 @@
 {
   "id": "host-expert-arithmetic",
   "category": "experts",
-  "summary": "Block-scaled expert rows (NVFP4, MXFP4, MXFP8, MXINT8, INT4 or an engine's own format) on any CPU in a declared operation order that a CUDA, HIP or Metal kernel reproduces bit for bit",
+  "summary": "Block-scaled expert rows (NVFP4, MXFP4, MXFP8, MXINT8, INT4 or an engine's own format) on any CPU in a declared operation order that a CUDA, HIP or Metal kernel reproduces bit for bit; and integer block rows (4-bit weights against per-block quantized activations) exact on every processor at integer speed",
   "implementation_status": "native_source",
   "implementation_scope": "C++20 scalar oracle; a portable vector path any compiler vectorizes for its CPU (Arm, x86, RISC-V), compiled again with AVX2 and AVX-512 on x86; hand-written AVX2 and AVX-512F paths for NVFP4; 4- or 8-bit codes, 16 or 32 per block, any element table, E4M3 and E8M0 scale decoders and a scale hook; 1-8 tokens per call; one device header for CUDA and HIP and a Metal version for both products; exact Python FP32 reference for NVFP4. Expert composition, activations, threading and the CPU share remain engine supplied.",
   "agent_guidance": {
@@ -15,7 +15,8 @@
       "Row interleaving that keeps every row's arithmetic and any thread split bit-identical",
       "E4M3 and E8M0 scale decoders and a hook for checkpoint-specific scale encodings",
       "dot_row_halving_format and dot_row_block_format<lanes, bits, block> for CUDA and HIP from one header, with explicit rounding intrinsics and a matching shuffle tree; the same functions in Metal",
-      "Exact Python FP32 reference using crit's NVFP4 codec"
+      "Exact Python FP32 reference using crit's NVFP4 codec",
+      "Integer block rows (host_int.h): 4-bit weights against activations quantized per block (E2M1 x 2 or INT8), exact block sums on any processor and one declared FP32 step, so the CPU rows (AVX-512 VNNI, AVX2), the device rows and the int-block-experts Hub kernels give the same bits at integer speed; declared quantizers, exp, SiLU and SwiGLU; an interleaved host layout for the CPU"
     ],
     "engine_supplies": [
       "Expert composition (projections, activation, routing weight) with activations that match bitwise on both processors",
@@ -77,6 +78,42 @@
     {
       "path": "inference/host-expert-arithmetic/code/implementation.py",
       "purpose": "Exact FP32 reference of the declared order"
+    },
+    {
+      "path": "inference/host-expert-arithmetic/code/host_int.h",
+      "purpose": "The integer block order: IntMatrix (rows or interleaved layout), IntActs, dot_rows_int, the declared quantizers, exp, SiLU and SwiGLU"
+    },
+    {
+      "path": "inference/host-expert-arithmetic/code/host_int.cpp",
+      "purpose": "Integer oracle, dispatch, interleave_row, quantizers and the declared exp"
+    },
+    {
+      "path": "inference/host-expert-arithmetic/code/host_int_avx2.cpp",
+      "purpose": "AVX2 integer rows (vpmaddubsw), both layouts, bitwise equal to the oracle"
+    },
+    {
+      "path": "inference/host-expert-arithmetic/code/host_int_avx512.cpp",
+      "purpose": "AVX-512 VNNI integer rows (vpdpbusd), both layouts, bitwise equal to the oracle"
+    },
+    {
+      "path": "inference/host-expert-arithmetic/code/host_int_device.cuh",
+      "purpose": "dot_row_int, the quantizers, exp, SiLU and SwiGLU on CUDA and HIP, bitwise equal to the host"
+    },
+    {
+      "path": "inference/host-expert-arithmetic/code/host_capi.cpp",
+      "purpose": "A C interface over the host rows (integer block and FP32 orders, quantizers, SwiGLU, the route-order combine) for ctypes"
+    },
+    {
+      "path": "inference/host-expert-arithmetic/code/native.py",
+      "purpose": "Builds the host rows (and a technique's own C++ beside them) into a shared library at load, ISA files with their own flags, cached by content"
+    },
+    {
+      "path": "inference/host-expert-arithmetic/code/rows.py",
+      "purpose": "HostRows: the C interface from Python over CPU torch tensors, rows split over threads"
+    },
+    {
+      "path": "inference/host-expert-arithmetic/code/declared.py",
+      "purpose": "The declared integer block order and FP32 order in torch on any device, the same bits as the C++ rows (an exact FP32 FMA by TwoSum): the torch fallback and an oracle"
     }
   ],
   "requires": {

@@ -57,6 +57,13 @@ escapes. Cancellation is checked between regions and at 1 MiB boundaries.
   file with a pool of positioned readers (Core's `ReadOnlyFile` read slots): demand reads before
   read-ahead, one read per pending key (a demand for a queued read-ahead moves it first), and a
   `Ticket` per read to wait on before `commit`.
+- [bundle_file.py](code/bundle_file.py): `FileBundleStore`, the plugin's bundle store (`open_store`, the file tier
+  of "experts:store"): every (layer, expert) bundle in one file in key order, written by `put()` (or a complete file
+  with the same layout reopened, its index beside it), read by `read(keys, into)` through lookup-table-rows' native
+  row reader (the bundles are its rows; positioned reads in Python without it) behind a `HostExpertTier` of
+  `host_bytes`. It has no device-readable region: device-expert-cache's `ExpertCache` fills its slots from `read()`
+  into pinned memory on the host, so its plans over this store synchronize and are not captured; a mapped store
+  (expert-tensors' `open_store`) serves captured rounds.
 
 No route predictor and no device copy: the engine copies a committed slot to the device cache
 (the slot is pinned, so a hit uploads directly) and copies an evicted device slot into an
@@ -139,8 +146,8 @@ and unused prefetched bytes, demand stall time and peak staging, not just predic
 accuracy. A host tier costs its capacity in host memory and one device-to-host copy per
 eviction, which overlaps the main stream; it pays when misses would otherwise come from the
 file, since the host link is usually several times faster than storage. Track tier hits, bytes
-read from the file per token and refusals. For scale only: one llama.cpp-based engine serving
-Qwen3.8-Flash-Next from NVMe on an RTX 3060 12 GB with 16 GB of RAM read 44.7 and 39.7 MiB
+read from the file per token and refusals. For scale only: one engine serving a mixture-of-experts
+model larger than its memory from NVMe on a 12 GB GPU with 16 GB of RAM read 44.7 and 39.7 MiB
 per generated token in two repeated requests without its 8 GiB tier and 35.4 and 12.4 MiB with
 it (13.9 and 14.3 against 16.3 and 22.0 tok/s); another engine measured fewer misses with
 identical tokens. Neither is a crit measurement. Checksums are O(B) per region and the reference builds a complete `bytes`

@@ -279,9 +279,25 @@ bool completes(cudaStream_t s, std::uint32_t* word) {
 
 }  // namespace
 
+namespace {
+// Makes `device` current for a scope and gives the caller's back.
+struct DeviceScope {
+    int previous = -1;
+    explicit DeviceScope(int device) {
+        if(cudaGetDevice(&previous) != cudaSuccess) previous = -1;
+        cudaSetDevice(device);
+    }
+    ~DeviceScope() {
+        if(previous >= 0) cudaSetDevice(previous);
+    }
+};
+}  // namespace
+
 JoinSupport probe_joins(int device) {
     JoinSupport out;
-    if(cudaSetDevice(device) != cudaSuccess) return out.detail = "cudaSetDevice failed", out;
+    const DeviceScope scope(device);
+    int current = -1;
+    if(cudaGetDevice(&current) != cudaSuccess || current != device) return out.detail = "cudaSetDevice failed", out;
     int map = 0;
     cudaDeviceGetAttribute(&map, cudaDevAttrCanMapHostMemory, device);
     HostWord word;
@@ -377,6 +393,7 @@ std::optional<double> measure(Join join, int joins, int replays) {
 
 JoinCosts measure_joins(int device, int joins_per_graph, int replays) {
     JoinCosts out;
+    const DeviceScope scope(device);
     out.support = probe_joins(device);
     if(!out.support.mapped) return out;
     out.device_poll_us = measure(Join::device_poll, joins_per_graph, replays);

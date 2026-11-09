@@ -1,0 +1,45 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "dense-layer-offload",
+  "title": "Whole layers on the device while they fit, the rest in host memory (dense-layer-offload's planner)",
+  "description": "dense-layer-offload's planner in the placement slot: tensors outside the decoder layers (embeddings, head, norms, caches) on the device, and each layer's tensors as one unit, resident on the device or in host memory. With the measured rates as options (device_gbs, upload_gbs, host_gbs from crit eval probe and this machine) the planner's fastest predicted plan places them, a streamed layer living in host memory; without them the leading layers stay resident while they fit. layers() reports each layer as device, stream or host for a model plugin that streams or runs host layers. Equals device-placement where everything fits.",
+  "fills": [
+    "placement"
+  ],
+  "devices": [
+    "host"
+  ],
+  "reference": [
+    "device-placement"
+  ],
+  "options": {
+    "device_gbs": {
+      "type": "float",
+      "default": 0.0,
+      "min": 0.0,
+      "description": "the device's measured bandwidth (crit eval probe), 0 when unmeasured"
+    },
+    "upload_gbs": {
+      "type": "float",
+      "default": 0.0,
+      "min": 0.0,
+      "description": "the measured pinned host-to-device bandwidth, 0 when unmeasured"
+    },
+    "host_gbs": {
+      "type": "float",
+      "default": 0.0,
+      "min": 0.0,
+      "description": "the measured host GEMV rate in bytes per ns, 0 when unmeasured"
+    },
+    "host_layer_ns": {
+      "type": "float",
+      "default": 0.0,
+      "min": 0.0,
+      "description": "the measured activation round trip of a run of host layers"
+    }
+  },
+  "sources": {
+    "offload": "code"
+  },
+  "entry": "plugin.py:create"
+}

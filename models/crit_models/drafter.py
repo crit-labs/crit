@@ -8,8 +8,9 @@ and predicts through the target's own output head, which is not trained and not 
 trained to match the target's next-token distribution at position t+1 (the token t+2) over calibration windows
 unrelated to Eval, by the KL divergence from the target's distribution; a held-out share of the windows measures
 how often its greedy draft equals the target's (top-1 agreement) and the KL left. The target's weights never change,
-so an engine that verifies every draft with the stored target keeps the target's output; `weights: as_stored`
-still holds for the target and the drafter rides along like a companion draft model, with its record.
+so an engine that verifies every draft with the stored target keeps the target's output. The drafter does not change
+the candidate's weights declaration, which the target weights alone decide, and it rides along like a companion draft
+model, with its record.
 
 The target pass follows the PTQ calibration pass (crit_models.ptq.calibrate): token embeddings through the decoder
 layers with the model's rotary embeddings and a causal mask, layer by layer so a model larger than device memory

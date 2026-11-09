@@ -78,6 +78,15 @@ def _decoder_steps(decoder):
     raise TextError(f"constraints do not support the tokenizer.json decoder {kind!r}")
 
 
+def constrainable(tokenizer):
+    """Whether byte_vocabulary derives the tokenizer's bytes: its tokenizer.json decoder is one constraints read."""
+    try:
+        _decoder_steps(json.loads(tokenizer.backend.to_str()).get("decoder"))
+    except TextError:
+        return False
+    return True
+
+
 def byte_vocabulary(tokenizer, eos=None):
     """The ByteVocabulary of a crit_core.text.Tokenizer. `eos` (default: the tokenizer's eos_token_id) is the one
     token that ends constrained output; every other special added token gets an empty piece and is never allowed.

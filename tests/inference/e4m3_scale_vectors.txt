@@ -1,6 +1,6 @@
 # E4M3FN scale encoding vectors: FP32 input bits, expected code (round to nearest even, saturating at 448).
 # Read by tests/test_techniques.py (nvfp4.py), tests/test_models.py (the PTQ codec) and tests/inference/nvfp4_tests.cpp
-# (nvfp4.h). The cases around 256 and the ties are the inputs of llama.cpp issue 31010 / PR 31020, which found an
+# (nvfp4.h). The cases around 256 and the ties are the inputs that exposed an
 # encoder that saturated every value >= 256 and rounded on a single bit; positive values only, as block scales are.
 0x43800000 0x78  # 256: exponent field 15 is finite (only 0x7F is NaN)
 0x43960000 0x79  # 300 -> 288

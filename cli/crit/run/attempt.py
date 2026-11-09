@@ -8,9 +8,9 @@ timed_out too. The log and the attempt's other files are evidence only once clea
 stopped may still write to them.
 """
 from contextlib import contextmanager
-from datetime import datetime, timezone
 import sys
 
+from ..records import utc_now
 from .records import file_sha, ident, now, read_json, safe_path, timestamp
 
 SEALED = "Sealed candidate is immutable; allocate a new candidate"
@@ -22,7 +22,7 @@ class Expired(Exception):
 
 def remaining(deadline_at):
     """Seconds left before the reservation's deadline."""
-    return (timestamp(deadline_at, "deadline") - datetime.now(timezone.utc)).total_seconds()
+    return (timestamp(deadline_at, "deadline") - utc_now()).total_seconds()
 
 
 def unsealed(root, candidate_id, sealed=SEALED):
@@ -33,18 +33,16 @@ def unsealed(root, candidate_id, sealed=SEALED):
     return folder
 
 
-def packaged(folder, needs, doing, who):
-    """The candidate's package manifest, which must declare `needs`; `doing` and `who` word the errors ("measuring",
-    "Eval measures")."""
+def packaged(folder, doing, who):
+    """The candidate's package manifest; the package must be a plugin package, the only kind Core's loader runs.
+    `doing` and `who` word the errors ("measuring", "Eval measures")."""
     path = folder / "package" / "manifest.json"
     if not path.is_file():
         raise ValueError(f"Package the candidate before {doing} it")
-    manifest = read_json(path)
-    missing = [capability for capability in needs if capability not in manifest["capabilities"]]
-    if missing:
-        raise ValueError(f"{who} the candidate through crit serve: its package must declare " + ", ".join(missing)
-                         + " (docs/SERVING.md)")
-    return manifest
+    if not (folder / "package" / "plugins").is_dir():
+        raise ValueError(f"{who} the candidate through crit serve, which runs plugin packages only: package it as "
+                         "plugins/ and the configuration that selects them (docs/PLUGINS.md)")
+    return read_json(path)
 
 
 class Attempt:

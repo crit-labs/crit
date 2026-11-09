@@ -1,0 +1,90 @@
+{
+  "id": "grouped-experts",
+  "category": "experts",
+  "summary": "Routed SwiGLU experts over expert bundles in a slot store: every format as stored, the routes grouped by expert on the device, one function for decode rows and prompt chunks, capture-safe",
+  "implementation_status": "reference",
+  "implementation_scope": "Python: the experts:bundles layout and packer for bf16, fp8 (channel and 128 x 128 block scales), nvfp4, int4 (E4M3 per 16) and mxfp4 bundles; the experts plugin's device form over its own bundles (forward) or a slot store with a slot table (forward_bundles, route_outputs, combine) through the registry kernel crit-labs/grouped-experts, and its tensor arithmetic in torch as the fallback (batched in fixed chunks, row invariant, capture-safe; the declared arithmetic is the kernel's alone). The kernel itself is crit-labs'; the router, the residency cache and the CPU tier are other plugins.",
+  "agent_guidance": {
+    "use_when": "A model with routed SwiGLU experts in any of the formats, decode rows and prompt chunks alike: as the experts slot's plugin at candidate 1, over the experts loaded on the device or over a residency cache's slot store",
+    "avoid_when": "Experts that are not SwiGLU over gate/up and down matrices, or shapes that are not multiples of 64; a provider's grouped GEMM that is faster on the target and keeps the same row invariance (measure it against this one first)",
+    "provides": [
+      "experts:bundles: one contiguous bundle per expert (layout, pack), row major as stored so a CPU tier reads it in place",
+      "forward over the plugin's loaded bundles, forward_bundles over a store [slots][bytes] of one format with a slot table [experts] (-2 skipped for another tier, -1 never read)",
+      "experts:routes: each route's unweighted rows and the declared route-order combine, so another tier's rows join a token's sum with the same bits",
+      "rounds:experts: capture-safe at a fixed token count (no host synchronization; the kernel's grids launched at their maximum)",
+      "prompts:experts: inside a captured prompt chunk (crit_plugins.prompt_graphs) at its padded bucket's token count, the padding's routes (ids -1, as the model masks them by valid_t) read no expert and add nothing, so a padded token's output is 0 and a real token's the unpadded call's",
+      "Row invariance: a route's bits the same alone or batched, in any chunk, in decode rows or prompt chunks"
+    ],
+    "engine_supplies": [
+      "The router's ids and weights per token, and the model's own shared expert and residual",
+      "Stored tensors per expert by role as the checkpoint keeps them (weight, scale, global_scale, input_scale), in crit's divisor convention for global and input scales",
+      "A residency cache's store and slot table where the experts do not all fit (expert_residency), filled with this plugin's pack()",
+      "The activations option: W4A16 everywhere, or each NVFP4 layer as its stored matrices declare (W4A4 where they carry input_scale, W4A16 where they do not), as the run's quality mode allows; the layer of each bundle it packs for a store"
+    ],
+    "preserve": [
+      "No reduction split by the row count and no atomics in a token's sum",
+      "Weights decoded exactly; global, channel and input scales on each row's FP32 sum",
+      "Each token's routes summed in route order with fmaf(weight, row, sum)",
+      "The bundle layout: the store builders, the CPU tier and the kernel read it"
+    ],
+    "adapt": [
+      "The kernel: the registry kernel, another provider's grouped GEMM measured against it, or the torch fallback",
+      "The route item width and the staging chunk (they change speed, never a route's bits)",
+      "workspace_mib: how many tokens of a long prompt chunk run at once"
+    ]
+  },
+  "path": "inference/grouped-experts/README.md",
+  "code_path": "inference/grouped-experts/code",
+  "code_files": [
+    {
+      "path": "inference/grouped-experts/code/bundles.py",
+      "purpose": "The experts:bundles layout per format, pack from stored tensors, the kernel's layout vector, decoding to operands and row factors"
+    },
+    {
+      "path": "inference/grouped-experts/code/fallback.py",
+      "purpose": "The grouped experts in torch: per-route gather and exact decode, batched products in fixed chunks, the declared NVFP4 quantizer and SwiGLU, the route-order combine"
+    }
+  ],
+  "requires": {
+    "hardware": "torch on any device for the fallback; the registry kernel on NVIDIA GPUs with BF16 tensor cores (sm_80 and newer)",
+    "model": "Routed experts with SwiGLU between a [2 * inter][hidden] gate/up matrix (gate rows first) and a [hidden][inter] down matrix, hidden and inter multiples of 64, top-k routing",
+    "workload": "Decode rows (1 to 8 tokens a row, verify windows) and prompt chunks of any length"
+  },
+  "contract": {
+    "input": "Per call: x [tokens][hidden], ids and weights [tokens][top], optionally a store uint8 [slots][bundle_bytes] and a slot table int32 [experts]; per expert at load, its stored matrices and their format",
+    "output": "out [tokens][hidden] FP32, or each route's unweighted rows [tokens * top][hidden] FP32 and their route-order combine",
+    "ownership": "The plugin owns its loaded bundles and its per-shape workspaces; a residency cache owns the store and slot table it passes",
+    "failure": "Unknown formats, shapes that are not multiples of 64, casts (a bf16 matrix that is not bfloat16, a byte component in another dtype), nvfp4 without a global scale, an nvfp4 expert with input_scale on one matrix only and a layer mixing experts with and without them are refused at load and pack; a store whose named bundles mix input scales, or lack what their layer declared, at its first eager call over the layer; the declared arithmetic without the registry kernel at creation",
+    "core_boundary": "No Core change; crit_plugins.device names the experts:bundles and experts:routes forms"
+  },
+  "dependencies": [
+    "torch",
+    "crit-labs/grouped-experts from the kernel registry (optional: the torch fallback serves without it)"
+  ],
+  "symbols": [
+    "layout",
+    "pack",
+    "kernel_layout",
+    "inter_of",
+    "operands",
+    "matrices",
+    "route_outputs",
+    "combine",
+    "quantize"
+  ],
+  "interactions": [
+    "expert-streamed-prefill",
+    "device-expert-cache",
+    "heterogeneous-expert-dispatch",
+    "host-expert-tier",
+    "host-expert-arithmetic"
+  ],
+  "techniques": [
+    "grouped-experts"
+  ],
+  "validation": {
+    "host": "The host form equals experts-reference on crit's experts cases; the device form against an FP64 block of the same decoded weights in every format, both through the kernel and the fallback; bitwise batched against alone, in prompt-sized calls, over a permuted slot store, with another tier's rows joined, and replayed from a CUDA graph (tests/test_device.py)",
+    "native": "None in crit: the kernel crit-labs/grouped-experts carries its own tests against an FP64 reference",
+    "performance": "Measured on an RTX 5090 with the local build of the kernel (README, Costs and validation)"
+  }
+}

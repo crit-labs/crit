@@ -11,10 +11,10 @@ from crit_core.serving import (JSON_CAPABILITY, LOGPROBS_CAPABILITY, RESIDENT_CA
                                STREAM_CAPABILITY)
 
 from .attempt import Attempt, Expired, packaged, remaining, unsealed
-from .records import file_sha, load_run, now, read_json
+from .records import file_sha, load_run, now, quality_mode, read_json
 
-# What crit serve needs from a package to serve it for a measurement: a resident chat adapter that streams. Every
-# resident package declares the temperature (crit run package), which greedy decoding sets.
+# What a measurement needs crit serve to offer, which Core's contract gives every engine (crit_core.engine): a resident
+# chat engine that streams.
 SERVED = (JSON_CAPABILITY, RESIDENT_CAPABILITY, STREAM_CAPABILITY)
 # What Eval's quality needs beside them: the score call and, for its honesty check, every served token's
 # log-probability.
@@ -35,10 +35,11 @@ class Served:
         self.expired = False
         self.failure = None  # a cleanup that failed, also on the deadline's thread
 
-    def open(self, tokens=None):
-        """Serve the candidate at `tokens` of context (default the run's). Returns the ServedEngine, crit serve's Api
-        and the loopback port it listens on. An engine already served is built again at the new context in the same
-        resident host, which keeps the model's files, device weights and the adapter's host-side weights."""
+    def open(self, tokens=None, configuration=None):
+        """Serve the candidate at `tokens` of context (default the run's), with `configuration`'s keys over its
+        configuration (an ablation's variant; default its own). Returns the ServedEngine, crit serve's Api and the
+        loopback port it listens on. An engine already served is built again at the new context and configuration in
+        the same resident host, which keeps the model's files, device weights and the adapter's host-side weights."""
         from crit_api.engine import ServedEngine
         from crit_api.server import Api, Server
         tokens = tokens or self.kv_tokens
@@ -48,7 +49,7 @@ class Served:
             engine, server = current
             self.log(f"crit serve: reloading {self.candidate_id} at {tokens:,} tokens of context in the same host")
             try:
-                engine.reopen(None if tokens == self.kv_tokens else tokens)
+                engine.reopen(None if tokens == self.kv_tokens else tokens, configuration=configuration)
             except BaseException:
                 self.stop()
                 raise
@@ -56,7 +57,7 @@ class Served:
         self.stop()  # an engine that failed to open
         engine = ServedEngine(self.store.root, self.run_id, self.candidate_id, project=self.store.project,
                               timeout=self.timeout, attempt=self.attempt,
-                              kv_tokens=None if tokens == self.kv_tokens else tokens)
+                              kv_tokens=None if tokens == self.kv_tokens else tokens, configuration=configuration)
         with self.lock:
             if self.expired:
                 raise Expired(f"{self.name} passed its reserved deadline")
@@ -121,17 +122,46 @@ class Served:
         self.log("crit serve: stopped")
 
 
-def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None, ready=None, stop=None, check=False):
+class Reopening:
+    """crit-eval's engines (its adapter) for the gate pre-check on the engine crit run serve serves: the engine at
+    the run's context is the one already listening; another context reloads it in the same resident host."""
+
+    def __init__(self, served, prepared, port):
+        self.served, self.prepared = served, prepared
+        self.port, self.tokens = port, served.kv_tokens
+        self.server = served.server
+
+    def create_eval_engine(self, context):
+        from crit_eval.run import chat
+        tokens = context["context_tokens"]
+        if tokens != self.tokens:
+            _, _, self.port = self.served.open(tokens)
+            self.tokens = tokens
+        engine = chat.Server("http://127.0.0.1:%d/v1" % self.port, self.prepared, None).create_eval_engine(context)
+        engine.close = lambda: None   # the engine stays served; crit run serve stops it
+        return engine
+
+
+def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None, ready=None, stop=None, check=False,
+          data=None, smoke=True):
     """crit run serve: the packaged candidate, not yet sealed, served through crit serve under a check attempt until
     Ctrl+C, `stop` (a threading.Event) or the reservation's deadline, for the checks a candidate passes before it is
     sealed (streaming, stop strings, tool calls, cancellation, Ctrl+C). `ready(port)` runs once the API listens.
     With `check`, crit runs the standard serving checks itself (crit.run.checks.serve_checks), stops the engine,
-    keeps their report as candidates/ID/logs/serve-check-ATTEMPT.json and records a functional check per case.
+    keeps their report as candidates/ID/logs/serve-check-ATTEMPT.json and records a functional check per case. With
+    `smoke` (the default) the report adds crit smoke (_smoke): the engine's quality components at the run's context
+    and at a quarter of it, in a minute or two each. With `data` too (crit-eval's prepared data for the run's model), the report adds crit-eval's gate pre-check
+    (crit_eval.run.precheck): honesty of short replies and of one long reply, the request history around them, the
+    device memory after the load and the speed cases at the lower context, the gates whole Eval rounds most often
+    fail on, in minutes.
     Settles the attempt and returns its result; crit serve serves the candidate once it is sealed."""
     root = store.directory(run_id)
     folder = unsealed(root, candidate_id, "The candidate is sealed: serve it with crit serve")
-    manifest = packaged(folder, SERVED, "serving", "crit run serve serves")
-    kv_tokens = load_run(root)["spec"]["hardware_constraints"]["kv_tokens"]
+    if data is not None and not check:
+        raise ValueError("--data is for crit run serve --check: the gate pre-check runs beside the serving checks")
+    manifest = packaged(folder, "serving", "crit run serve serves")
+    run = load_run(root)
+    kv_tokens = run["spec"]["hardware_constraints"]["kv_tokens"]
     # The engine is served until the reservation's deadline: reaching it is how a serve without --check ends.
     attempt = Attempt(store, run_id, candidate_id, "check", seconds, "serve", "crit run serve", "crit run serve",
                       deadline=False)
@@ -139,7 +169,7 @@ def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None
     with attempt.running() as log:
         served = Served(store, run_id, candidate_id, attempt.id, kv_tokens, log, "crit run serve", address=(host, port))
         with served.until(attempt.deadline_at):
-            _, _, bound = served.open()
+            engine, _, bound = served.open()
             log(f"Serving {run_id}/{candidate_id} (not sealed, {attempt.id}) at http://{host}:{bound}/v1; Ctrl+C stops")
             if ready is not None:
                 ready(bound)
@@ -147,7 +177,11 @@ def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None
                 from .checks import serve_checks
                 variables = (read_json(folder / "candidate.json")["configuration"].get("recon") or {}).get(
                     "template_variables") or {}
-                report = serve_checks(bound, manifest["capabilities"], variables, served.timeout, log)
+                report = serve_checks(bound, engine.spec()["capabilities"], variables, served.timeout, log)
+                if smoke:
+                    report += _smoke(served, bound, log)
+                if data is not None:
+                    report += _precheck(served, run, data, bound, log)
                 log("crit run serve --check: stopping the engine")
             try:
                 while not check and not served.expired and not (stop is not None and stop.wait(.25)):
@@ -166,6 +200,71 @@ def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None
                                                                      manifest, report, result["logs"])}
     attempt.finish()
     return result
+
+
+# crit smoke's second pass opens the engine at crit-eval's lower context, a quarter of the run's (lower_fraction,
+# rounded down to its 1024-token granularity), where buckets, graphs and caches sized for a smaller context run; never
+# below what the suite's longest prompt (4096 tokens) needs.
+SMOKE_LOWER_FRACTION, SMOKE_GRANULARITY, SMOKE_LOWER_FLOOR = 0.25, 1024, 5120
+
+
+def _smoke(served, port, log):
+    """crit smoke (smoke/README.md) on the served engine at the run's context, then reopened at the lower context in
+    the same resident host and back, its items in the serving checks' shape: smoke_TEST, and smoke_TEST@TOKENS at the
+    lower context. A package that offers none of what the suite reads skips it at once, without reopening."""
+    try:
+        from crit_smoke import Client, run
+    except ImportError:   # a checkout installed before smoke/ existed
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "smoke"))
+        from crit_smoke import Client, run
+    lower = max(int(served.kv_tokens * SMOKE_LOWER_FRACTION) // SMOKE_GRANULARITY * SMOKE_GRANULARITY,
+                SMOKE_LOWER_FLOOR)
+    items, contexts = [], [served.kv_tokens] + ([lower] if lower < served.kv_tokens else [])
+    for tokens in contexts:
+        suffix = "" if tokens == served.kv_tokens else f"@{tokens}"
+        try:
+            if suffix:
+                log(f"crit smoke: reopening at {tokens:,} tokens of context")
+                _, _, port = served.open(tokens)
+            found = run(Client(f"http://127.0.0.1:{port}", timeout=min(served.timeout, 120)),
+                        log=lambda line: log("crit smoke" + suffix + ": " + line.strip()))
+        except Exception as error:   # an engine that cannot open or answer fails the suite, the item says why
+            found = [{"name": "open", "state": "failed",
+                      "detail": f"at {tokens:,} tokens: {type(error).__name__}: {error}"[:2000]}]
+        items += [dict(item, name=f"smoke_{item['name']}{suffix}") for item in found]
+        if not suffix and all(item["state"] == "skipped" for item in found):
+            break
+    if any(item["name"].endswith(f"@{lower}") for item in items):
+        log(f"crit smoke: reopening at {served.kv_tokens:,} tokens of context")
+        try:
+            served.open()   # back at the run's context for what follows
+        except Exception as error:
+            items.append({"name": "smoke_reopen", "state": "failed",
+                          "detail": f"opening again at {served.kv_tokens:,} tokens: {type(error).__name__}: {error}"[:2000]})
+            raise
+    return items
+
+
+def _precheck(served, run, data, port, log):
+    """crit-eval's gate pre-check on the served engine (Reopening), its items in the serving checks' shape."""
+    from pathlib import Path
+    from crit_eval import load_json, machine_settings
+    from crit_eval.quality.prepare import PREPARED
+    from crit_eval.run.precheck import run_precheck
+    data = Path(data).absolute()
+    if not (data / PREPARED).is_file():
+        raise ValueError(f"{data} holds no {PREPARED}: prepare it from the run's model first (crit eval prepare)")
+    headroom = run["spec"]["hardware_constraints"].get("vram_headroom_bytes")
+    if headroom is None:
+        headroom = round(machine_settings().get("vram_headroom_gib", 1.0) * (1 << 30))
+    try:
+        return run_precheck(Reopening(served, load_json(data / PREPARED), port), run["spec"]["model_path"], data,
+                            served.kv_tokens, quality_mode(run["spec"]["correctness"]), log=log,
+                            vram_headroom_bytes=headroom)
+    except Exception as error:   # a pre-check that cannot run is a failed check, the report says why
+        return [{"name": "precheck", "state": "failed", "detail": f"{type(error).__name__}: {error}"[:2000]}]
 
 
 def _record_serve_checks(store, run_id, candidate_id, root, folder, attempt, manifest, report, logs):

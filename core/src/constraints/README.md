@@ -1,8 +1,13 @@
 # Structured output (constraints)
 
-An optional Core service that restricts generated output to a language over its
-exact bytes, as OpenAI's `response_format` (JSON mode, JSON schema) and
-regex/grammar constraints require. The runtime never calls it. Native code:
+A Core service that restricts generated output to a language over its exact
+bytes, as OpenAI's `response_format` (JSON mode, JSON schema), regex/grammar
+constraints and forced tool calls require. Core's runtime applies it to every
+engine: crit_core.native keeps one matcher per constrained request through the
+exports of [constraint_library.cpp](../runtime/constraint_library.cpp) (listed in
+[native_engine.h](../../include/crit/native_engine.h)), puts each row's allowed set
+on the model plugin's `StepRow.allowed`, checks the token the row produced and
+appends the one Core keeps. Native code:
 [constraints.h](../../include/crit/constraints.h), [constraints.cpp](constraints.cpp)
 and [grammar.cpp](grammar.cpp); masks reach sampling through
 `Sampler::sample(logits, AllowedTokens{...}, ...)` in [sampling.h](../../include/crit/sampling.h).

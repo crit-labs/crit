@@ -1,0 +1,120 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "heterogeneous-expert-dispatch",
+  "title": "Routed experts split between the device and the CPU tier, in the device's bits",
+  "description": "heterogeneous-expert-dispatch's partition. Host form: routes whose expert the expert_residency slot holds on the device run there (at most device_slots of them), the rest on the host; each route's weighted contribution is accepted into async-expert-contributions' ContributionGroup, which settles a token only when every route's receipt is done and sums them in route order, so the output is bitwise the reference whichever side ran a route. Device form on CUDA: nvfp4 / int4 experts; routes whose slot is -2 computed by host-expert-tier's CPU tier, posted and joined inside the stream through host-work-mailbox (one post and one join a layer, capturable), the others by the device part, summed in route order; both parts in host-expert-arithmetic's declared integer block order, so the split never changes a bit.",
+  "fills": [
+    "experts"
+  ],
+  "needs": [
+    "experts:source",
+    "experts:residency"
+  ],
+  "reference": [
+    "experts-reference"
+  ],
+  "test_with": [
+    "device-expert-cache",
+    "expert-residency",
+    "expert-tensors"
+  ],
+  "options": {
+    "device_slots": {
+      "type": "int",
+      "default": 64,
+      "min": 0
+    },
+    "resident": {
+      "type": "int",
+      "default": -1,
+      "min": -1,
+      "description": "forward() over the plugin's own store: the experts of each layer kept on the device (the lowest ids; -1 all); the others go to the CPU tier"
+    },
+    "max_tokens": {
+      "type": "int",
+      "default": 64,
+      "min": 1,
+      "description": "the most tokens one post sends the CPU (a decode step or verify round; the mailbox holds this many tokens of the model's top routes); a longer call posts in pieces"
+    },
+    "join": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "device_poll",
+        "stream_wait",
+        "host_eager"
+      ],
+      "description": "how the stream waits for the CPU: auto takes the cheaper capturable join measured at load (host-work-mailbox measure_joins)"
+    },
+    "native": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "on",
+        "off"
+      ],
+      "description": "the CPU tier's rows: native (built at load) or the declared order in torch; without the native tier CPU routes are joined on the host, outside capture"
+    },
+    "workers": {
+      "type": "int",
+      "default": -1,
+      "min": -1,
+      "description": "the CPU tier's worker threads (-1: one per physical core but the caller's)"
+    },
+    "pin": {
+      "type": "bool",
+      "default": true,
+      "description": "pin each CPU worker to a physical core of its own (Linux)"
+    },
+    "spin_us": {
+      "type": "int",
+      "default": 100,
+      "min": 0,
+      "description": "the least an idle CPU worker spins before it sleeps"
+    },
+    "spin_max_us": {
+      "type": "int",
+      "default": 3000,
+      "min": 0,
+      "description": "an idle CPU worker spins as long as the recent gaps between batches (1.5 times the longest of the last 16), at most this, then sleeps: awake through a decode step's layers, asleep between steps (0: spin_us only). The default was measured on one machine (6 cores, WSL2, decode layers about 1.2 ms apart): measure your own cadence"
+    },
+    "rows_per_task": {
+      "type": "int",
+      "default": 128,
+      "min": 64,
+      "description": "rows of one expert in a CPU pool task"
+    },
+    "idle_after_us": {
+      "type": "int",
+      "default": 2000,
+      "min": 0,
+      "description": "the mailbox's service thread polls the doorbells without pause this long after a job, then sleeps idle_sleep_us between polls: measured on one machine with decode layers about 1.2 ms apart"
+    },
+    "idle_sleep_us": {
+      "type": "int",
+      "default": 50,
+      "min": 0,
+      "description": "the service thread's sleep between polls when idle (the first job after a pause waits up to this)"
+    }
+  },
+  "sources": {
+    "dispatch": "code",
+    "contributions": "../async-expert-contributions/code",
+    "prefill": "../expert-streamed-prefill/code",
+    "tier": "../host-expert-tier/code",
+    "arithmetic": "../host-expert-arithmetic/code",
+    "quantized": "../quantized-projections/code",
+    "mailbox": "../host-work-mailbox/code",
+    "split": "../device-expert-cache/code"
+  },
+  "entry": "plugin.py:create",
+  "devices": [
+    "cuda"
+  ],
+  "provides": [
+    "experts:bundles",
+    "rounds:experts"
+  ]
+}

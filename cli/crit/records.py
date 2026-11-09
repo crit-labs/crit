@@ -6,7 +6,7 @@ ownership, Kernels and Models all build on these; nothing here knows a run.
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 import tempfile
+import threading
 import time
 
 from crit_core import jsonfile
@@ -42,8 +43,26 @@ def verification_scope():
         _verification_cache.reset(token)
 
 
+_clock = threading.Lock()
+_latest = [None]
+
+
+def utc_now():
+    """The UTC time, later than the last time this process read: a wall clock that steps back (a virtual machine's
+    clock kept in step with its host's, as WSL's is, moves back by up to a second every half minute or so) would
+    otherwise date a later record before an earlier one, and a run's records are checked in that order (a check or
+    benchmark after its candidate's creation, inside its segment). While the wall clock is behind, each read is a
+    microsecond after the last, so two records never share a time either."""
+    with _clock:
+        value = datetime.now(timezone.utc)
+        if _latest[0] is not None and value <= _latest[0]:
+            value = _latest[0] + timedelta(microseconds=1)
+        _latest[0] = value
+        return value
+
+
 def now():
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return utc_now().isoformat().replace("+00:00", "Z")
 
 
 def retry_denied(action, any_denial=False):
@@ -71,6 +90,11 @@ def digest(value):
 
 
 def file_sha(path, cache=False):
+    return _hashed(path, cache)[0]
+
+
+def _hashed(path, cache=False):
+    """(sha256, bytes) of the file at `path`, the size from the stat that saw the hashed bytes unchanged."""
     # Windows may retain stale timestamps while another handle is open.
     # Metadata cannot safely identify unchanged bytes there, even within a scope.
     if cache is False:
@@ -78,7 +102,7 @@ def file_sha(path, cache=False):
     before = path.stat()
     identity = (str(path), *file_identity(before))
     if cache is not None and identity in cache:
-        return cache[identity]
+        return cache[identity], before.st_size
     hasher = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -89,7 +113,7 @@ def file_sha(path, cache=False):
     value = hasher.hexdigest()
     if cache is not None and len(cache) < MAX_FILES:
         cache[identity] = value
-    return value
+    return value, after.st_size
 
 
 def text(value, name, limit=4096):
@@ -132,12 +156,23 @@ def keys(value, required, optional=()):
     return value
 
 
-def safe_path(root, relative):
-    text(relative, "record path")
-    parts = PurePosixPath(relative).parts
+def canonical(relative):
+    """`relative` as a record path: forward slashes, no drive, no empty, `.` or `..` part (a lexical check: no file is
+    read)."""
     if ("\\" in relative or ":" in relative or relative.startswith("/") or
             any(p in {"", ".", ".."} for p in relative.split("/"))):
         raise ValueError("References require canonical relative forward-slash paths")
+    return relative
+
+
+def _linked(info):
+    return stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400
+
+
+def safe_path(root, relative):
+    text(relative, "record path")
+    parts = PurePosixPath(relative).parts
+    canonical(relative)
     root = Path(root).absolute()
     if root.resolve() != root:
         raise ValueError("Reference escapes its retained directory")
@@ -152,9 +187,43 @@ def safe_path(root, relative):
             info = cursor.lstat()
         except FileNotFoundError:
             continue
-        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+        if _linked(info):
             raise ValueError("Symlink/reparse references are not permitted")
     return cursor
+
+
+def _tree(root):
+    """(path, relative, bytes: None for a folder) for every file and folder under `root`, walked once without following a link: the
+    checks safe_path makes of each path's every component (a canonical name, no link or reparse point, a root that
+    resolves to itself), each component checked once rather than once per path below it."""
+    root = Path(root)
+    base = root.absolute()
+    if base.resolve() != base:
+        raise ValueError("Reference escapes its retained directory")
+    try:
+        info = base.lstat()
+    except FileNotFoundError:
+        return []
+    if _linked(info):
+        raise ValueError("Symlink/reparse references are not permitted")
+    if not stat.S_ISDIR(info.st_mode):
+        return []
+    found, pending = [], [("", root)]
+    while pending:
+        prefix, folder = pending.pop()
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                relative = canonical(text(prefix + entry.name, "record path"))
+                # Windows reports a reparse point (a junction too) in the entry's own stat, read with the listing.
+                if entry.is_symlink() or (os.name == "nt" and _linked(entry.stat(follow_symlinks=False))):
+                    raise ValueError("Symlink/reparse references are not permitted")
+                path = folder / entry.name
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append((relative + "/", path))
+                is_file = entry.is_file(follow_symlinks=False)
+                # Windows lists a file's size with its name; elsewhere this is the one stat of the file the walk makes.
+                found.append((path, relative, entry.stat(follow_symlinks=False).st_size if is_file else None))
+    return found
 
 
 def read_json(path, *, max_bytes=MAX_JSON_BYTES):
@@ -205,27 +274,25 @@ def write_json(path, value, immutable=False, *, max_bytes=MAX_JSON_BYTES, tempor
 
 
 def inventory(root, exclude=()):
-    root = Path(root)
     files = []
-    for path in sorted(root.rglob("*")):
-        relative = path.relative_to(root).as_posix()
-        safe_path(root, relative)
-        if path.is_file() and relative not in exclude:
-            files.append((relative, path))
+    # In the order sorted(root.rglob("*")) gives, which every retained inventory was written in.
+    for path, relative, size in sorted(_tree(root), key=lambda item: item[0]):
+        if size is not None and relative not in exclude:
+            files.append((relative, path, size))
             if len(files) > MAX_FILES:
                 raise ValueError("Artifact exceeds file inventory limit")
     # Large artifacts (model checkpoints) hash files concurrently; hashlib releases
     # the GIL while digesting, so threads overlap reads and hashing. Row order and
     # values are identical to a sequential pass.
     cache = _verification_cache.get() if os.name != "nt" else None
-    total = sum(path.stat().st_size for _, path in files)
+    total = sum(size for _, _, size in files)
     workers = min(8, os.cpu_count() or 1, len(files)) if total >= HASH_PARALLEL_BYTES else 1
     if workers > 1:
         with ThreadPoolExecutor(workers) as pool:
-            digests = list(pool.map(lambda item: file_sha(item[1], cache), files))
+            hashed = list(pool.map(lambda item: _hashed(item[1], cache), files))
     else:
-        digests = [file_sha(path, cache) for _, path in files]
-    return [{"path": relative, "bytes": path.stat().st_size, "sha256": value} for (relative, path), value in zip(files, digests)]
+        hashed = [_hashed(path, cache) for _, path, _ in files]
+    return [{"path": relative, "bytes": size, "sha256": value} for (relative, _, _), (value, size) in zip(files, hashed)]
 
 
 def verify_inventory(root, rows, exclude=()):
@@ -233,7 +300,9 @@ def verify_inventory(root, rows, exclude=()):
         raise ValueError("Artifact requires a nonempty bounded file inventory")
     for row in rows:
         keys(row, {"path", "bytes", "sha256"})
-        safe_path(root, row["path"])
+        # A row's path is checked lexically: the inventory below walks the files, refusing a link anywhere, and must
+        # equal the rows.
+        canonical(text(row["path"], "record path"))
         number(row["bytes"], "file bytes", 0, 2 ** 60, integer=True)
         sha(row["sha256"], "file sha256")
     if rows != inventory(root, exclude):

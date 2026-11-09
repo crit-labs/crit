@@ -2,7 +2,7 @@
 config rule of the test's own for an architecture no package gives one (crit-eval's rules are tested in crit-eval).
 
 The tokenizer conformance tests tokenize the GGUF converter's vocabulary test sets (Hugging Face tokenizations of hard
-inputs) with the derived tokenizer.json; they need its checkout (CRIT_LLAMA_CPP) and `tokenizers`."""
+inputs) with the derived tokenizer.json; they need its checkout (CRIT_GGUF_TOOLS) and `tokenizers`."""
 import importlib.util
 import json
 import os
@@ -21,7 +21,7 @@ from crit_core.model.gguf_files import (PRE_TOKENIZERS, MetadataReader, base_con
                                         derive_config, derive_generation, derive_tokenizer, layer_flag)
 from gguf_writer import gguf_bytes  # noqa: E402
 
-LLAMA_CPP = os.environ.get("CRIT_LLAMA_CPP")
+GGUF_TOOLS = os.environ.get("CRIT_GGUF_TOOLS")
 HAS_TOKENIZERS = importlib.util.find_spec("tokenizers") is not None
 TOKENS = ["<|endoftext|>", "<|im_end|>", "<think>", "a", "b", "ab", "[PAD6]", "[PAD7]"]
 TYPES = [3, 3, 4, 1, 1, 1, 5, 5]
@@ -197,13 +197,13 @@ class DerivationTests(unittest.TestCase):
                          {"do_sample": True, "temperature": 0.6, "top_k": 20, "pad_token_id": 0})
 
 
-@unittest.skipUnless(LLAMA_CPP and HAS_TOKENIZERS, "needs CRIT_LLAMA_CPP (a converter checkout) and tokenizers")
+@unittest.skipUnless(GGUF_TOOLS and HAS_TOKENIZERS, "needs CRIT_GGUF_TOOLS (a converter checkout) and tokenizers")
 class TokenizerConformanceTests(unittest.TestCase):
     """The checkout's models/ggml-vocab-<name>.gguf with .inp (inputs) and .out (Hugging Face token ids)."""
 
     def test_vocabulary_test_sets(self):
         from tokenizers import Tokenizer
-        models = Path(LLAMA_CPP) / "models"
+        models = Path(GGUF_TOOLS) / "models"
         for name in ("qwen2", "qwen35", "llama-bpe", "gpt-2"):
             with self.subTest(name):
                 model = inspect_gguf_model(models / f"ggml-vocab-{name}.gguf")

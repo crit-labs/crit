@@ -1,10 +1,10 @@
 # crit Kernels
 
 Kernels helps agents find and adapt kernels from external providers for a complete engine. crit
-hosts no compute kernels: [SOURCES.md](SOURCES.md) lists where they come from, starting with the
-[Hugging Face Kernel Hub](https://huggingface.co/kernels), then libraries such as cuBLASLt, CUTLASS,
-FlashInfer and flash-linear-attention. Choose the implementation that fits the engine's operations,
-representations and hardware; a kernel written for the candidate is equally valid when none fits.
+hosts no compute kernels ([kernels and plugins](../docs/PLUGINS.md#kernels-and-plugins)): [SOURCES.md](SOURCES.md)
+lists where they come from, starting with the [Hugging Face Kernel Hub](https://huggingface.co/kernels), then
+libraries such as cuBLASLt, CUTLASS, FlashInfer and flash-linear-attention. Choose the implementation that fits the
+engine's operations, representations and hardware; a kernel written for the candidate is equally valid when none fits.
 [Core](../core/README.md) supplies the runtime, [Inference](../inference/README.md) the
 techniques and [Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md) the common checks for the integrated engine.
 
@@ -16,10 +16,11 @@ environment and package.
 
 ## Find an implementation
 
-Start from the technique: its `kernels.json` ([Inference](../inference/README.md#read-and-adapt-an-entry)) lists
-the provider kernels for each operation it needs, with the exact call, formats, GPUs, shapes and scale layout, and
-the CPU reference to check them against. crit-labs' own kernels sit in `hub-kernels/` until they are published to
-the Kernel Hub, each with an applicability card; a technique names them as `hub:crit-labs/NAME`. Otherwise:
+Start from the technique: its `operations.json` ([Inference](../inference/README.md#read-and-adapt-an-entry)) says
+what each device operation computes, the CPU reference to check a kernel against and how (tolerance, invariance).
+crit-labs' own kernels are kernel-builder projects in the crit-kernels repository, uploaded to the kernel registry as
+`crit-labs/NAME` with an applicability card (CARD.md); a library plugin that runs one declares it in its plugin.json.
+Then:
 
 1. Describe the operation: formula, input/output types, quantization and scales, dimensions and
    strides, aliases, and any fusion or recurrent state.
@@ -74,24 +75,28 @@ crit eval workbench profile work/kernels/down_gemv [--ncu NCU]
 ```
 
 `new` writes `kernel.json` (the shapes, here every FP8 matrix of the checkpoint, the column counts, the tolerance,
-whether the kernel must be column invariant, the yardstick), `kernel.py` (inputs, an FP64 reference, the candidate
-and the yardstick: cuBLAS or cuBLASLt for gemv and gemm in bf16 or fp8), crit-eval's `harness.py` and `src/`.
-`--format nvfp4` takes NVFP4 weights as compressed-tensors stores them (E2M1 pairs, E4M3 scales per 16 inputs, an
-FP32 global divisor) against bf16 activations, the arithmetic of a decode GEMV on stored weights and of a `preserve`
-run's prompts; its yardstick is cuBLAS on the weights widened to BF16 once. For gemv and gemm `src/NAME.cu` is the
-binding with an empty kernel to write; any other operation (`--op attention`,
-`--op scan`, ...) gets the same harness with `kernel.py`'s functions to fill in. `--from DIR` copies an existing
-kernel's source, a Hub kernel or a library sample, into `src/` as the starting point; it needs the source's license
-file beside it, and a Hub kernel's `torch-ext` binding gets the `registration.h` its macros need. `--starter` writes a
-simple, correct kernel in plain CUDA that builds for any NVIDIA GPU instead of the empty one (bf16 and fp8); in a run it is allowed
-from the fourth candidate on (`--run RUN_FOLDER`), so the first three candidates find or write their kernels
-themselves.
+whether the kernel must be column invariant, the yardstick), `kernel.py` (inputs, an FP64 reference, the candidate and
+the yardstick: cuBLAS or cuBLASLt for gemv and gemm in bf16 or fp8), crit-eval's `harness.py` and `src/`. `--format
+nvfp4` takes NVFP4 weights as compressed-tensors stores them (E2M1 pairs, E4M3 scales per 16 inputs, an FP32 global
+divisor) against bf16 activations, the arithmetic of a decode GEMV on stored weights and of prompts that keep 16-bit
+activations; its yardstick is cuBLAS on the weights widened to BF16 once. `src/` is a kernel-builder project, and crit
+holds no kernel source for it: `--from DIR` copies an existing one (a crit-kernels project, a Hub kernel's source, a
+library sample) with its license file, which it needs beside it, else `kernel-builder init` (on `PATH`, or the
+executable `CRIT_KERNEL_BUILDER` names) starts it from kernel-builder's own template; a `torch-ext` binding gets the
+`registration.h` its macros need. For gemv and gemm, `kernel.py` builds `src/` with torch's extension builder and calls
+its op `run_<format>`: register it in `src/torch-ext/torch_binding.cpp` (bf16 `run_bf16(Tensor x, Tensor w) -> Tensor`;
+fp8 `run_fp8(Tensor x, Tensor x_scale, Tensor w, Tensor w_scale) -> Tensor`; nvfp4 `run_nvfp4(Tensor x, Tensor w, Tensor
+w_scale, Tensor w_global) -> Tensor`, FP32 out); the same project builds for the Hub with kernel-builder. Any other
+operation (`--op attention`, `--op scan`, ...) gets the same harness with `kernel.py`'s functions to fill in. `--starter
+--from CRIT_KERNELS/workbench-starter` starts from crit-kernels' starter matmul (bf16 and fp8: simple, correct, a fixed
+per-column order, any NVIDIA GPU); in a run it is allowed from the fourth candidate on (`--run RUN_FOLDER`), so the
+first three candidates find or write their kernels themselves.
 
 crit-eval measures the folder ([workbench](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md#kernel-workbench)):
 `check` compares the kernel with the reference on every shape and column count and requires the same bits on a
 repeat and, when declared, for each column alone (`--repeatable no` declares a kernel that may round differently on a
 repeat, such as atomics or a split the workload chooses: its repeats are then judged within the tolerance, which
-suits an engine in quality mode `as_quantized`, where Eval passes output differences that part at near-ties); `bench` times it and the yardstick on inputs cycled past the L2,
+suits an engine in quality mode `speed`, where Eval passes output differences that part at near-ties); `bench` times it and the yardstick on inputs cycled past the L2,
 against the floor; its `bench.json` is the evidence an `own` lever's `yardstick` cites.
 
 ## Inspect and retain
@@ -133,9 +138,10 @@ thread-local stream slot).
 Keep shape-, format- or device-specific fast paths behind explicit applicability checks, and
 fall back to another implementation when one does not apply; if none does, report the precise
 gap. Loading success does not prove operation support, and parameterized dimensions do not make
-device instructions portable. Kernels may be fused with Inference code without a plugin
-interface, preserving the shared meaning, representations, ownership, stream ordering and
-state. A fusion can change rounding and needs its own numerical and whole-model checks.
+device instructions portable. Kernels may be fused with Inference code, inside a slot's plugin
+or across slots as one [fused plugin](../docs/PLUGINS.md#when-two-plugins-only-pay-together),
+preserving the shared meaning, representations, ownership, stream ordering and state. A fusion
+can change rounding and needs its own numerical and whole-model checks.
 
 Pin dependencies to exact source revisions and build variants, with hashes, notices, build
 commands and runtime dependencies; a floating branch or mutable cache is not a sealed

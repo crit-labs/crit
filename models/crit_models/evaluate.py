@@ -48,6 +48,9 @@ def evaluate(record_path, data, result_path, evaluation_path):
                          f"crit eval run --url ... --model {record['output']['path']} --data {data}")
     if result.get("aborted") or "status" not in result:
         raise ValueError(f"{result_path} is no finished Eval round")
+    # Every Eval result states the quality mode it was judged in; the evaluation records the terms.
+    from crit_eval.quality.fixed import mode_of
+    mode_of(result.get("requirements"))
     status = result["status"]
     kpis = status["kpis"]
     decode = kpis.get("decode_sampled") or kpis.get("decode_greedy") or kpis.get("decode") or {}
@@ -62,7 +65,10 @@ def evaluate(record_path, data, result_path, evaluation_path):
         "data": {"path": str(data.absolute()), "prepared_sha256": file_sha(data / PREPARED),
                  "model_sha256": prepared["model"]["sha256"]},
         "result": {"path": str(result_path.absolute()), "sha256": file_sha(result_path)},
+        # The quality terms Eval judged it under (quality mode, budget, exactness), recorded with what they measured;
+        # a run judges each candidate by its own Eval under the run's terms (crit run ... eval).
         "summary": {"gates": {g["name"]: g["state"] for g in status["gates"]}, "quality": quality,
+                    "requirements": result["requirements"],
                     "decode_score": decode.get("score"), "prefill_score": kpis["prefill"]["score"],
                     "ttft_ms": kpis["ttft"]["score_ms"]},
         "recorded_at": now(),

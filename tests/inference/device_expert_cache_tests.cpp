@@ -1,8 +1,10 @@
 // Device expert cache on CUDA against a host replica of the same clock directory:
 // identical slots, hits/misses and pool use over a long random routing sequence,
 // complete bundle contents after the fills, and rejected routes and launches; then the ExpertCache runtime with a
-// residency-profile preload and admission limits (a quota table by miss count and second-touch) against the replica.
+// residency-profile preload and admission limits (a quota table by miss count and second-touch) against the replica;
+// then background ranked residency (route counts, swaps begun and committed at window boundaries) against the replica.
 #include "device_cache.h"
+#include "ranked_residency.h"
 #include "runtime.h"
 
 #include <algorithm>
@@ -54,7 +56,7 @@ struct Replica {
         for(int i = 0; i < 4 * slots; ++i) {
             const int c = hand;
             hand = (hand + 1) % slots;
-            if(slot_pin[c] == stamp) continue;
+            if(slot_pin[c] == stamp || slot_key[c] == dc::kReserved) continue;
             if(slot_ref[c]) { slot_ref[c] = 0; continue; }
             return c;
         }
@@ -376,12 +378,118 @@ void run_runtime(const int S) {
     cudaFreeHost(host);
 }
 
+// Background ranked residency: plans count routes and admit nothing; every period windows the host policy ranks the
+// counts and swaps on a side stream, committed at the next boundary. The device directory, its counts and its swaps
+// match the replica driven by a second policy; bundles land in their slots; the hit rate climbs after a topic change.
+void run_ranked(const int S) {
+    constexpr int G = 3, E = 40;
+    constexpr std::size_t B = 1024;
+    std::uint8_t* host = nullptr;
+    ok(cudaHostAlloc(reinterpret_cast<void**>(&host), std::size_t(G) * E * B, cudaHostAllocMapped), "host store");
+    for(int k = 0; k < G * E; ++k)
+        for(std::size_t i = 0; i < B; ++i) host[std::size_t(k) * B + i] = pattern(k, i);
+    void* store = nullptr;
+    ok(cudaHostGetDevicePointer(&store, host, 0), "mapped pointer");
+    auto* slots_base = dev<std::uint8_t>(S * B);
+    cudaStream_t side = nullptr;
+    ok(cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking), "side stream");
+    dc::ExpertCache cache;
+    ok(cache.init(dc::Geometry{S, G, E, 0, B}, slots_base, static_cast<const std::uint8_t*>(store), nullptr, nullptr), "init");
+    ok(cache.set_admission(0, nullptr, false, nullptr), "no admissions");
+    dc::RankedOptions o;
+    o.period = 2;
+    o.max_swaps = 6;
+    o.burst_swaps = 12;
+    ok(cache.enable_route_counts(o.burst_swaps, nullptr), "route counts");
+    dc::RankedPolicy device_policy(G * E, S, o), replica_policy(G * E, S, o);
+    Replica ref(S, E, 0);
+    ref.table.assign(dc::kMaxRoutes + 1, 0);
+    std::vector<std::uint32_t> counts(std::size_t(G) * E), ref_counts(std::size_t(G) * E, 0);
+    std::vector<dc::Swap> pending;
+    auto* ids = dev<std::int32_t>(dc::kMaxRoutes);
+    std::mt19937 rng(19);
+    double first = 0.0, settled = 0.0;
+    int swapped = 0;
+    for(int w = 1; w <= 80; ++w) {
+        const int base = w <= 40 ? 0 : 20;   // the topic changes at window 41
+        int window_hits = 0, window_routes = 0;
+        for(int plan = 0; plan < 2 * G; ++plan) {
+            const int group = plan % G;
+            std::set<int> chosen;
+            while(chosen.size() < 4) chosen.insert(base + static_cast<int>(rng() % 12));
+            std::vector<int> ex(chosen.begin(), chosen.end());
+            std::shuffle(ex.begin(), ex.end(), rng);
+            put(ids, std::vector<std::int32_t>(ex.begin(), ex.end()));
+            const dc::Use* uses = nullptr;
+            ok(cache.plan_and_fetch(group, ids, nullptr, 4, 2, nullptr, &uses), "plan");
+            int h = 0, m = 0, pl = 0, by = 0;
+            const auto want = ref.plan(group, ex, h, m, pl, by);
+            for(int e : ex) ++ref_counts[std::size_t(group * E + e)];
+            const auto got = get(uses, 4);
+            for(int i = 0; i < 4; ++i) {
+                const bool hit = want[std::size_t(i)] >= 0;
+                require(hit == (got[i].source == dc::Source::slot), "ranked plan: hit or store as the replica");
+                if(hit) require(got[i].bundle == slots_base + std::size_t(want[std::size_t(i)]) * B, "ranked plan: slot");
+            }
+            window_hits += h;
+            window_routes += 4;
+        }
+        if(w == 41) first = double(window_hits) / window_routes;
+        if(w == 80) settled = double(window_hits) / window_routes;
+        if(!device_policy.boundary(w)) continue;
+        ok(cache.commit_swaps(nullptr), "commit");
+        for(const auto& s : pending) {   // the replica commits the same swaps
+            if(ref.slot_key[std::size_t(s.slot)] != dc::kReserved) continue;
+            ref.slot_key[std::size_t(s.slot)] = s.key;
+            ref.key_slot[s.key] = s.slot;
+            ref.slot_ref[std::size_t(s.slot)] = 0;
+        }
+        ok(cache.read_route_counts(counts.data(), nullptr), "read counts");
+        ok(cudaStreamSynchronize(nullptr), "sync counts");
+        require(counts == ref_counts, "route counts match the replica");
+        const auto keys = get(cache.directory().slot_key, S);
+        require(keys == std::vector<std::int32_t>(ref.slot_key.begin(), ref.slot_key.end()), "slots match after commit");
+        const auto bytes = get(slots_base, S * B);
+        for(int s = 0; s < S; ++s)
+            if(keys[std::size_t(s)] >= 0)
+                for(std::size_t b = 0; b < B; b += 97) require(bytes[std::size_t(s) * B + b] == pattern(keys[std::size_t(s)], b), "swapped bundle bytes");
+        pending = device_policy.decide(counts.data(), keys.data());
+        const auto replica_swaps = replica_policy.decide(ref_counts.data(), keys.data());
+        require(pending.size() == replica_swaps.size(), "the same swaps from the same counts");
+        for(std::size_t i = 0; i < pending.size(); ++i)
+            require(pending[i].slot == replica_swaps[i].slot && pending[i].key == replica_swaps[i].key, "swap order");
+        ok(cache.begin_swaps(pending.data(), static_cast<int>(pending.size()), 2, nullptr, side), "begin");
+        for(const auto& s : pending) {   // the replica begins them: unmapped and reserved
+            const int old = ref.slot_key[std::size_t(s.slot)];
+            if(old >= 0) ref.key_slot.erase(old);
+            ref.slot_key[std::size_t(s.slot)] = dc::kReserved;
+            ref.slot_ref[std::size_t(s.slot)] = 0;
+        }
+        swapped += static_cast<int>(pending.size());
+    }
+    dc::Telemetry t;
+    ok(cache.telemetry(t, nullptr), "telemetry");
+    require(t.failure == 0 && t.bypassed == t.misses, "every miss bypassed: no admission on the step's path");
+    require(settled > first + 0.3, "the hit rate climbs after the topic change");
+    if(!pending.empty())
+        require(cache.begin_swaps(pending.data(), 1, 2, nullptr, side) == cudaErrorInvalidValue, "one round of swaps at a time");
+    std::cout << "ranked residency, " << S << " slots: " << swapped << " swaps, hit rate " << first << " right after the topic "
+              << "change, " << settled << " settled; matches replica\n";
+    cache.release();
+    cudaStreamDestroy(side);
+    cudaFree(slots_base);
+    cudaFree(ids);
+    cudaFreeHost(host);
+}
+
 int main() {
     try {
         run(24);
         run(72);
         run_runtime(20);
         run_runtime(40);
+        run_ranked(16);
+        run_ranked(40);
         return 0;
     } catch(const std::exception& e) {
         std::cerr << "FAILED: " << e.what() << "\n";

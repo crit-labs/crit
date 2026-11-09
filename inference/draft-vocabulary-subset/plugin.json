@@ -1,0 +1,43 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "draft-vocabulary-subset",
+  "title": "Greedy drafts from a row subset of the draft head",
+  "description": "draft-vocabulary-subset's SubsetHead: the draft head computes only `size` rows of its output head (the lowest ids at first, then the tokens the rounds emit most), and the draft is the best of them. Verification still reads the full head, so greedy output is unchanged. Inside captured decode rounds the subset is a device tensor the model's device head reads (head.rows), emitted tokens are counted on the device, which chooses the subset again every `refresh` rows' rounds with no host between rounds (draft:device). Its device form samples its drafts in sampled rounds (the sampler's draft draws over the subset); the host form drafts greedily.",
+  "fills": [
+    "drafter"
+  ],
+  "devices": [
+    "host",
+    "cuda"
+  ],
+  "provides": [
+    "draft:device"
+  ],
+  "needs": [
+    "draft:head",
+    "draft:head-device",
+    "draft:head-rows"
+  ],
+  "reference": [
+    "greedy-head-drafter"
+  ],
+  "options": {
+    "size": {
+      "type": "int",
+      "default": 1024,
+      "min": 1,
+      "max": 1048576
+    },
+    "refresh": {
+      "type": "int",
+      "default": 64,
+      "min": 1,
+      "max": 1000000,
+      "description": "rounds between choosing the subset again from emitted counts"
+    }
+  },
+  "sources": {
+    "subset": "code"
+  },
+  "entry": "plugin.py:create"
+}

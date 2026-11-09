@@ -18,6 +18,7 @@
 namespace crit::techniques::device_cache {
 
 constexpr int kMaxRoutes = 32;  // routes planned per call (one warp)
+constexpr std::int32_t kReserved = -2;  // slot_key of a slot a background swap is filling: no plan uses or evicts it
 
 // Device pointers owned by the engine. Keys are group * experts + expert; the host
 // store holds one bundle per key in key order and must be device-visible (mapped
@@ -49,6 +50,9 @@ struct Directory {
     int admit_quota = -1;
     const std::int32_t* admit_by_misses = nullptr;
     std::uint8_t* key_seen = nullptr;
+    // Optional route counts [groups * experts] for background ranked residency (ranked_residency.h): every plan adds
+    // one per valid route, hit or miss. The host reads them between windows, ranks keys and swaps.
+    std::uint32_t* route_counts = nullptr;
 };
 
 // Where a route's bundle is: a cache slot, or the store for a miss the admission limits bypassed.
@@ -91,6 +95,18 @@ cudaError_t enqueue_prefetch_plan(const Directory& d, int group, const std::int3
 // Preloaded slots start unreferenced, so a profile entry no route uses is the clock's first victim.
 cudaError_t enqueue_preload(const Directory& d, const std::int32_t* keys, int count, Fill* fills, int* fill_count,
                             cudaStream_t stream);
+
+// Background ranked residency (ranked_residency.h): a swap puts `key` into `slot`. begin, on the main stream at a
+// window boundary, unmaps each slot's key (its routes become misses) and reserves the slot (kReserved: no plan uses or
+// evicts it), and writes the store-to-slot copies (fills holds count entries) for a side stream. commit, on the main
+// stream at the next boundary after it waited for those copies, maps each key to its slot; a key that became
+// resident another way meanwhile leaves its slot empty. Both work on device arrays of at most `count` swaps.
+struct Swap {
+    std::int32_t slot = -1, key = -1;
+};
+cudaError_t enqueue_swap_begin(const Directory& d, const Swap* swaps, int count, Fill* fills, int* fill_count,
+                               cudaStream_t stream);
+cudaError_t enqueue_swap_commit(const Directory& d, const Swap* swaps, int count, cudaStream_t stream);
 
 // The operands a provider's grouped GEMM takes for a plan's routes (CUTLASS's ptr-array grouped GEMM,
 // cublasGemmGroupedBatchedEx, a block-scaled grouped GEMM): per route r, a pointer to each component inside the

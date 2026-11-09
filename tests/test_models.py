@@ -475,6 +475,8 @@ class EvaluationTests(unittest.TestCase):
     status = {"gates": [{"name": "quality", "state": "pass"}],
               "kpis": {"quality": {"passed": True, "worst_ppl_ratio": 1.01}, "decode": {"score": 90.0},
                        "prefill": {"score": 900.0}, "ttft": {"score_ms": 12.0}}}
+    requirements = {"quality_budget": {"ppl_ratio_max": 1.4, "kld_mean_max": 0.4, "kld_p99_max": 4.0},
+                    "exactness": "reported", "quality_mode": "speed"}
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -496,6 +498,7 @@ class EvaluationTests(unittest.TestCase):
     def result(self, **fields):
         value = {"model_sha256": self.model_sha256, "suite_sha256": "suite", "adapter": None,
                  "server": "http://127.0.0.1:8000/v1", "engine": {"name": "out"}, "status": self.status,
+                 "requirements": self.requirements,
                  "ended_at": "2026-10-21T00:00:00+00:00", **fields}
         write_json(self.root / "result.json", {k: v for k, v in value.items() if v is not ...})
 
@@ -511,6 +514,14 @@ class EvaluationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "another model than the source"):
             self.evaluate()
 
+    def test_eval_refuses_a_result_that_states_no_known_quality_mode(self):
+        self.prepared(self.source)
+        for requirements in ({"quality_budget": {}, "exactness": "reported"},
+                             {**self.requirements, "quality_mode": "as_quantized"}):
+            self.result(requirements=requirements)
+            with self.assertRaisesRegex(ValueError, "preserve or speed"):
+                self.evaluate()
+
     def test_eval_binds_the_served_result_to_the_transform(self):
         self.prepared(self.source)
         self.result()
@@ -518,6 +529,8 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(evaluation["server"], {"url": "http://127.0.0.1:8000/v1", "model": "out"})
         self.assertEqual(evaluation["summary"]["gates"], {"quality": "pass"})
         self.assertEqual(evaluation["summary"]["decode_score"], 90.0)
+        # The quality terms Eval judged it under, for the run to check against its own.
+        self.assertEqual(evaluation["summary"]["requirements"], self.requirements)
         self.assertEqual(json.loads((self.root / "evaluation.json").read_text(encoding="utf-8")), evaluation)
         with self.assertRaisesRegex(ValueError, "already exists"):
             self.evaluate()

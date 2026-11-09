@@ -317,8 +317,8 @@ consuming node's module scope (`/model/layers.0/mlp/up_proj/MatMul` gives
 `.nbits_g_idx` with the node's `K`, `N`, `bits` and `block_size` as
 `attributes`. Other generated initializers are constants, not weights.
 External data must sit in a file beside the model, inside its bounds, with the
-length the shape needs. Refused: graphs from onnxruntime-genai's model builder
-(a `genai_config.json` beside them: fused, renamed layers), weights of other
+length the shape needs. Refused: generative ONNX graphs (a `genai_config.json`
+beside them: fused, renamed layers), weights of other
 quantized ops (`MatMulInteger`, `MatMulBnb4`, `QLinearMatMul`,
 `DequantizeLinear`, ...), sparse or segmented initializers, weights stored as
 varint fields and 4-bit element types. `find_onnx(folder)` takes a folder's

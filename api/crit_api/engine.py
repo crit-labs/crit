@@ -16,8 +16,8 @@ from crit.run.store import ROOT, RunStore
 
 from crit_core.serving import (COMPLETION_CAPABILITY, CONCURRENT_CAPABILITY, CONSTRAINTS_CAPABILITY,
                                CONTINUE_CAPABILITY, FIT_OUTPUT_CAPABILITY, GRAMMAR_CAPABILITY, IMAGES_CAPABILITY,
-                               JSON_CAPABILITY as CAPABILITY, MIN_LOGPROB, PLAIN_CAPABILITY, REQUEST_FACTS,
-                               RESIDENT_CAPABILITY, SCORE_CAPABILITY, STREAM_CAPABILITY, THINKING_BUDGET_CAPABILITY,
+                               MIN_LOGPROB, PLAIN_CAPABILITY, REQUEST_FACTS, SCORE_CAPABILITY, STREAM_CAPABILITY,
+                               THINKING_BUDGET_CAPABILITY,
                                TOKENIZE_CAPABILITY, unpacked_scores)
 
 from .residency import ResidentRuntime
@@ -51,7 +51,7 @@ class RequestRejected(EngineError):
 
 class Overloaded(EngineError):
     """The queue refused the request (admission.Refused) before the engine saw it: a full queue or an expired wait.
-    crit serve answers 429 (Anthropic 529, Ollama 503) with Retry-After."""
+    crit serve answers 429 (Anthropic 529, /api/chat 503) with Retry-After."""
     def __init__(self, message):
         super().__init__(message, 429)
 
@@ -332,13 +332,30 @@ def single_run(store):
     return runs[0]
 
 
+PLUGINS = "plugins"   # a plugin package's plugins folder (crit_core.engine.FOLDER)
+
+
+def package_capabilities(package, model_path, configuration):
+    """What crit serve offers for a package's engine: Core's capabilities for its plugin selection and the model
+    (crit_core.engine.capabilities), the package first checked to be a whole engine without running its code. Only
+    plugin packages serve: Core's loader is the one way an engine runs."""
+    from crit_core import engine as core_engine
+    from crit_plugins import PluginError
+    try:
+        core_engine.check_package(package, model_path, configuration)
+        return serving_capabilities(core_engine.capabilities(package, model_path, configuration))
+    except PluginError as exc:
+        raise ValueError(f"crit serve runs plugin packages only, which Core's loader assembles: {exc}") from None
+
+
 class ServedEngine:
     """Verifies sealed candidates of one run, keeps the requested one loaded in the resident host and runs requests
     within its declared capacity. Switching candidates reuses compatible model allocations.
 
     With `attempt` (crit run eval), it serves only `candidate_id`, packaged but not yet sealed, for Eval under that
     benchmark attempt of the candidate, whose reservation settles after the server stops; `kv_tokens` then serves it
-    at a lower context than the run's (Eval's lower-context gate).
+    at a lower context than the run's (Eval's lower-context gate), and `configuration` with these keys of its
+    configuration replaced (an ablation's variant of its plugins, crit run ... ablate).
 
     Requests the engine cannot take yet wait in its queue: `max_queue` of them at most, each for `queue_timeout`
     seconds at most (None: no bound); past either a request raises Overloaded. `max_concurrency` (crit serve
@@ -350,7 +367,8 @@ class ServedEngine:
     """
     def __init__(self, workspace, run_id=None, candidate_id=None, project=ROOT, runtime_directory=None,
                  host_limit=None, device_limit=None, timeout=600, load_timeout=None, verify_model=False, attempt=None,
-                 kv_tokens=None, max_queue=None, queue_timeout=None, idle_unload=None, max_concurrency=None):
+                 kv_tokens=None, max_queue=None, queue_timeout=None, idle_unload=None, max_concurrency=None,
+                 configuration=None):
         # No workspace: a subclass that serves engines from elsewhere (crit_api.installed) verifies its own.
         self.store = RunStore(workspace, project) if workspace is not None else None
         self.run_id = run_id or single_run(self.store)
@@ -359,7 +377,9 @@ class ServedEngine:
             raise ValueError("Measuring under an attempt needs its candidate")
         if kv_tokens is not None and attempt is None:
             raise ValueError("Only a measurement serves a candidate at another context")
-        self.attempt, self.context_tokens = attempt, kv_tokens
+        if configuration is not None and (attempt is None or not isinstance(configuration, dict)):
+            raise ValueError("Only a measurement serves a candidate with other configuration values, given as an object")
+        self.attempt, self.context_tokens, self.configuration = attempt, kv_tokens, configuration
         self.default = None
         self.timeout = number(timeout, "request timeout", .01, 86400)
         self.load_timeout = None if load_timeout is None else number(load_timeout, "load timeout", .01, 7 * 86400)
@@ -396,12 +416,11 @@ class ServedEngine:
         root = Path(view["folder"])
         package = safe_path(root, candidate["artifacts"]["package"])
         manifest = read_json(package / "manifest.json")
-        if CAPABILITY not in manifest["capabilities"]:
-            raise ValueError("This package has no chat-json-v1 interface. Its agent must add a chat adapter.")
-        if RESIDENT_CAPABILITY not in manifest["capabilities"]:
-            raise ValueError("Serving needs a resident adapter: publish the package with chat-resident-v1.")
-        if not Path(view["run"]["spec"]["model_path"]).exists():
-            raise ValueError("Model file is unavailable at its recorded path: " + view["run"]["spec"]["model_path"])
+        model_path = view["run"]["spec"]["model_path"]
+        if not Path(model_path).exists():
+            raise ValueError("Model file is unavailable at its recorded path: " + model_path)
+        configuration = {**candidate["configuration"], **(self.configuration or {})}
+        capabilities = package_capabilities(package, model_path, configuration)
         # External agents cannot be stopped from here. Their recorded attempts must have settled cleanup.
         for reservation in store.attempts(root):
             if (reservation["candidate_id"], reservation["attempt_id"]) == (candidate_id, self.attempt):
@@ -417,10 +436,9 @@ class ServedEngine:
                 raise ValueError("A measurement serves at most the run's context of %d tokens" % limits["kv_tokens"])
             limits = dict(limits, kv_tokens=self.context_tokens)
         return dict(run_id=run_id, candidate_id=candidate_id, selector=candidate_id, package_sha256=digest(manifest),
-                    package_path=str(package), model_path=view["run"]["spec"]["model_path"],
+                    package_path=str(package), model_path=model_path,
                     model_manifest=read_json(safe_path(root, "inputs.json"))["model_manifest"],
-                    configuration=candidate["configuration"], launch=manifest["launch"],
-                    capabilities=serving_capabilities(manifest["capabilities"]), limits=limits,
+                    configuration=configuration, capabilities=capabilities, limits=limits,
                     label=candidate["label"], signature=package_signature(package), verify_model=self.verify_model)
 
     def serves(self, candidate):
@@ -430,8 +448,8 @@ class ServedEngine:
         return candidate["sealed"]
 
     def candidates(self, refresh=False):
-        """Served candidates of the run whose packages declare a resident chat adapter (listed once, then on
-        refresh)."""
+        """Served candidates of the run whose packages are plugin packages, which Core's loader runs (listed once,
+        then on refresh)."""
         if self.listed is not None and not refresh:
             return self.listed
         with verification_scope():
@@ -439,8 +457,8 @@ class ServedEngine:
         result = []
         for candidate in view["candidates"]:
             if self.serves(candidate) and candidate["artifacts"].get("package"):
-                manifest = read_json(safe_path(Path(view["folder"]), candidate["artifacts"]["package"] + "/manifest.json"))
-                if {CAPABILITY, RESIDENT_CAPABILITY} <= set(manifest["capabilities"]):
+                package = safe_path(Path(view["folder"]), candidate["artifacts"]["package"])
+                if (package / PLUGINS).is_dir():
                     result.append({"candidate_id": candidate["candidate_id"], "label": candidate["label"]})
         self.listed = result
         return result
@@ -498,16 +516,19 @@ class ServedEngine:
             if self.idle_unload is not None:
                 threading.Thread(target=self._unload_idle, name="crit-idle-unload", daemon=True).start()
 
-    def reopen(self, kv_tokens=None, stop=None):
-        """Serve the measured candidate at `kv_tokens` of context (None: the run's) on the loaded runtime: the
-        resident host closes the engine and builds it again at the new limits in the same process, keeping the
-        model's mapped files and device weights (and whatever host-side weights the adapter keeps in the process)."""
+    def reopen(self, kv_tokens=None, stop=None, configuration=None):
+        """Serve the measured candidate at `kv_tokens` of context (None: the run's) with `configuration`'s keys over
+        its own (None: its own) on the loaded runtime: the resident host closes the engine and builds it again at the
+        new limits in the same process, keeping the model's mapped files and device weights (and whatever host-side
+        weights the adapter keeps in the process)."""
         if self.attempt is None:
             raise ValueError("Only a measurement serves a candidate at another context")
+        if configuration is not None and not isinstance(configuration, dict):
+            raise ValueError("configuration replaces keys of the candidate's configuration: an object")
         with self.lock:
             if self.closed or self._stopping.is_set():
                 raise ValueError("Engine is closed")
-            self.context_tokens = kv_tokens
+            self.context_tokens, self.configuration = kv_tokens, configuration
             self.specs.clear()
             self._load_default(self.spec(), stop)
 
@@ -576,6 +597,27 @@ class ServedEngine:
         status = status if status is not None else self.status()
         return (status.get("state") in {"ready", "generating"} and bool(status.get("engine"))
                 and not self.lock.loading() and not self._stopping.is_set())
+
+    def telemetry(self, candidate_id=None, timeout=5.0):
+        """The loaded engine's work so far (its telemetry(): Core's StepEngine.telemetry, the plugins' and Core's
+        counters), asked of the host when the call comes (crit serve's /health), or None: no engine loaded for
+        `candidate_id` (default: the default candidate), none reported, or the host not answering within `timeout`."""
+        candidate_id = candidate_id or self.default
+        status = self.runtime.status()
+        if self.ownership.blocked or not self.loaded(candidate_id, status):
+            return None
+        spec = self.spec(candidate_id)
+        request = record("telemetry_request", spec["run_id"], request_id=uuid.uuid4().hex,
+                         candidate_id=spec["candidate_id"], package_sha256=spec["package_sha256"], created_at=now())
+        try:
+            result = self.runtime.call("telemetry", {"spec": spec, "request": request}, threading.Event(), timeout,
+                                       request=request)
+        except (ValueError, OSError):
+            return None
+        if result.get("status") != "completed":
+            return None
+        found = (result.get("response") or {}).get("engine_telemetry")
+        return found if isinstance(found, dict) else None
 
     def facts(self, candidate_id=None):
         """The loaded engine's facts for Eval (crit_core.serving.engine_facts) when `candidate_id` (default: the

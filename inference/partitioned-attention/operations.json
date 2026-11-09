@@ -1,0 +1,16 @@
+{
+  "kind": "crit-technique-operations",
+  "technique": "partitioned-attention",
+  "operations": [
+    {
+      "id": "partial-attention-merge",
+      "what": "attention of one query over each partition of its keys with the partition's log-sum-exp, and the partials merged into the full result",
+      "reference": {
+        "path": "inference/partitioned-attention/code/implementation.py",
+        "symbol": "attention_partial, merge_partials"
+      },
+      "verify": "on the target, compute two partitions' partials and their merge with the kernels and with attention_partial and merge_partials: outputs within BF16 probability rounding, log-sum-exps within FP32 error",
+      "invariance": "the merged result independent of where the partitions are cut, within the tolerance; the same bits on a repeat"
+    }
+  ]
+}

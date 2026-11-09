@@ -1,10 +1,10 @@
 """Resident host with bounded request isolation and exclusive model lifecycle work."""
+import json
 from pathlib import Path
-import importlib.util
 import os
 import sys
-import types
 import threading
+import traceback
 
 if __package__ in {None, ""}:
     # Launched by path: make crit_api and, in a checkout, crit, crit_core and the crit Eval checkout beside it
@@ -14,12 +14,13 @@ if __package__ in {None, ""}:
                    root.parent / "crit-eval"):
         if any((folder / name).is_dir() for name in ("crit_api", "crit", "crit_core", "crit_eval")):
             sys.path.insert(0, str(folder))
-from crit.records import MAX_JSON_BYTES, digest, read_json, safe_path
+from crit.records import MAX_JSON_BYTES, digest, read_json
 from crit_api import channel
 from crit_api.logprobs import RESPONDING, response_bytes
 from crit_api.models import ModelContext, ModelPool
 from crit_api.stream import StreamWriter
 from crit_api.options import MAX_CHAT_RECORD
+from crit_core import engine as core_engine
 from crit_core.machine import keep_full_speed
 from crit_core.serving import (CONCURRENT_CAPABILITY, CONFIG_CAPABILITY, LOGPROBS_CAPABILITY, SCORE_CAPABILITY, STREAM_CAPABILITY,
                                STRICT_TOOLS_CAPABILITY, TOKENIZE_CAPABILITY, TOOL_CHOICE_CAPABILITY,
@@ -41,6 +42,20 @@ def effective_configuration_problem(engine, configuration):
         return ("Engine did not apply its frozen configuration (ignored: %s; changed: %s)"
                 % (", ".join(ignored) or "none", ", ".join(changed) or "none"))
     return None
+
+
+def device_free_bytes():
+    """The device memory this process can still allocate on its current CUDA device (cudaMemGetInfo, through torch
+    when an engine in this host initialized it), or None. Under the Windows display driver (native Windows, WSL)
+    nvidia-smi counts only memory already resident, so allocations an engine holds but has not touched read as free
+    there; the process's own figure is what it can still allocate."""
+    torch = sys.modules.get("torch")
+    try:
+        if torch is None or not torch.cuda.is_initialized():
+            return None
+        return int(torch.cuda.mem_get_info()[0])
+    except Exception:   # a reading never fails the host
+        return None
 
 
 class Cancelled(Exception):
@@ -75,6 +90,7 @@ class Host:
         self.engine = self.context = self.identity = None
         self.facts = None  # the loaded engine's facts for Eval (crit_core.serving.engine_facts)
         self.limits = None  # the loaded engine's limits: the same candidate at other limits is built again
+        self.configuration = None  # and its configuration: another one (an ablation's variant) is built again too
         self.blocked = False
         self.loads = 0
         self.capacity = 1
@@ -85,7 +101,34 @@ class Host:
         self.texts = 0  # tokenize requests running on the engine (chat-tokenize-v1)
         self.settled = threading.Condition(self.state_lock)
 
+    def telemetry(self, request):
+        """A telemetry request (crit serve's /health), on its own thread beside any generation: the loaded engine's work
+        so far (its telemetry(): Core's StepEngine.telemetry, the plugins' and Core's counters) as JSON values, None
+        when it reports none or its report fails (logged: a report never fails the host or a request). Unloaded
+        unless the host has loaded the request's engine; closing the engine waits for a running one."""
+        with self.state_lock:
+            if self.blocked or self.identity != {k: request[k] for k in ("run_id", "candidate_id", "package_sha256")}:
+                raise Unloaded("The resident host has not loaded the request's engine")
+            engine = self.engine
+            self.texts += 1
+        found = None
+        try:
+            report = getattr(engine, "telemetry", None)
+            if callable(report):
+                value = report()
+                found = json.loads(json.dumps(value)) if isinstance(value, dict) else None
+        except Exception:  # noqa: BLE001 - a plugin's report fails alone
+            traceback.print_exc(file=sys.stderr)
+            found = None
+        finally:
+            with self.state_lock:
+                self.texts -= 1
+                self.settled.notify_all()
+        return {"schema_version": 1, "record_kind": "telemetry_response",
+                **{k: request[k] for k in ("request_id", "candidate_id", "package_sha256")}, "engine_telemetry": found}
+
     def status(self, state, **extra):
+        free = device_free_bytes() if state == "ready" else None
         with self.state_lock:
             if self.active and state in {"ready", "draining"}:
                 state = "generating"
@@ -94,7 +137,8 @@ class Host:
                 "host_bytes": sum(p.host_bytes for p in self.pools.values()),
                 "device_bytes": sum(p.device_bytes for p in self.pools.values()),
                 "engine_loads": self.loads, "active_requests": self.active,
-                "max_concurrent_requests": self.capacity, "engine_facts": self.facts, **extra}})
+                "max_concurrent_requests": self.capacity, "engine_facts": self.facts,
+                **({"device_free_bytes": free} if free is not None else {}), **extra}})
 
     def detach(self):
         if self.engine is not None:
@@ -109,17 +153,19 @@ class Host:
             except BaseException:
                 self.blocked = True
                 raise
-            self.engine = self.context = self.identity = self.facts = self.limits = None
+            self.engine = self.context = self.identity = self.facts = self.limits = self.configuration = None
 
     def attach(self, spec):
         if self.blocked:
             raise ValueError("Resident host is quarantined")
         identity = {k: spec[k] for k in ("run_id", "candidate_id", "package_sha256")}
-        if identity == self.identity and spec.get("limits", {}) == self.limits:
+        if (identity == self.identity and spec.get("limits", {}) == self.limits
+                and spec.get("configuration") == self.configuration):
             self.pool.verify_sources()
             return
-        # Another candidate, or the same one at other limits (a measurement's lower context): the engine is closed and
-        # built again; the model's pool, its mapped files and device weights, stays.
+        # Another candidate, or the same one at other limits (a measurement's lower context) or with another
+        # configuration (an ablation's variant): the engine is closed and built again; the model's pool, its mapped
+        # files and device weights, stays.
         self.detach()
         model_id = digest(spec['model_manifest'])
         if self.pool.model_id is not None and self.pool.model_id != model_id:
@@ -147,23 +193,10 @@ class Host:
                         model_device_bytes=self.pool.device_bytes)
         loading("loading_engine")
         package = Path(spec["package_path"])
-        entry = safe_path(package, spec["launch"][0])
-        if entry.suffix.lower() != ".py":
-            raise ValueError("chat-resident-v1 requires a Python factory entry; native code may be wrapped by it")
-        namespace = "crit_resident_" + spec["package_sha256"]
-        if namespace not in sys.modules:
-            module = types.ModuleType(namespace)
-            module.__path__ = [str(package)]
-            sys.modules[namespace] = module
-        name = namespace + ".entry"
-        # A sealed package keeps its bytes: importing it must not write a __pycache__ into it. crit serve launches
-        # the host with -B; a host run in-process (a test, an embedding) may not have been.
+        # A sealed package keeps its bytes: importing its plugins must not write a __pycache__ into it. crit serve
+        # launches the host with -B; a host run in-process (a test, an embedding) may not have been.
         sys.dont_write_bytecode = True
-        module_spec = importlib.util.spec_from_file_location(name, entry)
-        module = importlib.util.module_from_spec(module_spec)
-        sys.modules[name] = module
-        module_spec.loader.exec_module(module)
-        self.context = ModelContext(self.pool, spec["configuration"], spec["launch"][1:], progress=loading)
+        self.context = ModelContext(self.pool, spec["configuration"], progress=loading)
         self.context.limits = spec.get('limits', {})
         self.context.drafters = tuple(spec.get('drafters') or ())
         try:
@@ -173,7 +206,8 @@ class Host:
                 raise ValueError("Strict, streaming or forced tools require chat-tools-v1")
             if TOOL_STREAM_CAPABILITY in capabilities and STREAM_CAPABILITY not in capabilities:
                 raise ValueError("chat-tool-stream-v1 requires chat-stream-v1")
-            self.engine = module.create_engine(self.context)
+            # The one way an engine runs: Core's loader assembles the package's plugins (crit_core.engine).
+            self.engine = core_engine.resident(self.context, package)
             if not all(callable(getattr(self.engine, name, None)) for name in ("generate", "reset", "close")):
                 raise ValueError("Resident engine must implement generate, reset and close")
             if STREAM_CAPABILITY in spec.get("capabilities", []) and not callable(getattr(self.engine, "generate_stream", None)):
@@ -205,7 +239,7 @@ class Host:
             if problem:
                 self.detach()  # close the constructed engine and its context before rejecting
                 raise ValueError(problem)
-        self.identity, self.limits = identity, spec.get("limits", {})
+        self.identity, self.limits, self.configuration = identity, spec.get("limits", {}), spec.get("configuration")
         self.facts = engine_facts(self.engine)
         self.loads += 1
         self.status("ready")
@@ -275,6 +309,8 @@ class Host:
         action, payload = command["action"], command["payload"]
         if action == "tokenize":
             return self.tokenize(payload["spec"], payload["request"])
+        if action == "telemetry":
+            return self.telemetry(payload["request"])
         if self.blocked:
             raise ValueError("Resident host is quarantined")
         if action == "unload":
@@ -378,7 +414,7 @@ def main():
         try:
             while True:
                 message = link.receive(MAX_CHAT_RECORD + MAX_JSON_BYTES)
-                if message["kind"] == "command" and message["action"] == "tokenize":
+                if message["kind"] == "command" and message["action"] in ("tokenize", "telemetry"):
                     threading.Thread(target=execute, args=(message,), daemon=True).start()
                     continue
                 with lock:
@@ -395,7 +431,8 @@ def main():
 
     def execute(command):
         cid = command["command_id"]
-        beside = command["action"] == "tokenize"  # beside the engine's work: no status, and a failure keeps the engine
+        # Beside the engine's work: no status, and a failure keeps the engine.
+        beside = command["action"] in ("tokenize", "telemetry")
         with lock:
             cancellation = cancels.setdefault(cid, Cancellation())
         status, error, response, rejection = "completed", None, None, None
@@ -411,7 +448,11 @@ def main():
                 # Refused before generation: the engine settled and stays loaded.
                 status, error, rejection = "rejected", str(exc), exc.record()
         except BaseException as exc:
-            status, error = "failed", str(exc)
+            # The exception's type and the traceback in the host's log: a KeyError's message alone is only the key
+            # ("'request_id'"), which says nothing about where an engine or its adapter failed.
+            status, error = "failed", (str(exc) if isinstance(exc, (ValueError, RuntimeError)) and str(exc)
+                                       else f"{type(exc).__name__}: {exc}")
+            traceback.print_exc(file=sys.stderr)
             host.blocked = host.blocked or not beside
         if not beside:
             host.blocked = host.blocked or host.pool.blocked
