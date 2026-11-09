@@ -256,9 +256,10 @@ DEVICE_EXTENSIONS = {
                               "draft_device kept; a draft without a law, or whose law gives it no mass, takes the "
                               "target's own draw) for sampled rows, by Core's law and draws as predictions(), "
                               "capture-safe",
-        "logprobs_device": "logprobs_device(view, logits, tokens): Core's TokenLogprob of the round's emitted tokens "
-                           "[rows][width + 1] over the logits rows that predicted them, into view.logprobs (and "
-                           "view.top_ids / view.top_logprobs in Core's order), capture-safe",
+        "logprobs_device": "logprobs_device(view, logits, tokens): the log-probabilities of the round's emitted tokens "
+                           "[rows][width + 1] over the logits rows that predicted them, in the arithmetic of the "
+                           "model's step and score paths (torch's FP32 log_softmax, as the driver's own), into "
+                           "view.logprobs (and view.top_ids / view.top_logprobs in Core's order), capture-safe",
     },
     "rounds:embeddings": {},
     "rounds:experts": {},

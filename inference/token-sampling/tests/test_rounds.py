@@ -270,7 +270,7 @@ class RoundSamplerTests(PluginTestCase):
                 tv = 0.5 * sum(abs(p.get(t, 0) - q.get(t, 0)) for t in range(6))
                 self.assertAlmostEqual(accepted / n, 1 - tv, delta=4 * math.sqrt((1 - tv) * tv / n) + 1e-3)
 
-    def test_greedy_rounds_take_the_argmax_and_logprobs_are_cores(self):
+    def test_greedy_rounds_take_the_argmax_and_logprobs_are_torchs_fp32_log_softmax(self):
         torch = self.torch
         for kernel in KERNELS:
             s = self.sampler(kernel)
@@ -283,16 +283,64 @@ class RoundSamplerTests(PluginTestCase):
                 v = view(torch, rows, width, mode, self.device(), logprobs=5)
                 found = s.predictions_device(v, logits, None)
                 s.logprobs_device(v, logits, found)   # the round driver's, after the accept
-                expected = torch.log_softmax(logits.double(), -1)
+                expected = torch.log_softmax(logits, -1)
                 with self.subTest(kernel=kernel, mode=mode):
                     self.assertEqual(found.tolist(), torch.argmax(logits, -1).tolist())
                     self.assertEqual(int(found[0, 1]), 10)
                     chosen = expected.gather(2, found[..., None])[..., 0]
-                    self.assertTrue(torch.allclose(v.logprobs[:, :width + 1].double(), chosen, atol=1e-5))
-                    ranked = torch.sort(logits, dim=-1, descending=True, stable=True).indices[..., :5]
+                    self.assertTrue(torch.equal(v.logprobs[:, :width + 1], chosen))
+                    ranked = torch.sort(expected, dim=-1, descending=True, stable=True).indices[..., :5]
                     self.assertEqual(v.top_ids[:, :width + 1].tolist(), ranked.tolist())
-                    self.assertTrue(torch.allclose(v.top_logprobs[:, :width + 1].double(),
-                                                   expected.gather(2, ranked), atol=1e-5))
+                    self.assertTrue(torch.equal(v.top_logprobs[:, :width + 1], expected.gather(2, ranked)))
+
+    def test_a_captured_rounds_log_probabilities_are_the_step_and_score_paths_bit_for_bit(self):
+        # A torch model's step and score paths take torch.log_softmax of FP32 logits rows (a step's row alone or a
+        # stack of rows, a score's chunk of rows): a captured round scores its emitted tokens in the same arithmetic,
+        # so each value, the chosen token's and every alternative's, is the same float. Vocabularies through each of
+        # torch's row kernels (one warp, a block over registers, shared memory, a block over the row in memory).
+        torch = self.torch
+        if self.device() != "cuda":
+            self.skipTest("CUDA graphs")
+        g = torch.Generator(device="cuda").manual_seed(29)
+        for kernel in KERNELS:
+            s = self.sampler(kernel)
+            for vocab in (700, 4096, 12000, 151936, 248320):
+                rows, width, top = 3, 2, 5
+                s.reserve(rows, width, vocab, "cuda", logprobs=top)
+                v = view(torch, rows, width, "greedy", "cuda", logprobs=top)
+                logits = torch.zeros(rows, width + 1, vocab, device="cuda")
+                tokens = torch.zeros(rows, width + 1, dtype=torch.int64, device="cuda")
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    for _ in range(2):   # the driver's warm-ups
+                        s.logprobs_device(v, logits, tokens)
+                torch.cuda.current_stream().wait_stream(stream)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    s.logprobs_device(v, logits, tokens)
+                for trial in range(2):
+                    # A model's rows: a long unlikely tail and a few likely tokens, two of them tied.
+                    logits.copy_(torch.randn(rows, width + 1, vocab, device="cuda", generator=g) * 2 - 4)
+                    likely = torch.randint(0, vocab, (rows, width + 1, 8), device="cuda", generator=g)
+                    logits.scatter_(2, likely, torch.rand(rows, width + 1, 8, device="cuda", generator=g) * 6 + 2)
+                    logits[0, 1, likely[0, 1, :2]] = 9.0
+                    tokens.copy_(torch.randint(0, vocab, (rows, width + 1), device="cuda", generator=g))
+                    tokens[1, 0] = likely[1, 0, 0]
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    flat = logits.reshape(-1, vocab)
+                    alone = torch.stack([torch.log_softmax(flat[j].clone(), -1) for j in range(len(flat))])
+                    stacked = torch.log_softmax(flat.flip(0), -1).flip(0)   # each row at another place
+                    ranked = torch.sort(alone, dim=-1, descending=True, stable=True)
+                    with self.subTest(kernel=kernel, vocab=vocab, trial=trial):
+                        self.assertTrue(torch.equal(alone, stacked))
+                        chosen = alone.gather(1, tokens.reshape(-1, 1))[:, 0].view(rows, width + 1)
+                        self.assertTrue(torch.equal(v.logprobs[:, :width + 1], chosen))
+                        self.assertEqual(v.top_ids[:, :width + 1].reshape(-1, top).tolist(),
+                                         ranked.indices[:, :top].tolist())
+                        self.assertTrue(torch.equal(v.top_logprobs[:, :width + 1].reshape(-1, top),
+                                                    ranked.values[:, :top]))
 
     def test_a_captured_round_replays_with_rules_staged_after_it(self):
         torch = self.torch

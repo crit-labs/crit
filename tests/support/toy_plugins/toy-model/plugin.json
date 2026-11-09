@@ -66,6 +66,13 @@
         "skip"
       ],
       "description": "on (with CUDA): each step's projection work runs as a captured prompt chunk (crit_plugins.prompt_graphs) of its rows, so a request reaches the projections plugin through replays only; skip: the captured chunk multiplies without the plugin, for the loader's checks"
+    },
+    "prompt_width": {
+      "type": "int",
+      "default": 1,
+      "min": 1,
+      "max": 65536,
+      "description": "the columns each row of the captured prompt chunk's product sums: wide, cuBLAS splits the sum through its workspace, for tests of engines side by side"
     }
   },
   "entry": "plugin.py:create",

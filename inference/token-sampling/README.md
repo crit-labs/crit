@@ -139,7 +139,10 @@ resolves the tie group exactly as Core ranks it. `enqueue_sample` and `enqueue_v
 the same work (`Logprobs`): the stage blocks also write the raw lists, extra blocks of the law
 kernel rank them beside the law blocks, and the full-law kernel writes every row's chosen
 token's log-probability once the token is known. Rows masked by `enqueue_mask` report over the
-masked row; Core's constrained `Sampler` reports over the unmasked one.
+masked row; Core's constrained `Sampler` reports over the unmasked one. `enqueue_ranked_logprobs`
+takes rows that are log-probabilities already (a torch engine's FP32 `log_softmax`, the
+arithmetic of its step and score paths) and reports each value as given, the alternatives
+ranked the same way, so a captured round reports the bits the engine's steps report.
 
 **History on the device.** `Request.counts` holds the committed output counts and
 `prompt_seen` the prompt tokens the repetition penalty counts. `enqueue_commit` adds a
@@ -160,9 +163,13 @@ drafter's draw (argmax in greedy rounds and for greedy rows) with its law kept s
 pairs; `targets` maps a draft vocabulary or a subset to target ids; a sampled round without `view.draft_laws` is
 refused), `laws(rows, widest)` the round's laws a drafter writes, and `predictions_device(view, logits, draft_laws)`
 writes every verify column's prediction by the rules above. After the accept, the round driver asks
-`logprobs_device(view, logits, tokens)` for Core's log-probabilities and ranked alternatives of the emitted tokens (the
+`logprobs_device(view, logits, tokens)` for the log-probabilities and ranked alternatives of the emitted tokens (the
 logits rows in emitted order, a tree's gathered along its path), so a round computes them once, of the tokens it
-keeps. A round over a token tree (`view.tree_depths`, draft-trees) predicts each node's own draw at
+keeps. They are torch's FP32 `log_softmax` of the rows, what a torch model's step and score paths compute, ranked in
+Core's order by `enqueue_ranked_logprobs` (by a stable sort without the CUDA sampler): a token's log-probability from
+a captured round is the step's and the score path's bit for bit for the same logits (torch's kernel reduces a row by
+its length and its address modulo 16 bytes, the same for every row of a vocabulary that is a multiple of 4). A round
+over a token tree (`view.tree_depths`, draft-trees) predicts each node's own draw at
 `out_count + depth` through `Rows::tree`. A second `reserve` keeps the rules staged before, and the plugin's facts
 name the kernel the rounds run (`round_sampling`: `native` or `torch`). The launches are
 `sampling.cu`'s through [sampling_torch.cpp](code/sampling_torch.cpp), built at load through torch's extension builder
@@ -186,6 +193,7 @@ than the rejection rule.
 | `Rows`, `enqueue_sample`, `scratch_floats` | One draw per (request, column or tree node) with a chosen `DrawPurpose`, optionally the law as a dense row or a `SparseLaw` (a drafter's `q`) |
 | `Verify`, `enqueue_verify` | Verify predictions for the device greedy accept kernel: the target's draws for greedy drafts, accept/residual/bonus for sampled drafts against dense or sparse `q`; `VerifyRule::block` for block verification |
 | `Logprobs`, `enqueue_logprobs`, `logprob_scratch_bytes` | Core's `TokenLogprob` values on the device: chosen tokens' log-probabilities and ranked alternatives of raw rows, standalone or fused into `enqueue_sample` / `enqueue_verify` (a device round's `RoundView::logprob` rows) |
+| `enqueue_ranked_logprobs` | The same over rows that are log-probabilities already (a torch engine's `log_softmax`): the chosen tokens' values and the ranked alternatives as given (the rounds:sampler extension's) |
 | `enqueue_commit` | Counts and positions after publication, from a device-held emitted count |
 
 [sampling_torch.cpp](code/sampling_torch.cpp) binds the launches for torch tensors (host code), and

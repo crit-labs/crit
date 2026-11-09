@@ -1,10 +1,12 @@
 """crit's wheel as pip installs it: built from a clean snapshot of HEAD (git archive, as CI's packaging step builds it)
 and installed with crit-core's into a fresh virtual environment, it carries the plugin library, so crit plugins and crit
-inference act on it there, plugins copy out of it and a library plugin's tests pass on the CPU. The environment borrows
-this Python's installed packages (torch, tokenizers, crit Eval) behind its own. The build uses this Python's
-setuptools when it is new enough (offline), else pip fetches one; the test skips without git, pip or a builder."""
+inference act on it there, plugins copy out of it and a library plugin's tests pass on the CPU, and crit run keeps a
+run without a checkout. The environment borrows this Python's installed packages (torch, tokenizers, crit Eval) behind
+its own. The build uses this Python's setuptools when it is new enough (offline), else pip fetches one; the test skips
+without git, pip or a builder."""
 from importlib import metadata
 import io
+import json
 import os
 from pathlib import Path
 import re
@@ -99,14 +101,14 @@ class WheelInstallTests(unittest.TestCase):
             raise AssertionError(f"pip install failed:\n{installed.stdout[-3000:]}{installed.stderr[-3000:]}")
         borrowed = site.getsitepackages() + ([site.getusersitepackages()] if site.ENABLE_USER_SITE else [])
         (cls.purelib / "crit-test-borrowed.pth").write_text(
-            f"import site; [site.addsitedir(p) for p in {borrowed!r}]\n", encoding="utf-8")
+            f"import site; list(map(site.addsitedir, {borrowed!r}))\n", encoding="utf-8")
         cls.crit = shutil.which("crit", path=str(scripts))
         if cls.crit is None:
             raise AssertionError(f"pip installed no crit command in {scripts}")
 
-    def crit_(self, *arguments, timeout=120):
-        """crit ... from the installed environment, run in a folder outside every checkout."""
-        result = run([self.crit, *arguments], cwd=self.work, timeout=timeout)
+    def crit_(self, *arguments, timeout=120, cwd=None):
+        """crit ... from the installed environment, run in a folder outside every checkout (default the test's)."""
+        result = run([self.crit, *arguments], cwd=cwd or self.work, timeout=timeout)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout
 
@@ -122,6 +124,14 @@ class WheelInstallTests(unittest.TestCase):
         checkout, shipped = files(self.source / "inference"), files(library)
         self.assertEqual(checkout - shipped, {"CMakeLists.txt"} | {p for p in checkout if p.startswith("examples/")})
         self.assertEqual(shipped - checkout, set())
+
+    def test_an_installed_crit_names_the_crit_eval_release_it_pins(self):
+        # Without crit Eval, an installed crit says to install the release it pins, not a checkout beside it.
+        found = run([str(self.python), "-c", "from crit.cli import eval_install; print(eval_install())"],
+                    cwd=self.work, timeout=60)
+        self.assertEqual(found.returncode, 0, found.stderr)
+        pinned = re.search(r'"crit-eval==([^"]+)"', (ROOT / "pyproject.toml").read_text(encoding="utf-8"))[1]
+        self.assertEqual(found.stdout.strip(), f"python -m pip install crit-eval=={pinned}")
 
     def test_crit_plugins_list_and_crit_inference_act_on_the_shipped_library(self):
         listed = self.crit_("plugins", "list")
@@ -144,6 +154,59 @@ class WheelInstallTests(unittest.TestCase):
         self.assertRegex(self.crit_("plugins", "add", str(engine), PLUGIN), rf"added +{PLUGIN} ")
         self.assertEqual(files(engine / "base" / PLUGIN), files(self.source / "inference" / "base" / PLUGIN))
         self.assertEqual(list((engine / "base" / PLUGIN).rglob("__pycache__")), [])
+
+    def test_crit_run_keeps_a_run_of_the_toy_engine_without_a_checkout(self):
+        """The folder crit run runs in is its project, holding settings.toml and runs/; the run's brief names the
+        installed crit's release; and a run of the CPU toy engine goes from create through recon, capture, resolve and
+        its first plan to a candidate, built and packaged, with no record in error."""
+        from core_text_fixtures import llama_files, write_files
+        from support.engines import TOY, selection
+        project = self.work / "project"
+        model = write_files(project / "model", llama_files())
+        (project / "settings.toml").write_text("ram_headroom_gib = 3\n", encoding="utf-8")
+        (project / "request.json").write_text(json.dumps({"model_path": str(model), "kv_tokens": 8192,
+                                                          "correctness_criteria": "Fixture gates"}), encoding="utf-8")
+
+        def crit(*arguments, record=None):
+            if record is not None:
+                (project / (arguments[-1])).write_text(json.dumps(record), encoding="utf-8")
+            return json.loads(self.crit_("run", *arguments, cwd=project))
+
+        run = crit("create", "--record", "request.json")["run"]
+        run_id, folder = run["run_id"], project / "runs" / run["run_id"]
+        self.assertEqual(run["spec"]["hardware_constraints"]["ram_headroom_bytes"], 3 << 30)   # the project's setting
+        version = self.crit_("--version").split()[1]
+        self.assertIn(f"\nRepository: https://github.com/crit-labs/crit/tree/v{version}, the release of the installed "
+                      f"crit {version} ({self.purelib / 'crit'})\n",
+                      (folder / "agent_request.md").read_text(encoding="utf-8"))
+        crit("--id", run_id, "recon")
+        notes = folder / "work" / "recon.md"
+        notes.write_bytes(re.sub(rb"(?m)^TODO\.?", b"Written for this test.", notes.read_bytes()))
+        self.assertEqual(crit("--id", run_id, "capture", "--inputs", "inputs.json")["prompt_tokens"], 512)
+        inputs = json.loads((project / "inputs.json").read_text(encoding="utf-8"))
+        crit("--id", run_id, "resolve", "--record", "inputs.json", record={
+            **inputs, "hardware_manifest": {"device": "host"}, "environment_manifest": {"benchmark": "synthetic"}})
+        plan = crit("--id", run_id, "plan", "--record", "plan.json", record={
+            "parent_candidate_id": None, "decision": "build", "gaps": [], "levers": [], "rejected": [],
+            "needed": {kpi: {"needed": True, "evidence": "no Eval yet"} for kpi in ("decode", "prefill")},
+            "strategy": {"current": {"name": "plain decode", "ceiling": "unknown", "evidence": "none yet"},
+                         "alternative": {"name": "drafting", "ceiling": "unknown", "evidence": "none yet"},
+                         "choice": "current", "reason": "the first candidate"},
+            "forecast": None, "gates": "Quality stays inside the budget", "prompt_activations": "stored"})
+        shutil.copytree(TOY, project / "source" / "plugins", ignore=shutil.ignore_patterns("__pycache__"))
+        candidate = crit("--id", run_id, "candidate", "--source", "source", "--record", "proposal.json", record={
+            "label": "Toy engine", "rationale": "The CPU toy engine", "strategy": "plain decode",
+            "configuration": {"plugins": selection()}, "store_decisions": {}, "plan_id": plan["plan_id"],
+            "lever_fates": {}})["candidate_id"]
+        built = crit("--id", run_id, "build", "--candidate", candidate, "--record", "recipe.json", record={"build": {
+            "toolchain": {"python": sys.version.split()[0]},
+            "command": [str(self.python), "-c", "open('built.txt', 'w').write('built')"]}})
+        self.assertEqual(built["attempt"]["outcome"], "completed")
+        self.assertEqual([d["path"] for d in built["package"]["build"]["dependencies"]], ["built.txt"])
+        view = crit("--id", run_id, "show")
+        self.assertEqual(view["errors"], [])
+        self.assertEqual([(c["candidate_id"], c["artifacts"]["package"]) for c in view["candidates"]],
+                         [(candidate, f"candidates/{candidate}/package")])
 
 
 if __name__ == "__main__":

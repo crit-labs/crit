@@ -6,6 +6,7 @@ import ast
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -13,6 +14,18 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def source_files(name):
+    """The files called `name` in the checkout's source: a walk that never enters build/ (build output, and CI's
+    temporary folder, build/ci-temp, where other tests' runs come and go), a dot-folder (.git, a virtual environment)
+    or __pycache__."""
+    found = []
+    for folder, folders, files in os.walk(ROOT):
+        folders[:] = sorted(f for f in folders if not (f.startswith(".") or f == "__pycache__"
+                                                         or (folder == str(ROOT) and f == "build")))
+        found += [Path(folder) / name] if name in files else []
+    return found
 sys.path.insert(0, str(ROOT / "core" / "python"))
 sys.path.insert(0, str(ROOT / "cli"))
 
@@ -124,7 +137,7 @@ class LibraryTests(unittest.TestCase):
                     self.assertIn(kernel["name"], strings, "declared, but the plugin's code never asks for it")
                     self.assertTrue(kernel["fallback"].strip())
         self.assertGreater(declared, 0)
-        self.assertEqual([p.relative_to(ROOT).as_posix() for p in ROOT.glob("**/build.toml") if ".git" not in p.parts],
+        self.assertEqual([p.relative_to(ROOT).as_posix() for p in source_files("build.toml")],
                          [], "kernel-builder projects live in crit-kernels")
 
     def test_a_kernel_name_in_a_docstring_or_comment_is_not_a_request(self):

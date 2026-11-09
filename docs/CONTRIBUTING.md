@@ -60,7 +60,7 @@ a clean snapshot:
 mkdir -p build/package-source
 git archive HEAD | tar -x -C build/package-source
 python -B -c "import os; from setuptools.build_meta import build_sdist, build_wheel; os.chdir('build/package-source'); build_sdist('../dist'); build_wheel('../dist')"
-python -m pip install build/dist/crit-0.17.0-py3-none-any.whl
+python -m pip install build/dist/crit-0.17.1-py3-none-any.whl
 ```
 
 The `crit` wheel holds `crit`, `crit_api`, `crit_kernels`, `crit_mcp`, `crit_models` and `crit_smoke`, and
@@ -72,6 +72,8 @@ a separate CMake project, and Eval's suite data ship in the source checkout. cri
 runs from (`inference/`, installed with `-e .` or not), else in the copy its wheel ships, so an engine's plugins are
 built from `python -m pip install .` as from a checkout: `crit plugins list|check|test|add` and `crit inference` act
 on the installed library, and a crit without it says its install is broken. `crit run` keeps its records against a
-crit checkout (`--project`), and serving a built engine needs neither, since a package carries its plugins.
-[tests/test_wheel_install.py](../tests/test_wheel_install.py) installs the wheel from a snapshot and runs the library
-from it.
+crit checkout (`--project`) and, from a crit installed without one, in any folder: the run's brief then names crit's
+repository at the installed release's tag (crit X.Y.Z is published from vX.Y.Z) for the guides, and runs stay outside
+the folder crit is installed in. Serving a built engine needs neither, since a package carries its plugins.
+[tests/test_wheel_install.py](../tests/test_wheel_install.py) installs the wheel from a snapshot, runs the library
+from it and keeps a run of the toy engine with it, outside any checkout, up to a built candidate.

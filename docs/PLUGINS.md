@@ -577,8 +577,10 @@ session=, tokens=, outputs=)` puts a sequence into a round slot in every pool (a
 far; the sampler stages its rules), `unbind` and `move` keep the decoding rows packed at the front, and a row a step
 does not schedule sits a round out (`view.hold`: it emits nothing, and every commit keeps it as it was). Each (rows,
 width, mode) is one graph with its own memory pool, captured at load on one capture stream per device, two eager
-warm-ups first; the memory the captures take is planned as `"rounds:captures"` ([memory](#memory)). Inputs a model
-computes from the tokens before each column (hashed n-gram ids) come from a `TokenRing` among its pools.
+warm-ups first, with cuBLAS workspaces made in a pool Core keeps for them (`capture_workspaces`: torch frees a
+stream's workspaces whenever a graph captured on it goes, and an engine closed beside another must not free what the
+other's graphs write); the memory the captures take is planned as `"rounds:captures"` ([memory](#memory)). Inputs a
+model computes from the tokens before each column (hashed n-gram ids) come from a `TokenRing` among its pools.
 
 A drafting model may let its rounds choose their draft width: the driver captures rounds at several widths
 (`widths=`, each in 0 .. widest) and a width policy (`width_policy=`, or `crit_plugins.rounds.width_policy(name,

@@ -155,7 +155,8 @@ crit run --root RUN_ROOT --id RUN_ID check --candidate CANDIDATE_ID --from-eval
 crit run --root RUN_ROOT --id RUN_ID measure --candidate CANDIDATE_ID
 ```
 
-Run these from the checkout or add `--project CRIT_ROOT`, in this order. Each reserves, runs and settles its own
+Run these from the checkout or add `--project CRIT_ROOT` (a crit installed without a checkout runs them from any
+folder, [Run records](RUN_RECORDS.md#cli-actions)), in this order. Each reserves, runs and settles its own
 attempt. `measure` comes after `check --from-eval`: a benchmark qualifies only on the checks recorded before it,
 and one that does not keeps the candidate from ever being eligible, so `measure` refuses a candidate whose checks
 are not recorded or did not pass, and says what to run first; `--exploratory` measures it anyway, for telemetry or

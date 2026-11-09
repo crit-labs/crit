@@ -439,6 +439,7 @@ class Sampler:
         if self.smi:
             self.smi.kill()
             self.smi.wait()
+            self.smi.stdout.close()
 
 
 def run_gpus(store, run_id):

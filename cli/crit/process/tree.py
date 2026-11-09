@@ -11,6 +11,44 @@ from crit.records import keys, read_json, write_json
 
 from .ownership import RETIREMENT_SECONDS, group_alive, process_identity
 
+if os.name == "nt":
+    import _winapi
+
+
+class OwnedProcess:
+    """What a tree's callers use of subprocess.Popen (pid, poll, wait, kill, returncode, the _handle it closes), for
+    the Windows process a tree creates itself (ProcessTree._windows_start), with Popen's semantics."""
+
+    def __init__(self, handle, pid, args):
+        self._handle, self.pid, self.args, self.returncode = subprocess.Handle(handle), pid, args, None
+
+    def poll(self):
+        return self._wait(0)
+
+    def wait(self, timeout=None):
+        code = self._wait(_winapi.INFINITE if timeout is None else int(timeout * 1000))
+        if code is None:
+            raise subprocess.TimeoutExpired(self.args, timeout)
+        return code
+
+    def _wait(self, milliseconds):
+        if self.returncode is None:
+            if _winapi.WaitForSingleObject(self._handle, milliseconds) == _winapi.WAIT_TIMEOUT:
+                return None
+            self.returncode = _winapi.GetExitCodeProcess(self._handle)
+        return self.returncode
+
+    def kill(self):
+        if self.returncode is not None:
+            return
+        try:
+            _winapi.TerminateProcess(self._handle, 1)
+        except PermissionError:  # denied once the process has exited
+            code = _winapi.GetExitCodeProcess(self._handle)
+            if code == _winapi.STILL_ACTIVE:
+                raise
+            self.returncode = code
+
 
 class ProcessTree:
     def __init__(self, command, cwd, log, job_name=None, env=None, errors=None):
@@ -22,6 +60,13 @@ class ProcessTree:
         self.job_name = job_name
         self.guardian = None
         if os.name == "nt":
+            if command and command[0] == sys.executable and getattr(sys, "_base_executable", sys.executable) != \
+                    sys.executable:
+                # A venv's python.exe is a launcher that starts the base interpreter, which a Microsoft Store Python
+                # activates under Windows' default policy, so the base's own children would leave the job. Start the
+                # base directly, naming the venv as the launcher does.
+                command = [sys._base_executable, *command[1:]]
+                env = dict(os.environ if env is None else env, __PYVENV_LAUNCHER__=sys.executable)
             self._windows_start(command, cwd, log, env, errors)
         else:
             self.process = subprocess.Popen(command, cwd=cwd, stdout=log, stderr=errors or subprocess.STDOUT,
@@ -29,8 +74,16 @@ class ProcessTree:
             self.identity = process_identity(self.process.pid)
 
     def _windows_start(self, command, cwd, log, env, errors=None):
+        """Create the command's process suspended, assign it to the tree's job, then let it run, so it starts no child
+        outside the job. It is created with a desktop app policy that keeps its children in the job too: a Microsoft
+        Store Python is a packaged app, and Windows starts the children of a packaged process, and a packaged
+        interpreter that a venv's launcher starts, outside the job of the process that starts them unless that
+        process's policy says otherwise. Without the policy the job held only the tree's first process there, and
+        closing the tree neither ended nor waited for the others, which kept running with the tree's log files open.
+        subprocess.Popen cannot pass the policy, so the tree creates its process itself."""
         import ctypes as c
         from ctypes import wintypes as w
+        import msvcrt
 
         class Limits(c.Structure):
             _fields_ = [("process_time", c.c_int64), ("job_time", c.c_int64), ("flags", w.DWORD),
@@ -43,10 +96,15 @@ class ProcessTree:
                         ("process_memory", c.c_size_t), ("job_memory", c.c_size_t),
                         ("peak_process", c.c_size_t), ("peak_job", c.c_size_t)]
 
-        class Thread(c.Structure):
-            _fields_ = [("size", w.DWORD), ("usage", w.DWORD), ("id", w.DWORD),
-                        ("owner", w.DWORD), ("base_priority", w.LONG),
-                        ("delta_priority", w.LONG), ("flags", w.DWORD)]
+        class Startup(c.Structure):  # STARTUPINFOEXW
+            _fields_ = [("size", w.DWORD), ("reserved", w.LPWSTR), ("desktop", w.LPWSTR), ("title", w.LPWSTR),
+                        ("x", w.DWORD), ("y", w.DWORD), ("width", w.DWORD), ("height", w.DWORD),
+                        ("columns", w.DWORD), ("rows", w.DWORD), ("fill", w.DWORD), ("flags", w.DWORD),
+                        ("show", w.WORD), ("reserved_size", w.WORD), ("reserved_data", c.c_void_p),
+                        ("stdin", w.HANDLE), ("stdout", w.HANDLE), ("stderr", w.HANDLE), ("attributes", c.c_void_p)]
+
+        class Created(c.Structure):  # PROCESS_INFORMATION
+            _fields_ = [("process", w.HANDLE), ("thread", w.HANDLE), ("pid", w.DWORD), ("tid", w.DWORD)]
 
         api = c.WinDLL("kernel32", use_last_error=True)
         signatures = {
@@ -54,10 +112,12 @@ class ProcessTree:
             "SetInformationJobObject": ([w.HANDLE, c.c_int, c.c_void_p, w.DWORD], w.BOOL),
             "AssignProcessToJobObject": ([w.HANDLE, w.HANDLE], w.BOOL),
             "OpenProcess": ([w.DWORD, w.BOOL, w.DWORD], w.HANDLE),
-            "CreateToolhelp32Snapshot": ([w.DWORD, w.DWORD], w.HANDLE),
-            "Thread32First": ([w.HANDLE, c.POINTER(Thread)], w.BOOL),
-            "Thread32Next": ([w.HANDLE, c.POINTER(Thread)], w.BOOL),
-            "OpenThread": ([w.DWORD, w.BOOL, w.DWORD], w.HANDLE),
+            "InitializeProcThreadAttributeList": ([c.c_void_p, w.DWORD, w.DWORD, c.POINTER(c.c_size_t)], w.BOOL),
+            "UpdateProcThreadAttribute": ([c.c_void_p, w.DWORD, c.c_size_t, c.c_void_p, c.c_size_t, c.c_void_p,
+                                           c.c_void_p], w.BOOL),
+            "DeleteProcThreadAttributeList": ([c.c_void_p], None),
+            "CreateProcessW": ([w.LPCWSTR, w.LPWSTR, c.c_void_p, c.c_void_p, w.BOOL, w.DWORD, c.c_void_p,
+                                w.LPCWSTR, c.c_void_p, c.c_void_p], w.BOOL),
             "ResumeThread": ([w.HANDLE], w.DWORD), "CloseHandle": ([w.HANDLE], w.BOOL)}
         signatures.update({"TerminateJobObject": ([w.HANDLE, w.UINT], w.BOOL),
             "QueryInformationJobObject": ([w.HANDLE, c.c_int, c.c_void_p, w.DWORD, c.c_void_p], w.BOOL)})
@@ -73,42 +133,57 @@ class ProcessTree:
             limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
             if not api.SetInformationJobObject(self.job, 9, c.byref(limits), c.sizeof(limits)):
                 raise c.WinError(c.get_last_error())
-            # CREATE_SUSPENDED prevents a launcher spawning children before assignment.
-            self.process = subprocess.Popen(command, cwd=cwd, stdout=log, stderr=errors or subprocess.STDOUT,
-                                            stdin=subprocess.DEVNULL, creationflags=0x4 | 0x08000000, env=env)
-            handle = api.OpenProcess(0x0100 | 0x0001, False, self.process.pid)
-            if not handle:
+            this = _winapi.GetCurrentProcess()
+
+            def inheritable(file):
+                return _winapi.DuplicateHandle(this, msvcrt.get_osfhandle(file.fileno()), this, 0, True,
+                                               _winapi.DUPLICATE_SAME_ACCESS)
+
+            size = c.c_size_t()
+            api.InitializeProcThreadAttributeList(None, 2, 0, c.byref(size))
+            attributes = c.create_string_buffer(size.value)
+            if not api.InitializeProcThreadAttributeList(attributes, 2, 0, c.byref(size)):
                 raise c.WinError(c.get_last_error())
+            standard = []  # input, output, errors
             try:
-                if not api.AssignProcessToJobObject(self.job, handle):
+                with open(os.devnull, "rb") as devnull:
+                    standard += [inheritable(devnull), inheritable(log)]
+                standard.append(inheritable(errors) if errors else standard[1])
+                # The process inherits its standard handles and no others (PROC_THREAD_ATTRIBUTE_HANDLE_LIST), and
+                # takes the policy (PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY,
+                # PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE), which Windows before 10 1703 refuses:
+                # it has no packaged apps.
+                inherited = (w.HANDLE * len(set(standard)))(*set(standard))
+                if not api.UpdateProcThreadAttribute(attributes, 0, 0x20002, inherited, c.sizeof(inherited), None,
+                                                     None):
+                    raise c.WinError(c.get_last_error())
+                policy = w.DWORD(0x2)
+                api.UpdateProcThreadAttribute(attributes, 0, 0x20012, c.byref(policy), c.sizeof(policy), None, None)
+                startup = Startup(size=c.sizeof(Startup), flags=0x100, stdin=standard[0], stdout=standard[1],
+                                  stderr=standard[2], attributes=c.addressof(attributes))  # STARTF_USESTDHANDLES
+                environment = None
+                if env is not None:
+                    variables = sorted(env.items(), key=lambda item: item[0].upper())
+                    environment = c.create_unicode_buffer("".join(f"{k}={v}\0" for k, v in variables) + "\0")
+                created = Created()
+                # CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW
+                if not api.CreateProcessW(None, c.create_unicode_buffer(subprocess.list2cmdline(command)), None,
+                                          None, True, 0x4 | 0x400 | 0x80000 | 0x08000000, environment,
+                                          None if cwd is None else os.fspath(cwd), c.byref(startup),
+                                          c.byref(created)):
                     raise c.WinError(c.get_last_error())
             finally:
-                api.CloseHandle(handle)
-            snapshot = api.CreateToolhelp32Snapshot(0x4, 0)
-            if snapshot == c.c_void_p(-1).value:
-                raise c.WinError(c.get_last_error())
-            resumed = False
+                api.DeleteProcThreadAttributeList(attributes)
+                for handle in set(standard):
+                    _winapi.CloseHandle(handle)
+            self.process = OwnedProcess(created.process, created.pid, command)
             try:
-                entry = Thread()
-                entry.size = c.sizeof(entry)
-                available = api.Thread32First(snapshot, c.byref(entry))
-                while available:
-                    if entry.owner == self.process.pid:
-                        thread = api.OpenThread(0x0002, False, entry.id)
-                        if not thread:
-                            raise c.WinError(c.get_last_error())
-                        try:
-                            if api.ResumeThread(thread) == 0xFFFFFFFF:
-                                raise c.WinError(c.get_last_error())
-                            resumed = True
-                        finally:
-                            api.CloseHandle(thread)
-                        break
-                    available = api.Thread32Next(snapshot, c.byref(entry))
+                if not api.AssignProcessToJobObject(self.job, created.process):
+                    raise c.WinError(c.get_last_error())
+                if api.ResumeThread(created.thread) == 0xFFFFFFFF:
+                    raise c.WinError(c.get_last_error())
             finally:
-                api.CloseHandle(snapshot)
-            if not resumed:
-                raise OSError("Could not resume the owned runner thread")
+                api.CloseHandle(created.thread)
         except BaseException:
             self.close()
             raise
@@ -246,15 +321,9 @@ def guarded_tree(command, cwd, log, ownership, folder, env=None, deadline=None):
     launch = folder / ("launch-" + uuid.uuid4().hex + ".json")
     write_json(launch, {"owner_path": str(ownership.path), "token": ownership.token,
                "command": command, "cwd": str(cwd)}, immutable=True)
-    interpreter, environment = sys.executable, env
-    if os.name == "nt" and getattr(sys, "_base_executable", sys.executable) != sys.executable:
-        # A venv's python.exe is a launcher that starts the base interpreter, and Windows activates a Microsoft
-        # Store base outside the launcher's job. Start the base directly, naming the venv as the launcher does.
-        interpreter = sys._base_executable
-        environment = dict(os.environ if env is None else env, __PYVENV_LAUNCHER__=sys.executable)
     ownership.launch_settled = False
-    tree = ProcessTree([interpreter, "-B", str(Path(__file__).with_name("guardian.py")), str(launch)], cwd, log,
-                       job_name="Local\\crit-runtime-" + ownership.token, env=environment)
+    tree = ProcessTree([sys.executable, "-B", str(Path(__file__).with_name("guardian.py")), str(launch)], cwd, log,
+                       job_name="Local\\crit-runtime-" + ownership.token, env=env)
     tree.launch_error_path = launch.with_suffix(".error.json")
     try:
         ready_path = launch.with_suffix(".ready.json")

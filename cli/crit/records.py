@@ -28,18 +28,23 @@ GIB = 1024 ** 3
 # released, briefly causes.
 SHARING_ERRORS = {5, 32, 33}
 _verification_cache = ContextVar("crit_verification_cache", default=None)
+_verified_inventories = ContextVar("crit_verified_inventories", default=None)
 
 
 @contextmanager
 def verification_scope():
-    """Deduplicate hashes only within one boundary check, observing file changes."""
+    """One boundary check: a run store's operation, or crit serve's check of a candidate before it serves it. Within
+    it a folder that matched its rows is not walked again for the same rows (verify_inventory), and a file is hashed
+    again only when its stat changes (on Windows every time: see _hashed). A scope entered inside one is part of it;
+    the next scope verifies everything again, so a file that changes between two checks fails the second."""
     if _verification_cache.get() is not None:
         yield
         return
-    token = _verification_cache.set({})
+    token, verified = _verification_cache.set({}), _verified_inventories.set(set())
     try:
         yield
     finally:
+        _verified_inventories.reset(verified)
         _verification_cache.reset(token)
 
 
@@ -296,6 +301,8 @@ def inventory(root, exclude=()):
 
 
 def verify_inventory(root, rows, exclude=()):
+    """Refuse unless the files under `root` (but `exclude`) are exactly `rows`. A verification scope walks and hashes
+    `root` once for the same rows: a run store's operation reads each candidate's manifests several times over."""
     if not isinstance(rows, list) or not rows or len(rows) > MAX_FILES:
         raise ValueError("Artifact requires a nonempty bounded file inventory")
     for row in rows:
@@ -305,5 +312,11 @@ def verify_inventory(root, rows, exclude=()):
         canonical(text(row["path"], "record path"))
         number(row["bytes"], "file bytes", 0, 2 ** 60, integer=True)
         sha(row["sha256"], "file sha256")
+    verified = _verified_inventories.get()
+    identity = None if verified is None else (str(Path(root).absolute()), digest(rows), tuple(sorted(exclude)))
+    if identity is not None and identity in verified:
+        return
     if rows != inventory(root, exclude):
         raise ValueError("Retained artifact bytes differ from manifest")
+    if identity is not None:
+        verified.add(identity)

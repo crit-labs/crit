@@ -15,7 +15,7 @@ import re
 import sys
 import threading
 
-from crit.cli import default_project
+from crit.cli import default_project, named_project
 from crit.records import GIB, read_json
 from crit.run.records import DEFAULT_QUALITY_MODE, QUALITY_MODES
 from crit.run.served import QUALITY, SERVED
@@ -248,7 +248,9 @@ def parser():
     parser.add_argument("--out", type=Path, help="The result file (default: the engine's bench/ folder in the store)")
     parser.add_argument("--store", type=Path, help="Engine store (default: PROJECT/engines)")
     parser.add_argument("--project", type=Path, default=default_project(),
-                        help="crit repository, whose settings.toml gives the device and headroom (default: this checkout)")
+                        help="crit checkout whose settings.toml gives the device, the headroom and crit Eval's settings "
+                             "and whose engines/ is the default store (default: this checkout); a crit installed "
+                             "without a checkout takes any folder (default: the current one)")
     parser.add_argument("--device", type=Path, help="A crit eval probe result (default: settings.toml's device, else "
                                                      "the store's, else a probe run now)")
     parser.add_argument("--parts", nargs="+", metavar="PART", help="crit Eval's parts (default: speed and quality)")
@@ -270,8 +272,10 @@ def main(argv=None):
     try:
         store = InstallStore(args.store or args.project / "engines")
         stage = args.stage if args.stage in (None, "full") else int(args.stage)
-        result, card_stats, label, out = bench(args.engine, store, args.data, args.out, args.project, args.device,
-                                               args.parts, stage, args.budget_minutes, args.reference, args.quality_mode)
+        with named_project(args.project):   # Eval reads the project's settings.toml, as the bench does
+            result, card_stats, label, out = bench(args.engine, store, args.data, args.out, args.project, args.device,
+                                                   args.parts, stage, args.budget_minutes, args.reference,
+                                                   args.quality_mode)
     except (ValueError, OSError, KeyError) as exc:
         print("error: " + str(exc), file=sys.stderr)
         return 1

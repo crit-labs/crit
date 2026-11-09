@@ -81,6 +81,7 @@ each form; the device memory both captures take is measured (captured_bytes, by 
 """
 import gc
 import inspect
+import warnings
 
 from .device import RoundBatch
 from .manifest import POLICY_SLOTS, PluginError
@@ -95,6 +96,7 @@ FORMS = ("plain", "logprobs")                  # a round's forms, by its key's l
 HEAD = ("n_emitted", "n_matched", "frontier")
 
 _CAPTURE_STREAMS = {}   # device -> the one stream every round driver of the process captures on
+_WORKSPACE_POOLS = {}   # device -> the memory pool the capture stream's cuBLAS workspaces are made in, for the process
 
 
 def capture_stream(device):
@@ -105,6 +107,38 @@ def capture_stream(device):
     if device not in _CAPTURE_STREAMS:
         _CAPTURE_STREAMS[device] = torch.cuda.Stream(device)
     return _CAPTURE_STREAMS[device]
+
+
+def capture_workspaces(stream):
+    """Give `stream` (the capture stream) fresh cuBLAS workspaces for the calling thread, made in a memory pool kept for
+    them for the process: called just before each capture on it (a round's, a prompt chunk's), after its warm-ups.
+
+    A captured graph keeps the address of the cuBLAS workspace its matrix products ran with (torch keeps one per handle,
+    a thread's, and stream, and its cuBLASLt products use it too), and torch frees every workspace of a stream when a
+    graph captured on that stream is destroyed (CUDAGraph.reset). Every capture shares the capture stream, so one
+    engine's graphs going (an engine closed in a process that keeps another) freed the workspace the other engine's
+    graphs still write: its memory went to other tensors, or back to the driver, and the next replay wrote there. Made
+    in this pool, a workspace a reset frees goes back to the pool, where nothing is made but the next capture's
+    workspaces (the same block again), so no graph's workspace is ever another tensor's memory, whichever graph goes
+    first. The stream's workspaces are dropped first the way a reset drops them, by resetting an empty capture on it:
+    torch's own clear (torch._C._cuda_clearCublasWorkspaces) frees every stream's, which graphs captured elsewhere may
+    hold."""
+    import torch
+    device = stream.device
+    pool = _WORKSPACE_POOLS.get(device)
+    if pool is None:
+        pool = _WORKSPACE_POOLS[device] = torch.cuda.MemPool()
+    empty = torch.cuda.CUDAGraph()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")   # torch warns that the capture is empty
+        with torch.cuda.stream(stream):
+            empty.capture_begin(capture_error_mode="thread_local")
+            empty.capture_end()
+    empty.reset()
+    operand, product = torch.zeros(2, 2, device=device), torch.empty(2, 2, device=device)
+    with torch.cuda.use_mem_pool(pool, device), torch.cuda.stream(stream):
+        torch.mm(operand, operand, out=product)   # allocates nothing but the workspace
+    return pool
 
 
 class RoundsRefused(PluginError):
@@ -782,6 +816,7 @@ class SpeculativeRounds:
             gc.disable()
             observed = self._observer.snapshot() if self._observer is not None else None
             try:
+                capture_workspaces(stream)
                 with torch.cuda.graph(graph, pool=pool, stream=stream):
                     self._round(rows, width, mode, logprobs)
             finally:
@@ -1202,8 +1237,9 @@ class Rounds(SpeculativeRounds):
     def _scored(self, view):
         """Each emitted token's log-probability (and ranked alternatives) in emitted order, after the accept: emitted
         token j was predicted by column j of a chain, by node view.tree_path[j] of a tree (its verifier sets the path),
-        whose logits rows are gathered into emitted order. The sampler's logprobs_device computes them where it has it
-        (Core's TokenLogprob and tie order); otherwise the driver does, in Core's tie order. Past n_emitted the values
+        whose logits rows are gathered into emitted order. The sampler's logprobs_device computes them where it has it;
+        otherwise the driver does: torch's FP32 log_softmax (a model's step and score arithmetic) in Core's tie
+        order. Past n_emitted the values
         are of token 0 and Core reads none of them. A plain-form round (view.logprobs None) scores nothing."""
         if view.logprobs is None or self._logits is None:
             return
@@ -1381,5 +1417,5 @@ class TokenRing:
 
 
 __all__ = ["FORMS", "HEAD", "MODES", "WIDTH_POLICIES", "FixedWidth", "RateWidth", "RoundView", "Rounds", "RoundsRefused",
-           "SpeculativeRounds", "StepWidth", "TokenRing", "capture_stream", "round_fact", "round_problems",
-           "width_policy"]
+           "SpeculativeRounds", "StepWidth", "TokenRing", "capture_stream", "capture_workspaces", "round_fact",
+           "round_problems", "width_policy"]

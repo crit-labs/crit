@@ -75,7 +75,8 @@ def parser():
     result.add_argument("--resident-ram-gib", type=float, help="Optional cap on retained model bytes in host memory")
     result.add_argument("--resident-vram-gib", type=float, help="Optional cap on retained model bytes in device memory")
     result.add_argument("--project", type=Path, default=default_project(),
-                        help="crit repository (default: this checkout)")
+                        help="crit repository (default: this checkout); a crit installed without a checkout takes "
+                             "any folder (default: the current one)")
     result.add_argument("--write-launchers", action="store_true",
                         help="Write serve.cmd and serve.sh into the run folder, which start this exact command, then exit")
     result.add_argument("--recover-runtime", action="store_true",

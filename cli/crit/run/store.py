@@ -1,6 +1,7 @@
 """Single-writer run coordinator; records are data, never executable recipes."""
 from contextlib import contextmanager
 from datetime import timedelta
+import functools
 import os
 import json
 from pathlib import Path
@@ -8,9 +9,10 @@ import shutil
 import tempfile
 import uuid
 
+from ..cli import checkout, installed
 # The coordinator lease each write takes (crit.lease); named from here as before.
 from ..lease import exclusive_lease, lease, lease_owner, read_lease_owner, release_dead_lease  # noqa: F401
-from ..records import retry_denied, utc_now
+from ..records import retry_denied, utc_now, verification_scope
 from .records import (
     HEADROOM_REASONS, LIFECYCLES, LINEAGE, MAX_CANDIDATES, SAFETY_WINDOW_MINUTES, STOP_REASONS, WEIGHTS, amendment,
     attempt_process_cap,
@@ -122,17 +124,37 @@ def run_device_file(run):
     return ((run["spec"].get("hardware_constraints") or {}).get("context") or {}).get("device_file")
 
 
+def store_operation(method):
+    """A RunStore operation as one verification scope (crit.records.verification_scope): however many of its
+    projections read a candidate, it walks and hashes the candidate's retained inventories once, and the next
+    operation verifies them again. An operation run inside another (select reads the run with get) is part of it."""
+    @functools.wraps(method)
+    def scoped(*args, **kwargs):
+        with verification_scope():
+            return method(*args, **kwargs)
+    return scoped
+
+
 class RunStore:
     def __init__(self, root, project=ROOT):
         self.project = Path(project).resolve()
-        if not (self.project / "core/include/crit/core.h").is_file():
+        # The crit the run's agent follows, which its agent_request.md names (repository): the project when it is a
+        # crit checkout, else the installed crit, when crit runs without a checkout. Its project is then any folder,
+        # the one of settings.toml and the default runs/, and its guides are crit's repository at its release.
+        crit = None
+        if not checkout(self.project) and (crit := installed()) is None:
             raise ValueError("Select a crit repository with --project")
+        self.repository = (str(self.project) if crit is None else
+                           f"{crit.guides}, the release of the installed crit {crit.version} ({crit.package})")
         requested = Path(root).expanduser().absolute()
         if requested.resolve() != requested or requested.is_symlink():
             raise ValueError("Run root must not traverse symlinks/reparse points")
         self.root = requested.resolve()
-        if self.root == self.project or any(self.root.is_relative_to(self.project / name) for name in PROTECTED):
+        if crit is None and (self.root == self.project or
+                             any(self.root.is_relative_to(self.project / name) for name in PROTECTED)):
             raise ValueError("Runs belong outside publication and protected retention")
+        if crit is not None and self.root.is_relative_to(crit.package.parent):
+            raise ValueError(f"Runs belong outside the folder crit is installed in ({crit.package.parent})")
         self.root.mkdir(parents=True, exist_ok=True)
 
     def directory(self, run_id):
@@ -147,6 +169,7 @@ class RunStore:
         replay.refuse(root)
         return root
 
+    @store_operation
     def get(self, run_id):
         root = self.directory(run_id)
         run = load_run(root)
@@ -189,6 +212,7 @@ class RunStore:
         return {"run": run, "state": state, "segment": bounds, "candidates": candidates, "errors": errors,
                 "folder": str(root), "prompt": prompt_path.read_text(encoding="utf-8")}
 
+    @store_operation
     def list(self):
         items, errors = [], []
         for path in sorted(self.root.glob("run-*/run.json"), reverse=True):
@@ -268,6 +292,7 @@ class RunStore:
             (root / "agent_request.md").write_text(prompt, encoding="utf-8", newline="\n")
         return bounds
 
+    @store_operation
     def create(self, data, origin=None):
         """A new run; with `origin`, a crit-hub engine folder the run starts from (hub.describe_engine), whose
         published evidence is kept under captured/origin/."""
@@ -329,6 +354,7 @@ class RunStore:
                 raise ValueError("Retained attempts exceed their authorized segment cap")
         return result
 
+    @store_operation
     def resume(self, run_id, minutes=None, attempt_limit=64, external_cleanup_confirmed=False, candidates=None, amend=None):
         """amend: {quality_budget?, exactness?, approved_by} changes the run's quality terms from this segment on."""
         if type(external_cleanup_confirmed) is not bool:
@@ -359,6 +385,7 @@ class RunStore:
             self._event(root, "segment_resumed", detail={"segment_id": bounds["segment_id"]})
         return self.get(run_id)
 
+    @store_operation
     def freeze_inputs(self, run_id, data):
         root = self._recording(run_id)
         with lease(root):
@@ -443,6 +470,7 @@ class RunStore:
             " (candidates on the candidate ladder)" if ladder.ladder(run) else
             " (candidates through Eval)" if counts_evaluated(run) else "") + "; stop, or Resume with more candidates")
 
+    @store_operation
     def candidate(self, run_id, source, proposal):
         root = self._recording(run_id)
         with lease(root):
@@ -527,6 +555,7 @@ class RunStore:
                                                                          **({"plan_id": value["plan_id"]} if "plan_id" in value else {})})
         return value
 
+    @store_operation
     def plan(self, run_id, data, check=False):
         """Record a candidate plan (plans.py): checked against the parent's newest Eval, which it freezes, with the
         priorities crit computes. Never changed afterwards; a revision is a new plan that supersedes it. check: run
@@ -553,6 +582,7 @@ class RunStore:
                                 "supersedes": value["supersedes"], "priorities": value["priorities"]})
         return value
 
+    @store_operation
     def plan_outcome(self, run_id, candidate_id, attempt_id):
         """After a retained Eval attempt of a candidate created from a plan: the plan's forecast next to what Eval
         measured, at plans/PLAN_ID/outcomes/ATTEMPT.json. None when the candidate has no plan."""
@@ -574,6 +604,7 @@ class RunStore:
                         detail={"plan_id": plan["plan_id"], "flags": [flag["kpi"] for flag in value["flags"]]})
         return value
 
+    @store_operation
     def recon(self, run_id, force=False, drafters=()):
         root = self._recording(run_id)
         with lease(root):
@@ -581,11 +612,13 @@ class RunStore:
             self._event(root, "model_recon", reference={"path": recon.RECON_JSON, "sha256": file_sha(root / recon.RECON_JSON)})
         return value
 
+    @store_operation
     def recon_compare(self, run_id, other):
         """What another checkpoint changes for an engine built for this run's model (recon.compare_with_run)."""
         root = self.directory(run_id)
         return recon.compare_with_run(root, load_run(root), Path(other).expanduser().resolve())
 
+    @store_operation
     def package(self, run_id, candidate_id, source, recipe):
         root = self._recording(run_id)
         with lease(root):
@@ -632,6 +665,7 @@ class RunStore:
             self._published(root, candidate_id, manifest_path, value)
         return value
 
+    @store_operation
     def append(self, run_id, candidate_id, kind, data):
         root = self._recording(run_id)
         with lease(root):
@@ -657,6 +691,7 @@ class RunStore:
                 latest[check.get("gate")] = path
         return [{"path": path.relative_to(root).as_posix(), "sha256": file_sha(path)} for path in sorted(latest.values())]
 
+    @store_operation
     def reserve(self, run_id, candidate_id, operation, seconds=None):
         root = self._recording(run_id)
         with lease(root):
@@ -701,6 +736,7 @@ class RunStore:
                 raise
         return value
 
+    @store_operation
     def eval_started(self, run_id, reservation, journal, resumes=None):
         """The run's event for an Eval attempt that starts measuring: its reservation, the journal it writes and the
         earlier attempt's journal it resumes (crit run ... eval --resume)."""
@@ -742,6 +778,7 @@ class RunStore:
         except (OSError, ValueError):
             pass
 
+    @store_operation
     def settle(self, run_id, reservation, data):
         root = self._recording(run_id)
         with lease(root):
@@ -777,6 +814,7 @@ class RunStore:
                              f"{candidate_id}): select needs every case's benchmark, and a sealed candidate takes no "
                              "new measurement")
 
+    @store_operation
     def seal(self, run_id, candidate_id, lifecycle, failure=None):
         root = self._recording(run_id)
         with lease(root):
@@ -812,6 +850,7 @@ class RunStore:
             self._event(root, "candidate_sealed", candidate_id)
         return value
 
+    @store_operation
     def select(self, run_id, candidate_id):
         root = self._recording(run_id)
         with lease(root):
@@ -827,6 +866,7 @@ class RunStore:
             self._event(root, "candidate_selected", candidate_id)
         return self.get(run_id)
 
+    @store_operation
     def stop(self, run_id, reason, critique=None, opportunities=None, cleanup="external", message="", headroom=None):
         if reason not in STOP_REASONS or cleanup not in {"external", "settled", "unresolved"}:
             raise ValueError("Invalid stopping reason or cleanup state")
@@ -865,6 +905,7 @@ class RunStore:
                                                         "headroom": headroom})
         return self.get(run_id)
 
+    @store_operation
     def cost(self, run_id, transcripts, agent=None, prices=None, until=None):
         """Write cost.json: the run's wall time, agent tokens and API price per candidate (cost.py)."""
         root = self._recording(run_id)
@@ -873,6 +914,7 @@ class RunStore:
             candidates, _ = read_candidates(root, run)
             return cost.write(root, run, candidates, transcripts, agent, prices, until)
 
+    @store_operation
     def recover(self, run_id):
         root = self.directory(run_id)
         with lease(root, recover=True):
@@ -1124,7 +1166,7 @@ class RunStore:
                           "own family's, and a plan freezes the parent's newest Eval attempt that measured speed.")
         return f"""# crit run {run['run_id']}
 
-Repository: {self.project}
+Repository: {self.repository}
 Run folder: {root}
 Immutable request: run.json ({run['request_sha256']})
 {budget_line}

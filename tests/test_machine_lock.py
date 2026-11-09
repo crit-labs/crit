@@ -12,13 +12,19 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "core/python"))
 from crit_core import machine  # noqa: E402
 
+# Holds the lock for argv[1] seconds, or until its input closes: start it with stdin=subprocess.PIPE, and end it early
+# by closing that rather than by killing it. A Windows venv's python.exe is a launcher, and killing it leaves the
+# interpreter it started, which holds the lock file open, to end a moment after the launcher, so the test's cleanup
+# could not remove the file.
 HOLD = """
-import sys, time
+import os, sys, threading
 sys.path.insert(0, sys.argv[2])
 from crit_core.machine import engine_lock
 with engine_lock("crit eval run (test holder)"):
     print("held", flush=True)
-    time.sleep(float(sys.argv[1]))
+    reader = threading.Thread(target=os.read, args=(0, 1), daemon=True)
+    reader.start()
+    reader.join(float(sys.argv[1]))
 """
 
 
@@ -44,7 +50,7 @@ class EngineLockTest(unittest.TestCase):
         env = dict(os.environ)
         env.pop(machine.HELD_ENV, None)
         proc = subprocess.Popen([sys.executable, "-c", HOLD, str(seconds), str(ROOT / "core/python")], env=env,
-                                stdout=subprocess.PIPE, text=True)
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.assertEqual(proc.stdout.readline().strip(), "held")
         return proc
 
@@ -71,6 +77,7 @@ class EngineLockTest(unittest.TestCase):
             self.assertGreater(waited, 0.5)
         finally:
             proc.wait(timeout=30)
+            proc.stdin.close()
             proc.stdout.close()
 
     def foreign_lease(self, age_s):
@@ -113,7 +120,7 @@ class EngineLockTest(unittest.TestCase):
                     self.fail("busy lock admitted a waiter")
             self.assertLess(time.monotonic() - started, 2)
         finally:
-            proc.terminate()
+            proc.stdin.close()   # the holder releases the lock and exits
             proc.wait(timeout=10)
             proc.stdout.close()
 
