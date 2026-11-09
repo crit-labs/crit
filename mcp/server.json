@@ -1,0 +1,30 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.crit-labs/crit",
+  "title": "crit",
+  "description": "Build, evaluate and serve a bespoke LLM inference engine for your own GPU with crit's commands.",
+  "repository": {
+    "url": "https://github.com/crit-labs/crit",
+    "source": "github",
+    "subfolder": "mcp"
+  },
+  "websiteUrl": "https://crit-hub.dev",
+  "version": "0.17.2",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "crit",
+      "version": "0.17.2",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ]
+    }
+  ]
+}

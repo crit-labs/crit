@@ -4,14 +4,24 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crit"
-version = "0.17.1"
+version = "0.17.2"
 description = "crit: inference runtime, reusable techniques, kernel discovery, evaluation and an OpenAI-compatible serving API"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
+# What PyPI's search and the MCP Registry's listing read beside the description.
+keywords = ["llm", "inference", "inference-engine", "llm-inference", "cuda", "gpu", "kernels", "speculative-decoding",
+            "quantization", "kv-cache", "benchmark", "evaluation", "openai-compatible", "mcp", "mcp-server",
+            "model-context-protocol", "ai-agents", "claude-code", "codex"]
+classifiers = ["Development Status :: 4 - Beta", "Environment :: GPU :: NVIDIA CUDA", "Intended Audience :: Developers",
+               "Intended Audience :: Science/Research", "Operating System :: POSIX :: Linux",
+               "Operating System :: Microsoft :: Windows", "Programming Language :: Python :: 3",
+               "Programming Language :: Python :: 3 :: Only", "Programming Language :: C++",
+               "Topic :: Scientific/Engineering :: Artificial Intelligence",
+               "Topic :: Software Development :: Code Generators"]
 # crit Core's Python package (core/python) and crit Eval (https://github.com/crit-labs/crit-eval) install on their own.
-dependencies = ["tokenizers>=0.22,<0.24", "jinja2>=3.1.4,<4", "crit-core==0.17.1", "crit-eval==0.6.1"]
+dependencies = ["tokenizers>=0.22,<0.24", "jinja2>=3.1.4,<4", "crit-core==0.17.2", "crit-eval==0.6.1"]
 
 [project.optional-dependencies]
 # crit-eval reference: score the quality texts on the checkpoint itself (crit models' GPTQ streams the same reference).
@@ -19,7 +29,11 @@ dependencies = ["tokenizers>=0.22,<0.24", "jinja2>=3.1.4,<4", "crit-core==0.17.1
 reference = ["crit-eval[reference]==0.6.1", "transformers>=5.20,<6"]
 
 [project.urls]
+Homepage = "https://crit-hub.dev"
 Repository = "https://github.com/crit-labs/crit"
+Documentation = "https://github.com/crit-labs/crit#readme"
+Changelog = "https://github.com/crit-labs/crit/blob/main/CHANGELOG.md"
+Issues = "https://github.com/crit-labs/crit/issues"
 
 [project.scripts]
 crit = "crit.cli:main"
@@ -27,10 +41,11 @@ crit = "crit.cli:main"
 [tool.setuptools]
 # The code packages, every package folder of cli/, api/, kernels/, models/, mcp/ and smoke/
 # (tests/test_product_surface.py holds the list to them), and crit's plugin library: inference/ as package data of
-# crit.library.inference, which an installed crit finds at crit/library/inference (crit.inference.LIBRARY). Only the
-# package data named below ships.
+# crit.library.inference, which an installed crit finds at crit/library/inference (crit.inference.LIBRARY), and the
+# guides crit mcp serves as package data of crit.library.guides (crit/library/guides). Only the package data named
+# below ships.
 packages = ["crit", "crit.process", "crit.pull", "crit.run", "crit_api", "crit_kernels", "crit_mcp", "crit_models",
-            "crit_smoke", "crit.library.inference"]
+            "crit_smoke", "crit.library.inference", "crit.library.guides"]
 include-package-data = false
 
 [tool.setuptools.package-dir]
@@ -41,12 +56,18 @@ crit_mcp = "mcp/crit_mcp"
 crit_models = "models/crit_models"
 crit_smoke = "smoke/crit_smoke"
 "crit.library.inference" = "inference"
+"crit.library.guides" = "."
 
 [tool.setuptools.package-data]
 crit_kernels = ["templates/*"]
 # Every technique's and base plugin's folder whole: manifests, plugin.py, code, tests, READMEs, entry.json and
 # operations.json, which crit plugins list|check|test|add and crit inference read.
 "crit.library.inference" = ["**/*"]
+# The guides crit mcp offers as crit:// resources (crit_mcp.server.GUIDES), so an installed crit's agent reads the
+# workflow it runs: AGENTS.md first.
+"crit.library.guides" = ["AGENTS.md", "docs/BUILDING_ENGINES.md", "docs/RUN_RECORDS.md", "docs/SERVING.md",
+                         "docs/CONTRIBUTION_CRITERIA.md", "cli/README.md", "kernels/README.md", "models/README.md",
+                         "mcp/README.md"]
 
 [tool.setuptools.exclude-package-data]
 # Inference's native build entry and walkthrough build against a checkout's core/ and tests/inference/ fixtures, which

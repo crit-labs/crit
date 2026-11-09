@@ -16,8 +16,8 @@ FOLDERS = ("core/python", "api", "../crit-eval", "kernels", "models", "cli", "mc
 for _folder in FOLDERS: sys.path.insert(0, str(ROOT / _folder))
 from crit.process.ownership import process_identity
 from crit_mcp.jobs import Jobs
-from crit_mcp.server import Server
-from crit_mcp.tools import family_parser, tools
+from crit_mcp.server import EXTRA_TOOLS, Failure, Server
+from crit_mcp.tools import ADDITIVE, DESTRUCTIVE, OPEN_WORLD, READ_ONLY, family_parser, tools
 
 
 class ToolTests(unittest.TestCase):
@@ -84,6 +84,37 @@ class ToolTests(unittest.TestCase):
         args = family_parser("run").parse_args(words[1:])
         self.assertEqual((args.id, args.action, args.candidate, args.only, args.label, args.budget_minutes, args.resume),
                          ("r", "eval", "c", ["speed", "quality"], "-dash", 30.0, True))
+
+
+    def test_every_tool_says_what_it_does_to_the_machine(self):
+        # Claude's directory asks each tool for a title and its read-only and destructive hints: a client runs a
+        # read-only tool unasked and confirms a destructive one. Every command is named once, so a new subcommand
+        # (crit's or crit Eval's) cannot ship with the conservative defaults unnoticed.
+        everything, missing = tools()
+        self.assertEqual(missing, {})
+        self.assertFalse(READ_ONLY & DESTRUCTIVE or READ_ONLY & ADDITIVE or DESTRUCTIVE & ADDITIVE)
+        self.assertEqual(set(everything), READ_ONLY | DESTRUCTIVE | ADDITIVE)
+        self.assertLessEqual(OPEN_WORLD, set(everything))
+        for definition in [tool.definition(30) for tool in everything.values()] + EXTRA_TOOLS:
+            hints = definition["annotations"]
+            self.assertEqual(hints["title"], definition["title"])
+            self.assertEqual({type(hints[key]) for key in ("readOnlyHint", "destructiveHint", "openWorldHint")}, {bool})
+            self.assertFalse(hints["readOnlyHint"] and hints["destructiveHint"], definition["name"])
+            self.assertLessEqual(len(definition["name"]), 64)
+        annotated = {name: everything[name].definition(30)["annotations"] for name in
+                     ("crit_run_show", "crit_run_seal", "crit_run_build", "crit_pull")}
+        self.assertEqual([(a["readOnlyHint"], a["destructiveHint"], a["openWorldHint"]) for a in annotated.values()],
+                         [(True, False, False), (False, True, False), (False, False, False), (False, False, True)])
+        stop = next(tool for tool in EXTRA_TOOLS if tool["name"] == "crit_job_stop")["annotations"]
+        self.assertEqual((stop["readOnlyHint"], stop["destructiveHint"]), (False, True))
+
+    def test_the_registry_entry_is_one_the_registry_takes(self):
+        # mcp/server.json is crit mcp's entry in the MCP Registry, which checks the name against the mcp-name line of
+        # crit's PyPI description (README.md); its versions move with every release (tests/test_versions.py).
+        entry = json.loads((ROOT / "mcp/server.json").read_text(encoding="utf-8"))
+        self.assertEqual(entry["packages"][0]["identifier"], "crit")
+        self.assertIn(f"mcp-name: {entry['name']} ", (ROOT / "README.md").read_text(encoding="utf-8"))
+        self.assertLessEqual(len(entry["description"]), 100)
 
 
 class Client:
@@ -205,6 +236,22 @@ class JobTests(unittest.TestCase):
             self.assertTrue(job.done.wait(30))
             self.assertEqual(job.read("output")[0].strip(), str(Path(directory).resolve()))
             server.jobs.close(grace=5)
+
+    def test_a_server_leaves_out_the_tools_it_is_told_to(self):
+        # crit mcp --without crit_run_cost: a harness that should not read an agent's transcripts never sees the tool.
+        with tempfile.TemporaryDirectory() as directory:
+            server = Server(jobs=Path(directory) / "jobs", families=("run",), without=["crit_run_cost", "crit_jobs"])
+            self.addCleanup(server.jobs.close, 5)
+            names = [tool["name"] for tool in server.handle("tools/list", {})["tools"]]
+            self.assertNotIn("crit_run_cost", names)
+            self.assertNotIn("crit_jobs", names)
+            self.assertIn("crit_run_show", names)
+            self.assertIn("crit_job_wait", names)
+            for name in ("crit_run_cost", "crit_jobs"):
+                with self.assertRaisesRegex(Failure, f"Unknown tool: {name}"):
+                    server.call(name, {}, {}, 1)
+            with self.assertRaisesRegex(ValueError, "No tool crit_run_nothing to leave out"):
+                Server(jobs=Path(directory) / "other", families=("run",), without=["crit_run_nothing"])
 
     def test_a_stopped_job_ends_with_its_whole_tree(self):
         with tempfile.TemporaryDirectory() as directory:

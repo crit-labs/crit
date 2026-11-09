@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 import unittest
 import venv
 
@@ -124,6 +125,32 @@ class WheelInstallTests(unittest.TestCase):
         checkout, shipped = files(self.source / "inference"), files(library)
         self.assertEqual(checkout - shipped, {"CMakeLists.txt"} | {p for p in checkout if p.startswith("examples/")})
         self.assertEqual(shipped - checkout, set())
+
+    def test_an_installed_crit_mcp_serves_every_guide(self):
+        # Outside every checkout, crit mcp's resources are the guides the wheel carries: AGENTS.md first, as its
+        # instructions ask, the same bytes as the checkout's.
+        messages = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}},
+                    {"jsonrpc": "2.0", "id": 2, "method": "resources/list"},
+                    {"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": {"uri": "crit://AGENTS.md"}}]
+        server = subprocess.Popen([self.crit, "mcp", "--only", "inference"], cwd=self.work, env=ENVIRONMENT,
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        answers = {}
+        try:
+            for message in messages:  # one at a time: each answer before the next request, and before the input ends
+                server.stdin.write(json.dumps(message).encode() + b"\n")
+                server.stdin.flush()
+                answer = json.loads(server.stdout.readline())
+                answers[answer["id"]] = answer["result"]
+        finally:
+            server.stdin.close()
+            server.wait(timeout=60)
+            server.stdout.close()
+        shipped = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        guides = shipped["tool"]["setuptools"]["package-data"]["crit.library.guides"] + ["inference/README.md"]
+        listed = [resource["uri"] for resource in answers[2]["resources"]]
+        self.assertEqual(listed[0], "crit://AGENTS.md")
+        self.assertEqual(sorted(listed), sorted("crit://" + guide for guide in guides))
+        self.assertEqual(answers[3]["contents"][0]["text"], (self.source / "AGENTS.md").read_text(encoding="utf-8"))
 
     def test_an_installed_crit_names_the_crit_eval_release_it_pins(self):
         # Without crit Eval, an installed crit says to install the release it pins, not a checkout beside it.

@@ -60,7 +60,19 @@ class Failure(Exception):
 
 
 class Server:
-    def __init__(self, project=None, root=None, cwd=None, jobs=None, wait=30, families=FAMILIES):
+    def __init__(self, project=None, root=None, cwd=None, jobs=None, wait=30, families=FAMILIES, without=()):
+        self.tools, self.missing = tools(families)
+        self.extra = {"crit_job_wait": self.job_wait, "crit_job_output": self.job_output,
+                      "crit_job_stop": self.job_stop, "crit_jobs": self.job_list,
+                      "crit_serve_status": self.serve_status}
+        # --without: tools this server leaves out, named exactly, before it makes anything.
+        unknown = sorted(set(without) - set(self.tools) - set(self.extra))
+        if unknown:
+            raise ValueError(f"No tool {', '.join(unknown)} to leave out; the tools are "
+                             f"{', '.join([*self.tools, *self.extra])}")
+        for name in without:
+            self.tools.pop(name, None)
+            self.extra.pop(name, None)
         # Without --project the commands find their own, as on the command line: this checkout, else the folder
         # they run in.
         checkout = ROOT if (ROOT / "core/include/crit/core.h").is_file() else None
@@ -72,10 +84,6 @@ class Server:
         self.jobs = Jobs(folder, {PROJECT_VARIABLE: str(self.project)} if project else None)
         self.scratch = folder / "records"
         self.wait = wait
-        self.tools, self.missing = tools(families)
-        self.extra = {"crit_job_wait": self.job_wait, "crit_job_output": self.job_output,
-                      "crit_job_stop": self.job_stop, "crit_jobs": self.job_list,
-                      "crit_serve_status": self.serve_status}
         self.cancelled = {}
         self.send = None
 
@@ -93,7 +101,8 @@ class Server:
         if method in {"ping", "logging/setLevel"}:
             return {}
         if method == "tools/list":
-            return {"tools": [tool.definition(self.wait) for tool in self.tools.values()] + EXTRA_TOOLS}
+            return {"tools": [tool.definition(self.wait) for tool in self.tools.values()] +
+                             [tool for tool in EXTRA_TOOLS if tool["name"] in self.extra]}
         if method == "tools/call":
             return self.call(params.get("name"), params.get("arguments") or {}, params.get("_meta") or {}, request_id)
         if method == "resources/list":
@@ -113,9 +122,9 @@ class Server:
         raise Failure(-32601, f"Method not found: {method}")
 
     def guide(self, name):
-        """A guide's file in the crit checkout the commands use, else in this one, else (inference/README.md) in the
-        plugin library this crit carries."""
-        for folder in (self.project, ROOT, LIBRARY_ROOT):
+        """A guide's file in the crit checkout the commands use, else in this one, else in what an installed crit
+        carries: inference/README.md in its plugin library, the other guides beside it in crit/library/guides."""
+        for folder in (self.project, ROOT, LIBRARY_ROOT, LIBRARY_ROOT / "guides"):
             if folder and (folder / name).is_file():
                 return folder / name
         return None
@@ -263,6 +272,12 @@ EXTRA_TOOLS = [
          "additionalProperties": False}},
 ]
 
+# The server's own tools work on its jobs and on a crit serve this machine reaches, never on the internet; only
+# crit_job_stop changes anything, and what it ends cannot be resumed as the same job.
+for _tool in EXTRA_TOOLS:
+    _tool["annotations"] = {"title": _tool["title"], "readOnlyHint": _tool["name"] != "crit_job_stop",
+                            "destructiveHint": _tool["name"] == "crit_job_stop", "openWorldHint": False}
+
 
 def serve(server, reader, writer):
     """Answer newline-delimited JSON-RPC messages from READER on WRITER until READER ends."""
@@ -342,6 +357,8 @@ def parser():
                         help="How long a call waits for its command by default (default: %(default)s)")
     parser.add_argument("--only", action="append", choices=FAMILIES, metavar="FAMILY",
                         help=f"Offer only these command families' tools (repeatable; any of {', '.join(FAMILIES)})")
+    parser.add_argument("--without", action="append", default=[], metavar="TOOL",
+                        help="Leave out this tool, such as crit_run_cost (repeatable)")
     return parser
 
 
@@ -357,7 +374,11 @@ def main(argv=None):
         signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
         if signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
             signal.signal(signal.SIGINT, signal.default_int_handler)
-    server = Server(args.project, args.root, args.cwd, args.jobs, args.wait, tuple(args.only or FAMILIES))
+    try:
+        server = Server(args.project, args.root, args.cwd, args.jobs, args.wait, tuple(args.only or FAMILIES),
+                        args.without)
+    except ValueError as error:
+        command.error(str(error))
     try:
         serve(server, reader, writer)
     finally:

@@ -48,6 +48,15 @@ run root) of `crit run` and `workspace` of `crit serve` to `--root`. `crit_run_s
 | `crit_serve_status` | A running `crit serve`'s `/health` and `/v1/models` |
 | `crit_job_wait`, `crit_job_output`, `crit_job_stop`, `crit_jobs` | Follow the commands' jobs |
 
+Every tool carries MCP annotations: its `title`, `readOnlyHint`, `destructiveHint` and `openWorldHint`, so a
+client can run the read-only ones without asking and confirm the rest. Read-only tools only read records, logs,
+files or the device (`crit_run_show`, `crit_eval_status`, `crit_kernels_search`, `crit_inference_*`,
+`crit_job_wait`, ...). Destructive tools end something or cannot be undone: `crit_run_stop`, `crit_run_seal`,
+`crit_run_select`, `crit_run_recover` and `crit_job_stop`. Every other tool adds records or files and removes
+nothing. `crit_pull`, `crit_eval_fetch`, `crit_eval_run` and `crit_run_eval` are open-world: they can
+download from crit-hub, an engine's git repository and Hugging Face. [tools.py](crit_mcp/tools.py) holds the table, and a tool it does
+not name (a newer crit Eval's subcommand) takes the protocol's cautious defaults, destructive and open-world.
+
 ## Jobs
 
 Each call runs its command as a job: an owned process tree (a process group, or a Windows job object) whose output
@@ -70,7 +79,9 @@ on, and `crit_run_recover` proves an abandoned lease.
 
 AGENTS.md and the guides it links (Building engines, Run records, Serving, the contribution criteria and the
 toolkit READMEs) are resources, `crit://AGENTS.md`, `crit://docs/RUN_RECORDS.md` and so on, for an agent that does
-not share the checkout's filesystem. The server's instructions tell the agent to read AGENTS.md first.
+not share the checkout's filesystem. The server's instructions tell the agent to read AGENTS.md first. A crit
+installed from its wheel carries them all (in `crit/library/guides`), so `crit mcp` serves the guides of the
+release it runs without a checkout.
 
 ## Options
 
@@ -82,6 +93,40 @@ not share the checkout's filesystem. The server's instructions tell the agent to
 | `--jobs DIR` | Folder of the jobs' logs and record files (default: a new temporary folder) |
 | `--wait SECONDS` | How long a call waits for its command by default (30) |
 | `--only FAMILY` | Offer only these command families' tools (repeatable): `run`, `eval`, `pull`, `serve`, `kernels`, `models`, `inference` |
+| `--without TOOL` | Leave out one tool (repeatable), such as `crit_run_cost`, which reads the agent's transcript files for their token counts |
 
 The server speaks protocol versions 2024-11-05 to 2025-11-25 over stdio, one JSON message per line. It has no
 HTTP transport: the agent's harness starts it beside crit.
+
+## What it runs and what it reaches
+
+`crit mcp` runs crit's own commands on the machine it starts on, as the command line would: they build and run
+native code (candidates' builds, `crit serve`, crit Eval's kernels and probes) and keep their records under the
+run root. The tools reach only these places:
+
+| Where | When |
+| --- | --- |
+| The local filesystem | Every command: run records, logs, checkpoints and the folders a call names |
+| `127.0.0.1` | `crit serve`, `crit_run_measure`, `crit_run_eval` and `crit_serve_status` talk to a local crit serve |
+| huggingface.co | `crit_pull` downloads an engine's checkpoint or prebuilt artifact; `crit_eval_fetch`, and `crit_eval_run` or `crit_run_eval` when the data is missing, download crit Eval's reference package |
+| crit-hub.dev and the engine's git repository | `crit_pull` reads crit-hub's index and the engine's card, and fetches its source at the card's commit, which it builds and runs locally |
+
+## Privacy
+
+crit collects no data and sends nothing to crit-labs: no telemetry, analytics or accounts. The downloads above
+send the requests any download does (the address and the file asked for) to those hosts, under their own
+privacy policies. Everything the commands write stays in the folders on your machine that they name, for as
+long as you keep it. `crit_run_cost` reads only the token counts and timestamps of the transcript files a call
+names, on this machine; leave it out with `--without crit_run_cost`. Questions go to
+[crit's issues](https://github.com/crit-labs/crit/issues).
+
+## Examples
+
+Prompts an agent with `crit mcp` handles end to end:
+
+- "Build me a fast engine for Qwen3.8-27B on this GPU, and serve the best candidate."
+- "Find the inference techniques for a hybrid model's KV cache and show me how candidates use them."
+- "Install the crit-hub engine OWNER/NAME, serve it, and check that it is healthy."
+- "Run Eval on candidate-0003 and tell me which gates it fails and why."
+
+Report problems in [crit's issues](https://github.com/crit-labs/crit/issues).
