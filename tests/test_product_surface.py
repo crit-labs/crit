@@ -1,4 +1,5 @@
 """Navigation, CLI and Inference regressions using temporary host fixtures."""
+import ast
 import copy
 import json
 from pathlib import Path
@@ -11,6 +12,7 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "cli"))
+sys.path.insert(0, str(ROOT / "mcp"))
 from crit import inference as store
 LAUNCHER = str(ROOT / "tests/run_crit.py")
 PRODUCT_FOLDERS = ("core", "inference", "kernels", "models", "eval", "api", "mcp", "smoke", "tests", "docs", "cli",
@@ -238,11 +240,21 @@ class ProductTests(unittest.TestCase):
         setuptools = package["tool"]["setuptools"]
         folders = {name: ROOT / path for name, path in setuptools["package-dir"].items()}
         self.assertEqual(folders.pop("crit.library.inference"), ROOT / "inference")
+        # crit mcp's guides, from the checkout's root as crit.library.guides' package data: exactly its GUIDES but the
+        # library's own inference/README.md.
+        self.assertEqual(folders.pop("crit.library.guides"), ROOT)
+        # Read from server.py's source, as this test runs without crit_core, which importing the server needs.
+        server = ast.parse((ROOT / "mcp/crit_mcp/server.py").read_text(encoding="utf-8"))
+        GUIDES = next(ast.literal_eval(node.value) for node in server.body if isinstance(node, ast.Assign)
+                      and [target.id for target in node.targets if isinstance(target, ast.Name)] == ["GUIDES"])
+        self.assertEqual(setuptools["package-data"]["crit.library.guides"],
+                         [guide for guide in GUIDES if guide != "inference/README.md"])
         self.assertEqual(sorted(folder.parent.name for folder in folders.values()),
                          sorted(["cli", "api", "kernels", "models", "mcp", "smoke"]))
         found = {".".join((name, *init.parent.relative_to(folder).parts))
                  for name, folder in folders.items() for init in folder.rglob("__init__.py")}
-        self.assertEqual(sorted(setuptools["packages"]), sorted(found | {"crit.library.inference"}))
+        self.assertEqual(sorted(setuptools["packages"]),
+                         sorted(found | {"crit.library.inference", "crit.library.guides"}))
         self.assertEqual({p.name for p in (ROOT / "cli").iterdir() if p.is_dir()}, {"crit"})
         self.assertEqual({p.name for p in (ROOT / "api").iterdir() if p.is_dir()}, {"crit_api"})
         self.assertEqual({p.name for p in (ROOT / "mcp").iterdir() if p.is_dir()}, {"crit_mcp"})

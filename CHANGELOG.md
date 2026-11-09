@@ -9,6 +9,39 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-11-09
+
+### Overview
+
+crit 0.17.2 readies `crit mcp` for Claude's and Codex's plugin directories and the MCP Registry. Every tool carries
+MCP annotations, so a client runs the read-only ones without asking and confirms the destructive ones;
+`crit mcp --without TOOL` leaves out a tool, such as `crit_run_cost`, which reads an agent's transcripts; and an
+installed crit serves every guide `crit mcp` names, AGENTS.md first, where it served only one. mcp/README.md says
+what `crit mcp` runs, every host it reaches and its privacy terms, crit's PyPI page carries keywords, classifiers,
+links and README images that show, and mcp/server.json is `crit mcp`'s MCP Registry entry. crit 0.17.2 needs
+crit-eval 0.6.1.
+
+### Added
+
+- `crit mcp --without TOOL` leaves out one tool (repeatable), such as `crit_run_cost`, which reads an agent's
+  transcript files.
+- `crit mcp`'s tools carry MCP annotations (`title`, `readOnlyHint`, `destructiveHint`, `openWorldHint`), so a
+  client runs the read-only ones without asking and confirms the destructive ones (stop, seal, select, recover and
+  `crit_job_stop`).
+- [mcp/README.md](mcp/README.md) says what `crit mcp` runs, every host it reaches, its privacy terms and example
+  prompts.
+- crit's PyPI page lists keywords, classifiers and its homepage, docs, changelog and issues links, and
+  [mcp/server.json](mcp/server.json) is `crit mcp`'s entry for the MCP Registry (`io.github.crit-labs/crit`),
+  which README.md's `mcp-name` line verifies.
+
+### Fixed
+
+- A crit installed from its wheel serves every guide `crit mcp` names (`crit://AGENTS.md` and the docs it links),
+  which the wheel now carries in `crit/library/guides`. Before, it served only `crit://inference/README.md`, though
+  its instructions ask the agent to read AGENTS.md first.
+- crit's PyPI page shows README.md's images and follows its links: the README links them absolutely, to the
+  repository's main branch. Before, PyPI showed broken images and dead links for every relative path.
+
 ## [0.17.1] - 2026-11-09
 
 ### Overview
@@ -3291,7 +3324,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.17.1...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.17.2...HEAD
+[0.17.2]: https://github.com/crit-labs/crit/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/crit-labs/crit/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/crit-labs/crit/compare/v0.16.1...v0.17.0
 [0.16.1]: https://github.com/crit-labs/crit/compare/v0.16.0...v0.16.1

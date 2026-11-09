@@ -19,6 +19,35 @@ MODULES = {name: module for name, module, _ in COMMANDS} | {"inference": "crit.i
 # it, the run root for crit run, and crit serve's workspace (the folder of run-* directories, the same run root).
 DEFAULTED = {"project": "project", ("run", "root"): "root", ("serve", "workspace"): "root"}
 
+# What each tool does to the machine, as MCP tool annotations: a client runs a read-only tool without asking and
+# confirms a destructive one first. Read-only tools only read files, records, logs or the device. Destructive
+# tools end something or cannot be undone: a stopped run or job, a sealed or selected candidate, a recovered lease.
+# Every other tool adds records or files (a plan, a build, an Eval result, a quantized checkpoint) and removes
+# nothing. Open-world tools reach the internet (crit-hub, Hugging Face); the rest stay on this machine and its
+# localhost. A tool this table does not name, such as a subcommand of a newer crit Eval, is taken as destructive and
+# open-world, the protocol's own defaults, until it is named here.
+READ_ONLY = {"crit_run_show", "crit_eval_context", "crit_eval_status", "crit_eval_journal", "crit_eval_compare",
+             "crit_kernels_target", "crit_kernels_inventory", "crit_kernels_search", "crit_kernels_inspect",
+             "crit_kernels_verify", "crit_models_plan", "crit_models_verify", "crit_inference_list",
+             "crit_inference_search", "crit_inference_show", "crit_inference_check"}
+DESTRUCTIVE = {"crit_run_stop", "crit_run_seal", "crit_run_select", "crit_run_recover"}
+ADDITIVE = {"crit_run_create", "crit_run_resolve", "crit_run_plan", "crit_run_check", "crit_run_benchmark",
+            "crit_run_candidate", "crit_run_recon", "crit_run_capture", "crit_run_build", "crit_run_package",
+            "crit_run_reserve", "crit_run_settle", "crit_run_measure", "crit_run_eval", "crit_run_serve",
+            "crit_run_ablate", "crit_run_resume", "crit_run_cost", "crit_run_replay", "crit_eval_run",
+            "crit_eval_precheck", "crit_eval_probe", "crit_eval_prepare", "crit_eval_reference", "crit_eval_fetch",
+            "crit_eval_pack", "crit_eval_pin", "crit_eval_ab", "crit_eval_kernels", "crit_eval_workbench", "crit_pull",
+            "crit_serve", "crit_kernels_retain", "crit_kernels_new", "crit_models_ptq", "crit_models_drafter",
+            "crit_models_eval"}
+OPEN_WORLD = {"crit_pull", "crit_eval_fetch", "crit_eval_run", "crit_run_eval"}
+
+
+def annotations(name, title):
+    """NAME's MCP tool annotations, with TITLE."""
+    known = name in READ_ONLY or name in DESTRUCTIVE or name in ADDITIVE
+    return {"title": title, "readOnlyHint": name in READ_ONLY,
+            "destructiveHint": name in DESTRUCTIVE or not known, "openWorldHint": name in OPEN_WORLD or not known}
+
 
 class _Parsed(Exception):
     def __init__(self, parser):
@@ -186,7 +215,7 @@ class Tool:
         if self.required:
             schema["required"] = self.required
         return {"name": self.name, "title": self.command, "description": self.description,
-                "inputSchema": schema}
+                "inputSchema": schema, "annotations": annotations(self.name, self.command)}
 
     def argv(self, arguments, defaults, scratch):
         """The command line, without crit itself: the family, then each level's words and options."""

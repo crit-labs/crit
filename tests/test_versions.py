@@ -28,6 +28,7 @@ PLACES = {
     "docs/CONTRIBUTING.md": [r"crit-" + NUMBER + r"-py3-none-any\.whl"],
     "docs/assets/badge-version.svg": [r'aria-label="version: ' + NUMBER + '"', r"<title>version: " + NUMBER + "</title>",
                                       r'<text x="75\.5" y="14">' + NUMBER + "</text>"],
+    "mcp/server.json": [lambda text: json.loads(text)["version"], lambda text: json.loads(text)["packages"][0]["version"]],
 }
 # Files that name earlier versions too: the changelog's history.
 HISTORY = {"CHANGELOG.md"}
