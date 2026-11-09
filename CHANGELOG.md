@@ -9,6 +9,82 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-11-09
+
+### Overview
+
+crit 0.17.1 runs `crit run` from a pip-installed crit, without a checkout: a run follows the installed
+release's guides, and the commands that run Eval name their project to it, so its settings.toml applies. Two
+engines in one process no longer break each other's captured prompt chunks (a capture takes its cuBLAS workspace
+from a pool kept for it), and a captured round's log-probabilities equal the step and score paths' bit for bit.
+The run store verifies each candidate once per operation, and on Windows a process tree keeps a Microsoft Store
+Python's children in its job, so crit's shutdown ends them and their files can be deleted at once. crit-labs'
+CUDA kernels are still not on the Hugging Face Hub: the plugins that load them run their torch fallbacks. crit
+0.17.1 needs crit-eval 0.6.1.
+
+### Changed
+
+- crit needs crit-eval 0.6.1 (`crit-eval==0.6.1`, and `crit-eval[reference]==0.6.1` in the `reference` extra),
+  whose Eval reads the settings of the project crit names to it.
+- `crit mcp --project P` names P to every job it starts (`CRIT_PROJECT`), so a `crit eval` job reads P's settings.toml as
+  `crit run`'s commands do. Before, its jobs used crit's default project.
+- crit run's store walks and hashes each retained inventory of a candidate (its source, package and seal) once per
+  operation. An operation reads a candidate's records several times over (an append checks the new record, refreshes
+  the candidate's telemetry, then the run's state reads every candidate), and each read verified the inventories
+  again: a served-engine test's setUp, two candidates through eight appends, walked 137 of them, now 76. Each store
+  operation is one verification scope, in which a folder that matched its rows is not walked again for the same rows
+  and, except on Windows, a file whose stat is unchanged is not hashed again; the next operation verifies everything
+  again.
+- `crit run` keeps runs from an installed crit without a checkout (`pip install crit`, or `python -m pip install .`
+  run outside the checkout): its `--project` is then any folder (default: the current one), the folder of
+  `settings.toml` and the default `runs/`, where a crit running from a checkout still wants a crit repository. Such a
+  run's brief (`agent_request.md`) names, as the repository its agent follows, crit's repository at the installed
+  release's tag (crit X.Y.Z is published from vX.Y.Z), with the version and the folder crit is installed in, and its
+  replays point at AGENTS.md there; runs stay outside the folder crit is installed in, as a checkout's stay outside
+  its published folders. A checkout's runs keep the checkout as their repository. `crit serve --workspace` serves
+  such runs the same way. tests/test_wheel_install.py keeps a run of the CPU toy engine with the installed wheel,
+  outside any checkout: create, recon, capture, resolve, a first plan, a candidate and its build.
+- Eval reads the settings of the project the command uses: crit names it to crit-eval in `CRIT_PROJECT` while the
+  command runs, `crit run` and `crit bench` their `--project`, `crit eval` crit's checkout or, for a crit installed
+  without one, the folder it runs in (unless the environment names a project). crit-eval found the settings only in
+  a checkout, so an installed crit's `crit run eval` and `crit eval` ignored the project's headroom,
+  `context_reserve_gib`, `context_tokens` and `eval_packages`; a crit-eval that reads `CRIT_PROJECT` (crit-eval's
+  Unreleased) takes them. The wheel test's run reads its project's `settings.toml`.
+
+### Fixed
+
+- An installed crit without crit Eval says to install the crit-eval release it pins (`python -m pip install
+  crit-eval==0.6.1`), not an editable crit-eval checkout beside it, which only a checkout has.
+- `crit run measure` closes the nvidia-smi sampler's pipe when it stops it (Python reported it unclosed).
+- crit_plugins: an engine closed in a process that keeps another leaves the other's captured rounds and prompt chunks
+  their memory. Every capture runs on Core's one capture stream, a captured graph keeps the address of the cuBLAS
+  workspace its products ran with, and torch frees all of a stream's workspaces when any graph captured on it is
+  destroyed, so the closed engine's graphs freed the workspace the open engine's still wrote: its memory went to
+  other tensors, or back to the driver and the next replay failed with an illegal memory access. Each capture now
+  runs with workspaces made in a memory pool Core keeps for them (`crit_plugins.rounds.capture_workspaces`), where a
+  freed workspace goes back and nothing else is made. Serving was not affected (crit serve closes an engine before it
+  loads the next); in-process tests that open engines side by side were.
+- token-sampling: a captured round's log-probabilities are torch's FP32 `log_softmax` of its logits rows, what a torch
+  model's step and score paths compute, so a token's log-probability from a round equals the step's and the score
+  path's bit for bit for the same logits (torch's kernel reduces a row by its length and its address modulo 16 bytes,
+  the same for every row of a vocabulary that is a multiple of 4). Before, the CUDA sampler normalized the rows itself
+  (FP32 exps with FP64 sums, after Core's double TokenLogprob) and the torch law in FP64, up to 2.4e-7 from the step
+  and score paths. The CUDA sampler now ranks the alternatives over those values as given
+  (`enqueue_ranked_logprobs`), in Core's order.
+
+- crit's process trees on Windows keep their processes' children in their job with a Microsoft Store Python too, so
+  closing a tree ends and waits for them: crit serve's resident host (behind its launch guardian), an MCP job's
+  command's children. A Store Python is a packaged app, and Windows starts a packaged process's children, and a Store
+  interpreter that a venv's launcher starts, outside the job of the process that starts them unless that process was
+  created with the desktop app policy that keeps them in. A tree now creates its first process with that policy
+  (subprocess.Popen cannot pass it), and starts this venv's python.exe as the base interpreter, as guarded launches
+  and MCP jobs did, so what a `python` build command of `crit pull` starts stays in its tree too (the Store
+  interpreter a venv's launcher starts takes Windows' default policy). Before, the job held that process only:
+  retiring the resident host left it running until it noticed its closed channel (a hung host held the retiring
+  request, crit serve's shutdown and an interrupted `crit run measure` for as long as it hung), a stopped MCP job's
+  children kept running, and the files they held open (the host's `runtime.log`, a job's `.out` and `.err`) could
+  not be deleted when crit returned (WinError 32).
+
 ## [0.17.0] - 2026-11-08
 
 ### Overview
@@ -21,7 +97,7 @@ and Core runs them natively, so log-probability requests and replays decode in c
 left crit: plugins load crit-labs' kernels through the registry. The quality modes are `preserve` and `speed`
 (`as_quantized` is refused), and new runs climb the candidate ladder under plan rules 7. Core's engine C ABI is
 version 5. For crit serve's clients, the `/api/chat` dialect counts under the metrics label `api_chat` and `GET /`
-answers `crit is running`. crit-labs' CUDA kernels are not on the Hugging Face Hub yet: they come with crit 0.17.1,
+answers `crit is running`. crit-labs' CUDA kernels are not on the Hugging Face Hub yet: a later release pins them,
 and until then each plugin that loads one runs its torch fallback, as the engine's facts say. crit 0.17.0 needs
 crit-eval 0.6.0.
 
@@ -3215,7 +3291,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.17.1...HEAD
+[0.17.1]: https://github.com/crit-labs/crit/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/crit-labs/crit/compare/v0.16.1...v0.17.0
 [0.16.1]: https://github.com/crit-labs/crit/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/crit-labs/crit/compare/v0.15.0...v0.16.0

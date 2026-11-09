@@ -20,6 +20,7 @@ import urllib.error
 import urllib.request
 
 from crit import __version__
+from crit.cli import PROJECT_VARIABLE
 from crit.inference import ROOT as LIBRARY_ROOT
 from crit.run.store import ROOT
 
@@ -67,7 +68,8 @@ class Server:
         self.settings = {"project": self.project, "root": Path(root).resolve() if root else None}
         self.cwd = Path(cwd or os.getcwd()).resolve()
         folder = Path(jobs) if jobs else Path(tempfile.mkdtemp(prefix="crit-mcp-"))
-        self.jobs = Jobs(folder)
+        # A --project names itself to every job, so a crit eval job reads its settings.toml as crit run's do.
+        self.jobs = Jobs(folder, {PROJECT_VARIABLE: str(self.project)} if project else None)
         self.scratch = folder / "records"
         self.wait = wait
         self.tools, self.missing = tools(families)
@@ -328,7 +330,9 @@ def parser():
     parser = argparse.ArgumentParser(prog="crit mcp", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--project", type=Path, help="crit repository the commands use, whose settings.toml gives the "
-                                                     "device and headroom (default: this checkout)")
+                                                     "device and headroom (default: this checkout; a crit installed "
+                                                     "without one takes any folder, default the folder the commands "
+                                                     "run in)")
     parser.add_argument("--root", type=Path, help="Run root crit run and crit serve use when a call names none "
                                                   "(default: PROJECT/runs)")
     parser.add_argument("--cwd", type=Path, help="Folder the commands run in (default: the current one)")

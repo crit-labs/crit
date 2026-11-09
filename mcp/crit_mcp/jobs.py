@@ -13,16 +13,12 @@ from crit.process.tree import ProcessTree
 
 def python():
     """This interpreter as a command, and the environment it needs. A Windows venv's python.exe is a launcher that
-    starts the base interpreter, which a Microsoft Store Python activates outside the launcher's job: start the base
-    directly, naming the venv as the launcher does (as crit's own guarded launches do)."""
-    environment = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
-    if os.name == "nt" and getattr(sys, "_base_executable", sys.executable) != sys.executable:
-        return sys._base_executable, {**environment, "__PYVENV_LAUNCHER__": sys.executable}
-    return sys.executable, environment
+    starts the base interpreter: the job's tree starts the base directly (crit.process.tree.ProcessTree)."""
+    return sys.executable, {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
 
 
 class Job:
-    def __init__(self, number, label, command, cwd, folder):
+    def __init__(self, number, label, command, cwd, folder, environment=None):
         self.id = f"job-{number}"
         self.label = label
         self.command = command
@@ -35,7 +31,8 @@ class Job:
         self.stopping = False
         self.cleanup_error = None
         self.done = threading.Event()
-        interpreter, environment = python()
+        interpreter, base = python()
+        environment = {**base, **(environment or {})}
         with open(self.output, "wb") as output, open(self.errors, "wb") as errors:
             self.tree = ProcessTree([interpreter, *command], cwd, output, env=environment, errors=errors)
         threading.Thread(target=self._watch, name=self.id, daemon=True).start()
@@ -102,8 +99,10 @@ class Job:
 
 
 class Jobs:
-    def __init__(self, folder):
+    def __init__(self, folder, environment=None):
+        """environment: variables every job gets beside this process's (the server's project for crit-eval)."""
         self.folder = Path(folder)
+        self.environment = dict(environment or {})
         self.folder.mkdir(parents=True, exist_ok=True)
         self.jobs = {}
         self.lock = threading.Lock()
@@ -111,7 +110,7 @@ class Jobs:
 
     def start(self, label, command, cwd):
         with self.lock:
-            job = Job(next(self.numbers), label, command, cwd, self.folder)
+            job = Job(next(self.numbers), label, command, cwd, self.folder, self.environment)
             self.jobs[job.id] = job
         return job
 

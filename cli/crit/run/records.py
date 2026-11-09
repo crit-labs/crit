@@ -173,8 +173,9 @@ def default_quality_budgets():
     try:
         from crit_eval import EVAL_DIR
     except ImportError:
-        raise ValueError("A run's quality budget defaults to crit Eval's thresholds: install crit Eval "
-                         "(python -m pip install -e ../crit-eval)") from None
+        from ..cli import eval_install
+        raise ValueError(f"A run's quality budget defaults to crit Eval's thresholds: install crit Eval ({eval_install()})"
+                         ) from None
     quality = json.loads((EVAL_DIR / "protocol.json").read_text(encoding="utf-8"))["quality"]
     return {"preserve": quality["thresholds"],
             **{mode: limits for mode, limits in quality["mode_thresholds"].items() if isinstance(limits, dict)}}
@@ -193,8 +194,9 @@ def quality_terms(correctness, amendments=()):
     amendment applied in order."""
     mode, budgets = quality_mode(correctness), default_quality_budgets()
     if mode not in budgets:
+        from ..cli import eval_install
         raise ValueError(f"crit Eval's protocol has no budget for quality mode {mode}: install the crit Eval this crit "
-                         "works with (python -m pip install -e ../crit-eval)")
+                         f"works with ({eval_install()})")
     budget = {**budgets[mode], **correctness.get("quality_budget", {})}
     exactness = correctness.get("exactness", "reported")
     for change in amendments:

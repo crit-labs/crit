@@ -4,7 +4,9 @@ The `crit` command is installed with the Python distribution (`python -m pip ins
 the checkout, or `python -m pip install .`) and drives every part of crit. Each subcommand prints its own options with
 `--help`. Both installs build engines: the wheel carries crit's plugin library (Inference) as package data, so
 `crit plugins` and `crit inference` act on it from an installed crit as from a checkout; `crit run` keeps its records
-against a crit checkout (`--project`).
+against a crit checkout (`--project`) or, from an installed crit without one, in any folder (`--project`, default the
+current one), whose `settings.toml` it reads and whose `runs/` is the default root. Such a run's brief names the
+installed release's guides, crit's repository at its tag, instead of a checkout.
 
 | Command | What it does | Guide |
 | --- | --- | --- |

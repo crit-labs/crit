@@ -16,6 +16,12 @@ crit run --project CRIT_ROOT --root RUN_ROOT --id RUN_ID ACTION ...
 Default root: `CRIT_ROOT/runs/`, outside product folders and protected retention.
 Global options precede the action; `create` omits `--id`.
 
+`CRIT_ROOT` is a crit checkout, and a crit running from one refuses any other `--project`. A crit installed without a
+checkout (`pip install crit`) takes any folder instead, by default the one it runs in, for `settings.toml` and the
+default root, and keeps runs outside the folder it is installed in. The run's brief (`agent_request.md`) names the
+repository its agent follows: the checkout, or crit's repository at the installed release's tag (crit X.Y.Z is
+published from `vX.Y.Z`) with the version and the folder crit is installed in.
+
 Optional, untracked `CRIT_ROOT/settings.toml` holds machine settings that `create`
 uses when the request omits them; unknown keys are an error. Copy
 [settings.example.toml](../settings.example.toml) to `settings.toml`: it lists every key with its
@@ -34,7 +40,10 @@ eval_packages = "/srv/crit/packages" # reference package source, a folder or htt
 `crit eval run` and `crit eval context` read `vram_headroom_gib`, `context_reserve_gib` and
 `context_tokens` from it when their flags are omitted; `crit eval run`, `crit eval fetch` and
 `crit run eval` fetch reference packages from `eval_packages`. The reserve holds activations, workspaces, graphs
-and speed techniques; a larger one trades context for that room.
+and speed techniques; a larger one trades context for that room. crit names its project to crit-eval in
+`CRIT_PROJECT` while a command runs Eval: `crit run` and `crit bench` their `--project`, `crit eval` crit's checkout
+or, for a crit installed without one, the folder it runs in (unless the environment already names a project), so
+Eval reads the same `settings.toml` as the run.
 
 | Action | Arguments / effect |
 | --- | --- |

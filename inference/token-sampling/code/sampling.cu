@@ -793,6 +793,7 @@ __device__ int merge_lists(const u64* list, int blocks, int stride, int K, u64* 
 // - log_sum) in double, alternatives ranked by float log-probability descending then id ascending. Core accumulates in
 // double in id order; here the exps are FP32 (compensated per thread, FP64 over threads and blocks in a fixed order),
 // so values agree to about 1e-7 relative in the sum and the rankings are Core's, ties at the boundary included.
+// Rows that are log-probabilities already (enqueue_ranked_logprobs) take max = 0 and log_sum = 0: every value as given.
 
 // A stage block's raw maximum and sum of exp(x - max) over its finite entries.
 struct Stat {
@@ -801,28 +802,32 @@ struct Stat {
     double sum;
 };
 
-// The raw part of a stage block: its Stat and, with K > 0, its best K raw keys (-inf entries included, padding not).
+// The raw part of a stage block: its Stat (unless `given`: rows of log-probabilities need none) and, with K > 0, its
+// best K raw keys (-inf entries included, padding not).
 template<int E>
-__device__ void raw_stage(const float (&v)[E], int lo, int vocab, int K, Stat* stat, u64* cand, TopShared<kStageThreads, E>& s) {
-    float m = neg_inf();
+__device__ void raw_stage(const float (&v)[E], int lo, int vocab, int K, Stat* stat, u64* cand, TopShared<kStageThreads, E>& s,
+                          bool given = false) {
+    if(!given) {
+        float m = neg_inf();
 #pragma unroll
-    for(int i = 0; i < E; ++i) m = fmaxf(m, v[i]);
-    m = block_max(m, s.red);
-    double part = 0.;
-    if(m != neg_inf()) {
-        float sum = 0.f, comp = 0.f;
+        for(int i = 0; i < E; ++i) m = fmaxf(m, v[i]);
+        m = block_max(m, s.red);
+        double part = 0.;
+        if(m != neg_inf()) {
+            float sum = 0.f, comp = 0.f;
 #pragma unroll
-        for(int i = 0; i < E; ++i)
-            if(!masked(v[i])) {
-                const float y = expf(v[i] - m) - comp;
-                const float t = sum + y;
-                comp = (t - sum) - y;
-                sum = t;
-            }
-        part = double(sum) - double(comp);
+            for(int i = 0; i < E; ++i)
+                if(!masked(v[i])) {
+                    const float y = expf(v[i] - m) - comp;
+                    const float t = sum + y;
+                    comp = (t - sum) - y;
+                    sum = t;
+                }
+            part = double(sum) - double(comp);
+        }
+        const double total = block_sum(part, s.red);
+        if(threadIdx.x == 0) *stat = Stat{m, 0.f, total};
     }
-    const double total = block_sum(part, s.red);
-    if(threadIdx.x == 0) *stat = Stat{m, 0.f, total};
     if(K <= 0) return;
     u64 key[E];
 #pragma unroll
@@ -951,11 +956,18 @@ __device__ void write_alternatives(const float* x, int vocab, const u64* top, in
 
 // A row's raw log-probabilities from its stage blocks (stat[0, B), lists of `stride` keys each holding its best n + 1):
 // max and log_sum (returned), the chosen token's log-probability when chosen_out is set (-inf for an id outside
-// [0, vocab)), and the n best alternatives. Block-wide.
+// [0, vocab)), and the n best alternatives. `given`: x is a row of log-probabilities already (no stats), each reported
+// as it is (max = log_sum = 0, so raw_logprob(v) is v). Block-wide.
 __device__ void row_logprobs(const float* x, int vocab, const Stat* stat, const u64* cand, int B, int stride, int n,
                              std::int32_t chosen, float* chosen_out, std::int32_t* ids, float* lps, double& max,
-                             double& log_sum, TopShared<kMergeThreads, kMergeItems>& s, u64* top, AltShared& alt) {
-    merge_stats(stat, B, max, log_sum, alt.red);
+                             double& log_sum, TopShared<kMergeThreads, kMergeItems>& s, u64* top, AltShared& alt,
+                             bool given = false) {
+    if(given) {
+        max = 0.;
+        log_sum = 0.;
+    } else {
+        merge_stats(stat, B, max, log_sum, alt.red);
+    }
     if(chosen_out && threadIdx.x == 0)
         *chosen_out = chosen >= 0 && chosen < vocab && max != double(neg_inf()) ? raw_logprob(x[chosen], max, log_sum) : neg_inf();
     if(n > 0) {
@@ -1796,8 +1808,9 @@ __global__ void block_kernel(Verify v, const RowResult* result) {
 }
 
 // ---- enqueue_logprobs: raw rows -> chosen log-probabilities and alternatives -------------------------------
+// (enqueue_ranked_logprobs: rows of log-probabilities -> the chosen values and alternatives as given, `given` set.)
 __global__ void __launch_bounds__(kStageThreads)
-raw_stage_kernel(const float* logits, int ld, int vocab, int B, int K, Stat* stat, u64* cand) {
+raw_stage_kernel(const float* logits, int ld, int vocab, int B, int K, Stat* stat, u64* cand, bool given) {
     __shared__ TopShared<kStageThreads, kStageItems> s;
     const int row = int(blockIdx.x) / B, b = int(blockIdx.x) - row * B;
     const float* x = logits + std::size_t(row) * ld;
@@ -1808,12 +1821,12 @@ raw_stage_kernel(const float* logits, int ld, int vocab, int B, int K, Stat* sta
         const int t = lo + i * kStageThreads + int(threadIdx.x);
         v[i] = t < vocab ? x[t] : neg_inf();
     }
-    raw_stage(v, lo, vocab, K, stat + blockIdx.x, cand + std::size_t(blockIdx.x) * std::size_t(K), s);
+    raw_stage(v, lo, vocab, K, stat + blockIdx.x, cand + std::size_t(blockIdx.x) * std::size_t(K), s, given);
 }
 
 __global__ void __launch_bounds__(kMergeThreads, 2)
 logprob_merge_kernel(const float* logits, int ld, int vocab, int B, int n, const Stat* stat, const u64* cand,
-                     const std::int32_t* chosen, float* chosen_lp, std::int32_t* top_ids, float* top_lps) {
+                     const std::int32_t* chosen, float* chosen_lp, std::int32_t* top_ids, float* top_lps, bool given) {
     __shared__ TopShared<kMergeThreads, kMergeItems> s;
     __shared__ u64 top[kCand];
     __shared__ AltShared alt;
@@ -1821,7 +1834,7 @@ logprob_merge_kernel(const float* logits, int ld, int vocab, int B, int n, const
     double mx = 0., log_sum = 0.;
     row_logprobs(logits + std::size_t(row) * ld, vocab, stat + std::size_t(row) * B, cand + std::size_t(row) * B * K, B, K, n,
                  chosen_lp ? chosen[row] : -1, chosen_lp ? chosen_lp + row : nullptr, top_ids + std::size_t(row) * n,
-                 top_lps + std::size_t(row) * n, mx, log_sum, s, top, alt);
+                 top_lps + std::size_t(row) * n, mx, log_sum, s, top, alt, given);
 }
 
 // One thread per logit: a clear bit in its row's mask word bans the token.
@@ -1959,19 +1972,36 @@ std::size_t logprob_scratch_bytes(int vocab, int rows, int n) noexcept {
     return std::size_t(rows) * B * (sizeof(Stat) + K * sizeof(u64));
 }
 
-cudaError_t enqueue_logprobs(const float* logits, int ld, int rows, int vocab, const std::int32_t* chosen, int n,
-                             float* chosen_logprob, std::int32_t* top_ids, float* top_logprobs, void* scratch,
-                             cudaStream_t stream) {
-    if(!logits || rows < 1 || vocab < 1 || ld < vocab || n < 0 || n > kMaxTopK || n > vocab || !scratch || !aligned8(scratch) ||
+namespace {
+
+cudaError_t launch_logprobs(const float* rows_in, int ld, int rows, int vocab, const std::int32_t* chosen, int n,
+                            float* chosen_logprob, std::int32_t* top_ids, float* top_logprobs, void* scratch,
+                            cudaStream_t stream, bool given) {
+    if(!rows_in || rows < 1 || vocab < 1 || ld < vocab || n < 0 || n > kMaxTopK || n > vocab || !scratch || !aligned8(scratch) ||
        (chosen_logprob && !chosen) || (n > 0 && (!top_ids || !top_logprobs)) || !fast_grid(std::uint64_t(rows), std::uint32_t(vocab)))
         return cudaErrorInvalidValue;
     const int B = blocks_per_row(vocab), K = n > 0 ? n + 1 : 0;
     auto* stat = static_cast<Stat*>(scratch);
     auto* cand = reinterpret_cast<u64*>(stat + std::size_t(rows) * B);
-    raw_stage_kernel<<<unsigned(rows * B), kStageThreads, 0, stream>>>(logits, ld, vocab, B, K, stat, cand);
-    logprob_merge_kernel<<<unsigned(rows), kMergeThreads, 0, stream>>>(logits, ld, vocab, B, n, stat, cand, chosen, chosen_logprob,
-                                                                      top_ids, top_logprobs);
+    if(!given || K > 0)   // rows of log-probabilities need no stats: the stage blocks only rank
+        raw_stage_kernel<<<unsigned(rows * B), kStageThreads, 0, stream>>>(rows_in, ld, vocab, B, K, stat, cand, given);
+    logprob_merge_kernel<<<unsigned(rows), kMergeThreads, 0, stream>>>(rows_in, ld, vocab, B, n, stat, cand, chosen, chosen_logprob,
+                                                                      top_ids, top_logprobs, given);
     return cudaGetLastError();
+}
+
+}  // namespace
+
+cudaError_t enqueue_logprobs(const float* logits, int ld, int rows, int vocab, const std::int32_t* chosen, int n,
+                             float* chosen_logprob, std::int32_t* top_ids, float* top_logprobs, void* scratch,
+                             cudaStream_t stream) {
+    return launch_logprobs(logits, ld, rows, vocab, chosen, n, chosen_logprob, top_ids, top_logprobs, scratch, stream, false);
+}
+
+cudaError_t enqueue_ranked_logprobs(const float* logprobs, int ld, int rows, int vocab, const std::int32_t* chosen, int n,
+                                    float* chosen_logprob, std::int32_t* top_ids, float* top_logprobs, void* scratch,
+                                    cudaStream_t stream) {
+    return launch_logprobs(logprobs, ld, rows, vocab, chosen, n, chosen_logprob, top_ids, top_logprobs, scratch, stream, true);
 }
 
 cudaError_t enqueue_commit(Request* requests, std::uint32_t count, std::uint32_t vocab, const std::int32_t* tokens,

@@ -35,7 +35,8 @@ tool's input schema is read from the command's own parser when the server starts
 and help are the command line's and never drift from it. Arguments are the options' long names with underscores
 (`--from-engine` is `from_engine`); a switch is `true`, a repeatable option a list. Every `record` option takes the
 JSON object itself (the server writes it to a file for the command) or a JSON file's path, and a JSON-text option
-such as `quality_budget` takes an object. `project` defaults to the checkout the server runs from, and `root` (the
+such as `quality_budget` takes an object. `project` defaults to the checkout the server runs from (a crit installed
+without one: the folder the commands run in, `--cwd`), and `root` (the
 run root) of `crit run` and `workspace` of `crit serve` to `--root`. `crit_run_show` gives the run's state.
 
 | Tool | What it does |
@@ -76,7 +77,7 @@ not share the checkout's filesystem. The server's instructions tell the agent to
 | Option | Purpose |
 | --- | --- |
 | `--root DIR` | Run root for `crit run` and `crit serve` calls that name none (default: `PROJECT/runs`) |
-| `--project DIR` | crit checkout the commands use, whose `settings.toml` gives the device and headroom (default: this checkout) |
+| `--project DIR` | crit checkout the commands use, whose `settings.toml` gives the device and headroom (default: this checkout; a crit installed without one takes any folder, default the folder the commands run in) |
 | `--cwd DIR` | Folder the commands run in (default: the current one) |
 | `--jobs DIR` | Folder of the jobs' logs and record files (default: a new temporary folder) |
 | `--wait SECONDS` | How long a call waits for its command by default (30) |

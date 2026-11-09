@@ -49,7 +49,7 @@ reply = client.chat.completions.create(model="default", messages=[{"role": "user
 | `--idle-unload SECONDS` | [Unload the engine](#unloading-the-engine) once no request has used it for this many seconds; the next request loads it again. Default: it stays loaded |
 | `--verify-model` | Before loading, read and SHA-256 every model file against the run's frozen manifest, and give engines without `chat-model-file-v1` a private read-only copy. By default the host only checks each file's size against the manifest and maps it in place, so the engine starts loading at once; a checkpoint with the same sizes but other bytes (another revision, corruption) is then served unnoticed |
 | `--resident-ram-gib N`, `--resident-vram-gib N` | Optional caps on pool-owned model bytes, not total process/device memory |
-| `--project PATH` | crit checkout used to verify packages; default this checkout |
+| `--project PATH` | crit checkout used to verify packages; default this checkout. An installed crit without one takes any folder, default the current one |
 | `--write-launchers` | Write `serve.cmd` (Windows, double-click) and `serve.sh` with the same options into the run folder, then exit. Under WSL, `serve.cmd` starts `serve.sh` in the same distribution. They never contain an API key; they keep `--api-key-file`, or set `CRIT_API_KEY` |
 | `--recover-runtime` | Verify retirement of a crashed runtime, release ownership, exit |
 

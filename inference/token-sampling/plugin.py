@@ -75,7 +75,8 @@ class CoreSampler:
         return self._round_sampling().predictions_device(view, logits, draft_laws)
 
     def logprobs_device(self, view, logits, tokens):
-        """Core's TokenLogprob of a round's emitted tokens into view.logprobs (and its ranked alternatives)."""
+        """A round's emitted tokens' log-probabilities into view.logprobs (and their ranked alternatives): torch's FP32
+        log_softmax of the logits rows, the step and score paths' arithmetic (code/device_rounds.py)."""
         return self._round_sampling().logprobs_device(view, logits, tokens)
 
     def facts(self):

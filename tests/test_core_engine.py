@@ -161,6 +161,43 @@ class ReplayedSlotTests(PackageFixture, unittest.TestCase):
             self.load("skip")
 
 
+@unittest.skipUnless(STEP_LIBRARY and _cuda(), "Core's runtime and a CUDA device for captured prompt chunks")
+class SideBySideEngineTests(PackageFixture, unittest.TestCase):
+    """Two engines in one process: one closed and freed leaves the other's captured prompt chunks their bits, and their
+    replays write no memory the other engine gave back. Every capture runs on Core's one capture stream, and torch frees
+    the stream's cuBLAS workspaces when a graph captured on it goes (CUDAGraph.reset); a graph's workspace is made where
+    nothing else is (crit_plugins.rounds.capture_workspaces)."""
+
+    def test_an_engine_freed_beside_another_leaves_its_captured_chunks_their_bits_and_memory(self):
+        import gc
+        import weakref
+        import torch
+        from crit_plugins.rounds import capture_stream
+        # Rows of 4,096 columns: cuBLAS sums each in parts through its workspace.
+        options = {"toy-model": {"prompt_graphs": "on", "prompt_width": 4096}}
+        kept = load(write_package(self.root / "kept", options=options), self.model)
+        try:
+            freed = load(write_package(self.root / "freed", options=options), self.model)
+            chunks, tokens = kept.model.prompts, list(range(5, 21))
+            before = chunks.run(1, 0, tokens).clone()
+            self.assertEqual(before.view(-1).tolist(), [4096.0 * t for t in tokens])
+            gone = weakref.ref(freed.model.prompts)
+            freed.close()
+            del freed
+            gc.collect()
+            self.assertIsNone(gone(), "the closed engine's captured chunks are freed")
+            # Fresh tensors on the capture stream take the memory freed there (its cache gives a block back to it).
+            with torch.cuda.stream(capture_stream(torch.device("cuda"))):
+                taken = [torch.full((8 << 20,), 7.0, device="cuda") for _ in range(4)]
+            after = chunks.run(1, 0, tokens)
+            torch.cuda.synchronize()
+            self.assertTrue(torch.equal(after, before), "the captured chunk gives other bits")
+            self.assertTrue(all(bool((t == 7.0).all()) for t in taken), "a replay wrote memory its engine gave back")
+            self.assertEqual(kept.generate([5, 6, 7], 4, stop_tokens=[])[0], oracle([5, 6, 7], 4, stops=()))
+        finally:
+            kept.close()
+
+
 class NativeReplayCheckTests(unittest.TestCase):
     def test_native_rounds_of_a_request_count_as_the_calls_their_captures_made(self):
         from crit_core.engine import slot_problems

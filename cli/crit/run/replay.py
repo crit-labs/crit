@@ -164,8 +164,8 @@ def _render(root, statuses, at):
                          + "; ".join(e["error"] for e in statuses.values() if "error" in e))
 
 
-def brief(run_id, at, limit, root, project, segment_id, statuses, before=None):
-    command = f"crit run --project {project} --root {root.parent} --id {run_id}"
+def brief(run_id, at, limit, root, store, segment_id, statuses, before=None):
+    command = f"crit run --project {store.project} --root {root.parent} --id {run_id}"
     title = f"before {before}" if before else f"at {at}"
     if at is None:
         reports = ("There is no candidate and no Eval yet: the run's records, work/recon.md and whatever else work/ held "
@@ -185,7 +185,7 @@ This folder ({root}) is crit run {run_id} as it stood {point}: its records, its
 candidates and their Eval results, and the files of work/ written by then (without build products). Nothing written
 later is here. {reports}
 
-You are the run's agent at that point. Follow AGENTS.md (in {project}) and the run's brief
+You are the run's agent at that point. Follow AGENTS.md (in {store.repository}) and the run's brief
 (segments/{segment_id}/agent_request.md) as you would from here, up to recording the next plan, and stop
 there: decide what the next candidate should be, or whether the run should stop. A replay builds nothing. Do not create
 candidates, package, measure, serve, run Eval, record plans or use the GPU, and do not change crit or crit-eval; crit
@@ -262,7 +262,7 @@ def make(store, run_id, at, out, count=1, before=None):
             if not (folder / "seal.json").is_file():
                 replica._refresh(root, folder.name)
         replica._state(root, current_segment_id=segment_id, phase="awaiting_agent")
-        text = brief(run["run_id"], at, limit, root, store.project, segment_id, statuses, before)
+        text = brief(run["run_id"], at, limit, root, store, segment_id, statuses, before)
         (root / FOLDER / "agent_request.md").write_text(text, encoding="utf-8", newline="\n")
         made.append({"root": str(replay_root), "folder": str(root), "brief": str(root / FOLDER / "agent_request.md"),
                      "copied_files": copied, "left_out_files": left})

@@ -28,7 +28,7 @@ import time
 
 from .device import PromptBatch
 from .manifest import POLICY_SLOTS, PluginError
-from .rounds import _method, _own_problems, capture_stream
+from .rounds import _method, _own_problems, capture_stream, capture_workspaces
 
 BUCKETS = (16, 64, 128, 512)
 # Replays of a captured bucket before its time is measured (the first ones upload the graph and warm its caches), and
@@ -258,6 +258,7 @@ class PromptGraphs:
             gc.disable()
             observed = self._observer.snapshot() if self._observer is not None else None
             try:
+                capture_workspaces(stream)
                 with torch.cuda.graph(graph, pool=self._pool if self.share_pool else None, stream=stream):
                     self.batch.derive()
                     output = self.forward(self.batch)

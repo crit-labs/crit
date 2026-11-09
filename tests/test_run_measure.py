@@ -183,14 +183,14 @@ class RunMeasureTests(MeasureFixture, unittest.TestCase):
         with patch.dict(os.environ, {"CRIT_ENGINE_LOCK": str(self.root / "engine.lock"),
                                      "CRIT_ENGINE_LEASE": "off", "CRIT_ENGINE_LOCK_HELD": ""}):
             holder = subprocess.Popen([sys.executable, "-B", "-c", HOLD, "3", str(ROOT / "core/python")],
-                                      stdout=subprocess.PIPE, text=True)
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
             try:
                 self.assertEqual(holder.stdout.readline().strip(), "held")
                 with patch("crit_api.engine.ServedEngine.open", side_effect=AssertionError("served while waiting")):
                     with self.assertRaisesRegex(ValueError, "Measurement timed_out: Engine lock acquisition"):
                         measure.measure(self.store, self.run_id, candidate, seconds=.1)
             finally:
-                holder.terminate()
+                holder.stdin.close()   # the holder releases the lock and exits (test_machine_lock.HOLD)
                 holder.wait(timeout=10)
                 holder.stdout.close()
         self.assertEqual((self.attempt()["outcome"], self.attempt()["cleanup_settled"]), ("timed_out", True))
@@ -474,7 +474,7 @@ class DeviceMemoryTests(unittest.TestCase):
 
     def test_device_memory_is_sampled_on_every_gpu_the_run_names_and_summed(self):
         class Smi:
-            stdout = iter(["0, 1000, 32000\n", "1, 3000, 32000\n", "0, 2000, 32000\n"])
+            stdout = io.StringIO("0, 1000, 32000\n1, 3000, 32000\n0, 2000, 32000\n")   # read, then closed, as a pipe
             killed = False
 
             def kill(self):

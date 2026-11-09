@@ -4,10 +4,13 @@ from datetime import timedelta
 import json
 import os
 from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
 from support.runs import ROOT, RunFixture, timestamp_for_test, with_plugins
+from crit import __version__
+from crit.cli import REPOSITORY, Installed
 from crit.run.records import (GIB, candidate_projection, digest, file_sha, ineligibility, inventory, now, read_json, safe_path,
                               write_json)
 from crit.run.store import PUBLISHED, RunStore, lease
@@ -661,6 +664,30 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         (folder / "unexpected.fixture").write_text("changed inventory")
         self.assertEqual(self.store.get(self.run_id)["candidates"], [])
 
+    def test_an_operation_walks_each_retained_inventory_once_and_the_next_walks_it_again(self):
+        from crit import records
+        sealed, *_ = self.measured()
+        self.store.seal(self.run_id, sealed["candidate_id"], "completed")
+        candidate, _, _, data = self.measured(label="Second engine")
+        walk, walked = records.inventory, []
+
+        def counted(root, *args, **kwargs):
+            walked.append(Path(root).relative_to(self.directory / "candidates").as_posix())
+            return walk(root, *args, **kwargs)
+
+        # The append projects the new record, refreshes the candidate's telemetry, and the run's state reads every
+        # candidate: three reads of the appended candidate, one of the sealed one.
+        with patch.object(records, "inventory", counted):
+            self.store.append(self.run_id, candidate["candidate_id"], "benchmark", data)
+        first, second = sealed["candidate_id"], candidate["candidate_id"]
+        self.assertEqual(sorted(walked), sorted([f"{second}/source", f"{second}/package", first, f"{first}/source",
+                                                 f"{first}/package"]))
+        path = self.directory / "candidates" / first / "package/engine.fixture"
+        path.write_bytes(path.read_bytes() + b" ")
+        view = self.store.get(self.run_id)
+        self.assertEqual([c["candidate_id"] for c in view["candidates"]], [second])
+        self.assertIn("candidates/" + first, [e["file"] for e in view["errors"]])
+
     def test_sealed_candidate_cannot_publish_new_measurements(self):
         candidate, package, checks, data = self.measured()
         self.store.seal(self.run_id, candidate["candidate_id"], "completed")
@@ -872,6 +899,29 @@ class RunRootTests(unittest.TestCase):
         for name in allowlist:
             with self.subTest(folder=name), self.assertRaisesRegex(ValueError, "Runs belong outside publication"):
                 RunStore(ROOT / name / "runs", ROOT)
+
+    def test_a_crit_installed_without_a_checkout_keeps_runs_in_any_folder_outside_its_own(self):
+        """An installed crit (crit.cli.installed) takes any folder as the project, names its release in the run's
+        brief and keeps runs out of the folder it is installed in; a crit run from a checkout still wants one."""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        base, request = Path(temp.name).resolve(), {"correctness_criteria": "Fixture gates", "kv_tokens": 8192}
+        (base / "model.fixture").write_text("synthetic input, not a model", encoding="utf-8")
+        workspace = base / "workspace"
+        crit = Installed(base / "site-packages" / "crit", __version__, f"{REPOSITORY}/tree/v{__version__}")
+        with patch("crit.run.store.installed", return_value=crit):
+            store = RunStore(workspace / "runs", workspace)
+            run_id = store.create({**request, "model_path": str(base / "model.fixture")})["run"]["run_id"]
+            brief = (store.directory(run_id) / "agent_request.md").read_text(encoding="utf-8")
+            self.assertIn(f"\nRepository: {crit.guides}, the release of the installed crit {__version__} "
+                          f"({crit.package})\n", brief)
+            self.assertIn(f'--candidate CANDIDATE_ID --project "{workspace}"', brief)
+            with self.assertRaisesRegex(ValueError, "Runs belong outside the folder crit is installed in"):
+                RunStore(base / "site-packages" / "runs", workspace)
+            # A checkout given as the project is the repository, as before.
+            self.assertEqual(RunStore(base / "runs", ROOT).repository, str(ROOT))
+        with self.assertRaisesRegex(ValueError, "Select a crit repository with --project"):
+            RunStore(workspace / "runs", workspace)
 
 
 if __name__ == "__main__":

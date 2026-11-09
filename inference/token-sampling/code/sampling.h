@@ -200,6 +200,13 @@ std::size_t logprob_scratch_bytes(int vocab, int rows, int n) noexcept;
 cudaError_t enqueue_logprobs(const float* logits, int ld, int rows, int vocab, const std::int32_t* chosen, int n,
                              float* chosen_logprob, std::int32_t* top_ids, float* top_logprobs, void* scratch,
                              cudaStream_t stream);
+// The same over rows that are log-probabilities already (row r = logprobs + r * ld, computed elsewhere: a torch
+// engine's FP32 log_softmax, the arithmetic of its step and score paths): chosen_logprob[r] is the row's value at
+// chosen[r] (-inf outside [0, vocab)) and the alternatives are the row's own values ranked as Logprobs ranks them,
+// each as given (nothing renormalized), so a round reports the bits a step reports for the same rows. Same scratch.
+cudaError_t enqueue_ranked_logprobs(const float* logprobs, int ld, int rows, int vocab, const std::int32_t* chosen,
+                                    int n, float* chosen_logprob, std::int32_t* top_ids, float* top_logprobs,
+                                    void* scratch, cudaStream_t stream);
 
 // After publication: add tokens[r * token_stride + i] for i < n to request r's counts and advance its
 // position by n, where n = emitted ? emitted[r * emitted_stride] : 1. In a device speculative round

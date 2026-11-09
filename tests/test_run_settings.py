@@ -2,13 +2,19 @@
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("core/python", "api", "../crit-eval", "kernels", "cli"): sys.path.insert(0, str(ROOT / _folder))
+from crit import cli
+from crit.cli import PROJECT_VARIABLE
+from crit.pull.bench import main as bench_main
 from crit.run.cli import load_settings, main
 from crit.run.records import GIB
 
@@ -188,6 +194,33 @@ class RunSettingsTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_settings(self.project)
             self.assertEqual(self.create()[0], 1)
+
+    def test_crit_eval_reads_the_settings_of_the_project_a_command_uses(self):
+        """crit run and crit bench name their --project to crit-eval (CRIT_PROJECT, which crit_eval.machine_settings
+        reads) while they run, and crit eval names crit's project unless the environment names one."""
+        seen = []
+
+        def look(*arguments, **options):
+            seen.append(os.environ.get(PROJECT_VARIABLE))
+            raise ValueError("looked")
+
+        other = self.project / "other"
+        with patch.dict(os.environ), patch("crit.run.cli.RunStore", side_effect=look), \
+                patch("crit.pull.bench.bench", side_effect=look), \
+                patch("crit.cli.family", return_value=SimpleNamespace(main=look)), \
+                contextlib.redirect_stderr(io.StringIO()):
+            os.environ.pop(PROJECT_VARIABLE, None)
+            self.assertEqual(main(["--project", str(self.project), "--id", "run-x", "show"]), 1)
+            self.assertEqual(bench_main(["owner/engine", "--data", str(self.project), "--project", str(other)]), 1)
+            for named in (None, str(other)):
+                if named:
+                    os.environ[PROJECT_VARIABLE] = named
+                with self.assertRaisesRegex(ValueError, "looked"):
+                    cli.main(["eval", "status", "result.json"])
+            self.assertEqual(os.environ[PROJECT_VARIABLE], str(other))   # as the environment named it
+            os.environ.pop(PROJECT_VARIABLE)
+            self.assertEqual(seen, [str(self.project), str(other), str(cli.default_project().resolve()), str(other)])
+            self.assertNotIn(PROJECT_VARIABLE, os.environ)   # named only while the command ran
 
 
 if __name__ == "__main__":

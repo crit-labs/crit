@@ -7,8 +7,11 @@ investigation to delivery. Changes to crit itself must meet [what belongs in cri
 [Contributing](docs/CONTRIBUTING.md).
 Install from the repo root with `python -m pip install -e .`, then run `crit ...`. A plain `python -m pip install .`
 builds engines too: the wheel carries the plugin library, so `crit plugins` and `crit inference` work from it as from
-the checkout, and `crit run` keeps its records against the checkout (`--project`). A harness that speaks MCP can
-run the same commands as tools through `crit mcp` ([MCP](mcp/README.md)), the long ones as jobs it waits on.
+the checkout, and `crit run` keeps its records against the checkout (`--project`). An installed crit without a
+checkout (`pip install crit`) keeps them in any folder (`--project`, default the current one, holding `settings.toml`
+and `runs/`), and the run's brief names its guides: these files at the installed release's tag of crit's repository.
+A harness that speaks MCP can run the same commands as tools through `crit mcp` ([MCP](mcp/README.md)), the long
+ones as jobs it waits on.
 
 ## 1. Set up the project
 

@@ -59,7 +59,8 @@ def parser():
     add.add_argument("--model", help="The card's model id, when the result names no checkpoint")
     add.add_argument("--store", type=Path, help="Engine store (default: PROJECT/engines)")
     add.add_argument("--project", type=Path, default=default_project(),
-                     help="crit repository (default: this checkout)")
+                     help="crit checkout whose engines/ is the default store (default: this checkout); a crit "
+                          "installed without a checkout takes any folder (default: the current one)")
     return parser
 
 

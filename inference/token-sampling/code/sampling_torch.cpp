@@ -154,19 +154,21 @@ void sample(const torch::Tensor& logits, int64_t vocab, const torch::Tensor& req
           "enqueue_sample");
 }
 
-// Raw rows' log-probabilities: chosen [rows] int32 tokens -> chosen_values [rows], and the n best alternatives.
+// Raw rows' log-probabilities: chosen [rows] int32 tokens -> chosen_values [rows], and the n best alternatives. given:
+// the rows are log-probabilities already (enqueue_ranked_logprobs: their own values, ranked).
 void logprobs(const torch::Tensor& logits, int64_t vocab, const torch::Tensor& chosen, int64_t n,
               const torch::Tensor& chosen_values, const torch::Tensor& top_ids, const torch::Tensor& top_values,
-              const torch::Tensor& scratch) {
+              const torch::Tensor& scratch, bool given) {
     const c10::cuda::CUDAGuard guard(logits.device());
     logit_rows(logits, logits.size(0));
     cuda_tensor(chosen, "chosen tokens");
     cuda_tensor(scratch, "scratch");
     const ts::Logprobs lp = logprobs_of(n, chosen_values, top_ids, top_values);
-    check(ts::enqueue_logprobs(logits.data_ptr<float>(), int(logits.stride(0)), int(logits.size(0)), int(vocab),
-                               ptr<const std::int32_t>(chosen), int(n), lp.chosen, lp.top_ids, lp.top_logprobs,
-                               ptr<void>(scratch), at::cuda::getCurrentCUDAStream()),
-          "enqueue_logprobs");
+    const auto enqueue = given ? ts::enqueue_ranked_logprobs : ts::enqueue_logprobs;
+    check(enqueue(logits.data_ptr<float>(), int(logits.stride(0)), int(logits.size(0)), int(vocab),
+                  ptr<const std::int32_t>(chosen), int(n), lp.chosen, lp.top_ids, lp.top_logprobs, ptr<void>(scratch),
+                  at::cuda::getCurrentCUDAStream()),
+          given ? "enqueue_ranked_logprobs" : "enqueue_logprobs");
 }
 
 }  // namespace

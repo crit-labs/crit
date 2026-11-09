@@ -29,7 +29,7 @@ load through torch's extension builder (native()): greedy rows and 1 <= top_k <=
 4,096 logits keep their best top_k + 1 processed candidates, one law block per row merges them and runs Core's steps 7
 to 12 in FP64, the verify rule included), open rows settled there when top_p or min_p closes the kept set within the
 top 64 or the draw lands among them, every other row on a one-block full-vocabulary law (FP32 values and weights: a draw
-within ~1e-5 of a boundary may differ), and Core's log-probabilities fused into the same launches. A drafter's laws are
+within ~1e-5 of a boundary may differ). A drafter's laws are
 then kept sparse (at most 64 kept (token, probability) pairs per draft; a law keeping more has no sparse form, and its
 draft is verified by the target's own draw, which keeps the law at a lower acceptance). Where it does not build (no CUDA
 compiler), with the `rounds` option torch, and on the CPU, the same rules run in torch over sorted rows in FP64 with
@@ -37,6 +37,13 @@ dense laws: capture-safe and exact against the host form up to cumulative sums i
 rounding of a boundary may differ), and slower (a sort of every row).
 
 Greedy rounds (view.mode greedy, replay or forced) take torch's argmax, whose first maximum is the lower id.
+
+A round's log-probabilities (logprobs_device) are torch's FP32 log_softmax of its logits rows, the arithmetic a torch
+model's step and score paths compute (torch.log_softmax over FP32 rows), so an emitted token's log-probability in a
+captured round is the step's and the score path's bit for bit given the same logits: torch's kernel reduces a row the
+same way whatever rows are beside it, by its length and its address modulo 16 bytes (the same for every row of a
+vocabulary that is a multiple of 4). The ranked alternatives are those values in Core's order (higher first, the lower
+id among equals): the CUDA sampler ranks the rows as given (enqueue_ranked_logprobs), the torch law by a stable sort.
 """
 import hashlib
 import os
@@ -97,10 +104,13 @@ class Native:
                            self._or(sparse, d), self._or(dense, d), scratch, int(lp_n), self._or(chosen, d),
                            self._or(top_ids, d), self._or(top_values, d), self._or(tree, d), self._or(tree_tokens, d))
 
-    def logprobs(self, logits, vocab, chosen, n, chosen_values, top_ids=None, top_values=None, scratch=None):
+    def logprobs(self, logits, vocab, chosen, n, chosen_values, top_ids=None, top_values=None, scratch=None,
+                 given=False):
+        """Core's TokenLogprob of raw logits rows (enqueue_logprobs), or with `given` the rows' own values, rows that
+        are log-probabilities already, ranked (enqueue_ranked_logprobs)."""
         d = logits.device
         self.module.logprobs(logits, int(vocab), chosen, int(n), chosen_values, self._or(top_ids, d),
-                             self._or(top_values, d), scratch)
+                             self._or(top_values, d), scratch, bool(given))
 
 
 def native(device):
@@ -288,6 +298,7 @@ class RoundState:
         self.chosen = torch.zeros(rows * cols, dtype=torch.float32, **dev)
         self.top_ids = torch.zeros(rows * cols, max(self.top, 1), dtype=torch.int32, **dev)
         self.top_values = torch.zeros(rows * cols, max(self.top, 1), dtype=torch.float32, **dev)
+        self.lp_rows = None   # the log-probability rows (logprob_rows), made by the first round that scores
         if self.native is not None:
             layout = self.native.layout()
             self.request_bytes, self.position_word = layout["request"], layout["position"] // 8
@@ -307,6 +318,19 @@ class RoundState:
                                           rule.get("top_k", 0), rule.get("seed", 0), rule.get("stream", 0), 0)
         b = self.request_bytes
         self.requests[slot * b:(slot + 1) * b].copy_(packed)
+
+    def logprob_rows(self, count, vocab):
+        """The first `count` of rows * (widest + 1) FP32 rows of `vocab` a round's log-probabilities are written into,
+        made at the first call: a round's warm-up, never inside a capture (one graph's pool would hold the rows every
+        later round writes)."""
+        found = self.lp_rows
+        if found is None or found.shape[1] != vocab:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("token-sampling: warm a round's log-probability form before capturing it (its rows "
+                                   "are made at the first call)")
+            found = self.lp_rows = torch.empty(self.rows * (self.widest + 1), vocab, dtype=torch.float32,
+                                               device=self.device)
+        return found[:count]
 
     def stage(self, slot, params):
         if not 0 <= slot < self.rows:
@@ -499,10 +523,11 @@ class RoundSampling:
         return out
 
     def logprobs_device(self, view, logits, tokens):
-        """Core's TokenLogprob of tokens [rows][width + 1] over the raw logits rows ([rows * (width + 1)][vocab] or
+        """The log-probabilities of tokens [rows][width + 1] over the logits rows ([rows * (width + 1)][vocab] or
         [rows][width + 1][vocab], each row the one that predicted its token: the round driver gathers a tree's along
         its path): view.logprobs[:, :width + 1] and, where the view keeps them (view.top_ids, view.top_logprobs), the
-        ranked alternatives, in Core's order (lower id first among equals). The round driver calls it after the
+        ranked alternatives, in Core's order (lower id first among equals). The values are torch's FP32 log_softmax of
+        the rows, a model's step and score arithmetic (the module's docstring). The round driver calls it after the
         accept, over the emitted tokens. Capture-safe."""
         rows, cols = view.rows, view.width + 1
         vocab = logits.shape[-1]
@@ -510,15 +535,17 @@ class RoundSampling:
         x = x if x.dtype == torch.float32 and x.stride(-1) == 1 else x.float().contiguous()
         state = self._round
         if state is not None and state.native is not None and rows <= state.rows and cols <= state.widest + 1:
+            values = state.logprob_rows(rows * cols, vocab)
+            torch._log_softmax(x, -1, False, out=values)   # torch.log_softmax's kernel, into the state's rows
             chosen = state.predictions[:rows * cols]
             chosen.view(rows, cols).copy_(tokens[:rows, :cols])
             n = state.top
-            state.native.logprobs(x, vocab, chosen, n, state.chosen[:rows * cols],
+            state.native.logprobs(values, vocab, chosen, n, state.chosen[:rows * cols],
                                   state.top_ids[:rows * cols] if n else None,
-                                  state.top_values[:rows * cols] if n else None, state.lp_scratch)
+                                  state.top_values[:rows * cols] if n else None, state.lp_scratch, given=True)
             self._write_logprobs(view, state, rows, cols)
             return
-        values = torch.log_softmax(x.double(), dim=-1)
+        values = torch.log_softmax(x, dim=-1)
         view.logprobs[:rows, :cols].copy_(values.gather(1, tokens[:rows, :cols].reshape(-1, 1).long()).view(rows, cols))
         if view.top_ids is not None and view.top_ids.shape[-1]:
             k = view.top_ids.shape[-1]

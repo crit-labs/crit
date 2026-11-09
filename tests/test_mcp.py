@@ -194,6 +194,18 @@ class JobTests(unittest.TestCase):
             time.sleep(.05)
         return job, int(job.read("output")[0])
 
+    def test_a_servers_project_reaches_its_jobs(self):
+        # crit eval has no --project: a job learns the server's from CRIT_PROJECT, as crit run's commands name theirs.
+        from crit.cli import PROJECT_VARIABLE
+        with tempfile.TemporaryDirectory() as directory:
+            server = Server(project=directory, jobs=Path(directory) / "jobs")
+            self.addCleanup(server.jobs.close, 5)
+            job = server.jobs.start("test", ["-c", f"import os; print(os.environ.get({PROJECT_VARIABLE!r}))"],
+                                    Path.cwd())
+            self.assertTrue(job.done.wait(30))
+            self.assertEqual(job.read("output")[0].strip(), str(Path(directory).resolve()))
+            server.jobs.close(grace=5)
+
     def test_a_stopped_job_ends_with_its_whole_tree(self):
         with tempfile.TemporaryDirectory() as directory:
             jobs = Jobs(directory)

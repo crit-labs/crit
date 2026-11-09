@@ -6,7 +6,7 @@ import signal
 import sys
 import tomllib
 
-from crit.cli import default_project
+from crit.cli import default_project, named_project
 
 from .records import exploratory_reason, ineligibility, read_json, safe_path
 from .store import RunStore
@@ -69,7 +69,9 @@ def json_argument(value, option):
 def parser():
     """The arguments of crit run (crit mcp offers its tools from them)."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project", type=Path, default=default_project())
+    parser.add_argument("--project", type=Path, default=default_project(),
+                        help="crit checkout the run follows, whose settings.toml it reads (default: this checkout); a "
+                             "crit installed without a checkout takes any folder (default: the current one)")
     parser.add_argument("--root", type=Path, help="Run root; defaults to PROJECT/runs")
     parser.add_argument("--id", help="Existing run identity")
     subs = parser.add_subparsers(dest="action", required=True)
@@ -240,6 +242,13 @@ def main(argv=None):
         signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
     if args.action != "create" and not args.id:
         command.error("--id is required for an existing run")
+    # Eval reads the machine's settings from the settings.toml this run reads, the project's.
+    with named_project(args.project):
+        return act(command, args)
+
+
+def act(command, args):
+    """Run the parsed action: its result as JSON on stdout and 0, or the error on stderr and 1."""
     try:
         store = RunStore(args.root or args.project / "runs", args.project)
         payload = read_json(args.record) if getattr(args, "record", None) else None

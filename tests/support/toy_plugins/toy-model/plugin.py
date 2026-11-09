@@ -58,16 +58,18 @@ class ToyModel:
         self.pool = parts["kv_cache"].pool([0], 1, 1, self.context, self.device, dtype="fp32")
         self.handles, self.steps, self.closed = 0, [], False
         # prompt_graphs: the step's projection work as a captured chunk of its rows, replayed (a test of Core's loader,
-        # which counts a replay as the calls its capture made).
+        # which counts a replay as the calls its capture made). prompt_width: the columns each row's product sums (wide,
+        # cuBLAS splits the sum through its workspace: a test of engines side by side).
         self.prompts = None
         if options.get("prompt_graphs", "off") != "off" and torch.cuda.is_available():   # toy-vision has no such option
             from crit_plugins.prompt_graphs import PromptGraphs
-            self.graph_weight = self.proj.load({"weight": torch.ones(1, 1, device="cuda")}, "fp32")
+            width = int(options.get("prompt_width", 1))
+            self.graph_weight = self.proj.load({"weight": torch.ones(1, width, device="cuda")}, "fp32")
             self.prompts = PromptGraphs(self._chunk, device="cuda", buckets=(16,), parts=parts, uses=["projections"])
             self.prompts.prepare()
 
     def _chunk(self, batch):
-        x = batch.tokens_t.float()[:, None]
+        x = batch.tokens_t.float()[:, None].expand(-1, self.graph_weight.shape[1]).contiguous()
         if self.options["prompt_graphs"] == "skip":
             return x @ self.graph_weight.T
         return self.proj.matmul(x, self.graph_weight)

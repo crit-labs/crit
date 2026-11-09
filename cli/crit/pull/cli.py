@@ -502,7 +502,9 @@ def parser():
                         help="Context the engine serves at (default: the context its card measured)")
     parser.add_argument("--store", type=Path, help="Engine store (default: PROJECT/engines)")
     parser.add_argument("--project", type=Path, default=default_project(),
-                        help="crit repository, whose settings.toml gives the device and headroom (default: this checkout)")
+                        help="crit checkout whose settings.toml gives the device and headroom and whose engines/ is the "
+                             "default store (default: this checkout); a crit installed without a checkout takes any "
+                             "folder (default: the current one)")
     parser.add_argument("--force", action="store_true", help="Install again over an installed engine")
     parser.add_argument("--ignore-requirements", action="store_true",
                         help="Install even when this machine does not meet the card's requirements")
