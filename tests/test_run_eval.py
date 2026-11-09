@@ -10,6 +10,7 @@ from unittest.mock import patch
 import sys
 
 from support.runs import RunFixture
+from support.serve import RECIPE, scripted_package, scripted_serving
 # Eval's server fixtures, from the crit-eval checkout beside this one.
 sys.path.append(str(Path(__file__).resolve().parents[2] / "crit-eval" / "tests"))
 from test_eval_server import Text, write_data, write_store
@@ -94,12 +95,9 @@ class RunEvalTests(RunFixture, unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.candidate_id = self.candidate()["candidate_id"]
-        package = self.root / "served-package"
-        package.mkdir()
-        (package / "engine.py").write_text(ADAPTER)
-        self.store.package(self.run_id, self.candidate_id, package,
-                           {"build": {"toolchain": {"fixture": "host-python"}, "dependencies": [], "command": ["fixture"]},
-                            "launch": ["engine.py"], "capabilities": self.capabilities})
+        scripted_serving(self, lambda: self.capabilities)
+        package = scripted_package(self.root / "served-package", ADAPTER)
+        self.store.package(self.run_id, self.candidate_id, package, RECIPE)
         self.folder = self.directory / "candidates" / self.candidate_id
         self.eval_data = self.root / "eval-data"
         self.eval_data.mkdir()
@@ -139,7 +137,9 @@ class RunEvalTests(RunFixture, unittest.TestCase):
         self.assertIsNotNone(lower["cases"]["chat"]["decode_tps"])
         self.assertTrue(result["context"]["points"])  # the long-context curve, served at the run's context
         self.assertEqual(result["requirements"]["exactness"], "reported")
-        self.assertEqual(result["requirements"]["quality_mode"], "preserve")
+        # The fixture's request names no quality mode: the run, and so its Eval, judge in speed.
+        self.assertEqual(result["requirements"]["quality_mode"], "speed")
+        self.assertEqual(result["requirements"]["quality_budget"]["kld_mean_max"], 0.4)
         chat_case = result["speed"]["cases"]["chat"]
         self.assertEqual(chat_case["tokens"], prepare.token_ids(Text(), ("tides rise and fall " * 20)[:12]))
         # The reference scored the data's texts first; the candidate then scored them through crit serve.
@@ -166,6 +166,29 @@ class RunEvalTests(RunFixture, unittest.TestCase):
         self.store.seal(self.run_id, self.candidate_id, "built")  # the result is part of the sealed inventory
         self.assertIn(measured["result"]["path"].split("/", 2)[2],
                       {row["path"] for row in read_json(self.folder / "seal.json")["files"]})
+
+    def test_eval_fetches_no_package_beside_the_scores_its_data_holds(self):
+        # Both quality modes judge against the same scores, and no run reads the allowance a package may carry: a
+        # speed run (the default) whose data holds the scores fetches nothing, though no allowance lies there.
+        write_store(self.eval_data)
+        fetched = []
+        with patch("crit_eval.quality.packages.source", lambda: self.root / "packages"), \
+                patch("crit_eval.quality.packages.fetch", lambda *args, **kwargs: fetched.append(args)):
+            self.evaluate(parts=("quality",))
+        self.assertEqual(self.run["spec"]["correctness"]["quality_mode"], "speed")
+        self.assertEqual(fetched, [])
+
+    def test_a_candidate_measured_only_by_eval_seals_as_completed_once_its_segment_stopped(self):
+        # A stopped segment refuses `measure` and Resume needs every candidate sealed: there the Eval attempt is the
+        # candidate's measurement. While the segment runs, the seal waits for the run's cases: select needs them.
+        self.evaluate(parts=("speed",))
+        with self.assertRaisesRegex(ValueError, "Measure case-0001 before sealing"):
+            self.store.seal(self.run_id, self.candidate_id, "completed")
+        state = read_json(self.directory / "state.json")
+        with patch("crit.run.store.read_json", lambda path, *a, **k: {**state, "stopping_reason": "budget_exhausted"}
+                   if Path(path).name == "state.json" else read_json(path, *a, **k)):
+            self.store.seal(self.run_id, self.candidate_id, "completed")
+        self.assertEqual(read_json(self.folder / "outcome.json")["lifecycle"], "completed")
 
     def test_an_off_device_placement_without_host_bytes_is_warned(self):
         from crit.run.recon import RECON_JSON
@@ -327,16 +350,11 @@ class RunEvalTests(RunFixture, unittest.TestCase):
 
 
 class UnservableEvalTests(RunFixture, unittest.TestCase):
-    def test_eval_needs_a_streaming_resident_package_that_scores_for_quality(self):
+    def test_eval_needs_a_package_and_prepared_data(self):
         candidate = self.candidate()["candidate_id"]
-        package = self.root / "served-package"
-        package.mkdir()
-        (package / "engine.py").write_text(ADAPTER)
-        self.store.package(self.run_id, candidate, package,
-                           {"build": {"toolchain": {"fixture": "host-python"}, "dependencies": [], "command": ["fixture"]},
-                            "launch": ["engine.py"], "capabilities": [c for c in SERVED if c != "chat-score-v1"]})
-        with self.assertRaisesRegex(ValueError, "must declare chat-score-v1"):
+        with self.assertRaisesRegex(ValueError, "Package the candidate before measuring it"):
             evaluation.evaluate(self.store, self.run_id, candidate, self.root)
+        self.store.package(self.run_id, candidate, scripted_package(self.root / "served-package", ADAPTER), RECIPE)
         with self.assertRaisesRegex(ValueError, "holds no prepared.json"):
             evaluation.evaluate(self.store, self.run_id, candidate, self.root, ["speed"])
 

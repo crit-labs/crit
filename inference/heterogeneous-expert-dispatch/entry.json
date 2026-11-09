@@ -52,6 +52,14 @@
     {
       "path": "inference/heterogeneous-expert-dispatch/code/routing.py",
       "purpose": "Routing description, its host reference for one token and the mapping from Core's parsed config fields"
+    },
+    {
+      "path": "inference/heterogeneous-expert-dispatch/code/cpu_routes.cu",
+      "purpose": "The post and scatter kernels of a layer's CPU routes over host-work-mailbox's Mailbox, and their torch binding, built at load"
+    },
+    {
+      "path": "inference/heterogeneous-expert-dispatch/code/device_dispatch.py",
+      "purpose": "DeviceDispatch: the CUDA device form's post, join, scatter and combine, the measured link/CPU split; DeclaredRoutes, the baseline device part"
     }
   ],
   "requires": {
@@ -108,7 +116,8 @@
   "validation": {
     "host": "Host fixtures and worked example cover budget feasibility, repeated routes, exact fallback, scratch separation and one activation preparation; measured policy fixtures check median/sparse/nonlinear costs, identity changes, explicit overlap, byte and occurrence limits, arbitrary widths, repeated expert uploads and weighted result preservation; RAM/commit/cgroup limits, unknown costs/observations, distinct experts and upload sources, fresh revalidation, zero incremental resident paths and route preservation; routing fixtures check hand-worked cases, the transformers router code of Mixtral, Qwen2/Qwen3-MoE, GPT-OSS, Llama 4, DeepSeek-V2/V3, GLM-4.5, MiniMax-M2, Ernie 4.5 and LongCat-Flash when installed, and the fail-closed config mapping",
     "native": "Device routing and shared-expert kernels are engine supplied; compare them with the host Routing reference (routing.py) on the model's parameterization",
-    "performance": "Unmeasured for a native engine; host fixture success is not a speed claim"
+    "performance": "Unmeasured for a native engine; host fixture success is not a speed claim",
+    "cuda": "Plugin tests on an RTX 5090: random admission quotas (any expert to the CPU tier) give the all-device bits for nvfp4 and int4; a captured graph replayed with new routes, weights and splits gives the eager bits; a token alone gives its batched bits; a cache's host store read in place gives the loaded experts' bits; the quota table is measured on the machine. All-arch build of cpu_routes.cu and mailbox.cu: sm_80, 86, 89, 90, 100a, 103a, 110a, 120a, 121a"
   },
   "native_integration": {
     "status": "Router and shared-expert kernels, mixed-source routed-expert arithmetic and physical cache staging are engine services",

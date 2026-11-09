@@ -2,18 +2,22 @@
 yardstick provider. crit-eval measures it (`crit eval workbench check|bench|profile FOLDER`).
 
 `crit kernels new NAME --op OP` scaffolds work/kernels/NAME (kernel.json, kernel.py, crit-eval's harness.py, src/):
-for a matmul (gemv, gemm) in bf16, fp8 or nvfp4 its FP64 reference, a library yardstick and a binding whose kernel the engine
-writes; for any other operation the harness with the functions to fill in. `--from DIR` copies an existing kernel's
-source (a Hub kernel, a library sample) into src/ with its license, as the starting point. `--model DIR` takes the
-shapes from the checkpoint's matrices in the format. `--starter` writes a simple, correct, portable kernel to start
-from instead of the empty binding; in a run it is allowed from the run's fourth candidate on (`--run RUN_FOLDER`), so
-the first three candidates find their kernels themselves. Scaffolding imports and runs nothing.
+for a matmul (gemv, gemm) in bf16, fp8 or nvfp4 its FP64 reference, a library yardstick and a candidate that calls the
+kernel's op run_<format>; for any other operation the harness with the functions to fill in. src/ is a kernel-builder
+project, and crit holds no kernel source for it: `--from DIR` copies an existing one (a crit-kernels project, a Hub
+kernel's source, a library sample) with its license, else kernel-builder's own template (`kernel-builder init`, on
+PATH or named by CRIT_KERNEL_BUILDER) starts it. `--model DIR` takes the shapes from the checkpoint's matrices in the
+format. `--starter` marks the kernel taken with --from as the starter (crit-kernels' workbench-starter: a simple,
+correct matmul in bf16 and fp8); in a run it is allowed from the run's fourth candidate on (`--run RUN_FOLDER`), so the
+first three candidates find their kernels themselves. Scaffolding imports nothing; it runs only kernel-builder init.
 """
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 
 TEMPLATES = Path(__file__).resolve().parent / "templates"
 MATMUL_OPS = {"gemv": [1, 2, 4, 8], "gemm": [64, 512, 2048]}
@@ -22,7 +26,7 @@ MATMUL_OPS = {"gemv": [1, 2, 4, 8], "gemm": [64, 512, 2048]}
 MATMUL_FORMATS = {"bf16": ("plain", "bf16"), "fp8": ("fp8", "fp8"), "nvfp4": ("nvfp4", "bf16")}
 YARDSTICKS = {"bf16": "lib:cuBLAS (torch.matmul in bf16)", "fp8": "lib:cuBLASLt (torch._scaled_mm, row-wise scales)",
               "nvfp4": "lib:cuBLAS (torch.matmul in bf16 on the weights widened to BF16 once)"}
-STARTERS = ("bf16", "fp8")   # formats --starter has a starter kernel for
+STARTERS = ("bf16", "fp8")   # formats crit-kernels' workbench-starter has a starter kernel for
 NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
 LICENSES = ("LICENSE", "LICENSE.md", "LICENSE.txt", "COPYING", "NOTICE")
 
@@ -58,6 +62,25 @@ def _fill(path, out, values):
 STARTER_FROM = 4   # a run's candidate number from which `--starter` is allowed
 
 
+def kernel_builder():
+    """The kernel-builder executable: CRIT_KERNEL_BUILDER, else kernel-builder on PATH; None without one."""
+    return os.environ.get("CRIT_KERNEL_BUILDER") or shutil.which("kernel-builder")
+
+
+def init_project(src, name):
+    """src/ as kernel-builder's own template project for kernel crit-labs/NAME (`kernel-builder init`)."""
+    tool = kernel_builder()
+    if tool is None:
+        raise ValueError("src/ is a kernel-builder project: install kernel-builder (or set CRIT_KERNEL_BUILDER) so "
+                         "`kernel-builder init` starts it, or pass --from DIR with an existing project (crit-kernels "
+                         "holds crit-labs' own)")
+    done = subprocess.run([tool, "init", "--name", "crit-labs/" + name.replace("_", "-"), str(src)],
+                          capture_output=True, text=True, timeout=120)
+    if done.returncode != 0 or not (src / "build.toml").is_file():
+        raise ValueError(f"kernel-builder init failed: {(done.stderr or done.stdout).strip()[-500:]}")
+    shutil.rmtree(src / ".git", ignore_errors=True)   # the workbench folder belongs to the run's source, not a repo
+
+
 def harness():
     """crit-eval's workbench harness, which every folder carries."""
     import crit_eval.workbench
@@ -73,11 +96,14 @@ def starter_allowed(run):
 def new(name, op, root, fmt=None, shapes=(), model=None, columns=None, source=None, yardstick=None,
         column_invariant=None, tolerance=None, starter=False, run=None, repeatable=True):
     """Scaffold the workbench folder root/NAME. Returns the kernel.json it wrote. repeatable False: the kernel may give
-    other bits on a repeat (atomics, a split the workload chooses), for engines in quality mode as_quantized; the check
+    other bits on a repeat (atomics, a split the workload chooses), for engines in quality mode speed; the check
     then judges each repeat against the reference within the tolerance."""
     if not NAME.fullmatch(name):
         raise ValueError("NAME is lower-case letters, digits and _, starting with a letter")
     if starter:
+        if source is None:
+            raise ValueError("--starter takes the starter kernel with --from DIR: crit-kernels' workbench-starter "
+                             "project")
         if run is None:
             raise ValueError("--starter needs --run RUN_FOLDER: a starter kernel is allowed from a run's candidate "
                              f"{STARTER_FROM} on")
@@ -100,9 +126,12 @@ def new(name, op, root, fmt=None, shapes=(), model=None, columns=None, source=No
         found += model_shapes(model, MATMUL_FORMATS[fmt][0])
     if not found:
         raise ValueError("Give the shapes: --shape N,K (repeatable) or --model MODEL_DIR")
-    (folder / "src").mkdir(parents=True)
     copied = []
-    if source is not None:
+    if source is None:
+        folder.mkdir(parents=True)
+        init_project(folder / "src", name)
+    else:
+        (folder / "src").mkdir(parents=True)
         source = Path(source)
         if not source.is_dir():
             raise ValueError(f"--from {source} is no directory")
@@ -116,14 +145,13 @@ def new(name, op, root, fmt=None, shapes=(), model=None, columns=None, source=No
         if not any(Path(row["path"]).name in LICENSES for row in copied):
             raise ValueError(f"--from {source} holds no license file ({', '.join(LICENSES)}): check the source's terms "
                              "and copy its license beside it first")
-        if any(path.suffix == ".cpp" and "TORCH_LIBRARY_EXPAND" in path.read_text(errors="replace")
-               for path in (folder / "src").rglob("*.cpp")):
-            shutil.copy2(TEMPLATES / "registration.h", folder / "src" / "registration.h")   # a Hub kernel's torch-ext
+    if any(path.suffix == ".cpp" and "TORCH_LIBRARY_EXPAND" in path.read_text(errors="replace")
+           for path in (folder / "src").rglob("*.cpp")):
+        shutil.copy2(TEMPLATES / "registration.h", folder / "src" / "registration.h")   # a kernel-builder torch-ext
     values = {"name": name, "op": op, "format": fmt or "custom", "module": "crit_wb_" + name,
               "yardstick": yardstick or YARDSTICKS.get(fmt, "the best existing provider")}
-    if matmul and source is None:
+    if matmul:
         _fill(TEMPLATES / "matmul_kernel.py", folder / "kernel.py", values)
-        _fill(TEMPLATES / ("matmul_kernel.cu" if starter else "matmul_stub.cu"), folder / "src" / f"{name}.cu", values)
     else:
         _fill(TEMPLATES / "custom_kernel.py", folder / "kernel.py", values)
     shutil.copy2(harness(), folder / "harness.py")

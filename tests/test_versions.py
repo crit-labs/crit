@@ -51,7 +51,8 @@ class VersionTests(unittest.TestCase):
 
     def test_every_file_that_names_the_version_is_a_known_place(self):
         version = read("cli/crit/__init__.py", PLACES["cli/crit/__init__.py"][0])
-        listed = subprocess.run(["git", "grep", "-l", "-F", version], cwd=ROOT, capture_output=True, text=True)
+        # Text files only (-I): a binary file can hold the version's bytes by chance (in a PNG's pixels, say).
+        listed = subprocess.run(["git", "grep", "-l", "-I", "-F", version], cwd=ROOT, capture_output=True, text=True)
         if listed.returncode not in (0, 1):
             self.skipTest("needs a git checkout: " + listed.stderr.strip())
         named = set(listed.stdout.split()) - HISTORY

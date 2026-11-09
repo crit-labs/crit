@@ -9,7 +9,11 @@ from unittest.mock import patch
 from support.runs import RunFixture
 from crit.run import plans
 from crit.run.cli import main
-from crit.run.records import file_sha, read_json, validate_spec, write_json
+from crit.run.records import NEW_RUN_BUDGET_COUNTS, digest, file_sha, now, read_json, validate_spec, write_json
+
+# Eval's budget for each quality mode, a run's unless it sets its own.
+PRESERVE_BUDGET = {"ppl_ratio_max": 1.05, "kld_mean_max": 0.05, "kld_p99_max": 0.5}
+SPEED_BUDGET = {"ppl_ratio_max": 1.4, "kld_mean_max": 0.4, "kld_p99_max": 4.0}
 
 
 def status(decode=100.0, prefill=1000.0, ttft=200.0, limits=(200.0, 4000.0, 100.0), noise=0.02, context=None,
@@ -86,8 +90,10 @@ class PlanFixture(RunFixture):
     new_run_plans = "required"
     # The plan rules the fixture's runs are created with; PlanRules3Tests set 3, the default of new runs.
     plan_rules = 2
-    # The run's quality mode, when not the default preserve.
-    quality_mode = None
+    # The run's quality mode: preserve, where check 16 (plan rules 6) asks nothing, so the other rules' tests plan
+    # without prompt_activations; PlanRules6Tests judge speed, and None leaves the request without one
+    # (the default, speed).
+    quality_mode = "preserve"
 
     def setUp(self):
         super().setUp()
@@ -863,9 +869,9 @@ class PlanRecordTests(PlanFixture, unittest.TestCase):
 
     def test_plan_rules_need_computed_limits(self):
         spec = copy.deepcopy(self.run["spec"])
-        for broken in ({**spec, "plan_rules": 7}, {key: value for key, value in spec.items() if key != "plan_limits"}):
+        for broken in ({**spec, "plan_rules": 8}, {key: value for key, value in spec.items() if key != "plan_limits"}):
             with self.subTest(broken=broken.get("plan_rules")):
-                with self.assertRaisesRegex(ValueError, "plan_rules is 2 to 6 when present"):
+                with self.assertRaisesRegex(ValueError, "plan_rules is 2 to 7 when present"):
                     validate_spec(broken)
 
     def test_without_the_round_floors_facts_the_plan_gives_the_alternatives_ceiling(self):
@@ -952,6 +958,15 @@ class PlanRules3Tests(PlanFixture, unittest.TestCase):
     def test_new_runs_check_plans_with_rules_3(self):
         self.assertEqual(self.run["spec"]["plan_rules"], 3)
 
+    def test_before_rules_4_a_check_a_lever_serves_is_free_text(self):
+        # Rules 3 know no repairs: check:NAME names a rule like any other text, and no check record is read.
+        parent = self.first()["candidate_id"]
+        repair = PlanRules4Tests.CHECK_REPAIR
+        with self.assertRaisesRegex(ValueError, "requirement levers alone do not make a candidate"):
+            self.store.plan(self.run_id, plan(parent, levers=[repair]))
+        recorded = self.store.plan(self.run_id, plan(parent, levers=plan()["levers"] + [repair]))
+        self.assertNotIn("objective", recorded["inputs"])
+
     def test_a_forecast_that_gains_more_on_p2_or_lets_p1_fall_says_why(self):
         parent = self.first()["candidate_id"]
         # Prefill at 25% of its limit is p1, decode at 50% p2.
@@ -1011,12 +1026,14 @@ class PlanRules3Tests(PlanFixture, unittest.TestCase):
                                                 "2,000: reject it with a quality measurement"):
             self.store.plan(self.run_id, decode_only)
 
-        def quality(activations, p05, spread=True):
+        def quality(activations, p05, spread=True, budget=PRESERVE_BUDGET):
             sets = {"long-4096/prompt": {"budget_used": 1.3, **({"budget_spread": {"budget_used": {
                 "p05": p05, "p50": 1.3, "p95": 1.6}}} if spread else {})}}
             label = activations if isinstance(activations, str) else "shares"
-            return self.evidence(f"fp8-{p05}-{spread}-{label}.json",
-                                 {"engine": {"prompt_activations": activations}, "quality": {"sets": sets}})
+            # Judged in preserve, this run's mode, with preserve's budget.
+            return self.evidence(f"fp8-{p05}-{spread}-{label}-{budget['kld_mean_max']}.json",
+                                 {"engine": {"prompt_activations": activations}, "quality": {"sets": sets},
+                                  "requirements": {"quality_mode": "preserve", "quality_budget": budget}})
 
         def with_fp8(path):
             return {**decode_only, "gaps": decode_only["gaps"] + [
@@ -1024,7 +1041,11 @@ class PlanRules3Tests(PlanFixture, unittest.TestCase):
                  "detail": "FP8 activations on the MLP"}]}
         for path, message in ((quality("fp8", 0.9), "inside the quality noise, so not a rejection"),
                               (quality("fp8", 1.1, spread=False), "no quality spread over positions"),
-                              (quality("bf16", 1.1), "measured prompt activations 'bf16', not 'fp8'")):
+                              (quality("bf16", 1.1), "measured prompt activations 'bf16', not 'fp8'"),
+                              # A share of a looser budget than the run's measures nothing about the run's.
+                              (quality("fp8", 1.1, budget={**PRESERVE_BUDGET, "kld_mean_max": 0.1}),
+                               "judged in quality mode preserve with the budget .*0.1.*, this run's terms are "
+                               "quality mode preserve with the budget")):
             with self.subTest(message=message):
                 with self.assertRaisesRegex(ValueError, message):
                     self.store.plan(self.run_id, with_fp8(path))
@@ -1081,6 +1102,120 @@ class PlanRules4Tests(PlanFixture, unittest.TestCase):
         enough = plan(parent, forecast={**plan()["forecast"], "decode": {"low": 100.0, "expected": 105.0, "high": 110.0},
                                         "prefill": {"low": 1050.0, "expected": 1100.0, "high": 1200.0}})
         self.assertEqual(self.store.plan(self.run_id, enough)["inputs"]["objective"]["candidate"], 2)
+
+    def test_a_gate_repair_needs_no_floor_on_p1_but_names_a_gate_the_parent_failed(self):
+        recorded = self.store.plan(self.run_id, plan(levers=[], forecast=None))
+        parent = self.candidate(plan_id=recorded["plan_id"])["candidate_id"]
+        self.evaluated(parent, {**status(), "gates": [{"name": "lower_context", "state": "fail"},
+                                                      {"name": "quality", "state": "pass"}]})
+        repair = {"id": "warm-at-load", "kind": "requirement", "serves": "gate:lower_context", "technique": "warm-up",
+                  "description": "every request path warm at load", "changes": {}, "group": None,
+                  "confidence": "high", "provider": "own: load-time warm-up"}
+        small = {**plan()["forecast"], "decode": {"low": 95.0, "expected": 101.0, "high": 105.0},
+                 "prefill": {"low": 1000.0, "expected": 1020.0, "high": 1040.0}}
+        with self.assertRaisesRegex(ValueError, "at least \\+10%"):
+            self.store.plan(self.run_id, plan(parent, forecast=small))
+        with self.assertRaisesRegex(ValueError, "names gates the parent's Eval did not fail: quality"):
+            self.store.plan(self.run_id, plan(parent, forecast=small,
+                                              levers=plan()["levers"] + [{**repair, "serves": "gate:quality"}]))
+        recorded = self.store.plan(self.run_id, plan(parent, forecast=small, levers=plan()["levers"] + [repair]))
+        self.assertEqual(recorded["inputs"]["objective"]["repairs"], ["lower_context"])
+        # A repair alone needs no speed lever, nor a forecast that improves decode or prefill (checks 5 to 9) or
+        # reaches toward the limit (check 15).
+        same = {**plan()["forecast"], "decode": {"low": 95.0, "expected": 100.0, "high": 105.0},
+                "prefill": {"low": 950.0, "expected": 1000.0, "high": 1050.0}}
+        with self.assertRaisesRegex(ValueError, "requirement levers alone do not make a candidate"):
+            self.store.plan(self.run_id, plan(parent, forecast=same,
+                                              levers=[{**repair, "serves": "AGENTS.md: warm paths"}]))
+        alone = self.store.plan(self.run_id, plan(parent, forecast=same, levers=[repair]))
+        self.assertEqual(alone["inputs"]["objective"]["repairs"], ["lower_context"])
+
+    # A requirement lever repairing the resources check, and a forecast that stays where the parent is.
+    CHECK_REPAIR = {"id": "headroom", "kind": "requirement", "serves": "check:resources", "technique": "KV pool sizing",
+                    "description": "size the KV pool so the run's VRAM headroom stays free at the required context",
+                    "changes": {}, "group": None, "confidence": "high", "provider": "own: KV pool sizing"}
+    SAME = {**plan()["forecast"], "decode": {"low": 95.0, "expected": 100.0, "high": 105.0},
+            "prefill": {"low": 950.0, "expected": 1000.0, "high": 1050.0}}
+
+    def packaged_parent(self):
+        """The run's first candidate, packaged and through an Eval whose every gate passed; its Eval attempt id."""
+        recorded = self.store.plan(self.run_id, plan(levers=[], forecast=None))
+        candidate = self.candidate(plan_id=recorded["plan_id"])
+        self.package(candidate)
+        attempt = self.evaluated(candidate["candidate_id"], {**status(), "gates": [
+            {"name": "capacity", "state": "pass"}, {"name": "quality", "state": "pass"}]})
+        return candidate["candidate_id"], attempt
+
+    def check(self, candidate_id, attempt, gate, state):
+        """A check of the candidate's package from its Eval attempt, as crit run ... check --from-eval records it."""
+        package = read_json(self.directory / "candidates" / candidate_id / "package/manifest.json")
+        result = f"candidates/{candidate_id}/eval/{attempt}.json"
+        return self.store.append(self.run_id, candidate_id, "check", {
+            "case_id": "case-0001", "package_sha256": digest(package), "gate": gate,
+            "criteria_sha256": digest(self.run["spec"]["correctness"]), "status": state,
+            "rationale": f"crit Eval {attempt}: fixture", "evidence": [{"path": result,
+                                                                        "sha256": file_sha(self.directory / result)}],
+            "evidence_level": "artifact_verified", "recorded_at": now(),
+            "extensions": {"recorded_by": "crit run check --from-eval"}})["check_id"]
+
+    def test_a_check_repair_names_a_check_the_parent_failed_and_needs_no_speed(self):
+        # Every gate of the parent's Eval passed, but crit run's resources check failed (free device memory at the
+        # required context below the run's headroom): select refuses it, and its child only repairs that.
+        parent, attempt = self.packaged_parent()
+        repair = self.CHECK_REPAIR
+        with self.assertRaisesRegex(ValueError, "A check repair names checks candidate-0001 did not fail: resources "
+                                                "\\(no resources check recorded\\)\\. check:NAME repairs a check whose "
+                                                "newest record of candidate-0001 failed; record its checks first "
+                                                "\\(crit run \\.\\.\\. check --candidate candidate-0001 --from-eval\\)"):
+            self.store.plan(self.run_id, plan(parent, forecast=self.SAME, levers=[repair]))
+        self.check(parent, attempt, "arithmetic", "passed")
+        self.check(parent, attempt, "functional", "passed")
+        failed = self.check(parent, attempt, "resources", "failed")
+        # Without the repair: requirement levers alone make no candidate; as a gate repair, resources is no Eval gate.
+        with self.assertRaisesRegex(ValueError, "requirement levers alone do not make a candidate"):
+            self.store.plan(self.run_id, plan(parent, forecast=self.SAME,
+                                              levers=[{**repair, "serves": "resources gate: VRAM headroom"}]))
+        with self.assertRaisesRegex(ValueError, "A gate repair names gates the parent's Eval did not fail: resources "
+                                                "\\(failed: none\\)\\. resources is a check of crit run, not a gate of "
+                                                "Eval's status: a lever repairing a failed one serves check:resources"):
+            self.store.plan(self.run_id, plan(parent, forecast=self.SAME, levers=[{**repair, "serves": "gate:resources"}]))
+        with self.assertRaisesRegex(ValueError, "A check repair names checks candidate-0001 did not fail: arithmetic "
+                                                "\\(its newest, check-0001 for case-0001, passed\\)\\. check:NAME "
+                                                "repairs a check whose newest record of candidate-0001 failed$"):
+            self.store.plan(self.run_id, plan(parent, forecast=self.SAME,
+                                              levers=[repair, {**repair, "id": "x", "serves": "check:arithmetic"}]))
+        with self.assertRaisesRegex(ValueError, "A check repair names checks crit run does not require: capacity "
+                                                "\\(required: arithmetic, functional, resources\\); a gate of the "
+                                                "parent's Eval is repaired as gate:NAME"):
+            self.store.plan(self.run_id, plan(parent, forecast=self.SAME, levers=[{**repair, "serves": "check:capacity"}]))
+        # The repair alone, with the parent's forecast: no speed lever, no +10% on p1, no improvement (checks 5 to 9).
+        recorded = self.store.plan(self.run_id, plan(parent, forecast=self.SAME, levers=[repair]))
+        path = f"candidates/{parent}/checks/{failed}.json"
+        self.assertEqual(recorded["inputs"]["objective"]["check_repairs"], {"resources": [
+            {"path": path, "sha256": file_sha(self.directory / path), "check_id": failed, "case_id": "case-0001",
+             "recorded_by": "crit run check --from-eval"}]})
+        self.assertNotIn("repairs", recorded["inputs"]["objective"])
+        # The plan changes nothing about the parent: its resources gate is failed and select refuses it.
+        self.store.seal(self.run_id, parent, "built")
+        candidate = next(c for c in self.store.get(self.run_id)["candidates"] if c["candidate_id"] == parent)
+        self.assertEqual((candidate["gates"]["resources"], candidate["eligible"]), ("failed", False))
+        with self.assertRaisesRegex(ValueError, "candidate-0001 is not eligible: required gate resources is failed"):
+            self.store.select(self.run_id, parent)
+
+    def test_a_check_repair_follows_the_parents_newest_check(self):
+        # The run's first plan has no parent whose check it could repair.
+        with self.assertRaisesRegex(ValueError, "A check repair names a failed check of the parent: the run's first "
+                                                "plan has none"):
+            self.store.plan(self.run_id, plan(levers=[self.CHECK_REPAIR], forecast=None))
+        parent, attempt = self.packaged_parent()
+        self.check(parent, attempt, "resources", "failed")
+        passed = self.check(parent, attempt, "resources", "passed")
+        with self.assertRaisesRegex(ValueError, f"did not fail: resources \\(its newest, {passed} for case-0001, "
+                                                "passed\\)"):
+            self.store.plan(self.run_id, plan(parent, forecast=self.SAME, levers=[self.CHECK_REPAIR]))
+        failed = self.check(parent, attempt, "resources", "failed")
+        recorded = self.store.plan(self.run_id, plan(parent, forecast=self.SAME, levers=[self.CHECK_REPAIR]))
+        self.assertEqual(recorded["inputs"]["objective"]["check_repairs"]["resources"][0]["check_id"], failed)
 
     def test_a_critique_round_names_the_parents_two_weakest_terms_and_other_levers(self):
         parent = self.first()["candidate_id"]
@@ -1156,6 +1291,245 @@ class PlanRules4Tests(PlanFixture, unittest.TestCase):
         self.assertEqual(self.store.plan(self.run_id, plan(child, review=review))["review"], review)
 
 
+class BudgetCountsTests(PlanFixture, unittest.TestCase):
+    """budget_counts evaluated, the default of new runs: the candidate budget is spent on candidates that go through
+    Eval, and a draft that failed before its Eval is fixed from the same plan at no cost."""
+    budget_counts = "evaluated"
+    plan_rules = 4
+    account = {"kpis": [{"kpi": kpi, "start": 1.0, "reached": 1.0, "limit": 2.0, "built": "fixture", "cause": "fixture"}
+                        for kpi in ("decode", "prefill", "ttft")]}
+
+    def test_a_draft_is_fixed_from_its_plan_and_keeps_its_objective(self):
+        from crit.run import records
+        self.assertEqual(records.NEW_RUN_BUDGET_COUNTS, "evaluated")
+        self.assertEqual(self.run["spec"]["budget_counts"], "evaluated")
+        prompt = (self.directory / "agent_request.md").read_text(encoding="utf-8")
+        self.assertIn("candidate budget: 3 candidates through Eval", prompt)
+        self.assertIn("is a draft", prompt)
+        self.assertIn("a fix keeps its draft's objective", prompt)
+        first = self.store.plan(self.run_id, plan(levers=[], forecast=None))
+        draft = self.candidate(plan_id=first["plan_id"])["candidate_id"]
+        # The draft failed its serve check. Its fix is a new candidate from the same plan once the draft is sealed.
+        with self.assertRaisesRegex(ValueError, "candidate-0001, a draft that has not reached Eval: seal it"):
+            self.candidate(plan_id=first["plan_id"])
+        self.store.seal(self.run_id, draft, "check_failed", {"message": "crit smoke: causal failed"})
+        # With no candidate through Eval yet, a first plan is still candidate 1's.
+        self.assertEqual(self.store.plan(self.run_id, plan(levers=[], forecast=None), check=True)
+                         ["inputs"]["objective"]["candidate"], 1)
+        fix = self.candidate(plan_id=first["plan_id"])["candidate_id"]
+        self.assertEqual(self.store.get(self.run_id)["state"]["plans"][0]["candidate_id"], fix)
+        self.evaluated(fix, status())
+        with self.assertRaisesRegex(ValueError, f"already linked to {fix}, which went through Eval"):
+            self.candidate(plan_id=first["plan_id"])
+        with self.assertRaisesRegex(ValueError, "null only while the run has no candidate that went through Eval"):
+            self.store.plan(self.run_id, plan(levers=[], forecast=None))
+        # The draft is not numbered: the next plan is candidate 2's.
+        second = self.store.plan(self.run_id, plan(fix))
+        self.assertEqual(second["inputs"]["objective"]["candidate"], 2)
+        self.assertEqual(self.store.get(self.run_id)["errors"], [])
+
+    def test_only_candidates_through_eval_spend_the_budget(self):
+        with patch("crit.run.records.NEW_RUN_PLAN_RULES", self.plan_rules):
+            self.run_id = self.store.create(self.data | {"candidate_budget": 1})["run"]["run_id"]
+        self.directory = self.store.directory(self.run_id)
+        first = self.store.plan(self.run_id, plan(levers=[], forecast=None))
+        for _ in range(3):  # drafts that never reached Eval cost nothing
+            draft = self.candidate(plan_id=first["plan_id"])["candidate_id"]
+            self.store.seal(self.run_id, draft, "build_failed", {"message": "fixture"})
+        with self.assertRaisesRegex(ValueError, "Only 0 of 1 budgeted candidates went through Eval"):
+            self.store.stop(self.run_id, "budget_exhausted", critique="critique", headroom=self.account)
+        candidate = self.candidate(plan_id=first["plan_id"])["candidate_id"]
+        other = self.store.plan(self.run_id, plan(levers=[], forecast=None))
+        rival = self.candidate(plan_id=other["plan_id"])["candidate_id"]
+        self.evaluated(candidate, status())
+        self.evaluated(candidate, status())  # a counted candidate's rerun costs nothing more
+        # The budget is used: another candidate's first Eval is refused, and so is a new candidate.
+        with self.assertRaisesRegex(ValueError, "candidate budget \\(1\\) is used \\(candidates through Eval\\)"):
+            self.store.reserve(self.run_id, rival, "eval")
+        recorded = self.store.plan(self.run_id, plan(candidate))
+        with self.assertRaisesRegex(ValueError, "candidate budget \\(1\\) is used"):
+            self.candidate(parent_candidate_id=candidate, plan_id=recorded["plan_id"])
+        self.store.stop(self.run_id, "budget_exhausted", critique="critique", headroom=self.account)
+        # A resume adds candidates.
+        self.store.seal(self.run_id, candidate, "cancelled", {"message": "fixture"})
+        self.store.seal(self.run_id, rival, "cancelled", {"message": "fixture"})
+        self.store.resume(self.run_id, attempt_limit=64, external_cleanup_confirmed=True, candidates=1)
+        self.candidate(parent_candidate_id=candidate, plan_id=recorded["plan_id"])
+        self.assertEqual(self.store.get(self.run_id)["errors"], [])
+
+
+class CandidateLadderTests(PlanFixture, unittest.TestCase):
+    """budget_counts ladder, the default of new runs: a candidate's number in the run says how far it goes, from
+    candidate 1's build, plugin tests and serve check with no Eval, through candidate 2's small Eval and candidates 3
+    and 4's medium one, to the full Eval from candidate 5 on; a draft is fixed from the same plan with its number."""
+    budget_counts = "ladder"
+    plan_rules = 4
+    account = {"kpis": [{"kpi": kpi, "start": 1.0, "reached": 1.0, "limit": 2.0, "built": "fixture", "cause": "fixture"}
+                        for kpi in ("decode", "prefill", "ttft")]}
+
+    def setUp(self):
+        super().setUp()
+        # A run at the default budget: the ladder's five rungs.
+        self.create()
+
+    def create(self, **updates):
+        data = {key: value for key, value in self.data.items() if key != "candidate_budget"} | updates
+        with patch("crit.run.records.NEW_RUN_PLAN_RULES", self.plan_rules):
+            self.run = self.store.create(data)["run"]
+        self.run_id = self.run["run_id"]
+        self.directory = self.store.directory(self.run_id)
+
+    def served(self, candidate_id, state="passed"):
+        """The candidate packaged, with the functional check crit run ... serve --check records."""
+        package = self.package({"candidate_id": candidate_id})
+        path = self.directory / "candidates" / candidate_id / "logs" / "serve-check-fixture.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"checks": []}), encoding="utf-8")
+        self.store.append(self.run_id, candidate_id, "check", {
+            "case_id": "case-0001", "package_sha256": digest(package), "gate": "functional",
+            "criteria_sha256": digest(self.run["spec"]["correctness"]), "status": state,
+            "rationale": "crit run serve --check: fixture",
+            "evidence": [{"path": path.relative_to(self.directory).as_posix(), "sha256": file_sha(path)}],
+            "evidence_level": "artifact_verified", "recorded_at": now(),
+            "extensions": {"recorded_by": "crit run serve --check"}})
+
+    def built(self, plan_id, parent=None):
+        """A candidate from the plan that passed its serve check and was sealed built, skipping its rung's Eval."""
+        candidate = self.candidate(plan_id=plan_id, **({"parent_candidate_id": parent} if parent else {}))["candidate_id"]
+        self.served(candidate)
+        self.store.seal(self.run_id, candidate, "built")
+        return candidate
+
+    def critique(self, parent):
+        """A critique round's plan from the parent: its two weakest terms and another lever beside them."""
+        path = self.directory / "work" / "kernels.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+        weakest = [{"kpi": "prefill", "term": "attention 9 ms vs 3 ms floor", "evidence": "work/kernels.json",
+                    "levers": ["chunked-prefill"]},
+                   {"kpi": "decode", "term": "verify pass 16 vs 13 ms floor", "evidence": "work/kernels.json",
+                    "levers": ["graphs"]}]
+        levers = plan()["levers"] + [lever("fused-norms", {"decode": {"change": 0.1, "source": "estimate"}})]
+        return plan(parent, levers=levers, weakest=weakest)
+
+    @staticmethod
+    def rung(recorded):
+        goal = recorded["inputs"]["objective"]
+        return goal["candidate"], goal["name"], goal["eval"]["scope"]
+
+    def test_new_runs_climb_the_ladder_at_five_candidates(self):
+        from crit.run import records
+        self.assertEqual(NEW_RUN_BUDGET_COUNTS, "ladder")
+        self.assertEqual(records.DEFAULT_CANDIDATE_BUDGET, 5)
+        self.assertEqual(self.run["spec"]["budget_counts"], "ladder")
+        self.assertEqual(self.store.get(self.run_id)["segment"]["limits"]["candidate_budget"], 5)
+        prompt = (self.directory / "agent_request.md").read_text(encoding="utf-8")
+        for line in ("candidate budget: 5 candidates on the candidate ladder", "- Candidate 1: build it",
+                     "No Eval: crit run ... eval refuses it", "At most a small Eval", "At most a medium Eval",
+                     "- Candidate 5 on, and the segment's last budgeted candidate", "Candidate 2 is the plugin round"):
+            self.assertIn(line, prompt)
+
+    def test_each_candidate_goes_as_far_as_its_rung(self):
+        first = self.store.plan(self.run_id, plan(levers=[], forecast=None))
+        self.assertEqual(self.rung(first), (1, "proof_of_concept", "none"))
+        draft = self.candidate(plan_id=first["plan_id"])["candidate_id"]
+        # Candidate 1 has no Eval, and no plan starts from it before it stands on its rung.
+        with self.assertRaisesRegex(ValueError, "first rung: no Eval"):
+            self.store.reserve(self.run_id, draft, "eval")
+        with self.assertRaisesRegex(ValueError, f"{draft} is not on the candidate ladder yet"):
+            self.store.plan(self.run_id, plan(draft))
+        # Sealed built without a passed serve check it is a draft: its fix keeps its plan and its number.
+        self.package({"candidate_id": draft})
+        self.store.seal(self.run_id, draft, "built")
+        with self.assertRaisesRegex(ValueError, f"{draft} is not on the candidate ladder yet"):
+            self.store.plan(self.run_id, plan(draft))
+        self.assertEqual(self.rung(self.store.plan(self.run_id, plan(levers=[], forecast=None), check=True)),
+                         (1, "proof_of_concept", "none"))
+        c1 = self.built(first["plan_id"])
+        with self.assertRaisesRegex(ValueError, f"already linked to {c1}, which is on the candidate ladder"):
+            self.candidate(plan_id=first["plan_id"])
+        with self.assertRaisesRegex(ValueError, "null only while the run has no candidate on the candidate ladder"):
+            self.store.plan(self.run_id, plan(levers=[], forecast=None))
+        # Candidate 2, the plugin round: its plan freezes no Eval, its Eval is the small one.
+        second = self.store.plan(self.run_id, plan(c1))
+        self.assertEqual(self.rung(second), (2, "plugin_round", "small"))
+        self.assertEqual(second["inputs"]["objective"]["eval"]["stage"], 1)
+        self.assertIsNone(second["inputs"]["eval"])
+        c2 = self.candidate(plan_id=second["plan_id"], parent_candidate_id=c1)["candidate_id"]
+        self.evaluated(c2, status())
+        # Candidates 3 and 4: the medium Eval, whether the parent ran its Eval or skipped it.
+        third = self.store.plan(self.run_id, plan(c2))
+        self.assertEqual(self.rung(third), (3, "crit_round", "medium"))
+        self.assertEqual(third["inputs"]["eval"]["path"].split("/")[1], c2)
+        c3 = self.built(third["plan_id"], c2)
+        fourth = self.store.plan(self.run_id, plan(c3))
+        self.assertEqual(self.rung(fourth), (4, "crit_round", "medium"))
+        self.assertIsNone(fourth["inputs"]["eval"])
+        c4 = self.built(fourth["plan_id"], c3)
+        # Candidate 5: the full Eval, which it cannot skip: sealed built without it, it is a draft.
+        fifth = self.store.plan(self.run_id, plan(c4))
+        self.assertEqual(self.rung(fifth), (5, "crit_round", "full"))
+        skipped = self.built(fifth["plan_id"], c4)
+        with self.assertRaisesRegex(ValueError, f"{skipped} is not on the candidate ladder yet"):
+            self.store.plan(self.run_id, plan(skipped))
+        with self.assertRaisesRegex(ValueError, "Only 4 of 5 budgeted candidates are on the candidate ladder"):
+            self.store.stop(self.run_id, "budget_exhausted", critique="critique", headroom=self.account)
+        c5 = self.candidate(plan_id=fifth["plan_id"], parent_candidate_id=c4)["candidate_id"]
+        self.evaluated(c5, status())
+        # The budget is used: a new candidate is refused, the stop accounts for it, and a resume adds critique rounds.
+        sixth = self.store.plan(self.run_id, self.critique(c5))
+        with self.assertRaisesRegex(ValueError, "candidate budget \\(5\\) is used \\(candidates on the candidate ladder\\)"):
+            self.candidate(plan_id=sixth["plan_id"], parent_candidate_id=c5)
+        self.store.stop(self.run_id, "budget_exhausted", critique="critique", headroom=self.account)
+        self.store.seal(self.run_id, c2, "cancelled", {"message": "fixture"})
+        self.store.seal(self.run_id, c5, "cancelled", {"message": "fixture"})
+        self.store.resume(self.run_id, attempt_limit=64, external_cleanup_confirmed=True, candidates=1)
+        later = self.store.plan(self.run_id, self.critique(c5))
+        self.assertEqual(self.rung(later)[1:], ("critique_round", "full"))
+        self.assertEqual(self.store.get(self.run_id)["errors"], [])
+
+    def test_the_segments_last_budgeted_candidate_gets_the_full_eval(self):
+        self.create(candidate_budget=2)
+        first = self.store.plan(self.run_id, plan(levers=[], forecast=None))
+        self.assertEqual(self.rung(first)[2], "none")
+        c1 = self.built(first["plan_id"])
+        self.assertEqual(self.rung(self.store.plan(self.run_id, plan(c1)))[1:], ("plugin_round", "full"))
+        # A single candidate is its own proof of concept and the full Eval.
+        self.create(candidate_budget=1)
+        self.assertEqual(self.rung(self.store.plan(self.run_id, plan(levers=[], forecast=None))),
+                         (1, "proof_of_concept", "full"))
+
+    def test_crit_run_eval_measures_as_far_as_the_rung(self):
+        from crit.run import evaluation
+        from crit.run.ladder import eval_options
+        with self.assertRaisesRegex(ValueError, "first rung: no Eval"):
+            eval_options("none", None, False, "candidate-0001")
+        self.assertEqual(eval_options("small", None, False, "c"), (1, False))
+        self.assertEqual(eval_options("medium", None, False, "c"), (2, False))
+        self.assertEqual(eval_options("medium", 1, False, "c"), (1, False))
+        self.assertEqual(eval_options("full", None, False, "c"), (None, True))
+        self.assertEqual(eval_options(None, 3, False, "c"), (3, False))  # outside the ladder, as asked
+        for name, stage, certify in (("small", 2, False), ("small", None, True), ("small", "full", False),
+                                     ("medium", 3, False), ("medium", None, True)):
+            with self.assertRaisesRegex(ValueError, "the full Eval \\(--certify\\) is for candidate 5 on"):
+                eval_options(name, stage, certify, "c")
+        with self.assertRaisesRegex(ValueError, "drop --stage"):
+            eval_options("full", 2, True, "c")
+        # crit run eval refuses before it reserves or reads the data.
+        first = self.store.plan(self.run_id, plan(levers=[], forecast=None))
+        c1 = self.candidate(plan_id=first["plan_id"])["candidate_id"]
+        self.served(c1)
+        with self.assertRaisesRegex(ValueError, "first rung: no Eval"):
+            evaluation.evaluate(self.store, self.run_id, c1, self.root / "no-data")
+        self.store.seal(self.run_id, c1, "built")
+        second = self.store.plan(self.run_id, plan(c1))
+        c2 = self.candidate(plan_id=second["plan_id"], parent_candidate_id=c1)["candidate_id"]
+        self.package({"candidate_id": c2})
+        with self.assertRaisesRegex(ValueError, f"{c2} gets at most a small Eval"):
+            evaluation.evaluate(self.store, self.run_id, c2, self.root / "no-data", certify=True)
+        self.assertEqual(list((self.directory / "candidates" / c2 / "attempts").glob("attempt-*")), [])
+
+
 class PlanRules5Tests(PlanFixture, unittest.TestCase):
     """Plan rules 5: the strategy's ceiling is the limit, and a forecast whose best case stays below half of a needed
     family's limit names the measured bound that keeps the rest out of reach."""
@@ -1200,26 +1574,26 @@ class PlanRules5Tests(PlanFixture, unittest.TestCase):
 
 
 class PlanRules6Tests(PlanFixture, unittest.TestCase):
-    """Plan rules 6, the default of new runs: an as_quantized run's build plans declare prompt_activations, no quantized
+    """Plan rules 6, the default of new runs: a speed run's build plans declare prompt_activations, no quantized
     format starts at BF16 without a measured rejection of the stored format, and a candidate serves what its plan
     declared."""
     plan_rules = 6
-    quality_mode = "as_quantized"
+    quality_mode = "speed"
     stored = {"nvfp4": "stored", "fp8": "fp8"}
 
     def evidence(self, name, value):
         return PlanRules3Tests.evidence(self, name, value)
 
-    def bf16_rejection(self, p05=1.1, activations="stored"):
+    def bf16_rejection(self, p05=1.1, activations="stored", mode="speed", budget=None):
         sets = {"long-4096/prompt": {"budget_used": 1.3, "budget_spread": {"budget_used": {"p05": p05}}}}
-        path = self.evidence(f"stored-{p05}-{activations}.json",
-                             {"engine": {"prompt_activations": activations}, "quality": {"sets": sets}})
+        budget = budget or (SPEED_BUDGET if mode == "speed" else PRESERVE_BUDGET)
+        path = self.evidence(f"stored-{p05}-{activations}-{mode}-{budget['kld_mean_max']}.json",
+                             {"engine": {"prompt_activations": activations}, "quality": {"sets": sets},
+                              "requirements": {"quality_mode": mode, "quality_budget": budget}})
         return {"kpi": "prefill", "gap": "activation:stored", "answer": "rejected", "evidence": path,
                 "detail": "NVFP4 prompt activations on the experts"}
 
-    def test_new_runs_check_plans_with_rules_6(self):
-        from crit.run import records
-        self.assertEqual(records.NEW_RUN_PLAN_RULES, 6)
+    def test_a_run_created_with_rules_6_keeps_them(self):
         self.assertEqual(self.run["spec"]["plan_rules"], 6)
 
     def test_candidate_1_starts_at_the_checkpoints_activation_format(self):
@@ -1228,8 +1602,9 @@ class PlanRules6Tests(PlanFixture, unittest.TestCase):
             self.store.plan(self.run_id, first)
         for exact in ("bf16", {"nvfp4": "bf16", "fp8": "fp8"}, {"nvfp4": {"stored": 0.5, "bf16": 0.5}}):
             with self.subTest(exact=exact):
-                with self.assertRaisesRegex(ValueError, "at bf16: in as_quantized a quantized format's prompt GEMMs "
-                                                        "start at the checkpoint's own activation format"):
+                with self.assertRaisesRegex(ValueError, "at bf16: in speed, a quantized "
+                                                        "format's prompt GEMMs start at its stored format's "
+                                                        "activations .*crit eval run --package P"):
                     self.store.plan(self.run_id, {**first, "prompt_activations": exact})
         with self.assertRaisesRegex(ValueError, "prompt_activations is what the planned engine declares"):
             self.store.plan(self.run_id, {**first, "prompt_activations": {"nvfp4": "int4"}})
@@ -1243,6 +1618,12 @@ class PlanRules6Tests(PlanFixture, unittest.TestCase):
             self.store.plan(self.run_id, {**first, "gaps": [self.bf16_rejection(p05=0.9)]})
         with self.assertRaisesRegex(ValueError, "measured prompt activations 'fp8', not 'stored'"):
             self.store.plan(self.run_id, {**first, "gaps": [self.bf16_rejection(activations="fp8")]})
+        # Judged by preserve's budget, which rejects what the run's speed mode admits: no rejection here; nor is
+        # one judged in the run's mode by a tighter budget than the run's.
+        for other in (self.bf16_rejection(mode="preserve"),
+                      self.bf16_rejection(budget={**SPEED_BUDGET, "kld_p99_max": 0.5})):
+            with self.assertRaisesRegex(ValueError, "this run's terms are quality mode speed with the budget"):
+                self.store.plan(self.run_id, {**first, "gaps": [other]})
         rejection = self.bf16_rejection()
         recorded = self.store.plan(self.run_id, {**first, "gaps": [rejection]})
         self.assertEqual(recorded["inputs"]["activation_evidence"]["path"], rejection["evidence"])
@@ -1261,18 +1642,202 @@ class PlanRules6Tests(PlanFixture, unittest.TestCase):
         self.assertEqual(self.store.plan(self.run_id, follow)["prompt_activations"], self.stored)
 
 
-class PlanRules6PreserveTests(PlanRules6Tests):
-    """Check 16 asks only as_quantized runs."""
+class PlanRules6DefaultModeTests(PlanRules6Tests):
+    """A request that names no quality mode is in speed: check 16 asks its plans."""
     quality_mode = None
+
+    def test_the_run_records_speed(self):
+        self.assertEqual(self.run["spec"]["correctness"]["quality_mode"], "speed")
+
+
+class PlanRules6PreserveTests(PlanRules6Tests):
+    """Check 16 asks only speed runs."""
+    quality_mode = "preserve"
 
     def test_a_preserve_run_is_not_asked(self):
         recorded = self.store.plan(self.run_id, {**plan(levers=[], forecast=None), "prompt_activations": "bf16"})
         self.assertEqual(recorded["prompt_activations"], "bf16")
         self.assertEqual(self.store.plan(self.run_id, plan(levers=[], forecast=None))["plan_id"], "plan-0002")
 
+
     test_candidate_1_starts_at_the_checkpoints_activation_format = None
     test_bf16_stands_on_a_measured_rejection_of_the_stored_format = None
     test_a_candidate_serves_what_its_plan_declared = None
+
+
+class PlanRules7Tests(PlanFixture, unittest.TestCase):
+    """Plan rules 7, the default of new runs: unknown noise takes its own family's, a plan freezes the newest Eval
+    attempt that measured speed, a limit claim rests on a round account, and a rejection bound by a term reopens once
+    that term shrinks."""
+    plan_rules = 7
+    reaching = {**plan()["forecast"], "prefill": {"low": 1100.0, "expected": 1500.0, "high": 2000.0}}
+
+    def evidence(self, name):
+        return PlanRules4Tests.evidence(self, name)
+
+    def account(self, terms, idle=0.0, total=None, name="round.json"):
+        terms = [{"term": term, "ms": ms, "floor_ms": floor} for term, ms, floor in terms]
+        total = total if total is not None else sum(t["ms"] for t in terms) + idle
+        return {"total_ms": total, "idle_ms": idle, "terms": terms, "evidence": self.evidence(name)}
+
+    def limited(self, parent, cause_terms, account, **updates):
+        """A plan marking prefill not needed, its limit claim resting on the prefill round account."""
+        gap = {"kpi": "prefill", "gap": "limit", "answer": "cause", "detail": "copies bound the chunk",
+               "evidence": self.evidence("bound.json"), **({"cause_terms": cause_terms} if cause_terms else {})}
+        return plan(parent, prefill=False, gaps=[gap], levers=[lever()],
+                    forecast={**plan()["forecast"], "prefill": {"low": 1000.0, "expected": 1000.0, "high": 1000.0}},
+                    **({"round": {"prefill": account}} if account else {}), **updates)
+
+    def test_new_runs_check_plans_with_rules_7(self):
+        from crit.run import records
+        self.assertEqual(records.NEW_RUN_PLAN_RULES, 7)
+        self.assertEqual(self.run["spec"]["plan_rules"], 7)
+
+    def test_a_check_repair_skips_the_speed_checks(self):
+        # One run's candidate 2 passed every gate of its Eval and failed crit run's resources check. Its child, planned
+        # only to repair that, was refused both ways: as a gate repair and as a speed plan.
+        parent, attempt = PlanRules4Tests.packaged_parent(self)
+        for gate, state in (("arithmetic", "passed"), ("functional", "passed"), ("resources", "failed")):
+            PlanRules4Tests.check(self, parent, attempt, gate, state)
+        repair, same = PlanRules4Tests.CHECK_REPAIR, PlanRules4Tests.SAME
+        with self.assertRaisesRegex(ValueError, "did not fail: resources \\(failed: none\\)\\. resources is a check of "
+                                                "crit run, not a gate of Eval's status"):
+            self.store.plan(self.run_id, plan(parent, forecast=same, levers=[lever(), {**repair, "serves": "gate:resources"}]))
+        with self.assertRaisesRegex(ValueError, "prefill is p1 but no lever improves it"):
+            self.store.plan(self.run_id, plan(parent, forecast=same,
+                                              levers=[lever(), {**repair, "serves": "resources: VRAM headroom"}]))
+        recorded = self.store.plan(self.run_id, plan(parent, forecast=same, levers=[lever(), repair]))
+        self.assertEqual(recorded["inputs"]["objective"]["check_repairs"]["resources"][0]["check_id"], "check-0003")
+        self.assertNotIn("reach", recorded["inputs"])   # check 15 does not apply to it either
+
+    def test_an_unknown_noise_takes_its_own_familys(self):
+        # Candidate 13 of one run: decode's noise unknown, a 151% first-token spread. Rules 2 gave decode 151%.
+        facts = PriorityTests.noisy(PriorityTests(), 0.5, 0.6, {"ttft": 1.51, "prefill": 0.04})
+        self.assertEqual(plans.noise_default(facts), (1.51, "ttft"))
+        self.assertEqual(plans.noises(facts, 2)["decode"], 1.51)
+        self.assertEqual(plans.noise_default(facts, "decode", 7), (0.05, "default"))
+        self.assertEqual(plans.noise_default(facts, "context_ttft", 7), (0.04, "prefill"))
+        self.assertEqual(plans.noises(facts, 7)["decode"], 0.05)
+        self.assertEqual(plans.noises(facts, 7)["ttft"], 1.51)
+        parent = PlanRules4Tests.first(self)["candidate_id"]
+        recorded = self.store.plan(self.run_id, plan(parent, forecast=self.reaching))
+        # The fixture measures no long context: those two take their families' measured noise.
+        self.assertEqual(recorded["inputs"]["noise_default"], {"context_decode": {"noise": 0.02, "source": "decode"},
+                                                                "context_ttft": {"noise": 0.02, "source": "prefill"}})
+
+    def test_a_plan_freezes_the_newest_attempt_that_measured_speed(self):
+        parent = PlanRules4Tests.first(self)["candidate_id"]
+        partial = status()
+        partial["kpis"]["decode"]["score"] = partial["kpis"]["prefill"]["score"] = None
+        speed = self.directory / "candidates" / parent / "eval"
+        newest = self.evaluated(parent, partial)   # a quality-only rerun
+        recorded = self.store.plan(self.run_id, plan(parent, forecast=self.reaching))
+        self.assertNotIn(newest, recorded["inputs"]["eval"]["path"])
+        self.assertTrue((speed.parent.parent.parent / recorded["inputs"]["eval"]["path"]).is_file())
+        self.assertEqual(recorded["inputs"]["kpis"]["decode"]["score"], 100.0)
+
+    def test_a_limit_claim_rests_on_a_round_account(self):
+        parent = PlanRules4Tests.first(self)["candidate_id"]
+        with self.assertRaisesRegex(ValueError, "give the parent's round account"):
+            self.store.plan(self.run_id, self.limited(parent, None, None))
+        with self.assertRaisesRegex(ValueError, "add up to 50 ms, the measured round is 60 ms"):
+            self.store.plan(self.run_id, self.limited(parent, ["expert copies"], self.account(
+                [("expert copies", 28.0, 26.0), ("dense", 22.0, 20.0)], total=60.0)))
+        with self.assertRaisesRegex(ValueError, "cause_terms gpu copies are no terms"):
+            self.store.plan(self.run_id, self.limited(parent, ["gpu copies"], self.account(
+                [("expert copies", 28.0, 26.0)])))
+        # Dense at 27% of its floor is not at its floor: candidate 14's stop record, as a round account.
+        slow = self.account([("expert copies", 28.0, 26.0), ("dense", 10.4, 2.8), ("rest", 13.3, 12.0)], idle=8.3)
+        with self.assertRaisesRegex(ValueError, "dense takes 10.4 of 60 ms at 27% of its floor"):
+            self.store.plan(self.run_id, self.limited(parent, ["expert copies"], slow))
+        with self.assertRaisesRegex(ValueError, "the device idles 8.3 of 60 ms"):
+            self.store.plan(self.run_id, self.limited(parent, ["expert copies", "dense"], slow))
+        recorded = self.store.plan(self.run_id, self.limited(parent, ["expert copies", "dense", "idle"], slow))
+        self.assertAlmostEqual(recorded["inputs"]["round"]["prefill"]["parts_ms"], 60.0)
+        # A small term may trail its floor: dense at 5 of 60 ms is below the 10% that matters.
+        small = self.account([("expert copies", 50.0, 48.0), ("dense", 5.0, 1.0), ("rest", 5.0, 4.0)])
+        self.store.plan(self.run_id, self.limited(parent, ["expert copies"], small))
+
+    def test_a_rejection_reopens_once_its_binding_term_shrinks(self):
+        parent = PlanRules4Tests.first(self)["candidate_id"]
+        bound = {"family": "decode", "term": "expert copies"}
+        before = self.account([("expert copies", 28.0, 26.0), ("dense", 30.0, 28.0)], name="before.json")
+        rejected = [{"name": "cpu-tier", "reason": "measured slower", "bound_by": bound,
+                     "evidence": self.evidence("cpu-slower.json")}]
+        with self.assertRaisesRegex(ValueError, "rejected cpu-tier is bound by 'link'"):
+            self.store.plan(self.run_id, plan(parent, forecast=self.reaching, round={"decode": before},
+                                              rejected=[{**rejected[0], "bound_by": {**bound, "term": "link"}}]))
+        self.store.plan(self.run_id, plan(parent, forecast=self.reaching, round={"decode": before}, rejected=rejected))
+        after = self.account([("expert copies", 12.0, 11.0), ("dense", 30.0, 28.0)], name="after.json")
+        with self.assertRaisesRegex(ValueError, "rejected 'cpu-tier' while expert copies took 28 ms of the decode "
+                                                "round; it is now 12 ms"):
+            self.store.plan(self.run_id, plan(parent, forecast=self.reaching, round={"decode": after}))
+        # Rejected again on the same measurement: still refused; on a new one, or planned again: recorded.
+        with self.assertRaisesRegex(ValueError, "Plan it again"):
+            self.store.plan(self.run_id, plan(parent, forecast=self.reaching, round={"decode": after}, rejected=rejected))
+        again = [{**rejected[0], "evidence": self.evidence("cpu-again.json")}]
+        recorded = self.store.plan(self.run_id, plan(parent, forecast=self.reaching, round={"decode": after},
+                                                     rejected=again))
+        self.assertEqual(recorded["inputs"]["reopened"][0]["name"], "cpu-tier")
+        planned = plan(parent, forecast=self.reaching, round={"decode": after},
+                       levers=plan()["levers"] + [lever("cpu-tier")], rejected=[])
+        self.assertIn("cpu-tier", [row["id"] for row in self.store.plan(self.run_id, planned)["levers"]])
+        # The same term, barely smaller: the rejection still holds.
+        close = self.account([("expert copies", 25.0, 24.0), ("dense", 30.0, 28.0)], name="close.json")
+        self.store.plan(self.run_id, plan(parent, forecast=self.reaching, round={"decode": close}))
+
+    def test_candidate_1_starts_with_the_cpu_tier_where_the_cpu_beats_the_link(self):
+        recon = self.directory / "work" / "recon.json"
+        recon.parent.mkdir(parents=True, exist_ok=True)
+        placement = {"scenario": "sparse_device_host", "plain_pass_floor_ms": {"link": 20.0, "cpu": 12.0, "split": 10.0}}
+        recon.write_text(json.dumps({"gathered": {"placement": placement}}), encoding="utf-8")
+        first = plan(levers=[], forecast=None)
+        with self.assertRaisesRegex(ValueError, "candidate 1 starts with the CPU expert tier"):
+            self.store.plan(self.run_id, first)
+        tier = {**lever("cpu-tier"), "kind": "requirement", "serves": "recon's starting design", "changes": {}}
+        recorded = self.store.plan(self.run_id, {**first, "levers": [{**tier, "provider": "inference:host-expert-tier"}]})
+        self.assertEqual(recorded["inputs"]["cpu_tier"]["floors_ms"], {"link": 20.0, "cpu": 12.0, "split": 10.0})
+        rejected = {"kpi": "decode", "gap": "placement:cpu", "answer": "rejected", "detail": "layers measured slower",
+                    "evidence": self.evidence("cpu-layers.json")}
+        self.assertIn("rejection", self.store.plan(self.run_id, {**first, "gaps": [rejected]})["inputs"]["cpu_tier"])
+        # A placement whose link is the faster source asks nothing.
+        placement["plain_pass_floor_ms"] = {"link": 10.0, "cpu": 12.0, "split": 11.0}
+        recon.write_text(json.dumps({"gathered": {"placement": placement}}), encoding="utf-8")
+        self.assertNotIn("cpu_tier", self.store.plan(self.run_id, first)["inputs"])
+
+    def test_earlier_runs_refuse_rules_7_fields(self):
+        with patch("crit.run.records.NEW_RUN_PLAN_RULES", 6):
+            self.view = self.store.create(self.data)
+        self.run, self.run_id = self.view["run"], self.view["run"]["run_id"]
+        self.directory = self.store.directory(self.run_id)
+        with self.assertRaisesRegex(ValueError, "belong to plan rules 7"):
+            self.store.plan(self.run_id, plan(levers=[], forecast=None, round={"decode": self.account(
+                [("dense", 10.0, 9.0)])}))
+
+
+class PlanRules7SpeedTests(PlanRules7Tests):
+    """Plan rules 7 under the defaults of new runs, quality mode speed included: check 16 (plan rules 6) asks every
+    build plan for prompt_activations and each parent to have served them, so these plans declare the checkpoint's
+    stored format and their candidates serve it, and the rules 7 checks hold beside check 16."""
+    quality_mode = None
+
+    def setUp(self):
+        super().setUp()
+        self.assertEqual(self.run["spec"]["correctness"]["quality_mode"], "speed")
+        self.undeclared = self.store.plan
+
+        def declaring(run_id, value, *args, **kwargs):
+            return self.undeclared(run_id, {"prompt_activations": PlanRules6Tests.stored, **value}, *args, **kwargs)
+        self.store.plan = declaring
+
+    def evaluated(self, candidate_id, value, completed=True, **result):
+        """An Eval attempt whose engine served the prompt activations its plan declared."""
+        return super().evaluated(candidate_id, value, completed,
+                                 **{"engine": {"prompt_activations": PlanRules6Tests.stored}, **result})
+
+    def test_check_16_asks_a_plan_that_declares_no_prompt_activations(self):
+        with self.assertRaisesRegex(ValueError, "build plan declares prompt_activations"):
+            self.undeclared(self.run_id, plan(levers=[], forecast=None))
 
 
 class ReconPlanRules3Tests(PlanFixture, unittest.TestCase):

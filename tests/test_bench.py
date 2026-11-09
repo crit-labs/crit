@@ -62,7 +62,7 @@ class BenchTests(Installed):
         self.assertEqual(seen["server"], f"crit serve --engine {ENGINE}")
         self.assertEqual([m["id"] for m in seen["models"]["data"]], [ENGINE])
         self.assertEqual(out.parent, self.store.folder(ENGINE) / "bench")
-        self.assertEqual((label, card["decode_tok_s"]), ("card (rtx5090)", 100.0))
+        self.assertEqual((label, card["decode_tok_s"]), ("card (rtx5090, preserve)", 100.0))
         lines = bench.comparison(card, bench.measured_stats(result), label).splitlines()
         self.assertIn("100.0", next(l for l in lines if l.startswith("decode")))
         self.assertIn("99.0", next(l for l in lines if l.startswith("decode")))
@@ -96,6 +96,37 @@ class BenchTests(Installed):
         self.assertEqual(bench.gpu_of(card, "NVIDIA GeForce RTX 4090"), "rtx4090")
         self.assertEqual(bench.gpu_of(card, "NVIDIA GeForce RTX 3090"), "rtx3090")
         self.assertEqual(bench.card_result(card, "rtx3090", "m")["gpu"], "rtx5090", "the model on another GPU")
+
+    def test_a_card_judged_in_another_quality_mode_is_not_compared(self):
+        self.install()
+        data = self.prepared_data()
+        seen = []
+
+        def run(adapter, model, data_folder, out, config, parts, **options):
+            seen.append(options["quality_mode"])
+            result = {"speed": {"decode_score": 80.0}, "context": {"tokens": options["context_tokens"]}}
+            write_json(out, result)
+            return result
+        with patch("crit_eval.run.runner.run", run), patch("sys.stderr"),                 patch.object(bench, "SERVED", ("chat-json-v1", "chat-resident-v1")):
+            # The card's result was judged in preserve: measured in speed, its numbers are left out.
+            _, card, label, _ = bench.bench(ENGINE, self.store, data, device=self.device, project=ROOT,
+                                            quality_mode="speed")
+            self.assertEqual((card, label), (None, "card (preserve)"))
+            _, card, label, _ = bench.bench(ENGINE, self.store, data, device=self.device, project=ROOT,
+                                            quality_mode="preserve")
+            self.assertEqual((card["decode_tok_s"], label), (100.0, "card (rtx5090, preserve)"))
+        self.assertEqual(seen, ["speed", "preserve"])
+
+    def test_bench_judges_in_the_cards_quality_mode_else_in_speed(self):
+        self.assertEqual(bench.card_mode({"quality_mode": "speed", "measured_with": "crit-eval-v0.4.0"}),
+                         "speed")
+        self.assertEqual(bench.card_mode({"quality_mode": "preserve"}), "preserve")
+        # No result for this model to compare with: crit's default.
+        self.assertEqual(bench.card_mode(None), "speed")
+        # Every crit-hub result states its mode: none, or a mode no longer named, is refused.
+        for stated in ({"measured_with": "crit-eval-v0.2.1"}, {"quality_mode": "as_quantized"}):
+            with self.assertRaisesRegex(ValueError, "crit-hub cards state preserve or speed"):
+                bench.card_mode(stated)
 
 
 @unittest.skipIf(yaml is None, "PyYAML is not installed")

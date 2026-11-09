@@ -1,0 +1,32 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "device-placement",
+  "title": "Every tensor on the device",
+  "description": "The plain placement: weights, caches and state all live on the device, and a model whose tensors do not fit the device's free memory at the served context is refused before anything loads. A placement that keeps some tensors in host memory or files is compared with it where everything fits. With off_device it also places a model larger than the device whose routed experts and lookup tables reach it through a device expert cache and a host table: groups named by those prefixes go to host memory in the prefixes' order while they fit, then to files, the rest stays on the device; slots(tensors, budget, bundle_bytes) sizes the cache's own slots from what the device groups leave (the KV pool's unused pages lend it more at run time).",
+  "fills": [
+    "placement"
+  ],
+  "devices": [
+    "host"
+  ],
+  "options": {
+    "reserve_mib": {
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 65536,
+      "description": "MiB of the device free memory kept out of the plan (CUDA context, workspaces, graph pools, a desktop on the same GPU)"
+    },
+    "off_device": {
+      "type": "str",
+      "default": "",
+      "description": "comma-separated name prefixes of groups that live off the device, in order of preference for host memory (\"experts.,tables.\": routed experts' bundles, then lookup tables); empty: every group on the device"
+    },
+    "files": {
+      "type": "bool",
+      "default": true,
+      "description": "off-device groups that host memory cannot hold go to files (false: refused)"
+    }
+  },
+  "entry": "plugin.py:create"
+}

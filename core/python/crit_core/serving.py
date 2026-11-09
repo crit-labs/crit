@@ -1,31 +1,16 @@
-"""The shared body of a crit serve adapter (chat-resident-v1, docs/SERVING.md): an engine supplies only decoding.
+"""The body of Core's resident adapter (chat-resident-v1, docs/SERVING.md): crit_core.engine.ResidentEngine is a
+ResidentChat over a package's engine, so every engine crit serve runs gets one chat layer and supplies only decoding.
 
-Every resident chat adapter has to render the conversation with the model's chat template (tools and tool history
-included), validate and forward per-request sampling, stream text without the model's stop tokens, honor
-cancellation and report Core's phase telemetry. ResidentChat does all of that once, so an adapter cannot ship
-without a feature by forgetting it:
+It renders the conversation with the model's chat template (tools and tool history included), validates and forwards
+per-request sampling, streams text without the model's stop tokens, honors cancellation and reports Core's phase
+telemetry; its subclass implements generate_tokens over the engine's token generator:
 
-    from crit_core.serving import ResidentChat
+    class ResidentEngine(ResidentChat):
+        def generate_tokens(self, ids, max_new_tokens, sampling, on_tokens, cancelled, **options):
+            ...   # Core's runtime: tokens None when cancelled; timing: prefill_ms, decode_ms, first_token_ms
 
-    class Engine(ResidentChat):
-        sampling = ("temperature", "top_p", "top_k", "seed")   # request fields the decoder applies
-
-        def __init__(self, context):
-            model = Path(context.model_file("config.json")).parent
-            super().__init__(context, model)
-            self.decoder = open_my_engine(model, self.capacity)
-
-        def generate_tokens(self, ids, max_new_tokens, sampling, on_tokens, cancelled):
-            tokens, timing = self.decoder.generate(ids, max_new_tokens, **sampling, on_tokens=on_tokens,
-                                                   cancelled=cancelled)
-            return tokens, timing   # tokens None when cancelled; timing: prefill_ms, decode_ms, first_token_ms
-
-    def create_engine(context):
-        return Engine(context)
-
-Declare `capabilities(text, Engine.sampling, tool_format=Engine.tool_format)` in the package record; `crit run
-package` checks that a resident chat package declares tools (when the model's template teaches a call format) and
-temperature. ResidentChat is the one place calls are parsed: in the format the model's chat template teaches when
+What it serves is declared by capabilities() (crit_core.engine.capabilities calls it for a package; a package
+declares nothing). ResidentChat is the one place calls are parsed: in the format the model's chat template teaches when
 crit_core.text.tools registers it, else in the package's own `tool_format` (a crit_core.text.ToolFormat; crit
 carries no model-specific syntax). Either way the adapter returns parsed calls (chat-tools-v1, streamed with
 chat-tool-stream-v1). Reasoning in the template's markers (<think>...</think>) is returned apart from the reply in
@@ -42,10 +27,13 @@ forced to the continuation (score_tokens returns rows as a list or, from flat ar
 engine that also decodes one token per target pass, without drafting, sets `plain = True` and declares
 capabilities(..., plain=True) (chat-plain-v1): a request carrying "decode": "plain" then reaches generate_tokens as
 plain=True (Eval's exactness check on the served engine). An engine whose decoder keeps a reply to a
-crit-byte-grammar-v1 grammar, as for response_format, sets `grammars = True` and declares capabilities(...,
-grammars=True), which adds chat-tool-choice-v1 where ResidentChat can write the call syntax (forces_calls):
-tool_choice "required" or a named function then reaches generate_tokens as grammar=artifact, the
-grammar of a reply that makes the forced calls (crit_core.text.tools.call_grammar). An engine keeps the facts Eval's
+constraint sets `grammars = True` and declares capabilities(..., grammars=True), which adds chat-tool-choice-v1 where
+ResidentChat can write the call syntax (forces_calls): tool_choice "required" or a named function then reaches
+generate_tokens as constraint={"type": "grammar", "grammar": artifact}, the crit-byte-grammar-v1 grammar of a reply
+that makes the forced calls (crit_core.text.tools.call_grammar). One that also keeps it to a request's response_format
+sets `constraints = True` and declares capabilities(..., constraints=True) (chat-constraints-v1 and
+chat-constraints-grammar-v1): the response_format reaches generate_tokens as constraint, json_object or a compiled
+grammar (docs/SERVING.md). An engine keeps the facts Eval's
 headroom reads in `facts` (engine_facts), and generate_tokens' timing may add accepted (drafts accepted per round),
 verify_ms and draft_ms, and expert_reads and expert_hits (its device expert cache's) for crit serve's telemetry. Every ResidentChat fits a request's output to the context
 (chat-fit-output-v1): with limits.fit_output it decodes at most the room the prompt leaves and names that cap in the
@@ -105,9 +93,10 @@ THINKING_BUDGET_CAPABILITY = "chat-thinking-budget-v1"
 # What a resident engine reports for Eval (crit serve's /v1/models engine_facts): whether it speculates and can decode
 # plainly, its draft width, the bytes one model pass and one draft step read, the activation format of its
 # quantized matrices' prompt GEMMs (crit-eval's prefill ceilings by activation format), and prompt_cache false when it
-# keeps no prompt cache (crit-eval then sends it no follow-up turns).
+# keeps no prompt cache (crit-eval then sends it no follow-up turns). plugins: the plugin filling each slot of an
+# engine built from plugins (crit_plugins.Assembly.facts), so a client sees which ones the loaded engine runs.
 ENGINE_FACTS = ("speculative", "plain", "draft_width", "bytes_per_pass", "host_bytes_per_pass", "draft_bytes_per_step",
-                "draft_ms", "kv_bytes_per_token", "prompt_activations", "prompt_cache")
+                "draft_ms", "kv_bytes_per_token", "prompt_activations", "prompt_cache", "plugins", "kernels")
 # What a generation's timing may report beside its phases, for crit serve's telemetry and an Eval adapter's results:
 # the drafting facts (drafts accepted and made per round, device time in verify passes and draft steps), which plain
 # decoding has none of, and the device expert cache's routed reads and hits, which every decode has.
@@ -188,14 +177,14 @@ def forces_calls(text, tool_format=None):
 
 
 def capabilities(text, sampling=(), *, stream=True, config=True, tool_format=None, images=False, concurrent=False,
-                 logprobs=False, score=False, plain=False, grammars=False, continuation=True, completion=None,
-                 tokenize=True, reasoning_format=None):
+                 logprobs=False, score=False, plain=False, grammars=False, constraints=False, continuation=True,
+                 completion=None, tokenize=True, reasoning_format=None):
     """The serving capabilities a package built on ResidentChat declares, for a model's ModelText and the package's
     own `tool_format` (ResidentChat.tool_format) and `reasoning_format` (ResidentChat.reasoning_format), if any; a
     reasoning format, its own or the one the templates teach, declares chat-thinking-budget-v1, and False declares
     none. logprobs: the engine sets ResidentChat.logprobs; score:
     it sets ResidentChat.scores and implements score_tokens(); plain: it sets ResidentChat.plain; grammars: it sets
-    ResidentChat.grammars; continuation False: it renders its own prompt and does not continue a final assistant
+    ResidentChat.grammars; constraints: it sets ResidentChat.constraints; continuation False: it renders its own prompt and does not continue a final assistant
     message; completion: raw prompts (completion-v1), which ResidentChat continues with any decoder, by default
     unless `images`: an images engine passes True when its generate_prepared also takes PreparedPrompt(ids) without
     inputs; tokenize False: its prompt_ids() override is not safe to call beside generation (ResidentChat.render).
@@ -215,6 +204,7 @@ def capabilities(text, sampling=(), *, stream=True, config=True, tool_format=Non
     result += [LOGPROBS_CAPABILITY] if logprobs else []
     result += [SCORE_CAPABILITY] if score else []
     result += [PLAIN_CAPABILITY] if plain else []
+    result += [CONSTRAINTS_CAPABILITY, GRAMMAR_CAPABILITY] if constraints else []
     if tool_format is not None or template_tool_format(text):
         result += [TOOLS_CAPABILITY] + ([TOOL_STREAM_CAPABILITY] if stream else [])
         result += [TOOL_CHOICE_CAPABILITY] if grammars and forces_calls(text, tool_format) else []
@@ -242,6 +232,17 @@ def engine_facts(engine):
         elif key in ("speculative", "plain", "prompt_cache"):
             if isinstance(value, bool):
                 out[key] = value
+        elif key == "plugins":
+            if isinstance(value, dict) and all(isinstance(k, str) and (v is None or isinstance(v, str))
+                                               for k, v in value.items()):
+                out[key] = dict(value)
+        elif key == "kernels":
+            # The registry kernels the plugins run (crit_plugins.kernels): per repository its source (local, hub or
+            # fallback), version, revision and, for a fallback, why.
+            if isinstance(value, dict) and all(isinstance(k, str) and isinstance(v, dict) and
+                                               v.get("source") in ("local", "hub", "fallback") for k, v in value.items()):
+                out[key] = {k: {f: v[f] for f in ("source", "version", "revision", "reason", "plugins") if f in v}
+                            for k, v in value.items()}
         elif key == "host_bytes_per_pass":
             # The part of bytes_per_pass read from host memory: {"link": copied over the host link, "cpu": computed
             # by the CPU}, which crit-eval prices at the probe's host rates.
@@ -456,6 +457,11 @@ class PreparedPrompt:
     token_count: int | None = None
 
 
+# The prompt-token caches of the process by the identity (path and sha256) of the files the text layer read, so every
+# ResidentChat of one tokenizer shares one: they hold tokenizer output only, bounded per cache.
+_PROMPT_TOKEN_CACHES = {}
+
+
 class ResidentChat:
     """chat-resident-v1 over an engine's token generator. Subclasses set `sampling` (the request fields their
     decoder applies) and implement generate_tokens(); `stop_ids` defaults to the model's generation stop tokens.
@@ -469,7 +475,8 @@ class ResidentChat:
     each token's log-probability and up to TOP_LOGPROBS alternatives (chat-logprobs-v1); the response then carries
     them for every generated token but stop tokens, reasoning and tool calls included. `grammars` True: the decoder
     keeps a reply to a grammar, so tool_choice "required" or a named function forces the calls (chat-tool-choice-v1)
-    in a registered format; the model may reason first when the tokenizer spells the reasoning markers as text. A raw
+    in a registered format; the model may reason first when the tokenizer spells the reasoning markers as text.
+    `constraints` True: it keeps a reply to a request's response_format as well (chat-constraints-v1). A raw
     prompt (completion-v1) skips the template, tools and the reasoning split: the reply is all the text the model
     writes, and its log-probabilities keep the stop token's row. `prompt_token_cache` True (the default): a chat
     prompt that extends a recent one, as a conversation's next turn does, is encoded from near the seam
@@ -482,6 +489,7 @@ class ResidentChat:
     scores = False
     plain = False
     grammars = False
+    constraints = False
     tool_format = None
     reasoning_format = None
     images = False
@@ -504,9 +512,16 @@ class ResidentChat:
         self.context = context
         self.configuration = dict(configuration if configuration is not None else (context.configuration or {}))
         # A folder's files, or those a lone GGUF's metadata derives.
-        self.text = load_model_text(open_model(model).files, clock=None)
+        files = open_model(model).files
+        self.text = load_model_text(files, clock=None)
         if self.prompt_token_cache and getattr(self.text, "prompt_tokens", False) is None:   # a ModelText without one
-            self.text = replace(self.text, prompt_tokens=PromptTokenCache(self.text.tokenizer))
+            # One cache per tokenizer in the process: a package reopened in the same host (crit serve's switch back,
+            # Eval's lower-context engine) finds the prompts it encoded before, instead of encoding them in full again.
+            identity = tuple((r.path, r.sha256) for r in files.records)
+            cache = _PROMPT_TOKEN_CACHES.get(identity)
+            if cache is None:
+                cache = _PROMPT_TOKEN_CACHES[identity] = PromptTokenCache(self.text.tokenizer)
+            self.text = replace(self.text, prompt_tokens=cache)
         limits = getattr(context, "limits", {}) or {}
         self.capacity = int(capacity or limits.get("kv_tokens") or 0) or None
         self.stop_ids = set(self.text.generation.stop_token_ids if stop_ids is None else stop_ids)
@@ -532,10 +547,11 @@ class ResidentChat:
         on_tokens(tokens, rows): per token (logprob, [(token, logprob), ...]) with its n most likely alternatives,
         ranked, natural-log probabilities of the raw logits (crit::core::TokenLogprob). An engine with `plain` also takes
         plain=True when the request asks for plain decoding: one token per target pass, no drafting. An engine with
-        `grammars` also takes grammar=artifact when the request forces tool calls: a crit-byte-grammar-v1 artifact the
-        reply's bytes must keep to, applied as for response_format (a fresh GrammarMatcher over
+        `grammars` also takes constraint={"type": "grammar", "grammar": artifact} when the request forces tool calls: a
+        crit-byte-grammar-v1 artifact the reply's bytes must keep to (a fresh GrammarMatcher over
         ByteGrammar::load(artifact) masking every position, a stop token only where the grammar is complete), so the
-        reply is the calls (docs/SERVING.md). timing may add accepted (drafts accepted in each round), verify_ms and
+        reply is the calls; one with `constraints` takes the request's response_format as constraint, {"type":
+        "json_object"} or a json_schema or grammar type with its compiled "grammar" (docs/SERVING.md). timing may add accepted (drafts accepted in each round), verify_ms and
         draft_ms (device time in verify passes and draft steps), and expert_reads and expert_hits (the decode's routed
         expert reads and those the device's expert cache served), which crit serve reports in its telemetry."""
         raise NotImplementedError
@@ -670,7 +686,7 @@ class ResidentChat:
 
     def generate_prepared(self, prompt, max_new_tokens, sampling, on_tokens, cancelled, **options):
         """Override to consume prepared image inputs with the engine's token generator; `options` (logprobs, plain,
-        grammar) go to generate_tokens. A raw prompt (completion-v1) comes as PreparedPrompt(ids), without inputs."""
+        constraint) go to generate_tokens. A raw prompt (completion-v1) comes as PreparedPrompt(ids), without inputs."""
         if prompt.inputs is not None:
             raise NotImplementedError("Prepared image inputs require generate_prepared")
         return self.generate_tokens(prompt.ids, max_new_tokens, sampling, on_tokens, cancelled, **options)
@@ -727,7 +743,12 @@ class ResidentChat:
         echoed = None
         if echo:
             echoed = request["prompt"]["text"] if "text" in request["prompt"] else self.text.tokenizer.decode(ids)
-        calls_format, reply, grammar = None, None, None
+        calls_format, reply = None, None
+        constraint = request.get("response_format")
+        if constraint is not None and constraint.get("type") == "text":
+            constraint = None
+        if constraint is not None and not self.constraints:
+            raise RequestRejected("This engine keeps no reply to a response_format (chat-constraints-v1)")
         choice = request.get("tool_choice", "auto")
         if request.get("tools"):   # calls only come when tools are offered
             if getattr(self, "calls_format", None) is None:   # also subclasses that set up self.text themselves
@@ -750,16 +771,18 @@ class ResidentChat:
                 splitter.state = "reasoning"
             boundaries.update(splitter.token_ids)
         if reply and choice != "auto":
-            grammar = self._calls_grammar(request, calls_format, splitter)
+            if constraint is not None:
+                raise RequestRejected("A reply is kept to a response_format or to forced calls, not both")
+            constraint = {"type": "grammar", "grammar": self._calls_grammar(request, calls_format, splitter)}
         budget = limits.get("thinking_tokens")
         if budget is not None:
             if type(budget) is not int or budget < 1:
                 raise ValueError("limits.thinking_tokens must be a positive integer")
             if splitter is None:
                 raise RequestRejected("This model's chat template writes no reasoning for a thinking budget to end")
-            if prompt.inputs is not None or grammar is not None or alternatives is not None:
-                raise RequestRejected("A thinking budget applies to text prompts without logprobs or a forced tool "
-                                      "call")
+            if prompt.inputs is not None or constraint is not None or alternatives is not None:
+                raise RequestRejected("A thinking budget applies to text prompts without logprobs, a forced tool call "
+                                      "or a response_format")
         stream = MarkerDecoder(self.text.tokenizer, markers={v: k for k, v in boundaries.items()},
                                stream=self.text.text_stream(ids, skip_special_tokens=not kept))
         pieces, reasoning = [], []
@@ -797,7 +820,7 @@ class ResidentChat:
                         route(part)
 
         detector = None
-        if self.loop_stop and grammar is None:
+        if self.loop_stop and constraint is None:
             from crit_core.text.loops import LoopDetector
             detector = LoopDetector(**(self.loop_stop if isinstance(self.loop_stop, dict) else {}))
         step_tokens = []   # this generation's tokens, the reply when the detector stops it
@@ -818,8 +841,8 @@ class ResidentChat:
         options = {} if alternatives is None else {"logprobs": alternatives}
         if plain:
             options["plain"] = True
-        if grammar is not None:
-            options["grammar"] = grammar
+        if constraint is not None:
+            options["constraint"] = constraint
         # Without a budget the reply is one generation. With one, a generation ends where the reasoning would pass
         # the budget; the reply then gets the format's closing marker, as the model would write it, and the engine
         # continues from the prompt plus everything so far.

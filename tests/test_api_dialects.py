@@ -1,5 +1,5 @@
 """crit serve's other dialects over the synthetic resident engine: the Anthropic Messages API, the OpenAI Responses
-API, the Ollama API, the Prometheus metrics endpoint and unloading and loading the engine."""
+API, the /api/chat API, the Prometheus metrics endpoint and unloading and loading the engine."""
 import http.client
 import json
 from pathlib import Path
@@ -14,7 +14,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("core/python", "api", "../crit-eval", "kernels", "cli", "tests"): sys.path.insert(0, str(ROOT / _folder))
 from crit import __version__
-from crit_api import anthropic, ollama
+from crit_api import anthropic, api_chat
 from crit_api.engine import EngineError
 from crit_api.metrics import Histogram, Metrics
 from crit_api.server import Api, Server
@@ -383,7 +383,7 @@ class ThinkingFixture(DialectFixture):
 
 
 class UndeclaredThinkingTests(ThinkingFixture, unittest.TestCase):
-    """A package without chat-template-kwargs-v1: OpenAI's thinking controls are a 400, Anthropic's and Ollama's are
+    """A package without chat-template-kwargs-v1: OpenAI's thinking controls are a 400, Anthropic's and /api/chat's are
     ignored and listed whatever they hold."""
 
     def test_openai_refuses_the_controls_and_the_other_dialects_list_them(self):
@@ -625,7 +625,7 @@ class ToolStopTests(DialectFixture, unittest.TestCase):
         self.assertIn("unfinished tool call", chunks[-1]["error"]["message"])
         self.assertFalse(any(c["choices"][0]["finish_reason"] for c in chunks if c.get("choices")))
 
-    def test_anthropic_and_ollama_stops_keep_the_calls_before_them(self):
+    def test_anthropic_and_api_chat_stops_keep_the_calls_before_them(self):
         content = "steps:" + json.dumps(self.STOPPED)
         response, value = self.messages(content, tools=TOOLS, stop_sequences=["Observation:"])
         self.assertEqual(response.status, 200, value)
@@ -653,7 +653,7 @@ class ToolStopTests(DialectFixture, unittest.TestCase):
         self.assertIn("tool_choice is none", value["error"]["message"])
         schema = {"type": "object", "properties": {"a": {"type": "integer", "minimum": 0, "maximum": 9}},
                   "required": ["a"], "additionalProperties": False}
-        # vLLM's structured_outputs alike.
+        # structured_outputs alike.
         response, value = self.chat([["text", '{"a":1}']], tool_choice="none", structured_outputs={"json": schema})
         self.assertEqual((response.status, value["choices"][0]["message"]["content"]), (200, '{"a":1}'), value)
         response, value = self.chat([["text", '{"a":1}']], structured_outputs={"json": schema})
@@ -664,7 +664,7 @@ class ToolStopTests(DialectFixture, unittest.TestCase):
         self.assertEqual((response.status, value["content"]), (200, [{"type": "text", "text": '{"a":1}'}]), value)
         response, value = self.messages('reply:{"a":1}', tools=TOOLS, output_config=output)
         self.assertEqual((response.status, value["error"]["type"]), (400, "invalid_request_error"))
-        # Ollama has no tool_choice: its tools are always offered.
+        # /api/chat has no tool_choice: its tools are always offered.
         response, data = self.call("POST", "/api/chat", {"model": "default", "stream": False, "tools": OPENAI_TOOLS,
                                                          "format": "json", "messages": [{"role": "user", "content": "hi"}]})
         self.assertEqual(response.status, 400)
@@ -703,7 +703,7 @@ class ContinueTests(DialectFixture, unittest.TestCase):
         self.assertEqual(response.status, 200, data)
         echoed = json.loads(json.loads(data)["choices"][0]["message"]["content"])
         self.assertEqual((echoed["messages"], echoed["continue_final_message"]), (self.prefill, True))
-        # Anthropic's prefill and an Ollama chat that ends with the assistant are continued without a flag.
+        # Anthropic's prefill and an /api/chat request that ends with the assistant are continued without a flag.
         response, data = self.call("POST", "/v1/messages", {"model": "x", "max_tokens": 50, "messages": self.prefill})
         self.assertEqual(response.status, 200, data)
         echoed = json.loads(json.loads(data)["content"][0]["text"])
@@ -940,17 +940,17 @@ class ResponsesReasoningTests(DialectFixture, unittest.TestCase):
         self.assertEqual(completed["output"][1]["content"][0]["text"], "Because.")
 
 
-class OllamaTests(DialectFixture, unittest.TestCase):
+class ApiChatTests(DialectFixture, unittest.TestCase):
     def chat(self, content, **options):
         body = {"model": "default", "messages": [{"role": "user", "content": content}], "stream": False, **options}
         response, data = self.call("POST", "/api/chat", body)
         return response, json.loads(data) if body.get("stream") is False else data
 
-    def test_the_server_answers_what_ollama_clients_probe(self):
+    def test_the_server_answers_what_api_chat_clients_probe(self):
         response, data = self.call("GET", "/")
-        self.assertEqual((response.status, data), (200, b"Ollama is running"))
+        self.assertEqual((response.status, data), (200, b"crit is running"))
         response, data = self.call("GET", "/api/version")
-        self.assertEqual(json.loads(data), {"version": ollama.OLLAMA_COMPAT_VERSION, "crit_version": __version__})
+        self.assertEqual(json.loads(data), {"version": api_chat.COMPAT_VERSION, "crit_version": __version__})
         response, data = self.call("GET", "/api/tags")
         models = json.loads(data)["models"]
         self.assertEqual([m["name"] for m in models], [self.run_id + "/" + self.a, self.run_id + "/" + self.b])
@@ -975,7 +975,7 @@ class OllamaTests(DialectFixture, unittest.TestCase):
         loaded = json.loads(data)["models"]
         self.assertEqual([(m["name"], m["digest"], m["context_length"], m["expires_at"]) for m in loaded],
                          [(self.model_name or self.run_id + "/" + self.a, self.served.spec(self.a)["package_sha256"],
-                           8192, ollama.LOADED_UNTIL)])
+                           8192, api_chat.LOADED_UNTIL)])
         self.assertEqual(loaded[0]["size_vram"], self.served.status()["device_bytes"])
         response, data = self.call("POST", "/api/chat", {"model": self.run_id + "/" + self.b, "stream": False,
                                                          "messages": [{"role": "user", "content": "reply:hi"}]})
@@ -983,7 +983,7 @@ class OllamaTests(DialectFixture, unittest.TestCase):
         response, data = self.call("GET", "/api/ps")
         self.assertEqual([m["name"] for m in json.loads(data)["models"]], [self.run_id + "/" + self.b])
 
-    def test_a_chat_reply_carries_ollama_counts_and_durations(self):
+    def test_a_chat_reply_carries_api_chat_counts_and_durations(self):
         response, value = self.chat("reply:hello")
         self.assertEqual(response.status, 200, value)
         self.assertEqual(value["message"], {"role": "assistant", "content": "hello"})
@@ -998,9 +998,9 @@ class OllamaTests(DialectFixture, unittest.TestCase):
         response, value = self.chat("reply:hello")
         self.assertEqual(value["prompt_eval_cached_count"], 0)  # the engine computed all 10 prompt tokens
         measured = {"prompt_tokens": 10, "output_tokens": 4, "prefill_tokens": 7, "prefill_ms": 5, "decode_ms": 10}
-        self.assertEqual(ollama.final("m", "stop", measured, 0.1)["prompt_eval_cached_count"], 3)
+        self.assertEqual(api_chat.final("m", "stop", measured, 0.1)["prompt_eval_cached_count"], 3)
         unmeasured = dict(measured, prefill_tokens=None, prefill_ms=None)
-        self.assertNotIn("prompt_eval_cached_count", ollama.final("m", "stop", unmeasured, 0.1))
+        self.assertNotIn("prompt_eval_cached_count", api_chat.final("m", "stop", unmeasured, 0.1))
 
     def test_logprobs_need_a_package_that_reports_them(self):
         response, value = self.chat("reply:hi", logprobs=True)
@@ -1084,7 +1084,7 @@ class OllamaTests(DialectFixture, unittest.TestCase):
 
 
 class FitOutputTests(DialectFixture, unittest.TestCase):
-    """A package declaring chat-fit-output-v1 fits Anthropic's max_tokens and Ollama's num_predict to the context."""
+    """A package declaring chat-fit-output-v1 fits Anthropic's max_tokens and /api/chat's num_predict to the context."""
     fit_output = True
 
     def test_anthropic_max_tokens_past_the_context_is_fitted_and_a_prompt_alone_still_overflows(self):
@@ -1098,7 +1098,7 @@ class FitOutputTests(DialectFixture, unittest.TestCase):
         self.assertEqual((response.status, value["error"]["message"]), (400, "prompt is too long: 9000 tokens > 8192 maximum"))
         self.assertEqual(self.served.status()["engine_loads"], 1)
 
-    def test_ollama_num_predict_minus_one_or_two_or_past_the_context_is_fitted(self):
+    def test_api_chat_num_predict_minus_one_or_two_or_past_the_context_is_fitted(self):
         for value in (-1, -2, 9000):
             with self.subTest(num_predict=value):
                 response, data = self.call("POST", "/api/chat", {"model": "default", "stream": False, "messages": [
@@ -1128,11 +1128,11 @@ class FitOutputTests(DialectFixture, unittest.TestCase):
             self.assertEqual((reply["limit"], reply["fit_output"]), (8191, True if extra else None))
 
 
-class NamedOllamaTests(DialectFixture, unittest.TestCase):
+class NamedApiChatTests(DialectFixture, unittest.TestCase):
     """--model-name: the default candidate is listed and loaded under the given name."""
     model_name = "local-model"
     test_ps_lists_the_loaded_model_and_tags_carry_package_digests = \
-        OllamaTests.test_ps_lists_the_loaded_model_and_tags_carry_package_digests
+        ApiChatTests.test_ps_lists_the_loaded_model_and_tags_carry_package_digests
 
 
 class StreamErrorTests(DialectFixture, unittest.TestCase):
@@ -1261,7 +1261,7 @@ class MethodsAndBodiesTests(DialectFixture, unittest.TestCase):
 
 
 class LifecycleTests(DialectFixture, unittest.TestCase):
-    """Unloading and loading the engine through the API: crit's own endpoints, and Ollama's requests without a prompt
+    """Unloading and loading the engine through the API: crit's own endpoints, and /api/chat requests without a prompt
     and keep_alive 0."""
 
     def loaded(self):
@@ -1306,7 +1306,7 @@ class LifecycleTests(DialectFixture, unittest.TestCase):
         response, data = self.call("DELETE", "/v1/crit/unload")
         self.assertEqual((response.status, response.getheader("Allow")), (405, "POST, OPTIONS"))
 
-    def test_ollama_requests_without_a_prompt_load_and_keep_alive_0_unloads(self):
+    def test_api_chat_requests_without_a_prompt_load_and_keep_alive_0_unloads(self):
         response, data = self.call("POST", "/api/generate", {"model": "default", "keep_alive": 0})
         value = json.loads(data)
         self.assertEqual((response.status, value["model"], value["response"], value["done"], value["done_reason"]),
@@ -1337,12 +1337,12 @@ class LifecycleTests(DialectFixture, unittest.TestCase):
 
     def test_keep_alive_0_is_zero_in_any_spelling_and_idle_unload_sets_ps_expiry(self):
         for value in (0, 0.0, "0", "0s", "0m", "00.0h"):
-            self.assertTrue(ollama.unloads(value), value)
+            self.assertTrue(api_chat.unloads(value), value)
         for value in (None, False, 1, -1, "", "5m", "-1", "0x"):
-            self.assertFalse(ollama.unloads(value), value)
+            self.assertFalse(api_chat.unloads(value), value)
         card = {"id": "m", "label": "M", "context_length": 8}
-        self.assertEqual(ollama.loaded_card(card, 0, "", {})["expires_at"], ollama.LOADED_UNTIL)
-        self.assertEqual(ollama.loaded_card(card, 0, "", {}, 86400)["expires_at"], "1970-01-02T00:00:00Z")
+        self.assertEqual(api_chat.loaded_card(card, 0, "", {})["expires_at"], api_chat.LOADED_UNTIL)
+        self.assertEqual(api_chat.loaded_card(card, 0, "", {}, 86400)["expires_at"], "1970-01-02T00:00:00Z")
 
 
 class LifecycleKeyTests(DialectFixture, unittest.TestCase):
@@ -1383,7 +1383,7 @@ class LenientTests(DialectFixture, unittest.TestCase):
                                     "X-Crit-Ignored-Parameters" for key in
                                     ("reasoning_effort", "top_p", "typical_p", "user", "verbosity")])
 
-    def test_an_ollama_request_that_only_loads_ignores_unknown_keys_too(self):
+    def test_an_api_chat_request_that_only_loads_ignores_unknown_keys_too(self):
         response, data = self.call("POST", "/api/chat", {"model": "default", "messages": [], "mystery": 1})
         self.assertEqual((response.status, json.loads(data)["done_reason"]), (200, "load"), data)
         response, data = self.call("POST", "/api/generate", {"model": "default", "keep_alive": 0, "mystery": 1})
@@ -1421,7 +1421,7 @@ class LenientTests(DialectFixture, unittest.TestCase):
         response, data = self.call("POST", "/api/generate", {"model": "default", "prompt": "hi", "raw": True})
         self.assertEqual(response.status, 400, data)
 
-    def test_anthropic_and_ollama_requests_ignore_unknown_keys_and_options(self):
+    def test_anthropic_and_api_chat_requests_ignore_unknown_keys_and_options(self):
         response, value = self.messages("reply:hi", top_p=.9, top_k=5, mystery=1)
         self.assertEqual((response.status, value["content"]), (200, [{"type": "text", "text": "hi"}]), value)
         self.assertEqual(response.getheader("X-Crit-Ignored-Parameters"), "mystery,top_k,top_p")
@@ -1531,7 +1531,7 @@ class KeepAliveTests(DialectFixture, unittest.TestCase):
                          ["content_block_delta", "content_block_stop", "message_delta", "message_stop"])
         self.assertEqual(names[-1], "message_stop")
 
-    def test_ollama_streams_and_a_zero_interval_send_no_pings(self):
+    def test_api_chat_streams_and_a_zero_interval_send_no_pings(self):
         data = self.quiet("/api/chat", "reply:hello")
         lines = [json.loads(line) for line in data.decode().splitlines()]
         self.assertEqual([line["done"] for line in lines], [False, True])
@@ -1661,11 +1661,11 @@ class MetricsTests(DialectFixture, unittest.TestCase):
         self.assertTrue(response.getheader("Content-Type").startswith("text/plain"))
         text = data.decode()
         for line in ('crit_serve_requests_total{dialect="anthropic",outcome="completed"} 1',
-                     'crit_serve_requests_total{dialect="ollama",outcome="completed"} 1',
+                     'crit_serve_requests_total{dialect="api_chat",outcome="completed"} 1',
                      'crit_serve_requests_total{dialect="openai",outcome="completed"} 1',
                      'crit_serve_requests_total{dialect="responses",outcome="completed"} 1',
                      'crit_serve_requests_total{dialect="anthropic",outcome="rejected"} 1',
-                     'crit_serve_requests_total{dialect="ollama",outcome="rejected"} 1',
+                     'crit_serve_requests_total{dialect="api_chat",outcome="rejected"} 1',
                      'crit_serve_requests_total{dialect="openai",outcome="rejected"} 1',
                      'crit_serve_requests_total{dialect="responses",outcome="rejected"} 1',
                      "crit_serve_prompt_tokens_total 40", "crit_serve_completion_tokens_total 16",

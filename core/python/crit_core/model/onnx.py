@@ -15,7 +15,7 @@ checkpoint the graph was exported from does, so Eval's ceiling and reference rea
 
 where <module> is the node's name without its leading "/" and its last part, "/" read as "." (the scopes
 torch.onnx gives nodes, as Optimum exports them). Other generated initializers (shape constants) are not weights.
-Graphs from onnxruntime-genai's model builder (genai_config.json beside them) fuse and rename layers and are
+Generative ONNX graphs (a genai_config.json beside them), whose builder fuses and renames the model's layers, are
 refused, as are weights of quantized ops other than MatMulNBits (UNREAD_OPS). Initializers may hold their bytes
 inline (raw_data) or in external data files beside the model (location,
 offset, length); both are bounds-checked. Weights stored as varint fields, sparse initializers and 4-bit element
@@ -342,8 +342,8 @@ def find_onnx(path):
             _fail(f"{path}: {len(names)} .onnx files; name the one to read: {', '.join(names[:8])}")
         found = path / names[0]
     if (found.parent / GENAI_CONFIG).exists():
-        _fail(f"{found}: built by onnxruntime-genai's model builder ({GENAI_CONFIG}), whose graph fuses and renames "
-              "the model's layers; crit reads ONNX exported from a Hugging Face checkpoint (Optimum, torch.onnx)")
+        _fail(f"{found}: a generative ONNX graph ({GENAI_CONFIG} beside it), whose builder fuses and renames the "
+              "model's layers; crit reads ONNX exported from a Hugging Face checkpoint (Optimum, torch.onnx)")
     return found
 
 

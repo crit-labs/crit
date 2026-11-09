@@ -325,16 +325,19 @@ def parser():
     make.add_argument("--shape", action="append", default=[], help="N,K (repeatable)")
     make.add_argument("--model", type=Path, help="take the shapes from this checkpoint's matrices in the format")
     make.add_argument("--columns", help="column (token) counts, comma-separated")
-    make.add_argument("--from", dest="source", type=Path, help="an existing kernel's source folder to start from")
+    make.add_argument("--from", dest="source", type=Path,
+                      help="a kernel-builder project to start src/ from (a crit-kernels project, a Hub kernel's "
+                           "source); without it, kernel-builder init starts one")
     make.add_argument("--yardstick", help="the provider to time beside the kernel (provider syntax of plan levers)")
     make.add_argument("--column-invariant", choices=("yes", "no"))
     make.add_argument("--repeatable", choices=("yes", "no"), default="yes",
                       help="no: the kernel may give other bits on a repeat (atomics, a split the workload chooses); "
-                           "the check judges repeats within the tolerance. For quality mode as_quantized engines")
+                           "the check judges repeats within the tolerance. For quality mode speed engines")
     make.add_argument("--tolerance", type=float)
     make.add_argument("--root", type=Path, default=Path("work/kernels"))
-    make.add_argument("--starter", action="store_true", help="a simple, correct kernel to start from (gemv, gemm); "
-                                                              "allowed from a run's fourth candidate on")
+    make.add_argument("--starter", action="store_true",
+                      help="the kernel --from copies is the starter (crit-kernels' workbench-starter: a simple, correct "
+                           "gemv/gemm in bf16 and fp8); allowed from a run's fourth candidate on")
     make.add_argument("--run", type=Path, help="the run folder, for --starter")
     return parser
 

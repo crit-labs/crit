@@ -1,7 +1,10 @@
 """A run with a candidate, its package, checks and benchmarks, all synthetic records (RunFixture): nothing it
-records executes. Importing it puts crit's packages, and crit Eval beside this checkout, on the path."""
+records executes. Every candidate's source and package is a plugin package, as crit run requires: the toy engine's
+plugins (support/engines.py) beside the fixture's files. Importing it puts crit's packages, and crit Eval beside this
+checkout, on the path."""
 from datetime import datetime
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 from unittest.mock import patch
@@ -10,17 +13,31 @@ ROOT = Path(__file__).resolve().parents[2]
 for _folder in ("core/python", "api", "../crit-eval", "kernels", "cli"): sys.path.insert(0, str(ROOT / _folder))
 from crit.run.records import GIB, digest, file_sha, now  # noqa: E402
 from crit.run.store import RunStore  # noqa: E402
+from .engines import TOY, selection  # noqa: E402
+
+
+def with_plugins(folder):
+    """The toy engine's plugins in folder/plugins (a candidate's source, a package), beside any it holds."""
+    plugins = Path(folder) / "plugins"
+    for plugin in sorted(TOY.iterdir()):
+        if (plugin / "plugin.json").is_file() and not (plugins / plugin.name).exists():
+            shutil.copytree(plugin, plugins / plugin.name, ignore=shutil.ignore_patterns("__pycache__"))
+    return folder
 
 
 class RunFixture:
     model_files = None  # {name: text} makes the model a recon'd fixture folder (core_text_fixtures.llama_files)
     # Runs as created before plans (no plans field, plan_id optional); plan tests create runs that require them.
     new_run_plans = None
+    # Runs as created before budget counts (every candidate spends the budget); budget tests create runs that count
+    # the candidates through Eval.
+    budget_counts = None
 
     def setUp(self):
-        plans = patch("crit.run.records.NEW_RUN_PLANS", self.new_run_plans)
-        plans.start()
-        self.addCleanup(plans.stop)
+        for name, value in (("NEW_RUN_PLANS", self.new_run_plans), ("NEW_RUN_BUDGET_COUNTS", self.budget_counts)):
+            patched = patch(f"crit.run.records.{name}", value)
+            patched.start()
+            self.addCleanup(patched.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
@@ -31,7 +48,9 @@ class RunFixture:
         else:
             self.model = self.root / "model.fixture"
             self.model.write_text("synthetic input, not a model", encoding="utf-8")
-        self.data = {"model_path": str(self.model), "correctness_criteria": "Fixed fixture gates", "budget_minutes": 1,
+        # A segment long enough for every test's records: a check or benchmark recorded after the segment's deadline is
+        # refused, and a loaded machine takes more than a minute between a test's run and its later records.
+        self.data = {"model_path": str(self.model), "correctness_criteria": "Fixed fixture gates", "budget_minutes": 30,
                      "kv_tokens": 8192, "targets": {"decode_tps": 15}, "workload": {"repetitions": 3}}
         self.store = RunStore(self.root / "runs")
         self.view = self.store.create(self.data)
@@ -48,8 +67,11 @@ class RunFixture:
             "environment_manifest": {"benchmark": "synthetic"}, "case_manifests": {"case-0001": [{"path": "captured/input.fixture", "bytes": path.stat().st_size, "sha256": file_sha(path)}]}})
 
     def proposal(self, **updates):
-        return {"label": "Fixture engine", "rationale": "Test retained artifact contracts", "strategy": "Generic fixture",
-                "configuration": {"batch": 1}, "store_decisions": {"attention-state": {"status": "untested", "reason": "Host artifact fixture only"}}, **updates}
+        value = {"label": "Fixture engine", "rationale": "Test retained artifact contracts", "strategy": "Generic fixture",
+                 "configuration": {"batch": 1}, "store_decisions": {"attention-state": {"status": "untested", "reason": "Host artifact fixture only"}}, **updates}
+        if isinstance(value["configuration"], dict) and "plugins" not in value["configuration"]:
+            value["configuration"] = {**value["configuration"], "plugins": selection()}
+        return value
 
     def candidate(self, **updates):
         if not (self.directory / "inputs.json").exists():
@@ -57,15 +79,16 @@ class RunFixture:
         source = self.root / "source-input"
         source.mkdir(exist_ok=True)
         (source / "engine.fixture").write_text("complete synthetic source", encoding="utf-8")
+        with_plugins(source)
         return self.store.candidate(self.run_id, source, self.proposal(**updates))
 
     def package(self, candidate):
         package = self.root / "package-input"
         package.mkdir(exist_ok=True)
         (package / "engine.fixture").write_text("synthetic package bytes; never execute", encoding="utf-8")
+        with_plugins(package)
         return self.store.package(self.run_id, candidate["candidate_id"], package,
-            {"build": {"toolchain": {"identity": "host fixture"}, "dependencies": [], "command": ["fixture"]},
-             "launch": ["engine.fixture"], "capabilities": ["prefill", "decode"]})
+            {"build": {"toolchain": {"identity": "host fixture"}, "dependencies": [], "command": ["fixture"]}})
 
     def checks(self, candidate, package, arithmetic="passed", evidence_level="artifact_verified"):
         result = []

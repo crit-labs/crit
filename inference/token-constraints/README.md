@@ -55,6 +55,35 @@ repair = residual(target, draft)
 assert 0 < p_accept < 1 and repair[2] == 1 and repair[5] == 0  # the repair stays inside the language
 ```
 
+## On the device
+
+The plugin's device form masks each constrained row before Core's law and then
+draws by token-sampling's device law: `sample(logits, params)` takes a row's
+`crit_plugins.Allowed` (Core's matcher bitmask) as its `allowed`, and
+`staged(rows, device, vocabulary)` keeps the masks in a device buffer at a fixed
+address, which `set(params)` fills from the host's bitmask words (one
+asynchronous copy) before a launch and `sample(logits)` unpacks inside it, so a
+step with constrained rows captures in a CUDA graph. Columns past the vocabulary
+are never allowed, for an unconstrained row either, and a row a step does not
+stage keeps no mask from an earlier one. Both give the host form's tokens
+(`select`).
+
+Inside captured decode rounds (`rounds:sampler`) it is token-sampling's round
+form (option `rounds`, as token-sampling's) with each round slot's mask staged
+beside its rules: `stage(slot, params)` keeps the slot's `allowed` words in a
+device buffer at a fixed address, and a round masks every logits row of a
+constrained slot before the law (predictions and log-probabilities) and cuts
+its drafts, so the slot emits one token a round, its column 0's, under the
+allowed set Core staged. So selecting token-constraints keeps captured rounds
+for every request.
+
+Sampled verification under a constraint stays the host form (`predictions`):
+Core decodes a constrained request plainly, one token per step
+(`StepRequest.plain`), because its matcher computes the allowed set of the next
+position only once the tokens before it are known. A verify window would need
+the mask at every draft position, from the matcher advanced along each draft
+(and every branch of a tree), before the window is computed.
+
 ## Adapting it
 
 Target and draft use their own constrained probabilities in the same acceptance and residual formulas; share

@@ -29,7 +29,7 @@ unsigned long long xcr0() {
 #endif
 
 struct Features {
-    bool avx2 = false, avx512 = false;
+    bool avx2 = false, avx512 = false, vnni = false;
     Features() {
 #ifdef CRIT_HOST_ISA_CPUID
         unsigned r[4];
@@ -43,6 +43,7 @@ struct Features {
         cpuid(7, 0, r);
         avx2 = ymm && fma && (r[1] & (1u << 5));
         avx512 = zmm && fma && (r[1] & (1u << 16));
+        vnni = avx512 && (r[1] & (1u << 30)) && (r[2] & (1u << 11));   // AVX512BW (EBX 30), AVX512_VNNI (ECX 11)
 #endif
     }
 };
@@ -72,6 +73,14 @@ bool supported(Isa isa) noexcept {
         case Isa::portable: return true;
         default: return false;
     }
+}
+
+bool avx512_vnni() noexcept {
+#if defined(CRIT_HOST_ISA_FILES)
+    return features().vnni;
+#else
+    return false;
+#endif
 }
 
 Isa best_isa() noexcept {

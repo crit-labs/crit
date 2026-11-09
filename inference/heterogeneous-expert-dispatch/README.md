@@ -59,6 +59,8 @@ activation quantizations.
 | [`implementation.py`](code/implementation.py) | `ResidencyGroup`, `ResidencyPlan`, `prefix_residency_plans`; `Route`, `partition`, `combine`; `ReadySlot`, `MixedRoute`, `MixedSourcePlan`, `mixed_source_plan`; `execute_mixed`, which calls `quantize(activations)` once then `project(encoded, plan)` once |
 | [`measured_dispatch.py`](code/measured_dispatch.py) | `CalibrationKey`, `TimingCurve`, `DispatchCalibration`, `plan_dispatch` returning a `DispatchDecision` of every `DispatchCandidate`; optional `HostMemoryCosts`, `admit_host` and `revalidate_memory` |
 | [`routing.py`](code/routing.py) | `Routing`, one description of top-k routing; `route`, its host reference for one token; `routing_from_config`, which maps the config.json fields Core parses |
+| [`cpu_routes.cu`](code/cpu_routes.cu) | The post and scatter kernels of a layer's CPU routes over host-work-mailbox's `Mailbox`, and their torch binding (built at load) |
+| [`device_dispatch.py`](code/device_dispatch.py) | `DeviceDispatch` (post, forward, calibrate, status), `DeclaredRoutes` (the baseline device part), the extension's build |
 
 `decision.best` is `None` when no feasible measured split exists; the engine then
 uses its ordinary exact path. Rejected splits keep their bytes and reasons. The
@@ -85,7 +87,8 @@ softmax, Qwen-MoE's `norm_topk_prob`, GPT-OSS's and Llama 4's scoring after
 selection, and DeepSeek-V3's sigmoid with a correction bias, eight groups ranked by
 their two best values, renormalization and 2.5x scaling (GLM-4.5 and Kimi K2 use the
 same form with one group). The host fixtures check each against the transformers
-router it names.
+router class it names, in crit's supported transformers range (`>=5.20,<6`, the
+`reference` extra).
 
 `routing_from_config` reads Core's `scoring_func`, `norm_topk_prob`,
 `routed_scaling_factor`, `n_group`, `topk_group` and `topk_method`. A field the
@@ -100,6 +103,34 @@ and sigmoid (for example `sqrtsoftplus`), and a renormalization floor stored und
 config key Core does not parse (Ernie 4.5's `moe_norm_min`), which the engine passes
 as `renormalize_floor`.
 
+
+## The plugin on CUDA
+
+The experts slot's device form splits a layer between the device and
+[host-expert-tier](../host-expert-tier/README.md)'s CPU tier by the slot table an expert cache's plan writes
+([experts:bundles](../../docs/PLUGINS.md#device-extensions)): a slot >= 0 is the device part's, -2 the CPU's. One post kernel (`cpu_routes.cu`) lists the layer's -2
+routes in route order, writes their expert keys, tokens and the tokens' FP32 rows into a
+[host-work-mailbox](../host-work-mailbox/README.md) slot and posts it (or answers it itself when the layer has none);
+the mailbox's service thread runs the tier's C handler (`crit_tier_serve`) on the tier's worker pool; the stream joins
+(the capturable join `measure_joins` finds cheaper here) and a scatter kernel copies the CPU's rows into the device
+part's route rows, which its combine then sums in route order. One post and one join a layer: the next layer's input
+needs this layer's sum, so a decode step cannot join less often; a layer with no CPU routes pays its post kernel and a
+join that passes at once. `post(layer, x, ids, slots)` posts early, right after the slot table is known and before the
+link's fills, so the CPU computes while the link copies; `forward` then only joins. All of it captures in a CUDA graph
+and replays with new routes and splits.
+
+Both parts compute host-expert-arithmetic's declared integer block order (NVFP4 W4A4, INT4 W4A8; the device experts'
+`declared` arithmetic), so a token's bits never depend on which part computed which route: the plugin's tests check
+random admission quotas against the all-device result bit for bit, eagerly and in replayed graphs. The device part is
+an object with `route_outputs(layer, x, ids, store, slots)` and `combine(y, ids, weights)` (the experts plugin's
+`experts:routes`); the baseline here, `DeclaredRoutes`, is the declared order in torch on the device (exact, slow), a
+baseline to replace with the experts plugin's own declared kernel. `forward_bundles` takes a cache's store and slot
+table; `forward` uses the plugin's own: the first `resident` experts of each layer in a device store, the rest on the
+CPU. `quota_table(tokens)` measures, with the loaded experts on this machine, a layer's time with k misses copied over
+the link, j computed on the CPU (plus the join) and both at once, and returns
+[device-expert-cache](../device-expert-cache/README.md)'s split.py quota table (link misses per miss count) for the
+cache's admission: the share is measured per shape, never a constant. Without the native CPU tier or the CUDA build the
+CPU routes are computed on the host after a synchronization (the same bits, not capturable), and the facts say so.
 
 ## What the engine supplies
 
@@ -258,8 +289,8 @@ between two identical requests. A miss the host computes is not admitted to the
 device cache, so the miss rate rises with the host share; weigh that against the
 transfer it saves.
 
-**In quality mode `as_quantized` the split need not be exact.** Eval passes an output
-difference that parts at a near-tie there ([forks](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#forks-in-quality-mode-as_quantized)), which is all that rounding
+**In quality mode `speed` the split need not be exact.** Eval passes an output
+difference that parts at a near-tie there ([forks](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#forks-in-quality-mode-speed)), which is all that rounding
 apart on two processors can cause. So host workers may compute misses with their own
 fastest rows (8-bit activations on integer dot products, for example, where the device
 runs 4-bit ones), and prompt chunks may put an expert on the host because it is not
@@ -272,6 +303,18 @@ doorbell protocol, measured join choice, release and failure answering, and the
 rules for host worker pools fed from the device.
 
 ## Costs and validation
+
+**The CUDA form, for scale only** (one RTX 5090 and a Ryzen 5 9600 under WSL2, 2.78 MB NVFP4 experts of hidden 2560
+and inter 640, the device part left out since it is the same in every split): a layer's post, join (the poll kernel,
+2.7-2.9 µs measured against 40-44 µs for the stream wait) and scatter with nothing for the CPU cost 5.4 µs. A captured
+round of 48 layers at 3.5 misses a layer took 23.3 ms with every miss copied over the link (~104-114 µs an expert),
+20.1 ms with one miss a layer on the CPU and 17.8 ms with two, at one token an expert; at four tokens an expert 23.5,
+21.0 and 27.5 ms. The CPU tier there computes an expert in 135-206 µs at one token and 300-360 µs at four (5 threads,
+bundles read in place), so the share that pays moves with the tokens an expert has: `quota_table(tokens)` measures it
+there as link misses for 1-4 misses a layer of [0, 0, 1, 2] at one token an expert, [0, 1, 1, 2] at two and [1, 1, 2, 2]
+at four.
+The scatter reads mapped host memory only in blocks that have rows to copy: reads over the link serialize, and one read
+of the status word in each of a grid's blocks cost 0.78 ms a layer before.
 
 Placement feasibility is not a throughput model. Splitting can gain from overlap
 but adds transfers, launches and reduction; mixed sources can add irregular access
@@ -300,7 +343,8 @@ aliasing scratch with live content.
 [Routing fixtures](../../tests/test_expert_routing.py)
 check the host reference against hand-worked cases and, when transformers is
 installed, against the Mixtral, Qwen2/Qwen3-MoE, GPT-OSS, Llama 4, DeepSeek-V2/V3,
-GLM-4.5, MiniMax-M2, Ernie 4.5 and LongCat-Flash router code, plus the config
+GLM-4.5, MiniMax-M2, Ernie 4.5 and LongCat-Flash router classes, each built from a
+minimal config with an identity gate so the fixture sets the logits, plus the config
 mapping. Host fixtures cover placement feasibility, duplicate occurrences,
 ordered combination, staging demands, exact fallback and single activation
 preparation. [Measured policy fixtures](../../tests/test_measured_expert_policies.py)

@@ -35,11 +35,9 @@ reuse-aware admission and an optional [asynchronous batch pipeline](src/runtime/
 active capacity goes up to 4096 lanes, subject to memory admission. Beside the
 scheduler Core ships what batched engines share: [batched steps](src/batch/README.md)
 (the step's row layout, page-reserving admission, speculative rows, batch-invariance
-rules) and [step engines](src/runtime/README.md#step-engines), which give a
-Python engine Core's scheduler. The [batched reference engine](../inference/batched-reference-engine/README.md)
-combines them with its own paged attention kernels. Core's default stays one request (`Profile.max_concurrency` 1): an
-engine opts in through its profile and model declaration
-([building engines](../docs/BUILDING_ENGINES.md#serve-concurrent-requests)). CUDA and
+rules) and [step engines](src/runtime/README.md#step-engines), which give an engine's model plugin Core's
+scheduler. Every engine Core's loader runs batches: its model plugin declares `max_concurrency`
+of 2 or more ([building engines](../docs/BUILDING_ENGINES.md#serve-concurrent-requests)). CUDA and
 Inference techniques are opt-in. The SDK covers
 generation (with optional log-probabilities, request text and stop strings) and
 scoring, with capability-checked [request options](src/runtime/README.md#request-options).
@@ -53,8 +51,8 @@ package in `python/` and the [contracts](contracts/README.md) in `contracts/`;
 | Part | Responsibility | Header |
 | --- | --- | --- |
 | [Runtime](src/runtime/README.md) | Requests, bounded scheduling, readiness, commit/publication, cancellation, retirement | [core.h](include/crit/core.h) |
-| [Engine libraries](src/runtime/README.md#engine-libraries) | C ABI for an engine shared library; stock Eval and serve adapters in `crit_core.native` | [native_engine.h](include/crit/native_engine.h) |
-| [Step engines](src/runtime/README.md#step-engines) | A `ConcurrentModel` over C step callbacks (`crit_core_steps`), so a Python engine gets Core's scheduler, admission, cancellation and retirement (`crit_core.native.StepEngine`) | [step_engine.h](include/crit/step_engine.h) |
+| [Engine ABI](src/runtime/README.md#engine-abi) | Core's engine C ABI, exported by `crit_core_steps` for the engines Core's loader assembles; Core's Eval and serve adapters in `crit_core.engine` | [native_engine.h](include/crit/native_engine.h) |
+| [Step engines](src/runtime/README.md#step-engines) | A `ConcurrentModel` over C step callbacks (`crit_core_steps`), so an engine's model plugin gets Core's scheduler, admission, cancellation and retirement (`crit_core.native.StepEngine`, which Core's loader opens) | [step_engine.h](include/crit/step_engine.h) |
 | [Tracing](src/runtime/README.md#lifecycle-tracing) | Bounded lifecycle trace and [operator ranges](src/runtime/README.md#operator-ranges), optional NVTX sink | [trace.h](include/crit/trace.h) |
 | [Memory](src/memory/README.md) | Resource budgets, reservations, [host-memory admission](src/memory/README.md#host-memory-admission) | [host_memory.h](include/crit/host_memory.h) |
 | [Text](src/text/README.md) | Stop strings, reply text streams, incremental decoding over `detokenize()` | [text.h](include/crit/text.h) |
@@ -65,10 +63,10 @@ package in `python/` and the [contracts](contracts/README.md) in `contracts/`;
 | [Model](src/model/README.md) | Safetensors checkpoints, typed `config.json` and `generation_config.json`, stop ids | [safetensors.h](include/crit/safetensors.h), [model_config.h](include/crit/model_config.h) |
 | [Structured output](src/constraints/README.md) | Optional token matchers for choices, JSON and compiled grammars, masked sampling | [constraints.h](include/crit/constraints.h) |
 | [Device graphs](src/backends/cuda/README.md#graph-capture) | Optional graph cache, staged geometry and replay state machine; CUDA harness with `CRIT_CORE_CUDA` | [device_graph.h](include/crit/device_graph.h), [cuda_graph.h](include/crit/cuda_graph.h) |
-| [Shared device allocations](src/backends/cuda/README.md#shared-allocations-and-mapped-sources) | Optional leases charged once, mapped-source resolution; CUDA hooks with `CRIT_CORE_CUDA` | [device_memory.h](include/crit/device_memory.h), [cuda_memory.h](include/crit/cuda_memory.h) |
+| [Shared device allocations](src/backends/cuda/README.md#shared-allocations-and-mapped-sources) | Optional leases charged once, [fixed buffer plans](src/backends/cuda/README.md#fixed-buffer-plans) (every buffer allocated once, the rest as slots), mapped-source resolution; CUDA hooks with `CRIT_CORE_CUDA` | [device_memory.h](include/crit/device_memory.h), [cuda_memory.h](include/crit/cuda_memory.h) |
 | [Programmatic dependent launch](src/backends/cuda/README.md#programmatic-dependent-launch) | Kernel launches that overlap the previous kernel's tail on sm_90+, with a device query and an ordinary fallback; `CRIT_CORE_CUDA` | [cuda_launch.h](include/crit/cuda_launch.h) |
 | [CUDA backend](src/backends/cuda/README.md) | Allocation, streams/events, ownership services, [device time by category](src/backends/cuda/README.md#device-time-by-category) | [cuda.h](include/crit/cuda.h) |
-| [Python package](python/README.md) | `crit_core`: model files, strict JSON, [config and safetensors](python/crit_core/model/README.md), [text layer](python/crit_core/text/README.md), constraints | [crit_core](python/crit_core) |
+| [Python package](python/README.md) | `crit_core`: model files, strict JSON, [config and safetensors](python/crit_core/model/README.md), [text layer](python/crit_core/text/README.md), constraints; `crit_plugins`: the [plugin](../docs/PLUGINS.md) contract an engine loads with | [crit_core](python/crit_core), [crit_plugins](python/crit_plugins) |
 | [Contracts](contracts/README.md) | Native ownership and request responsibilities | [CONTRACTS.json](contracts/CONTRACTS.json) |
 
 ## Build and use
@@ -102,10 +100,10 @@ cmake --build build/consumer
 ctest --test-dir build/consumer --output-on-failure
 ```
 
-The SDK is version 0.16.1. Include `<crit/core.h>` and link the installed target:
+The SDK is version 0.17.0. Include `<crit/core.h>` and link the installed target:
 
 ```cmake
-find_package(critCore 0.16.1 EXACT CONFIG REQUIRED)
+find_package(critCore 0.17.0 EXACT CONFIG REQUIRED)
 target_link_libraries(your_engine PRIVATE crit::core)
 ```
 

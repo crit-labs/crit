@@ -15,7 +15,10 @@ crit-eval's crit_eval.run.journal), each line synced as it completes; an attempt
 (eval/attempt-N.json, `aborted`), and `--resume` measures in a new attempt from where it stopped: the journal's
 requests are answered again at their recorded times, the engine loads only for the requests left. Eval
 measures in stages (crit-eval's protocol stages): as far as its budget allows at the candidate's measured rates,
-and the run's kv_tokens itself only with certify, for the candidate that will ship. The attempt has no fixed process
+and the run's kv_tokens itself only with certify, for the candidate that will ship. On the candidate ladder
+(crit.run.ladder) the candidate's rung sets how far: none on candidate 1, at most stage 1 (the small Eval) on candidate
+2, at most stage 2 (the medium Eval) on candidates 3 and 4, and the certified Eval (the full one) from candidate 5 on
+and on the segment's last budgeted candidate. The attempt has no fixed process
 cap, since Eval's work scales with the model and the device: it may run to the
 segment's deadline, and each request is bounded by the rates the engine measured in it (crit_eval.run.deadline), so a
 hung engine stops the attempt.
@@ -25,9 +28,10 @@ import os
 from pathlib import Path
 import time
 
+from . import ladder
 from .attempt import Attempt, Expired, packaged, remaining, unsealed
 from .records import file_sha, ident, load_run, now, quality_mode, quality_terms, read_json, safe_path
-from .served import QUALITY, SERVED, Served
+from .served import Served
 from .store import amendments
 
 # Allocator settings the reference may set for its own process (expandable segments) and that crit serve's resident
@@ -64,8 +68,9 @@ def summary(store, run_id, outcome):
 def host_bytes_warning(root, result):
     """What crit run eval prints when recon's placement keeps weights off the device and the Eval result's engine
     declares no host_bytes_per_pass: a note when Eval priced its floors by the placement's memory tiers (crit-eval's
-    headroom.tiers), which assume even routing until the engine reports its expert cache's hits, else a warning that
-    Eval priced its pass floor as if every byte came from device memory, a floor it cannot reach. None otherwise."""
+    headroom.tiers), at the engine's measured expert cache hit rate, or with the misses beyond the device's capacity
+    unmeasured (an optimistic floor) while the engine reports no expert reads and hits, else a warning that Eval priced
+    its pass floor as if every byte came from device memory, a floor it cannot reach. None otherwise."""
     from .recon import RECON_JSON
     facts = safe_path(root, RECON_JSON)
     scenario = (((read_json(facts).get("gathered") or {}).get("placement") or {}).get("scenario")
@@ -75,8 +80,10 @@ def host_bytes_warning(root, result):
         return None
     priced = (((result or {}).get("headroom") or {}).get("host_pass") or {})
     if priced.get("source") == "placement":
+        rate = priced.get("hit_rate")
+        rate = f"a {rate:.0%}" if isinstance(rate, (int, float)) else "an unmeasured"
         return (f"NOTE: recon's placement is {scenario} and the candidate declares no host_bytes_per_pass, so Eval priced "
-                f"its floors by the placement's memory tiers at a {priced.get('hit_rate') or 0:.0%} expert cache hit rate "
+                f"its floors by the placement's memory tiers at {rate} expert cache hit rate "
                 f"({priced.get('hit_rate_source')}). Report expert_reads and expert_hits in the decode telemetry for the "
                 "cache's own hit rate, or host_bytes_per_pass ({\"link\", \"cpu\"} bytes per pass) for the engine's own "
                 "path.")
@@ -181,7 +188,10 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
     run = load_run(root)
     folder = unsealed(root, candidate_id)
     parts = tuple(parts or PARTS)
-    packaged(folder, SERVED + (QUALITY if "quality" in parts else ()), "measuring", "Eval measures")
+    packaged(folder, "measuring", "Eval measures")
+    # The candidate ladder: the rung says how far Eval measures the candidate, and refuses more.
+    if ladder.ladder(run):
+        stage, certify = ladder.eval_options(ladder.scope_of(root, candidate_id), stage, certify, candidate_id)
     model, data = run["spec"]["model_path"], data.absolute()
     if not (data / PREPARED).is_file():
         raise ValueError(f"{data} holds no {PREPARED}: prepare it from the run's model first "
@@ -266,12 +276,12 @@ def _measure(store, run_id, candidate_id, attempt, deadline_at, model, data, out
                 # Between the reference's layers and texts: scoring stops at the reservation's deadline.
                 if remaining(deadline_at) <= 0:
                     raise Expired("Eval passed its reserved deadline while the reference scored the quality texts")
-            from crit_eval.quality.fixed import ALLOWANCE, STORE
+            from crit_eval.quality.fixed import STORE
             from crit_eval.quality.packages import fetch, source
-            mode = options["quality_mode"]
-            # A published package's scores (with the as_quantized allowance beside them), when the source has them.
-            if source() is not None and (not (data / STORE / "index.json").is_file()
-                                         or mode == "as_quantized" and not (data / STORE / ALLOWANCE).is_file()):
+            # A published package's scores, when the data holds none and the source has them. Both quality modes judge
+            # against the same scores: no run reads the allowance a package may carry beside them (protocol
+            # quality.allowance), so its absence is no reason to fetch again.
+            if source() is not None and not (data / STORE / "index.json").is_file():
                 fetch(model, data, source(), log)
             with own_allocator_env():
                 how = score_data(model, data, log, check)

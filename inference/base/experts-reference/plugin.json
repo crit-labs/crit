@@ -1,0 +1,27 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "experts-reference",
+  "title": "The FP64 routed SwiGLU block (expert-streamed-prefill)",
+  "description": "expert-streamed-prefill's moe_block: each token's routes in order, SwiGLU between each expert's gate/up and down matrices, the outputs summed with the routing weights. Slow and exact: the reference every experts plugin is compared with, on the weights of the expert_source slot. Its device form runs the same block in torch over the experts' matrices loaded on the device, its products in FP64, each token's routes summed in route order; capture-safe at a fixed token count (rounds:experts) and inside a captured prompt chunk, whose padding's routes (ids -1) add nothing (prompts:experts).",
+  "fills": [
+    "experts"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "needs": [
+    "experts:source"
+  ],
+  "provides": [
+    "rounds:experts",
+    "prompts:experts"
+  ],
+  "test_with": [
+    "expert-tensors"
+  ],
+  "sources": {
+    "prefill": "../../expert-streamed-prefill/code"
+  },
+  "entry": "plugin.py:create"
+}

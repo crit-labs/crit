@@ -95,6 +95,14 @@
     {
       "path": "inference/attention-state/code/host_page_tier.h",
       "purpose": "HostPageTier: a bounded host tier for prefix pages Core's StateCache evicts (admit from StateStorage::evicted, continuation verified by chain hash and tokens for a restore round)"
+    },
+    {
+      "path": "inference/attention-state/code/pages.py",
+      "purpose": "Paged KV pool in torch on the device (bf16, fp16, fp32, fp8 pages with layer scales, fp8:row and int8 pages with a scale per position and KV head, copy-on-write forks, round slots bound with their pages reserved and their slots and lengths on the device): the kv_cache slot's device form"
+    },
+    {
+      "path": "inference/attention-state/code/device_attention.py",
+      "purpose": "The attention slot's device form over the pool, shared by the library's attention plugins: FlashInfer, then the registry's paged-kv-attention kernels (split-KV decode and verify windows over every page type with tree masks and block lists, fp8:row and INT8 prompt chunks), then torch fallbacks (gathered SDPA, a capture-safe masked softmax over the page tables)"
     }
   ],
   "requires": {

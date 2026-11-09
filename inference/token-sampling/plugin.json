@@ -1,0 +1,32 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "token-sampling",
+  "title": "Core's sampling law: penalties-free selection, top-k, top-p, min-p and Core's draws",
+  "description": "The FP64 mirror of token-sampling's device sampler: rank order with the lower id first, Core's Philox draw at each output position, and the rejection-sampling predictions of a verify round. The reference every sampler plugin is compared with. Its device form runs the same law over logits rows in torch (code/device_law.py), the draw from Core's Philox on the host; inside captured decode rounds (rounds:sampler) its CUDA sampler (code/sampling.cu, built at load) draws drafts with their sparse laws and predicts every verify column by rejection sampling with Core's draws, no host value inside (code/device_rounds.py).",
+  "fills": [
+    "sampler"
+  ],
+  "provides": [
+    "sampler:core-law",
+    "rounds:sampler"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "options": {
+    "rounds": {
+      "type": "choice",
+      "default": "native",
+      "choices": [
+        "native",
+        "torch"
+      ],
+      "description": "what samples inside captured decode rounds (rounds:sampler): native, code/sampling.cu built for the device at load through torch's extension builder (where it does not build, the torch law, with a warning), or the torch law over sorted rows (slower)"
+    }
+  },
+  "sources": {
+    "token_sampling": "code"
+  },
+  "entry": "plugin.py:create"
+}

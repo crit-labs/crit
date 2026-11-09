@@ -18,7 +18,8 @@
       "Device commits of output counts and positions from a device-held emitted count",
       "Core's TokenLogprob values on the device: chosen tokens' log-probabilities and up to 64 ranked alternatives of raw rows (enqueue_logprobs), also fused into enqueue_sample and enqueue_verify (Logprobs), ties at the boundary resolved as Core ranks them",
       "FP64 Python mirror of processing, law, draw and verification with Core's bit-identical draw",
-      "A kernel applying a structured-output bitmask (Core's TokenMatcher::allowed_bits) to logit rows before selection"
+      "A kernel applying a structured-output bitmask (Core's TokenMatcher::allowed_bits) to logit rows before selection",
+      "The sampler slot's rounds:sampler extension for captured decode rounds (code/device_rounds.py): per-slot staged rules, draw positions from the round's output counts on the device, drafts with sparse laws, verify predictions (token trees at each node's depth) and log-probabilities, the sampling law bound for torch at load, a torch law as the fallback"
     ],
     "engine_supplies": [
       "Target and draft logits as FP32 rows on the device, and the scratch rows",
@@ -46,7 +47,11 @@
   "code_files": [
     {"path": "inference/token-sampling/code/sampling.h", "purpose": "Params, Request, Rows and Verify; selection, mask, sample, verify and commit launch interfaces"},
     {"path": "inference/token-sampling/code/sampling.cu", "purpose": "Two-stage top-64 selection, the full-vocabulary law (processing, prefix searches, draw), rejection-sampling verification, commits and constraint masking"},
-    {"path": "inference/token-sampling/code/sampling.py", "purpose": "FP64 Python mirror of processing, law, draw and verification with Core's Philox draw and a runnable example"}
+    {"path": "inference/token-sampling/code/sampling.py", "purpose": "FP64 Python mirror of processing, law, draw and verification with Core's Philox draw and a runnable example"},
+    {"path": "inference/token-sampling/code/device_law.py", "purpose": "Core's sampling law over logits rows in torch on the device, a constrained row's mask applied first: the sampler slot's device form"},
+    {"path": "inference/token-sampling/code/device_staged.py", "purpose": "Core's law with a step's rules staged in device buffers and Core's Philox draw on the device: sampling a model can capture in a CUDA graph"},
+    {"path": "inference/token-sampling/code/device_rounds.py", "purpose": "The rounds:sampler extension: a captured round's rules staged per slot, draft draws with their sparse laws and rejection-sampling verify predictions on the device (sampling.cu through sampling_torch.cpp, built at load), with a torch law as the fallback"},
+    {"path": "inference/token-sampling/code/sampling_torch.cpp", "purpose": "Host binding of sampling.cu's launches (enqueue_verify, enqueue_sample, enqueue_logprobs) and Request rows for torch tensors on torch's current stream"}
   ],
   "requires": {
     "hardware": "CUDA C++20 and Core's sampling header (crit::core) for the device path; Python 3.11+ standard library for the mirror",

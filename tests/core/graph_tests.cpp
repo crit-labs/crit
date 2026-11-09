@@ -106,8 +106,8 @@ void graph_generations() {
     cache.capture(rebound, owners, capture);
     require(captures == 2, "a binding generation change must recapture");
 }
-// Speculative verify widths that alternate between rounds (llama.cpp PRs 28666 and 31004 found a single cached graph
-// re-captured on every alternation): the width is part of a graph's shape identity, so each width is captured once
+// Speculative verify widths that alternate between rounds (a single cached graph would be re-captured on every
+// alternation): the width is part of a graph's shape identity, so each width is captured once
 // and every later round of that width replays it. Capacity bounds the widths kept; past it a new width needs an
 // explicit settled eviction, never a silent recapture of a kept one.
 void graph_widths() {

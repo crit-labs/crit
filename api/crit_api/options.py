@@ -15,7 +15,7 @@ from crit_core.serving import (PLAIN_CAPABILITY, STREAM_CAPABILITY, STRICT_TOOLS
 MAX_CHAT_RECORD = 16 * 1024 * 1024  # bounded image data plus retained request metadata
 MAX_TOOLS = 128  # functions one request may offer
 SAMPLING = frozenset(SAMPLING_FIELDS)   # the request fields crit's sampling law has, a capability each
-# Samplers crit's sampling law does not have, by llama.cpp's and Ollama's names: (the value that turns it off, range).
+# Samplers crit's sampling law does not have, by other servers' names: (the value that turns it off, range).
 # No engine applies them, so the off value is a no-op.
 EXTRA_SAMPLING = {"typical_p": (1, 0, 1), "tfs_z": (1, 0, 1), "mirostat": (0, 0, 2),
                   "dry_multiplier": (0, 0, float("inf")), "xtc_probability": (0, 0, 1)}

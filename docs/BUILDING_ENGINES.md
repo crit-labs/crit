@@ -39,8 +39,13 @@ plan for both decode modes before the first candidate. `--force` gathers again a
 tokenizer and template, each hashed), which every candidate records; `recon --compare OTHER_MODEL`
 compares the run's model with another checkpoint and says which sections differ and what that
 means for the engine (an equal fingerprint: weight values only, so the engine loads it unchanged).
-`candidate_budget` counts complete candidates; there is no time budget, only a 30-day
-safety window.
+`candidate_budget` (default 5) counts the candidates on the [candidate
+ladder](RUN_RECORDS.md#the-candidate-ladder): candidate 1 builds, passes its plugins' tests and
+`crit run ... serve --check` with no Eval; candidate 2 takes every plugin that fits, with at most a small
+Eval (Eval's stage 1); candidates 3 and 4 at most a medium one (up to stage 2); candidate 5 on, and the
+segment's last budgeted candidate, the full Eval, certified. A draft that fails before its rung's
+measurement is sealed and fixed from the same plan at no cost ([budget counts](RUN_RECORDS.md#budget-counts)).
+There is no time budget, only a 30-day safety window.
 
 To improve, port or adapt an engine that crit-hub already lists, pass its folder in a crit-hub
 checkout to `create --from-engine ENGINE_DIR` ([origin engine](RUN_RECORDS.md#origin-engine)). The
@@ -48,6 +53,15 @@ run records the engine, its source pin and the checkpoint it was measured on, ke
 results under `captured/origin/`, and `resolve` says whether the run's model is that checkpoint. Check
 the source out at the pinned commit and make it the first candidate, with `"lineage": "origin-engine"`
 in the proposal, measured before any change: that is the baseline every later Eval compares against.
+
+An engine built outside a run (a proof of a model's plugins over the library, say) is measured and served only as a
+run's candidate: crit serve serves a run's candidates and the engines crit pull installed, nothing else
+([the engine](PLUGINS.md#the-engine)). Create the run with the user's request and `candidate_budget` 1, so the first
+candidate takes the full Eval, finish recon.md and say under Decisions how and where the source was built, record a
+first plan with no levers (it imports a baseline as is), and create the candidate from the package's `plugins/`
+folder: crit writes configuration.json from the candidate's configuration, recon block included, and refuses a
+supplied one that differs. A recipe whose build compiles nothing checks the sources. Run `serve --check` before the
+Eval.
 
 Every candidate serves Eval's [max context](https://github.com/crit-labs/crit-eval/blob/main/docs/CONTEXT.md): the context the user wants
 (`context_tokens` in `settings.toml`, default 200,000), capped by the model's positions and
@@ -61,7 +75,7 @@ in `settings.toml`) and `create` freezes it as `kv_tokens`, with why it is that 
   "model_path": "ABSOLUTE_LOCAL_MODEL_PATH",
   "correctness_criteria": "REPLACE_WITH_FIXED_CRITERIA",
   "device": "ABSOLUTE_PATH_TO_DEVICE_JSON",
-  "candidate_budget": 3,
+  "candidate_budget": 5,
   "attempt_limit": 32,
   "verification_level": "artifact_verified",
   "workload": {
@@ -116,7 +130,9 @@ Before any code for a candidate, record its [plan](RUN_RECORDS.md#plan) after th
 Eval: whether decode and prefill are still needed, the current strategy's ceiling and the
 best alternative's, the levers with each KPI's projected change, a forecast for every KPI
 and how the gates hold. crit freezes the parent's newest Eval, computes the priorities and
-refuses an incomplete plan; the run's first plan has no parent and may import a baseline as
+refuses an incomplete plan (on the [candidate ladder](RUN_RECORDS.md#the-candidate-ladder), a parent
+that skipped its rung's Eval is planned from after its seal, with no Eval to freeze); the run's first
+plan has no parent and may import a baseline as
 is. The proposal names the plan's `plan_id`, gives each of its levers a fate in `lever_fates`
 (built, pruned or deferred, with the reason unless built) and gives label, rationale, strategy,
 configuration and Inference decisions (`implemented`, `inherited`, `rejected`, `untested`)
@@ -132,20 +148,70 @@ descendants, logs and cleanup, failures included.
 
 ```text
 crit run --root RUN_ROOT --id RUN_ID build --candidate CANDIDATE_ID --record recipe.json [--drop GLOB]
-crit run --root RUN_ROOT --id RUN_ID measure --candidate CANDIDATE_ID
+crit run --root RUN_ROOT --id RUN_ID serve --candidate CANDIDATE_ID --check
+crit run --root RUN_ROOT --id RUN_ID ablate --candidate CANDIDATE_ID
 crit run --root RUN_ROOT --id RUN_ID eval --candidate CANDIDATE_ID --data EVAL_DATA_DIR
 crit run --root RUN_ROOT --id RUN_ID check --candidate CANDIDATE_ID --from-eval
-crit run --root RUN_ROOT --id RUN_ID serve --candidate CANDIDATE_ID --check
+crit run --root RUN_ROOT --id RUN_ID measure --candidate CANDIDATE_ID
 ```
 
-Run these from the checkout or add `--project CRIT_ROOT`. Each reserves, runs and settles its own
-attempt. `build` copies the retained source to `work/builds/CANDIDATE_ID-ATTEMPT`, runs the recipe's
+Run these from the checkout or add `--project CRIT_ROOT`, in this order. Each reserves, runs and settles its own
+attempt. `measure` comes after `check --from-eval`: a benchmark qualifies only on the checks recorded before it,
+and one that does not keeps the candidate from ever being eligible, so `measure` refuses a candidate whose checks
+are not recorded or did not pass, and says what to run first; `--exploratory` measures it anyway, for telemetry or
+memory ([measured benchmarks](RUN_RECORDS.md#measured-benchmarks)). `eval` measures as far as the candidate's rung on the [candidate
+ladder](RUN_RECORDS.md#the-candidate-ladder) allows and refuses candidate 1; a candidate that skips its
+rung's small or medium Eval is sealed `built` after `serve --check` passed instead. `build` copies the retained source to `work/builds/CANDIDATE_ID-ATTEMPT`, runs the recipe's
 literal `build.command` there to the reservation's deadline (log `logs/build-ATTEMPT.log`), settles the
-attempt and packages the folder: every file the build added or changed is bound as a dependency, and
-capabilities the recipe leaves out come from the adapter's `declared_capabilities(model_path)` (an empty
-list is refused, since a package that declares nothing cannot be served); `--drop`
-removes intermediates first. `check --from-eval` records the arithmetic, functional and resources check
+attempt and packages the folder: every file the build added or changed is bound as a dependency; `--drop`
+removes intermediates first. A recipe is its `build` only: Core's loader runs the package, so there is no launch
+entry, and what the engine serves is Core's to say. `check --from-eval` records the arithmetic, functional and resources check
 of every case from the candidate's newest Eval result ([Run records](RUN_RECORDS.md#check)).
+
+An engine is Core plus [plugins](PLUGINS.md), and a candidate is a plugin package: `plugins/` and the
+configuration whose `plugins` selection fills every slot an engine fills (`model`, `placement`, `projections`,
+`attention`, `kv_cache`, `sampler`, and the slots its model plugin `requires`). `crit run candidate` and `package`
+check it with Core's loader rules before they record it, without running its code, and refuse anything else. Choose
+the `model` plugin for the checkpoint's architecture first, then a plugin for each slot it calls: start from crit's
+library with `crit plugins add`, put the engine's own device code inside a plugin where it pays, keep each plugin's
+tests against its reference passing (`crit plugins test`), and declare the device it runs on. The model plugin is the
+step model of Core's concurrent runtime: every step holds the rows of many requests, prompt chunks and decode rows
+together, and a row's tokens never depend on the other rows. `ablate` serves the packaged candidate with each plugin
+switched off and alone before its Eval, and says which plugin pays, slows or breaks the engine
+([ablation](PLUGINS.md#ablation)).
+
+The library's plugins are meant to give a fast engine from candidate 1, with only the model plugin written for the
+checkpoint ([the model plugin](PLUGINS.md#the-model-plugin)): decode rounds captured through Core's round driver
+([captured rounds](PLUGINS.md#captured-rounds)), short prompt chunks through Core's prompt graphs, norms and rotary
+positions through the norms slot, the drafter over the model's device draft head, and the KV pool, attention,
+projections, recurrence and experts plugins each in its stored format with its registry kernel or torch fallback. A
+mixture of experts larger than the device (placement `sparse_device_host`) needs no engine code for its experts'
+residency: device-placement's `off_device` puts the routed experts' bundles in host memory, the expert_source's
+`open_store(layout, layers, experts, device)` holds every expert's bundle (the experts plugin's `layout()` and
+`pack()`) in host memory the device reads, and expert_residency's `cache(...)` keeps the hot ones in device slots.
+Make the KV pool with `spare` bytes for the cache's own slots and pass it as `lend`, so the cache also uses the pages
+no sequence holds; warm it from a residency profile (`cache.warm(...)`) and read the engine's `telemetry()` for its hit
+rate. The facts each plugin provides say whether it runs inside captured rounds and prompt chunks; the round driver's
+`problems` names any that keeps a selection out. A drafting model plugin may let its rounds choose their draft width
+among several captured ones (`Rounds(widths=..., width_policy=...)`, [captured rounds](PLUGINS.md#captured-rounds)),
+sizing every buffer and grant for the widest.
+
+In `preserve`, Eval's honesty check holds every reply token's log-probability and its alternatives within 0.001
+nats of the same reply scored as fixed text (crit-eval protocol `quality.honesty`). The reply comes from decode rows
+and the score from prompt rows, so the two paths must give a token the same bits, and a prompt path that sums in
+another order than the decode path (a GEMM for long prompt calls against a GEMV or tile for decode rows, a prompt
+reader or FlashInfer's prefill against the split-KV reader) misses it by thousandths to tenths of a nat. With the
+library's plugins an engine keeps one arithmetic on both paths in three settings: the attention plugin's
+`prompt_reader: decode`, which reads a step's prompt rows and captured prompt chunks in the decode's reduction (its
+facts say `served_vs_scored: exact`); attention-state's `fresh_mib: 0`, so a prompt chunk over FP8 or INT8 pages reads
+its own keys and values from the pages as decode rows do; and prompt calls through the projections' decode kernel:
+prompt chunks of at most `invariant_rows(projections)` tokens, or quantized-projections' `tile_rows` where its tile
+takes the prompt arithmetic (`prompt_gemm: pinned` keeps a prompt row's bits the same at every length, but in another
+reduction than the decode rows'). Prefill then runs at the decode kernels' rate: on a 33B NVFP4 model on one RTX 5090,
+385 tokens a second through the CUDA-core GEMV and 1,024 through the tile, against about 2,150 on the prompt path.
+A `speed` engine's honesty bound is looser, so the prompt reader, fresh chunk keys and values and pinned prompt GEMMs
+fit it.
+
 A build or check crit does not run itself is reserved, settled and recorded by hand:
 
 ```text
@@ -167,17 +233,16 @@ The package holds runnable files, dependencies and notices, without
 a residency or routing profile that fills a device expert cache before the first request
 ([device-expert-cache](../inference/device-expert-cache/README.md)); it is then part of the
 candidate's identity, and as a content-dependent choice it is built from a general corpus
-unrelated to Eval. Build/launch recipes are literal arguments, without
-shell expansion.
+unrelated to Eval. Build commands are literal arguments, without shell expansion.
 
 | Check | What to retain |
 | --- | --- |
 | Baseline | Requests through Core admission, session, commit and retirement; exact source/package identities. When continuing earlier work, re-record the previous best: the same package can measure several percent differently in another session |
-| Strategy | Measured bottleneck; alternatives with estimated ceilings; Inference code used and the hooks your engine supplies |
+| Strategy | Measured bottleneck; alternatives with estimated ceilings; the plugin in each slot, the Inference code it starts from and the facts your engine supplies |
 | Headroom | `crit eval status`: each KPI and the long-context curve against its floor or ceiling. Re-measure every candidate and on resume |
 | Correctness | Separate arithmetic, functional and resource gates with fixed criteria; failures stay failed |
 | Repeatability | Same output in a fresh process and after other requests, long ones included (Eval's request-history gate; [recorded selection](../inference/recorded-selection/README.md)) |
-| Quality | When arithmetic changes, perplexity and KL divergence from a reference ([full-vocabulary comparison](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#full-vocabulary-comparison)). Under `weights_policy: as_stored`, requantized or pruned weights don't qualify and each candidate declares `weights` ([run records](RUN_RECORDS.md)) |
+| Quality | When arithmetic changes, perplexity and KL divergence from a reference, the checkpoint the user selected with exact activations ([full-vocabulary comparison](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#full-vocabulary-comparison)). The run's quality mode says how much of that drift may be traded for speed, whatever format the checkpoint is stored in: `speed` (the default) or `preserve`. Under `weights_policy: as_stored`, requantized or pruned target weights don't qualify and each candidate declares `weights`; draft-only weights take any encoding in any run ([run records](RUN_RECORDS.md)) |
 | Performance | Matched inputs/protocol, warmups, every repetition, prefill/decode/request/load costs, physical memory, plus [`crit eval`](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md); tune text-dependent settings such as draft width on its mixed cases |
 | Coverage | Representative contexts and request shapes; operator tests alone don't qualify a model |
 
@@ -198,11 +263,11 @@ rejection sampling so the distribution stays exact, and sample on the device.
 
 ### Serve concurrent requests
 
-Build the engine to serve several requests at once; one request at a time is the special case. Core's
-default stays one request (`Profile.max_concurrency` and `ModelInfo.max_concurrency` 1), so the engine opts
-in: a `ConcurrentModel` with a profile above one and [mixed batches](../core/src/runtime/README.md#mixed-token-work-batches)
-(`max_batch_tokens`), so that one step runs every scheduled request's decode rows and prompt chunks and reads
-each weight once. Core supplies what every batched engine needs:
+Every engine serves several requests at once; one request at a time is the special case of a batch of one. The
+model plugin is the step model of Core's concurrent runtime, its info declares `max_concurrency` of 2 or more (Core's
+loader refuses one that cannot batch), and with [mixed batches](../core/src/runtime/README.md#mixed-token-work-batches)
+(`max_batch_tokens`) one step runs every scheduled request's decode rows and prompt chunks and reads each weight
+once. Core supplies what every batched engine needs:
 
 | Need | Core |
 | --- | --- |
@@ -211,18 +276,18 @@ each weight once. Core supplies what every batched engine needs:
 | Batched rows that keep their serial bits | The [batch invariance rules](../core/src/batch/README.md#batch-invariance) |
 | KV pages, prefix reuse, copy-on-write forks | [State cache](../core/src/state/README.md) |
 | Speculative rounds per request in a shared step | [Speculative rows](../core/src/batch/README.md#speculative-rows) |
-| Serving | An [engine library](../core/src/runtime/README.md#engine-libraries) with `concurrent_requests` and `chat-concurrent-v1`; a Python engine as a [step engine](../core/src/runtime/README.md#step-engines) |
+| Serving | Core's loader runs the model plugin on its [step engine](../core/src/runtime/README.md#step-engines); crit serve serves it as `chat-concurrent-v1` |
 
-The [batched reference engine](../inference/batched-reference-engine/README.md) puts them together for a
-synthetic model, with its own paged attention kernels over the state cache's pages; an engine's attention kernels
-are its own or a provider's ([Kernels](../kernels/README.md)). A request's tokens must not depend on the requests sharing its steps: Eval's repeatable and
+An engine's attention plugin reads the state cache's pages with its own kernels or a provider's
+([Kernels](../kernels/README.md)). A request's tokens must not depend on the requests sharing its steps: Eval's repeatable and
 request-history gates and the greedy exactness check compare replies across requests, so every kernel on the
 step path follows the invariance rules. Measure concurrency as a workload of its own: a case with
 `workload.concurrency` N, which `crit run measure` sends as N requests at once and records with each
 request's speed and their aggregate (`aggregate_tps`), and Eval's
 [concurrency](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#concurrency) part, which
-crit serve's `max_concurrent_requests` turns on: closed-loop levels of 1 to 64 clients against a batched
-ceiling, with whether batched replies equal serial ones.
+crit serve's `max_concurrent_requests` turns on: closed-loop levels of 1 to 64 clients, whose gate judges that
+batched replies equal serial ones and that a level's requests ran together, and whose speedup is reported beside the
+cost model's expectation for the engine's placement, not judged.
 
 ### Run the common Eval suite
 
@@ -241,14 +306,15 @@ with its largest gaps ("decode 46.6 tok/s is 11% of its limit 419.5 tok/s; pass 
 ..."): a low fraction is the next plan's room, not a result. Where recon's placement keeps weights off the
 device, Eval prices them at host memory's tier ([memory tiers](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#memory-tiers)),
 routed experts at the device cache's hit rate the engine reports (`expert_reads` and `expert_hits` in its decode
-telemetry; even routing without them), and keeps the all-on-device fraction beside it; the engine's facts declare
+telemetry, or the expert cache's reads and hits in the engine's `telemetry()`; without them Eval prices only the
+misses the device's capacity forces, an optimistic floor it names as unmeasured, never an assumed rate), the KV at
+the engine's `kv_bytes_per_token` (left out, and named missing, without it), and keeps the all-on-device fraction
+beside it; the engine's facts declare
 `host_bytes_per_pass` (`{"link", "cpu"}` bytes a pass reads from host memory) to price its own path instead, and
-`crit run eval` notes which it was. The package therefore needs its
-[resident adapter](#4-make-the-package-servable-and-seal) with `chat-stream-v1`,
-`chat-logprobs-v1` and `chat-score-v1` from its first Eval on; `crit_core.serving.ResidentChat`
-provides them (`score_tokens` runs the engine's prefill at every position and its decode forced
-to a continuation; `crit_core.native.ResidentEngine` implements it for Core engines with query
-scoring and replay).
+`crit run eval` notes which it was. Core's resident adapter serves `chat-stream-v1`, `chat-logprobs-v1` and
+`chat-score-v1` for every engine from its first Eval on (a fixed-text score runs the engine's prefill at every
+position by query scoring and its decode forced to a continuation by replay), so the model plugin declares
+`token_logprobs` with 20 alternatives, `scoring`, `query_scoring` and `replay`, which Core's loader requires.
 Eval measures each speed case at steady state: before it compares repetitions, a request
 whose speed still moves away from the one before it is one more warmup, up to the
 protocol's bound, and the case records its warmups and drift (crit-eval's
@@ -273,7 +339,10 @@ the sampled suite, exactness and the follow-up turns again. No stage serves the 
 second engine: `--certify`, for the candidate you will propose, runs stage 3 whatever the budget, one request at the
 run's `kv_tokens`, which the resources check needs, and the speed cases again on an engine opened at a lower context,
 which the lower-context gate needs (stage 3 ran it in crit-eval 0.4). `--stage` caps how far a run goes, `--stage full` runs every
-part as before stages.
+part as before stages. On the [candidate ladder](RUN_RECORDS.md#the-candidate-ladder) the candidate's rung sets them:
+`crit run ... eval` refuses candidate 1, runs stage 1 (the small Eval) on candidate 2 and up to stage 2 (the medium
+Eval) on candidates 3 and 4, and certifies (the full Eval) candidate 5 on and the segment's last budgeted candidate;
+it refuses `--certify` or a higher stage below the full rung, and `--stage` on it.
 
 Use the reports crit-eval gives beyond the KPIs ([Measurements](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#limits)):
 
@@ -281,30 +350,25 @@ Use the reports crit-eval gives beyond the KPIs ([Measurements](https://github.c
   weight format, attention, recurrence, other kernels, the host's share of the first token) next to its
   floor, with a gap per term, and splits a speculative round into its verify pass and draft steps.
 - **Prefill ceilings by activation format:** the stored-format ceiling prices NVFP4 matrices at W4A4.
-  Declare the engine's `prompt_activations` (adapter info, crit serve's `engine_facts`); status prices the
+  Declare the engine's `prompt_activations` (the model plugin's info, crit serve's `engine_facts`); status prices the
   ceilings at BF16, FP16 accumulation, FP8 and the stored format, says which the quality evidence rules out
   and names the fastest shown passing as the reachable limit.
-- **Quality during development:** `crit eval run --adapter A --only quality` scores the quality texts in
-  process (`crit_core.native.eval_engine` offers `score()`); development evidence, never the gate.
+- **Quality during development:** `crit eval run --package P --only quality` scores the quality texts in
+  process through Core's eval-v1 adapter; development evidence, never the gate. Pass the run's
+  `--quality-mode` (crit eval's own default is `speed`).
   `--attribute-drift` scores again with each of the engine's `exact_variants` and reports each matrix
   group's share of the budget; each set's `budget_spread` is the share's spread over its positions, and a
   difference inside it is not a measurement.
 - **Time to first token by part**, the sampled cases' **standard errors** (`--adaptive-sampled` repeats a
-  noisy case), acceptance beyond the built draft width (the adapter's `wider_draft`) and the **device
+  noisy case), acceptance beyond the built draft width (the model plugin's `wider_draft`) and the **device
   memory** left free at the required context.
 
-Hardware telemetry stays in process, through an [Eval adapter](https://github.com/crit-labs/crit-eval/blob/main/docs/ADAPTER.md) retained
-with the candidate's source: tokens per round and acceptance on the pinned continuation
-(`crit eval pin`, with the adapter's `replay`), `crit eval ab` to confirm small
-differences and `crit eval kernels` to start kernel work, checking
+Hardware telemetry stays in process, through Core's [eval-v1 adapter](https://github.com/crit-labs/crit-eval/blob/main/docs/ADAPTER.md)
+over the package (`--package DIR`): tokens per round and acceptance on the pinned continuation
+(`crit eval pin --package`, with Core's `replay`), `crit eval ab --package` to confirm small
+differences and `crit eval kernels --package` to start kernel work, checking
 [Kernels](../kernels/README.md) first. Pass the run's `kv_tokens` to `pin`, `ab` and
-`kernels` as `--context`. An engine built as a Core
-[engine library](../core/src/runtime/README.md#engine-libraries) uses the stock adapters in
-`crit_core.native` for Eval and for serving; so does a Python engine that implements the library's
-interface (`info`, `generate`, `score`, `close`) and passes the function opening it in place of the
-library path ([Python engines](../core/src/runtime/README.md#python-engines)), or, to batch concurrent
-requests, a step (`open`, `step`, `commit`, `retire`) that Core's runtime schedules
-([step engines](../core/src/runtime/README.md#step-engines)). Make the trace readable: class the engine's kernels in its
+`kernels` as `--context`. Make the trace readable: class the engine's kernels in its model plugin's
 info's `kernel_work` (`{"match": NAME_PART, "term": matmul|attention|recurrent|other|draft, "format":
 nvfp4|fp8|bf16}`, or `crit eval kernels --work RULES` without engine changes) and keep the draft step's
 kernels distinctly named (`draft` in the name), so
@@ -313,7 +377,12 @@ into verify and draft. Trace every case the prefill score takes (status names th
 and read each matmul's achieved TFLOPS against the rate of the prompt activations it already uses: that
 gap is open whatever quality allows. A term is exhausted only when it runs near that floor or when another
 kernel structure, or a vendor library at the same arithmetic as a yardstick, was measured on it; tiling,
-block and launch variants of one kernel reject those variants, not the term. Run the full suite for the final comparison;
+block and launch variants of one kernel reject those variants, not the term. Under WSL a profiler trace (torch's
+profiler, CUPTI) may record no kernels of CUDA graph replays and none launched through `cuLaunchKernelEx` (as
+registry kernels are), so a captured round's profile reads empty or low there: time such work on the GPU itself, with
+CUDA events around the call and a spin kernel (`torch.cuda._sleep`) before it, so the host queues the call's kernels
+while the GPU is busy and the span holds no host gaps. Run the full suite for the final comparison
+(on the ladder, the full rung's certified Eval);
 retain raw results, settings, inputs and the Eval revision; report skipped cases and
 overrides.
 
@@ -323,26 +392,23 @@ the agreed gates. See [Eval results](https://github.com/crit-labs/crit-eval/blob
 
 ## 4. Make the package servable and seal
 
-Before the candidate's first Eval, implement the [resident adapter](SERVING.md#adapter-contract)
-(`chat-json-v1`, `chat-resident-v1`, `chat-stream-v1`, `chat-logprobs-v1`,
-`create_engine(context)`, model allocations reused across requests). Before sealing, serve the package with
+The package needs no adapter: crit serve runs it through Core's loader and Core's resident adapter
+([serving](SERVING.md#cores-resident-adapter)), which streams, reports log-probabilities, scores fixed text and serves
+concurrent requests for every engine. Reuse model allocations across requests and rebuilds through the serving
+context's device leases (`context.serving.device`). Before sealing, serve the package with
 `crit run --root RUN_ROOT --id RUN_ID serve --candidate CANDIDATE_ID --check`: crit serves it under a check
 attempt and verifies consecutive greedy requests, a leading system message, streaming, a stop string, a client
 cancelling mid-reply, a tool call and its result, log-probabilities and a template switch (each where the package
 declares it) and stopping the engine, keeps the report as `logs/serve-check-ATTEMPT.json` and records a functional
 check per case. Without `--check` it serves until Ctrl+C for checks of your own, such as real tokenizer counts and
-synchronized phase times; once sealed, verify A → B → A switching with
-`crit serve`. Declare `chat-config-v1` so the host
-rejects an adapter that drops or changes a configuration key. For `response_format`,
-apply Core's [structured-output service](../core/src/constraints/README.md) while
-sampling and declare `chat-constraints-v1`
-([structured output](SERVING.md#structured-output-for-adapters)).
+synchronized phase times; once sealed, verify A → B → A switching with `crit serve`.
 
 ```text
 crit run --root RUN_ROOT --id RUN_ID seal --candidate CANDIDATE_ID --lifecycle completed
 ```
 
-Use `built` for a servable engine without benchmarks, or the actual failure lifecycle.
+A candidate measured by `crit run ... measure` or by a completed `crit run ... eval` seals as `completed`. Use `built`
+for a servable engine without measurements, or the actual failure lifecycle.
 Sealing needs settled attempts and closes the candidate permanently. A failed gate
 does not prevent serving, but prevents qualification.
 

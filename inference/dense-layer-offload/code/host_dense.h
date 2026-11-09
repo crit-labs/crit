@@ -68,8 +68,8 @@ void gemv(ThreadPool&, Isa, const std::uint16_t* w, std::size_t rows, std::size_
 
 // One pre-norm block on the host for `batch` rows at positions pos0 .. pos0 + batch - 1 of one sequence (a prompt
 // chunk or a decode step), with weights [out][in] in BF16 bits and a host KV cache [position][kv_heads][head_dim] of
-// BF16-rounded values: x += O(attention(rope(Q), rope(K), V)); x += Down(silu(Gate) * Up). Matches the layer of the
-// batched reference engine's synthetic model up to summation order.
+// BF16-rounded values: x += O(attention(rope(Q), rope(K), V)); x += Down(silu(Gate) * Up). A device layer that rounds
+// the same intermediates to BF16 matches it up to summation order.
 struct BlockShape { int hidden, heads, kv_heads, head_dim, ffn; };
 struct BlockWeights { const std::uint16_t *qkv, *o, *gate_up, *down; };
 struct HostKv { float* k; float* v; int capacity; };

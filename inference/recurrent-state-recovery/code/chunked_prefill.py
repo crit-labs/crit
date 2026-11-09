@@ -14,7 +14,10 @@ triangular solve), which suits tensor cores. The result equals the token-by-toke
 """
 import math
 
-from reference import Geometry, Step, _advance, _normal  # noqa: F401  (Geometry/Step re-exported for callers)
+try:   # imported as part of a package (a crit plugin's source)
+    from .reference import Geometry, Step, _advance, _normal  # noqa: F401  (Geometry/Step re-exported for callers)
+except ImportError:
+    from reference import Geometry, Step, _advance, _normal  # noqa: F401
 
 
 def sequential(matrix, steps, geometry):

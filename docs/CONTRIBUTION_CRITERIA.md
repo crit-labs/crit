@@ -39,8 +39,14 @@ crit and put the model's **instance** in its engine package.
 | Its own tool-call syntax | A parser for that model | A hook the package fills (`ResidentChat.tool_format` with a `ToolFormat`) |
 | A config key spelled its own way | An `if` for that family in each reader | One alias table that every reader shares |
 | Special handling of some tensors | A list of that checkpoint's tensor names | A role the tensors declare, or a rule derived from the config |
-| A kernel tuned for its shapes | The tuned kernel as a default | A dispatch interface, with the tuned kernel kept in the engine or the Kernel Hub |
+| A kernel tuned for its shapes | The tuned kernel as a default | The plugin's dispatch and its torch fallback, with the tuned kernel in the engine or in the kernel registry (a crit-kernels project) |
 | A faster setting on one GPU | The constant | A measurement (`crit eval probe`) the setting is derived from |
+
+**No compute kernels.** crit holds techniques, their host references and their mechanisms, never compute kernels:
+the arithmetic a library or the kernel registry could provide comes from there, and a missing kernel becomes a
+kernel-builder project in crit-kernels that crit-labs uploads. [Kernels and plugins](PLUGINS.md#kernels-and-plugins)
+gives the rule: what stays in a technique as mechanism, how a plugin declares and loads a registry kernel with its
+fallback, and what a technique keeps instead of a list of kernels.
 
 The tool-call work from the Gemma 4 run shows the pattern. A Gemma-only parser
 (`gemma-call`) went into Core first and was then replaced by `ResidentChat.tool_format`,
@@ -69,6 +75,11 @@ When Python and C++ both need the same table, they read one source.
 - An Inference entry states a technique and its contract for any model that fits the
   technique's assumptions. Measurements from one engine illustrate it. They never set
   thresholds or shares that a reader would copy as tuning constants.
+- An entry that fills an engine slot ships as a [plugin](PLUGINS.md) (`plugin.json`, `plugin.py`, `tests/`)
+  whose tests pass against the slot's base plugin, so an engine takes it with `crit plugins add` and an
+  ablation can measure it. A plugin that runs on a device keeps its host form as the oracle, and its device form
+  is tested against it: exactly where the slot promises (token ids, row invariance, capture), within a documented
+  tolerance otherwise.
 - Lessons from one run go into that run's records, its `summary.md` and its crit-hub
   entry. Only the general principle behind them goes into crit.
 - Naming a model as an example is fine ("for example Gemma 4's empty thought

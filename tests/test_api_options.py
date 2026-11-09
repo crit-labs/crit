@@ -232,14 +232,8 @@ class RequestOptionsTests(test_api.ApiTests):
 
 
 class LegacyOptionsTests(test_api.ApiTests):
-    """A package sealed before crit run package required temperature."""
+    """An engine crit serve offers no sampling fields for (as for a package sealed before Core served them all)."""
     temperature = False
-
-    def setUp(self):
-        legacy = patch("crit.run.store.serving_gaps", return_value=[])
-        legacy.start()
-        self.addCleanup(legacy.stop)
-        super().setUp()
 
     def test_legacy_adapter_rejects_generation_options_instead_of_ignoring_them(self):
         for options in ({"temperature": 0}, {"seed": 0}, {"tools": TOOLS}, {"frequency_penalty": 0}):

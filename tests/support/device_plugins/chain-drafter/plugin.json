@@ -1,0 +1,19 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "chain-drafter",
+  "title": "A test stand-in for a chain drafter inside captured rounds",
+  "description": "One draft per depth from the model's device draft head, inside a captured round. For the round driver's tests; greedy-head-drafter provides the same form.",
+  "fills": [
+    "drafter"
+  ],
+  "needs": [
+    "draft:head-device"
+  ],
+  "provides": [
+    "draft:device"
+  ],
+  "devices": [
+    "cuda"
+  ],
+  "entry": "plugin.py:create"
+}

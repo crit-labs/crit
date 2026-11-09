@@ -1,0 +1,107 @@
+{
+  "id": "fused-norms",
+  "category": "execution",
+  "summary": "The elementwise work around a transformer's matmuls (RMSNorm with a residual, head norms, rotary positions, gated norms, activation products, L2 norms, residual-stream mixes), one kernel launch per call, each row's bits independent of its batch",
+  "implementation_status": "reference",
+  "implementation_scope": "The norms slot's host form, an FP64 reference over rows of numbers (rows.py: RMSNorm with an offset weight, a weight per group and a residual, the gated RMSNorm, rotary positions in half or interleaved pairs with partial rotation from inverse frequencies or a cos|sin table, SiLU / GELU / sigmoid products, L2 norms, sums over residual streams and a row added into every stream: stream_sum_rows, stream_add_rows); the device form in plain torch ops (torch_norms.py: FP32 inside, one rounding to a chosen dtype, every reduction through torch's one-row-at-a-time fused rms_norm, capture-safe), which is the base plugin torch-norms and this plugin's fallback; the checks any norms device form passes (conformance.py). The plugin's device form takes FlashInfer (a provider) for the calls whose function it computes exactly (rms_norm without a residual and rms_norm_heads with a weight and output in the input dtype; silu_mul and gelu_mul of packed BF16 or FP16 halves) and the registry kernel crit-labs/fused-norms (Triton, one launch per call, loaded by name at its pin) for the rest: residual norms (FlashInfer normalizes the unrounded sum), other weight or output dtypes, grouped weights, rotary positions, gated and L2 norms, sigmoid gates, interleaved or two-tensor products, stream mixes; torch where the kernel is not there.",
+  "agent_guidance": {
+    "use_when": "A model plugin's layers normalize, rotate, gate or multiply activations around their matmuls: decode rounds launch one kernel per operation instead of a chain of small torch kernels, and prompt passes read each activation once",
+    "avoid_when": "The arithmetic is fused into a matmul's epilogue or prologue already (a GEMV writing the residual add and the gated product), or a layer needs a normalization this slot does not name (LayerNorm with a bias, group norms)",
+    "provides": [
+      "rms_norm with an offset weight (weight stored as weight - 1), a residual stream advanced in place in its own dtype (FP32 beside 16-bit rows) and a chosen output dtype (BF16, FP16 or FP32)",
+      "Query/key head norms, alone or fused with rotary positions (rms_norm_heads, rms_norm_rope), on strided views of a fused projection's output",
+      "Rotary positions: half or interleaved pairs, partial rotation, inverse frequencies (FP32 angle, as checkpoints' reference code) or a cos|sin table, an attention factor; in place on request",
+      "The gated RMSNorm of linear-attention outputs (silu or sigmoid of the gate), SiLU / GELU products of packed or separate gate and up rows, sigmoid output gates, L2 norms",
+      "Several residual streams: one norm weight per stream (or head) in one call, a gated, weighted or plain sum over the streams in stream order (stream_sum), one row added into every stream with a weight per stream (stream_add)",
+      "Each row's bits independent of the rows beside it and of the row count, so decode rows, verify windows and prompt rows agree; capture-safe calls on fixed shapes",
+      "An FP64 host reference and conformance checks (against the host form, rows alone and batched, strided views, CUDA graph replay) for any norms plugin"
+    ],
+    "engine_supplies": [
+      "Its layer arithmetic: which norm, offset, eps, rotary style, rotary dimension and table a layer uses (read from the checkpoint's config)",
+      "Inverse frequencies or a cos|sin table (attention-state's rope_table derives scaled ones), FP32 on the device",
+      "Weights on the device in their stored dtype; the residual stream's dtype",
+      "Warm calls of each shape before capturing a graph"
+    ],
+    "preserve": [
+      "FP32 inside and one rounding, to the dtype asked for",
+      "A row's reduction order fixed by its width alone: never by the row count",
+      "The rotary angle fp32(position) x fp32(inverse frequency), as the checkpoints' reference code computes it",
+      "The residual normalized as stored: its sum rounded to its dtype first"
+    ],
+    "adapt": [
+      "Fusing the residual add, the scale or the gated product into the neighbouring matmul's epilogue instead, where a projections plugin offers it",
+      "Writing FP8 or FP4 activations straight from the norm for a quantized matmul",
+      "Further fusions (q and k in one launch, norm and rope with the KV write)"
+    ]
+  },
+  "path": "inference/fused-norms/README.md",
+  "code_path": "inference/fused-norms/code",
+  "code_files": [
+    {
+      "path": "inference/fused-norms/code/rows.py",
+      "purpose": "The norms slot's host form: every operation over rows of numbers in FP64, the oracle of every device form"
+    },
+    {
+      "path": "inference/fused-norms/code/torch_norms.py",
+      "purpose": "The device form in plain torch ops: torch-norms, and fused-norms' fallback without its registry kernel"
+    },
+    {
+      "path": "inference/fused-norms/code/conformance.py",
+      "purpose": "The checks a norms device form passes: against the host form, rows alone and batched, strided views, out= and dtypes, CUDA graph replay"
+    }
+  ],
+  "requires": {
+    "hardware": "Python 3.11+ for the host form; torch on CUDA or the CPU for the torch device form; a CUDA GPU with Triton for the registry kernel",
+    "model": "RMSNorm-family normalization (with or without a zero-centred weight), rotary positions, SiLU / GELU / sigmoid gating",
+    "workload": "Decode rows, verify windows and prompt chunks of any count"
+  },
+  "contract": {
+    "input": "Rows of BF16, FP16 or FP32 values (the last dimension contiguous, the others any strides), weights of the row width, positions [tokens] and FP32 inverse frequencies or a cos|sin table",
+    "output": "A new tensor of the input's shape (a product's half) in the dtype asked for, or `out`; rms_norm with a residual also advances the residual in place",
+    "ownership": "The caller owns every tensor; nothing is kept between calls",
+    "failure": "Shapes, dtypes, rotary dimensions and layouts that do not fit raise ValueError before anything runs; values are not checked (a NaN row stays NaN)",
+    "core_boundary": "Arithmetic of a model's layers, called by its model plugin through the norms slot; Core knows none of it"
+  },
+  "dependencies": [
+    "Python standard library",
+    "torch for the device form",
+    "the kernels package and the registry kernel crit-labs/fused-norms for one launch per call",
+    "FlashInfer, optional, for the calls it computes exactly"
+  ],
+  "symbols": [
+    "rms_norm_rows",
+    "gated_rms_norm_rows",
+    "rope_rows",
+    "act_mul_rows",
+    "l2_norm_rows",
+    "Rows",
+    "rms_norm",
+    "rms_norm_heads",
+    "rms_norm_rope",
+    "gated_rms_norm",
+    "rope",
+    "silu_mul",
+    "gelu_mul",
+    "sigmoid_mul",
+    "l2_norm",
+    "against_rows",
+    "rows_alone",
+    "captured",
+    "stream_sum_rows",
+    "stream_add_rows",
+    "stream_sum",
+    "stream_add"
+  ],
+  "interactions": [
+    "attention-state",
+    "quantized-projections"
+  ],
+  "techniques": [
+    "fused-norms"
+  ],
+  "validation": {
+    "host": "Worked values of every host operation (unit root mean square, offset weights, residual sums, rotation of pairs in both styles, products, L2 norms) and crit's norms cases",
+    "native": "No native code in crit: the registry kernel crit-labs/fused-norms (Triton) is tested in its kernel-builder project against a float64 reference; this plugin's device tests run the conformance checks on CUDA through the registry kernel (LOCAL_KERNELS) and through the torch fallback, and torch-norms' on CUDA and the CPU",
+    "performance": "Kernel launches, host time and GPU time per call against the torch chains at three models' shapes, by the kernel project's benchmarks/shapes.py: README.md, Measured"
+  }
+}

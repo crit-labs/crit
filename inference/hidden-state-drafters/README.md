@@ -75,6 +75,15 @@ accepted with probability c settles at a cut near 0.55 for a target of 0.5, and 
 overstates itself (accepted with probability c^2) near 0.75, where a constant tuned for
 the first would keep drafts accepted a quarter of the time.
 
+## On the device inside captured rounds
+
+[device_drafting.py](code/device_drafting.py) runs the drafter rules over device tensors for the plugin's
+`draft:device` form: each depth's draft-vocabulary argmax (or the sampler's draft draw) mapped by `d2t`, its softmax
+confidence in FP64, `truncate`, and `ConfidenceCut` as `DeviceCut`: bins of decayed (tested, accepted) counts, a
+round's labels staged by `commit_round` (overwritten by a truncation's second commit) and folded in at the next
+round's draft before its threshold, all on the device, so the cut learns without the host. A round's rows decay in one product where the host decays after each row: the sums differ by FP64 rounding.
+The CUDA glue in hidden_drafters.cu (over device-speculative-round's control block) is not needed by it.
+
 ## What the code supplies
 
 | File | Supplies |

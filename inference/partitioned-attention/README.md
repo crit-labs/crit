@@ -1,8 +1,9 @@
 # Partitioned attention
 
 Split a long KV sequence across ranks so each evaluates the same queries over
-disjoint keys, then merge the partial results exactly. This is a host reference,
-not a distributed runtime or device kernel.
+disjoint keys, then merge the partial results exactly. The technique's code is a
+host reference, not a distributed runtime; its plugin serves the technique on one
+GPU through attention-state's device form ([on one GPU](#on-one-gpu)).
 
 ## When to use it
 
@@ -59,6 +60,25 @@ assert SequencePartition(4, 1).global_position(3) == 13
 assert attention_partial((1., 1.), rows, value_width=1,
                          query_position=0).output == (2.,)
 ```
+
+## On one GPU
+
+The plugin's device form is this technique within one device, through
+attention-state's device form ([device_attention.py](../attention-state/code/device_attention.py))
+and the registry kernel `crit-labs/paged-kv-attention`: a decode or verify row's
+keys are split into `partitions` partitions (piece `i`, of 16 to 128 positions
+by the head width and page kind, to partition `i mod P`, the interleaved
+ownership above at piece granularity), each partition's partial output and
+log-sum-exp are computed in parallel and
+merged in partition order by the formula above, so a long row's work spreads
+over the GPU and follows its own length (read on the device, so one CUDA graph
+serves every length). `forward(..., lse=True)` also returns each token's
+log-sum-exp, the normalizer a merge across devices needs, and `merge(outs,
+lses)` is `merge_partials` on the device (an empty part, `-inf`, weighs
+nothing). Without the registry kernel the partitions run in torch as one masked
+FP32 softmax per row. Its tests compare it with softmax-attention's device form
+(bit for bit), merged shards of a sequence with the whole, and the host form
+with direct softmax.
 
 ## Adapting it
 

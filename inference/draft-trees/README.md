@@ -58,6 +58,20 @@ places them at `frontier + 0 .. m - 1` without overwriting a row a later move re
 nodes increase). Afterwards the path is set to the identity, so rerunning commit after a
 Core truncation moves nothing.
 
+## On the device inside captured rounds
+
+[device_tree.py](code/device_tree.py) is tree.py's drafting and walk over device tensors (the plugin's `draft:device` and
+`verify:device`): every row's frontier is expanded at once (`head.logits(depth, tokens, view, parents=...)`, the top
+`branch` tokens by (logit desc, id asc) through an exact composite key, log-softmax scores in FP64), the beam and the
+kept nodes ranked by (score desc, index asc), nodes ordered by depth then rank, and PAD nodes under the root when there
+are fewer candidates than nodes. The walk finds the accepted path at once (a node stands when its token is its
+parent's prediction and its parent stands; siblings hold distinct tokens), writes `tree_path` (the rows a KV commit
+keeps, and the logits rows each emitted token's log-probability is read from) and rewrites the round's predictions in
+path order, so what the driver reads by column afterwards (a truncation, the result block) is the path's. Its buffers
+(parents, depths, path) are the plugin's own, reserved once. The verify pass needs ancestor masks in attention (`attention:tree`); in a sampled round each node predicts
+the target's own draw at its depth (token-sampling's `predictions_device` over `view.tree_depths`). draft_tree.cu's kernels (over
+device-speculative-round's control block) are not needed by it.
+
 ## What the code supplies
 
 | File | Supplies |

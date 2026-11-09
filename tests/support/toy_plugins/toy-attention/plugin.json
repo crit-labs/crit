@@ -1,0 +1,15 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "toy-attention",
+  "title": "Toy softmax attention",
+  "fills": [
+    "attention"
+  ],
+  "needs": [
+    "kv:toy-rows"
+  ],
+  "devices": [
+    "cpu"
+  ],
+  "entry": "plugin.py:create"
+}

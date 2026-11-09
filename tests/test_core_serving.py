@@ -12,7 +12,6 @@ for _folder in ("core/python", "api", "cli", "tests"): sys.path.insert(0, str(RO
 from core_text_fixtures import QWEN3, llama_files, write_files  # noqa: E402
 from test_core_markers import marked_tokenizer  # noqa: E402
 from test_core_tools import BRACKET, XML_TEMPLATE  # noqa: E402
-from crit.run.store import serving_gaps  # noqa: E402
 from crit_api.engine import reply  # noqa: E402
 from crit_api.logprobs import completion_logprobs  # noqa: E402
 from crit_core.constraints import ByteGrammar, GrammarState, byte_vocabulary, matches  # noqa: E402
@@ -54,6 +53,13 @@ class ResidentChatTests(unittest.TestCase):
         self.model = write_files(Path(temp.name) / "model", llama_files(**{"chat_template.jinja": TEMPLATE}))
         self.plain = write_files(Path(temp.name) / "plain", llama_files())
         self.context = types.SimpleNamespace(configuration={"batch": 1}, limits={"kv_tokens": 4096})
+
+    def test_engines_reopened_on_one_tokenizer_share_its_prompt_token_cache(self):
+        # crit serve reopens a package in the same host (a switch back, Eval's lower-context engine): the reopened
+        # engine finds the prompts encoded before instead of encoding them in full again.
+        first, again = Decoder(self.context, self.model), Decoder(self.context, self.model)
+        self.assertIs(first.text.prompt_tokens, again.text.prompt_tokens)
+        self.assertIsNot(Decoder(self.context, self.plain).text.prompt_tokens, first.text.prompt_tokens)
 
     def test_decode_rounds_from_the_engine_timing_reach_the_telemetry(self):
         engine = Decoder(self.context, self.model)
@@ -457,8 +463,8 @@ class GrammarDecoder(XmlDecoder):
     grammars = True
     forced = "<tool_call>\n<function=read_file>\n<parameter=path>\na.py\n</parameter>\n</function>\n</tool_call>"
 
-    def generate_tokens(self, ids, max_new_tokens, sampling, on_tokens, cancelled, grammar=None):
-        self.grammar = grammar
+    def generate_tokens(self, ids, max_new_tokens, sampling, on_tokens, cancelled, constraint=None):
+        self.grammar = grammar = None if constraint is None else constraint["grammar"]
         if grammar is None:
             return super().generate_tokens(ids, max_new_tokens, sampling, on_tokens, cancelled)
         reply = self.text.tokenizer.encode(self.forced, add_special_tokens=False)
@@ -527,6 +533,49 @@ class ForcedCallTests(unittest.TestCase):
                                                                      tool_format=engine.tool_format))
                 with self.assertRaisesRegex(RequestRejected, "tool_choice must be auto or none"):
                     engine.generate(request(tools=TOOLS, tool_choice="required"), threading.Event())
+
+
+class StructuredDecoder(Decoder):
+    """Keeps its reply to a request's response_format (constraints): it records the constraint it was given and
+    writes `reply`."""
+    grammars = constraints = True
+    reply = '{"ok": true}'
+
+    def generate_tokens(self, ids, max_new_tokens, sampling, on_tokens, cancelled, constraint=None):
+        self.constraint = constraint
+        reply = self.text.tokenizer.encode(self.reply, add_special_tokens=False)
+        on_tokens(reply + [1])
+        return reply + [1], {"prefill_ms": 2.0, "decode_ms": 3.0, "first_token_ms": 2.5}
+
+
+class StructuredOutputTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.model = write_files(Path(temp.name) / "model", llama_files(**{"chat_template.jinja": TEMPLATE}))
+        self.context = types.SimpleNamespace(configuration={}, limits={"kv_tokens": 4096})
+
+    def test_a_response_format_reaches_the_decoder_as_its_constraint(self):
+        engine = StructuredDecoder(self.context, self.model)
+        capable = capabilities(engine.text, Decoder.sampling, grammars=True, constraints=True)
+        self.assertTrue({"chat-constraints-v1", "chat-constraints-grammar-v1"} <= set(capable))
+        self.assertNotIn("chat-constraints-v1", capabilities(engine.text, Decoder.sampling, grammars=True))
+        schema = {"type": "json_schema", "name": "r", "schema": {"type": "object"}, "grammar": "g"}
+        for constraint in ({"type": "json_object"}, schema):
+            self.assertEqual(engine.generate(request(response_format=constraint), threading.Event())["assistant"],
+                             StructuredDecoder.reply)
+            self.assertEqual(engine.constraint, constraint)
+        engine.generate(request(response_format={"type": "text"}), threading.Event())
+        self.assertIsNone(engine.constraint)
+        # A reply is kept to one constraint: forced calls bring their own grammar.
+        with self.assertRaisesRegex(RequestRejected, "a response_format or to forced calls, not both"):
+            engine.generate(request(response_format={"type": "json_object"}, tools=TOOLS, tool_choice="required"),
+                            threading.Event())
+
+    def test_an_engine_without_constraints_refuses_a_response_format(self):
+        with self.assertRaisesRegex(RequestRejected, "keeps no reply to a response_format"):
+            Decoder(self.context, self.model).generate(request(response_format={"type": "json_object"}),
+                                                        threading.Event())
 
 
 class LogprobDecoder(Decoder):
@@ -753,21 +802,21 @@ class ThinkingBudgetTests(unittest.TestCase):
         self.assertNotIn("chat-thinking-budget-v1", capabilities(think, reasoning_format=False))
 
 
-class PackageGapTests(unittest.TestCase):
-    def test_resident_packages_need_temperature_and_tools_when_the_template_teaches_them(self):
+class PackageCapabilityTests(unittest.TestCase):
+    def test_every_engine_applies_core_sampling_and_serves_tools_when_the_template_teaches_them(self):
+        """What a package serves is Core's to say (crit_core.engine.capabilities): every engine applies a request's
+        temperature, and calls tools when the model's chat template teaches a call format crit parses."""
+        from crit_core.engine import capabilities as package_capabilities
+        from support.engines import write_package
         with tempfile.TemporaryDirectory() as temp:
             tools = write_files(Path(temp) / "tools", llama_files(**{"chat_template.jinja": TEMPLATE}))
             plain = write_files(Path(temp) / "plain", llama_files())
-            resident = ["chat-json-v1", "chat-resident-v1"]
-            self.assertEqual(serving_gaps(["prefill", "decode"], tools), [])
-            self.assertEqual(serving_gaps(resident + ["chat-sampling-temperature-v1"], plain), [])
-            self.assertEqual(len(serving_gaps(resident, plain)), 1)
-            gaps = serving_gaps(resident + ["chat-sampling-temperature-v1"], tools)
-            self.assertEqual(len(gaps), 1)
-            self.assertIn("chat-tools-v1", gaps[0])
-            for parsed in ("chat-tools-v1", "chat-tool-template-v1"):   # the second: packages sealed before
-                self.assertEqual(serving_gaps(resident + ["chat-sampling-temperature-v1", parsed], tools), [])
-            self.assertEqual(serving_gaps(resident + ["chat-sampling-temperature-v1"], Path(temp) / "model.gguf"), [])
+            package = write_package(Path(temp) / "package")
+            taught, untaught = package_capabilities(package, tools), package_capabilities(package, plain)
+            for found in (taught, untaught):
+                self.assertIn("chat-sampling-temperature-v1", found)
+            self.assertIn("chat-tools-v1", taught)
+            self.assertNotIn("chat-tools-v1", untaught)
 
 
 if __name__ == "__main__":

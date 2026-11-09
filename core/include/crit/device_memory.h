@@ -3,8 +3,12 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <vector>
 
 // Host protocol of shared device allocations and mapped sources: leases over one physical allocation charged once
@@ -67,6 +71,62 @@ private:
 };
 // Services destroyed while holding allocations whose release failed; those allocations and charges stay retained.
 std::size_t quarantined_buffer_services() noexcept;
+
+// A fixed buffer plan: every device buffer an engine needs, named and sized once at load, packed into one allocation
+// with a scratch region and as many equal slots (cache pages, expert slots) as the rest of the budget holds after a
+// reserve. Allocating once lets an engine run with no framework allocator, whose temporaries need headroom, so the
+// reserve shrinks to what lies outside the plan (the driver, captured graphs). Memory a smaller plan no longer needs (a
+// lower context's KV pages, say) becomes slots when the engine plans again. Pure arithmetic; BufferArena allocates it.
+struct BufferRequest {
+    std::string name;
+    std::size_t bytes = 0;
+    std::size_t alignment = 256;
+};
+struct PlannedBuffer {
+    std::string name;
+    std::size_t offset = 0, bytes = 0;
+};
+struct BufferBudget {
+    std::size_t available = 0;      // device bytes the engine may use (free memory or its Resources limit, the smaller)
+    std::size_t reserve = 0;        // left outside the plan: the driver, captured graphs, anything not planned
+    std::size_t scratch_bytes = 0;  // a per-step bump region (Arena), sized from its measured peak
+    std::size_t slot_bytes = 0;     // 0: no slots
+    std::size_t slot_alignment = 256;
+    std::size_t min_slots = 0, max_slots = (std::numeric_limits<std::size_t>::max)();
+};
+struct BufferPlan {
+    std::vector<PlannedBuffer> buffers;   // in request order
+    std::size_t scratch_offset = 0, scratch_bytes = 0;
+    std::size_t slots_offset = 0, slot_bytes = 0, slot_stride = 0, slots = 0;
+    std::size_t total_bytes = 0;    // the one allocation
+    std::size_t reserve_bytes = 0;
+    std::size_t unused_bytes = 0;   // available - reserve - total: under one slot unless max_slots bound
+    // Throws std::out_of_range for an unknown name.
+    const PlannedBuffer& buffer(std::string_view name) const;
+};
+// Fixed buffers in request order, each at its alignment; then the scratch region; then the slots. Throws
+// std::invalid_argument for an empty or repeated name, a zero-byte buffer or an alignment that is not a power of two,
+// and std::runtime_error naming the shortfall when the buffers, scratch and min_slots do not fit available - reserve.
+BufferPlan plan_buffers(std::span<const BufferRequest>, const BufferBudget&);
+
+// One BufferService allocation laid out by a plan, charged once. buffer(name) and slot(i) are views into it; scratch()
+// is an Arena over the scratch region that the engine rewinds per step (mark/rewind; peak() sizes the next plan).
+// close() gives the allocation back through its lease.
+class BufferArena {
+public:
+    BufferArena(BufferService&, BufferPlan);
+    std::span<std::byte> buffer(std::string_view name) const;
+    std::span<std::byte> slot(std::size_t i) const;   // throws std::out_of_range past slots()
+    std::size_t slots() const noexcept { return plan_.slots; }
+    Arena& scratch();                                 // throws std::logic_error for a plan without scratch
+    const BufferPlan& plan() const noexcept { return plan_; }
+    void* data() const;
+    void close();
+private:
+    BufferPlan plan_;
+    BufferLease lease_;
+    std::optional<Arena> scratch_;
+};
 
 // One backend-reported host range and its actual device alias. The owner keeps the registration alive.
 struct MappedSpan {

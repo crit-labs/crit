@@ -28,7 +28,7 @@ from crit.records import GIB, digest, file_sha, inventory, now, read_json, safe_
 from crit.run.store import ROOT
 
 from . import requirements as machine
-from .store import ENTRY, INSTALL, MANIFEST, InstallStore, checkpoint_folder, engine_id
+from .store import INSTALL, MANIFEST, PLUGINS, InstallStore, checkpoint_folder, engine_id
 
 INDEX = "https://crit-hub.dev/index.json"
 BUILD_SECONDS = 1800
@@ -73,7 +73,7 @@ def read_card(engine, hub=None, index=None):
         raise ValueError(f"{engine}'s card and lock must be objects")
     if card.get("origin") != "crit":
         raise ValueError(f"{engine} was built with another toolkit (origin: {card.get('origin')}); crit pull installs "
-                         "engines exported from crit, whose source has a crit serve adapter")
+                         "engines exported from crit, which are plugin packages")
     check_source(card, f"{engine}'s card")
     if not isinstance(lock.get("checkpoints"), dict) or not lock["checkpoints"]:
         raise ValueError(f"{engine}'s card.lock.json lists no checkpoint files")
@@ -405,9 +405,10 @@ def pull(engine, store, project=ROOT, hub=None, index=None, checkout=None, model
         source = staging / "source"
         source.mkdir()
         unpack(fetch_source(card["source"], store, checkout), card["source"].get("path"), source)
-        if not (source / "engine" / ENTRY).is_file():
+        if not (source / "engine" / PLUGINS).is_dir():
             raise ValueError(f"{card['source']['repository']} at {card['source']['revision'][:12]} holds no "
-                             f"{card['source'].get('path') or '.'}/engine/{ENTRY}: not a crit engine export")
+                             f"{card['source'].get('path') or '.'}/engine/{PLUGINS}/: not a crit engine export, which "
+                             "is a plugin package")
         shutil.copytree(source / "engine", package)
         for notice in ("THIRD_PARTY.md", "LICENSES.txt"):
             if (source / notice).is_file():
@@ -434,13 +435,16 @@ def pull(engine, store, project=ROOT, hub=None, index=None, checkout=None, model
             build(package, command, folder / "logs" / "build.log", build_seconds)
         files = inventory(package)
         outputs = [row["path"] for row in files if sources.get(row["path"]) != row["sha256"]]
-        from crit.run.build import adapter_capabilities
-        capabilities = adapter_capabilities(package, ENTRY, str(store.root / model_folder))
+        from crit_core.engine import check_package
+        from crit_plugins import PluginError
+        try:
+            check_package(package, store.root / model_folder, configuration)
+        except PluginError as exc:
+            raise ValueError(f"{engine} is no engine Core can load: {exc}") from None
         for cache in sorted(package.rglob("__pycache__"), reverse=True):
             shutil.rmtree(cache)
         files = inventory(package)
         manifest = {"schema_version": 1, "record_kind": "installed_package", "engine": engine, "files": files,
-                    "launch": [ENTRY], "capabilities": capabilities,
                     "build": ({"command": command, "outputs": outputs} if command else
                               {"artifact": built["artifact"], "outputs": outputs} if built else None),
                     "configuration_sha256": digest(configuration)}
@@ -482,7 +486,7 @@ def parser():
     """The arguments of crit pull (crit mcp offers its tools from them)."""
     parser = argparse.ArgumentParser(prog="crit pull", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("engine", nargs="?", metavar="OWNER/NAME", help="The crit-hub engine, such as crit-labs/nvfp4-gemv-int8kv")
+    parser.add_argument("engine", nargs="?", metavar="OWNER/NAME", help="The crit-hub engine, as OWNER/NAME")
     parser.add_argument("--hub", type=Path, help="Read the card from this crit-hub checkout (default: crit-hub's index.json)")
     parser.add_argument("--index", help=f"crit-hub's index.json, a URL or file (default: {INDEX})")
     parser.add_argument("--engines", type=Path, metavar="CHECKOUT",

@@ -1,10 +1,17 @@
-"""device-speculative-round's Python driver (python_round.py) and adaptive width rule (width_policy.py): batched rounds
+"""Core's round driver over an engine's own hooks (crit_plugins.rounds.SpeculativeRounds) with device-speculative-round's
+pieces (python_round.py: rejection sampling, copied drafts) and adaptive width rule (width_policy.py): batched rounds
 over a toy target with two different drafters decode exactly what plain greedy decoding does, at any widths, through
 stops, output limits, truncations and row changes; replay and forced rounds follow a fixed text; sampled rounds keep
 the target's distribution; and captured CUDA graphs give the eager rounds' tokens."""
+import os
+from pathlib import Path
+import sys
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
-from test_techniques import load
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core" / "python"))   # Core's runtime, for native rounds
+from test_techniques import load  # noqa: E402
+from crit_plugins.rounds import SpeculativeRounds  # noqa: E402
 
 try:
     import torch
@@ -136,13 +143,13 @@ class PythonRoundTests(unittest.TestCase):
             for widths in ([0], [1], [4], [3, 0, 6, 2, 5]):
                 with self.subTest(drafter=drafter, widths=widths):
                     toy = Toy(4, 6, "cpu", drafter)
-                    rounds = self.m.SpeculativeRounds(toy, 4, 6, "cpu")
+                    rounds = SpeculativeRounds(toy, 4, 6, "cpu")
                     outputs, _ = self.decode(toy, rounds, prompts, counts, widths)
                     self.assertEqual(outputs, [plain(p, c) for p, c in zip(prompts, counts)])
 
     def test_a_good_drafter_emits_several_tokens_per_round_and_the_policy_widens(self):
         toy = Toy(1, 8, "cpu")
-        rounds = self.m.SpeculativeRounds(toy, 1, 8, "cpu")
+        rounds = SpeculativeRounds(toy, 1, 8, "cpu")
         policy = self.policy.WidthPolicy([1, 2, 4, 8], base_ms=10.0, step_ms=0.5)
         outputs, cycles = self.decode(toy, rounds, [[3, 1, 4]], [200], policy)
         self.assertEqual(outputs, [plain([3, 1, 4], 200)])
@@ -154,7 +161,7 @@ class PythonRoundTests(unittest.TestCase):
         reference = [plain(p, 60) for p in prompts]
         stop = reference[0][17]   # a token the first row predicts mid-round
         toy = Toy(3, 5, "cpu")
-        rounds = self.m.SpeculativeRounds(toy, 3, 5, "cpu")
+        rounds = SpeculativeRounds(toy, 3, 5, "cpu")
         outputs, _ = self.decode(toy, rounds, prompts, [60, 1, 12], [5], stops=[stop])
         self.assertEqual(outputs, [plain(p, c, [stop]) for p, c in zip(prompts, [60, 1, 12])])
         self.assertEqual(outputs[0][-1], stop)
@@ -162,13 +169,13 @@ class PythonRoundTests(unittest.TestCase):
     def test_a_truncation_keeps_fewer_tokens_and_decoding_continues_exactly(self):
         prompts = [[2, 7, 1], [8, 2]]
         toy = Toy(2, 4, "cpu")
-        rounds = self.m.SpeculativeRounds(toy, 2, 4, "cpu")
+        rounds = SpeculativeRounds(toy, 2, 4, "cpu")
         outputs, _ = self.decode(toy, rounds, prompts, [30, 30], [4], truncate={1: 1, 3: 2, 4: 0})
         self.assertEqual(outputs, [plain(p, 30) for p in prompts])
 
     def test_rows_move_and_release_between_rounds(self):
         toy = Toy(3, 3, "cpu")
-        rounds = self.m.SpeculativeRounds(toy, 3, 3, "cpu")
+        rounds = SpeculativeRounds(toy, 3, 3, "cpu")
         prompts = [[1], [2], [3]]
         out = [[toy.prefill(slot, p)] for slot, p in enumerate(prompts)]
         for slot, p in enumerate(prompts):
@@ -195,7 +202,7 @@ class PythonRoundTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 toy = Toy(1, 4, "cpu")
                 toy.prefill(0, prompt)
-                rounds = self.m.SpeculativeRounds(toy, 1, 4, "cpu", continuation=40)
+                rounds = SpeculativeRounds(toy, 1, 4, "cpu", continuation=40)
                 outputs, cycles = self.decode(toy, rounds, [prompt], [30], [4], mode=mode, continuations=[text])
                 self.assertEqual(outputs, [text[:30]])
                 if mode == "forced":
@@ -207,10 +214,11 @@ class PythonRoundTests(unittest.TestCase):
         class Scored(Toy):
             def verify(self, view):
                 super().verify(view)
-                view.logprobs[:, :view.width + 1] = -view.predictions[:, :view.width + 1].float()
+                if view.logprobs is not None:   # the log-probability form
+                    view.logprobs[:, :view.width + 1] = -view.predictions[:, :view.width + 1].float()
         toy = Scored(1, 3, "cpu")
-        rounds = self.m.SpeculativeRounds(toy, 1, 3, "cpu", logprobs=True)
-        rounds.start_row(0, 2, toy.prefill(0, [1, 2]), 10)
+        rounds = SpeculativeRounds(toy, 1, 3, "cpu", logprobs=True)
+        rounds.start_row(0, 2, toy.prefill(0, [1, 2]), 10, logprobs=True)
         rounds.launch(1, 3)
         found = rounds.read()[0]
         self.assertEqual(found["logprobs"], [-float(t) for t in found["tokens"]])
@@ -252,7 +260,7 @@ class PythonRoundTests(unittest.TestCase):
                     probs, view.drafts[:, :view.width], probs[:, :view.width], torch.full((view.rows, view.width), 0.99),
                     torch.full((view.rows, cols), 0.5))
         toy = Sampled(2, 3, "cpu")
-        rounds = m.SpeculativeRounds(toy, 2, 3, "cpu")
+        rounds = SpeculativeRounds(toy, 2, 3, "cpu")
         for slot, prompt in enumerate([[1, 2, 3], [4]]):
             rounds.start_row(slot, len(prompt), toy.prefill(slot, prompt), 12)
         rounds.launch(2, 3, "sampled")
@@ -289,7 +297,7 @@ class PythonRoundTests(unittest.TestCase):
         for matched, slower in ((8, False), (2, True)):
             toy = Copying(2, width, "cpu", drafter="ngram")
             copies = m.CopyDrafts(2, width, "cpu", threshold=4)
-            rounds = m.SpeculativeRounds(toy, 2, width, "cpu")
+            rounds = SpeculativeRounds(toy, 2, width, "cpu")
             outputs = []
             for slot, prompt in enumerate(prompts):
                 rounds.start_row(slot, len(prompt), toy.prefill(slot, prompt), counts[slot] - 1)
@@ -345,7 +353,7 @@ class PythonRoundTests(unittest.TestCase):
         for graphs in (False, True):
             toy = Toy(3, 6, "cuda")
             toy.reset_capture = lambda saved=toy.snapshot(), toy=toy: toy.restore(saved)
-            rounds = self.m.SpeculativeRounds(toy, 3, 6, "cuda")
+            rounds = SpeculativeRounds(toy, 3, 6, "cuda")
             for slot, prompt in enumerate(prompts):
                 rounds.start_row(slot, len(prompt), toy.prefill(slot, prompt), counts[slot] - 1)
             if graphs:
@@ -362,6 +370,43 @@ class PythonRoundTests(unittest.TestCase):
         self.assertEqual(results[False], [plain(p, c) for p, c in zip(prompts, counts)])
 
     @unittest.skipIf(torch is None or not torch.cuda.is_available(), "no CUDA device")
+    def test_a_capture_collects_dead_cycles_first_and_none_while_it_records(self):
+        # A dead cycle holding pinned host memory a stream used (an engine closed before): collected while a round is
+        # captured, it left torch's host cache unable to flush at the next capture (CUDA's invalid argument).
+        import gc
+        import weakref
+        from crit_plugins.rounds import capture_stream
+        seen = []
+
+        class Watched(Toy):
+            def verify(self, view):
+                if torch.cuda.is_current_stream_capturing():
+                    seen.append(gc.isenabled())
+                super().verify(view)
+
+        class Cycle:
+            pass
+        dead = Cycle()
+        dead.me, dead.pinned = dead, torch.zeros(64, pin_memory=True)
+        with torch.cuda.stream(capture_stream(torch.device("cuda"))):
+            dead.pinned.copy_(torch.ones(64, device="cuda"), non_blocking=True)
+        torch.cuda.synchronize()
+        freed = []
+        weakref.finalize(dead, freed.append, True)
+        del dead
+        toy = Watched(1, 2, "cuda")
+        toy.reset_capture = lambda saved=toy.snapshot(), toy=toy: toy.restore(saved)
+        rounds = SpeculativeRounds(toy, 1, 2, "cuda")
+        rounds.start_row(0, 2, toy.prefill(0, [1, 2]), 8)
+        rounds.capture(1, 2, "greedy")
+        self.assertEqual(freed, [True], "dead cycles are collected before the capture")
+        self.assertEqual(seen, [False], "and none while it records")
+        self.assertTrue(gc.isenabled())
+        rounds.capture(1, 1, "greedy")   # the next capture flushes the host cache
+        rounds.launch(1, 1)
+        self.assertIn(len(rounds.read()[0]["tokens"]), (1, 2))
+
+    @unittest.skipIf(torch is None or not torch.cuda.is_available(), "no CUDA device")
     def test_captured_rounds_apply_copied_drafts_staged_after_capture(self):
         """CopyDrafts.apply inside a captured round reads what set() staged in pinned memory before each replay."""
         m = self.m
@@ -376,7 +421,7 @@ class PythonRoundTests(unittest.TestCase):
                     super().draft(view)
                     copies.apply(view)
             toy = Copying(2, width, "cuda", drafter="ngram")
-            rounds = m.SpeculativeRounds(toy, 2, width, "cuda")
+            rounds = SpeculativeRounds(toy, 2, width, "cuda")
             for slot, prompt in enumerate(prompts):
                 rounds.start_row(slot, len(prompt), toy.prefill(slot, prompt), counts[slot] - 1)
             if graphs:
@@ -432,3 +477,104 @@ class WidthPolicyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(torch is None or not torch.cuda.is_available() or not os.environ.get("CRIT_CORE_STEP_LIBRARY"),
+                 "native rounds need CUDA and Core's crit_core_steps (CRIT_CORE_STEP_LIBRARY)")
+class NativeRoundTests(unittest.TestCase):
+    """A toy step model over SpeculativeRounds served by Core's step engine: with native rounds Core runs every decode
+    step itself (no step() call with decode rows) and the requests decode exactly what the model's own Python rounds
+    and plain greedy decoding give."""
+
+    def serve(self, native):
+        from crit_core.native import StepEngine, StepResult
+        rows, widest, width = 3, 4, 3
+
+        class Session:
+            def __init__(self, request):
+                self.prompt, self.output, self.slot = list(request.prompt), request.output_tokens, None
+
+        class Model:
+            def __init__(self):
+                self.toy = Toy(rows, widest, "cuda")
+                self.rounds = SpeculativeRounds(self.toy, rows, widest, "cuda")
+                for r in range(1, rows + 1):
+                    self.rounds.capture(r, width, "greedy")
+                self.slots, self.decode_steps, self.native = [], 0, None
+
+            def info(self):
+                return {"implementation": "toy native rounds", "vocabulary": V, "context": 4096,
+                        "max_concurrency": rows, "max_row_tokens": widest + 1, "decode_token_work": widest + 1,
+                        "max_batch_tokens": 0}
+
+            def native_rounds(self, library):
+                if not native:
+                    return None
+                self.native = self.rounds.native_rounds(library, [width] * rows)
+                return self.native
+
+            def open(self, request):
+                return Session(request)
+
+            def step(self, scheduled):
+                decode = [r for r in scheduled if r.prefill_complete]
+                results = {}
+                for r in scheduled:
+                    if r.prefill_complete:
+                        continue
+                    s = r.session
+                    s.slot = len(self.slots)
+                    self.slots.append(s)
+                    first = self.toy.prefill(s.slot, s.prompt)
+                    self.rounds.start_row(s.slot, len(s.prompt), first, s.output - 1)
+                    if self.native is not None:
+                        self.native.bind(s.slot, s)
+                    results[id(s)] = StepResult(len(s.prompt), [first], True)
+                if decode:
+                    self.decode_steps += 1
+                    assert sorted(r.session.slot for r in decode) == list(range(len(decode)))
+                    self.rounds.launch(len(decode), width)
+                    found = self.rounds.read()
+                    for r in decode:
+                        results[id(r.session)] = StepResult(0, found[r.session.slot]["tokens"], True)
+                return [results[id(r.session)] for r in scheduled]
+
+            def commit(self, decisions):
+                if self.native is not None:
+                    n, w, ran = self.native.last
+                    if ran:
+                        self.rounds.adopt(n, w)
+
+            def retire(self, session, finish):
+                slot, last = session.slot, len(self.slots) - 1
+                self.rounds.release(slot)
+                if slot != last:   # keep the decoding rows packed at the front
+                    moved = self.slots[last]
+                    self.rounds.move(last, slot)
+                    self.toy.state[slot] = self.toy.state[last]
+                    self.toy.features[slot] = self.toy.features[last]
+                    moved.slot = slot
+                    self.slots[slot] = moved
+                    if self.native is not None:
+                        self.native.bind(slot, moved)
+                self.slots.pop()
+                if self.native is not None:
+                    self.native.unbind(last)
+
+        model = Model()
+        engine = StepEngine(model)
+        prompts, counts = [[1, 2, 3], [4, 5, 6, 7, 8], [9], [10, 11], [12, 13, 14]], [40, 23, 31, 9, 17]
+        try:
+            with ThreadPoolExecutor(len(prompts)) as pool:   # several requests decode in one round
+                outputs = list(pool.map(lambda pc: engine.generate(pc[0], pc[1], stop_tokens=[])[0], zip(prompts, counts)))
+        finally:
+            engine.close()
+        return [list(o) for o in outputs], model.decode_steps, prompts, counts
+
+    def test_native_rounds_decode_without_step_calls_and_match_the_python_rounds(self):
+        python_out, python_steps, prompts, counts = self.serve(native=False)
+        native_out, native_steps, _, _ = self.serve(native=True)
+        self.assertEqual(python_out, [plain(p, c) for p, c in zip(prompts, counts)])
+        self.assertEqual(native_out, python_out)
+        self.assertGreater(python_steps, 10)
+        self.assertEqual(native_steps, 0)

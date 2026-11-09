@@ -7,8 +7,11 @@ the weights. The transforms are post-training quantization (PTQ) and
 decoding. Pruning and quantization-aware distillation will reuse the same workflow and records.
 
 A run allows transformed weights only with `weights_policy: transformable`
-([Run records](../docs/RUN_RECORDS.md#request)), the default of an `as_quantized` run; its
-`quality_budget` is the drift the transform and the engine may spend together. PTQ starts
+([Run records](../docs/RUN_RECORDS.md#request)), the default of a run in quality mode `speed`,
+crit's default; its `quality_budget` is the drift from the checkpoint the transform
+and the engine may spend together. The weights policy and the quality mode are separate choices: the
+policy says what the engine may do to the stored target weights, the mode how much drift it may trade
+for speed. Draft-only weights take any encoding in any run (the stored target verifies every token). PTQ starts
 from an unquantized checkpoint; for one already quantized, an engine re-encodes its 16-bit
 matrices as it loads them instead ([Run records](../docs/RUN_RECORDS.md#request)).
 
@@ -18,7 +21,7 @@ matrices as it loads them instead ([Run records](../docs/RUN_RECORDS.md#request)
 crit models plan --recipe recipe.json --source SOURCE_DIR
 crit models ptq  --recipe recipe.json --source SOURCE_DIR --out OUT_DIR --record transform.json [--calibration data.jsonl]
 crit eval prepare   --model SOURCE_DIR --data DATA_DIR
-crit eval run --url URL --model OUT_DIR --data DATA_DIR --context TOKENS --out result.json
+crit eval run --url URL --model OUT_DIR --data DATA_DIR --context TOKENS --quality-mode MODE --quality-budget JSON --out result.json
 crit models eval --record transform.json --data DATA_DIR --result result.json --evaluation evaluation.json
 crit models verify --record transform.json
 ```
@@ -30,10 +33,11 @@ crit models verify --record transform.json
    source shard under its own name, targets in their export tensors, every other
    tensor and file byte for byte, `config.json` with a compressed-tensors
    `quantization_config`. It writes the `models_transform` record. It needs `torch`
-   and `safetensors`, and `transformers` for GPTQ; with `--device cuda` the GPU must
-   be free of other measurements.
+   and `safetensors`, and `transformers` (`>=5.20,<6`, the `reference` extra) for
+   GPTQ; with `--device cuda` the GPU must be free of other measurements.
 3. **Eval** measures the output in your engine: serve `OUT_DIR` with it on any
-   OpenAI-compatible server and run `crit eval run --url` against data prepared from the
+   OpenAI-compatible server and run `crit eval run --url` (with the run's `--quality-mode` and
+   `--quality-budget`: crit eval's own default mode is `speed`) against data prepared from the
    **source** checkpoint ([Engines behind a server](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md#engines-behind-a-server)),
    whose reference scores `crit eval reference --model SOURCE --data DATA` stored first. Stop
    the server, then `crit models eval` verifies the output and writes the `models_evaluation`
@@ -112,9 +116,10 @@ Most checkpoints ship no draft layer, and the run rules forbid the agent to trai
 the user's transform instead: `crit models drafter` distills a draft head from the target itself,
 records how (recipe, calibration data, seed, hashes, cost, the agreement it reached), and the result
 rides along with the target like a published companion draft model. The target's weights never
-change, so a candidate that verifies every draft with the stored target keeps the target's output
-and declares `weights: as_stored` as before; it records the drafter's transform record with its
-source and names the drafter's `output.manifest_sha256` in its configuration.
+change, so a candidate that verifies every draft with the stored target keeps the target's output.
+The drafter does not change the candidate's `weights`, which the target weights alone decide; the
+candidate records the drafter's transform record with its source and names the drafter's
+`output.manifest_sha256` in its configuration.
 
 ```text
 crit models plan    --recipe drafter.json --source MODEL_DIR

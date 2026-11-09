@@ -1,0 +1,12 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "toy-placement",
+  "title": "Every toy tensor on the device",
+  "fills": [
+    "placement"
+  ],
+  "devices": [
+    "host"
+  ],
+  "entry": "plugin.py:create"
+}

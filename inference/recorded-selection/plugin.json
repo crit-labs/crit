@@ -1,0 +1,26 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "recorded-selection",
+  "title": "Eager, full or partial graph replay chosen from measured offers",
+  "description": "recorded-selection's select_replay: the offer of least run time times expected uses plus its capture cost when not yet captured, among the modes the engine supports, of a compatible phase and identity, padded only where allowed, whose memory fits the free bytes; ties keep the input order. The choices made are kept for the frozen configuration (chosen).",
+  "fills": [
+    "graphs"
+  ],
+  "devices": [
+    "host"
+  ],
+  "options": {
+    "modes": {
+      "type": "str",
+      "default": "eager,full,partial"
+    },
+    "allow_padding": {
+      "type": "bool",
+      "default": false
+    }
+  },
+  "sources": {
+    "replay": "code"
+  },
+  "entry": "plugin.py:create"
+}

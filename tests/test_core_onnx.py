@@ -105,7 +105,7 @@ class OnnxReaderTests(unittest.TestCase):
         with self.assertRaisesRegex(OnnxError, "2 .onnx files; name the one"):
             open_model(self.root / "onnx")
         (self.root / "genai_config.json").write_text("{}")
-        with self.assertRaisesRegex(OnnxError, "onnxruntime-genai's model builder"):
+        with self.assertRaisesRegex(OnnxError, r"a generative ONNX graph \(genai_config\.json beside it\)"):
             open_model(self.root / "model.onnx")
 
     @unittest.skipUnless(HAS_ONNX, "needs onnx")

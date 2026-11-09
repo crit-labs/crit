@@ -3,7 +3,10 @@ from datetime import timedelta
 import unittest
 
 from support.runs import RunFixture
-from crit.run.records import candidate_projection, file_sha, read_json, record, timestamp, write_json
+from crit.run.records import CLOCK_SLACK, candidate_projection, file_sha, read_json, record, timestamp, write_json
+
+# Just past what a step back of the wall clock between two processes may move a record (records.CLOCK_SLACK).
+PAST_SLACK = CLOCK_SLACK + timedelta(microseconds=1)
 
 
 class AttemptFixture(RunFixture):
@@ -72,7 +75,7 @@ class AttemptResultTests(AttemptFixture, unittest.TestCase):
 
     def test_time_and_completion_rules_agree_before_publication_and_on_recovery(self):
         for reservation in self.reservations():
-            before = (timestamp(reservation["reserved_at"], "start") - timedelta(microseconds=1)).isoformat()
+            before = (timestamp(reservation["reserved_at"], "start") - PAST_SLACK).isoformat()
             late = (timestamp(reservation["deadline_at"], "deadline") + timedelta(microseconds=1)).isoformat()
             for changes in ({"ended_at": before}, {"ended_at": "invalid"},
                             {"outcome": "completed", "exit_code": 0, "ended_at": late},
@@ -140,7 +143,7 @@ class AttemptResultTests(AttemptFixture, unittest.TestCase):
 class AttemptReservationTests(AttemptFixture, unittest.TestCase):
     def mutations(self, reservation):
         start = timestamp(reservation["reserved_at"], "start")
-        before = (timestamp(self.view["segment"]["started_at"], "start") - timedelta(microseconds=1)).isoformat()
+        before = (timestamp(self.view["segment"]["started_at"], "start") - PAST_SLACK).isoformat()
         late = (timestamp(self.view["segment"]["deadline_at"], "deadline") + timedelta(microseconds=1)).isoformat()
         return ({"cost": {"unit": "attempt", "amount": 0}}, {"cost": {"unit": "attempt", "amount": True}},
                 {"cost": {"unit": "attempt", "amount": 1.0}}, {"operation": "unknown"},
@@ -230,7 +233,7 @@ class AttemptReservationTests(AttemptFixture, unittest.TestCase):
         candidate = self.candidate()
         self.package(candidate)
         reservation = self.store.reserve(self.run_id, candidate["candidate_id"], "check", 10)
-        before_creation = (timestamp(candidate["created_at"], "created") - timedelta(microseconds=1)).isoformat()
+        before_creation = (timestamp(candidate["created_at"], "created") - PAST_SLACK).isoformat()
         for changes in ({"inputs_manifest_sha256": "0" * 64}, {"package_sha256": "0" * 64},
                         {"reserved_at": before_creation}):
             with self.subTest(changes=changes):

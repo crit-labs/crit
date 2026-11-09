@@ -13,6 +13,8 @@ from crit.run import recon
 from crit.run.cli import main
 from crit.run.records import file_sha, read_json
 from crit.run.store import RunStore
+from support.engines import selection
+from support.runs import with_plugins
 
 THINKING = """{%- for message in messages %}<|im_start|>{{ message.role }}
 {{ message.content }}<|im_end|>
@@ -48,11 +50,10 @@ class ReconTests(unittest.TestCase):
             self.store.freeze_inputs(self.run_id, {"hardware_manifest": {"device": "host"},
                 "environment_manifest": {"benchmark": "synthetic"}, "case_manifests": {"case-0001": [
                     {"path": "captured/input.fixture", "bytes": captured.stat().st_size, "sha256": file_sha(captured)}]}})
-        source = self.root / "source"
-        source.mkdir(exist_ok=True)
+        source = with_plugins(self.root / "source")
         (source / "engine.fixture").write_text("source", encoding="utf-8")
         return self.store.candidate(self.run_id, source, {"label": "Fixture", "rationale": "Recon freezing",
-            "strategy": "Fixture", "configuration": configuration, "store_decisions": {}})
+            "strategy": "Fixture", "configuration": {"plugins": selection(), **configuration}, "store_decisions": {}})
 
     def test_gathers_sampling_stops_template_and_architecture_with_sources(self):
         value = self.store.recon(self.run_id)
@@ -280,7 +281,7 @@ class ReconTests(unittest.TestCase):
         run_id = store.create({"model_path": str(single), "correctness_criteria": "Fixture gates",
                                "budget_minutes": 1, "kv_tokens": 8192})["run"]["run_id"]
         self.store, self.run_id, self.directory = store, run_id, store.directory(run_id)
-        self.assertEqual(self.candidate({"batch": 1})["configuration"], {"batch": 1})
+        self.assertEqual(self.candidate({"batch": 1})["configuration"], {"batch": 1, "plugins": selection()})
 
 
 if __name__ == "__main__":

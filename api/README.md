@@ -2,7 +2,7 @@
 
 `crit_api` is `crit serve`: it loads one sealed candidate engine, keeps it resident and answers
 HTTP requests until stopped. Any OpenAI client can use the engine, and the same engine also speaks
-the Anthropic Messages, OpenAI Responses and Ollama APIs. `crit run ... eval` measures every
+the Anthropic Messages, OpenAI Responses and `/api/chat` APIs. `crit run ... eval` measures every
 candidate through this server, so what Eval reports is what clients get. The full reference is
 [Serving](../docs/SERVING.md).
 
@@ -26,7 +26,7 @@ reply = client.chat.completions.create(model="default", messages=[{"role": "user
 | `POST /v1/completions` | Raw-prompt completions, for engines that declare them |
 | `POST /v1/messages` | The Anthropic Messages API, so Claude Code needs only a base URL |
 | `POST /v1/responses` | The OpenAI Responses API, statelessly, for clients such as Codex |
-| `/api/chat`, `/api/generate`, `/api/tags`, ... | The Ollama API, for local chat UIs |
+| `/api/chat`, `/api/generate`, `/api/tags`, ... | The API local chat UIs look for |
 | `GET /v1/models`, `GET /health`, `GET /metrics` | Served models and their context, readiness, Prometheus metrics |
 | `POST /v1/crit/score`, `/tokenize`, `/v1/crit/abort`, `/v1/crit/load`, `/v1/crit/unload` | Fixed-text scores, the engine's tokenizer, cancelling a request, loading and unloading weights |
 
@@ -53,5 +53,5 @@ stop, timeout, client death or a failed request, the server keeps running, and t
 engine. Requests are admitted up to the engine's capacity
 and queued with bounds ([admission.py](crit_api/admission.py)); each dialect is one module over the same engine
 ([server.py](crit_api/server.py), [anthropic.py](crit_api/anthropic.py), [responses.py](crit_api/responses.py),
-[ollama.py](crit_api/ollama.py)). Engines plug in through the
-[adapter contract](../docs/SERVING.md#adapter-contract).
+[api_chat.py](crit_api/api_chat.py)). Engines plug in through the
+[Core's resident adapter](../docs/SERVING.md#cores-resident-adapter).

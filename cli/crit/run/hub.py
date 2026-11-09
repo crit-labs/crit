@@ -12,7 +12,7 @@ from pathlib import Path
 import shutil
 
 from ..card import CARD, LOCK, NAME, REPOSITORY, check_source, read_folder
-from .records import ORIGIN_DIR, digest, file_sha, safe_path, sha, text
+from .records import ORIGIN_DIR, QUALITY_MODES, digest, file_sha, safe_path, sha, text
 
 
 def describe_engine(folder):
@@ -53,6 +53,9 @@ def describe_engine(folder):
     for result in card["results"] if isinstance(card["results"], list) else []:
         if not isinstance(result, dict):
             continue
+        if result.get("evidence") and result.get("quality_mode") not in QUALITY_MODES:
+            raise ValueError(f"{card_path}: a result states the quality mode it was judged in, quality_mode "
+                             f"{' or '.join(QUALITY_MODES)}; found {result.get('quality_mode')!r}")
         for ref in result.get("evidence") or []:
             if not isinstance(ref, dict) or not isinstance(ref.get("file"), str):
                 raise ValueError(f"{card_path}: evidence entries are {{file, sha256}}")
@@ -63,7 +66,8 @@ def describe_engine(folder):
             if found != sha(ref.get("sha256"), "evidence sha256"):
                 raise ValueError(f"{folder}: evidence {ref['file']} does not match its sha256 in {CARD}")
             evidence.append({"file": ref["file"], "sha256": found, "measured_with": result.get("measured_with"),
-                             "gpu": result.get("gpu"), "model": result.get("model"), "source": str(path)})
+                             "gpu": result.get("gpu"), "model": result.get("model"),
+                             "quality_mode": result["quality_mode"], "source": str(path)})
     return {
         "engine": engine, "title": text(str(card["title"]), "card title", 400), "origin": card["origin"],
         "summary": card.get("summary") if isinstance(card.get("summary"), str) else None,
@@ -91,7 +95,7 @@ def store_evidence(origin, root):
         shutil.copyfile(source, destination)
         if file_sha(destination) != ref["sha256"]:
             raise ValueError(f"{ref['file']} changed while it was copied")
-        stored.append({key: ref[key] for key in ("file", "sha256", "measured_with", "gpu", "model")}
+        stored.append({key: ref[key] for key in ("file", "sha256", "measured_with", "gpu", "model", "quality_mode")}
                       | {"path": f"{ORIGIN_DIR}/{destination.name}"})
     return {**origin, "evidence": stored}
 

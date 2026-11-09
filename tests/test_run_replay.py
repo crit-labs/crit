@@ -81,6 +81,24 @@ class ReplayTests(PlanFixture, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exists: replay into a new folder"):
             self.make()
 
+    def test_files_dated_by_a_wall_clock_that_stepped_back_stay_out(self):
+        # A virtual machine's wall clock steps back by up to a second (WSL's does), while crit dates its records by a
+        # clock that never does: a draft written after the Eval can be dated before its end, and a file written after
+        # the cutoff before the cutoff. Both stay out.
+        limit, _ = replay.cutoff(self.directory, self.parent)
+        draft = self.directory / "work" / "plan-draft.json"
+        stamp = (limit - replay.MARGIN).timestamp() - 1
+        os.utime(draft, (stamp, stamp))
+        late = self.directory / "work" / "late.txt"
+        late.write_text("measured just after the cutoff", encoding="utf-8")
+        stamp = limit.timestamp() - 1
+        os.utime(late, (stamp, stamp))
+        self.make()
+        folder = self.out / "replay-1" / self.run_id
+        self.assertTrue((folder / "work" / "early.txt").is_file())
+        for left in ("work/plan-draft.json", "work/late.txt"):
+            self.assertFalse((folder / left).exists(), left)
+
     def test_a_later_candidates_files_with_older_times_are_left_out_without_its_record(self):
         # A retained source keeps its files' original times, older than the cutoff, while the candidate's record is not.
         source = self.directory / "candidates" / "candidate-0002" / "source"

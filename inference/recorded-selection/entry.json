@@ -3,7 +3,7 @@
   "category": "execution",
   "summary": "Select compatible eager/full/partial replay by measured costs and retain reproducible per-shape implementation choices",
   "implementation_status": "native_source",
-  "implementation_scope": "Python and header-only C++20 recorded choice tables and repeatability checks, plus a portable Python phase/shape/capability/memory replay selector with cold-setup amortization; candidate execution, native capture and costs are engine supplied",
+  "implementation_scope": "Python and header-only C++20 recorded choice tables and repeatability checks, plus a portable Python phase/shape/capability/memory replay selector with cold-setup amortization, and a cuBLASLt binding that pins one recorded split-K-free algorithm per prompt GEMM shape; candidate execution, native capture and costs are engine supplied",
   "agent_guidance": {
     "use_when": "The engine chooses among interchangeable implementations whose rounding differs, or among supported eager/full/partial execution offers with measured costs and memory limits",
     "avoid_when": "Only one execution path is available and reproducible, or replay offers lack trustworthy compatibility identities and costs",
@@ -13,7 +13,8 @@
       "Export of every choice as a flat JSON table for the frozen configuration, and a strict native parser",
       "Out-of-range detection when a recorded index exceeds the current candidate list",
       "Cross-process repeatability runner with first differing JSON path and sequence index, usable as functional-check evidence",
-      "Compatible eager/full/partial selection using measured run/setup costs, memory limits and explicit padding permission"
+      "Compatible eager/full/partial selection using measured run/setup costs, memory limits and explicit padding permission",
+      "Pinned prompt GEMMs in every cuBLASLt prompt format (FP16, BF16 and FP32; FP8 e4m3/e5m2 and mixed pairs, unscaled, per-tensor or per-row scaled; block-scaled MXFP8, MXFP4 and NVFP4; to BF16, FP16 or FP32): one recorded split-K-free cuBLASLt algorithm per shape and format for every row count, recorded row-exact and fastest per row, with faster bit-identical algorithms for short row buckets, refused on another device or cuBLASLt version"
     ],
     "engine_supplies": [
       "Stable candidate lists per key (for example a library heuristic list queried at the bucket width)",
@@ -52,10 +53,18 @@
     {
       "path": "inference/recorded-selection/code/replay.py",
       "purpose": "Backend-neutral eager/full/partial replay choice with complete identities, padding permission, memory feasibility and amortized measured costs"
+    },
+    {
+      "path": "inference/recorded-selection/code/pinned_gemm.py",
+      "purpose": "Records, tables and replays one row-exact split-K-free cuBLASLt algorithm per prompt GEMM shape"
+    },
+    {
+      "path": "inference/recorded-selection/code/pinned_gemm.cpp",
+      "purpose": "cuBLASLt binding: split-K-free heuristic candidates, one plan per recorded algorithm, per-row-count checks and GEMMs in every format: 16-bit, FP32, FP8 with tensor or row scales, block-scaled MXFP8, MXFP4 and NVFP4"
     }
   ],
   "requires": {
-    "hardware": "Python 3.11+ standard library; C++20 standard library for the native table",
+    "hardware": "Python 3.11+ standard library; C++20 standard library for the native table; pinned_gemm needs PyTorch, a C++ compiler and cuBLASLt on a CUDA GPU; its FP8 formats need compute capability 8.9 or later and MXFP8, MXFP4 and NVFP4 10.0 or later, as cuBLASLt offers them",
     "model": "No model or tensor layout requirement",
     "workload": "Any engine that selects among implementations per shape, and any command that can write its result as JSON"
   },
@@ -68,7 +77,8 @@
   },
   "dependencies": [
     "Python standard library",
-    "C++20 standard library for the native table"
+    "C++20 standard library for the native table",
+    "PyTorch with torch.utils.cpp_extension and cuBLASLt for pinned_gemm"
   ],
   "symbols": [
     "bucket",
@@ -81,7 +91,14 @@
     "ExecutionShape",
     "ReplayOffer",
     "ReplayChoice",
-    "select_replay"
+    "select_replay",
+    "gemm_key",
+    "parse_format",
+    "blocked_scales",
+    "GemmTable",
+    "record",
+    "short_buckets",
+    "pinned_mm"
   ],
   "interactions": [
     "quantized-projections"
@@ -90,8 +107,8 @@
     "recorded-selection"
   ],
   "validation": {
-    "host": "Buckets and caps, keys, table validation, tuning ties and unavailable candidates, replay without timing, out-of-range indices, difference reports for values, lengths, types and nested sequences, and fresh-process runs that are identical, different or failing; Replay amortization, phase/identity gates, padding, resident/cold memory limits and partial fallback",
-    "native": "Header-only table: bucket rules, tuning ties, replay without timing, fallback, out-of-range indices, to_json/parse round trip and malformed tables",
+    "host": "Buckets and caps, keys, table validation, tuning ties and unavailable candidates, replay without timing, out-of-range indices, difference reports for values, lengths, types and nested sequences, and fresh-process runs that are identical, different or failing; Replay amortization, phase/identity gates, padding, resident/cold memory limits and partial fallback; pinned GEMM table keys, format parsing, blocked scale layout and padding, file round trip with and without short buckets and device/version refusal",
+    "native": "Header-only table: bucket rules, tuning ties, replay without timing, fallback, out-of-range indices, to_json/parse round trip and malformed tables; pinned GEMMs on CUDA: for every format the GPU takes, rows bit-identical across prompt lengths and close to torch or the FP32 dequantized product; formats the GPU lacks skipped with the reason",
     "performance": "No speed or determinism claim for any candidate; both are the engine's measurements"
   }
 }

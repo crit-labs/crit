@@ -9,7 +9,7 @@ from crit.run.store import ROOT, RunStore
 from .engine import EngineError, ServedEngine
 from .installed import installed_spec
 
-# Names clients send: Ollama tags (name:tag), gateway paths (vendor/name), Vertex versions (name@date); * is a wildcard.
+# Names clients send: /api tags (name:tag), gateway paths (vendor/name), Vertex versions (name@date); * is a wildcard.
 ALIAS = r"[A-Za-z0-9*][A-Za-z0-9._:/@*-]{0,127}"
 
 

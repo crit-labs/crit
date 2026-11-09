@@ -1,0 +1,13 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "eager-graphs",
+  "title": "Every step runs eagerly",
+  "description": "The plain graphs plugin: the first eager offer of the step's exact shape and identity, never a captured graph.",
+  "fills": [
+    "graphs"
+  ],
+  "devices": [
+    "host"
+  ],
+  "entry": "plugin.py:create"
+}

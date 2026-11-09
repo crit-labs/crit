@@ -55,6 +55,18 @@ public:
     // made with SMs on a side stream may only run between the main stream's kernels: measure it before enabling.
     cudaError_t prefetch(int group, const std::int32_t* predicted, int count, int blocks_per_bundle, cudaStream_t side);
 
+    // Background ranked residency (ranked_residency.h). enable_route_counts allocates and clears the route counts
+    // and sizes the swap buffers for max_swaps; the plans then count routes. read_route_counts copies the cumulative
+    // counts ([groups * experts], unsigned, wrapping) into host memory on `stream` (pinned for an asynchronous copy;
+    // the host waits on the stream or an event). begin_swaps (at most max_swaps, a host array) unmaps and reserves
+    // the slots on `main` at a window boundary and copies the bundles on `side`; commit_swaps, at the next boundary,
+    // makes `main` wait for those copies and maps the keys. Call them between captured windows, never inside one.
+    cudaError_t enable_route_counts(int max_swaps, cudaStream_t stream);
+    cudaError_t read_route_counts(std::uint32_t* host, cudaStream_t stream) const;
+    cudaError_t begin_swaps(const Swap* swaps, int count, int blocks_per_bundle, cudaStream_t main, cudaStream_t side);
+    cudaError_t commit_swaps(cudaStream_t main);
+    int pending_swaps() const { return pending_; }
+
     // Reads the counters and the failure flag; synchronizes `stream`, so call it outside capture (between requests,
     // or after a step whose output depends on the flag).
     cudaError_t telemetry(Telemetry& out, cudaStream_t stream) const;
@@ -69,6 +81,11 @@ private:
     Fill* fills_ = nullptr;              // [groups * kMaxRoutes]
     Fill* pool_fills_ = nullptr;         // [2 * pool_slots]
     int* fill_counts_ = nullptr;         // [groups] plans, [groups + 0/1] pool halves
+    Swap* swaps_ = nullptr;              // [max_swaps_]
+    Fill* swap_fills_ = nullptr;         // [max_swaps_]
+    int* swap_count_ = nullptr;
+    cudaEvent_t begun_ = nullptr, copied_ = nullptr;
+    int max_swaps_ = 0, pending_ = 0;
 };
 
 } // namespace crit::techniques::device_cache

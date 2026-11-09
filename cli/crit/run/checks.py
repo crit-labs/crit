@@ -2,8 +2,8 @@
 and the standard serving checks against the packaged candidate (crit run serve --check).
 
 From Eval, each of the run's fixed gates is judged by the Eval gates its criteria name: arithmetic by quality and
-sampling; functional by coverage, repeatable, request_history, prompt_cache, retrieval and lower_context (and
-exactness when the run requires it); resources by capacity and the device memory left free at the required
+sampling; functional by coverage, repeatable, request_history, prompt_cache, retrieval, lower_context and concurrency
+(and exactness when the run requires it); resources by capacity and the device memory left free at the required
 context against the run's VRAM headroom. One check per case and gate cites the retained result.
 """
 import http.client
@@ -12,10 +12,11 @@ import time
 
 from crit_core.serving import LOGPROBS_CAPABILITY, TEMPLATE_KWARGS_CAPABILITY, TOOL_CHOICE_CAPABILITY, TOOLS_CAPABILITY
 
-from .records import digest, file_sha, ident, load_run, now, quality_terms, read_json, safe_path
+from .records import digest, file_sha, ident, load_run, now, quality_mode, quality_terms, read_json, safe_path
 
 GATES = {"arithmetic": ("quality", "sampling"),
-         "functional": ("coverage", "repeatable", "request_history", "prompt_cache", "retrieval", "lower_context")}
+         "functional": ("coverage", "repeatable", "request_history", "prompt_cache", "retrieval", "lower_context",
+                        "concurrency")}
 
 
 def eval_results(folder):
@@ -54,10 +55,15 @@ def from_eval(store, run_id, candidate_id, attempt=None):
     # The terms in force now, every resume's amendment applied: a result from before an amendment is stale.
     latest = max(p.stem for p in (root / "segments").glob("segment-*.json"))
     budget, exactness = quality_terms(run["spec"]["correctness"], amendments(root, latest))
+    mode = quality_mode(run["spec"]["correctness"])
     required = result.get("requirements") or {}
-    if required.get("quality_budget") != budget or required.get("exactness") != exactness:
+    # The mode too: two modes may share a budget, but not their forks, honesty bound and prefill limits. A result
+    # that states no mode is refused with the rest.
+    if (required.get("quality_budget") != budget or required.get("exactness") != exactness
+            or required.get("quality_mode") != mode):
         raise ValueError(f"{path.relative_to(root).as_posix()} ran under quality terms {required}, the run's are "
-                         f"{{'quality_budget': {budget}, 'exactness': '{exactness}'}}: evaluate the candidate again")
+                         f"{{'quality_budget': {budget}, 'exactness': '{exactness}', 'quality_mode': '{mode}'}}: "
+                         "evaluate the candidate again")
     gates = {g["name"]: g for g in (result.get("status") or {}).get("gates", [])}
     verdicts = {}
     for gate, names in GATES.items():

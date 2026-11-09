@@ -1,0 +1,23 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "chain-verifier",
+  "title": "Longest verified prefix of a draft chain, with its correction or bonus token (mtp-decode)",
+  "description": "mtp-decode's verify: drafts are accepted while each equals the target's prediction, then the target's own token follows (the correction, or the bonus after the last draft), bounded by the output allowance and ending after a stop token. Verifies chains only. Inside captured decode rounds the same rule runs for every row on the device (verify:device, mtp-decode's device_verify.py): it writes each row's emitted tokens and counts, and the round driver advances its state and counts acceptance by depth.",
+  "fills": [
+    "verifier"
+  ],
+  "devices": [
+    "host",
+    "cuda"
+  ],
+  "provides": [
+    "verify:device"
+  ],
+  "conflicts": [
+    "draft:tree"
+  ],
+  "sources": {
+    "mtp": "../../mtp-decode/code"
+  },
+  "entry": "plugin.py:create"
+}

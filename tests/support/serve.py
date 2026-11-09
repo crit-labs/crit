@@ -1,12 +1,71 @@
-"""A run with two sealed resident candidates, A (selected) and B, served by a ServedEngine (ServeFixture), and
-the synthetic resident adapter their packages launch (ADAPTER)."""
+"""A run with two sealed resident candidates, A (selected) and B, served by a ServedEngine (ServeFixture), and the
+scripted chat engine (ADAPTER) their resident host runs in place of Core's adapter.
+
+Each package is a plugin package, as crit run requires, and crit serve runs it the one way it runs any engine,
+through Core's loader (crit_core.engine.resident). These tests are about crit serve's HTTP API, host protocol and
+residency, not about an engine, so they run a test double at Core's adapter boundary: the host starts with
+support/hooks on PYTHONPATH, whose sitecustomize makes Core's adapter create the package's engine.py instead (ADAPTER,
+plus a test's adapter_suffix), and crit serve offers the capabilities the fixture names in place of the ones Core
+derives (package_capabilities). The real path, a plugin package through Core's loader behind the HTTP API, is
+tests/test_serve_end_to_end.py, beside tests/test_core_engine.py and tests/core/concurrency_end_to_end_check.py."""
 import json
+from pathlib import Path
 import threading
 import time
 from unittest.mock import patch
 
-from .runs import RunFixture
+from .runs import RunFixture, with_plugins
 from crit_api.engine import EngineError, ServedEngine
+from crit_api.options import serving_capabilities
+
+HOOKS = Path(__file__).with_name("hooks")   # sitecustomize: the scripted engine in the resident host
+SCRIPTED = "engine.py"                      # the package file it creates the engine from
+RECIPE = {"build": {"toolchain": {"fixture": "host-python"}, "dependencies": [], "command": ["fixture"]}}
+
+
+def scripted_serving(test, capabilities):
+    """Serve `test`'s packages with their scripted engine.py (the module docstring), crit serve offering
+    `capabilities` (a list, or a function returning one) for every package, in this process and in the processes of
+    crit's it starts (support/hooks)."""
+    import os
+    path = os.pathsep.join([str(HOOKS)] + ([os.environ['PYTHONPATH']] if os.environ.get('PYTHONPATH') else []))
+    found = capabilities() if callable(capabilities) else capabilities
+    environment = patch.dict('os.environ', {'CRIT_TEST_RESIDENT': SCRIPTED, 'PYTHONPATH': path,
+                                            'CRIT_TEST_CAPABILITIES': json.dumps(list(found))})
+    environment.start()
+    test.addCleanup(environment.stop)
+    offered = capabilities if callable(capabilities) else (lambda: capabilities)
+    for module in ('crit_api.engine', 'crit_api.installed'):
+        patcher = patch(module + '.package_capabilities',
+                        lambda package, model, configuration: serving_capabilities(offered()))
+        patcher.start()
+        test.addCleanup(patcher.stop)
+    # A resident host a test runs in its own process (crit_api.host.Host) creates the scripted engine too.
+    patcher = patch('crit_core.engine.resident', scripted_resident)
+    patcher.start()
+    test.addCleanup(patcher.stop)
+
+
+def scripted_resident(context, package):
+    """The package's scripted engine (its engine.py's create_engine), where Core's loader would assemble it."""
+    import hashlib
+    import importlib.util
+    import sys
+    path = Path(package) / SCRIPTED
+    name = "crit_test_resident_" + hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:16]
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name].create_engine(context)
+
+
+def scripted_package(folder, adapter):
+    """A plugin package whose resident host runs `adapter` as its scripted engine (scripted_serving)."""
+    folder = with_plugins(Path(folder))
+    (folder / SCRIPTED).write_text(adapter, encoding="utf-8")
+    return folder
 
 ADAPTER = r'''
 import json
@@ -120,16 +179,14 @@ class ServeFixture(RunFixture):
     tool_stream = False
     tool_choice = True  # with request_options, declare chat-tool-choice-v1
     fit_output = False  # declare chat-fit-output-v1
-    temperature = True  # declare chat-sampling-temperature-v1, which crit run package requires
+    temperature = True  # declare chat-sampling-temperature-v1
     adapter_suffix = ''
     extra_capabilities = ()
 
-    def package(self, candidate):
-        package = self.root / ('resident-package-' + candidate['candidate_id'])
-        package.mkdir(exist_ok=True)
-        capabilities = ['prefill', 'decode', 'chat-json-v1', 'chat-resident-v1']
+    def capabilities(self):
+        """What the fixture's engine serves (crit serve offers it in place of Core's derived capabilities)."""
+        capabilities = ['chat-json-v1', 'chat-resident-v1']
         capabilities.extend(self.extra_capabilities)
-        adapter = ADAPTER
         if self.stream:
             capabilities.append('chat-stream-v1')
         if self.constraints:
@@ -148,17 +205,25 @@ class ServeFixture(RunFixture):
             capabilities.append('chat-fit-output-v1')
         if self.reported is not None:
             capabilities.append('chat-config-v1')
-            adapter += '\nEngine.effective_configuration = lambda self: %r\n' % (self.reported,)
-        (package / 'engine.py').write_text(adapter + self.adapter_suffix)
-        return self.store.package(self.run_id, candidate['candidate_id'], package,
-            {'build': {'toolchain': {'fixture': 'host-python'}, 'dependencies': [], 'command': ['fixture']},
-             'launch': ['engine.py'], 'capabilities': capabilities})
+        return capabilities
+
+    def package(self, candidate):
+        package = self.root / ('resident-package-' + candidate['candidate_id'])
+        package.mkdir(exist_ok=True)
+        adapter = ADAPTER
+        if self.reported is not None:
+            # Every configuration names its plugins, which the engine applies with the rest.
+            reported = {'plugins': candidate['configuration']['plugins'], **self.reported}
+            adapter += '\nEngine.effective_configuration = lambda self: %r\n' % (reported,)
+        scripted_package(package, adapter + self.adapter_suffix)
+        return self.store.package(self.run_id, candidate['candidate_id'], package, RECIPE)
 
     def setUp(self):
         super().setUp()
         environment = patch.dict('os.environ', {'CRIT_RUNTIME_DIRECTORY': str(self.root / 'runtime-owner')})
         environment.start()
         self.addCleanup(environment.stop)
+        scripted_serving(self, self.capabilities)
         candidate, *_ = self.measured()
         self.a = candidate['candidate_id']
         self.store.seal(self.run_id, self.a, 'completed')

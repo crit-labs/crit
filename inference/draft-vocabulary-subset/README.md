@@ -64,6 +64,14 @@ cutting it to 49,152 and 32,768 rows dropped tokens per round on a long summary
 from 3.54 to 2.83 and 2.38, more than the cheaper head saved. Choose `S` from
 measured rounds with `choose_size`.
 
+## On the device inside captured rounds
+
+The plugin's `draft:device` form keeps the subset as a device tensor the model's device head reads as `head.rows` (the
+head computes only those rows), takes each depth's best subset row (or the sampler's draft draw over them, mapped to
+target ids), and counts the emitted tokens on the device: `commit_round` stages the round's tokens (a truncation's
+second commit overwrites them) and the next round's draft counts them and, every `refresh` rows' rounds, chooses the
+subset again (the `size` most emitted, lower ids first on a tie) in place, with no host between rounds.
+
 ## What the code supplies
 
 - [subset.py](code/subset.py): `choose_subset`, `prior_subset`, `SubsetHead`

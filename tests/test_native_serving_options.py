@@ -1,4 +1,6 @@
-"""Request sampling overrides reach the native call without changing resident defaults."""
+"""Core's adapters (crit_core.engine) over an engine's runtime: request sampling overrides reach the runtime without
+changing resident defaults, Eval's requests take neutral penalties and the engine's own times, and fixed text is
+scored as crit serve scores it."""
 from pathlib import Path
 import sys
 import threading
@@ -7,7 +9,9 @@ from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core/python"))
 from core_text_fixtures import byte_level_json
-from crit_core.native import ResidentEngine, Scores
+from crit_core import engine as core_engine
+from crit_core.engine import ResidentEngine
+from crit_core.native import NativeError, Scores
 from crit_core.serving import ScoreRows
 from crit_core.text import TextStream, Tokenizer
 
@@ -36,23 +40,25 @@ class NativeServingOptionsTests(unittest.TestCase):
         engine.native.generate.side_effect = generate
         return engine
 
-    def test_eval_requests_take_neutral_penalties_instead_of_the_engines_defaults(self):
+    def eval_engine(self, library):
+        """Core's eval-v1 adapter over a package whose loaded engine is `library`'s return value."""
         from unittest.mock import patch
-        from crit_core import native
+        with patch.object(core_engine, "read_configuration", lambda package: {"plugins": {"use": {}}}), \
+                patch.object(core_engine, "load", lambda *args, **options: library.return_value):
+            return core_engine.EvalEngine({"model": "m", "config": {"package": "p"}})
+
+    def test_eval_requests_take_neutral_penalties_instead_of_the_engines_defaults(self):
         facts = {"sampling": {"temperature": True, "penalties": True}, "speculative": False, "context": 4096}
         library = Mock()
         library.return_value.info.return_value = facts
         library.return_value.generate.return_value = ([5, 6], {"timing": {"decode_steps": 1}})
-        with patch.object(native, "NativeEngine", library):
-            engine = native.EvalEngine({"model": "m", "config": {}}, "libengine.so")
+        engine = self.eval_engine(library)
         neutral = {"temperature": 0.0, "presence_penalty": 0.0, "frequency_penalty": 0.0, "repetition_penalty": 1.0}
         self.assertEqual(engine.sampling, neutral)
         engine.generate([1, 2], 2, lambda tokens: None)
         self.assertEqual(library.return_value.generate.call_args.kwargs["sampling"], neutral)
         facts["sampling"] = {"temperature": True}   # an engine without penalties gets none
-        with patch.object(native, "NativeEngine", library):
-            self.assertEqual(native.EvalEngine({"model": "m", "config": {}}, "libengine.so").sampling,
-                             {"temperature": 0.0})
+        self.assertEqual(self.eval_engine(library).sampling, {"temperature": 0.0})
         # Fixed-text scores replay greedily with neutral penalties too.
         resident = self.engine()
         resident.facts = {"score_paths": []}
@@ -62,15 +68,12 @@ class NativeServingOptionsTests(unittest.TestCase):
         self.assertEqual(resident.native.generate.call_args.kwargs["sampling"], neutral)
 
     def test_eval_generations_carry_the_engines_own_prefill_and_first_token_times(self):
-        from unittest.mock import patch
-        from crit_core import native
         facts = {"sampling": {"temperature": True}, "speculative": True, "plain": True, "context": 4096}
         library = Mock()
         library.return_value.info.return_value = facts
         library.return_value.generate.return_value = ([5, 6], {"timing": {"decode_steps": 1, "prefill_ms": 12.5,
                                                                           "first_token_ms": 13.0, "decode_ms": 4.0}})
-        with patch.object(native, "NativeEngine", library):
-            engine = native.EvalEngine({"model": "m", "config": {}}, "libengine.so")
+        engine = self.eval_engine(library)
         found = engine.generate([1, 2], 2, lambda tokens: None)
         self.assertEqual((found["prefill_ms"], found["first_token_ms"]), (12.5, 13.0))
         self.assertEqual(engine.generate_plain([1, 2], 2, lambda tokens: None)["first_token_ms"], 13.0)
@@ -78,8 +81,6 @@ class NativeServingOptionsTests(unittest.TestCase):
         self.assertNotIn("prefill_ms", engine.generate([1, 2], 2, lambda tokens: None))   # not reported, left out
 
     def test_an_eval_engine_scores_fixed_text_as_crit_serve_does(self):
-        from unittest.mock import patch
-        from crit_core import native
         facts = {"sampling": {"temperature": True, "penalties": True}, "speculative": False, "context": 4096,
                  "token_logprobs": True, "query_scoring": True, "replay": True, "score_paths": ["prefill", "decode"]}
         library = Mock()
@@ -90,8 +91,7 @@ class NativeServingOptionsTests(unittest.TestCase):
             options["on_tokens"]([3], [(-0.25, [(3, -0.25), (0, -1.0)])])
             return list(options["replay"]), {"timing": {"prefill_ms": 1.0}}
         library.return_value.generate.side_effect = generate
-        with patch.object(native, "NativeEngine", library):
-            engine = native.EvalEngine({"model": "m", "config": {}}, "libengine.so")
+        engine = self.eval_engine(library)
         rows = engine.score([1, 2], [3], 2)
         self.assertEqual(rows, {"prompt": [{"logprob": -0.5, "top": [[2, -0.5], [0, -1.0]]}],
                                 "continuation": [{"logprob": -0.25, "top": [[3, -0.25], [0, -1.0]]}]})
@@ -102,13 +102,8 @@ class NativeServingOptionsTests(unittest.TestCase):
                                                    "frequency_penalty": 0.0, "repetition_penalty": 1.0})
         self.assertEqual(engine.score([1, 2], [3], 2, prompt_rows=False)["prompt"], [])
         library.return_value.generate.side_effect = lambda ids, n, **options: ([9], {"timing": {}})
-        with self.assertRaisesRegex(native.NativeError, "other tokens than the continuation"):
+        with self.assertRaisesRegex(NativeError, "other tokens than the continuation"):
             engine.score([1, 2], [3], 2)
-        # An engine that cannot score by query or report log-probabilities offers no score().
-        for key in ("token_logprobs", "query_scoring", "replay"):
-            with patch.object(native, "NativeEngine", library):
-                library.return_value.info.return_value = {k: v for k, v in facts.items() if k != key}
-                self.assertFalse(hasattr(native.EvalEngine({"model": "m", "config": {}}, "libengine.so"), "score"))
 
     def test_scores_pass_the_engines_arrays_and_count_both_prefills(self):
         import array

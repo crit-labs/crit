@@ -1,0 +1,32 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "expert-tensors",
+  "title": "Expert weights held as given, in memory",
+  "description": "The plain expert_source: each expert's gate/up and down matrices kept as added. Every experts plugin is compared on it, and an engine whose experts fit in memory needs nothing else. Its bundle store (experts:store): open_store(layout, layers, experts, device, path=None) -> device-expert-cache's BundleStore: every expert's bundle (the experts plugin's layout() and pack()) in host memory the device reads, built by put() into anonymous memory or a file (`path`, or the store_path option; a complete file with the same layout opens without puts), then mapped and registered (read-only where the device allows): region() gives the host bytes and a device view a cache fills its slots from, address() a bundle's device address, read() copies bundles out.",
+  "fills": [
+    "expert_source"
+  ],
+  "devices": [
+    "host"
+  ],
+  "provides": [
+    "experts:source",
+    "experts:store"
+  ],
+  "options": {
+    "store_path": {
+      "type": "str",
+      "default": "",
+      "description": "the file of the bundle store (built once, reopened while its layout holds); empty: anonymous host memory"
+    },
+    "csf_scales": {
+      "type": "str",
+      "default": "",
+      "description": "scale components of the experts plugin's slot layout the store keeps CSF-compressed, with the exception words each bundle holds for each (\"gate_up_scale:256,down_scale:128\"; ModelOpt's encoding, about half the bytes of E4M3 scales): put() encodes them from the slot-layout bundle or takes the checkpoint's (compressed=), the device expert cache rebuilds the slot layout as it fills slots (no CPU tier over such a store); empty: the slot layout as it is"
+    }
+  },
+  "sources": {
+    "cache": "../../device-expert-cache/code"
+  },
+  "entry": "plugin.py:create"
+}

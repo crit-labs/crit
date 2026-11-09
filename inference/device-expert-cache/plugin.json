@@ -1,0 +1,139 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "device-expert-cache",
+  "title": "A device expert cache: the directory on the device under a clock or a ranked policy",
+  "description": "Host form: device-expert-cache's ClockDirectory, the host twin of its device directory, under one of its two policies. clock: a plan pins its resident experts, then admits each miss in route order to the slot the clock hand finds unpinned and unreferenced; admit_quota bounds the misses a plan admits (-1 for all), second_touch admits an expert only on its second miss, and a bypassed miss runs from the store. ranked (RankedPolicy, off the step's critical path): plans admit no misses and count every route; every `period` windows the keys are ranked by decayed route counts and the top ones swapped in, begun at one boundary and committed at the next, and a plan for a layer at or below the previous plan's layer starts a new window. The host form plans at most 32 experts and never more than the slots. Device form (experts:cache): cache(layers, experts, layout, slots, device, source, lend=None) -> ExpertCache: one store tensor of bundle slots on the device, the directory in device tensors, plan(layer, ids) one capture-safe launch per routed layer over a step's routes (duplicates and -1 allowed; misses admitted by the policy, or with cpu_tier sent to the CPU tier as slot -2 by admit_quota, quota_table or second_touch) then one fill launch copying the admitted bundles by SM loads from the store's device address; prompt(layer, ids) never admits (end_prompt() ends a prompt step): long chunks stage every non-resident expert of a layer by the copy engine into a ring of slots, the next layer under the current one, short ones plan their routed misses into ring slots; with lend (a KV pool made with spare bytes) the pool's pages no sequence holds are slots too, reclaimed before KV lands there. The directory's plan and fill are CUDA built at load (directory_ops.cu), torch ops where it does not build (native false: always), the same rule as LayerDirectory bit for bit.",
+  "fills": [
+    "expert_residency"
+  ],
+  "provides": [
+    "experts:residency",
+    "experts:cache"
+  ],
+  "options": {
+    "policy": {
+      "type": "choice",
+      "default": "clock",
+      "choices": [
+        "clock",
+        "ranked"
+      ],
+      "description": "clock: admit misses as they come (admit_quota, second_touch); ranked: swap the experts with the most decayed routes in at window boundaries (decay, period, max_swaps, burst_swaps)"
+    },
+    "slots": {
+      "type": "int",
+      "default": 64,
+      "min": 1
+    },
+    "layers": {
+      "type": "int",
+      "default": 128,
+      "min": 1
+    },
+    "experts": {
+      "type": "int",
+      "default": 512,
+      "min": 1
+    },
+    "admit_quota": {
+      "type": "int",
+      "default": -1,
+      "min": -1
+    },
+    "second_touch": {
+      "type": "bool",
+      "default": false
+    },
+    "decay": {
+      "type": "float",
+      "default": 0.85,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "period": {
+      "type": "int",
+      "default": 3,
+      "min": 1
+    },
+    "max_swaps": {
+      "type": "int",
+      "default": 96,
+      "min": 0
+    },
+    "burst_swaps": {
+      "type": "int",
+      "default": 384,
+      "min": 0
+    },
+    "cpu_tier": {
+      "type": "bool",
+      "default": false,
+      "description": "a CPU half computes the misses the device form does not admit (slot -2): needed for admit_quota, quota_table, second_touch, and for ranked to admit nothing on the step's path"
+    },
+    "quota_table": {
+      "type": "str",
+      "default": "",
+      "description": "device form: the admission quota by a plan's miss count, comma-separated from 0 misses (the last serves larger counts; split.py quota_table), over admit_quota; per token bucket as \"tokens:q0,q1;tokens:q0,...\" (a plan of t tokens reads the largest bucket <= t)"
+    },
+    "ring": {
+      "type": "choice",
+      "default": "borrow",
+      "choices": [
+        "borrow",
+        "fixed"
+      ],
+      "description": "device form: the prompt ring borrowed from the cache's own slots while prompts run (back after a round of decode plans without a prompt), or kept apart"
+    },
+    "ring_slots": {
+      "type": "int",
+      "default": -1,
+      "min": -1,
+      "description": "device form: slots of the prompt ring (-1: twice the experts of a layer, at most half the own slots); at least the experts of a layer for long prompt chunks"
+    },
+    "stage_routes": {
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "description": "device form: a prompt chunk of at least this many routes stages every non-resident expert of a layer by the copy engine (0: as many as the experts of a layer); shorter ones copy their routed misses on the device"
+    },
+    "fill_blocks": {
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "description": "device form: thread blocks of the fill (0: half the multiprocessors; a CSF store's program fill: twice)"
+    },
+    "fill_vector": {
+      "type": "choice",
+      "default": "16",
+      "choices": [
+        "4",
+        "8",
+        "16"
+      ],
+      "description": "device form: bytes a fill thread loads at a time"
+    },
+    "native": {
+      "type": "bool",
+      "default": true,
+      "description": "device form: run the directory's CUDA plan and fill (built at load); false: its torch ops"
+    },
+    "round_rows": {
+      "type": "int",
+      "default": 64,
+      "min": 1,
+      "description": "device form: the rows a round may have (the per-row reads and hits counters count_round adds into the round)"
+    }
+  },
+  "devices": [
+    "cuda"
+  ],
+  "test_with": [
+    "attention-state",
+    "expert-tensors",
+    "ssd-expert-materialization"
+  ],
+  "sources": {
+    "cache": "code"
+  },
+  "entry": "plugin.py:create"
+}

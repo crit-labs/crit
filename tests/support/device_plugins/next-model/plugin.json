@@ -1,0 +1,49 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "next-model",
+  "title": "A Qwen3-Next-layout hybrid MoE decoder on the GPU, over the library's device plugins",
+  "description": "The hybrid engine test's model plugin: a Qwen3NextForCausalLM checkpoint's gated-delta layers through the recurrence slot (the model's causal convolution before it), its gated full-attention layers through the attention and kv_cache slots, and every layer's routed SwiGLU block through the router and experts slots beside its gated shared expert, every matrix in the projections slot, the norms, rotary positions, gated norm, output gate and SiLU product in the norms slot, every step of many sequences one batch.",
+  "fills": [
+    "model"
+  ],
+  "needs": [
+    "model_type:qwen3_next"
+  ],
+  "requires": [
+    "recurrence",
+    "router",
+    "experts",
+    "norms"
+  ],
+  "devices": [
+    "cuda"
+  ],
+  "options": {
+    "concurrency": {
+      "type": "int",
+      "default": 4,
+      "min": 2,
+      "max": 64
+    },
+    "prefill_chunk": {
+      "type": "int",
+      "default": 64,
+      "min": 1,
+      "max": 4096
+    },
+    "context": {
+      "type": "int",
+      "default": 512,
+      "min": 16,
+      "max": 1048576
+    },
+    "widest": {
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 8,
+      "description": "drafts of the widest round the recurrence pool keeps verify rows for (0: decode rows only)"
+    }
+  },
+  "entry": "plugin.py:create"
+}

@@ -144,12 +144,15 @@ void Engine::Impl::publish_group(std::span<const WorkItem> items, std::vector<Ro
         lane.request->phases.step(value.frontier-lane.frontier,value.reused,lane.prefilled,value.prefilled,value.tokens.size());
         lane.frontier=value.frontier; lane.prefilled=value.prefilled;
         if(value.failure) lane.request->failure = value.failure;
+        bool wake;
         {
             std::lock_guard lock(lane.request->mutex);
             lane.request->result.tokens.insert(lane.request->result.tokens.end(),value.tokens.begin(),value.tokens.end());
+            wake = lane.request->streaming;
         }
         trace_buffer.point(TracePhase::publication,lane.key);
-        lane.request->cv.notify_all();
+        // A waiter that takes its tokens only at completion is not woken for each publication.
+        if(wake) lane.request->cv.notify_all();
     }
     for(std::size_t i=0;i<staged.size();++i) if(decisions[i].terminal && !decisions[i].discard) begin_retirement(*staged[i].lane,staged[i].finish);
 }

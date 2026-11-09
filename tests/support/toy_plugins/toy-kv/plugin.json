@@ -1,0 +1,15 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "toy-kv",
+  "title": "Toy KV rows in lists",
+  "fills": [
+    "kv_cache"
+  ],
+  "provides": [
+    "kv:toy-rows"
+  ],
+  "devices": [
+    "cpu"
+  ],
+  "entry": "plugin.py:create"
+}

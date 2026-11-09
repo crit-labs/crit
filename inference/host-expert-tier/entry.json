@@ -1,0 +1,112 @@
+{
+  "id": "host-expert-tier",
+  "category": "experts",
+  "summary": "A ready CPU expert tier: one layer's CPU-computed routed experts in the integer block order (the device's bits), split over a pinned worker pool, served from a host-work-mailbox payload",
+  "implementation_status": "native_source",
+  "implementation_scope": "C++20 ExpertPool (one thread per physical core minus the caller's, pinned on Linux; flat batches with epoch-tagged lock-free claims; spin then sleep) and HostExpertTier (an expert table over bundles read in place, routes grouped by expert in chunks of up to 8 tokens, gate/up rows with the declared SwiGLU and intermediate quantization in one pooled phase, down rows, per-row posts, FP32 inputs quantized per route by each expert's declared quantizer, unweighted per-route rows), the mailbox payloads and crit_tier_serve, a C interface for ctypes; the experts slot's device form on the CPU (cpu_tier.py, bundles.py) over the native tier or host-expert-arithmetic's torch declared order. The device's post and join live in heterogeneous-expert-dispatch.",
+  "agent_guidance": {
+    "use_when": "Experts do not all fit on the device and crit eval probe's CPU expert lane, alone or beside the link, beats copying misses over the link (recon's placement prints both); start candidate 1 on it there",
+    "avoid_when": "Every expert fits on the device, or the probed lane and a measured layer give the CPU no share on the target machine",
+    "provides": [
+      "ExpertPool: one worker per physical core minus the caller's, pinned, flat batches claimed with one compare-and-swap of an epoch-tagged word, spin then yield then sleep, a task's exception rethrown after the batch drains",
+      "HostExpertTier::compute: a layer's CPU routes, each expert's rows read once for all of its tokens (up to 8 a chunk), rows split over the pool, bitwise equal to a serial computation for any pool size, ISA or store layout",
+      "The expert composition declared end to end: host_int's integer rows, swiglu_declared and the intermediate's declared quantizer (E2M1 x 2 or INT8), so the device's kernels give the same bits",
+      "A host-work-mailbox payload of FP32 token rows (route keys and tokens, the rows, room for the outputs: input_layout) and crit_tier_serve, the mailbox handler that serves it",
+      "interleave_matrix for the CPU's store layout, and telemetry: routes, expert chunks, ms per phase, expert bytes read"
+    ],
+    "engine_supplies": [
+      "The experts in pinned host memory (interleaved for the CPU; the device cache's store beside it) with their scale decoders and post factors",
+      "A device kernel that quantizes the layer's input as the tier expects, writes the payload, posts and joins (poll join from measure_joins), and sums the rows with routing weights in plan order",
+      "The CPU share: device-expert-cache admission limits from split.py, fed with this tier's measured layer times and the link's"
+    ],
+    "preserve": [
+      "One declared arithmetic on every processor: integer block rows, swiglu_declared, the declared quantizer",
+      "Per-route unweighted rows, summed on the device in plan order, never a host-side sum over experts",
+      "A core left to the caller (the host loop and the mailbox's service thread); the CPU share from measurement on the target"
+    ],
+    "adapt": [
+      "Rows per task, worker count, pinning and the payload's route capacity",
+      "Expert composition (activation, fused or separate gate/up) as long as the device declares the same"
+    ]
+  },
+  "path": "inference/host-expert-tier/README.md",
+  "code_path": "inference/host-expert-tier/code",
+  "code_files": [
+    {
+      "path": "inference/host-expert-tier/code/expert_pool.h",
+      "purpose": "ExpertPool, PoolOptions and physical_cores"
+    },
+    {
+      "path": "inference/host-expert-tier/code/expert_pool.cpp",
+      "purpose": "Epoch-tagged claims, pinning from sysfs, spin/yield/sleep parking"
+    },
+    {
+      "path": "inference/host-expert-tier/code/host_tier.h",
+      "purpose": "TierExpert, TierBatch, HostExpertTier, the payload layout, interleave_matrix, TierStats"
+    },
+    {
+      "path": "inference/host-expert-tier/code/host_tier.cpp",
+      "purpose": "Routes grouped by expert, the three pooled phases, the payload server"
+    },
+    {
+      "path": "inference/host-expert-tier/code/implementation.py",
+      "purpose": "Python model of the pool's epoch-tagged claim, the tier's chunking and the device's plan-order sum"
+    },
+    {
+      "path": "inference/host-expert-tier/code/tier_capi.cpp",
+      "purpose": "A C interface over the tier and its pool, and crit_tier_serve, the host-work-mailbox handler"
+    },
+    {
+      "path": "inference/host-expert-tier/code/bundles.py",
+      "purpose": "The experts slot's nvfp4 / int4 bundle layout and pack, read in place by the tier"
+    },
+    {
+      "path": "inference/host-expert-tier/code/cpu_tier.py",
+      "purpose": "CpuTier: the expert table over bundles, the native tier or the torch declared order, the mailbox handler's address and payload layout"
+    }
+  ],
+  "requires": {
+    "hardware": "Any CPU host-expert-arithmetic's integer rows run on (AVX-512 VNNI and AVX2 fast paths on x86, scalar elsewhere); a GPU and mapped pinned memory for the mailbox wiring",
+    "model": "Expert-routed models with 4-bit block-scaled experts (NVFP4 or INT4) and a SwiGLU expert",
+    "workload": "Decode and verify rounds whose expert misses measured dispatch gives the CPU"
+  },
+  "contract": {
+    "input": "TierExperts sharing [2 * inter][hidden] and [hidden][inter] (an expert table filled by set_expert, views of bundles the engine keeps), an ExpertPool, and per call a TierBatch (quantized inputs), an InputBatch (FP32 token rows) or a mailbox payload of FP32 rows",
+    "output": "Each route's unweighted expert output row in FP32, bitwise equal to the declared arithmetic computed serially",
+    "ownership": "Views only: the engine owns the experts, the payload and the outputs; the pool's threads live with the pool",
+    "failure": "Mismatched expert shapes, an unsupported ISA, a bad batch geometry or an expert id out of range throw std::invalid_argument; a task's exception is rethrown by the pool after its batch drains",
+    "core_boundary": "No Core change; engines own the pool and the tier beside their mailbox"
+  },
+  "dependencies": [
+    "host-expert-arithmetic's host_int.h integer rows (crit_host_nvfp4)",
+    "C++20 standard library and threads"
+  ],
+  "symbols": [
+    "crit::techniques::host_tier::ExpertPool",
+    "crit::techniques::host_tier::PoolOptions",
+    "crit::techniques::host_tier::physical_cores",
+    "crit::techniques::host_tier::HostExpertTier",
+    "crit::techniques::host_tier::TierExpert",
+    "crit::techniques::host_tier::TierBatch",
+    "crit::techniques::host_tier::TierStats",
+    "crit::techniques::host_tier::interleave_matrix",
+    "crit::techniques::host_tier::InputBatch"
+  ],
+  "interactions": [
+    "host-expert-arithmetic",
+    "host-work-mailbox",
+    "device-expert-cache",
+    "async-expert-contributions",
+    "heterogeneous-expert-dispatch"
+  ],
+  "techniques": [
+    "host-expert-tier",
+    "host-expert-arithmetic",
+    "heterogeneous-expert-dispatch"
+  ],
+  "validation": {
+    "host": "crit_host_expert_tier_tests: a layer of 21 routes over 6 experts equals a serial computation bit for bit for pools of 0, 2 and 5 workers, scalar and the fastest ISA, both store layouts and both intermediate formats; per-row posts and FP32 inputs over 36 configurations; both payloads serve the same bits; 3,000 pools started and stopped, 253,500 batches, each task once in its own batch. Plugin tests: the device form is the declared order per route summed by FMAs in route order, the native tier and the torch path give the same bits, a token alone gives its batched bits, a bundle store read in place equals loaded experts, within the quantization's error of the dense FP64 block",
+    "native": "Built and run on a Ryzen 5 9600 under WSL2 with GCC (AVX-512 VNNI path); the native tier equals the int-block-experts device kernels bit for bit on an RTX 5090 at hidden 2560 / inter 640 for 1, 3 and 8 tokens, on random experts and on real NVFP4 checkpoint experts",
+    "performance": "Ryzen 5 9600, 6 threads, 2.76 MB experts (hidden 2560, inter 640), 6 experts a layer: 0.58 / 0.77 / 0.89 ms a layer at 1 / 2 / 3 tokens an expert, 30 / 23 / 20 GB/s of experts"
+  }
+}

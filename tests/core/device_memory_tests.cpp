@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -327,6 +328,76 @@ void upload_shadow() {
     require(threw && shadow.upload(device_a.data(), slots, copy), "a failed copy is not remembered");
 }
 
+void buffer_plan() {
+    const std::vector<BufferRequest> requests{{"weights", 1000, 256}, {"kv", 4096, 4096}, {"logits", 10, 64}};
+    BufferBudget budget;
+    budget.available = 64 * 1024;
+    budget.reserve = 8 * 1024;
+    budget.scratch_bytes = 300;
+    budget.slot_bytes = 1000;
+    const auto plan = plan_buffers(requests, budget);
+    require(plan.buffer("weights").offset == 0 && plan.buffer("kv").offset == 4096 && plan.buffer("logits").offset == 8192,
+            "buffers in request order at their alignment");
+    require(plan.scratch_offset == 8448 && plan.scratch_bytes == 300 && plan.slots_offset == 8960 && plan.slot_stride == 1024,
+            "scratch after the buffers, slots after the scratch");
+    require(plan.slots == (56 * 1024 - 8960) / 1024 && plan.total_bytes == 8960 + plan.slots * 1024, "the rest becomes slots");
+    require(plan.unused_bytes < plan.slot_stride && plan.total_bytes + plan.unused_bytes + plan.reserve_bytes == budget.available,
+            "available = plan + unused + reserve");
+    // A smaller KV buffer (a lower context) gives its bytes to slots.
+    auto smaller = requests;
+    smaller[1].bytes = 1024;
+    require(plan_buffers(smaller, budget).slots > plan.slots, "freed buffer bytes become slots");
+    budget.max_slots = 3;
+    require(plan_buffers(requests, budget).slots == 3, "max_slots caps the slots");
+    budget.max_slots = std::numeric_limits<std::size_t>::max();
+    budget.min_slots = 1000;
+    rejects<std::runtime_error>([&] { (void)plan_buffers(requests, budget); }, "short by");
+    budget.min_slots = 0;
+    rejects<std::invalid_argument>([&] { (void)plan_buffers(std::vector<BufferRequest>{{"a", 8}, {"a", 8}}, budget); }, "named twice");
+    rejects<std::invalid_argument>([&] { (void)plan_buffers(std::vector<BufferRequest>{{"a", 0}}, budget); }, "no bytes");
+    rejects<std::invalid_argument>([&] { (void)plan_buffers(std::vector<BufferRequest>{{"a", 8, 3}}, budget); }, "power of two");
+    rejects<std::out_of_range>([&] { (void)plan.buffer("missing"); }, "no buffer missing");
+    BufferBudget none;
+    none.available = 4096;
+    const auto plain = plan_buffers(std::vector<BufferRequest>{{"x", 100}}, none);
+    require(plain.slots == 0 && plain.total_bytes == 100 && plain.unused_bytes == 3996, "a plan without slots");
+}
+
+void buffer_arena() {
+    Fixture f;
+    const std::vector<BufferRequest> requests{{"a", 3}, {"b", 5, 16}};
+    BufferBudget budget;
+    budget.available = 8 * 1024;   // the fixture's Resources allow 8 device bytes: charge goes through the service
+    budget.scratch_bytes = 64;
+    budget.slot_bytes = 100;
+    budget.slot_alignment = 128;
+    auto plan = plan_buffers(requests, budget);
+    Resources resources{0, plan.total_bytes};
+    BufferService service{f.backend, resources, Memory::device};
+    BufferArena arena(service, plan);
+    require(f.backend->events == Events{"allocate " + std::to_string(plan.total_bytes)}, "one allocation for the whole plan");
+    require(resources.usage(Memory::device).live == plan.total_bytes, "charged once");
+    auto* base = static_cast<std::byte*>(arena.data());
+    require(arena.buffer("a").data() == base && arena.buffer("b").data() == base + 16 && arena.buffer("b").size() == 5,
+            "buffers are views at their offsets");
+    require(arena.slots() == plan.slots && arena.slot(0).data() == base + plan.slots_offset &&
+                arena.slot(1).data() == base + plan.slots_offset + 128 && arena.slot(1).size() == 100, "slots at their stride");
+    rejects<std::out_of_range>([&] { (void)arena.slot(arena.slots()); }, "past");
+    auto& scratch = arena.scratch();
+    const auto mark = scratch.mark();
+    const auto s = scratch.allocate(40, 16);
+    require(s.data() >= base + plan.scratch_offset && s.data() + 40 <= base + plan.scratch_offset + 64, "scratch in its region");
+    scratch.rewind(mark);
+    rejects<std::runtime_error>([&] { (void)scratch.allocate(65, 1); }, "capacity");
+    arena.close();
+    require(f.backend->events.back() == "release " + std::to_string(plan.total_bytes) && resources.usage(Memory::device).live == 0,
+            "close releases the allocation and its charge");
+    budget.scratch_bytes = 0;
+    BufferArena bare(service, plan_buffers(requests, budget));
+    rejects<std::logic_error>([&] { (void)bare.scratch(); }, "no scratch");
+    bare.close();
+}
+
 int main(int argc, char** argv) {
     try {
         const std::string test = argc > 1 ? argv[1] : "all";
@@ -337,7 +408,8 @@ int main(int argc, char** argv) {
             {"memory_threads", memory_threads}, {"mapped_contiguous", mapped_contiguous},
             {"mapped_discontinuous", mapped_discontinuous}, {"mapped_rejects", mapped_rejects},
             {"mapped_generations", mapped_generations}, {"host_block_pool", host_block_pool},
-            {"memory_upload_shadow", upload_shadow}};
+            {"memory_upload_shadow", upload_shadow}, {"memory_buffer_plan", buffer_plan},
+            {"memory_buffer_arena", buffer_arena}};
         bool found = false;
         for(const auto& [name, run] : tests) if(test == "all" || test == name) {
             run();

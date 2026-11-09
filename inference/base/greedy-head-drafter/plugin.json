@@ -1,0 +1,24 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "greedy-head-drafter",
+  "title": "Greedy chain drafts from the engine's draft head",
+  "description": "The plain drafter: width greedy tokens, each the draft head's best token after the previous ones. The reference a tree drafter equals with one branch. Inside captured decode rounds it drafts the chain over the model's device draft head (draft:head-device): argmax drafts, or in sampled rounds the sampler's draft draws with their laws kept (draft:device, mtp-decode's device_drafts.py): the device form samples its drafts where the host form drafts greedily, both keeping the target's law.",
+  "fills": [
+    "drafter"
+  ],
+  "devices": [
+    "host",
+    "cuda"
+  ],
+  "needs": [
+    "draft:head",
+    "draft:head-device"
+  ],
+  "provides": [
+    "draft:device"
+  ],
+  "sources": {
+    "mtp": "../../mtp-decode/code"
+  },
+  "entry": "plugin.py:create"
+}

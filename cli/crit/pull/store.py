@@ -23,14 +23,15 @@ from crit.records import digest, keys, number, read_json, safe_path, text, verif
 ENGINE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 INSTALL = "install.json"
 MANIFEST = "manifest.json"
-# The adapter module of an engine exported from crit (crit-engines <name>/engine/adapter.py).
-ENTRY = "adapter.py"
+# An engine exported from crit is a plugin package (crit-engines <name>/engine/): its plugins and the configuration
+# whose selection names them, which Core's loader assembles (crit_core.engine).
+PLUGINS = "plugins"
 
 
 def engine_id(value):
     """An installed engine's name, <owner>/<name> as crit-hub names it."""
     if not isinstance(value, str) or not ENGINE.fullmatch(value) or any(p in (".", "..") for p in value.split("/")):
-        raise ValueError(f"Name the engine as <owner>/<name>, as crit-hub does (crit-labs/nvfp4-gemv-int8kv), not {value!r}")
+        raise ValueError(f"Name the engine as <owner>/<name>, as crit-hub does (an account, a slash and the engine's name), not {value!r}")
     return value
 
 
@@ -83,8 +84,11 @@ class InstallStore:
         folder = self.folder(engine)
         package = safe_path(folder, "package")
         manifest = read_json(package / MANIFEST)
-        keys(manifest, {"schema_version", "record_kind", "engine", "files", "launch", "capabilities", "build",
-                        "configuration_sha256"})
+        if "launch" in manifest:
+            raise ValueError(f"{engine} was installed as an engine with an adapter of its own, which crit no longer "
+                             f"runs: an engine is a plugin package now; crit pull {engine} --force installs it again "
+                             "once its crit-hub source is one")
+        keys(manifest, {"schema_version", "record_kind", "engine", "files", "build", "configuration_sha256"})
         if digest(manifest) != install["package"]["sha256"]:
             raise ValueError(f"{engine}'s package manifest is not the one it was installed with; crit pull it again")
         verify_inventory(package, manifest["files"], exclude={MANIFEST})
@@ -112,5 +116,5 @@ class InstallStore:
             drafters.append(str(drafter))
         return dict(run_id="installed", candidate_id=engine, selector=engine, package_sha256=digest(manifest),
                     package_path=str(package), model_path=str(model), model_manifest=rows, configuration=configuration,
-                    launch=manifest["launch"], capabilities=manifest["capabilities"], limits=dict(limits),
+                    limits=dict(limits),
                     drafters=drafters, label=text(install["title"], "engine title", 400))

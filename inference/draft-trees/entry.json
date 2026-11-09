@@ -13,7 +13,8 @@
       "Device tree walk writing device-speculative-round's control block and packed result, so truncation and the single readback work unchanged",
       "Greedy and sampled acceptance with one walk: argmax predictions, or the target's own draws at each node's depth",
       "In-order compaction of accepted rows for contiguous and slot-mapped caches, idempotent after a Core truncation",
-      "A Python reference of every rule and a chain constructor equal to greedy speculation"
+      "A Python reference of every rule and a chain constructor equal to greedy speculation",
+      "Tree drafting and the accept walk for every row of a captured round on the device (code/device_tree.py): exact top-k expansion, beam and kept-node ranking, PAD nodes, the accepted path for a KV commit"
     ],
     "engine_supplies": [
       "The drafter's forward over the beam with its own tree attention",
@@ -39,7 +40,8 @@
   "code_files": [
     {"path": "inference/draft-trees/code/tree.py", "purpose": "Host reference: expansion, EAGLE-2 drafting, tree build, chains, the walk and compaction"},
     {"path": "inference/draft-trees/code/draft_tree.h", "purpose": "Candidate, build and row-array layouts; expand, select, build, tree-accept, compact and settle launch interfaces"},
-    {"path": "inference/draft-trees/code/draft_tree.cu", "purpose": "Reference CUDA kernels for expansion, selection, tree build, the tree walk, compaction and settle"}
+    {"path": "inference/draft-trees/code/draft_tree.cu", "purpose": "Reference CUDA kernels for expansion, selection, tree build, the tree walk, compaction and settle"},
+    {"path": "inference/draft-trees/code/device_tree.py", "purpose": "tree.py's EAGLE-2 expansion, kept tree and accept walk for every row of a captured round in torch, the tree path a KV commit keeps, acceptance by depth"}
   ],
   "requires": {
     "hardware": "CUDA C++20 (sm_80+ reference kernels) and device-speculative-round's greedy_accept.h; Python 3.11+ standard library for the reference",

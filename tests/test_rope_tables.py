@@ -85,7 +85,7 @@ class RopeTableTests(unittest.TestCase):
     def test_rules_without_transformers(self):
         plain = rope_table(config({"rope_theta": 1e4}).rope, 4)
         self.assertEqual(plain, ((1.0, 0.01), 1.0))
-        # A declared attention_factor is the final scale: never multiplied by YaRN's own mscale (SGLang #33558).
+        # A declared attention_factor is the final scale: never multiplied by YaRN's own mscale.
         declared = config(CASES[6][1])
         self.assertEqual(rope_table(declared.rope, 128, declared.max_positions).attention_factor, 1.4852)
         # YaRN without factor uses max_position_embeddings / original_max_position_embeddings.

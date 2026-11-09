@@ -1,0 +1,52 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "ssd-expert-materialization",
+  "title": "Experts read from an immutable file behind a bounded host tier",
+  "description": "ssd-expert-materialization's FileExpertSource: every expert is written once to a file and read back checked against its SHA-256, through the HostExpertTier that keeps recently read experts in host memory (host_bytes, the bytes host-memory admission granted; 0 for none). The file is immutable once read, so every expert is added before the first matrices(). FP64 rows here; an engine stores its checkpoint encoding and decodes it in its kernels. Its bundle store (experts:store): open_store(layout, layers, experts, device, path=None, identity=None) -> FileBundleStore (csf_scales: CSF scales kept compressed), the file tier: every bundle in one file (built by put(), or a complete file with the same layout reopened), read on demand by lookup-table-rows' native row reader (readers threads, the bundles its rows) behind the same bounded host tier; it has no device-readable region, so a device expert cache fills from it with read() on the host (not captured).",
+  "fills": [
+    "expert_source"
+  ],
+  "provides": [
+    "experts:source",
+    "experts:store"
+  ],
+  "reference": [
+    "expert-tensors"
+  ],
+  "test_with": [
+    "experts-reference",
+    "device-expert-cache"
+  ],
+  "options": {
+    "host_bytes": {
+      "type": "int",
+      "default": 1048576,
+      "min": 0
+    },
+    "directory": {
+      "type": "str",
+      "default": ""
+    },
+    "readers": {
+      "type": "int",
+      "default": 16,
+      "min": 1,
+      "max": 256,
+      "description": "threads reading bundles from the store file"
+    },
+    "csf_scales": {
+      "type": "str",
+      "default": "",
+      "description": "scale components of the experts plugin's slot layout the store keeps CSF-compressed, with the exception words each bundle holds for each (\"gate_up_scale:256,down_scale:128\"; ModelOpt's encoding, about half the bytes of E4M3 scales): put() encodes them from the slot-layout bundle or takes the checkpoint's (compressed=), the device expert cache rebuilds the slot layout as it fills slots (no CPU tier over such a store); empty: the slot layout as it is"
+    }
+  },
+  "devices": [
+    "host"
+  ],
+  "sources": {
+    "ssd": "code",
+    "rows": "../lookup-table-rows/code",
+    "cache": "../device-expert-cache/code"
+  },
+  "entry": "plugin.py:create"
+}

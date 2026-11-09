@@ -1,0 +1,67 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "lookup-table-rows",
+  "title": "Lookup-table rows from a file or host memory, gathered for the device",
+  "description": "Host form: lookup-table-rows' RowTable: the table stays on disk as FP32 rows, opened for random access (no read-ahead), the rows a step asks for read with positioned reads in parallel (workers), a hot-row LRU of cache_rows in host memory; within FP32 rounding of the in-memory table. Device form (embeddings:host, rounds:embeddings, prompts:embeddings: a padded prompt bucket's lookup captures like a round's, the padding reading row 0; a captured lookup keeps its buffer set out of the eager ring; a table the Python reader serves is refused through round_problems()): store(rows) keeps a table on the device; open(source, width, dtype, device) keeps it in host memory (a tensor's rows copied once into registered memory, or a file mapped and registered with mapped=True) gathered over the link by torch's index_select, or in files (one or many, rows in id order) read by the native row reader: a persistent pool of `readers` positioned reads, POSIX_FADV_RANDOM, a hot-row cache of prefetch_rows rows that prefetch(ids) fills in the background; lookup(ids) puts the gather on the stream as a host function between a copy of the ids to pinned memory and a copy of the rows to the device, so it captures in a CUDA graph. Rows are bytes as stored: exact.",
+  "fills": [
+    "embeddings"
+  ],
+  "reference": [
+    "memory-table-rows"
+  ],
+  "options": {
+    "workers": {
+      "type": "int",
+      "default": 8,
+      "min": 1
+    },
+    "cache_rows": {
+      "type": "int",
+      "default": 0,
+      "min": 0
+    },
+    "directory": {
+      "type": "str",
+      "default": ""
+    },
+    "readers": {
+      "type": "int",
+      "default": 64,
+      "min": 1,
+      "max": 1024,
+      "description": "device form: threads of the native row reader's positioned reads"
+    },
+    "prefetch_rows": {
+      "type": "int",
+      "default": 262144,
+      "min": 0,
+      "description": "device form: rows the hot-row cache holds (prefetch fills it; 0: no cache, prefetch does nothing)"
+    },
+    "ring": {
+      "type": "int",
+      "default": 4,
+      "min": 1,
+      "max": 64,
+      "description": "device form: buffer sets per lookup size of a file table, used in turn by eager lookups (a lookup's rows stay valid until this many later lookups of its size); each captured lookup (a round, a prompt bucket) keeps one for its graph, so give one more than the captures of a size"
+    },
+    "native": {
+      "type": "bool",
+      "default": true,
+      "description": "device form: the native row reader (built at load); false: Python threads, which a CUDA graph cannot capture"
+    }
+  },
+  "sources": {
+    "table": "code",
+    "memory": "../device-expert-cache/code"
+  },
+  "entry": "plugin.py:create",
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "provides": [
+    "embeddings:host",
+    "rounds:embeddings",
+    "prompts:embeddings"
+  ]
+}

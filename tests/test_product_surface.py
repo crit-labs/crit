@@ -13,7 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "cli"))
 from crit import inference as store
 LAUNCHER = str(ROOT / "tests/run_crit.py")
-PRODUCT_FOLDERS = ("core", "inference", "kernels", "models", "eval", "api", "mcp", "tests", "docs", "cli", ".github")
+PRODUCT_FOLDERS = ("core", "inference", "kernels", "models", "eval", "api", "mcp", "smoke", "tests", "docs", "cli",
+                   ".github")
 
 
 class ProductTests(unittest.TestCase):
@@ -136,39 +137,48 @@ class ProductTests(unittest.TestCase):
             actual = {p.decode() for p in result.stdout.split(b"\0") if p}
             self.assertEqual(actual, set(ignored))
 
-    def test_kernels_json_names_providers_references_and_checks(self):
+    def test_operations_json_states_each_operation_s_contract_and_lists_no_kernels(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.fixture(root)
-            (root / "kernels").mkdir()
-            (root / "kernels/SOURCES.md").write_text("| [FlashInfer](https://example.invalid) | x | y | z |\n", encoding="utf-8")
             (root / "inference/example/code/reference.py").write_text("def ref():\n    return 0\n", encoding="utf-8")
-            good = {"kind": "crit-technique-kernels", "technique": "example", "as_of": "2026-11-02", "evidence": "docs",
-                    "operations": [{"id": "op", "what": "an operation", "verify": "against ref on the target",
-                                    "reference": {"path": "inference/example/code/reference.py", "symbol": "ref"},
-                                    "kernels": [{"provider": "lib:FlashInfer", "call": "f()", "formats": ["bf16"],
-                                                 "archs": ["sm_80"], "shapes": "any"},
-                                                {"provider": "hub:crit-labs/x", "call": "g()", "formats": ["bf16"],
-                                                 "archs": ["sm_80"], "shapes": "any", "published": False}]}]}
-            self.assertEqual(store.check_kernels(root, "example", good), [])
+            good = {"kind": "crit-technique-operations", "technique": "example",
+                    "operations": [{"id": "op", "what": "an operation", "verify": "against ref on the target, within 1e-5",
+                                    "invariance": "a row's bits independent of the rows beside it",
+                                    "reference": {"path": "inference/example/code/reference.py", "symbol": "ref"}}]}
+            self.assertEqual(store.check_operations(root, "example", good), [])
+            qualified = copy.deepcopy(good)
+            qualified["operations"][0]["reference"]["symbol"] = "example::ref (exact), code.ref"
+            self.assertEqual(store.check_operations(root, "example", qualified), [])
             for change, expected in (
-                    (lambda d: d["operations"][0]["kernels"][0].update(provider="own: mine"), "never code in crit"),
-                    (lambda d: d["operations"][0]["kernels"][0].update(provider="lib:Nowhere"), "not a provider"),
-                    (lambda d: d["operations"][0]["kernels"][1].pop("published"), "says whether it is published"),
-                    (lambda d: d["operations"][0]["kernels"][0].update(archs=[]), "archs"),
+                    (lambda d: d["operations"][0].update(kernels=[{"provider": "lib:FlashInfer"}]), "no kernel lists"),
+                    (lambda d: d["operations"][0].update(local="hub-kernels/x"), "kernel source paths"),
+                    (lambda d: d.update(as_of="2026-11-02"), "unknown fields as_of"),
+                    (lambda d: d["operations"][0].update(invariance=""), "invariance is a line"),
                     (lambda d: d["operations"][0]["reference"].update(path="cli/crit/inference.py"), "file of the technique"),
+                    (lambda d: d["operations"][0]["reference"].update(symbol="ref, other_ref (the FP64 twin)"),
+                     "reference symbols other_ref are not in"),
+                    (lambda d: d["operations"][0]["reference"].update(symbol="re"), "reference symbols re are not in"),
+                    (lambda d: d["operations"][0]["reference"].update(line=3), "reference is {path, symbol}"),
                     (lambda d: d["operations"][0].pop("verify"), "verify required"),
                     (lambda d: d.update(technique="other"), "technique example required")):
                 bad = copy.deepcopy(good)
                 change(bad)
                 with self.subTest(expected=expected):
-                    self.assertTrue(any(expected in e for e in store.check_kernels(root, "example", bad)),
-                                    store.check_kernels(root, "example", bad))
+                    self.assertTrue(any(expected in e for e in store.check_operations(root, "example", bad)),
+                                    store.check_operations(root, "example", bad))
+            (root / "inference/example/kernels.json").write_text("{}", encoding="utf-8")
+            self.assertTrue(any("keeps no kernel lists" in e for e in store.check(root)), store.check(root))
+            (root / "inference/example/kernels.json").unlink()
+            (root / "inference/base/dense").mkdir(parents=True)
+            (root / "inference/base/dense/kernels.json").write_text("{}", encoding="utf-8")
+            self.assertTrue(any(e.startswith("base/dense/kernels.json: a plugin keeps no kernel lists")
+                                for e in store.check(root)), store.check(root))
 
     def test_real_inference_entries_are_generic_local_implementations(self):
         self.assertEqual(store.check(), [])
         entries = store.load()["entries"]
-        self.assertEqual(len(entries), 29)
+        self.assertEqual(len(entries), 31)
         for entry in entries:
             self.assertNotIn("donors", entry)
             self.assertNotIn("code_locations", entry)
@@ -187,6 +197,8 @@ class ProductTests(unittest.TestCase):
         self.assertIn(entry["agent_guidance"]["provides"][0], shown.stdout)
         self.assertIn(entry["agent_guidance"]["engine_supplies"][0], shown.stdout)
         self.assertIn(entry["path"], shown.stdout)
+        self.assertIn("Plugins (crit plugins add ENGINE/plugins ID copies one into an engine):\n"
+                      "  expert-residency (this technique): ", shown.stdout)
         searched = subprocess.run([sys.executable, "-B", LAUNCHER, "inference", "search",
                                    "state reconciliation", "--json"], capture_output=True, timeout=20, check=True)
         self.assertIn("mtp-decode", [item["id"] for item in json.loads(searched.stdout)])
@@ -222,12 +234,23 @@ class ProductTests(unittest.TestCase):
     def test_cli_only_package_has_one_entrypoint_and_no_browser_sources(self):
         package = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertEqual(package["project"]["scripts"], {"crit": "crit.cli:main"})
-        self.assertEqual(package["tool"]["setuptools"]["packages"]["find"]["where"], ["cli", "api", "kernels", "models", "mcp"])
+        # The wheel holds every package of the code folders and the plugin library, inference/, as package data.
+        setuptools = package["tool"]["setuptools"]
+        folders = {name: ROOT / path for name, path in setuptools["package-dir"].items()}
+        self.assertEqual(folders.pop("crit.library.inference"), ROOT / "inference")
+        self.assertEqual(sorted(folder.parent.name for folder in folders.values()),
+                         sorted(["cli", "api", "kernels", "models", "mcp", "smoke"]))
+        found = {".".join((name, *init.parent.relative_to(folder).parts))
+                 for name, folder in folders.items() for init in folder.rglob("__init__.py")}
+        self.assertEqual(sorted(setuptools["packages"]), sorted(found | {"crit.library.inference"}))
         self.assertEqual({p.name for p in (ROOT / "cli").iterdir() if p.is_dir()}, {"crit"})
         self.assertEqual({p.name for p in (ROOT / "api").iterdir() if p.is_dir()}, {"crit_api"})
         self.assertEqual({p.name for p in (ROOT / "mcp").iterdir() if p.is_dir()}, {"crit_mcp"})
         self.assertEqual({p.name for p in (ROOT / "kernels").iterdir() if p.is_dir()}, {"crit_kernels", "examples"})
         self.assertEqual({p.name for p in (ROOT / "models").iterdir() if p.is_dir()}, {"crit_models"})
+        self.assertEqual({p.name for p in (ROOT / "smoke").iterdir() if p.is_dir()}, {"crit_smoke"})
+        self.assertEqual({p.name for p in (ROOT / "core/python").iterdir()
+                          if p.is_dir() and not p.name.endswith(".egg-info")}, {"crit_core", "crit_plugins"})
         assets = [p for folder in PRODUCT_FOLDERS for p in (ROOT / folder).rglob("*")
                   if p.is_file() and p.suffix in {".html", ".css", ".js"}]
         self.assertEqual(assets, [])

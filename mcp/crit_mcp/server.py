@@ -20,6 +20,7 @@ import urllib.error
 import urllib.request
 
 from crit import __version__
+from crit.inference import ROOT as LIBRARY_ROOT
 from crit.run.store import ROOT
 
 from .jobs import Jobs
@@ -110,8 +111,9 @@ class Server:
         raise Failure(-32601, f"Method not found: {method}")
 
     def guide(self, name):
-        """A guide's file in the crit checkout the commands use, else in this one."""
-        for folder in (self.project, ROOT):
+        """A guide's file in the crit checkout the commands use, else in this one, else (inference/README.md) in the
+        plugin library this crit carries."""
+        for folder in (self.project, ROOT, LIBRARY_ROOT):
             if folder and (folder / name).is_file():
                 return folder / name
         return None

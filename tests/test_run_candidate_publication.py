@@ -8,7 +8,7 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from support.runs import ROOT, RunFixture
+from support.runs import ROOT, RunFixture, with_plugins
 from crit.run import store as run_store
 from crit.run.records import inventory
 
@@ -19,18 +19,18 @@ class CandidatePublicationTests(RunFixture, unittest.TestCase):
         source = self.root / "source-input"
         source.mkdir()
         (source / "engine.fixture").write_text("complete retained source", encoding="utf-8")
-        return source
+        return with_plugins(source)
 
     def test_entire_work_directory_can_supply_candidate_source(self):
         self.resolve()
-        source = self.directory / "work"
+        source = with_plugins(self.directory / "work")
         (source / "engine.fixture").write_text("source from work", encoding="utf-8")
         copytree = shutil.copytree
         calls = []
 
         def bounded_copy(*args, **kwargs):
             calls.append(args)
-            if len(calls) > 5:
+            if sum(Path(call[0]) == source for call in calls) > 1:
                 raise OSError("recursive copy of staging into itself")
             return copytree(*args, **kwargs)
 

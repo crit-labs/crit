@@ -17,8 +17,8 @@ memory reads faster than the host link copies (`crit eval probe`: `host_memory_g
 `host_to_device_gbs`), as it does on many desktop machines: recon's placement then prices misses computed on the
 CPU below misses copied over the link, so the CPU is a primary source of misses there, not a later refinement. The split varies with cache state,
 host load and request history, so greedy output stops repeating if host and device round differently. One
-engine saw decision forks from mixing CPU W4A8 with device W4A4. In quality mode `as_quantized` Eval passes such
-forks when they part at near-ties ([forks](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#forks-in-quality-mode-as_quantized)), so there the exact rows are one option to measure against
+engine saw decision forks from mixing CPU W4A8 with device W4A4. In quality mode `speed` Eval passes such
+forks when they part at near-ties ([forks](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#forks-in-quality-mode-speed)), so there the exact rows are one option to measure against
 the host's own faster arithmetic, not a requirement.
 
 Don't use it when every expert fits on the device, or when measured dispatch gives the CPU no share on the
@@ -73,6 +73,55 @@ then look scales up inline instead of decoding each row first. A checkpoint that
 per-slab base with exception lists, supplies its own decoder in the engine. A scale stored at a power-of-two
 offset with a compensating `post` (for example halved scales against doubled E2M1 codes) gives the same bits.
 
+## Integer block rows
+
+The FP32 orders above are exact but slow on a CPU: one FMA per token for every 16 weights, about 8 GB/s of weights per
+thread for one token and far less for a verify window's several (14-16 GB/s on 6 threads of a Ryzen 5 9600 at 3 tokens
+an expert, below a PCIe 4.0 link's 25-28). A CPU tier built on them can lose to copying its misses.
+
+`host_int.h` adds an order that is exact *and* fast. A 4-bit weight's value times 2 is a small integer (E2M1: 0, 1, 2,
+3, 4, 6, 8, 12 and negatives; INT4: -8..7), and so is an activation quantized per block (E2M1 x 2 for 4-bit
+activations, -127..127 for 8-bit ones). A 16-block's dot of those integers is an exact int32 in any order, so
+vpdpbusd, vpmaddubsw, Arm's SDOT, dp4a and int8 tensor cores all agree on it. Only the FP32 step is declared: block b
+to lane b % 16 (or 32), `lane = fma(float(sum), wscale_b * ascale_b, lane)` with the product rounded, blocks in order,
+the halving (or sequential) reduction, times post.
+
+- **Where it is exact.** Exact here means the same bits on every processor, not drift-free. For a checkpoint whose
+  experts declare 4-bit input activations (NVFP4 W4A4) it is the arithmetic the checkpoint declares and the device's
+  W4A4 GEMMs run; for weight-only checkpoints, 8-bit activations are a quantization of the engine's own. Against
+  Eval's reference (the checkpoint's stored weights with exact activations) both are drift, whatever the checkpoint
+  declares: `speed`'s budget admits it, and `preserve` measures it against its budget like any precision
+  change, with the FP32 rows as the drift-free order.
+- **The rest of the expert, declared too.** `quantize_e2m1x2`, `quantize_int8`, `exp_declared`, `silu_declared` and
+  `swiglu_declared` use IEEE operations only (the exp is FMAs and an exact power-of-two scaling, no library `expf`), so
+  an expert's intermediate is quantized to the same codes on either processor. `host_int_device.cuh` has them for CUDA
+  and HIP, named `_device`, with `dot_row_int<L>`.
+- **Paths.** The scalar oracle; AVX2 (vpmaddubsw) and AVX-512 with BW and VNNI (vpdpbusd), chosen at run time by
+  `best_int_isa()`. A host store may keep experts in `Layout::interleaved` (`interleave_row`): a vector lane then
+  holds one block, so the block sums need no reduction inside a vector. Every path and layout gives the oracle's bits.
+- **Kernels.** crit-labs' `int-block-experts` registry kernel runs the same order on the device
+  ([operations.json](operations.json) says how to check one):
+  decode rows for 1 to 8 tokens a matrix and a prompt GEMM on int8 tensor cores, the same bits as the CPU rows.
+- **Cost.** On one Ryzen 5 9600 (6 threads, WSL2) the interleaved AVX-512 rows read 40-42 GB/s of weights for one token,
+  26 GB/s for three and 16-22 GB/s for eight (`host_int_tests` prints its own); the rows layout runs at 30-40, 20 and
+  11-16. Beside link copies, the two share host memory's read rate: time both together before setting the split.
+
+## The plugin
+
+As a projections plugin on the CPU (`devices: ["cpu"]`), it multiplies a checkpoint's stored matrices with CPU torch
+tensors: `load(tensors, format, role=None)` for `nvfp4` and `int4` (`{weight, scale, global_scale, input_scale}`, E4M3
+scale per 16) and `bf16`; `matmul(x, matrix, out_dtype=None)`. The option `activations` picks what an NVFP4 matrix
+multiplies: `fp32` (weight only, the 16-lane FP32 order above), `e2m1x2` (W4A4 at the matrix's input_scale) or `int8`
+(W4A8 per 32), the last two in the integer block order; INT4 matrices run W4A8 or W4A4. Activations are quantized per
+row and every row is computed alone, so a row's bits never depend on the rows beside it at any row count (the facts say
+`row_invariance` `prompt_rows`); 16-bit matrices go through torch a row at a time. The rows run natively: `native.py`
+builds `host_capi.cpp` with the host rows into a shared library when the plugin loads (each ISA file with its own
+flags, cached by a hash of the compiler, the flags and every source), and `rows.py` calls it through ctypes, splitting
+a matrix's rows over threads. Without a C++ compiler the same orders run in torch (`declared.py`, option `native: off`
+forces it), with the same bits: torch has no FMA, so `declared.fma32` rounds a * b + c once (the product exact in FP64,
+TwoSum's exact error, the FP64 sum rounded to FP32 and moved one step where it lies exactly between two FP32 values).
+`declared.py` runs on any torch device, so it is also an exact device-side twin of the CPU rows, slow.
+
 ## What the code supplies
 
 | File | Supplies |
@@ -83,7 +132,13 @@ offset with a compensating `post` (for example halved scales against doubled E2M
 | [`host_nvfp4_portable.inc`](code/host_nvfp4_portable.inc) | The portable rows, compiled for the baseline target and again with AVX2 and AVX-512 |
 | [`host_nvfp4_device.cuh`](code/host_nvfp4_device.cuh) | `dot_row_halving_format` and `dot_row_block_format<lanes, bits, block>` for any format, and the NVFP4 `dot_row_halving` and `dot_row_block`: the device side of both products with the halving reduction, one source for CUDA and HIP |
 | [`host_nvfp4_device.metal`](code/host_nvfp4_device.metal) | The same functions in the Metal Shading Language, for a library built with fast math off |
+| [`host_int.h`](code/host_int.h), [`host_int.cpp`](code/host_int.cpp), [`host_int_avx2.cpp`](code/host_int_avx2.cpp), [`host_int_avx512.cpp`](code/host_int_avx512.cpp) | The integer block order: `IntMatrix` (rows or interleaved), `IntActs`, `dot_rows_int`, `interleave_row`, the declared quantizers, exp, SiLU and SwiGLU; scalar oracle, AVX2 and AVX-512 VNNI paths, bitwise equal |
+| [`host_int_device.cuh`](code/host_int_device.cuh) | `dot_row_int<L>` and the declared functions on CUDA and HIP |
 | [`implementation.py`](code/implementation.py) | Exact FP32 reference of the declared order (one rounding per operation), standard library only |
+| [`host_capi.cpp`](code/host_capi.cpp) | A C interface over the rows, quantizers, SwiGLU and the route-order combine, for ctypes |
+| [`native.py`](code/native.py) | Builds the host rows (and a technique's own C++ beside them) into a shared library at load; `NativeUnavailable` without a compiler |
+| [`rows.py`](code/rows.py) | `HostRows`: the C interface over CPU torch tensors, rows split over threads |
+| [`declared.py`](code/declared.py) | The integer block order, the FP32 order, the quantizers, `exp_declared`/SwiGLU and the combine in torch on any device, bit for bit the C++ (`fma32`) |
 
 ## What the engine supplies
 

@@ -4,18 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crit"
-version = "0.16.1"
+version = "0.17.0"
 description = "crit: inference runtime, reusable techniques, kernel discovery, evaluation and an OpenAI-compatible serving API"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 # crit Core's Python package (core/python) and crit Eval (https://github.com/crit-labs/crit-eval) install on their own.
-dependencies = ["tokenizers>=0.22,<0.24", "jinja2>=3.1.4,<4", "crit-core==0.16.1", "crit-eval==0.5.3"]
+dependencies = ["tokenizers>=0.22,<0.24", "jinja2>=3.1.4,<4", "crit-core==0.17.0", "crit-eval==0.6.0"]
 
 [project.optional-dependencies]
-# crit-eval reference: score the quality texts on the checkpoint itself.
-reference = ["crit-eval[reference]==0.5.3"]
+# crit-eval reference: score the quality texts on the checkpoint itself (crit models' GPTQ streams the same reference).
+# transformers: crit's supported range, which the host suite's transformers fixtures pass on (5.20.0, 5.20.2, 5.22.2).
+reference = ["crit-eval[reference]==0.6.0", "transformers>=5.20,<6"]
 
 [project.urls]
 Repository = "https://github.com/crit-labs/crit"
@@ -23,10 +24,31 @@ Repository = "https://github.com/crit-labs/crit"
 [project.scripts]
 crit = "crit.cli:main"
 
-[tool.setuptools.packages.find]
-where = ["cli", "api", "kernels", "models", "mcp"]
-include = ["crit", "crit.*", "crit_api*", "crit_kernels*", "crit_models*", "crit_mcp*"]
+[tool.setuptools]
+# The code packages, every package folder of cli/, api/, kernels/, models/, mcp/ and smoke/
+# (tests/test_product_surface.py holds the list to them), and crit's plugin library: inference/ as package data of
+# crit.library.inference, which an installed crit finds at crit/library/inference (crit.inference.LIBRARY). Only the
+# package data named below ships.
+packages = ["crit", "crit.process", "crit.pull", "crit.run", "crit_api", "crit_kernels", "crit_mcp", "crit_models",
+            "crit_smoke", "crit.library.inference"]
+include-package-data = false
 
+[tool.setuptools.package-dir]
+crit = "cli/crit"
+crit_api = "api/crit_api"
+crit_kernels = "kernels/crit_kernels"
+crit_mcp = "mcp/crit_mcp"
+crit_models = "models/crit_models"
+crit_smoke = "smoke/crit_smoke"
+"crit.library.inference" = "inference"
 
 [tool.setuptools.package-data]
 crit_kernels = ["templates/*"]
+# Every technique's and base plugin's folder whole: manifests, plugin.py, code, tests, READMEs, entry.json and
+# operations.json, which crit plugins list|check|test|add and crit inference read.
+"crit.library.inference" = ["**/*"]
+
+[tool.setuptools.exclude-package-data]
+# Inference's native build entry and walkthrough build against a checkout's core/ and tests/inference/ fixtures, which
+# no installed crit holds; nothing an installed crit runs reads them.
+"crit.library.inference" = ["CMakeLists.txt", "examples/**", "**/__pycache__/**"]

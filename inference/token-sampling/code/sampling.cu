@@ -222,13 +222,19 @@ __device__ __forceinline__ float sparse_at(const SparseQ& q, std::int32_t t) {
 }
 
 // How a verify column's draft is checked: 0 the target's own draw (greedy drafts, cut columns: a draft id outside the
-// vocabulary or an empty sparse law, and a full-law draft without a dense row), 1 against its sparse law, 2 against
-// its dense row. Every thread reads the same value.
+// vocabulary or an empty sparse law, a full-law draft without a dense row, and a draft its law gives no mass, q(d) = 0:
+// no draft was drawn from that law, so the rejection rule would accept it whenever p(d) > 0), 1 against its sparse law,
+// 2 against its dense row. Every thread reads the same value.
 __device__ __forceinline__ int draft_mode(const Verify& v, std::size_t col, std::int32_t d, int vocab) {
     if(d < 0 || d >= vocab) return 0;
     const std::int32_t count = v.draft_laws ? v.draft_laws[col].count : -1;
-    if(count > 0) return 1;
-    return count < 0 && v.draft_probabilities ? 2 : 0;
+    if(count > 0) {
+        const SparseLaw& q = v.draft_laws[col];
+        for(std::int32_t i = 0; i < count; ++i)
+            if(q.ids[i] == d) return q.probabilities[i] > 0.f ? 1 : 0;
+        return 0;
+    }
+    return count < 0 && v.draft_probabilities && v.draft_probabilities[col * std::size_t(vocab) + d] > 0.f ? 2 : 0;
 }
 
 struct Shared {

@@ -1,0 +1,78 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "host-expert-tier",
+  "title": "Routed experts on the CPU tier in the device's declared order",
+  "description": "host-expert-tier's contract. Host form: routes grouped by expert in route order, at most max_tokens a chunk, each route's unweighted output row in FP32, then device_sum multiplies by the routing weight and sums a token's routes in plan order with one FP32 rounding per operation (within FP32 rounding of the reference). Device form on the CPU: nvfp4 (W4A4) and int4 (W4A8) experts as bundles read in place, each route's row in host-expert-arithmetic's declared integer block order (the bits of a device kernel that declares it), summed in route order by FMAs; the native tier (C++ over a pinned worker pool, built at load) or the same order in torch where it does not build.",
+  "fills": [
+    "experts"
+  ],
+  "devices": [
+    "cpu"
+  ],
+  "needs": [
+    "experts:source"
+  ],
+  "provides": [
+    "experts:bundles"
+  ],
+  "reference": [
+    "experts-reference"
+  ],
+  "test_with": [
+    "expert-tensors"
+  ],
+  "options": {
+    "max_tokens": {
+      "type": "int",
+      "default": 8,
+      "min": 1,
+      "description": "host form: routes of one expert in a chunk"
+    },
+    "native": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "on",
+        "off"
+      ],
+      "description": "the device form's rows: the native tier built at load (on: refuse to load without it), or the declared order in torch (off), the same bits; auto takes the native tier where it builds"
+    },
+    "workers": {
+      "type": "int",
+      "default": -1,
+      "min": -1,
+      "description": "the native tier's worker threads (-1: one per physical core but the caller's)"
+    },
+    "pin": {
+      "type": "bool",
+      "default": true,
+      "description": "pin each worker to a physical core of its own (Linux)"
+    },
+    "spin_us": {
+      "type": "int",
+      "default": 100,
+      "min": 0,
+      "description": "the least an idle CPU worker spins before it sleeps"
+    },
+    "rows_per_task": {
+      "type": "int",
+      "default": 128,
+      "min": 64,
+      "description": "rows of one expert in a pool task"
+    },
+    "spin_max_us": {
+      "type": "int",
+      "default": 3000,
+      "min": 0,
+      "description": "an idle CPU worker spins as long as the recent gaps between batches (1.5 times the longest of the last 16), at most this, then sleeps: awake through a decode step's layers, asleep between steps (0: spin_us only). The default was measured on one machine (6 cores, WSL2, decode layers about 1.2 ms apart): measure your own cadence"
+    }
+  },
+  "sources": {
+    "tier": "code",
+    "prefill": "../expert-streamed-prefill/code",
+    "arithmetic": "../host-expert-arithmetic/code",
+    "quantized": "../quantized-projections/code"
+  },
+  "entry": "plugin.py:create"
+}

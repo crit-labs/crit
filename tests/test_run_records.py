@@ -7,7 +7,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from support.runs import ROOT, RunFixture, timestamp_for_test
+from support.runs import ROOT, RunFixture, timestamp_for_test, with_plugins
 from crit.run.records import (GIB, candidate_projection, digest, file_sha, ineligibility, inventory, now, read_json, safe_path,
                               write_json)
 from crit.run.store import PUBLISHED, RunStore, lease
@@ -37,11 +37,12 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         self.assertIn("candidate --source", handoff)
         for resource in ("core/README.md", "inference/README.md", "kernels/README.md", "crit-eval's docs/README.md"):
             self.assertIn(resource, handoff)
-        self.assertIn("eval-v1 adapter", handoff)
+        self.assertIn("Core's eval-v1 adapter over the package", handoff)
         self.assertIn("Eval result JSON is separate evidence", handoff)
-        self.assertIn("chat-json-v1 and chat-resident-v1 with chat-stream-v1 and chat-logprobs-v1", handoff)
+        self.assertIn("every candidate is a plugin package", handoff)
+        self.assertIn("there is no adapter or launch entry to write", handoff)
         self.assertIn("Measure every candidate with crit run ... eval", handoff)
-        self.assertIn("create_engine(context)", handoff)
+        self.assertNotIn("create_engine(context)", handoff)
         self.assertNotIn("--crit-chat-request", handoff)
         self.assertIn("summary.md", handoff)
         self.assertIn(f'crit serve --workspace "{self.store.root}" --run {self.run_id} --candidate CANDIDATE_ID --project "{self.store.project}"', handoff)
@@ -131,18 +132,49 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         candidate = self.candidate(configuration={"batch": 3})
         self.package(candidate)
         folder = self.directory / "candidates" / candidate["candidate_id"] / "package"
-        self.assertEqual(json.loads((folder / "configuration.json").read_text(encoding="utf-8")), {"batch": 3})
+        self.assertEqual(json.loads((folder / "configuration.json").read_text(encoding="utf-8")),
+                         candidate["configuration"])
+        self.assertEqual(candidate["configuration"]["batch"], 3)
         manifest = read_json(folder / "manifest.json")
         self.assertIn("configuration.json", [row["path"] for row in manifest["files"]])
         other = self.candidate(configuration={"batch": 4})
-        source = self.root / "package-mismatch"
-        source.mkdir()
+        source = with_plugins(self.root / "package-mismatch")
         (source / "configuration.json").write_text('{"batch": 5}', encoding="utf-8")
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "differs from the candidate configuration"):
             self.store.package(self.run_id, other["candidate_id"], source,
-                {"build": {"toolchain": {"identity": "host fixture"}, "dependencies": [], "command": ["fixture"]},
-                 "launch": ["engine.fixture"], "capabilities": ["prefill", "decode"]})
+                {"build": {"toolchain": {"identity": "host fixture"}, "dependencies": [], "command": ["fixture"]}})
         self.assertFalse((self.directory / "candidates" / other["candidate_id"] / "package").exists())
+
+    def test_a_candidate_and_its_package_are_plugin_packages(self):
+        """crit run takes an engine only as Core's loader runs it: plugins/ and a configuration whose plugins
+        selection fills every slot an engine fills. A launch entry or capabilities are no recipe's to give."""
+        recipe = {"build": {"toolchain": {"identity": "host fixture"}, "dependencies": [], "command": ["fixture"]}}
+        source = self.root / "monolith"
+        source.mkdir()
+        (source / "engine.py").write_text("def create_engine(context): ...", encoding="utf-8")
+        if not (self.directory / "inputs.json").exists():
+            self.resolve()
+        with self.assertRaisesRegex(ValueError, "The candidate's source is no engine Core can load: .*has no plugins/ "
+                                                "folder"):
+            self.store.candidate(self.run_id, source, self.proposal())
+        with_plugins(source)
+        with self.assertRaisesRegex(ValueError, "the configuration names no plugins"):
+            self.store.candidate(self.run_id, source, {**self.proposal(), "configuration": {"batch": 1}})
+        selection = self.proposal()["configuration"]["plugins"]
+        del selection["use"]["sampler"]
+        with self.assertRaisesRegex(ValueError, "leaves sampler empty"):
+            self.store.candidate(self.run_id, source, {**self.proposal(), "configuration": {"plugins": selection}})
+        candidate = self.store.candidate(self.run_id, source, self.proposal())
+        bare = self.root / "bare-package"
+        bare.mkdir()
+        (bare / "engine.py").write_text("def create_engine(context): ...", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "The package is no engine Core can load"):
+            self.store.package(self.run_id, candidate["candidate_id"], bare, recipe)
+        with self.assertRaisesRegex(ValueError, "Unknown fields; use extensions: capabilities, launch"):
+            self.store.package(self.run_id, candidate["candidate_id"], with_plugins(bare),
+                               {**recipe, "launch": ["engine.py"], "capabilities": ["chat-json-v1"]})
+        manifest = self.store.package(self.run_id, candidate["candidate_id"], bare, recipe)
+        self.assertFalse({"launch", "capabilities"} & set(manifest))
 
     def test_weights_policy_keeps_transformed_candidates_ineligible(self):
         view = self.store.create(dict(self.data, weights_policy="as_stored"))
@@ -167,12 +199,46 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.create(dict(self.data, weights_policy="sometimes"))
 
-    def test_as_quantized_runs_default_to_transformable_weights(self):
-        view = self.store.create(dict(self.data, quality_mode="as_quantized"))
+    def test_speed_runs_default_to_transformable_weights(self):
+        # A request that names neither is in speed, which may re-encode stored weights.
+        self.assertEqual(self.run["spec"]["correctness"]["weights_policy"], "transformable")
+        view = self.store.create(dict(self.data, quality_mode="speed"))
         self.assertEqual(view["run"]["spec"]["correctness"]["weights_policy"], "transformable")
-        kept = self.store.create(dict(self.data, quality_mode="as_quantized", weights_policy="as_stored"))
+        kept = self.store.create(dict(self.data, quality_mode="speed", weights_policy="as_stored"))
         self.assertEqual(kept["run"]["spec"]["correctness"]["weights_policy"], "as_stored")
-        self.assertNotIn("weights_policy", self.store.create(dict(self.data))["run"]["spec"]["correctness"])
+        preserve = self.store.create(dict(self.data, quality_mode="preserve"))["run"]["spec"]["correctness"]
+        self.assertNotIn("weights_policy", preserve)
+        self.assertEqual(self.store.create(dict(self.data, quality_mode="preserve", weights_policy="transformable"))
+                         ["run"]["spec"]["correctness"]["weights_policy"], "transformable")
+
+    def test_every_run_record_states_its_quality_mode(self):
+        # speed is the default, recorded explicitly so the run never depends on what the default was.
+        self.assertEqual(self.run["spec"]["correctness"]["quality_mode"], "speed")
+        self.assertEqual(self.store.create(dict(self.data, quality_mode="preserve"))["run"]["spec"]["correctness"]
+                         ["quality_mode"], "preserve")
+        # A record that states no mode, or one no longer named, is refused: no mode is read for another.
+        from crit.run import records
+        for mode in (None, "as_quantized"):
+            with self.subTest(mode=mode):
+                path = self.directory / "run.json"
+                old = read_json(path)
+                if mode is None:
+                    del old["spec"]["correctness"]["quality_mode"]
+                else:
+                    old["spec"]["correctness"]["quality_mode"] = mode
+                old["request_sha256"] = digest(old["spec"])
+                write_json(path, old)
+                with self.assertRaisesRegex(ValueError, "quality_mode requires preserve or speed"):
+                    records.load_run(self.directory)
+
+    def test_crit_names_the_quality_modes_and_their_default_as_crit_eval_does(self):
+        # crit imports crit Eval only where a command needs it (default_quality_budgets says how to install it), so
+        # it keeps its own copy of the modes; the two copies stay alike.
+        from crit.run import records
+        from crit_eval.quality import fixed
+        self.assertEqual((records.QUALITY_MODES, records.DEFAULT_QUALITY_MODE),
+                         (fixed.QUALITY_MODES, fixed.DEFAULT_QUALITY_MODE))
+        self.assertEqual(set(records.default_quality_budgets()), set(records.QUALITY_MODES))
 
     def test_parallel_inventory_matches_sequential_hashing(self):
         folder = self.root / "artifact"
@@ -206,6 +272,68 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         self.assertFalse(view["state"]["target_satisfied"])
         with self.assertRaises(ValueError):
             self.store.stop(self.run_id, "satisfied", critique="fixture critique")
+
+    def test_two_reads_of_crits_clock_never_share_a_time_while_the_wall_clock_is_behind(self):
+        # Records written while a stepped-back wall clock catches up (an install, then its reinstall) keep distinct,
+        # increasing times.
+        from datetime import datetime as wall
+        from crit import records
+
+        class Clock(wall):
+            back = timedelta(0)
+
+            @classmethod
+            def now(cls, tz=None):
+                return wall.now(tz) - cls.back
+        with patch.object(records, "datetime", Clock):
+            first = records.utc_now()
+            Clock.back = timedelta(seconds=1)
+            reads = [records.utc_now() for _ in range(3)]
+        self.assertEqual(sorted(set([first] + reads)), [first] + reads)
+
+    def test_records_stay_in_their_segment_when_the_wall_clock_steps_back(self):
+        # A virtual machine's clock kept in step with its host's moves back by up to a second at times (WSL's does,
+        # every half minute or so): a check recorded after its candidate in the same process must not read as recorded
+        # before it, by however much the clock stepped (here past the slack two processes get).
+        from datetime import datetime as wall
+        from crit import records
+        from crit.run.records import CLOCK_SLACK
+
+        class Clock(wall):
+            back = timedelta(0)
+
+            @classmethod
+            def now(cls, tz=None):
+                return wall.now(tz) - cls.back
+        with patch.object(records, "datetime", Clock):
+            candidate = self.candidate()
+            Clock.back = CLOCK_SLACK + timedelta(seconds=1)
+            package = self.package(candidate)
+            data = self.benchmark_data(package, self.checks(candidate, package))
+            self.store.append(self.run_id, candidate["candidate_id"], "benchmark", data)
+            self.assertGreaterEqual(records.utc_now(), timestamp_for_test(candidate["created_at"]))
+        view = self.store.get(self.run_id)
+        self.assertEqual(view["errors"], [])
+        self.assertEqual(len(view["candidates"][0]["series"]), 1)
+
+    def test_records_another_process_stamped_a_moment_early_stay_in_their_segment(self):
+        # Two processes' clocks can disagree by a step back of the wall clock (records.CLOCK_SLACK): a benchmark
+        # stamped half a second before its candidate's creation still belongs to it, one stamped past the slack not.
+        from crit.run.records import CLOCK_SLACK
+        candidate = self.candidate()
+        package = self.package(candidate)
+        created = timestamp_for_test(candidate["created_at"])
+        checks = self.checks(candidate, package)
+        early = (created - timedelta(seconds=0.5)).isoformat()
+        self.store.append(self.run_id, candidate["candidate_id"], "benchmark",
+                          self.benchmark_data(package, checks, started_at=early))
+        view = self.store.get(self.run_id)
+        self.assertEqual(view["errors"], [])
+        self.assertEqual(len(view["candidates"][0]["series"]), 1)
+        too_early = (created - CLOCK_SLACK - timedelta(seconds=0.5)).isoformat()
+        with self.assertRaisesRegex(ValueError, "Benchmark outside segment"):
+            self.store.append(self.run_id, candidate["candidate_id"], "benchmark",
+                              self.benchmark_data(package, checks, started_at=too_early))
 
     def test_failed_gate_keeps_exploratory_speeds_and_cannot_be_selected(self):
         candidate, *_ = self.measured(arithmetic="failed")
@@ -373,30 +501,34 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         self.assertIsNotNone(self.candidate())
 
     def test_quality_budget_and_exactness_reach_the_agent_request(self):
+        # A request that names no quality mode is in speed, with Eval's budget for it, eight times
+        # preserve's, and the brief says what the mode means: drift from the selected checkpoint traded for speed.
         prompt = (self.directory / "agent_request.md").read_text(encoding="utf-8")
-        self.assertIn("PPL ratio ≤ 1.05, mean KLD ≤ 0.05, p99 KLD ≤ 0.5", prompt)
+        self.assertIn("PPL ratio ≤ 1.4, mean KLD ≤ 0.4, p99 KLD ≤ 4.0", prompt)
         self.assertIn("exactness reported", prompt)
         self.assertIn("being close to a limit is no reason to reject it", prompt)
+        self.assertIn("Quality mode speed", prompt)
+        self.assertIn("whatever format that checkpoint is stored in", prompt)
+        self.assertIn("--quality-mode speed", prompt)
+        self.assertIn("output differences that part at near-ties pass", prompt)
         data = self.data | {"quality_budget": {"ppl_ratio_max": 1.0, "kld_mean_max": 0.0}, "exactness": "required"}
         run_id = self.store.create(data)["run"]["run_id"]
         strict = (self.store.directory(run_id) / "agent_request.md").read_text(encoding="utf-8")
-        self.assertIn("PPL ratio ≤ 1.0, mean KLD ≤ 0.0, p99 KLD ≤ 0.5", strict)
+        self.assertIn("PPL ratio ≤ 1.0, mean KLD ≤ 0.0, p99 KLD ≤ 4.0", strict)
         self.assertIn("--exactness required", strict)
-        self.assertIn("Quality mode preserve", prompt)
-        self.assertIn("--quality-mode preserve", prompt)
         for bad in ({"quality_budget": {"ppl_ratio_max": 0.9}}, {"quality_budget": {"kld_max": 1}}, {"exactness": "maybe"},
-                    {"quality_mode": "fast"}):
+                    {"quality_mode": "fast"}, {"quality_mode": None}, {"quality_mode": "as_quantized"}):
             with self.assertRaises(ValueError):
                 self.store.create(self.data | bad)
-        # The user's other quality mode: the run records it and the brief says what it means.
-        run = self.store.create(self.data | {"quality_mode": "as_quantized"})["run"]
-        self.assertEqual(run["spec"]["correctness"]["quality_mode"], "as_quantized")
-        quantized = (self.store.directory(run["run_id"]) / "agent_request.md").read_text(encoding="utf-8")
-        self.assertIn("Quality mode as_quantized (the user's choice)", quantized)
-        self.assertIn("--quality-mode as_quantized", quantized)
-        # Its default budget is Eval's for that mode, eight times preserve's.
-        self.assertIn("PPL ratio ≤ 1.4, mean KLD ≤ 0.4, p99 KLD ≤ 4.0", quantized)
-        self.assertIn("output differences that part at near-ties pass", quantized)
+        # The user's other quality mode: the run records it, with Eval's budget for it, and the brief says what it means.
+        run = self.store.create(self.data | {"quality_mode": "preserve"})["run"]
+        self.assertEqual(run["spec"]["correctness"]["quality_mode"], "preserve")
+        kept = (self.store.directory(run["run_id"]) / "agent_request.md").read_text(encoding="utf-8")
+        self.assertIn("Quality mode preserve (the run's; never change it)", kept)
+        self.assertIn("--quality-mode preserve", kept)
+        self.assertIn("PPL ratio ≤ 1.05, mean KLD ≤ 0.05, p99 KLD ≤ 0.5", kept)
+        self.assertIn("activation quantization, whatever format the checkpoint declares", kept)
+        self.assertNotIn("near-ties", kept.split("Quality budget:")[1].split("\n")[0])
 
     def test_resume_amends_quality_terms_for_later_segments(self):
         prompt = (self.directory / "agent_request.md").read_text(encoding="utf-8")
@@ -408,7 +540,7 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         result = self.store.resume(self.run_id, external_cleanup_confirmed=True, candidates=2, amend=amend)
         segment_id = result["segment"]["segment_id"]
         prompt = (self.directory / "segments" / segment_id / "agent_request.md").read_text(encoding="utf-8")
-        self.assertIn("PPL ratio ≤ 1.1, mean KLD ≤ 0.05", prompt)
+        self.assertIn("PPL ratio ≤ 1.1, mean KLD ≤ 0.4", prompt)   # over the run's mode's budget (speed)
         self.assertIn("--exactness required", prompt)
         self.assertIn("approved by Yan", prompt)
         self.store.stop(self.run_id, "cancelled", critique="critique")
@@ -558,9 +690,8 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         package.mkdir()
         (package / "engine.fixture").write_text("complete synthetic source", encoding="utf-8")  # same bytes as the source
         (package / "launcher.fixture").write_text("launcher only in the package", encoding="utf-8")
-        self.store.package(self.run_id, candidate["candidate_id"], package,
-            {"build": {"toolchain": {"identity": "host fixture"}, "dependencies": [], "command": ["fixture"]},
-             "launch": ["launcher.fixture"], "capabilities": ["prefill", "decode"]})
+        self.store.package(self.run_id, candidate["candidate_id"], with_plugins(package),
+            {"build": {"toolchain": {"identity": "host fixture"}, "dependencies": [], "command": ["fixture"]}})
         folder = self.directory / "candidates" / candidate["candidate_id"]
         shared, own = folder / "package/engine.fixture", folder / "package/launcher.fixture"
         self.assertEqual(shared.read_text(encoding="utf-8"), "complete synthetic source")
@@ -655,8 +786,7 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         checks = self.checks(candidate, package)
         data = self.benchmark_data(package, checks)
         deadline = timestamp_for_test(self.view["segment"]["deadline_at"])
-        with patch("crit.run.store.datetime") as clock:
-            clock.now.return_value = deadline + timedelta(seconds=1)
+        with patch("crit.run.store.utc_now", return_value=deadline + timedelta(seconds=1)):
             self.store.append(self.run_id, candidate["candidate_id"], "benchmark", data)
             with self.assertRaises(ValueError):
                 self.store.reserve(self.run_id, candidate["candidate_id"], "benchmark")

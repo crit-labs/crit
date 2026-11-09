@@ -6,6 +6,7 @@ import ctypes
 import io
 import json
 import os
+from pathlib import Path
 import signal
 import subprocess
 import sys
@@ -14,10 +15,11 @@ import unittest
 from unittest.mock import patch
 
 from support.runs import RunFixture, timestamp_for_test
+from support.serve import RECIPE, scripted_package, scripted_serving
 from support.runs import ROOT
 from crit.process.ownership import process_identity
 from crit.run import attempt as run_attempt, measure
-from crit.run.records import file_sha, read_json
+from crit.run.records import digest, file_sha, now, read_json
 
 # A resident chat adapter whose prompt is one token per character of its messages and whose greedy reply is one "x"
 # per token, three tokens per decode round. A message starting "early" ends after 40 tokens, one starting "hold"
@@ -83,14 +85,16 @@ class MeasureFixture(RunFixture):
             "environment_manifest": {"benchmark": "synthetic"}, "case_manifests": {"case-0001": [
                 {"path": "captured/case-0001/request.json", "bytes": path.stat().st_size, "sha256": file_sha(path)}]}})
 
-    def served(self, adapter=ADAPTER, capabilities=SERVED):
-        candidate = self.candidate()["candidate_id"]
-        package = self.root / ("package-" + candidate)
-        package.mkdir()
-        (package / "engine.py").write_text(adapter, encoding="utf-8")
-        self.store.package(self.run_id, candidate, package,
-                           {"build": {"toolchain": {"fixture": "host-python"}, "dependencies": [], "command": ["fixture"]},
-                            "launch": ["engine.py"], "capabilities": capabilities})
+    def served(self, adapter=ADAPTER, capabilities=SERVED, checks=True):
+        """A packaged candidate whose package serves `adapter`; with `checks`, its checks recorded and passed, as
+        crit run ... check --from-eval leaves them before measure."""
+        self.record = self.candidate()
+        candidate = self.record["candidate_id"]
+        scripted_serving(self, capabilities)
+        package = scripted_package(self.root / ("package-" + candidate), adapter)
+        self.manifest = self.store.package(self.run_id, candidate, package, RECIPE)
+        if checks:
+            self.checks(self.record, self.manifest)
         self.folder = self.directory / "candidates" / candidate
         return candidate
 
@@ -157,10 +161,8 @@ class RunMeasureTests(MeasureFixture, unittest.TestCase):
         self.assertEqual(record["extensions"]["chat_template_kwargs"], {"enable_thinking": True})
         self.assertEqual(json.loads((self.root / "template.json").read_text()), {"enable_thinking": True})
 
-    def test_a_package_measure_cannot_serve_or_a_sealed_candidate_is_refused_before_any_reservation(self):
-        candidate = self.served(capabilities=[c for c in SERVED if c != "chat-stream-v1"])
-        with self.assertRaisesRegex(ValueError, "must declare chat-stream-v1"):
-            measure.measure(self.store, self.run_id, candidate)
+    def test_a_sealed_candidate_is_refused_before_any_reservation(self):
+        candidate = self.served()
         self.store.seal(self.run_id, candidate, "built")
         with self.assertRaisesRegex(ValueError, "Sealed candidate is immutable"):
             measure.measure(self.store, self.run_id, candidate)
@@ -241,6 +243,98 @@ class RunMeasureTests(MeasureFixture, unittest.TestCase):
         self.assertEqual(printed["extensions"]["served_by"], "crit serve")
 
 
+class MeasureChecksTests(MeasureFixture, unittest.TestCase):
+    """measure measures a candidate whose recorded checks let its benchmarks qualify and refuses the others before any
+    reservation: a benchmark binds the checks recorded before it, and one that does not qualify keeps the candidate
+    from ever being eligible."""
+
+    def check(self, gate, status="passed", evidence_level="artifact_verified"):
+        """A check of the case, as crit run ... check --from-eval records it."""
+        path = self.folder / "checks/raw" / f"{gate}-{status}-{evidence_level}.fixture"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"synthetic {gate} result", encoding="utf-8")
+        return self.store.append(self.run_id, self.record["candidate_id"], "check", {
+            "case_id": "case-0001", "package_sha256": digest(self.manifest), "gate": gate,
+            "criteria_sha256": digest(self.run["spec"]["correctness"]), "status": status,
+            "rationale": "Synthetic fixture outcome",
+            "evidence": [{"path": path.relative_to(self.directory).as_posix(), "sha256": file_sha(path)}],
+            "evidence_level": evidence_level, "recorded_at": now()})["check_id"]
+
+    def refused(self, pattern):
+        with self.assertRaisesRegex(ValueError, pattern):
+            measure.measure(self.store, self.run_id, self.record["candidate_id"])
+        self.assertFalse((self.folder / "attempts").exists())
+        self.assertEqual(self.benchmarks(), [])
+
+    def test_measure_refuses_a_candidate_until_its_checks_are_recorded(self):
+        candidate = self.served(checks=False)
+        self.refused("^crit run measure refuses candidate-0001: its benchmarks would stay exploratory, since case-0001 "
+                     "has no arithmetic check; case-0001 has no functional check; case-0001 has no resources check\\. "
+                     "Record its checks first: crit run \\.\\.\\. check --candidate candidate-0001 --from-eval records "
+                     "the arithmetic, functional and resources checks of every case from its completed Eval \\(crit run "
+                     "\\.\\.\\. eval --candidate candidate-0001\\), then measure\\. To measure it anyway \\(telemetry, "
+                     "memory\\), pass --exploratory: a benchmark that does not qualify keeps candidate-0001 from ever "
+                     "being eligible$")
+        self.check("arithmetic")
+        self.check("functional")
+        self.refused("since case-0001 has no resources check\\. Record its checks first")
+        # A benchmark binds each gate's latest check: a reported one, in a run that requires artifact_verified evidence,
+        # until a verified one follows it.
+        self.check("resources", evidence_level="reported")
+        self.refused("since resources check check-0003 \\(case-0001\\) is reported, the run requires artifact_verified "
+                     "evidence\\. Record its checks first")
+        self.check("resources")
+        (record,) = measure.measure(self.store, self.run_id, candidate)
+        self.assertEqual([Path(ref["path"]).stem for ref in record["checks"]], ["check-0001", "check-0002", "check-0004"])
+        series = read_json(self.folder / "telemetry.json")["series"][0]
+        self.assertEqual((series["gates"]["arithmetic"], series["gates"]["functional"]), ("passed", "passed"))
+
+    def test_a_check_that_did_not_pass_keeps_the_candidate_from_eligibility(self):
+        self.served(checks=False)
+        self.check("arithmetic", "failed")
+        self.check("functional")
+        self.check("resources", "unverified")
+        lasting = ("since arithmetic check check-0001 \\(case-0001\\) failed; resources check check-0003 \\(case-0001\\) "
+                   "unverified\\. No later record undoes that, so candidate-0001 cannot become eligible: build the fix "
+                   "as a new candidate \\(its plan repairs a failed check with a requirement lever serving "
+                   "check:arithmetic\\)\\. To measure it anyway")
+        self.refused(lasting)
+        self.check("arithmetic")   # a later pass undoes neither
+        self.check("resources")
+        self.refused(lasting)
+
+    def test_an_earlier_benchmark_below_the_headroom_keeps_later_ones_exploratory(self):
+        candidate = self.served()
+        data = self.benchmark_data(self.manifest, [])
+        data["metrics"]["minimum_free_vram_bytes"]["samples"] = [0, 0, 0]
+        self.store.append(self.run_id, candidate, "benchmark", data)
+        with self.assertRaisesRegex(ValueError, "since benchmark-0001 \\(case-0001\\) failed resources: its free memory "
+                                                "is below the run's headroom or unmeasured\\. No later record undoes "
+                                                "that, so candidate-0001 cannot become eligible: build the fix as a new "
+                                                "candidate\\. To measure"):
+            measure.measure(self.store, self.run_id, candidate)
+
+    def test_exploratory_measures_anyway_and_its_benchmarks_stay_exploratory(self):
+        from crit.run.cli import main
+        candidate = self.served(checks=False)
+        command = ["--root", str(self.store.root), "--id", self.run_id, "measure", "--candidate", candidate]
+        errors = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
+            self.assertEqual(main(command), 1)
+        self.assertIn("ERROR: crit run measure refuses candidate-0001", errors.getvalue())
+        self.assertIn("crit run ... check --candidate candidate-0001 --from-eval", errors.getvalue())
+        (record,) = measure.measure(self.store, self.run_id, candidate, exploratory=True)
+        self.assertEqual(record["checks"], [])
+        self.assertEqual(read_json(self.folder / "telemetry.json")["series"][0]["qualification"], "exploratory")
+        logged = (self.folder / "logs/measure-attempt-0001.log").read_text()
+        self.assertIn("crit run measure --exploratory: the benchmarks stay exploratory, since case-0001 has no "
+                      "arithmetic check", logged)
+        errors = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
+            self.assertEqual(main(command + ["--exploratory"]), 0)
+        self.assertIn("warning: benchmark-0002 is exploratory and cannot make candidate-0001 eligible", errors.getvalue())
+
+
 class EarlyReplyTests(MeasureFixture, unittest.TestCase):
     content = "early" + "x" * 507
 
@@ -317,7 +411,9 @@ class MeasureCliTests(MeasureFixture, unittest.TestCase):
                         "--root", str(self.store.root), "--id", self.run_id, "measure", "--candidate", candidate],
                         stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, **options)
                     try:
-                        end, pid = time.monotonic() + 15, None
+                        # Starting the CLI and crit serve up to the engine's loader takes seconds; a loaded machine (CI's
+                        # two-core runners at four jobs) can take longer than 15, and the wait ends when the marker appears.
+                        end, pid = time.monotonic() + 60, None
                         while pid is None and process.poll() is None and time.monotonic() < end:
                             try:
                                 pid = json.loads(marker.read_text())["pid"]
@@ -343,7 +439,7 @@ finally:
                             self.assertEqual(sent.returncode, 0, sent.stderr)
                         else:
                             process.send_signal(signum)
-                        self.assertNotEqual(process.wait(timeout=15), 0)
+                        self.assertNotEqual(process.wait(timeout=60), 0)
                         self.assertEqual((self.attempt()["outcome"], self.attempt()["cleanup_settled"]),
                                          ("interrupted", True))
                         self.assertIsNone(process_identity(pid))

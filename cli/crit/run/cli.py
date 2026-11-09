@@ -118,9 +118,9 @@ def parser():
     sub = subs.add_parser("build", help="Build a candidate's retained source with the recipe's build.command under a "
                                         "build attempt (log kept, attempt settled), then package the result")
     sub.add_argument("--candidate", required=True)
-    sub.add_argument("--record", type=Path, required=True, help="Recipe: build {toolchain, command[, dependencies]}, "
-                     "launch[, capabilities]; the build's outputs are bound as dependencies, capabilities default to "
-                     "the adapter's declared_capabilities(model_path)")
+    sub.add_argument("--record", type=Path, required=True, help="Recipe: build {toolchain, command[, dependencies]}; "
+                     "the build's outputs are bound as dependencies, and the package is the plugin package Core's "
+                     "loader runs")
     sub.add_argument("--seconds", type=float, help="Reservation length (default: the build process cap)")
     sub.add_argument("--drop", action="append", default=[], metavar="GLOB",
                      help="Remove these build-folder paths (intermediates) before packaging; repeatable")
@@ -128,7 +128,7 @@ def parser():
     sub = subs.add_parser("package", help="Package a candidate's runnable files and manifest")
     sub.add_argument("--candidate", required=True)
     sub.add_argument("--source", type=Path, required=True)
-    sub.add_argument("--record", type=Path, required=True, help="build, launch and capabilities")
+    sub.add_argument("--record", type=Path, required=True, help="Recipe: build {toolchain, command[, dependencies]}")
     sub = subs.add_parser("reserve", help="Consume an attempt before a launch")
     sub.add_argument("--candidate", help="Candidate owner; omit only for discovery")
     sub.add_argument("--operation", choices=("discovery", "build", "check", "benchmark"), required=True)
@@ -136,9 +136,14 @@ def parser():
     sub = subs.add_parser("settle", help="Settle a reserved attempt: exit, logs, cleanup")
     sub.add_argument("--reservation", required=True, help="Reservation path relative to run")
     sub.add_argument("--record", type=Path, required=True)
-    sub = subs.add_parser("measure", help="Benchmark the run's cases on a packaged candidate through crit serve")
+    sub = subs.add_parser("measure", help="Benchmark the run's cases on a packaged candidate through crit serve, once "
+                                          "its checks are recorded (check --from-eval)")
     sub.add_argument("--candidate", required=True)
     sub.add_argument("--seconds", type=float, help="Reservation length (default: the benchmark process cap)")
+    sub.add_argument("--exploratory", action="store_true",
+                     help="Measure even when the candidate's checks would leave its benchmarks exploratory (not "
+                          "recorded, or a required one did not pass), for telemetry or memory: a benchmark that does "
+                          "not qualify keeps the candidate from ever being eligible")
     sub = subs.add_parser("eval", help="Run Eval on a packaged candidate through crit serve, quality against the "
                                        "run's model's scores of the fixed texts (scored once into the data)")
     sub.add_argument("--candidate", required=True)
@@ -152,10 +157,13 @@ def parser():
     sub.add_argument("--stage", choices=["1", "2", "3", "full"],
                      help="How far Eval measures (crit-eval's protocol stages): by default as far as its budget allows "
                           "at the candidate's measured rates; 1, 2 or 3 at most that far; full every part as before "
-                          "stages")
+                          "stages. On the candidate ladder the candidate's rung sets it: stage 1 on candidate 2, up "
+                          "to stage 2 on candidates 3 and 4, a lower stage only below that")
     sub.add_argument("--certify", action="store_true",
                      help="The candidate that will ship: stage 3 whatever the budget, then one request at the run's "
-                          "kv_tokens, which the resources check needs")
+                          "kv_tokens, which the resources check needs. On the candidate ladder the full Eval of "
+                          "candidate 5 on and of the segment's last budgeted candidate, which crit run eval certifies "
+                          "without it")
     sub.add_argument("--budget-minutes", type=float, metavar="MINUTES",
                      help="Eval's wall-clock budget, loads included (default: crit-eval's 45)")
     sub.add_argument("--resume", nargs="?", const=True, metavar="ATTEMPT",
@@ -171,6 +179,22 @@ def parser():
     sub.add_argument("--check", action="store_true", help="Run the standard serving checks (consecutive requests, "
                      "system message, streaming, stop string, cancelling, tool call, logprobs, template switch, "
                      "stopping), keep their report and record a functional check per case, then stop")
+    sub.add_argument("--data", type=Path, help="With --check: crit-eval's prepared data for the run's model; the report "
+                     "adds the gate pre-check (honesty of short replies and one long reply, request history, device "
+                     "memory, the lower context), the gates whole Eval rounds most often fail on, in minutes")
+    sub.add_argument("--no-smoke", action="store_true", help="With --check: leave out crit smoke, the quality "
+                     "component tests --check runs at the run's context and at a quarter of it (smoke/README.md)")
+    sub = subs.add_parser("ablate", help="Serve a candidate built from plugins with each variant of its plugins (as "
+                                         "built, at its base, without each and with each alone): a short bench of "
+                                         "the run's cases and crit smoke per variant, and what each plugin adds, "
+                                         "costs or breaks (docs/PLUGINS.md)")
+    sub.add_argument("--candidate", required=True)
+    sub.add_argument("--variant", action="append", help="Serve only this variant (repeatable), e.g. full, base, "
+                     "without:ID, only:ID; crit plugins variants lists them")
+    sub.add_argument("--repetitions", type=int, default=3, help="Repetitions per case and variant (default 3)")
+    sub.add_argument("--no-smoke", action="store_true", help="Leave out crit smoke on each variant")
+    sub.add_argument("--smoke-test", action="append", help="Run only this crit smoke test on each variant (repeatable)")
+    sub.add_argument("--seconds", type=float, help="Reservation length (default: the check process cap)")
     sub = subs.add_parser("seal", help="Close a candidate (sealed candidates are immutable)")
     sub.add_argument("--candidate", required=True)
     sub.add_argument("--lifecycle", required=True)
@@ -284,7 +308,7 @@ def main(argv=None):
             result = store.settle(args.id, reservation, payload)
         elif args.action == "measure":
             from .measure import measure
-            result = measure(store, args.id, args.candidate, args.seconds)
+            result = measure(store, args.id, args.candidate, args.seconds, args.exploratory)
             for record in result:
                 warn_exploratory(store, args.id, args.candidate, record["benchmark_id"])
         elif args.action == "eval":
@@ -299,7 +323,12 @@ def main(argv=None):
                 print(line, file=sys.stderr)
         elif args.action == "serve":
             from .served import serve
-            result = serve(store, args.id, args.candidate, args.host, args.port, args.seconds, check=args.check)
+            result = serve(store, args.id, args.candidate, args.host, args.port, args.seconds, check=args.check,
+                           data=args.data, smoke=not args.no_smoke)
+        elif args.action == "ablate":
+            from .ablate import ablate
+            result = ablate(store, args.id, args.candidate, args.seconds, args.variant, args.repetitions,
+                            smoke=not args.no_smoke, smoke_tests=args.smoke_test)
         elif args.action == "seal":
             failure = {"message": args.failure} if args.failure else None
             result = store.seal(args.id, args.candidate, args.lifecycle, failure)

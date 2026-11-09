@@ -136,7 +136,9 @@ def select(logits, temperature=0.0, top_p=1.0, top_k=0, seed=0, position=0, stre
 def verify(rows, drafts, temperature, top_p=1.0, top_k=0, min_p=0.0, seed=0, position=0, stream=0, draft_laws=None):
     """enqueue_verify's predictions for K drafts over K + 1 processed rows (column c already counts drafts[:c]).
 
-    draft_laws, when given, holds K dicts token -> q probability the drafts were drawn from."""
+    draft_laws, when given, holds K dicts token -> q probability the drafts were drawn from, or None for a draft drawn
+    from no law (a copy); a draft its law gives no mass (q(d) = 0) or no law takes the target's own draw, as a greedy
+    draft does."""
     out = []
     for c, values in enumerate(rows):
         kept = law(values, temperature, top_p, top_k, min_p)
@@ -149,6 +151,9 @@ def verify(rows, drafts, temperature, top_p=1.0, top_k=0, min_p=0.0, seed=0, pos
         d = drafts[c]
         p = {t: x / total for t, x in kept}
         q = draft_laws[c]
+        if q is None or not q.get(d, 0.0) > 0:   # no law the draft was drawn from: the target's own draw
+            out.append(walk(kept, uniform(seed, at, stream) * total))
+            continue
         if uniform(seed, at, stream, ACCEPT) * q.get(d, 0.0) < p.get(d, 0.0):
             out.append(d)
             continue

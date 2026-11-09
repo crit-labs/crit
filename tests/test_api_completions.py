@@ -1,4 +1,4 @@
-"""Raw-prompt completions through crit serve (completion-v1): POST /v1/completions and Ollama's raw /api/generate,
+"""Raw-prompt completions through crit serve (completion-v1): POST /v1/completions and the raw /api/generate,
 with a synthetic resident adapter."""
 import http.client
 import json
@@ -221,7 +221,7 @@ class CompletionTests(CompletionFixture, unittest.TestCase):
         self.assertEqual(self.served.status()["engine_loads"], 1)
 
     def test_the_chat_requests_extensions_apply_to_a_raw_prompt(self):
-        # vLLM's include_stop_str_in_output and priority, crit's timeout, n null, and the request's id.
+        # The extensions include_stop_str_in_output and priority, crit's timeout, n null, and the request's id.
         response, value = self.complete("x=> one two three", stop="two", include_stop_str_in_output=True, priority=-1,
                                         crit={"timeout": 30}, n=None, best_of=None)
         self.assertEqual(response.status, 200, value)
@@ -255,7 +255,7 @@ class CompletionTests(CompletionFixture, unittest.TestCase):
         self.assertEqual((response.status, json.loads(data)["error"]["param"]), (400, "prompt"))
 
 
-class OllamaRawTests(CompletionFixture, unittest.TestCase):
+class ApiGenerateRawTests(CompletionFixture, unittest.TestCase):
     def generate(self, prompt, **options):
         return self.call("/api/generate", {"model": "default", "prompt": prompt, "raw": True, **options})
 
@@ -276,7 +276,7 @@ class OllamaRawTests(CompletionFixture, unittest.TestCase):
         self.assertEqual("".join(r["response"] for r in rows[:-1]), " a b c")
         self.assertEqual((rows[-1]["done"], rows[-1]["done_reason"]), (True, "stop"))
 
-    def test_raw_logprobs_take_ollamas_fields_and_think_is_ignored(self):
+    def test_raw_logprobs_take_the_api_generate_fields_and_think_is_ignored(self):
         response, data = self.generate("x=>hi", stream=False, logprobs=True, top_logprobs=1, think=True)
         self.assertEqual(response.status, 200, data)
         value = json.loads(data)
@@ -314,7 +314,7 @@ class FittedCompletionTests(CompletionFixture, unittest.TestCase):
         response, value = self.complete("echo-request", max_tokens=1000)
         self.assertEqual(json.loads(value["choices"][0]["text"])["limit"], 1000)
         self.assertIsNone(response.getheader("X-Crit-Max-Tokens-Applied"))
-        # Ollama's num_predict -1 asks for all the room the context leaves.
+        # /api/generate's num_predict -1 asks for all the room the context leaves.
         response, data = self.call("/api/generate", {"model": "default", "prompt": "echo-request", "raw": True,
                                                      "stream": False, "options": {"num_predict": -1}})
         self.assertEqual(json.loads(json.loads(data)["response"])["limit"], 8191)

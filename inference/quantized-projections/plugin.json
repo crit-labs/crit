@@ -1,0 +1,169 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "quantized-projections",
+  "title": "Quantized projection: grouped W8/W4 integers with FP32 group scales, or NVFP4",
+  "description": "quantized-projections' formats, chosen by `format`. int8 and int4, its G32 representation: each group of `group` weights shares one represented FP32 scale, codes are signed 8 or 4 bits, and the projection multiplies the decoded values. nvfp4, its NVFP4 codec and scalar FP64 projection: E2M1 codes in adjacent nibbles, E4M3 block scales per 16 and one global scale, each block decoded once and reused for every token row (four_over_six scales a block to 4 instead of 6 where that lowers the error). An optimized kernel consumes the same codes, scales and accumulation contract. Its device form loads a checkpoint's stored BF16, FP8 (per channel or per tensor), MXFP8 and NVFP4 matrices on the engine's device and multiplies them through cuBLASLt with torch's scaled matmul (code/device_matrices.py): FP8 activations per row, NVFP4 activations per 16-value block (W4A4), FP32 accumulation; with activations bf16 an NVFP4 matrix keeps 16-bit activations (W4A16), and with fp8_activations bf16 an FP8 one (W8A16), the matrix decoded a chunk of rows at a time for the prompt GEMMs; NVFP4 matrices stacked by rows keep one global scale per row. Decode rows (calls of up to decode_rows, 16) run on crit-labs' registry kernels: mma-rows' tensor-core tile (gemv mma; short prompts too, tile_rows) or decode-gemv's GEMVs (code/device_nvfp4.py); prompt GEMMs on cuBLASLt, or with prompt_gemm pinned on crit-labs/pinned-gemm (one split-K-free algorithm per shape and format, a prompt row's bits the same at every length), with fixed_tiles on crit-labs/fixed-tile-gemm, and with tile on mma-rows' prompt tile (every prompt row with the bits it has as a decode row: the facts' prompt_exact, for preserve mode's honesty); each with a torch fallback of the same row invariance. A draft-only matrix (an MTP layer, a draft head) may be re-encoded at load from bf16 or fp8 to nvfp4 or fp8 (load(..., encode=)), and the facts record it (draft_encoding). Decode rows (up to 16) take the prompt rows' activations by default (decode_activations; bf16 for weight-only decode rows) and keep each row's bits alone and batched. Captured rounds (rounds:projections) and prompt chunks (prompts:projections): every decode and prompt path runs on buffers sized at load without host synchronization, and every call path of a matrix runs once at load (Triton compiles, cuBLAS's first use of a shape, CUDA modules), so no request compiles; a shape the warm-up did not meet raises inside a capture.",
+  "fills": [
+    "projections"
+  ],
+  "provides": [
+    "prompts:projections",
+    "rounds:projections"
+  ],
+  "devices": [
+    "cuda"
+  ],
+  "needs_when": {
+    "stored:nvfp4": [
+      "cuda:fp4"
+    ],
+    "stored:fp8": [
+      "cuda:fp8"
+    ]
+  },
+  "reference": [
+    "projections-dense"
+  ],
+  "options": {
+    "format": {
+      "type": "choice",
+      "default": "int8",
+      "choices": [
+        "int8",
+        "int4",
+        "nvfp4"
+      ]
+    },
+    "group": {
+      "type": "int",
+      "default": 32,
+      "min": 1,
+      "max": 4096,
+      "description": "weights per FP32 scale, for int8 and int4"
+    },
+    "four_over_six": {
+      "type": "bool",
+      "default": false,
+      "description": "for nvfp4: scale blocks to 4 instead of 6 where that lowers the error"
+    },
+    "activations": {
+      "type": "choice",
+      "default": "nvfp4",
+      "choices": [
+        "nvfp4",
+        "bf16"
+      ],
+      "description": "on the device, what a stored NVFP4 matrix multiplies: NVFP4 activations (W4A4: prompt rows through cuBLASLt, decode rows as decode_activations says) or 16-bit ones (weight only: GEMVs for decode rows, the matrix decoded for the prompt GEMMs)"
+    },
+    "fp8_activations": {
+      "type": "choice",
+      "default": "fp8",
+      "choices": [
+        "fp8",
+        "bf16"
+      ],
+      "description": "FP8 matrices' prompt rows: fp8 (W8A8: each activation row in E4M3 by its own scale, cuBLASLt with the row and column scales in its epilogue), or bf16 (W8A16: the E4M3 weights widened exactly to BF16 times the 16-bit activations, FP32 sums, the row scale after; on the tile up to tile_rows, past it the matrix a chunk of rows at a time for a BF16 GEMM): an exact variant a preserve-mode engine may take where activation quantization costs too much quality. Decode rows with decode_activations prompt follow it. The facts give every format's arithmetic (prompt_arithmetic)"
+    },
+    "decode_activations": {
+      "type": "choice",
+      "default": "prompt",
+      "choices": [
+        "prompt",
+        "bf16"
+      ],
+      "description": "on the device, what decode rows (calls of up to the facts' row_invariance rows: decode steps, verify windows) of FP8 and W4A4 NVFP4 matrices multiply: prompt, the prompt rows' activations (each row quantized to E4M3, or to NVFP4 at the input scale), so a decoded token and the same token in a prompt (a replay, a prompt cache) differ only in their sums' order; bf16, the 16-bit activations themselves (weight only: W8A16, W4A16), closer to the unquantized model and further from the prompt rows. Weight-only NVFP4 (activations bf16) and MXFP8 matrices multiply 16-bit activations in both phases. With prompt, W4A4 NVFP4 decode rows run mma-rows' block-scaled FP4 MMA where the device has it (the sm_120 family; E2M1 codes with their block scales on both operands, FP32 sums, the prompt rows' arithmetic in another order), else the tile on the quantized values as BF16"
+    },
+    "decode_formats": {
+      "type": "str",
+      "default": "",
+      "description": "comma-separated format=activations pairs (formats fp8 and nvfp4, activations prompt or bf16) that override decode_activations for the matrices of that format, chosen per matrix at load from its format, e.g. nvfp4=prompt,fp8=bf16: W4A4 NVFP4 decode rows on the prompt rows' NVFP4 activations (mma-rows' FP4 MMA where the device has it) and FP8 decode rows on 16-bit activations (W8A16: decode-gemv's dot GEMV with gemv auto); a format it does not name takes decode_activations. The facts' decode_activations (per format) and decode_kernels (per role) say which each matrix took"
+    },
+    "decode_rows": {
+      "type": "int",
+      "default": 16,
+      "min": 8,
+      "max": 16,
+      "description": "the most rows a decode call takes (8 to 16), each row's bits those of the row alone (the facts' row_invariance rows; 8 on the Triton GEMV): the CUDA-core GEMVs grow compute bound toward 16 rows on wide matrices (a vocabulary-wide FP8 head is about 2.6x cuBLASLt there), so a model that runs 9-16 decode rows mostly in such matrices may take 8 and send the rest as prompt rows"
+    },
+    "tile_rows": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "0",
+        "64",
+        "128",
+        "192",
+        "256"
+      ],
+      "description": "on mma-rows' tile (gemv mma), the most prompt rows a call sends through the tile too, 64 rows a kernel call: auto, by each matrix's prompt arithmetic as far as the tile beats its prompt path (weight-only prompts 64; W4A4, W8A8 and BF16 none: measured, device_matrices.AUTO_TILES), or one count for every matrix. A row gets the same bits in any call of up to that many rows where the decode and prompt arithmetic agree (the facts' row_invariance.rows: the fewest over the loaded matrices), so captured prompt buckets that size equal the unpadded chunk. Not for weight-only NVFP4 prompts in fp16_acc or fp8, nor with prompt_gemm fixed_tiles"
+    },
+    "prompt": {
+      "type": "choice",
+      "default": "bf16",
+      "choices": [
+        "bf16",
+        "fp16_acc",
+        "fp8"
+      ],
+      "description": "with activations bf16, the prompt GEMMs' arithmetic: the matrix decoded to BF16 (FP32 accumulation), to FP16 accumulating in FP16 (twice the rate, FP16 out), or to FP8 rows against FP8 activation rows (rowwise scaled)"
+    },
+    "prompt_gemm": {
+      "type": "choice",
+      "default": "provider",
+      "choices": [
+        "provider",
+        "fixed_tiles",
+        "pinned",
+        "tile"
+      ],
+      "description": "the GEMM prompt rows (calls of more rows than a decode call takes) go through: provider, torch's (cuBLASLt picks its algorithm, and so a row's sums, by the row count); fixed_tiles, for BF16 matrices and weight-only ones with prompt bf16, one whose tiles never change an output's order (crit-labs/fixed-tile-gemm; one row at a time through torch where it is not here, correct and much slower); pinned, for every format (W4A4, W8A8, W8A16, W4A16 with prompt bf16, MXFP8, BF16), cuBLASLt with one split-K-free algorithm per GEMM shape and format, chosen at load and run for every row count (crit-labs/pinned-gemm; one row a call through the provider where it is not here, correct and much slower); tile, for every format with gemv mma (W4A16 with prompt bf16), crit-labs/mma-rows' prompt tile: each prompt row multiplies the decode rows' activations in the decode tile's order, so every output has the bits the same row gets as a decode row (the facts' row_invariance prompt_exact: a scored token's log-probability is the served one's, preserve mode's exact honesty) at GEMM-like weight reuse; a matrix the decode tile does not take, or a kernel build without the prompt tile, goes through the provider and the facts say prompt_exact false. With fixed_tiles, pinned or tile a prompt row's result is the same at every prompt length, in any chunk, padded bucket or pass shared with other sequences (the facts' row_invariance prompt_rows), and prompt rows skip mma-rows' tile (tile_rows applies to decode rows only)"
+    },
+    "prompt_roles": {
+      "type": "str",
+      "default": "",
+      "description": "with activations bf16, comma-separated role=arithmetic pairs (bf16, fp16_acc, fp8) that override `prompt` for the matrices a model loads with that role (load(tensors, format, role)), e.g. gate_up=fp8 for FP8 rows on the widest matrix and `prompt` elsewhere; a role it does not name takes `prompt`; prompt_gemm fixed_tiles applies to the bf16 ones"
+    },
+    "gemv": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "mma",
+        "native",
+        "triton"
+      ],
+      "description": "the decode rows' kernel: auto, each matrix's fastest measured one: FP8 matrices' 16-bit decode rows (W8A16) on crit-labs/decode-gemv's dot GEMV (a Triton program of 16 rows by a block of the matrix on tensor cores, a fixed split of K added in order; faster than the tile from 8 rows on, level below; K a multiple of 128), W4A4 decode rows on crit-labs/mma-rows' block-scaled FP4 MMA (the sm_120 family; K a multiple of 128), every other matrix as mma (the facts' decode_kernels name each role's); mma, crit-labs/mma-rows' tensor-core tile (every format, the weights read once a call whatever the rows, the prompt rows' quantized activations; K a multiple of 32), else as native; native, crit-labs/decode-gemv's CUDA-core GEMVs (its Triton GEMV for NVFP4 matrices whose width is no multiple of 32); triton, its Triton GEMV for NVFP4 (BF16 rows then run a row at a time through torch); where no kernel is here, the torch fallbacks (the matrix's exact values, one row at a time). Each keeps FP32 sums and a row's bits alone and batched; their orders differ, so a process uses one a matrix"
+    }
+  },
+  "sources": {
+    "quantized": "code"
+  },
+  "kernels": [
+    {
+      "name": "crit-labs/decode-gemv",
+      "version": 1,
+      "revision": null,
+      "fallback": "torch: the matrix decoded a chunk of rows at a time to its exact values, one activation row per GEMM (FP32 sums, the inverse global scale once); decoders as torch operations with the kernel's bits"
+    },
+    {
+      "name": "crit-labs/fixed-tile-gemm",
+      "version": 1,
+      "revision": null,
+      "fallback": "torch: one prompt row per GEMM, so a row keeps its bits whatever rows share the call (correct, much slower)"
+    },
+    {
+      "name": "crit-labs/mma-rows",
+      "version": 1,
+      "revision": null,
+      "fallback": "the CUDA-core GEMVs of crit-labs/decode-gemv for decode rows (or their torch fallbacks), the prompt path for every prompt row"
+    },
+    {
+      "name": "crit-labs/pinned-gemm",
+      "version": 1,
+      "revision": null,
+      "fallback": "with prompt_gemm pinned: one prompt row a call through the provider's GEMM (one algorithm for every row, so a row keeps its bits; correct, much slower)"
+    }
+  ],
+  "entry": "plugin.py:create"
+}

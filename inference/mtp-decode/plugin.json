@@ -1,0 +1,48 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "mtp-decode",
+  "title": "Prompt and history copy drafts: the continuation of the context's last tokens",
+  "description": "mtp-decode's PromptCopyIndex: the longest earlier continuation of the last `window` tokens, from the prompt or (with a longer match) the output, bounded per round. Needs no draft model; with override, the model's draft head drafts and long copies replace its first drafts. Inside captured decode rounds the copies come from each round slot's token history on the device (draft:device, code/device_drafts.py), with no host between rounds; a copied draft has no law (in sampled rounds its column is verified by the target's own draw).",
+  "fills": [
+    "drafter"
+  ],
+  "devices": [
+    "host",
+    "cuda"
+  ],
+  "provides": [
+    "draft:device"
+  ],
+  "options": {
+    "window": {
+      "type": "int",
+      "default": 3,
+      "min": 1,
+      "max": 64
+    },
+    "history_window": {
+      "type": "int",
+      "default": 6,
+      "min": 1,
+      "max": 256
+    },
+    "capacity": {
+      "type": "int",
+      "default": 16384,
+      "min": 66,
+      "max": 262144,
+      "description": "tokens of each round slot's history ring on the device: copies search its last capacity - (widest + 1) (the host index holds the whole context); more than the history window and 64 past the widest round"
+    },
+    "override": {
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 64,
+      "description": "0: copy drafts alone; N >= 1: the model's draft head drafts the chain and a copy whose match covers at least N tokens replaces its first drafts"
+    }
+  },
+  "sources": {
+    "mtp": "code"
+  },
+  "entry": "plugin.py:create"
+}

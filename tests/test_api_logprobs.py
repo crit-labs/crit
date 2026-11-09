@@ -157,8 +157,8 @@ class LogprobApiTests(ServeFixture, unittest.TestCase):
         self.assertIn("ranked", value["error"]["message"])
 
 
-class OllamaLogprobTests(ServeFixture, unittest.TestCase):
-    """Ollama's logprobs and top_logprobs on /api/chat and /api/generate."""
+class ApiChatLogprobTests(ServeFixture, unittest.TestCase):
+    """logprobs and top_logprobs on /api/chat and /api/generate."""
     extra_capabilities = ("chat-logprobs-v1",)
     adapter_suffix = LOGPROB_ADAPTER
     stream = True
@@ -182,7 +182,7 @@ class OllamaLogprobTests(ServeFixture, unittest.TestCase):
         rows = [json.loads(line) for line in data.decode().splitlines()]
         return response, rows if body["stream"] else rows[0]
 
-    def test_the_last_object_lists_each_token_in_ollamas_shape(self):
+    def test_the_last_object_lists_each_token_in_the_api_chat_shape(self):
         for path in ("/api/chat", "/api/generate"):
             with self.subTest(path=path):
                 response, value = self.call(path, logprobs=True, top_logprobs=2)
@@ -209,7 +209,7 @@ class OllamaLogprobTests(ServeFixture, unittest.TestCase):
                 self.assertEqual([(e["token"], len(e["top_logprobs"])) for e in rows[-1]["logprobs"]],
                                  [("h", 1), ("�", 1)])
 
-    def test_top_logprobs_without_logprobs_is_ignored_as_ollama_does(self):
+    def test_top_logprobs_without_logprobs_is_ignored_and_listed(self):
         response, value = self.call("/api/chat", top_logprobs=2)
         self.assertEqual(response.status, 200, value)
         self.assertNotIn("logprobs", value)
@@ -217,7 +217,7 @@ class OllamaLogprobTests(ServeFixture, unittest.TestCase):
         response, value = self.call("/api/chat", logprobs=False, top_logprobs=0)
         self.assertEqual((response.status, response.getheader("X-Crit-Ignored-Parameters")), (200, None))
 
-    def test_invalid_logprob_requests_are_ollama_errors(self):
+    def test_invalid_logprob_requests_are_api_chat_errors(self):
         for options, words in (({"logprobs": True, "top_logprobs": 21}, "top_logprobs must be between 0 and 20"),
                                ({"top_logprobs": -1}, "top_logprobs"), ({"top_logprobs": 1.0}, "top_logprobs"),
                                ({"logprobs": "yes"}, "logprobs must be a boolean"),

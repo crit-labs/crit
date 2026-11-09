@@ -1,0 +1,56 @@
+{
+  "kind": "crit-technique-operations",
+  "technique": "quantized-projections",
+  "operations": [
+    {
+      "id": "nvfp4-projection",
+      "what": "rows times NVFP4 weights (E2M1 codes, E4M3 scale per 16, one global scale): decode GEMVs with 16-bit activations (W4A16), the matrix's values decoded for a prompt GEMM, prompt GEMMs with 16-bit or NVFP4 activations",
+      "reference": {
+        "path": "inference/quantized-projections/code/nvfp4.py",
+        "symbol": "project"
+      },
+      "verify": "on the target, project a few rows of a real matrix with the kernel and with project (FP64): within FP16/BF16 accumulation error for 16-bit activations; with NVFP4 activations compare against project of the activations quantized by quantize_row, then judge the drift with crit eval's quality run. Same bits on a repeat",
+      "invariance": "decode calls (up to the facts' row_invariance rows, at least 8) keep each row's bits alone and batched; prompt rows only where the plugin's facts say row_invariance prompt_rows"
+    },
+    {
+      "id": "nvfp4-activation-quantization",
+      "what": "16-bit activation rows to NVFP4 with the checkpoint's global input scale: E4M3 block scale e4m3(amax / 6 * gs) and E2M1 codes per 16, each row on its own",
+      "reference": {
+        "path": "inference/quantized-projections/code/nvfp4.py",
+        "symbol": "quantize_row"
+      },
+      "verify": "on the target, quantize a few real activation rows with the kernel and with quantize_row at the same global scale: identical codes and scale bytes once the kernel's scale layout is unswizzled, and the same bits on a repeat",
+      "invariance": "each row's codes and scales independent of the other rows"
+    },
+    {
+      "id": "fp8-row-projection",
+      "what": "rows times FP8 E4M3 weights with one scale per row: decode rows with 16-bit activations (W8A16), prompt rows with per-token FP8 activations (W8A8)",
+      "reference": {
+        "path": "inference/quantized-projections/code/row_fp8.h",
+        "symbol": "fp8::project"
+      },
+      "verify": "on the target, project a few rows with the kernel and with the double-accumulating oracle: within FP32 accumulation error of the scaled products, the same bits on a repeat",
+      "invariance": "decode calls (up to the facts' row_invariance rows, at least 8) keep each row's bits alone and batched (cuBLASLt's FP8 GEMM does not at real widths: decode rows need a GEMV or one row a call)"
+    },
+    {
+      "id": "mxfp8-projection",
+      "what": "16-bit activation rows times MXFP8 weights (E4M3 codes, one E8M0 exponent per 32 inputs, modelopt's [out][in / 32] layout): decode GEMVs (W8A16) and the matrix's exact values for a prompt GEMM",
+      "reference": {
+        "path": "inference/quantized-projections/code/fp8_block.h",
+        "symbol": "e8m0 (with fp8::decode)"
+      },
+      "verify": "on the target, multiply a few rows of a real matrix with the kernel and with the FP64 product of the activations and e4m3(code) * e8m0(exponent): within FP32 accumulation of exact products (2e-5 of the products' magnitude), the decoded values equal to the FP64 ones, the same bits on a repeat",
+      "invariance": "decode calls (up to the facts' row_invariance rows, at least 8) keep each row's bits alone and batched"
+    },
+    {
+      "id": "fp8-matched-pair",
+      "what": "rows times E4M3 weights (MXFP8 E8M0 block scales, 128 x 128 FP32 block scales or row scales) against E4M3 activations quantized per group, in one declared per-output order (README, Matched decode and prompt kernels: per 32-element block one e4m3 MMA with a zero accumulator, lane b % 16 = fma(block sum, weight scale * activation scale, lane), the halving tree over 16 lanes, post): decode rows for 1 to 8 tokens and a prompt GEMM with the same bits for every output",
+      "reference": {
+        "path": "inference/quantized-projections/code/fp8_block.h",
+        "symbol": "quantize_group, project_fp64, e8m0"
+      },
+      "verify": "on the target GPU, first check that the tensor core's block sum depends only on an output's own row and token (rows and tokens moved across tile positions and companions give the same bits: the matched pair's own fixture does this); then the kernel's decode rows and prompt GEMM against a reference kernel written in the declared order on the same quantized activations, every output bit for bit across jobs that give a token different companions, each output within 2^-9 of project_fp64 relative to the products' magnitude, and its quantizer against quantize_group bit for bit, ties and saturation included",
+      "invariance": "decode rows and the prompt GEMM give every output the same bits, whatever tokens share a job; the same bits on a repeat"
+    }
+  ]
+}
