@@ -1,8 +1,8 @@
 """Plain attention in the attention slot: attention-state's softmax over the visible rows (implementation.py) as the
 host form. On the device (attention-state's device_attention.py) each token attends its sequence's positions up to its
-own, read where the pool keeps them: FlashInfer's paged kernels over 16-bit and FP8 pages when FlashInfer is installed,
-the registry's paged-kv-attention kernels (a split-KV reader of decode and verify windows over every page type, trees
-and block lists included, and a prompt reader of fp8:row and INT8 pages) where they load, and torch otherwise: each
+own, read where the pool keeps them: crit's paged-kv-attention kernels (a split-KV reader of decode and verify windows
+over every page type, trees and block lists included, and a prompt reader over every page type) where they load
+(FlashInfer's paged kernels over 16-bit and FP8 pages only with option flashinfer auto, a yardstick), and torch otherwise: each
 row's KV gathered and torch's scaled dot product attention, the plain path the others are tested against (option
 kernels: torch forces it). Captured rounds (rounds:attention) read through the pool's round tables. Its memory()
 declares exactly what the device form allocates when it is made."""
@@ -11,7 +11,7 @@ from pathlib import Path
 from .state import device_attention
 from .state import implementation as reference
 
-KERNELS = "crit-labs/paged-kv-attention"
+KERNELS = "paged-kv-attention"
 
 
 class SoftmaxAttention:
@@ -48,16 +48,17 @@ class SoftmaxAttention:
 
 
 def _kernels(options):
-    """The registry kernel the device form reads pages with, or None (option kernels torch, or not available)."""
+    """crit's kernel paged-kv-attention, which the device form reads pages with (built on this GPU with the engine's
+    tuned knobs or its defaults), or None (option kernels torch, or it does not build here)."""
     if options["kernels"] != "auto":
         return None
-    from crit_plugins.kernels import registry_kernel
-    return registry_kernel(KERNELS, folder=Path(__file__).parent)
+    from crit_plugins.kernels import load_kernel
+    return load_kernel(KERNELS, folder=Path(__file__).parent)
 
 
 def memory(context, options):
     """What the device form allocates when it is made (device_attention.device_memory), exactly: the split-KV reader's
-    partials where the registry kernel loads, FlashInfer's workspaces where it serves, on a CUDA engine."""
+    partials where crit's paged-kv-attention kernel loads, FlashInfer's workspaces where it serves, on a CUDA engine."""
     found, host = device_attention.device_memory(device_attention.engine_device(context), options["kernels"],
                                                  _kernels(options) is not None, options["workspace_mib"],
                                                  options["flashinfer"], options["flashinfer_mib"], options["decode"],
@@ -70,5 +71,5 @@ def create(context, options, parts):
                                             options["decode"], options["partitions"], options["piece"],
                                             device_attention.engine_device(context), options["workspace_mib"],
                                             options["flashinfer"], options["flashinfer_mib"],
-                                            options["prompt_reader"])
+                                            options["prompt_reader"], options["reader"])
     return SoftmaxAttention(parts["kv_cache"], form)

@@ -30,7 +30,6 @@ ahead makes it a copy from memory); work of the graph that does not need the row
 from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
 import os
-from pathlib import Path
 import threading
 
 from crit_plugins.files import pread

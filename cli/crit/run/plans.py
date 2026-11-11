@@ -4,7 +4,11 @@ their outcome after the candidate's Eval.
 crit checks a plan's completeness and its consistency with the facts it freezes (the parent's Eval), never whether
 its reasoning is good, the line headroom_record holds for stop records. The priorities are crit's: decode and
 prefill are p1 or p2 by which family is further from its limit, time to first token is p2 or p3 and never p1, and a
-plan in which neither decode nor prefill is needed is a stop plan."""
+plan in which neither decode nor prefill is needed is a stop plan.
+
+There is one set of plan rules (docs/RUN_RECORDS.md#plan). A check either refuses a plan with what to fix (CHECKS) or,
+where it judges a forecast rather than a fact, records a warning in the plan's inputs.warnings: a forecast is an
+estimate, and a refusal on an estimate only teaches the planner to raise it."""
 import json
 import math
 import re
@@ -12,8 +16,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from . import ladder
-from .records import (counts_evaluated, digest, evaluated_candidates, file_sha, header, ident, keys, load_run, now,
-                      number, quality_mode, quality_terms, read_json, record, safe_path, text)
+from .records import (digest, evaluated_candidates, file_sha, header, ident, keys, load_run, now, number,
+                      quality_mode, quality_terms, read_json, record, safe_path, text)
 
 KPIS = ("decode", "prefill", "ttft", "context_decode", "context_ttft")
 HEADLINE = ("decode", "prefill", "ttft")
@@ -24,6 +28,8 @@ FAMILY = {member: family for family, members in FAMILIES.items() for member in m
 # Numbers outside the priorities whose drop beyond their noise an outcome flags, and whether lower is better.
 UNTIERED = {"greedy_decode": False, "heldout_decode": False, "followup_ttft": True}
 MS = {"ttft", "context_ttft"}
+# A lever change measured before the plan: the source names its evidence file in the run.
+MEASURED_SOURCE = "measured:"
 DECISIONS = {"build", "stop"}
 CONFIDENCE = {"low", "medium", "high"}
 # A speed lever is planned for its KPI changes; a requirement lever for a rule or gate it serves (`serves`), such as
@@ -32,11 +38,6 @@ LEVER_KINDS = {"speed", "requirement"}
 MAX_ROWS = 200
 # Eval results hold every case and quality row; they are read once, when a plan freezes one or an outcome compares.
 EVAL_JSON_BYTES = 256 * 1024 * 1024
-
-
-def rules(run):
-    """The version of the plan rules a run was created with: 2 to 7 from `"plan_rules"` in its spec, else 1."""
-    return run["spec"].get("plan_rules", 1)
 
 
 def _get(value, *path):
@@ -165,16 +166,16 @@ def _draft_bytes(room, model):
     return (found, "model files (crit_eval.limits.context.draft_step_bytes)") if found else (None, None)
 
 
-# Plan rules 2: crit's computed limits and the alternative's ceiling use Eval's cost model, the round floor with the
-# draft steps at Eval's draft floor; where the draft width is unknown, the pass floor alone is an upper bound.
+# crit's computed limits and the alternative's ceiling use Eval's cost model, the round floor with the draft steps at
+# Eval's draft floor; where the draft width is unknown, the pass floor alone is an upper bound.
 ROUND_FLOOR = "Eval's round floor, draft steps at Eval's draft floor"
-# Plan rules 2: the drafter an alternative's ceiling assumes, the one the parent's Eval measured or a new one.
+# The drafter an alternative's ceiling assumes, the one the parent's Eval measured or a new one.
 DRAFTERS = ("measured", "new")
 UPPER_BOUND = "upper bound, draft cost excluded"
 
 
 def _draft_floor(result, model):
-    """Plan rules 2: the time one draft step costs at its bytes floor, as Eval charges it, and where it comes from: Eval's
+    """The time one draft step costs at its bytes floor, as Eval charges it, and where it comes from: Eval's
     own draft floor (headroom.projection.draft_floor_ms), else the engine's draft_bytes_per_step over the bandwidth,
     else the checkpoint's draft layers (crit_eval.limits.context.draft_step_bytes) over it; (None, None) when none is known."""
     room = result.get("headroom") or {}
@@ -213,33 +214,27 @@ def _width(result):
     return width if type(width) is int and width >= 1 else None
 
 
-def alternative_limit(result, model, kpi, tokens_per_round, draft_steps, version=1, companion=None):
+def alternative_limit(result, model, kpi, tokens_per_round, draft_steps, companion=None):
     """The alternative strategy's ceiling for decode or context_decode on the parent's Eval cases (points): the
-    plan's tokens per round over a round floor crit computes, the pass floor plus draft_steps draft steps at their
-    bytes floor (rules 2: at Eval's draft floor, _draft_floor), geometric mean. Rules 2 without a draft floor take a
-    companion drafter's (_companion: the one recon recorded): ceil(draft_steps / drafts_per_pass) drafter passes at
-    its pass_bytes over the bandwidth, a block drafter's one pass yielding its whole block. None when the attempt and
-    the model files lack the pass floor's facts, or the draft step's."""
+    plan's tokens per round over a round floor crit computes, the pass floor plus draft_steps draft steps at Eval's
+    draft floor (_draft_floor), geometric mean. Without a draft floor it takes a companion drafter's (_companion: the
+    one recon recorded): ceil(draft_steps / drafts_per_pass) drafter passes at its pass_bytes over the bandwidth, a
+    block drafter's one pass yielding its whole block. None when the attempt and the model files lack the pass floor's
+    facts, or the draft step's."""
     room = result.get("headroom") or {}
     bandwidth = _positive(room.get("bandwidth_gbs"))
     per_pass, source = _bytes_per_pass(room, model)
     if not bandwidth or not per_pass:
         return None
     kv = _positive(room.get("kv_bytes_per_token")) or 0
-    if version >= 2:
-        step_ms, draft_source = _draft_floor(result, model) if draft_steps else (None, None)
-        if draft_steps and step_ms is None and companion:
-            passes = math.ceil(draft_steps / companion["drafts_per_pass"])
-            step_ms = passes * companion["pass_bytes"] / (bandwidth * 1e9) * 1000 / draft_steps
-            draft_source = f"recon companion drafter {companion['path']} ({passes} pass x pass_bytes)"
-        if draft_steps and step_ms is None:
-            return None
-        step_ms = step_ms or 0.0
-    else:
-        draft, draft_source = _draft_bytes(room, model) if draft_steps else (None, None)
-        if draft_steps and not draft:
-            return None
-        step_ms = (draft or 0) / (bandwidth * 1e9) * 1000
+    step_ms, draft_source = _draft_floor(result, model) if draft_steps else (None, None)
+    if draft_steps and step_ms is None and companion:
+        passes = math.ceil(draft_steps / companion["drafts_per_pass"])
+        step_ms = passes * companion["pass_bytes"] / (bandwidth * 1e9) * 1000 / draft_steps
+        draft_source = f"recon companion drafter {companion['path']} ({passes} pass x pass_bytes)"
+    if draft_steps and step_ms is None:
+        return None
+    step_ms = step_ms or 0.0
     held = _held(result, kpi)
     if not held:
         return None
@@ -250,7 +245,7 @@ def alternative_limit(result, model, kpi, tokens_per_round, draft_steps, version
             "round_floor_ms": _geomean([floor(tokens) for tokens in held]),
             "inputs": {"bytes_per_pass": source, "bandwidth_gbs": "headroom.bandwidth_gbs",
                        "kv_bytes_per_token": "headroom.kv_bytes_per_token" if kv else None,
-                       ("draft_floor_ms" if version >= 2 else "draft_bytes_per_step"): draft_source}}
+                       "draft_floor_ms": draft_source}}
 
 
 def _held(result, kpi):
@@ -293,7 +288,7 @@ def acceptance_rates(result):
 
 
 def _widest(result):
-    """Plan rules 2: the widest draft an alternative may claim, as wide as Eval projects its acceptance bound:
+    """The widest draft an alternative may claim, as wide as Eval projects its acceptance bound:
     max(the parent's draft width, the protocol's acceptance_ceiling_width)."""
     from crit_eval import EVAL_DIR
     protocol = json.loads((EVAL_DIR / "protocol.json").read_text(encoding="utf-8"))
@@ -316,13 +311,13 @@ def implied_rate(tokens_per_round, draft_steps):
     return (low + high) / 2
 
 
-# Plan rules 2: tokens per round a long-context point must exceed for its engine to count as drafting where the draft
+# Tokens per round a long-context point must exceed for its engine to count as drafting where the draft
 # width is unknown (crit serve counts a plain engine's n tokens over n - 1 passes, slightly above 1).
 DRAFTING_TOKENS_PER_ROUND = 1.1
 
 
 def measured_acceptance(result, kpi):
-    """Plan rules 2: the per-token acceptance of the drafter the parent's Eval measured, for decode or context_decode.
+    """The per-token acceptance of the drafter the parent's Eval measured, for decode or context_decode.
     decode: per case the rate Eval's acceptance bound uses (acceptance_rates). context_decode: per long-context point its
     measured tokens per round at the engine's draft width inverted to a rate (implied_rate); where the width is unknown,
     a cap at the points' measured tokens per round (geometric mean). None when Eval measured no drafter."""
@@ -343,7 +338,7 @@ def measured_acceptance(result, kpi):
 
 
 def acceptance_bound(acceptance, draft_steps):
-    """Plan rules 2: the most tokens per round the measured drafter reaches at draft_steps draft steps with every later
+    """The most tokens per round the measured drafter reaches at draft_steps draft steps with every later
     draft accepted as often as its first, as Eval projects its acceptance bound (crit_eval.limits.headroom.tokens_at_rate):
     per case (point) (1 - a^(k+1)) / (1 - a) at its rate a, geometric mean; or the cap measured_acceptance gives."""
     from crit_eval.limits.headroom import tokens_at_rate
@@ -352,14 +347,13 @@ def acceptance_bound(acceptance, draft_steps):
     return _geomean([tokens_at_rate(rate, draft_steps)[draft_steps] for rate in acceptance["rates"].values()])
 
 
-def computed_limits(result, model, version=1):
+def computed_limits(result, model):
     """The decode limits crit computes from an Eval attempt's facts: per measured decode case (and long-context point)
     the measured tokens per round (1 where none is measured) over its pass floor, the bytes one pass reads (the
     pass's weights and state plus the KV of the tokens held) over the device's memory bandwidth, and their geometric
-    mean. Deterministic: measured acceptance, never full acceptance. In rules 1 the draft steps' own cost is left out,
-    an upper bound at the measured acceptance; rules 2 charge each round the engine's draft width at Eval's draft floor
-    (Eval's round floor), and keep the upper bound, labelled, where the width or the draft floor is unknown. {} when the
-    attempt lacks the bandwidth or the bytes per pass."""
+    mean. Deterministic: measured acceptance, never full acceptance. Each round is charged the engine's draft width at
+    Eval's draft floor (Eval's round floor); where the width or the draft floor is unknown the pass floor alone stands,
+    labelled an upper bound. {} when the attempt lacks the bandwidth or the bytes per pass."""
     from crit_eval.limits.headroom import decode_suite
     room = result.get("headroom") or {}
     bandwidth = _positive(room.get("bandwidth_gbs"))
@@ -369,14 +363,14 @@ def computed_limits(result, model, version=1):
     kv = _positive(room.get("kv_bytes_per_token")) or 0
     paths = {"bytes_per_pass": source, "bandwidth_gbs": "headroom.bandwidth_gbs",
              "kv_bytes_per_token": "headroom.kv_bytes_per_token" if kv else None}
-    width, step_ms, label = _width(result), None, {}
-    if version >= 2:
-        step_ms, draft_source = _draft_floor(result, model) if width else (None, None)
-        if width and step_ms is not None:
-            label = {"bound": ROUND_FLOOR, "draft_steps": width, "draft_floor_ms": step_ms}
-            paths = {**paths, "draft_width": "headroom.draft_width", "draft_floor_ms": draft_source}
-        else:
-            label = {"bound": UPPER_BOUND}
+    width = _width(result)
+    step_ms, draft_source = _draft_floor(result, model) if width else (None, None)
+    if width and step_ms is not None:
+        label = {"bound": ROUND_FLOOR, "draft_steps": width, "draft_floor_ms": step_ms}
+        paths = {**paths, "draft_width": "headroom.draft_width", "draft_floor_ms": draft_source}
+    else:
+        label = {"bound": UPPER_BOUND}
+
     draft_ms = width * step_ms if label.get("bound") == ROUND_FLOOR else 0.0
     draft_formula = " + draft_width x draft_floor_ms" if draft_ms else ""
 
@@ -419,31 +413,30 @@ def computed_limits(result, model, version=1):
     return found
 
 
-# Plan rules 2: a family at this fraction of its limit or above is near it. Near the limit a near tie no longer puts
-# both families in p1, and a family further from its limit is marked not needed only with the cause in gaps.
+# A family at this fraction of its limit or above is near it. Near the limit a near tie no longer puts both families
+# in p1, and a family further from its limit is marked not needed only with the cause in gaps.
 NEAR_LIMIT = 0.85
-# Plan rules 2: the gaps entry that answers why a family's own limit is not reachable.
+# The gaps entry that answers why a family's own limit is not reachable.
 LIMIT_GAP = "limit"
-# Plan rules 2: the relative noise of a KPI whose noise the Eval leaves unknown, when it knows none of its KPIs'.
+# The relative noise of a KPI whose noise the Eval leaves unknown, when it knows none of its family's.
 DEFAULT_NOISE = 0.05
-# Plan rules 3: a family below this fraction of its limit is marked not needed only on measured rejections: every
-# gaps entry on it carries the evidence, an Eval gap answers rejected, and (prefill) every faster prompt activation
-# format Eval reports is rejected by a quality measurement outside the quality noise.
+# A family below this fraction of its limit is marked not needed only on measured rejections: every gaps entry on it
+# carries the evidence, an Eval gap answers rejected, and (prefill) every faster prompt activation format Eval reports
+# is rejected by a quality measurement outside the quality noise.
 MEASURED_ONLY = 0.5
-# Plan rules 5: a build plan whose forecast's best case leaves a needed family below this fraction of its limit says,
-# with a measurement in the run, what keeps the rest out of reach.
+# A build plan whose forecast's best case leaves a needed family below this fraction of its limit gets a warning,
+# unless a gaps entry `limit` names the measured bound that keeps the rest out of reach.
 REACH = 0.5
-# Plan rules 3: a gaps entry naming a prompt activation format Eval prices (crit-eval's ceilings by activation format).
+# A gaps entry naming a prompt activation format Eval prices (crit-eval's ceilings by activation format).
 ACTIVATION_GAP = "activation:"
 
 
-def noise_default(facts, kpi=None, version=2):
-    """Plan rules 2: the noise an unknown noise takes, the largest relative noise the Eval knows among its KPIs, else
-    DEFAULT_NOISE, with where it comes from. Plan rules 7, given the KPI: the largest known noise of its own family
-    (time to first token is a family of its own), else DEFAULT_NOISE: a first token's spread says nothing about decode's
-    noise, and borrowing it once set a decode lever's bar at 151%."""
+def noise_default(facts, kpi=None):
+    """The noise an unknown noise takes, with where it comes from: given the KPI, the largest known noise of its own
+    family (time to first token is a family of its own), else of every KPI, else DEFAULT_NOISE. A first token's spread
+    says nothing about decode's noise, and borrowing it once set a decode lever's bar at 151%."""
     known = {name: noise for name, noise in ((facts or {}).get("noise") or {}).items() if noise is not None}
-    if version >= 7 and kpi is not None:
+    if kpi is not None:
         peers = FAMILIES.get(FAMILY.get(kpi), (kpi,))
         known = {name: noise for name, noise in known.items() if name in peers}
     if not known:
@@ -452,54 +445,45 @@ def noise_default(facts, kpi=None, version=2):
     return known[kpi], kpi
 
 
-def noises(facts, version):
-    """Each KPI's relative noise as the plan rules use it: as frozen in rules 1 (unknown stays None), with unknown
-    noise at noise_default in rules 2 (its family's in rules 7)."""
+def noises(facts):
+    """Each KPI's relative noise as the plan rules use it: as Eval measured it, an unknown one at its family's
+    default (noise_default)."""
     frozen = (facts or {}).get("noise") or {}
-    if version < 2:
-        return dict(frozen)
-    return {kpi: frozen.get(kpi) if frozen.get(kpi) is not None else noise_default(facts, kpi, version)[0]
-            for kpi in KPIS}
+    return {kpi: frozen.get(kpi) if frozen.get(kpi) is not None else noise_default(facts, kpi)[0] for kpi in KPIS}
 
 
-def family(facts, name, version=1):
-    """A family's fraction of its limit (the lower of its members') and its noise: in rules 1 the noise of the member
-    that sets the fraction, in rules 2 the largest noise of its members with a fraction (unknown at its default)."""
+def family(facts, name):
+    """A family's fraction of its limit (the lower of its members') and its noise, the largest of its members with a
+    fraction (an unknown one at its default)."""
     members = [(facts["kpis"][kpi]["fraction"], kpi) for kpi in FAMILIES[name]
                if kpi in facts["kpis"] and facts["kpis"][kpi]["fraction"] is not None]
     if not members:
         return None, None
-    fraction, kpi = min(members)
-    if version < 2:
-        return fraction, facts["noise"].get(kpi)
-    noise = noises(facts, version)
+    fraction = min(members)[0]
+    noise = noises(facts)
     return fraction, max(noise[member] for _, member in members)
 
 
-def priorities(needed, facts, version=1):
+def priorities(needed, facts):
     """The plan's priorities from its needed flags and the frozen fractions, or None with the reason. Decode and
     prefill are p1 and p2 by which is further from its limit, both p1 when the distance between their fractions is
-    within the noise: in rules 1 the larger of (relative noise × fraction) of the two families, in rules 2 the two
-    combined in quadrature, except (rules 2) when both are at NEAR_LIMIT or above, where the lower is p1 alone. Time
-    to first token is never p1."""
+    within their noise bands combined in quadrature, except when both are at NEAR_LIMIT or above, where the lower is
+    p1 alone. Time to first token is never p1."""
     decode, prefill = needed["decode"]["needed"], needed["prefill"]["needed"]
     if not decode and not prefill:
         return None, "neither decode nor prefill is needed: the plan is a stop plan"
     if facts is None:
         return None, "the run has no Eval yet: priorities follow from the first Eval's fractions of the limits"
     if decode and prefill:
-        (f_decode, n_decode), (f_prefill, n_prefill) = family(facts, "decode", version), family(facts, "prefill", version)
+        (f_decode, n_decode), (f_prefill, n_prefill) = family(facts, "decode"), family(facts, "prefill")
         missing = [name for name, fraction in (("decode", f_decode), ("prefill", f_prefill)) if fraction is None]
         if missing:
             return None, "the parent's Eval reports no fraction of the limit for " + " and ".join(missing)
-        if version >= 2:
-            band = math.hypot(n_decode * f_decode, n_prefill * f_prefill)
-        else:
-            band = max((n_decode or 0) * f_decode, (n_prefill or 0) * f_prefill)
-        near = version >= 2 and f_decode >= NEAR_LIMIT and f_prefill >= NEAR_LIMIT
+        band = math.hypot(n_decode * f_decode, n_prefill * f_prefill)
+        near = f_decode >= NEAR_LIMIT and f_prefill >= NEAR_LIMIT
         if abs(f_decode - f_prefill) <= band and not near:
             return {"p1": ["decode", "prefill"], "p2": ["ttft"], "p3": []}, None
-        # Apart, or both near their limits (rules 2): the family further from its limit alone, decode on an exact tie.
+        # Apart, or both near their limits: the family further from its limit alone, decode on an exact tie.
         first, second = ("prefill", "decode") if f_prefill < f_decode else ("decode", "prefill")
         return {"p1": [first], "p2": [second], "p3": ["ttft"]}, None
     return {"p1": ["decode" if decode else "prefill"], "p2": ["ttft"], "p3": []}, None
@@ -570,40 +554,45 @@ CRIT_FIELDS = {"plan_id", "segment_id", "created_at", "request_sha256", "inputs"
 
 
 OPTIONAL = {"supersedes", "estimated_limits", "forecast_justification", "weakest", "review", "prompt_activations",
-            "round"}
+            "round", "engine"}
+# A plan for an external engine (crit.run.external) says so: its candidate declares configuration.engine, and its rungs
+# name levers by technique or kernel taken into the engine's own code, not by plugin.
+EXTERNAL = "external"
 
-# Plan rules 4: what each candidate of a run is for, by its number in the run (objective()). The proof of concept
-# works end to end; the crit rounds raise it with crit's toolkit; each critique round names the parent's two weakest
-# terms and improves them, with other levers beside them.
+# What each candidate of a run is for, by its rung on the candidate ladder (crit.run.ladder; objective()).
 OBJECTIVES = {
-    "proof_of_concept": "the first engine that works end to end: it serves, passes the functional gates and the "
-                        "quality gate at the required context, built in its placement scenario's starting design "
-                        "(recon.md's placement plan)",
+    "proof_of_concept": "the first engine that builds and passes crit run ... serve --check (its plugins' tests "
+                        "included), built in its placement scenario's starting design (recon.md's placement plan)",
+    "plugin_round": "the parent with every plugin crit's library and crit-hub offer that fits the checkpoint and the "
+                    "GPU (crit plugins list --model MODEL --device cuda) in the slots it fills, each plugin's tests "
+                    "passing against its reference; crit run ... ablate says which plugin pays, slows or breaks the "
+                    "engine",
     "crit_round": "improve the parent as much as possible with crit's toolkit: Inference techniques and Kernels Hub "
                   "kernels, each measured against its floor and fixed or replaced where it trails",
     "critique_round": "name the parent's two weakest terms (the largest measured distances to their floors, from Eval "
                       "and the kernel trace) in weakest, improve both, and add other levers beside them",
 }
-CRIT_ROUNDS = 3        # candidates 2 and 3
-# On the candidate ladder (crit.run.ladder) candidate 1 builds and serves with no Eval, candidate 2 is the plugin
-# round, candidates 3 to LADDER_CRIT_ROUNDS are crit rounds and critique rounds start after the ladder's full Eval.
-LADDER_OBJECTIVES = {
-    "proof_of_concept": "the first engine that builds, passes its plugins' tests (crit plugins test) and crit run ... "
-                        "serve --check, built in its placement scenario's starting design (recon.md's placement plan)",
-    "plugin_round": "the parent with every plugin crit's library and crit-hub offer that fits the checkpoint and the "
-                    "GPU (crit plugins list --model MODEL --device cuda) in the slots it fills, each plugin's tests "
-                    "passing against its reference (crit plugins test); crit run ... ablate says which plugin pays, "
-                    "slows or breaks the engine",
+# The same rungs for an external engine: what differs is where a lever lives (the engine's own code) and how it is
+# switched (the options the engine declares, which crit run ... ablate varies).
+EXTERNAL_OBJECTIVES = {
+    "proof_of_concept": "the first engine that builds, starts from its launch command and passes crit run ... serve "
+                        "--check, built in its placement scenario's starting design (recon.md's placement plan)",
+    "technique_round": "the parent with every crit Inference technique and kernel template that fits the checkpoint "
+                       "and the GPU taken into the engine's own code, each a lever named by its technique or kernel "
+                       "(provider inference:ID or kernel:FAMILY/ID) and declared as an option the engine exposes, so "
+                       "crit run ... ablate --set OPTION=VALUE says which pays, slows or breaks the engine",
 }
-LADDER_CRIT_ROUNDS = ladder.RUNGS   # candidates 3 to 5
-# Plan rules 4: what supplies a speed lever's code (`provider`): an Inference entry, a Kernel Hub repository, a library
-# (kernels/SOURCES.md), or the engine's own code, which carries a `yardstick`: the measurement of the best existing
+CRIT_ROUNDS = ladder.RUNGS   # candidates 3 to 5 are crit rounds, 6 on critique rounds
+# What supplies a speed lever's code (`provider`): an Inference entry, a crit kernel template (kernel:FAMILY/ID, as an
+# external engine takes one into its own code), a Kernel Hub repository, a library
+# (kernels/README.md#libraries), or the engine's own code, which carries a `yardstick`: the measurement of the best existing
 # provider for the operation, or the providers it checked and why none fits.
-PROVIDERS = ("inference:", "hub:", "lib:", "own")
-# Candidates 2 to FLOOR_UNTIL forecast at least MIN_GAIN of expected gain on a p1 KPI over the parent's Eval.
+PROVIDERS = ("inference:", "kernel:", "hub:", "lib:", "own")
+# Candidates 2 to FLOOR_UNTIL that forecast less than MIN_GAIN of expected gain on a p1 KPI over the parent's Eval
+# get a warning: their rung is for a large step.
 MIN_GAIN, FLOOR_UNTIL = 0.10, 5
 # A requirement lever that `serves` "gate:NAME" repairs that gate of the parent's Eval (state "fail"): the plan is a
-# gate repair, which a candidate needs whatever it forecasts, so the floor on p1 and a critique round's weakest terms
+# gate repair, which a candidate needs whatever it forecasts, so the gain warning and a critique round's weakest terms
 # do not apply to it.
 GATE_REPAIR = "gate:"
 # A requirement lever that `serves` "check:NAME" repairs a check crit run requires (arithmetic, functional,
@@ -633,7 +622,7 @@ def _largest(plan, p1):
 
 
 def review_facts(root, run, parent, eval_ref):
-    """Plan rules 4, check 14: what the plan for the parent's child reviews: the parent's plan, its outcome at the Eval
+    """What the plan for the parent's child reviews: the parent's plan, its outcome at the Eval
     attempt this plan freezes, the KPIs that missed their forecast and the levers built, pruned or deferred. None when
     the parent has no plan or no outcome at that attempt."""
     planned = [s for s in summaries(root, run) if s["candidate_id"] == parent]
@@ -655,23 +644,25 @@ def review_facts(root, run, parent, eval_ref):
             "largest_p1_lever": largest, "largest_p1_fate": fates.get(largest) if largest else None}
 
 
-def objective(number, rungs=False, last=False):
-    """Plan rules 4: the objective of the run's candidate `number` (1 for the first). rungs: the run counts its budget
-    on the candidate ladder, where the objective also names the rung's Eval (`eval`, crit.run.ladder.rung), the full
-    one when `last` (the plan's candidate takes its segment's last budgeted candidate)."""
-    if rungs:
-        name = ("proof_of_concept" if number == 1 else "plugin_round" if number == 2
-                else "crit_round" if number <= LADDER_CRIT_ROUNDS else "critique_round")
-        return {"candidate": number, "name": name, "rule": LADDER_OBJECTIVES.get(name, OBJECTIVES.get(name)),
-                **({"min_gain": MIN_GAIN} if 2 <= number <= FLOOR_UNTIL else {}), "eval": ladder.rung(number, last)}
-    name = ("proof_of_concept" if number == 1 else "crit_round" if number <= CRIT_ROUNDS else "critique_round")
-    return {"candidate": number, "name": name, "rule": OBJECTIVES[name],
-            **({"min_gain": MIN_GAIN} if 2 <= number <= FLOOR_UNTIL else {})}
+def objective(number, last=False, origin=False, external=False):
+    """The objective of the run's candidate `number` (1 for the first) by its rung on the candidate ladder, with the
+    rung's Eval (`eval`, crit.run.ladder.rung): the full one when `last` (the plan's candidate takes its segment's last
+    budgeted candidate), a small one for an origin engine's import (`origin`). `external`: the rungs of an external
+    engine, whose second is a technique round (EXTERNAL_OBJECTIVES)."""
+    name = ("proof_of_concept" if number == 1 else ("technique_round" if external else "plugin_round") if number == 2
+            else "crit_round" if number <= CRIT_ROUNDS else "critique_round")
+    rule = (EXTERNAL_OBJECTIVES if external else {}).get(name) or OBJECTIVES[name]
+    return {"candidate": number, "name": name, "rule": rule, **({"engine": EXTERNAL} if external else {}),
+            **({"min_gain": MIN_GAIN} if 2 <= number <= FLOOR_UNTIL else {}),
+            "eval": ladder.rung(number, last, origin)}
 
 
 def _fields(data):
-    """Check 1: fields, types and text limits; unknown keys are refused."""
+    """Fields, types and text limits; unknown keys are refused."""
     keys(data, FIELDS, OPTIONAL)
+    if "engine" in data and data["engine"] != EXTERNAL:
+        raise ValueError(f'engine is "{EXTERNAL}" for an external engine started from its launch command; a plan for a '
+                         "plugin package leaves it out")
     if "prompt_activations" in data:
         from crit_core.serving import prompt_activations
         if not prompt_activations(data["prompt_activations"]):
@@ -738,7 +729,7 @@ def _fields(data):
         text(row["detail"], f"gaps detail for {row['gap']}", 8000)
     strategy = data["strategy"]
     keys(strategy, {"current", "alternative", "choice", "reason"})
-    for side in ("current", "alternative"):  # check 10: both present and nonempty
+    for side in ("current", "alternative"):  # both present and nonempty
         keys(strategy[side], {"name", "ceiling", "evidence"}, {"limits"} if side == "alternative" else ())
         text(strategy[side]["name"], f"strategy.{side}.name", 400)
         text(strategy[side]["ceiling"], f"strategy.{side}.ceiling (a number with its unit and where it comes from)", 400)
@@ -802,8 +793,9 @@ def _fields(data):
             keys(change, {"change", "source"})
             number(change["change"], f"{lever['id']} {kpi} change (relative, in the KPI's improving direction)", -100, 1000)
             source = text(change["source"], f"{lever['id']} {kpi} source", 500)
-            if source != "estimate" and not source.startswith("eval-gap:"):
-                raise ValueError(f"{lever['id']} {kpi} source is eval-gap:<gap name> or estimate")
+            if source != "estimate" and not source.startswith(("eval-gap:", MEASURED_SOURCE)):
+                raise ValueError(f"{lever['id']} {kpi} source is eval-gap:<gap name>, {MEASURED_SOURCE}<path in the "
+                                 "run> or estimate")
     for row in data["rejected"]:
         keys(row, {"name", "reason"}, {"bound_by", "evidence"})
         text(row["name"], "rejected name", 400)
@@ -863,11 +855,6 @@ def _alternative(run, root, facts, result, data, sources):
     crit computes the alternative's round floor wherever the attempt or the model files hold its facts, so only the
     tokens per round are the plan's; elsewhere the plan gives the ceiling. Used whatever the plan chooses."""
     limits = data["strategy"]["alternative"].get("limits", {})
-    if run["spec"].get("plan_limits") != "computed":
-        if limits:
-            raise ValueError("strategy.alternative.limits rank a run that computes plan limits; this run ranks by the "
-                             "current strategy's limits only")
-        return None
     found = {}
     for kpi, row in limits.items():
         current = (facts or {}).get("kpis", {}).get(kpi) if facts else None
@@ -875,27 +862,21 @@ def _alternative(run, root, facts, result, data, sources):
             raise ValueError(f"strategy.alternative.limits names {kpi}, which the parent's Eval did not measure")
         model = run["spec"]["model_path"]
         steps = row.get("draft_steps", 0)
-        if rules(run) >= 2 and "tokens_per_round" in row and row["tokens_per_round"] > steps + 1:
+        if "tokens_per_round" in row and row["tokens_per_round"] > steps + 1:
             raise ValueError(f"strategy.alternative.limits.{kpi}.tokens_per_round {row['tokens_per_round']:g} is above "
                              f"draft_steps + 1 = {steps + 1}: a round of {steps} draft steps emits at most {steps + 1} "
                              "tokens (the drafts and the target's own token)")
         drafted = _drafter(run, root, data["parent_candidate_id"], result, kpi, row, steps)
-        # Rules 2 charge the draft steps at Eval's draft floor, as computed_limits does: one cost model, Eval's.
-        computed = (alternative_limit(result, model, kpi, row["tokens_per_round"], steps, rules(run),
+        # The draft steps are charged at Eval's draft floor, as computed_limits does: one cost model, Eval's.
+        computed = (alternative_limit(result, model, kpi, row["tokens_per_round"], steps,
                                       _companion(root, row, name=f"strategy.alternative.limits.{kpi}"))
                     if "tokens_per_round" in row else None)
         if "tokens_per_round" in row and computed is None:
-            if rules(run) >= 2:  # a bare limit is refused there too (_drafter): say the one way that is left
-                raise ValueError(f"crit cannot compute the round floor for strategy.alternative.limits.{kpi} (no bytes "
-                                 "per pass, bandwidth or draft step cost: a separate drafter no Eval has measured is "
-                                 "priced from recon --drafter's pass bytes): record the drafter with recon, or in plan "
-                                 f"rules 2 leave {kpi} out of strategy.alternative.limits, so the alternative does not "
-                                 "rank it; its strategy, forecast and evidence still stand")
-            raise ValueError(f"crit cannot compute the round floor for strategy.alternative.limits.{kpi} (no bytes per "
-                             "pass, bandwidth or draft step bytes): give its limit and how it was derived instead")
-        if "limit" in row and alternative_limit(result, model, kpi, 1.0, 0) is not None:
-            raise ValueError(f"crit computes the round floor for {kpi} from the parent's Eval: give "
-                             f"strategy.alternative.limits.{kpi}.tokens_per_round (and draft_steps), not a limit")
+            raise ValueError(f"crit cannot compute the round floor for strategy.alternative.limits.{kpi} (no bytes "
+                             "per pass, bandwidth or draft step cost: a separate drafter no Eval has measured is "
+                             "priced from recon --drafter's pass bytes): record the drafter with recon, or leave "
+                             f"{kpi} out of strategy.alternative.limits, so the alternative does not rank it; its "
+                             "strategy, forecast and evidence still stand")
         limit = computed["limit"] if computed else row["limit"]
         entry = {"limit": limit, "unit": "tok/s", "derivation": row["derivation"],
                  "computed_by": "crit" if computed else "plan",
@@ -903,8 +884,7 @@ def _alternative(run, root, facts, result, data, sources):
                      "round_floor_ms": computed["round_floor_ms"], "inputs": computed["inputs"],
                      "formula": "geometric mean over the parent's decode cases (long-context points) of tokens_per_round "
                                 "x 1000 / round_floor_ms, round_floor_ms = the pass floor with the tokens held plus "
-                                "draft_steps x " + ("draft_floor_ms" if rules(run) >= 2 else "draft_bytes_per_step / bandwidth"),
-                     **({"bound": ROUND_FLOOR} if rules(run) >= 2 else {})} if computed else {}), **drafted}
+                                "draft_steps x draft_floor_ms", "bound": ROUND_FLOOR} if computed else {}), **drafted}
         current_limit = (current["score"] / current["fraction"]) if current["fraction"] else None
         entry |= {"current_limit": current_limit, "current_source": sources.get(kpi),
                   "won": current_limit is None or limit > current_limit}
@@ -916,7 +896,7 @@ def _alternative(run, root, facts, result, data, sources):
 
 
 def _drafter(run, root, parent, result, kpi, row, steps):
-    """Plan rules 2: the drafter an alternative's ceiling assumes and the bound on its claim. Every claim gives its
+    """The drafter an alternative's ceiling assumes and the bound on its claim. Every claim gives its
     tokens per round (never a bare limit) and stays within Eval's widest projected draft (_widest) and draft_steps + 1
     tokens a round. The drafter the parent's Eval measured (measured) and a new one (new) both stay within the measured
     drafter's acceptance bound at the claimed steps (acceptance_bound): a new drafter is assumed to accept like the
@@ -925,11 +905,6 @@ def _drafter(run, root, parent, result, kpi, row, steps):
     applies, noted. Returns the entry's drafter fields with the claim's implied acceptance rate; refuses a claim above
     its bound."""
     name = f"strategy.alternative.limits.{kpi}"
-    if rules(run) < 2:
-        for key in ("drafter", "acceptance_evidence"):
-            if key in row:
-                raise ValueError(f"{name}.{key} is a field of plan rules 2; this run checks plans with the first rules")
-        return {}
     if "drafter" not in row:
         raise ValueError(f"{name}.drafter names the drafter the ceiling assumes: measured (the drafter the parent's Eval "
                          "measured) or new")
@@ -937,7 +912,7 @@ def _drafter(run, root, parent, result, kpi, row, steps):
     if evidence is not None and drafter != "new":
         raise ValueError(f"{name}.acceptance_evidence is for a new drafter: the measured drafter's acceptance is its Eval's")
     if "tokens_per_round" not in row:
-        raise ValueError(f"{name} gives a bare limit: in plan rules 2 an alternative's ceiling is its tokens_per_round "
+        raise ValueError(f"{name} gives a bare limit: an alternative's ceiling is its tokens_per_round "
                          "and draft_steps over a round floor crit computes, so it can be bounded; where crit cannot "
                          "compute the floor (no bandwidth or bytes per pass), the alternative does not rank the families")
     measured = None
@@ -972,7 +947,7 @@ EVIDENCE = re.compile(r"candidates/(candidate-[0-9]{4,8})/eval/(attempt-[0-9]{4,
 
 
 def _evidence(root, parent, kpi, path, name):
-    """Plan rules 2: a new drafter's acceptance measurement, another candidate's completed Eval attempt retained in the
+    """A new drafter's acceptance measurement, another candidate's completed Eval attempt retained in the
     run (candidates/<candidate>/eval/<attempt>.json, not the parent's): (its result, {path, sha256}, its measured
     acceptance for the KPI). Refused when it is anything else or measured no drafter acceptance."""
     match = EVIDENCE.fullmatch(path)
@@ -1047,66 +1022,58 @@ def speed_levers(levers):
 
 
 def _above(lever, noise):
-    """Whether a lever has a change above its KPI's noise; a positive change on a KPI of unknown noise counts (in rules
-    2 no noise is unknown: `noise` comes from noises())."""
-    return any(row["change"] > (noise.get(kpi) or 0) if noise.get(kpi) is not None else row["change"] > 0
-               for kpi, row in lever["changes"].items())
+    """Whether a lever has a change above its KPI's noise (noises(): none is unknown)."""
+    return any(row["change"] > (noise.get(kpi) or 0) for kpi, row in lever["changes"].items())
+
 
 
 def build(root, run, bounds, data, status_for=None):
     """Validate a plan payload against the run's facts and return the record crit stores (without plan_id).
     status_for: the Eval status to judge the parent's result by, by its path in the run (a replay's statuses rendered
-    again, replay.status_for); by default the status stored in the result. The plan passes CHECKS, those of the run's
-    plan rules and the ones before them."""
+    again, replay.status_for); by default the status stored in the result. The plan passes every check in CHECKS; the
+    ones that judge a forecast add warnings (inputs.warnings) instead of refusing it."""
     _fields(data)
-    version = rules(run)
     parent = data["parent_candidate_id"]
     first = parent is None
     candidates = sorted(path.name for path in safe_path(root, "candidates").glob("candidate-*"))
-    rungs = ladder.ladder(run)
-    # The run's candidates by number: on the candidate ladder those on it, with budget_counts evaluated those that went
-    # through Eval (a draft's fix plans the same candidate again).
-    counted = ladder.counted(root) if rungs else None
-    numbered = (sorted(counted) if rungs else sorted(evaluated_candidates(root)) if counts_evaluated(run)
-                else candidates)
-    # Check 2: the parent exists and the plan freezes its newest Eval attempt.
-    if first and numbered:
+    # The run's candidates on the candidate ladder, by number (a draft's fix plans the same candidate again).
+    counted = ladder.counted(root)
+    if first and counted:
         raise ValueError("parent_candidate_id names the candidate whose Eval the plan starts from; null only while the "
-                         "run has no candidate" + (" on the candidate ladder" if rungs else " that went through Eval"
-                                                   if counts_evaluated(run) else ""))
+                         "run has no candidate on the candidate ladder")
+    external = data.get("engine") == EXTERNAL
+    if not first and parent in candidates and is_external(root, parent) != external:
+        raise ValueError(f"{parent} is " + ("an external engine: its child's plan says engine \"external\""
+                                            if not external else "a plugin package: a plan from it leaves engine out")
+                         + " (an engine keeps its kind; start another run for the other kind)")
     eval_ref, facts, computed, result = None, None, None, None
     if not first:
         if parent not in candidates:
             raise ValueError(f"parent_candidate_id {parent} is not a candidate of this run")
+        # A parent stands on its rung before a plan starts from it: through its Eval, or below the full Eval sealed
+        # built or completed with a passed serve check, when it skipped its Eval.
+        if parent not in counted:
+            raise ValueError(f"{parent} is not on the candidate ladder yet: run its Eval (crit run ... eval), or, "
+                             "below the full Eval, seal it built (crit run ... seal --lifecycle built) once crit run "
+                             "... serve --check passes, before planning from it (crit run ... next says which)")
         found = completed_evals(root, parent)
-        if rungs:
-            # On the ladder a parent stands on its rung before a plan starts from it: through its Eval, or below the
-            # full Eval sealed built or completed with a passed serve check, when it skipped its Eval.
-            if parent not in counted:
-                raise ValueError(f"{parent} is not on the candidate ladder yet: run its Eval (crit run ... eval), or, "
-                                 "below the full Eval, seal it built (crit run ... seal --lifecycle built) once its "
-                                 "plugins' tests and crit run ... serve --check pass, before planning from it")
-            if not found and (parent in evaluated_candidates(root) or ladder.scope_of(root, parent) == "full"):
-                raise ValueError(f"{parent} has no completed Eval attempt: run crit run ... eval --candidate {parent} "
-                                 "(--resume goes on from a stopped one) before planning from it")
-        elif not found and newest_eval(root) is not None:
-            raise ValueError(f"{parent} has no completed Eval attempt: run crit run ... eval --candidate {parent} before "
-                             "planning from it")
-        # Rules 7: the newest attempt that measured decode and prefill, so a partial rerun (quality alone) leaves the
-        # attempt the plan's gaps, forecast and review refer to in place.
+        if not found and (parent in evaluated_candidates(root) or ladder.scope_of(root, parent) == "full"):
+            raise ValueError(f"{parent} has no completed Eval attempt: run crit run ... eval --candidate {parent} "
+                             "(--resume goes on from a stopped one) before planning from it")
+        # The newest attempt that measured decode and prefill, so a partial rerun (quality alone) leaves the attempt
+        # the plan's gaps, forecast and review refer to in place.
         for path in reversed(found):
             eval_ref = {"path": path.relative_to(root).as_posix(), "sha256": file_sha(path)}
             result = read_json(path, max_bytes=EVAL_JSON_BYTES)
             status = (status_for or {}).get(eval_ref["path"])
             facts = extract(status if status is not None else result.get("status") or {})
-            if version < 7 or path == found[0] or all(
-                    (facts["kpis"].get(kpi) or {}).get("score") is not None for kpi in ("decode", "prefill")):
+            if path == found[0] or all((facts["kpis"].get(kpi) or {}).get("score") is not None
+                                       for kpi in ("decode", "prefill")):
                 break
         if found:
-            if run["spec"].get("plan_limits") == "computed":
-                # The limits Eval leaves out that crit can compute from the attempt (and the run's model files).
-                computed = {kpi: entry for kpi, entry in computed_limits(result, run["spec"]["model_path"], version).items()
-                            if kpi in facts["kpis"] and facts["kpis"][kpi]["fraction"] is None}
+            # The limits Eval leaves out that crit can compute from the attempt (and the run's model files).
+            computed = {kpi: entry for kpi, entry in computed_limits(result, run["spec"]["model_path"]).items()
+                        if kpi in facts["kpis"] and facts["kpis"][kpi]["fraction"] is None}
     needed = {name: data["needed"][name]["needed"] for name in FAMILIES}
     # A limit Eval leaves out is the plan's estimate when the priorities compare the two families.
     compared = [kpi for name in FAMILIES for kpi in FAMILIES[name]] if all(needed.values()) else []
@@ -1116,69 +1083,66 @@ def build(root, run, bounds, data, status_for=None):
     recon_path = root / "work" / "recon.json"
     inputs = {"eval": eval_ref, "recon_sha256": file_sha(recon_path) if recon_path.is_file() else None,
               **(facts or {"kpis": None, "noise": None, "untiered": None, "gaps": None}), "estimated": estimated,
-              **({"computed_limits": computed, "fraction_sources": sources, "estimates_not_used": unused,
-                  "alternative_limits": alternative} if run["spec"].get("plan_limits") == "computed" else {}),
-              **({"noise_default": dict(zip(("noise", "source"), noise_default(facts)))}
-                 if 2 <= version < 7 and facts is not None else {}),
-              # Rules 7: each unknown noise's default, from its own family.
-              **({"noise_default": {kpi: dict(zip(("noise", "source"), noise_default(facts, kpi, version)))
+              "computed_limits": computed, "fraction_sources": sources, "estimates_not_used": unused,
+              "alternative_limits": alternative,
+              # Each unknown noise's default, from its own family.
+              **({"noise_default": {kpi: dict(zip(("noise", "source"), noise_default(facts, kpi)))
                                     for kpi in KPIS if (facts.get("noise") or {}).get(kpi) is None}}
-                 if version >= 7 and facts is not None else {})}
-    if version >= 4 or rungs:
-        # The run's candidates so far, this plan's candidate the next one (a revision plans the same one again). On the
-        # candidate ladder the segment's last budgeted candidate gets the full Eval.
-        budget = bounds["limits"].get("candidate_budget")
-        last = (rungs and budget is not None
-                and sum(found == bounds["segment_id"] for found in counted.values()) + 1 >= budget)
-        inputs["objective"] = objective(len(numbered) + 1, rungs, last)
+                 if facts is not None else {})}
+    # This plan's candidate is the next one on the ladder (a revision plans the same one again); the segment's last
+    # budgeted candidate gets the full Eval, and an origin engine's import a small one, so the run has a baseline.
+    budget = bounds["limits"]["candidate_budget"]
+    last = sum(found == bounds["segment_id"] for found in counted.values()) + 1 >= budget
+    inputs["objective"] = objective(len(counted) + 1, last, origin=first and "origin_engine" in run["spec"],
+                                    external=external)
     plan = SimpleNamespace(
-        root=root, run=run, bounds=bounds, data=data, version=version, parent=parent, first=first, eval_ref=eval_ref,
+        root=root, run=run, bounds=bounds, data=data, parent=parent, first=first, eval_ref=eval_ref,
         facts=facts, computed=computed, result=result, needed=needed, compared=compared, sources=sources,
         estimated=estimated, inputs=inputs, decision=data["decision"], forecast=data["forecast"], order=None, reason=None,
-        # The noise checks 4, 6 and 9 use: in rules 2 an unknown noise takes its default.
-        noise=noises(facts, version),
-        # Requirement levers are exempt from checks 5 (a numeric change) and 6, and never count toward 7 or 8.
+        # The noise the checks weigh changes and gaps against: an unknown noise takes its family's default.
+        noise=noises(facts), warnings=[],
+        # Requirement levers need no numeric change and never count as a KPI's lever.
         levers=speed_levers(data["levers"]))
-    # A gate repair (rules 4): requirement levers serving gate:NAME for gates the parent's Eval failed, or check:NAME
-    # for checks crit run requires that the parent failed. Either exempts the plan from the speed checks.
-    plan.repairs = _gate_repairs(plan) if version >= 4 and data["decision"] == "build" else []
-    plan.check_repairs = _check_repairs(plan) if version >= 4 and data["decision"] == "build" else {}
+    # A gate repair: requirement levers serving gate:NAME for gates the parent's Eval failed, or check:NAME for checks
+    # crit run requires that the parent failed. Either exempts the plan from the speed checks.
+    plan.repairs = _gate_repairs(plan) if data["decision"] == "build" else []
+    plan.check_repairs = _check_repairs(plan) if data["decision"] == "build" else {}
     plan.repairing = bool(plan.repairs or plan.check_repairs)
-    for minimum, check in CHECKS:
-        if version >= minimum:
-            check(plan)
+    for check in CHECKS:
+        check(plan)
+    if plan.warnings:
+        inputs["warnings"] = plan.warnings
     return {**data, "supersedes": data.get("supersedes"), "segment_id": bounds["segment_id"], "created_at": now(),
             "request_sha256": run["request_sha256"], "inputs": inputs, "priorities": plan.order,
             "priorities_reason": plan.reason}
 
 
 def _check_decision(plan):
-    """Check 3: the decision follows the needed flags (in rules 2 the run's first plan too)."""
-    if not plan.first or plan.version >= 2:
-        if plan.decision == "stop" and any(plan.needed.values()):
-            raise ValueError("A stop plan requires both decode and prefill not needed: "
-                             + ", ".join(name for name, flag in plan.needed.items() if flag) + " is marked needed")
-        if plan.decision == "build" and not any(plan.needed.values()):
-            raise ValueError("neither decode nor prefill is needed: record a stop plan (decision stop)")
+    """The decision follows the needed flags."""
+    if plan.decision == "stop" and any(plan.needed.values()):
+        raise ValueError("A stop plan requires both decode and prefill not needed: "
+                         + ", ".join(name for name, flag in plan.needed.items() if flag) + " is marked needed")
+    if plan.decision == "build" and not any(plan.needed.values()):
+        raise ValueError("neither decode nor prefill is needed: record a stop plan (decision stop)")
 
 
 def _check_gap_names(plan):
     """Every gaps entry and every lever change sourced from an Eval gap names a gap the parent's Eval reports, beside
-    the entries rules 2 (limit) and 3 (activation:FORMAT) add."""
-    facts, version = plan.facts, plan.version
+    crit's own entries (limit, activation:FORMAT, placement:cpu)."""
+    facts = plan.facts
     gap_names = {(gap["kpi"], gap["name"]) for gap in (facts or {}).get("gaps") or []}
     for row in plan.data["gaps"]:
-        if version >= 3 and row["gap"].startswith(ACTIVATION_GAP):
+        if row["gap"].startswith(ACTIVATION_GAP):
             if row["kpi"] != "prefill" or row["answer"] != "rejected" or "evidence" not in row:
                 raise ValueError(f"gaps entry {row['gap']!r} names a prompt activation format: kpi prefill, answer "
                                  "rejected, with the evidence of its quality measurement")
             continue
-        if version >= 7 and row["gap"] == CPU_TIER_GAP:
+        if row["gap"] == CPU_TIER_GAP:
             if row["kpi"] != "decode" or row["answer"] != "rejected" or "evidence" not in row:
                 raise ValueError(f"gaps entry {CPU_TIER_GAP!r} rejects the CPU expert tier: kpi decode, answer rejected, "
                                  "with the evidence of its measurement")
             continue
-        if version >= 2 and row["gap"] == LIMIT_GAP:
+        if row["gap"] == LIMIT_GAP:
             if row["kpi"] not in FAMILIES or row["answer"] != "cause":
                 raise ValueError(f"gaps entry {LIMIT_GAP!r} names a family (decode or prefill) and answers cause: why "
                                  "the rest of that family's limit is not reachable")
@@ -1192,7 +1156,7 @@ def _check_gap_names(plan):
 
 
 def _check_answered_gaps(plan):
-    """Check 4: every gap above the noise on a KPI marked not needed is answered."""
+    """Every Eval gap above its KPI's noise on a family marked not needed is answered."""
     facts = plan.facts
     if plan.first or facts is None:
         return
@@ -1200,11 +1164,9 @@ def _check_answered_gaps(plan):
     for name, flag in plan.needed.items():
         if flag:
             continue
-        threshold = family(facts, name)[1]
         for gap in facts["gaps"]:
             gain = gap["projected_gain"]
-            # Rules 1 compare with the noise of the member that sets the family, rules 2 with the gap's own KPI.
-            limit = plan.noise.get(gap["kpi"]) if plan.version >= 2 else threshold
+            limit = plan.noise.get(gap["kpi"])
             if FAMILY.get(gap["kpi"]) == name and type(gain) in (int, float) and gain > (limit or 0) \
                     and (gap["kpi"], gap["name"]) not in answered:
                 raise ValueError(f"{name} is marked not needed, but the {gap['kpi']} gap {gap['name']!r} "
@@ -1213,12 +1175,12 @@ def _check_answered_gaps(plan):
 
 
 def _check_limit_gaps(plan):
-    """Check 4, rules 2: a family marked not needed below NEAR_LIMIT answers why its own limit is not reachable."""
+    """A family marked not needed below NEAR_LIMIT answers why its own limit is not reachable."""
     if plan.facts is None:
         return
     limits = {row["kpi"] for row in plan.data["gaps"] if row["gap"] == LIMIT_GAP}
     for name, flag in plan.needed.items():
-        fraction = family(plan.facts, name, plan.version)[0]
+        fraction = family(plan.facts, name)[0]
         if not flag and fraction is not None and fraction < NEAR_LIMIT and name not in limits:
             raise ValueError(f"{name} is marked not needed at {fraction:.0%} of its limit, below {NEAR_LIMIT:.0%}: "
                              f"add a gaps entry {{\"kpi\": \"{name}\", \"gap\": \"{LIMIT_GAP}\", \"answer\": "
@@ -1227,26 +1189,24 @@ def _check_limit_gaps(plan):
 
 
 def _check_measured_only(plan):
-    """Rules 3: a family far below its limit is not needed only on measured rejections (_measured_only)."""
+    """A family far below its limit is not needed only on measured rejections (_measured_only)."""
     if plan.facts is not None:
-        plan.inputs["gap_evidence"] = _measured_only(plan.root, plan.data, plan.facts, plan.result, plan.needed,
-                                                     plan.version)
+        plan.inputs["gap_evidence"] = _measured_only(plan.root, plan.data, plan.facts, plan.result, plan.needed)
 
 
 def _prioritize(plan):
     """The priorities the plan's needed flags give, with the estimates and limit sources the ranking rests on."""
-    plan.order, plan.reason = priorities(plan.data["needed"], plan.facts, plan.version)
+    plan.order, plan.reason = priorities(plan.data["needed"], plan.facts)
     if plan.order is not None:
         # The ranking rests on these estimates where it compares the families.
         plan.order["estimated"] = [kpi for kpi in plan.estimated if kpi in plan.compared]
-        if plan.run["spec"].get("plan_limits") == "computed":
-            # Where each compared fraction comes from: Eval's limit, crit's computed limit or the plan's estimate.
-            plan.order["sources"] = {kpi: plan.sources[kpi] for kpi in plan.compared if kpi in plan.sources}
+        # Where each compared fraction comes from: Eval's limit, crit's computed limit or the plan's estimate.
+        plan.order["sources"] = {kpi: plan.sources[kpi] for kpi in plan.compared if kpi in plan.sources}
 
 
 def _check_levers(plan):
-    """Checks 5 to 8 of a build plan: its levers name KPI changes above the noise (or pay in a group), one improves
-    more than time to first token, and every needed p1 family has one."""
+    """A build plan's levers name KPI changes above the noise (or pay in a group), one improves more than time to
+    first token, and every needed p1 family has one."""
     if plan.decision != "build":
         return
     levers, noise, first, order = plan.levers, plan.noise, plan.first, plan.order
@@ -1254,27 +1214,29 @@ def _check_levers(plan):
         if not lever["changes"]:
             raise ValueError(f"{lever['id']} names no KPI change")
     if plan.repairing:
-        return   # a gate repair is built for the gate whatever its speed levers change (checks 5 to 8)
-    # Check 5: levers, each naming a KPI change.
+        return   # a gate repair is built for the gate whatever its speed levers change
+    # Levers, each naming a KPI change.
     if not levers and not first:
         raise ValueError("A build plan names its levers: each with the KPIs it changes (requirement levers alone "
                          "do not make a candidate)")
     for lever in levers:
         if not lever["changes"]:
             raise ValueError(f"{lever['id']} names no KPI change")
-    # Check 6: a lever below the noise joins a group with one above it.
+    # A lever below the noise joins a group with one above it.
     if not first:
         paying = {lever["group"] for lever in levers if lever["group"] is not None and _above(lever, noise)}
         for lever in levers:
             if not _above(lever, noise) and (lever["group"] is None or lever["group"] not in paying
                                              or sum(other["group"] == lever["group"] for other in levers) < 2):
                 raise ValueError(f"{lever['id']} changes no KPI by more than its noise: put it in a group with the "
-                                 "lever it pays together with, or leave it out")
-    # Check 8: no plan targets time to first token alone.
+                                 "lever it pays together with, or leave it out (measure it first, crit run ... ablate "
+                                 "--data EVAL_DATA --set PLUGIN.OPTION=VALUE, or --set OPTION=VALUE on an external "
+                                 "engine's declared options, rather than raising its estimate)")
+    # No plan targets time to first token alone.
     if levers and not any(row["change"] > 0 for lever in levers for kpi, row in lever["changes"].items() if kpi != "ttft"):
         raise ValueError("No lever improves decode, prefill, context_decode or context_ttft: time to first token is "
                          "never the reason for a candidate on its own")
-    # Check 7: every needed p1 KPI has a lever on its family.
+    # Every needed p1 KPI has a lever on its family.
     if not first and order is not None:
         for name in order["p1"]:
             if plan.needed.get(name) and not any(row["change"] > 0 for lever in levers
@@ -1283,7 +1245,8 @@ def _check_levers(plan):
 
 
 def _check_forecast(plan):
-    """Check 9: the forecast covers every KPI the parent's Eval measured and improves decode or prefill."""
+    """The forecast covers every KPI the parent's Eval measured and improves decode, prefill or a long-context KPI
+    beyond its noise (a fix for long-context requests counts)."""
     forecast, facts = plan.forecast, plan.facts
     measured = tuple(HEADLINE + (CONTEXT if facts is not None and "context_decode" in facts["kpis"] else ()))
     if forecast is None:
@@ -1297,15 +1260,16 @@ def _check_forecast(plan):
     if extra:
         raise ValueError("forecast names " + ", ".join(extra) + ", which the parent's Eval did not measure")
     if plan.decision == "build" and not plan.first and facts is not None and not plan.repairing:
-        scored = [kpi for kpi in ("decode", "prefill") if facts["kpis"][kpi]["score"]]
-        if scored and not any(forecast[kpi]["expected"] / facts["kpis"][kpi]["score"] - 1 > (plan.noise.get(kpi) or 0)
-                              for kpi in scored):
-            raise ValueError("The forecast improves neither decode nor prefill beyond its noise over the parent's "
-                             "Eval: a candidate is planned for at least one of them")
+        families = ("decode", "prefill") + CONTEXT
+        scored = [kpi for kpi in families if kpi in forecast and (facts["kpis"].get(kpi) or {}).get("score")]
+        gains = {kpi: _gain(kpi, forecast[kpi]["expected"], facts["kpis"][kpi]["score"]) for kpi in scored}
+        if scored and not any(gain > (plan.noise.get(kpi) or 0) for kpi, gain in gains.items()):
+            raise ValueError("The forecast improves neither decode, prefill, context_decode nor context_ttft beyond "
+                             "its noise over the parent's Eval: a candidate is planned for at least one of them")
 
 
 def _check_forecast_priorities(plan):
-    """Check 12 (rules 3): a forecast that puts its gain on p2 or lets a p1 KPI fall says why."""
+    """A forecast that puts its gain on p2 or lets a p1 KPI fall says why."""
     if plan.decision == "build" and plan.forecast is not None and plan.facts is not None and plan.order is not None:
         plan.inputs["forecast_checks"] = _forecast_checks(plan.order, plan.forecast, plan.facts)
         if plan.inputs["forecast_checks"] and "forecast_justification" not in plan.data:
@@ -1314,10 +1278,12 @@ def _check_forecast_priorities(plan):
 
 
 def _check_reach(plan):
-    """Check 15 (rules 5): the strategy's ceiling is the limit, not the engine's own measurement."""
+    """The strategy's ceiling is the limit, not the engine's own measurement: how far the forecast reaches toward it,
+    with a warning below REACH (_reach)."""
     # A gate repair is built for its gate, not for reach: the forecast may stay where the parent is.
     if plan.decision == "build" and plan.forecast is not None and plan.facts is not None and not plan.repairing:
-        plan.inputs["reach"] = _reach(plan.root, plan.data, plan.facts, plan.computed, plan.forecast, plan.needed)
+        plan.inputs["reach"] = _reach(plan.root, plan.data, plan.facts, plan.computed, plan.forecast, plan.needed,
+                                      plan.warnings)
 
 
 def _failed_gates(result):
@@ -1394,7 +1360,8 @@ def _check_repairs(plan):
 
 
 def _check_objective(plan):
-    """Check 13 (rules 4): the objective's requirements."""
+    """The objective's requirements: providers and yardsticks, a critique round's weakest terms, and (a warning) the
+    gain a rung from candidate 2 to FLOOR_UNTIL is for."""
     if plan.decision != "build":
         return
     root, data, levers, forecast, facts, order = plan.root, plan.data, plan.levers, plan.forecast, plan.facts, plan.order
@@ -1406,7 +1373,7 @@ def _check_objective(plan):
     # Every speed lever names what supplies its code; the engine's own code is measured against what exists.
     for lever in levers:
         if "provider" not in lever:
-            raise ValueError(f"{lever['id']} names no provider: " + ", ".join(PROVIDERS) + " (kernels/SOURCES.md "
+            raise ValueError(f"{lever['id']} names no provider: " + ", ".join(PROVIDERS) + " (kernels/README.md#libraries "
                              "lists where kernels come from)")
         if lever["provider"].startswith("own"):
             if "yardstick" not in lever:
@@ -1433,27 +1400,19 @@ def _check_objective(plan):
         best = max((_gain(kpi, forecast[kpi]["expected"], (facts["kpis"].get(kpi) or {}).get("score"))
                     for name in order["p1"] for kpi in FAMILIES.get(name, (name,)) if kpi in forecast), default=0.0)
         if best < goal["min_gain"]:
-            raise ValueError(f"Candidate {goal['candidate']} forecasts {best:+.1%} on p1 ({', '.join(order['p1'])}): "
-                             f"candidates 2 to {FLOOR_UNTIL} are planned for at least +{goal['min_gain']:.0%} on a "
-                             "p1 KPI; plan the levers that close more of its gap")
-
-
-def _check_rules_4_fields(plan):
-    """weakest (critique rounds) and review belong to plan rules 4."""
-    if plan.version < 4:
-        if "weakest" in plan.data:
-            raise ValueError("weakest belongs to plan rules 4 (critique rounds)")
-        if "review" in plan.data:
-            raise ValueError("review belongs to plan rules 4, once the parent's plan has an outcome")
+            plan.warnings.append(f"candidate {goal['candidate']} forecasts {best:+.1%} on p1 "
+                                 f"({', '.join(order['p1'])}): candidates 2 to {FLOOR_UNTIL} are for at least "
+                                 f"+{goal['min_gain']:.0%} on a p1 KPI, so check whether a lever that closes more of "
+                                 "its gap was left out. Never raise a forecast to clear this")
 
 
 def _check_review(plan):
-    """Check 14 (rules 4): the plan reviews its parent's plan against the parent's measured Eval."""
+    """The plan reviews its parent's plan against the parent's measured Eval."""
     root, data = plan.root, plan.data
     facts_review = review_facts(root, plan.run, plan.parent, plan.eval_ref) if not plan.first else None
     if facts_review is None:
         if "review" in data:
-            raise ValueError("review belongs to plan rules 4, once the parent's plan has an outcome")
+            raise ValueError("review is for a plan whose parent's plan has an outcome; this one has none")
         return
     plan.inputs["review"] = facts_review
     review = data.get("review")
@@ -1487,7 +1446,7 @@ def _check_review(plan):
 
 
 def _check_supersedes(plan):
-    """Check 11: a revision replaces the newest plan of its chain before its candidate exists."""
+    """A revision replaces the newest plan of its chain before its candidate exists."""
     if plan.data.get("supersedes") is None:
         return
     old = load(plan.root, plan.run, plan.data["supersedes"])
@@ -1501,8 +1460,7 @@ def _check_supersedes(plan):
         raise ValueError(f"{old['plan_id']} is already superseded by {summary['superseded_by']}")
 
 
-# Plan rules 6: in a speed run a prompt GEMM over quantized weights starts at a quantized
-# activation format.
+# In a speed run a prompt GEMM over quantized weights starts at a quantized activation format.
 EXACT_ACTIVATION = "bf16"
 STORED_GAP = ACTIVATION_GAP + "stored"
 
@@ -1520,7 +1478,7 @@ def _bf16_formats(declared):
 
 
 def _check_activations(plan):
-    """Check 16, rules 6, speed runs: a build plan declares the prompt activations its candidate takes, and
+    """Speed runs: a build plan declares the prompt activations its candidate takes, and
     no quantized format's prompt GEMMs start at BF16. speed judges against the same exact reference as
     preserve, with a budget that admits the stored format's activations without evidence per group (the mode trades
     drift for speed), so a candidate reads prompts at the stored format (or fp8 / fp16_acc) from the first one on;
@@ -1558,7 +1516,7 @@ def _check_activations(plan):
                          f"(gaps entry {STORED_GAP})")
 
 
-# Plan rules 7: the round account. A term of at least ROUND_SHARE of the round that runs slower than FLOOR_RATE of its
+# The round account. A term of at least ROUND_SHARE of the round that runs slower than FLOOR_RATE of its
 # floor is not at its floor, nor is idle time of that share; terms and idle add up to the round within ACCOUNT_SLACK.
 # A rejection bound by a term reopens once that term falls by STALE.
 IDLE = "idle"
@@ -1570,17 +1528,12 @@ def _account_terms(account):
 
 
 def _check_round(plan):
-    """Check 17 (rules 7): a family's limit claim rests on a round account. A gaps entry `limit` names the terms of the
+    """A family's limit claim rests on a round account. A gaps entry `limit` names the terms of the
     parent's round (plan field `round`, per family) that bound it in `cause_terms`; every other term large enough to
     matter runs at least at half its floor's rate, the device idles less than that share, and the parts add up to the
     measured round. A stop record once called a decode round "at its bandwidth floor but for the expert copies" while
     its dense matrices ran at 27% of their floor and the device idled 8 of 60 ms."""
     data = plan.data
-    if plan.version < 7:
-        if "round" in data or any("cause_terms" in row for row in data["gaps"]) or \
-                any("bound_by" in row or "evidence" in row for row in data["rejected"]):
-            raise ValueError("round, gaps cause_terms and rejected bound_by / evidence belong to plan rules 7")
-        return
     rounds = data.get("round") or {}
     recorded = {}
     for name, account in rounds.items():
@@ -1635,7 +1588,7 @@ def _check_round(plan):
 
 
 def _check_stale_rejections(plan):
-    """Check 18 (rules 7): a rejection measured while a term bound the round holds only while that term does. Once an
+    """A rejection measured while a term bound the round holds only while that term does. Once an
     earlier plan's rejection is bound by a term this plan's round account shows STALE smaller (or gone), the lever is
     planned again (a lever whose id is its name) or rejected again here on new evidence. "CPU expert compute: slower"
     measured while link copies bound the round says nothing once they no longer do."""
@@ -1673,7 +1626,7 @@ def _check_stale_rejections(plan):
         plan.inputs["reopened"] = reopened
 
 
-# Plan rules 7: where recon's placement prices misses computed on the CPU (alone or split with the link) below misses
+# Where recon's placement prices misses computed on the CPU (alone or split with the link) below misses
 # copied over the link, candidate 1 starts with the CPU expert tier, or the plan names the measurement that rejects it.
 CPU_TIER = "inference:host-expert-tier"
 CPU_TIER_GAP = "placement:cpu"
@@ -1694,7 +1647,7 @@ def _cpu_wins(root):
 
 
 def _check_cpu_tier(plan):
-    """Check 19 (rules 7): candidate 1 of a placement whose CPU beats the link starts with the CPU expert tier."""
+    """Candidate 1 of a placement whose CPU beats the link starts with the CPU expert tier."""
     if not plan.first or plan.decision != "build":
         return
     floors = _cpu_wins(plan.root)
@@ -1713,20 +1666,33 @@ def _check_cpu_tier(plan):
     plan.inputs["cpu_tier"]["rejection"] = _evidence_file(plan.root, rejected["evidence"], f"gaps entry {CPU_TIER_GAP}")
 
 
-# The checks build runs on a plan, in order, each with the first version of the plan rules it belongs to: a check
-# raises ValueError for a plan that breaks it, and may record what crit derived in the plan's inputs.
-CHECKS = ((1, _check_decision), (1, _check_gap_names), (1, _check_answered_gaps), (2, _check_limit_gaps),
-          (3, _check_measured_only), (1, _prioritize), (1, _check_levers), (1, _check_forecast),
-          (3, _check_forecast_priorities), (5, _check_reach), (4, _check_objective), (1, _check_rules_4_fields),
-          (4, _check_review), (6, _check_activations), (1, _check_round), (7, _check_stale_rejections),
-          (7, _check_cpu_tier), (1, _check_supersedes))
+def _check_lever_sources(plan):
+    """A lever change measured before the plan names its evidence, `measured:PATH`, a file of the run (an ablation
+    report with the lever as an option variant, a probe's output), which crit records in inputs.lever_evidence."""
+    found = {}
+    for lever in plan.data["levers"]:
+        for kpi, change in lever["changes"].items():
+            if change["source"].startswith(MEASURED_SOURCE):
+                path = change["source"][len(MEASURED_SOURCE):]
+                found.setdefault(lever["id"], {})[kpi] = _evidence_file(plan.root, path, f"{lever['id']} {kpi}")
+    if found:
+        plan.inputs["lever_evidence"] = found
 
 
-def _reach(root, data, facts, computed, forecast, needed):
-    """Plan rules 5, check 15: how far the forecast's best case reaches toward each needed family's limit (Eval's, else
-    the one crit computed), recorded beside the strategy as {limit, fraction, forecast_high, reach} with the limit's
-    source. Below REACH the plan answers why the rest is out of reach: a gaps entry `limit` (answer cause) with the
-    evidence, a file in the run that measured the bound; an engine's own speed alone is no bound."""
+# The checks build runs on a plan, in order: a check raises ValueError for a plan that breaks it, may record what crit
+# derived in the plan's inputs, and adds to plan.warnings what it judges on a forecast alone.
+CHECKS = (_check_decision, _check_gap_names, _check_answered_gaps, _check_limit_gaps, _check_measured_only,
+          _prioritize, _check_levers, _check_forecast, _check_forecast_priorities, _check_reach, _check_objective,
+          _check_review, _check_activations, _check_round, _check_stale_rejections, _check_cpu_tier,
+          _check_lever_sources, _check_supersedes)
+
+
+def _reach(root, data, facts, computed, forecast, needed, warnings):
+    """How far the forecast's best case reaches toward each needed family's limit (Eval's, else the one crit
+    computed), recorded beside the strategy as {limit, fraction, forecast_high, reach} with the limit's source. Below
+    REACH without a gaps entry `limit` (answer cause) whose evidence measured the bound, a warning: the strategy's
+    ceiling is the limit, so a forecast that low says a lever is missing or the bound is unmeasured. A forecast is
+    never raised to clear it."""
     found = {}
     causes = {row["kpi"]: row for row in data["gaps"] if row["gap"] == LIMIT_GAP}
     for name, flag in needed.items():
@@ -1742,22 +1708,19 @@ def _reach(root, data, facts, computed, forecast, needed):
         if high / limit >= REACH:
             continue
         cause = causes.get(name)
-        label = (f"The forecast's best case for {name} ({high:g}) is {high / limit:.0%} of its limit {limit:g}"
+        label = (f"the forecast's best case for {name} ({high:g}) is {high / limit:.0%} of its limit {limit:g}"
                  + (f" (the parent's Eval measured {row['fraction']:.0%})" if row.get("fraction") else ""))
         if cause is None or "evidence" not in cause:
-            raise ValueError(f"{label}, below {REACH:.0%}: the strategy's ceiling is that limit, not the engine's own "
-                             "measurement. Plan the levers that close more of it, or add a gaps entry {\"kpi\": "
-                             f"\"{name}\", \"gap\": \"{LIMIT_GAP}\", \"answer\": \"cause\", \"detail\": ..., "
-                             "\"evidence\": ...} naming the measured physical bound that keeps the rest out of reach (an "
-                             "engine reading weights from host memory: the floor Eval prices from its memory tiers at "
-                             "its expert cache hit rate, or from its declared host_bytes_per_pass), the evidence a file "
-                             "in the run")
+            warnings.append(f"{label}, below {REACH:.0%}: plan the levers that close more of it, or name the measured "
+                            f"bound in a gaps entry {LIMIT_GAP!r} (answer cause, with evidence). Never raise a "
+                            "forecast to clear this")
+            continue
         found[name]["evidence"] = _evidence_file(root, cause["evidence"], label)
     return found
 
 
 def _forecast_checks(order, forecast, facts):
-    """Plan rules 3, check 12: what the forecast does against the priorities: more expected gain on p2 than on p1
+    """What the forecast does against the priorities: more expected gain on p2 than on p1
     (priority_flag), or a p1 KPI forecast below the parent's score (above it for a time)."""
     found = []
     flag = priority_flag({"priorities": order, "forecast": forecast, "inputs": {"kpis": facts["kpis"]}})
@@ -1783,7 +1746,7 @@ def _evidence_file(root, path, name):
 
 
 def _quality_rejection(root, path, activation, name):
-    """Plan rules 3: whether the crit-eval result at `path` measured `activation` (its engine's prompt_activations)
+    """Whether the crit-eval result at `path` measured `activation` (its engine's prompt_activations)
     and its quality outside the noise: some set's share of the budget above the budget at the 5th percentile of its
     spread over positions (crit-eval's budget_spread). A rejection inside the quality noise is not a rejection, and
     neither is one judged under other quality terms than the run's: its budget share is relative to its own budget,
@@ -1818,15 +1781,15 @@ def _quality_rejection(root, path, activation, name):
     return over
 
 
-def _measured_only(root, data, facts, result, needed, version):
-    """Plan rules 3: a family marked not needed below MEASURED_ONLY of its limit stands only on measured rejections:
+def _measured_only(root, data, facts, result, needed):
+    """A family marked not needed below MEASURED_ONLY of its limit stands only on measured rejections:
     every gaps entry on it names its evidence (a file in the run), every Eval gap on it answers rejected, and for
     prefill every prompt activation format Eval prices faster than the engine's own is rejected, by Eval's own quality
     evidence or by a gaps entry `activation:<format>` whose evidence is a crit-eval result that measured that format
     outside the quality noise (_quality_rejection). Returns the evidence recorded, per gap."""
     recorded = {}
     for name, flag in needed.items():
-        fraction = family(facts, name, version)[0]
+        fraction = family(facts, name)[0]
         if flag or fraction is None or fraction >= MEASURED_ONLY:
             continue
         for row in data["gaps"]:
@@ -1867,9 +1830,9 @@ def _measured_only(root, data, facts, result, needed, version):
 FATES = {"built", "pruned", "deferred"}
 
 
-def check_fates(plan, fates, required):
+def check_fates(plan, fates):
     """A proposal's lever_fates against its plan: {lever_id: {fate, detail}}, fate built, pruned or deferred, a detail
-    for pruned and deferred, no unknown lever; with `required`, every lever of the plan has exactly one fate."""
+    for pruned and deferred, no unknown lever, and every lever of the plan exactly one fate."""
     if not isinstance(fates, dict):
         raise ValueError("lever_fates maps each lever id of the plan to {fate, detail}")
     ids = [lever["id"] for lever in plan["levers"]]
@@ -1883,33 +1846,49 @@ def check_fates(plan, fates, required):
         if row["fate"] != "built" or "detail" in row:
             text(row.get("detail"), f"{lever_id} detail (why it was {row['fate']})", 4000)
     missing = [lever_id for lever_id in ids if lever_id not in fates]
-    if required and missing:
+    if missing:
         raise ValueError("lever_fates gives no fate to " + ", ".join(missing) + f" of {plan['plan_id']}: built, "
                          "pruned or deferred, each with a detail unless built")
     return fates
 
 
+def is_external(root, candidate_id):
+    """Whether the run's candidate is an external engine (its configuration declares configuration.engine)."""
+    from .external import candidate_spec
+    return candidate_spec(safe_path(root, f"candidates/{ident(candidate_id, 'candidate')}")) is not None
+
+
+def check_engine(plan, configuration):
+    """A candidate's configuration is the kind its plan was made for: an external engine (configuration.engine) for a
+    plan with engine "external", a plugin package otherwise."""
+    from .external import spec_of
+    planned, declared = plan.get("engine") == EXTERNAL, spec_of(configuration) is not None
+    if planned and not declared:
+        raise ValueError(f"{plan['plan_id']} plans an external engine: declare it and its launch command in "
+                         "configuration.engine (docs/RUN_RECORDS.md#external-engines)")
+    if declared and not planned:
+        raise ValueError(f"The configuration declares an external engine, but {plan['plan_id']} plans a plugin "
+                         'package: record a plan with engine "external"')
+
+
 def check_link(root, run, plan_id, parent):
     """A proposal's plan: it exists, is the newest of its chain, builds, is unlinked and starts from the same parent.
-    With budget_counts evaluated a plan whose candidate never reached Eval (a draft, sealed with what stopped it) links
-    again: the new candidate is the draft's fix."""
+    A plan whose candidate never reached the candidate ladder (a draft, sealed with what stopped it) links again: the
+    new candidate is the draft's fix."""
     plan = load(root, run, plan_id)
     summary = next(s for s in summaries(root, run) if s["plan_id"] == plan_id)
     if summary["superseded_by"] is not None:
         raise ValueError(f"{plan_id} is superseded by {summary['superseded_by']}: name the newest plan")
     linked = summary["candidate_id"]
     if linked is not None:
-        rungs = ladder.ladder(run)
-        drafts = counts_evaluated(run) or rungs
-        if not drafts or linked in (ladder.counted(root) if rungs else evaluated_candidates(root)):
-            raise ValueError(f"{plan_id} is already linked to {linked}" + (
-                ", which is on the candidate ladder" if rungs else ", which went through Eval" if drafts else "")
-                + ": record a new plan")
+        if linked in ladder.counted(root):
+            raise ValueError(f"{plan_id} is already linked to {linked}, which is on the candidate ladder: record a "
+                             "new plan")
         if not (safe_path(root, f"candidates/{linked}") / "seal.json").is_file():
-            raise ValueError(f"{plan_id} built {linked}, a draft that has not reached " + (
-                "the candidate ladder" if rungs else "Eval") + ": seal it with what stopped it (crit run ... seal "
-                f"--candidate {linked} --lifecycle build_failed or check_failed --failure ...) before building its fix "
-                "from the plan")
+            raise ValueError(f"{plan_id} built {linked}, a draft that has not reached the candidate ladder: seal it "
+                             f"with what stopped it (crit run ... seal --candidate {linked} --lifecycle build_failed "
+                             "or check_failed --failure ...) before building its fix from the plan")
+
     if plan["decision"] != "build":
         raise ValueError(f"{plan_id} is a stop plan; a candidate needs a build plan")
     if plan["parent_candidate_id"] != parent:
@@ -2005,3 +1984,74 @@ def outcome(run, plan, candidate_id, attempt_id, eval_ref, status, fates=None):
     return record("plan_outcome", run["run_id"], plan_id=plan["plan_id"], candidate_id=candidate_id, attempt_id=attempt_id,
                   recorded_at=now(), plan_sha256=digest(plan), eval=eval_ref, kpis=kpis, estimates=estimates, flags=flags,
                   requirements=requirements, levers=levers, forecast_on_p2=priority_flag(plan), alternative=alternative)
+
+
+TODO = "TODO"
+
+
+def draft(root, run, bounds):
+    """crit run ... plan --draft: the next plan's skeleton and the facts crit freezes for it, so the planner fills in
+    judgement only. Returns {plan, facts}: `plan` is a payload of the plan's shape (TODO where the planner writes,
+    the parent's scores as a flat forecast to move, the review and weakest entries this plan owes), `facts` what crit
+    computes from the parent's Eval (objective and rung, priorities while both families are needed, each KPI's score,
+    limit and noise, Eval's gaps, the parent plan's outcome)."""
+    counted = ladder.counted(root)
+    parent = max(counted) if counted else None
+    found = completed_evals(root, parent) if parent else []
+    result, facts, eval_ref = None, None, None
+    for path in reversed(found):
+        result = read_json(path, max_bytes=EVAL_JSON_BYTES)
+        facts = extract(result.get("status") or {})
+        eval_ref = path.relative_to(root).as_posix()
+        if path == found[0] or all((facts["kpis"].get(kpi) or {}).get("score") is not None
+                                   for kpi in ("decode", "prefill")):
+            break
+    computed = {}
+    if result is not None:
+        computed = {kpi: entry for kpi, entry in computed_limits(result, run["spec"]["model_path"]).items()
+                    if kpi in facts["kpis"] and facts["kpis"][kpi]["fraction"] is None}
+        for kpi, entry in computed.items():
+            row = facts["kpis"][kpi]
+            if row["score"] is not None and entry["limit"] >= row["score"]:
+                row["limit"], row["fraction"] = entry["limit"], row["score"] / entry["limit"]
+    budget = bounds["limits"].get("candidate_budget")
+    last = budget is not None and sum(seg == bounds["segment_id"] for seg in counted.values()) + 1 >= budget
+    external = (is_external(root, parent) if parent else
+                (run["spec"].get("origin_engine") or {}).get("origin") == EXTERNAL)
+    goal = objective(len(counted) + 1, last, origin=parent is None and "origin_engine" in run["spec"],
+                     external=external)
+    review = review_facts(root, run, parent, {"path": eval_ref}) if parent and eval_ref else None
+    needed = {"decode": {"needed": True}, "prefill": {"needed": True}}
+    order, reason = priorities(needed, facts) if facts else (None, "no Eval to rank by yet")
+    plan = {
+        "parent_candidate_id": parent, "decision": "build",
+        "needed": {name: {"needed": True, "evidence": TODO + ": why this family can still gain more than its noise"}
+                   for name in FAMILIES},
+        "gaps": [], "rejected": [], "levers": [],
+        "strategy": {side: {"name": TODO, "ceiling": TODO + ": a number, its unit and where it comes from",
+                            "evidence": TODO} for side in ("current", "alternative")}
+        | {"choice": "current", "reason": TODO},
+        "forecast": ({kpi: {"low": row["score"], "expected": row["score"], "high": row["score"]}
+                      for kpi, row in facts["kpis"].items() if row["score"]} if facts else None),
+        "gates": TODO + ": how quality stays inside the budget and the required context is met"}
+    if quality_mode(run["spec"]["correctness"]) == "speed":
+        plan["prompt_activations"] = "stored"
+    if external:
+        plan["engine"] = EXTERNAL
+    if review:
+        plan["review"] = {"plan_id": review["plan_id"],
+                          "kpis": {kpi: {"cause": TODO, "evidence": TODO + ": a path in the run"}
+                                   for kpi in review["missed"]},
+                          "levers": {lever: {"result": TODO} for lever in review["built"] + review["dropped"]},
+                          "lesson": TODO}
+    if goal["name"] == "critique_round":
+        plan["weakest"] = [{"kpi": TODO, "term": TODO, "evidence": TODO, "levers": [TODO]} for _ in range(2)]
+    return {"plan": plan, "facts": {
+        "objective": goal, "eval": eval_ref, "priorities_if_both_needed": order or reason,
+        "kpis": facts["kpis"] if facts else None, "noise": noises(facts) if facts else None,
+        "computed_limits": computed or None,
+        "eval_gaps": facts["gaps"] if facts else None, "standing": standing(result.get("status")) if result else [],
+        "review": review,
+        "rules": "docs/RUN_RECORDS.md#plan: every lever names its KPI changes, provider and (own code) yardstick; "
+                 "levers below their noise share a group with one above it; measure an option with crit run ... "
+                 "ablate --set and cite it as measured:PATH rather than estimating it"}}

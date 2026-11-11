@@ -91,6 +91,9 @@ def parser():
     subs.choices["plan"].add_argument("--check", action="store_true",
                                       help="Run the plan's checks and print the record crit would store, recording nothing "
                                            "(the plan command of a replay)")
+    subs.choices["plan"].add_argument("--draft", action="store_true",
+                                      help="Instead: write the next plan's skeleton to --record (a new file) and print "
+                                           "the facts crit computes for it from the parent's Eval")
     subs.choices["plan"].description = ("Record the next candidate's plan after the parent's Eval and before any code: "
                                         "needed flags, strategy, levers, forecast and gates; crit freezes the parent's "
                                         "newest Eval and computes the priorities")
@@ -186,6 +189,8 @@ def parser():
                      "memory, the lower context), the gates whole Eval rounds most often fail on, in minutes")
     sub.add_argument("--no-smoke", action="store_true", help="With --check: leave out crit smoke, the quality "
                      "component tests --check runs at the run's context and at a quarter of it (smoke/README.md)")
+    sub.add_argument("--no-plugin-tests", action="store_true", help="With --check: leave out the package's plugin "
+                     "tests (crit plugins test), which --check runs first")
     sub = subs.add_parser("ablate", help="Serve a candidate built from plugins with each variant of its plugins (as "
                                          "built, at its base, without each and with each alone): a short bench of "
                                          "the run's cases and crit smoke per variant, and what each plugin adds, "
@@ -194,8 +199,22 @@ def parser():
     sub.add_argument("--variant", action="append", help="Serve only this variant (repeatable), e.g. full, base, "
                      "without:ID, only:ID; crit plugins variants lists them")
     sub.add_argument("--repetitions", type=int, default=3, help="Repetitions per case and variant (default 3)")
+    sub.add_argument("--data", type=Path, help="crit-eval's prepared data for the run's model: each variant also "
+                     "decodes Eval's speed cases and held-out prompts at the model's sampling (--seeds seeds each), so "
+                     "a plugin whose effect depends on the text is measured on the text Eval scores")
+    sub.add_argument("--seeds", type=int, default=3, help="With --data: seeds per Eval case and variant (default 3)")
+    sub.add_argument("--set", action="append", metavar="PLUGIN.OPTION=VALUE[;...]", help="An option variant "
+                     "(repeatable): the full selection with these options set, served beside it on the same cases (an "
+                     "in-process A/B); with --set only full and the option variants run, unless --variant names others. "
+                     "An external candidate takes OPTION=VALUE[;...] on the options its configuration.engine declares")
     sub.add_argument("--no-smoke", action="store_true", help="Leave out crit smoke on each variant")
     sub.add_argument("--smoke-test", action="append", help="Run only this crit smoke test on each variant (repeatable)")
+    sub.add_argument("--seconds", type=float, help="Reservation length (default: the check process cap)")
+    sub = subs.add_parser("kernels", help="Trace an external candidate's own processes while it serves the run's cases "
+                                          "(crit-eval's CUPTI tracer, Linux) and rank their kernels per phase; where "
+                                          "tracing is not possible the report says why")
+    sub.add_argument("--candidate", required=True)
+    sub.add_argument("--nvcc", help="nvcc of a CUDA toolkit that ships CUPTI")
     sub.add_argument("--seconds", type=float, help="Reservation length (default: the check process cap)")
     sub = subs.add_parser("seal", help="Close a candidate (sealed candidates are immutable)")
     sub.add_argument("--candidate", required=True)
@@ -204,8 +223,9 @@ def parser():
     sub = subs.add_parser("select", help="Select a sealed eligible candidate")
     sub.add_argument("--candidate", required=True)
     sub = subs.add_parser("resume", help="Open a new segment for more candidates, optionally amending the quality terms")
-    sub.add_argument("--candidates", type=int, help="Candidates this segment builds (no working time budget)")
-    sub.add_argument("--minutes", type=int, help="Time-budget segment instead, or the safety window with --candidates")
+    sub.add_argument("--candidates", type=int, required=True, help="Candidates on the candidate ladder this segment "
+                     "builds (no working time budget)")
+    sub.add_argument("--minutes", type=int, help="The segment's safety window (default 30 days)")
     sub.add_argument("--attempt-limit", type=int, default=64)
     sub.add_argument("--external-agent-stopped", action="store_true")
     sub.add_argument("--quality-budget", metavar="JSON", help="Amend the drift budget: any of ppl_ratio_max, kld_mean_max, kld_p99_max")
@@ -229,6 +249,8 @@ def parser():
     sub.add_argument("--agent", metavar="CMD", help="Start an agent on every replay at once with this command (any "
                      "harness; {brief}, {folder}, {root} and {number} name the replay's), wait for all, then collect")
     sub.add_argument("--collect", action="store_true", help="Instead: check and list the plans the replays under --out wrote")
+    subs.add_parser("next", help="Print the run's one next step: where the run and its open candidate stand, the "
+                                 "command to run and why (crit.run.state)")
     subs.add_parser("show", help="Print the run, its state and its candidates as JSON")
     subs.add_parser("recover", help="Explicit dead-owner lease recovery and projection rebuild; never resets attempts/deadlines")
     return parser
@@ -251,7 +273,8 @@ def act(command, args):
     """Run the parsed action: its result as JSON on stdout and 0, or the error on stderr and 1."""
     try:
         store = RunStore(args.root or args.project / "runs", args.project)
-        payload = read_json(args.record) if getattr(args, "record", None) else None
+        payload = (read_json(args.record) if getattr(args, "record", None) and not getattr(args, "draft", False)
+                   else None)
         if args.action == "create":
             settings = load_settings(args.project)
             if isinstance(payload, dict):
@@ -266,8 +289,16 @@ def act(command, args):
             result = store.create(payload, args.from_engine)
         elif args.action == "resolve":
             result = store.freeze_inputs(args.id, payload)
+        elif args.action == "plan" and args.draft:
+            if args.check:
+                command.error("plan takes --draft or --check, not both")
+            result = store.plan_draft(args.id, args.record)
         elif args.action == "plan":
             result = store.plan(args.id, payload, args.check)
+        elif args.action == "next":
+            from .state import render
+            result = store.next(args.id)
+            print(render(result), file=sys.stderr)
         elif args.action == "replay" and args.collect:
             from .replay import collect, render_collected
             result = collect(args.out, args.id, RunStore, args.project)
@@ -333,11 +364,15 @@ def act(command, args):
         elif args.action == "serve":
             from .served import serve
             result = serve(store, args.id, args.candidate, args.host, args.port, args.seconds, check=args.check,
-                           data=args.data, smoke=not args.no_smoke)
+                           data=args.data, smoke=not args.no_smoke, plugin_tests=not args.no_plugin_tests)
         elif args.action == "ablate":
             from .ablate import ablate
             result = ablate(store, args.id, args.candidate, args.seconds, args.variant, args.repetitions,
-                            smoke=not args.no_smoke, smoke_tests=args.smoke_test)
+                            smoke=not args.no_smoke, smoke_tests=args.smoke_test, data=args.data, seeds=args.seeds,
+                            sets=args.set)
+        elif args.action == "kernels":
+            from .external import kernels
+            result = kernels(store, args.id, args.candidate, args.seconds, args.nvcc)
         elif args.action == "seal":
             failure = {"message": args.failure} if args.failure else None
             result = store.seal(args.id, args.candidate, args.lifecycle, failure)
@@ -360,5 +395,6 @@ def act(command, args):
         print(json.dumps(result, indent=2, allow_nan=False))
         return 0
     except (ValueError, OSError, KeyError, TypeError, RecursionError) as exc:
-        print("ERROR: " + str(exc), file=sys.stderr)
+        from ..errors import report
+        report(exc, "ERROR: ", sys.stderr)
         return 1

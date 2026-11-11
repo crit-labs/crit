@@ -143,38 +143,31 @@ def _sources(value, folder, where):
     return out
 
 
-KERNEL = re.compile(r"[a-z0-9][a-z0-9-]{0,63}/[a-z0-9][a-z0-9._-]{0,95}")
+KERNEL = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 
 
 def _kernels(value, where):
-    """kernels: the registry kernels the plugin loads (crit_plugins.kernels), each {name: ORG/NAME on the Hugging Face
-    kernel registry, version: its major version, revision: the pinned revision, null until it is published, fallback:
-    what the plugin runs when the kernel is not there (a line of text), backend: the build it loads where that is not
-    torch's own device backend (cpu for a CPU kernel beside a CUDA torch), optional}."""
+    """kernels: crit's kernels the plugin loads (crit_plugins.kernels), each {name: the kernel's id in crit's kernel
+    library (kernels/techniques/<family>/<id>), fallback: what the plugin runs when the kernel cannot be built here (a line of
+    text), backend: the build it loads where that is not torch's own device backend (cpu for a CPU kernel beside a
+    CUDA torch), optional}."""
     if not isinstance(value, list):
-        raise PluginError(f"{where}: kernels is a list of {{name, version, revision, fallback}}")
+        raise PluginError(f"{where}: kernels is a list of {{name, fallback}}")
     out = []
     for item in value:
-        if (not isinstance(item, dict) or set(item) - {"name", "version", "revision", "fallback", "backend"} or "name" not in item):
-            raise PluginError(f"{where}: a kernel is {{name, version, revision, fallback}}")
-        name, version, revision = item["name"], item.get("version"), item.get("revision")
-        fallback = item.get("fallback")
+        if not isinstance(item, dict) or set(item) - {"name", "fallback", "backend"} or "name" not in item:
+            raise PluginError(f"{where}: a kernel is {{name, fallback}} (and optionally backend)")
+        name, fallback = item["name"], item.get("fallback")
+        if not isinstance(name, str) or not KERNEL.fullmatch(name):
+            raise PluginError(f"{where}: kernel {name!r} is the id of one of crit's kernels (kernels/techniques/<family>/<id>)")
         if not isinstance(fallback, str) or not fallback.strip():
             raise PluginError(f"{where}: kernel {name!r} says what the plugin runs without it (fallback)")
-        if not isinstance(name, str) or not KERNEL.fullmatch(name):
-            raise PluginError(f"{where}: kernel {name!r} is ORG/NAME, a repository of the kernel registry")
-        if version is not None and (type(version) is not int or version < 1):
-            raise PluginError(f"{where}: kernel {name}'s version is a major version, 1 or more")
-        if revision is not None and (not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{7,64}", revision)):
-            raise PluginError(f"{where}: kernel {name}'s revision is the registry commit it is pinned to, or null")
-        if version is None and revision is None:
-            raise PluginError(f"{where}: kernel {name} names its version or a pinned revision")
         backend = item.get("backend")
         if backend is not None and backend not in ("cuda", "rocm", "metal", "xpu", "cpu"):
             raise PluginError(f"{where}: kernel {name}'s backend is cuda, rocm, metal, xpu or cpu")
         if any(o["name"] == name for o in out):
             raise PluginError(f"{where}: kernel {name} is named twice")
-        out.append({"name": name, "version": version, "revision": revision, "fallback": fallback, "backend": backend})
+        out.append({"name": name, "fallback": fallback, "backend": backend})
     return out
 
 

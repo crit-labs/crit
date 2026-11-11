@@ -10,7 +10,7 @@ with Core's stop rules. It ships as the `crit-core` distribution (`pip install c
 `crit_plugins`, in the same distribution, is the contract every engine loads with, since every engine is Core plus
 plugins: plugin manifests, crit's slots and their interfaces (the required ones and the model plugin, Core's step
 model), the slots' device forms and the device extensions plugins provide (`device`), the assembly that checks a
-selection as a whole engine, creates its plugins and measures their memory, the registry kernel loader (`kernels`),
+selection as a whole engine, creates its plugins and measures their memory, the kernel loader (`kernels`),
 Core's round driver for captured decode rounds (`rounds`) and captured prompt chunks (`prompt_graphs`), the helpers a
 plugin's own tests use and the variants an ablation serves ([crit plugins](../../docs/PLUGINS.md)). Core's loader,
 `crit_core.engine`, assembles a package with it and runs the result. It holds no technique and no arithmetic: the

@@ -62,7 +62,8 @@ class ToolTests(unittest.TestCase):
             self.assertEqual([w for w in build if w.startswith("--drop")], ["--drop=obj/*", "--drop=-tmp"])
             self.assertIn("--no-package", build)
             # An object for a JSON text option is its JSON; the server's defaults fill what the call leaves out.
-            resume = self.tools["crit_run_resume"].argv({"id": "r", "quality_budget": {"ppl_ratio_max": 1.1}},
+            resume = self.tools["crit_run_resume"].argv({"id": "r", "candidates": 2,
+                                                         "quality_budget": {"ppl_ratio_max": 1.1}},
                                                         {"root": "R"}, scratch)
             self.assertEqual(resume[:3], ["run", "--root=R", "--id=r"])
             self.assertIn('--quality-budget={"ppl_ratio_max": 1.1}', resume)
@@ -221,7 +222,8 @@ class JobTests(unittest.TestCase):
     def started(self, jobs):
         job = jobs.start("test", ["-c", self.TREE], Path.cwd())
         deadline = time.monotonic() + 30
-        while not job.read("output")[0].strip() and time.monotonic() < deadline:
+        # The tree prints its child's pid to stdout, then "working" to stderr: wait for both, not just the first.
+        while not (job.read("output")[0].strip() and job.last_line()) and time.monotonic() < deadline:
             time.sleep(.05)
         return job, int(job.read("output")[0])
 
@@ -312,6 +314,19 @@ class ServeStatusTests(unittest.TestCase):
             self.assertEqual((status["health"]["ready"], status["models"]["data"][0]["id"]), (True, "run/candidate-0001"))
             status = json.loads(server.serve_status({"url": url}, {}, None)["content"][0]["text"])
             self.assertEqual(status["models"]["status"], 401)
+            # The key never goes to a public name or address, and only http(s) servers are asked.
+            for elsewhere in ("https://example.com", "http://8.8.8.8:8000"):
+                with self.assertRaisesRegex(ValueError, "api_key is sent only"):
+                    server.serve_status({"url": elsewhere, "api_key": "key"}, {}, None)
+            with self.assertRaisesRegex(ValueError, "http:// or https://"):
+                server.serve_status({"url": "file:///etc/passwd"}, {}, None)
+
+    def test_a_server_without_a_jobs_folder_removes_its_own_when_it_closes(self):
+        server = Server(families=())
+        folder = server.temporary
+        self.assertTrue(folder.is_dir())
+        server.close()
+        self.assertFalse(folder.exists())
 
 
 if __name__ == "__main__":

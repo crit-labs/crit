@@ -1,7 +1,7 @@
 """Expert routing in the router slot: heterogeneous-expert-dispatch's route (routing.py) under one Routing, and its
-device form, the same rule over a step's router logits (FP32, ties to the lower expert and group id): one launch of the
-registry kernel crit-labs/topk-routing (a warp per token row) where it loads and the rule has no group limit, else
-torch.
+device form, the same rule over a step's router logits (FP32, ties to the lower expert and group id): one launch of
+crit's kernel topk-routing (a warp per token row; built on this GPU, tuned or default knobs) where it builds and the
+rule has no group limit, else torch.
 
 The device form is capture-safe: no host synchronization, fixed shapes for a fixed token count, a bias moved to the
 device once, at its first (eager) call, and kept. A row with NaN logits (a captured round's junk positions) still
@@ -14,7 +14,7 @@ from pathlib import Path
 from .dispatch import routing
 
 HERE = Path(__file__).resolve().parent
-KERNEL = "crit-labs/topk-routing"
+KERNEL = "topk-routing"
 NAN_KEY, MASKED_KEY = -(1 << 31) + 1, -(1 << 31)   # selection keys: NaN below -inf, experts a group limit drops below NaN
 BIASES = 256   # device copies of biases kept
 
@@ -40,8 +40,8 @@ class TopKRouter:
             except ImportError:
                 cuda = False
             if cuda:
-                from crit_plugins.kernels import registry_kernel
-                self.kernel = registry_kernel(KERNEL, folder=HERE)
+                from crit_plugins.kernels import load_kernel
+                self.kernel = load_kernel(KERNEL, folder=HERE)
 
     def route(self, logits, top, bias=None):
         rule = replace(self.routing, correction_bias=bias is not None)

@@ -14,6 +14,9 @@ KPIS = {"decode_tps": True, "prefill_tps": True, "ttft_ms": False}
 # the drafter changes how long a round takes, while a short bench's tokens per round move with what it samples.
 ROUND, DRAFTING = "round_ms", 1.05
 LOWER = {ROUND}
+# The slots whose plugins choose the drafts: their effect on the tokens a round keeps is theirs, so their verdict reads
+# decode even where both variants draft.
+DRAFT_SLOTS = ("drafter", "verifier")
 
 
 def toggles(selection):
@@ -94,6 +97,40 @@ def variants(selection, registry=None, facts=None, names=None):
     return out
 
 
+def option_variants(selection, assignments, registry=None, facts=None):
+    """Variants of the full selection with plugin options set: each of `assignments` is one variant, a text of
+    PLUGIN.OPTION=JSON pairs joined by ";" (mtp-decode.override=0;attention-state.fresh_mib=64), named "set:" and that text.
+    A value that is no JSON is a string. With a registry each is checked like variants(), one the plugins refuse
+    carrying its `error`. An in-process A/B of one option is the same engine served twice, as built and with it set,
+    measured on the same cases."""
+    import json
+    selection = normalize(selection, registry)
+    if registry is not None and facts is None:
+        facts = engine_facts(selection, registry)
+    out = []
+    for text in assignments:
+        options = {plugin_id: dict(given) for plugin_id, given in selection["options"].items()}
+        for pair in [part.strip() for part in text.split(";") if part.strip()]:
+            key, sep, value = pair.partition("=")
+            plugin_id, dot, option = key.strip().rpartition(".")
+            if not sep or not dot or not plugin_id or not option:
+                raise PluginError(f"--set {pair!r}: give PLUGIN.OPTION=VALUE")
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                parsed = value
+            options.setdefault(plugin_id, {})[option] = parsed
+        variant = {"name": f"set:{text}",
+                   "plugins": {"use": dict(selection["use"]), "base": selection["base"], "options": options}}
+        if registry is not None:
+            try:
+                check(variant["plugins"], registry, facts)
+            except PluginError as error:
+                variant["error"] = str(error)
+        out.append(variant)
+    return out
+
+
 def _positive(value):
     return isinstance(value, (int, float)) and value > 0
 
@@ -137,10 +174,13 @@ def blame(report_variants, selection, noise=NOISE):
     where both variants of the pair draft, the smoke failures it brings (failing with it, passing without it), and a
     verdict from its effect in the engine (alone when that is unmeasured): breaks, pays (some KPI better by more than
     `noise`, none worse), slows (some worse, none better), trades (some better, some worse), neutral or
-    unmeasured."""
+    unmeasured. Where both variants of a pair draft, the verdict of a plugin outside the drafter and verifier slots
+    reads the time per decode round in place of decode: a short bench's tokens per round move with what it samples, so
+    its decode does too, by more than the plugin's own effect (`judged` names the KPIs the verdict read)."""
     by_name = {name: v for v in report_variants for name in [v["name"], *v.get("also", [])]}
     measured = lambda name: by_name.get(name) if by_name.get(name, {}).get("state") == "measured" else None
     switched = toggles(selection)
+    drafting = {plugin_id for slot, plugin_id in normalize(selection)["use"].items() if slot in DRAFT_SLOTS}
     full, base = measured("full"), measured("base")
     out = []
     for plugin_id in switched:
@@ -162,11 +202,40 @@ def blame(report_variants, selection, noise=NOISE):
                 and by_name.get("full", {}).get("state") == "failed":
             breaks.add("load")   # the engine loads without it and not with it
         row["breaks"] = sorted(breaks)
-        changes = [c for c in row["in_engine"].values() if c is not None] or [
-            c for c in row["alone"].values() if c is not None]
+        def judged(effect):
+            if ROUND in effect and plugin_id not in drafting:
+                return {kpi: c for kpi, c in effect.items() if kpi != "decode_tps" and c is not None}
+            return {kpi: c for kpi, c in effect.items() if kpi != ROUND and c is not None}
+        read = judged(row["in_engine"]) or judged(row["alone"])
+        row["judged"] = sorted(read)
+        changes = list(read.values())
         better, worse = any(c > noise for c in changes), any(c < -noise for c in changes)
         row["verdict"] = ("breaks" if row["breaks"] else "trades" if better and worse else "pays" if better else
                           "slows" if worse else "neutral" if changes else "unmeasured")
+        out.append(row)
+    return out
+
+
+def settings(report_variants, noise=NOISE):
+    """What each option variant (option_variants) did against the full selection: its KPI changes (the time per decode
+    round where both draft) and smoke failures it adds, with a verdict like blame()'s."""
+    by_name = {v["name"]: v for v in report_variants}
+    full = by_name.get("full") if by_name.get("full", {}).get("state") == "measured" else None
+    out = []
+    for variant in report_variants:
+        if not variant["name"].startswith("set:"):
+            continue
+        row = {"plugin": variant["name"], "in_engine": {}, "alone": {}, "breaks": []}
+        if variant.get("state") == "measured" and full:
+            for kpi in KPIS:
+                row["in_engine"][kpi] = _change(kpi, variant["kpis"][kpi], full["kpis"][kpi])
+            if _drafts(variant) and _drafts(full):
+                row["in_engine"][ROUND] = _change(ROUND, variant["kpis"].get(ROUND), full["kpis"].get(ROUND))
+            row["breaks"] = sorted(_failed(variant) - _failed(full))
+        changes = [c for c in row["in_engine"].values() if c is not None]
+        better, worse = any(c > noise for c in changes), any(c < -noise for c in changes)
+        row["verdict"] = ("breaks" if row["breaks"] or variant.get("state") == "failed" else "trades" if better and worse
+                          else "pays" if better else "slows" if worse else "neutral" if changes else "unmeasured")
         out.append(row)
     return out
 

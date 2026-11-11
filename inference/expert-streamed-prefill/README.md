@@ -7,7 +7,7 @@ Small chunks therefore re-send the same experts again and again, and run the exp
 projections at a handful of rows per expert. The entry supplies a schedule that picks the
 chunk from the grouped projection's measured rate curve and overlaps each layer's expert
 copies with the layer before it, and a CPU reference that any grouped projection is
-checked against before an engine trusts it. The projection itself comes from a library or the kernel registry
+checked against before an engine trusts it. The projection itself comes from a library or crit's own kernels
 ([Kernels](../../kernels/README.md)); [operations.json](operations.json) states what it computes and how to verify it.
 
 ## When to use it
@@ -52,10 +52,10 @@ routed rows, runs every expert's gate/up and down projections with SwiGLU betwee
 sums each token's expert outputs with its routing weights. A grouped GEMM that takes one
 pointer per expert reads each expert wherever it sits: a cache slot, a staging buffer or
 device-visible host memory. [operations.json](operations.json) states the operation such a
-kernel computes and how it is checked; the kernels come from libraries and the kernel registry
-([Kernels](../../kernels/README.md)), crit-labs' `grouped-experts` registry kernel among them
-(not published yet), which the [grouped-experts](../grouped-experts/README.md) plugin loads:
-every format on BF16 tensor cores from sm_80, over expert bundles in a slot store.
+kernel computes and how it is checked; the kernels come from libraries and crit's own kernels
+([Kernels](../../kernels/README.md)), crit's kernel `grouped-experts` among them (built for the engine's device, tuned for the model or on its default knobs), which the
+[grouped-experts](../grouped-experts/README.md) plugin loads: every format on BF16 tensor cores
+from sm_80, over expert bundles in a slot store.
 `reference.py` gives the order a stable route sort produces (`route_order`) and the block's
 FP64 result (`moe_block`, from weights decoded with `decode_matrix`).
 
@@ -94,7 +94,7 @@ two chunk sizes.
 ## What the engine supplies
 
 The router and its top-k ids and weights per chunk, the grouped projection (from a
-library or the kernel registry, checked against `moe_block` on the target), the expert pointer table (which
+library or crit's own kernels, checked against `moe_block` on the target), the expert pointer table (which
 slot, staging buffer or host address holds each expert this step), the staging buffers and
 the copy-engine copies into them with their events, the attention and dense layers, and the
 measurements: the projection's rate by rows per expert, each step's time at the chosen

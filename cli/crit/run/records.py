@@ -37,25 +37,11 @@ EXACTNESS_MODES = {"reported", "required"}  # must speculative output equal plai
 QUALITY_MODES = ("preserve", "speed")
 # The quality mode of a run whose request (and settings.toml) names none.
 DEFAULT_QUALITY_MODE = "speed"
-# Runs created from this version on require a recorded plan (crit run ... plan) for every candidate; older runs
-# have no plans field and keep plan_id optional.
-NEW_RUN_PLANS = "required"
-# Runs created from this version on rank plans with the decode limits crit computes from the Eval attempt's facts
-# when Eval states none (crit.run.plans.computed_limits); older runs keep the agent's estimates.
-NEW_RUN_PLAN_LIMITS = "computed"
-# Runs created from this version on give every lever of a candidate's plan its fate in the proposal; older runs keep
-# fates optional.
-NEW_RUN_LEVER_FATES = "required"
-# Runs created from this version on check plans with the seventh version of the plan rules (crit.run.plans.rules);
-# older runs keep the rules they were created with.
-NEW_RUN_PLAN_RULES = 7
-# Runs created from this version on spend a segment's candidate budget on the candidate ladder (crit.run.ladder): each
-# candidate's number says how far it goes, from candidate 1's build, plugin tests and serve check with no Eval to the
-# full Eval from candidate 5 on, and one that fails before its rung's measurement (a draft) is fixed as a new
-# candidate from the same plan at no cost. Runs created before it with "evaluated" spend it on candidates that go
-# through Eval, and older runs count every candidate they create.
-NEW_RUN_BUDGET_COUNTS = "ladder"
-BUDGET_COUNTS = ("evaluated", "ladder")
+# Every run follows the current rules: a plan for every candidate, the plan rules of crit.run.plans, lever fates in
+# every proposal and a candidate budget counted on the candidate ladder (crit.run.ladder). Runs created by earlier crit
+# releases recorded which version of those rules they followed in these spec keys; crit still reads such runs (to
+# show, serve or replay them) and ignores the keys.
+LEGACY_SPEC_KEYS = {"plans", "plan_limits", "lever_fates", "plan_rules", "budget_counts"}
 WEIGHTS = {"as_stored", "transformed"}             # candidate: did it change them?
 
 RUN_ID = r"run-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}"
@@ -386,12 +372,7 @@ def request_spec(data):
             "objectives": {"targets": targets, "verification_level": level},
             "resource_limits": resource_limits(data),
             **({"eval_sampling": eval_sampling(data["eval_sampling"])} if "eval_sampling" in data else {}),
-            **({"origin_engine": validate_origin(data["origin_engine"])} if "origin_engine" in data else {}),
-            **({"plans": NEW_RUN_PLANS} if NEW_RUN_PLANS else {}),
-            **({"plan_limits": NEW_RUN_PLAN_LIMITS} if NEW_RUN_PLANS and NEW_RUN_PLAN_LIMITS else {}),
-            **({"lever_fates": NEW_RUN_LEVER_FATES} if NEW_RUN_PLANS and NEW_RUN_LEVER_FATES else {}),
-            **({"plan_rules": NEW_RUN_PLAN_RULES} if NEW_RUN_PLANS and NEW_RUN_PLAN_LIMITS and NEW_RUN_PLAN_RULES else {}),
-            **({"budget_counts": NEW_RUN_BUDGET_COUNTS} if NEW_RUN_BUDGET_COUNTS else {})}
+            **({"origin_engine": validate_origin(data["origin_engine"])} if "origin_engine" in data else {})}
     validate_spec(spec)
     return spec
 
@@ -407,18 +388,18 @@ def eval_sampling(value):
 
 
 def resource_limits(data):
-    """A run is bounded by candidates, not minutes, unless it asks only for a time budget."""
+    """A run is bounded by candidates on the candidate ladder, not minutes: budget_minutes is only a safety window."""
     limits = {"attempt_limit": number(data.get("attempt_limit", 64), "Attempt limit", 1, 1000, integer=True),
               # Eval at a long required context (curve, lower context, capacity) runs well past 10 minutes.
               "process_seconds": {"discovery": 180, "build": 1800, "check": 3600, "benchmark": 1800, "agent": 10800}}
-    if "budget_minutes" in data and "candidate_budget" not in data:
-        return {"budget_minutes": number(data["budget_minutes"], "Budget", 1, 180, integer=True), **limits}
     return {"budget_minutes": number(data.get("budget_minutes", SAFETY_WINDOW_MINUTES), "Safety window", 1, SAFETY_WINDOW_MINUTES, integer=True),
             "candidate_budget": number(data.get("candidate_budget", DEFAULT_CANDIDATE_BUDGET), "Candidate budget", 1, 64, integer=True),
             **limits}
 
 
 def validate_limits(limits, name):
+    """A segment's limits. Segments of runs created by earlier crit releases may have only a time budget (no
+    candidate_budget); crit reads them, and opens new segments with a candidate budget only."""
     keys(limits, {"budget_minutes", "attempt_limit", "process_seconds"}, {"candidate_budget"})
     if "candidate_budget" in limits:
         number(limits["candidate_budget"], name + " candidate budget", 1, 64, integer=True)
@@ -453,17 +434,7 @@ def validate_level(value):
 
 def validate_spec(value):
     keys(value, {"model_path", "hardware_constraints", "cases", "benchmark_protocol", "correctness", "objectives", "resource_limits"},
-         {"eval_sampling", "origin_engine", "plans", "plan_limits", "lever_fates", "plan_rules", "budget_counts"})
-    if value.get("budget_counts", "evaluated") not in BUDGET_COUNTS:
-        raise ValueError("budget_counts is evaluated or ladder when present")
-    if value.get("plans", "required") != "required":
-        raise ValueError("plans is required when present")
-    if value.get("plan_limits", "computed") != "computed" or ("plan_limits" in value and "plans" not in value):
-        raise ValueError("plan_limits is computed when present, in a run that requires plans")
-    if value.get("lever_fates", "required") != "required" or ("lever_fates" in value and "plans" not in value):
-        raise ValueError("lever_fates is required when present, in a run that requires plans")
-    if "plan_rules" in value and (value["plan_rules"] not in (2, 3, 4, 5, 6, 7) or value.get("plan_limits") != "computed"):
-        raise ValueError("plan_rules is 2 to 7 when present, in a run that computes plan limits")
+         {"eval_sampling", "origin_engine"} | LEGACY_SPEC_KEYS)
     if "eval_sampling" in value and eval_sampling(value["eval_sampling"]) != value["eval_sampling"]:
         raise ValueError("eval_sampling is not in its validated form")
     if "origin_engine" in value:
@@ -1052,15 +1023,9 @@ def ineligibility(run, candidate):
     return reasons
 
 
-def counts_evaluated(run):
-    """Whether the run's candidate budget counts the candidates that went through Eval (budget_counts), not every
-    candidate it creates."""
-    return run["spec"].get("budget_counts") == "evaluated"
-
-
 def evaluated_candidates(root):
-    """candidate_id -> the segment of its first Eval attempt, for every candidate an Eval attempt was reserved for:
-    the candidates a run with budget_counts evaluated has spent its budget on."""
+    """candidate_id -> the segment of its first Eval attempt, for every candidate an Eval attempt was reserved for
+    (each stands on the candidate ladder: crit.run.ladder.counted)."""
     found = {}
     for path in sorted(safe_path(root, "candidates").glob("candidate-*/attempts/attempt-*/reservation.json")):
         value = read_json(path)

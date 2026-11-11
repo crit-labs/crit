@@ -1,5 +1,5 @@
 """The norms slot's device form in plain torch ops (crit_plugins.device.DEVICE_INTERFACES["norms"]): the base plugin
-torch-norms, and fused-norms' fallback where the registry kernel is not there.
+torch-norms, and fused-norms' fallback where crit's kernel fused-norms cannot be built.
 
 Every operation reads its inputs in their own dtype (BF16, FP16 or FP32), computes in FP32 and rounds once, to
 out_dtype (by default the dtype of the tensor it normalizes or gates). Each row's bits are independent of the rows
@@ -88,7 +88,6 @@ def rms_norm_heads(x, weight, eps, offset=0.0, out_dtype=None, out=None):
 
 def _angles(positions, freqs, rotary_dim, scale):
     """(cos, sin) [tokens][rotary_dim / 2] FP32 for each token's position."""
-    torch = _torch()
     if freqs.dim() == 1:
         found = 2 * freqs.shape[0]
     elif freqs.dim() == 2:

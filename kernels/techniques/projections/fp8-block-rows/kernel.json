@@ -1,0 +1,511 @@
+{
+  "schema": "crit-kernel-v1",
+  "id": "fp8-block-rows",
+  "family": "projections",
+  "title": "Matched FP8 projections: E4M3 weights (MXFP8, 128 x 128 or row scales) against per-group E4M3 activations, decode rows and a prompt GEMM with the same bits for every output",
+  "package": "fp8_block_rows",
+  "language": "cuda",
+  "operations": [
+    "fp8-matched-pair"
+  ],
+  "sources": [
+    "fp8_block_cuda/binding.cu",
+    "fp8_block_cuda/fp8_block.cu",
+    "torch-ext/torch_binding.cpp"
+  ],
+  "capabilities": [
+    "8.9",
+    "9.0",
+    "10.0",
+    "12.0"
+  ],
+  "structures": {
+    "rows": {
+      "what": "decode rows: a CTA 16 weight rows of one job of 1 to 8 tokens, the 16 lanes split over its warps (one e4m3 m16n8k32 MMA a 32-element block), the halving tree in shared memory; an alias of decode-gemv's rows-fp8-block (the Python rows forward there: the same kernel, the same bits; this structure's tuning applies to it, its sweep tunes it)",
+      "call": "rows",
+      "rows": [
+        1,
+        8
+      ],
+      "tune_rows": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "WARPS": {
+          "values": [
+            4,
+            8,
+            16
+          ],
+          "default": 16,
+          "what": "warps a CTA (16 lanes over them: 4, 2 or 1 lanes a warp)"
+        },
+        "AHEAD": {
+          "values": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "default": 2,
+          "what": "rounds of weight and activation loads in flight ahead of the MMAs"
+        },
+        "STREAM": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 0,
+          "what": "read weight codes with L1::no_allocate"
+        }
+      },
+      "yardstick": {
+        "library": "cuBLASLt's MXFP8 GEMM (torch._scaled_mm, E4M3 with blocked E8M0 scales, FP32 output); the activations' power-of-two group scales converted to E8M0 once outside the timed call, the global 0.5 left out"
+      },
+      "bench": "bench.py:Rows",
+      "alias": {
+        "kernel": "decode-gemv",
+        "of": "rows-fp8-block"
+      }
+    },
+    "gemm": {
+      "what": "prompt GEMM: a warp 16 weight rows x 8 TILES tokens a pass, lane by lane in the tree's order (one e4m3 m16n8k32 MMA a block and n-tile), folded as the lanes finish; token tiles over grid.z",
+      "call": "gemm",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        32,
+        128,
+        512,
+        2048
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "WARPS": {
+          "values": [
+            2,
+            4,
+            8,
+            16
+          ],
+          "default": 8,
+          "what": "warps a CTA (16 weight rows each)"
+        },
+        "TILES": {
+          "values": [
+            1,
+            2,
+            4,
+            8
+          ],
+          "default": 4,
+          "what": "n-tiles of 8 tokens a warp computes a pass, sharing the weight fragment"
+        },
+        "UNROLL": {
+          "values": [
+            0,
+            1,
+            2,
+            4
+          ],
+          "default": 0,
+          "what": "unroll of a lane's block loop (0: the compiler's choice)"
+        }
+      },
+      "yardstick": {
+        "library": "cuBLASLt's MXFP8 GEMM (torch._scaled_mm, E4M3 with blocked E8M0 scales, FP32 output); the activations' power-of-two group scales converted to E8M0 once outside the timed call, the global 0.5 left out"
+      },
+      "bench": "bench.py:Gemm"
+    },
+    "gemm-staged": {
+      "what": "prompt GEMM with shared-memory staging: a CTA BM weight rows x BN tokens, the blocks visited lane by lane in the tree's order through a STAGES-deep cp.async ring, a warp BM / WM rows x BN / WN tokens (one e4m3 m16n8k32 MMA with a zero accumulator a 16 x 8 tile and block), each lane folded into the tree as it finishes: the declared order's bits, the same as gemm and rows",
+      "call": "gemm_staged",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        32,
+        128,
+        512,
+        2048
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "BM": {
+          "values": [
+            32,
+            64,
+            128
+          ],
+          "default": 128,
+          "what": "weight rows a CTA"
+        },
+        "BN": {
+          "values": [
+            16,
+            32,
+            64
+          ],
+          "default": 64,
+          "what": "tokens a CTA"
+        },
+        "WM": {
+          "values": [
+            2,
+            4
+          ],
+          "default": 4,
+          "what": "warps along the rows (a warp BM / WM rows)"
+        },
+        "WN": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 2,
+          "what": "warps along the tokens (a warp BN / WN tokens)"
+        },
+        "GROUP": {
+          "values": [
+            1,
+            2
+          ],
+          "default": 2,
+          "what": "lanes of the tree a stage carries a block of (sibling lanes folded together: fewer barriers a block)"
+        },
+        "RUN": {
+          "values": [
+            1,
+            2
+          ],
+          "default": 1,
+          "what": "blocks of each lane a stage carries, in the lane's order (fewer barriers a block, no more registers)"
+        },
+        "STAGES": {
+          "values": [
+            4
+          ],
+          "default": 4,
+          "what": "stages of the shared-memory ring (STAGES - 1 in flight; one value swept, the template takes 3 and more)"
+        }
+      },
+      "yardstick": {
+        "library": "cuBLASLt's MXFP8 GEMM (torch._scaled_mm, E4M3 with blocked E8M0 scales, FP32 output); the activations' power-of-two group scales converted to E8M0 once outside the timed call, the global 0.5 left out"
+      },
+      "bench": "bench.py:GemmStaged"
+    },
+    "gemm-native": {
+      "what": "prompt GEMM accumulated in the tensor cores, NOT the declared order: a CTA TM tokens x TN weight rows, a STAGES-deep cp.async ring of swizzled BK-byte tiles (kernel core tile.cuh), ldmatrix fragments; MXFP8 throughout (mx) on sm_120a: kind::mxf8f6f4 block-scaled m16n8k32 MMAs, the scales applied and every block summed in the FP32 accumulator; otherwise an e4m3 MMA a block with the scales on the CUDA cores. An output's bits depend on the tile and the token count",
+      "call": "gemm_native",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        128,
+        512,
+        2048,
+        4096
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "row_invariant": false,
+      "knobs": {
+        "TM": {
+          "values": [
+            64,
+            128,
+            256
+          ],
+          "default": 128,
+          "what": "tokens a CTA (the MMA's M)"
+        },
+        "TN": {
+          "values": [
+            64,
+            128,
+            256
+          ],
+          "default": 128,
+          "what": "weight rows a CTA (the MMA's N)"
+        },
+        "WM": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 2,
+          "what": "warps along the tokens (a warp TM / WM tokens)"
+        },
+        "WN": {
+          "values": [
+            2,
+            4
+          ],
+          "default": 4,
+          "what": "warps along the weight rows (a warp TN / WN rows)"
+        },
+        "BK": {
+          "values": [
+            64,
+            128
+          ],
+          "default": 64,
+          "what": "bytes of every row a stage (the K step of the ring)"
+        },
+        "STAGES": {
+          "values": [
+            3,
+            4
+          ],
+          "default": 3,
+          "what": "stages of the cp.async ring (STAGES - 1 in flight)"
+        },
+        "GROUP": {
+          "values": [
+            8
+          ],
+          "default": 8,
+          "what": "weight-row tiles a group of the CTA order (the CTAs that run together share their rows)"
+        },
+        "EPI": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 0,
+          "what": "epilogue: 0 the accumulators stored from registers while the CTA's next tile loads, 1 staged through shared memory as whole rows"
+        }
+      },
+      "order": "the tensor core's: each MMA sums its 32-element block with its scales into the FP32 accumulator, blocks in increasing order (not the declared per-lane order and tree)",
+      "yardstick": {
+        "library": "cuBLASLt's MXFP8 GEMM (torch._scaled_mm, E4M3 with blocked E8M0 scales, FP32 output); the activations' power-of-two group scales converted to E8M0 once outside the timed call, the global 0.5 left out"
+      },
+      "bench": "bench.py:GemmNative"
+    },
+    "gemm-native-channel": {
+      "what": "prompt GEMM of matrices whose scales do not change along K (an FP8 checkpoint's per-channel W8A8: one FP32 scale a weight row, one a token), NOT the declared order: a CTA TM tokens x TN weight rows, a STAGES-deep cp.async ring of swizzled BK-byte code tiles (no scales in the mainloop), every block summed in the tensor cores' FP32 accumulator (on sm_120a the block-scaled e4m3 MMA with unit scales, twice the plain MMA's rate), token scale x weight scale x post in the epilogue, FP32 or BF16 out rounded once. An output's bits depend on the tile and the token count",
+      "call": "gemm_native_channel",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        128,
+        512,
+        2048,
+        8192
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "row_invariant": false,
+      "knobs": {
+        "TM": {
+          "values": [
+            64,
+            128,
+            256
+          ],
+          "default": 128,
+          "what": "tokens a CTA (the MMA's M)"
+        },
+        "TN": {
+          "values": [
+            64,
+            128,
+            256
+          ],
+          "default": 128,
+          "what": "weight rows a CTA (the MMA's N)"
+        },
+        "WM": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 2,
+          "what": "warps along the tokens (a warp TM / WM tokens)"
+        },
+        "WN": {
+          "values": [
+            2,
+            4
+          ],
+          "default": 4,
+          "what": "warps along the weight rows (a warp TN / WN rows)"
+        },
+        "BK": {
+          "values": [
+            64,
+            128
+          ],
+          "default": 128,
+          "what": "bytes of every row a stage (the K step of the ring)"
+        },
+        "STAGES": {
+          "values": [
+            2,
+            3,
+            4
+          ],
+          "default": 3,
+          "what": "stages of the cp.async ring (STAGES - 1 in flight)"
+        },
+        "GROUP": {
+          "values": [
+            8
+          ],
+          "default": 8,
+          "what": "weight-row tiles a group of the CTA order (the CTAs that run together share their rows)"
+        },
+        "EPI": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 1,
+          "what": "epilogue: 0 the scaled outputs stored from registers while the CTA's next tile loads, 1 staged through shared memory as whole rows"
+        }
+      },
+      "order": "the tensor core's: each MMA sums its 32-element block into the FP32 accumulator, blocks in increasing order; the scales applied once to the sum",
+      "yardstick": {
+        "library": "cuBLASLt's FP8 GEMM with row-wise scales (torch._scaled_mm, E4M3 operands, scale_a [tokens, 1] and scale_b [1, rows] FP32, BF16 output) on the same bytes"
+      },
+      "bench": "bench.py:GemmNativeChannel"
+    },
+    "gemm-native-blocks": {
+      "what": "prompt GEMM of scales that change along K (an FP8 block checkpoint's 128 x 128 FP32 block scales against activations quantized per group, MXFP8 matrices against activations whose scales are not powers of two; gemm_native(mx=False) for every table but a channel-scaled one), NOT the declared order: a CTA TM tokens x TN weight rows, a STAGES-deep cp.async ring of swizzled BK-byte code tiles and a STAGES + 1 slot ring of the stage's FP32 scales, each scale span's MMAs (the run of 32-element blocks over which neither operand's scale changes) summed in the tensor cores (on sm_120a the block-scaled e4m3 MMA with unit scales), one FMA a span with the span's activation x weight scale; a scale constant along K and post in the epilogue, FP32 or BF16 out rounded once. An output's bits depend on the tile and the scale layout",
+      "call": "gemm_native",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        128,
+        512,
+        2048,
+        8192
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "row_invariant": false,
+      "knobs": {
+        "TM": {
+          "values": [
+            64,
+            128,
+            256
+          ],
+          "default": 128,
+          "what": "tokens a CTA (the MMA's M)"
+        },
+        "TN": {
+          "values": [
+            64,
+            128,
+            256
+          ],
+          "default": 128,
+          "what": "weight rows a CTA (the MMA's N)"
+        },
+        "WM": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 2,
+          "what": "warps along the tokens (a warp TM / WM tokens)"
+        },
+        "WN": {
+          "values": [
+            2,
+            4
+          ],
+          "default": 4,
+          "what": "warps along the weight rows (a warp TN / WN rows)"
+        },
+        "BK": {
+          "values": [
+            64,
+            128
+          ],
+          "default": 128,
+          "what": "bytes of every row a stage (the K step of the ring)"
+        },
+        "STAGES": {
+          "values": [
+            2,
+            3,
+            4
+          ],
+          "default": 2,
+          "what": "stages of the cp.async code ring (STAGES - 1 in flight; the scale ring holds STAGES + 1)"
+        },
+        "GROUP": {
+          "values": [
+            8
+          ],
+          "default": 8,
+          "what": "weight-row tiles a group of the CTA order (the CTAs that run together share their rows)"
+        },
+        "EPI": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 1,
+          "what": "epilogue: 0 the outputs stored from registers while the CTA's next tile loads, 1 staged through shared memory as whole rows"
+        }
+      },
+      "default_rows": [
+        {
+          "rows": [
+            1,
+            512
+          ],
+          "knobs": {
+            "TM": 64,
+            "TN": 64,
+            "WM": 2,
+            "WN": 4,
+            "STAGES": 4
+          }
+        }
+      ],
+      "order": "the tensor core's within a scale span (each MMA adds its 32-element block into the span's FP32 sum, blocks in increasing order), then one FMA a span into the output's FP32 sum, spans in increasing order; scales constant along K applied once after",
+      "yardstick": {
+        "library": "cuBLASLt's MXFP8 GEMM (torch._scaled_mm, E4M3 with blocked E8M0 scales per 32 on both operands, BF16 output) on the same codes: cuBLASLt has no FP8 GEMM with FP32 128 x 128 / 1 x 128 block scales on sm_120 (CUBLAS_STATUS_NOT_SUPPORTED, torch 2.14.1), so its block-scaled MXFP8 GEMM is the yardstick"
+      },
+      "bench": "bench.py:GemmNativeBlocks"
+    }
+  }
+}

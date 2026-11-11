@@ -1,0 +1,13 @@
+{
+  "plugins": {
+    "options": {},
+    "use": {
+      "attention": "toy-attention",
+      "kv_cache": "toy-kv",
+      "model": "toy-model",
+      "placement": "toy-placement",
+      "projections": "toy-projections",
+      "sampler": "toy-sampler"
+    }
+  }
+}

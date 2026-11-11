@@ -2,7 +2,7 @@
   "schema": "crit-plugin-v1",
   "id": "grouped-experts",
   "title": "Routed experts over expert bundles in a slot store, grouped by expert on the device",
-  "description": "The experts slot's device plugin for decode rows and prompt chunks alike. Each expert is one bundle in its stored format (bf16, fp8 with channel or 128 x 128 block scales, nvfp4, int4 with an E4M3 scale per 16, mxfp4; code/bundles.py), held by the plugin or by a residency cache's slot store and found through a slot table. A layer's routes are grouped by expert on the device and every expert's gate/up and down rows run once for all of its routes, through the registry kernel crit-labs/grouped-experts (BF16 tensor cores, weights decoded exactly, crit's declared SwiGLU, each token's routes summed in route order) or the same arithmetic in torch where the kernel is not there. A route's bits do not depend on the rows beside it, on the chunk or on decode against prompt, and a call at a fixed token count is captured in a CUDA graph. With activations nvfp4, NVFP4 experts run W4A4: inputs and intermediates quantized per route at the checkpoint's input scales by crit's declared quantizer. Its host form is expert-streamed-prefill's FP64 block on the expert_source slot's weights.",
+  "description": "The experts slot's device plugin for decode rows and prompt chunks alike. Each expert is one bundle in its stored format (bf16, fp8 with channel or 128 x 128 block scales, nvfp4, int4 with an E4M3 scale per 16, mxfp4, int4_zp:<group> (INT4 with a zero point a group: AWQ and GPTQ checkpoints' experts, load format awq or gptq, repacked exactly at load; no act order); code/bundles.py), held by the plugin or by a residency cache's slot store and found through a slot table. A layer's routes are grouped by expert on the device and every expert's gate/up and down rows run once for all of its routes, through crit's kernel grouped-experts (built on this GPU, tuned or default knobs; BF16 tensor cores, weights decoded exactly, crit's declared SwiGLU, each token's routes summed in route order) or the same arithmetic in torch where the kernel is not there. A route's bits do not depend on the rows beside it, on the chunk or on decode against prompt, and a call at a fixed token count is captured in a CUDA graph. With activations nvfp4, NVFP4 experts run W4A4: inputs and intermediates quantized per route at the checkpoint's input scales by crit's declared quantizer. Its host form is expert-streamed-prefill's FP64 block on the expert_source slot's weights.",
   "fills": [
     "experts"
   ],
@@ -42,7 +42,7 @@
         "tensor",
         "declared"
       ],
-      "description": "tensor: BF16 tensor cores for every format (the fastest); declared: crit's integer block order (host-expert-arithmetic's host_int.h), the bits crit's CPU expert tier gives on the same bundles, for NVFP4 experts W4A4 (with activations nvfp4) and int4 experts W4A8 (8-bit activations, a quantization of its own for speed runs), so a dispatch that sends some routes to the CPU changes no token; only the registry kernel computes it (refused without it)"
+      "description": "tensor: BF16 tensor cores for every format (the fastest); declared: crit's integer block order (host-expert-arithmetic's host_int.h), the bits crit's CPU expert tier gives on the same bundles, for NVFP4 experts W4A4 (with activations nvfp4) and int4 experts W4A8 (8-bit activations, a quantization of its own for speed runs), so a dispatch that sends some routes to the CPU changes no token; only crit's kernel grouped-experts computes it (refused without it)"
     },
     "workspace_mib": {
       "type": "int",
@@ -54,14 +54,12 @@
     "kernel": {
       "type": "bool",
       "default": true,
-      "description": "use the registry kernel crit-labs/grouped-experts where it loads; false runs the torch arithmetic"
+      "description": "use crit's kernel grouped-experts (built on this GPU, tuned or default knobs) where it builds; false runs the torch arithmetic"
     }
   },
   "kernels": [
     {
-      "name": "crit-labs/grouped-experts",
-      "version": 1,
-      "revision": null,
+      "name": "grouped-experts",
       "fallback": "the tensor arithmetic in torch (code/fallback.py): each route's expert decoded and multiplied by batched matrix products in fixed chunks; correct, row invariant and capture-safe, much slower; the declared arithmetic is refused"
     }
   ],

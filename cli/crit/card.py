@@ -10,6 +10,8 @@ CARD = "card.yaml"
 LOCK = "card.lock.json"
 COMMIT = re.compile(r"[0-9a-f]{40}")
 REPOSITORY = re.compile(r"https://[A-Za-z0-9.-]+(/[A-Za-z0-9_.~-]+)+/?")
+# A folder in the engine's repository: relative, forward slashes, no segment that is empty, . or .. or starts with -.
+SOURCE_PATH = re.compile(r"(?!-)(?!\.\.?(/|$))[A-Za-z0-9_.-]+(/(?!-)(?!\.\.?(/|$))[A-Za-z0-9_.-]+)*/?")
 NAME = re.compile(r"[A-Za-z0-9_.-]+")
 LOCK_BYTES = 16 << 20   # a lock lists every file of every checkpoint the engine was measured on
 
@@ -51,4 +53,8 @@ def check_source(card, where):
     if (not isinstance(source, dict) or not REPOSITORY.fullmatch(str(source.get("repository", "")))
             or not COMMIT.fullmatch(str(source.get("revision", "")))):
         raise ValueError(f"{where}: source needs an https repository and a full 40-character commit revision")
+    path = source.get("path")
+    if path not in (None, "", ".") and not (isinstance(path, str) and SOURCE_PATH.fullmatch(path)):
+        raise ValueError(f"{where}: source path {path!r} must be a folder in the repository, a relative path such as "
+                         "engines/my-engine")
     return source

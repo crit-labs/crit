@@ -1,7 +1,8 @@
 """recurrent-state-recovery's device form against its reference's (sequential-recurrence): decode and verify rows give
-the same bits, prompt rows (its two-pass chunked prefill where recurrent-scans is installed, the scan otherwise) agree
-with the float64 recurrence within 2e-3 + 2e-2 |x|, and its three commit strategies keep a verify window's accepted
-prefix with the same bits, which continue as the base plugin's serial decode."""
+the same bits, prompt rows (its chunked prefill where crit's kernel recurrent-scans builds, on tensor cores or in FP32
+by the prefill option, the scan otherwise) agree with the float64 recurrence within 2e-3 + 2e-2 |x|, and its three
+commit strategies keep a verify window's accepted prefix with the same bits, which continue as the base plugin's
+serial decode."""
 from crit_plugins import StepBatch
 from crit_plugins.device import RoundBatch
 from crit_plugins.testing import PluginTestCase
@@ -58,9 +59,26 @@ class DeviceTests(PluginTestCase):
             self.assertTrue(torch.equal(a, b) and torch.equal(xa, xb))
         self.assertTrue(torch.equal(pools[0].state(0, "a"), pools[1].state(0, "a")))
 
-    def test_prompt_rows_follow_the_float64_recurrence_and_the_reference_plugin(self):
+    def test_both_scan_structures_give_the_same_bits(self):
+        """The scan option (recurrent-scans' pool-delta or pool-delta-pipe) changes no bit: decode rows, verify rows
+        committed deferred, a scanned prompt row, the state and the convolution window."""
         torch = self.torch
-        pinned = {"exact_rows": 16}   # 150 tokens through the chunked kernels, wherever the crossover is
+        plugins = [self.assemble(options={"scan": scan, "commit": "deferred"})["recurrence"]
+                   for scan in ("pool-delta", "pool-delta-pipe")]
+        pools = [self.pool(p) for p in plugins]
+        for first, count in ((0, 12), (12, 1), (13, 1), (14, 3), (17, 1)):
+            (a, xa), (b, xb) = (self.step(p, pool, first, count) for p, pool in zip(plugins, pools))
+            self.assertTrue(torch.equal(a, b) and torch.equal(xa, xb), (first, count))
+        self.assertTrue(torch.equal(pools[0].state(0, "a"), pools[1].state(0, "a")))
+
+    def test_prompt_rows_follow_the_float64_recurrence_and_the_reference_plugin(self):
+        for prefill in ("tensor_cores", "fp32"):
+            with self.subTest(prefill=prefill):
+                self.prompt_rows(prefill)
+
+    def prompt_rows(self, prefill):
+        torch = self.torch
+        pinned = {"exact_rows": 16, "prefill": prefill}   # 150 tokens through the chunked kernels
         mine = self.assemble(options=pinned)["recurrence"]
         base = self.reference(options={"sequential-recurrence": pinned})["recurrence"]
         found = {}
@@ -68,6 +86,11 @@ class DeviceTests(PluginTestCase):
             pool = self.pool(plugin)
             out, _ = self.step(plugin, pool, 0, 150)
             found[name] = (out, pool.state(0, "a").clone())
+        facts = mine.facts()["recurrence_prompts"]["pools"][-1]
+        if self.dev == "cuda" and mine.kernels(self.dev, self.dk) is not None:   # the kernel built: its prefill ran
+            self.assertEqual(facts["chunked"], "two_pass" if prefill == "fp32" else prefill)
+            self.assertIs(facts["chunked_row_invariant"], False)
+            self.assertIn("FP16" if prefill == "tensor_cores" else "FP32", facts["chunked_arithmetic"])
         d = {n: t[:150].double() for n, t in self.inputs.items()}
         normal = lambda x: x / torch.sqrt((x * x).sum(-1, keepdim=True) + 1e-6)  # noqa: E731
         S = torch.zeros(self.h, self.dk, self.dv, dtype=torch.float64, device=self.dev)

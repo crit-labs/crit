@@ -467,6 +467,31 @@ class PluginTestRunnerTests(unittest.TestCase):
         self.assertIn("no tests", items["kv-fp8"]["detail"])
 
 
+class PluginTestCacheTests(unittest.TestCase):
+    def test_a_plugin_whose_tests_passed_unchanged_is_reported_cached_and_a_change_runs_them_again(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as temp:
+            root = write_plugins(Path(temp) / "plugins", {k: PLUGINS[k] for k in
+                                                          ("attn-fp8", "kv-fp8", "attn-kv-fused", "attn-plain", "kv-bf16")},
+                                 tests={"attn-kv-fused": {"test_fused.py": PASSING},
+                                        "attn-plain": {"test_plain.py": FAILING}})
+            with patch.dict("os.environ", {"CRIT_PLUGIN_TEST_CACHE": str(Path(temp) / "cache")}):
+                first = {i["name"]: i for i in run_tests(root, only={"attn-kv-fused", "attn-plain"}, cache=True,
+                                                         log=lambda line: None)}
+                again = {i["name"]: i for i in run_tests(root, only={"attn-kv-fused", "attn-plain"}, cache=True,
+                                                         log=lambda line: None)}
+                self.assertNotIn("cached", first["attn-kv-fused"])
+                self.assertTrue(again["attn-kv-fused"]["cached"])
+                self.assertEqual(again["attn-kv-fused"]["detail"], "1 tests")
+                # A failure is never cached, and a changed file runs the tests again.
+                self.assertEqual(again["attn-plain"]["state"], "failed")
+                folder = Path(temp) / "plugins" / "attn-kv-fused"
+                (folder / "notes.txt").write_text("changed", encoding="utf-8")
+                changed = {i["name"]: i for i in run_tests(root, only={"attn-kv-fused"}, cache=True,
+                                                           log=lambda line: None)}
+                self.assertNotIn("cached", changed["attn-kv-fused"])
+
+
 class AblationTests(PluginFixture, unittest.TestCase):
     def test_variants_switch_each_plugin_off_and_on_alone(self):
         self.assertEqual(toggles(FULL), ["attn-fp8", "kv-fp8", "draft-eagle"])
@@ -551,6 +576,26 @@ class AblationTests(PluginFixture, unittest.TestCase):
         self.assertNotIn("round_ms", row["in_engine"])
         self.assertEqual(row["verdict"], "pays")
         self.assertIsNone(summary({"case-0001": {"decode_tps": 100.0}})["round_ms"])
+
+    def test_where_both_variants_draft_a_plugin_outside_the_drafter_is_judged_by_its_round_time(self):
+        # A Qwen3.8-27B engine's recurrence plugin: decode 11.6% lower at 2.6 tokens a round against 2.9, in rounds
+        # 0.3% longer: the tokens the short bench accepted moved, the plugin's own cost did not.
+        def drafting(name, decode, accepted):
+            kpis = summary({"case-0001": {"decode_tps": decode, "prefill_tps": 6000.0, "ttft_ms": 88.0,
+                                          "accepted_tokens_per_round": accepted}})
+            return {"name": name, "state": "measured", "kpis": kpis, "smoke": {"failed": []}}
+        recurrence = {"use": {"recurrence": "scan-two-pass"}, "base": {"recurrence": "scan-plain"}}
+        full, base = drafting("full", 132.6, 2.57), drafting("base", 150.0, 2.9)
+        (row,) = blame([full, {**base, "also": ["without:scan-two-pass"]}], recurrence)
+        self.assertLess(row["in_engine"]["decode_tps"], -0.1)
+        self.assertGreater(row["in_engine"]["round_ms"], -0.01)
+        self.assertEqual(row["judged"], ["prefill_tps", "round_ms", "ttft_ms"])
+        self.assertEqual(row["verdict"], "neutral")
+        # The drafter's own toggle is judged by the tokens per second its drafts give, rounds of any length.
+        drafter = {"use": {"drafter": "draft-wide"}, "base": {"drafter": "draft-narrow"}}
+        (row,) = blame([full, {**base, "also": ["without:draft-wide"]}], drafter)
+        self.assertEqual(row["judged"], ["decode_tps", "prefill_tps", "ttft_ms"])
+        self.assertEqual(row["verdict"], "slows")
 
 
 class CliTests(PluginFixture, unittest.TestCase):

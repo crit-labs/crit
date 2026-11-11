@@ -1,7 +1,7 @@
 """crit run ... ablate end to end: a toy engine built from plugins, packaged as a run's candidate and served through
 crit serve, built again in the same resident host with each variant of its plugins, benched and smoke-tested; the
 report says which plugin pays and which one slows the engine. The package is a whole engine (the toy engine's
-plugins, support/toy_plugins, with the attention and drafter plugins below in their slots); its resident host runs
+plugins, inference/examples/plugin-engine/plugins, with the attention and drafter plugins below in their slots); its resident host runs
 the scripted ENGINE over the assembled plugins (support/serve.py's scripted serving)."""
 import json
 from pathlib import Path
@@ -159,6 +159,28 @@ class AblateTests(run_measure.MeasureFixture, unittest.TestCase):
         self.assertGreater(full["smoke"]["skipped"], 0)
         self.assertEqual(result["attempt"]["logs"][1]["path"], result["report"])
         self.assertEqual(self.store.get(self.run_id)["errors"], [])
+
+    def test_option_variants_on_evals_cases_say_what_an_option_does(self):
+        # An in-process A/B: the drafter at width 1 against the engine as built, on the run's case and on crit-eval's
+        # speed cases and held-out prompts, one request per seed.
+        import tempfile
+        candidate = self.plugin_package()
+        with tempfile.TemporaryDirectory() as data:
+            prompt = [{"role": "user", "content": "tell me about rivers"}]
+            (Path(data) / "prepared.json").write_text(json.dumps({
+                "sampling": {"temperature": 1.0, "top_p": 0.95},
+                "speed": [{"id": "chat", "messages": prompt, "output_tokens": 32}],
+                "heldout": [{"id": "de", "messages": prompt, "output_tokens": 16}]}), encoding="utf-8")
+            result = ablate(self.store, self.run_id, candidate, repetitions=2, smoke=False, noise=0.10, data=data,
+                            seeds=2, sets=["draft-three.width=1"])
+        self.assertEqual([row["name"] for row in result["variants"]], ["full", "set:draft-three.width=1"])
+        report = read_json(self.directory / result["report"])
+        full = report["variants"][0]
+        self.assertEqual(sorted(full["cases"]), ["case-0001", "eval:chat", "eval:heldout:de"])
+        self.assertEqual((report["eval_data"], report["seeds"]), (data, 2))
+        (row,) = report["blame"]
+        self.assertEqual((row["plugin"], row["verdict"]), ("set:draft-three.width=1", "slows"), row)
+        self.assertLess(row["in_engine"]["decode_tps"], -0.10)
 
     def test_a_variant_is_warmed_until_its_decode_rounds_take_a_steady_time(self):
         # A rebuilt engine whose first three requests run cold, each less than the one before, as a real engine's

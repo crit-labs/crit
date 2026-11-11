@@ -28,7 +28,6 @@ def stored(generator, hidden, inter, format, per_row):
 
 def dense(matrix, format):
     """The FP64 weights a stored matrix means (W = value * scale / global)."""
-    from importlib import import_module
     codes = matrix["weight"]
     low, high = (codes & 15).long(), (codes >> 4).long()
     nib = torch.stack([low, high], -1).reshape(codes.shape[0], -1)

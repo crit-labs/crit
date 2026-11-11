@@ -1,0 +1,306 @@
+{
+  "schema": "crit-kernel-v1",
+  "id": "recurrent-scans",
+  "family": "recurrence",
+  "title": "Recurrent layers of hybrid models: gated delta (two-pass chunked prefill in FP32 or on tensor cores, column scan, pool rows of many sequences with a device commit), Mamba-2 and the short causal convolution",
+  "package": "recurrent_scans",
+  "language": "cuda",
+  "operations": [
+    "gated-delta"
+  ],
+  "sources": [
+    "recurrent_scans_cuda/binding.cu",
+    "recurrent_scans_cuda/recurrent_kernels.cu",
+    "recurrent_scans_cuda/delta_tensor_cores.cu",
+    "recurrent_scans_cuda/pool_binding.cu",
+    "recurrent_scans_cuda/recurrent_rows.cu",
+    "torch-ext/torch_binding.cpp"
+  ],
+  "capabilities": [
+    "8.0",
+    "8.6",
+    "8.9",
+    "9.0",
+    "10.0",
+    "10.3",
+    "11.0",
+    "12.0",
+    "12.1"
+  ],
+  "libraries": [],
+  "structures": {
+    "delta-prefill-rb": {
+      "what": "gated_delta_prefill for 128 key dims: pass 1 (block per value head and 64-token chunk, 4 x 4 register tiles, T = (I + L)^-1 by forward substitution) builds every chunk's matrices at once; pass 2 walks the chunks in order per value head and COLS value columns with the state slice in shared memory, RU x 4 tiles of U and the outputs and RS x 4 of the state from float4 shared loads. Every configuration sums the same terms in the same order (a zero sum's sign aside)",
+      "call": "gated_delta_prefill",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        512,
+        2048,
+        8192
+      ],
+      "key": [
+        "k_heads",
+        "v_heads",
+        "dk",
+        "dv"
+      ],
+      "row_invariant": false,
+      "knobs": {
+        "COLS": {
+          "values": [
+            16,
+            32,
+            64
+          ],
+          "default": 64,
+          "what": "value columns a pass-2 block owns (the grid is value heads x dv / COLS)"
+        },
+        "THREADS": {
+          "values": [
+            128,
+            256,
+            512,
+            1024
+          ],
+          "default": 512,
+          "what": "threads a pass-2 block: THREADS / (COLS / 4) rows of tiles, each 64 / that rows of U and 128 / that key rows of the state"
+        },
+        "MINB": {
+          "values": [
+            0,
+            2
+          ],
+          "default": 0,
+          "what": "pass 2's minimum blocks a multiprocessor in __launch_bounds__ (0: none), which caps its registers"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer chunk_gated_delta_rule (log-domain gates, keys and queries normalized beforehand as here) on q, k and v rounded to BF16 once (it takes 16-bit inputs only), the start state transposed once to its V-major layout; fla is not installed in crit-venv"
+      },
+      "bench": "bench.py:DeltaPrefillRb"
+    },
+    "delta-prefill-tc": {
+      "what": "gated_delta_prefill(tensor_cores=True), the chunked WY form on tensor cores (FP16 operands, FP32 accumulation and state; dk 64 or 128, dv a multiple of 16): pass 1, block per key head and 64-token chunk, K K^T and Q K^T by mma.sync once for the key head's value heads, T = (I + A)^-1 a column a thread by forward substitution in FP32, T diag(beta), the decayed q . k and FP16 keys and queries; pass 2, block per value head and WARPS x 16 value columns, the chunks in order, each warp's transposed state slice in MMA accumulators that are also the A operand of S^T K^T and S^T Q^T, the chunk's tiles through STAGES cp.async shared-memory stages (swizzled, ldmatrix). Other bits than delta-prefill-rb (another rounding); the knobs regroup the work only",
+      "call": "gated_delta_prefill",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        512,
+        2048,
+        8192
+      ],
+      "key": [
+        "k_heads",
+        "v_heads",
+        "dk",
+        "dv"
+      ],
+      "row_invariant": false,
+      "knobs": {
+        "WARPS": {
+          "values": [
+            1,
+            2,
+            4,
+            8
+          ],
+          "default": 4,
+          "what": "warps a pass-2 block, 16 value columns each (the grid is value heads x dv / (16 WARPS))"
+        },
+        "STAGES": {
+          "values": [
+            1,
+            2
+          ],
+          "default": 2,
+          "what": "pass 2's shared-memory stages: 2 loads the next chunk's tiles while the current one computes"
+        },
+        "OVERLAP": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 0,
+          "what": "1: both passes in one launch, pass 1's workers on the multiprocessors pass 2's blocks leave free, pass 2 waiting on each chunk's flag (taken only where every block fits on the device at once, else the two launches of 0); slower than 0 on an RTX 5090 at Qwen3.8-27B's layer, where pass 1 is bound by memory"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer chunk_gated_delta_rule (log-domain gates, keys and queries normalized beforehand as here) on q, k and v rounded to BF16 once (it takes 16-bit inputs only), the start state transposed once to its V-major layout; fla is not installed in crit-venv"
+      },
+      "bench": "bench.py:DeltaPrefillTc"
+    },
+    "pool-delta": {
+      "what": "pool_delta, the decode and verify rows of many sequences in one launch: block per (value head, SLOTS x 32 value columns, row), a warp per 4 (LANE_COLS) value columns with its lanes' key rows of the FP32 state in registers, keys and queries L2-normalized from the same reduction, one update expression on every path. A row's bits do not depend on the rows beside it or on the configuration",
+      "call": "pool_delta",
+      "rows": [
+        1,
+        65535
+      ],
+      "tune_rows": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32
+      ],
+      "key": [
+        "k_heads",
+        "v_heads",
+        "dk",
+        "dv"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "SLOTS": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 1,
+          "what": "32-column slots a block covers (8 warps and one pending count and stash parity each), so 256 x SLOTS threads"
+        },
+        "PREFETCH": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 1,
+          "what": "load the next token's q, k, v and beta while the current one updates the state"
+        },
+        "MINB": {
+          "values": [
+            0,
+            2,
+            3,
+            4,
+            6
+          ],
+          "default": 0,
+          "what": "minimum blocks a multiprocessor in __launch_bounds__ (0: none), which caps the registers"
+        },
+        "LANE_COLS": {
+          "values": [
+            4,
+            8,
+            16
+          ],
+          "default": 4,
+          "what": "value columns a lane holds (a 32-column slot then takes 32 / LANE_COLS warps): the same sums, 16 to 64 contiguous bytes a lane a key row, fewer warps loading and normalizing the same keys"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer gated_delta_rule_decode_pretranspose (one token a row; it also writes the state back) or gated_delta_rule_mtp without the state update (verify windows), on the same FP32 states transposed once to its V-major layout, the gates as its pre-activation inputs made once; BF16 out; fla is not installed in crit-venv"
+      },
+      "bench": "bench.py:PoolDelta"
+    },
+    "pool-delta-pipe": {
+      "what": "pool_delta(pipelined=True): pool-delta's rows and bits (the lane's tile in the same registers, the same update, sums, pending counts and stash parities per 32 value columns) on another schedule: a block of 32 / LANE_COLS warps runs ITEMS slots (value head, 32 value columns, row) one after another, each slot's state tile copied coalesced into swizzled shared memory by cp.async STAGES slots ahead, the next slot's pending count, first token and decay input loaded into registers while the current one runs",
+      "call": "pool_delta",
+      "rows": [
+        1,
+        65535
+      ],
+      "tune_rows": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32
+      ],
+      "key": [
+        "k_heads",
+        "v_heads",
+        "dk",
+        "dv"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "LANE_COLS": {
+          "values": [
+            4,
+            8,
+            16
+          ],
+          "default": 8,
+          "what": "value columns a lane holds (a block then has 32 / LANE_COLS warps): the same sums"
+        },
+        "ITEMS": {
+          "values": [
+            1,
+            2,
+            4,
+            8
+          ],
+          "default": 1,
+          "what": "slots a block runs one after another (the grid is rows x value heads x dv / 32 / ITEMS)"
+        },
+        "STAGES": {
+          "values": [
+            1,
+            2
+          ],
+          "default": 1,
+          "what": "state tiles a block has in flight ahead of the slot it runs (shared memory: STAGES x 16 KB at dk 128)"
+        },
+        "MINB": {
+          "values": [
+            0,
+            2,
+            4,
+            6
+          ],
+          "default": 0,
+          "what": "minimum blocks a multiprocessor in __launch_bounds__ (0: none), which caps the registers"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer gated_delta_rule_decode_pretranspose (one token a row; it also writes the state back) or gated_delta_rule_mtp without the state update (verify windows), on the same FP32 states transposed once to its V-major layout, the gates as its pre-activation inputs made once; BF16 out; fla is not installed in crit-venv"
+      },
+      "bench": "bench.py:PoolDeltaPipe"
+    },
+    "delta-prefill-64": {
+      "what": "gated_delta_prefill for 64 key dims: the same two passes as delta-prefill-rb with a thread per row and 16 columns (pass 1) or 16 value columns (pass 2), shared values one per FMA; untuned",
+      "call": "gated_delta_prefill"
+    },
+    "pool-replay": {
+      "what": "pool_delta_replay: a round's commit over every layer, the accepted stashed steps replayed from the start state (recompute) or each sequence's pending count applied (flush), block per (value head, 32 value columns, row) walking the layers; untuned (its blocks are the pending counts' slots)",
+      "call": "pool_delta_replay"
+    },
+    "pool-conv": {
+      "what": "pool_conv: the causal depthwise convolution of rows over their sequences' windows, a thread per channel (128 a block, one pending count each) with the window in registers, 2 to 8 taps or 2 to 4 at dilation 2 to 4; untuned",
+      "call": "pool_conv"
+    },
+    "pool-conv-prompt": {
+      "what": "pool_conv_prompt: one sequence's prompt chunk padded to a captured graph's bucket, a thread per (channel, 32 rows); untuned",
+      "call": "pool_conv_prompt"
+    },
+    "conv-segments": {
+      "what": "conv_segments: one long row out of place, a thread per (channel, 32 rows), the bits of pool_conv's; untuned",
+      "call": "conv_segments"
+    },
+    "delta-columns": {
+      "what": "gated_delta_scan: one sequence's column scan for decode and verify from FP32 inputs, block per (value head, 32 value columns), optionally writing the state after every token; untuned",
+      "call": "gated_delta_scan"
+    },
+    "causal-conv": {
+      "what": "causal_conv1d: one sequence's convolution with its carried window, a thread per channel (in place) or per (channel, 32 rows) out of place; untuned",
+      "call": "causal_conv1d"
+    },
+    "ssd-prefill": {
+      "what": "ssd_prefill: Mamba-2's two-pass chunked prefill (64-token chunks), block per head and chunk, then per head and 32 rows of head_dim; untuned",
+      "call": "ssd_prefill"
+    },
+    "ssd-columns": {
+      "what": "ssd_scan: Mamba-2's column scan, block per (head, 8 rows of head_dim), a warp a row; untuned",
+      "call": "ssd_scan"
+    }
+  }
+}

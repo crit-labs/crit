@@ -82,6 +82,20 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             policy.set_costs([[1.0] * len(WIDTHS)])
 
+    def test_calibrated_costs_are_fitted_so_timing_noise_cannot_swap_two_widths(self):
+        # Two loads timed widths 2, 4 and 6 at nearly the same cost, noise swapping 4 and 6; the fit keeps the order
+        # a round's columns give (cost grows with width) and the same table up to the noise.
+        from crit_plugins.rounds import fitted_costs
+        inf = float("inf")
+        first = fitted_costs([[19.0, 20.4, 20.2], [21.0, inf, 23.0]], [2, 4, 6])
+        second = fitted_costs([[19.1, 20.1, 20.5], [21.0, inf, 23.0]], [2, 4, 6])
+        for table in (first, second):
+            self.assertLessEqual(table[0][0], table[0][1])
+            self.assertLessEqual(table[0][1], table[0][2])
+            self.assertEqual(table[1][1], inf)
+        self.assertAlmostEqual(first[0][2], second[0][2], delta=0.3)
+        self.assertEqual(fitted_costs([[7.0, inf, inf]], [2, 4, 6]), [[7.0, inf, inf]])
+
     def test_policies_take_only_the_drivers_widths_and_name_themselves(self):
         from crit_plugins.rounds import FixedWidth, StepWidth, width_policy
         self.assertEqual(driver(1, None).width(1), 6, "fixed at the widest by default")

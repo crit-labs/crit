@@ -149,7 +149,7 @@ def fetch_source(source, store, checkout=None):
         if git("-C", repo, "cat-file", "-e", revision + "^{commit}", check=False).returncode:
             log(f"crit pull: fetching {repository} at {revision[:12]}")
             git("-C", repo, "fetch", "--quiet", "--depth", "1", repository, revision)
-    return git("-C", repo, "archive", "--format=tar", revision, path).stdout
+    return git("-C", repo, "archive", "--format=tar", revision, "--", path).stdout  # a path is never an option
 
 
 def unpack(archive, path, target):
@@ -209,8 +209,8 @@ def fetch_checkpoint(store, entry, local=None, path=None):
             raise ValueError(f"{local} is not {name}:\n  " + "\n  ".join(bad))
         for row in rows:
             target = safe_path(folder, row["path"])
-            if target.is_file() and target.stat().st_size == row["bytes"]:
-                continue
+            if target.is_file() and target.stat().st_size == row.get("bytes", -1):
+                continue  # a row with a hash only (a drafter's) is linked again: verified() checked the local copy
             target.parent.mkdir(parents=True, exist_ok=True)
             target.unlink(missing_ok=True)
             try:
@@ -454,7 +454,7 @@ def pull(engine, store, project=ROOT, hub=None, index=None, checkout=None, model
                   "installed_at": now(), "crit_version": __version__,
                   "card": {**origin, "summary": card.get("summary"), "contributor": card.get("contributor")},
                   "source": {k: card["source"].get(k) for k in ("repository", "revision", "path")},
-                  "checkpoint": {"model": model_id, "repository": entry["repository"], "revision": entry["revision"],
+                  "checkpoint": {"model": model_id, "repository": entry["repository"], "revision": entry.get("revision"),
                                  "folder": model_folder, "files_sha256": digest(entry["files"]), "from": model_from},
                   "package": {"sha256": digest(manifest), "files": len(files)},
                   "limits": limits,
@@ -540,7 +540,8 @@ def main(argv=None):
                       args.checkpoint, args.device, args.context, args.force, args.ignore_requirements,
                       args.build_timeout, local, args.build_from_source)
     except (ValueError, OSError, KeyError, TypeError) as exc:
-        print("error: " + str(exc), file=sys.stderr)
+        from ..errors import report
+        report(exc, "error: ", sys.stderr)
         return 1
     print(json.dumps(record, indent=2))
     serve = "crit serve --engine " + record["engine"] + (f" --store {args.store}" if args.store else "")

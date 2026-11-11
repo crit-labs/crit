@@ -1,6 +1,6 @@
 """KV state in the kv_cache slot: attention-state's transactional causal reference (implementation.py) as the host
 form, and its paged pool on the device (pages.py) as the device form, with captured rounds' slot binding
-(rounds:kv_cache). Its pages are written by the registry's paged-kv-attention kernels when they load (one launch per
+(rounds:kv_cache). Its pages are written by crit's paged-kv-attention kernels when they load (one launch per
 layer for keys and values), else in torch."""
 from pathlib import Path
 
@@ -8,7 +8,7 @@ from .state import device_attention
 from .state import implementation as reference
 from .state import pages
 
-KERNELS = "crit-labs/paged-kv-attention"
+KERNELS = "paged-kv-attention"
 
 
 class KVStateCache:
@@ -113,8 +113,8 @@ def memory(context, options):
 def create(context, options, parts):
     kernels = None
     if options["kernels"] == "auto":
-        from crit_plugins.kernels import registry_kernel
-        kernels = registry_kernel(KERNELS, folder=Path(__file__).parent)
+        from crit_plugins.kernels import load_kernel
+        kernels = load_kernel(KERNELS, folder=Path(__file__).parent)
     fresh = None
     device = device_attention.engine_device(context)
     if device.startswith("cuda") and options["fresh_mib"]:

@@ -1,6 +1,5 @@
 #include "attention.h"
 #include "batch_attention.h"
-#include "attention_gemm.h"
 #include "state_pages_fixture.h"
 #include <array>
 #include <cstring>
@@ -425,7 +424,7 @@ int wmain(int argc, wchar_t** argv) {
 int main(int argc, char** argv) {
 #endif
   try {
-    if (argc < 2) throw std::invalid_argument("Choose arithmetic, rotary, integration, failures or openblas LIBRARY BITS SGEMM CONFIG THREADS");
+    if (argc < 2) throw std::invalid_argument("Choose arithmetic, rotary, integration, failures or batches");
     Checked checked, integrated;
     int integer_bits = 0;
     std::string configuration = "scalar-double-accumulation-fp32-gemm";
@@ -436,16 +435,7 @@ int main(int argc, char** argv) {
     else if (mode == "integration" && argc == 2) integrated = integration(scalar);
     else if (mode == "failures" && argc == 2) failures();
     else if (mode == "batches" && argc == 2) checked = batches();
-    else if (mode == "openblas" && argc == 7) {
-      const auto bits = ascii(argv[3]);
-      if (bits != "32" && bits != "64") throw std::invalid_argument("Explicit BLAS ABI required");
-      crit_kernels::OpenBlas blas(std::filesystem::path(argv[2]), bits == "64" ? 64 : 32, ascii(argv[4]), ascii(argv[5]), ascii(argv[6]));
-      crit_kernels::OpenBlasAttentionGemm gemm{blas};
-      integer_bits = bits == "64" ? 64 : 32; configuration = blas.configuration();
-      for (unsigned char c : configuration)
-        if (c < 32 || c > 126) throw std::runtime_error("Printable provider configuration required");
-      checked = arithmetic(gemm); integrated = integration(gemm); rotary_checks();
-    } else throw std::invalid_argument("Invalid attention fixture arguments");
+    else throw std::invalid_argument("Invalid attention fixture arguments");
     std::cout << std::setprecision(10) << "{\"schema_version\":1,\"record_kind\":\"attention_check\",\"cases\":" << checked.cases
       << ",\"integration_cases\":" << integrated.cases << ",\"integer_bits\":" << integer_bits
       << ",\"configuration\":" << std::quoted(configuration)

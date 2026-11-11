@@ -85,12 +85,14 @@ class DialectFixture(ServeFixture):
     api_keys = ()
     model_name = None
     lenient = False
+    cors_origin = "*"
+    host = "127.0.0.1"
 
     def setUp(self):
         super().setUp()
         self.served = self.engine()
-        self.server = Server(("127.0.0.1", 0), Api(self.served, model_name=self.model_name, api_keys=self.api_keys,
-                                                         cors_origin="*", lenient=self.lenient))
+        self.server = Server((self.host, 0), Api(self.served, model_name=self.model_name, api_keys=self.api_keys,
+                                                       cors_origin=self.cors_origin, lenient=self.lenient))
         thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(self.server.server_close)
@@ -1247,10 +1249,10 @@ class MethodsAndBodiesTests(DialectFixture, unittest.TestCase):
 
     def test_a_malformed_length_is_a_400_and_closes_even_where_the_body_may_be_empty(self):
         # The bytes after the headers are an unread body, never a second request.
-        smuggled = b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        smuggled = b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
         for path in ("/v1/crit/unload", "/v1/chat/completions"):
             for length in (b"abc", b"-5"):
-                request = b"POST %s HTTP/1.1\r\nHost: x\r\nContent-Length: %s\r\n\r\n" % (path.encode(), length)
+                request = b"POST %s HTTP/1.1\r\nHost: localhost\r\nContent-Length: %s\r\n\r\n" % (path.encode(), length)
                 with socket.create_connection(self.server.server_address[:2], timeout=30) as connection:
                     connection.sendall(request + smuggled)
                     data = b"".join(iter(lambda: connection.recv(65536), b""))
@@ -1352,7 +1354,9 @@ class LifecycleKeyTests(DialectFixture, unittest.TestCase):
         for path in ("/v1/crit/unload", "/v1/crit/load"):
             response, data = self.call("POST", path)
             self.assertEqual((response.status, json.loads(data)["error"]["code"]), (401, "invalid_api_key"))
-        self.assertTrue(json.loads(self.call("GET", "/health")[1])["loaded"])
+        # Without the key /health says only whether the server is up and ready; with it, the engine's state too.
+        self.assertEqual(sorted(json.loads(self.call("GET", "/health")[1])), ["ready", "status"])
+        self.assertTrue(json.loads(self.call("GET", "/health", headers={"Authorization": "Bearer secret"})[1])["loaded"])
         response, data = self.call("POST", "/v1/crit/unload", headers={"Authorization": "Bearer secret"})
         self.assertEqual((response.status, json.loads(data)["unloaded"]), (200, True))
 
@@ -1775,3 +1779,91 @@ class HistogramTests(unittest.TestCase):
             "crit_serve_request_queue_time_seconds", "crit_serve_e2e_request_latency_seconds",
             "crit_serve_time_to_first_token_seconds", "crit_serve_time_per_output_token_seconds",
             "crit_serve_request_prompt_tokens")], [1, 2, 0, 0, 1])
+
+
+class RawBodies:
+    def send(self, method, path, body, headers=None):
+        connection = http.client.HTTPConnection(*self.server.server_address[:2], timeout=30)
+        self.addCleanup(connection.close)
+        connection.request(method, path, body, {"Content-Type": "application/json", **(headers or {})})
+        response = connection.getresponse()
+        return response, response.read()
+
+
+class CrossSiteTests(RawBodies, DialectFixture, unittest.TestCase):
+    """A server on loopback without --cors-origin: a web page in the user's browser cannot drive it, by a request the
+    browser sends without a preflight or by a DNS name rebound to 127.0.0.1; clients that are not browsers still can."""
+    cors_origin = None
+
+    def raw(self, request):
+        with socket.create_connection(self.server.server_address[:2], timeout=30) as connection:
+            connection.sendall(request)
+            return b"".join(iter(lambda: connection.recv(65536), b""))
+
+    def test_a_web_origin_is_refused_before_its_body_is_read(self):
+        body = json.dumps({"model": "toy", "messages": [{"role": "user", "content": "hi"}]})
+        response, data = self.send("POST", "/v1/chat/completions", body, {"Origin": "https://example.com",
+                                                                           "Content-Type": "text/plain"})
+        self.assertEqual((response.status, json.loads(data)["error"]["code"]), (403, "forbidden"))
+        self.assertIn("--cors-origin", json.loads(data)["error"]["message"])
+        response, data = self.call("POST", "/v1/crit/unload", headers={"Origin": "null"})
+        self.assertEqual(response.status, 403)
+        self.assertTrue(json.loads(self.call("GET", "/health")[1])["loaded"])
+
+    def test_a_host_that_is_not_loopback_is_refused(self):
+        data = self.raw(b"GET /v1/models HTTP/1.1\r\nHost: attacker.example:8000\r\nConnection: close\r\n\r\n")
+        self.assertEqual(data.split(b" ", 2)[1], b"403")
+        for host in (b"localhost:1", b"127.0.0.1", b"[::1]:8000", b"app.localhost"):
+            data = self.raw(b"GET /v1/models HTTP/1.1\r\nHost: " + host + b"\r\nConnection: close\r\n\r\n")
+            self.assertEqual(data.split(b" ", 2)[1], b"200", host)
+
+    def test_clients_that_send_no_origin_are_answered(self):
+        response, _ = self.call("GET", "/v1/models")
+        self.assertEqual(response.status, 200)
+
+
+class AllowedOriginTests(DialectFixture, unittest.TestCase):
+    cors_origin = "http://localhost:3000"
+
+    def test_only_the_configured_origin_is_answered(self):
+        response, _ = self.call("GET", "/v1/models", headers={"Origin": "http://localhost:3000"})
+        self.assertEqual((response.status, response.getheader("Access-Control-Allow-Origin")),
+                         (200, "http://localhost:3000"))
+        response, _ = self.call("GET", "/v1/models", headers={"Origin": "http://localhost:3001"})
+        self.assertEqual(response.status, 403)
+
+
+class RequestRobustnessTests(RawBodies, DialectFixture, unittest.TestCase):
+    api_keys = ("secret",)
+
+    def test_a_body_nested_too_deeply_is_a_400(self):
+        body = "[" * 100000 + "]" * 100000
+        response, data = self.send("POST", "/v1/chat/completions", body, {"Authorization": "Bearer secret"})
+        self.assertEqual(response.status, 400)
+        # Python 3.14's parser takes this depth, so the body reaches the object check instead of the recursion one.
+        self.assertRegex(json.loads(data)["error"]["message"], "nests too deeply|must be a JSON object")
+
+    def test_a_request_without_the_key_is_refused_before_its_body_is_read(self):
+        # The headers claim a body the client never sends: the 401 comes without waiting for it.
+        with socket.create_connection(self.server.server_address[:2], timeout=10) as connection:
+            connection.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+                               b"Content-Length: 1000000\r\n\r\n")
+            data = b"".join(iter(lambda: connection.recv(65536), b""))
+        self.assertEqual(data.split(b" ", 2)[1], b"401")
+
+
+@unittest.skipUnless(socket.has_ipv6, "no IPv6 on this machine")
+class Ipv6LoopbackTests(DialectFixture, unittest.TestCase):
+    host = "::1"
+
+    def setUp(self):
+        try:
+            with socket.socket(socket.AF_INET6) as probe:
+                probe.bind(("::1", 0))
+        except OSError:
+            self.skipTest("::1 cannot be bound here")
+        super().setUp()
+
+    def test_the_server_listens_on_ipv6_loopback(self):
+        response, _ = self.call("GET", "/v1/models")
+        self.assertEqual(response.status, 200)

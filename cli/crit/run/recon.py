@@ -4,7 +4,7 @@
 lone .gguf whose metadata derives the description files) through Core's text layer and writes work/recon.json (the
 facts, the files they came from and the `frozen` block every later candidate takes into configuration["recon"])
 and scaffolds work/recon.md, whose model-card, reference-code, drafting-plan and prefill-arithmetic-plan sections the
-agent writes (runs with plan rules 3 refuse a candidate while either plan is unfinished: recon.unfinished). With
+agent writes (crit refuses a candidate while either plan is unfinished: recon.unfinished). With
 `--drafter PATH` (repeatable) it also reads each companion drafter's config.json through crit_core.model.drafters
 (EAGLE-3, DFlash, DSpark and crit's own `crit models drafter` heads) and records what the engine wires: kind, taps
 into the target, draft vocabulary, block size and mask token, checked against the target's depth.
@@ -21,8 +21,8 @@ from .records import file_sha, keys, now, read_json, record, safe_path, text, wr
 
 RECON_JSON = "work/recon.json"
 RECON_MD = "work/recon.md"
-# The recon.md sections a run with plan rules 3 needs written before its first candidate: decode's and prefill's plans,
-# and the placement plan where recon.json records the placement scenario.
+# The recon.md sections a run needs written before its first candidate: decode's and prefill's plans, and the
+# placement plan where recon.json records the placement scenario.
 PLANS = ("Drafting plan for both decode modes", "Prefill arithmetic plan")
 PLACEMENT_PLAN = "Placement plan"
 # Where candidate 1 starts in each placement scenario (crit_eval.limits.context.SCENARIOS): the design a proof of concept
@@ -680,7 +680,7 @@ quality measurement that allows it:
 `crit eval run --package P --only quality --quality-mode preserve --attribute-drift`, the engine declaring
 `prompt_activations` and one `exact_variants` entry per group, each group's share of the budget read against the
 quality spread (`budget_spread`). Name the prefill ceiling crit-eval prices for this plan next to the stored-format
-one. In a speed run (plan rules 6), candidate 1 already reads prompts at
+one. In a speed run candidate 1 already reads prompts at
 the stored format's activations for every quantized group (stored, or fp8 / fp16_acc), and each plan declares them
 in prompt_activations; groups the checkpoint stores in 16 bits start at bf16 or fp16_acc, and where the run allows
 transformed weights, re-encoding them (FP8 per channel) is their lever to measure.

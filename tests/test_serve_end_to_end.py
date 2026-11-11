@@ -1,5 +1,5 @@
 """crit serve end to end, the one way it runs an engine: a sealed candidate's plugin package (the toy engine's plugins,
-support/toy_plugins) opened by Core's loader in crit serve's resident host on Core's concurrent runtime, behind the
+inference/examples/plugin-engine/plugins) opened by Core's loader in crit serve's resident host on Core's concurrent runtime, behind the
 HTTP API, with no test hook. A model whose chat template teaches a call syntax crit writes and whose tokenizer's bytes
 Core can match, so Core's adapter serves every capability it derives: chat, streaming, tool calls forced by
 tool_choice, structured output, token log-probabilities, fixed-text scores, tokenizing and concurrent requests.
@@ -11,7 +11,6 @@ import json
 import os
 import threading
 import unittest
-from urllib.parse import urlparse
 
 from core_text_fixtures import llama_files
 from support.engines import selection

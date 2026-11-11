@@ -9,6 +9,271 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-11
+
+### Overview
+
+crit 0.18.0 runs its own kernels. The twelve kernels are templates in crit (`kernels/techniques/<family>/<id>/`), built from a
+kernel core on the user's machine for its GPU and tuned by `crit kernels sweep` on the model's own shapes, timed
+against the library doing the same arithmetic; nothing is downloaded or shipped prebuilt, and the library plugins
+run these kernels by default, the libraries kept only as yardstick options. New this release: crit's own prompt
+GEMMs for FP8, NVFP4, MXFP8 and BF16, INT4 with a zero point (AWQ, GPTQ) on every projection and expert kernel, a
+format-generic decode GEMV, a CUDA flash tile for paged attention, and sweeps tuned by sequence length. On an RTX
+5090, Qwen3.8-27B at 200k context decoded at 188 tok/s and prefilled at about 7,850 tok/s with crit's kernels,
+against 176 tok/s and about 7,000 with cuBLASLt's prompt GEMMs. Runs follow one set of plan rules, `crit run ...
+next` names each next step, and `crit run ... ablate` measures plugins and options on Eval's data. `crit run`
+also takes external candidates, engines crit did not assemble from plugins, started from their own launch command
+and served, checked, evaluated, ablated and traced like a plugin package. `crit core build` builds Core's runtime,
+and crit serve, crit pull and crit mcp refuse what a web page or a crafted card could send them. crit 0.18.0 needs
+crit-eval 0.6.1.
+
+### Added
+
+- crit's kernels are templates each engine builds and tunes for its device. The twelve kernels that were to be published to the Hugging Face
+  kernel registry are source in crit, `kernels/techniques/<family>/<id>/` (projections: decode-gemv, mma-rows, pinned-gemm,
+  fixed-tile-gemm, fp8-block-rows; attention: paged-kv-attention; recurrence: recurrent-scans; experts:
+  grouped-experts, int-block-experts, topk-routing; norms: fused-norms; starters: workbench-starter), each described
+  by a `kernel.json`: its operations, sources, compute capabilities and structures, every structure's speed-only
+  constants (warps, rows a warp owns, tiles, K splits, stages, loads in flight, Triton block sizes) as knobs with the
+  values a sweep may try. Nothing is downloaded or shipped prebuilt. `crit kernels build ID` compiles a kernel for the
+  current GPU on first use (cached in `CRIT_KERNEL_CACHE`; `--arch` checks the build for other architectures), with
+  the default knobs, which reproduce the kernel as it was hand-tuned. `crit kernels sweep ID --model CHECKPOINT --out
+  DIR` builds every knob configuration (many a build, picked at run time), checks each against the operation's
+  reference and the row-invariance contract, times it on the checkpoint's own shapes with a cold L2, re-times the
+  picks, and writes the tuning table the build reads; a knob that changes the summation order keeps one value a shape
+  for every row count. On an RTX 5090 with Qwen3.8-27B's NVFP4 matrices, the decode GEMV's sweep (192 configurations,
+  about 6 minutes) was 1.0-1.5x faster than its defaults and within 4% of a hand-tuned specialist GEMV up to 4 rows.
+  `crit kernels list` shows them; kernels/TEMPLATES.md is the contract for a new kernel or structure.
+- A kernel core (`kernels/core/`): the building blocks kernels are made of, with no algorithm in them. Number formats
+  (E4M3, E8M0, E2M1, INT4 groups, encoders, block-scale layouts), tensor-core multiplies per GPU generation (mma.sync,
+  block-scaled FP4/FP8 on sm_120a, wgmma and tcgen05 wrappers), cp.async pipelines, ldmatrix, TMA and programmatic
+  launch, crit's fixed-order reductions, epilogues, column and chunked scans, the online softmax and the block-scaled
+  declared order, CUDA headers (`#include "crit_kcore/<area>.cuh"`) and Triton modules (`from crit_kcore import
+  <area>`), each checked on the device. The kernels take these blocks instead of private copies, with the same bits;
+  a kernel's build key covers only the core blocks it uses. New tensor-core structures, timed against the library at
+  the same arithmetic on an RTX 5090 (vs library, above 1 faster): paged-kv-attention's `flash-window`,
+  `flash-fused` and `flash-prefill` (prefill 0.77-1.5, verify windows 0.6-2.5, from 0.36-0.68 and 0.15-0.42);
+  recurrent-scans' `delta-prefill-tc`, the chunked gated-delta prefill (1.01-2.34 against FlashInfer, from
+  0.17-0.50); mma-rows' staged decode tile (knobs `SW`, `SPF`: 0.89-1.01 against flashinfer's NVFP4 GEMM at 1 to 16
+  rows, the same bits as the register tile); fp8-block-rows' and int-block-experts' `gemm-staged` (1.5-3.6x their
+  previous prompt GEMMs, 0.09-0.91 of cuBLASLt's block-scaled GEMMs). Prefill structures that give up row invariance
+  for speed say so (`row_invariant: false` in kernel.json, `prompt_rows` in the plugin's facts), and the plugins keep
+  the previous structure selectable (`reader: split|flash`, `prefill: tensor_cores|fp32`, `gemv: crossover`).
+  `crit kernels sweep` times the library as a graph replay where it captures (`library_timed`).
+- Kernels take any weight format and more of the libraries' designs, timed on an RTX 5090 (vs library, above 1
+  faster). decode-gemv has one CUDA GEMV (`gemv-cuda`) and one Triton GEMV (`gemv-triton`) for every weight format
+  (NVFP4, FP8, MXFP8, BF16, INT4 with a zero point a group), the format a decoder trait over the kernel core; the
+  previous per-format structures stay as aliases with their bits and their tunings. INT4 with a zero point (AWQ and
+  GPTQ, act order included) runs on decode-gemv, mma-rows' tiles and grouped-experts (format `int4_zp`), exactly
+  (two BF16 MMAs where BF16 cannot hold the value), with `repack_awq` / `repack_gptq` writing crit's rows from the
+  checkpoints; quantized-projections loads `awq` and `gptq` matrices and grouped-experts packs them into bundles.
+  recurrent-scans' `pool-delta-pipe` stages the decode rows' state tiles by cp.async (the same bits as `pool-delta`,
+  0.75-1.73 against FlashInfer at 1 to 32 rows, the plugins' default `scan`). fp8-block-rows' and int-block-experts'
+  `gemm-native` accumulate prompt GEMMs in the block-scaled tensor cores (MXFP8, NVFP4; 0.82-1.76 of cuBLASLt;
+  `row_invariant: false`; quantized-projections' `prompt_gemm` picks them, `auto` where they are faster).
+  paged-kv-attention has a CUDA flash tile (`cuda-window`, `cuda-fused`, `cuda-prefill`; `reader: cuda`).
+- crit's own prompt GEMMs for every format, timed on an RTX 5090 with Qwen3.8-27B's matrices (vs library, above 1
+  faster). fp8-block-rows' `gemm-native-channel` (per-channel FP8, BF16 out from the epilogue: 1.04-1.50 of cuBLASLt)
+  and `gemm-native-blocks` (128x128 FP32 weight blocks and MXFP8 with scales that are not powers of two, a span
+  accumulator folded once a scale span: 1.0-1.33 on small outputs, 0.65-0.78 where compute dominates, against
+  cuBLASLt's MXFP8 GEMM since cuBLASLt has no FP32 block-scaled FP8 GEMM on sm_120). fixed-tile-gemm's CUDA BF16 and
+  FP16 GEMMs, `cuda-mm` (row invariant, one summation order for every row count) and `cuda-mm-split` (K split over
+  CTAs, partials added in split order): at or above cuBLAS from 16 to 8192 rows except 0.97-0.99 on 5120x17408 at 32
+  and 64 rows. int-block-experts' NVFP4 `gemm-native` on sm_120a: a producer warp feeding TMA tiles through an
+  mbarrier ring to 4, 8 or 12 consumer warps (192x128 tiles), cuBLASLt's tiled scale layout, BF16 out with a column
+  scale, TMA stores overlapping the next tile, stream-K for the last wave (planned from the job's capacity, so bits
+  stay fixed a configuration), and a faster `quantize_nvfp4` with the declared bits: 0.89-0.96 of cuBLASLt from 512
+  to 8192 tokens, 1.14 on the down projection at 128.
+- paged-kv-attention's CUDA tile: row groups of several warps (`VWARPS`), 8-bit pages converted in registers
+  (`CONVERT`; FP8 decode at 131K positions 208 to 125 us), a staged split merge, fused launches with few partials run
+  as a window launch and that merge, the fused ring's folds spread over the next group's programs, lane-major split
+  partials, and opt-in order knobs that size splits by position (`RAMP`) or fill one launch shape (`CHUNK` 192, 288,
+  320). Default bits are unchanged. Against FlashInfer at 1 to 64 columns after a sweep: 0.76-1.06 on Qwen3.8-27B
+  BF16 pages, 0.81-1.06 on FP8 pages, 0.72-1.69 on Nanbeige4.3-33B INT8 pages; 16 columns are the slowest case.
+- `crit kernels sweep`: a structure may declare `lengths` (kernel.json `{"field", "values"}`), swept as shapes with
+  one order-knob group a shape and speed-knob table entries a length range (`crit_lookup_S(..., length)`,
+  `knobs(..., length=)`); older tuning files hold for every length. paged-kv-attention declares 4K, 32K and 131K
+  positions. A sweep that kept only the bench's 4K tuned long-context attention at 4K.
+- `crit_plugins.kernels.load_kernel(name, folder=..., tuned=False)` loads a kernel with its default knobs whatever the
+  engine's tuning (recorded `<id>:untuned`), for a plugin that needs one configuration a shape at every row count.
+- A Triton kernel may hold CUDA sources (kernel.json `cuda`), compiled by crit's build like a CUDA kernel's (build key,
+  architectures, generated tuning header, one library a variant); and a structure may alias another kernel's
+  structure (kernel.json `alias`), its tuning table, sweeps and `select()` following it, a forwarded kernel recorded in
+  the engine's facts.
+- `crit run ... ablate --data EVAL_DATA` adds crit-eval's speed cases and held-out prompts to every variant, each at
+  the model's sampling with `--seeds` requests (default 3, seeded where the package declares seeded sampling), and
+  judges each plugin over them with the run's cases. The run's cases are often one short prompt: a drafter whose
+  copied drafts replaced correct ones on long prompts was judged neutral there (-1%) while it cost a long-prompt
+  Eval case a quarter of its greedy decode.
+- `crit run ... ablate --set PLUGIN.OPTION=VALUE[;...]` serves option variants, the full selection with options
+  changed, beside `full` on the same cases, with a verdict per variant (`crit_plugins.ablation.option_variants` and
+  `settings`): the in-process A/B a build otherwise writes its own probe scripts for.
+- A plan may forecast a candidate to improve `context_decode` or `context_ttft` alone: a run's fix for long-context requests that decoded outside its captured rounds was refused
+  for improving neither decode nor prefill, and the plan passed only once it added a draft-width lever nobody had
+  measured, which then failed the generality gate. A lever's change may cite its measurement, `measured:PATH` (a file
+  of the run, recorded with its sha256 in `inputs.lever_evidence`), and the refusal of a lever below the noise says
+  to measure it rather than raise its estimate.
+- `crit run ... next` reads the run's records and names the one next step, its command and why (`crit.run.state`):
+  each open candidate is in one explicit state (`created`, `build_failed`, `packaged`, `check_failed`,
+  `serve_checked`, `eval_stopped`, `evaluated`, `running`), and the run's step follows from it, its rung and its plans.
+  Agents learned the order of about 13 commands per candidate from prose and from refusals.
+- `crit run ... plan --draft --record plan.json` writes the next plan's skeleton (the parent, TODO where the planner
+  writes, the parent's scores as a flat forecast, the review and weakest entries the plan owes) and prints what crit
+  computes for it: the objective and rung, the priorities, each KPI's score, limit and noise, Eval's gaps and the
+  parent plan's outcome.
+- `crit run ... serve --check` runs the package's plugin tests first (`crit plugins test`, cached; `--no-plugin-tests`
+  leaves them out), so one command is the check before a candidate's Eval or seal.
+- External candidates in `crit run`: a configuration's `engine` declares an engine crit did not assemble from plugins
+  and the command that starts its own OpenAI-compatible server (`{port}`, `{host}`, `{model}`, `{context_tokens}`,
+  `{package}`); its package holds no `plugins/`. `serve` (with `--check`), `eval` and `measure` start it under the
+  attempt's reservation, wait for its health path, run the serving checks, crit smoke, Eval and the benchmarks
+  against its URL, and stop its whole process tree when the work ends, fails or passes the deadline, keeping its
+  output as `logs/engine-ATTEMPT.log`. A plan for one says `"engine": "external"`, its candidate 2 is a technique
+  round, and levers name a technique or a kernel template (`kernel:FAMILY/ID`) instead of a plugin.
+- `crit run ... ablate` on an external candidate serves only the options its configuration declares (`--set
+  OPTION=VALUE`, or each declared switch flipped) beside it as built; an engine that declares none has no ablation, and
+  the report says so.
+- `crit run ... kernels` traces an external candidate's own process tree with crit-eval's CUPTI tracer while it
+  serves the run's cases, or records why it cannot; MCP offers it as `crit_run_kernels`.
+- `crit_plugins.device.release_cached_under(free_below)` hands back what torch's caching allocator holds and nothing
+  uses only when the device has fewer than `free_below` bytes free: a model plugin calls it where a request's
+  temporaries end (a prompt's last chunk, a long score), so one request's cached blocks leave room for the next
+  one's allocations without a release, and its wait on the device, after every step.
+- `crit core build` builds Core's runtime, `crit_core_steps`, which every engine runs on: in a checkout into
+  `build/core-steps`, from an installed crit (whose wheel carries no C++) from Core's source at the release's tag into
+  Core's cache. Core's loader finds that library without `CRIT_CORE_STEP_LIBRARY`, and `crit core where` names the one
+  it loads.
+
+### Removed
+
+- The kernel register: `kernels/SOURCES.md`, the catalog commands `crit kernels target / inventory / search / inspect /
+  retain / verify` with their record format (`kernels/FORMAT.md`), and the OpenBLAS retained-provider example. crit's
+  kernels are its templates; the few libraries an engine calls directly are listed in kernels/README.md as each
+  template's yardstick. `crit kernels sweep` times that library beside the tuned kernel on the same shapes
+  (`yardstick` in kernel.json, `library_us` and `vs_library` in the report).
+- Time-budget segments: a request's `budget_minutes` without `candidate_budget`, and `crit run ... resume --minutes`
+  without `--candidates`. A segment's budget is candidates on the ladder; `budget_minutes` is its safety window.
+
+### Changed
+
+- crit's kernels live in `kernels/techniques/<family>/<id>/`, the kernel core beside them in `kernels/core/`, the way
+  crit keeps `core/` and `inference/` apart; the workbench's starter stays in `kernels/starters/`. An engine picks
+  each operation's kernel in three levels (kernels/README.md#levels, AGENTS.md): crit's kernel wherever one covers it,
+  a library only where crit has none, the workbench where neither fits.
+- The library plugins run crit's kernels by default and keep the libraries only as yardstick options.
+  quantized-projections' `prompt_gemm: auto` is `native` for every format (MXFP8, FP8 rows, NVFP4, BF16, FP8-decoded
+  weight-only NVFP4 with `prompt: fp8`); `pinned` runs crit's row-invariant GEMMs with their default knobs, and the
+  previous cuBLASLt pinning is `pinned_cublaslt`. The attention plugins' `flashinfer` option is off by default,
+  fused-norms runs without FlashInfer (one-pass long rows, programmatic launch), and sequential-recurrence's prompt
+  rows past `exact_rows` run recurrent-scans' chunked prefill, fla's kernel only with its new `fla` option. On an RTX
+  5090, Qwen3.8-27B at 200k context decoded at 188 tok/s and prefilled at about 7,850 tok/s (first token 153 ms) with
+  crit's kernels, against 176 tok/s and about 7,000 (172 ms) with cuBLASLt's prompt GEMMs.
+- `crit kernels sweep` times each library yardstick beside the configuration picked for that shape and row count,
+  both as graph replays where they capture, alternating (`paired_us` in the report): timed once after a long sweep,
+  the library read up to 60% slower than it is.
+- One set of plan rules for every run. Runs no longer record which version of the rules they follow (`plan_rules`
+  2 to 8, `plans`, `plan_limits`, `lever_fates`, `budget_counts`): every new plan is checked by the current rules,
+  every candidate names a plan and every lever's fate, and every segment's budget counts the candidates on the
+  candidate ladder. Runs of earlier releases that recorded those keys still load, to show, serve and replay.
+  docs/RUN_RECORDS.md#plan lists the checks once, flat, instead of eight versions of deltas.
+- A plan judged only on its forecast gets a warning (`inputs.warnings`) instead of a refusal: a forecast high below
+  half of a needed family's limit, and a candidate from 2 to 5 below +10% on p1. A run inflated its prefill forecast
+  to the minimum the reach rule accepted, which AGENTS.md forbids in another paragraph.
+- A run started from a crit-hub engine (`create --from-engine`) gives its first candidate, the engine as imported, a
+  small Eval: on the ladder candidate 1 had none, so the origin's own baseline went unmeasured.
+- The run's brief (`agent_request.md`) holds the run's facts and the user's terms only (about 400 words, from about
+  3,700) and points to AGENTS.md and `crit run ... next`. AGENTS.md is the build agent's rules only (about 3,500
+  words, from 7,300), with its contradictions resolved: exactness is required only when the run says so, the
+  baseline is the run's first Eval result, a qualified candidate is defined once (docs/RUN_RECORDS.md#states), and a
+  resume goes on with a stopped Eval rather than measuring again. docs/BUILDING_ENGINES.md keeps the engineering
+  details (about 2,350 words, from 5,200) and repeats no procedure.
+- The run's `phase` (`state.json`) is the segment's state only; a candidate's lifecycle and the stop's reason live in
+  their own fields. Older runs' phases read as `building` or `stopped`.
+- AGENTS.md: a plan's levers rest on measurements where one can be taken first (`ablate --data --set`, cited as
+  `measured:PATH`), and an estimate is never raised to pass a check; the plugin round keeps only plugins its ablation
+  on Eval's data shows paying, neutral ones dropped, and a plugin option (a threshold, a width) is measured, not
+  guessed. One run kept a copy-draft override at a threshold it picked without measuring, judged neutral on its own
+  short case, at a 9% sampled decode cost on Eval's suite.
+- BUILDING_ENGINES.md: every request kind (log-probabilities, replays, constraints, plain) decodes in the captured
+  rounds, since Eval's long-context point asks for log-probabilities; and when draft steps dominate a round, the draft
+  head is the lever (`draft-vocabulary-subset`, `draft-trees`), with `draft_bytes_per_step` declared for Eval's
+  headroom.
+- mtp-decode's README says why a short copy override replaces correct chain drafts in long contexts, and how to
+  measure the threshold.
+- crit smoke's `causal` and `causal_long` say what in the engine's facts makes a prompt's rows follow its length when
+  they fail: prompt GEMMs whose `row_invariance` has `prompt_rows` false (quantized-projections' `prompt_gemm:
+  pinned` keeps them invariant) and a recurrence whose prompts take its exact scan up to `exact_rows` tokens and its
+  chunked kernel beyond. One run spent two draft candidates finding the two options by probe scripts.
+- `crit_plugins.device.free_device_bytes()`: a placement plan's free device bytes after torch's allocator hands back
+  what it caches for nothing. The example model plugins plan with it, and PLUGINS.md says why: a model plugin that
+  re-encoded its head at load planned its KV pool against memory its temporaries still held and refused to load.
+- `Rounds.calibrate()` times each captured round as the median of several spans and fits each row count's times as a
+  line in the round's columns (`crit_plugins.rounds.fitted_costs`) before a width policy reads them. RateWidth chose
+  from the raw times, so where two widths' rates nearly tied a load's timing noise swapped them: an engine opened at a
+  lower context decoded the same text at other widths, up to 10% slower, and failed Eval's lower-context gate.
+- Plugins load crit's own kernels (`crit_plugins.kernels.load_kernel`, a plugin.json kernel entry `{name, fallback}`),
+  built for the GPU with the engine's tuning (`CRIT_KERNEL_TUNING`, a folder of the sweep's tables) or the default
+  knobs, instead of registry kernels; the engine's facts say `tuned`, `built` or `fallback` per kernel. A kernel that
+  cannot be built here (no CUDA toolkit, an architecture it does not cover) is reported once on stderr with the plugin
+  that runs its fallback and what the build needs: an engine on a fallback looked merely slow.
+- The workbench's `--starter` starts from crit's `kernels/starters/workbench-starter` without `--from`.
+- `crit plugins test` reports a plugin whose tests passed before under the same key as `cached`, without running them
+  again: the key covers the plugin's files, the plugins its tests use, crit's `crit_plugins` and `crit_core` and the
+  environment (Python, torch, the device, `CRIT_KERNEL_TUNING`, transformers, fla, FlashInfer, Triton) and the
+  source of the crit kernels the plugin declares;
+  `--no-cache` runs them all. A first candidate's library plugins, copied unchanged, took 13 minutes of tests in one
+  run and are now tested once per machine and crit version. Results are kept in `~/.cache/crit/plugin-tests` or
+  `CRIT_PLUGIN_TEST_CACHE`.
+- `crit mcp` serves every guide AGENTS.md links: `crit://docs/PLUGINS.md`, `crit://docs/CONTRIBUTING.md` and
+  `crit://smoke/README.md` join the resources, and an installed crit carries them in `crit/library/guides`, so an
+  agent without the checkout reads the plugin contract it builds an engine to.
+- `crit run ... build` writes the candidate's `configuration.json` into the build folder beside its plugins (unless
+  the source has one) before the recipe's command runs, so a build command that checks or reads the selection finds
+  it; the package carries the same file.
+- The ablation judges a plugin outside the drafter and verifier slots by the time per decode round in place of decode
+  where both variants draft: a short bench's tokens per round move with what it samples, so its decode does too, by
+  more than the plugin's own effect. Each plugin's row names the KPIs its verdict read (`judged`).
+- The example model plugins of the GPU tests (`tests/support/device_plugins`): llama-model decodes a request asking
+  for log-probabilities in rounds, its round driver capturing each round in the log-probability form too, and
+  llama-model and next-model score a fixed text a prefill chunk at a time, each chunk's KV and recurrent state kept
+  for the next, so a long score takes one chunk's temporaries.
+- crit run from a checkout refuses a `crit_core` imported from elsewhere, such as the release on PyPI that its
+  version pin also accepts, and names the install that fixes it: `python -m pip install -e core/python -e .`, as
+  AGENTS.md and Contributing now say.
+- CI lints with ruff's pyflakes rules (`[tool.ruff]` in pyproject.toml, kernels/ joining once its rework settles)
+  and installs crit as AGENTS.md says in a fresh environment on Linux and Windows, then builds Core's runtime and
+  checks the plugin library on it. The release publishes crit-core before crit, so a failed upload never leaves a
+  crit whose pinned Core is missing. Twelve unused imports and variables in Inference and the tests are gone.
+
+### Fixed
+
+- Kernel core TMA loads target `.shared::cta` (CUDA 12.8 and newer). With `.shared::cluster` sm_120 compiled each
+  load to a call, and the driver reserved 3.3 GB of device memory for the kernels' dynamic stack on their first
+  launch: a Qwen3.8-27B engine no longer fit at 200k context.
+- crit serve answers a JSON body nested too deeply with a 400 instead of dropping the connection, and `--host ::1`
+  listens on IPv6 loopback instead of failing to bind.
+- `crit run` and `crit pull` report a defect in crit (a missing key, a wrong type) with its type and the place it
+  happened instead of a bare `ERROR: 'bytes'`, and print the traceback with `CRIT_DEBUG=1`. `crit pull --checkpoint`
+  no longer fails on a drafter's rows that carry a hash and no size, or on a checkpoint pinned to a file without a
+  revision.
+- Core reads the compute capability of the GPU an engine runs on, the first one `CUDA_VISIBLE_DEVICES` names, instead
+  of always the machine's GPU 0, when no probe file says it.
+- `POST /v1/crit/abort` no longer finds a request it or a closed connection already cancelled. Such a request stays
+  in flight until its handler has answered, and its client can have its 499 first, so `{"all": true}` sent right
+  after could report it again.
+
+### Security
+
+- crit serve refuses what a web page in the user's browser could send it: on loopback a `Host` that is not loopback
+  (DNS rebinding) and, without `--cors-origin` allowing it, any request carrying an `Origin`. A request's API key is
+  checked before its body is read, `/health` tells a caller without a key only `status` and `ready`, and a
+  connection idle for 120 seconds in a read or write is closed.
+- A crit-hub card's `source.path` must be a relative folder in the engine's repository, and `crit pull` passes it to
+  git after `--`, so a card cannot hand git an option such as `--output` or `--remote`.
+- crit mcp's `crit_serve_status` asks only http(s) servers and sends an `api_key` only to this machine or a private
+  network address, `crit_job_output` reads at most 60,000 characters a call, and a server without `--jobs` removes
+  its temporary jobs folder when it closes. `crit_job_stop` says that on Windows it ends the tree at once.
+
 ## [0.17.2] - 2026-11-09
 
 ### Overview
@@ -36,6 +301,11 @@ crit-eval 0.6.1.
 
 ### Fixed
 
+- `crit kernels sweep` flushes the L2 cache with a write between samples: a read flush left the lines a call wrote
+  back in L2, so a library that writes its state was timed warm (flashinfer's NVFP4 GEMM read 125 us against 69 us on
+  its own). Asking it for a structure without a bench names the ones it can sweep.
+- Plugin device tests read their plugins folder once a process: discovery on every assemble was most of their time on
+  a slow file system (grouped-experts' tests 20 min to 25 s, sequential-recurrence's 11 min to 30 s).
 - A crit installed from its wheel serves every guide `crit mcp` names (`crit://AGENTS.md` and the docs it links),
   which the wheel now carries in `crit/library/guides`. Before, it served only `crit://inference/README.md`, though
   its instructions ask the agent to read AGENTS.md first.
@@ -3324,7 +3594,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.17.2...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/crit-labs/crit/compare/v0.17.2...v0.18.0
 [0.17.2]: https://github.com/crit-labs/crit/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/crit-labs/crit/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/crit-labs/crit/compare/v0.16.1...v0.17.0

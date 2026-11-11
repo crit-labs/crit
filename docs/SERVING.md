@@ -34,7 +34,7 @@ reply = client.chat.completions.create(model="default", messages=[{"role": "user
 | `--api-key KEY` | Require `Authorization: Bearer KEY`; repeat for several keys, any of which a request may carry; default the comma-separated keys in `CRIT_API_KEY`. A non-local `--host` without a key prints a warning |
 | `--api-key-file PATH` | Also accept the keys in this file, one per line; blank lines and lines starting with `#` are skipped, and a file without a key is an error |
 | `--ssl-certfile PATH`, `--ssl-keyfile PATH` | Serve HTTPS with this PEM certificate chain and its private key (default: the key in the certificate file); the printed URL starts with `https://` |
-| `--cors-origin ORIGIN` | Allow browser requests from this origin, or `*` |
+| `--cors-origin ORIGIN` | Allow browser requests from this origin, or `*`; without it a request a browser marks with an `Origin` is a 403, so a web page cannot drive the server ([browsers](#browsers-and-other-machines)) |
 | `--model-name NAME` | Model ID reported for the default candidate |
 | `--reasoning-alias` | Return [reasoning](#reasoning) as `reasoning` as well as `reasoning_content`, for clients that read the field `reasoning` |
 | `--models PATH` | JSON catalog of named models from several runs; replaces `--workspace`, `--run`, `--candidate` and `--model-name` |
@@ -222,7 +222,7 @@ the lock still wait until the server stops.
 
 | Endpoint | Behavior |
 | --- | --- |
-| `GET /health` | `{"status": "ok", "ready": ..., "loaded": ..., "engine": ..., "max_concurrent_requests": ..., "engine_telemetry": ...}`; `loaded` is false while the engine is [unloaded](#unloading-the-engine), and so is `ready`; `max_concurrent_requests` is the default model's (as on its card); `engine_telemetry` is the loaded engine's work so far by section, asked of it beside any generation (its plugins' `telemetry()` and Core's counters, [facts and telemetry](PLUGINS.md#facts-and-telemetry)), None while it is not ready or reports none. 503 when the runtime is blocked, and with `?ready=1` also while `ready` is false. No key needed |
+| `GET /health` | `{"status": "ok", "ready": ..., "loaded": ..., "engine": ..., "max_concurrent_requests": ..., "engine_telemetry": ...}` (with API keys, a request without one gets only `status` and `ready`); `loaded` is false while the engine is [unloaded](#unloading-the-engine), and so is `ready`; `max_concurrent_requests` is the default model's (as on its card); `engine_telemetry` is the loaded engine's work so far by section, asked of it beside any generation (its plugins' `telemetry()` and Core's counters, [facts and telemetry](PLUGINS.md#facts-and-telemetry)), None while it is not ready or reports none. 503 when the runtime is blocked, and with `?ready=1` also while `ready` is false. No key needed |
 | `GET /v1/models`, `GET /v1/models/{id}` | The run's sealed resident candidates, or catalog names, with `label`, `display_name` (a catalog entry's, else the label), `context_length` (the candidate's `kv_tokens`) and `max_model_len` (the same, under the name LiteLLM reads), `default`, `loaded` (its engine is the one loaded), package `capabilities`, `supported_sampling_parameters`, `limits`, `max_concurrent_requests` (crit's: the requests it runs at once, [concurrent requests](#concurrent-requests)) and `engine_facts` ([facts for Eval](#engine-facts-and-plain-decoding)) |
 | `POST /v1/chat/completions` | Chat completion, JSON or server-sent events |
 | `POST /v1/completions` | [Raw-prompt completions](#raw-prompt-completions) for packages declaring `completion-v1`, JSON or server-sent events |
@@ -458,7 +458,8 @@ without running, its client, a stream's too, getting the 499 as the response's s
 As after a closed connection, a cooperative adapter keeps its weights loaded and one that does not
 settle within the grace period is retired. The answer is
 `{"object": "crit.abort", "found": true, "request_ids": [...]}`, crit's ids of the requests it
-cancelled; an id no request in flight has is `"found": false`, not an error.
+cancelled; an id no request in flight has, or one already cancelled (by an earlier abort or its closed
+connection), is `"found": false`, not an error.
 
 ### Images
 
@@ -763,8 +764,8 @@ the quantized matrices' prompt GEMMs, `bf16`, `fp16_acc`, `fp8` or `stored`, for
 format, per stored format, or as shares of a format's FLOPs: crit-eval's prefill ceilings by
 activation format and their reachable limit), `prompt_cache` (a boolean; `false` when the
 engine keeps no prompt cache, so crit-eval sends it no follow-up turns), `plugins` (an engine
-built from [plugins](PLUGINS.md): the plugin filling each slot) and `kernels` (the registry kernels
-its plugins asked for, each with the source it came from, `local`, `hub` or `fallback`, its revision and,
+built from [plugins](PLUGINS.md): the plugin filling each slot) and `kernels` (crit's kernels
+its plugins asked for, each with how it was built, `tuned`, `built` or `fallback`, its tuning file and,
 for a fallback, why: [kernels and plugins](PLUGINS.md#kernels-and-plugins)), each only when the engine
 reports it in a valid form; `null` when the candidate is not loaded or reports none. A speculative engine that declares
 `chat-plain-v1` decodes a request carrying `"crit": {"decode": "plain"}` one token per
@@ -821,6 +822,14 @@ The same engine answers three more APIs, so the tools people already run need on
 request is translated into the chat request above and validated the same way, so the capabilities a
 package declares (tools, images, sampling fields, structured output) gate it in every dialect, and the
 API keys set with `--api-key` or `--api-key-file` guard every endpoint except `/health`, `/` and `/api/version`.
+
+<a id="browsers-and-other-machines"></a>
+
+**Browsers and other machines.** A server bound to loopback (the default) answers only a `Host` that names loopback,
+so a web page whose DNS name is rebound to 127.0.0.1 cannot reach it, and a request carrying an `Origin` header other
+than `--cors-origin`'s (any with `*`) is a 403: browsers send one with every cross-site request, other clients none.
+A request's key is checked before its body is read, a body that is not JSON (one nested too deeply among them) is a
+400, and a connection that sends or reads nothing for 120 seconds is closed. `--host ::1` listens on IPv6 loopback.
 
 **Anthropic Messages** (`POST /v1/messages`, [crit_api/anthropic.py](../api/crit_api/anthropic.py)): the
 API Claude Code and the Anthropic SDKs speak. Point them at the server (`ANTHROPIC_BASE_URL`, or the

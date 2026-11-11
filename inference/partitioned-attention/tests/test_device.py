@@ -76,6 +76,13 @@ class PartitionedDeviceTests(PluginTestCase):
         batch = StepBatch.build([("a", 699, 1), ("b", 60, 4), ("c", 0, 1)], "cuda")
         q = torch.randn(batch.tokens, 4, 64, generator=g).cuda().to(torch.bfloat16)
         self.assertTrue(torch.equal(self.attention.forward(0, q, pool, batch), reference.forward(0, q, pool, batch)))
+        # reader flash: the flash structures in both, the same bits, within the readers' rounding of split's
+        flash = self.assemble(USE, options={"reader": "flash"})["attention"]
+        flash_reference = self.reference(USE, {"softmax-attention": {"decode": "split", "reader": "flash"}})[
+            "attention"]
+        got = flash.forward(0, q, pool, batch)
+        self.assertTrue(torch.equal(got, flash_reference.forward(0, q, pool, batch)))
+        torch.testing.assert_close(got.float(), reference.forward(0, q, pool, batch).float(), atol=2e-2, rtol=2e-2)
 
     def test_memory_declares_exactly_what_the_device_form_allocates(self):
         from crit_plugins.assemble import load_module

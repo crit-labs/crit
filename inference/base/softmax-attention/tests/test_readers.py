@@ -1,10 +1,12 @@
 """prompt_reader "decode": every row kind over the pages in the decode's reduction, so a position's attention has the
 same bits as a decode row alone, as a verify window's column, as a round's column, in a step's prompt row and in a
 captured prompt chunk (served == scored), over FP8, fp8:row, INT8 and BF16 pages, at a 27B attention shape, before and
-past the length where partitions hold several pieces; through the registry's split-KV reader and through its torch
+past the length where partitions hold several pieces; through crit's split-KV reader and through its torch
 fallback over the page tables; in two pools of different page kinds in one model; with block lists, a prompt row,
-a decode row and a round's columns alike through the registry's kernel. prompt_reader "prefill" (the prompt reader,
-another reduction) stays within the bound its facts state. The fresh buffer is off: a prompt chunk's own fresh keys
+a decode row and a round's columns alike through crit's kernel. prompt_reader "prefill" (the prompt reader,
+another reduction) stays within the bound its facts state. reader "flash" (crit's flash structures) and reader "cuda"
+(the CUDA flash tile): every row kind the same bits too, each in its own reduction; their prompt readers within the
+bound. The fresh buffer is off: a prompt chunk's own fresh keys
 and values are a stated difference (test_fresh)."""
 from crit_plugins import StepBatch
 from crit_plugins.device import PromptBatch, RoundBatch
@@ -22,8 +24,8 @@ class ReaderAgreementTests(PluginTestCase):
             self.skipTest("rounds and captured chunks run on CUDA")
         self.torch = __import__("torch")
 
-    def engine(self, kernels="auto", prompt_reader="decode"):
-        parts = self.assemble(USE, options={"prompt_reader": prompt_reader, "kernels": kernels},
+    def engine(self, kernels="auto", prompt_reader="decode", reader="split"):
+        parts = self.assemble(USE, options={"prompt_reader": prompt_reader, "kernels": kernels, "reader": reader},
                               use_options={"attention-state": {"page": 64, "fresh_mib": 0}})
         return parts["kv_cache"], parts["attention"]
 
@@ -125,14 +127,14 @@ class ReaderAgreementTests(PluginTestCase):
                     self.agree(attention, self.pool(kv, dtype), prefix, (kernels, dtype, prefix))
 
     def test_block_lists_read_the_same_bits_in_a_prompt_row_a_decode_row_and_a_round(self):
-        # Block-sparse lists take one partition count in every launch of the registry's split-KV reader (a prompt
+        # Block-sparse lists take one partition count in every launch of crit's split-KV reader (a prompt
         # row's pieces, a step's window rows, a round's columns): a decoded token reads its listed blocks in the prompt
         # row's reduction, past the length where the device's partitions would split a row differently. (The torch
         # fallback reads a prompt row's lists over the gathered rows, another order.)
         torch, size, prefix = self.torch, 16, 3000
         kv, attention = self.engine()
         if attention.device_form.kernels is None:
-            self.skipTest("the registry's split-KV reader does not load here")
+            self.skipTest("crit's split-KV reader does not load here")
         for dtype in ("fp8", "bf16"):
             pool = self.pool(kv, dtype)
             pool.open("a")
@@ -182,3 +184,61 @@ class ReaderAgreementTests(PluginTestCase):
         facts = self.engine()[1].facts()
         self.assertEqual(facts["served_vs_scored"], "exact")
         self.assertIn("decode's reduction", facts["prompt_reads"])
+
+    def test_the_flash_reader_reads_every_row_kind_with_the_same_bits(self):
+        # reader "flash": decode rows, verify windows, rounds, a step's prompt row and a captured chunk through crit's
+        # flash structures (contiguous splits of one chunk per pool): one reduction for all of them.
+        kv, attention = self.engine(reader="flash")
+        if attention.device_form.kernels is None:
+            self.skipTest("crit's kernels do not load here")
+        for dtype in KINDS:
+            for prefix in (0, 3000):
+                self.agree(attention, self.pool(kv, dtype), prefix, ("flash", dtype, prefix))
+        facts = attention.facts()
+        self.assertEqual(facts["served_vs_scored"], "exact")
+        self.assertIn("flash", facts["reader"])
+        self.assertNotIn("prompt_rows", facts)
+
+    def test_the_flash_prompt_reader_stays_within_the_bound_and_says_it_is_not_row_invariant(self):
+        kv, attention = self.engine(prompt_reader="prefill", reader="flash")
+        if attention.device_form.kernels is None:
+            self.skipTest("crit's kernels do not load here")
+        self.assertIn("not row-invariant", attention.facts()["prompt_rows"])
+        for dtype in ("int8", "fp8:row"):
+            pool = self.pool(kv, dtype)
+            pool.open("a")
+            self.step(attention, pool, [("a", 0, 600)])
+            pool.keep("a", 600)
+            prompt = self.step(attention, pool, [("a", 600, CHUNK)])
+            for at in (0, 50, 99):
+                decoded = self.step(attention, pool, [("a", 600 + at, 1)])
+                self.assertLess(float((decoded.float() - prompt[at:at + 1].float()).abs().max()), 1.6e-2, dtype)
+
+    def test_the_cuda_reader_reads_every_row_kind_with_the_same_bits(self):
+        # reader "cuda": the same row kinds through the kernel's CUDA flash tile (16 query rows a warp, one chunk and
+        # block per pool): one reduction for all of them, its own.
+        kv, attention = self.engine(reader="cuda")
+        if attention.device_form.kernels is None:
+            self.skipTest("crit's kernels do not load here")
+        for dtype in KINDS:
+            for prefix in (0, 3000):
+                self.agree(attention, self.pool(kv, dtype), prefix, ("cuda", dtype, prefix))
+        facts = attention.facts()
+        self.assertEqual(facts["served_vs_scored"], "exact")
+        self.assertIn("cuda", facts["reader"])
+        self.assertNotIn("prompt_rows", facts)
+
+    def test_the_cuda_prompt_reader_stays_within_the_bound_and_says_it_is_not_row_invariant(self):
+        kv, attention = self.engine(prompt_reader="prefill", reader="cuda")
+        if attention.device_form.kernels is None:
+            self.skipTest("crit's kernels do not load here")
+        self.assertIn("not row-invariant", attention.facts()["prompt_rows"])
+        for dtype in ("int8", "fp8:row", "bf16"):
+            pool = self.pool(kv, dtype)
+            pool.open("a")
+            self.step(attention, pool, [("a", 0, 600)])
+            pool.keep("a", 600)
+            prompt = self.step(attention, pool, [("a", 600, CHUNK)])
+            for at in (0, 50, 99):
+                decoded = self.step(attention, pool, [("a", 600 + at, 1)])
+                self.assertLess(float((decoded.float() - prompt[at:at + 1].float()).abs().max()), 1.6e-2, dtype)

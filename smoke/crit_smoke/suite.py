@@ -118,6 +118,25 @@ def fluent(ctx):
     return state, f"perplexity {math.exp(loss):.2f} on {len(ctx.prose())} tokens of prose (limit {limit:g})"
 
 
+def row_paths(facts):
+    """Why a prompt's rows may change with its length, from the engine's facts: the projections' prompt GEMMs (their
+    row_invariance prompt_rows false: the GEMM's algorithm, and so a row's sums, follows the row count) and a
+    recurrence's two prompt paths (rows up to scan_rows tokens on its exact scan, longer ones on its chunked kernel).
+    A failed causal test names them, so a build fixes the engine's options instead of guessing ("" when neither
+    applies)."""
+    found = []
+    if (facts.get("row_invariance") or {}).get("prompt_rows") is False:
+        found.append("the projections' prompt rows follow the row count (row_invariance prompt_rows false; "
+                     "quantized-projections prompt_gemm pinned keeps a row's bits at every length)")
+    pools = (facts.get("recurrence_prompts") or {}).get("pools") or []
+    split = sorted({pool["scan_rows"] for pool in pools if pool.get("chunked") and pool.get("scan_rows")})
+    if split:
+        found.append(f"the recurrence runs prompts up to {split[-1]} tokens on its exact scan and longer ones on its "
+                     "chunked kernel, two summation orders (sequential-recurrence exact_rows 0 puts every prompt row "
+                     "on one path)")
+    return ("; likely: " + "; ".join(found)) if found else ""
+
+
 @test(SCORE, TOKENIZE)
 def causal(ctx):
     """A prefix's rows equal the whole prompt's first rows: no position sees a later token, and prompt lengths at
@@ -129,7 +148,8 @@ def causal(ctx):
         rows = ctx.client.score(ids[:n])[0]
         ok, summary = compare(rows, full[:n - 1], ctx.tolerance)
         if not ok:
-            return "failed", f"prefix of {n} tokens against the whole prompt of {len(ids)}: {summary}"
+            return "failed", f"prefix of {n} tokens against the whole prompt of {len(ids)}: {summary}" \
+                + row_paths(ctx.client.facts())
         worst = worst or summary
     return "passed", f"{len(lengths)} prefixes ({lengths[0]} to {lengths[-1]} tokens) match the whole prompt"
 
@@ -171,7 +191,7 @@ def causal_long(ctx):
         ok, summary = compare(rows[start:], full[start:n - 1], ctx.tolerance)
         if not ok:
             return "failed", f"prefix of {n} tokens against the whole prompt of {len(ids)}, rows {start} to {n - 2}: " \
-                             + summary
+                             + summary + row_paths(ctx.client.facts())
     return "passed", f"{len(lengths)} prefixes ({lengths[0]} to {lengths[-1]} tokens) match the whole prompt of " \
                      f"{len(ids)} on their last {WINDOW} rows"
 

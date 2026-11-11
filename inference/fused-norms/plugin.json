@@ -2,7 +2,7 @@
   "schema": "crit-plugin-v1",
   "id": "fused-norms",
   "title": "Normalization, rotary positions and gated products in one kernel launch per call",
-  "description": "fused-norms' operations in the norms slot: RMSNorm with a residual added in place (an FP32 residual stream beside 16-bit rows), an offset weight and a chosen output dtype; query/key head norms, alone or with rotary positions; gated RMSNorm; rotary positions (half or interleaved pairs, partial, inverse frequencies or a cos|sin table); SiLU, GELU and sigmoid products; L2 norms; the sum of several residual streams (gated, weighted or plain) and one row added into every stream; a norm weight per stream or head. Each call is one launch of the registry kernel crit-labs/fused-norms (where the torch chain launches several), reading its inputs once in their own dtype with strided views as they are, FP32 inside and one rounding; each row's bits independent of the rows beside it and of the row count; capture-safe. Without the kernel, the plugin runs torch-norms' arithmetic (code/torch_norms.py), and the engine's facts say so. Its host form is the slot's FP64 rows (code/rows.py). The fused forms (norms:fused) are one launch where a layer's separate calls take two: the query and key norms with rotary positions (or rotary positions alone) of one layer, and a row added into the residual streams with the streams' norms; each output has the bits of the separate calls. softplus_decay is a gated delta layer's log-decay and beta gate from its projection's rows, one launch where torch takes six.",
+  "description": "fused-norms' operations in the norms slot: RMSNorm with a residual added in place (an FP32 residual stream beside 16-bit rows), an offset weight and a chosen output dtype; query/key head norms, alone or with rotary positions; gated RMSNorm; rotary positions (half or interleaved pairs, partial, inverse frequencies or a cos|sin table); SiLU, GELU and sigmoid products; L2 norms; the sum of several residual streams (gated, weighted or plain) and one row added into every stream; a norm weight per stream or head. Each call is one launch of crit's kernel fused-norms (Triton, built for the engine's device with the engine's tuning or its default knobs; where the torch chain launches several), reading its inputs once in their own dtype with strided views as they are, FP32 inside and one rounding; each row's bits independent of the rows beside it and of the row count; capture-safe. Where the kernel cannot be built, the plugin runs torch-norms' arithmetic (code/torch_norms.py), and the engine's facts say so. Its host form is the slot's FP64 rows (code/rows.py). The fused forms (norms:fused) are one launch where a layer's separate calls take two: the query and key norms with rotary positions (or rotary positions alone) of one layer, and a row added into the residual streams with the streams' norms; each output has the bits of the separate calls. softplus_decay is a gated delta layer's log-decay and beta gate from its projection's rows, one launch where torch takes six.",
   "fills": [
     "norms"
   ],
@@ -17,18 +17,10 @@
   "reference": [
     "torch-norms"
   ],
-  "options": {
-    "flashinfer": {
-      "type": "bool",
-      "default": true,
-      "description": "FlashInfer (a provider) for the calls whose function it computes exactly: RMSNorm without a residual with a weight and output in the input dtype, and the SiLU and GELU products of packed BF16 or FP16 halves"
-    }
-  },
+  "options": {},
   "kernels": [
     {
-      "name": "crit-labs/fused-norms",
-      "version": 1,
-      "revision": null,
+      "name": "fused-norms",
       "fallback": "torch-norms' arithmetic (code/torch_norms.py): the same operations as chains of torch kernels"
     }
   ],

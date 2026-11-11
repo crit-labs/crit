@@ -22,6 +22,7 @@ FAMILIES = (
     ("serve", "crit_api.cli", "Serve a sealed candidate as an OpenAI-compatible API; use crit serve --help"),
     ("pull", "crit.pull.cli", "Install a crit-hub engine for crit serve --engine; use crit pull --help"),
     ("smoke", "crit_smoke.cli", "Check a served engine's quality components in seconds; use crit smoke --help"),
+    ("core", "crit.core", "Build Core's native runtime, crit_core_steps, in this checkout; use crit core --help"),
     ("plugins", "crit.plugins", "List, check and test an engine's plugins; use crit plugins --help"),
     ("bench", "crit.pull.bench", "Measure an installed engine with crit Eval beside its card; use crit bench --help"),
     ("hub", "crit.pull.report", "Add a crit bench result to its crit-hub card (crit hub report); use crit hub --help"),
@@ -98,9 +99,34 @@ def family(module):
         raise
 
 
+def core_mismatch():
+    """Why this checkout's crit cannot run, or None: crit from a checkout runs on that checkout's Core (core/python),
+    and a crit-core installed from elsewhere (a release from PyPI, another checkout) would pair this CLI and plugin
+    library with another Core's contracts."""
+    if not checkout(ROOT):
+        return None
+    import importlib.util
+    try:
+        spec = importlib.util.find_spec("crit_core")
+    except (ImportError, ValueError):
+        return None
+    if spec is None or spec.origin is None:
+        return None   # not installed: the commands put core/python on the path themselves
+    here = (ROOT / "core" / "python").resolve()
+    found = Path(spec.origin).resolve()
+    if here in found.parents:
+        return None
+    return (f"this crit checkout ({ROOT}) runs on its own Core, but Python imports crit_core from {found.parents[1]}. "
+            f"Install the checkout's Core: python -m pip install -e {here}")
+
+
 def main(argv=None):
     # Route subcommands with their own parsers before the maintenance parser.
     arguments = list(sys.argv[1:] if argv is None else argv)
+    mismatch = core_mismatch()
+    if mismatch and arguments[:1] not in (["--version"], ["-h"], ["--help"]):
+        print("error: " + mismatch, file=sys.stderr)
+        return 2
     routes = {name: module for name, module, _ in FAMILIES}
     if arguments and arguments[0] == "eval":   # crit's project, unless the environment names one
         with named_project(os.environ.get(PROJECT_VARIABLE) or default_project()):

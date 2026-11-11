@@ -3,7 +3,7 @@
   "category": "experts",
   "summary": "Prefill through host-resident routed experts: chunk size from the grouped projection's measured rate curve, layer double-buffered expert copies, and the FP64 reference any grouped projection is checked against",
   "implementation_status": "reference",
-  "implementation_scope": "Python schedule: rate-curve knee, chunk choice, expected touched experts, whole-layer copy decision, double-buffered step timeline, prefill estimate and staging size; the schedule on the device (streamed.py: the experts plugin's grouped kernel measured by rows per expert, the chunk at its knee, a prompt's routed layer run chunk by chunk over bundles a staging source supplies); Python FP64 reference of the routed SwiGLU block (stable route order, BF16/FP8 row/NVFP4/MXFP4 decoders, moe_block). The grouped projection comes from a library or the kernel registry (operations.json states its contract; the grouped-experts plugin runs one over the registry kernel crit-labs/grouped-experts); the router, copies, events, attention and dense layers are the engine's.",
+  "implementation_scope": "Python schedule: rate-curve knee, chunk choice, expected touched experts, whole-layer copy decision, double-buffered step timeline, prefill estimate and staging size; the schedule on the device (streamed.py: the experts plugin's grouped kernel measured by rows per expert, the chunk at its knee, a prompt's routed layer run chunk by chunk over bundles a staging source supplies); Python FP64 reference of the routed SwiGLU block (stable route order, BF16/FP8 row/NVFP4/MXFP4 decoders, moe_block). The grouped projection comes from a library or crit's own kernels (operations.json states its contract; the grouped-experts plugin runs one over crit's kernel grouped-experts, built for the engine's device); the router, copies, events, attention and dense layers are the engine's.",
   "agent_guidance": {
     "use_when": "Prefill of an expert-routed model whose routed experts live mostly in host memory, so a prompt chunk's time is dominated by copying non-resident experts and the prefill rate grows with the chunk size",
     "avoid_when": "Every expert fits on the device (measure a provider's grouped GEMM for the format first), or decode steps that route a few tokens (device-expert-cache and GEMV-shaped rows instead)",
@@ -16,7 +16,7 @@
     ],
     "engine_supplies": [
       "Router ids and weights per chunk, the attention and dense layers and the residual add",
-      "The grouped projection from a library or the kernel registry (or its own), checked against moe_block on the target",
+      "The grouped projection from a library or crit's own kernels (or its own), checked against moe_block on the target",
       "The expert pointer table per step and the staging buffers, taken from memory decode leaves unused while a prompt runs",
       "Copy-engine copies into the staging buffers with the events that order them against compute",
       "Measured rates by rows per expert on the target, step times at the chosen chunk and non-resident bytes per layer"

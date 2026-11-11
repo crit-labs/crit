@@ -345,6 +345,20 @@ class PullTests(unittest.TestCase):
                                    "--device", str(self.device)]), 1)
 
 
+class SourcePathTests(unittest.TestCase):
+    """A card's source path names a folder in the engine's repository and is never read as an option of git."""
+
+    def test_a_path_that_is_not_a_relative_folder_is_refused(self):
+        from crit.card import check_source
+        base = {"repository": "https://github.com/crit-labs/crit-engines", "revision": "a" * 40}
+        for path in (None, ".", "fast-engine", "engines/fast-engine/"):
+            self.assertEqual(check_source({"source": {**base, "path": path}}, "card")["path"], path)
+        for path in ("--output=/tmp/x", "--remote=https://example.com/x", "-x", "../x", "engines/../x", "./x",
+                     "/engines", "engines//x", "engines\\x", 3):
+            with self.assertRaisesRegex(ValueError, "source path"):
+                check_source({"source": {**base, "path": path}}, "card")
+
+
 class RequirementTests(unittest.TestCase):
     def test_architectures(self):
         self.assertTrue(machine.arch_runs("sm_120a", "12.0"))

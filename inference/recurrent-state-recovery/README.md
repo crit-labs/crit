@@ -46,7 +46,7 @@ compare a kernel using it against its own decode contract.
 must evaluate the step with the same operations in the same order.
 `fmaf(S, decay, k * delta)` and `fmaf(k, delta, S * decay)` round differently,
 and the drift only shows near ties, which a short exactness check can miss.
-crit-labs' recurrent-scans routes every pool path (verify, checkpoint, stash replay,
+crit's kernel recurrent-scans routes every pool path (verify, checkpoint, stash replay,
 recompute) through one `fmaf(k, delta, S * decay)`, and the device form's torch
 formula through one expression of its own.
 
@@ -125,13 +125,17 @@ production and the next target forward.
 The layer's prompt and decode arithmetic (the chunked prefill and the token-by-token scan
 of gated delta, Mamba-2 and the short convolution before them) is a kernel provider's, not
 this entry's: [flash-linear-attention](https://github.com/fla-org/flash-linear-attention)
-(`fla.ops.gated_delta_rule`, listed in [Kernels' sources](../../kernels/SOURCES.md)) for
-prompt chunks, and crit-labs' recurrent-scans on the kernel registry for the rest: its
+(`fla.ops.gated_delta_rule`, listed in [Kernels' libraries](../../kernels/README.md#libraries)) for
+prompt chunks, and crit's kernel recurrent-scans
+([kernels/techniques/recurrence/recurrent-scans](../../kernels/techniques/recurrence/recurrent-scans), built for
+the engine's device with the engine's tuned knobs or its defaults) for the rest: its
 pool rows (`pool_delta`: a launch for the decode and verify rows of many sequences, each
 from its own state, writing a stash, per-column checkpoints or its start state;
 `pool_delta_replay`: the recompute commit and the flush; `pool_conv`, `conv_segments`: the
-causal convolution over pooled windows) and its two-pass chunked prefill
-(`gated_delta_prefill`). What this entry adds is the speculative part: which state a
+causal convolution over pooled windows) and its chunked prefill (`gated_delta_prefill`: on
+tensor cores, structure `delta-prefill-tc`, the chunked WY form with FP16 operands and FP32
+accumulation and state; or in FP32 on CUDA cores, `delta-prefill-rb`; both plugins' `prefill`
+option, `tensor_cores` by default). What this entry adds is the speculative part: which state a
 verify keeps, and how the accepted prefix becomes the live state without a host read
 (below), and the pool that ties a slot's rows to them.
 
@@ -197,9 +201,14 @@ cost nothing. All three give the same bits, so the choice never changes a reply.
 ms per 2,048-token chunk in BF16 and 0.77 ms in FP32 (3.2 ms per 8,192), the plugin's fla path
 with its FP32 casts 0.88 ms; recurrent-scans' two-pass prefill (FP32 SIMT) 1.32 ms (5.2 ms per
 8,192), this plugin's path with its normalization 1.55 ms; the column scan over the whole
-chunk 2.05 ms; the convolution 0.03 ms. On this GPU the two-pass prefill trails fla's
-kernel: this plugin keeps it as the technique's own chunked form (and the path without fla),
-`sequential-recurrence` runs fla.
+chunk 2.05 ms; the convolution 0.03 ms. recurrent-scans' prefill on tensor cores (`prefill:
+tensor_cores`, the default) takes 0.21 ms per 2,048-token chunk and 0.78 ms per 8,192 on FP32
+inputs, ahead of fla and of FlashInfer's `chunk_gated_delta_rule` on BF16 inputs (0.29 and
+0.84 ms; the kernel's README has the sweep). `prefill: fp32` keeps the FP32 two-pass prefill.
+`sequential-recurrence` runs fla where it is installed and the same prefill otherwise. Every
+chunked kernel sums in another order than the scan, so a prompt row's bits follow the prompt's
+length and chunking: the facts' `recurrence_prompts` pools say which kernel runs
+(`chunked`, `chunked_arithmetic`) and `chunked_row_invariant: false`.
 
 **Short prompts.** A chunked kernel pays a fixed cost per call (fla: ~15 Triton launches a
 layer, 0.12 ms of GPU time at 16 tokens and ~0.7 ms of host time), the column scan one launch
@@ -280,8 +289,8 @@ come at the checkpoint's key heads (`key_heads`, value head `h` reading key head
   which `accept(sequence, its tokens)` makes live and `accept(sequence, 0)` drops; it
   runs the scan up to the pool's `scan_rows` tokens (`scan_rows_captured` while the stream
   captures a graph; both the plugin's `exact_rows`) and the chunked kernel past it (this
-  plugin: recurrent-scans' two-pass prefill; `sequential-recurrence`: fla in FP32, on its
-  stated tiles).
+  plugin: recurrent-scans' chunked prefill, on tensor cores or in FP32 by `prefill`;
+  `sequential-recurrence`: fla in FP32, on its stated tiles, else the same prefill).
 - **captured prompt chunks** (`prompts:recurrence`, Core's `crit_plugins.prompt_graphs`).
   A `PromptBatch` (one sequence's chunk padded to a bucket) reads its sequence and count on
   the device from the rows the pool's `stage_prompt(batch)` wrote before the replay, and
@@ -299,9 +308,11 @@ come at the checkpoint's key heads (`key_heads`, value head `h` reading key head
   plugin's `commit` option. Nothing reads the host, nothing allocates but the output,
   so a round of (rows, width) is captured once.
 - **arithmetic.** recurrent-scans' `pool_delta` / `pool_delta_replay` / `pool_conv` /
-  `conv_segments` / `gated_delta_prefill` from the kernel registry (declared in the
-  plugin's manifest) where installed; otherwise the same semantics in torch, a row at a
-  time (CPU, or a GPU without the kernel), capture-safe.
+  `conv_segments` / `gated_delta_prefill`, crit's kernel (declared in the plugin's
+  manifest) built for the GPU on first use, with the engine's tuning
+  (`CRIT_KERNEL_TUNING`) or its default knobs; the engine's facts say `tuned`, `built` or
+  `fallback`. Where it does not build, the same semantics in torch, a row at a time (CPU,
+  or a GPU without the kernel), capture-safe.
 
 Each decode or verify row's bits are its own (the rows beside it change nothing), a
 verify row's accepted columns have the bits of decoding them one by one, and a row
@@ -378,7 +389,7 @@ accepted checkpoint for every count (clamped below 0 and above the columns) bit 
 bit, and the many-count record writes every group's counts and nothing else. The
 reference scans its strategies were proven with (checkpoints, recompute and deferred
 against the FP64 host oracle over 96 geometries, deferred for 96 rounds bit for bit
-against checkpoints) moved to crit-labs' recurrent-scans with their fixture. The
+against checkpoints) moved to crit's kernel recurrent-scans with their fixture. The
 plugin's tests check the device form as stated above, on CPU, on CUDA with
 recurrent-scans and with the torch formula; `sequential-recurrence`'s, that every
 autotuned kernel fla's chunked path reaches holds its stated tile, so nothing times a tile

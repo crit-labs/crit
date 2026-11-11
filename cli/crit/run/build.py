@@ -1,6 +1,7 @@
 """crit run build: a candidate built from its retained source under a build attempt, then packaged.
 
-The retained source is copied to work/builds/CANDIDATE-ATTEMPT and the recipe's literal build.command runs there,
+The retained source is copied to work/builds/CANDIDATE-ATTEMPT with the candidate's configuration.json beside its
+plugins (unless the source has one), and the recipe's literal build.command runs there,
 its output kept as candidates/CANDIDATE/logs/build-ATTEMPT.log, bounded by the reservation's deadline (the whole
 process tree is stopped at it). The attempt settles with the command's outcome. A completed build is packaged
 from that folder: every file the build added or changed is bound as a dependency (path and sha256) beside the
@@ -32,6 +33,12 @@ def build(store, run_id, candidate_id, recipe, seconds=None, drop=(), package=Tr
         if work.exists():
             shutil.rmtree(work)
         shutil.copytree(folder / "source", work)
+        # The candidate's configuration beside its plugins, as the package will carry it, so a build command that
+        # checks or reads the selection finds it (package_recipe binds it as no build output).
+        if not (work / "configuration.json").is_file():
+            from .store import configuration_text
+            configuration = read_json(folder / "candidate.json")["configuration"]
+            (work / "configuration.json").write_bytes(configuration_text(configuration).encode("utf-8"))
         log(f"crit run build: {' '.join(command)} in {work.relative_to(root).as_posix()}")
         attempt.end(*_run(command, work, attempt.log_path, attempt.deadline_at))
     result = attempt.settle()

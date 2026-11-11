@@ -1,4 +1,4 @@
-"""Concurrent requests end to end on the CPU: the toy engine's plugin package (tests/support/toy_plugins), which Core's
+"""Concurrent requests end to end on the CPU: the toy engine's plugin package (the plugin engine example), which Core's
 loader runs on Core's concurrent runtime (crit_core_steps), served by crit serve four requests at once, measured by
 `crit run measure` at concurrency 4 and by crit Eval's concurrency part. Both see the aggregate grow with the requests in flight and a peak
 of as many requests as clients, and every batched reply equals the serial one. crit_eval is the one on PYTHONPATH (an
@@ -27,7 +27,7 @@ from crit_eval import EVAL_DIR, load_json  # noqa: E402
 from crit_eval.run.chat import ChatEngine, Server as ChatServer, load_text  # noqa: E402
 from crit_eval.run.concurrency import run_concurrency  # noqa: E402
 
-# The package: the toy engine's plugins (tests/support/toy_plugins), whose model's next token is a hash of every token
+# The package: the toy engine's plugins (the plugin engine example), whose model's next token is a hash of every token
 # its row has seen, so a row decodes the same tokens in a batch as alone, and whose every step takes 4 ms however many
 # rows it holds, as a memory-bound decode step does. Four rows a step, no requests waiting beyond them.
 OPTIONS = {"toy-model": {"step_ms": 4, "prefill_chunk": 256, "concurrency": 4, "pending": 0}}

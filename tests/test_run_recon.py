@@ -26,10 +26,6 @@ THINKING = """{%- for message in messages %}<|im_start|>{{ message.role }}
 
 class ReconTests(unittest.TestCase):
     def setUp(self):
-        # A run as created before plans: recon freezing does not depend on them.
-        plans = patch("crit.run.records.NEW_RUN_PLANS", None)
-        plans.start()
-        self.addCleanup(plans.stop)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name).resolve()
@@ -52,8 +48,22 @@ class ReconTests(unittest.TestCase):
                     {"path": "captured/input.fixture", "bytes": captured.stat().st_size, "sha256": file_sha(captured)}]}})
         source = with_plugins(self.root / "source")
         (source / "engine.fixture").write_text("source", encoding="utf-8")
+        notes = self.directory / recon.RECON_MD
+        if notes.is_file():   # recon.md's plans are written before any candidate
+            text = notes.read_text(encoding="utf-8")
+            for title in recon.PLANS + (recon.PLACEMENT_PLAN,):
+                text = text.replace(f"## {title}\n\nTODO", f"## {title}\n\nWritten for the fixture. TODO")
+            notes.write_text(text, encoding="utf-8")
+        plan = {"parent_candidate_id": None, "decision": "build", "gaps": [], "levers": [], "rejected": [],
+                "needed": {name: {"needed": True, "evidence": "fixture"} for name in ("decode", "prefill")},
+                "strategy": {"current": {"name": "fixture", "ceiling": "unknown", "evidence": "fixture"},
+                             "alternative": {"name": "none", "ceiling": "unknown", "evidence": "fixture"},
+                             "choice": "current", "reason": "fixture"},
+                "forecast": None, "gates": "fixture", "prompt_activations": "stored"}
+        plan_id = self.store.plan(self.run_id, plan)["plan_id"]
         return self.store.candidate(self.run_id, source, {"label": "Fixture", "rationale": "Recon freezing",
-            "strategy": "Fixture", "configuration": {"plugins": selection(), **configuration}, "store_decisions": {}})
+            "strategy": "Fixture", "configuration": {"plugins": selection(), **configuration}, "store_decisions": {},
+            "plan_id": plan_id, "lever_fates": {}})
 
     def test_gathers_sampling_stops_template_and_architecture_with_sources(self):
         value = self.store.recon(self.run_id)

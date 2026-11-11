@@ -3,7 +3,7 @@
   "category": "projections",
   "summary": "Packed G32 integer CPU projections, a row-scaled FP8 host codec and the reference NVFP4 codec",
   "implementation_status": "native_source",
-  "implementation_scope": "Grouped integer reference, native G32 signed 4/8-bit storage, scalar/optional AVX2 projections with optional dynamic int8 activations, plus a row-scaled FP8 host codec and oracle; NVFP4 codec (E2M1 codes, E4M3 block-16 scales, FP32 divisor, adjacent packing) with an FP64 Python oracle and a scalar C++ batched projection that decodes each block once per batch; the host twin of a matched FP8 decode/prompt order (its activation quantizer, E8M0 scales, an FP64 projection); the projections slot's device form over stored BF16, FP8 and NVFP4 matrices through torch's scaled matmul and crit-labs' registry kernels (W4A16 GEMVs, decoders, a fixed-tile GEMM) with torch fallbacks, and draft-only re-encoding to NVFP4 or FP8 at load; every compute kernel comes from a library or the kernel registry",
+  "implementation_scope": "Grouped integer reference, native G32 signed 4/8-bit storage, scalar/optional AVX2 projections with optional dynamic int8 activations, plus a row-scaled FP8 host codec and oracle; NVFP4 codec (E2M1 codes, E4M3 block-16 scales, FP32 divisor, adjacent packing) with an FP64 Python oracle and a scalar C++ batched projection that decodes each block once per batch; the host twin of a matched FP8 decode/prompt order (its activation quantizer, E8M0 scales, an FP64 projection); the projections slot's device form over stored BF16, FP8 and NVFP4 matrices through torch's scaled matmul and crit's kernels (W4A16 GEMVs, decoders, a fixed-tile GEMM, a tensor-core decode tile; built for the engine's device, tuned or with default knobs) with torch fallbacks, and draft-only re-encoding to NVFP4 or FP8 at load; every compute kernel comes from a library or crit's kernel library",
   "agent_guidance": {
     "use_when": "Use or adapt the grouped-integer codec, the row-scaled FP8 codec or the NVFP4 codec as the host reference of a format",
     "avoid_when": "The artifact uses another block format or activation encoding; this is not a universal quantized tensor decoder",
@@ -14,7 +14,7 @@
       "Validated borrowed G32 packed rows, native scalar/AVX2 projection and dynamically quantized int8 activation groups",
       "Finite E4M3FN and BF16 word conversion, row-scale validation and independent host projection oracle",
       "NVFP4 encode/decode with stated ties-to-even and saturation, adjacent packing and a batched scalar projection reference",
-      "The host twin of a matched decode/prompt order for FP8 projections (fp8_block.h: the declared quantizer, E8M0 scales, FP64 bounds); the order itself is described in the README and its kernels are crit-labs' fp8-block-rows",
+      "The host twin of a matched decode/prompt order for FP8 projections (fp8_block.h: the declared quantizer, E8M0 scales, FP64 bounds); the order itself is described in the README and its kernels are crit's fp8-block-rows",
       "Draft-only re-encoding of stored BF16/FP8 matrices to NVFP4 or FP8 at load, code for code with the FP64 codec"
     ],
     "engine_supplies": [
@@ -72,11 +72,11 @@
     },
     {
       "path": "inference/quantized-projections/code/device_nvfp4.py",
-      "purpose": "NVFP4 weights with 16-bit activations (W4A16) and BF16 decode rows: crit-labs' registry kernels decode-gemv (CUDA and Triton GEMVs, decoders) and fixed-tile-gemm (a row-invariant prompt GEMM), or torch fallbacks that keep each row's bits alone and batched"
+      "purpose": "NVFP4 weights with 16-bit activations (W4A16) and BF16 decode rows: crit's kernels decode-gemv (CUDA and Triton GEMVs, decoders) and fixed-tile-gemm (a row-invariant prompt GEMM), built for the engine's device, or torch fallbacks that keep each row's bits alone and batched"
     }
   ],
   "requires": {
-    "hardware": "Python 3.11+ for the general integer reference; C++20 for native G32/FP8; optional CRIT_GROUPED_INT_AVX2 requires an AVX2 build and CPU; the device form: torch with CUDA (FP8 needs sm_89+, NVFP4 W4A4 sm_100/sm_120), the kernels package for the registry kernels (else the torch fallbacks)",
+    "hardware": "Python 3.11+ for the general integer reference; C++20 for native G32/FP8; optional CRIT_GROUPED_INT_AVX2 requires an AVX2 build and CPU; the device form: torch with CUDA (FP8 needs sm_89+, NVFP4 W4A4 sm_100/sm_120), for crit's kernels the CUDA toolkit (nvcc) and ninja to build them on first use (else the torch fallbacks)",
     "model": "Exact grouped-integer format or separately validated row-scaled E4M3FN/BF16 format; arbitrary artifact codecs need adaptation; NVFP4 with adjacent packing and a divisor global scale (convert other layouts explicitly)",
     "workload": "Native G32 supports positive token batches, row-major tensors with width divisible by 32, FP32 or dynamic G32 int8 activations"
   },
@@ -125,7 +125,7 @@
   ],
   "validation": {
     "host": "Host fixtures and worked example cover signed/odd nibble packing, zero groups, scale representation and projection geometry; native tests cover every finite FP8 code, ties, zero/subnormal scales, odd extents and invalid words; native G32 fixture compares 108 scalar/SIMD projection profiles to independently reconstructed arithmetic, signed minimum codes, ties, invalid scales/extents and encoded-KV ownership; NVFP4 Python and native fixtures cover all E2M1 codes, every finite E4M3 code, ties, saturation, zero blocks, packing, error bounds and batched projection against FP64",
-    "native": "The native codec fixtures above run on the host; the device form's tests (tests/test_device.py) run every path bit for bit for row invariance, on the registry kernels (LOCAL_KERNELS or the Hub) and on the torch fallbacks, and draft-only re-encoding against nvfp4.py code for code; the matched FP8 order's device fixture lives with its kernels (crit-labs/fp8-block-rows)",
+    "native": "The native codec fixtures above run on the host; the device form's tests (tests/test_device.py) run every path bit for bit for row invariance, on crit's kernels (built on the GPU, tuned or with default knobs) and on the torch fallbacks, and draft-only re-encoding against nvfp4.py code for code; the matched FP8 order's device fixture lives with its kernels (crit's fp8-block-rows)",
     "performance": "Kernel and model speed require matched consumer measurements; an AVX2 build alone establishes no speedup"
   }
 }

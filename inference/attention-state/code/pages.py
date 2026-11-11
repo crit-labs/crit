@@ -11,7 +11,7 @@ attention kernel that reads them so.
 Page types: BF16, FP16, FP32; FP8 E4M3 with the layer's key and value scales ("fp8", stored = value / scale); FP8 E4M3
 with one FP32 scale per position and KV head ("fp8:row", its absolute maximum over 448, the quotient rounded to the
 nearest E4M3 value: fp8_rows); INT8 with one FP32 scale per position and KV head ("int8", its absolute maximum over 127,
-rounded to the nearest code, ties to even: int8_rows). A pool given the registry's paged-kv-attention kernels writes
+rounded to the nearest code, ties to even: int8_rows). A pool given crit's paged-kv-attention kernels writes
 through them (one launch for keys and values, the same codes and scales as the torch rules here), else in torch.
 
 Captured decode rounds (crit_plugins.device DEVICE_EXTENSIONS "rounds:kv_cache"): bind(slot, sequence, capacity) takes
@@ -38,7 +38,7 @@ import math
 DTYPES = ("bf16", "fp16", "fp32", "fp8", "fp8:row", "int8")
 # Page types whose codes carry an FP32 scale per position and KV head beside them.
 ROW_SCALED = ("fp8:row", "int8")
-# Page types the registry's paged-kv-attention kernels read and write (FP32 pages are torch's).
+# Page types crit's paged-kv-attention kernels read and write (FP32 pages are torch's).
 KERNEL_KINDS = ("bf16", "fp16", "fp8", "fp8:row", "int8")
 # Page types that store keys and values at a lower precision than the projections gave them: a prompt chunk's own
 # keys and values are kept fresh beside them for its attention (fresh_rows).
@@ -61,7 +61,7 @@ class KVPool:
     count, first position, first partial row and page table of up to step_rows window rows (`windows`, in row order),
     into the same device tensors every step, so a model can capture a decode step in a CUDA graph and replay it after
     the next reserve(). round_rows: the round slots bind() may use (DEVICE_EXTENSIONS "rounds:kv_cache"). kernels:
-    the registry's paged-kv-attention module, or None (torch)."""
+    crit's paged-kv-attention module, or None (torch)."""
 
     def __init__(self, layers, kv_heads, head_dim, tokens, device, dtype="bf16", *, page=16, value_dim=None,
                  step_rows=0, step_tokens=0, window=16, round_rows=8, kernels=None, spare=0, fresh=None):

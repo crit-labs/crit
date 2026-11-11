@@ -1,0 +1,177 @@
+{
+  "schema": "crit-kernel-v1",
+  "id": "pinned-gemm",
+  "family": "projections",
+  "title": "Row-count-independent prompt GEMMs: cuBLASLt pinned to one split-K-free algorithm per shape and format, for 16-bit, FP8, MXFP8, MXFP4 and NVFP4 operands",
+  "package": "pinned_gemm",
+  "language": "cuda",
+  "operations": [
+    "nvfp4-projection",
+    "fp8-row-projection",
+    "mxfp8-projection"
+  ],
+  "sources": [
+    "pinned_gemm_cuda/pinned_gemm.cu",
+    "torch-ext/torch_binding.cpp"
+  ],
+  "capabilities": [
+    "8.0",
+    "8.6",
+    "8.9",
+    "9.0",
+    "10.0a",
+    "10.3a",
+    "11.0a",
+    "12.0a",
+    "12.1a"
+  ],
+  "structures": {
+    "lt-dense": {
+      "what": "BF16, FP16 or FP32 (no TF32) operands into a 16- or 32-bit output: cuBLASLt's dense tensor-core GEMMs, one algorithm a shape (pin(); the knobs are read in Python, at pin time)",
+      "call": "pin",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        64,
+        512,
+        4096
+      ],
+      "key": [
+        "N",
+        "K",
+        "IN",
+        "OUT"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "REP_ROWS": {
+          "values": [
+            512,
+            2048,
+            8192
+          ],
+          "default": 2048,
+          "order": true,
+          "what": "the row count whose cuBLASLt heuristic list is searched for split-K-free algorithms"
+        },
+        "CHOICE": {
+          "values": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "default": 0,
+          "order": true,
+          "what": "which of the list's distinct row-exact algorithms is pinned (the last one where fewer are listed)"
+        }
+      },
+      "yardstick": {
+        "library": "cuBLASLt unpinned through torch (torch.matmul, torch.mm with out_dtype for FP32 outputs): its heuristic's algorithm at each row count, split-K included"
+      },
+      "bench": "bench.py:LtDense"
+    },
+    "lt-fp8": {
+      "what": "FP8 E4M3/E5M2 operands, unscaled or with tensor or row scales: cuBLASLt's FP8 GEMMs (sm_89 and newer), one algorithm a shape",
+      "call": "pin",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        64,
+        512,
+        4096
+      ],
+      "key": [
+        "N",
+        "K",
+        "IN",
+        "OUT"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "REP_ROWS": {
+          "values": [
+            512,
+            2048,
+            8192
+          ],
+          "default": 2048,
+          "order": true,
+          "what": "the row count whose cuBLASLt heuristic list is searched for split-K-free algorithms"
+        },
+        "CHOICE": {
+          "values": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "default": 0,
+          "order": true,
+          "what": "which of the list's distinct row-exact algorithms is pinned (the last one where fewer are listed)"
+        }
+      },
+      "yardstick": {
+        "library": "cuBLASLt unpinned through torch._scaled_mm (unit tensor scales, FP32 output): its heuristic's algorithm at each row count"
+      },
+      "bench": "bench.py:LtFp8"
+    },
+    "lt-block": {
+      "what": "block-scaled MXFP8, MXFP4 and NVFP4 operands: cuBLASLt's block-scaled GEMMs (sm_100 and newer), one algorithm a shape",
+      "call": "pin",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        64,
+        512,
+        4096
+      ],
+      "key": [
+        "N",
+        "K",
+        "IN",
+        "OUT"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "REP_ROWS": {
+          "values": [
+            512,
+            2048,
+            8192
+          ],
+          "default": 2048,
+          "order": true,
+          "what": "the row count whose cuBLASLt heuristic list is searched for split-K-free algorithms"
+        },
+        "CHOICE": {
+          "values": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "default": 0,
+          "order": true,
+          "what": "which of the list's distinct row-exact algorithms is pinned (the last one where fewer are listed)"
+        }
+      },
+      "yardstick": {
+        "library": "cuBLASLt unpinned through torch._scaled_mm (NVFP4, the same blocked scales): its heuristic's algorithm at each row count; the global alpha left out"
+      },
+      "bench": "bench.py:LtBlock"
+    }
+  }
+}

@@ -11,7 +11,9 @@ in a decode row or a prompt chunk, so batched decoding matches serial decoding a
 
 Use it as the experts slot's plugin of a model with routed SwiGLU experts (top-k routing, a [2 * inter][hidden]
 gate/up matrix with the gate rows first, a [hidden][inter] down matrix, both multiples of 64) in bf16, fp8 with
-channel or 128 x 128 block scales, nvfp4, int4 with an E4M3 scale per 16, or mxfp4. It serves at candidate 1: its
+channel or 128 x 128 block scales, nvfp4, int4 with an E4M3 scale per 16, mxfp4, or AWQ / GPTQ int4 with a zero
+point a group (bundle format `int4_zp:<group>`, loaded as `awq` or `gptq` tensors `qweight`, `qzeros`, `scales`;
+act order is refused, since the kernel reads x and h in order). It serves at candidate 1: its
 arithmetic is the stored format's, its decode and prompt paths are one kernel, and a call at a fixed token count is
 captured in a CUDA graph (rounds:experts).
 
@@ -49,7 +51,8 @@ carry theirs or none does, and they match what the layer's loads or packs declar
 without their scales are refused, never run as zeros); without a declaration the bundles decide. The facts name each
 layer's activations (`experts.layers`). `activations: bf16` runs every layer W4A16.
 
-**The arithmetic.** The registry kernel crit-labs/grouped-experts (BF16 tensor cores, sm_80 and newer):
+**The arithmetic.** crit's kernel grouped-experts (`kernels/techniques/experts/grouped-experts`: BF16 tensor cores, sm_80 and
+newer), built for the engine's device with the engine's tuning or its default knobs (no knob changes a route's bits):
 
 - the routes sorted by expert, stable (a one-block sort for decode-sized calls, a stable device sort beyond 1,024
   routes), cut into items of 8 routes (decode) or 32 (prompt chunks), every grid launched at its largest size and
@@ -64,7 +67,7 @@ layer's activations (`experts.layers`). `activations: bf16` runs every layer W4A
   quantize_e2m1x2), the operands e2m1 times the decoded block scale;
 - the down rows' FP32 outputs per route, then the route-order combine.
 
-Where the kernel is not there (not published, no build for the GPU, a CPU device) the plugin runs the same operands
+Where the kernel is not there (it does not build on the machine, a CPU device) the plugin runs the same operands
 and factors in torch (code/fallback.py): each route's bundle gathered and decoded, batched matrix products in chunks of
 one fixed size (so a route runs the same shapes in any call) with BF16 operands and FP32 sums chosen per call (no
 global precision flag read or set), the declared quantizer and SwiGLU. It is correct, row invariant and capture-safe,
@@ -141,7 +144,7 @@ assert torch.equal(again, out)
 ## Costs and validation
 
 tests/test_plugin.py: the host form equals experts-reference on crit's experts cases. tests/test_device.py, through
-the kernel (LOCAL_KERNELS) and the fallback: every format within 5e-3 of the largest output of an FP64 block over the
+the kernel (where it builds) and the fallback: every format within 5e-3 of the largest output of an FP64 block over the
 same decoded weights (3e-2 for W4A4, where an FP32 intermediate a rounding away from an E2M1 boundary takes the other
 code); a route's bits the same alone, batched and in prompt-sized calls; a permuted slot store and another tier's rows
 joined in route order give the all-device bits; a captured call replays new routes and its workspace outlives later

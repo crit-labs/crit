@@ -16,7 +16,7 @@
       "E4M3 and E8M0 scale decoders and a hook for checkpoint-specific scale encodings",
       "dot_row_halving_format and dot_row_block_format<lanes, bits, block> for CUDA and HIP from one header, with explicit rounding intrinsics and a matching shuffle tree; the same functions in Metal",
       "Exact Python FP32 reference using crit's NVFP4 codec",
-      "Integer block rows (host_int.h): 4-bit weights against activations quantized per block (E2M1 x 2 or INT8), exact block sums on any processor and one declared FP32 step, so the CPU rows (AVX-512 VNNI, AVX2), the device rows and the int-block-experts Hub kernels give the same bits at integer speed; declared quantizers, exp, SiLU and SwiGLU; an interleaved host layout for the CPU"
+      "Integer block rows (host_int.h): 4-bit weights against activations quantized per block (E2M1 x 2 or INT8), exact block sums on any processor and one declared FP32 step, so the CPU rows (AVX-512 VNNI, AVX2), the device rows and crit's kernel int-block-experts gives the same bits at integer speed; declared quantizers, exp, SiLU and SwiGLU; an interleaved host layout for the CPU"
     ],
     "engine_supplies": [
       "Expert composition (projections, activation, routing weight) with activations that match bitwise on both processors",
@@ -114,6 +114,10 @@
     {
       "path": "inference/host-expert-arithmetic/code/declared.py",
       "purpose": "The declared integer block order and FP32 order in torch on any device, the same bits as the C++ rows (an exact FP32 FMA by TwoSum): the torch fallback and an oracle"
+    },
+    {
+      "path": "inference/host-expert-arithmetic/code/device_int.py",
+      "purpose": "The device form on CUDA over crit's kernel int-block-experts: decode rows in the declared integer block order, prompt rows on its gemm-native (not row invariant) or gemm-staged (the declared order)"
     }
   ],
   "requires": {

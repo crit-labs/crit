@@ -105,4 +105,18 @@ jobs:
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+      - name: Split crit-core from crit
+        # crit pins crit-core exactly: crit-core is published first, so a failed upload never leaves a crit on PyPI
+        # whose pinned Core is missing.
+        run: |
+          mkdir -p core-dist
+          mv dist/crit_core-* core-dist/
+          ls -l core-dist dist
+      - name: Publish crit-core
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: core-dist/
+      - name: Publish crit
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: dist/

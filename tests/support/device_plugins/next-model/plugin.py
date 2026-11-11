@@ -13,7 +13,7 @@ import json
 from crit_core.batch import DECODE, PREFILL, StepLayout, step_item
 from crit_core.native import Scores, StepResult
 from crit_plugins import StepBatch
-from crit_plugins.device import DECODE_ROWS
+from crit_plugins.device import DECODE_ROWS, free_device_bytes
 
 CORE_SAMPLING = ("temperature", "top_p", "top_k", "min_p", "seed")
 
@@ -52,7 +52,7 @@ class NextModel:
             tensors.update(load_file(str(path), device="cpu"))
         kv_bytes = 2 * len(self.full) * self.context * sequences * self.kv_heads * self.head_dim * 2
         state_bytes = len(self.linear) * sequences * self.nv * self.dk * self.dv * 4
-        free, _ = torch.cuda.mem_get_info()
+        free = free_device_bytes()   # after the load's own temporaries go back to the device
         placed = parts["placement"].plan({**{n: t.numel() * t.element_size() for n, t in tensors.items()},
                                           "kv": kv_bytes, "states": state_bytes}, {"device": free, "host": 0})
         if set(placed.values()) != {"device"}:
@@ -283,15 +283,26 @@ class NextModel:
         self._close(session.handle)
 
     def score(self, ids, first_target, path="", queries=None, top_k=0):
+        """A fixed text's scores through the prompt path: its tokens a prefill_chunk at a time, as a prompt's chunks
+        (the same arithmetic as prefill, and one chunk's temporaries however long the text), each chunk's KV
+        and recurrent state kept for the next."""
         torch = self.torch
         sequence = ("score", self.handles)
+        chunk, wanted = int(self.options["prefill_chunk"]), range(first_target - 1, len(ids) - 1)
+        found = []
         self._open(sequence)
         try:
-            batch = StepBatch.build([(sequence, 0, len(ids))], self.device)
-            rows = list(range(first_target - 1, len(ids) - 1))
-            logp = torch.log_softmax(self._forward(torch.tensor(ids, device=self.device), batch, rows), -1)
+            for start in range(0, wanted.stop, chunk):   # the last token predicts nothing scored
+                end = min(start + chunk, wanted.stop)
+                batch = StepBatch.build([(sequence, start, end - start)], self.device)
+                rows = [row - start for row in wanted if start <= row < end]
+                logits = self._forward(torch.tensor(ids[start:end], device=self.device), batch, rows)
+                found.append(torch.log_softmax(logits, -1))
+                self.states.accept(sequence, end - start)   # the chunk's recurrent state and window
+                self.pool.keep(sequence, end)
         finally:
             self._close(sequence)
+        logp = torch.cat(found)
         targets = torch.tensor(ids[first_target:], device=self.device)
         target = logp.gather(1, targets[:, None])[:, 0].tolist()
         query = ([logp[t, torch.tensor(row, device=self.device)].tolist() for t, row in enumerate(queries)]

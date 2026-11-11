@@ -99,7 +99,8 @@ the halving (or sequential) reduction, times post.
 - **Paths.** The scalar oracle; AVX2 (vpmaddubsw) and AVX-512 with BW and VNNI (vpdpbusd), chosen at run time by
   `best_int_isa()`. A host store may keep experts in `Layout::interleaved` (`interleave_row`): a vector lane then
   holds one block, so the block sums need no reduction inside a vector. Every path and layout gives the oracle's bits.
-- **Kernels.** crit-labs' `int-block-experts` registry kernel runs the same order on the device
+- **Kernels.** crit's kernel `int-block-experts` (`kernels/techniques/experts/int-block-experts`, built for the engine's device,
+  tuned or default knobs, none of which changes a bit) runs the same order on the device
   ([operations.json](operations.json) says how to check one):
   decode rows for 1 to 8 tokens a matrix and a prompt GEMM on int8 tensor cores, the same bits as the CPU rows.
 - **Cost.** On one Ryzen 5 9600 (6 threads, WSL2) the interleaved AVX-512 rows read 40-42 GB/s of weights for one token,
@@ -108,7 +109,7 @@ the halving (or sequential) reduction, times post.
 
 ## The plugin
 
-As a projections plugin on the CPU (`devices: ["cpu"]`), it multiplies a checkpoint's stored matrices with CPU torch
+As a projections plugin on the CPU, it multiplies a checkpoint's stored matrices with CPU torch
 tensors: `load(tensors, format, role=None)` for `nvfp4` and `int4` (`{weight, scale, global_scale, input_scale}`, E4M3
 scale per 16) and `bf16`; `matmul(x, matrix, out_dtype=None)`. The option `activations` picks what an NVFP4 matrix
 multiplies: `fp32` (weight only, the 16-lane FP32 order above), `e2m1x2` (W4A4 at the matrix's input_scale) or `int8`
@@ -121,6 +122,20 @@ a matrix's rows over threads. Without a C++ compiler the same orders run in torc
 forces it), with the same bits: torch has no FMA, so `declared.fma32` rounds a * b + c once (the product exact in FP64,
 TwoSum's exact error, the FP64 sum rounded to FP32 and moved one step where it lies exactly between two FP32 values).
 `declared.py` runs on any torch device, so it is also an exact device-side twin of the CPU rows, slow.
+
+On CUDA (`devices` also names `cuda`: matrices whose stored tensors are CUDA tensors) the same W4A4 and W4A8 matrices
+run on crit's kernel `int-block-experts` ([code/device_int.py](code/device_int.py)): decode rows (calls of up to 16
+rows) on its `rows`, the declared integer block order, every output the CPU rows' bits; prompt rows by option
+`prompt_gemm`: `native` (the default) runs W4A4 prompt rows on its `gemm-native` (the activations by its
+`quantize_nvfp4`, the declared quantizer's codes and scale bytes; block-scaled FP4 MMAs on sm_120a for NVFP4 weights, the
+s8 MMA a 16-block for INT4 weights), accumulated in the tensor cores: not the declared order, not row invariant and
+not the CPU rows' bits (the facts' `row_invariance` `prompt_rows` false), within 2e-6 of the FP64 product of the same
+quantized activations relative to the products' magnitude; `declared` runs every prompt row on `gemm-staged` in the
+declared order (W4A8 prompt rows always: no 4-bit tensor-core kind multiplies INT8 activations exactly). Each matrix's
+factor of the E2M1 x 2 representation is the kernel table's post and each row's inverse global scale multiplies the
+FP32 output after (both power-of-two scalings apart, so the output is the CPU rows' `total * (factor * inverse)` bit for
+bit). Weight-only (`fp32`) rows are not on CUDA here (quantized-projections' are). tests/test_cuda.py checks the CPU
+rows' bits and the native bound.
 
 ## What the code supplies
 

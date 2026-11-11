@@ -397,6 +397,27 @@ class RateWidth:
 WIDTH_POLICIES = {"fixed": FixedWidth, "step": StepWidth, "rate": RateWidth}
 
 
+def fitted_costs(table, widths):
+    """A calibration table [rows][widths] (ms, inf where not captured) fitted per row count by least squares as
+    a + b x (width + 1), floored at the smallest time measured for that row count: a round's cost grows with its
+    columns, and the fit keeps two near-equal widths from swapping with a load's timing noise. A row count with one
+    captured width keeps its time."""
+    out = []
+    for row in table:
+        points = [(w + 1, t) for w, t in zip(widths, row) if t != float("inf")]
+        if len(points) < 2:
+            out.append(list(row))
+            continue
+        n = len(points)
+        mx, my = sum(x for x, _ in points) / n, sum(y for _, y in points) / n
+        sxx = sum((x - mx) ** 2 for x, _ in points)
+        b = max(0.0, sum((x - mx) * (y - my) for x, y in points) / sxx) if sxx else 0.0
+        a = my - b * mx
+        low = min(y for _, y in points)
+        out.append([max(low, a + b * (w + 1)) if t != float("inf") else t for w, t in zip(widths, row)])
+    return out
+
+
 def width_policy(name, **options):
     """The width policy `name` (fixed, step or rate) with its options: what a model plugin's option selects."""
     if name not in WIDTH_POLICIES:
@@ -995,10 +1016,13 @@ class SpeculativeRounds:
                 needed.append((rows, w))
         return needed
 
-    def calibrate(self, mode="greedy", repeats=3):
+    def calibrate(self, mode="greedy", repeats=3, trials=5):
         """The time of every captured round of `mode` in its plain form, the one most rounds run (CUDA events around
-        `repeats` replays, every row held and the driver's state put back after), [rows][widths] in ms (inf where no
-        round is captured), given to the width policy when it takes costs (set_costs). Returns the table."""
+        `repeats` replays, the median of `trials` such spans, every row held and the driver's state put back after),
+        [rows][widths] in ms (inf where no round is captured), fitted per row count as a + b x (width + 1) over the
+        widths captured (fitted_costs), and given to the width policy when it takes costs (set_costs). Returns the
+        fitted table. A policy choosing from raw times chose differently from one load to the next where two widths'
+        rates nearly tie, so an engine opened at another context decoded the same text at other widths."""
         torch = self.torch
         if self.device.type != "cuda":
             raise ValueError("calibrating times captured rounds: a CUDA device")
@@ -1010,16 +1034,20 @@ class SpeculativeRounds:
                 continue
             self.hold.fill_(1)
             graph.replay()
-            start.record()
-            for _ in range(repeats):
-                graph.replay()
-            end.record()
-            end.synchronize()
-            table[rows - 1][self.round_widths.index(width)] = start.elapsed_time(end) / repeats
+            spans = []
+            for _ in range(max(1, trials)):
+                start.record()
+                for _ in range(repeats):
+                    graph.replay()
+                end.record()
+                end.synchronize()
+                spans.append(start.elapsed_time(end) / repeats)
+            table[rows - 1][self.round_widths.index(width)] = sorted(spans)[len(spans) // 2]
         for name, tensor in self._state().items():
             tensor.copy_(saved[name])
         self._reset()
         torch.cuda.synchronize(self.device)
+        table = fitted_costs(table, self.round_widths)
         costs = _method(self.width_policy, "set_costs")
         if costs is not None:
             costs(table)

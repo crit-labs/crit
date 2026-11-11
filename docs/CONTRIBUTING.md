@@ -7,7 +7,7 @@ origin. See [licensing](LICENSES.md).
 
 Every change must meet the three criteria in [what belongs in crit](CONTRIBUTION_CRITERIA.md):
 it improves the platform measurably, it does not overfit to one model or machine, and it is
-valuable to almost any model on any CUDA hardware.
+valuable to almost any model on any hardware backend.
 
 ## Code boundaries
 
@@ -37,10 +37,14 @@ the pinned dependencies CI installs:
 
 ```sh
 python -m pip install tokenizers==0.23.3 jinja2==3.1.6
-python -m pip install -e .
+python -m pip install -e core/python -e .
+crit core build
 python -B -m unittest discover -s tests -v
 ```
 
+`-e core/python` matters: crit's version pin on `crit-core` is met by the release on PyPI too, and a checkout's CLI
+on a released Core fails in confusing ways, so crit refuses to run that way. `crit core build` builds Core's runtime,
+`crit_core_steps`, into `build/core-steps`, where Core's loader finds it (`CRIT_CORE_STEP_LIBRARY` names another).
 `python -B tests/run_parallel.py` runs the same tests one module per process, several at once, as CI does.
 
 CI installs no transformers, so the fixtures that compare against transformers' own code (expert routing, RoPE
@@ -60,7 +64,7 @@ a clean snapshot:
 mkdir -p build/package-source
 git archive HEAD | tar -x -C build/package-source
 python -B -c "import os; from setuptools.build_meta import build_sdist, build_wheel; os.chdir('build/package-source'); build_sdist('../dist'); build_wheel('../dist')"
-python -m pip install build/dist/crit-0.17.2-py3-none-any.whl
+python -m pip install build/dist/crit-0.18.0-py3-none-any.whl
 ```
 
 The `crit` wheel holds `crit`, `crit_api`, `crit_kernels`, `crit_mcp`, `crit_models` and `crit_smoke`, and

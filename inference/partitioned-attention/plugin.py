@@ -1,6 +1,6 @@
 """Partitioned attention in the attention slot: partitioned-attention's partials and merge (implementation.py) as the
 host form. On the device, the same technique on one GPU through attention-state's device form (device_attention.py):
-the registry's split-KV reader splits each row's keys into partitions (piece i of its positions to partition i mod P),
+crit's split-KV reader splits each row's keys into partitions (piece i of its positions to partition i mod P),
 computes each partition's partial output with its log-sum-exp in parallel and merges them in partition order by their
 log-sum-exps, so a long row's work spreads over the GPU and follows its length; merge() combines partials computed
 elsewhere (a sequence's shards on other devices) the same way, in torch."""
@@ -9,7 +9,7 @@ from pathlib import Path
 from .partitioned import implementation as partitioned
 from .state import device_attention
 
-KERNELS = "crit-labs/paged-kv-attention"
+KERNELS = "paged-kv-attention"
 
 
 class PartitionedAttention:
@@ -61,16 +61,18 @@ class PartitionedAttention:
 
 
 def _kernels(options):
-    """The registry kernel the device form reads pages with, or None (option kernels torch, or not available)."""
+    """crit's kernel paged-kv-attention, which the device form reads pages with (built on this GPU with the engine's
+    tuned knobs or its defaults), or None (option kernels torch, or it does not build here)."""
     if options["kernels"] != "auto":
         return None
-    from crit_plugins.kernels import registry_kernel
-    return registry_kernel(KERNELS, folder=Path(__file__).parent)
+    from crit_plugins.kernels import load_kernel
+    return load_kernel(KERNELS, folder=Path(__file__).parent)
 
 
 def memory(context, options):
     """What the device form allocates when it is made (device_attention.device_memory), exactly: the split-KV reader's
-    partials where the registry kernel loads, FlashInfer's prompt workspaces where it serves, on a CUDA engine."""
+    partials where crit's paged-kv-attention kernel loads, FlashInfer's prompt workspaces where it serves, on a CUDA
+    engine."""
     found, host = device_attention.device_memory(device_attention.engine_device(context), options["kernels"],
                                                  _kernels(options) is not None, options["workspace_mib"],
                                                  options["flashinfer"], options["flashinfer_mib"], "split",
@@ -84,5 +86,5 @@ def create(context, options, parts):
                                             device=device_attention.engine_device(context),
                                             kernels_mib=options["workspace_mib"], flashinfer=options["flashinfer"],
                                             flashinfer_mib=options["flashinfer_mib"],
-                                            prompt_reader=options["prompt_reader"])
+                                            prompt_reader=options["prompt_reader"], reader=options["reader"])
     return PartitionedAttention(parts["kv_cache"], options, form)

@@ -222,6 +222,8 @@ def main(argv=None):
     tested.add_argument("folder", type=Path, nargs="?")
     tested.add_argument("--only", action="append", help="Test only this plugin (repeatable)")
     tested.add_argument("--timeout", type=float, default=600, help="Seconds per plugin (default %(default)s)")
+    tested.add_argument("--no-cache", action="store_true", help="Run every plugin's tests, also those that passed "
+                        "before with the same files and environment (by default they are reported as cached)")
     shown = subs.add_parser("variants", help="Show the variants crit run ... ablate serves for a selection")
     shown.add_argument("folder", type=Path)
     shown.add_argument("--selection", type=Path, required=True)
@@ -276,7 +278,7 @@ def main(argv=None):
                     print(f"  {slot:<16} {plugin_id or '-'}")
             return 0
         if args.action == "test":
-            items = run_tests(registry, set(args.only or ()), args.timeout)
+            items = run_tests(registry, set(args.only or ()), args.timeout, cache=not args.no_cache)
             failed = sum(i["state"] == "failed" for i in items)
             print(f"{len(items) - failed} passed, {failed} failed")
             return 1 if failed else 0

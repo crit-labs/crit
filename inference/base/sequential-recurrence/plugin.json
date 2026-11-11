@@ -2,7 +2,7 @@
   "schema": "crit-plugin-v1",
   "id": "sequential-recurrence",
   "title": "The token-by-token gated-delta recurrence (recurrent-state-recovery)",
-  "description": "recurrent-state-recovery's FP64 recurrence, one token after another: the state decays, takes the beta-weighted delta of each token's value against its prediction, and gives the token's output. The reference every recurrence plugin is compared with. On the device it keeps every sequence's state and causal-convolution window in a pool (code/device_states.py) and runs the same formula over a step's rows and a captured round's: decode tokens and verify windows through one column scan over FP32 state, each row's bits its own, with the accepted prefix committed on the device (deferred, from per-column checkpoints, or recomputed); prompt chunks through the same scan up to exact_rows tokens (the configuration's, default 512) and through fla's chunked gated-delta kernel (when fla is installed) past it, each of its Triton kernels on a stated tile, not the one fla's autotune times best (some tiles give other bits). The scan is recurrent-scans' from the kernel registry where it is installed, a torch formula otherwise.",
+  "description": "recurrent-state-recovery's FP64 recurrence, one token after another: the state decays, takes the beta-weighted delta of each token's value against its prediction, and gives the token's output. The reference every recurrence plugin is compared with. On the device it keeps every sequence's state and causal-convolution window in a pool (code/device_states.py) and runs the same formula over a step's rows and a captured round's: decode tokens and verify windows through one column scan over FP32 state, each row's bits its own, with the accepted prefix committed on the device (deferred, from per-column checkpoints, or recomputed); prompt chunks through the same scan up to exact_rows tokens (the configuration's, default 512) and through crit's recurrent-scans chunked prefill past it (option prefill; option fla, off by default, a yardstick: fla's chunked gated-delta kernel where installed, each of its Triton kernels on a stated tile, not the one fla's autotune times best). The scan is crit's kernel recurrent-scans (built for the engine's device, with the engine's tuned knobs or its defaults) where it builds, a torch formula otherwise.",
   "fills": [
     "recurrence"
   ],
@@ -27,23 +27,48 @@
       "default": true,
       "description": "long rows reach fla's chunked kernel in FP32: closer to the exact recurrence where strong decays leave outputs small, at twice the kernel's time"
     },
+    "prefill": {
+      "type": "choice",
+      "default": "tensor_cores",
+      "choices": [
+        "tensor_cores",
+        "fp32"
+      ],
+      "description": "recurrent-scans' chunked prefill for prompt rows past exact_rows where fla is not installed: tensor_cores (structure delta-prefill-tc, the chunked WY form with FP16 operands rounded once a chunk and FP32 accumulation and state, dk 64 or 128 and dv a multiple of 16; several times faster than fp32, numbers in recurrent-scans' README) or fp32 (delta-prefill-rb, the two-pass prefill in FP32 on CUDA cores, dv a multiple of 64). Both are another summation order than the scan, within the chunked tolerance, so a prompt row's bits follow the prompt's length and chunking either way (facts: recurrence_prompts)"
+    },
+    "scan": {
+      "type": "choice",
+      "default": "pool-delta-pipe",
+      "choices": [
+        "pool-delta-pipe",
+        "pool-delta"
+      ],
+      "description": "recurrent-scans' structure for the decode, verify and scanned prompt rows: pool-delta-pipe (each slot's state tile and first tokens staged in shared memory by cp.async, whole 128-byte rows, ahead of the slot a block runs; as fast or faster than pool-delta on decode and verify rows from 1 to 32 sequences, tuned or not, numbers in recurrent-scans' README) or pool-delta (the state tile loaded into registers, the structure before). The same bits either way for every row, commit and pending count, so a pool may switch between them (facts: recurrence_prompts' scan)"
+    },
     "commit": {
       "type": "choice",
       "default": "deferred",
-      "choices": ["deferred", "checkpoints", "recompute"],
+      "choices": [
+        "deferred",
+        "checkpoints",
+        "recompute"
+      ],
       "description": "how a captured round keeps its accepted prefix: deferred (record the count; the next row replays it from a stash), checkpoints (the state after every column, one selected) or recompute (the start state kept, the prefix replayed at commit)"
     },
     "kernels": {
       "type": "bool",
       "default": true,
-      "description": "run decode and verify rows through recurrent-scans from the kernel registry where it is installed; false: the torch formula"
+      "description": "run decode and verify rows through crit's kernel recurrent-scans where it builds on this GPU; false: the torch formula"
+    },
+    "fla": {
+      "type": "bool",
+      "default": false,
+      "description": "prompt rows past exact_rows through fla's chunked gated-delta kernel (where fla is installed) instead of recurrent-scans' chunked prefill: a library's kernel, a yardstick only"
     }
   },
   "kernels": [
     {
-      "name": "crit-labs/recurrent-scans",
-      "version": 1,
-      "revision": null,
+      "name": "recurrent-scans",
       "fallback": "the column scan, its commit replay and the causal convolution in torch (code/device_states.py), capture-safe, a row at a time"
     }
   ],

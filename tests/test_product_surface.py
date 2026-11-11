@@ -210,7 +210,7 @@ class ProductTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             kernels = subprocess.run([sys.executable, "-B", "-S", LAUNCHER, "kernels"],
                                    cwd=directory, capture_output=True, text=True, timeout=10, check=True)
-            self.assertIn("https://huggingface.co/kernels", kernels.stdout)
+            self.assertIn("build and sweep compile crit's kernel sources here", kernels.stdout)
             self.assertIn("kernels/README.md", kernels.stdout)
             self.assertEqual(list(Path(directory).iterdir()), [])
 
@@ -240,6 +240,8 @@ class ProductTests(unittest.TestCase):
         setuptools = package["tool"]["setuptools"]
         folders = {name: ROOT / path for name, path in setuptools["package-dir"].items()}
         self.assertEqual(folders.pop("crit.library.inference"), ROOT / "inference")
+        # crit's kernel templates, kernels/ as package data of crit.library.kernels (crit_kernels.build.library).
+        self.assertEqual(folders.pop("crit.library.kernels"), ROOT / "kernels")
         # crit mcp's guides, from the checkout's root as crit.library.guides' package data: exactly its GUIDES but the
         # library's own inference/README.md.
         self.assertEqual(folders.pop("crit.library.guides"), ROOT)
@@ -254,11 +256,14 @@ class ProductTests(unittest.TestCase):
         found = {".".join((name, *init.parent.relative_to(folder).parts))
                  for name, folder in folders.items() for init in folder.rglob("__init__.py")}
         self.assertEqual(sorted(setuptools["packages"]),
-                         sorted(found | {"crit.library.inference", "crit.library.guides"}))
+                         sorted(found | {"crit.library.inference", "crit.library.kernels", "crit.library.guides"}))
         self.assertEqual({p.name for p in (ROOT / "cli").iterdir() if p.is_dir()}, {"crit"})
         self.assertEqual({p.name for p in (ROOT / "api").iterdir() if p.is_dir()}, {"crit_api"})
         self.assertEqual({p.name for p in (ROOT / "mcp").iterdir() if p.is_dir()}, {"crit_mcp"})
-        self.assertEqual({p.name for p in (ROOT / "kernels").iterdir() if p.is_dir()}, {"crit_kernels", "examples"})
+        self.assertEqual({p.name for p in (ROOT / "kernels").iterdir() if p.is_dir()},
+                         {"crit_kernels", "core", "examples", "techniques", "starters"})
+        self.assertEqual({p.name for p in (ROOT / "kernels/techniques").iterdir() if p.is_dir()},
+                         {"attention", "experts", "norms", "projections", "recurrence"})
         self.assertEqual({p.name for p in (ROOT / "models").iterdir() if p.is_dir()}, {"crit_models"})
         self.assertEqual({p.name for p in (ROOT / "smoke").iterdir() if p.is_dir()}, {"crit_smoke"})
         self.assertEqual({p.name for p in (ROOT / "core/python").iterdir()

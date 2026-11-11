@@ -1,4 +1,4 @@
-"""quantized-projections on crit-labs/mma-rows' tile (gemv mma): every format's decode rows and short prompt rows
+"""quantized-projections on mma-rows' tile (gemv mma): every format's decode rows and short prompt rows
 through one fixed tile, a row's bits the same in any call of up to the facts' rows, padded prompt buckets captured in
 a graph equal to the unpadded chunk (prompts:projections), the prompt rows' arithmetic agreeing with the prompt path's;
 and the prompt GEMMs' decode workspace a fixed, declared size, a chunk of matrix rows at a time (the factory makes it,
@@ -57,7 +57,7 @@ class TileTests(PluginTestCase):
 
     def tile_here(self):
         if self.nvfp4.mma("cuda") is None:
-            self.skipTest("the tile comes with crit-labs/mma-rows, not here")
+            self.skipTest("the tile comes with mma-rows, not here")
 
     def test_every_format_keeps_a_row_s_bits_in_any_call_up_to_the_facts_rows_at_real_widths(self):
         torch = self.torch
@@ -229,7 +229,7 @@ class TileTests(PluginTestCase):
         compile, and a captured prompt chunk can hold it."""
         torch = self.torch
         if self.nvfp4.rows_kernel() is None:
-            self.skipTest("the Triton decoder comes with crit-labs/decode-gemv, not here")
+            self.skipTest("the Triton decoder comes with decode-gemv, not here")
         for prompt, dtype in (("bf16", torch.bfloat16), ("fp16_acc", torch.float16)):
             self.nvfp4._WARM.discard(("decode", dtype))
             plugin = self.assemble(options={"activations": "bf16", "prompt": prompt}, context=OnCuda())["projections"]
@@ -242,7 +242,7 @@ class TileTests(PluginTestCase):
         nothing (Triton's JIT cache hook, which runs on every compile)."""
         torch = self.torch
         if self.nvfp4.rows_kernel() is None:
-            self.skipTest("the Triton kernels come with crit-labs/decode-gemv and fixed-tile-gemm, not here")
+            self.skipTest("the Triton kernels come with decode-gemv and fixed-tile-gemm, not here")
         import triton
         compiled = []
 
@@ -270,8 +270,8 @@ class TileTests(PluginTestCase):
         finally:
             triton.knobs.runtime.jit_cache_hook = before
 
-    def test_a_call_looks_up_no_registry_kernel(self):
-        """The registry modules a matrix's calls use are held from load: a call asks crit_plugins.kernels for none."""
+    def test_a_call_looks_up_no_load_kernel(self):
+        """The kernel modules a matrix's calls use are held from load: a call asks crit_plugins.kernels for none."""
         torch = self.torch
         from unittest.mock import patch
         cases = [("nvfp4", {"activations": "bf16"}), ("nvfp4", {}), ("fp8:channel", {}), ("mxfp8", {}), ("bf16", {}),

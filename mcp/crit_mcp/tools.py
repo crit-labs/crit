@@ -26,18 +26,17 @@ DEFAULTED = {"project": "project", ("run", "root"): "root", ("serve", "workspace
 # nothing. Open-world tools reach the internet (crit-hub, Hugging Face); the rest stay on this machine and its
 # localhost. A tool this table does not name, such as a subcommand of a newer crit Eval, is taken as destructive and
 # open-world, the protocol's own defaults, until it is named here.
-READ_ONLY = {"crit_run_show", "crit_eval_context", "crit_eval_status", "crit_eval_journal", "crit_eval_compare",
-             "crit_kernels_target", "crit_kernels_inventory", "crit_kernels_search", "crit_kernels_inspect",
-             "crit_kernels_verify", "crit_models_plan", "crit_models_verify", "crit_inference_list",
+READ_ONLY = {"crit_run_show", "crit_run_next", "crit_eval_context", "crit_eval_status", "crit_eval_journal", "crit_eval_compare",
+             "crit_kernels_list", "crit_models_plan", "crit_models_verify", "crit_inference_list",
              "crit_inference_search", "crit_inference_show", "crit_inference_check"}
 DESTRUCTIVE = {"crit_run_stop", "crit_run_seal", "crit_run_select", "crit_run_recover"}
 ADDITIVE = {"crit_run_create", "crit_run_resolve", "crit_run_plan", "crit_run_check", "crit_run_benchmark",
             "crit_run_candidate", "crit_run_recon", "crit_run_capture", "crit_run_build", "crit_run_package",
             "crit_run_reserve", "crit_run_settle", "crit_run_measure", "crit_run_eval", "crit_run_serve",
-            "crit_run_ablate", "crit_run_resume", "crit_run_cost", "crit_run_replay", "crit_eval_run",
+            "crit_run_ablate", "crit_run_kernels", "crit_run_resume", "crit_run_cost", "crit_run_replay", "crit_eval_run",
             "crit_eval_precheck", "crit_eval_probe", "crit_eval_prepare", "crit_eval_reference", "crit_eval_fetch",
             "crit_eval_pack", "crit_eval_pin", "crit_eval_ab", "crit_eval_kernels", "crit_eval_workbench", "crit_pull",
-            "crit_serve", "crit_kernels_retain", "crit_kernels_new", "crit_models_ptq", "crit_models_drafter",
+            "crit_serve", "crit_kernels_new", "crit_kernels_build", "crit_kernels_sweep", "crit_models_ptq", "crit_models_drafter",
             "crit_models_eval"}
 OPEN_WORLD = {"crit_pull", "crit_eval_fetch", "crit_eval_run", "crit_run_eval"}
 

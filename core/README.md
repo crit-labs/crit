@@ -1,8 +1,9 @@
 # crit Core
 
-Core is the engine foundation. [Inference](../inference/README.md) supplies
-optional techniques and [Kernels](../kernels/README.md) guides kernel selection;
-neither is required to integrate an engine. [Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md)
+Core is the engine foundation. Every engine is Core plus [plugins](../docs/PLUGINS.md),
+one per slot. [Inference](../inference/README.md) supplies the library's plugins and
+[Kernels](../kernels/README.md) its kernels; an engine may take them or write its own
+plugins. [Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md)
 measures the completed engine through a separate adapter.
 
 Core owns lifecycle and resource infrastructure and ships libraries for request
@@ -24,10 +25,11 @@ chat-resident-v1 adapters in `crit_core.native`, the package capabilities in
 `crit_core.serving`, and the request contexts Eval sends (`ReplayContinuation`,
 `PlainDecoding`).
 
-An engine integrates through the public Model/Session/Backend boundary: declare
-capabilities and resource needs, advance requests, expose ready progress, commit
+An engine integrates as a plugin package that Core's loader assembles
+([the engine](../docs/PLUGINS.md#the-engine)): its model plugin is Core's step model,
+and its plugins declare capabilities and resource needs, advance requests, commit
 accepted output and drain owned work. Its execution strategy (dense or
-expert-routed, CPU or accelerator, caches, graph capture) stays internal.
+expert-routed, CPU or accelerator, caches, graph capture) lives inside its plugins.
 
 Serving concurrent requests is the normal path. A `ConcurrentModel` runs
 [mixed prefill/decode batches](src/runtime/README.md#mixed-token-work-batches) with
@@ -71,8 +73,8 @@ package in `python/` and the [contracts](contracts/README.md) in `contracts/`;
 
 ## Build and use
 
-For a small engine built directly from this checkout, start with the
-[Core + Inference walkthrough](../inference/examples/core-projection/README.md).
+For the smallest engine Core's loader runs, start with the
+[plugin engine walkthrough](../inference/examples/plugin-engine/README.md).
 
 Use CMake 3.28+ and a C++20 compiler (GCC, Clang or MSVC). Warnings are errors.
 CUDA is off by default; enable `CRIT_CORE_CUDA` with Toolkit 13.1+. On AMD GPUs, `CRIT_CORE_HIP` builds the same
@@ -80,6 +82,11 @@ backend on ROCm's HIP runtime as `crit::hip` ([HIP](src/backends/cuda/README.md#
 `CRIT_CORE_SANITIZERS` accepts GCC/Clang driver flags only (see
 [request release](src/runtime/README.md#request-release) for a known `thread`
 false positive).
+
+`crit core build` builds just the runtime engines load, `crit_core_steps`, into `build/core-steps` (from a crit
+installed without a checkout: into Core's cache, `CRIT_CORE_CACHE`, default `~/.cache/crit/core/VERSION`, from the
+release's tag), where `crit_core.native.step_library()` finds it when `CRIT_CORE_STEP_LIBRARY` names none. The full
+build with its tests:
 
 ```sh
 cmake -S core -B build/core -DBUILD_TESTING=ON
@@ -100,10 +107,10 @@ cmake --build build/consumer
 ctest --test-dir build/consumer --output-on-failure
 ```
 
-The SDK is version 0.17.2. Include `<crit/core.h>` and link the installed target:
+The SDK is version 0.18.0. Include `<crit/core.h>` and link the installed target:
 
 ```cmake
-find_package(critCore 0.17.2 EXACT CONFIG REQUIRED)
+find_package(critCore 0.18.0 EXACT CONFIG REQUIRED)
 target_link_libraries(your_engine PRIVATE crit::core)
 ```
 

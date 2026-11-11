@@ -1,17 +1,18 @@
 """The gated-delta recurrence in the recurrence slot, token by token: recurrent-state-recovery's reference
 (chunked_prefill.sequential over reference.py) as the host form; on the device, every sequence's state and convolution
 window in a pool (device_states.py), decode tokens and verify windows through the column scan with a device commit of
-their accepted prefix (recurrent-scans' pool rows where the kernel is installed, the torch formula otherwise), prompt
-chunks through the same scan up to exact_rows tokens, the configuration's (default 512), and through fla's chunked
-kernel (when fla is installed) past it, each of its Triton kernels on a stated tile (device_states.FLA_TILES) rather
-than the one fla's autotune times best."""
+their accepted prefix (crit's kernel recurrent-scans' pool rows where it builds, the torch formula otherwise), prompt
+chunks through the same scan up to exact_rows tokens, the configuration's (default 512), and through recurrent-scans'
+chunked prefill past it (on tensor cores or in FP32, the prefill option). Option fla (default off, a yardstick): fla's
+chunked kernel instead where fla is installed, each of its Triton kernels on a stated tile (device_states.FLA_TILES)
+rather than the one fla's autotune times best."""
 from pathlib import Path
 
 from .recurrence import chunked_prefill as recurrence
 from .recurrence import device_states
 
 HERE = Path(__file__).resolve().parent
-KERNEL = "crit-labs/recurrent-scans"
+KERNEL = "recurrent-scans"
 MAX_KEYS = 256   # the pool rows' widest key dimension
 
 
@@ -31,23 +32,23 @@ def check_state(state, geometry):
 
 
 class SequentialRecurrence:
-    prompt = "fla"   # prompt rows: fla's chunked kernel, else recurrent-scans' two-pass prefill, else the scan
+    prompt = "two_pass"   # prompt rows: recurrent-scans' chunked prefill (fla's with option fla), else the scan
 
     def __init__(self, exact_rows=device_states.DEFAULT_EXACT_ROWS, chunk_fp32=True, commit="deferred", kernels=True,
-                 folder=HERE):
+                 folder=HERE, prefill="tensor_cores", scan="pool-delta-pipe"):
         self.exact_rows, self.chunk_fp32, self.commit = exact_rows, chunk_fp32, commit
-        self.use_kernels, self.folder = kernels, folder
+        self.use_kernels, self.folder, self.arithmetic, self.scan = kernels, folder, prefill, scan
         self.prompts = []   # each pool's prompt rows: where the scan hands them to the chunked kernel
 
     def kernels(self, device, keys, conv=None):
-        """recurrent-scans from the kernel registry for a CUDA pool of `keys` key dimensions and convolution `conv`,
-        or None (the torch formula, recorded in the engine's facts when the kernel is there but does not cover the
-        shape)."""
+        """crit's kernel recurrent-scans (built for this GPU, tuned or default knobs) for a CUDA pool of `keys` key
+        dimensions and convolution `conv`, or None (the torch formula, recorded in the engine's facts when the
+        kernel builds but does not cover the shape)."""
         import torch
         if not self.use_kernels or torch.device(device).type != "cuda":
             return None
-        from crit_plugins.kernels import record_fallback, registry_kernel
-        module = registry_kernel(KERNEL, folder=self.folder)
+        from crit_plugins.kernels import record_fallback, load_kernel
+        module = load_kernel(KERNEL, folder=self.folder)
         if module is not None and keys > MAX_KEYS:
             record_fallback(KERNEL, folder=self.folder,
                             reason=f"key dimensions {keys} past the pool rows' {MAX_KEYS}: the torch formula runs them")
@@ -72,14 +73,19 @@ class SequentialRecurrence:
         """Sets the pool's crossovers from the exact_rows option, the same value in an eager call and inside a captured
         graph: prompt rows of up to that many tokens run the scan, longer ones the chunked kernel (0: every prompt
         row). The two give other bits, so the configuration chooses, never a timing; device_states.scan_rows measures a
-        value to recommend."""
+        value to recommend. Without fla, recurrent-scans' chunked prefill in the prefill option's arithmetic."""
+        pool.prefill = self.arithmetic
+        pool.pipelined = self.scan == "pool-delta-pipe"
         chunked = device_states.chunked_kind(pool, device_states.STANDARD, self.prompt)
         pool.scan_rows = pool.scan_rows_captured = int(self.exact_rows)
         self.prompts.append({"heads": pool.heads, "key_heads": pool.key_heads, "keys": pool.keys, "values": pool.values,
                              "layers": len(pool.layers), "chunked": chunked,
+                             "chunked_arithmetic": device_states.CHUNKED_ARITHMETIC.get(chunked),
+                             "chunked_row_invariant": None if chunked is None else False,
                              "scan_rows": None if chunked is None else pool.scan_rows,
                              "scan_rows_captured": None if chunked is None else pool.scan_rows_captured,
-                             "source": "exact_rows", "default": device_states.DEFAULT_EXACT_ROWS})
+                             "source": "exact_rows", "default": device_states.DEFAULT_EXACT_ROWS,
+                             "scan": self.scan if pool.kernels is not None else None})
 
     def facts(self):
         """Where prompt rows run (the scan up to scan_rows tokens eagerly, scan_rows_captured in a captured graph, then
@@ -104,4 +110,8 @@ class SequentialRecurrence:
 
 
 def create(context, options, parts):
-    return SequentialRecurrence(options["exact_rows"], options["chunk_fp32"], options["commit"], options["kernels"])
+    found = SequentialRecurrence(options["exact_rows"], options["chunk_fp32"], options["commit"], options["kernels"],
+                                 prefill=options["prefill"], scan=options["scan"])
+    if options.get("fla"):
+        found.prompt = "fla"   # the yardstick: fla's chunked kernel where it is installed
+    return found

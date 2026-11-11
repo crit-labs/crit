@@ -143,18 +143,23 @@ class Reopening:
 
 
 def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None, ready=None, stop=None, check=False,
-          data=None, smoke=True):
+          data=None, smoke=True, plugin_tests=True):
     """crit run serve: the packaged candidate, not yet sealed, served through crit serve under a check attempt until
     Ctrl+C, `stop` (a threading.Event) or the reservation's deadline, for the checks a candidate passes before it is
     sealed (streaming, stop strings, tool calls, cancellation, Ctrl+C). `ready(port)` runs once the API listens.
-    With `check`, crit runs the standard serving checks itself (crit.run.checks.serve_checks), stops the engine,
-    keeps their report as candidates/ID/logs/serve-check-ATTEMPT.json and records a functional check per case. With
+    With `check`, crit first runs the package's plugin tests (crit plugins test, cached by files and environment;
+    `plugin_tests` False leaves them out), then the standard serving checks (crit.run.checks.serve_checks), stops the
+    engine, keeps their report as candidates/ID/logs/serve-check-ATTEMPT.json and records a functional check per case:
+    the one check a candidate passes before its rung's Eval or its seal. With
     `smoke` (the default) the report adds crit smoke (_smoke): the engine's quality components at the run's context
     and at a quarter of it, in a minute or two each. With `data` too (crit-eval's prepared data for the run's model), the report adds crit-eval's gate pre-check
     (crit_eval.run.precheck): honesty of short replies and of one long reply, the request history around them, the
     device memory after the load and the speed cases at the lower context, the gates whole Eval rounds most often
     fail on, in minutes.
+    An external candidate (crit.run.external) is started from its launch command instead, in its own process tree,
+    and has no plugin tests; every other check is the same.
     Settles the attempt and returns its result; crit serve serves the candidate once it is sealed."""
+    from .external import candidate_spec, serving
     root = store.directory(run_id)
     folder = unsealed(root, candidate_id, "The candidate is sealed: serve it with crit serve")
     if data is not None and not check:
@@ -166,8 +171,10 @@ def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None
     attempt = Attempt(store, run_id, candidate_id, "check", seconds, "serve", "crit run serve", "crit run serve",
                       deadline=False)
     report = None
+    external = candidate_spec(folder) is not None
     with attempt.running() as log:
-        served = Served(store, run_id, candidate_id, attempt.id, kv_tokens, log, "crit run serve", address=(host, port))
+        tested = _plugin_tests(folder, log) if check and plugin_tests and not external else []
+        served = serving(store, run_id, candidate_id, attempt, kv_tokens, log, "crit run serve", address=(host, port))
         with served.until(attempt.deadline_at):
             engine, _, bound = served.open()
             log(f"Serving {run_id}/{candidate_id} (not sealed, {attempt.id}) at http://{host}:{bound}/v1; Ctrl+C stops")
@@ -177,7 +184,7 @@ def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None
                 from .checks import serve_checks
                 variables = (read_json(folder / "candidate.json")["configuration"].get("recon") or {}).get(
                     "template_variables") or {}
-                report = serve_checks(bound, engine.spec()["capabilities"], variables, served.timeout, log)
+                report = tested + serve_checks(bound, engine.spec()["capabilities"], variables, served.timeout, log)
                 if smoke:
                     report += _smoke(served, bound, log)
                 if data is not None:
@@ -192,7 +199,8 @@ def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None
     if report is not None:
         completed = attempt.outcome == "completed"
         report.append({"name": "stop_engine", "state": "passed" if completed else "failed",
-                       "detail": "the engine stopped and its resident host exited, as on Ctrl+C" if completed
+                       "detail": ("the engine's whole process tree stopped, as on Ctrl+C" if external else
+                                  "the engine stopped and its resident host exited, as on Ctrl+C") if completed
                        else f"stopping the engine: {attempt.failure}"})
     result = attempt.settle()
     if report is not None:
@@ -200,6 +208,22 @@ def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None
                                                                      manifest, report, result["logs"])}
     attempt.finish()
     return result
+
+
+def _plugin_tests(folder, log):
+    """The packaged plugins' own tests against their references (crit plugins test, one plugin per process, cached by
+    files and environment), as serving-check items plugin_test_ID."""
+    from crit_plugins.testing import run_tests
+    plugins = folder / "package" / "plugins"
+    if not plugins.is_dir():
+        return [{"name": "plugin_tests", "state": "failed", "detail": "the package holds no plugins/ folder"}]
+    log("crit run serve --check: running the package's plugin tests (crit plugins test)")
+    try:
+        items = run_tests(plugins, log=lambda line: log("crit plugins test: " + str(line).strip()), cache=True)
+    except Exception as error:   # a registry that does not load is the check's failure, not the attempt's
+        return [{"name": "plugin_tests", "state": "failed", "detail": f"{type(error).__name__}: {error}"[:2000]}]
+    return [{"name": f"plugin_test_{item['name']}", "state": item["state"], "detail": item.get("detail", "")}
+            for item in items]
 
 
 # crit smoke's second pass opens the engine at crit-eval's lower context, a quarter of the run's (lower_fraction,

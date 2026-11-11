@@ -1,6 +1,8 @@
 """A plugin's own tests: helpers for writing them, and the runner crit plugins test uses (each plugin's tests in a
 process of their own, so plugins never share imports, device state or a failure)."""
 from contextlib import contextmanager
+import copy
+import functools
 import inspect
 import math
 import os
@@ -82,11 +84,18 @@ def compiles():
             found.append(f"a new torch extension build directory {name}")
 
 
+@functools.lru_cache(maxsize=None)
 def _plugin_folder(path):
     for folder in Path(path).resolve().parents:
         if (folder / MANIFEST).is_file():
             return folder
     raise ValueError(f"{path} lies in no plugin folder")
+
+
+# A test process reads its plugins folder's manifests once: discovery stats and reads every plugin's files, which took
+# almost all of a device test's time where the checkout sits on a slow file system (a Windows drive seen from WSL).
+# Each test gets its own copy, so a test that changes a manifest it was given changes nothing for the next.
+_DISCOVERED = {}
 
 
 class PluginTestCase(unittest.TestCase):
@@ -100,7 +109,11 @@ class PluginTestCase(unittest.TestCase):
     def registry(self):
         """The plugins beside it: those of the folder of plugins it lies in (an engine's plugins folder, or crit's
         Inference folder for a technique of crit's library), base plugins included."""
-        return Registry.discover(plugins_root(self.plugin_folder()))
+        root = plugins_root(self.plugin_folder())
+        found = _DISCOVERED.get(str(root))
+        if found is None:
+            found = _DISCOVERED[str(root)] = Registry.discover(root)
+        return Registry(copy.deepcopy(list(found.manifests.values())))
 
     def plugin_id(self):
         return self.plugin_folder().name
@@ -294,9 +307,73 @@ class PluginTestCase(unittest.TestCase):
 RAN = re.compile(r"^Ran (\d+) tests? in", re.M)
 
 
-def run_tests(registry, only=None, timeout=600, log=print):
+def _tree_hash(digest, folder):
+    for path in sorted(Path(folder).rglob("*")):
+        if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc":
+            digest.update(path.relative_to(folder).as_posix().encode())
+            digest.update(path.read_bytes())
+
+
+def _environment():
+    """What a plugin's test result depends on beside its files: Python, torch and its CUDA, the device, the kernel
+    tuning named (CRIT_KERNEL_TUNING) and the transformers and provider packages' versions."""
+    import importlib.metadata as metadata
+    found = {"python": sys.version.split()[0], "kernel_tuning": os.environ.get("CRIT_KERNEL_TUNING", "")}
+    for name in ("torch", "transformers", "flash-linear-attention", "flashinfer-python", "triton"):
+        try:
+            found[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            found[name] = None
+    torch = sys.modules.get("torch")
+    if found["torch"] is not None:
+        try:
+            import torch
+            found["device"] = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+        except Exception:   # noqa: BLE001 - an environment without a usable device is keyed as such
+            found["device"] = "unknown"
+    return found
+
+
+def test_key(registry, manifest):
+    """The key of a plugin's test result: its folder's files, those of the plugins its tests name (reference, test_with),
+    the source of crit's kernels it declares, crit's own plugin and Core packages (crit_plugins, crit_core) and the
+    environment (_environment). A passing result under the same key is that test's result again."""
+    import hashlib
+    import json
+    digest = hashlib.sha256()
+    _tree_hash(digest, manifest["folder"])
+    for other in sorted(set(manifest.get("reference") or ()) | set(manifest.get("test_with") or ())):
+        if other in registry:
+            _tree_hash(digest, registry[other]["folder"])
+    if manifest.get("kernels"):
+        try:
+            from crit_kernels.build import manifests
+            library = manifests()
+        except Exception:   # noqa: BLE001 - without crit's kernel library the plugin tests its fallbacks
+            library = {}
+        for kernel in sorted(k["name"] for k in manifest["kernels"]):
+            digest.update(kernel.encode())
+            if kernel in library:
+                _tree_hash(digest, library[kernel][0])
+    package_root = Path(__file__).resolve().parents[1]
+    for package in ("crit_plugins", "crit_core"):
+        if (package_root / package).is_dir():
+            _tree_hash(digest, package_root / package)
+    digest.update(json.dumps(_environment(), sort_keys=True).encode())
+    return digest.hexdigest()
+
+
+def cache_folder():
+    """Where passing plugin test results are kept: CRIT_PLUGIN_TEST_CACHE, else ~/.cache/crit/plugin-tests."""
+    return Path(os.environ.get("CRIT_PLUGIN_TEST_CACHE") or Path.home() / ".cache" / "crit" / "plugin-tests")
+
+
+def run_tests(registry, only=None, timeout=600, log=print, cache=False):
     """Each plugin's tests (unittest files test*.py in its tests folder), one plugin per process. Returns one item per
-    plugin: {name, state, detail, seconds}; a plugin without tests fails, since every plugin is checked on its own."""
+    plugin: {name, state, detail, seconds}; a plugin without tests fails, since every plugin is checked on its own.
+    cache: skip a plugin whose tests passed before under the same key (test_key: its files, the plugins its tests
+    use, crit's packages and the environment), reported as passed with `cached` true, and keep each new pass
+    (cache_folder()); a library plugin copied unchanged into engine after engine is tested once per machine."""
     if not isinstance(registry, Registry):
         registry = Registry.discover(registry)
     package_root = str(Path(__file__).resolve().parents[1])
@@ -304,6 +381,19 @@ def run_tests(registry, only=None, timeout=600, log=print):
     for manifest in registry:
         if only and manifest["id"] not in only:
             continue
+        key = test_key(registry, manifest) if cache else None
+        stored = cache_folder() / f"{key}.json" if key else None
+        if stored is not None and stored.is_file():
+            import json
+            try:
+                found = json.loads(stored.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                found = None
+            if found and found.get("state") == "passed":
+                items.append({"name": manifest["id"], "state": "passed", "detail": found.get("detail", ""),
+                              "seconds": 0.0, "cached": True})
+                log(f" passed  {manifest['id']:<32}   cached  {found.get('detail', '')} (unchanged since they passed)")
+                continue
         started = time.perf_counter()
         tests = Path(manifest["tests"]).resolve()   # the tests run in the plugin's folder, so never relative
         files = sorted(tests.glob("test*.py")) if tests.is_dir() else []
@@ -330,6 +420,14 @@ def run_tests(registry, only=None, timeout=600, log=print):
         seconds = time.perf_counter() - started
         items.append({"name": manifest["id"], "state": "passed" if passed else "failed", "detail": detail,
                       "seconds": round(seconds, 2)})
+        if passed and stored is not None:
+            import json
+            try:
+                stored.parent.mkdir(parents=True, exist_ok=True)
+                stored.write_text(json.dumps({"state": "passed", "detail": detail, "plugin": manifest["id"]}),
+                                  encoding="utf-8")
+            except OSError:
+                pass   # a cache that cannot be written leaves the next run to test again
         log(f" {'passed' if passed else 'failed'}  {manifest['id']:<32} {seconds:6.2f}s  "
             f"{detail if passed else detail.splitlines()[-1]}")
     return items

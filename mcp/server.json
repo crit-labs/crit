@@ -9,12 +9,12 @@
     "subfolder": "mcp"
   },
   "websiteUrl": "https://crit-hub.dev",
-  "version": "0.17.2",
+  "version": "0.18.0",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "crit",
-      "version": "0.17.2",
+      "version": "0.18.0",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

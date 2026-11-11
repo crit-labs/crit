@@ -37,132 +37,173 @@ class ExtensionTests(unittest.TestCase):
                 assemble({"use": {"drafter": "drafts"}}, registry)
 
 
-class KernelRegistryTests(unittest.TestCase):
-    """crit_plugins.kernels: the registry kernels a plugin's manifest declares, loaded at their pins, local builds, and
-    recorded fallbacks."""
+class KernelLoaderTests(unittest.TestCase):
+    """crit_plugins.kernels: crit's kernels a plugin's manifest declares, built from crit's library with the engine's
+    tuning or the default knobs, and recorded fallbacks."""
 
     def setUp(self):
         from unittest.mock import patch
         from crit_plugins import kernels
         self.kernels = kernels
         kernels.forget()
+        kernels.use_tuning(None)
         self.addCleanup(kernels.forget)
-        self.saved = sys.modules.get("kernels")
+        self.addCleanup(kernels.use_tuning, None)
+        self.saved = {name: sys.modules.get(name) for name in ("crit_kernels", "crit_kernels.build")}
         self.addCleanup(self._restore)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name) / "plugins"
-        # the tests name their own local builds: a LOCAL_KERNELS of the run (local kernel builds) must not reach them
+        self.temp = Path(temp.name)
+        self.root = self.temp / "plugins"
+        # the tests name their own tuning: a CRIT_KERNEL_TUNING of the run must not reach them
         environ = patch.dict("os.environ")
         environ.start()
         self.addCleanup(environ.stop)
-        os.environ.pop("LOCAL_KERNELS", None)
+        os.environ.pop("CRIT_KERNEL_TUNING", None)
 
     def _restore(self):
-        if self.saved is None:
-            sys.modules.pop("kernels", None)
-        else:
-            sys.modules["kernels"] = self.saved
+        for name, module in self.saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
     def fake(self, available):
+        """crit_kernels.build with load() returning available[id] (a failed build raises), and its calls."""
+        import json
         import types
-        module = types.ModuleType("kernels")
+        package, module = types.ModuleType("crit_kernels"), types.ModuleType("crit_kernels.build")
         calls = []
 
-        def get_kernel(repo, **options):
-            calls.append((repo, options))
-            if repo not in available:
-                raise FileNotFoundError(f"Cannot find a build variant for {repo}\nmore lines")
-            return available[repo]
-        module.get_kernel = get_kernel
-        sys.modules["kernels"] = module
+        def load(kernel_id, tuning=None, **options):
+            calls.append((kernel_id, tuning))
+            if kernel_id not in available:
+                raise RuntimeError(f"Error building extension '{kernel_id}'\nnvcc: not found")
+            return available[kernel_id]
+        module.load = load
+        module.read_tuning = lambda path: json.loads(Path(path).read_text())
+        package.build = module
+        sys.modules["crit_kernels"], sys.modules["crit_kernels.build"] = package, module
         return calls
 
     def plugin(self, plugin_id, *kernels):
-        """A host plugin whose manifest declares `kernels` ({name, version, revision, fallback[, backend]})."""
+        """A host plugin whose manifest declares `kernels` ({name, fallback[, backend]})."""
         import json
         write_plugins(self.root, {plugin_id: {"fills": ["drafter"], "devices": ["host"]}})
         path = self.root / plugin_id / "plugin.json"
         manifest = json.loads(path.read_text())
-        manifest["kernels"] = [dict({"version": 1, "revision": None, "fallback": "torch"}, **k) for k in kernels]
+        manifest["kernels"] = [dict({"fallback": "torch"}, **k) for k in kernels]
         path.write_text(json.dumps(manifest))
         return self.root / plugin_id
 
-    def test_a_published_kernel_comes_from_the_registry_at_its_pinned_revision(self):
+    def test_a_kernel_is_built_once_with_its_default_knobs_and_shared_by_plugins(self):
         sentinel = object()
-        calls = self.fake({"crit-labs/grouped-experts": sentinel})
-        moe = self.plugin("moe", {"name": "crit-labs/grouped-experts", "revision": "abc1234"})
-        other = self.plugin("other", {"name": "crit-labs/grouped-experts", "revision": "abc1234"})
-        self.assertIs(self.kernels.registry_kernel("crit-labs/grouped-experts", folder=moe), sentinel)
-        self.assertEqual(calls, [("crit-labs/grouped-experts", {"trust_remote_code": ["crit-labs/grouped-experts"],
-                                                               "revision": "abc1234"})])
-        self.assertIs(self.kernels.registry_kernel("crit-labs/grouped-experts", folder=other), sentinel)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(self.kernels.loaded()["crit-labs/grouped-experts"],
-                         {"source": "hub", "version": 1, "revision": "abc1234", "plugins": ["moe", "other"]})
+        calls = self.fake({"grouped-experts": sentinel})
+        moe = self.plugin("moe", {"name": "grouped-experts"})
+        other = self.plugin("other", {"name": "grouped-experts"})
+        self.assertIs(self.kernels.load_kernel("grouped-experts", folder=moe), sentinel)
+        self.assertIs(self.kernels.load_kernel("grouped-experts", folder=other), sentinel)
+        self.assertEqual(calls, [("grouped-experts", None)])
+        self.assertEqual(self.kernels.loaded()["grouped-experts"], {"source": "built", "plugins": ["moe", "other"]})
 
-    def test_an_unpublished_kernel_is_asked_for_by_its_version(self):
-        calls = self.fake({"crit-labs/grouped-experts": object()})
-        self.kernels.registry_kernel("crit-labs/grouped-experts",
-                                     folder=self.plugin("moe", {"name": "crit-labs/grouped-experts"}))
-        self.assertEqual(calls[0][1], {"trust_remote_code": ["crit-labs/grouped-experts"], "version": 1})
+    def test_the_engines_tuning_builds_a_tuned_kernel(self):
+        import json
+        calls = self.fake({"recurrent-scans": object()})
+        tuning = self.temp / "tuning"
+        tuning.mkdir()
+        (tuning / "recurrent-scans.json").write_text(json.dumps({"schema": "crit-kernel-tuning-v1"}))
+        recur = self.plugin("recur", {"name": "recurrent-scans"})
+        self.kernels.use_tuning(tuning)
+        self.kernels.load_kernel("recurrent-scans", folder=recur)
+        self.assertEqual(calls, [("recurrent-scans", {"schema": "crit-kernel-tuning-v1"})])
+        record = self.kernels.loaded()["recurrent-scans"]
+        self.assertEqual((record["source"], record["tuning"]), ("tuned", str(tuning / "recurrent-scans.json")))
 
-    def test_a_local_build_named_in_local_kernels_is_recorded_as_local(self):
-        from unittest.mock import patch
-        self.fake({"crit-labs/recurrent-scans": object()})
-        recur = self.plugin("recur", {"name": "crit-labs/recurrent-scans"})
-        with patch.dict("os.environ", {"LOCAL_KERNELS": "crit-labs/recurrent-scans=/tmp/recurrent-scans"}):
-            self.kernels.registry_kernel("crit-labs/recurrent-scans", folder=recur)
-        self.assertEqual(self.kernels.loaded()["crit-labs/recurrent-scans"]["source"], "local")
-
-    def test_an_unavailable_kernel_falls_back_with_its_reason(self):
+    def test_a_plugin_may_ask_for_a_kernel_with_its_default_knobs_beside_the_tuned_one(self):
+        import json
+        tuned, untuned = object(), object()
+        calls = []
         self.fake({})
-        proj = self.plugin("proj", {"name": "crit-labs/fp8-block-rows"})
-        self.assertIsNone(self.kernels.registry_kernel("crit-labs/fp8-block-rows", folder=proj))
-        record = self.kernels.loaded()["crit-labs/fp8-block-rows"]
+        build = sys.modules["crit_kernels.build"]
+
+        def load(kernel_id, tuning=None, **options):
+            calls.append((kernel_id, tuning))
+            return tuned if tuning else untuned
+        build.load = load
+        tuning = self.temp / "tuning"
+        tuning.mkdir()
+        (tuning / "fp8-block-rows.json").write_text(json.dumps({"schema": "crit-kernel-tuning-v1"}))
+        proj = self.plugin("proj", {"name": "fp8-block-rows"})
+        self.kernels.use_tuning(tuning)
+        self.assertIs(self.kernels.load_kernel("fp8-block-rows", folder=proj), tuned)
+        self.assertIs(self.kernels.load_kernel("fp8-block-rows", folder=proj, tuned=False), untuned)
+        self.assertIs(self.kernels.load_kernel("fp8-block-rows", folder=proj, tuned=False), untuned)   # built once
+        self.assertEqual(calls, [("fp8-block-rows", {"schema": "crit-kernel-tuning-v1"}), ("fp8-block-rows", None)])
+        found = self.kernels.loaded()
+        self.assertEqual(found["fp8-block-rows"]["source"], "tuned")
+        self.assertEqual(found["fp8-block-rows" + self.kernels.UNTUNED], {"source": "built", "plugins": ["proj"]})
+
+    def test_a_kernel_that_cannot_be_built_falls_back_with_its_reason(self):
+        self.fake({})
+        proj = self.plugin("proj", {"name": "fp8-block-rows"})
+        self.assertIsNone(self.kernels.load_kernel("fp8-block-rows", folder=proj))
+        record = self.kernels.loaded()["fp8-block-rows"]
         self.assertEqual(record["source"], "fallback")
-        self.assertEqual(record["reason"], "FileNotFoundError: Cannot find a build variant for crit-labs/fp8-block-rows")
-        self.assertEqual(self.kernels.fallbacks(), {"crit-labs/fp8-block-rows": record["reason"]})
+        self.assertEqual(record["reason"], "RuntimeError: nvcc: not found")
+        self.assertEqual(self.kernels.fallbacks(), {"fp8-block-rows": record["reason"]})
 
-    def test_without_the_kernels_package_every_kernel_falls_back(self):
-        sys.modules["kernels"] = None   # import kernels raises ImportError
-        moe = self.plugin("moe", {"name": "crit-labs/grouped-experts"})
-        self.assertIsNone(self.kernels.registry_kernel("crit-labs/grouped-experts", folder=moe))
-        self.assertEqual(self.kernels.loaded()["crit-labs/grouped-experts"]["reason"],
-                         "the kernels package is not installed")
+    def test_without_crits_kernels_package_every_kernel_falls_back(self):
+        sys.modules["crit_kernels"] = sys.modules["crit_kernels.build"] = None   # imports raise ImportError
+        moe = self.plugin("moe", {"name": "grouped-experts"})
+        self.assertIsNone(self.kernels.load_kernel("grouped-experts", folder=moe))
+        self.assertEqual(self.kernels.loaded()["grouped-experts"]["reason"],
+                         "crit's kernels package (crit_kernels) is not installed")
 
-    def test_an_undeclared_kernel_and_bad_pins_are_refused(self):
-        moe = self.plugin("moe", {"name": "crit-labs/grouped-experts"})
-        with self.assertRaisesRegex(PluginError, "moe loads the registry kernel crit-labs/other, which its "
-                                                 "plugin.json does not declare"):
-            self.kernels.registry_kernel("crit-labs/other", folder=moe)
-        for bad, message in (({"name": "Grouped"}, "is ORG/NAME"), ({"name": "a/b", "version": 0}, "major version"),
-                             ({"name": "a/b", "revision": "main"}, "pinned to"),
-                             ({"name": "a/b", "version": None}, "names its version"),
-                             ({"name": "a/b", "fallback": ""}, "without it"),
-                             ({"name": "a/b", "backend": "tpu"}, "backend is cuda, rocm, metal, xpu or cpu")):
+    def test_an_undeclared_kernel_and_bad_entries_are_refused(self):
+        moe = self.plugin("moe", {"name": "grouped-experts"})
+        with self.assertRaisesRegex(PluginError, "moe loads the kernel other, which its plugin.json does not declare"):
+            self.kernels.load_kernel("other", folder=moe)
+        for bad, message in (({"name": "crit-labs/grouped"}, "is the id of one of crit's kernels"),
+                             ({"name": "a", "version": 1}, r"is \{name, fallback\}"),
+                             ({"name": "a", "fallback": ""}, "without it"),
+                             ({"name": "a", "backend": "tpu"}, "backend is cuda, rocm, metal, xpu or cpu")):
             self.plugin("moe", bad)
             with self.assertRaisesRegex(PluginError, message):
                 Registry.discover(self.root)
 
-    def test_a_cpu_kernel_beside_a_device_torch_loads_its_cpu_build(self):
-        calls = self.fake({"crit-labs/host-rows": object()})
-        tier = self.plugin("tier", {"name": "crit-labs/host-rows", "backend": "cpu", "fallback": "torch on the CPU"})
-        self.assertIsNotNone(self.kernels.registry_kernel("crit-labs/host-rows", folder=tier))
-        self.assertEqual(calls[0][1], {"trust_remote_code": ["crit-labs/host-rows"], "backend": "cpu", "version": 1})
-
     def test_the_engine_facts_carry_the_kernels_of_its_plugins(self):
         from crit_core.serving import engine_facts
         self.fake({})
-        self.kernels.registry_kernel("crit-labs/grouped-experts",
-                                     folder=self.plugin("moe", {"name": "crit-labs/grouped-experts"}))
-        self.kernels.registry_kernel("crit-labs/recurrent-scans",
-                                     folder=self.plugin("elsewhere", {"name": "crit-labs/recurrent-scans"}))
+        self.kernels.load_kernel("grouped-experts", folder=self.plugin("moe", {"name": "grouped-experts"}))
+        self.kernels.load_kernel("recurrent-scans", folder=self.plugin("elsewhere", {"name": "recurrent-scans"}))
         assembly = assemble({"use": {"drafter": "moe"}}, Registry.discover(self.root))
         facts = assembly.facts()
-        self.assertEqual(list(facts["kernels"]), ["crit-labs/grouped-experts"])
+        self.assertEqual(list(facts["kernels"]), ["grouped-experts"])
         engine = type("Engine", (), {"facts": facts})()
-        self.assertEqual(engine_facts(engine)["kernels"]["crit-labs/grouped-experts"]["source"], "fallback")
+        self.assertEqual(engine_facts(engine)["kernels"]["grouped-experts"]["source"], "fallback")
+
+
+class ReleaseCachedTests(unittest.TestCase):
+    def test_cached_blocks_go_back_only_below_the_free_threshold(self):
+        import types
+        from unittest import mock
+        from crit_plugins.device import release_cached_under
+        state = {"free": 4 << 30, "reserved": 3 << 30, "emptied": 0}
+
+        def empty():   # torch's cache of 3 GiB, 1 GiB of it in use
+            state["emptied"] += 1
+            state["free"] += state["reserved"] - (1 << 30)
+            state["reserved"] = 1 << 30
+        cuda = types.SimpleNamespace(is_available=lambda: True, is_initialized=lambda: True, device_count=lambda: 1,
+                                     mem_get_info=lambda device: (state["free"], 32 << 30), empty_cache=empty,
+                                     memory_allocated=lambda i: 1 << 30, memory_reserved=lambda i: state["reserved"])
+        fake = types.SimpleNamespace(cuda=cuda, device=lambda name: types.SimpleNamespace(type=str(name).split(":")[0]))
+        with mock.patch.dict(sys.modules, {"torch": fake}):
+            self.assertEqual(release_cached_under(1 << 30), 0)         # 4 GiB free: the cache stays
+            self.assertEqual(state["emptied"], 0)
+            self.assertEqual(release_cached_under(8 << 30), 2 << 30)   # under 8 GiB: the 2 GiB nothing uses
+            self.assertEqual((state["emptied"], state["free"]), (1, 6 << 30))
+            self.assertIsNone(release_cached_under(8 << 30, "cpu"))
 
 
 class RoundBatchTests(unittest.TestCase):

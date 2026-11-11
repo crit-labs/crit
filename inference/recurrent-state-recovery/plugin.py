@@ -2,15 +2,16 @@
 recurrent-state-recovery's two-pass chunked gated-delta prefill (chunked_prefill.two_pass); on the device every
 sequence's state and convolution window in a pool (device_states.py) whose verify rows keep their accepted prefix by the
 technique's strategy (deferred replay, per-column checkpoints or recompute, chosen by `commit`), prompt chunks through
-the column scan up to exact_rows tokens, the configuration's (default 512), and through recurrent-scans' two-pass
-chunked prefill past it, the scan alone where the kernel is not installed."""
+the column scan up to exact_rows tokens, the configuration's (default 512), and through recurrent-scans' chunked
+prefill past it (crit's kernel, built for the engine's device: on tensor cores or in FP32, the prefill option), the
+scan alone where the kernel does not build."""
 from pathlib import Path
 
 from .recurrence import chunked_prefill as recurrence
 from .recurrence import device_states
 
 HERE = Path(__file__).resolve().parent
-KERNEL = "crit-labs/recurrent-scans"
+KERNEL = "recurrent-scans"
 MAX_KEYS = 256   # the pool rows' widest key dimension
 
 
@@ -30,23 +31,23 @@ def check_state(state, geometry):
 
 
 class ChunkedRecurrence:
-    prompt = "two_pass"   # prompt rows: recurrent-scans' two-pass chunked prefill, else the scan
+    prompt = "two_pass"   # prompt rows: recurrent-scans' chunked prefill (the prefill option's), else the scan
 
     def __init__(self, chunk_size, exact_rows=device_states.DEFAULT_EXACT_ROWS, commit="deferred", kernels=True,
-                 folder=HERE):
+                 folder=HERE, prefill="tensor_cores", scan="pool-delta-pipe"):
         self.chunk_size, self.exact_rows, self.commit = chunk_size, exact_rows, commit
-        self.use_kernels, self.folder = kernels, folder
+        self.use_kernels, self.folder, self.arithmetic, self.scan = kernels, folder, prefill, scan
         self.prompts = []   # each pool's prompt rows: where the scan hands them to the chunked kernel
 
     def kernels(self, device, keys, conv=None):
-        """recurrent-scans from the kernel registry for a CUDA pool of `keys` key dimensions and convolution `conv`,
-        or None (the torch formula, recorded in the engine's facts when the kernel is there but does not cover the
-        shape)."""
+        """crit's kernel recurrent-scans (built for this GPU, tuned or default knobs) for a CUDA pool of `keys` key
+        dimensions and convolution `conv`, or None (the torch formula, recorded in the engine's facts when the
+        kernel builds but does not cover the shape)."""
         import torch
         if not self.use_kernels or torch.device(device).type != "cuda":
             return None
-        from crit_plugins.kernels import record_fallback, registry_kernel
-        module = registry_kernel(KERNEL, folder=self.folder)
+        from crit_plugins.kernels import record_fallback, load_kernel
+        module = load_kernel(KERNEL, folder=self.folder)
         if module is not None and keys > MAX_KEYS:
             record_fallback(KERNEL, folder=self.folder,
                             reason=f"key dimensions {keys} past the pool rows' {MAX_KEYS}: the torch formula runs them")
@@ -71,14 +72,19 @@ class ChunkedRecurrence:
         """Sets the pool's crossovers from the exact_rows option, the same value in an eager call and inside a captured
         graph: prompt rows of up to that many tokens run the scan, longer ones the chunked kernel (0: every prompt
         row). The two give other bits, so the configuration chooses, never a timing; device_states.scan_rows measures a
-        value to recommend."""
+        value to recommend. The chunked kernel's arithmetic is the prefill option's (pool.prefill)."""
+        pool.prefill = self.arithmetic
+        pool.pipelined = self.scan == "pool-delta-pipe"
         chunked = device_states.chunked_kind(pool, device_states.STANDARD, self.prompt)
         pool.scan_rows = pool.scan_rows_captured = int(self.exact_rows)
         self.prompts.append({"heads": pool.heads, "key_heads": pool.key_heads, "keys": pool.keys, "values": pool.values,
                              "layers": len(pool.layers), "chunked": chunked,
+                             "chunked_arithmetic": device_states.CHUNKED_ARITHMETIC.get(chunked),
+                             "chunked_row_invariant": None if chunked is None else False,
                              "scan_rows": None if chunked is None else pool.scan_rows,
                              "scan_rows_captured": None if chunked is None else pool.scan_rows_captured,
-                             "source": "exact_rows", "default": device_states.DEFAULT_EXACT_ROWS})
+                             "source": "exact_rows", "default": device_states.DEFAULT_EXACT_ROWS,
+                             "scan": self.scan if pool.kernels is not None else None})
 
     def facts(self):
         """Where prompt rows run (the scan up to scan_rows tokens eagerly, scan_rows_captured in a captured graph, then
@@ -106,4 +112,5 @@ class ChunkedRecurrence:
 
 
 def create(context, options, parts):
-    return ChunkedRecurrence(options["chunk_size"], options["exact_rows"], options["commit"], options["kernels"])
+    return ChunkedRecurrence(options["chunk_size"], options["exact_rows"], options["commit"], options["kernels"],
+                             prefill=options["prefill"], scan=options["scan"])

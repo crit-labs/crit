@@ -1,7 +1,7 @@
 """softmax-attention over a RoundBatch (rounds:attention), trees (attention:tree) and block lists (attention:blocks):
 against a float64 reference per page type, batched rows equal to rows alone, a verify window accepted at every length
 and continued equal to serial decoding, one CUDA graph replayed at other lengths, and work that follows the rows'
-lengths. Bit for bit where the registry's split-KV reader serves; within the fallback's FP32 rounding otherwise."""
+lengths. Bit for bit where crit's split-KV reader serves; within the fallback's FP32 rounding otherwise."""
 from types import SimpleNamespace
 
 from crit_plugins import StepBatch
@@ -97,7 +97,7 @@ class RoundAttentionTests(PluginTestCase):
         parts = self.assemble(USE)
         kv, attention = parts["kv_cache"], parts["attention"]
         if attention.device_form.kernels is None:
-            self.skipTest("the registry's split-KV reader is not here")
+            self.skipTest("crit's split-KV reader is not here")
         for dtype in TYPES:
             pool = kv.pool([0], HKV, D, 4096, "cuda", dtype)
             if dtype == "fp8":
@@ -207,7 +207,7 @@ class RoundAttentionTests(PluginTestCase):
 
     def test_a_step_decodes_as_a_round_does_with_the_split_reader(self):
         if not self.split:
-            self.skipTest("the registry's split-KV reader is not loaded")
+            self.skipTest("crit's split-KV reader is not loaded")
         pool = self.pool("bf16")
         self.prefill(pool, "a", 500, seed=7)
         q = self.queries([500, 501, 502], 8)

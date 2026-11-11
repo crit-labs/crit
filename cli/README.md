@@ -1,7 +1,8 @@
 # crit CLI
 
-The `crit` command is installed with the Python distribution (`python -m pip install -e .` from
-the checkout, or `python -m pip install .`) and drives every part of crit. Each subcommand prints its own options with
+The `crit` command is installed with the Python distribution (`python -m pip install -e core/python -e .` from
+the checkout, or `python -m pip install .`) and drives every part of crit; `crit core build` then builds Core's
+runtime, which every engine runs on. Each subcommand prints its own options with
 `--help`. Both installs build engines: the wheel carries crit's plugin library (Inference) as package data, so
 `crit plugins` and `crit inference` act on it from an installed crit as from a checkout; `crit run` keeps its records
 against a crit checkout (`--project`) or, from an installed crit without one, in any folder (`--project`, default the
@@ -16,6 +17,7 @@ installed release's guides, crit's repository at its tag, instead of a checkout.
 | `crit pull` | Installs a crit-hub engine (requirements, pinned source, build, checked checkpoint) for `crit serve --engine` | [Installed engines](../docs/SERVING.md#installed-engines) |
 | `crit bench` | Measures an installed crit-hub engine with crit Eval beside its card's numbers | [Benchmark your machine](../docs/SERVING.md#benchmark-your-machine) |
 | `crit hub` | Adds a `crit bench` result to its crit-hub card (`crit hub report`) for a pull request | [Benchmark your machine](../docs/SERVING.md#benchmark-your-machine) |
+| `crit core` | Builds Core's runtime, `crit_core_steps`, where Core's loader finds it (`build`), or names the one it loads (`where`) | [Core](../core/README.md) |
 | `crit smoke` | Checks a served engine's quality paths in minutes: prefill that never depends on prompt length, decode against prefill, request isolation, recall | [Smoke tests](../smoke/README.md) |
 | `crit kernels` | Finds, inspects and retains external kernels for the target hardware | [Kernels](../kernels/README.md) |
 | `crit models` | Quantizes weights, distills draft heads and records each transform | [Models](../models/README.md) |
@@ -30,20 +32,25 @@ installed release's guides, crit's repository at its tag, instead of a checkout.
 crit eval probe --out device.json
 crit run --project CRIT_ROOT create --record request.json
 crit run --project CRIT_ROOT --id RUN_ID recon
+crit run --project CRIT_ROOT --id RUN_ID capture --case case-0001 --inputs inputs.json
 crit run --project CRIT_ROOT --id RUN_ID resolve --record inputs.json
+crit run --project CRIT_ROOT --id RUN_ID plan --draft --record plan.json
 crit run --project CRIT_ROOT --id RUN_ID plan --record plan.json
 crit run --project CRIT_ROOT --id RUN_ID candidate --source SOURCE_DIR --record proposal.json
-crit run --project CRIT_ROOT --id RUN_ID package --candidate ID --source PACKAGE_DIR --record recipe.json
-crit run --project CRIT_ROOT --id RUN_ID serve --check --candidate ID
-crit run --project CRIT_ROOT --id RUN_ID ablate --candidate ID
+crit run --project CRIT_ROOT --id RUN_ID build --candidate ID --record recipe.json
+crit run --project CRIT_ROOT --id RUN_ID serve --check --data EVAL_DATA_DIR --candidate ID
+crit run --project CRIT_ROOT --id RUN_ID ablate --candidate ID --data EVAL_DATA_DIR
 crit run --project CRIT_ROOT --id RUN_ID eval --candidate ID --data EVAL_DATA_DIR
+crit run --project CRIT_ROOT --id RUN_ID check --candidate ID --from-eval
+crit run --project CRIT_ROOT --id RUN_ID measure --candidate ID
 crit run --project CRIT_ROOT --id RUN_ID seal --candidate ID --lifecycle completed
 crit run --project CRIT_ROOT --id RUN_ID select --candidate ID
 crit serve --workspace CRIT_ROOT/runs
 ```
 
-Plan, candidate, package, the checks, eval and seal repeat once per candidate, with builds recorded in between; [Building engines](../docs/BUILDING_ENGINES.md)
-gives the full sequence and [AGENTS.md](../AGENTS.md) the rules an agent follows.
+Plan to seal repeat once per candidate, and how far each goes depends on its rung on the
+[candidate ladder](../docs/RUN_RECORDS.md#the-candidate-ladder). `crit run --id RUN_ID next` names the next step at
+any point; [AGENTS.md](../AGENTS.md) holds the rules an agent follows.
 
 ## How it is built
 

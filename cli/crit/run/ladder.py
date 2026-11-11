@@ -1,9 +1,9 @@
-"""The candidate ladder: how far each candidate of a run goes, by its number in the run, in runs whose candidate budget
-counts the candidates on it (budget_counts "ladder", the default of new runs; docs/RUN_RECORDS.md#the-candidate-ladder).
+"""The candidate ladder: how far each candidate of a run goes, by its number in the run, and what a segment's candidate
+budget counts (docs/RUN_RECORDS.md#the-candidate-ladder).
 
 | Candidate | Built | Eval |
 | --- | --- | --- |
-| 1 | builds, passes its plugins' tests and crit run ... serve --check | none |
+| 1 | builds and passes crit run ... serve --check (its plugins' tests included) | none (small for an origin engine) |
 | 2 | every plugin crit's library and crit-hub offer that fits the checkpoint and the GPU | at most small (stage 1) |
 | 3, 4 | as candidate 2, improved with crit's toolkit | at most medium (stage 2) |
 | 5 on | as candidate 4 | full (--certify) |
@@ -11,17 +11,18 @@ counts the candidates on it (budget_counts "ladder", the default of new runs; do
 The segment's last budgeted candidate gets the full Eval whatever its number, so a run with a smaller budget still ends
 on a certified candidate. A candidate is on the ladder once an Eval attempt was reserved for it, or, on a rung below the
 full Eval, once it is sealed built or completed with a passed crit run ... serve --check; any other candidate is a
-draft, fixed as a new candidate from the same plan at no cost and with its number.
+draft, fixed as a new candidate from the same plan at no cost and with its number. A run started from a crit-hub engine
+(create --from-engine) gives its first candidate, the engine as imported, a small Eval, so the run has a measured
+baseline before any change.
 """
 from .records import evaluated_candidates, ident, read_json, safe_path
 
-LADDER = "ladder"
 # The ladder's rungs: the default candidate budget of a ladder run.
 RUNGS = 5
 # Each rung's Eval: none, at most Eval's stage 1, at most stage 2, or the certified Eval.
 SCOPES = {
-    "none": "no Eval: crit run ... eval is refused. The candidate is sealed built once its plugins' tests (crit plugins "
-            "test) and crit run ... serve --check pass",
+    "none": "no Eval: crit run ... eval is refused. The candidate is sealed built once crit run ... serve --check "
+            "passes (it runs the plugins' tests first)",
     "small": "at most a small Eval: crit run ... eval measures Eval's stage 1 (each speed case once, quality on the "
              "short texts, the request history)",
     "medium": "at most a medium Eval: crit run ... eval measures up to Eval's stage 2 (stage 1, then the repetitions, "
@@ -35,22 +36,17 @@ SEALED = ("built", "completed")
 SERVE_CHECK = "crit run serve --check"
 
 
-def ladder(run):
-    """Whether the run's candidate budget counts the candidates on the candidate ladder."""
-    return run["spec"].get("budget_counts") == LADDER
-
-
-def scope(number, last=False):
+def scope(number, last=False, origin=False):
     """The Eval of the run's candidate `number` (1 for the first); `last`: it takes its segment's last budgeted
-    candidate, which gets the full Eval."""
+    candidate, which gets the full Eval; `origin`: it is a crit-hub engine as imported, which gets a small one."""
     if last or number >= RUNGS:
         return "full"
-    return "none" if number == 1 else "small" if number == 2 else "medium"
+    return ("small" if origin else "none") if number == 1 else "small" if number == 2 else "medium"
 
 
-def rung(number, last=False):
+def rung(number, last=False, origin=False):
     """What a plan records of its candidate's rung (inputs.objective.eval): the Eval and its rule."""
-    name = scope(number, last)
+    name = scope(number, last, origin)
     return {"scope": name, "rule": SCOPES[name], **({"stage": STAGES[name]} if name in STAGES else {})}
 
 

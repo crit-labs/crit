@@ -13,8 +13,8 @@ LIBRARY = ROOT / "inference"
 GUIDANCE_TEXT = ("use_when", "avoid_when")
 GUIDANCE_LISTS = ("provides", "engine_supplies", "preserve", "adapt")
 # A technique's operations.json: per operation it needs on a device, what it computes, its CPU reference and how a
-# kernel is verified against it. No kernel lists: kernels come from libraries and the kernel registry (kernels/SOURCES.md);
-# a plugin declares the registry kernels it loads in its plugin.json.
+# kernel is verified against it. No kernel lists: kernels come from libraries (kernels/README.md#libraries) and crit's kernel
+# templates (kernels/techniques/<family>/<id>); a plugin declares crit's kernels it loads in its plugin.json.
 OPERATIONS_KIND = "crit-technique-operations"
 OPERATIONS_FILE = "operations.json"
 OPERATION_TEXT = ("what", "verify")
@@ -90,7 +90,7 @@ def check_operations(root, ident, found):
         unknown = sorted(set(op) - OPERATION_FIELDS)
         if unknown:
             errors.append(f"{label}: unknown fields {', '.join(unknown)}: a technique keeps no kernel lists or kernel "
-                          "source paths (kernels come from libraries and the kernel registry, kernels/SOURCES.md)")
+                          "source paths (kernels come from crit's kernel templates, kernels/, and libraries)")
         for field in OPERATION_TEXT:
             if not isinstance(op.get(field), str) or not op[field].strip():
                 errors.append(f"{label}: {field} required")
@@ -274,7 +274,7 @@ def main(argv=None, root=ROOT):
                         found = operations(root, entry["id"])
                         if found:
                             print("Operations (inference/" + entry["id"] + "/" + OPERATIONS_FILE + "; kernels for them: "
-                                  "kernels/SOURCES.md and the kernel registry):")
+                                  "crit's kernel templates, crit kernels list, and kernels/README.md#libraries):")
                             for op in found["operations"]:
                                 print("  " + op["id"] + ": " + op["what"])
                                 print("    verify against " + op["reference"]["path"] + " " + op["reference"]["symbol"]

@@ -25,6 +25,7 @@ import binascii
 from contextlib import contextmanager
 import copy
 import json
+import os
 import re
 import threading
 import time
@@ -150,20 +151,24 @@ _PROBED = {}
 
 def cuda_capability(probe=None):
     """The compute capability (120 for 12.0) of the engine's GPU: from `probe`, a crit eval probe device file (its
-    compute_capability, or its first device's), else the machine's first GPU by nvidia-smi; None when unknown."""
+    compute_capability, or its first device's), else by nvidia-smi of the GPU the engine runs on, the first that
+    CUDA_VISIBLE_DEVICES names (an index or a UUID) or GPU 0 without it; None when unknown."""
     if probe is not None:
         found = probe.get("compute_capability") or next(
             (d.get("compute_capability") for d in probe.get("devices") or [] if isinstance(d, dict)), None)
     else:
-        if "nvidia-smi" not in _PROBED:
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        gpu = visible.split(",")[0].strip() if visible and visible.strip() else "0"
+        if ("nvidia-smi", gpu) not in _PROBED:
             import subprocess
             try:
-                done = subprocess.run(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader", "-i", "0"],
+                done = subprocess.run(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader", "-i", gpu],
                                       capture_output=True, text=True, timeout=20)
-                _PROBED["nvidia-smi"] = done.stdout.strip() if done.returncode == 0 else None
+                lines = done.stdout.strip().splitlines() if done.returncode == 0 else []
+                _PROBED[("nvidia-smi", gpu)] = lines[0].strip() if lines else None
             except (OSError, subprocess.SubprocessError):
-                _PROBED["nvidia-smi"] = None
-        found = _PROBED["nvidia-smi"]
+                _PROBED[("nvidia-smi", gpu)] = None
+        found = _PROBED[("nvidia-smi", gpu)]
     try:
         major, minor = (int(part) for part in str(found).split("."))
     except (TypeError, ValueError):
