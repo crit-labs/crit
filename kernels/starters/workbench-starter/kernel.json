@@ -1,0 +1,32 @@
+{
+  "schema": "crit-kernel-v1",
+  "id": "workbench-starter",
+  "family": "starters",
+  "title": "The kernel workbench's starter matmul: BF16, or E4M3 with row and column scales, FP32 out, one warp an output row",
+  "package": "workbench_starter",
+  "language": "cuda",
+  "operations": [
+    "fp8-row-projection"
+  ],
+  "sources": [
+    "workbench_starter_cuda/starter.cu",
+    "torch-ext/torch_binding.cpp"
+  ],
+  "capabilities": [
+    "8.0",
+    "8.6",
+    "8.9",
+    "9.0",
+    "10.0",
+    "12.0"
+  ],
+  "libraries": [],
+  "structures": {
+    "matmul": {
+      "what": "y[columns][N] = x[columns][K] . w[N][K]^T on CUDA cores: one warp an output row with every column (up to 16), each lane a strided share of K, FP32 sums in a fixed order and one xor-shuffle tree; a correct starting point a workbench copies, nothing to tune",
+      "call": "run_bf16",
+      "rows": [1, 16],
+      "row_invariant": true
+    }
+  }
+}

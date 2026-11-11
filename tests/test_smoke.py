@@ -203,6 +203,16 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(moved["state"], "failed", moved)
         self.assertIn("prefix of 17 tokens", moved["detail"])
 
+    def test_a_failed_causal_test_names_the_prompt_paths_the_engine_reports(self):
+        from crit_smoke.suite import row_paths
+        facts = {"row_invariance": {"rows": 16, "prompt_rows": False},
+                 "recurrence_prompts": {"pools": [{"chunked": "fla", "scan_rows": 512}, {"chunked": None}]}}
+        hint = row_paths(facts)
+        self.assertIn("prompt_gemm pinned", hint)
+        self.assertIn("up to 512 tokens on its exact scan", hint)
+        self.assertEqual(row_paths({"row_invariance": {"prompt_rows": True},
+                                    "recurrence_prompts": {"pools": [{"chunked": "fla", "scan_rows": 0}]}}), "")
+
     def test_a_suite_past_its_budget_stops_as_failed(self):
         results = self.results(only={"rows_valid", "fluent"}, budget=0)
         self.assertEqual(list(results), ["budget"])

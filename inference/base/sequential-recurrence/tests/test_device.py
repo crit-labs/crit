@@ -1,9 +1,10 @@
 """sequential-recurrence's device form: a step's rows continue their sequences as the host form and a float64
 recurrence do (strong decays included); a decode or verify row's bits do not depend on the rows beside it; a captured
 round's verify window, rolled back to any accepted count, continues exactly as the serial decode (state and convolution
-window), by every commit strategy; rounds capture and replay; prompt chunks (fla's kernel where installed, on its
-stated tiles) agree within the stated tolerance. On CUDA the rows run recurrent-scans where the kernel registry has it
-(LOCAL_KERNELS for a local build) and the torch formula otherwise; both keep every exact promise.
+window), by every commit strategy; rounds capture and replay; prompt chunks (recurrent-scans' chunked prefill, fla's kernel with option fla, on its
+stated tiles) agree within the stated tolerance. On CUDA the rows run crit's kernel recurrent-scans where it builds
+for this GPU (crit_kernels.build, default knobs or CRIT_KERNEL_TUNING's) and the torch formula otherwise; both keep
+every exact promise.
 
 Tolerances: decode and verify rows (the FP32 column scan) against float64 within 1e-5 + 1e-4 |x|; prompt rows through a
 chunked kernel within 2e-3 + 2e-2 |x| (fla in FP32 or the two-pass prefill: another summation order)."""
@@ -150,7 +151,7 @@ class DeviceRecurrenceTests(PluginTestCase):
                              "beta": rng.uniform(0.1, 0.9)} for _ in range(HEADS)] for _ in range(80)] for s in "ab"}
 
     def plugins(self, **options):
-        """The plugin, and on CUDA with the registry kernel also with the torch formula: [(name, plugin)]. Prompt rows
+        """The plugin, and on CUDA with crit's kernel also with the torch formula: [(name, plugin)]. Prompt rows
         past 16 tokens run the chunked kernel unless the options say otherwise (no crossover measured per test shape)."""
         options = {"exact_rows": 16, **options}
         found = [("default", self.assemble(options=options)["recurrence"])]
@@ -566,7 +567,7 @@ class DeviceRecurrenceTests(PluginTestCase):
         from crit_plugins.kernels import loaded
         pool = self.recurrence.pool([0], 1, 300, 4, "cuda", 2)
         self.assertIsNone(pool.kernels)
-        record = loaded()["crit-labs/recurrent-scans"]
+        record = loaded()["recurrent-scans"]
         self.assertEqual(record["source"], "fallback")
         self.assertIn("300", record["reason"])
 
@@ -668,7 +669,7 @@ class DeviceRecurrenceTests(PluginTestCase):
         FP32 (chunk_fp32) and in BF16."""
         from unittest import mock
         torch = self.torch
-        probe = self.assemble(options={})["recurrence"]
+        probe = self.assemble(options={"fla": True})["recurrence"]
         states = sys.modules[type(probe).__module__].device_states
         rig = Rig(torch, self.device(), 2, 6, 128, 128, tokens=200, seed=61, dtype=torch.bfloat16)
         if states.chunked_kind(rig.pool(probe), rig.geometry, probe.prompt) != "fla":
@@ -684,7 +685,7 @@ class DeviceRecurrenceTests(PluginTestCase):
             raise AssertionError("an fla kernel timed its tiles")
 
         for chunk_fp32 in (True, False):
-            plugin = self.assemble(options={"exact_rows": 0, "chunk_fp32": chunk_fp32})["recurrence"]
+            plugin = self.assemble(options={"exact_rows": 0, "chunk_fp32": chunk_fp32, "fla": True})["recurrence"]
             found = []
             for _ in range(2):
                 for tuner in reached.values():

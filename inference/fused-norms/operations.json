@@ -1,0 +1,56 @@
+{
+  "kind": "crit-technique-operations",
+  "technique": "fused-norms",
+  "operations": [
+    {
+      "id": "rms-norm",
+      "what": "RMSNorm per last-dimension row (x / sqrt(mean(x^2) + eps) * (offset + weight)), with a residual added in place first in the residual's dtype and the stored sum normalized, a weight per group of rows (heads or residual streams), a chosen output dtype; the L2 norm (x / sqrt(sum(x^2) + eps))",
+      "reference": {
+        "path": "inference/fused-norms/code/rows.py",
+        "symbol": "rms_norm_rows, l2_norm_rows"
+      },
+      "verify": "on the target against the FP64 rows: FP32 out within 2e-5 absolute plus 2e-5 relative, 16-bit out within one output rounding (plus 1% of a step of the largest value); with a residual, the stored sum within the residual dtype's rounding",
+      "invariance": "a row's bits independent of the rows beside it and of the row count, the same on a repeat"
+    },
+    {
+      "id": "rotary-positions",
+      "what": "rotary positions on each head of a token at its position (half or interleaved pairs, partial rotation, FP32 inverse frequencies with the angle fp32(position) * fp32(freq), or a cos|sin table; a scale on cos and sin), alone or after the head's RMSNorm in FP32 between them, for one head tensor or a layer's queries and keys together",
+      "reference": {
+        "path": "inference/fused-norms/code/rows.py",
+        "symbol": "rope_rows, rms_norm_rows"
+      },
+      "verify": "on the target against the FP64 rows: FP32 out within 2e-5 absolute plus 2e-5 relative, 16-bit out within one output rounding; the queries and keys in one launch equal to the separate calls bit for bit",
+      "invariance": "a token's heads' bits independent of the other tokens of the call and of the token count"
+    },
+    {
+      "id": "gated-products",
+      "what": "the gated RMSNorm (rms_norm(x) * silu(z) or * sigmoid(z)) and the activation products silu(gate) * up, gelu(gate) * up (erf or tanh), x * sigmoid(gate), of separate, packed-halves or interleaved gate and up rows",
+      "reference": {
+        "path": "inference/fused-norms/code/rows.py",
+        "symbol": "gated_rms_norm_rows, act_mul_rows"
+      },
+      "verify": "on the target against the FP64 rows: FP32 out within 2e-5 absolute plus 2e-5 relative, 16-bit out within one output rounding",
+      "invariance": "a row's bits independent of the rows beside it and of the row count"
+    },
+    {
+      "id": "stream-mixes",
+      "what": "several residual streams of a token: scale * the sum over the streams in stream order of activation(gate) * stream (a gate per value or per stream, or none), one row added into every stream with a weight per stream in place, and that add followed by the streams' RMSNorm",
+      "reference": {
+        "path": "inference/fused-norms/code/rows.py",
+        "symbol": "stream_sum_rows, stream_add_rows, rms_norm_rows"
+      },
+      "verify": "on the target against the FP64 rows: FP32 out within 2e-5 absolute plus 2e-5 relative, 16-bit out within one output rounding; the fused add and norm equal to the separate calls bit for bit",
+      "invariance": "a token's bits independent of the other tokens of the call and of the token count"
+    },
+    {
+      "id": "softplus-decay",
+      "what": "a gated delta or state-space layer's discretized log-decay -rate * softplus(x + bias) (softplus(v) = v past 20) and its gate sigmoid(g), FP32 inside",
+      "reference": {
+        "path": "inference/fused-norms/code/rows.py",
+        "symbol": "softplus_decay_rows"
+      },
+      "verify": "on the target against the FP64 rows within FP32 rounding (2e-6 relative), and bit for bit against torch's own softplus and sigmoid on CUDA in FP32",
+      "invariance": "a token's bits independent of the other tokens of the call and of the token count"
+    }
+  ]
+}

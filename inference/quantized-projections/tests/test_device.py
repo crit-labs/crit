@@ -1,7 +1,7 @@
 """quantized-projections' device form: stored BF16, FP8 and NVFP4 matrices multiply as their decoded values do, the
-NVFP4 codes and scales round trip, and each row's result is the same alone and in a batch, on the registry kernels'
-paths (LOCAL_KERNELS or the Hub) and on the torch fallbacks; draft-only re-encoding gives the FP64 codec's codes."""
-import math
+NVFP4 codes and scales round trip, and each row's result is the same alone and in a batch, on crit's kernels' paths
+(built on this GPU, with the engine's tuning or the default knobs) and on the torch fallbacks; draft-only re-encoding
+gives the FP64 codec's codes."""
 import struct
 import unittest
 
@@ -285,8 +285,8 @@ class DeviceMatrixTests(PluginTestCase):
         return importlib.import_module(matrices.__package__ + ".device_nvfp4")
 
     def paths(self):
-        """The decode-row paths this machine has: the registry kernel's CUDA and Triton GEMVs where crit-labs/
-        decode-gemv loads (LOCAL_KERNELS or the Hub), and always the torch fallback."""
+        """The decode-row paths this machine has: crit's kernel decode-gemv's CUDA and Triton GEMVs where it builds
+        here, and always the torch fallback."""
         device_nvfp4 = self.native_module()
         found = ["fallback"]
         if device_nvfp4.native("cuda") is not None:
@@ -294,14 +294,14 @@ class DeviceMatrixTests(PluginTestCase):
         return device_nvfp4, found
 
     def load_on(self, path, stored, options=None):
-        """A weight-only NVFP4 matrix loaded on one decode-row path (the fallback: as if no registry kernel were here)."""
+        """A weight-only NVFP4 matrix loaded on one decode-row path (the fallback: as if no crit kernel were here)."""
         device_nvfp4 = self.native_module()
         plugin = self.assemble(options={"activations": "bf16", "gemv": "triton" if path == "triton" else "native",
                                         **(options or {})})["projections"]
         if path != "fallback":
             return plugin, plugin.load(stored, "nvfp4")
         from unittest.mock import patch
-        with patch.object(device_nvfp4, "kernel", lambda name: None):   # as if no registry kernel were here
+        with patch.object(device_nvfp4, "kernel", lambda name: None):   # as if no crit kernel were here
             return plugin, plugin.load(stored, "nvfp4")
 
     def test_every_gemv_path_multiplies_by_the_stored_values_and_keeps_a_row_s_bits_alone_and_batched(self):
@@ -364,22 +364,21 @@ class DeviceMatrixTests(PluginTestCase):
             for a, b in zip(found["kernel"], found["fallback"]):
                 self.assertTrue(torch.equal(a.view(torch.uint8), b.view(torch.uint8)))
 
-    def test_the_facts_name_the_registry_kernels_and_where_they_came_from(self):
+    def test_the_facts_name_the_load_kernels_and_where_they_came_from(self):
         from crit_plugins import kernels
         codec, stored = self.nvfp4_weight()
         plugin = self.assemble(options={"activations": "bf16", "prompt_gemm": "fixed_tiles"})["projections"]
         m = plugin.load(stored, "nvfp4")
         plugin.matmul(torch_rows(self.torch, 20), m)
-        import os
         record = kernels.loaded()
-        local = os.environ.get("LOCAL_KERNELS") or ""
-        for name in ("crit-labs/decode-gemv", "crit-labs/fixed-tile-gemm"):
+        for name in ("decode-gemv", "fixed-tile-gemm"):
             self.assertIn(name, record)
-            self.assertIn(record[name]["source"], ("local", "hub", "fallback"))
-            if name + "=" in local:   # a local build named in LOCAL_KERNELS is what serves
-                self.assertEqual(record[name]["source"], "local", record[name])
+            self.assertIn(record[name]["source"], ("tuned", "built", "fallback"))
+            if record[name]["source"] != "fallback":   # built with the engine's tuning where it has one for the kernel
+                tuning = kernels.tuning_file(name)
+                self.assertEqual(record[name]["source"], "tuned" if tuning else "built", record[name])
+                self.assertEqual(record[name].get("tuning"), str(tuning) if tuning else None)
             self.assertIn("quantized-projections", record[name]["plugins"])
-            self.assertEqual(record[name]["version"], 1)
 
     def test_weight_only_prompt_rows_run_in_the_chosen_arithmetic(self):
         # fp16_acc: FP16 values and sums (a relative step of 1/1024 per term); fp8: E4M3 weights and activation rows

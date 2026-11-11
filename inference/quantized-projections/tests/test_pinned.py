@@ -1,7 +1,9 @@
-"""quantized-projections with prompt_gemm pinned: every format's prompt rows through cuBLASLt with one algorithm per
-GEMM shape and format (crit-labs/pinned-gemm), so a prompt row's bits are the same at every prompt length, in any
-chunk and in a padded bucket captured in a graph; the facts say so (row_invariance prompt_rows); the values agree
-with the provider's path in the order of their sums only; without the kernel, one row a call keeps the bits."""
+"""quantized-projections with prompt_gemm pinned: every format's prompt rows through crit's GEMMs in one
+configuration per matrix shape (fp8-block-rows' and int-block-experts' gemm-native launched as for PIN_ROWS tokens,
+fixed-tile-gemm for 16-bit operands), so a prompt row's bits are the same at every prompt length, in any chunk and in
+a padded bucket captured in a graph; the facts say so (row_invariance prompt_rows); the values agree with the
+provider's path in the order of their sums only; without the kernels, one row a call keeps the bits. The same tests
+run prompt_gemm pinned_cublaslt (cuBLASLt with one algorithm per GEMM shape and format, pinned-gemm: the yardstick)."""
 import unittest
 from unittest.mock import patch
 
@@ -20,6 +22,8 @@ class OnCuda:
 
 
 class PinnedTests(PluginTestCase):
+    GEMM = "pinned"
+
     def setUp(self):
         if self.device() != "cuda":
             self.skipTest("pinned prompt GEMMs run on CUDA")
@@ -32,8 +36,18 @@ class PinnedTests(PluginTestCase):
         self.g = torch.Generator().manual_seed(23)
 
     def kernel_here(self):
-        if self.nvfp4.pinned("cuda") is None:
-            self.skipTest("pinned prompt GEMMs come with crit-labs/pinned-gemm, not here")
+        if self.GEMM == "pinned_cublaslt":
+            if self.nvfp4.pinned("cuda") is None:
+                self.skipTest("pinned_cublaslt prompt GEMMs come with pinned-gemm, not here")
+            return
+        if None in (self.nvfp4.fp8_block("cuda"), self.nvfp4.int_block("cuda"), self.nvfp4.tiles_kernel()):
+            self.skipTest("pinned prompt GEMMs come with fp8-block-rows, int-block-experts and fixed-tile-gemm")
+
+    def on_kernel(self, m):
+        """The matrix's prompt rows go through the pinned GEMMs, not one row a call."""
+        if self.GEMM == "pinned_cublaslt":
+            return m.pinned is not None or m.format == "mxfp8" or m.activations == "bf16"
+        return m.prompt_kernel.endswith(" pinned") or m.prompt_kernel == "fixed-tile-gemm"
 
     def stored(self, format, n, k, runs=None):
         torch, g = self.torch, self.g
@@ -55,7 +69,7 @@ class PinnedTests(PluginTestCase):
         return found
 
     def loaded(self, format, options, n, k, runs=None):
-        plugin = self.assemble(options={**options, "prompt_gemm": "pinned"}, context=OnCuda())["projections"]
+        plugin = self.assemble(options={**options, "prompt_gemm": self.GEMM}, context=OnCuda())["projections"]
         return plugin, plugin.load(self.stored(format, n, k, runs), format)
 
     def test_a_prompt_row_s_bits_are_the_same_at_every_row_count_past_the_decode_rows(self):
@@ -66,7 +80,12 @@ class PinnedTests(PluginTestCase):
         self.kernel_here()
         for format, options, n, k, runs in CASES:
             plugin, m = self.loaded(format, options, n, k, runs)
-            self.assertIsNotNone(m.pinned, (format, options))
+            self.assertTrue(self.on_kernel(m), (format, options, m.prompt_kernel))
+            if self.GEMM == "pinned" and m.native_gemm is not None:   # the default-knob build, in the facts' record
+                from crit_plugins import kernels
+                name = {"nvfp4": "int-block-experts"}.get(m.format, "fp8-block-rows") + kernels.UNTUNED
+                self.assertEqual(kernels.loaded()[name]["source"], "built", name)
+                self.assertIn("quantized-projections", kernels.loaded()[name]["plugins"])
             self.assertTrue(plugin.facts()["row_invariance"]["prompt_rows"], (format, options))
             x = torch.randn(4096, k, generator=self.g).cuda().to(torch.bfloat16)
             for out in (None, torch.float32):
@@ -107,8 +126,8 @@ class PinnedTests(PluginTestCase):
         for format, options, n, k, runs in CASES:
             with self.subTest(format=format, options=options):
                 stored = self.stored(format, n, k, runs)
-                plugin = self.assemble(options={**options, "prompt_gemm": "pinned"}, context=OnCuda())["projections"]
-                provider = self.assemble(options=options, context=OnCuda())["projections"]
+                plugin = self.assemble(options={**options, "prompt_gemm": self.GEMM}, context=OnCuda())["projections"]
+                provider = self.assemble(options={**options, "prompt_gemm": "provider"}, context=OnCuda())["projections"]
                 m, p = plugin.load(stored, format), provider.load(stored, format)
                 x = torch.randn(700, k, generator=self.g).cuda().to(torch.bfloat16)
                 pinned, theirs = plugin.matmul(x, m, torch.float32), provider.matmul(x, p, torch.float32)
@@ -140,11 +159,16 @@ class PinnedTests(PluginTestCase):
 
     def test_without_the_kernel_one_row_a_call_keeps_the_bits(self):
         torch = self.torch
-        with patch.object(self.nvfp4, "pinned", lambda device: None):
+        import contextlib
+        names = ("untuned", "tiles_kernel") if self.GEMM == "pinned" else ("pinned",)
+        with contextlib.ExitStack() as stack:
+            for name in names:
+                stack.enter_context(patch.object(self.nvfp4, name, lambda *a: None))
             for format, options, n, k, runs in (CASES[0], CASES[2], CASES[4], CASES[5]):
                 with self.subTest(format=format, options=options):
                     plugin, m = self.loaded(format, options, 256, k, runs and (128, 128))
                     self.assertIsNone(m.pinned)
+                    self.assertIsNone(m.native_gemm)
                     self.assertTrue(plugin.facts()["row_invariance"]["prompt_rows"])
                     x = torch.randn(60, k, generator=self.g).cuda().to(torch.bfloat16)
                     whole = plugin.matmul(x, m)
@@ -153,14 +177,14 @@ class PinnedTests(PluginTestCase):
 
     def test_the_contract_s_prompt_row_check_passes_and_other_prompts_are_refused(self):
         self.kernel_here()
-        plugin = self.assemble(options={"prompt_gemm": "pinned"}, context=OnCuda())["projections"]
+        plugin = self.assemble(options={"prompt_gemm": self.GEMM}, context=OnCuda())["projections"]
         self.assertKeepsRows(plugin)
         self.assertTrue(plugin.facts()["row_invariance"]["prompt_rows"])
         for prompt in ("fp16_acc", "fp8"):
             with self.assertRaises(ValueError):
-                self.assemble(options={"activations": "bf16", "prompt": prompt, "prompt_gemm": "pinned"},
+                self.assemble(options={"activations": "bf16", "prompt": prompt, "prompt_gemm": self.GEMM},
                               context=OnCuda())
-        provider = self.assemble(context=OnCuda())["projections"]
+        provider = self.assemble(options={"prompt_gemm": "provider"}, context=OnCuda())["projections"]
         provider.load(self.stored("nvfp4", 256, 256), "nvfp4")
         self.assertFalse(provider.facts()["row_invariance"]["prompt_rows"])
 
@@ -170,6 +194,13 @@ class PinnedTests(PluginTestCase):
         memory = load_module(plugin).memory(OnCuda(), {})
         self.assertEqual(memory, {"device": self.matrices.BUFFER_BYTES})
         self.assertGreaterEqual(self.matrices.BUFFER_BYTES, self.matrices.GEMM_BYTES + self.matrices.WORKSPACE_BYTES)
+
+
+class CublasltPinnedTests(PinnedTests):
+    GEMM = "pinned_cublaslt"
+
+    def test_the_pinned_workspace_is_declared(self):
+        self.skipTest("the same declaration: PinnedTests checks it")
 
 
 if __name__ == "__main__":

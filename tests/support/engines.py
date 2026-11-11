@@ -1,13 +1,13 @@
 """A toy engine package for tests that load engines the one way crit loads them, through Core's loader
-(crit_core.engine): plugins/ holding the toy CPU plugins (toy_plugins/) and configuration.json whose plugins selection
-fills every slot an engine fills. Its model is toy_plugins/toy-model, a batched step model on Core's concurrent runtime,
+(crit_core.engine): plugins/ holding the toy CPU plugins (inference/examples/plugin-engine/plugins, the plugin engine example) and configuration.json whose plugins selection
+fills every slot an engine fills. Its model is toy-model, a batched step model on Core's concurrent runtime,
 which needs Core's crit_core_steps library (STEP_LIBRARY)."""
 import json
 import os
 from pathlib import Path
 import shutil
 
-TOY = Path(__file__).with_name("toy_plugins")
+TOY = Path(__file__).resolve().parents[2] / "inference" / "examples" / "plugin-engine" / "plugins"
 USE = {"model": "toy-model", "placement": "toy-placement", "projections": "toy-projections",
        "attention": "toy-attention", "kv_cache": "toy-kv", "sampler": "toy-sampler"}
 DRAFTING = {"drafter": "toy-drafter", "verifier": "toy-verifier"}

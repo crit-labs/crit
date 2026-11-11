@@ -68,14 +68,12 @@
         "auto",
         "torch"
       ],
-      "description": "auto: pages written by the registry's paged-kv-attention kernels where they load; torch: in torch"
+      "description": "auto: pages written by crit's paged-kv-attention kernels where they load; torch: in torch"
     }
   },
   "kernels": [
     {
-      "name": "crit-labs/paged-kv-attention",
-      "version": 1,
-      "revision": null,
+      "name": "paged-kv-attention",
       "fallback": "keys and values encoded and written with torch ops (index_copy_), the same codes and scales"
     }
   ],

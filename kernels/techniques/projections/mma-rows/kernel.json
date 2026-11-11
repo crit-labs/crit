@@ -1,0 +1,226 @@
+{
+  "schema": "crit-kernel-v1",
+  "id": "mma-rows",
+  "family": "projections",
+  "title": "Projections of 1 to 64 rows on tensor cores in one fixed tile (NVFP4, FP8, MXFP8, BF16 weights; BF16, FP8 or NVFP4 activations), the block-scaled FP4 MMA, a prompt tile with the decode tile's bits, and the activations' quantizers",
+  "package": "mma_rows",
+  "language": "cuda",
+  "operations": [
+    "nvfp4-projection",
+    "nvfp4-activation-quantization",
+    "fp8-row-projection",
+    "mxfp8-projection",
+    "int4-group-projection"
+  ],
+  "sources": [
+    "mma_rows_cuda/binding.cu",
+    "mma_rows_cuda/mma_rows.cu",
+    "mma_rows_cuda/fp4_mma.cu",
+    "mma_rows_cuda/prompt_binding.cu",
+    "mma_rows_cuda/prompt_tile.cu",
+    "torch-ext/torch_binding.cpp"
+  ],
+  "capabilities": [
+    "8.0",
+    "8.6",
+    "8.9",
+    "9.0",
+    "10.0a",
+    "10.3a",
+    "11.0a",
+    "12.0a",
+    "12.1a"
+  ],
+  "structures": {
+    "decode-tile": {
+      "what": "1 to 64 rows on mma.m16n8k16 (BF16 operands, FP32 sums): a warp's 16 x GROUPS matrix rows the A operand, 8 activation rows a column the B operand, K's steps in SPLITS contiguous parts added in part order by a row tile's last CTA; up to 16 rows also as the staged tile (SW > 0): the same MMAs in the same order, each step's activations staged once a CTA in shared memory; every weight format a Row decoder over the kernel core's (INT4 with a zero point as two BF16 parts, each MMA run on both)",
+      "call": "mm_rows",
+      "rows": [
+        1,
+        64
+      ],
+      "tune_rows": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ],
+      "key": [
+        "weights",
+        "N",
+        "K"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "GROUPS": {
+          "values": [
+            1,
+            2
+          ],
+          "default": 1,
+          "order": true,
+          "what": "16-row groups a warp takes (speed only; one plan a matrix: plan() takes no row count, so every knob here keeps one value a matrix)"
+        },
+        "WARPS": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 4,
+          "order": true,
+          "what": "warps a CTA"
+        },
+        "SPLITS": {
+          "values": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            6,
+            8,
+            12,
+            16,
+            24,
+            32
+          ],
+          "default": 0,
+          "order": true,
+          "what": "parts of K's steps, one a CTA (the sums' order); 0: plan()'s rule from the multiprocessors' resident CTAs, as before the knobs; capped at the matrix's steps"
+        },
+        "SW": {
+          "values": [
+            0,
+            4,
+            8
+          ],
+          "default": 0,
+          "what": "1 to 16 rows: 0, each warp reads its activations from global memory; 4 or 8, the staged tile: a CTA of SW warps stages each step's activations once in shared memory (cp.async, three steps in flight), the same MMAs in the same order (speed only, per matrix and row count)"
+        },
+        "SPF": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 0,
+          "what": "the staged tile (SW > 0) loads a step's weights a step ahead, two steps of weights in registers (speed only)"
+        }
+      },
+      "yardstick": {
+        "library": "NVFP4: flashinfer mm_bf16_fp4 (W4A16, backend cute-dsl-native) on the stored codes, block scales in its 128 x 4 layout once, per-row inverse scale left out; BF16: cuBLAS (torch.matmul); FP8: cuBLAS on the values times row scales widened to BF16 once (no library takes FP8 weights against BF16 activations); INT4 with a zero point: torch's W4A16 INT4 group GEMM (torch._weight_int4pack_mm, tinygemm) on the same codes repacked once"
+      },
+      "bench": "bench.py:DecodeTile"
+    },
+    "fp4-tile": {
+      "what": "W4A4 rows on the block-scaled FP4 MMA (mma.sync kind::mxf4nvf4 m16n8k64, sm_120 family): the activations quantized to NVFP4 by a pre-pass, E2M1 codes with their UE4M3 block scales on both operands, FP32 sums, SPLITS parts of K added in part order",
+      "call": "mm_rows",
+      "rows": [
+        1,
+        64
+      ],
+      "tune_rows": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "WARPS": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 4,
+          "order": true,
+          "what": "warps a CTA (one plan a matrix, as decode-tile's)"
+        },
+        "SPLITS": {
+          "values": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            6,
+            8,
+            12,
+            16,
+            24,
+            32
+          ],
+          "default": 0,
+          "order": true,
+          "what": "parts of K's 128-value steps; 0: plan()'s rule from the FP4 MMA's resident CTAs"
+        },
+        "HOIST": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 2,
+          "what": "steps of weights a warp loads together"
+        }
+      },
+      "yardstick": {
+        "library": "cuBLASLt's block-scaled NVFP4 GEMM (torch._scaled_mm, float4_e2m1fn_x2 with blocked UE4M3 scales); the activations quantized once outside the timed call, so the tile's pre-pass (about 1 us) is in its time only; per-row inverse scale left out"
+      },
+      "bench": "bench.py:Fp4Tile"
+    },
+    "prompt-tile": {
+      "what": "any number of rows with the decode tile's bits (mm_prompt): each output the same chain of mma.m16n8k16 the decode tile runs, a CTA of PW warps reusing each decoded weight for PT rows staged in shared memory (cp.async, two buffers)",
+      "call": "mm_prompt",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        64,
+        512,
+        2048
+      ],
+      "key": [
+        "weights",
+        "N",
+        "K"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "PW": {
+          "values": [
+            4,
+            8,
+            16
+          ],
+          "default": 8,
+          "what": "warps a CTA, each its own 16 matrix rows"
+        },
+        "PT": {
+          "values": [
+            32,
+            64
+          ],
+          "default": 64,
+          "what": "activation rows a CTA (8 an MMA column)"
+        }
+      },
+      "yardstick": {
+        "library": "as decode-tile at 64 to 2,048 rows: flashinfer mm_bf16_fp4 for NVFP4, cuBLAS (torch.matmul) for BF16 and for FP8 widened to BF16 once"
+      },
+      "bench": "bench.py:PromptTile"
+    },
+    "quantizers": {
+      "what": "the activations' quantizers alone (FP8 rows: one CTA a row; NVFP4 blocks: one thread a 16-value block into cuBLASLt's tiled scale layout), for a provider's GEMM on the same activations",
+      "call": "quantize_fp8_rows"
+    }
+  }
+}

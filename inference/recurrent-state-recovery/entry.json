@@ -3,7 +3,7 @@
   "category": "speculation",
   "summary": "Speculative recurrent-state recovery: output-only gated-delta verification, atomic accepted-prefix recovery, the device commit of a captured round's accepted prefix (deferred, checkpoints or recompute) and a pooled device form",
   "implementation_status": "native_source",
-  "implementation_scope": "Bounded C++20 FP64 host gated-delta chain, physical accepted-node mapping, after-token checkpoints and private sibling commit; Python formula; the CUDA device commit (select_accepted from per-column checkpoints, record_accepted for a deferred commit) from a device-held count; the recurrence slot's device form (device_states.py): a pool of every sequence's FP32 state and causal-convolution window, step rows with a host accept and captured-round rows with commit_round by strategy, over crit-labs' recurrent-scans pool kernels from the kernel registry or a capture-safe torch formula; a pure-Python two-pass chunked prefill (chunk-parallel triangular solve, then a sequential matrix-product pass) checked against the token-by-token recurrence. The scans themselves (column scan, chunked prefill, convolution) are recurrent-scans', not this entry's",
+  "implementation_scope": "Bounded C++20 FP64 host gated-delta chain, physical accepted-node mapping, after-token checkpoints and private sibling commit; Python formula; the CUDA device commit (select_accepted from per-column checkpoints, record_accepted for a deferred commit) from a device-held count; the recurrence slot's device form (device_states.py): a pool of every sequence's FP32 state and causal-convolution window, step rows with a host accept and captured-round rows with commit_round by strategy, over the pool kernels of crit's kernel recurrent-scans (built for the engine's device, tuned or default knobs) or a capture-safe torch formula; a pure-Python two-pass chunked prefill (chunk-parallel triangular solve, then a sequential matrix-product pass) checked against the token-by-token recurrence. The scans themselves (column scan, chunked prefill, convolution) are recurrent-scans', not this entry's",
   "agent_guidance": {
     "use_when": "A short speculative accepted prefix can be reconstructed more cheaply than retaining a full recurrent matrix after every proposed token",
     "avoid_when": "Recovery work outweighs state-storage savings, recurrence/cast semantics differ, or complete continuation state cannot be restored",
@@ -19,7 +19,7 @@
     "engine_supplies": [
       "Model projections, gates, head mappings, activation/state cast rules and sampler acceptance",
       "Index, target/draft and other continuation siblings beyond the state and convolution window",
-      "The scan kernels (a provider's or crit-labs' recurrent-scans), source/destination reservations, producer ordering and failure settlement",
+      "The scan kernels (a provider's or crit's kernel recurrent-scans), source/destination reservations, producer ordering and failure settlement",
       "Materialization of correction or bonus tokens and full-model qualification"
     ],
     "preserve": [
@@ -77,7 +77,7 @@
     }
   ],
   "requires": {
-    "hardware": "Python 3.11+ standard library for formula; CMake 3.28+, C++20 and Core (crit::core) for native host POC; CUDA C++20 with Core CRIT_CORE_CUDA for the device commit; torch for the device form (CUDA or CPU), optionally crit-labs' recurrent-scans and fla",
+    "hardware": "Python 3.11+ standard library for formula; CMake 3.28+, C++20 and Core (crit::core) for native host POC; CUDA C++20 with Core CRIT_CORE_CUDA for the device commit; torch for the device form (CUDA or CPU), optionally crit's kernel recurrent-scans (needs the CUDA toolkit to build) and fla",
     "model": "Declared gated-delta recurrence with caller-supplied projected/gated step inputs and complete sibling restoration",
     "workload": "One rooted verification chain per round; bounded physical nodes, outputs, state, siblings and positions"
   },
@@ -91,7 +91,7 @@
   "dependencies": [
     "Python standard library",
     "CMake 3.28+, C++20 standard library and Core's state header (crit::core)",
-    "CUDA runtime for the device commit", "torch for the device form; optionally crit-labs' recurrent-scans and fla"
+    "CUDA runtime for the device commit", "torch for the device form; optionally crit's kernel recurrent-scans and fla"
   ],
   "symbols": [
     "Recovery",

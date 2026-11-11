@@ -9,15 +9,15 @@
   <br />
 </p>
 
-### Why wait for someone to optimize an LLM for your GPU when an AI agent can build a specialized inference engine in a few hours?
+### An agentic toolkit for building and optimizing high-performance inference engines tailored to your GPU and desired LLM.
 
-[![Version 0.17.2](https://raw.githubusercontent.com/crit-labs/crit/main/docs/assets/badge-version.svg)](https://github.com/crit-labs/crit/blob/main/CHANGELOG.md)
+[![Version 0.18.0](https://raw.githubusercontent.com/crit-labs/crit/main/docs/assets/badge-version.svg)](https://github.com/crit-labs/crit/blob/main/CHANGELOG.md)
 [![License Apache-2.0](https://raw.githubusercontent.com/crit-labs/crit/main/docs/assets/badge-license.svg)](https://github.com/crit-labs/crit/blob/main/LICENSE)
 [![crit-hub engines](https://raw.githubusercontent.com/crit-labs/crit/main/docs/assets/badge-crit-hub.svg)](https://github.com/crit-labs/crit-hub)
 [![CI](https://github.com/crit-labs/crit/actions/workflows/ci.yml/badge.svg)](https://github.com/crit-labs/crit/actions/workflows/ci.yml)
 
 [Summary](#summary) • [Quick start](#quick-start) • [What `crit` solves](#what-crit-solves) • [Case studies](#case-study) •
-[How `crit` works](#how-crit-works) • [API](#api) • [CLI](#cli) • [crit-hub](#crit-hub) • [Limitations](#limitations) • [Documentation](#documentation)
+[How `crit` works](#how-crit-works) • [API](#api) • [CLI](#cli) • [MCP](#mcp) • [crit-hub](#crit-hub) • [Limitations](#limitations) • [Documentation](#documentation)
 
 </div>
 
@@ -27,16 +27,16 @@
 
 ## Summary
 
-**`crit` is a toolkit for optimizing or building inference engines tailored to your hardware and desired model.**
+**Your coding agent builds the engine; `crit` gives it the runtime, the techniques, the kernels and the measurements.**
 > [!IMPORTANT]
-> Combines a runtime foundation, reusable techniques as plugins, kernel discovery
+> Combines a runtime foundation, reusable techniques as plugins, its own kernels built and tuned for your GPU
 > and physics-based evaluation. 
 >
 > In our latest case study, a coding agent built an engine for Qwen3.8-27B on one RTX 5090 in under 4 hours and 
 > five candidates, reaching 189 tok/s sampled decode and 8,295 tok/s prefill with the model's full 262,144-token context.
 > 
-> Follow the [building guide](https://github.com/crit-labs/crit/blob/main/docs/BUILDING_ENGINES.md) yourself, or give your coding
-> agent the [agent instructions](https://github.com/crit-labs/crit/blob/main/AGENTS.md), target model and hardware.
+> Give your coding agent the [agent instructions](https://github.com/crit-labs/crit/blob/main/AGENTS.md), target model and
+> hardware. crit is an agent toolkit: its records, checks and guides are written for an agent driving it.
 
 ---
 
@@ -294,7 +294,7 @@ its first candidate to its last.
 
 ## How `crit` works
 
-An agent, or you, builds the engine as a series of candidates. Each candidate is a complete,
+An agent builds the engine as a series of candidates. Each candidate is a complete,
 servable engine, measured the same way, and each next one is chosen from the last one's numbers.
 A candidate is assembled from [plugins](https://github.com/crit-labs/crit/blob/main/docs/PLUGINS.md), one per slot (attention, KV cache, drafter, ...).
 Before Eval measures it, [crit smoke](https://github.com/crit-labs/crit/blob/main/smoke/README.md) checks its quality paths in minutes, and an ablation
@@ -351,7 +351,7 @@ fast: the model, its kernels, its layouts and its execution strategy.
 | [Contracts](https://github.com/crit-labs/crit/blob/main/core/contracts/README.md) | Who owns what between Core and your engine |
 | [Plugins](https://github.com/crit-labs/crit/blob/main/docs/PLUGINS.md) | Slots and their interfaces, plugin manifests and the checked assembly an engine built from plugins loads with |
 
-Try the [Core + Inference walkthrough](https://github.com/crit-labs/crit/blob/main/inference/examples/core-projection/README.md).
+Try the [plugin engine walkthrough](https://github.com/crit-labs/crit/blob/main/inference/examples/plugin-engine/README.md).
 
 </details>
 
@@ -375,7 +375,7 @@ into the engine on Core, each in its slot as a plugin.
 | Bottleneck | Example entries |
 | --- | --- |
 | One token per pass | [Speculative decoding](https://github.com/crit-labs/crit/blob/main/inference/mtp-decode/README.md), [draft trees](https://github.com/crit-labs/crit/blob/main/inference/draft-trees/README.md), [device-side rounds](https://github.com/crit-labs/crit/blob/main/inference/device-speculative-round/README.md), [EAGLE-3 and DFlash drafters](https://github.com/crit-labs/crit/blob/main/inference/hidden-state-drafters/README.md) |
-| Weight bytes per pass | [Quantized projections](https://github.com/crit-labs/crit/blob/main/inference/quantized-projections/README.md), with the GEMM and GEMV kernels from [Kernels](https://github.com/crit-labs/crit/blob/main/kernels/README.md)' providers |
+| Weight bytes per pass | [Quantized projections](https://github.com/crit-labs/crit/blob/main/inference/quantized-projections/README.md), on crit's GEMM and GEMV [kernels](https://github.com/crit-labs/crit/blob/main/kernels/README.md) |
 | Long context | [Attention state](https://github.com/crit-labs/crit/blob/main/inference/attention-state/README.md), [prefix checkpoints](https://github.com/crit-labs/crit/blob/main/inference/checkpoint-storage/README.md), [session scheduling](https://github.com/crit-labs/crit/blob/main/inference/session-scheduling/README.md) |
 | Model larger than VRAM | Recon names the placement scenario. Sparse models: a [device expert cache](https://github.com/crit-labs/crit/blob/main/inference/device-expert-cache/README.md) with [expert residency](https://github.com/crit-labs/crit/blob/main/inference/expert-residency/README.md) and the checkpoint's drafter from the first candidate, misses [computed on the CPU](https://github.com/crit-labs/crit/blob/main/inference/host-expert-arithmetic/README.md) or copied by [measured dispatch](https://github.com/crit-labs/crit/blob/main/inference/heterogeneous-expert-dispatch/README.md); dense models: [dense layer offload](https://github.com/crit-labs/crit/blob/main/inference/dense-layer-offload/README.md) |
 | Embedding and n-gram tables | [Lookup table rows](https://github.com/crit-labs/crit/blob/main/inference/lookup-table-rows/README.md): rows read on demand from disk, no read-ahead |
@@ -398,7 +398,7 @@ All entries are in the [full guide](https://github.com/crit-labs/crit/blob/main/
 | --- | --- |
 | Shown value | A measured gain, a reproduced and fixed bug, or a capability engines had to rebuild themselves |
 | No overfitting | Nothing in it is true only for the model or GPU where it was found |
-| Broad use | Dense, MoE, hybrid and multimodal models and other CUDA GPUs use it unchanged or are unaffected |
+| Broad use | Dense, MoE, hybrid and multimodal models and other GPUs and backends use it unchanged or are unaffected |
 
 </details>
 
@@ -411,34 +411,56 @@ All entries are in the [full guide](https://github.com/crit-labs/crit/blob/main/
 
 <br />
 
-**Kernels is a register of kernel collections.**
+**crit ships its own GPU kernels, built and tuned on your machine for your GPU and model.**
 
-`crit` hosts no compute kernels. Your agent takes each operation's kernel from an established
-provider, or writes its own when none fits, then measures it against its floor in Eval's kernel
-profile and against the best other provider for the same operation.
+crit's kernels cover the operations that decide an engine's speed: projections, attention, recurrent scans, experts
+and norms. Each one is a template built from a shared kernel core; `crit kernels sweep` tunes its knobs on the
+model's own shapes, checks every configuration against an FP64 reference and times it against the best library.
+Nothing is downloaded or shipped prebuilt. Wherever one of these kernels covers an operation, your agent uses it.
 
-| Provider | Covers |
+<a id="kernels-list"></a>
+
+| Family | Kernels |
+| --- | --- |
+| Projections | [decode-gemv](https://github.com/crit-labs/crit/blob/main/kernels/techniques/projections/decode-gemv/README.md), [mma-rows](https://github.com/crit-labs/crit/blob/main/kernels/techniques/projections/mma-rows/README.md), [pinned-gemm](https://github.com/crit-labs/crit/blob/main/kernels/techniques/projections/pinned-gemm/README.md), [fixed-tile-gemm](https://github.com/crit-labs/crit/blob/main/kernels/techniques/projections/fixed-tile-gemm/README.md), [fp8-block-rows](https://github.com/crit-labs/crit/blob/main/kernels/techniques/projections/fp8-block-rows/README.md) |
+| Attention | [paged-kv-attention](https://github.com/crit-labs/crit/blob/main/kernels/techniques/attention/paged-kv-attention/README.md) |
+| Recurrence | [recurrent-scans](https://github.com/crit-labs/crit/blob/main/kernels/techniques/recurrence/recurrent-scans/README.md) |
+| Experts | [grouped-experts](https://github.com/crit-labs/crit/blob/main/kernels/techniques/experts/grouped-experts/README.md), [int-block-experts](https://github.com/crit-labs/crit/blob/main/kernels/techniques/experts/int-block-experts/README.md), [topk-routing](https://github.com/crit-labs/crit/blob/main/kernels/techniques/experts/topk-routing/README.md) |
+| Norms | [fused-norms](https://github.com/crit-labs/crit/blob/main/kernels/techniques/norms/fused-norms/README.md) |
+
+**Every kernel has the same layout:**
+
+| Part | What it holds |
+| --- | --- |
+| `kernel.json` | Operations, sources, GPU architectures, structures, knobs and the library yardstick |
+| `bench.py` | The sweep's shapes, inputs, reference check and timing |
+| `torch-ext/`, `<id>_cuda/` | The kernel's Triton and CUDA source, built from [the kernel core](https://github.com/crit-labs/crit/blob/main/kernels/core/README.md) |
+| `tests/`, `README.md` | Tests against the FP64 reference; design, measured speed against the yardstick, what is left |
+
+<a id="kernels-libraries"></a>
+
+**If no crit kernel covers an operation, your agent takes it from one of these libraries:**
+
+| Library | Covers |
 | --- | --- |
 | [Hugging Face Kernel Hub](https://huggingface.co/kernels) | Community kernels for attention, GEMMs, activations, normalization, MoE and more, built per framework version and backend (CUDA, ROCm, Metal, XPU, CPU) |
 | [cuBLASLt](https://docs.nvidia.com/cuda/cublas/#using-the-cublaslt-api) | GEMMs in BF16/FP16, FP8 (per-tensor and per-row scales), block-scaled NVFP4 and MXFP8 on the GPUs that have them; epilogues |
-| [CUTLASS](https://github.com/NVIDIA/cutlass) | GEMM and convolution templates for layouts and fusions cuBLASLt does not take, grouped GEMMs, mixed-input GEMMs (4- or 8-bit weights widened to 16 bits inside the main loop) |
+| [CUTLASS](https://github.com/NVIDIA/cutlass) | GEMM and convolution templates for layouts and fusions cuBLASLt does not take, grouped GEMMs, mixed-input GEMMs |
 | [cuDNN](https://docs.nvidia.com/deeplearning/cudnn/) | Fused attention (SDPA), normalization |
 | [FlashAttention](https://github.com/Dao-AILab/flash-attention) | Prompt and decode attention, paged KV, sliding windows, softcap |
 | [FlashInfer](https://github.com/flashinfer-ai/flashinfer) | Paged and ragged attention, FP8 KV, MLA, cascade attention, top-k / top-p / min-p sampling, some GEMMs |
 | [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) | Chunked prefill and recurrent decode for gated delta, Mamba-style, RWKV and other linear attention |
-| [Triton](https://github.com/triton-lang/triton) | Writing a missing kernel in Python, compiled per device; ahead-of-time compilation for native engines |
 | [Marlin](https://github.com/IST-DASLab/marlin) | Mixed-input GEMMs: 4-bit weights (GPTQ-style groups) against 16-bit activations |
 | [ggml](https://github.com/ggml-org/ggml) | GGUF block formats (Q4_0 .. Q8_0, K-quants, IQ) on CUDA, Metal, Vulkan, ROCm and CPU |
 | [OpenBLAS](https://github.com/OpenMathLib/OpenBLAS), oneDNN | CPU GEMMs and fused CPU operators |
 | [Composable Kernel](https://github.com/ROCm/composable_kernel), [hipBLASLt](https://github.com/ROCm/hipBLASLt) | GEMMs and attention on AMD GPUs |
 | [MLX](https://github.com/ml-explore/mlx), Metal Performance Shaders | GEMMs, attention and quantized matmuls on Apple GPUs |
 
-**Kernel workbench**
-
-When the agent writes a kernel, or adapts a provider's, `crit kernels new` gives it a workbench folder with
-the checkpoint's own shapes, an FP64 reference and a yardstick such as cuBLAS. `crit eval workbench check` then
-compares the kernel with the reference on every shape and requires the same bits on a repeat, and `bench` times
-it against the yardstick and the GPU's floor. See [the workbench](https://github.com/crit-labs/crit/blob/main/kernels/README.md#write-or-adapt-a-kernel-the-workbench).
+**If no library fits either, your agent builds the kernel itself** in the
+[kernel workbench](https://github.com/crit-labs/crit/blob/main/kernels/README.md#write-or-adapt-a-kernel-the-workbench):
+`crit kernels new` scaffolds a folder with the checkpoint's own shapes, an FP64 reference and a library yardstick,
+and `crit eval workbench check`, `bench` and `profile` check it, time it and break it down. A kernel that holds
+beyond one model and GPU is a welcome contribution as a crit kernel.
 
 </details>
 
@@ -504,8 +526,41 @@ server, so the numbers you read are the numbers you get. Engines implement the
 One `crit` command drives everything: `crit run` keeps the run's records (plans, candidates,
 measurements, ablations, selection, cost), `crit eval` runs the common suite, `crit smoke` checks a served
 engine in minutes, `crit plugins` checks and tests an engine's plugins, `crit serve` serves an engine,
-`crit pull` installs a crit-hub engine, and `crit kernels`, `crit models` and `crit inference` reach the other
-parts. Records are written only through it, so each plan, candidate, Eval and seal is checked as it is recorded.
+`crit pull` installs a crit-hub engine, `crit bench` and `crit hub report` measure it on your machine and add the
+result to its card, and `crit kernels`, `crit models` and `crit inference` reach the other parts. Records are written only
+through it, so each plan, candidate, Eval and seal is checked as it is recorded.
+
+</details>
+
+---
+
+<a id="mcp"></a>
+
+<details>
+<summary><strong>🧩 MCP</strong> → <a href="mcp/README.md">Full guide</a></summary>
+
+<br />
+
+`crit mcp` offers crit's command line to an agent as [MCP](https://modelcontextprotocol.io) tools, so an agent whose
+harness speaks MCP (Claude Code, Codex, Cline and most others) drives a run through typed tools instead of shell
+commands, and waits on builds and Eval through jobs the server owns.
+
+```bash
+claude mcp add crit -- crit mcp --root /path/to/runs
+```
+
+| Tool | What it does |
+| --- | --- |
+| `crit_run_*` | A run's records: next, create, plan, candidate, build, package, eval, serve, seal, ... |
+| `crit_eval_*` | crit Eval: probe, prepare, reference, run, status, kernels, workbench, ab, ... |
+| `crit_kernels_*` | List, build and sweep crit's kernels; scaffold a workbench |
+| `crit_models_*`, `crit_inference_*` | Weight transforms and drafters; the Inference techniques |
+| `crit_pull`, `crit_serve`, `crit_serve_status` | Install a crit-hub engine, serve it, check a running server |
+| `crit_job_*`, `crit_jobs` | Wait on, read and stop the commands' jobs |
+
+Every tool's inputs come from the command's own parser, and its annotations mark it read-only, destructive or
+open-world, so a client can run the read-only ones without asking. See the [full guide](https://github.com/crit-labs/crit/blob/main/mcp/README.md) for hosts, jobs and
+privacy.
 
 </details>
 
@@ -562,7 +617,7 @@ card for a pull request ([Benchmark your machine](https://github.com/crit-labs/c
 | To… | Read |
 | --- | --- |
 | Build and compare engines | [Building engines](https://github.com/crit-labs/crit/blob/main/docs/BUILDING_ENGINES.md) · [Agent instructions](https://github.com/crit-labs/crit/blob/main/AGENTS.md) · [Run records](https://github.com/crit-labs/crit/blob/main/docs/RUN_RECORDS.md) |
-| Integrate the native runtime | [Core](https://github.com/crit-labs/crit/blob/main/core/README.md) · [Contracts](https://github.com/crit-labs/crit/blob/main/core/contracts/README.md) · [Core + Inference walkthrough](https://github.com/crit-labs/crit/blob/main/inference/examples/core-projection/README.md) |
+| Integrate the native runtime | [Core](https://github.com/crit-labs/crit/blob/main/core/README.md) · [Contracts](https://github.com/crit-labs/crit/blob/main/core/contracts/README.md) · [Plugin engine walkthrough](https://github.com/crit-labs/crit/blob/main/inference/examples/plugin-engine/README.md) |
 | Choose or adapt a technique | [Inference](https://github.com/crit-labs/crit/blob/main/inference/README.md) |
 | Build an engine from plugins and measure each one | [Plugins](https://github.com/crit-labs/crit/blob/main/docs/PLUGINS.md) · [Smoke tests](https://github.com/crit-labs/crit/blob/main/smoke/README.md) |
 | Find and adapt kernels | [Kernels](https://github.com/crit-labs/crit/blob/main/kernels/README.md) |

@@ -1,6 +1,6 @@
 """Core's engine loader (crit_core.engine): a package is its plugins and the configuration that selects them, and an
 engine is Core running what the selection assembles. The loader refuses a package that is not a whole engine and a
-model plugin that cannot batch or serve the contract, runs the toy package (support/toy_plugins) on Core's concurrent
+model plugin that cannot batch or serve the contract, runs the toy package (inference/examples/plugin-engine/plugins) on Core's concurrent
 runtime, and Core's eval-v1 and chat-resident-v1 adapters serve it with its plugins in their facts."""
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -278,6 +278,22 @@ class FactTests(unittest.TestCase):
                          ["device:cuda", "cuda:sm_86", "cuda:bf16"])
         self.assertEqual(machine_facts("cuda", {"compute_capability": None}), ["device:cuda"])   # unknown: none
         self.assertEqual(machine_facts("cpu", {"compute_capability": "12.0"}), ["device:cpu"])
+
+    def test_without_a_probe_the_gpu_cuda_runs_on_is_asked(self):
+        from unittest.mock import patch
+        import os
+        asked = []
+
+        def run(command, **_):
+            asked.append(command[command.index("-i") + 1])
+            return types.SimpleNamespace(returncode=0, stdout="8.9\n")
+        for visible, gpu in (("2,0", "2"), ("GPU-1234abcd", "GPU-1234abcd"), (None, "0")):
+            environment = {k: v for k, v in os.environ.items() if k != "CUDA_VISIBLE_DEVICES"}
+            environment.update({"CUDA_VISIBLE_DEVICES": visible} if visible else {})
+            with patch.dict(os.environ, environment, clear=True), patch("subprocess.run", run), \
+                    patch.dict(core_engine._PROBED, clear=True):
+                self.assertEqual(core_engine.cuda_capability(), 89)
+            self.assertEqual(asked[-1], gpu)
 
 
 class LoadTests(PackageFixture, unittest.TestCase):

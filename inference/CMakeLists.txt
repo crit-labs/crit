@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_inference VERSION 0.17.2 LANGUAGES CXX)
+project(crit_inference VERSION 0.18.0 LANGUAGES CXX)
 # Inference's native examples and fixtures. Inference uses Core only through its public SDK
 # (crit::core, crit::cuda); Core never builds or includes Inference code.
 find_package(Threads REQUIRED)
@@ -8,7 +8,7 @@ option(CRIT_INFERENCE_CUDA "Build Inference's CUDA reference kernels and their f
 option(CRIT_INFERENCE_INSTALLED_CORE "Use an installed Core SDK (CMAKE_PREFIX_PATH) instead of this checkout's core/" OFF)
 if(NOT TARGET crit::core)
   if(CRIT_INFERENCE_INSTALLED_CORE)
-    find_package(critCore 0.17.2 CONFIG REQUIRED)
+    find_package(critCore 0.18.0 CONFIG REQUIRED)
   else()
     if(CRIT_INFERENCE_CUDA)
       set(CRIT_CORE_CUDA ON CACHE BOOL "Build the explicit CUDA backend services" FORCE)
@@ -201,7 +201,7 @@ crit_inference_executable(crit_dependent_steps_tests SOURCES ${FIXTURES}/depende
   INCLUDES ${INFERENCE}/concurrent-request-execution/code LINK crit::core)
 crit_inference_tests(crit_dependent_steps_tests crit_dependent_steps 30 compare ahead cancel recovery stale commit quarantine immovable)
 crit_inference_executable(crit_attention_tests SOURCES ${FIXTURES}/attention_tests.cpp
-  INCLUDES ${INFERENCE}/attention-state/code ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/examples/openblas
+  INCLUDES ${INFERENCE}/attention-state/code
   LINK crit::core ${CMAKE_DL_LIBS})
 crit_inference_tests(crit_attention_tests crit_attention 45 batches arithmetic rotary integration failures)
 crit_inference_executable(crit_rope_table_tests SOURCES ${FIXTURES}/rope_table_tests.cpp
@@ -249,10 +249,6 @@ crit_inference_executable(crit_pipeline_tests SOURCES ${FIXTURES}/pipeline_tests
 crit_inference_test(crit_inference_pipeline 30 crit_pipeline_tests)
 crit_inference_executable(crit_prompt_copy_tests SOURCES ${FIXTURES}/prompt_copy_tests.cpp INCLUDES ${INFERENCE}/mtp-decode/code)
 add_test(NAME crit_prompt_copy COMMAND crit_prompt_copy_tests)
-
-crit_inference_executable(crit_core_projection_example SOURCES ${INFERENCE}/examples/core-projection/main.cpp
-  INCLUDES ${INFERENCE}/quantized-projections/code LINK crit::core)
-crit_inference_test(crit_core_projection_example 30 crit_core_projection_example)
 
 if(NOT CRIT_INFERENCE_CUDA)
   return()

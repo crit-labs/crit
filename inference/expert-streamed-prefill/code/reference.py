@@ -2,7 +2,7 @@
 
 A routed SwiGLU block over a prompt chunk: each token's routes in order, each expert's gate/up and down matrices
 decoded from their stored format, SwiGLU between them, the outputs summed with the routing weights. Any kernel
-(a provider's grouped GEMM, a Hub kernel, the engine's own) fed the same routes, weights and activations must land
+(a provider's grouped GEMM, one of crit's kernels, the engine's own) fed the same routes, weights and activations must land
 within its arithmetic's tolerance of moe_block, and route_order states the order a stable route sort must produce.
 
 FP64 in pure Python is slow: check a few tokens of a real chunk (their rows only), not a whole prompt.

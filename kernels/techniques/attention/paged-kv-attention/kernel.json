@@ -1,0 +1,918 @@
+{
+  "schema": "crit-kernel-v1",
+  "id": "paged-kv-attention",
+  "family": "attention",
+  "title": "Attention over paged KV caches in Triton: page writes (BF16, FP16, FP8, INT8), split-KV decode and verify windows merged by their log-sum-exps, causal prompt chunks, and flash structures (grouped heads packed into tensor-core tiles, contiguous KV splits) for windows and prompt chunks, and a CUDA flash tile (queries in shared memory, 16 rows a warp) for both",
+  "package": "paged_kv_attention",
+  "language": "triton",
+  "capabilities": [
+    "8.0",
+    "8.6",
+    "8.9",
+    "9.0",
+    "10.0",
+    "11.0",
+    "12.0"
+  ],
+  "operations": [
+    "paged-attention",
+    "partial-attention-merge"
+  ],
+  "cuda": {
+    "sources": [
+      "torch-ext/paged_kv_attention/cuda_window.cu"
+    ],
+    "structures": [
+      "cuda-window",
+      "cuda-fused",
+      "cuda-prefill"
+    ],
+    "variant": {
+      "T": [
+        0,
+        1
+      ],
+      "KIND": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "D": [
+        64,
+        128,
+        256
+      ],
+      "DV": [
+        64,
+        128,
+        256
+      ],
+      "W": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        6,
+        8
+      ],
+      "S": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "VS": [
+        0,
+        1,
+        2,
+        4
+      ]
+    },
+    "device": {
+      "SMEM": "shared_memory_per_block_optin"
+    },
+    "check": [
+      {
+        "T": 0,
+        "KIND": 0,
+        "D": 256,
+        "DV": 256,
+        "W": 0,
+        "S": 0,
+        "VS": 0
+      },
+      {
+        "T": 1,
+        "KIND": 3,
+        "D": 128,
+        "DV": 128,
+        "W": 0,
+        "S": 0,
+        "VS": 0
+      },
+      {
+        "T": 0,
+        "KIND": 2,
+        "D": 64,
+        "DV": 128,
+        "W": 0,
+        "S": 0,
+        "VS": 0
+      }
+    ]
+  },
+  "structures": {
+    "write": {
+      "what": "a step's keys and values into their page slots in one launch, one program per token and KV head, encoded for the page kind (exact: the same codes and scales whatever the warps)",
+      "call": "write",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        1,
+        16,
+        256,
+        4096
+      ],
+      "key": [
+        "D",
+        "DV",
+        "HKV",
+        "KIND"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "WARPS": {
+          "values": [
+            0,
+            1,
+            2,
+            4,
+            8
+          ],
+          "default": 0,
+          "what": "warps a program (0: one up to 128 values a head, two past)"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer append_paged_kv_cache into the same slots (the pool as pages of one position), 16-bit pages only: no library encodes FP8 or INT8 pages"
+      },
+      "bench": "bench.py:Write"
+    },
+    "split": {
+      "what": "how a row's keys split over the KV partitions of every split-KV launch over a cache (decode, verify windows, fused prompt rows, block lists): positions a piece and the partition count, piece i to partition i mod P; one value each per cache, read by partitions() and piece_size()",
+      "call": "attend",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        1,
+        8
+      ],
+      "key": [
+        "D",
+        "DV",
+        "HKV",
+        "KIND"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "PIECE": {
+          "values": [
+            0,
+            16,
+            32,
+            64,
+            128
+          ],
+          "default": 0,
+          "order": true,
+          "what": "positions a piece (0: 16,384 head values over 16-bit pages, 8,192 over FP8 and INT8, within 16..128)"
+        },
+        "PARTS": {
+          "values": [
+            0,
+            8,
+            16,
+            32,
+            64,
+            128
+          ],
+          "default": 0,
+          "order": true,
+          "what": "KV partitions a row (0: about 1.5 programs per SM over FP8 and INT8 pages, 0.75 over 16-bit, a power of two within 8..128)"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer BatchDecodeWithPagedKVCacheWrapper (tensor-core kernels, any query heads a KV head) over the same rows and page tables, its own KV split; per-position-scaled FP8 and INT8 pages widened once to BF16 (FlashInfer reads 16-bit pages and FP8 pages with one scale a layer)"
+      },
+      "bench": "bench.py:Split"
+    },
+    "window": {
+      "what": "the split-KV window launch: a query tile of a row's columns times a KV head's query heads over the pieces of one partition, mma.sync on every GPU (tile_for's tile), its partials written for the merge",
+      "call": "attend",
+      "rows": [
+        1,
+        64
+      ],
+      "tune_rows": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        64
+      ],
+      "key": [
+        "D",
+        "DV",
+        "HQ",
+        "HKV",
+        "PAGE",
+        "KIND"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "WARPS": {
+          "values": [
+            0,
+            1,
+            2,
+            4,
+            8
+          ],
+          "default": 0,
+          "what": "warps a tile (0: two up to 32 rows, four over a 64-row tile); a tile of 64 rows or more keeps the rule's on GPUs with warpgroup MMA"
+        },
+        "STAGES": {
+          "values": [
+            0,
+            1,
+            2,
+            3,
+            4
+          ],
+          "default": 0,
+          "what": "pipeline stages of a piece's loads (0: three up to 32 rows, four over a 64-row tile)"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer BatchPrefillWithPagedKVCacheWrapper, causal, over the same rows' columns and page tables (BatchDecode for one column); per-position-scaled FP8 and INT8 pages widened once to BF16 (FlashInfer reads 16-bit pages and FP8 pages with one scale a layer)"
+      },
+      "bench": "bench.py:Window"
+    },
+    "merge": {
+      "what": "the merge after a split launch: one program per column and query head folding its partitions' partials in partition order (elementwise: its warps and the partials loaded a turn change no bits)",
+      "call": "attend",
+      "rows": [
+        1,
+        64
+      ],
+      "tune_rows": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        64
+      ],
+      "key": [
+        "D",
+        "DV",
+        "HQ",
+        "HKV",
+        "PAGE",
+        "KIND"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "WARPS": {
+          "values": [
+            1,
+            2,
+            4,
+            8
+          ],
+          "default": 4,
+          "what": "warps a merge program"
+        },
+        "CHUNK": {
+          "values": [
+            4,
+            8,
+            16,
+            32
+          ],
+          "default": 16,
+          "what": "partitions whose partials a merge program loads a turn (at most the partitions' power of two), folded one by one"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer BatchPrefillWithPagedKVCacheWrapper over the same windows, as window's: the merge is timed in the whole attend call it closes, FlashInfer's split and merge inside its call; per-position-scaled FP8 and INT8 pages widened once to BF16 (FlashInfer reads 16-bit pages and FP8 pages with one scale a layer)"
+      },
+      "bench": "bench.py:Merge"
+    },
+    "fused": {
+      "what": "the fused window launch (prompt rows as windows of up to 64 columns): each program reads every partition of its tile in turn and folds them as the merge does, over a part of the value columns: the split launch's bits, no partials",
+      "call": "attend",
+      "rows": [
+        1,
+        64
+      ],
+      "tune_rows": [
+        1,
+        16,
+        64
+      ],
+      "key": [
+        "D",
+        "DV",
+        "HQ",
+        "HKV",
+        "PAGE",
+        "KIND"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "WARPS": {
+          "values": [
+            2,
+            4,
+            8
+          ],
+          "default": 4,
+          "what": "warps a tile; a tile of 64 rows or more keeps the rule's on GPUs with warpgroup MMA"
+        },
+        "STAGES": {
+          "values": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "default": 3,
+          "what": "pipeline stages of a piece's loads"
+        },
+        "VSPLIT": {
+          "values": [
+            0,
+            1,
+            2,
+            4
+          ],
+          "default": 0,
+          "what": "programs a tile, each over a part of the value columns and computing the scores again (0: two past 128 value columns, else one)"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer BatchPrefillWithPagedKVCacheWrapper, causal, over the same windows; per-position-scaled FP8 and INT8 pages widened once to BF16 (FlashInfer reads 16-bit pages and FP8 pages with one scale a layer)"
+      },
+      "bench": "bench.py:Fused"
+    },
+    "sparse": {
+      "what": "the block-sparse launch: one program per token, partition and KV head over the positions of the token's listed KV blocks, partials merged as the window launch's",
+      "call": "attend",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        1,
+        8,
+        64
+      ],
+      "key": [
+        "D",
+        "DV",
+        "HQ",
+        "HKV",
+        "PAGE",
+        "KIND"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "WARPS": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 2,
+          "what": "warps a program; a tile of 64 rows or more keeps the rule's on GPUs with warpgroup MMA"
+        },
+        "STAGES": {
+          "values": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "default": 3,
+          "what": "pipeline stages of a piece's loads"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer BatchDecodeWithPagedKVCacheWrapper over page lists holding exactly each token's listed blocks (the same keys in the softmax); per-position-scaled FP8 and INT8 pages widened once to BF16 (FlashInfer reads 16-bit pages and FP8 pages with one scale a layer)"
+      },
+      "bench": "bench.py:Sparse"
+    },
+    "prefill": {
+      "what": "a causal prompt chunk of one sequence: a block of queries over blocks of its positions in one online softmax (FP32 row sums), through its page table; INT8 queries on integer tensor cores over INT8 pages with int8_qk",
+      "call": "prefill",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        16,
+        256,
+        2048
+      ],
+      "key": [
+        "D",
+        "HQ",
+        "HKV",
+        "PAGE",
+        "KIND",
+        "INT8"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "BLOCK_M": {
+          "values": [
+            32,
+            64,
+            128
+          ],
+          "default": 64,
+          "order": true,
+          "what": "queries a program (speed only under mma.sync; on GPUs with warpgroup MMA another tile may take another instruction)"
+        },
+        "BLOCK_N": {
+          "values": [
+            0,
+            32,
+            64,
+            128
+          ],
+          "default": 0,
+          "order": true,
+          "what": "positions a step of the online softmax (0: 64 up to 128-wide heads, 32 past)"
+        },
+        "WARPS": {
+          "values": [
+            4,
+            8
+          ],
+          "default": 4,
+          "order": true,
+          "what": "warps a program (on GPUs with warpgroup MMA the instruction follows them)"
+        },
+        "STAGES": {
+          "values": [
+            0,
+            2,
+            3,
+            4
+          ],
+          "default": 0,
+          "what": "pipeline stages of a block's loads (0: three with int8_qk, else two)"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer BatchPrefillWithPagedKVCacheWrapper, causal, the chunk over its sequence's page table; BF16 queries (FlashInfer has no INT8 query path); per-position-scaled FP8 and INT8 pages widened once to BF16 (FlashInfer reads 16-bit pages and FP8 pages with one scale a layer)"
+      },
+      "bench": "bench.py:Prefill"
+    },
+    "flash-window": {
+      "what": "the flash window launch (attend(..., flash=True)): a row's columns times a KV head's query heads packed into tiles of the cache's one shape (ROWS x WARPS), the row's keys in contiguous splits of CHUNK positions walked in blocks of BLOCK_N with the online softmax on the tensor cores (base 2, FP32 row sums), every block masked (one rounding for every block), the splits merged in split order; CHUNK, BLOCK_N, ROWS and WARPS one per cache for every flash launch over it (flash_chunk(), flash_block(), flash_tile())",
+      "call": "attend",
+      "rows": [
+        1,
+        64
+      ],
+      "tune_rows": [
+        1,
+        4,
+        16,
+        64
+      ],
+      "key": [
+        "D",
+        "DV",
+        "HQ",
+        "HKV",
+        "PAGE",
+        "KIND"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "CHUNK": {
+          "values": [
+            0,
+            256
+          ],
+          "default": 0,
+          "order": true,
+          "what": "positions a split (0: 1,024), a multiple of BLOCK_N"
+        },
+        "BLOCK_N": {
+          "values": [
+            0,
+            64
+          ],
+          "default": 0,
+          "order": true,
+          "what": "positions a step of the online softmax (0: 32)"
+        },
+        "ROWS": {
+          "values": [
+            0,
+            64
+          ],
+          "default": 0,
+          "order": true,
+          "what": "rows a tile, columns times query heads (0: 32); GPUs with warpgroup MMA keep one 64-row four-warp tile"
+        },
+        "WARPS": {
+          "values": [
+            0,
+            8
+          ],
+          "default": 0,
+          "order": true,
+          "what": "warps a tile (0: four)"
+        },
+        "STAGES": {
+          "values": [
+            0,
+            2
+          ],
+          "default": 0,
+          "what": "pipeline stages of a block's loads (0: one past 128-wide heads, two up to them)"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer BatchPrefillWithPagedKVCacheWrapper, causal, over the same rows' columns and page tables (BatchDecode for one column); per-position-scaled FP8 and INT8 pages widened once to BF16 (FlashInfer reads 16-bit pages and FP8 pages with one scale a layer)"
+      },
+      "bench": "bench.py:FlashWindow"
+    },
+    "flash-fused": {
+      "what": "the fused flash launch (attend(..., flash=True, fused=True), prompt rows as windows of up to 64 columns): each program walks every split of its tile in turn and folds them in split order as the flash merge does, over a part of the value columns, in the cache's tile: the flash window launch's bits, no partials",
+      "call": "attend",
+      "rows": [
+        1,
+        64
+      ],
+      "tune_rows": [
+        1,
+        16,
+        64
+      ],
+      "key": [
+        "D",
+        "DV",
+        "HQ",
+        "HKV",
+        "PAGE",
+        "KIND"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "STAGES": {
+          "values": [
+            0,
+            2
+          ],
+          "default": 0,
+          "what": "pipeline stages of a block's loads (0: one past 128-wide heads, two up to them)"
+        },
+        "VSPLIT": {
+          "values": [
+            0,
+            1,
+            4
+          ],
+          "default": 0,
+          "what": "programs a tile, each over a part of the value columns and computing the scores again (0: two from 128 value columns, else one)"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer BatchPrefillWithPagedKVCacheWrapper, causal, over the same windows; per-position-scaled FP8 and INT8 pages widened once to BF16 (FlashInfer reads 16-bit pages and FP8 pages with one scale a layer)"
+      },
+      "bench": "bench.py:FlashFused"
+    },
+    "flash-prefill": {
+      "what": "the flash prompt chunk (prefill(..., flash=True)): the chunk's tokens times a KV head's query heads packed into tiles, its positions split on the device over SPLITS programs a tile (merged by their states) or read in one range (written directly), blocks a tile sees in full without the causal mask, exp2 with the scale folded in, FP32 row sums; a token's bits follow the chunk's length",
+      "call": "prefill",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        16,
+        256,
+        2048
+      ],
+      "key": [
+        "D",
+        "HQ",
+        "HKV",
+        "PAGE",
+        "KIND",
+        "INT8"
+      ],
+      "row_invariant": false,
+      "knobs": {
+        "BLOCK_M": {
+          "values": [
+            0,
+            64
+          ],
+          "default": 0,
+          "what": "rows a tile, tokens times query heads (0: 32)"
+        },
+        "BLOCK_N": {
+          "values": [
+            0,
+            64
+          ],
+          "default": 0,
+          "what": "positions a step (0: 32)"
+        },
+        "WARPS": {
+          "values": [
+            0,
+            8
+          ],
+          "default": 0,
+          "what": "warps a tile (0: four)"
+        },
+        "STAGES": {
+          "values": [
+            0,
+            2
+          ],
+          "default": 0,
+          "what": "pipeline stages of a block's loads (0: one past 128-wide heads, two up to them)"
+        },
+        "SPLITS": {
+          "values": [
+            0,
+            1,
+            16
+          ],
+          "default": 0,
+          "what": "programs a tile's positions split over (0: about two programs an SM, at most 64; 1: one range, no merge)"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer BatchPrefillWithPagedKVCacheWrapper, causal, the chunk over its sequence's page table; BF16 queries (FlashInfer has no INT8 query path); per-position-scaled FP8 and INT8 pages widened once to BF16 (FlashInfer reads 16-bit pages and FP8 pages with one scale a layer)"
+      },
+      "bench": "bench.py:FlashPrefill"
+    },
+    "cuda-window": {
+      "what": "the CUDA flash tile's window launch (attend(..., flash=\"cuda\"), cuda_window.cu): a row's columns times a KV head's query heads in tiles of 16 rows a warp, the queries in shared memory (ldmatrix a k-step), the row's keys and values in blocks of BLOCK_N through a cp.async ring the CTA's warps share, BF16 mma.sync with FP32 accumulators, each warp's online softmax in registers (no cross-warp reduction), contiguous splits of CHUNK positions merged in split order; CHUNK and BLOCK_N one per cache for every cuda launch over it (cuda_chunk(), cuda_block()), the warps change no bit",
+      "call": "attend",
+      "rows": [
+        1,
+        64
+      ],
+      "tune_rows": [
+        1,
+        4,
+        16,
+        64
+      ],
+      "key": [
+        "D",
+        "DV",
+        "HQ",
+        "HKV",
+        "PAGE",
+        "KIND"
+      ],
+      "lengths": {
+        "field": "N",
+        "values": [
+          4096,
+          32768,
+          131072
+        ]
+      },
+      "row_invariant": true,
+      "knobs": {
+        "CHUNK": {
+          "values": [
+            0,
+            128,
+            192,
+            256,
+            288,
+            320,
+            384,
+            512,
+            768,
+            1024,
+            2048
+          ],
+          "default": 0,
+          "order": true,
+          "what": "positions a split (0: the GPU's rule, a decode row of 90,112 positions over two programs an SM, its KV heads counted by their square root: 90,112 x sqrt(KV heads) / (2 x SMs) to the nearest 128, 128 to 2,048), a multiple of BLOCK_N"
+        },
+        "BLOCK_N": {
+          "values": [
+            0,
+            16,
+            32,
+            64
+          ],
+          "default": 0,
+          "order": true,
+          "what": "positions a step of the online softmax (0: 16 over 16-bit pages, 32 over 8-bit pages)"
+        },
+        "WARPS": {
+          "values": [
+            0,
+            2,
+            8
+          ],
+          "default": 0,
+          "what": "warps a CTA, 16 query rows each (0: four; never more than the window's rows need): speed only, each warp owns its rows' softmax"
+        },
+        "STAGES": {
+          "values": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "default": 0,
+          "what": "cp.async stages of a block's keys and values (0: one over 16-bit pages, the keys and values in buffers of their own, two over 8-bit pages; fewer where the GPU's shared memory does not hold them)"
+        },
+        "VWARPS": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 0,
+          "what": "warps a row group of 16 query rows, sharing its scores (each computing some of a block's positions) and splitting its value columns (0: the rule with WARPS 0, as many row groups as the tile's query rows fill up to four and four warps in all; 1 with a tuning's WARPS): speed only, every warp of a group runs its softmax on the same scores"
+        },
+        "CONVERT": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 0,
+          "what": "where 8-bit pages' codes become 16-bit operands: 1 a 16-bit block in shared memory the CTA converts once a block, 2 each warp's fragments in registers (0: the rule, registers; launches with fresh rows always the shared block): speed only, the same operands"
+        },
+        "RAMP": {
+          "values": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "default": 0,
+          "order": true,
+          "what": "a row's first positions in RAMP bands of 16 splits (CUDA_RAMP_SPLITS), band b's of CHUNK / 2^(RAMP - b) positions, then splits of CHUNK (0: every split CHUNK positions): short rows in many small splits, long ones in about as many as without; one per cache for every cuda launch over it (cuda_ramp()), CHUNK a multiple of BLOCK_N x 2^RAMP"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer BatchPrefillWithPagedKVCacheWrapper, causal, over the same rows' columns and page tables (BatchDecode for one column); per-position-scaled FP8 and INT8 pages widened once to BF16 (FlashInfer reads 16-bit pages and FP8 pages with one scale a layer)"
+      },
+      "bench": "bench.py:CudaWindow"
+    },
+    "cuda-fused": {
+      "what": "the CUDA flash tile's fused launch (attend(..., flash=\"cuda\", fused=True), prompt rows as windows of up to 64 columns): the window launch's programs, one a split, each writing its state into a ring its tile owns, the last of a group of splits folding the group's states in split order with the merge's steps into the tile's running state, over VSPLIT parts of the value columns: the cuda window launch's bits, a workspace that follows the tiles, no partials a split; its block and chunk cuda-window's",
+      "call": "attend",
+      "rows": [
+        1,
+        64
+      ],
+      "tune_rows": [
+        1,
+        16,
+        64
+      ],
+      "key": [
+        "D",
+        "DV",
+        "HQ",
+        "HKV",
+        "PAGE",
+        "KIND"
+      ],
+      "lengths": {
+        "field": "N",
+        "values": [
+          4096,
+          32768,
+          131072
+        ]
+      },
+      "row_invariant": true,
+      "knobs": {
+        "WARPS": {
+          "values": [
+            0,
+            1,
+            2,
+            8
+          ],
+          "default": 0,
+          "what": "warps a CTA, 16 query rows each (0: four; never more than the window's rows need): speed only, each warp owns its rows' softmax"
+        },
+        "STAGES": {
+          "values": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "default": 0,
+          "what": "cp.async stages of a block's keys and values (0: one over 16-bit pages, the keys and values in buffers of their own, two over 8-bit pages; fewer where the GPU's shared memory does not hold them)"
+        },
+        "VSPLIT": {
+          "values": [
+            0,
+            1,
+            2,
+            4
+          ],
+          "default": 0,
+          "what": "programs a tile, each over a part of the value columns and computing the scores again (0: one)"
+        },
+        "VWARPS": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 0,
+          "what": "warps a row group of 16 query rows, sharing its scores (each computing some of a block's positions) and splitting its value columns (0: the rule with WARPS 0, as many row groups as the tile's query rows fill up to four and four warps in all; 1 with a tuning's WARPS): speed only, every warp of a group runs its softmax on the same scores"
+        },
+        "CONVERT": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 0,
+          "what": "where 8-bit pages' codes become 16-bit operands: 1 a 16-bit block in shared memory the CTA converts once a block, 2 each warp's fragments in registers (0: the rule, registers; launches with fresh rows always the shared block): speed only, the same operands"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer BatchPrefillWithPagedKVCacheWrapper, causal, over the same windows; per-position-scaled FP8 and INT8 pages widened once to BF16 (FlashInfer reads 16-bit pages and FP8 pages with one scale a layer)"
+      },
+      "bench": "bench.py:CudaFused"
+    },
+    "cuda-prefill": {
+      "what": "the CUDA flash tile's prompt chunk (prefill(..., flash=\"cuda\")): the chunk's tokens times a KV head's query heads in tiles of 16 rows a warp, its positions split on the device over SPLITS programs a tile (merged by their states) or read in one range (written directly); a token's bits follow the chunk's length",
+      "call": "prefill",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        16,
+        256,
+        2048
+      ],
+      "key": [
+        "D",
+        "HQ",
+        "HKV",
+        "PAGE",
+        "KIND",
+        "INT8"
+      ],
+      "row_invariant": false,
+      "knobs": {
+        "BLOCK_N": {
+          "values": [
+            0,
+            16,
+            64
+          ],
+          "default": 0,
+          "what": "positions a step (0: 32)"
+        },
+        "WARPS": {
+          "values": [
+            0,
+            2,
+            8
+          ],
+          "default": 0,
+          "what": "warps a CTA, 16 query rows each (0: four; never more than the window's rows need): speed only, each warp owns its rows' softmax"
+        },
+        "STAGES": {
+          "values": [
+            0,
+            1,
+            3
+          ],
+          "default": 0,
+          "what": "cp.async stages of a block's keys and values (0: two; fewer where the GPU's shared memory does not hold them)"
+        },
+        "SPLITS": {
+          "values": [
+            0,
+            1,
+            16
+          ],
+          "default": 0,
+          "what": "programs a tile's positions split over (0: about two programs an SM, at most 64; 1: one range, no merge)"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer BatchPrefillWithPagedKVCacheWrapper, causal, the chunk over its sequence's page table; BF16 queries (FlashInfer has no INT8 query path); per-position-scaled FP8 and INT8 pages widened once to BF16 (FlashInfer reads 16-bit pages and FP8 pages with one scale a layer)"
+      },
+      "bench": "bench.py:CudaPrefill"
+    }
+  }
+}

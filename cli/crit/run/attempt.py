@@ -34,14 +34,18 @@ def unsealed(root, candidate_id, sealed=SEALED):
 
 
 def packaged(folder, doing, who):
-    """The candidate's package manifest; the package must be a plugin package, the only kind Core's loader runs.
-    `doing` and `who` word the errors ("measuring", "Eval measures")."""
+    """The candidate's package manifest; the package must be a plugin package, which Core's loader runs, or an
+    external candidate, which its launch command starts (crit.run.external). `doing` and `who` word the errors
+    ("measuring", "Eval measures")."""
     path = folder / "package" / "manifest.json"
     if not path.is_file():
         raise ValueError(f"Package the candidate before {doing} it")
     if not (folder / "package" / "plugins").is_dir():
-        raise ValueError(f"{who} the candidate through crit serve, which runs plugin packages only: package it as "
-                         "plugins/ and the configuration that selects them (docs/PLUGINS.md)")
+        from .external import candidate_spec
+        if candidate_spec(folder) is None:
+            raise ValueError(f"{who} the candidate through crit serve, which runs plugin packages: package it as "
+                             "plugins/ and the configuration that selects them (docs/PLUGINS.md), or declare an "
+                             "external engine and its launch command in configuration.engine (docs/RUN_RECORDS.md)")
     return read_json(path)
 
 
@@ -61,6 +65,7 @@ class Attempt:
         self.id = self.reservation["attempt_id"]
         self.log_path = safe_path(self.root, f"candidates/{candidate_id}/logs/{name}-{self.id}.log")
         self.outcome, self.failure, self.settled, self.interrupted, self.exit_code = "completed", None, True, None, None
+        self.evidence = []   # files the work wrote beside the log, kept with it (an external engine's output)
 
     @property
     def deadline_at(self):
@@ -108,7 +113,7 @@ class Attempt:
                 and timestamp(ended, "ended") > timestamp(self.deadline_at, "deadline")):
             self.outcome, self.failure = "timed_out", f"{self.subject} passed its reserved deadline"
         logs = ([{"path": path.relative_to(self.root).as_posix(), "sha256": file_sha(path)}
-                 for path in (self.log_path, *evidence) if path.is_file()] if self.settled else [])
+                 for path in (self.log_path, *self.evidence, *evidence) if path.is_file()] if self.settled else [])
         exit_code = self.exit_code if self.exit_code is not None or self.outcome != "completed" else 0
         return self.store.settle(self.run_id, self.reservation, {
             "outcome": self.outcome, "ended_at": ended, "exit_code": exit_code, "cleanup_settled": self.settled,

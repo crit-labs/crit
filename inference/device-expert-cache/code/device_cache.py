@@ -17,7 +17,7 @@ Background ranked residency (ranked_residency.py): with count_routes every plan 
 routes; begin_swaps unmaps and reserves slots (RESERVED: no plan uses or evicts them) and
 commit_swaps maps their new keys at the next window boundary.
 
-plan_layer is the rule the device form follows (expert_cache.py, its registry kernel and its
+plan_layer is the rule the device form follows (expert_cache.py, its crit kernel and its
 torch fallback, bit for bit): one plan per routed layer over all of a step's routes, ids
 [tokens * top] with duplicates and -1 (not routed); the distinct experts in the order they are
 first routed; hits pinned; the misses decided in that order (quota, quota by miss count,

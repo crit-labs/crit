@@ -22,6 +22,37 @@ from dataclasses import dataclass, field
 DECODE_ROWS = 8
 
 
+def free_device_bytes(device="cuda"):
+    """The device's free bytes for a placement plan or a pool's size, after handing back what torch's caching allocator
+    holds and nothing uses (crit_plugins.assemble.release_cached): a model plugin that re-encodes or converts weights
+    at load leaves those temporaries cached, and torch.cuda.mem_get_info alone counts them as taken, so a KV pool
+    planned from it comes out smaller than the device allows, or refuses to fit. None where the device's memory
+    cannot be read."""
+    import torch
+    from .assemble import release_cached
+    if not torch.cuda.is_available():
+        return None
+    release_cached(device)
+    return int(torch.cuda.mem_get_info(torch.device(device))[0])
+
+
+def release_cached_under(free_below, device="cuda"):
+    """Hand back what torch's caching allocator holds and nothing uses only when the device has fewer than
+    `free_below` bytes free: for a model plugin where a request's temporaries end (a prompt's last chunk, a long
+    score), so that blocks cached from one request leave room for the next one's allocations, the KV a longer prompt
+    takes among them, without releasing after every step (each release waits for the device, and the allocations
+    after it go back to the driver). Returns the bytes released (0 above the threshold), or None where the device's
+    memory cannot be read."""
+    import torch
+    from .assemble import release_cached
+    device = torch.device(device)
+    if device.type != "cuda" or not torch.cuda.is_available() or not torch.cuda.is_initialized():
+        return None
+    if torch.cuda.mem_get_info(device)[0] >= free_below:
+        return 0
+    return release_cached("cuda")
+
+
 def invariant_rows(projections):
     """The most rows one matmul call of this projections plugin takes as decode rows, each row's bits those of the row
     alone: its facts' row_invariance rows, at least DECODE_ROWS. A model plugin splits a step's decode rows (verify

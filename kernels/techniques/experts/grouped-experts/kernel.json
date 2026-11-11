@@ -1,0 +1,224 @@
+{
+  "schema": "crit-kernel-v1",
+  "id": "grouped-experts",
+  "family": "experts",
+  "title": "Routed SwiGLU experts over a slot store of expert bundles on BF16 tensor cores, every stored format, decode rows and prompt chunks with the same bits",
+  "package": "grouped_experts",
+  "language": "cuda",
+  "operations": [
+    "grouped-expert-projection"
+  ],
+  "sources": [
+    "grouped_experts_cuda/binding.cu",
+    "grouped_experts_cuda/grouped_experts.cu",
+    "torch-ext/torch_binding.cpp"
+  ],
+  "capabilities": [
+    "8.0",
+    "8.6",
+    "8.9",
+    "9.0",
+    "10.0",
+    "10.3",
+    "11.0",
+    "12.0",
+    "12.1"
+  ],
+  "libraries": [],
+  "structures": {
+    "decode": {
+      "what": "items of 8 routes (decode rows): a warp owns row tiles of one expert, 4-bit codes decoded through a shared byte table, the routes' operands read straight from global memory, weights DEPTH blocks ahead",
+      "call": "route_outputs",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        1,
+        2,
+        4,
+        8,
+        32
+      ],
+      "key": [
+        "format",
+        "a4",
+        "gate_up",
+        "hidden",
+        "inter"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "WARPS": {
+          "values": [
+            2,
+            4,
+            8
+          ],
+          "default": 4,
+          "what": "warps a block, each owning TILES row tiles of one expert"
+        },
+        "TILES": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 1,
+          "what": "MMA row tiles a warp owns (gate/up: 8 inter rows each, down: 16 output rows), sharing each B fragment"
+        },
+        "DEPTH": {
+          "values": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            6,
+            8
+          ],
+          "default": 0,
+          "what": "64-k blocks of weights in flight a warp (0: the format's depth, 2-6 by format and tiles)"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer grouped GEMM (flashinfer.grouped_mm.grouped_mm_bf16, cuDNN MoE backend) on the pass's weights widened to BF16 once, the routes' inputs gathered in expert order and (gate/up) the SwiGLU in torch: no library takes every stored format against BF16 inputs one pass at a time"
+      },
+      "bench": "bench.py:Decode"
+    },
+    "prompt": {
+      "what": "items of 32 routes (prompt chunks): the routes' operands staged in shared memory by cp.async, the next chunk landing while the current one computes; each weight fragment feeds four n-tiles",
+      "call": "route_outputs",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        256,
+        1024,
+        4096
+      ],
+      "key": [
+        "format",
+        "a4",
+        "gate_up",
+        "hidden",
+        "inter"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "WARPS": {
+          "values": [
+            2,
+            4,
+            8
+          ],
+          "default": 4,
+          "what": "warps a block, each owning TILES row tiles of one expert"
+        },
+        "TILES": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 2,
+          "what": "MMA row tiles a warp owns (gate/up: 8 inter rows each, down: 16 output rows), sharing each B fragment"
+        },
+        "DEPTH": {
+          "values": [
+            0,
+            1,
+            2,
+            3,
+            4
+          ],
+          "default": 0,
+          "what": "64-k blocks of weights in flight a warp (0: the format's depth, 2-6 by format and tiles)"
+        },
+        "CHUNK": {
+          "values": [
+            64,
+            128,
+            256
+          ],
+          "default": 256,
+          "what": "k values of the item's inputs staged a pass by cp.async (two halves of shared memory, at most 48 KiB)"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer grouped GEMM (flashinfer.grouped_mm.grouped_mm_bf16, cuDNN MoE backend) on the pass's weights widened to BF16 once, the routes' inputs gathered in expert order and (gate/up) the SwiGLU in torch: no library takes every stored format against BF16 inputs one pass at a time"
+      },
+      "bench": "bench.py:Prompt"
+    },
+    "prompt-wide": {
+      "what": "items of 64 routes (Workspace(width=64)): as prompt, each weight fragment decoded once for eight n-tiles",
+      "call": "route_outputs",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        1024,
+        4096
+      ],
+      "key": [
+        "format",
+        "a4",
+        "gate_up",
+        "hidden",
+        "inter"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "WARPS": {
+          "values": [
+            2,
+            4,
+            8
+          ],
+          "default": 4,
+          "what": "warps a block, each owning TILES row tiles of one expert"
+        },
+        "TILES": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 1,
+          "what": "MMA row tiles a warp owns (gate/up: 8 inter rows each, down: 16 output rows), sharing each B fragment"
+        },
+        "DEPTH": {
+          "values": [
+            0,
+            1,
+            2,
+            3,
+            4
+          ],
+          "default": 0,
+          "what": "64-k blocks of weights in flight a warp (0: the format's depth, 2-6 by format and tiles)"
+        },
+        "CHUNK": {
+          "values": [
+            64,
+            128
+          ],
+          "default": 128,
+          "what": "k values of the item's inputs staged a pass by cp.async (two halves of shared memory, at most 48 KiB)"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer grouped GEMM (flashinfer.grouped_mm.grouped_mm_bf16, cuDNN MoE backend) on the pass's weights widened to BF16 once, the routes' inputs gathered in expert order and (gate/up) the SwiGLU in torch: no library takes every stored format against BF16 inputs one pass at a time"
+      },
+      "bench": "bench.py:PromptWide"
+    },
+    "declared": {
+      "what": "crit's integer block order (nvfp4 W4A4, int4 W4A8) for the CPU tier's bits: a half-warp per output row, dp4a block sums, the halving tree; the declared quantizers and SwiGLU"
+    },
+    "plan-combine": {
+      "what": "the routes grouped by expert (a one-block bitonic sort up to 1,024 routes, items from a stable sort beyond) and each token's routes summed in route order"
+    }
+  }
+}

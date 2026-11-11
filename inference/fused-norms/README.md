@@ -72,23 +72,17 @@ inputs) is S `stream_sum` calls, each written into its stream's `out=` view.
 
 ## Which code serves each call
 
-Providers first: a call goes to FlashInfer (where it is installed; option `flashinfer`) when FlashInfer computes exactly
-the slot's function for it, checked by the plugin's own tests through the plugin (the conformance checks below), and
-otherwise to the registry kernel `crit-labs/fused-norms` (a kernel-builder project in crit-kernels, Triton), loaded by
-name at the pin plugin.json declares (`crit_plugins.kernels`): one launch that reads its inputs once. Where the kernel
-is not there (not published yet, no build for the machine, no `kernels` package) the plugin runs `torch_norms.py`, the
-same operations as chains of torch kernels, and the engine's facts say it fell back (`kernels`). A route depends on
-dtypes, shapes and options only, never on the row count; kernel or torch is chosen once, when the plugin is created.
-
-| Call | Served by | Why |
-| --- | --- | --- |
-| `rms_norm` without a residual, `rms_norm_heads`: weight `[dim]` in x's dtype, offset 0 or 1, output in x's dtype | FlashInfer `rmsnorm` / `gemma_rmsnorm` | the same function, one rounding, a row's bits whatever the row count, strided rows and capture (checked) |
-| `silu_mul`, `gelu_mul` (erf or tanh) of packed `[gate \| up]` halves, BF16 or FP16, output in their dtype | FlashInfer `silu_and_mul`, `gelu_and_mul`, `gelu_tanh_and_mul` | the same functions and properties (checked); FP32 they do not take |
-| `rms_norm` with a residual | the kernel | FlashInfer's fused add normalizes the unrounded sum and overwrites x; the slot normalizes the sum as stored, and an FP32 residual beside 16-bit rows is the common case |
-| a weight in another dtype than x (FP32 weights beside BF16 rows), one weight per head or stream, a chosen output dtype | the kernel | FlashInfer takes a weight of the input's dtype and writes the input's dtype |
-| `rope`, `rms_norm_rope` | the kernel | FlashInfer's rotary kernels take queries and keys together, with frequencies from a base or a cos\|sin cache; the slot's take one tensor and the model's frequencies (scaled ones too), and the norm fused |
-| `gated_rms_norm`, `l2_norm`, `sigmoid_mul`, interleaved or two-tensor products (or another output dtype), `stream_sum`, `stream_add`, `softplus_decay` | the kernel | no provider kernel for them |
-| `rms_norm_rope_pair`, `rope_pair`, `stream_add_norm` | the kernel, one launch | a fused form has the separate calls' bits: a `stream_add_norm` whose norm FlashInfer would compute is the kernel's `stream_add`, then FlashInfer's norm |
+Every call goes to crit's kernel `fused-norms` (Triton, `kernels/techniques/norms/fused-norms`), loaded by the name plugin.json
+declares (`crit_plugins.kernels`) and built for the engine's device with the engine's tuning table (`crit kernels sweep`
+tunes its block sizes and warp counts for the model's widths) or its default knobs: one launch that reads its inputs
+once. Where the kernel cannot be built (no Triton or CUDA, crit's kernels package not installed) the plugin runs
+`torch_norms.py`, the same operations as chains of torch kernels, and the engine's facts say so (`kernels`: tuned,
+built or fallback). Kernel or torch is chosen once, when the plugin is created. No library kernel serves a call:
+FlashInfer's norms and activation products are the kernel's yardstick (its sweep bench and README times them beside
+the kernel), not a path of this plugin. Until round 4 FlashInfer served `rms_norm` / `rms_norm_heads` without a
+residual and the packed `silu_mul` / `gelu_mul` (option `flashinfer`, now removed); the kernel matches or beats it on
+those calls at Qwen3.8-27B's shapes (the kernel's README: 1.04-1.13 for the SiLU product at 1-16 rows, 1.0-1.05 at
+128-8,192, 0.99-1.15 for the norm).
 
 ## What the code supplies
 
@@ -131,9 +125,9 @@ assert stream_add_rows(streams, [[1.0, 1.0]], [[2.0, -1.0]]) == [[[3.0, 4.0], [2
 
 ## Measured
 
-One RTX 5090 (torch 2.14.1, Triton 3.8, FlashInfer 0.7.3), the kernel project's `benchmarks/shapes.py`: each
-operation as a model writes it by hand in torch (the chain), as one call of the registry kernel, and as FlashInfer's
-call where it has the operation, with BF16 rows and an FP32 residual stream. GPU time per call inside a CUDA graph
+One RTX 5090 (torch 2.14.1, Triton 3.8, FlashInfer 0.7.3), the kernel's `benchmarks/shapes.py`: each
+operation as a model writes it by hand in torch (the chain), as one call of the kernel (its default knobs), and as FlashInfer's
+call where it has the operation (a yardstick), with BF16 rows and an FP32 residual stream. GPU time per call inside a CUDA graph
 (what a captured decode round pays; median of 7) and kernels launched per call, at a 5,120-wide hidden row with 24
 query and 4 KV heads of 256 (64 rotary values, zero-centred weights), 48 gated-norm heads of 128 and a 17,408-wide
 MLP. **Bold**: the path this plugin serves the call on.
@@ -141,11 +135,11 @@ MLP. **Bold**: the path this plugin serves the call on.
 | Operation | rows | chain: launches, GPU us | kernel: launches, GPU us | FlashInfer: GPU us |
 | --- | --- | --- | --- | --- |
 | residual add + RMSNorm (FP32 residual) | 1 / 8 / 1,024 / 8,192 | 9, 11.0 / 14.4 / 62.5 / 1,186 | **1, 2.4 / 5.5 / 14.3 / 340** | (a BF16 residual, the unrounded sum: 1.8 / 2.4 / 9.3 / 226) |
-| RMSNorm, BF16 weight, no residual | 1 / 8 / 1,024 / 8,192 | 10, 13.0 / 16.4 / 58.0 / 1,091 | 1, 1.9 / 1.8 / 5.4 / 111 | **1.6 / 2.1 / 6.2 / 109** |
+| RMSNorm, BF16 weight, no residual | 1 / 8 / 1,024 / 8,192 | 10, 13.0 / 16.4 / 58.0 / 1,091 | **1, 1.9 / 1.8 / 5.4 / 111** | 1.6 / 2.1 / 6.2 / 109 |
 | q and k: head norm + rotary positions | 1 / 8 / 1,024 / 8,192 | 46, 58.0 / 66.5 / 157 / 1,767 | **2, 4.7 / 5.5 / 11.9 / 155** | |
 | gated RMSNorm | 1 / 8 / 1,024 / 8,192 | 13, 17.3 / 21.4 / 136 / 2,559 | **1, 1.8 / 1.9 / 7.5 / 191** | |
 | attention output gate | 1 / 8 / 1,024 / 8,192 | 3, 4.1 / 5.5 / 19.8 / 457 | **1, 1.7 / 1.4 / 12.6 / 191** | |
-| SiLU product (packed halves) | 1 / 8 / 1,024 / 8,192 | 2, 2.4 / 4.0 / 98.2 / 922 | 1, 1.2 / 1.7 / 37.6 / 553 | **1.3 / 1.0 / 35.1 / 562** |
+| SiLU product (packed halves) | 1 / 8 / 1,024 / 8,192 | 2, 2.4 / 4.0 / 98.2 / 922 | **1, 1.2 / 1.7 / 37.6 / 553** (round 4, a graph of 100 calls: 0.80 / 0.89 / 36-44 / 541, FlashInfer 0.91 / 0.95 / 36-38 / 548) | 1.3 / 1.0 / 35.1 / 562 |
 
 A decode row through 16 full-attention and 48 gated-delta layers of that shape launches about 2,700 kernels for these
 operations as torch chains (3.4 ms of GPU time in a graph) and 288 as this plugin's calls (0.6 ms). At 8,192 prompt
@@ -170,5 +164,5 @@ for the 289 calls at 1 to 16 rows. The fused forms change no bits: each output e
 
 Uncaptured, a call costs the host its launch path: 25 to 90 us of CPU time a call through Triton on that (loaded)
 machine, 11 to 26 us through FlashInfer, about 10 us a torch kernel. Through the kernel it is a clear gain for the
-chains of 9 to 46 kernels and about even for the attention gate; the SiLU product, which Triton would lose there, is
-FlashInfer's. Captured rounds pay none of it.
+chains of 9 to 46 kernels and about even for the attention gate; the SiLU product loses there against FlashInfer's
+launch path (an engine's eager steps only). Captured rounds pay none of it.

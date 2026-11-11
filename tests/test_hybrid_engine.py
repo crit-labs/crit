@@ -3,7 +3,8 @@ attention, projections, sampling and placement plugins with the gated-delta recu
 block, the expert store and fused-norms (zero-centred norms, query/key norms with partial rotary positions, the gated
 norm and the output gate) into a package beside a Qwen3-Next-layout model plugin (support/device_plugins/next-model);
 Core's loader runs it on Core's concurrent runtime. Its fixed-text scores follow transformers' log-probabilities of the
-same checkpoint (its BF16 weights in FP32, so only the engine rounds), each token of its greedy continuations is
+same checkpoint (its BF16 weights in FP32, so only the engine rounds), a text longer than a prefill chunk among
+them (scored chunk by chunk, the state carried), each token of its greedy continuations is
 transformers' choice up to BF16 rounding, and requests in flight together decode what each decodes alone. Needs
 CUDA, transformers with Qwen3-Next, safetensors and Core's crit_core_steps (CRIT_CORE_STEP_LIBRARY).
 
@@ -133,6 +134,18 @@ class HybridEngineTests(unittest.TestCase):
                 continue
             self.assertLess(abs(value - float(best[i])), 0.5, (i, value, float(best[i])))
 
+    def test_a_text_longer_than_a_prefill_chunk_scores_chunk_by_chunk(self):
+        # 150 tokens, three of the model's prefill chunks: the first scores as the text cut after it does, and the later
+        # ones, which read the recurrent state and KV the chunks before them kept, follow transformers on average.
+        (ids,) = self.prompts(1, 150)
+        chunk = self.engine.model.options["prefill_chunk"]
+        scored = self.engine.score(ids, 1, "prefill")
+        self.assertEqual(scored.target[:chunk], self.engine.score(ids[:chunk + 1], 1, "prefill").target)
+        logp = self.logits(ids)[:len(ids) - 1].log_softmax(-1)
+        expected = logp[torch.arange(len(ids) - 1), torch.tensor(ids[1:])].tolist()
+        later = [abs(a - b) for a, b in zip(scored.target[chunk:], expected[chunk:])]
+        self.assertLess(sum(later) / len(later), 0.15, later)
+
     def test_greedy_continuations_are_transformers_choices(self):
         for prompt in self.prompts(3):
             tokens, _ = self.engine.generate(prompt, 12, stop_tokens=[], sampling={"temperature": 0.0})
@@ -152,16 +165,14 @@ class HybridEngineTests(unittest.TestCase):
 
 class HybridGroupedExpertsTests(HybridEngineTests):
     """The same engine with grouped-experts in the experts slot: the experts as BF16 bundles, the routes grouped by
-    expert on the device (the registry kernel where LOCAL_KERNELS names a build of it, else its torch fallback)."""
+    expert on the device (crit's kernel grouped-experts where it builds here, else its torch fallback)."""
     selection = {**SELECTION, "use": {**SELECTION["use"], "experts": "grouped-experts"}}
     library = [p for p in LIBRARY if p != "experts-reference"] + ["grouped-experts"]
 
-    def test_the_experts_run_on_the_path_local_kernels_gives(self):
-        local = any(entry.split("=", 1)[0] == "crit-labs/grouped-experts"
-                    for entry in os.environ.get("LOCAL_KERNELS", "").split(":") if entry)
-        source = self.engine.facts["kernels"]["crit-labs/grouped-experts"]["source"]
-        self.assertEqual(source, "local" if local else "fallback")
-        self.assertEqual(self.engine.facts["experts"]["path"], "kernel" if local else "torch")
+    def test_the_experts_run_on_the_path_the_kernel_build_gives(self):
+        source = self.engine.facts["kernels"]["grouped-experts"]["source"]
+        self.assertIn(source, ("tuned", "built", "fallback"))
+        self.assertEqual(self.engine.facts["experts"]["path"], "torch" if source == "fallback" else "kernel")
 
 
 if __name__ == "__main__":

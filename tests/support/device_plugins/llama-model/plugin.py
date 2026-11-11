@@ -7,19 +7,22 @@ many sequences' rows computed as one batch.
 With the option `rounds` its greedy requests decode through Core's round driver (crit_plugins.rounds.Rounds) once
 their prompt is in: each decode step of the rows in round slots is one round (verify over a RoundBatch, the sampler's
 device predictions, the drafter's drafts from the model's draft head when the selection drafts), captured per row count
-and launched by Core natively. The draft head is a stub (draft:head-device): the target itself one token a row per
-depth, drafting its second choice where a position p has p % draft_miss == 2, so rounds accept some drafts and reject
-others."""
+and launched by Core natively. A request asking for log-probabilities decodes in rounds too: the driver captures each
+round in its log-probability form as well, which scores every emitted token with the alternatives the model's info
+offers (max_top_logprobs), and Core runs that form for a round with such a row. The draft head is a stub
+(draft:head-device): the target itself one token a row per depth, drafting its second choice where a position p has
+p % draft_miss == 2, so rounds accept some drafts and reject others."""
 import json
 import math
 
 from crit_core.batch import DECODE, PREFILL, StepLayout, step_item
 from crit_core.native import Scores, StepResult
 from crit_plugins import StepBatch
-from crit_plugins.device import DECODE_ROWS, RoundBatch
+from crit_plugins.device import DECODE_ROWS, RoundBatch, free_device_bytes
 
 CORE_SAMPLING = ("temperature", "top_p", "top_k", "min_p", "seed")
 STOPS = 8   # stop ids a row in a round slot holds
+TOP = 20    # the alternatives a token's log-probabilities carry at most (max_top_logprobs), in step() and in rounds
 
 
 class Session:
@@ -76,7 +79,7 @@ class LlamaModel:
         tensors = {}
         for path in sorted(context.model.glob("*.safetensors")):
             tensors.update(load_file(str(path), device="cpu"))
-        free, _ = torch.cuda.mem_get_info()
+        free = free_device_bytes()   # after the load's own temporaries go back to the device
         kv_tokens = int(context.context_tokens or options["context"]) * options["concurrency"]
         kv_bytes = 2 * self.layers * kv_tokens * self.kv_heads * self.head_dim * 2   # BF16 keys and values
         placed = parts["placement"].plan({**{n: t.numel() * t.element_size() for n, t in tensors.items()},
@@ -123,7 +126,7 @@ class LlamaModel:
             self.rounds = Rounds(self, self.sampler, rows=rows, widest=self.width, device=self.device,
                                  drafter=self.drafter, head=self.draft_head, pools=[self.pool], parts=parts,
                                  uses=["projections", "attention", "kv_cache", "norms"], stops=STOPS,
-                                 vocabulary=self.vocabulary)
+                                 logprobs=TOP, vocabulary=self.vocabulary)
 
     def info(self):
         drafts = self.drafter is not None
@@ -131,7 +134,7 @@ class LlamaModel:
                 "context": self.context, "prefill_chunk": self.options["prefill_chunk"],
                 "max_concurrency": self.options["concurrency"], "max_pending": 8, "max_batch_tokens": 512,
                 "max_row_tokens": self.width + 1, "decode_token_work": self.width + 1, "stop_tokens": self.stops,
-                "sampling": dict.fromkeys(CORE_SAMPLING, True), "token_logprobs": True, "max_top_logprobs": 20,
+                "sampling": dict.fromkeys(CORE_SAMPLING, True), "token_logprobs": True, "max_top_logprobs": TOP,
                 "scoring": True, "query_scoring": True, "score_paths": ["prefill"], "replay": True,
                 "speculative": drafts, "plain": drafts}
 
@@ -224,8 +227,13 @@ class LlamaModel:
             found = self.rounds.read()
             for i in bound:
                 s = rows[i].session
-                s.phase, s.produced, s.rows = "round", found[s.slot]["tokens"], 0
-                results[i] = StepResult(0, s.produced, True, drafted=self.width)
+                row = found[s.slot]
+                s.phase, s.produced, s.rows = "round", row["tokens"], 0
+                logprobs = None
+                if s.request.logprobs is not None:   # the round ran its log-probability form: the row is scheduled
+                    asked = int(s.request.logprobs)
+                    logprobs = [(value, top[:asked]) for value, top in zip(row["logprobs"], row["top"])]
+                results[i] = StepResult(0, s.produced, True, logprobs=logprobs, drafted=self.width)
         rest = [i for i, row in enumerate(rows) if row.session.slot is None]
         if rest:
             for i, result in zip(rest, self._plain([rows[i] for i in rest])):
@@ -260,7 +268,7 @@ class LlamaModel:
                 s.produced = [token]
                 if s.request.logprobs is not None:
                     row = torch.log_softmax(logits[j], -1)
-                    top = torch.topk(row, min(int(s.request.logprobs), 20))
+                    top = torch.topk(row, min(int(s.request.logprobs), TOP))
                     logprobs = [(float(row[token]), list(zip(top.indices.tolist(), top.values.tolist())))]
                 j += 1
             results[placement.item] = StepResult(placement.rows if placement.phase == PREFILL else 0, s.produced, has,
@@ -269,11 +277,12 @@ class LlamaModel:
 
     def _roundable(self, s):
         """Whether a request whose prompt is in decodes in round slots from here: rounds on, the selection able to run
-        inside one, a free slot, and a greedy request without log-probabilities, replay or plain decoding."""
+        inside one, a free slot, and a greedy request without replay or plain decoding (one asking for
+        log-probabilities runs the driver's log-probability form)."""
         r, rounds = s.request, self.rounds
         return (rounds is not None and not rounds.problems and len(self.slots) < rounds.rows
-                and not float(r.sampling.get("temperature", 0.0)) > 0 and r.logprobs is None and not r.replay
-                and not r.plain and len(r.stop_tokens) <= STOPS)
+                and not float(r.sampling.get("temperature", 0.0)) > 0 and not r.replay and not r.plain
+                and len(r.stop_tokens) <= STOPS and (r.logprobs is None or int(r.logprobs) <= rounds.top))
 
     def commit(self, decisions):
         rounds = self.rounds
@@ -311,14 +320,14 @@ class LlamaModel:
 
     def _bind(self, s):
         """The session decodes in the next free round slot: its pending token (the first output) at the prompt's
-        end, the rest of its output limit, its stop tokens."""
+        end, the rest of its output limit, its stop tokens, and whether its request asks for log-probabilities."""
         s.slot = len(self.slots)
         self.slots.append(s)
         r = s.request
         self.rounds.bind(s.slot, s.handle, len(s.prompt), s.pending, r.output_tokens - len(s.outputs),
                          len(s.prompt) + r.output_tokens + self.width + 1, stops=r.stop_tokens,
                          params={"temperature": 0.0}, session=s, tokens=s.prompt + [s.pending],
-                         outputs=len(s.outputs))
+                         outputs=len(s.outputs), logprobs=r.logprobs is not None)
 
     def retire(self, session, finish):
         if session.slot is not None:
@@ -334,15 +343,25 @@ class LlamaModel:
         self.pool.close(session.handle)
 
     def score(self, ids, first_target, path="", queries=None, top_k=0):
+        """A fixed text's scores through the prompt path: its tokens a prefill_chunk at a time, as a prompt's chunks
+        (the same arithmetic as prefill, and one chunk's temporaries however long the text), each chunk's KV
+        kept for the next."""
         torch = self.torch
         sequence = ("score", self.handles)
+        chunk, wanted = int(self.options["prefill_chunk"]), range(first_target - 1, len(ids) - 1)
+        found = []
         self.pool.open(sequence)
         try:
-            batch = StepBatch.build([(sequence, 0, len(ids))], self.device)
-            rows = list(range(first_target - 1, len(ids) - 1))
-            logp = torch.log_softmax(self._forward(torch.tensor(ids, device=self.device), batch, rows), -1)
+            for start in range(0, wanted.stop, chunk):   # the last token predicts nothing scored
+                end = min(start + chunk, wanted.stop)
+                batch = StepBatch.build([(sequence, start, end - start)], self.device)
+                rows = [row - start for row in wanted if start <= row < end]
+                logits = self._forward(torch.tensor(ids[start:end], device=self.device), batch, rows)
+                found.append(torch.log_softmax(logits, -1))
+                self.pool.keep(sequence, end)
         finally:
             self.pool.close(sequence)
+        logp = torch.cat(found)
         targets = torch.tensor(ids[first_target:], device=self.device)
         target = logp.gather(1, targets[:, None])[:, 0].tolist()
         query = ([logp[t, torch.tensor(row, device=self.device)].tolist() for t, row in enumerate(queries)]

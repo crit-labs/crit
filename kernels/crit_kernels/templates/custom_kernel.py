@@ -1,8 +1,8 @@
 """{name}: a {op} kernel on the workbench (see harness.py). Fill in the five functions below; the harness checks
 candidate() against reference() on every shape in kernel.json and times it against its floor and yardstick().
 
-Start from an existing kernel where one exists (kernels/SOURCES.md: the Hub, cuBLASLt, CUTLASS, FlashInfer,
-flash-linear-attention, Triton, ...): put its source in src/ (`crit kernels new --from` copies a local one there with
+Start from an existing kernel where one exists (one of crit's templates in kernels/techniques/<family>/<id>, or a library's
+source: cuBLASLt, CUTLASS, FlashInfer, flash-linear-attention, Triton, ...): put its source in src/ (`crit kernels new --from` copies a local one there with
 its license), then change it.
 """
 from pathlib import Path

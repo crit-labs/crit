@@ -1,7 +1,7 @@
 // Device side of host_int.h, for CUDA and HIP from one source: the integer block rows, the declared activation
 // quantizers and the declared exp, SiLU and SwiGLU. Block sums are exact integers (dp4a on CUDA, plain int32 math
 // elsewhere), and every FP32 step uses an explicit round-to-nearest intrinsic so nothing contracts, so a device row
-// gives host_int's oracle bits. The crit-labs/int-block-experts Hub kernel carries these functions.
+// gives host_int's oracle bits. crit's kernel int-block-experts (kernels/techniques/experts) carries these functions.
 #pragma once
 #include <cstdint>
 

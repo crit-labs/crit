@@ -48,12 +48,11 @@ def summary(store, run_id, outcome):
     the priorities the run's rule gives while decode and prefill are both needed, how far each KPI stands from its
     limit, and the host_bytes_warning."""
     from crit_eval.reports.status import render
-    from .plans import extract, priorities, rules, standing
+    from .plans import extract, priorities, standing
     status = outcome.pop("status")
     lines = [render(status)]
     # Eval states the goals without an order; the run's priority rule orders them for the next plan.
-    order, reason = priorities({"decode": {"needed": True}, "prefill": {"needed": True}}, extract(status),
-                               rules(store.get(run_id)["run"]))
+    order, reason = priorities({"decode": {"needed": True}, "prefill": {"needed": True}}, extract(status))
     lines.append("priorities while decode and prefill are both needed: " + (
         "; ".join(f"{tier} {', '.join(order[tier])}" for tier in ("p1", "p2", "p3") if order[tier])
         if order else reason) + " (crit run ... plan computes them from the plan's needed flags)")
@@ -190,8 +189,7 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
     parts = tuple(parts or PARTS)
     packaged(folder, "measuring", "Eval measures")
     # The candidate ladder: the rung says how far Eval measures the candidate, and refuses more.
-    if ladder.ladder(run):
-        stage, certify = ladder.eval_options(ladder.scope_of(root, candidate_id), stage, certify, candidate_id)
+    stage, certify = ladder.eval_options(ladder.scope_of(root, candidate_id), stage, certify, candidate_id)
     model, data = run["spec"]["model_path"], data.absolute()
     if not (data / PREPARED).is_file():
         raise ValueError(f"{data} holds no {PREPARED}: prepare it from the run's model first "
@@ -226,7 +224,7 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
     store.eval_started(run_id, reservation, journal, earlier)
     with attempt.running() as log:
         out.parent.mkdir(parents=True, exist_ok=True)
-        result = _measure(store, run_id, candidate_id, attempt.id, attempt.deadline_at, model, data, out, parts,
+        result = _measure(store, run_id, candidate_id, attempt, attempt.deadline_at, model, data, out, parts,
                           options, log)
     # Eval and the server ran in this process; the resident host's exit is part of the cleanup. The journal and the
     # result (complete, or what an attempt that stopped measured) are evidence beside the log.
@@ -239,25 +237,42 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
             **({"plan_outcome": f"plans/{planned['plan_id']}/outcomes/{attempt.id}.json"} if planned else {})}
 
 
-class EvalEngines(Served):
+class Opening:
     """Eval's engines for a packaged candidate (crit_eval.run.runner.run takes it as its adapter): every engine Eval opens
-    is the candidate served through crit serve at the context Eval asks for, the run's or the lower-context gate's,
-    and stops when Eval closes it."""
+    is the candidate served at the context Eval asks for, the run's or the lower-context gate's, and stops when Eval
+    closes it: through crit serve (EvalEngines), or from an external candidate's launch command (ExternalEngines)."""
 
+    def create_eval_engine(self, context):
+        from crit_eval.run import chat
+        _, api, port = self.open(context["context_tokens"])
+        served = chat.Server("http://127.0.0.1:%d/v1" % port, self.prepared, api.model).create_eval_engine(context)
+        # Eval opens engines one after another: the next one is built in the same resident host (Served.open), or
+        # an external engine started again at another context, and the server stops when Eval's attempt ends
+        # (Served.until).
+        served.close = lambda: None
+        return served
+
+
+class EvalEngines(Opening, Served):
     def __init__(self, store, run_id, candidate_id, attempt, kv_tokens, prepared, log, deadline_at):
         # crit serve's own bound on a request is the attempt's deadline: Eval bounds each request by what it measured.
         super().__init__(store, run_id, candidate_id, attempt, kv_tokens, log, "Eval",
                          timeout=min(86400, max(1.0, remaining(deadline_at))))
         self.prepared = prepared
 
-    def create_eval_engine(self, context):
-        from crit_eval.run import chat
-        _, api, port = self.open(context["context_tokens"])
-        served = chat.Server("http://127.0.0.1:%d/v1" % port, self.prepared, api.model).create_eval_engine(context)
-        # Eval opens engines one after another: the next one is built in the same resident host (Served.open), and
-        # the server stops when Eval's attempt ends (Served.until).
-        served.close = lambda: None
-        return served
+
+def eval_engines(store, run_id, candidate_id, attempt, kv_tokens, prepared, log, deadline_at):
+    """Eval's engines for the candidate under `attempt` (attempt.Attempt), by its kind."""
+    from .external import External, candidate_spec
+
+    class ExternalEngines(Opening, External):
+        pass
+    if candidate_spec(safe_path(store.directory(run_id), f"candidates/{candidate_id}")) is None:
+        return EvalEngines(store, run_id, candidate_id, attempt.id, kv_tokens, prepared, log, deadline_at)
+    served = ExternalEngines(store, run_id, candidate_id, attempt, kv_tokens, log, "Eval",
+                             timeout=min(86400, max(1.0, remaining(deadline_at))))
+    served.prepared, served.deadline_at = prepared, deadline_at
+    return served
 
 
 def _measure(store, run_id, candidate_id, attempt, deadline_at, model, data, out, parts, options, log):
@@ -268,8 +283,8 @@ def _measure(store, run_id, candidate_id, attempt, deadline_at, model, data, out
     from crit_eval.quality.prepare import PREPARED
     from crit_eval.quality.reference import score_data
     from crit_eval.run.runner import run as run_eval
-    served = EvalEngines(store, run_id, candidate_id, attempt, options["context_tokens"], load_json(data / PREPARED),
-                         log, deadline_at)
+    served = eval_engines(store, run_id, candidate_id, attempt, options["context_tokens"], load_json(data / PREPARED),
+                          log, deadline_at)
     with engine_lock(f"crit run eval {run_id} {candidate_id}", deadline=time.monotonic() + remaining(deadline_at)):
         if "quality" in parts:
             def check():

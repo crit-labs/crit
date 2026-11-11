@@ -68,7 +68,7 @@ class WorkbenchTests(unittest.TestCase):
         self.addCleanup(environment.stop)
 
     def starter(self):
-        """A starter project as crit-kernels' workbench-starter holds it (a kernel-builder project with its license)."""
+        """A starter project as crit's workbench-starter holds it (a kernel project with its license)."""
         source = self.root / "workbench-starter"
         (source / "torch-ext").mkdir(parents=True)
         (source / "LICENSE").write_text("Apache-2.0\n", encoding="utf-8")
@@ -170,7 +170,7 @@ class WorkbenchTests(unittest.TestCase):
                       (self.root / "plain" / "src" / "kernel_cuda" / "kernel.cu").read_text(encoding="utf-8"))
         run = self.root / "run"
         starter = self.starter()
-        with self.assertRaisesRegex(ValueError, "--starter takes the starter kernel with --from"):
+        with self.assertRaisesRegex(ValueError, "--starter needs --run"):   # without --from: crit's starter
             workbench.new("s0", "gemm", self.root, "bf16", ["64,128"], starter=True)
         with self.assertRaisesRegex(ValueError, "--starter needs --run"):
             workbench.new("s1", "gemm", self.root, "bf16", ["64,128"], source=starter, starter=True)

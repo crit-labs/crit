@@ -83,7 +83,7 @@ lanes reduced by the halving tree ((i, i + 8), then (i, i + 4), (i, i + 2), (i, 
 compute the lanes in any order, split them over warps and tile any number of rows and tokens. The activation quantizer
 is declared as well: MXFP8's shared exponent 2^(floor(log2 amax) - 8), or amax / 448, then E4M3 by round to nearest
 even with saturation. Its host twin is in [fp8_block.h](code/fp8_block.h), with E8M0 decoding and an FP64 projection
-for error bounds; the order written out as device functions, and the kernels that keep it, are crit-labs'
+for error bounds; the order written out as device functions, and the kernels that keep it, are crit's
 `fp8-block-rows` kernel.
 
 The order rests on one property of the tensor core: an output's block sum depends only on its own row and token, the
@@ -96,8 +96,7 @@ target and keep FP8 projections on one GPU.
 rows are exact on any processor, so CPU rows, GPU decode rows and a GPU prompt GEMM share one order there too.
 
 The operations a kernel for these formats must compute, and how to verify one against this entry's references, are in
-[operations.json](operations.json); the kernels themselves come from libraries or the kernel registry
-([Kernels](../../kernels/README.md)).
+[operations.json](operations.json); the kernels themselves come from libraries or crit's own kernels, built for the engine's device and tuned for the model ([Kernels](../../kernels/README.md)).
 
 ## What the code supplies
 
@@ -109,7 +108,7 @@ The operations a kernel for these formats must compute, and how to verify one ag
 | [nvfp4.py](code/nvfp4.py), [nvfp4.h](code/nvfp4.h) | NVFP4 codec; FP64 oracle in Python, fixed-order FP32 in C++ |
 | [fp8_block.h](code/fp8_block.h) | The matched FP8 order's host twin: `quantize_group`, `e8m0`, `project_fp64` |
 | [device_matrices.py](code/device_matrices.py) | The device form: stored BF16, FP8 and NVFP4 matrices, torch's scaled matmul, draft-only `reencode` |
-| [device_nvfp4.py](code/device_nvfp4.py) | W4A16 decode rows, decoders and the fixed-tile GEMM through crit-labs' registry kernels, torch fallbacks |
+| [device_nvfp4.py](code/device_nvfp4.py) | W4A16 decode rows, decoders and the fixed-tile GEMM through crit's kernels, torch fallbacks |
 
 ## What the engine supplies
 
@@ -127,17 +126,19 @@ The plugin's device form multiplies a stored NVFP4 matrix in one of two ways (op
 activations (W4A4) through cuBLASLt's block-scaled GEMM, or with 16-bit activations (W4A16, weight only), which a
 preserve-mode engine needs, since quantizing the activations to 4 bits moves every product by several percent. No
 provider reachable from torch covers W4A16 NVFP4 (cuBLASLt's block-scaled GEMM takes NVFP4 on both operands; FlashInfer's
-FP4 weight-only kernels sit inside its fused MoE), so [device_nvfp4.py](code/device_nvfp4.py) takes crit-labs' registry
-kernels, declared with their pins in [plugin.json](plugin.json) (`kernels`): `decode-gemv`, a GEMV for up to 16 rows (the
+FP4 weight-only kernels sit inside its fused MoE), so [device_nvfp4.py](code/device_nvfp4.py) takes crit's kernels,
+declared in [plugin.json](plugin.json) (`kernels`) and built for the engine's device the first time the plugin asks, with the
+engine's tuning (`CRIT_KERNEL_TUNING`, from `crit kernels sweep`) or their default knobs: `decode-gemv`, a GEMV for up
+to 16 rows (the
 same order whatever the row count, so a decode row is the same alone and batched; the E2M1 codes decoded by the
 hardware conversion where the target has it, sm_100a and later, with the same bits as the portable decode) and a
 decoder that writes the matrix in BF16 for torch's GEMM on longer prompts. torch's GEMM picks its kernel by the row
 count, so a prompt row's sums depend on how many rows share the GEMM; option `prompt_gemm` fixed_tiles runs them
 through `fixed-tile-gemm`, a GEMM whose K loop never changes, so a model can put the prompts of several sequences into
 one pass and still give each the result of a pass of its own (`prompt_gemm: pinned` does it for every format,
-below). Where a registry kernel is not there (not published
-yet, no build for the machine, offline), a torch fallback serves with the same contract and the engine's facts say so
-under `kernels`: the GEMV decodes the matrix a chunk of rows at a time to its exact values (e2m1 times the block
+below). Where a kernel cannot be built here (no CUDA toolkit, an
+architecture it does not cover), a torch fallback serves with the same contract and the engine's facts say so under
+`kernels` (each kernel's source: tuned, built or fallback): the GEMV decodes the matrix a chunk of rows at a time to its exact values (e2m1 times the block
 scale, at most 6 significant bits) and multiplies one activation row per GEMM with FP32 sums, the decoders are torch
 operations with the kernel's bits, and the fixed-tile GEMM becomes one GEMM per prompt row (correct, much slower).
 Prompts of up to 16 rows still take the GEMV: a model that batches prompts keeps a lone short one in a pass of its
@@ -169,7 +170,79 @@ differs from the row alone at real widths (a 12,288 x 5,120 FP8 matrix).
 **MXFP8.** Format `mxfp8` loads E4M3 weights with one E8M0 exponent per 32 inputs as modelopt stores them (`weight`
 [out][in], `scale` [out][in / 32] bytes): decode rows through the W8A16 GEMV (each value times its power of two, exact),
 prompt rows on the exact values decoded to BF16 (torch operations) and torch's GEMM or the fixed-tile GEMM. The
-checkpoint's own MXFP8 activations are not reproduced (facts `prompt_activations` mxfp8: bf16).
+checkpoint's own MXFP8 activations are reproduced with `mxfp8_activations: mxfp8` (W8A8: each 32 inputs of a row in
+E4M3 under the shared power of two 2^(floor(log2 amax) - 8), fp8-block-rows' quantizer, or its torch twin `mx_codes`
+with the same bits): prompt rows on fp8-block-rows' block-scaled `gemm-native` with `prompt_gemm: native` (else the
+quantized values, exact in BF16, through the W8A16 paths), decode rows with `decode_activations: prompt` on the same
+quantized values through the W8A16 GEMV or the tile (facts `prompt_activations` mxfp8: stored, `decode_activations`
+mxfp8). The default stays `bf16` (facts mxfp8: bf16).
+
+**AWQ and GPTQ (INT4 with a zero point a group).** Formats `awq` (`qweight` int32 [in][out / 8] in AWQ's nibble order
+0, 2, 4, 6, 1, 3, 5, 7, `qzeros` [in / group][out / 8] alike, FP16 `scales` [in / group][out]) and `gptq` (`qweight`
+[in / 8][out], `qzeros` in sequence with zero = stored + `zero_offset`, 1 by default for checkpoints that store zero - 1,
+0 for those that store the zero; `g_idx` for act order) load into crit's INT4 rows (format `int4_zp` in the facts:
+unsigned codes [out][in / 2], FP16 scales and uint8 zero points [out][in / group], a value (code - zero) * scale) through
+`decode-gemv`'s `repack_awq` / `repack_gptq` (on the device, exact; the same bytes in torch without the kernel,
+`repack_int4`). They multiply 16-bit activations (W4A16). Decode rows go on `mma-rows`' tile (its INT4 weights: the
+two-part BF16 decode, each MMA on hi and lo, every product exact) with `gemv: auto` or `mma`, on `decode-gemv`'s INT4
+GEMV with `gemv: native`, and with `gemv: crossover` on the GEMV up to the crossover the two kernels' sweep reports
+measured at the matrix's shape (decode-gemv's `gemv-cuda` and mma-rows' `decode-tile`, keyed by weights 4), the tile
+past it. Prompt rows go on `mma-rows`' prompt tile with the matrix's plan, so a prompt row has its decode row's bits on
+the tile (facts `prompt_kernels` int4_zp: mma-rows prompt-tile, `row_invariance` `prompt_rows`). GPTQ's act order sorts
+the inputs by group at load; every call multiplies x[:, perm]. Without the kernels the exact values in FP32 serve
+(one row a call for decode rows). The group is a multiple of 32 for the kernels (the torch fallback takes any).
+
+**Native prompt GEMMs.** `prompt_gemm: native` sends the quantized prompt arithmetic through crit's own
+GEMMs accumulated in the tensor cores: W8A8 FP8 matrices (each activation row in E4M3 by its own scale, the same codes
+as the provider path) through `fp8-block-rows`' `gemm-native` (its generic path: a 32-element block's e4m3 MMA sum
+times the row scales on the CUDA cores), MXFP8 matrices with `mxfp8_activations: mxfp8` through its block-scaled
+kind::mxf8f6f4 MMAs (sm_120a; K a multiple of 128, else the generic path), and W4A4 NVFP4 matrices through
+`int-block-experts`' `gemm-native` (the decode rows' NVFP4 activations at the input scale, kind::mxf4nvf4 MMAs,
+each row's inverse global scale on the FP32 output; the matrix's tiled block scales are copied row major into the
+shared workspace a call, an eighth of the codes' bytes, so a matrix whose scales outgrow it keeps cuBLASLt). These are
+not the declared order and not row invariant: a prompt row's bits may change with the prompt's length and the tuning,
+which the slot contract allows for prompt rows (crit_plugins.device: a call of more than `invariant_rows` rows "may sum
+in another order"), and the facts say so (`row_invariance` `prompt_rows` false, `prompt_kernels` naming each role's
+kernel). Within FP32 accumulation of the FP64 product of the same quantized activations (tests/test_native_int4.py:
+2e-6 of the products' magnitude for FP8 rows and W4A4, 1e-5 on the block-scaled MXFP8 path). BF16 matrices and the
+BF16-decoded chunks of weight-only matrices (W8A16, W4A16 with `prompt: bf16`, MXFP8 with 16-bit activations) take
+`fixed-tile-gemm` with `native` (round 4; torch's GEMM before, and where that kernel is not here): its split-K
+GEMM `mm_split` (not row invariant, as native's quantized GEMMs; `fixed_tiles` and `pinned` keep its row-invariant
+`mm`). Untuned it is 1.0-1.14x cuBLAS at 16-128 rows on Qwen3.8-27B's widths but one (14336 x 5120 at 128 rows,
+0.80) and 0.84-1.00x past 256 rows (fixed-tile-gemm's README). Weight-only NVFP4 prompts in `fp8` take FP8-decoded
+chunks against FP8 activation rows on fp8-block-rows' per-channel GEMM (`gemm-native-channel`, both scales in its
+epilogue; torch's scaled matmul before). Weight-only NVFP4 prompts in `fp16_acc` (FP16 sums: no crit kernel computes
+them) and a matrix whose crit kernel is not here take the provider path; `prompt_gemm: provider` keeps cuBLAS(Lt) for
+all, and `pinned_cublaslt` its pinned algorithms, both as yardsticks. `prompt_gemm: auto` (the default) is `native` for
+every prompt arithmetic: crit runs its own kernels and the libraries are yardsticks (device_matrices.NATIVE_AUTO, a
+kind each: `fp8_rows`, `mx`, `nvfp4`, `bf16`, `fp8_decoded`, all True; a kind set False would take the provider). RTX
+5090, default knobs (no tuning), a graph of 20 calls, the lower of 3 rounds, native / provider in us at 128 / 512 /
+2,048 rows (round 3, before the kernels' round 4: the W8A8 and W4A4 columns are their earlier generic paths):
+
+| Matrix (N x K) | W8A8 FP8 rows | MXFP8 W8A8 (provider: W8A16 on the MXFP8 values) | W4A4 NVFP4 |
+| --- | --- | --- | --- |
+| 10240 x 5120 | 81 / 37, 313 / 129, 1,284 / 521 (0.41-0.46x) | 53 / 1,580, 157 / 1,829, 692 / 2,721 (3.9-30x) | 42 / 22, 91 / 55, 373 / 209 (0.52-0.61x) |
+| 5120 x 17408 | 259 / 106, 531 / 233, 2,117 / 888 (0.41-0.44x) | 160 / 2,670, 368 / 3,140, 1,294 / 5,109 (3.9-17x) | 97 / 58, 131 / 93, 520 / 387 (0.60-0.74x) |
+| 34816 x 5120 | 328 / 150, 1,049 / 457, 4,225 / 1,704 (0.40-0.46x) | 164 / 5,451, 526 / 6,125, 2,007 / 8,832 (4.4-33x) | 130 / 71, 349 / 204, 1,530 / 713 (0.47-0.54x) |
+
+Those W8A8 FP8 rows were fp8-block-rows' generic path (one fixed configuration, each 32-block's MMA summed on the CUDA
+cores). Round 4: FP8 rows go to its per-channel GEMM (`gemm-native-channel`, the full K summed in the tensor cores, the
+row and column scales in a BF16 epilogue), 1.04-1.50x cuBLASLt's rowwise FP8 GEMM tuned and 0.96-1.34x untuned on
+Qwen3.8-27B's stacked shapes at 128-8,192 tokens (its README), and every native GEMM whose build has the BF16 epilogue (`NATIVE_BF16_OUT`) writes BF16
+directly: the FP32 output and its cast to BF16 (a copy kernel, 5% of a native engine's prefill) are gone. W4A4: with
+int-block-experts' round-4 build (`NATIVE_TILED_SCALES`, `NATIVE_COLUMN_SCALES`) the kernel reads the weights' and the
+activations' block scales in the tiled layout the matrix keeps (no copy or permute a call) and takes stacked matrices'
+own inverse global scales as its column scales, BF16 out in one rounding; an older build keeps the row-major copies.
+int-block-experts' round-2 sweep on Qwen3.8-27B (BF16 out, tiled scales), vs cuBLASLt's block-scaled NVFP4 GEMM, tuned
+/ untuned: 34816 x 5120 0.93 / 0.93 at 128 tokens, 0.93-0.96 / 0.90-0.96 at 512-8,192; 5120 x 17408 1.14 / 1.04 at
+128, 0.89-0.93 / 0.87-0.92 at 512-8,192 (through the plugin, stacked gate/up matrices with their column scales,
+untuned: 1.00-1.11 at 128-8,192 tokens, where the provider runs one GEMM a run). W4A4 runs on it under auto
+(`NATIVE_AUTO["nvfp4"]`) at those speeds: crit's kernel, the library its yardstick. The AWQ INT4 paths at the same shapes, us at 1 / 4 / 8 / 16 decode rows
+and 128 / 512 / 2,048 prompt rows: 10240 x 5120 tile 18.2 / 19.7 / 21.7 / 36.7, INT4 GEMV 12.2 / 17.6 / 25.9 / 48.1,
+prompt tile 147 / 581 / 2,308; 5120 x 17408 tile 31.3 / 32.2 / 36.4 / 62.5, GEMV 18.8 / 29.3 / 45.5 / 78.7, prompt tile
+494 / 996 / 4,075; 34816 x 5120 tile 56.3 / 61.8 / 72.7 / 92.6, GEMV 35.8 / 54.7 / 82.9 / 161.9, prompt tile 588 /
+1,921 / 7,544 (the GEMV faster at 1 to 4 rows, the tile from 8: `gemv: crossover` with both sweeps' reports takes
+each).
 
 **The tile.** Decode rows go through `mma-rows` (with `gemv: mma` every matrix's, with `gemv: auto`, the default,
 every matrix's but those the next paragraph names), a tensor-core tile for 1 to 64 rows of any
@@ -212,6 +285,20 @@ by format):
 W4A4 decode rows get other bits than under `gemv: mma` (each still the same alone and batched, at every row count);
 `gemv: mma` keeps the tile's.
 
+**Crossover.** `gemv: crossover` splits each matrix's decode calls by their rows between two kernels: calls of up to
+the matrix's crossover go through `decode-gemv`'s CUDA-core GEMV (one row is a stream of weights, which the GEMV reads a
+few percent faster than the tile), longer ones through `mma-rows`' tile, as `gemv: mma`. The crossover is measured, not
+set: the largest row count at which the GEMV's tuned time is no more than the tile's at every count both sweeps timed
+at the matrix's shape, read from their reports beside the engine's tuning (`crit kernels sweep` writes
+`<kernel>.report.json` next to `<kernel>.json` in `CRIT_KERNEL_TUNING`), swept on this device's model. Without both
+reports at the shape, for decode rows on quantized activations (the GEMV's then need torch's quantizer, which the
+reports do not time), or for a matrix the tile does not take, the crossover is 0 and every call takes the tile. The two
+kernels sum in different orders, so a row keeps its bits across calls of up to the crossover and across longer calls,
+not between them: the facts' `row_invariance.rows` is the crossover (the fewest over the loaded matrices) and
+`decode_crossover` names it per role (`decode_kernels` say `gemv_mma`). It suits single-sequence decoding without
+verify windows; preserve mode's batched verification needs one kernel a matrix (`auto` or `mma`), and `prompt_gemm:
+tile` refuses it.
+
 **Prompt GEMMs.** Prompt rows past the tile multiply in the arithmetic `activations` and `prompt` give. FP8 and W4A4
 rows are quantized by `mma-rows`' quantizers in one kernel (the same bits as the torch quantizers, which serve without
 it) and multiplied by cuBLASLt with the scales in its epilogue and a BF16 output: FP8 with the row and column scales,
@@ -229,6 +316,20 @@ matrix's load takes only its own tensors.
 differently, so with `prompt_gemm: provider` a prompt row computes other bits when the prompt is longer, is cut into
 other chunks or is padded to a captured bucket: a prefix scores its tokens differently from the whole prompt, by tenths
 of a nat on a W4A4 engine, whose activation codes flip downstream of a moved ulp. `prompt_gemm: pinned` runs every
+format's prompt GEMMs on crit's kernels in one configuration a matrix shape (round 4): the quantized ones (W8A8 FP8
+rows, MXFP8 with MXFP8 activations, W4A4) on `native`'s GEMMs built with their default knobs (one 128 x 128
+configuration for every token count, whatever the engine's tuning picks by count; `load_kernel(..., tuned=False)`,
+in the engine's facts as `fp8-block-rows:untuned` and `int-block-experts:untuned`) and launched as for
+`device_matrices.PIN_ROWS` (8,192)
+tokens whatever the call's count (the real count is read on the device; longer calls go in pieces of 8,192 rows), so
+any choice by the token bound (a split) is that of 8,192 tokens for every call, and the 16-bit ones
+(BF16 matrices, the decoded chunks of W8A16, W4A16 with `prompt: bf16` and MXFP8 with 16-bit activations) on
+`fixed-tile-gemm`. A row's tensor-core sums then depend on its own activations and the matrix only
+(tests/test_pinned.py: a row's bits at every count from 17 to 4,096 rows, at other offsets, in padded captured
+buckets and at 27B, 33B and hybrid-MoE shapes). Where crit's GEMM for a matrix is not here, its prompt rows go one a
+call through the provider (correct, much slower); the facts name each role's kernel (`prompt_kernels`: `...
+gemm-native pinned`, `fixed-tile-gemm`). `prompt_gemm: pinned_cublaslt` is the earlier pinned path, cuBLASLt's
+algorithms pinned, kept as the yardstick of `pinned` (a library's GEMM): it runs every
 format's prompt GEMMs through `pinned-gemm`: at load, each GEMM shape and format (each run of a stacked W4A4 matrix,
 each decoded chunk's width) is pinned to one split-K-free cuBLASLt algorithm, the first of the heuristic's list at
 2,048 rows that gives a row the same bits at every count from 1 to 4,096 rows and at other offsets, chosen without
@@ -240,8 +341,9 @@ decoded chunks (W4A16 with `prompt: bf16`, W8A16, MXFP8) multiply BF16 into FP32
 skip the tile (tile_rows applies to decode rows only), decode rows keep their own contract, and the facts say
 `row_invariance` `prompt_rows` true: a row's bits are the same at every prompt length past the decode rows, in any
 chunk, in a padded bucket and in a pass shared with other sequences. Weight-only NVFP4 prompts in `fp16_acc` or `fp8`
-are refused. Without `pinned-gemm` the prompt rows go one a call through the provider's path (one algorithm for one
-row; correct, much slower). On an RTX 5090 a pinned NVFP4 GEMM is as fast as torch's past 64 rows (8,192-row W4A4
+are refused (with `pinned` too). Without `pinned-gemm` the prompt rows go one a call through the provider's path
+(one algorithm for one row; correct, much slower). On an RTX 5090 a cuBLASLt-pinned NVFP4 GEMM is as fast as torch's
+past 64 rows (8,192-row W4A4
 gate/up and down 2.8 and 1.3 ms); FP8 rows pay their scales after the GEMM (about a third more at 8,192 rows), and
 small-N BF16 GEMMs and weight-only decoded GEMMs at 17-64 rows, which torch splits along K, are slower (a 96 x 5,120
 BF16 matrix 42 against 18 us).
@@ -264,20 +366,21 @@ On the GEMVs, every format keeps each row's bits in a call of up to 16 rows, alo
 device form promises 8 and a plugin's facts may promise more; tests/test_device.py checks 16 bit for bit for BF16, FP8
 per channel and per tensor, MXFP8, W4A4 and W4A16, with either `decode_activations`): torch's BF16 GEMM picks another kernel at 2 rows than at 1 and
 differed there, which the BF16 GEMV removes. Calls of more rows (prompt rows) keep it through `prompt_gemm: pinned`
-(every format) or `prompt_gemm: fixed_tiles` (BF16, MXFP8 and weight-only matrices with BF16 prompts), and the
+or `pinned_cublaslt` (every format) or `prompt_gemm: fixed_tiles` (BF16, MXFP8 and weight-only matrices with BF16
+prompts), and the
 plugin's facts say so (`row_invariance`: `rows` 16, `prompt_rows` true once every matrix it loaded multiplies its
 prompt rows that way).
 
 **Captured rounds.** The plugin provides `rounds:projections`: every decode and prompt path is device work on buffers
-sized at load, without a host synchronization, and the registry kernels, the fallbacks' tables and the decode
-workspaces are made at load. Each matrix holds the registry modules its calls use from load (a call looks none up),
+sized at load, without a host synchronization, and crit's kernels, the fallbacks' tables and the decode
+workspaces are made at load. Each matrix holds the kernel modules its calls use from load (a call looks none up),
 and runs every path once at load on zero activations: decode rows at every count it takes, the tile's prompt counts,
 and its prompt route over a ladder of row counts up to 2,048, into its default output and FP32. So no request meets a
 first use (a Triton kernel's compile, cuBLAS or cuBLASLt picking and loading a kernel for a shape, a CUDA module loaded
 on its first launch); matrices of the same shape and arithmetic warm once. A Triton kernel's first call inside a
 capture still raises and says so (a shape the warm-up did not meet). tests/test_rounds.py captures every decode
 arithmetic at 27B widths, replays it on new inputs and checks the eager bits and each row's bits at 1 to 8 rows;
-tests/test_tiles.py checks that no call after load compiles a Triton kernel or asks for a registry kernel.
+tests/test_tiles.py checks that no call after load compiles a Triton kernel or asks for a crit kernel.
 
 A model plugin may pass each matrix's role (`load(tensors, format, role)`, in the model's own words), and option
 `prompt_roles` gives the roles it names their own prompt arithmetic over `prompt`: `prompt: fp16_acc` with
@@ -335,7 +438,7 @@ experts of a layer one `input_scale`). Grouped block-scaled GEMMs reach their ra
 enough rows per expert, so measure the rate by rows per expert on the target device before
 choosing the prompt chunk size, and keep weight-only GEMVs for decode. Check the prompt's
 drift against the reference, since activations are quantized too. Both halves come from
-providers ([Kernels' sources](../../kernels/SOURCES.md)): FlashInfer's FP4 quantization
+providers ([Kernels' libraries](../../kernels/README.md#libraries)): FlashInfer's FP4 quantization
 writes the activations' E2M1 codes and E4M3 block scales from a global scale, in the
 swizzled scale layout cuBLASLt's block-scaled NVFP4 GEMM reads (16-element vector scales;
 the scale tensors are tiled, not row-major, so a plain `[rows][cols / 16]` array is the
@@ -361,7 +464,7 @@ extents, zero groups, invalid representations and hook dispatch.
 finite FP8 code, signed zeros, scales and invalid encodings. None of these qualify a converted model or establish a speedup.
 
 The device form's tests ([tests/test_device.py](tests/test_device.py)) run each path bit for bit for row invariance
-(BF16, FP8 per channel and per tensor, W4A4 and W4A16; the registry kernels with LOCAL_KERNELS or from the Hub, and
-the torch fallbacks without), the fallback decoders against the kernel's bits, CUDA graph capture, and draft-only
+(BF16, FP8 per channel and per tensor, W4A4 and W4A16; on crit's kernels, built on the GPU with the engine's
+tuning or the default knobs, and on the torch fallbacks without them), the fallback decoders against the kernel's bits, CUDA graph capture, and draft-only
 re-encoding against nvfp4.py code for code (ties to even, saturation, zero blocks). The matched FP8 order's device
 fixture lives with its kernels (`fp8-block-rows`).

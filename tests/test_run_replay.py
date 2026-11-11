@@ -27,7 +27,6 @@ def later(*paths):
 
 
 class ReplayTests(PlanFixture, unittest.TestCase):
-    plan_rules = 3
 
     def setUp(self):
         super().setUp()

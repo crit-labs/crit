@@ -49,7 +49,8 @@ Eval reads the same `settings.toml` as the run.
 | --- | --- |
 | `create` | `--record request.json [--from-engine ENGINE_DIR]`; new run and first segment; with an engine folder of a crit-hub checkout, the run starts from that engine ([origin engine](#origin-engine)) |
 | `resolve` | `--record inputs.json`; freezes verified model and input identities |
-| `plan` | `--record plan.json [--check]`; records the next candidate's plan after the parent's Eval (or its seal, when it skipped its rung's Eval on the [candidate ladder](#the-candidate-ladder)) and before any code, freezes that Eval and computes the priorities ([plan](#plan)); with `--check`, runs the same checks and prints the record it would store, recording nothing |
+| `next` | Prints the run's one next step: where the run and its open candidate stand ([states](#states)), the command to run and why |
+| `plan` | `--record plan.json [--check \| --draft]`; records the next candidate's plan after the parent stands on the [candidate ladder](#the-candidate-ladder) and before any code, freezes the parent's Eval and computes the priorities ([plan](#plan)); `--check` runs the same checks and prints the record, recording nothing; `--draft` writes the plan's skeleton to the `--record` file and prints the facts crit computes for it |
 | `candidate` | `--source DIR --record proposal.json`; allocates an ID, retains source |
 | `capture` | `[--case ID] [--text FILE] [--instruction TEXT] [--system TEXT] [--template-kwargs JSON] [--inputs INPUTS_JSON]`; before `resolve`, after `recon`: writes `captured/CASE/request.json`, a chat request whose messages render to the workload's `prompt_tokens` with recon's frozen `template_variables` under its own `chat_template_kwargs` (the given text or a neutral passage, cut to whole words and padded to the exact count), prints its manifest row and sets it in the inputs payload |
 | `build` | `--candidate ID --record recipe.json [--seconds N] [--drop GLOB ...] [--no-package]`; reserves a build attempt, copies the retained source to `work/builds/ID-ATTEMPT`, runs the recipe's literal `build.command` there to the deadline (whole process tree; log `logs/build-ATTEMPT.log`), settles the attempt and, when it completed, packages that folder: each file the build added or changed bound as a dependency (`version` `built by ATTEMPT`) after the recipe's own; `--drop` removes intermediates first |
@@ -58,13 +59,14 @@ Eval reads the same `settings.toml` as the run.
 | `package` | `--candidate ID --source DIR --record recipe.json`; runnable files and manifest |
 | `check`, `benchmark` | `--candidate ID --record payload.json`; appends evidence. `check --candidate ID --from-eval [ATTEMPT]` instead records every case's arithmetic, functional and resources check from the candidate's retained Eval result (default its newest; [Check](#check)) |
 | `measure` | `--candidate ID [--seconds N] [--exploratory]`; after `check --from-eval`: reserves a benchmark attempt, serves the packaged candidate through `crit serve`, streams every resident case's chat request to it, settles it and records one benchmark per case ([measured benchmarks](#measured-benchmarks)). Refuses, before reserving, a candidate whose checks would leave its benchmarks exploratory; `--exploratory` measures it anyway |
-| `serve` | `--candidate ID [--host HOST] [--port 8000] [--seconds N] [--check] [--no-smoke]`; reserves a check attempt, serves the packaged, not yet sealed candidate through `crit serve` at `http://HOST:PORT/v1` until Ctrl+C or the reservation's deadline, for the checks a candidate passes before sealing, and settles the attempt (log `logs/serve-ATTEMPT.log`); with `--check` crit runs the standard serving checks itself (consecutive greedy requests, a system message, streaming, a stop string, a client cancelling, a tool call and its result, log-probabilities, a template switch, each where declared, and stopping the engine) and [crit smoke](../smoke/README.md) at the run's context and again with the engine reopened at a quarter of it (`--no-smoke` leaves it out), keeps their report as `logs/serve-check-ATTEMPT.json` and records a functional check per case; `crit serve` serves the candidate once it is sealed |
-| `ablate` | `--candidate ID [--variant NAME ...] [--repetitions 3] [--no-smoke] [--smoke-test TEST ...] [--seconds N]`; reserves a check attempt, serves the packaged, not yet sealed candidate built from plugins through `crit serve`, builds it again in the same resident host with each variant of its plugins, benches the run's resident cases and runs crit smoke on each, and keeps the report as `logs/ablation-ATTEMPT.json` ([ablation](#ablation)) |
+| `serve` | `--candidate ID [--host HOST] [--port 8000] [--seconds N] [--check [--data DATA]] [--no-smoke] [--no-plugin-tests]`; reserves a check attempt, serves the packaged, not yet sealed candidate through `crit serve` at `http://HOST:PORT/v1` until Ctrl+C or the reservation's deadline, for the checks a candidate passes before sealing, and settles the attempt (log `logs/serve-ATTEMPT.log`); with `--check` crit first runs the package's plugin tests (`crit plugins test`, cached; `--no-plugin-tests` leaves them out), then the standard serving checks itself (consecutive greedy requests, a system message, streaming, a stop string, a client cancelling, a tool call and its result, log-probabilities, a template switch, each where declared, and stopping the engine) and [crit smoke](../smoke/README.md) at the run's context and again with the engine reopened at a quarter of it (`--no-smoke` leaves it out), with `--data` crit-eval's gate pre-check, keeps their report as `logs/serve-check-ATTEMPT.json` and records a functional check per case: the one check before a candidate's Eval or seal; `crit serve` serves the candidate once it is sealed. An [external engine](#external-engines) is started from its launch command instead and has no plugin tests |
+| `ablate` | `--candidate ID [--variant NAME ...] [--set ...] [--repetitions 3] [--no-smoke] [--smoke-test TEST ...] [--seconds N]`; reserves a check attempt, serves the packaged, not yet sealed candidate built from plugins through `crit serve`, builds it again in the same resident host with each variant of its plugins, benches the run's resident cases and runs crit smoke on each, and keeps the report as `logs/ablation-ATTEMPT.json` ([ablation](#ablation)); an [external engine](#external-engines) is served A/B on the options it declares only |
+| `kernels` | `--candidate ID [--nvcc PATH] [--seconds N]`; an [external engine](#external-engines) only: reserves a check attempt, starts it with crit-eval's CUPTI tracer in its environment, sends each resident case once to warm and once traced, and keeps the kernels per phase as `logs/kernels-ATTEMPT.json`; where tracing is not possible (not Linux, no CUDA toolkit with CUPTI, no kernel recorded) the report says why. A plugin package is traced in process with `crit eval kernels --package` |
 | `eval` | `--candidate ID --data EVAL_DATA_DIR [--only PART] [--baseline RESULT] [--label TEXT] [--seconds N] [--stage 1|2|3|full] [--certify] [--budget-minutes N] [--resume [ATTEMPT]]`; on the [candidate ladder](#the-candidate-ladder) measures as far as the candidate's rung allows and refuses candidate 1; reserves a benchmark attempt, serves the packaged candidate through `crit serve`, scores the data's quality texts on the run's model unless stored, runs Eval over the chat API with the run's quality terms and `kv_tokens`, settles it and retains the result as `candidates/ID/eval/ATTEMPT.json` beside its journal `ATTEMPT.journal.jsonl` ([Eval evidence](#eval-evidence)); for a candidate created from a plan it writes the plan's [outcome](#outcome), and it prints the priorities the result's fractions give. `--resume` goes on from an attempt that stopped (default the newest with a journal) in a new attempt |
 | `seal` | `--candidate ID --lifecycle STATE [--failure TEXT]`; closes the candidate |
 | `select` | `--candidate ID`; selects a sealed eligible candidate |
 | `stop` | `--record stop.json` |
-| `resume` | `--candidates N [--attempt-limit N] [--external-agent-stopped]`; new segment for N more candidates (`--minutes N` alone: legacy time-budget segment). `--quality-budget JSON`, `--exactness MODE`, `--approved-by NAME` amend quality terms from this segment on, recorded as the segment's `amendment` |
+| `resume` | `--candidates N [--minutes N] [--attempt-limit N] [--external-agent-stopped]`; new segment for N more candidates on the ladder (`--minutes`: its safety window). `--quality-budget JSON`, `--exactness MODE`, `--approved-by NAME` amend quality terms from this segment on, recorded as the segment's `amendment` |
 | `cost` | `--transcript PATH [--transcript PATH ...] [--agent NAME] [--prices JSON] [--until TIMESTAMP]`; accounts the run's build cost from the agent's transcripts and writes `cost.json` ([cost](#cost)) |
 | `replay` | `--at CANDIDATE` or `--before PLAN`, `--out DIR [--count N] [--agent CMD]`; copies the run as it stood when the candidate's Eval finished (or just before the plan was recorded) into `DIR/replay-1` ... `DIR/replay-N`, for an agent to say what it would do next with today's crit and crit-eval; `--agent CMD` starts any harness on every replay at once and collects; `--collect` checks and lists the plans the replays wrote ([replays](#replays)) |
 | `show`, `recover` | Inspect; or prove abandoned ownership and rebuild active projections |
@@ -87,7 +89,7 @@ hashes; add them only where a field below requires one.
 | `context_reserve_gib` | Device memory kept out of the KV cache when deriving `kv_tokens` from `device`; default the protocol's 3 |
 | `drafters` | Up to 8 companion drafter folders (EAGLE-3, DFlash, DSpark) a candidate may load beside the model. With `device`, their stored weights are kept out of the KV cache too, so a speculating candidate still fits `kv_tokens`; `hardware_constraints.context` records `companion_drafter_bytes` and each drafter. Name the same folders to `recon --drafter` |
 | (devices) | A `device` file of several GPUs (`crit eval probe --devices`) sizes `kv_tokens` from their memory together, and `hardware_constraints.context.devices` names them (`index`, `device`); `crit run measure` samples device memory on every one of them |
-| `candidate_budget`, `attempt_limit` | Segment bounds: candidates on the [candidate ladder](#the-candidate-ladder) (default 5, 1–64; [budget counts](#budget-counts)) and attempts (default 64, 1–1000). `budget_minutes` is a safety window, default and maximum 43200 (30 days). `budget_minutes` without `candidate_budget` creates a legacy time-budget segment (1–180) |
+| `candidate_budget`, `attempt_limit` | Segment bounds: candidates on the [candidate ladder](#the-candidate-ladder) (default 5, 1–64; [budget counts](#budget-counts)) and attempts (default 64, 1–1000). `budget_minutes` is a safety window, default and maximum 43200 (30 days) |
 | `workload` | Defaults: prompt 512, output 128, concurrency 1, repetitions 3, warmups 1, mode `resident` |
 | `cases` | Optional 1–32 distinct `{case_id, workload}` objects with complete workloads |
 | `benchmark_protocol` | Fixed protocol identity; default `crit-matched-v1` |
@@ -100,14 +102,11 @@ hashes; add them only where a field below requires one.
 | `eval_sampling` | Optional, the user's only: `{settings, approved_by}`, settings `temperature` (> 0, required) and any of `top_p`, `top_k`, `min_p`, as an object or `"temperature=0.6,top_p=0.95"`. Eval's sampled suite then measures at these settings instead of the model's `generation_config.json`: `crit run ... eval` requires data prepared with `crit eval prepare --sampling` and the same settings (and refuses overridden data without it), recon applies them to the served default, and results label them as an override |
 | `origin_engine` | Written by `create --from-engine`, never by hand: the crit-hub engine the run starts from ([origin engine](#origin-engine)) |
 
-`create` freezes `"plans": "required"` into the run spec: every candidate of the run names a recorded
-[plan](#plan). Runs created before it have no `plans` field; their proposals may name a plan, which is
-then checked. It also freezes `"plan_limits": "computed"`: the run's plans rank with the decode limits
-crit computes when Eval states none ([computed limits](#computed-limits)); runs without it keep the
-agent's estimates. And it freezes `"lever_fates": "required"`: each proposal gives every lever of its
-plan a fate; runs without it keep fates optional, checked when given. With `"plan_limits"` it freezes
-`"plan_rules": 2`: the run's plans follow the second version of the plan rules ([plan rules
-2](#plan-rules-2)); runs without it keep the first.
+Every candidate names a recorded [plan](#plan) and gives each of its levers a fate, and a segment's budget counts
+the candidates on the [candidate ladder](#the-candidate-ladder). Runs created by earlier crit releases recorded which
+version of these rules they followed (`plans`, `plan_limits`, `lever_fates`, `plan_rules`, `budget_counts` in the
+spec, and segments with a time budget only); crit still reads them to show, serve and replay such runs, and applies
+the current rules to anything new.
 
 #### Quality modes
 
@@ -132,33 +131,29 @@ to `transformable`.
 
 #### Budget counts
 
-`create` freezes `"budget_counts": "ladder"`: a segment's `candidate_budget` counts the candidates on
-the [candidate ladder](#the-candidate-ladder), not the candidates it creates. A candidate is on it once
+A segment's `candidate_budget` counts the candidates on the [candidate ladder](#the-candidate-ladder), not
+the candidates it creates. A candidate is on it once
 the segment reserved its first Eval attempt (`crit run ... eval`), or, on a rung below the full Eval,
 once it is sealed `built` or `completed` with a passed `crit run ... serve --check` (a functional check
 that `serve --check` recorded with status `passed`). Any other candidate is a draft: its build, its
 package or `serve --check` failed, or a fix was found before measuring it; on the full rung, a candidate
 sealed without its Eval is one too. Seal it with what stopped it (`build_failed` or `check_failed` and
 the failure) and build the fix as a new candidate that names the same `plan_id`: it costs no budget and
-keeps the draft's [objective](#plan-rules-4) and rung, and the segment's `attempt_limit` bounds its
-builds. Later Evals of a counted candidate (a resume, a partial rerun) cost nothing more. Once the
-budget is used, an Eval of a candidate not yet counted is refused, and so is `candidate`, until a
-resume. Runs created with `"budget_counts": "evaluated"` count the candidates whose first Eval attempt
-the segment reserved, with the same drafts but no ladder, and runs without the field count every
-candidate created in the segment, and a plan links to one candidate only.
+keeps the draft's objective and rung, and the segment's `attempt_limit` bounds its builds. Later Evals of a
+counted candidate (a resume, a partial rerun) cost nothing more. Once the budget is used, an Eval of a candidate
+not yet counted is refused, and so is `candidate`, until a resume.
 
 #### The candidate ladder
 
-In a run with `"budget_counts": "ladder"` a candidate's number in the run (the candidates on the ladder
-so far plus one; a draft's fix keeps its number) is its rung, which says how far its round goes and how
-far Eval measures it. crit records the rung in the plan's `inputs.objective`
-(`crit.run.plans.objective`), with plan rules 4 as with every earlier version: the objective's name and
-rule, and `eval`, the rung's Eval (`scope`, `rule`, and `stage` for a small or medium one).
+A candidate's number in the run (the candidates on the ladder so far plus one; a draft's fix keeps its number)
+is its rung, which says how far its round goes and how far Eval measures it. crit records the rung in the plan's
+`inputs.objective`: the objective's name and rule, and `eval`, the rung's Eval (`scope`, `rule`, and `stage` for a
+small or medium one). `crit run ... next` names the step each rung takes next.
 
 | Candidate | Objective | Eval (`scope`) | `crit run ... eval` |
 | --- | --- | --- | --- |
-| 1 | `proof_of_concept`: builds, passes its plugins' tests (`crit plugins test`) and `serve --check`, in its placement scenario's starting design | `none` | refused: seal it `built` |
-| 2 | `plugin_round`: every plugin crit's library and crit-hub offer that fits the checkpoint and the GPU (`crit plugins list --model MODEL --device cuda`), in the slots it fills, each plugin's tests passing; `ablate` says which pays | `small`, optional | Eval's stage 1 (`--stage 1`) |
+| 1 | `proof_of_concept`: builds and passes `serve --check` (its plugins' tests included), in its placement scenario's starting design | `none`; `small` for an [origin engine](#origin-engine) | refused: seal it `built`; an origin engine's stage 1 is the run's baseline |
+| 2 | `plugin_round`: every plugin crit's library and crit-hub offer that fits the checkpoint and the GPU (`crit plugins list --model MODEL --device cuda`), in the slots it fills, each plugin's tests passing; `ablate` says which pays. For an [external engine](#external-engines) `technique_round`: every Inference technique and kernel template that fits, taken into the engine's own code as levers named by technique or kernel and declared as options, which `ablate --set` measures | `small`, optional | Eval's stage 1 (`--stage 1`) |
 | 3, 4 | `crit_round` | `medium`, optional | up to Eval's stage 2 (`--stage 1` or 2) |
 | 5 | `crit_round` | `full` | certified (`--certify`) |
 | 6 on | `critique_round` | `full` | certified |
@@ -175,6 +170,30 @@ its Eval, or, when it skipped its Eval, after its seal, and then freezes no Eval
 like the run's first plan; a parent that went through Eval, or stands on the full rung, needs a
 completed Eval attempt. Only the full Eval measures the required context and the lower-context gate, so
 the candidate a run proposes stands on the full rung.
+
+#### States
+
+`crit run ... next` reads the run's records (`crit.run.state`) and names the one next step and its command. Each
+open candidate is in one state:
+
+| State | Means | Next step |
+| --- | --- | --- |
+| `created` | source retained, not built | `build` |
+| `build_failed` | its newest build failed | seal it `build_failed`; the fix is a new candidate from the same plan |
+| `packaged` | built and packaged | `serve --check --data EVAL_DATA` |
+| `check_failed` | its newest `serve --check` failed | seal it `check_failed`; the fix is a new candidate from the same plan |
+| `serve_checked` | `serve --check` passed | rung 1: seal `built`; rungs 2 to 4: `eval`, or seal `built` to skip it; full rung: `eval` |
+| `eval_stopped` | its newest Eval attempt stopped | `eval --resume` |
+| `evaluated` | a completed Eval | `check --from-eval`, then `measure`, then seal `completed` |
+| `running` | an attempt runs | wait, or settle it when its process is gone |
+
+With every candidate sealed the next step is a candidate from a recorded plan, a new plan (`plan --draft`), or the
+stop. A candidate **qualifies** when it is sealed `completed` on the full rung, its certified Eval passed the gates,
+and its checks (`check --from-eval`) and every case's benchmark were recorded and passed: `select` takes only such a
+candidate, and the run proposes one.
+
+The run's own `phase` (`state.json`) is the segment's state only: `awaiting_agent`, `running`, `discovering`,
+`building`, `finished`, `failed`, `launch_failed`, `expired` or `stopped`; the stop's reason is `stopping_reason`.
 
 Workload keys: `prompt_tokens`, `output_tokens` (1–1,000,000), `concurrency` (1–256),
 `repetitions` (1–100), `warmup_runs` (0–100), `mode` (`resident`/`cold`). KV capacity
@@ -195,7 +214,7 @@ Provider spend limits are the caller's responsibility.
 | Payload | Fields |
 | --- | --- |
 | Inputs | Nonempty `hardware_manifest`, `environment_manifest`; `case_manifests` mapping **every** fixed case ID to an ordered nonempty list of `{path, bytes, sha256}` under the run's `captured/`. In a run with an origin engine, crit adds `origin_checkpoint`: whether the model is the exact checkpoint the engine was measured on |
-| Proposal | `label`, `rationale`, `strategy`, `configuration` object, `store_decisions` object; `plan_id` (the [plan](#plan) it is built from; required when the run spec has `"plans": "required"`); optional `parent_candidate_id`, `origin_candidate_id` (earlier retained candidates); `weights` (`as_stored` or `transformed`, required when `weights_policy` is `as_stored`); `lineage` (`origin-engine`: the candidate is the origin engine's source as imported, in a run created with `--from-engine`). A run whose model is a folder needs `work/recon.json` (`recon`) before its first candidate; crit adds its `frozen` block as `configuration.recon` (a supplied `recon` must equal it) and `extensions.recon` with its path and SHA-256 |
+| Proposal | `label`, `rationale`, `strategy`, `configuration` object, `store_decisions` object; `plan_id` (the [plan](#plan) it is built from); `lever_fates` (every lever of the plan `built`, `pruned` or `deferred`, with the reason unless built); optional `parent_candidate_id`, `origin_candidate_id` (earlier retained candidates); `weights` (`as_stored` or `transformed`, required when `weights_policy` is `as_stored`); `lineage` (`origin-engine`: the candidate is the origin engine's source as imported, in a run created with `--from-engine`). A run whose model is a folder needs `work/recon.json` (`recon`) before its first candidate; crit adds its `frozen` block as `configuration.recon` (a supplied `recon` must equal it) and `extensions.recon` with its path and SHA-256 |
 | Package recipe | `build: {toolchain: {...}, dependencies: [...], command: [...]}`, nothing else: Core's loader runs the package and says what it serves |
 
 In an `as_stored` run, a candidate declaring `transformed` weights (requantized,
@@ -219,13 +238,12 @@ quality gates).
 never recycled; labels don't determine paths or ordering.
 
 For `plan_id` crit checks that the plan exists, is not superseded, is not linked to another
-candidate (with [budget counts](#budget-counts), other than a sealed draft that never reached the ladder or Eval), has `"decision": "build"` and starts from the proposal's `parent_candidate_id`, and keeps
+candidate (other than a sealed draft that never reached the ladder: [budget counts](#budget-counts)), has `"decision": "build"` and starts from the proposal's `parent_candidate_id`, and keeps
 `plan_id` in `candidate.json`. `rationale` and `strategy` stay; they may summarize the plan.
 
 `lever_fates` maps lever ids of that plan to `{fate, detail}`: `fate` is `built`, `pruned` or
-`deferred`, and `detail` (why) is required unless built. Unknown ids are refused. In a run with
-`"lever_fates": "required"` every lever of the plan has exactly one fate; elsewhere fates are optional
-and checked when given. `candidate.json` keeps them.
+`deferred`, and `detail` (why) is required unless built. Unknown ids are refused, and every lever of the
+plan has exactly one fate. `candidate.json` keeps them.
 Candidate creation stages its source, source manifest and identity together in a
 scratch directory at the run root before publishing the candidate directory. An interruption before publication
 leaves no candidate ID; after publication, `recover` rebuilds its telemetry from the
@@ -244,6 +262,46 @@ the package. What the engine serves is Core's ([Serving](SERVING.md#cores-reside
 from before plugin packages names its `launch` entry and `capabilities`, stays readable as history and does not
 serve.
 
+#### External engines
+
+An external engine (the charter's vision A: an engine from elsewhere that takes crit's techniques and kernel
+templates into its own code, never rebuilt as plugins) is a candidate of its own kind. Its configuration declares it
+in `engine`, and its source and package hold its files and no `plugins/`:
+
+```json
+"engine": {
+  "kind": "external",
+  "launch": {"command": ["python", "server.py", "--port", "{port}", "--model", "{model}", "--context", "{context_tokens}"],
+             "cwd": ".", "env": {}, "health": "/v1/models", "ready_seconds": 900},
+  "capabilities": ["chat-tools-v1"],
+  "max_concurrency": 8,
+  "options": {"draft_width": {"flag": "--draft-width", "default": 4},
+              "eager": {"flag": "--enforce-eager", "switch": true, "default": false}}
+}
+```
+
+- `launch.command` starts its OpenAI-compatible server. crit fills `{port}` (required: crit picks a free port, so no
+  two attempts meet on one), `{host}`, `{model}` (the run's model folder), `{context_tokens}` and `{package}` in the
+  command and in `env`. A command without `{context_tokens}` serves at the engine's own context, and a part that
+  asks for another context is served at it; the attempt's log says so. `cwd` is the package folder it starts in
+  (default the package), `health` the path that answers 200 once it serves (default `/v1/models`) and
+  `ready_seconds` how long it may take (default 900).
+- `capabilities` are what it serves beside plain chat, in crit serve's names, for the serving checks (default: its
+  model card's `capabilities`); `max_concurrency` how many requests it runs at once when its `/health` and card do
+  not say.
+- `options` are the switches it exposes, each a flag of the launch command: `default` is the value as built, and a
+  `switch` is a bare flag given when its value is true. They are what `ablate` varies.
+
+`serve` (with `--check`), `eval`, `measure`, `ablate` and `kernels` start it from its launch command under the
+attempt's reservation, in its own process tree, wait for its health path, run the same serving checks, crit smoke,
+Eval and benchmarks against its URL as for a plugin package, and stop the whole tree when the work ends, fails or
+passes the reservation's deadline (a cleanup that cannot prove the tree gone leaves the attempt's cleanup unsettled).
+Its output is kept as `logs/engine-ATTEMPT.log` beside the attempt's log, and a benchmark's `served_by` names the
+launch command. A plan for it says `"engine": "external"`; its candidate must declare `configuration.engine`, a
+child keeps its parent's kind, and its rungs name levers by technique or kernel (provider `inference:ID` or
+`kernel:FAMILY/ID`) instead of plugin. A configuration is either a plugin selection or an external engine, never
+both.
+
 Packaging copies and validates the input inventory and recipe in a scratch directory
 at the run root, then renames the complete package into the candidate. A copy or validation
 failure can be retried. If publication succeeded but updating projections failed,
@@ -256,41 +314,48 @@ copying staged output back into itself.
 
 ### Plan
 
-`crit run ... plan --record plan.json` records the next candidate's plan after the parent's Eval and
-before any code (on the [candidate ladder](#the-candidate-ladder), after the parent's seal when it
-skipped its rung's Eval). crit assigns `plan-0001`, `plan-0002`, ... (never recycled), stores
-`plans/PLAN_ID/plan.json`, never changes it afterwards and records a `plan_recorded` event.
+`crit run ... plan --record plan.json` records the next candidate's plan after its parent stands on the
+[candidate ladder](#the-candidate-ladder) (after its Eval, or after its seal when its rung skipped Eval) and before
+any code. crit assigns `plan-0001`, `plan-0002`, ... (never recycled), stores `plans/PLAN_ID/plan.json`, never
+changes it afterwards and records a `plan_recorded` event. `plan --draft --record plan.json` writes the next plan's
+skeleton instead (TODO where the planner writes, the parent's scores as a flat forecast, the `review` and `weakest`
+entries this plan owes) and prints what crit computes for it: the objective and rung, the priorities while both
+families are needed, each KPI's score, limit and noise, Eval's gaps and the parent plan's outcome. `plan --check`
+runs every check and prints the record without storing it.
+
+There is one set of plan rules. Every run follows it, whatever crit release created the run.
 
 | Field | Content |
 | --- | --- |
-| `parent_candidate_id` | The candidate whose Eval the plan starts from; `null` only while the run has no candidate |
+| `parent_candidate_id` | The candidate the plan starts from: the newest on the ladder; `null` only while the run has none |
 | `supersedes` | Optional: the plan this one replaces ([revisions](#revisions)) |
 | `decision` | `build` or `stop` |
 | `needed` | `{"decode": {"needed": bool, "evidence": text}, "prefill": {...}}` |
-| `gaps` | For KPIs marked not needed: `[{kpi, gap, answer, detail}]`, `gap` the Eval gap's `name`, `answer` `cause` (its physical cause) or `rejected` (measured and rejected); optional `evidence`, a file in the run, which [plan rules 3](#plan-rules-3) require below half the limit |
-| `strategy` | `{current: {name, ceiling, evidence}, alternative: {name, ceiling, evidence}, choice, reason}`; `ceiling` is text: a number with its unit and where it comes from; `choice` is `current` or `alternative` |
-| `levers` | `[{id, technique, description, changes, group, confidence}]`. `technique` is an Inference entry name or free text; `changes` maps KPIs (`decode`, `prefill`, `ttft`, `context_decode`, `context_ttft`) to `{change, source}`: `change` is the projected relative change of that KPI's score in its improving direction (0.12 = 12% better, negative = worse), `source` is `eval-gap:<gap name>` or `estimate`. `group` is null or a name shared by levers that only pay together; `confidence` is `low`, `medium` or `high`. Optional `kind`: `speed` (the default) or `requirement`, work a rule or gate requires that Eval does not score, with `serves` naming that rule or gate (e.g. `AGENTS.md: sampled requests speculate`; in [plan rules 4](#plan-rules-4) on, `gate:NAME` or `check:NAME` for the repair of a gate or check the parent failed); its `changes` may be empty or 0 |
-| `rejected` | `[{name, reason}]`: alternatives considered and not planned |
-| `forecast_justification` | Optional (plan rules 3): why a forecast that expects more gain on p2 than on p1, or lets a p1 KPI fall, is worth building |
-| `weakest` | Plan rules 4, critique rounds: the parent's two weakest terms, `[{kpi, term, evidence, levers}]` ([plan rules 4](#plan-rules-4)) |
-| `review` | Plan rules 4: the review of the parent's plan against its outcome, `{plan_id, kpis, levers, lesson}` ([plan rules 4](#plan-rules-4)) |
+| `gaps` | `[{kpi, gap, answer, detail}]` with optional `evidence` (a file in the run) and `cause_terms`. `gap` is an Eval gap's `name`, or one of crit's own: `limit` (why the rest of a family's limit is out of reach, answer `cause`), `activation:FORMAT` (a prompt activation format rejected on a quality measurement) or `placement:cpu` (the CPU expert tier rejected). `answer` is `cause` (its physical cause) or `rejected` (measured and rejected) |
+| `strategy` | `{current: {name, ceiling, evidence}, alternative: {name, ceiling, evidence, limits?}, choice, reason}`; `ceiling` is text: a number, its unit and where it comes from; `choice` is `current` or `alternative`; `limits` below |
+| `levers` | `[{id, technique, description, changes, group, confidence, provider, yardstick?, kind?, serves?}]`. `changes` maps KPIs (`decode`, `prefill`, `ttft`, `context_decode`, `context_ttft`) to `{change, source}`: the projected relative change in the KPI's improving direction (0.12 = 12% better), its source `measured:PATH` (a file of the run that measured it, such as an ablation report of the lever as an option variant), `eval-gap:NAME` or `estimate`. `group` names levers that only pay together; `confidence` is `low`, `medium` or `high`. `provider` says what supplies a speed lever's code: `inference:ENTRY`, `hub:ORG/NAME`, `lib:NAME` ([Kernels' sources](../kernels/SOURCES.md)) or `own: ...`, which carries `yardstick` `{evidence, detail}`: the measured best existing provider for the operation, or the providers checked and why none fits. `kind` `requirement` marks work a rule requires that Eval does not score, with `serves` naming it (`gate:NAME` or `check:NAME` for the repair of a gate or check the parent failed); its `changes` may be empty |
+| `rejected` | `[{name, reason, bound_by?, evidence?}]`: alternatives considered and not planned; `bound_by` `{family, term}` names the round term that bound the measurement |
 | `forecast` | `{KPI: {low, expected, high}}` in Eval's units (tok/s; ms for `ttft` and `context_ttft`) for `decode`, `prefill`, `ttft`, and `context_decode`, `context_ttft` when the parent's Eval measured them |
+| `forecast_justification` | Optional: why a forecast that expects more gain on p2 than on p1, or lets a p1 KPI fall, is worth building |
 | `gates` | How quality stays inside the budget and the required context is met |
-| `estimated_limits` | Optional: `{KPI: {limit, derivation}}`, the agent's estimate of a limit the parent's Eval does not give, in Eval's units (tok/s; ms for `ttft` and `context_ttft`), and how it was derived (for example a drafter's expected tokens per round over the pass floor) |
+| `estimated_limits` | Optional: `{KPI: {limit, derivation}}`, an estimate of a limit neither the parent's Eval gives nor crit computes |
+| `prompt_activations` | `speed` runs: the formats the candidate's prompt GEMMs take per stored format, as the engine declares them to Eval |
+| `round` | Optional: the parent's measured round per family, `{total_ms, idle_ms, terms: [{term, ms, floor_ms}], evidence}`, which a `limit` gap rests on |
+| `review` | The review of the parent's plan against its outcome, `{plan_id, kpis, levers, lesson}` (check 12) |
+| `weakest` | Critique rounds: the parent's two weakest terms, `[{kpi, term, evidence, levers}]` (check 11) |
 
 crit adds the record header (`plan_id`, `segment_id`, `created_at`, `request_sha256`) and:
 
-- `inputs`: the parent's newest completed Eval attempt (`eval`: path and SHA-256), `recon_sha256`
-  (`work/recon.json`) and a frozen extract of that result's `status`: per KPI the `score`, `limit` and
-  `fraction` of the limit (each goal's `fraction_of_limit`, else the KPI's `fraction_of_ceiling` or
-  `fraction_of_floor`), the relative `noise` per KPI (each goal's `noise`; for results without it,
-  decode is two standard errors or the end-to-end decode noise, ttft the end-to-end ttft noise, the
-  others unknown), the `untiered` scores (greedy decode, held-out decode, follow-up time to first token)
-  and the `gaps`. A missing field is unknown (null), never an error. `estimated` lists the KPIs whose
-  `fraction` crit computed from `estimated_limits` (their `limit` stays Eval's null).
-- `priorities`: `{p1, p2, p3, estimated}` lists computed from `needed` and the frozen fractions, or null with
-  `priorities_reason` (no Eval yet, a missing limit, or a stop plan). `context_decode` counts toward
-  the decode family, `context_ttft` toward prefill; a family's fraction is the lower of its members'.
+- `inputs`: the parent's newest completed Eval attempt that measured decode and prefill (`eval`: path and SHA-256),
+  `recon_sha256` and a frozen extract of that result's `status`: per KPI the `score`, `limit` and `fraction` of the
+  limit, the relative `noise` per KPI, the `untiered` scores (greedy decode, held-out decode, follow-up time to first
+  token) and the `gaps`. A missing field is unknown (null), never an error. An unknown noise takes the largest known
+  noise of its own family (decode with `context_decode`, prefill with `context_ttft`, time to first token alone),
+  else 5% (`inputs.noise_default`). Beside them: `objective` (the candidate's rung, below), `computed_limits`,
+  `fraction_sources`, `alternative_limits`, the evidence each check recorded and `warnings`.
+- `priorities`: `{p1, p2, p3, estimated, sources}` computed from `needed` and the frozen fractions, or null with
+  `priorities_reason`. `context_decode` counts toward the decode family, `context_ttft` toward prefill; a family's
+  fraction is the lower of its members', its noise the largest of theirs.
 
   | Needed | p1 | p2 | p3 |
   | --- | --- | --- | --- |
@@ -301,274 +366,84 @@ crit adds the record header (`plan_id`, `segment_id`, `created_at`, `request_sha
   | Only prefill | prefill | ttft | |
   | Neither | the plan is a stop plan | | |
 
-  Within noise: the fractions differ by at most the larger of (relative noise × fraction) of the two
-  families, each with the noise of the member that sets its fraction (unknown counts as 0).
-
-  When both families are needed, every measured member of them whose limit neither Eval gives nor crit
-  computes needs an estimated limit; crit refuses the plan naming the KPI otherwise. An estimate is
-  physically consistent with the frozen score (a ceiling at or above a rate, a floor at or below a time),
-  has a nonempty derivation, and never replaces a limit Eval gives. crit computes the missing fractions
-  from Eval's limit, then its own computed limit, then the estimate; every check uses them like Eval's,
-  `priorities.estimated` lists the KPIs whose estimate the ranking rests on and, in runs that compute
-  limits, `priorities.sources` names the source (`eval`, `computed`, `estimate`) of each compared fraction.
+  Within noise: the fractions differ by at most the two families' noise bands combined in quadrature,
+  `√((noise_decode × f_decode)² + (noise_prefill × f_prefill)²)`. Near the limit (both at 0.85 or above) the lower
+  one is p1 alone. Priorities order the work and settle conflicts; they never leave a lever out.
 
 #### Computed limits
 
-In a run with `"plan_limits": "computed"`, when the parent's Eval states no limit for `decode` or
-`context_decode`, crit computes one from the same attempt: per measured decode case (long-context
-point) the measured `tokens_per_round` (1 where none is measured) over its pass floor, `(bytes_per_pass +
-kv_bytes_per_token × (prompt_tokens + output_tokens / 2)) / bandwidth_gbs`, and their geometric mean.
-`bytes_per_pass` is the attempt's (`headroom.bytes_per_pass`, the engine's or Eval's model-files figure),
-else the run's model files read as Eval reads them (`crit_eval.limits.context.pass_bytes`). It uses the
-acceptance measured so far, never full acceptance, and leaves the draft steps' own cost out, so it is
-deterministic and an upper bound at that acceptance. `inputs.computed_limits[KPI]` keeps the `limit`,
-`unit`, `formula`, the JSON paths of its `inputs` and whether it was `used`; a limit below the measured
-score is kept with a `note` and not used. `inputs.fraction_sources` names each fraction's source. An
-agent's estimate for a KPI crit computed is kept in `inputs.estimates_not_used` with its relative
-`difference` from crit's limit and is not used.
+Where the parent's Eval states no limit for `decode` or `context_decode`, crit computes one from the same attempt,
+with Eval's cost model: per measured decode case (long-context point) the measured `tokens_per_round` over the round
+floor, the pass floor `(bytes_per_pass + kv_bytes_per_token × (prompt_tokens + output_tokens / 2)) / bandwidth`
+plus the engine's draft width at Eval's draft floor, geometric mean. Where the draft width or floor is unknown, the
+pass floor alone stands, labelled an upper bound. A limit below the measured score is kept with a note and not used.
+Where neither Eval nor crit gives a limit and both families are needed, the plan states `estimated_limits` (at or
+above the measured rate, at or below the measured time). A fraction comes from Eval's limit, then crit's, then the
+estimate, and `priorities.sources` names which.
 
-The priorities measure the distance to what is reachable, not to the current strategy's own ceiling. In
-these runs `strategy.alternative` may add `limits` for `decode` and `context_decode`: `{tokens_per_round,
-draft_steps, derivation}`, from which crit computes the alternative's ceiling on the parent's Eval cases
-(points), `tokens_per_round` over the pass floor plus `draft_steps` draft steps at `draft_bytes_per_step`
-(the attempt's, else the checkpoint's draft layers, `crit_eval.limits.context.draft_step_bytes`) over the
-bandwidth; or `{limit, derivation}` only where crit cannot compute that round floor. crit ranks decode and
-`context_decode` by the higher of the current strategy's limit and the alternative's ceiling, whatever
-`strategy.choice` says. `inputs.alternative_limits[KPI]` keeps the `limit`, how it was computed
-(`computed_by` `crit` or `plan`, `tokens_per_round`, `draft_steps`, `round_floor_ms`, `inputs`, `formula`),
-the `current_limit` and its `current_source`, and whether it `won`; a winning alternative is the source
-`alternative` in `priorities.sources`. When the plan chooses the alternative, its outcome compares that
-ceiling with the measured score (`alternative`). Runs without `plan_limits` refuse `limits`.
+The priorities measure the distance to what is reachable, not to the current strategy's ceiling.
+`strategy.alternative.limits` gives, for `decode` and `context_decode`, the alternative's `{tokens_per_round,
+draft_steps, drafter, derivation}`; crit computes its round floor the same way and ranks the family by the higher of
+the current limit and that ceiling. A claim is bounded: `draft_steps` at most the widest draft Eval projects (the
+parent's draft width or 8), `tokens_per_round` at most `draft_steps + 1` and within the measured drafter's acceptance
+at those steps, `(1 - a^(k+1)) / (1 - a)` per case. `drafter` is `measured` or `new`; a new drafter is assumed to
+accept like the measured one unless `acceptance_evidence` cites another candidate's Eval attempt that measured it.
+A separate drafter no Eval measured is priced from `recon --drafter`'s pass bytes (`companion` names one when recon
+recorded several). Where crit cannot compute the floor, leave the KPI out of `limits`.
 
-#### Plan rules 2
+#### Checks
 
-Runs with `"plan_rules": 2` check their plans with these changes to the rules above:
+crit checks completeness and consistency with the frozen facts, never whether the reasoning is good. A check that
+fails refuses the plan with what to fix:
 
-- `strategy.alternative.limits.KPI.tokens_per_round` is at most `draft_steps + 1`: a round of `draft_steps`
-  draft steps emits at most its drafts and the target's own token.
-- No noise is unknown. A KPI whose noise the Eval leaves unknown takes the largest relative noise that
-  Eval knows among its KPIs, else 5%; `inputs.noise_default` keeps that `noise` and its `source` (the
-  KPI, or `default`). `inputs.noise` stays as frozen.
-- A family's noise is the largest of its members' with a fraction, whichever member sets the fraction.
-- Within noise: the fractions differ by at most the two families' noise bands combined in quadrature,
-  `√((noise_decode × f_decode)² + (noise_prefill × f_prefill)²)`.
-- Check 4 compares each gap with its own KPI's noise, check 6 each lever change with its KPI's noise and
-  check 9 the forecast with the KPI's noise, all with the default where Eval left it unknown.
-- crit's computed limits and the alternative's ceiling follow Eval's cost model, the round floor: tokens
-  per round over the pass floor with the tokens held plus the draft steps at Eval's draft floor, taken from
-  `headroom.projection.draft_floor_ms`, else `headroom.draft_bytes_per_step` or
-  `engine.draft_bytes_per_step` over the bandwidth, else the checkpoint's draft layers; `inputs` names
-  the source (`draft_floor_ms`). The computed limit charges the engine's draft width (`draft_steps`,
-  `draft_floor_ms`), the alternative its own `draft_steps`; both carry `"bound": "Eval's round floor,
-  draft steps at Eval's draft floor"`, so the same strategy at the same tokens per round gets the same
-  limit from either, and Eval's own limit where it gives one. Where the draft width is unknown (a plain
-  engine, or a drafter that reports none) or no draft floor is known, the computed limit is the pass
-  floor alone, `"bound": "upper bound, draft cost excluded"`.
-- Each `strategy.alternative.limits` row names the `drafter` its ceiling assumes: `measured`, the drafter
-  the parent's Eval measured, or `new`. A claim (`tokens_per_round` at `draft_steps` = k) is bounded:
-  - k is at most the widest draft Eval projects, the parent's draft width or the protocol's
-    `acceptance_ceiling_width` (8), whichever is larger, and `tokens_per_round` at most k + 1;
-  - both drafters stay within the measured drafter's acceptance bound at k: per case
-    `(1 - a^(k+1)) / (1 - a)` at its acceptance rate a, geometric mean over the cases, the projection
-    behind Eval's acceptance bound. For `decode`, a is the rate Eval's acceptance bound uses (the first
-    draft's conditional acceptance over the decode suite's measured rounds, the greedy suite's where it is
-    higher). For `context_decode`, a is each long-context point's measured tokens per round at the draft
-    width inverted to a rate; where the width is unknown, the points' measured tokens per round caps the
-    claim. A new drafter is assumed to accept like the measured one;
-  - a new drafter is bounded by its own measured acceptance instead when the row cites another
-    candidate's completed Eval attempt retained in the run that measured it, `acceptance_evidence`
-    (`candidates/<candidate>/eval/<attempt>.json`, not the parent's; crit records its path, SHA-256 and
-    source, and refuses an attempt without a draft width and per-round accepted counts);
-  - without a measured drafter (a plain baseline, or no per-round accepted counts) the physical bound
-    applies, with a `note`.
-  No row gives a bare `limit` in these runs: where crit cannot compute the round floor (no bandwidth or bytes
-  per pass), the alternative does not rank the families. Where the parent's Eval measured no draft floor and the
-  checkpoint has no draft layers, a separate drafter's draft cost comes from the companion drafter
-  `recon --drafter` recorded with its `pass_bytes` (what one drafter pass reads, its output head included):
-  ceil(k / drafts_per_pass) passes at the bandwidth, so a block drafter's one pass prices its whole block. With
-  several recorded, the row names one by its recorded path (`companion`). Each entry keeps the `drafter`, the claim's
-  `implied_acceptance` (the constant rate a at which k draft steps emit its tokens per round), and the
-  `acceptance_bound` (`tokens_per_round`, `draft_steps`, `widest`, `source`, and the `rates` or the `cap`)
-  or the `acceptance_evidence`.
-
-Known limits of plan rules 2, checked only after the build by the plan's outcome (the forecast next to
-the measurement, an alternative's ceiling next to its measured score):
-
-- A measured drafter whose Eval has no per-round accepted counts keeps the physical bound.
-- `estimated_limits` have no upper bound beyond being at or above the measured score.
-- A family marked not needed with a `limit` cause is not checked further: its cause is free text.
-- Check 3 applies to the run's first plan too: it builds only with decode or prefill needed and stops
-  only with neither.
-- Near the limit (`NEAR_LIMIT` = 0.85 in `crit.run.plans`): when both families are needed and both
-  fractions are 0.85 or above, a near tie no longer puts both in p1; the family with the lower fraction is
-  p1 alone (decode on an exact tie), the other p2 and time to first token p3.
-- A family marked not needed with a parent Eval and a fraction below 0.85 answers why the rest of its
-  limit is out of reach: a `gaps` entry `{"kpi": "decode" or "prefill", "gap": "limit", "answer": "cause",
-  "detail": the physical cause}`. Such an entry names no Eval gap and must answer `cause`.
-
-#### Plan rules 3
-
-Runs created from this version on have `"plan_rules": 3`: the rules 2 above and these.
-
-- Check 12, at record time: a build plan whose forecast expects more gain on p2 than on p1 (the gain
-  summed per tier, as the outcome's `forecast_on_p2` sums it), or forecasts a p1 KPI below the parent's
-  score (above it for a time), says why in `forecast_justification`; crit records it and lists what it
-  answers in `inputs.forecast_checks`. Without it the plan is refused.
-- Below half the limit (`MEASURED_ONLY` = 0.5 in `crit.run.plans`) a family is marked not needed only on
-  measured rejections. Every `gaps` entry on it names its `evidence`, a file retained in the run (crit
-  records its path and SHA-256 in `inputs.gap_evidence`), and an Eval gap answers `rejected`: a cause
-  alone, such as "the quality budget", no longer stands. For prefill, every prompt activation format the
-  parent's Eval prices above the engine's own declared `prompt_activations` (crit-eval's
-  `kpis.prefill.activations`) is rejected too, unless Eval's own quality evidence rules it out: a `gaps`
-  entry `{"kpi": "prefill", "gap": "activation:FORMAT", "answer": "rejected", "evidence": RESULT, "detail"}`
-  whose evidence is a crit-eval result that measured that format (its engine's `prompt_activations`) and
-  kept some quality set over its budget at the 5th percentile of its spread over positions
-  (`budget_spread`). A rejection inside the quality noise is not a rejection, a result without the
-  spread cannot give one, and neither can a result judged under other quality terms than the run's
-  (its `requirements.quality_mode` and `quality_budget`, every resume's amendment applied): a budget
-  share is relative to its own budget. An engine that declares no prompt activations cannot mark
-  prefill not needed there: Eval names neither the format in use nor the faster ones.
-- recon.md's `Drafting plan for both decode modes` and `Prefill arithmetic plan` are written, neither
-  missing nor starting with TODO, before the first candidate, and its `Placement plan` too where
-  `recon.json` records a placement scenario (`gathered.placement`, from the request's device). The prefill plan gives each matrix group's
-  prompt activation format and, in `preserve`, its quality measurement (`crit eval run --quality-mode preserve
-  --attribute-drift`).
-
-#### Plan rules 4
-
-Runs created from this version on have `"plan_rules": 4`: the rules 3 above and these. crit records each
-plan's `inputs.objective` (`crit.run.plans.objective`): the candidate's number in the run (the run's
-candidates so far plus one; with [budget counts](#budget-counts) those on the ladder or through Eval, so a
-draft's fix keeps its number), its objective's name and rule, and `min_gain` where it applies. On the
-[candidate ladder](#the-candidate-ladder) the objectives follow its rungs, and the objective adds the
-rung's `eval`: candidate 1's proof of concept builds, passes its plugins' tests and `serve --check`,
-candidate 2 is the `plugin_round`, candidates 3 to 5 are crit rounds and critique rounds start at
-candidate 6. The list below is the order of runs created with `"budget_counts": "evaluated"` or before.
-
-- Candidate 1, `proof_of_concept`: the first engine that works end to end (it serves, passes the
-  functional gates and the quality gate at the required context).
-- Candidates 2 and 3, `crit_round`: improve the parent as much as possible with crit's toolkit, Inference
-  techniques and Kernels Hub kernels, each measured against its floor and fixed or replaced where it trails.
-- Candidates 4 on, `critique_round` (check 13): the plan names the parent's two weakest terms in
-  `weakest`, `[{kpi, term, evidence, levers}]`: what is slow with its measured time and floor, a file in
-  the run that measured it, and the ids of the plan's speed levers that improve its KPI's family. The plan
-  has at least one other speed lever beside those.
-- Candidates 2 to 5 (check 13): the forecast's expected gain on some p1 KPI over the parent's Eval is at
-  least `MIN_GAIN` (10%); a plan below it is refused, with no justification that lets it pass. A plan whose
-  parent skipped its Eval on the ladder freezes none and has no gain to check.
-- Gate repairs (check 13): a plan whose requirement lever `serves` `gate:NAME` repairs a gate the parent's Eval
-  failed (its status gate `NAME` in state `fail`): the floor on p1, a critique round's `weakest`, checks 5 to 8 (speed
-  levers above the noise, one on every needed p1 family), check 9's improvement and check 15's reach do not apply to it, since a candidate
-  that fails a gate needs the repair whatever it forecasts; it may name no speed lever at all. A named gate the parent's Eval did not
-  fail is refused; crit records the repaired gates in `inputs.objective.repairs`.
-- Check repairs (check 13): a requirement lever that `serves` `check:NAME` repairs a [check](#check) crit run requires
-  (`arithmetic`, `functional` or `resources`) that the parent failed, and makes the plan exempt as a gate repair is. A
-  failed check keeps the parent from being eligible even when every gate of its Eval passed: `check --from-eval` also
-  judges the device memory left free at the required context against the run's VRAM headroom (`resources`), and `serve
-  --check` records a functional check. The repair stands on the parent's newest check record of that gate for a case
-  having status `failed`; crit cites each such record in `inputs.objective.check_repairs` (`{NAME: [{path, sha256,
-  check_id, case_id, recorded_by}]}`). It is refused when NAME is no required check (a gate of Eval's status is
-  `gate:NAME`), in the run's first plan, when the parent has no check of that gate yet (record them first with `crit
-  run ... check --candidate PARENT --from-eval`), and when its newest one passed. `gate:resources` is refused with a
-  pointer to `check:resources`: resources is crit run's check, not a gate of Eval's status. The parent's own
-  eligibility does not change: `select` still refuses it for the failed check.
-- Check 13, providers: every speed lever names what supplies its code in `provider`: `inference:ENTRY`,
-  `hub:ORG/NAME` (a Kernel Hub repository), `lib:NAME` (a library, [Kernels' sources](../kernels/SOURCES.md))
-  or `own: ...` (the engine's own code). An `own` lever carries `yardstick` `{evidence, detail}`: a file in the
-  run with the measurement of the best existing provider for the operation, or the providers it checked and why
-  none fits.
-- Check 14, the review: once the parent's plan has an outcome at the Eval attempt this plan freezes
-  (`plans/PLAN_ID/outcomes/ATTEMPT.json`, written by `crit run ... eval`), the plan reviews it in `review`:
-  `{plan_id, kpis, levers, lesson}`. `kpis` gives `{cause, evidence}` for every KPI the outcome measured
-  short of its forecast's low (above its high for a time), the evidence a file in the run; `levers` says
-  what each lever the parent's proposal built, pruned or deferred delivered (`{result}`); `lesson` what
-  this plan changes because of it. crit records what it checked in `inputs.review` (the outcome's path
-  and SHA-256, the missed KPIs, the levers by fate). The parent plan's largest p1 lever (its largest
-  forecast change on a p1 family), when pruned or deferred, is planned again under the same id or its
-  `levers` entry adds `evidence` and `structure`: the measurement of another kernel structure or a vendor
-  library at the same arithmetic that rejected it, never variants of one kernel.
-
-#### Plan rules 5
-
-Runs created from this version on have `"plan_rules": 5`: the rules 4 above and check 15, the reach. A
-strategy's ceiling is the limit the parent's Eval measures (or crit computes, `computed_limits`), not the
-engine's own measurement: crit records in `inputs.reach`, per needed family, the limit and its source, the
-fraction the parent's Eval measured, the forecast's high and its share of the limit. A build plan whose
-forecast high stays below `REACH` (half) of a needed family's limit is refused unless its `gaps` has an entry
-`{"kpi": FAMILY, "gap": "limit", "answer": "cause", "detail", "evidence"}` naming the measured physical bound
-that keeps the rest out of reach, the evidence a file in the run (recorded beside the reach). An engine that
-reads weights from host memory is priced at their tier, at the expert cache hit rate it reports (or by its declared
-`host_bytes_per_pass`), so the limit Eval prices is one it can reach.
-Refusing rather than warning follows the checks above: a plan that does not meet a rule is not recorded, and
-the message says what to add.
-
-#### Plan rules 6
-
-Runs created from this version on have `"plan_rules": 6`: the rules 5 above and check 16, in `speed` runs
-only. A build plan declares `prompt_activations`, the formats its candidate's prompt GEMMs take per stored format,
-in the form an engine declares them to Eval (`bf16`, `fp16_acc`, `fp8` or `stored`, or per format a share of
-them). No quantized format starts at `bf16`: `speed`'s budget admits a quantized
-matrix's stored-format activations without evidence per group, so a candidate reads prompts at the stored format (or
-`fp8` / `fp16_acc`) from candidate 1 on (a matrix the checkpoint stores in 16 bits is no quantized format here). A
-`bf16` share stands only beside a gaps entry `{"kpi": "prefill", "gap": "activation:stored", "answer":
-"rejected", "evidence", "detail"}` whose evidence is a crit-eval result that measured `stored` outside the quality
-noise; crit records it in `inputs.activation_evidence`. The next plan is refused when its parent's Eval reports
-other `prompt_activations` than the parent's plan declared, unless it carries that rejection.
-
-#### Plan rules 7
-
-Runs created from this version on have `"plan_rules": 7`: the rules 6 above and these.
-
-- An unknown noise takes the largest known noise of its own family (decode with `context_decode`, prefill with
-  `context_ttft`, time to first token alone), else 5%, never another family's: a first token's spread says nothing
-  about decode's noise. crit records each default in `inputs.noise_default` by KPI.
-- Check 2 freezes the parent's newest completed Eval attempt that measured decode and prefill: a rerun of one
-  part (quality alone) leaves the attempt the plan's gaps, forecast and review refer to in place.
-- Check 17, the round account. A `gaps` entry `limit` rests on the parent's measured round: plan field
-  `round` maps the family to `{total_ms, idle_ms, terms: [{term, ms, floor_ms}], evidence}`, one decode round or
-  prompt chunk with the device's idle time and each part's time beside its floor (its bytes or operations at the
-  device's rate), adding up to the measured round within 10%. The entry names the terms that bind it in
-  `cause_terms`. Every other term of at least 10% of the round runs at least at half its floor's rate, and idle time
-  of 10% or more is named too (`idle`); otherwise the term is not at its floor and the limit not out of reach yet. crit
-  records the account's evidence and sum in `inputs.round`.
-- Check 18, reopened rejections. A `rejected` entry may name the term of its family's round account that bound it
-  when it was measured (`bound_by: {family, term}`) with its `evidence`. Once a later plan's round account shows that
-  term at least 25% smaller (or gone), the lever is planned again (a lever whose id is the rejected name) or rejected
-  again in that plan on a new measurement. crit records the rejections it reopened in `inputs.reopened`.
-- Check 19, the CPU tier. Where recon.json's placement (`sparse_device_host` or `_disk`) prices misses computed on
-  the CPU, alone or split with the link, below misses copied over the link (its plain-pass floors, from `crit eval
-  probe`'s CPU expert lane), candidate 1's plan has a lever, speed or requirement, with provider
-  `inference:host-expert-tier`, or a `gaps` entry `{"kpi": "decode", "gap": "placement:cpu", "answer":
-  "rejected", "evidence", "detail"}` with the layer times that reject it on this machine. crit records the floors in
-  `inputs.cpu_tier`.
-
-crit checks completeness and consistency with the frozen facts, never whether the reasoning is good,
-and refuses a plan with a message that says what to fix:
-
-1. Fields, types and text limits; unknown keys are refused. `eval-gap:` sources and `gaps` entries name
+1. Fields, types and text limits; unknown keys are refused. `eval-gap:` sources and Eval-gap entries in `gaps` name
    gaps of the parent's Eval.
-2. `parent_candidate_id` exists and has a completed Eval attempt, unless the run has no Eval yet; the
-   plan freezes the newest.
+2. The parent is on the ladder; a parent that went through Eval, or stands on the full rung, has a completed Eval.
 3. `stop` requires decode and prefill both not needed; `build` requires at least one needed.
-4. For each KPI marked not needed, every Eval gap in its family whose `projected_gain` exceeds the
-   family's noise (every positive gap when the noise is unknown) has an entry in `gaps`.
-5. A build plan names at least one speed lever, each with at least one KPI change.
-6. A lever whose positive changes are all within their KPIs' known noise shares a `group` with a lever
-   that has a change above the noise.
-7. Every needed KPI in p1 has a lever with a positive change on its family.
-8. Some lever improves decode, prefill, `context_decode` or `context_ttft`: no plan targets time to
-   first token alone.
+4. A family marked not needed answers every Eval gap on it above its KPI's noise in `gaps`; below 0.85 of its limit
+   it adds a `limit` entry with the physical cause; below half its limit every entry on it carries `evidence` and an
+   Eval gap answers `rejected`, and for prefill every faster prompt activation format Eval prices is rejected by a
+   crit-eval result that measured it outside the quality noise (`activation:FORMAT`), under the run's quality terms.
+5. A build plan names at least one speed lever, each with a KPI change; one improves more than time to first token;
+   every needed p1 family has one.
+6. A lever whose changes are all within their KPIs' noise shares a `group` with a lever above it. Measure an option
+   (`crit run ... ablate --data EVAL_DATA --set PLUGIN.OPTION=VALUE`, cited as `measured:PATH`) rather than raise an
+   estimate.
+7. The forecast covers every KPI the parent's Eval measured, `0 < low ≤ expected ≤ high`, and improves decode,
+   prefill, `context_decode` or `context_ttft` beyond its noise.
+8. A forecast that gains more on p2 than on p1, or lets a p1 KPI fall, carries `forecast_justification`.
+9. `strategy.current` and `strategy.alternative` are present; `limits` claims stay within their bounds (above).
+10. Every speed lever names its `provider`, and an `own` one its `yardstick`.
+11. Critique rounds (candidate 6 on) name the parent's two weakest terms in `weakest`, each with its evidence and
+    the levers that improve it, and add other levers beside them.
+12. Once the parent's plan has an outcome, `review` gives the cause and evidence of every KPI that missed its
+    forecast, what each lever delivered and the lesson. The parent's largest p1 lever, pruned or deferred, is planned
+    again or rejected on a measurement of another kernel structure or a vendor library at the same arithmetic.
+13. `speed` runs declare `prompt_activations`; no quantized format starts at `bf16` without a rejection of the stored
+    format (`activation:stored`); the parent served what its plan declared.
+14. A `limit` gap rests on the parent's `round` account: its terms and idle time add up to the measured round within
+    10%, `cause_terms` names the terms that bind it, and every other term of 10% of the round or more runs at least
+    at half its floor's rate (idle time too).
+15. A rejection with `bound_by` is reopened once a later round shows that term 25% smaller: the lever is planned
+    again or rejected again on new evidence.
+16. Where recon's placement prices CPU-computed expert misses below link copies, candidate 1 plans the CPU expert
+    tier (`inference:host-expert-tier`) or rejects it with a measurement (`placement:cpu`).
+17. `measured:PATH` sources and every `evidence` name files of the run; crit records their SHA-256.
+18. `supersedes` names a plan of the same segment and parent, neither linked to a candidate nor superseded.
 
-Requirement levers are exempt from checks 5 and 6 and never count toward checks 7 and 8.
-9. A build plan's `forecast` covers every required KPI with `0 < low ≤ expected ≤ high` and, with a
-   parent Eval, forecasts decode or prefill better than the parent's score by more than its noise
-   (unknown noise: any improvement). A stop plan's forecast may be null.
-10. `strategy.current` and `strategy.alternative` are both present and nonempty.
-11. `supersedes` names a plan of the same segment and parent that is neither linked to a candidate nor
-    already superseded.
+A gate repair (a requirement lever that `serves` `gate:NAME` for a gate the parent's Eval failed, or `check:NAME`
+for a [check](#check) crit run requires that the parent failed) is built for the repair whatever it forecasts:
+checks 5, 6, 7's improvement, 11 and the warnings below do not apply to it. The run's first plan skips the checks
+that need a parent's Eval and may import a baseline as is.
 
-The run's first plan (no parent) skips 3, 4, 6, 7 and 9's improvement test, may have no levers (it
-imports a baseline as is) and may forecast null.
+Two judgements rest on the forecast alone, so crit records them as `inputs.warnings` instead of refusing the plan:
+a forecast whose high stays below half of a needed family's limit without a `limit` gap that measured the bound
+(`inputs.reach` keeps the share), and a candidate from 2 to 5 that forecasts less than +10% on a p1 KPI. A warning
+says a lever may be missing. It is never a reason to raise a forecast.
+
+The candidate's objective is its rung (`inputs.objective`, [candidate ladder](#the-candidate-ladder)): 1 the proof
+of concept, 2 the plugin round, 3 to 5 crit rounds (crit's toolkit, each technique measured against its floor and
+fixed or replaced where it trails), 6 on critique rounds.
 
 #### Revisions
 
@@ -640,7 +515,15 @@ each alone). Each variant must report its plugins in crit serve's `engine_facts`
 resident cases (warmed until steady, then `--repetitions` 3) and runs crit smoke. The report,
 `candidates/ID/logs/ablation-ATTEMPT.json`, is the attempt's evidence: each variant's per-case medians
 and smoke items, and per plugin its change in the engine and alone, the smoke tests it breaks and a
-verdict. It records no check and no benchmark.
+verdict. Where both variants of a pair draft, a plugin outside the drafter and verifier slots is judged by the time
+per decode round in place of decode, since a short bench's tokens per round move with what it samples; the row's
+`judged` names the KPIs its verdict read. It records no check and no benchmark.
+
+An [external engine](#external-engines) has no plugins to switch: `ablate` serves it as built (`full`) and with
+`--set OPTION=VALUE[;...]` on the options its configuration declares (without `--set`, each declared switch
+flipped), each started again from its launch command, benched and smoke-tested the same way and judged against
+`full`. An option it does not declare is refused. An engine that declares no option has no ablation: the report
+says so (`"ablation": "unavailable"` and the reason) and nothing is started.
 
 ### Benchmark
 
@@ -700,7 +583,7 @@ checks would leave its benchmarks exploratory, and says why and what to do:
 - a required check that did not pass (`failed`, `unverified`, `not_applicable`), or an earlier benchmark whose free
   memory fell below the run's headroom (or went unmeasured): no later record undoes it, so the candidate cannot
   become eligible, and the fix is a new candidate (its plan repairs a failed check with a requirement lever serving
-  `check:GATE`, [plan rules 4](#plan-rules-4)).
+  `check:GATE`, [plan checks](#checks)).
 
 `--exploratory` measures such a candidate anyway, for telemetry or memory during development: its measurement log
 says why the benchmarks stay exploratory, the command warns as `benchmark` does, and the candidate is never
@@ -790,10 +673,9 @@ untouched for a minute; with the lock off, settle it first.
 Supply `reason`, `critique` (the engine and remaining opportunities), `opportunities`
 (ranked list), `cleanup` (`external`, `settled` or `unresolved`), optional `message` and
 `headroom`. Reasons: `satisfied` (needs an eligible selected candidate meeting the
-targets), `search_exhausted`, `blocked`, `budget_exhausted` (refused while the segment
-has counted fewer candidates than `candidate_budget`, with [budget counts](#budget-counts)
-those on the ladder or through Eval; once it is used, `candidate` is refused until a resume),
-`cancelled`, `interrupted`.
+targets), `search_exhausted`, `blocked`, `budget_exhausted` (refused while fewer of the
+segment's candidates than `candidate_budget` stand on the ladder; once it is used, `candidate`
+is refused until a resume), `cancelled`, `interrupted`.
 
 `headroom` is `{"kpis": [{kpi, start, reached, limit, built, cause}]}`, `kpi` one of
 `decode`, `prefill`, `ttft`, `context_decode`, `context_ttft` (the last two when Eval
@@ -806,8 +688,7 @@ was built for the KPI, `cause` the physical cause of any remaining distance. Eva
 `context_decode` and `context_ttft` when the run's newest Eval measured the long-context curve. The
 account is recorded in the `run_stopped` event.
 
-Stopping early is a plan: in a run that requires plans, `search_exhausted` while the segment still has
-budgeted candidates requires that the segment's newest unsuperseded plan is a stop plan whose `inputs`
+Stopping early is a plan: `search_exhausted` while the segment still has budgeted candidates requires that the segment's newest unsuperseded plan is a stop plan whose `inputs`
 froze the newest completed Eval attempt of the newest candidate that has one. With the budget used up,
 no stop plan is needed.
 
@@ -823,7 +704,8 @@ quality mode it was judged in (a card's result that states none is refused), whi
 under `captured/origin/` as the numbers before the run's work; the agent request names each one's mode, and
 says that a result judged in another mode than the run's does not compare with its Evals. The agent request tells the
 agent to check the source out at that commit and make it the first candidate, declared with
-`"lineage": "origin-engine"` in its proposal and measured before any change, so it is the baseline. At
+`"lineage": "origin-engine"` in its proposal: its rung takes a small Eval (stage 1), so the run has a baseline
+measured in its own mode before any change. At
 `resolve`, `inputs.json` gains `origin_checkpoint`: per checkpoint the files the run's model lacks or
 stores with other bytes, and `matched`, the checkpoint the model is, or null; a different checkpoint is
 recorded, never refused, and `recon --compare` shows what it changes. crit-hub's exporter writes the
@@ -971,4 +853,6 @@ an extra file inside a newly sealed candidate and invalidate its inventory.
 Before sealing or resuming, settle every reservation and external process tree; a
 vanished coordinator does not prove an agent stopped. `resume` keeps the request and
 results, appends fresh bounds and requires sealed candidates plus cleanup confirmation.
-Changing criteria, model or workload needs a new run.
+After a resume, an Eval that stopped goes on with `eval --resume`; measure a sealed candidate from the start again
+only when crit, crit-eval, the driver or the device changed since its Eval (the same package can measure several
+percent differently in another session). Changing criteria, model or workload needs a new run.

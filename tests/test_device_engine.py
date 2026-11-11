@@ -2,7 +2,7 @@
 softmax-attention, projections-dense, token-sampling, fused-norms (with its base, torch-norms) and device-placement
 into a package beside a Llama-layout model plugin (support/device_plugins/llama-model); Core's loader runs it on Core's
 concurrent runtime, and with torch-norms in fused-norms' place it decodes the same tokens. Its fixed-text
-scores equal transformers' log-probabilities of the same checkpoint, each token of its greedy continuations is
+scores (a prefill chunk at a time) equal transformers' log-probabilities of the same checkpoint, each token of its greedy continuations is
 transformers' choice at that position up to BF16 rounding, a reply kept to a grammar takes transformers' best allowed
 token, and requests in flight together decode what each decodes alone. Needs CUDA, transformers, safetensors and
 Core's crit_core_steps (CRIT_CORE_STEP_LIBRARY)."""
@@ -73,7 +73,7 @@ class DeviceEngineTests(unittest.TestCase):
         self.assertGreater(info["max_concurrent_requests"], 1)
 
     def test_scores_equal_transformers_log_probabilities(self):
-        (ids,) = self.prompts(1, 40)
+        (ids,) = self.prompts(1, 150)   # three of the model's prefill chunks, the KV carried from one to the next
         scored = self.engine.score(ids, 1, "prefill")
         with torch.no_grad():
             logp = self.reference(torch.tensor([ids]).cuda()).logits[0].float().log_softmax(-1)

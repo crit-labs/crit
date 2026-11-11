@@ -1,6 +1,6 @@
 """The gated-delta recurrence of many sequences on a device, with the causal convolution before it and the device
 commit of a speculative round's accepted prefix: the recurrence slot's device form (crit_plugins.device), in torch, over
-crit-labs' recurrent-scans kernels where they are installed.
+crit's kernel recurrent-scans where it builds for the GPU.
 
 Each token decays the state (exp(log_decay) per value head), takes the beta-weighted delta of its value against the
 state's prediction for its key, and reads the result with its query: reference.py's formula over [heads][keys][values]
@@ -29,10 +29,10 @@ window and writes neither: its stash says what it would add, and a commit picks 
   no accept. Padding alone (a capture's warm-ups) changes no sequence.
 
 The arithmetic (the column scan with its stash, checkpoints and replay; the convolution) is recurrent-scans' pool rows
-when the plugin found the kernel (crit_plugins.kernels.registry_kernel), and this module's torch formula otherwise; the
+when the plugin found the kernel (crit_plugins.kernels.load_kernel), and this module's torch formula otherwise; the
 commit's bookkeeping (counts, the checkpoint select) is torch's here in both cases. Prompt rows up to the pool's
 scan_rows tokens run the scan with the step's decode rows (one launch a layer); longer ones fla's chunked kernel or
-recurrent-scans' two-pass chunked prefill, by the plugin's choice. The scan and a chunked kernel give other bits, so
+recurrent-scans' chunked prefill (on tensor cores or in FP32, the pool's prefill), by the plugin's choice. The scan and a chunked kernel give other bits, so
 which one a prompt row runs follows from its length and the configuration only, never from a timing: the pool's
 scan_rows (an eager call) and scan_rows_captured (inside a captured graph) are the plugin's exact_rows option, the same
 value for both (DEFAULT_EXACT_ROWS when a pool is made without a plugin). scan_rows() measures where a chunked kernel
@@ -146,6 +146,13 @@ class StatePool:
         # Prompt rows up to this many tokens run the scan (forward): in an eager call, and inside a captured graph. The
         # plugin that makes the pool sets both from its exact_rows option; never measured here.
         self.scan_rows = self.scan_rows_captured = DEFAULT_EXACT_ROWS
+        # recurrent-scans' chunked prefill for prompt rows past scan_rows: "fp32" (its two-pass prefill in FP32,
+        # structure delta-prefill-rb) or "tensor_cores" (structure delta-prefill-tc: FP16 operands, FP32 accumulation
+        # and state), the plugin's prefill option.
+        self.prefill = "fp32"
+        # recurrent-scans' structure for the pool rows: pool-delta (False) or pool-delta-pipe (True: the same bits on
+        # another schedule, staged state tiles), the plugin's scan option.
+        self.pipelined = False
         # The prompt chunk stage_prompt put in the pool's fixed buffers (a captured chunk reads them): its row table
         # (the scan's, kind FINAL, writing the final state and window over the live ones), its flush row (the pending
         # count applied, before a chunked kernel), its sequence's index (padding alone: the spare sequence where the
@@ -458,21 +465,34 @@ def _pin_fla():
 
 def chunked_kind(pool, geometry, prompt):
     """The chunked kernel prompt rows run through: "fla" (prompt "fla", fla installed and pinned to FLA_TILES, its
-    normalization), "two_pass" (recurrent-scans' prefill, its shapes) or None (the scan)."""
+    normalization), else recurrent-scans' chunked prefill by the pool's prefill: "tensor_cores" (prefill
+    "tensor_cores", keys 64 or 128, values a multiple of 16), "two_pass" (its FP32 prefill, values a multiple of 64), or
+    None (the scan)."""
     if pool.device.type != "cuda":
         return None
     if prompt == "fla" and geometry["normalize_keys"] == geometry["normalize_queries"] and geometry["epsilon"] == 1e-6:
         if fla_pinned():
             return "fla"
-    if pool.kernels is not None and pool.keys in (64, 128) and pool.values % 64 == 0:
-        return "two_pass"
+    if pool.kernels is not None and pool.keys in (64, 128):
+        if getattr(pool, "prefill", "fp32") == "tensor_cores" and pool.values % 16 == 0:
+            return "tensor_cores"
+        if pool.values % 64 == 0:
+            return "two_pass"
     return None
 
 
 STANDARD = {"epsilon": 1e-6, "normalize_keys": True, "normalize_queries": True}   # the models' normalization
 SCAN_AGREEMENT = "the state after the prompt, its window and its outputs: the bits of decoding its tokens one by one"
 CHUNKED_AGREEMENT = ("the state after the prompt and its outputs within 2e-3 + 2e-2 |x| of the scan's, the window the "
-                     "same bits (fla in FP32 on its stated tiles, the two-pass prefill: another summation order)")
+                     "same bits (fla in FP32 on its stated tiles, the two-pass prefill in FP32 or on tensor cores: another "
+                     "summation order and rounding; a prompt row's bits follow the prompt's length and chunking)")
+# What each chunked kernel computes in (the facts' pools say which one a pool's prompt rows past scan_rows take).
+CHUNKED_ARITHMETIC = {
+    "fla": "fla's chunked gated-delta kernel on its stated tiles (FP32 inputs with chunk_fp32: TF32 tensor-core dots)",
+    "two_pass": "recurrent-scans' two-pass prefill (delta-prefill-rb): FP32 on CUDA cores",
+    "tensor_cores": "recurrent-scans' chunked WY prefill on tensor cores (delta-prefill-tc): FP16 operands rounded once a "
+                    "chunk, FP32 accumulation and state; values and states within FP16's range",
+}
 CAPTURED = ("a captured prompt chunk (prompts:recurrence, a padded bucket): in a bucket of up to scan_rows_captured "
             "tokens the "
             "scan over its real tokens, the bits of the step's scan rows; in a larger one the chunked kernel over the "
@@ -500,11 +520,13 @@ def scan_rows(pool, prompt, chunk_fp32=True):
     if chunked is None:
         return dict.fromkeys(WAYS, 1 << 30)
     key = (pool.key_heads, pool.heads, pool.keys, pool.values, str(pool.device),
-           torch.cuda.get_device_name(pool.device), pool.kernels is not None, chunked, chunk_fp32)
+           torch.cuda.get_device_name(pool.device), pool.kernels is not None, chunked, chunk_fp32, pool.pipelined)
     if key in _CROSSOVERS:
         return _CROSSOVERS[key]
     probe = StatePool([0], pool.heads, pool.keys, pool.values, pool.device, 1, 0, None, pool.key_heads, None,
                       "deferred", pool.kernels)
+    probe.prefill = pool.prefill
+    probe.pipelined = pool.pipelined
     probe.open(0)
     g = torch.Generator(device="cpu").manual_seed(0)
     last, found = None, {}
@@ -602,7 +624,7 @@ def forward(layer, query, key, value, log_decay, beta, pool, batch, geometry, ex
             pool.kernels.pool_delta(out, pool.states, pool.stash, pool.control, scratch, q, k, v, g, b,
                                     starts=batch.starts_t, slots=batch.slots_t, table=pool.table, rows=batch.rows,
                                     kind=kind, layer=li, capacity=pool.capacity, epsilon=args[0], scale=args[1],
-                                    normalize_keys=args[2], normalize_queries=args[3])
+                                    normalize_keys=args[2], normalize_queries=args[3], pipelined=pool.pipelined)
             return out
         sequences = pool.table[:batch.rows].long()
         rows_at = torch.where(sequences < 0, pool.spare, sequences)
@@ -622,7 +644,7 @@ def forward(layer, query, key, value, log_decay, beta, pool, batch, geometry, ex
     if pool.kernels is not None:
         pool.kernels.pool_delta(out, pool.states, pool.stash, pool.control, scratch, q, k, v, g, b, meta=meta,
                                 rows=batch.rows, kind=STASH, layer=li, capacity=pool.capacity, epsilon=args[0],
-                                scale=args[1], normalize_keys=args[2], normalize_queries=args[3])
+                                scale=args[1], normalize_keys=args[2], normalize_queries=args[3], pipelined=pool.pipelined)
     else:
         for r, ((_, i, first, count), kind) in enumerate(zip(rows, kinds)):
             _torch_state(pool, li, index[r:r + 1], kind, first, count, (q, k, v, g, b), args, out, scratch, slots[r])
@@ -638,7 +660,8 @@ def forward(layer, query, key, value, log_decay, beta, pool, batch, geometry, ex
         if chunked == "fla":
             final = _fla(torch, q[span], k[span], v[span], g[span], b[span], state, geometry, chunk_fp32, out[span])
         else:
-            final = _two_pass(pool, q[span], k[span], v[span], g[span], b[span], state, geometry, out[span])
+            final = _two_pass(pool, q[span], k[span], v[span], g[span], b[span], state, geometry, out[span],
+                              chunked == "tensor_cores")
         pool.finals.setdefault(sequence, {})[li] = final
     return out
 
@@ -662,7 +685,7 @@ def _prompt_state(pool, li, q, k, v, g, b, batch, geometry, chunk_fp32, prompt, 
         live = pool.states[li].view(pool.states.shape[1], -1)   # FINAL's scratch slot i: sequence i's live state
         pool.kernels.pool_delta(out, pool.states, pool.stash, pool.control, live, q, k, v, g, b, meta=pool.prompt_meta,
                                 rows=1, kind=STASH, layer=li, capacity=pool.capacity, epsilon=args[0], scale=args[1],
-                                normalize_keys=args[2], normalize_queries=args[3])
+                                normalize_keys=args[2], normalize_queries=args[3], pipelined=pool.pipelined)
         return out
     # The torch formula steps through the bucket: a padding token's decay exp(0) = 1 and beta 0 leave the state's bits.
     valid = batch.valid_t[:, None]
@@ -684,14 +707,14 @@ def _prompt_chunked(pool, li, q, k, v, g, b, batch, geometry, chunk_fp32, chunke
     if pool.kernels is not None:
         pool.kernels.pool_delta(out, pool.states, pool.stash, pool.control, None, q, k, v, g, b, meta=pool.prompt_flush,
                                 rows=1, kind=STASH, layer=li, capacity=pool.capacity, epsilon=args[0], scale=args[1],
-                                normalize_keys=args[2], normalize_queries=args[3])
+                                normalize_keys=args[2], normalize_queries=args[3], pipelined=pool.pipelined)
     else:
         _torch_state(pool, li, pool.prompt_index, FLUSH)
     state = pool.states[li].index_select(0, pool.prompt_index)[0]
     if chunked == "fla":
         final = _fla(torch, q, k, v, g, b, state, geometry, chunk_fp32, out)
     else:
-        final = _two_pass(pool, q, k, v, g, b, state, geometry, out)
+        final = _two_pass(pool, q, k, v, g, b, state, geometry, out, chunked == "tensor_cores")
     final = torch.where(pool.prompt_real[:, None, None], final, state)
     pool.states[li].index_copy_(0, pool.prompt_index, final[None])
     out.copy_(torch.where(valid[:, :, None], out, 0.0))
@@ -708,14 +731,14 @@ def _fla(torch, q, k, v, g, b, state, geometry, chunk_fp32, out):
     return final[0].float()
 
 
-def _two_pass(pool, q, k, v, g, b, state, geometry, out):
+def _two_pass(pool, q, k, v, g, b, state, geometry, out, tensor_cores=False):
     torch, eps = pool.torch, geometry["epsilon"]
     qn = _normal(torch, q.float(), eps, geometry["normalize_queries"]).contiguous()
     kn = _normal(torch, k.float(), eps, geometry["normalize_keys"]).contiguous()
     final = state.clone()
     found = torch.empty(out.shape, dtype=torch.float32, device=out.device)
     pool.kernels.gated_delta_prefill(qn, kn, v.float().contiguous(), g.contiguous(), b.contiguous(), final,
-                                     scale=geometry["query_scale"], out=found)
+                                     scale=geometry["query_scale"], out=found, tensor_cores=tensor_cores)
     out.copy_(found)
     return final
 

@@ -26,7 +26,6 @@ from crit.pull.requirements import nvidia_smi
 
 from .attempt import Attempt, packaged, remaining, unsealed
 from .records import ALL_METRICS, digest, inputs, load_run, now, read_json, safe_path, series_gates
-from .served import Served
 
 TIMED = ("prefill_tps", "decode_tps", "request_ms", "ttft_ms")
 PER_REQUEST = TIMED + ("accepted_tokens_per_round",)
@@ -169,7 +168,7 @@ def measure(store, run_id, candidate_id, seconds=None, exploratory=False):
     with attempt.running() as log:
         if reasons:
             log("crit run measure --exploratory: the benchmarks stay exploratory, since " + "; ".join(reasons))
-        measured = _measure(store, run_id, candidate_id, attempt.id, attempt.deadline_at,
+        measured = _measure(store, run_id, candidate_id, attempt, attempt.deadline_at,
                             run["spec"]["hardware_constraints"]["kv_tokens"], cases, log)
     # The server ran in this process; the resident host's exit is part of the cleanup.
     attempt.settle()
@@ -186,7 +185,8 @@ def measure(store, run_id, candidate_id, seconds=None, exploratory=False):
                    "workload": case["workload"], "metrics": result["metrics"], "missing_metrics": result["missing"],
                    "checks": [], "outcome": "completed", "started_at": result["started_at"],
                    "ended_at": result["ended_at"],
-                   "extensions": {"measured_by": "crit run measure", "served_by": "crit serve", "attempt_id": attempt.id,
+                   "extensions": {"measured_by": "crit run measure", "served_by": served_by(root, candidate_id),
+                                  "attempt_id": attempt.id,
                                   "output_tokens": result["output_tokens"], "sampling": result["sampling"],
                                   **({"chat_template_kwargs": result["template_kwargs"]}
                                      if result.get("template_kwargs") else {}),
@@ -195,12 +195,20 @@ def measure(store, run_id, candidate_id, seconds=None, exploratory=False):
     return recorded
 
 
+def served_by(root, candidate_id):
+    """What served the candidate's measurements: crit serve, or an external candidate's own launch command."""
+    from .external import SERVED_BY, candidate_spec
+    return "crit serve" if candidate_spec(safe_path(root, f"candidates/{candidate_id}")) is None else SERVED_BY
+
+
 def _measure(store, run_id, candidate_id, attempt, deadline_at, kv_tokens, cases, log):
-    """Serve the candidate and measure every case; a failed engine cleanup raises with `settled` False."""
+    """Serve the candidate (attempt.Attempt) and measure every case; a failed engine cleanup raises with `settled`
+    False."""
     from crit_core.machine import engine_lock
+    from .external import serving
     # A request may take what is left of the reservation, whose deadline stops the server.
-    served = Served(store, run_id, candidate_id, attempt, kv_tokens, log, "The measurement",
-                    timeout=min(86400, max(1.0, remaining(deadline_at))))
+    served = serving(store, run_id, candidate_id, attempt, kv_tokens, log, "The measurement",
+                     timeout=min(86400, max(1.0, remaining(deadline_at))))
     with engine_lock(f"crit run measure {run_id} {candidate_id}", deadline=time.monotonic() + remaining(deadline_at)):
         with served.until(deadline_at):
             started = time.perf_counter()
@@ -229,12 +237,15 @@ def _case(port, case, load_ms, sampler, timeout, log, capacity=None):
     clients = case.get("concurrency", 1)
     samples = {name: [] for name in PER_REQUEST + MEMORY + (("aggregate_tps",) if clients > 1 else ())}
     outputs, peaks, begun = [], [], now()
+    seeds = case.get("seeds")
     for i in range(case["warmup_runs"] + case["repetitions"]):
         sampler.reset()
-        wave = _wave(port, body, timeout, clients)
+        # A case with seeds sends each measured repetition with its own seed (crit run ablate's Eval cases).
+        sent = {**body, "seed": seeds[i - case["warmup_runs"]]} if seeds and i >= case["warmup_runs"] else body
+        wave = _wave(port, sent, timeout, clients)
         memory = sampler.window()
         for _, _, _, usage, _ in wave:
-            if usage["prompt_tokens"] != case["prompt_tokens"]:
+            if case["prompt_tokens"] is not None and usage["prompt_tokens"] != case["prompt_tokens"]:
                 raise ValueError(f"{case['case_id']}: crit serve rendered the case's messages as "
                                  f"{usage['prompt_tokens']} prompt tokens, the workload has {case['prompt_tokens']}")
         if i < case["warmup_runs"]:

@@ -1,6 +1,6 @@
 """rounds:projections at real widths: every decode arithmetic captured in a CUDA graph and replayed on new inputs gives
-the eager bits, and a row of a k-row call (k 1..8) is the row alone, on the registry kernels (LOCAL_KERNELS or the Hub)
-and on the fallbacks alike."""
+the eager bits, and a row of a k-row call (k 1..8) is the row alone, on crit's kernels (built on this GPU) and on the
+fallbacks alike."""
 import unittest
 
 from crit_plugins.testing import PluginTestCase
@@ -77,7 +77,7 @@ class RoundTests(PluginTestCase):
         plugin = self.assemble(options={"activations": "bf16", "gemv": "triton"}, context=OnCuda())["projections"]
         m = plugin.load(self.stored("nvfp4", 96, 256), "nvfp4")
         if m.triton is None:
-            self.skipTest("the Triton GEMV comes with crit-labs/decode-gemv, not here")
+            self.skipTest("the Triton GEMV comes with decode-gemv, not here")
         static = torch.randn(5, 256, generator=self.g).cuda().to(torch.bfloat16)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):   # the load warmed every row count the GEMV takes

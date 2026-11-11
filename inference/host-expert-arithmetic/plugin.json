@@ -2,7 +2,7 @@
   "schema": "crit-plugin-v1",
   "id": "host-expert-arithmetic",
   "title": "Block-scaled rows on the CPU in the device's declared order",
-  "description": "host-expert-arithmetic's declared row orders. Host form: every product, lane FMA and reduction step rounded once to FP32 in the order the options declare, within FP32 rounding of quantized-projections in its nvfp4 format. Device form on the CPU: a checkpoint's stored NVFP4 or INT4 matrices (E4M3 scale per 16) weight only in the 16-lane FP32 order, or W4A4 / W4A8 in the integer block order (activations quantized per row by the declared quantizers), 16-bit matrices a row at a time through torch; every row's bits those of the row alone at any row count (row_invariance prompt_rows). The native rows (C++ with AVX2 and AVX-512 paths, built at load) or the same orders in torch where they do not build.",
+  "description": "host-expert-arithmetic's declared row orders. Host form: every product, lane FMA and reduction step rounded once to FP32 in the order the options declare, within FP32 rounding of quantized-projections in its nvfp4 format. Device form on the CPU: a checkpoint's stored NVFP4 or INT4 matrices (E4M3 scale per 16) weight only in the 16-lane FP32 order, or W4A4 / W4A8 in the integer block order (activations quantized per row by the declared quantizers), 16-bit matrices a row at a time through torch; every row's bits those of the row alone at any row count (row_invariance prompt_rows). The native rows (C++ with AVX2 and AVX-512 paths, built at load) or the same orders in torch where they do not build. Device form on CUDA (matrices whose tensors are CUDA tensors): the same W4A4 and W4A8 matrices on crit's kernel int-block-experts, decode rows in the declared integer block order (the CPU rows' bits), prompt rows by prompt_gemm.",
   "fills": [
     "projections"
   ],
@@ -62,6 +62,15 @@
       "default": -1,
       "min": -1,
       "description": "device form: threads a matrix's rows are split over (-1: physical cores)"
+    },
+    "prompt_gemm": {
+      "type": "choice",
+      "default": "native",
+      "choices": [
+        "native",
+        "declared"
+      ],
+      "description": "CUDA form, prompt rows (calls of more than 16 rows): native, W4A4 prompt rows on int-block-experts' gemm-native (the activations by its quantize_nvfp4, block-scaled FP4 MMAs on sm_120a, the s8 MMA a 16-block for INT4 weights): NOT the declared order and not row invariant (a prompt row's bits may change with the prompt's length and are not the CPU rows'; the facts' row_invariance prompt_rows false), W4A8 ones as declared; declared, every prompt row on gemm-staged in the declared integer block order, the CPU rows' bits"
     }
   },
   "sources": {
@@ -70,6 +79,13 @@
   },
   "entry": "plugin.py:create",
   "devices": [
-    "cpu"
+    "cpu",
+    "cuda"
+  ],
+  "kernels": [
+    {
+      "name": "int-block-experts",
+      "fallback": "none on CUDA: a CUDA matrix is refused without it (the CPU form needs no kernel)"
+    }
   ]
 }

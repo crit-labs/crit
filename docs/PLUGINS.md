@@ -83,7 +83,7 @@ plugins/
 | `reference` | The plugins its tests compare it with, which fill its slots between them, each once: the plugin it replaces (its slot's plain plugin), or for a fused plugin the separate plugins it must equal |
 | `test_with` | The other plugins its tests assemble beside it, which must be in the engine too |
 | `sources` | Folders of code it imports, by name: `{"sampling": "code"}` makes the plugin's `code/` folder the subpackage `.sampling`, so `plugin.py` reads `from .sampling import sampling`; `"../token-sampling/code"` imports another technique's |
-| `kernels` | The registry kernels its code loads, each `{name, version, revision, fallback}` and optionally `backend` ([kernels and plugins](#kernels-and-plugins)) |
+| `kernels` | crit's kernels its code loads, each `{name, fallback}` and optionally `backend` ([kernels and plugins](#kernels-and-plugins)) |
 | `tests` | Its test folder (default `tests`) |
 
 The factory gets the engine's `context` (crit serve's [model context](SERVING.md#cores-resident-adapter), so
@@ -173,7 +173,7 @@ slot's device form as the plugin is created: the host form is an oracle, and dec
 
 | Slot | Device form |
 | --- | --- |
-| `projections` | `load(tensors, format, role=None, encode=None)` (bf16, fp8:channel, fp8:tensor, mxfp8, nvfp4 as stored, `{weight, scale, global_scale, input_scale}`; role, the matrix's part in the model's own words, where the model plugin gives one; encode, for a matrix only a drafter reads, the format the plugin re-encodes it to, recorded in its facts as `draft_encoding`), `matmul(x, matrix, out_dtype=None)` (each row's bits those of the row alone in a call of up to `invariant_rows(plugin)` rows: [row invariance](#row-invariance)) |
+| `projections` | `load(tensors, format, role=None, encode=None)` (bf16, fp8:channel, fp8:tensor, mxfp8, nvfp4 as stored, `{weight, scale, global_scale, input_scale}`; awq and gptq as stored, `{qweight, qzeros, scales}` (gptq also `g_idx`); role, the matrix's part in the model's own words, where the model plugin gives one; encode, for a matrix only a drafter reads, the format the plugin re-encodes it to, recorded in its facts as `draft_encoding`), `matmul(x, matrix, out_dtype=None)` (each row's bits those of the row alone in a call of up to `invariant_rows(plugin)` rows: [row invariance](#row-invariance)) |
 | `kv_cache` | `pool(layers, kv_heads, head_dim, tokens, device, dtype, *, value_dim=None)`: a KV pool (`crit_plugins.device.KV_POOL`) with `open`, `close`, `fork`, `length`, `reserve(batch)` (each token's KV slot), `write(layer, slots, keys, values)` (a slot below 0 skipped), `keep(sequence, length)` and `gather(layer, sequence, count)` (a sequence's keys and values), and `kv_heads`, `head_dim`, `value_dim` (0: a pool of keys only, with `kv:keys`); `assertImplements` writes, forks, rolls back and gathers through it |
 | `attention` | `forward(layer, queries, pool, batch, scale=None)`: each token attends its sequence's KV up to its position, over a StepBatch or (with `rounds:attention`) a RoundBatch; with the attention facts also `blocks` and `block_size` (`attention:blocks`: each token reads only its listed KV blocks, chosen canonically by `crit_plugins.device.topk_blocks`), `parents` (`attention:tree`: a verify window's columns see their ancestors in the draft tree) and `lse=True` (`attention:lse`: each token's log-sum-exp beside its output) |
 | `recurrence` | `pool(layers, heads, keys, values, device, sequences=None, widest=0, conv=None, key_heads=None, rows=None)`: a state pool with `open`, `close`, `fork`, `accept(sequence, count)` (any prefix of a row of up to widest + 1 tokens), `state`, `window` and `flush`; `forward(layer, query, key, value, log_decay, beta, pool, batch, geometry)` over a StepBatch or RoundBatch, each decode or verify row's bits its own; `convolve(layer, x, weight, bias, pool, batch, activation='silu')`, the causal depthwise convolution over each sequence's window in the pool (`conv=(channels, kernel)` or `(channels, kernel, dilation)`: the window the last (kernel - 1) * dilation inputs) |
@@ -238,30 +238,28 @@ refuses rounds of more rows when it is built.
 
 ### Kernels and plugins
 
-crit hosts no compute kernels. Kernels are not plugins: they are the arithmetic plugins run, a GEMM or GEMV,
-attention, a norm, a scan, a fused MoE, any arithmetic a library or the kernel registry could provide. A plugin takes
-its arithmetic in this order:
+Kernels are not plugins: they are the arithmetic plugins run, a GEMM or GEMV, attention, a norm, a scan, a fused MoE.
+A plugin takes its arithmetic in this order:
 
 1. a provider: torch, cuBLASLt through torch's scaled matmul, FlashInfer, fla, CUTLASS
-   ([Kernels' sources](../kernels/SOURCES.md));
-2. a crit-labs kernel from the Hugging Face kernel registry (the Kernel Hub), for an operation no provider covers.
-   Each is a kernel-builder project in the crit-kernels repository, uploaded as `crit-labs/NAME`. The plugin declares
-   it in its plugin.json as a dependency with its pin, `"kernels": [{"name": "crit-labs/NAME", "version": 1,
-   "revision": null, "fallback": "what runs without it"}]` (revision null until the kernel is published, then the
-   registry commit it is pinned to; `backend` where the build is not torch's own device backend, `cpu` for a CPU
-   kernel beside a CUDA torch), and loads it once, when it is created, with
-   `crit_plugins.kernels.registry_kernel("crit-labs/NAME", folder=Path(__file__).parent)`, which reads that pin and
-   refuses a kernel the manifest does not declare;
-3. last, a plain torch fallback with the same contract, where the kernel is not there (not published, no build for
-   the machine, offline): the plugin still serves correctly, and the engine's facts say so.
+   ([Kernels' libraries](../kernels/README.md#libraries));
+2. one of crit's own kernels, for an operation no provider covers well. They are templates in crit's
+   [kernel library](../kernels/README.md#crits-kernels) (`kernels/techniques/<family>/<id>/`, a `kernel.json` each), source that
+   crit builds for the engine's device the first time a plugin asks, with the engine's tuning table
+   (`crit kernels sweep` tunes each kernel's knobs for the model on that GPU) or the kernel's default knobs. Nothing
+   is downloaded. The plugin declares it in its plugin.json, `"kernels": [{"name": "ID", "fallback": "what runs
+   without it"}]` (`backend` where the build is not torch's own device backend, `cpu` for a CPU kernel beside a CUDA
+   torch), and loads it once, when it is created, with
+   `crit_plugins.kernels.load_kernel("ID", folder=Path(__file__).parent)`, which refuses a kernel the manifest does not
+   declare;
+3. last, a plain torch fallback with the same contract, where the kernel cannot be built here (no CUDA toolkit, an
+   architecture it does not cover): the plugin still serves correctly, and the engine's facts say so.
 
 Every request is recorded (`crit_plugins.kernels.loaded()`), and the engine's facts carry the record under `kernels`:
-per kernel the source it came from (`local`, `hub` or `fallback`), its revision and, for a fallback, why. A fresh clone
-with no published kernel serves on its fallbacks and says so. To test a kernel before it is published, build its
-project for the machine's GPU and torch only and set `LOCAL_KERNELS=crit-labs/NAME=/path/to/project` (several entries
-joined by `:`): `registry_kernel` then loads that build through the same `kernels.get_kernel` call a published kernel
-takes, its source recorded as `local`, and the registry is never asked for a repository named there. Run the plugin's
-tests twice, with `LOCAL_KERNELS` (the registry path) and without it (the fallback path).
+per kernel its source (`tuned`: built with the engine's tuning, `built`: with its default knobs, or `fallback`), the
+tuning file and, for a fallback, why. The engine's tuning is a folder of `<ID>.json` files from `crit kernels sweep`,
+named by `CRIT_KERNEL_TUNING` (or `crit_plugins.kernels.use_tuning`). A plugin's tests cover both paths: the kernel
+where it builds, and the torch fallback.
 
 Mechanism code that runs on the device is no compute kernel and stays in its technique, built and tested there: a
 sampling law bit-identical to Core's host sampler, a round's accept, draft trees and hidden-state drafters, a recurrent
@@ -393,7 +391,14 @@ from crit-hub is copied in.
 The placement plan is the placement, not advice: the model plugin plans every tensor it keeps on the device (weights,
 KV, state, an optional draft-only copy) through the placement plugin, and on CUDA the loader refuses an engine that
 holds more device memory after its first requests than its plans and the plugins' declarations put there
-(`plan_problems`, with `PLAN_SLACK`, 5% and 64 MiB, for small tensors). Three things keep that count honest:
+(`plan_problems`, with `PLAN_SLACK`, 5% and 64 MiB, for small tensors). The device bytes a plan is given are
+`crit_plugins.device.free_device_bytes()`: the free memory after torch's allocator hands back what it caches for
+nothing, since a model plugin that re-encodes or converts weights before planning its pools leaves those temporaries
+cached, and `torch.cuda.mem_get_info` alone counts them as taken (one engine's KV pool refused to fit for it). Where
+a request's temporaries end (a prompt's last chunk, a long score), `crit_plugins.device.release_cached_under(free_below)`
+hands the cache back only when the device has fewer than `free_below` bytes free, so one request's cached blocks
+leave room for the next one's without a release, and its wait on the device, after every step. Three things keep
+the plan's count honest:
 
 - **Declared memory is measured.** A plugin's `memory(context, options) -> {"device", "host"}` declares the workspaces
   its factory allocates when it is made. The loader measures each factory's device growth while it runs
@@ -437,8 +442,7 @@ widths.
 
 An engine's facts are what it states about itself for crit serve's `/v1/models` card (`engine_facts`), Eval and the
 ablation: the model plugin's info, then each plugin object's optional `facts()` for the keys the info states none of
-(the first plugin in creation order winning a key), then `plugins` (the plugin filling each slot) and `kernels` (the
-registry kernels its plugins asked for and where each came from). The facts Eval reads
+(the first plugin in creation order winning a key), then `plugins` (the plugin filling each slot) and `kernels` (crit's kernels its plugins asked for and how each was built: tuned, built or fallback). The facts Eval reads
 (`crit_core.serving.ENGINE_FACTS`) include a projections plugin's `prompt_activations`, which crit-eval prices
 prefill by, and the kv_cache plugin's `kv_bytes_per_token`: the device bytes one more token of context takes in the
 pools it made (every layer's keys and values at its pool's precision, their scales too, summed over every pool, a
@@ -632,7 +636,10 @@ captures' memory is planned as `"prompts:captures"`.
 ## Each plugin's own tests
 
 `crit plugins test ENGINE/plugins` runs each plugin's `tests/test*.py` in a process of its own (no plugin shares
-another's imports or device state) and fails a plugin that has none. `PluginTestCase` gives a test:
+another's imports or device state) and fails a plugin that has none. A plugin whose tests passed before under the
+same key (its files, the plugins its tests use, crit's `crit_plugins` and `crit_core`, and the environment: Python,
+torch, the device, `CRIT_KERNEL_TUNING` and the provider packages' versions) is reported `cached` without running them
+again; `--no-cache` runs every plugin's tests. `PluginTestCase` gives a test:
 
 | Helper | What it does |
 | --- | --- |
@@ -697,7 +704,7 @@ session-scheduling and concurrent-request-execution, since Core's concurrent run
 engine.
 The plugin system itself is Core's, since an engine loads with it: `crit_plugins` in
 [core/python](../core/python/README.md) holds the manifest, the assembly, the slot interfaces and device forms, the
-registry kernel loader, Core's round driver and prompt graphs, the test helpers and the ablation's variants, and
+kernel loader, Core's round driver and prompt graphs, the test helpers and the ablation's variants, and
 holds no technique. The library and `crit plugins` are crit's command line
 ([cli/crit/plugins.py](../cli/crit/plugins.py)).
 
@@ -715,22 +722,22 @@ the engine's own facts (`draft:head`), or a slot whose plugin is still to be cho
 then on: it changes it like the rest of its source.
 
 Every slot but `model` has library plugins that run on the device, each with its host form as before and the slot's
-[device form](#device-form) in torch, over providers where one covers the arithmetic and crit-labs' registry kernels
+[device form](#device-form) in torch, over providers where one covers the arithmetic and crit's own kernels
 where none does, each with its torch fallback ([kernels and plugins](#kernels-and-plugins)). Their facts say which
 [device extensions](#device-extensions) they provide (each plugin.json's `provides`):
 
 | Slot | Library plugin | Device form |
 | --- | --- | --- |
-| `kv_cache` | `attention-state` | A paged KV pool of every sequence: BF16, FP16, FP32 and FP8 E4M3 pages with the layer's scales (static ones from the checkpoint through `kv:scales`), FP8 E4M3 (`fp8:row`) or INT8 pages with one scale per position and KV head, copy-on-write forks, pools of keys only and rows at chosen slots (`kv:keys`); rows of up to its `window` tokens read as window rows; with `step_rows`, a step's slots and window rows' metadata in device buffers at fixed addresses, so a model replays its decode steps from CUDA graphs; round slots for captured rounds (up to `round_rows`, pages reserved at bind, slots computed and lengths committed on the device) and prompt buffers for captured prompt chunks; over FP8 and INT8 pages a fresh buffer of a prompt chunk's own 16-bit keys and values (`fresh_mib`, off by default: 0 reads the chunk from the pages, which keeps a scored continuation on the served decode's reads; facts `prompt_kv`, `prompt_kv_fresh_tokens`); its unused pages lent to a device expert cache (`spare`, `lendable()`, `on_reserve()`); pages written by the registry kernel crit-labs/paged-kv-attention where it loads; `kv_bytes_per_token` in its facts |
-| `attention` | `softmax-attention` (base), `partitioned-attention` | Each row's queries over its sequence's pages read in place (one device form, attention-state's code/device_attention.py): FlashInfer's paged prefill over 16-bit and FP8 prompt rows when FlashInfer is installed (the KV split pinned, so a row does not depend on the rows beside it); decode and verify windows of every page type through the registry kernel crit-labs/paged-kv-attention's split-KV reader (KV partitions walking each row's length on the device, merged by their log-sum-exps; block lists take PIECE_PARTITIONS in every launch, so prompt, step and round rows sum a list in one order), in a step as in a captured round, so a decode row's bits are the same in both and plain, log-probability and replay requests decode what a drafted round decodes (softmax-attention's `decode: flashinfer` reads a step's window rows with FlashInfer's decode instead, for engines that decode in steps only), with tree masks and block lists; fp8:row and INT8 prompt rows through its prompt reader; otherwise the rows gathered and torch's SDPA, or a masked softmax over the page tables that captures in a CUDA graph. Captured prompt chunks read the staged prompt table on the device. `prompt_reader`: `prefill` (the default) reads prompt rows through a prompt reader, the fastest and another reduction than decode rows'; `decode` reads a step's prompt rows and captured chunks in the decode's reduction (window rows of up to 64 columns through the split-KV reader, or its torch fallback), so a scored token equals the same token served, bit for bit (facts `prompt_reads`, `served_vs_scored`) partitioned-attention is the same on one GPU, with log-sum-exps and `merge` for partials of other devices |
-| `projections` | `projections-dense` (base), `quantized-projections`, `host-expert-arithmetic` (cpu) | BF16 matrices (`out_dtype` FP32 for logits, on the CPU too). quantized-projections: stored BF16, FP8 (per channel or tensor), MXFP8 and NVFP4 matrices; prompt rows through cuBLASLt (torch's scaled matmul) with FP8 or NVFP4 activations, or with 16-bit activations on the matrix decoded a chunk of rows at a time (BF16, FP16 accumulation or FP8 rows by `prompt` and `prompt_roles`; FP8 matrices' W8A16 with `fp8_activations: bf16`); with `prompt_gemm: pinned` every format's prompt GEMMs on one split-K-free cuBLASLt algorithm per shape and format, chosen at load (crit-labs/pinned-gemm), and with `fixed_tiles` the BF16 and weight-only ones through crit-labs/fixed-tile-gemm, so a prompt row's bits are the same at every prompt length, chunk and padded bucket (`row_invariance` `prompt_rows`); decode rows (up to `decode_rows`, 16) through crit-labs/mma-rows' tensor-core tile or crit-labs/decode-gemv's GEMVs at the prompt rows' activations (`decode_activations: prompt`) or 16-bit ones, each row's bits alone and batched; short prompts through the tile as far as it measured faster (`tile_rows: auto`); every call path of a matrix run once at load, so no request compiles; the prompt arithmetic of every format in its facts (`prompt_arithmetic`); draft-only matrices re-encoded at load (`encode`). host-expert-arithmetic: stored NVFP4 / INT4 matrices weight only (the FP32 order) or W4A4 / W4A8 (the integer block order) on the CPU, BF16 a row at a time, every row's bits those of the row alone at any count |
-| `recurrence` | `sequential-recurrence` (base), `recurrent-state-recovery` | Every sequence's FP32 state and convolution window in a pool; decode tokens and verify windows of a step or a captured round in one column-scan launch (crit-labs/recurrent-scans where installed, else torch), the accepted prefix kept on the device (`commit`: deferred, checkpoints or recompute); prompt rows of up to `exact_rows` tokens (a stated value, 512 by default: the largest default prompt bucket; 0: none) through the same scan, so their bits are a decode's, and longer ones through fla's chunked kernel (sequential-recurrence; each of its autotuned Triton kernels pinned to one stated tile, `FLA_TILES`, since fla's autotune picks among tiles of other bits) or recurrent-scans' two-pass prefill (recurrent-state-recovery); which one a chunk runs and on which tiles follows from the configuration, never from a timing (a model whose chunk grid stays within `exact_rows` keeps every prompt row exact and a prefix's rows equal to the whole prompt's) |
-| `router` | `topk-router` (base) | Softmax or sigmoid routing, correction bias, group limits, renormalization: one launch of the registry kernel crit-labs/topk-routing where it loads and the rule has no group limit, torch otherwise; capture-safe (a row of NaN logits still picks valid distinct experts, NaN ranking below -inf) |
-| `experts` | `experts-reference` (base), `grouped-experts`, `host-expert-tier` (cpu), `heterogeneous-expert-dispatch` | experts-reference: the routed SwiGLU block over the experts' dense matrices, FP64 products in fixed chunks, capture-safe. grouped-experts: each expert one bundle in its stored format (bf16, fp8 channel or block, nvfp4 W4A16, or with `activations: nvfp4` each NVFP4 layer as its stored matrices declare, W4A4 where they carry input scales, int4, mxfp4), the routes grouped by expert on the device over the plugin's bundles or a residency cache's slot store, through the registry kernel crit-labs/grouped-experts or its torch fallback; a route's bits independent of the rows beside it and of decode against prompt; a long prompt chunk runs in parts, each combined into its tokens' rows as it goes, one prompt workspace serving the shorter prompt-sized calls of its shape. host-expert-tier: NVFP4 W4A4 / INT4 W4A8 experts in host-expert-arithmetic's declared integer block order on the CPU (a native tier built at load over a pinned worker pool, or torch with the same bits). heterogeneous-expert-dispatch: on CUDA, the routes an expert cache sends to the CPU (slot -2) computed by host-expert-tier's tier and joined inside the stream through host-work-mailbox, the split never changing a bit |
+| `kv_cache` | `attention-state` | A paged KV pool of every sequence: BF16, FP16, FP32 and FP8 E4M3 pages with the layer's scales (static ones from the checkpoint through `kv:scales`), FP8 E4M3 (`fp8:row`) or INT8 pages with one scale per position and KV head, copy-on-write forks, pools of keys only and rows at chosen slots (`kv:keys`); rows of up to its `window` tokens read as window rows; with `step_rows`, a step's slots and window rows' metadata in device buffers at fixed addresses, so a model replays its decode steps from CUDA graphs; round slots for captured rounds (up to `round_rows`, pages reserved at bind, slots computed and lengths committed on the device) and prompt buffers for captured prompt chunks; over FP8 and INT8 pages a fresh buffer of a prompt chunk's own 16-bit keys and values (`fresh_mib`, off by default: 0 reads the chunk from the pages, which keeps a scored continuation on the served decode's reads; facts `prompt_kv`, `prompt_kv_fresh_tokens`); its unused pages lent to a device expert cache (`spare`, `lendable()`, `on_reserve()`); pages written by crit's kernel paged-kv-attention where it loads; `kv_bytes_per_token` in its facts |
+| `attention` | `softmax-attention` (base), `partitioned-attention` | Each row's queries over its sequence's pages read in place (one device form, attention-state's code/device_attention.py): FlashInfer's paged prefill over 16-bit and FP8 prompt rows when FlashInfer is installed (the KV split pinned, so a row does not depend on the rows beside it); decode and verify windows of every page type through crit's kernel paged-kv-attention's split-KV reader (KV partitions walking each row's length on the device, merged by their log-sum-exps; block lists take PIECE_PARTITIONS in every launch, so prompt, step and round rows sum a list in one order), in a step as in a captured round, so a decode row's bits are the same in both and plain, log-probability and replay requests decode what a drafted round decodes (softmax-attention's `decode: flashinfer` reads a step's window rows with FlashInfer's decode instead, for engines that decode in steps only), with tree masks and block lists; fp8:row and INT8 prompt rows through its prompt reader; otherwise the rows gathered and torch's SDPA, or a masked softmax over the page tables that captures in a CUDA graph. Captured prompt chunks read the staged prompt table on the device. `prompt_reader`: `prefill` (the default) reads prompt rows through a prompt reader, the fastest and another reduction than decode rows'; `decode` reads a step's prompt rows and captured chunks in the decode's reduction (window rows of up to 64 columns through the split-KV reader, or its torch fallback), so a scored token equals the same token served, bit for bit (facts `prompt_reads`, `served_vs_scored`) partitioned-attention is the same on one GPU, with log-sum-exps and `merge` for partials of other devices |
+| `projections` | `projections-dense` (base), `quantized-projections`, `host-expert-arithmetic` (cpu) | BF16 matrices (`out_dtype` FP32 for logits, on the CPU too). quantized-projections: stored BF16, FP8 (per channel or tensor), MXFP8, NVFP4 and AWQ / GPTQ INT4 matrices (INT4 with a zero point a group, repacked at load); with `prompt_gemm: native` the quantized prompt GEMMs on crit's own kernels, and with `auto` (the default) only where they measured faster than the provider path; MXFP8 checkpoints' own activations with `mxfp8_activations: mxfp8`; prompt rows through cuBLASLt (torch's scaled matmul) with FP8 or NVFP4 activations, or with 16-bit activations on the matrix decoded a chunk of rows at a time (BF16, FP16 accumulation or FP8 rows by `prompt` and `prompt_roles`; FP8 matrices' W8A16 with `fp8_activations: bf16`); with `prompt_gemm: pinned` every format's prompt GEMMs on one split-K-free cuBLASLt algorithm per shape and format, chosen at load (pinned-gemm), and with `fixed_tiles` the BF16 and weight-only ones through fixed-tile-gemm, so a prompt row's bits are the same at every prompt length, chunk and padded bucket (`row_invariance` `prompt_rows`); decode rows (up to `decode_rows`, 16) through mma-rows' tensor-core tile or decode-gemv's GEMVs at the prompt rows' activations (`decode_activations: prompt`) or 16-bit ones, each row's bits alone and batched; short prompts through the tile as far as it measured faster (`tile_rows: auto`); every call path of a matrix run once at load, so no request compiles; the prompt arithmetic of every format in its facts (`prompt_arithmetic`); draft-only matrices re-encoded at load (`encode`). host-expert-arithmetic: stored NVFP4 / INT4 matrices weight only (the FP32 order) or W4A4 / W4A8 (the integer block order) on the CPU, BF16 a row at a time, every row's bits those of the row alone at any count |
+| `recurrence` | `sequential-recurrence` (base), `recurrent-state-recovery` | Every sequence's FP32 state and convolution window in a pool; decode tokens and verify windows of a step or a captured round in one column-scan launch (recurrent-scans where installed, else torch), the accepted prefix kept on the device (`commit`: deferred, checkpoints or recompute); prompt rows of up to `exact_rows` tokens (a stated value, 512 by default: the largest default prompt bucket; 0: none) through the same scan, so their bits are a decode's, and longer ones through fla's chunked kernel (sequential-recurrence; each of its autotuned Triton kernels pinned to one stated tile, `FLA_TILES`, since fla's autotune picks among tiles of other bits) or recurrent-scans' two-pass prefill (recurrent-state-recovery); which one a chunk runs and on which tiles follows from the configuration, never from a timing (a model whose chunk grid stays within `exact_rows` keeps every prompt row exact and a prefix's rows equal to the whole prompt's) |
+| `router` | `topk-router` (base) | Softmax or sigmoid routing, correction bias, group limits, renormalization: one launch of crit's kernel topk-routing where it loads and the rule has no group limit, torch otherwise; capture-safe (a row of NaN logits still picks valid distinct experts, NaN ranking below -inf) |
+| `experts` | `experts-reference` (base), `grouped-experts`, `host-expert-tier` (cpu), `heterogeneous-expert-dispatch` | experts-reference: the routed SwiGLU block over the experts' dense matrices, FP64 products in fixed chunks, capture-safe. grouped-experts: each expert one bundle in its stored format (bf16, fp8 channel or block, nvfp4 W4A16, or with `activations: nvfp4` each NVFP4 layer as its stored matrices declare, W4A4 where they carry input scales, int4, mxfp4), the routes grouped by expert on the device over the plugin's bundles or a residency cache's slot store, through crit's kernel grouped-experts or its torch fallback; a route's bits independent of the rows beside it and of decode against prompt; a long prompt chunk runs in parts, each combined into its tokens' rows as it goes, one prompt workspace serving the shorter prompt-sized calls of its shape. host-expert-tier: NVFP4 W4A4 / INT4 W4A8 experts in host-expert-arithmetic's declared integer block order on the CPU (a native tier built at load over a pinned worker pool, or torch with the same bits). heterogeneous-expert-dispatch: on CUDA, the routes an expert cache sends to the CPU (slot -2) computed by host-expert-tier's tier and joined inside the stream through host-work-mailbox, the split never changing a bit |
 | `expert_residency` | `device-expert-cache` | The directory on the device (`experts:cache`): one capture-safe plan launch and one fill launch per routed layer (a slot table: slot, -1 not routed, -2 the CPU tier), fills by SM loads from a registered host store, prompt chunks through a copy-engine ring that never admits, a KV pool's unused pages as slots, clock or ranked policy, telemetry and per-row counters through `count_round` |
 | `expert_source` | `expert-tensors` (base), `ssd-expert-materialization` | Bundle stores (`experts:store`, `open_store`): bundles in registered host memory with a device view, or a file tier read by a native reader behind a host tier, which a cache fills from on the host; `csf_scales` keeps NVFP4 scale components CSF-compressed in the store |
 | `embeddings` | `memory-table-rows` (base), `lookup-table-rows` | A device table, or (memory-table-rows' `host`, lookup-table-rows' `open`) a table in registered host memory gathered over the link; lookup-table-rows also reads tables in files (native positioned reads, prefetch into a hot-row cache, the gather a host function a CUDA graph captures) and stored NVFP4 rows decoded on the device |
-| `norms` | `torch-norms` (base), `fused-norms` | torch ops with every reduction through torch's fused rms_norm (torch's mean over a row is not row-invariant at hidden widths); fused-norms: FlashInfer for the calls whose function it computes exactly, one launch per call of the registry kernel crit-labs/fused-norms for the rest, torch-norms' arithmetic where it is not there |
+| `norms` | `torch-norms` (base), `fused-norms` | torch ops with every reduction through torch's fused rms_norm (torch's mean over a row is not row-invariant at hidden widths); fused-norms: FlashInfer for the calls whose function it computes exactly, one launch per call of crit's kernel fused-norms for the rest, torch-norms' arithmetic where it is not there |
 | `sampler` | `token-sampling`, `token-constraints` | Core's sampling law over logits rows, Core's Philox draws; `staged(rows, device)` keeps a step's rules in device buffers and draws on the device, so a model captures its sampling in its decode graph; inside captured rounds (`rounds:sampler`) its sampling law (sampling.cu, built at load) draws drafts with their sparse laws, predicts every verify column by rejection sampling and scores the emitted tokens, or the torch law. token-constraints masks each constrained row to its allowed set first (in captured rounds with each slot's mask staged beside its rules) |
 | `placement` | `device-placement` (base), `dense-layer-offload` | Every tensor on the device (`reserve_mib` kept free beside the plan), or with `off_device` the groups of those name prefixes (routed experts' bundles, lookup tables) in host memory, then files, and `slots()` to size a device expert cache; whole layers on the device while they fit and the rest in host memory, by dense-layer-offload's planner over measured rates (host policy code) |
 | `graphs` | `eager-graphs` (base), `recorded-selection` | The capture a step or prompt chunk runs, from the model plugin's offers: always eager, or the least run time per use among the measured offers that compute the arithmetic its options name (host policy code) |
@@ -778,6 +785,19 @@ against the engine's own facts as the candidate's selection shows them: what its
 provides, which the engine as built supplies. `--variant NAME` serves only some of them, `--no-smoke` leaves the
 suite out, and `--smoke-test TEST` runs some of its tests.
 
+The run's cases are the workload the user captured, often one prompt. A plugin whose effect depends on the text it
+decodes (a drafter, copied drafts, a draft width, a vocabulary subset) can look neutral there and still cost decode on
+long prompts or other languages. `--data EVAL_DATA` adds crit-eval's speed cases and held-out prompts to every
+variant (`eval:ID`, `eval:heldout:ID`): each request is the case's messages at the model's sampling as Eval sends them,
+`--seeds N` requests each (default 3, one seed apiece where the package declares seeded sampling), and the report
+judges each plugin on their geometric mean with the run's cases. Use it on every ablation of a drafting engine.
+
+`--set PLUGIN.OPTION=VALUE[;PLUGIN.OPTION=VALUE...]` (repeatable) serves an option variant `set:...`: the full
+selection with those options changed, on the same cases. With `--set` and no `--variant`, only `full` and the option
+variants run, so `ablate --data EVAL_DATA --set mtp-decode.override=0 --set attention-state.fresh_mib=64` is an
+in-process A/B of two options against the engine as built, on Eval's text, without writing a probe script. Each
+option variant gets a row like a plugin's, its `in_engine` changes against `full`.
+
 The ablation is one check attempt, so it has the run's check process cap (an hour by default) for two variants
 and two more per plugin, each built again, benched and smoke-tested (crit smoke takes a minute or two on a working
 engine). When they do not fit, serve `full` and the `without:` variants in one attempt and `base` with the `only:`
@@ -794,11 +814,13 @@ with the time per decode round they give, its crit smoke items, and a row per pl
 | `alone` | `only:ID` against `base`: what it adds on its own |
 | `breaks` | crit smoke tests that fail with it and pass without it (`load` when the engine only loads without it) |
 | `verdict` | `breaks`, `pays` (better by more than the noise, 3%, on some KPI and worse on none), `slows`, `trades` (better on one KPI, worse on another), `neutral` or `unmeasured` |
+| `judged` | The KPIs the verdict read (below: the time per decode round in place of decode where both variants draft) |
 
 Where both variants of a comparison draft (more than 1.05 tokens a round), the row also compares their time per
 decode round (`round_ms`). A plugin outside the drafter changes how long a round takes, while the tokens a short bench
 accepts per round move with what it samples: two variants that accept 3.2 and 3.8 tokens a round can decode at the
-same speed with one round 20% faster.
+same speed with one round 20% faster. So such a plugin's verdict reads `round_ms` in place of decode; a plugin in
+the drafter or verifier slot, whose drafts are what a round keeps, is still judged by decode.
 
 A short bench is not Eval: its numbers rank variants of one engine on one machine in one session, and a change
 within the noise is no result. Use the ablation to decide what goes into the candidate Eval measures: drop or fix a
@@ -812,7 +834,7 @@ the attempt's evidence.
 conflicts, options, cycles), the assembly (order, memory budget, closing on failure), the test runner and the
 ablation's variants and verdicts. `tests/test_plugin_library.py` runs every library plugin's tests, holds every
 Inference entry to being a plugin, lending one its code or being an engine service, checks that each kernel a plugin
-declares is one its code asks `registry_kernel` for and that no kernel-builder project (`build.toml`) lives in crit,
+declares is one its code asks `load_kernel` for and is one of crit's kernels (`kernels/techniques/<family>/<id>/kernel.json`),
 and adds plugins into a temporary engine where their tests pass again. `tests/test_device_contracts.py` holds
 plugins to the device extensions they provide, and `tests/test_core_rounds.py`, `tests/test_python_rounds.py` and
 `tests/test_device_engine_rounds.py` cover Core's round driver.

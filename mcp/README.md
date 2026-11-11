@@ -37,20 +37,27 @@ and help are the command line's and never drift from it. Arguments are the optio
 JSON object itself (the server writes it to a file for the command) or a JSON file's path, and a JSON-text option
 such as `quality_budget` takes an object. `project` defaults to the checkout the server runs from (a crit installed
 without one: the folder the commands run in, `--cwd`), and `root` (the
-run root) of `crit run` and `workspace` of `crit serve` to `--root`. `crit_run_show` gives the run's state.
+run root) of `crit run` and `workspace` of `crit serve` to `--root`. `crit_run_next` gives the run's next step
+and `crit_run_show` its records.
+
+`crit plugins`, `crit smoke`, `crit bench` and `crit hub` are not tools: an engine's plugins are files the agent
+writes, so it runs `crit plugins list|add|test` and `crit smoke --url` in its own shell beside the server.
+`crit_run_serve` with `check` runs a candidate's plugin tests and crit smoke as part of the serving check.
 
 | Tool | What it does |
 | --- | --- |
-| `crit_run_*` | A run's records: create, recon, resolve, plan (`check` to check it without recording), candidate, build, package, measure, eval, serve, check, seal, select, stop, cost, replay, show, ... |
+| `crit_run_*` | A run's records: next, create, recon, resolve, plan (`check` to check it without recording, `draft` for its skeleton), candidate, build, package, measure, eval, serve, check, seal, select, stop, cost, replay, show, ... |
 | `crit_eval_*` | crit Eval: probe, prepare, reference, run, status, kernels, workbench, compare, ab, ... |
 | `crit_pull`, `crit_serve` | Install a crit-hub engine; serve sealed candidates or an installed engine |
-| `crit_kernels_*`, `crit_models_*`, `crit_inference_*` | Find and retain kernels and scaffold workbenches; transform weights; search the Inference techniques |
-| `crit_serve_status` | A running `crit serve`'s `/health` and `/v1/models` |
+| `crit_kernels_*` | List, build and sweep crit's kernel templates on this device; scaffold a workbench for a kernel the engine writes |
+| `crit_models_*` | Plan, quantize and verify a weight transform, bind its Eval; distill a drafter (only on the user's word: a run never trains one) |
+| `crit_inference_*` | List, search, show and check the Inference techniques |
+| `crit_serve_status` | A running `crit serve`'s `/health` and `/v1/models`; its `api_key` goes only to this machine or a private network address |
 | `crit_job_wait`, `crit_job_output`, `crit_job_stop`, `crit_jobs` | Follow the commands' jobs |
 
 Every tool carries MCP annotations: its `title`, `readOnlyHint`, `destructiveHint` and `openWorldHint`, so a
 client can run the read-only ones without asking and confirm the rest. Read-only tools only read records, logs,
-files or the device (`crit_run_show`, `crit_eval_status`, `crit_kernels_search`, `crit_inference_*`,
+files or the device (`crit_run_next`, `crit_run_show`, `crit_eval_status`, `crit_kernels_list`, `crit_inference_*`,
 `crit_job_wait`, ...). Destructive tools end something or cannot be undone: `crit_run_stop`, `crit_run_seal`,
 `crit_run_select`, `crit_run_recover` and `crit_job_stop`. Every other tool adds records or files and removes
 nothing. `crit_pull`, `crit_eval_fetch`, `crit_eval_run` and `crit_run_eval` are open-world: they can
@@ -77,9 +84,9 @@ on, and `crit_run_recover` proves an abandoned lease.
 
 ## Resources
 
-AGENTS.md and the guides it links (Building engines, Run records, Serving, the contribution criteria and the
-toolkit READMEs) are resources, `crit://AGENTS.md`, `crit://docs/RUN_RECORDS.md` and so on, for an agent that does
-not share the checkout's filesystem. The server's instructions tell the agent to read AGENTS.md first. A crit
+AGENTS.md and the guides it links (Building engines, Run records, Plugins, Serving, the contribution criteria,
+Contributing and the CLI, Inference, Kernels, Models, smoke and MCP READMEs) are resources, `crit://AGENTS.md`,
+`crit://docs/PLUGINS.md` and so on, for an agent that does not share the checkout's filesystem. The server's instructions tell the agent to read AGENTS.md first. A crit
 installed from its wheel carries them all (in `crit/library/guides`), so `crit mcp` serves the guides of the
 release it runs without a checkout.
 

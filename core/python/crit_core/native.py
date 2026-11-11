@@ -454,6 +454,35 @@ class _Attached:
 
 # Where Core's crit_core_steps library (crit/step_engine.h) is, when the loader is given none.
 STEP_LIBRARY = "CRIT_CORE_STEP_LIBRARY"
+# The library's file on each OS, and the folders of a crit checkout it is looked for in when STEP_LIBRARY names none:
+# where `crit core build` builds it (build/core-steps), and Core's build folder of core/README.md (build/core), each
+# with a multi-configuration generator's Release folder.
+STEP_LIBRARY_FILES = ("libcrit_core_steps.so", "crit_core_steps.dll", "libcrit_core_steps.dylib")
+STEP_LIBRARY_FOLDERS = ("build/core-steps", "build/core-steps/Release", "build/core", "build/core/Release")
+
+
+def step_cache():
+    """Where `crit core build` builds this Core's library outside a checkout: CRIT_CORE_CACHE (default
+    ~/.cache/crit/core), one folder a Core version."""
+    from . import __version__
+    return Path(os.environ.get("CRIT_CORE_CACHE") or Path.home() / ".cache" / "crit" / "core") / __version__
+
+
+def step_library():
+    """The crit_core_steps library to load: the file STEP_LIBRARY names, else the one built in the crit checkout this
+    Core runs from (STEP_LIBRARY_FOLDERS), else the one `crit core build` built for this Core's version (step_cache),
+    else None."""
+    named = os.environ.get(STEP_LIBRARY)
+    if named:
+        return named
+    root = Path(__file__).resolve().parents[3]
+    folders = [root / f for f in STEP_LIBRARY_FOLDERS] if (root / "core" / "include" / "crit" / "core.h").is_file() else []
+    cache = step_cache() / "build"
+    for folder in folders + [cache, cache / "Release"]:
+        for name in STEP_LIBRARY_FILES:
+            if (folder / name).is_file():
+                return str(folder / name)
+    return None
 # The settings of a step model's info that configure Core (crit/step_engine.h's "engine" object), from the table Core's
 # step engine reads too (step_settings.json); the rest are facts.
 STEP_SETTINGS = tuple(jsonfile.read(Path(__file__).with_name("step_settings.json"))["settings"])
@@ -717,7 +746,7 @@ class StepEngine(_Runtime):
     next (StepRow.allowed), which the model passes to its sampler; Core checks each token such a row produces against
     them, and a row that produces another token or more than one fails the request. CONSTRAINTS are the kinds;
     constrain(vocabulary) gives Core the model's byte vocabulary that json and grammar constraints are matched over. It generates and scores max_concurrent_requests
-    (max_concurrency + max_pending) requests at once. `library` is crit_core_steps, else CRIT_CORE_STEP_LIBRARY.
+    (max_concurrency + max_pending) requests at once. `library` is crit_core_steps, else step_library()'s.
     facts: what the engine reports beside the model's info (the loader's plugins); close: what closes the model's
     parts, the assembly (else the model's own close()); telemetry: what reports the engine's work so far (the
     assembly's telemetry(), else the model's own). A model with native_rounds(library) returning NativeRounds decodes
@@ -741,10 +770,11 @@ class StepEngine(_Runtime):
         self._counted = {"steps": 0, "rows": 0, "step_s": 0.0}
         self._threads = set()   # Core's threads that keep their Python thread state (_keep_thread_state)
         info = dict(model.info())
-        library = library or os.environ.get(STEP_LIBRARY)
+        library = library or step_library()
         if not library:
-            raise NativeError("Core's runtime is its crit_core_steps library: build Core (core/README.md) and set "
-                              f"{STEP_LIBRARY} to it")
+            raise NativeError("Core's runtime is its crit_core_steps library, which is not built: run `crit core build`, "
+                              f"or build Core (core/README.md) and set {STEP_LIBRARY} to the "
+                              "library")
         self._load(library)
         self.library, self.path = self.path, None   # Eval takes it from the facts' native_libraries
         self.lib.crit_engine_open_steps.restype = ctypes.c_void_p

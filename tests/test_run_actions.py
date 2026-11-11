@@ -86,6 +86,19 @@ class BuildTests(RunFixture, unittest.TestCase):
         self.assertNotIn("tmp/object.o", [row["path"] for row in package["files"]])
         self.assertEqual(self.store.get(self.run_id)["errors"], [])
 
+    def test_a_build_command_reads_the_candidates_configuration(self):
+        # The build folder holds the candidate's configuration.json beside its plugins (a check of the selection, a
+        # build reading an option), and the package carries the same file, bound as no build output.
+        candidate = self.built_candidate()
+        reader = [sys.executable, "-B", "-c", "import json; json.load(open('configuration.json'))['plugins']['use']"]
+        result = build(self.store, self.run_id, candidate, {"build": {**self.recipe()["build"], "command": reader}},
+                       log=lambda m: None)
+        self.assertEqual(result["attempt"]["outcome"], "completed")
+        configuration = read_json(self.directory / "candidates" / candidate / "candidate.json")["configuration"]
+        packaged = self.directory / "candidates" / candidate / "package/configuration.json"
+        self.assertEqual(read_json(packaged), configuration)
+        self.assertNotIn("configuration.json", [d["path"] for d in result["package"]["build"]["dependencies"]])
+
     def test_a_failed_build_is_settled_failed_with_its_log_and_not_packaged(self):
         candidate = self.built_candidate()
         with self.assertRaisesRegex(ValueError, "Build failed: .* exited 3 \\(log candidates/.*build-attempt-0001.log\\)"
@@ -155,11 +168,14 @@ class FromEvalTests(RunFixture, unittest.TestCase):
         budget = {"ppl_ratio_max": 1.4, "kld_mean_max": 0.4, "kld_p99_max": 4.0}
         for requirements in ({"quality_budget": budget, "exactness": "reported", "quality_mode": "preserve"},
                              {"quality_budget": budget, "exactness": "reported"}):
+            # Each in a run of its own: every candidate's first plan starts a run without a candidate on the ladder.
+            self.run_id = self.store.create(self.data)["run"]["run_id"]
+            self.directory = self.store.directory(self.run_id)
             other, _ = self.evaluated(gates(), requirements=requirements)
             with self.assertRaisesRegex(ValueError, "the run's are .*'quality_mode': 'speed'"):
                 from_eval(self.store, self.run_id, other)
         with self.assertRaisesRegex(ValueError, "no retained Eval result for attempt-0009"):
-            from_eval(self.store, self.run_id, candidate, "attempt-0009")
+            from_eval(self.store, self.run_id, other, "attempt-0009")
 
     def test_the_cli_records_from_eval_or_a_record_but_not_neither(self):
         import contextlib
@@ -188,7 +204,11 @@ class ServeCheckTests(run_measure.MeasureFixture, unittest.TestCase):
         smoke = {name: state for name, state in items.items() if name.startswith("smoke_")}
         self.assertTrue(smoke)
         self.assertNotIn("failed", smoke.values(), smoke)
-        self.assertEqual({k: v for k, v in items.items() if k not in smoke},
+        # The package's plugin tests run first, one item per plugin.
+        tested = {name: state for name, state in items.items() if name.startswith("plugin_test_")}
+        self.assertTrue(tested)
+        self.assertEqual(set(tested.values()), {"passed"}, tested)
+        self.assertEqual({k: v for k, v in items.items() if k not in smoke and k not in tested},
                          {"consecutive": "passed", "system_message": "passed", "streaming": "passed",
                           "stop_string": "passed", "cancel": "passed", "stop_engine": "passed"})
         self.assertEqual(check["evidence"][1]["path"], f"candidates/{candidate}/logs/serve-attempt-0001.log")

@@ -1,7 +1,7 @@
-"""The grouped experts in plain torch: what the experts plugin runs where the registry kernel is not there (no published
-build for the machine, a CPU device). It computes what the kernel's tensor arithmetic computes, the same operands and
-factors, with torch's batched matrix products in place of the kernel's tensor-core tiles, so its sums differ from the
-kernel's in their last bits but never in meaning:
+"""The grouped experts in plain torch: what the experts plugin runs where crit's kernel grouped-experts is not there
+(it does not build on the machine, a CPU device). It computes what the kernel's tensor arithmetic computes, the same
+operands and factors, with torch's batched matrix products in place of the kernel's tensor-core tiles, so its sums
+differ from the kernel's in their last bits but never in meaning:
 
 - each route's expert bundle is gathered from the store by its slot and decoded exactly (bundles.operands): the
   weights' codes times their block scales as BF16 operands, the per-row factors (1 / global scale, channel scale, 1 /
@@ -90,11 +90,15 @@ def quantize(v, g):
     return (signed * decoded[..., None]).reshape(v.shape)
 
 
-def _products(weights, vectors):
+def _products(weights, vectors, split=False):
     """weights [C][rows][cols] times vectors [C][cols] -> [C][rows] FP32, both exact in BF16: BF16 operands with FP32
     sums on CUDA; FP64 sums rounded to FP32 on the CPU or where torch has no BF16 product with FP32 sums. Explicit per
-    call: no global precision flag (TF32, reduced-precision CPU matmuls) changes them."""
+    call: no global precision flag (TF32, reduced-precision CPU matmuls) changes them. split: the weights are exact in
+    two BF16 parts (int4_zp), hi = bf16(w) and lo = w - hi, each multiplied, the two sums added."""
     import torch
+    if split and weights.is_cuda:
+        hi = weights.to(torch.bfloat16)
+        return _products(hi.float(), vectors) + _products(weights - hi.float(), vectors)
     if weights.is_cuda:
         a, b = weights.to(torch.bfloat16), vectors.to(torch.bfloat16)[:, :, None]
         try:
@@ -121,9 +125,9 @@ def _block_products(values, blocks, vectors):
     return total
 
 
-def _matrix(operand, vectors):
+def _matrix(operand, vectors, split=False):
     values, factor, blocks = operand
-    out = _products(values, vectors) if blocks is None else _block_products(values, blocks, vectors)
+    out = _products(values, vectors, split) if blocks is None else _block_products(values, blocks, vectors)
     return out if factor is None else out * factor
 
 
@@ -150,6 +154,7 @@ def route_outputs(x, ids, store, slots, found, a4, y):
         token = torch.cat([token, torch.zeros(padded - n, dtype=token.dtype, device=device)])
     xb = x.to(torch.bfloat16).float()
     inter = found["inter"]
+    split = str(found["format"]).startswith("int4_zp")
     for c0 in range(0, n, C):
         b = store.index_select(0, slot[c0:c0 + C])
         (gu, gu_f, gu_b), (dn, dn_f, dn_b) = bundles.operands(b, found)
@@ -158,10 +163,10 @@ def route_outputs(x, ids, store, slots, found, a4, y):
             scales = bundles.inputs(b, found)
             xin = quantize(xin, scales[:, 0])
             gu_f, dn_f = gu_f * scales[:, 2:3], dn_f * scales[:, 3:4]
-        both = _matrix((gu, gu_f, gu_b), xin)
+        both = _matrix((gu, gu_f, gu_b), xin, split)
         h = swiglu(both[:, :inter], both[:, inter:])
         h = quantize(h, scales[:, 1]) if a4 else h.to(torch.bfloat16).float()
-        out = _matrix((dn, dn_f, dn_b), h)
+        out = _matrix((dn, dn_f, dn_b), h, split)
         count = min(C, n - c0)
         keep = valid[c0:c0 + count, None]
         y[c0:c0 + count] = torch.where(keep, out[:count], y[c0:c0 + count])

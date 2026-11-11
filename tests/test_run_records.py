@@ -36,21 +36,17 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         self.resolve()
         with self.assertRaises(FileExistsError):
             self.resolve()
-        handoff = (self.directory / "agent_request.md").read_text()
-        self.assertIn("candidate --source", handoff)
-        for resource in ("core/README.md", "inference/README.md", "kernels/README.md", "crit-eval's docs/README.md"):
-            self.assertIn(resource, handoff)
-        self.assertIn("Core's eval-v1 adapter over the package", handoff)
-        self.assertIn("Eval result JSON is separate evidence", handoff)
-        self.assertIn("every candidate is a plugin package", handoff)
-        self.assertIn("there is no adapter or launch entry to write", handoff)
-        self.assertIn("Measure every candidate with crit run ... eval", handoff)
+        handoff = (self.directory / "agent_request.md").read_text(encoding="utf-8")
+        # The brief holds the run's facts and points to AGENTS.md and crit run ... next for the rest.
+        for line in ("Follow AGENTS.md", f"--id {self.run_id} next\n", "Repository: ", "Run folder: ",
+                     "The user's terms", "crit serve --workspace"):
+            self.assertIn(line, handoff)
+        self.assertLess(len(handoff.split()), 600)
         self.assertNotIn("create_engine(context)", handoff)
         self.assertNotIn("--crit-chat-request", handoff)
-        self.assertIn("summary.md", handoff)
         self.assertIn(f'crit serve --workspace "{self.store.root}" --run {self.run_id} --candidate CANDIDATE_ID --project "{self.store.project}"', handoff)
         segment_handoff = self.directory / "segments/segment-0001/agent_request.md"
-        self.assertEqual(segment_handoff.read_text(), handoff)
+        self.assertEqual(segment_handoff.read_text(encoding="utf-8"), handoff)
 
     def test_run_root_rejects_eval_sources_before_creating_directories(self):
         project = self.root / "project"
@@ -126,6 +122,7 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         folder = self.directory / "candidates" / candidate["candidate_id"]
         self.assertTrue((folder / "source/engine.fixture").is_file())
         self.assertTrue((folder / "package/engine.fixture").is_file())
+        self.on_ladder(candidate)
         second = self.candidate(parent_candidate_id=candidate["candidate_id"], configuration={"batch": 2})
         self.assertNotEqual(candidate["candidate_id"], second["candidate_id"])
         self.assertEqual(second["parent_candidate_id"], candidate["candidate_id"])
@@ -467,6 +464,9 @@ class RunRecordTests(RunFixture, unittest.TestCase):
             self.store.stop(self.run_id, "blocked", critique="critique", headroom={"kpis": [decode, decode]})
         with self.assertRaises(ValueError):
             self.store.stop(self.run_id, "blocked", critique="critique", headroom={"kpis": [{**decode, "kpi": "vibes"}]})
+        # Stopping with budgeted candidates left is a stop plan first.
+        self.first_plan(decision="stop", needed={name: {"needed": False, "evidence": "fixture"}
+                                                 for name in ("decode", "prefill")})
         self.store.stop(self.run_id, "blocked", critique="critique", headroom={"kpis": [decode]})
         with self.assertRaises(ValueError):  # the old shape without a start or a cause
             self.store.stop(self.run_id, "blocked", critique="critique", headroom={"kpis": [
@@ -490,18 +490,19 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         self.assertNotIn("hard deadline", prompt)
         headroom = {"kpis": [{"kpi": kpi, "start": 1.0, "reached": 1.0, "limit": 2.0, "built": "fixture", "cause": "fixture"}
                              for kpi in ("decode", "prefill", "ttft")]}
-        first = self.candidate()
-        self.store.seal(self.run_id, first["candidate_id"], "build_failed", {"message": "fixture"})
+        # A draft costs nothing; a candidate on the ladder spends the budget.
+        draft = self.candidate()
+        self.store.seal(self.run_id, draft["candidate_id"], "build_failed", {"message": "fixture"})
+        first = self.on_ladder(self.candidate())
         with self.assertRaisesRegex(ValueError, "Only 1 of 2 budgeted candidates"):
             self.store.stop(self.run_id, "budget_exhausted", critique="critique", headroom=headroom)
-        second = self.candidate()
-        self.store.seal(self.run_id, second["candidate_id"], "build_failed", {"message": "fixture"})
-        with self.assertRaisesRegex(ValueError, "candidate budget \\(2\\) is used"):
-            self.candidate()
+        second = self.on_ladder(self.candidate(parent_candidate_id=first))
+        with self.assertRaisesRegex(ValueError, "candidate budget \\(2 candidates on the candidate ladder\\) is used"):
+            self.candidate(parent_candidate_id=second)
         self.store.stop(self.run_id, "budget_exhausted", critique="critique", headroom=headroom)
         result = self.store.resume(self.run_id, attempt_limit=8, external_cleanup_confirmed=True, candidates=4)
         self.assertEqual(result["segment"]["limits"]["candidate_budget"], 4)
-        self.assertIsNotNone(self.candidate())
+        self.assertIsNotNone(self.candidate(parent_candidate_id=second))
 
     def test_quality_budget_and_exactness_reach_the_agent_request(self):
         # A request that names no quality mode is in speed, with Eval's budget for it, eight times
@@ -509,11 +510,10 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         prompt = (self.directory / "agent_request.md").read_text(encoding="utf-8")
         self.assertIn("PPL ratio ≤ 1.4, mean KLD ≤ 0.4, p99 KLD ≤ 4.0", prompt)
         self.assertIn("exactness reported", prompt)
-        self.assertIn("being close to a limit is no reason to reject it", prompt)
+        self.assertIn("Spend it on speed", prompt)
         self.assertIn("Quality mode speed", prompt)
-        self.assertIn("whatever format that checkpoint is stored in", prompt)
         self.assertIn("--quality-mode speed", prompt)
-        self.assertIn("output differences that part at near-ties pass", prompt)
+        self.assertIn("output forks at near-ties pass", prompt)
         data = self.data | {"quality_budget": {"ppl_ratio_max": 1.0, "kld_mean_max": 0.0}, "exactness": "required"}
         run_id = self.store.create(data)["run"]["run_id"]
         strict = (self.store.directory(run_id) / "agent_request.md").read_text(encoding="utf-8")
@@ -530,12 +530,10 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         self.assertIn("Quality mode preserve (the run's; never change it)", kept)
         self.assertIn("--quality-mode preserve", kept)
         self.assertIn("PPL ratio ≤ 1.05, mean KLD ≤ 0.05, p99 KLD ≤ 0.5", kept)
-        self.assertIn("activation quantization, whatever format the checkpoint declares", kept)
+        self.assertIn("activation quantization, a lower-precision KV cache or head", kept)
         self.assertNotIn("near-ties", kept.split("Quality budget:")[1].split("\n")[0])
 
     def test_resume_amends_quality_terms_for_later_segments(self):
-        prompt = (self.directory / "agent_request.md").read_text(encoding="utf-8")
-        self.assertIn("ambitious one-shot", prompt)
         self.store.stop(self.run_id, "cancelled", critique="critique")
         with self.assertRaisesRegex(ValueError, "approved_by"):
             self.store.resume(self.run_id, external_cleanup_confirmed=True, candidates=2, amend={"exactness": "reported"})
@@ -555,7 +553,7 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         self.store.stop(self.run_id, "cancelled", critique="critique")
         result = self.store.resume(self.run_id, external_cleanup_confirmed=True, candidates=3)
         self.assertEqual(result["segment"]["limits"]["candidate_budget"], 3)
-        with self.assertRaisesRegex(ValueError, "--candidates or --minutes"):
+        with self.assertRaisesRegex(ValueError, "Resume requires --candidates"):
             self.store.resume(self.run_id, external_cleanup_confirmed=True)
 
     def test_later_failed_check_keeps_all_candidate_timings_exploratory(self):
@@ -767,8 +765,8 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         self.store.seal(self.run_id, candidate["candidate_id"], "build_failed", {"message": "fixture failure"})
         originals = {p: p.read_bytes() for p in (self.directory / "run.json", self.directory / "segments/segment-0001.json", self.directory / "candidates/candidate-0001/seal.json")}
         with self.assertRaises(ValueError):
-            self.store.resume(self.run_id, 2)
-        result = self.store.resume(self.run_id, 2, 3, True)
+            self.store.resume(self.run_id, 2, candidates=1)
+        result = self.store.resume(self.run_id, 2, 3, True, candidates=1)
         self.assertEqual(result["segment"]["segment_id"], "segment-0002")
         self.assertEqual(result["state"]["budget"]["attempts"], 1)
         self.assertEqual(result["state"]["budget"]["segment_attempts"], 0)
@@ -839,6 +837,7 @@ class RunRecordTests(RunFixture, unittest.TestCase):
 
     def test_one_invalid_candidate_does_not_hide_valid_run_or_candidates(self):
         first = self.candidate()
+        self.on_ladder(first)
         second = self.candidate(parent_candidate_id=first["candidate_id"])
         (self.directory / "candidates" / first["candidate_id"] / "telemetry.json").write_text("{")
         result = self.store.get(self.run_id)

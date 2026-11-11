@@ -28,6 +28,7 @@ def source_files(name):
     return found
 sys.path.insert(0, str(ROOT / "core" / "python"))
 sys.path.insert(0, str(ROOT / "cli"))
+sys.path.insert(0, str(ROOT / "kernels"))
 
 from crit_plugins import SLOTS, PluginError, Registry  # noqa: E402
 from crit_plugins.slots import CASES, INTERFACES  # noqa: E402
@@ -42,7 +43,7 @@ BASE = ["chain-verifier", "device-placement", "eager-graphs", "expert-tensors", 
 
 
 def kernel_requests(paths):
-    """What Python modules can ask crit_plugins.kernels.registry_kernel for: whether any calls it, and the string
+    """What Python modules can ask crit_plugins.kernels.load_kernel for: whether any calls it, and the string
     constants of the modules' code (not their docstrings or comments), where a kernel's name must be."""
     calls, strings = False, set()
     for path in paths:
@@ -54,7 +55,7 @@ def kernel_requests(paths):
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 f = node.func
-                calls |= (f.id if isinstance(f, ast.Name) else getattr(f, "attr", None)) == "registry_kernel"
+                calls |= (f.id if isinstance(f, ast.Name) else getattr(f, "attr", None)) == "load_kernel"
             elif isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
                 strings.add(node.value)
     return calls, strings
@@ -64,6 +65,9 @@ def tests_of(manifest):
     """A plugin's test code, less the lines that only expect an error message."""
     return "\n".join(line for path in sorted(Path(manifest["tests"]).glob("*.py"))
                      for line in path.read_text(encoding="utf-8").splitlines() if "assertRaisesRegex" not in line)
+
+
+tests_of.__test__ = False   # a helper, not a test (pytest collects module functions named test*)
 
 
 class LibraryTests(unittest.TestCase):
@@ -118,12 +122,12 @@ class LibraryTests(unittest.TestCase):
                     code = Path(source["folder"])
                     self.assertEqual((code.parent.parent, code.name), (INFERENCE, "code"), source["path"])
 
-    def test_every_declared_registry_kernel_is_one_the_plugin_loads_and_none_lives_in_crit(self):
-        """plugin.json "kernels" lists what the plugin's code asks crit_plugins.kernels.registry_kernel for, by name
-        (crit_plugins.kernels refuses an undeclared one at run time), and no kernel-builder project lives in crit. The
-        plugin's modules (its tests aside) must call registry_kernel and hold each declared name as a string of their
-        code, a docstring or a comment naming it not counting; which call takes which name is the plugin's tests' to
-        show (they run on the registry path and on the fallback)."""
+    def test_every_declared_kernel_is_one_the_plugin_loads_and_one_of_crits(self):
+        """plugin.json "kernels" lists what the plugin's code asks crit_plugins.kernels.load_kernel for, by name
+        (crit_plugins.kernels refuses an undeclared one at run time), and each is one of crit's kernels
+        (kernels/techniques/<family>/<id>/kernel.json). The plugin's modules (its tests aside) must call load_kernel and hold each
+        declared name as a string of their code, a docstring or a comment naming it not counting; which call takes which
+        name is the plugin's tests' to show (they run on the kernel's path and on the fallback)."""
         declared = 0
         for manifest in self.registry:
             folders = [Path(manifest["folder"])] + [Path(s["folder"]) for s in manifest["sources"].values()]
@@ -133,22 +137,28 @@ class LibraryTests(unittest.TestCase):
             for kernel in manifest["kernels"]:
                 declared += 1
                 with self.subTest(plugin=manifest["id"], kernel=kernel["name"]):
-                    self.assertTrue(calls, "declares kernels, but the plugin's code never calls registry_kernel")
+                    self.assertTrue(calls, "declares kernels, but the plugin's code never calls load_kernel")
                     self.assertIn(kernel["name"], strings, "declared, but the plugin's code never asks for it")
                     self.assertTrue(kernel["fallback"].strip())
         self.assertGreater(declared, 0)
+        from crit_kernels.build import manifests
+        library = manifests()
+        for manifest in self.registry:
+            for kernel in manifest["kernels"]:
+                with self.subTest(plugin=manifest["id"], kernel=kernel["name"]):
+                    self.assertIn(kernel["name"], library, "a declared kernel is one of crit's (kernels/techniques/<family>/<id>)")
         self.assertEqual([p.relative_to(ROOT).as_posix() for p in source_files("build.toml")],
-                         [], "kernel-builder projects live in crit-kernels")
+                         [], "crit's kernels are described by kernel.json, not kernel-builder projects")
 
     def test_a_kernel_name_in_a_docstring_or_comment_is_not_a_request(self):
         with tempfile.TemporaryDirectory() as directory:
             module = Path(directory) / "code.py"
-            module.write_text('"""Uses "crit-labs/a" (docs)."""\nfrom crit_plugins.kernels import registry_kernel\n'
-                              '# crit-labs/b\nNAME = "crit-labs/c"\n\n\ndef f():\n    """crit-labs/d"""\n'
-                              '    return registry_kernel(NAME, folder=None)\n', encoding="utf-8", newline="\n")
-            self.assertEqual(kernel_requests([module]), (True, {"crit-labs/c"}))
-            module.write_text('NAME = "crit-labs/c"\n', encoding="utf-8", newline="\n")
-            self.assertEqual(kernel_requests([module]), (False, {"crit-labs/c"}))
+            module.write_text('"""Uses "a" (docs)."""\nfrom crit_plugins.kernels import load_kernel\n'
+                              '# b\nNAME = "c"\n\n\ndef f():\n    """d"""\n'
+                              '    return load_kernel(NAME, folder=None)\n', encoding="utf-8", newline="\n")
+            self.assertEqual(kernel_requests([module]), (True, {"c"}))
+            module.write_text('NAME = "c"\n', encoding="utf-8", newline="\n")
+            self.assertEqual(kernel_requests([module]), (False, {"c"}))
 
     def test_every_slot_with_cases_has_one_base_plugin_and_it_has_no_entry(self):
         base = [m for m in self.registry if Path(m["folder"]).parent == INFERENCE / "base"]
@@ -287,7 +297,9 @@ class AddTests(unittest.TestCase):
             with self.subTest(capability=capability):
                 self.assertIn("stored:nvfp4", text.splitlines()[0])
                 self.assertIn("not projections-dense: conflicts with stored:nvfp4", text)
-                self.assertEqual("projections (required): quantized-projections" in text, fits, text)
+                fitting = next(line for line in text.splitlines() if line.startswith("projections (required)"))
+                fitted = [plugin.strip() for plugin in fitting.split(":", 1)[1].split(",")]
+                self.assertEqual("quantized-projections" in fitted, fits, text)
                 self.assertEqual("not quantized-projections: needs cuda:fp4" in text, not fits, text)
                 # No library plugin implements llama yet: the model plugin is the one to write.
                 self.assertIn("nothing fits model", text)

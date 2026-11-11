@@ -5,11 +5,13 @@ the command's own parser. Each call runs the command as a job: the call returns 
 within wait_seconds, else the job, which crit_job_wait, crit_job_output and crit_job_stop follow. crit's guides
 (AGENTS.md and the docs it links) are resources."""
 import argparse
+import ipaddress
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -17,6 +19,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from crit import __version__
@@ -30,9 +33,9 @@ from .tools import FAMILIES, defaults_for, tools
 # Newest first; a client asking for another version gets the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 # The guides an agent reads before driving a run, as crit://PATH resources.
-GUIDES = ("AGENTS.md", "docs/BUILDING_ENGINES.md", "docs/RUN_RECORDS.md", "docs/SERVING.md",
-          "docs/CONTRIBUTION_CRITERIA.md", "cli/README.md", "inference/README.md", "kernels/README.md",
-          "models/README.md", "mcp/README.md")
+GUIDES = ("AGENTS.md", "docs/BUILDING_ENGINES.md", "docs/RUN_RECORDS.md", "docs/PLUGINS.md", "docs/SERVING.md",
+          "docs/CONTRIBUTION_CRITERIA.md", "docs/CONTRIBUTING.md", "cli/README.md", "inference/README.md",
+          "kernels/README.md", "models/README.md", "smoke/README.md", "mcp/README.md")
 # Characters of a command's output and errors a result carries; the rest stays in the job's logs.
 OUTPUT_CHARACTERS = 60000
 ERROR_CHARACTERS = 8000
@@ -80,6 +83,7 @@ class Server:
         self.settings = {"project": self.project, "root": Path(root).resolve() if root else None}
         self.cwd = Path(cwd or os.getcwd()).resolve()
         folder = Path(jobs) if jobs else Path(tempfile.mkdtemp(prefix="crit-mcp-"))
+        self.temporary = None if jobs else folder   # removed when the server closes
         # A --project names itself to every job, so a crit eval job reads its settings.toml as crit run's do.
         self.jobs = Jobs(folder, {PROJECT_VARIABLE: str(self.project)} if project else None)
         self.scratch = folder / "records"
@@ -205,7 +209,7 @@ class Server:
         stream = arguments.get("stream", "errors")
         if stream not in {"output", "errors"}:
             raise ValueError("stream is output or errors")
-        offset, limit = arguments.get("offset", 0), arguments.get("limit", OUTPUT_CHARACTERS)
+        offset, limit = arguments.get("offset", 0), min(arguments.get("limit") or OUTPUT_CHARACTERS, OUTPUT_CHARACTERS)
         if offset is None or offset < 0:
             offset = max(0, job.size(stream) - limit)  # the end of the log
         text, after = job.read(stream, offset, limit)
@@ -222,8 +226,18 @@ class Server:
 
     def serve_status(self, arguments, meta, request_id):
         url = arguments.get("url", "http://127.0.0.1:8000").rstrip("/")
-        headers = {"Authorization": "Bearer " + arguments["api_key"]} if arguments.get("api_key") else {}
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme not in {"http", "https"} or not parts.hostname:
+            raise ValueError("url is a crit serve's http:// or https:// address, such as http://127.0.0.1:8000")
         result = {"url": url}
+        headers = {}
+        if arguments.get("api_key"):
+            if not local_host(parts.hostname):
+                # A key goes only to this machine or its private network, never to a name a prompt could point
+                # anywhere.
+                raise ValueError(f"api_key is sent only to a server on this machine or a private network address, "
+                                 f"not to {parts.hostname}")
+            headers = {"Authorization": "Bearer " + arguments["api_key"]}
         for name, path in (("health", "/health"), ("models", "/v1/models")):
             request = urllib.request.Request(url + path, headers=headers)
             try:
@@ -237,6 +251,20 @@ class Server:
 
     def close(self):
         self.jobs.close(grace=5)
+        if self.temporary is not None:
+            shutil.rmtree(self.temporary, ignore_errors=True)
+
+
+def local_host(host):
+    """Whether HOST is this machine (loopback, localhost) or an address of a private network (a WSL host, a LAN)."""
+    host = host.strip("[]").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_private or address.is_link_local
 
 
 def reply(value, error=False):
@@ -255,11 +283,14 @@ EXTRA_TOOLS = [
      "reads the end", "inputSchema": {"type": "object", "properties": {
          "job": JOB, "stream": {"type": "string", "enum": ["errors", "output"], "default": "errors"},
          "offset": {"type": "integer", "default": 0}, "limit": {"type": "integer", "minimum": 1,
+                                                               "maximum": OUTPUT_CHARACTERS,
                                                                "default": OUTPUT_CHARACTERS}},
          "required": ["job"], "additionalProperties": False}},
     {"name": "crit_job_stop", "title": "Stop a job", "description":
      "Interrupt a running job as Ctrl+C would (crit releases its leases and settles what it can), ending its "
-     "process tree after grace_seconds; an Eval stopped so goes on with crit_run_eval resume",
+     "process tree after grace_seconds; an Eval stopped so goes on with crit_run_eval resume. On Windows, which has "
+     "no Ctrl+C for a tree without a console, the tree is ended at once: a run's lease it held is then proved "
+     "abandoned with crit_run_recover",
      "inputSchema": {"type": "object", "properties": {"job": JOB, "grace_seconds": {
          "type": "number", "minimum": 0, "default": 30}}, "required": ["job"], "additionalProperties": False}},
     {"name": "crit_jobs", "title": "List jobs", "description": "This server's jobs: state, exit code, logs",
@@ -268,7 +299,8 @@ EXTRA_TOOLS = [
      "A running crit serve's /health (loaded engine, readiness, capacity) and /v1/models",
      "inputSchema": {"type": "object", "properties": {
          "url": {"type": "string", "default": "http://127.0.0.1:8000", "description": "The server, without /v1"},
-         "api_key": {"type": "string", "description": "One of the server's --api-key values, if it has any"}},
+         "api_key": {"type": "string", "description": "One of the server's --api-key values, if it has any; sent "
+                     "only to this machine or a private network address"}},
          "additionalProperties": False}},
 ]
 

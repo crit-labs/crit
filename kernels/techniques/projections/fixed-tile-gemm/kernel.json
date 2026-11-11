@@ -1,0 +1,528 @@
+{
+  "schema": "crit-kernel-v1",
+  "id": "fixed-tile-gemm",
+  "family": "projections",
+  "title": "A row-invariant prompt GEMM in Triton: 16-bit x [M][K] times dense [N][K] on tensor cores in fixed tiles with one K loop, whatever M is",
+  "package": "fixed_tile_gemm",
+  "language": "triton",
+  "capabilities": [
+    "8.0",
+    "8.6",
+    "8.9",
+    "9.0",
+    "10.0",
+    "10.3",
+    "11.0",
+    "12.0",
+    "12.1"
+  ],
+  "operations": [
+    "nvfp4-projection",
+    "mxfp8-projection"
+  ],
+  "structures": {
+    "mm": {
+      "what": "a BLOCK_M x BLOCK_N tile a program (grouped by GROUP_M 8), FP32 accumulation of tl.dot over one K loop of BLOCK_K steps, no split of K; MM_SMALL's 64 x 64 tile where the knobs' tile would not fill the device twice over (SMALL); at 1 to 32 rows untuned a 16 x 64 tile (4 warps, 6 stages, no switch): the same K loop, so the same bits",
+      "call": "mm",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        16,
+        32,
+        64,
+        128,
+        512,
+        2048,
+        8192
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "BLOCK_M": {
+          "values": [
+            16,
+            32,
+            64,
+            128,
+            256
+          ],
+          "default": 128,
+          "what": "output rows (tokens) a program computes"
+        },
+        "BLOCK_N": {
+          "values": [
+            32,
+            64,
+            128,
+            256
+          ],
+          "default": 128,
+          "what": "output columns a program computes"
+        },
+        "BLOCK_K": {
+          "values": [
+            32,
+            64,
+            128
+          ],
+          "default": 64,
+          "order": true,
+          "what": "the K loop's step (each output's sum runs over K in these steps)"
+        },
+        "WARPS": {
+          "values": [
+            2,
+            4,
+            8
+          ],
+          "default": 8,
+          "what": "num_warps of the knobs' tile"
+        },
+        "STAGES": {
+          "values": [
+            2,
+            3,
+            4,
+            5,
+            6
+          ],
+          "default": 3,
+          "what": "num_stages: K steps of loads in flight"
+        },
+        "SMALL": {
+          "values": [
+            1,
+            0
+          ],
+          "default": 1,
+          "what": "take MM_SMALL's 64 x 64 tile (4 warps, 4 stages, the knobs' BLOCK_K) where the knobs' tile would not fill the device twice over"
+        }
+      },
+      "yardstick": {
+        "library": "cuBLAS (torch.matmul) on the same BF16 operands, its heuristic's kernel at each row count"
+      },
+      "bench": "bench.py:Mm",
+      "default_rows": [
+        {
+          "rows": [
+            1,
+            32
+          ],
+          "knobs": {
+            "BLOCK_M": 16,
+            "BLOCK_N": 64,
+            "WARPS": 4,
+            "STAGES": 6,
+            "SMALL": 0
+          }
+        }
+      ]
+    },
+    "mm-split": {
+      "what": "mm with K split over SPLIT programs a tile (each K range in BLOCK_K steps), the FP32 partials added in split order by a second pass and rounded once: more programs for narrow matrices at a few rows; NOT row invariant (the split, and so a row's sums, may follow the row count); deterministic",
+      "call": "mm_split",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        16,
+        32,
+        64,
+        128,
+        512,
+        2048,
+        8192
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "row_invariant": false,
+      "knobs": {
+        "BLOCK_M": {
+          "values": [
+            16,
+            32,
+            64,
+            128,
+            256
+          ],
+          "default": 128,
+          "what": "output rows (tokens) a program computes"
+        },
+        "BLOCK_N": {
+          "values": [
+            32,
+            64,
+            128,
+            256
+          ],
+          "default": 128,
+          "what": "output columns a program computes"
+        },
+        "BLOCK_K": {
+          "values": [
+            32,
+            64,
+            128
+          ],
+          "default": 64,
+          "what": "the K loop's step"
+        },
+        "WARPS": {
+          "values": [
+            2,
+            4,
+            8
+          ],
+          "default": 8,
+          "what": "num_warps"
+        },
+        "STAGES": {
+          "values": [
+            2,
+            3,
+            4,
+            5,
+            6
+          ],
+          "default": 3,
+          "what": "num_stages: K steps of loads in flight"
+        },
+        "SPLIT": {
+          "values": [
+            0,
+            1,
+            2,
+            3,
+            4
+          ],
+          "default": 0,
+          "what": "programs K is split over (0: as many, up to 4 and at least 1,024 values of K each, as bring the tiles to the device's multiprocessors)"
+        }
+      },
+      "default_rows": [
+        {
+          "rows": [
+            1,
+            32
+          ],
+          "knobs": {
+            "BLOCK_M": 16,
+            "BLOCK_N": 64,
+            "WARPS": 4,
+            "STAGES": 6
+          }
+        },
+        {
+          "rows": [
+            33,
+            96
+          ],
+          "knobs": {
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "WARPS": 4,
+            "STAGES": 4
+          }
+        }
+      ],
+      "yardstick": {
+        "library": "cuBLAS (torch.matmul) on the same BF16 operands, its heuristic's kernel (split-K included) at each row count"
+      },
+      "bench": "bench.py:MmSplit"
+    },
+    "cuda-mm": {
+      "what": "the CUDA GEMM (cuda_gemm.cu, kernel.json \"cuda\"): a CTA TM rows x TN columns, a STAGES-deep cp.async ring of swizzled BK-byte tiles (kernel core tile.cuh), m16n8k16 BF16 / FP16 MMAs from ldmatrix fragments read a k-step ahead, persistent CTAs in a grouped order, the FP32 sums rounded once in the epilogue (gemm_epilogue.cuh); every output summed over K in k16 steps in increasing order into one accumulator whatever the knobs and the row count: row invariant, one configuration a shape for every row count",
+      "call": "mm_cuda",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        16,
+        32,
+        64,
+        128,
+        512,
+        2048,
+        8192
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "TM": {
+          "values": [
+            16,
+            32,
+            64,
+            128,
+            256
+          ],
+          "default": 128,
+          "what": "output rows (tokens) a CTA computes"
+        },
+        "TN": {
+          "values": [
+            64,
+            128,
+            256
+          ],
+          "default": 128,
+          "what": "output columns (weight rows) a CTA computes"
+        },
+        "WM": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 2,
+          "what": "warps along the rows (a warp TM / WM rows)"
+        },
+        "WN": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 4,
+          "what": "warps along the columns (a warp TN / WN columns)"
+        },
+        "BK": {
+          "values": [
+            64,
+            128
+          ],
+          "default": 128,
+          "what": "bytes of every row a stage (32 or 64 values of K)"
+        },
+        "STAGES": {
+          "values": [
+            2,
+            3,
+            4
+          ],
+          "default": 3,
+          "what": "stages of the cp.async ring (STAGES - 1 in flight)"
+        },
+        "GROUP": {
+          "values": [
+            8
+          ],
+          "default": 8,
+          "what": "column tiles a group of the CTA order (the CTAs that run together share their weight rows)"
+        },
+        "EPI": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 1,
+          "what": "epilogue: 0 stores from registers while the CTA's next tile loads, 1 staged through shared memory as whole rows"
+        }
+      },
+      "default_rows": [
+        {
+          "rows": [
+            1,
+            32
+          ],
+          "knobs": {
+            "TM": 16,
+            "TN": 64,
+            "WM": 1,
+            "WN": 4,
+            "STAGES": 4
+          }
+        },
+        {
+          "rows": [
+            33,
+            256
+          ],
+          "knobs": {
+            "TM": 64,
+            "TN": 128,
+            "WM": 2,
+            "WN": 4,
+            "STAGES": 4
+          }
+        }
+      ],
+      "yardstick": {
+        "library": "cuBLAS (torch.matmul) on the same BF16 operands, its heuristic's kernel at each row count"
+      },
+      "bench": "bench.py:CudaMm"
+    },
+    "cuda-mm-split": {
+      "what": "cuda-mm with K split over SPLIT CTAs a tile (each K range in BK steps), the FP32 partials added in split order by a second pass and rounded once: more CTAs for narrow matrices at a few rows; NOT row invariant (the split may follow the row count); deterministic",
+      "call": "mm_cuda_split",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        16,
+        32,
+        64,
+        128,
+        512,
+        2048,
+        8192
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "row_invariant": false,
+      "knobs": {
+        "TM": {
+          "values": [
+            16,
+            32,
+            64,
+            128,
+            256
+          ],
+          "default": 128,
+          "what": "output rows (tokens) a CTA computes"
+        },
+        "TN": {
+          "values": [
+            64,
+            128,
+            256
+          ],
+          "default": 128,
+          "what": "output columns (weight rows) a CTA computes"
+        },
+        "WM": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 2,
+          "what": "warps along the rows (a warp TM / WM rows)"
+        },
+        "WN": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 4,
+          "what": "warps along the columns (a warp TN / WN columns)"
+        },
+        "BK": {
+          "values": [
+            64,
+            128
+          ],
+          "default": 128,
+          "what": "bytes of every row a stage (32 or 64 values of K)"
+        },
+        "STAGES": {
+          "values": [
+            2,
+            3,
+            4
+          ],
+          "default": 3,
+          "what": "stages of the cp.async ring (STAGES - 1 in flight)"
+        },
+        "GROUP": {
+          "values": [
+            8
+          ],
+          "default": 8,
+          "what": "column tiles a group of the CTA order (the CTAs that run together share their weight rows)"
+        },
+        "EPI": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 1,
+          "what": "epilogue: 0 stores from registers while the CTA's next tile loads, 1 staged through shared memory as whole rows"
+        },
+        "SPLIT": {
+          "values": [
+            0,
+            1,
+            2,
+            3,
+            4
+          ],
+          "default": 0,
+          "what": "CTAs K is split over a tile (0: as many, up to 4 and at least 1,024 values of K each, as bring the tiles to the device's multiprocessors)"
+        }
+      },
+      "default_rows": [
+        {
+          "rows": [
+            1,
+            32
+          ],
+          "knobs": {
+            "TM": 16,
+            "TN": 64,
+            "WM": 1,
+            "WN": 4,
+            "STAGES": 4
+          }
+        },
+        {
+          "rows": [
+            33,
+            96
+          ],
+          "knobs": {
+            "TM": 64,
+            "TN": 128,
+            "WM": 2,
+            "WN": 4,
+            "STAGES": 4
+          }
+        }
+      ],
+      "yardstick": {
+        "library": "cuBLAS (torch.matmul) on the same BF16 operands, its heuristic's kernel (split-K included) at each row count"
+      },
+      "bench": "bench.py:CudaMmSplit"
+    }
+  },
+  "cuda": {
+    "sources": [
+      "torch-ext/fixed_tile_gemm/cuda_gemm.cu"
+    ],
+    "structures": [
+      "cuda-mm",
+      "cuda-mm-split"
+    ],
+    "variant": {
+      "T": [
+        0,
+        1
+      ]
+    },
+    "check": [
+      {
+        "T": 0
+      },
+      {
+        "T": 1
+      }
+    ]
+  }
+}

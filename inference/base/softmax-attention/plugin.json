@@ -2,7 +2,7 @@
   "schema": "crit-plugin-v1",
   "id": "softmax-attention",
   "title": "Exact causal softmax attention over the KV rows (attention-state)",
-  "description": "attention-state's attend for each query over the rows at positions up to its own: the plain attention every attention plugin is compared with. On the device (attention-state's device_attention.py) it reads attention-state's pages in place: 16-bit and FP8 prompt rows through FlashInfer's paged prefill kernels when FlashInfer is installed (the KV split pinned, so a row does not depend on the rows beside it); decode and verify windows of every page type through the registry's paged-kv-attention split-KV reader where it loads, in a step as in a captured round (no host work, its work following each row's length), so a row a step decodes (plain decoding, log-probabilities, replays) has the bits of the same row in a round (option decode flashinfer: a step's window rows through FlashInfer's decode instead), with tree masks and block-sparse lists; fp8:row and INT8 prompt rows through its prompt reader; otherwise each row's queries over its sequence's KV gathered from the pool with torch's scaled dot product attention or a masked softmax, the plain path the others are tested against (option kernels: torch forces it). A captured prompt chunk (prompts:attention) reads the staged prompt table on the device: the registry's prompt reader at a position read on the device, or the split-KV reader or its torch fallback; no FlashInfer plan inside a capture.",
+  "description": "attention-state's attend for each query over the rows at positions up to its own: the plain attention every attention plugin is compared with. On the device (attention-state's device_attention.py) it reads attention-state's pages in place: prompt rows of every page type through crit's paged-kv-attention prompt reader (FlashInfer's paged prefill over 16-bit and FP8 pages only with option flashinfer auto, a yardstick); decode and verify windows of every page type through crit's paged-kv-attention split-KV reader (built for the engine's device, tuned or default knobs) where it loads, in a step as in a captured round (no host work, its work following each row's length), so a row a step decodes (plain decoding, log-probabilities, replays) has the bits of the same row in a round (option decode flashinfer: a step's window rows through FlashInfer's decode instead), with tree masks and block-sparse lists; otherwise each row's queries over its sequence's KV gathered from the pool with torch's scaled dot product attention or a masked softmax, the plain path the others are tested against (option kernels: torch forces it). A captured prompt chunk (prompts:attention) reads the staged prompt table on the device: crit's prompt reader at a position read on the device, or the split-KV reader or its torch fallback; no FlashInfer plan inside a capture.",
   "fills": [
     "attention"
   ],
@@ -31,7 +31,7 @@
         "auto",
         "torch"
       ],
-      "description": "auto: FlashInfer for 16-bit and FP8 pages when it is installed, the registry's paged-kv-attention kernels where they load; torch: every row gathered and multiplied in torch"
+      "description": "auto: crit's paged-kv-attention kernels where they load (every page kind, window and prompt rows; FlashInfer only with option flashinfer auto); torch: every row gathered and multiplied in torch"
     },
     "int8_qk": {
       "type": "bool",
@@ -45,7 +45,7 @@
         "split",
         "flashinfer"
       ],
-      "description": "a step's window rows (decode tokens, verify windows): split: the registry's split-KV reader wherever it loads, the same kernel as captured rounds (a decode row's bits the same in a step and in a round: a plain or log-probability request's tokens equal a drafted round's); flashinfer: FlashInfer's decode and prefill over 16-bit and FP8 pages where it is installed, else the split-KV reader (another reduction than a captured round's, so a row a step decodes may differ from the same row in a round: for engines that decode in steps only)"
+      "description": "a step's window rows (decode tokens, verify windows): split: crit's split-KV reader wherever it loads, the same kernel as captured rounds (a decode row's bits the same in a step and in a round: a plain or log-probability request's tokens equal a drafted round's); flashinfer: FlashInfer's decode and prefill over 16-bit and FP8 pages where it is installed, else the split-KV reader (another reduction than a captured round's, so a row a step decodes may differ from the same row in a round: for engines that decode in steps only)"
     },
     "prompt_reader": {
       "type": "choice",
@@ -54,7 +54,17 @@
         "prefill",
         "decode"
       ],
-      "description": "prefill: prompt rows through a prompt reader (FlashInfer's prefill or the registry's), fastest, another reduction than decode rows' (a scored token may differ from the served one by more than 0.001 nats); decode: prompt rows (a step's and a captured chunk's) in the decode's reduction, the split-KV reader as window rows of up to 64 columns (each program folding its partitions as the merge does) or its torch fallback over the page tables: a scored token equals the same token served, bit for bit, over every page type (window rows through the split-KV reader too, no FlashInfer)"
+      "description": "prefill: prompt rows through a prompt reader (FlashInfer's prefill or crit's), fastest, another reduction than decode rows' (a scored token may differ from the served one by more than 0.001 nats); decode: prompt rows (a step's and a captured chunk's) in the decode's reduction, the split-KV reader as window rows of up to 64 columns (each program folding its partitions as the merge does) or its torch fallback over the page tables: a scored token equals the same token served, bit for bit, over every page type (window rows through the split-KV reader too, no FlashInfer)"
+    },
+    "reader": {
+      "type": "choice",
+      "default": "split",
+      "choices": [
+        "split",
+        "flash",
+        "cuda"
+      ],
+      "description": "which of crit's paged-kv-attention structures read the pages where the kernel loads: split: the split-KV launch (piece i of a row's positions to KV partition i mod P, partials merged in partition order) for window rows and crit's prompt reader for prompt chunks; flash: the flash structures (flash-window, flash-fused: a row's positions in contiguous splits of one chunk per pool, its columns times a KV head's query heads packed into tensor-core tiles, the splits merged in split order; a column's bits the same alone, in any window, in a step and in a captured round, another reduction than split's) and the flash prompt chunk (flash-prefill: a prompt token's bits follow its chunk's length); partitions and piece do not apply, block lists stay on the split launch; cuda: the same launches through the CUDA flash tile (cuda-window, cuda-fused, cuda-prefill: queries in shared memory, 16 rows a warp, each warp's online softmax in registers, one chunk and block per pool; a column's bits the same alone, in any window, in a step and in a round, another reduction than split's and flash's; its prompt chunk follows the chunk's length), compiled with nvcc for the GPU on first use"
     },
     "partitions": {
       "type": "int",
@@ -79,12 +89,12 @@
     },
     "flashinfer": {
       "type": "choice",
-      "default": "auto",
+      "default": "off",
       "choices": [
         "auto",
         "off"
       ],
-      "description": "auto: FlashInfer's paged kernels where it is installed, for pools of 16-bit and FP8 pages, its workspaces allocated when the plugin is made; off: none (a model whose KV pages FlashInfer cannot read, fp8:row or INT8, allocates nothing for it)"
+      "description": "off (the default): no library kernel, crit's kernels read every row; auto: FlashInfer's paged prefill for eager prompt rows of 16-bit and FP8 pages where it is installed (and with decode flashinfer a step's window rows), a yardstick to compare crit's kernels with, its workspaces allocated when the plugin is made"
     },
     "flashinfer_mib": {
       "type": "int",
@@ -96,9 +106,7 @@
   },
   "kernels": [
     {
-      "name": "crit-labs/paged-kv-attention",
-      "version": 1,
-      "revision": null,
+      "name": "paged-kv-attention",
       "fallback": "window rows (decode, verify, trees, block lists, rounds) in a masked FP32 softmax over the pool's page tables in torch; prompt rows over fp8:row and INT8 pages gathered and multiplied by torch's SDPA"
     }
   ],

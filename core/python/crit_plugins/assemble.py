@@ -400,8 +400,8 @@ class Assembly:
                 for key, value in dict(report() or {}).items():
                     found.setdefault(key, value)
         found["plugins"] = dict(self.use)
-        # The registry kernels this engine's plugins asked for, and where each came from (crit_plugins.kernels).
-        kernels = {repo: record for repo, record in loaded().items() if set(record.get("plugins") or ()) & set(self.order)}
+        # crit's kernels this engine's plugins asked for, and how each was built (crit_plugins.kernels).
+        kernels = {name: record for name, record in loaded().items() if set(record.get("plugins") or ()) & set(self.order)}
         if kernels:
             found["kernels"] = kernels
         return found

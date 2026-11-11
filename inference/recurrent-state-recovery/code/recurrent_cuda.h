@@ -2,7 +2,7 @@
 // The device commit of an accepted speculative prefix of a gated-delta layer: selecting the state after the accepted
 // columns from per-column checkpoints, and recording the accepted count for a deferred commit, both from a count in
 // device memory (a round's control[n_emitted]), so a captured round commits without a host read. Mechanism, not
-// arithmetic: the scans that write the checkpoints or the deferred stash come from a kernel provider (crit-labs'
+// arithmetic: the scans that write the checkpoints or the deferred stash come from a kernel provider (crit's kernel
 // recurrent-scans).
 #include <cstddef>
 #include <cstdint>

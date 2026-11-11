@@ -3,7 +3,7 @@
   "category": "execution",
   "summary": "The elementwise work around a transformer's matmuls (RMSNorm with a residual, head norms, rotary positions, gated norms, activation products, L2 norms, residual-stream mixes), one kernel launch per call, each row's bits independent of its batch",
   "implementation_status": "reference",
-  "implementation_scope": "The norms slot's host form, an FP64 reference over rows of numbers (rows.py: RMSNorm with an offset weight, a weight per group and a residual, the gated RMSNorm, rotary positions in half or interleaved pairs with partial rotation from inverse frequencies or a cos|sin table, SiLU / GELU / sigmoid products, L2 norms, sums over residual streams and a row added into every stream: stream_sum_rows, stream_add_rows); the device form in plain torch ops (torch_norms.py: FP32 inside, one rounding to a chosen dtype, every reduction through torch's one-row-at-a-time fused rms_norm, capture-safe), which is the base plugin torch-norms and this plugin's fallback; the checks any norms device form passes (conformance.py). The plugin's device form takes FlashInfer (a provider) for the calls whose function it computes exactly (rms_norm without a residual and rms_norm_heads with a weight and output in the input dtype; silu_mul and gelu_mul of packed BF16 or FP16 halves) and the registry kernel crit-labs/fused-norms (Triton, one launch per call, loaded by name at its pin) for the rest: residual norms (FlashInfer normalizes the unrounded sum), other weight or output dtypes, grouped weights, rotary positions, gated and L2 norms, sigmoid gates, interleaved or two-tensor products, stream mixes; torch where the kernel is not there.",
+  "implementation_scope": "The norms slot's host form, an FP64 reference over rows of numbers (rows.py: RMSNorm with an offset weight, a weight per group and a residual, the gated RMSNorm, rotary positions in half or interleaved pairs with partial rotation from inverse frequencies or a cos|sin table, SiLU / GELU / sigmoid products, L2 norms, sums over residual streams and a row added into every stream: stream_sum_rows, stream_add_rows); the device form in plain torch ops (torch_norms.py: FP32 inside, one rounding to a chosen dtype, every reduction through torch's one-row-at-a-time fused rms_norm, capture-safe), which is the base plugin torch-norms and this plugin's fallback; the checks any norms device form passes (conformance.py). The plugin's device form is crit's kernel fused-norms (Triton, one launch per call, built for the engine's device with the engine's tuning or its default knobs) for every call; torch where the kernel cannot be built. No library kernel serves a call (FlashInfer is the kernel's yardstick only).",
   "agent_guidance": {
     "use_when": "A model plugin's layers normalize, rotate, gate or multiply activations around their matmuls: decode rounds launch one kernel per operation instead of a chain of small torch kernels, and prompt passes read each activation once",
     "avoid_when": "The arithmetic is fused into a matmul's epilogue or prologue already (a GEMV writing the residual add and the gated product), or a layer needs a normalization this slot does not name (LayerNorm with a bias, group norms)",
@@ -43,7 +43,7 @@
     },
     {
       "path": "inference/fused-norms/code/torch_norms.py",
-      "purpose": "The device form in plain torch ops: torch-norms, and fused-norms' fallback without its registry kernel"
+      "purpose": "The device form in plain torch ops: torch-norms, and fused-norms' fallback where its kernel cannot be built"
     },
     {
       "path": "inference/fused-norms/code/conformance.py",
@@ -51,7 +51,7 @@
     }
   ],
   "requires": {
-    "hardware": "Python 3.11+ for the host form; torch on CUDA or the CPU for the torch device form; a CUDA GPU with Triton for the registry kernel",
+    "hardware": "Python 3.11+ for the host form; torch on CUDA or the CPU for the torch device form; a CUDA GPU with Triton for crit's kernel fused-norms",
     "model": "RMSNorm-family normalization (with or without a zero-centred weight), rotary positions, SiLU / GELU / sigmoid gating",
     "workload": "Decode rows, verify windows and prompt chunks of any count"
   },
@@ -65,8 +65,7 @@
   "dependencies": [
     "Python standard library",
     "torch for the device form",
-    "the kernels package and the registry kernel crit-labs/fused-norms for one launch per call",
-    "FlashInfer, optional, for the calls it computes exactly"
+    "Triton and crit's kernel fused-norms (kernels/techniques/norms/fused-norms, built for the engine's device) for one launch per call"
   ],
   "symbols": [
     "rms_norm_rows",
@@ -101,7 +100,7 @@
   ],
   "validation": {
     "host": "Worked values of every host operation (unit root mean square, offset weights, residual sums, rotation of pairs in both styles, products, L2 norms) and crit's norms cases",
-    "native": "No native code in crit: the registry kernel crit-labs/fused-norms (Triton) is tested in its kernel-builder project against a float64 reference; this plugin's device tests run the conformance checks on CUDA through the registry kernel (LOCAL_KERNELS) and through the torch fallback, and torch-norms' on CUDA and the CPU",
-    "performance": "Kernel launches, host time and GPU time per call against the torch chains at three models' shapes, by the kernel project's benchmarks/shapes.py: README.md, Measured"
+    "native": "crit's kernel fused-norms (Triton, kernels/techniques/norms/fused-norms) is tested in its tests/ against a float64 reference, at its default knobs and at others; this plugin's device tests run the conformance checks on CUDA through the kernel (built here with the default knobs, or the tuning CRIT_KERNEL_TUNING names) and through the torch fallback, and torch-norms' on CUDA and the CPU",
+    "performance": "Kernel launches, host time and GPU time per call against the torch chains at three models' shapes, by the kernel's benchmarks/shapes.py: README.md, Measured"
   }
 }

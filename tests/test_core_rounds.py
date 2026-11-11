@@ -635,7 +635,7 @@ class RoundsTests(unittest.TestCase):
         # its emitted tokens, and a truncation keeps a prefix of them.
         class PathVerifier:
             def accept_device(self, view):
-                rows, width = view.rows, view.width
+                rows = view.rows
                 view.n_emitted[:] = 2
                 view.n_matched[:] = 1
                 view.emitted.fill_(-1)

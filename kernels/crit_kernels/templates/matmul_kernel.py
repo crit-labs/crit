@@ -1,11 +1,13 @@
 """{name}: y[columns, N] = x[columns, K] @ w[N, K]^T in {format} ({op}), on the workbench (see harness.py).
 
-candidate() builds src/, a kernel-builder project (kernel-builder's template, or the project --from copied: crit-kernels'
-workbench-starter is a correct, slow starting point), with torch's extension builder and calls its op run_{format}:
+candidate() builds src/, a torch extension project (kernel-builder's template, or the project --from copied: crit's
+kernels/starters/workbench-starter is a correct, slow starting point), with torch's extension builder and calls its op
+run_{format}:
 register that op in src/torch-ext/torch_binding.cpp (bf16: run_bf16(Tensor x, Tensor w) -> Tensor; fp8:
 run_fp8(Tensor x, Tensor x_scale, Tensor w, Tensor w_scale) -> Tensor; nvfp4: run_nvfp4(Tensor x, Tensor w, Tensor
 w_scale, Tensor w_global) -> Tensor, FP32 out). Keep inputs() and reference() as the contract, and keep yardstick() on
-the best existing provider for the same arithmetic. The same project builds for the Hub with kernel-builder.
+the best existing provider for the same arithmetic. A kernel that proves out belongs in crit's kernel templates,
+with its speed constants as knobs (kernels/TEMPLATES.md).
 """
 from pathlib import Path
 
@@ -27,6 +29,7 @@ def ext():
         sources = sorted(str(p) for p in src.rglob("*") if p.suffix in (".cu", ".cpp")
                          and not skip & set(p.relative_to(src).parts))
         includes = sorted({str(src), str(src / "torch-ext")} | {str(Path(p).parent) for p in sources})
+        includes.append(r"{core_include}")   # crit's kernel core: #include "crit_kcore/<area>.cuh"
         (HERE / "build").mkdir(exist_ok=True)
         load(name="{module}", sources=sources, extra_include_paths=includes, build_directory=str(HERE / "build"),
              extra_cflags=["-DCUDA_KERNEL"], extra_cuda_cflags=["-O3", "-DCUDA_KERNEL"], verbose=False)

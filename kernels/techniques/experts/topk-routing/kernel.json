@@ -1,0 +1,75 @@
+{
+  "schema": "crit-kernel-v1",
+  "id": "topk-routing",
+  "family": "experts",
+  "title": "Top-k expert routing of router logits in one kernel, a warp per token row: softmax or sigmoid scores, correction bias, renormalization, NaN-safe ties to the lower id",
+  "package": "topk_routing",
+  "language": "cuda",
+  "operations": [],
+  "sources": [
+    "topk_routing_cuda/binding.cu",
+    "topk_routing_cuda/topk_routing.cu",
+    "torch-ext/torch_binding.cpp"
+  ],
+  "capabilities": [
+    "8.0",
+    "8.6",
+    "8.9",
+    "9.0",
+    "10.0",
+    "10.3",
+    "11.0",
+    "12.0",
+    "12.1"
+  ],
+  "libraries": [],
+  "structures": {
+    "warp-rows": {
+      "what": "a warp per token row: each lane holds experts lane, lane + 32, ...; scores, the selection by repeated warp argmax and the weights in registers",
+      "call": "route",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        1,
+        8,
+        64,
+        512,
+        4096
+      ],
+      "key": [
+        "experts",
+        "top"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "WARPS": {
+          "values": [
+            1,
+            2,
+            4,
+            8,
+            16
+          ],
+          "default": 4,
+          "what": "warps a block, one token row each at a time"
+        },
+        "ROWS": {
+          "values": [
+            1,
+            2,
+            4,
+            8
+          ],
+          "default": 1,
+          "what": "token rows a warp takes, one after another"
+        }
+      },
+      "yardstick": {
+        "library": "torch ops (softmax or sigmoid, bias, gather, renormalization) around the faster row top-k: torch.topk below 1,024 rows, FlashInfer's flashinfer.top_k (sorted) from 1,024; no library fuses the rule without group limits"
+      },
+      "bench": "bench.py:WarpRows"
+    }
+  }
+}

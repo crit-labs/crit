@@ -4,11 +4,11 @@ Llama-layout model plugin (support/device_plugins/llama-model) and two test stan
 round forms (round-sampler over token-sampling, greedy only, and chain-drafter, drafting from the model's stub draft
 head), which token-sampling and greedy-head-drafter also provide; the KV pool's and attention's round forms are the
 library's own (attention-state, softmax-attention). With the model's
-`rounds`, its greedy requests decode through crit_plugins.rounds.Rounds, captured per row count and launched by Core
-natively: plain rounds (no drafts) and drafting
-rounds decode token for token what the same plugins decode through step(), batched rows what each decodes alone, each
-result counts its rounds and accepted drafts, a selection whose attention has no round form decodes through step()
-instead, and loading leaves the package's bytes as they were. Needs CUDA, transformers, safetensors and Core's
+`rounds`, its greedy requests decode through crit_plugins.rounds.Rounds, captured per row count (in both of the
+driver's forms) and launched by Core natively: plain rounds (no drafts) and drafting rounds decode token for token what
+the same plugins decode through step(), batched rows what each decodes alone, a request asking for log-probabilities
+gets in rounds what step() scores, each result counts its rounds and accepted drafts, a selection whose attention has
+no round form decodes through step() instead, and loading leaves the package's bytes as they were. Needs CUDA, transformers, safetensors and Core's
 crit_core_steps (CRIT_CORE_STEP_LIBRARY)."""
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -38,7 +38,7 @@ LIBRARY = ["attention-state", "softmax-attention", "projections-dense", "token-s
            "fused-norms"]
 STAND_INS = ["llama-model", "round-sampler", "chain-drafter"]
 # A decode row through step() reads the KV as a round's column does (softmax-attention's split-KV reader, or its
-# torch fallback without the registry kernel), so rounds decode token for token what step() decodes.
+# torch fallback without crit's kernel), so rounds decode token for token what step() decodes.
 ATTENTION = {"softmax-attention": {"decode": "split"}}
 GREEDY = {"temperature": 0.0}
 
@@ -127,7 +127,7 @@ class DeviceRoundTests(unittest.TestCase):
         from crit_plugins.testing import compiles
         rounds = self.drafting.model.rounds
         before = {name: tensor.clone() for name, tensor in rounds._state().items()}
-        self.assertEqual(rounds.warm("greedy", widths=[1, 2]), 2 * rounds.rows)
+        self.assertEqual(rounds.warm("greedy", widths=[1, 2]), 2 * rounds.rows * len(rounds.forms))
         for name, tensor in rounds._state().items():
             self.assertTrue(torch.equal(tensor, before[name]), name)
         with compiles() as found:
@@ -144,7 +144,8 @@ class DeviceRoundTests(unittest.TestCase):
             rounds = engine.model.rounds
             self.assertEqual(rounds.problems, [])
             self.assertIsNotNone(rounds.native)
-            self.assertEqual(sorted(rounds.graphs), [(rows, width, "greedy", False) for rows in range(1, 5)])
+            self.assertEqual(sorted(rounds.graphs), [(rows, width, "greedy", form) for rows in range(1, 5)
+                                                     for form in (False, True)])
         self.assertTrue(self.drafting.info()["speculative"])
         self.assertIsNone(self.steps.model.rounds)
 
@@ -196,14 +197,33 @@ class DeviceRoundTests(unittest.TestCase):
             self.assertEqual(tokens, expected)
             self.assertEqual(result["finish"], "stop")
 
+    def test_log_probability_requests_decode_in_rounds_scoring_what_step_scores(self):
+        # Each round with such a row runs the driver's log-probability form: every emitted token's log-probability and
+        # the alternatives asked for, as step() scores them, the drafting engine's rounds drafting as before.
+        (prompt,) = self.prompts(1, 10)
+        def scored(engine):
+            rows = []
+            tokens, result = engine.generate(prompt, 12, stop_tokens=[], sampling=GREEDY, logprobs=2,
+                                             on_tokens=lambda found, values: rows.extend(values))
+            return tokens, rows, result
+        tokens, reference, _ = scored(self.steps)
+        self.assertEqual(len(reference), 12)
+        for engine in (self.plain, self.drafting):
+            before = engine.model.rounds.telemetry()["rounds"]["by_form"]["logprobs"]
+            found, rows, result = scored(engine)
+            self.assertEqual(found, tokens)
+            self.assertEqual([[t for t, _ in top] for _, top in rows], [[t for t, _ in top] for _, top in reference])
+            for (value, top), (expected, expected_top) in zip(rows, reference):
+                self.assertAlmostEqual(value, expected, delta=1e-3)
+                for (_, a), (_, b) in zip(top, expected_top):
+                    self.assertAlmostEqual(a, b, delta=1e-3)
+            self.assertGreater(engine.model.rounds.telemetry()["rounds"]["by_form"]["logprobs"], before)
+        self.assertLess(result["rounds"], len(tokens) - 1)   # the drafting engine's rounds kept drafts
+
     def test_requests_rounds_cannot_take_decode_through_step(self):
-        # Log-probabilities, a replay or plain decoding on request: the same plugins, one token a step.
+        # A replay or plain decoding on request: the same plugins, one token a step.
         (prompt,) = self.prompts(1, 10)
         reference, _ = self.steps.generate(prompt, 12, stop_tokens=[], sampling=GREEDY)
-        rows = []
-        tokens, _ = self.drafting.generate(prompt, 12, stop_tokens=[], sampling=GREEDY, logprobs=2,
-                                           on_tokens=lambda found, values: rows.extend(values))
-        self.assertEqual((tokens, len(rows)), (reference, 12))
         tokens, _ = self.drafting.generate(prompt, 12, stop_tokens=[], sampling=GREEDY, plain=True)
         self.assertEqual(tokens, reference)
         tokens, _ = self.drafting.generate(prompt, 12, stop_tokens=[], sampling=GREEDY, replay=reference)

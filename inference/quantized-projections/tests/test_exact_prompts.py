@@ -1,4 +1,4 @@
-"""quantized-projections with prompt_gemm tile: every format's prompt rows through crit-labs/mma-rows' prompt tile with
+"""quantized-projections with prompt_gemm tile: every format's prompt rows through mma-rows' prompt tile with
 the decode rows' activations and plan, so a prompt row's output has the bits of the same row decoded alone (a scored
 token's log-probability is the served one's: preserve mode's exact honesty), in any chunk, into every output type, at
 real widths; the facts say prompt_exact; a selection that cannot keep it says so or is refused."""
@@ -31,7 +31,7 @@ class ExactPromptTests(PluginTestCase):
         self.nvfp4 = importlib.import_module(module.device_matrices.__package__ + ".device_nvfp4")
         mma = self.nvfp4.mma("cuda")
         if mma is None or getattr(mma, "mm_prompt", None) is None:
-            self.skipTest("the prompt tile comes with crit-labs/mma-rows' prompt tile, not here")
+            self.skipTest("the prompt tile comes with mma-rows' prompt tile, not here")
         self.g = torch.Generator().manual_seed(23)
 
     def stored(self, format, n, k):
@@ -86,7 +86,7 @@ class ExactPromptTests(PluginTestCase):
     def test_without_the_prompt_tile_the_facts_say_prompt_rows_are_not_exact(self):
         torch = self.torch
 
-        class Without:   # the registry module of an earlier build: the decode tile, no prompt tile
+        class Without:   # the module of an earlier mma-rows: the decode tile, no prompt tile
             def __init__(self, module):
                 self.module = module
 

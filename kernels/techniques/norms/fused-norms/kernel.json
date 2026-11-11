@@ -1,0 +1,126 @@
+{
+  "schema": "crit-kernel-v1",
+  "id": "fused-norms",
+  "family": "norms",
+  "title": "RMSNorm with a residual, head norms with rotary positions, gated norms, activation products and residual-stream mixes, one Triton launch a call",
+  "package": "fused_norms",
+  "language": "triton",
+  "operations": [
+    "rms-norm",
+    "rotary-positions",
+    "gated-products",
+    "stream-mixes",
+    "softplus-decay"
+  ],
+  "structures": {
+    "rows": {
+      "what": "one-pass row norms (rms_norm with or without a residual, rms_norm_heads, gated_rms_norm, l2_norm, stream_add_norm): a program holds HB rows of BD = the width rounded up to a power of two values, FP32 sums of squares in the order that layout gives them",
+      "call": "rms_norm",
+      "rows": [1, 1048576],
+      "tune_rows": [1, 8, 64, 512, 4096],
+      "key": ["D"],
+      "row_invariant": true,
+      "knobs": {
+        "ELEMENTS": {"values": [1024, 2048, 4096, 8192, 16384], "default": 4096, "order": true,
+                     "what": "values a program holds: HB = max(1, ELEMENTS / BD) rows a program"},
+        "SPAN": {"values": [128, 256, 512, 1024, 2048], "default": 512, "order": true,
+                 "what": "values a warp covers: num_warps = BD * HB / SPAN, 1 to 16"}
+      },
+      "yardstick": {"library": "FlashInfer gemma_fused_add_rmsnorm (with a residual, in place, on a BF16 copy of the FP32 residual: it keeps the residual in the rows' dtype) or gemma_rmsnorm (without), the weight in BF16"},
+      "bench": "bench.py:Rows"
+    },
+    "rope": {
+      "what": "rotary positions on heads, alone or after their norm (rope, rms_norm_rope) and the query/key pair in one launch (rope_pair, rms_norm_rope_pair): a program holds up to HB heads of one token, BD values each",
+      "call": "rms_norm_rope_pair",
+      "rows": [1, 1048576],
+      "tune_rows": [1, 8, 64, 512, 4096],
+      "key": ["D"],
+      "row_invariant": true,
+      "knobs": {
+        "ELEMENTS": {"values": [1024, 2048, 4096, 8192, 16384], "default": 4096, "order": true,
+                     "what": "values a program holds: HB = max(1, ELEMENTS / BD) heads a program, at most the heads rounded up to a power of two"},
+        "SPAN": {"values": [128, 256, 512, 1024, 2048], "default": 512, "order": true,
+                 "what": "values a warp covers: num_warps = BD * HB / SPAN, 1 to 16"}
+      },
+      "yardstick": {"library": "FlashInfer gemma_rmsnorm of the queries and of the keys, then apply_rope_pos_ids_inplace (three launches: no FlashInfer call fuses head norms with 1-D rotary positions); apply_rope_pos_ids alone without the norms"},
+      "bench": "bench.py:Rope"
+    },
+    "long-rows": {
+      "what": "norms of rows wider than 16,384 values: one row a program, held in registers and read once (CHUNK 0 up to 32,768 values, or a CHUNK at least the row's block), else in two passes of CHUNK values (the sums of squares, then the normalized row)",
+      "call": "rms_norm",
+      "rows": [1, 1048576],
+      "tune_rows": [1, 8, 64, 512],
+      "key": ["D"],
+      "row_invariant": true,
+      "knobs": {
+        "CHUNK": {"values": [0, 1024, 2048, 4096, 8192, 32768], "default": 0, "order": true,
+                  "what": "values a pass step reads; the sums of squares accumulate CHUNK lanes (0: the row's block, its width rounded up to a power of two, in one pass up to 32,768 values, else 4,096 in two passes; a CHUNK at least the row's block: one pass)"},
+        "WARPS": {"values": [0, 4, 8, 16, 32], "default": 0, "order": true, "what": "warps a program (0: 16 in one pass, 8 in two)"},
+        "PDL": {"values": [0, 1, 2, 3], "default": 3, "what": "one-pass rows: programmatic dependent launch on sm_90 and newer (0: none; 1, 2, 3: wait for the kernel before, then let the next start after this program's loads, its stores, or its exit): speed only"}
+      },
+      "yardstick": {"library": "FlashInfer gemma_rmsnorm (gemma_fused_add_rmsnorm with a residual, on a BF16 copy of it), the weight in BF16"},
+      "bench": "bench.py:LongRows"
+    },
+    "act-mul": {
+      "what": "activation products (silu_mul, gelu_mul, sigmoid_mul): BLOCK values of one row a program, elementwise",
+      "call": "silu_mul",
+      "rows": [1, 1048576],
+      "tune_rows": [1, 8, 64, 512, 4096],
+      "key": ["N"],
+      "row_invariant": true,
+      "knobs": {
+        "BLOCK": {"values": [256, 512, 1024, 2048, 4096], "default": 1024, "what": "values a program"},
+        "WARPS": {"values": [1, 2, 4, 8, 16], "default": 4, "what": "warps a program"},
+        "PDL": {"values": [0, 1, 2, 3], "default": 0, "what": "programmatic dependent launch on sm_90 and newer (0: none; 1, 2, 3: wait for the kernel before, then let the next start after this program's loads, its stores, or its exit): speed only"}
+      },
+      "default_rows": [{"rows": [1, 8], "knobs": {"BLOCK": 512, "PDL": 1}},
+                       {"rows": [9, 32], "knobs": {"PDL": 1}},
+                       {"rows": [33, 96], "knobs": {"PDL": 3}},
+                       {"rows": [97, 1048576], "knobs": {"BLOCK": 2048, "WARPS": 8, "PDL": 2}}],
+      "yardstick": {"library": "FlashInfer silu_and_mul (its programmatic dependent launch on, as it runs by default)"},
+      "bench": "bench.py:ActMul"
+    },
+    "stream-sum": {
+      "what": "the gated, weighted or plain sum over a token's residual streams in stream order (stream_sum): BLOCK values of one token a program",
+      "call": "stream_sum",
+      "rows": [1, 1048576],
+      "tune_rows": [1, 8, 64, 512, 4096],
+      "key": ["S", "D"],
+      "row_invariant": true,
+      "knobs": {
+        "BLOCK": {"values": [256, 512, 1024, 2048, 4096], "default": 1024, "what": "values a program"},
+        "WARPS": {"values": [1, 2, 4, 8, 16], "default": 4, "what": "warps a program"}
+      },
+      "yardstick": {"library": "torch ops (x * g[..., None]).sum(1) in FP32 and a cast: no library fuses a weighted sum over residual streams"},
+      "bench": "bench.py:StreamSum"
+    },
+    "stream-add": {
+      "what": "one row added into every residual stream with a weight per stream, in place (stream_add): BLOCK values of one token a program",
+      "call": "stream_add",
+      "rows": [1, 1048576],
+      "tune_rows": [1, 8, 64, 512, 4096],
+      "key": ["S", "D"],
+      "row_invariant": true,
+      "knobs": {
+        "BLOCK": {"values": [256, 512, 1024, 2048, 4096], "default": 1024, "what": "values a program"},
+        "WARPS": {"values": [1, 2, 4, 8, 16], "default": 4, "what": "warps a program"}
+      },
+      "yardstick": {"library": "torch ops h.add_(w[..., None] * x[:, None]): no library adds a row into weighted residual streams"},
+      "bench": "bench.py:StreamAdd"
+    },
+    "softplus-decay": {
+      "what": "a gated delta or state-space layer's log-decay -rate * softplus(x + bias) and sigmoid gate (softplus_decay): BLOCK values of one token a program",
+      "call": "softplus_decay",
+      "rows": [1, 1048576],
+      "tune_rows": [1, 8, 64, 512, 4096],
+      "key": ["N"],
+      "row_invariant": true,
+      "knobs": {
+        "BLOCK": {"values": [32, 64, 128, 256, 512, 1024], "default": 1024, "what": "values a program"},
+        "WARPS": {"values": [1, 2, 4, 8], "default": 4, "what": "warps a program"}
+      },
+      "yardstick": {"library": "torch ops -rate * softplus(x + bias) and sigmoid(gate) in FP32: no library computes a gated delta layer's decay and beta on their own"},
+      "bench": "bench.py:SoftplusDecay"
+    }
+  }
+}

@@ -40,6 +40,10 @@ from .options import (EXTRA_SAMPLING, MAX_TOOLS, RequestError, SAMPLING, TEMPLAT
 MAX_BODY = 8 * 1024 * 1024
 BODY_SIZE = "The request body must be between 1 byte and 8 MiB"
 TLS_HANDSHAKE_SECONDS = 10
+# Seconds a connection may sit in a blocking read or write (the request line, headers and body, a reply's bytes) before
+# it is closed, so a client that sends nothing holds no handler thread. A stream's delivery keeps its own deadline.
+IDLE_SECONDS = 120
+LOOPBACK_NAMES = {"localhost", "127.0.0.1", "::1"}
 GET_PATHS = {"", "/health", "/api/version", "/v1/models", "/metrics", "/api/tags", "/api/ps"}
 # Tokenizer and chat template of the engine (chat-tokenize-v1): /tokenize, /detokenize and /apply-template in the
 # shapes other servers answer, and Anthropic's token count.
@@ -524,7 +528,9 @@ class Api:
     def abort(self, body):
         """POST /v1/crit/abort: {"request_id"}, crit's id of a request in flight (its X-Request-Id) or the X-Request-Id
         its client sent, or {"all": true}. Sets each matching request's cancel event, as its client closing the
-        connection does: a queued request leaves the queue, a running one ends its turn. Returns crit's ids found."""
+        connection does: a queued request leaves the queue, a running one ends its turn. Returns crit's ids found. A
+        request already cancelled is not found again, though it stays tracked until its handler has answered: its
+        client may have its 499 before then."""
         if not isinstance(body, dict) or set(body) not in ({"request_id"}, {"all"}):
             raise RequestError('The abort request is {"request_id": ID} or {"all": true}')
         if body.get("all", True) is not True:
@@ -533,7 +539,8 @@ class Api:
         if "request_id" in body and (not isinstance(wanted, str) or not wanted):
             raise RequestError("request_id must be a non-empty string", param="request_id")
         with self.active_lock:
-            found = [ident for ident, (client, _) in self.active.items() if wanted is None or wanted in (ident, client)]
+            found = [ident for ident, (client, cancel) in self.active.items()
+                     if not cancel.is_set() and (wanted is None or wanted in (ident, client))]
             for ident in found:
                 self.active[ident][1].set()
         return {"object": "crit.abort", "found": bool(found), "request_ids": found}
@@ -1052,9 +1059,24 @@ class TextStream(OpenAIStream):
         return self.choice("", ran.finish, None if ran.logprobs is None else completion_logprobs(ran.logprobs))
 
 
+def loads(raw):
+    """A request body's JSON: ValueError for any body that is not JSON, one nested too deeply among them."""
+    try:
+        return json.loads(raw)
+    except RecursionError:
+        raise ValueError("the JSON nests too deeply") from None
+
+
+def loopback(host):
+    """Whether a host name or address is this machine's loopback."""
+    host = host.strip("[]").lower()
+    return host in LOOPBACK_NAMES or host.startswith("127.") or host.endswith(".localhost")
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "crit-serve"
     protocol_version = "HTTP/1.1"
+    timeout = IDLE_SECONDS
     disable_nagle_algorithm = True  # each streamed chunk leaves at once, not after the client's delayed ACK
 
     @property
@@ -1073,7 +1095,29 @@ class Handler(BaseHTTPRequestHandler):
             return False
         supplied = self.headers.get("X-Request-Id", "")
         self.client_request_id = supplied if re.fullmatch(r"[\x21-\x7e]{1,128}", supplied) else None
+        refusal = self.cross_site()
+        if refusal:
+            self.close_connection = True  # its body is never read
+            self.error(403, refusal, code="forbidden")
+            return False
         return True
+
+    def cross_site(self):
+        """Why a request a web page made is refused, or None. A server on loopback answers only a Host naming
+        loopback, so a page whose DNS name is rebound to 127.0.0.1 cannot reach it; a request a browser marks with an
+        Origin is answered only from --cors-origin's origin (any with *). Clients other than browsers send no Origin."""
+        bound = str(self.server.server_address[0])
+        host = self.headers.get("Host")
+        if host and loopback(bound):
+            name = host.rsplit(":", 1)[0] if not host.startswith("[") else host[1:].split("]", 1)[0]
+            if not loopback(name):
+                return f"Host {host} is not this machine; a server on loopback answers requests to loopback only"
+        origin = self.headers.get("Origin")
+        allowed = self.api.cors_origin
+        if origin and allowed != "*" and origin.rstrip("/") != (allowed or "").rstrip("/"):
+            return (f"Requests from the web origin {origin} are refused; start crit serve with --cors-origin "
+                    f"{origin} to allow them")
+        return None
 
     def send_response(self, code, message=None):
         """Every response carries crit's id of its request, which error bodies repeat and a failed request's records
@@ -1189,16 +1233,20 @@ class Handler(BaseHTTPRequestHandler):
             return self.fail(404, message, code="not_supported")
         return self.fail(404, "Unknown endpoint " + path, code="not_found")
 
-    def authorized(self):
-        """With API keys configured, every request carries one as a Bearer token or, as Anthropic clients send it,
-        in x-api-key."""
+    def keyed(self):
+        """Whether the request may use the server: no API keys are configured, or it carries one as a Bearer token or,
+        as Anthropic clients send it, in x-api-key."""
         if not self.api.key_digests:
             return True
         supplied = self.headers.get("Authorization", "")
         if supplied.startswith("Bearer ") and self.api.accepts(supplied[7:]):
             return True
         key = self.headers.get("x-api-key", "")
-        if key and self.api.accepts(key):
+        return bool(key and self.api.accepts(key))
+
+    def authorized(self):
+        """With API keys configured, every request carries one; else 401 is sent."""
+        if self.keyed():
             return True
         self.fail(401, "Missing or invalid API key", "authentication_error", code="invalid_api_key")
         return False
@@ -1296,8 +1344,11 @@ class Handler(BaseHTTPRequestHandler):
             status = self.api.engine.status()
             ok, ready = status.get("state") not in {"blocked", "interrupted"}, self.api.engine.ready(status)
             wanted = parse_qs(self.path.partition("?")[2]).get("ready", [""])[-1] in {"1", "true"}
-            return self.send_json(200 if ok and (ready or not wanted) else 503,
-                                  {"status": "ok" if ok else "unavailable", "ready": ready,
+            code = 200 if ok and (ready or not wanted) else 503
+            if not self.keyed():
+                # With API keys, a caller without one learns only whether the server is up and ready.
+                return self.send_json(code, {"status": "ok" if ok else "unavailable", "ready": ready})
+            return self.send_json(code, {"status": "ok" if ok else "unavailable", "ready": ready,
                                    "loaded": bool(status.get("engine")), "engine": status,
                                    "max_concurrent_requests": self.api.capacity(),
                                    # Asked of the loaded engine now, beside any generation
@@ -1332,19 +1383,23 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0].rstrip("/")
         if path.startswith("/v1/responses/"):
             return self.do_DELETE()  # The SDKs post .../cancel with no body, which read_body would refuse first.
+        if not self.keyed():
+            # Checked before the body is read, so a caller without a key costs no read of up to MAX_BODY bytes.
+            self.close_connection = True  # the unread body must not be parsed as the next request
+            return self.authorized()
         raw = self.read_body(empty=path in {"/v1/crit/load", "/v1/crit/unload"})
-        if raw is None or not self.authorized():
+        if raw is None:
             return
         if path == "/v1/crit/abort":
             try:
-                return self.send_json(200, self.api.abort(json.loads(raw)))
+                return self.send_json(200, self.api.abort(loads(raw)))
             except (ValueError, UnicodeDecodeError) as exc:
                 return self.error(400, "Invalid JSON body: " + str(exc))
             except RequestError as exc:
                 return self.error(exc.status, str(exc), param=exc.param, code=exc.code)
         if path == "/v1/crit/score":
             try:
-                request = self.api.score_request(json.loads(raw))
+                request = self.api.score_request(loads(raw))
             except (ValueError, UnicodeDecodeError) as exc:
                 self.api.metrics.count("crit", "rejected")
                 return self.error(400, "Invalid JSON body: " + str(exc))
@@ -1390,7 +1445,7 @@ class Handler(BaseHTTPRequestHandler):
         thinking) -> request, by default as every chat request is validated), then run it as a reply or a stream. The
         body as sent stays the request's source, which a reply may echo. Returns the request once it ran."""
         try:
-            body = source = json.loads(raw) if parsed is None else parsed
+            body = source = loads(raw) if parsed is None else parsed
             ignored, thinking = [], None
             if translate is not None:
                 body, ignored, thinking = translate(body, self.api.lenient)
@@ -1423,7 +1478,7 @@ class Handler(BaseHTTPRequestHandler):
         POST /v1/crit/unload releases the loaded engine's weights (with "model", only that model's) once its requests
         drain. The body may be empty. Either answers with the engine's status after it."""
         try:
-            body = json.loads(raw) if raw else {}
+            body = loads(raw) if raw else {}
             if not isinstance(body, dict):
                 raise RequestError("The request body must be a JSON object")
             unknown = sorted(set(body) - {"model"})
@@ -1473,7 +1528,7 @@ class Handler(BaseHTTPRequestHandler):
         never queued behind it; one that waits to load the candidate leaves when its client disconnects or POST
         /v1/crit/abort cancels it, and a full queue refuses it as it refuses a reply."""
         try:
-            candidate, operation, fields, ignored = self.api.tokenize_request(json.loads(raw), path)
+            candidate, operation, fields, ignored = self.api.tokenize_request(loads(raw), path)
         except (ValueError, UnicodeDecodeError) as exc:
             return self.fail(400, "Invalid JSON body: " + str(exc))
         except RequestError as exc:
@@ -1692,7 +1747,7 @@ class Handler(BaseHTTPRequestHandler):
         done_reason "load", with keep_alive 0 unloads it and answers "unload"; keep_alive 0 on a reply unloads the model
         once the reply is sent, as keep_alive 0 asks."""
         try:
-            body = json.loads(raw)
+            body = loads(raw)
             action = api_chat.lifecycle(body, generate, self.api.lenient)
             candidate = self.api.candidate(body.get("model")) if action else None
         except (ValueError, UnicodeDecodeError) as exc:
@@ -1722,7 +1777,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def api_chat_show(self, raw):
         try:
-            body = json.loads(raw)
+            body = loads(raw)
             if not isinstance(body, dict):
                 raise RequestError("The request body must be a JSON object")
             name = body.get("model", body.get("name"))
@@ -1755,6 +1810,8 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = sys.platform != "win32"
 
     def __init__(self, address, api, tls=None):
+        if ":" in str(address[0]):
+            self.address_family = socket.AF_INET6  # an IPv6 address such as ::1
         super().__init__(address, Handler)
         self.api = api
         self.tls = tls

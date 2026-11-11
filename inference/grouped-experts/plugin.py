@@ -1,26 +1,28 @@
 """Routed SwiGLU experts over expert bundles in the experts slot. The host form is expert-streamed-prefill's FP64 block
 (as experts-reference's), on the expert_source slot's weights. The device form keeps each expert as one bundle in its
-stored format (code/bundles.py: bf16, fp8:channel, fp8:block, nvfp4, int4, mxfp4) and runs a layer's routes over its
-own loaded bundles (forward) or over a residency cache's slot store and slot table (forward_bundles): through the
-registry kernel crit-labs/grouped-experts (BF16 tensor cores, every format, the routes grouped by expert on the device),
-or, where it is not there, through the same arithmetic in torch (code/fallback.py). Either way a route's bits do not
-depend on the rows beside it, on chunking or on decode against prompt, and a call at a fixed token count captures in a
-CUDA graph (after one eager call at that count); every workspace a capture used is kept for the plugin's life. In a
-captured prompt chunk (prompts:experts) the padding's routes, ids -1 as the model masks them, read no expert and add
-nothing. With activations nvfp4 each NVFP4 layer runs as its stored matrices declare: W4A4 where they carry
-input_scale, W4A16 where they do not (the facts name each layer's)."""
+stored format (code/bundles.py: bf16, fp8:channel, fp8:block, nvfp4, int4, mxfp4, int4_zp:<group> from AWQ and
+GPTQ experts) and runs a layer's routes over its
+own loaded bundles (forward) or over a residency cache's slot store and slot table (forward_bundles): through crit's
+kernel grouped-experts (BF16 tensor cores, every format, the routes grouped by expert on the device; built on this GPU,
+tuned or default knobs), or, where it does not build, through the same arithmetic in torch (code/fallback.py). Either
+way a route's bits do not depend on the rows beside it, on chunking or on decode against prompt, and a call at a fixed
+token count captures in a CUDA graph (after one eager call at that count); every workspace a capture used is kept for
+the plugin's life. In a captured prompt chunk (prompts:experts) the padding's routes, ids -1 as the model masks them,
+read no expert and add nothing. With activations nvfp4 each NVFP4 layer runs as its stored matrices declare: W4A4
+where they carry input_scale, W4A16 where they do not (the facts name each layer's)."""
 from pathlib import Path
 
 from .grouped import bundles, fallback
 from .prefill import reference
 
 HERE = Path(__file__).resolve().parent
-KERNEL = "crit-labs/grouped-experts"
+KERNEL = "grouped-experts"
 ANY_EXPERT = (1 << 30) - 1   # the id bound of a combine without a slot table
 PROMPT_KEEP = 2              # workspaces of prompt-sized calls kept, besides decode shapes and those a capture used
 DECLARED = ("nvfp4", "int4")  # the formats crit's integer block order computes (W4A4, W4A8)
 MAX_ITEMS = 65535            # route items in one kernel call (the kernel's MAX_ITEMS)
 PLAN_BYTES = 40              # a route's plan temporaries above 1,024 routes (sort keys and order, counts)
+KNOWN = tuple(f for f in bundles.FORMATS if f != "int4_zp") + ("int4_zp:<group>",)
 
 
 def check_routes(x, ids, weights):
@@ -52,10 +54,10 @@ class GroupedExperts:
         self.paths = {}          # (layer, store) -> W4A4 or not, read from the store's bundles at its first eager call
         self.kernel = None
         if options["kernel"] and self._cuda():
-            from crit_plugins.kernels import registry_kernel
-            self.kernel = registry_kernel(KERNEL, folder=HERE)
+            from crit_plugins.kernels import load_kernel
+            self.kernel = load_kernel(KERNEL, folder=HERE)
         if self.arithmetic == "declared" and self.kernel is None:
-            raise ValueError(f"grouped-experts: arithmetic declared runs only on the registry kernel {KERNEL}, which is "
+            raise ValueError(f"grouped-experts: arithmetic declared runs only on crit's kernel {KERNEL}, which is "
                              f"not here ({self._no_kernel(options)}); it exists to give the CPU expert tier's bits, which "
                              "the torch arithmetic does not")
 
@@ -101,7 +103,7 @@ class GroupedExperts:
         """One expert's bundle (uint8 [bundle_bytes] on the tensors' device) for a store this plugin will read: refused
         as load() refuses it. With `layer`, the bundle declares that layer's activations as a load does (W4A4 where the
         stored matrices carry input_scale), and a store forward_bundles reads for the layer must match it."""
-        w4a4 = self._refuse(format, gate_up, down)
+        w4a4 = self._refuse(bundles.bundle_format(gate_up, down, format), gate_up, down)
         if layer is not None and w4a4 is not None:
             self._declare(layer, w4a4)
         return bundles.pack(gate_up, down, format)
@@ -109,8 +111,8 @@ class GroupedExperts:
     def _refuse(self, format, gate_up, down):
         """Refuses what this plugin does not compute; for an nvfp4 expert under activations nvfp4, whether it runs W4A4
         (both matrices carry input_scale, as the checkpoint declares them) or W4A16 (neither does), else None."""
-        if format not in bundles.FORMATS:
-            raise ValueError(f"grouped-experts computes {', '.join(bundles.FORMATS)}, not {format!r}")
+        if not bundles.known(format):
+            raise ValueError(f"grouped-experts computes {', '.join(KNOWN)}, not {format!r}")
         if self.arithmetic == "declared" and format not in DECLARED:
             raise ValueError(f"grouped-experts: arithmetic declared computes {' and '.join(DECLARED)} experts, not "
                              f"{format}")
@@ -136,13 +138,18 @@ class GroupedExperts:
 
     def load(self, layer, expert, gate_up, down, format="bf16"):
         """An expert's gate/up and down matrices (bfloat16 tensors, or the stored tensors by role) as one bundle on the
-        engine's device. A load after the layer's first forward writes the bundle into the layer's store in place."""
+        engine's device. A load after the layer's first forward writes the bundle into the layer's store in place.
+        awq and gptq matrices (format awq or gptq, the checkpoint's tensors; gate/up one matrix or a (gate, up) pair)
+        load as int4_zp:<group> bundles, the layer's format from then on."""
+        stored = format
+        format = bundles.bundle_format(gate_up, down, format)
         w4a4 = self._refuse(format, gate_up, down)
         if w4a4 is not None:
             self._declare(layer, w4a4)
-        weight = gate_up["weight"] if isinstance(gate_up, dict) else gate_up
+        first = gate_up[0] if isinstance(gate_up, (tuple, list)) else gate_up
+        weight = first.get("weight", first.get("qweight")) if isinstance(first, dict) else first
         device = self.device if self.device is not None else weight.device
-        bundle = bundles.pack(gate_up, down, format, device)
+        bundle = bundles.pack(gate_up, down, stored, device)
         entry = self.layers.setdefault(layer, {"format": format, "bytes": bundle.numel(), "bundles": {}, "store": None,
                                                "captured": False})
         if entry["format"] != format or entry["bytes"] != bundle.numel():
@@ -189,6 +196,16 @@ class GroupedExperts:
         store, format = self._own(layer, x.device)
         return self.forward_bundles(layer, x, ids, weights, store, None, format)
 
+    def _named_format(self, layer, format):
+        """A store's bundle format: awq and gptq stand for the int4_zp:<group> bundles the layer's loads packed."""
+        if format in bundles.STORED_INT4:
+            entry = self.layers.get(layer)
+            if entry is None or not str(entry["format"]).startswith("int4_zp"):
+                raise ValueError(f"grouped-experts: {format} experts are int4_zp:<group> bundles: name the bundles' "
+                                 "format (bundles.bundle_format), or load the layer's experts first")
+            return entry["format"]
+        return format
+
     def forward_bundles(self, layer, x, ids, weights, store, slots, format):
         """out [tokens][hidden] FP32: the routed SwiGLU block over a store [S][bundle_bytes] of `format` bundles, each
         expert in its slot (slots [experts] int32; None: expert e in slot e); routes to negative slots skipped. A long
@@ -196,6 +213,7 @@ class GroupedExperts:
         goes, so no call holds every route's row at once (a token's sum is over its own routes in route order: the
         same bits whole or in parts)."""
         import torch
+        format = self._named_format(layer, format)
         tokens = ids.shape[0]
         step = self._part_tokens(layer, x, ids, store, slots, format)
         if tokens > step:
@@ -210,8 +228,8 @@ class GroupedExperts:
 
     def _part_tokens(self, layer, x, ids, store, slots, format):
         """Tokens per part of a call of these routes over this store (_step's)."""
-        if format not in bundles.FORMATS:
-            raise ValueError(f"grouped-experts computes {', '.join(bundles.FORMATS)}, not {format!r}")
+        if not bundles.known(format):
+            raise ValueError(f"grouped-experts computes {', '.join(KNOWN)}, not {format!r}")
         hidden = x.shape[1]
         inter = bundles.inter_of(format, hidden, store.shape[1])
         found = bundles.layout(format, hidden, inter)
@@ -223,8 +241,9 @@ class GroupedExperts:
         """Each route's unweighted output row, [tokens * top][hidden] FP32 (a workspace: valid until the next call of
         the shape); routes with id -1 or a negative slot keep the rows they had."""
         import torch
-        if format not in bundles.FORMATS:
-            raise ValueError(f"grouped-experts computes {', '.join(bundles.FORMATS)}, not {format!r}")
+        format = self._named_format(layer, format)
+        if not bundles.known(format):
+            raise ValueError(f"grouped-experts computes {', '.join(KNOWN)}, not {format!r}")
         tokens, top = ids.shape
         hidden = x.shape[1]
         inter = bundles.inter_of(format, hidden, store.shape[1])
@@ -249,7 +268,7 @@ class GroupedExperts:
             return self.kernel.route_outputs(xb, ids.contiguous(), store, slots, bundles.kernel_layout(found), ws, a4,
                                              self.arithmetic)
         if declared:
-            raise ValueError(f"grouped-experts: arithmetic declared runs on the registry kernel {KERNEL}: CUDA "
+            raise ValueError(f"grouped-experts: arithmetic declared runs on crit's kernel {KERNEL}: CUDA "
                              f"activations, not {x.device}")
         return fallback.route_outputs(x, ids, store, slots, found, a4, ws.y)
 
@@ -367,7 +386,7 @@ class GroupedExperts:
 
 
 class _KernelWithin:
-    """The registry kernel's Workspace for `tokens` tokens over the leading rows of a larger one's buffers: the same
+    """The kernel's Workspace for `tokens` tokens over the leading rows of a larger one's buffers: the same
     items (capacity covers fewer routes at the same width), h, y, ones and the W4A4 operands sliced to its routes."""
 
     def __init__(self, parent, tokens):

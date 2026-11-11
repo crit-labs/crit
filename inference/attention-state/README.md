@@ -96,9 +96,8 @@ operation in [attention.h](code/attention.h):
 
 The plan packs a query tile and streams key tiles from pages; queries sharing a KV
 head are rows of one QK GEMM, and online softmax rescales across tiles. There is
-no dense KV or full score matrix. `ScalarAttentionGemm` is the default; Kernels'
-[OpenBLAS adapter](../../kernels/examples/openblas/attention_gemm.h) uses SGEMM,
-qualified by its [retained-provider workflow](../../kernels/examples/openblas/README.md#paged-attention-integration).
+no dense KV or full score matrix. `ScalarAttentionGemm` is the default; an
+engine passes another GEMM (a vendor BLAS's SGEMM) through the same call.
 
 ## What the code supplies
 
@@ -116,7 +115,7 @@ qualified by its [retained-provider workflow](../../kernels/examples/openblas/RE
 from quantized-projections, so add both code folders to the include path and link
 `crit::core`. Inference keeps no page ledger; GPU pages, device attention and
 model projections are engine work. Device attention over paged KV comes from a provider
-([Kernels' sources](../../kernels/SOURCES.md)): FlashInfer's paged and ragged attention
+([Kernels' libraries](../../kernels/README.md#libraries)): FlashInfer's paged and ragged attention
 (BF16 and FP8 KV, prefill, decode and a verify's query block) or FlashAttention's paged KV,
 which read a block table like Core's `StateCache` gives (`view(...)` above). Store device
 pages in a format the provider reads (BF16 or FP8 rows per head); the INT8 G32 rows of
@@ -223,9 +222,10 @@ the layer's key and value scales (`fp8`), FP8 E4M3 with an FP32 scale per
 position and KV head (`fp8:row`: the row's absolute maximum over 448, the
 quotient rounded to the nearest E4M3 value) and INT8 with an FP32 scale per
 position and KV head (`int8`: over 127, rounded to the nearest code, ties to
-even). `fp8_rows` and `int8_rows` are the encoding rules; the registry kernel
-`crit-labs/paged-kv-attention` writes a step's keys and values in one launch
-with the same codes and scales, and torch writes them where it does not load.
+even). `fp8_rows` and `int8_rows` are the encoding rules; crit's kernel
+`paged-kv-attention` (built for the engine's device, with the engine's tuned knobs
+or its defaults) writes a step's keys and values in one launch with the same
+codes and scales, and torch writes them where it does not build.
 
 Captured decode rounds bind a sequence to a round slot (`rounds:kv_cache`):
 `bind(slot, sequence, capacity)` takes its pages up to `capacity` positions
@@ -253,25 +253,48 @@ table in fixed buffers (`prompt_slots`, `prompt_table`), the padding's slots at
 the dump page; `reserve(batch)` inside the graph returns those slots, and
 `commit_prompt(batch)` sets the length after. A chunk of padding alone (a
 capture's warm-up) takes no page. The attention plugins read the prompt table
-on the device: the registry's prompt reader at a position read on the device
+on the device: crit's prompt reader at a position read on the device
 (one graph for every frontier), else the bucket as window rows through the
 split-KV reader or its torch fallback; no FlashInfer plan runs in a capture.
 
 [device_attention.py](code/device_attention.py) is the attention slot's device
 form over this pool, which softmax-attention and partitioned-attention share:
-FlashInfer's paged prefill over 16-bit and FP8 pages first for prompt rows (and
-its decode for a step's window rows with softmax-attention's `decode:
-flashinfer`), then the registry's
-paged-kv-attention kernels (a split-KV reader of decode and verify windows over
-every page type, whose partitions walk each row's own length read on the
+crit's paged-kv-attention kernels, built for the engine's device with tuned or default knobs
+(a split-KV reader of decode and verify windows over every page type, whose partitions walk each row's own length read on the
 device, with tree masks and block-sparse lists, tiles every GPU multiplies
 with mma.sync and one partition count per pool, so a column's bits are the same
-alone, in a window, in a step and in a round; and a prompt reader), then
+alone, in a window, in a step and in a round; and a prompt reader over every
+page type, eager prompt rows one row a launch), then
 torch: rows gathered and multiplied by SDPA, or a masked FP32 softmax over the
 page tables that captures in a CUDA graph (in a capture it reads every position
 the tables hold, so its cost follows the pool's capacity; in an eager step only
 the positions its rows reach). The pool's `window` option (16 tokens) is the one
-knob of what is a window row: a longer row is a prompt row.
+knob of what is a window row: a longer row is a prompt row. No library kernel
+reads the pages by default: the plugins' option `flashinfer` (default `off`)
+set to `auto` puts FlashInfer's paged prefill on eager prompt rows of 16-bit and
+FP8 pages (and with softmax-attention's `decode: flashinfer` its decode on a
+step's window rows), a yardstick to compare crit's kernels with in an engine.
+
+The attention plugins' option `reader` picks which of the kernel's structures read
+the pages: `split` (the default, the split-KV reader above and crit's earlier prompt
+reader) or `flash`, the kernel's flash structures: a row's positions in contiguous
+splits of one chunk per pool (`flash_chunk()`, the engine's tuning or 1,024
+positions), a window's columns times a KV head's query heads packed into
+tensor-core tiles of up to 128 rows, the splits merged (or, for `prompt_reader:
+decode`'s prompt pieces, folded in the program) in split order. A column's bits are
+then the same alone, in a verify window, in a step and in a round (one reduction,
+another than `split`'s), and the facts say so (`reader`). Crit's prompt reader
+becomes the flash prompt chunk, which splits a chunk's positions by its length: a
+prompt token's bits follow the chunk it is read in, so the facts carry
+`prompt_rows: not row-invariant` (as FlashInfer's prefill, within the readers'
+rounding of decode rows); `reader: split` keeps the earlier reader. Block lists stay
+on the split launch, and the options `partitions` and `piece` do not apply.
+`reader: cuda` reads the same launches through the kernel's CUDA flash tile
+(`cuda-window`, `cuda-fused`, `cuda-prefill`: the queries in shared memory, 16 rows
+a warp, each warp's online softmax in registers, one chunk and block per pool from
+`cuda_chunk()`): a column's bits are again the same alone, in a window, in a step and
+in a round (its own reduction), its prompt chunk not row-invariant as the flash
+one's; int8_qk prompt chunks stay on the Triton flash prompt chunk.
 
 The plugin's `facts()` report `kv_bytes_per_token`: the device bytes one token's
 slot takes in every page tensor of the pools the plugin made (keys, values and an

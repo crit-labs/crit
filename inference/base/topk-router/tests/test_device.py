@@ -13,7 +13,8 @@ RULES = [{}, {"scoring": "sigmoid", "score_before_selection": True, "renormalize
 
 class DeviceRouterTests(PluginTestCase):
     def routers(self, rule):
-        """The router with the registry kernel (where it loads) and with torch alone, on a GPU; torch on a CPU."""
+        """The router with crit's kernel topk-routing (where it builds) and with torch alone, on a GPU; torch
+        on a CPU."""
         kernels = (True, False) if self.device() == "cuda" else (False,)
         return [self.assemble(options={**rule, "kernel": k})["router"] for k in kernels]
 

@@ -1,0 +1,672 @@
+{
+  "schema": "crit-kernel-v1",
+  "id": "decode-gemv",
+  "family": "projections",
+  "title": "Weight-only decode GEMVs: NVFP4, FP8, MXFP8, BF16 and INT4 (zero point a group: AWQ, GPTQ) weights times 1 to 16 rows of 16-bit activations",
+  "package": "decode_gemv",
+  "language": "cuda",
+  "operations": [
+    "nvfp4-projection",
+    "fp8-row-projection",
+    "mxfp8-projection",
+    "int4-group-projection"
+  ],
+  "sources": [
+    "decode_gemv_cuda/binding.cu",
+    "decode_gemv_cuda/decode_gemv.cu",
+    "decode_gemv_cuda/declared_rows.cu",
+    "decode_gemv_cuda/declared_binding.cu",
+    "torch-ext/torch_binding.cpp"
+  ],
+  "capabilities": [
+    "8.0",
+    "8.6",
+    "8.9",
+    "9.0",
+    "10.0a",
+    "10.3a",
+    "11.0a",
+    "12.0a",
+    "12.1a"
+  ],
+  "structures": {
+    "gemv-cuda": {
+      "what": "the CUDA-core decode GEMV for every weight format (the key's weights: 0 NVFP4, 1 FP8 row scales, 2 MXFP8, 3 BF16, 4 INT4 with a zero point a group: AWQ, GPTQ), the format a decoder trait over the kernel core's: each lane reads 16 bytes of every row it owns per step, decodes them exactly to FP32, sums in a fixed order; one xor-shuffle tree per warp, the format's row scale after the sum",
+      "call": "gemv_int4",
+      "rows": [
+        1,
+        16
+      ],
+      "tune_rows": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ],
+      "key": [
+        "weights",
+        "N",
+        "K"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "WARPS": {
+          "values": [
+            2,
+            4,
+            8
+          ],
+          "default": 4,
+          "what": "warps a block"
+        },
+        "ROWS": {
+          "values": [
+            0,
+            1,
+            2,
+            4,
+            8
+          ],
+          "default": 0,
+          "what": "output rows a warp owns; 0: the format's rule from before the knobs (NVFP4 and INT4: 2, 4 at 3-4 activation rows, 8 at 5-8, 4 at 9-16; BF16: 2, 4 at 3-8; FP8 and MXFP8: 4 at 1-4, 2 at 5-8, 1 at 9-16, halved where the matrix gives fewer than two blocks a multiprocessor)"
+        },
+        "WPR": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 1,
+          "order": true,
+          "what": "warps sharing a row's K, partial sums added in warp order"
+        },
+        "PREF": {
+          "values": [
+            0,
+            1,
+            2
+          ],
+          "default": 0,
+          "what": "steps of weight loads in flight ahead of the arithmetic"
+        },
+        "STREAM": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 0,
+          "what": "read codes with L1::no_allocate"
+        }
+      },
+      "yardstick": {
+        "library": "by format: NVFP4, flashinfer mm_bf16_fp4 (W4A16, backend cute-dsl-native) on the stored codes, the block scales in its 128 x 4 layout once, the per-row inverse scale left out; FP8 and MXFP8, cuBLAS (torch.matmul) on the values times their scales widened to BF16 once (no library takes FP8 weights against 16-bit activations); BF16, cuBLAS on the same matrix; INT4 with a zero point, torch's W4A16 INT4 group GEMM (torch._weight_int4pack_mm, tinygemm: BF16 scale and offset a group, the same codes repacked once)"
+      },
+      "bench": "bench.py:GemvCuda"
+    },
+    "gemv-nvfp4": {
+      "what": "alias of gemv-cuda for NVFP4 weights with the knobs it had before gemv-cuda (a tuning that names it still applies: its table wins for its format where it names a configuration other than its defaults, or where the tuning tunes it and not gemv-cuda); no bench: sweeps tune gemv-cuda",
+      "call": "gemv",
+      "rows": [
+        1,
+        16
+      ],
+      "tune_rows": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "WARPS": {
+          "values": [
+            2,
+            4,
+            8
+          ],
+          "default": 4,
+          "what": "warps a block"
+        },
+        "ROWS": {
+          "values": [
+            1,
+            2,
+            4,
+            8
+          ],
+          "default": 2,
+          "what": "output rows a warp owns"
+        },
+        "WPR": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 1,
+          "order": true,
+          "what": "warps sharing a row's K, partial sums added in warp order"
+        },
+        "PREF": {
+          "values": [
+            0,
+            1,
+            2
+          ],
+          "default": 0,
+          "what": "steps of weight loads in flight ahead of the arithmetic"
+        },
+        "STREAM": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 0,
+          "what": "read codes with L1::no_allocate"
+        }
+      },
+      "alias": {
+        "of": "gemv-cuda",
+        "weights": [
+          0
+        ]
+      }
+    },
+    "gemv-fp8": {
+      "what": "alias of gemv-cuda for FP8 and MXFP8 weights with the knobs it had before gemv-cuda (a tuning that names it still applies: its table wins for its format where it names a configuration other than its defaults, or where the tuning tunes it and not gemv-cuda); no bench: sweeps tune gemv-cuda",
+      "call": "gemv_fp8",
+      "rows": [
+        1,
+        16
+      ],
+      "tune_rows": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "WARPS": {
+          "values": [
+            2,
+            4,
+            8
+          ],
+          "default": 4,
+          "what": "warps a block"
+        },
+        "ROWS": {
+          "values": [
+            0,
+            1,
+            2,
+            4,
+            8
+          ],
+          "default": 0,
+          "what": "output rows a warp owns; 0: the rule from before the knobs (4 at 1-4 activation rows, 2 at 5-8, 1 at 9-16, halved where the matrix gives fewer than two blocks a multiprocessor)"
+        },
+        "PREF": {
+          "values": [
+            0,
+            1,
+            2
+          ],
+          "default": 0,
+          "what": "steps of code loads in flight ahead of the arithmetic"
+        },
+        "STREAM": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 0,
+          "what": "read codes with L1::no_allocate"
+        }
+      },
+      "alias": {
+        "of": "gemv-cuda",
+        "weights": [
+          1,
+          2
+        ]
+      }
+    },
+    "gemv-bf16": {
+      "what": "alias of gemv-cuda for BF16 weights with the knobs it had before gemv-cuda (a tuning that names it still applies: its table wins for its format where it names a configuration other than its defaults, or where the tuning tunes it and not gemv-cuda); no bench: sweeps tune gemv-cuda",
+      "call": "gemv_bf16",
+      "rows": [
+        1,
+        16
+      ],
+      "tune_rows": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "WARPS": {
+          "values": [
+            2,
+            4,
+            8
+          ],
+          "default": 4,
+          "what": "warps a block"
+        },
+        "ROWS": {
+          "values": [
+            1,
+            2,
+            4,
+            8
+          ],
+          "default": 2,
+          "what": "output rows a warp owns"
+        },
+        "PREF": {
+          "values": [
+            0,
+            1,
+            2
+          ],
+          "default": 0,
+          "what": "steps of weight loads in flight ahead of the arithmetic"
+        },
+        "STREAM": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 0,
+          "what": "read weights with L1::no_allocate"
+        }
+      },
+      "alias": {
+        "of": "gemv-cuda",
+        "weights": [
+          3
+        ]
+      }
+    },
+    "gemv-triton": {
+      "what": "the Triton decode GEMV for every weight format (the key's weights, gemv-cuda's codes: 0 NVFP4, 1 FP8 row scales, 2 MXFP8, 3 BF16, 4 INT4 with a zero point a group), the format a decoder over the kernel core's (crit_kcore.formats), the multiply a path: fma (FP32 sums a 16-value group carried over K, the group's factor after its sum, eight rows a program) or dot (tl.dot on a [16 x BK] activation block and a [BN x BK] weight block decoded exactly to the dot's 16-bit type, FP32 sums, SPLIT parts of K added in part order); the row factor after the sum",
+      "call": "gemv_any",
+      "rows": [
+        1,
+        16
+      ],
+      "tune_rows": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ],
+      "key": [
+        "weights",
+        "N",
+        "K"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "MUL": {
+          "values": [
+            0,
+            1,
+            2
+          ],
+          "default": 0,
+          "order": true,
+          "what": "the multiply path: 1 fma, 2 dot; 0: the rule (dot where K is a multiple of 128 and the format's values are exact in the dot's type: NVFP4, FP8, BF16 and INT4 against BF16 activations, NVFP4 and FP8 against FP16; fma elsewhere, MXFP8 always)"
+        },
+        "BN": {
+          "values": [
+            0,
+            2,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128
+          ],
+          "default": 0,
+          "order": true,
+          "what": "matrix rows a program (fma: 2-32, 0 the autotuner's tile per shape, BK then 512; dot: 16-128, 0 with BK, WARPS or SPLIT 0 the shape rule from the multiprocessor count)"
+        },
+        "BK": {
+          "values": [
+            0,
+            128,
+            256,
+            512,
+            1024
+          ],
+          "default": 0,
+          "order": true,
+          "what": "values a step (fma: the 16-value group sums carried over K, 0: 512; dot: K a tl.dot step)"
+        },
+        "WARPS": {
+          "values": [
+            0,
+            2,
+            4,
+            8
+          ],
+          "default": 0,
+          "what": "num_warps (0: the rule's; fma 4)"
+        },
+        "STAGES": {
+          "values": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "default": 0,
+          "what": "num_stages of the fma path (0: 3)"
+        },
+        "SPLIT": {
+          "values": [
+            0,
+            1,
+            2,
+            4,
+            8
+          ],
+          "default": 0,
+          "order": true,
+          "what": "the dot path's parts of K, partial sums added in part order (a plan whose split * BK does not divide K takes the rule's)"
+        }
+      },
+      "yardstick": {
+        "library": "by format, as gemv-cuda's: NVFP4 flashinfer mm_bf16_fp4; FP8 and MXFP8 cuBLAS (torch.matmul) on the values times their scales widened to BF16 once; BF16 cuBLAS on the same matrix; INT4 with a zero point torch's W4A16 INT4 group GEMM (torch._weight_int4pack_mm)"
+      },
+      "bench": "bench.py:GemvTriton"
+    },
+    "gemv-nvfp4-triton": {
+      "what": "alias of gemv-triton for NVFP4 weights on the fma path (gemv_triton, 1 to 8 rows): a program takes BLOCK_N rows and BLOCK_K values a step, one FP32 sum per row and 16-value block carried over K, the blocks added once at the end (its own order, not the CUDA GEMV's); its tuning still applies to gemv_triton, and to gemv_any on NVFP4 where its table names a configuration other than its defaults or the tuning tunes it and not gemv-triton",
+      "call": "gemv_triton",
+      "rows": [
+        1,
+        8
+      ],
+      "tune_rows": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "BLOCK_N": {
+          "values": [
+            0,
+            2,
+            4,
+            8,
+            16,
+            32
+          ],
+          "default": 0,
+          "what": "matrix rows a program; 0: Triton's autotuner picks the tile per shape from GEMV_TILES, as before the knobs (WARPS and STAGES then unused)"
+        },
+        "WARPS": {
+          "values": [
+            2,
+            4,
+            8
+          ],
+          "default": 4,
+          "what": "num_warps"
+        },
+        "STAGES": {
+          "values": [
+            1,
+            2,
+            3
+          ],
+          "default": 3,
+          "what": "num_stages"
+        },
+        "BLOCK_K": {
+          "values": [
+            256,
+            512,
+            1024
+          ],
+          "default": 512,
+          "order": true,
+          "what": "values a step: the number of 16-value block sums carried over K"
+        }
+      },
+      "yardstick": {
+        "library": "flashinfer mm_bf16_fp4 (W4A16, backend cute-dsl-native) on the stored codes, the block scales in its 128 x 4 layout once; the per-row inverse scale left out (one alpha a matrix)"
+      },
+      "bench": "bench.py:GemvNvfp4Triton",
+      "alias": {
+        "of": "gemv-triton",
+        "weights": [
+          0
+        ]
+      }
+    },
+    "gemv-fp8-dot": {
+      "what": "alias of gemv-triton for FP8 weights on the dot path (gemv_fp8_dot, 1 to 16 rows, BF16 operands): a program multiplies a [16 x BK] block of the activations by a [BN x BK] block of the E4M3 weights (exact in BF16) with tl.dot, FP32 sums over its part of K; with SPLIT parts a second kernel adds them in part order; its tuning still applies to gemv_fp8_dot, and to gemv_any on FP8 where its table names a configuration other than its defaults or the tuning tunes it and not gemv-triton",
+      "call": "gemv_fp8_dot",
+      "rows": [
+        1,
+        16
+      ],
+      "tune_rows": [
+        1,
+        4,
+        8,
+        16
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "BN": {
+          "values": [
+            0,
+            16,
+            32,
+            64,
+            128
+          ],
+          "default": 0,
+          "order": true,
+          "what": "matrix rows a program; 0 (all four knobs 0): fp8_dot_tile's shape rule, as before the knobs. Every knob is per matrix (fp8_dot_tile takes no row count)"
+        },
+        "BK": {
+          "values": [
+            0,
+            128,
+            256,
+            512
+          ],
+          "default": 0,
+          "order": true,
+          "what": "K a tl.dot step"
+        },
+        "WARPS": {
+          "values": [
+            0,
+            2,
+            4,
+            8
+          ],
+          "default": 0,
+          "order": true,
+          "what": "num_warps"
+        },
+        "SPLIT": {
+          "values": [
+            0,
+            1,
+            2,
+            4,
+            8
+          ],
+          "default": 0,
+          "order": true,
+          "what": "parts of K, partial sums added in part order (falls back to the rule where split * BK does not divide K)"
+        }
+      },
+      "yardstick": {
+        "library": "cuBLAS (torch.matmul) on the E4M3 values times their row scales widened to BF16 once: no library takes FP8 weights against 16-bit activations (cuBLASLt's FP8 GEMMs quantize the activations too)"
+      },
+      "bench": "bench.py:GemvFp8Dot",
+      "alias": {
+        "of": "gemv-triton",
+        "weights": [
+          1
+        ]
+      }
+    },
+    "rows-int-block": {
+      "what": "the declared integer decode rows (int-block-experts' rows, which alias it): 4-bit weights (E2M1 x 2 or INT4, an E4M3 scale per 16, a post factor) against int8 activations quantized per 16 or 32, a matrix of a table a job of 1 to 8 tokens; a half-warp an output row, the exact dp4a dot of each 16-block, the declared step on lane b % 16 in block order, the halving tree (the kernel core's declared_rows.cuh on multiply.cuh's DeclaredInt)",
+      "call": "rows_int_block",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "THREADS": {
+          "values": [
+            64,
+            128,
+            256,
+            512
+          ],
+          "default": 256,
+          "what": "threads a block, a half-warp an output row"
+        },
+        "ROWS": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 1,
+          "what": "output rows a half-warp owns, a token's activation block read once for them"
+        },
+        "STREAM": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 0,
+          "what": "read codes with L1::no_allocate"
+        },
+        "UNROLL": {
+          "values": [
+            1,
+            2
+          ],
+          "default": 1,
+          "what": "blocks a lane loads before computing them (loads in flight)"
+        }
+      },
+      "yardstick": {
+        "library": "cuBLAS (torch.matmul) BF16 on the weights widened to BF16 and the INT8 activations dequantized to BF16, both once: no library multiplies E2M1 weights by INT8 activations in blocks of 32"
+      },
+      "bench": "bench.py:RowsIntBlock"
+    },
+    "rows-fp8-block": {
+      "what": "the declared FP8 decode rows (fp8-block-rows' rows, which alias it; sm_89 on): E4M3 weights with a scale grid (MXFP8's E8M0 per 32, 128 x 128 FP32 blocks, a scale a row) against E4M3 activations per group, 16 weight rows a CTA, one e4m3 m16n8k32 MMA a 32-block, the declared step, the halving tree in shared memory (declared_rows.cuh on DeclaredFp8)",
+      "call": "rows_fp8_block",
+      "rows": [
+        1,
+        8
+      ],
+      "tune_rows": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "WARPS": {
+          "values": [
+            4,
+            8,
+            16
+          ],
+          "default": 16,
+          "what": "warps a CTA (16 lanes over them: 4, 2 or 1 lanes a warp)"
+        },
+        "AHEAD": {
+          "values": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "default": 2,
+          "what": "rounds of weight and activation loads in flight ahead of the MMAs"
+        },
+        "STREAM": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 0,
+          "what": "read weight codes with L1::no_allocate"
+        }
+      },
+      "yardstick": {
+        "library": "cuBLASLt's MXFP8 GEMM (torch._scaled_mm, E4M3 with blocked E8M0 scales, FP32 output); the activations' power-of-two group scales converted to E8M0 once outside the timed call, the global 0.5 left out"
+      },
+      "bench": "bench.py:RowsFp8Block"
+    },
+    "decode-nvfp4": {
+      "what": "the decoders (Triton): an NVFP4 matrix's values in BF16/FP16, or as FP8 rows in units of a row scale, one FP32 product rounded once; elementwise, nothing to tune",
+      "call": "decode"
+    }
+  }
+}

@@ -3,13 +3,14 @@ yardstick provider. crit-eval measures it (`crit eval workbench check|bench|prof
 
 `crit kernels new NAME --op OP` scaffolds work/kernels/NAME (kernel.json, kernel.py, crit-eval's harness.py, src/):
 for a matmul (gemv, gemm) in bf16, fp8 or nvfp4 its FP64 reference, a library yardstick and a candidate that calls the
-kernel's op run_<format>; for any other operation the harness with the functions to fill in. src/ is a kernel-builder
-project, and crit holds no kernel source for it: `--from DIR` copies an existing one (a crit-kernels project, a Hub
-kernel's source, a library sample) with its license, else kernel-builder's own template (`kernel-builder init`, on
-PATH or named by CRIT_KERNEL_BUILDER) starts it. `--model DIR` takes the shapes from the checkpoint's matrices in the
-format. `--starter` marks the kernel taken with --from as the starter (crit-kernels' workbench-starter: a simple,
-correct matmul in bf16 and fp8); in a run it is allowed from the run's fourth candidate on (`--run RUN_FOLDER`), so the
-first three candidates find their kernels themselves. Scaffolding imports nothing; it runs only kernel-builder init.
+kernel's op run_<format>; for any other operation the harness with the functions to fill in. src/ is a torch
+extension project (sources plus a torch-ext binding): `--from DIR` copies an existing one (one of crit's kernels in
+kernels/techniques/<family>/<id>, a provider's kernel source, a library sample) with its license, else kernel-builder's template
+(`kernel-builder init`, on PATH or named by CRIT_KERNEL_BUILDER) starts it. `--model DIR` takes the shapes from the
+checkpoint's matrices in the format. `--starter` starts from crit's starter matmul (kernels/starters/workbench-starter:
+simple, correct, bf16 and fp8; or the kernel --from names); in a run it is allowed from the run's fourth candidate on
+(`--run RUN_FOLDER`), so the first three candidates find their kernels themselves. Scaffolding imports nothing; it
+runs only kernel-builder init. A kernel that proves out belongs in crit's kernel templates, with knobs (TEMPLATES.md).
 """
 import hashlib
 import json
@@ -26,7 +27,7 @@ MATMUL_OPS = {"gemv": [1, 2, 4, 8], "gemm": [64, 512, 2048]}
 MATMUL_FORMATS = {"bf16": ("plain", "bf16"), "fp8": ("fp8", "fp8"), "nvfp4": ("nvfp4", "bf16")}
 YARDSTICKS = {"bf16": "lib:cuBLAS (torch.matmul in bf16)", "fp8": "lib:cuBLASLt (torch._scaled_mm, row-wise scales)",
               "nvfp4": "lib:cuBLAS (torch.matmul in bf16 on the weights widened to BF16 once)"}
-STARTERS = ("bf16", "fp8")   # formats crit-kernels' workbench-starter has a starter kernel for
+STARTERS = ("bf16", "fp8")   # formats crit's workbench-starter has a starter kernel for
 NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
 LICENSES = ("LICENSE", "LICENSE.md", "LICENSE.txt", "COPYING", "NOTICE")
 
@@ -68,12 +69,12 @@ def kernel_builder():
 
 
 def init_project(src, name):
-    """src/ as kernel-builder's own template project for kernel crit-labs/NAME (`kernel-builder init`)."""
+    """src/ as kernel-builder's template project for kernel NAME (`kernel-builder init`)."""
     tool = kernel_builder()
     if tool is None:
         raise ValueError("src/ is a kernel-builder project: install kernel-builder (or set CRIT_KERNEL_BUILDER) so "
-                         "`kernel-builder init` starts it, or pass --from DIR with an existing project (crit-kernels "
-                         "holds crit-labs' own)")
+                         "`kernel-builder init` starts it, or pass --from DIR with an existing project (crit's kernels "
+                         "are in kernels/techniques/<family>/<id>)")
     done = subprocess.run([tool, "init", "--name", "crit-labs/" + name.replace("_", "-"), str(src)],
                           capture_output=True, text=True, timeout=120)
     if done.returncode != 0 or not (src / "build.toml").is_file():
@@ -102,8 +103,8 @@ def new(name, op, root, fmt=None, shapes=(), model=None, columns=None, source=No
         raise ValueError("NAME is lower-case letters, digits and _, starting with a letter")
     if starter:
         if source is None:
-            raise ValueError("--starter takes the starter kernel with --from DIR: crit-kernels' workbench-starter "
-                             "project")
+            from .build import find
+            source = find("workbench-starter")[0]   # crit's starter matmul, kernels/starters/workbench-starter
         if run is None:
             raise ValueError("--starter needs --run RUN_FOLDER: a starter kernel is allowed from a run's candidate "
                              f"{STARTER_FROM} on")
@@ -149,7 +150,8 @@ def new(name, op, root, fmt=None, shapes=(), model=None, columns=None, source=No
            for path in (folder / "src").rglob("*.cpp")):
         shutil.copy2(TEMPLATES / "registration.h", folder / "src" / "registration.h")   # a kernel-builder torch-ext
     values = {"name": name, "op": op, "format": fmt or "custom", "module": "crit_wb_" + name,
-              "yardstick": yardstick or YARDSTICKS.get(fmt, "the best existing provider")}
+              "yardstick": yardstick or YARDSTICKS.get(fmt, "the best existing provider"),
+              "core_include": str(Path(__file__).resolve().parent.parent / "core" / "include")}
     if matmul:
         _fill(TEMPLATES / "matmul_kernel.py", folder / "kernel.py", values)
     else:

@@ -102,7 +102,7 @@
     },
     {
       "path": "inference/attention-state/code/device_attention.py",
-      "purpose": "The attention slot's device form over the pool, shared by the library's attention plugins: FlashInfer, then the registry's paged-kv-attention kernels (split-KV decode and verify windows over every page type with tree masks and block lists, fp8:row and INT8 prompt chunks), then torch fallbacks (gathered SDPA, a capture-safe masked softmax over the page tables)"
+      "purpose": "The attention slot's device form over the pool, shared by the library's attention plugins: crit's paged-kv-attention kernels (split-KV decode and verify windows over every page type with tree masks and block lists, prompt rows and chunks over every page type), then torch fallbacks; FlashInfer only with the plugins' option flashinfer auto (a yardstick) (gathered SDPA, a capture-safe masked softmax over the page tables)"
     }
   ],
   "requires": {

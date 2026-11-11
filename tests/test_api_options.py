@@ -1,7 +1,6 @@
 """Serving options travel across the actual resident process boundary and back over HTTP."""
 import json
 import unittest
-from unittest.mock import patch
 
 import test_api
 from crit_api.options import (EXTRA_SAMPLING, SAMPLING, RequestError, sampling_capability, sampling_options,

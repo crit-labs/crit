@@ -3,7 +3,7 @@
   "category": "experts",
   "summary": "Routed SwiGLU experts over expert bundles in a slot store: every format as stored, the routes grouped by expert on the device, one function for decode rows and prompt chunks, capture-safe",
   "implementation_status": "reference",
-  "implementation_scope": "Python: the experts:bundles layout and packer for bf16, fp8 (channel and 128 x 128 block scales), nvfp4, int4 (E4M3 per 16) and mxfp4 bundles; the experts plugin's device form over its own bundles (forward) or a slot store with a slot table (forward_bundles, route_outputs, combine) through the registry kernel crit-labs/grouped-experts, and its tensor arithmetic in torch as the fallback (batched in fixed chunks, row invariant, capture-safe; the declared arithmetic is the kernel's alone). The kernel itself is crit-labs'; the router, the residency cache and the CPU tier are other plugins.",
+  "implementation_scope": "Python: the experts:bundles layout and packer for bf16, fp8 (channel and 128 x 128 block scales), nvfp4, int4 (E4M3 per 16) and mxfp4 bundles; the experts plugin's device form over its own bundles (forward) or a slot store with a slot table (forward_bundles, route_outputs, combine) through crit's kernel grouped-experts (built for the engine's device, tuned or default knobs), and its tensor arithmetic in torch as the fallback (batched in fixed chunks, row invariant, capture-safe; the declared arithmetic is the kernel's alone). The kernel itself is crit-labs'; the router, the residency cache and the CPU tier are other plugins.",
   "agent_guidance": {
     "use_when": "A model with routed SwiGLU experts in any of the formats, decode rows and prompt chunks alike: as the experts slot's plugin at candidate 1, over the experts loaded on the device or over a residency cache's slot store",
     "avoid_when": "Experts that are not SwiGLU over gate/up and down matrices, or shapes that are not multiples of 64; a provider's grouped GEMM that is faster on the target and keeps the same row invariance (measure it against this one first)",
@@ -28,7 +28,7 @@
       "The bundle layout: the store builders, the CPU tier and the kernel read it"
     ],
     "adapt": [
-      "The kernel: the registry kernel, another provider's grouped GEMM measured against it, or the torch fallback",
+      "The kernel: crit's kernel grouped-experts (tuned for the model or on its default knobs), another provider's grouped GEMM measured against it, or the torch fallback",
       "The route item width and the staging chunk (they change speed, never a route's bits)",
       "workspace_mib: how many tokens of a long prompt chunk run at once"
     ]
@@ -46,7 +46,7 @@
     }
   ],
   "requires": {
-    "hardware": "torch on any device for the fallback; the registry kernel on NVIDIA GPUs with BF16 tensor cores (sm_80 and newer)",
+    "hardware": "torch on any device for the fallback; crit's kernel grouped-experts, built for the engine's device, on NVIDIA GPUs with BF16 tensor cores (sm_80 and newer)",
     "model": "Routed experts with SwiGLU between a [2 * inter][hidden] gate/up matrix (gate rows first) and a [hidden][inter] down matrix, hidden and inter multiples of 64, top-k routing",
     "workload": "Decode rows (1 to 8 tokens a row, verify windows) and prompt chunks of any length"
   },
@@ -54,12 +54,12 @@
     "input": "Per call: x [tokens][hidden], ids and weights [tokens][top], optionally a store uint8 [slots][bundle_bytes] and a slot table int32 [experts]; per expert at load, its stored matrices and their format",
     "output": "out [tokens][hidden] FP32, or each route's unweighted rows [tokens * top][hidden] FP32 and their route-order combine",
     "ownership": "The plugin owns its loaded bundles and its per-shape workspaces; a residency cache owns the store and slot table it passes",
-    "failure": "Unknown formats, shapes that are not multiples of 64, casts (a bf16 matrix that is not bfloat16, a byte component in another dtype), nvfp4 without a global scale, an nvfp4 expert with input_scale on one matrix only and a layer mixing experts with and without them are refused at load and pack; a store whose named bundles mix input scales, or lack what their layer declared, at its first eager call over the layer; the declared arithmetic without the registry kernel at creation",
+    "failure": "Unknown formats, shapes that are not multiples of 64, casts (a bf16 matrix that is not bfloat16, a byte component in another dtype), nvfp4 without a global scale, an nvfp4 expert with input_scale on one matrix only and a layer mixing experts with and without them are refused at load and pack; a store whose named bundles mix input scales, or lack what their layer declared, at its first eager call over the layer; the declared arithmetic without crit's kernel grouped-experts at creation",
     "core_boundary": "No Core change; crit_plugins.device names the experts:bundles and experts:routes forms"
   },
   "dependencies": [
     "torch",
-    "crit-labs/grouped-experts from the kernel registry (optional: the torch fallback serves without it)"
+    "crit's kernel grouped-experts, built for the engine's device (optional: the torch fallback serves without it)"
   ],
   "symbols": [
     "layout",
@@ -84,7 +84,7 @@
   ],
   "validation": {
     "host": "The host form equals experts-reference on crit's experts cases; the device form against an FP64 block of the same decoded weights in every format, both through the kernel and the fallback; bitwise batched against alone, in prompt-sized calls, over a permuted slot store, with another tier's rows joined, and replayed from a CUDA graph (tests/test_device.py)",
-    "native": "None in crit: the kernel crit-labs/grouped-experts carries its own tests against an FP64 reference",
-    "performance": "Measured on an RTX 5090 with the local build of the kernel (README, Costs and validation)"
+    "native": "None in crit: the kernel grouped-experts (kernels/techniques/experts/grouped-experts) carries its own tests against an FP64 reference",
+    "performance": "Measured on an RTX 5090 with the kernel on its default knobs (README, Costs and validation)"
   }
 }

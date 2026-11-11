@@ -237,11 +237,11 @@ def engine_facts(engine):
                                                for k, v in value.items()):
                 out[key] = dict(value)
         elif key == "kernels":
-            # The registry kernels the plugins run (crit_plugins.kernels): per repository its source (local, hub or
-            # fallback), version, revision and, for a fallback, why.
+            # crit's kernels the plugins run (crit_plugins.kernels): per kernel its source (tuned: built with the
+            # engine's tuning; built: with its default knobs; fallback), the tuning file and, for a fallback, why.
             if isinstance(value, dict) and all(isinstance(k, str) and isinstance(v, dict) and
-                                               v.get("source") in ("local", "hub", "fallback") for k, v in value.items()):
-                out[key] = {k: {f: v[f] for f in ("source", "version", "revision", "reason", "plugins") if f in v}
+                                               v.get("source") in ("tuned", "built", "fallback") for k, v in value.items()):
+                out[key] = {k: {f: v[f] for f in ("source", "tuning", "reason", "plugins") if f in v}
                             for k, v in value.items()}
         elif key == "host_bytes_per_pass":
             # The part of bytes_per_pass read from host memory: {"link": copied over the host link, "cpu": computed

@@ -1,6 +1,6 @@
-"""grouped-experts' device form against an FP64 reference of the same decoded weights in every format, through the
-registry kernel where it loads (LOCAL_KERNELS) and through the torch fallback (option kernel false): a route's bits the
-same alone and batched, in decode rows and prompt-sized calls, on a repeat, over a slot store with a slot table, and in
+"""grouped-experts' device form against an FP64 reference of the same decoded weights in every format, through crit's
+kernel grouped-experts where it builds and through the torch fallback (option kernel false): a route's bits the same
+alone and batched, in decode rows and prompt-sized calls, on a repeat, over a slot store with a slot table, and in
 a captured CUDA graph whose workspace outlives later prompt shapes; a load after a forward; E8M0 bytes 0 and 255
 decoded alike on both paths; a model whose layers declare W4A4 and W4A16 run each as declared; what it cannot compute
 refused (formats, casts, bundles and stores that do not carry what their layer declares, the declared arithmetic
@@ -13,7 +13,7 @@ import sys
 
 from crit_plugins.testing import PluginTestCase
 
-KERNEL = "crit-labs/grouped-experts"
+KERNEL = "grouped-experts"
 
 USE = {"expert_source": "expert-tensors"}
 CASES = [("bf16", "bf16"), ("fp8:channel", "bf16"), ("fp8:block", "bf16"), ("nvfp4", "bf16"), ("nvfp4", "nvfp4"),
@@ -103,19 +103,20 @@ class DeviceExpertsTests(PluginTestCase):
         gate_up, down = bundles.matrices(store, found)
         gate_up, down = gate_up.double().cpu(), down.double().cpu()
         xs, out = x.double().cpu(), torch.zeros(x.shape[0], H, dtype=torch.float64)
-        for t in range(x.shape[0]):
-            for j in range(ids.shape[1]):
-                e = int(ids[t, j])
-                if e < 0:
-                    continue
-                g_in, g_dn = self.inputs[e]
-                xin = (fallback.quantize(xs[t:t + 1].float(), torch.tensor([g_in])).double()[0] / g_in if a4
-                       else quantize_int8(xs[t:t + 1].float()).double()[0] if int8 else xs[t])
-                gu = gate_up[e] @ xin
-                h = torch.nn.functional.silu(gu[:I]) * gu[I:]
-                h = (fallback.quantize(h[None].float(), torch.tensor([g_dn])).double()[0] / g_dn if a4
-                     else quantize_int8(h[None].float()).double()[0] if int8 else h.float().bfloat16().double())
-                out[t] += float(w[t, j]) * (down[e] @ h)
+        # All tokens routed to an expert at once (the quantizers work row by row, so a row's operand is the one it
+        # gets alone); a Python loop over tokens and slots made this reference most of the folder's run time.
+        ids, w = ids.cpu(), w.double().cpu()
+        for e in sorted({int(v) for v in ids.flatten().tolist() if int(v) >= 0}):
+            t, j = (ids == e).nonzero(as_tuple=True)
+            g_in, g_dn = self.inputs[e]
+            rows = xs[t]
+            xin = (fallback.quantize(rows.float(), torch.full((len(t),), float(g_in))).double() / g_in if a4
+                   else quantize_int8(rows.float()).double() if int8 else rows)
+            gu = xin @ gate_up[e].T
+            h = torch.nn.functional.silu(gu[:, :I]) * gu[:, I:]
+            h = (fallback.quantize(h.float(), torch.full((len(t),), float(g_dn))).double() / g_dn if a4
+                 else quantize_int8(h.float()).double() if int8 else h.float().bfloat16().double())
+            out.index_add_(0, t, w[t, j][:, None] * (h @ down[e].T))
         return out
 
     def paths(self):
@@ -126,7 +127,7 @@ class DeviceExpertsTests(PluginTestCase):
         if self.device() != "cuda":
             self.skipTest("the kernel runs on CUDA")
         if self.assemble(USE)["experts"].kernel is None:
-            self.skipTest(f"no build of {KERNEL} here (LOCAL_KERNELS)")
+            self.skipTest(f"crit's kernel {KERNEL} does not build here")
 
     def test_every_format_matches_the_fp64_reference(self):
         for kernel in self.paths():
@@ -155,7 +156,7 @@ class DeviceExpertsTests(PluginTestCase):
                 self.assertEqual(experts.facts()["experts"]["arithmetic"], "declared")
 
     def test_the_declared_arithmetic_is_refused_without_the_kernel(self):
-        with self.assertRaisesRegex(ValueError, f"declared runs only on the registry kernel {KERNEL}.*kernel is false"):
+        with self.assertRaisesRegex(ValueError, f"declared runs only on crit's kernel {KERNEL}.*kernel is false"):
             self.assemble(USE, {"arithmetic": "declared", "activations": "nvfp4", "kernel": False})
 
     def test_a_route_keeps_its_bits_alone_batched_and_in_a_prompt_call(self):
@@ -222,7 +223,7 @@ class DeviceExpertsTests(PluginTestCase):
             self.skipTest("the kernel runs on CUDA")
         a, b = self.experts("nvfp4", "nvfp4", True), self.experts("nvfp4", "nvfp4", False)
         if a.kernel is None:
-            self.skipTest("no build of crit-labs/grouped-experts here (LOCAL_KERNELS)")
+            self.skipTest(f"crit's kernel {KERNEL} does not build here")
         x, ids, w = self.routes(7, 3, 6, 11)
         fa, fb = a.forward(3, x, ids, w), b.forward(3, x, ids, w)
         self.assertLess(float((fa - fb).abs().max() / fb.abs().max()), 3e-2)

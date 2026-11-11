@@ -1,6 +1,6 @@
 # What belongs in crit
 
-crit is a vessel for any LLM on any CUDA hardware, and it has to stay maintainable
+crit is a vessel for any LLM on any hardware backend, and it has to stay maintainable
 while the number of supported architectures grows. Nobody can maintain a toolkit
 that carries a code path for each model family. Core is the general foundation that
 most architectures, ideally all of them, build on. Engines are where one model on one
@@ -24,9 +24,9 @@ licensing).
    constants tuned on one GPU, shortcuts that work for one checkpoint's tensor names,
    and docs that turn one run's measured numbers into general advice.
 3. **It is applicable and valuable to almost any model and any hardware.** A
-   different architecture (dense, MoE, hybrid recurrent, multimodal) and a different
-   CUDA GPU (consumer or datacenter, another generation) either use it unchanged or
-   are unaffected by it. Something that is correct everywhere but only ever helps one
+   different architecture (dense, MoE, hybrid recurrent, multimodal), a different
+   GPU (consumer or datacenter, another generation) and a different backend (CUDA, ROCm,
+   Metal, Vulkan, CPU) either use it unchanged or are unaffected by it. Something that is correct everywhere but only ever helps one
    family still fails this criterion.
 
 ## Interfaces, not instances
@@ -39,14 +39,16 @@ crit and put the model's **instance** in its engine package.
 | Its own tool-call syntax | A parser for that model | A hook the package fills (`ResidentChat.tool_format` with a `ToolFormat`) |
 | A config key spelled its own way | An `if` for that family in each reader | One alias table that every reader shares |
 | Special handling of some tensors | A list of that checkpoint's tensor names | A role the tensors declare, or a rule derived from the config |
-| A kernel tuned for its shapes | The tuned kernel as a default | The plugin's dispatch and its torch fallback, with the tuned kernel in the engine or in the kernel registry (a crit-kernels project) |
+| A kernel tuned for its shapes | The tuned kernel as a default | A kernel template whose knobs `crit kernels sweep` tunes for each model and GPU, the plugin's dispatch and its torch fallback |
 | A faster setting on one GPU | The constant | A measurement (`crit eval probe`) the setting is derived from |
 
-**No compute kernels.** crit holds techniques, their host references and their mechanisms, never compute kernels:
-the arithmetic a library or the kernel registry could provide comes from there, and a missing kernel becomes a
-kernel-builder project in crit-kernels that crit-labs uploads. [Kernels and plugins](PLUGINS.md#kernels-and-plugins)
-gives the rule: what stays in a technique as mechanism, how a plugin declares and loads a registry kernel with its
-fallback, and what a technique keeps instead of a list of kernels.
+**Kernels are templates.** A technique holds its host reference and its mechanisms; its arithmetic comes from a
+library where one covers it, and otherwise from one of crit's kernel templates (`kernels/techniques/<family>/<id>/`): source
+built for the engine's device, with every constant that only changes speed (warps, tiles, splits, stages) a knob that
+`crit kernels sweep` tunes for the model and GPU. A contribution to a kernel adds a structure or a knob value, never a
+constant chosen on one GPU. [Kernels and plugins](PLUGINS.md#kernels-and-plugins) gives the rule: what stays in a
+technique as mechanism, how a plugin declares and loads a kernel with its fallback, and what a technique keeps
+instead of a list of kernels.
 
 The tool-call work from the Gemma 4 run shows the pattern. A Gemma-only parser
 (`gemma-call`) went into Core first and was then replaced by `ResidentChat.tool_format`,
@@ -106,8 +108,8 @@ declares and the official code ignores).
 
 - Which criterion does the evidence satisfy, and where is the evidence (test,
   measurement, reproduced bug)?
-- Would a model of a different architecture, and a different CUDA GPU, use this
-  unchanged or be unaffected by it?
+- Would a model of a different architecture, a different GPU and a different backend use
+  this unchanged or be unaffected by it?
 - Is anything named after one model, checkpoint or GPU? If so, is that only an
   example, or does the behavior depend on it?
 - Is the model-specific part, if there is one, in the engine package behind a general

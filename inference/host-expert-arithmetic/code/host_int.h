@@ -8,7 +8,7 @@
 // is declared: block b goes to lane b % lanes; lane = fma(float(sum_b), wscale_b * ascale_b, lane) with the scale
 // product rounded first; blocks in order; the lanes reduced by host_nvfp4's halving tree (or sequentially); the
 // result times post. A device row or a device GEMM that declares the same (host_nvfp4_device.cuh's dot_row_int, the
-// crit-labs/int-block-experts Hub kernel) gives the same bits, so the CPU can take an expert's rows at its
+// int-block-experts kernel in crit's kernels/techniques/experts) gives the same bits, so the CPU can take an expert's rows at its
 // integer speed (DRAM-bound with a few threads) and the output does not depend on where they ran.
 //
 // For a checkpoint whose experts declare 4-bit input activations (NVFP4 W4A4), this is the arithmetic the checkpoint

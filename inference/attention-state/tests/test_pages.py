@@ -1,5 +1,5 @@
 """attention-state's device form: the paged KV pool keeps each sequence's rows where its host form keeps them, in torch
-and through the registry's paged-kv-attention writes (the same codes and scales)."""
+and through crit's paged-kv-attention writes (the same codes and scales)."""
 from crit_plugins import StepBatch
 from crit_plugins.testing import PluginTestCase
 
@@ -100,7 +100,7 @@ class KVPoolTests(PluginTestCase):
             self.assertTrue(self.torch.equal(pool.gather(3, "b", 20)[0].cpu(), k.cpu()))
 
     def test_row_scaled_codes_are_the_torch_rules_whatever_path_writes_them(self):
-        # With the registry's paged-kv-attention loaded, a CUDA pool writes keys and values in one launch: the same
+        # With crit's paged-kv-attention kernel loaded, a CUDA pool writes keys and values in one launch: the same
         # codes and scales as int8_rows and fp8_rows compute.
         from crit_plugins.assemble import load_module
         pages = load_module(self.registry()["attention-state"]).pages

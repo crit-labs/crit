@@ -1,5 +1,5 @@
 """quantized-projections' decode kernels per matrix: with gemv auto, FP8 matrices' 16-bit decode rows on
-crit-labs/decode-gemv's dot GEMV (one kernel for every decode row count, a row's bits the same alone and in a call of
+decode-gemv's dot GEMV (one kernel for every decode row count, a row's bits the same alone and in a call of
 up to 16 rows at any offset, the stored weights' exact products in FP32 sums, compiled at load; without the kernel, the
 tile); W4A4 decode rows on mma-rows' block-scaled FP4 MMA; decode_formats setting the decode activations per format;
 the facts naming each role's kernel and activations."""
@@ -27,7 +27,7 @@ class DotTests(PluginTestCase):
         self.nvfp4 = importlib.import_module(self.matrices.__package__ + ".device_nvfp4")
         self.g = torch.Generator().manual_seed(29)
         if self.nvfp4.dot("cuda") is None:
-            self.skipTest("the dot GEMV comes with crit-labs/decode-gemv, not here")
+            self.skipTest("the dot GEMV comes with decode-gemv, not here")
 
     def fp8(self, n, k):
         torch, g = self.torch, self.g
@@ -114,7 +114,7 @@ class Fp4DecodeTests(PluginTestCase):
         self.nvfp4 = importlib.import_module(self.matrices.__package__ + ".device_nvfp4")
         module = self.nvfp4.mma("cuda")
         if module is None or not callable(getattr(module, "fp4_mma", None)) or not module.fp4_mma("cuda"):
-            self.skipTest("the FP4 MMA comes with crit-labs/mma-rows on the sm_120 family, not here")
+            self.skipTest("the FP4 MMA comes with mma-rows on the sm_120 family, not here")
         self.g = torch.Generator().manual_seed(31)
 
     def stored(self, n, k, runs=None):
@@ -215,6 +215,68 @@ class DecodeFormatsTests(PluginTestCase):
         for text in ("mxfp8=prompt", "fp8=fp8", "nvfp4", "fp8=bf16,fp8=prompt", "int8=bf16"):
             with self.assertRaises(ValueError, msg=text):
                 self.plugin(decode_formats=text)
+
+
+class CrossoverTests(PluginTestCase):
+    """gemv crossover: a weight-only NVFP4 matrix's decode calls of up to the crossover the two kernels' sweep
+    reports measure (the GEMV's tuned time no more than the tile's at every timed count up to it) on decode-gemv's
+    CUDA GEMV with its bits, longer ones on mma-rows' tile with the tile's bits; the facts' row_invariance rows the
+    crossover; without the reports, or on another device's, every call on the tile."""
+
+    def setUp(self):
+        if self.device() != "cuda":
+            self.skipTest("the GEMV and the tile run on CUDA")
+        import importlib
+        import torch
+        from crit_plugins.assemble import load_module
+        self.torch = torch
+        self.matrices = load_module(self.registry()["quantized-projections"]).device_matrices
+        self.nvfp4 = importlib.import_module(self.matrices.__package__ + ".device_nvfp4")
+        if self.nvfp4.mma("cuda") is None or self.nvfp4.native("cuda") is None:
+            self.skipTest("mma-rows and decode-gemv are not both here")
+        self.g = torch.Generator().manual_seed(41)
+
+    def reports(self, n, k, gemv, tile, device=None):
+        """Fake sweep reports at (n, k): {rows: us} for decode-gemv's gemv-cuda (NVFP4, weights 0) and mma-rows'
+        decode-tile."""
+        name = device or self.torch.cuda.get_device_name(0)
+        found = {"decode-gemv": ({"device": name}, {"structures": {"gemv-cuda": [
+                     {"shape": {"weights": 0, "N": n, "K": k}, "rows": r, "tuned_us": us} for r, us in gemv.items()]}}),
+                 "mma-rows": ({"device": name}, {"structures": {"decode-tile": [
+                     {"shape": {"weights": 0, "N": n, "K": k}, "rows": r, "tuned_us": us} for r, us in tile.items()]}})}
+        return lambda kernel: found.get(kernel)
+
+    def test_calls_up_to_the_measured_crossover_take_the_gemv_and_longer_ones_the_tile(self):
+        torch = self.torch
+        n, k = 2048, 1024
+        stored = {"weight": torch.randint(0, 256, (n, k // 2), generator=self.g, dtype=torch.uint8),
+                  "scale": (torch.rand(n, k // 16, generator=self.g) * 2 + 0.01).to(torch.float8_e4m3fn),
+                  "global_scale": torch.tensor(500.0)}
+        options = {"activations": "bf16", "decode_activations": "bf16"}
+        x = torch.randn(16, k, generator=self.g).cuda().to(torch.bfloat16)
+        gemv = self.assemble(options={**options, "gemv": "native"}, context=OnCuda())["projections"]
+        tile = self.assemble(options={**options, "gemv": "mma"}, context=OnCuda())["projections"]
+        g, t = gemv.load(stored, "nvfp4"), tile.load(stored, "nvfp4")
+        timed = self.reports(n, k, {1: 10.0, 2: 11.0, 4: 15.0, 8: 20.0, 16: 30.0},
+                             {1: 11.0, 2: 11.0, 4: 12.0, 8: 13.0, 16: 15.0})
+        with patch.object(self.matrices, "_report", timed):
+            cross = self.assemble(options={**options, "gemv": "crossover"}, context=OnCuda())["projections"]
+            m = cross.load(stored, "nvfp4", role="down")
+        self.assertEqual((m.gemv_rows, m.path, m.invariant_rows), (2, "gemv_mma", 2))
+        for rows in range(1, 17):
+            want = gemv.matmul(x[:rows], g, torch.float32) if rows <= 2 else tile.matmul(x[:rows], t, torch.float32)
+            self.assertTrue(torch.equal(cross.matmul(x[:rows], m, torch.float32), want), rows)
+        facts = cross.facts()
+        self.assertEqual((facts["row_invariance"]["rows"], facts["decode_crossover"]), (2, {"down": 2}))
+        self.assertEqual(facts["decode_kernels"]["down"]["kernels"], ["gemv_mma"])
+        for found in (lambda kernel: None, self.reports(n, k, {1: 12.0}, {1: 11.0}),
+                      self.reports(n, k, {1: 10.0}, {1: 11.0}, device="another GPU")):
+            with patch.object(self.matrices, "_report", found):
+                m = self.assemble(options={**options, "gemv": "crossover"}, context=OnCuda())["projections"].load(
+                    stored, "nvfp4")
+            self.assertEqual((m.gemv_rows, m.path), (0, "mma"))
+        with self.assertRaises(ValueError):
+            self.assemble(options={**options, "gemv": "crossover", "prompt_gemm": "tile"}, context=OnCuda())
 
 
 if __name__ == "__main__":

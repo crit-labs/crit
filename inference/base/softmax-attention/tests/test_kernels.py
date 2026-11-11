@@ -1,5 +1,6 @@
-"""softmax-attention's page-reading paths equal its gathered-rows SDPA path in a step: FlashInfer's over 16-bit and FP8
-pages (when FlashInfer is installed), the registry's split-KV and prompt readers over every page type (where they load),
+"""softmax-attention's page-reading paths equal its gathered-rows SDPA path in a step: crit's split-KV and prompt
+readers over every page type (where they load; the default, no library kernel), FlashInfer's over 16-bit and FP8 pages
+with option flashinfer auto (when FlashInfer is installed: a yardstick),
 the torch fallbacks otherwise; a row's result does not depend on the rows beside it; a decode step over step buffers
 replays from a CUDA graph."""
 from crit_plugins import StepBatch
@@ -23,10 +24,10 @@ class PagedKernelTests(PluginTestCase):
             self.skipTest("the page-reading kernels run on CUDA")
         self.torch = __import__("torch")
 
-    def engine(self, dtype, page, step_rows=0, int8_qk=False, decode="flashinfer"):
+    def engine(self, dtype, page, step_rows=0, int8_qk=False, decode="flashinfer", flashinfer="off"):
         state = {"page": page, "step_rows": step_rows, "step_tokens": 512}
         kv = self.assemble(USE, use_options={"attention-state": state})["kv_cache"]
-        fast = self.assemble(USE, options={"int8_qk": int8_qk, "decode": decode},
+        fast = self.assemble(USE, options={"int8_qk": int8_qk, "decode": decode, "flashinfer": flashinfer},
                              use_options={"attention-state": state})["attention"]
         plain = self.assemble(USE, options={"kernels": "torch"}, use_options={"attention-state": state})["attention"]
         pool = kv.pool([0], HKV, D, 4096, "cuda", dtype)
@@ -45,17 +46,17 @@ class PagedKernelTests(PluginTestCase):
         self.written = keys, values
         return batch
 
-    def expected_kind(self, fast, dtype, step_rows, decode):
-        if _flashinfer() and dtype in ("bf16", "fp16", "fp8") and not step_rows and decode == "flashinfer":
+    def expected_kind(self, fast, dtype, step_rows, decode, flashinfer):
+        if _flashinfer() and dtype in ("bf16", "fp16", "fp8") and not step_rows and decode == "flashinfer" and                 flashinfer == "auto":
             return "flashinfer"
         return "split" if fast.device_form.kernels is not None else "torch"
 
-    def compare(self, dtype, page, step_rows=0, int8_qk=False, bound=0.02, decode="flashinfer"):
+    def compare(self, dtype, page, step_rows=0, int8_qk=False, bound=0.02, decode="flashinfer", flashinfer="off"):
         torch = self.torch
-        pool, fast, plain = self.engine(dtype, page, step_rows, int8_qk, decode)
+        pool, fast, plain = self.engine(dtype, page, step_rows, int8_qk, decode, flashinfer)
         probe = torch.zeros(1, HQ, D, dtype=torch.bfloat16, device="cuda")
         self.assertEqual((fast.device_form.reader(pool, probe), plain.device_form.reader(pool, probe)),
-                         (self.expected_kind(fast, dtype, step_rows, decode), "torch"))
+                         (self.expected_kind(fast, dtype, step_rows, decode, flashinfer), "torch"))
         for s in "abc":
             pool.open(s)
         self.write(pool, [("a", 0, 300), ("b", 0, 70)], 1)
@@ -84,6 +85,14 @@ class PagedKernelTests(PluginTestCase):
         self.compare("fp8", 64)
         self.compare("fp16", 48)
 
+    def test_no_library_kernel_by_default_and_flashinfer_on_request(self):
+        form = self.assemble(USE)["attention"].device_form
+        self.assertEqual(form._wrappers, {})            # option flashinfer off: nothing of FlashInfer is made
+        self.assertIsNone(form.flashinfer_workspace)
+        if _flashinfer():                               # the yardstick, on request: the same results within bounds
+            self.compare("bf16", 16, flashinfer="auto")
+            self.compare("fp8", 64, flashinfer="auto")
+
     def test_row_scaled_pages_read_as_sdpa_does(self):
         for dtype in ("int8", "fp8:row"):
             self.compare(dtype, 64)
@@ -99,7 +108,8 @@ class PagedKernelTests(PluginTestCase):
         torch = self.torch
         state = {"page": 16}
         kv = self.assemble(USE, use_options={"attention-state": state})["kv_cache"]
-        attention = self.assemble(USE, options={"decode": "split"}, use_options={"attention-state": state})["attention"]
+        attention = self.assemble(USE, options={"decode": "split", "flashinfer": "auto"},
+                                  use_options={"attention-state": state})["attention"]
         plans = []
         for kind, wrapper in attention.device_form._wrappers.items():
             def counted(*args, _plan=wrapper.plan, _kind=kind, **kwargs):

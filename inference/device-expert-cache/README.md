@@ -131,7 +131,7 @@ same from Python through torch's cudart. (For scale only: on one machine, `cudaH
 
 **Feeding the expert arithmetic.** The routed experts' GEMMs come from a provider's grouped
 GEMM (CUTLASS's ptr-array grouped GEMM, `cublasGemmGroupedBatchedEx`, or a block-scaled grouped
-GEMM for 4-bit formats, from [Kernels' sources](../../kernels/SOURCES.md)), which takes device
+GEMM for 4-bit formats, from [Kernels' libraries](../../kernels/README.md#libraries)), which takes device
 arrays of pointers. `enqueue_operands` writes them from a plan's `Use`s on the device, so a captured
 step goes from the plan to the GEMM with no host round trip. For each route it writes a pointer to
 each component inside the bundle (the offsets from the store's index), to the route's activation

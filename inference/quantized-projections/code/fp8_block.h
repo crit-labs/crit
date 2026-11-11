@@ -1,6 +1,6 @@
 // Host side of the matched FP8 projections (the order the README declares; its device functions and kernels are
-// crit-labs' fp8-block-rows): the declared activation quantizer's twin, E8M0 scale decoding, and an FP64 projection to
-// bound a kernel's error. The tensor core's block sum has no host twin: FP8
+// crit's kernel fp8-block-rows): the declared activation quantizer's twin, E8M0 scale decoding, and an FP64
+// projection to bound a kernel's error. The tensor core's block sum has no host twin: FP8
 // outputs are compared kernel against kernel, on the target GPU.
 #pragma once
 #include "row_fp8.h"

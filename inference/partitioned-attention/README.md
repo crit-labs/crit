@@ -65,9 +65,9 @@ assert attention_partial((1., 1.), rows, value_width=1,
 
 The plugin's device form is this technique within one device, through
 attention-state's device form ([device_attention.py](../attention-state/code/device_attention.py))
-and the registry kernel `crit-labs/paged-kv-attention`: a decode or verify row's
-keys are split into `partitions` partitions (piece `i`, of 16 to 128 positions
-by the head width and page kind, to partition `i mod P`, the interleaved
+and crit's kernel `paged-kv-attention` (built for the engine's device, tuned or
+default knobs): a decode or verify row's keys are split into `partitions` partitions (piece `i`, of 16 to 128 positions
+by the head width and page kind or the engine's tuning, to partition `i mod P`, the interleaved
 ownership above at piece granularity), each partition's partial output and
 log-sum-exp are computed in parallel and
 merged in partition order by the formula above, so a long row's work spreads
@@ -75,10 +75,18 @@ over the GPU and follows its own length (read on the device, so one CUDA graph
 serves every length). `forward(..., lse=True)` also returns each token's
 log-sum-exp, the normalizer a merge across devices needs, and `merge(outs,
 lses)` is `merge_partials` on the device (an empty part, `-inf`, weighs
-nothing). Without the registry kernel the partitions run in torch as one masked
-FP32 softmax per row. Its tests compare it with softmax-attention's device form
+nothing). Without the kernel (where it does not build) the partitions run in torch as
+one masked FP32 softmax per row. Its tests compare it with softmax-attention's device form
 (bit for bit), merged shards of a sequence with the whole, and the host form
 with direct softmax.
+
+With the option `reader: flash` the partitions are contiguous instead: splits of one
+chunk of positions per pool (the kernel's `flash_chunk()`), each read by tensor-core
+tiles that pack a window's columns times a KV head's query heads, and merged in
+split order by the same formula; a column's bits are the same alone, in a window and
+in a round (another reduction than the interleaved one), and the prompt reader is
+the kernel's flash prompt chunk, whose splits follow the chunk's length (its facts
+say `prompt_rows: not row-invariant`). `partitions` and `piece` then do not apply.
 
 ## Adapting it
 

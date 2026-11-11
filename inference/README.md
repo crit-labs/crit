@@ -3,16 +3,15 @@
 Inference holds crit's reusable inference techniques. Each entry explains a
 mechanism, supplies actual code and states what an engine must preserve when it
 adapts that code. Entries are techniques, not compute kernels: the GEMMs, attention,
-normalization and scan kernels an engine runs come from the providers
-[Kernels](../kernels/README.md) lists (the Hugging Face kernel registry first, then
-libraries such as cuBLASLt, CUTLASS, FlashInfer and flash-linear-attention), or the
-engine writes them. crit hosts no compute kernel: a library plugin that needs one no
-provider has loads a crit-labs registry kernel declared in its plugin.json and keeps a
-torch fallback, and mechanism code that runs on the device (a cache directory, a
+normalization and scan kernels an engine runs come from crit's kernel templates in
+[Kernels](../kernels/README.md) (built for the engine's device and tuned by `crit kernels sweep`), from
+libraries such as cuBLASLt, CUTLASS, FlashInfer and flash-linear-attention, or the
+engine writes them. A library plugin that needs a kernel no provider has loads one of
+crit's kernels declared in its plugin.json and keeps a torch fallback, and mechanism code that runs on the device (a cache directory, a
 mailbox, a round's accept, a CPU SIMD codec) stays in its technique
 ([kernels and plugins](../docs/PLUGINS.md#kernels-and-plugins)). Agents copy, specialize,
-combine or fuse entries; the engine owns that design, and a complete engine can use crit
-without any entry.
+combine or fuse entries; the engine owns that design, and an engine may write every plugin
+itself instead of taking an entry.
 
 Use [Core](../core/README.md) for lifecycle, requests and resources,
 [Kernels](../kernels/README.md) to find and integrate kernels (external links never
@@ -38,7 +37,7 @@ leaves to the engine.
 | Recover speculative recurrence | [recurrent-state-recovery](recurrent-state-recovery/README.md) | Gated-delta verification, accepted-prefix repair, chunked prefill reference; on the device a state pool whose verify windows keep their accepted prefix in captured rounds (deferred, checkpoints or recompute) |
 | Share KV and execute attention | [attention-state](attention-state/README.md) | FP32/int8 COW pages for Core's state cache, a host tier for evicted pages, tiled CPU attention, GQA, masks, RoPE; on the device a paged pool with FP8 and INT8 row-scaled pages, round slots for captured rounds and prompt buffers for captured prompt chunks, and the attention slot's shared device form (code/device_attention.py) |
 | Partition a long attention sequence | [partitioned-attention](partitioned-attention/README.md) | Interleaved ownership, stable partial reduction, head-major scatter; serves on CUDA: split-KV partitions merged by log-sum-exp on one GPU |
-| Execute low-bit projections | [quantized-projections](quantized-projections/README.md) | G32 W4/W8 and dynamic A8 on the CPU, row-scaled FP8 and NVFP4 host codecs; on CUDA stored BF16, FP8, MXFP8 and NVFP4 matrices through cuBLASLt and the registry kernels mma-rows, decode-gemv, fixed-tile-gemm and pinned-gemm, each decode row's bits alone and batched |
+| Execute low-bit projections | [quantized-projections](quantized-projections/README.md) | G32 W4/W8 and dynamic A8 on the CPU, row-scaled FP8 and NVFP4 host codecs; on CUDA stored BF16, FP8, MXFP8 and NVFP4 matrices through cuBLASLt and crit's kernels mma-rows, decode-gemv, fixed-tile-gemm and pinned-gemm, each decode row's bits alone and batched |
 | Reuse expert weights, lend cache memory or borrow idle KV and workspace memory | [expert-residency](expert-residency/README.md) | Byte-cache leases, complete bundles, C++ region loans and owner slot loans |
 | Plan expert residency inside decode graphs | [device-expert-cache](device-expert-cache/README.md) | Ready `ExpertCache` (the `experts:cache` device form): CUDA directory, miss copies, admission limits and the CPU/link split, a prompt ring, lent KV pages, profile warm start, prefetch, offline policy replay |
 | Run routed experts in their stored format on the device | [grouped-experts](grouped-experts/README.md) | Routed SwiGLU experts over bundles in a slot store, every stored format (bf16, fp8, nvfp4, int4, mxfp4), the routes grouped by expert on the device; one function for decode rows and prompt chunks (registry kernel crit-labs/grouped-experts, torch fallback) |
@@ -61,7 +60,7 @@ leaves to the engine.
 | Draft with a published EAGLE-3, DFlash or DSpark drafter | [hidden-state-drafters](hidden-state-drafters/README.md) | Core's reader of every drafter format (one tap convention), catch-up, block input, d2t mapping, confidence cuts |
 | Cheapen the draft head | [draft-vocabulary-subset](draft-vocabulary-subset/README.md) | Head row subset, index mapping, CUDA gather-argmax |
 | Select compatible execution and retain choices | [recorded-selection](recorded-selection/README.md) | Phase/shape replay policy, recorded choices, repeatability checks |
-| Fuse the elementwise work around the matmuls | [fused-norms](fused-norms/README.md) | RMSNorm with a residual, head norms with rotary positions, gated norms, activation products, L2 norms, residual-stream mixes as the `norms` slot: one launch per call of the registry kernel crit-labs/fused-norms, each row's bits independent of its batch; the FP64 host form, the torch form (base torch-norms, and the fallback) and conformance checks for any norms plugin |
+| Fuse the elementwise work around the matmuls | [fused-norms](fused-norms/README.md) | RMSNorm with a residual, head norms with rotary positions, gated norms, activation products, L2 norms, residual-stream mixes as the `norms` slot: one launch per call of crit's kernel fused-norms, each row's bits independent of its batch; the FP64 host form, the torch form (base torch-norms, and the fallback) and conformance checks for any norms plugin |
 
 Each entry has a Python host reference; the entries that fill a slot also serve on a device as plugins, and some add
 C++ or CUDA mechanism code. Each entry states its tested scope and missing native or engine work. Host tests establish
@@ -106,8 +105,8 @@ reference to check a kernel against (`reference`: a file of the technique and it
 target before trusting it (`verify`, tolerance included) and, where the contract promises one, what must stay
 bit-equal (`invariance`). `crit inference show ID` prints them and `crit inference check` validates the file (and
 refuses kernel lists, provider names, kernel source paths and a leftover `kernels.json`). The kernels themselves come
-from the libraries in [Kernels' sources](../kernels/SOURCES.md) and the kernel registry; a technique's plugin declares
-the registry kernels it loads in its plugin.json. Run each candidate against the reference on the target GPU and
+from crit's kernel templates (`kernels/techniques/<family>/<id>/`) and the libraries in [Kernels' libraries](../kernels/README.md#libraries);
+a technique's plugin declares crit's kernels it loads in its plugin.json. Run each candidate against the reference on the target GPU and
 checkpoint, keep the fastest that passes, and drop one that fails. A technique with no device arithmetic of its own
 (bookkeeping, scheduling, host formulas) has none.
 
@@ -183,5 +182,5 @@ ctest --test-dir build/inference -C Release --output-on-failure
 
 `-DCRIT_INFERENCE_INSTALLED_CORE=ON` uses an installed Core SDK from
 `CMAKE_PREFIX_PATH`. `-DCRIT_INFERENCE_CUDA=ON` adds the CUDA kernels and fixtures
-(CUDA Toolkit 13.1+ and a device). The [Core walkthrough](examples/core-projection/README.md)
-connects a projection to a Core engine.
+(CUDA Toolkit 13.1+ and a device). The [plugin engine walkthrough](examples/plugin-engine/README.md)
+is the smallest engine package Core's loader runs.

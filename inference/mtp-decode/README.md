@@ -68,7 +68,13 @@ far back the match goes, over the ring's last `capacity - (widest + 1)` position
 which the model calls after the round driver binds the slot. `commit_round` writes the round's emitted tokens into the ring from the device's counts, so
 copies need no host between rounds (Core's native rounds). The copies equal the host index's wherever the sequence
 fits that span (`capacity`, default 16,384 tokens). With `override` the model's draft head drafts the chain
-(`head_chain`) and a copy matching at least `override` tokens replaces its first drafts. A copied draft is drawn from no
+(`head_chain`) and a copy matching at least `override` tokens replaces its first drafts. The override is a bet that
+the copy is right where the head is not: a short match occurs by chance in a long context (a few common tokens recur
+throughout code, markup and prose), and the copy then replaces drafts the head had right, so a round that would have
+accepted its whole chain accepts nothing. Measure the threshold, never guess it: serve the engine with the override
+off and at a few lengths on prompts long enough to repeat themselves (`crit run ... ablate --data EVAL_DATA --set
+mtp-decode.override=N`, whose Eval cases include long tool-call and agent prompts) and keep the one that pays there
+and on the held-out prompts. A copied draft is drawn from no
 law: in sampled rounds its column's law is cleared and the verify takes the target's own draw there.
 [device_verify.py](code/device_verify.py) is this entry's verify for every row of a round (chain-verifier's
 `verify:device`): it writes each row's emitted tokens and counts, and the round driver advances its own state.

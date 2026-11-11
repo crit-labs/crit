@@ -2,19 +2,20 @@
 the NVFP4 and MXFP8 decoders for prompt GEMMs, and a fixed-tile prompt GEMM: the projections slot's arithmetic that no
 provider reachable from torch has.
 
-crit hosts no kernel. No provider reachable from torch covers W4A16 NVFP4 (cuBLASLt's block-scaled GEMM takes NVFP4 on
-both operands; FlashInfer's FP4 weight-only kernels sit inside its fused MoE), so the arithmetic comes from crit-labs'
-kernels in the Hugging Face kernel registry (crit_plugins.kernels.registry_kernel, declared with their pins in the
-plugin's plugin.json "kernels"), and where one is not there (not published yet, no build for this machine, offline)
-from a plain torch fallback with the same contract, which the engine's facts then name under "kernels":
+No provider reachable from torch covers W4A16 NVFP4 (cuBLASLt's block-scaled GEMM takes NVFP4 on both operands;
+FlashInfer's FP4 weight-only kernels sit inside its fused MoE), so the arithmetic comes from crit's kernels
+(kernels/techniques/projections/, built on this machine's GPU the first time a plugin asks, with the engine's tuning or their
+default knobs: crit_plugins.kernels.load_kernel, declared in the plugin's plugin.json "kernels"), and where one cannot
+be built here (no CUDA toolkit, an architecture it does not cover) from a plain torch fallback with the same contract,
+which the engine's facts then name under "kernels":
 
-- crit-labs/decode-gemv: `gemv` (CUDA cores, NVFP4 W4A16, 1 to 16 rows), `gemv_fp8` (CUDA cores, FP8 E4M3 with a row
+- decode-gemv: `gemv` (CUDA cores, NVFP4 W4A16, 1 to 16 rows), `gemv_fp8` (CUDA cores, FP8 E4M3 with a row
   scale or MXFP8's E8M0 scale per 32 inputs, W8A16, 1 to 16 rows), `gemv_bf16` (CUDA cores, BF16 weights, 1 to 16
   rows), `gemv_triton` (Triton, NVFP4 W4A16, 1 to 8 rows), `decode` and `decode_fp8` (an NVFP4 matrix's values for a
   provider's GEMM).
-- crit-labs/fixed-tile-gemm: `mm`, a tensor-core GEMM with one K loop and fixed tiles whatever the row count, so a
+- fixed-tile-gemm: `mm`, a tensor-core GEMM with one K loop and fixed tiles whatever the row count, so a
   row's result does not depend on the rows beside it.
-- crit-labs/mma-rows: `mm_rows`, 1 to 64 rows of any format on tensor cores in one fixed tile (the weights read once a
+- mma-rows: `mm_rows`, 1 to 64 rows of any format on tensor cores in one fixed tile (the weights read once a
   call, every value exact in BF16, FP32 sums, the prompt rows' quantized activations computed by its pre-pass), and
   its quantizers; device_matrices calls it directly (_tile).
 
@@ -39,21 +40,22 @@ from . import device_matrices
 
 MAX_ROWS = 16      # the CUDA GEMVs' and the fallbacks' most rows a call (device_matrices.GEMV_ROWS)
 TRITON_ROWS = 8    # the Triton GEMV's
-ROWS, TILES, MMA, PINNED = ("crit-labs/decode-gemv", "crit-labs/fixed-tile-gemm", "crit-labs/mma-rows",
-                             "crit-labs/pinned-gemm")
+ROWS, TILES, MMA, PINNED = ("decode-gemv", "fixed-tile-gemm", "mma-rows",
+                             "pinned-gemm")
+FP8_BLOCK, INT_BLOCK = "fp8-block-rows", "int-block-experts"   # their gemm-native prompt GEMMs (not the declared order)
 
 # E2M1 values of codes 0..15 (bit 3 the sign), the fallback decoders' table.
 E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 
 def kernel(name):
-    """The registry kernel's module (crit_plugins.kernels.registry_kernel at the pin the plugin's plugin.json declares:
+    """crit's kernel `name`, built for this machine (crit_plugins.kernels.load_kernel, declared in the plugin.json of
     device_matrices.KERNEL_FOLDER, which quantized-projections' plugin.py sets, and a plugin that runs this code for its
-    own device form sets to its folder; crit_plugins.kernels caches the module and the manifest), or None: the
-    fallbacks serve, and crit_plugins.kernels records why for the engine's facts. Without a plugin folder no kernel is
-    asked for."""
-    from crit_plugins.kernels import registry_kernel
+    own device form sets to its folder; crit_plugins.kernels caches the module and the manifest, and records whether it
+    was built with the engine's tuning or the default knobs), or None: the fallbacks serve, and crit_plugins.kernels
+    records why for the engine's facts. Without a plugin folder no kernel is asked for."""
+    from crit_plugins.kernels import load_kernel
     folder = device_matrices.KERNEL_FOLDER
-    return registry_kernel(name, folder=folder) if folder is not None else None
+    return load_kernel(name, folder=folder) if folder is not None else None
 
 
 # (kernel, shape) of each Triton launch that ran eagerly: Triton compiles (and the GEMV autotunes) on a kernel's first
@@ -72,22 +74,22 @@ def _warmed(key, what):
 
 
 def rows_kernel():
-    """crit-labs/decode-gemv's module, or None (the torch fallbacks serve)."""
+    """decode-gemv's module, or None (the torch fallbacks serve)."""
     return kernel(ROWS)
 
 
 def tiles_kernel():
-    """crit-labs/fixed-tile-gemm's module, or None (the row-at-a-time fallback serves)."""
+    """fixed-tile-gemm's module, or None (the row-at-a-time fallback serves)."""
     return kernel(TILES)
 
 
 def mma_kernel():
-    """crit-labs/mma-rows' module, or None (decode rows go through the GEMVs)."""
+    """mma-rows' module, or None (decode rows go through the GEMVs)."""
     return kernel(MMA)
 
 
 def mma(device):
-    """crit-labs/mma-rows (its tensor-core tile for 1 to 64 rows) for `device`, or None where it is not here."""
+    """mma-rows (its tensor-core tile for 1 to 64 rows) for `device`, or None where it is not here."""
     if torch.device(device).type != "cuda":
         return None
     module = mma_kernel()
@@ -95,7 +97,7 @@ def mma(device):
 
 
 def pinned(device):
-    """crit-labs/pinned-gemm (cuBLASLt GEMMs pinned to one algorithm for every row count) for `device`, or None where
+    """pinned-gemm (cuBLASLt GEMMs pinned to one algorithm for every row count) for `device`, or None where
     it is not here."""
     if torch.device(device).type != "cuda":
         return None
@@ -103,8 +105,38 @@ def pinned(device):
     return module if module is not None and callable(getattr(module, "pin", None)) else None
 
 
+def fp8_block(device):
+    """fp8-block-rows (its gemm_native: FP8 prompt GEMMs accumulated in the tensor cores, block-scaled MXFP8 MMAs on
+    sm_120a; and its MXFP8 activation quantizer) for `device`, or None where it is not here."""
+    if torch.device(device).type != "cuda":
+        return None
+    module = kernel(FP8_BLOCK)
+    return module if module is not None and callable(getattr(module, "gemm_native", None)) else None
+
+
+def untuned(name, device):
+    """crit's kernel `name` built with its default knobs whatever the engine's tuning (prompt_gemm pinned: the
+    defaults hold one gemm-native configuration for every token count, a tile good across counts, where a tuning's
+    pick for a long prompt can leave a short one's SMs idle; crit_plugins.kernels.load_kernel(..., tuned=False),
+    recorded in the engine's facts as name + ":untuned"), or None where it does not build here."""
+    if torch.device(device).type != "cuda" or device_matrices.KERNEL_FOLDER is None:
+        return None
+    from crit_plugins.kernels import load_kernel
+    module = load_kernel(name, folder=device_matrices.KERNEL_FOLDER, tuned=False)
+    return module if module is not None and callable(getattr(module, "gemm_native", None)) else None
+
+
+def int_block(device):
+    """int-block-experts (its gemm_native: NVFP4 W4A4 prompt GEMMs on block-scaled FP4 MMAs, quantize_nvfp4) for
+    `device`, or None where it is not here."""
+    if torch.device(device).type != "cuda":
+        return None
+    module = kernel(INT_BLOCK)
+    return module if module is not None and callable(getattr(module, "gemm_native", None)) else None
+
+
 def dot(device):
-    """crit-labs/decode-gemv's FP8 dot GEMV (Triton, tensor cores, 1 to 16 rows) for `device`, or None where it is not
+    """decode-gemv's FP8 dot GEMV (Triton, tensor cores, 1 to 16 rows) for `device`, or None where it is not
     here."""
     if torch.device(device).type != "cuda":
         return None
@@ -113,7 +145,7 @@ def dot(device):
 
 
 def native(device):
-    """The CUDA GEMVs (crit-labs/decode-gemv's gemv and gemv_bf16) for `device`, or None where the kernel is not
+    """The CUDA GEMVs (decode-gemv's gemv and gemv_bf16) for `device`, or None where the kernel is not
     available here: gemv then runs the Triton GEMV where that is available, else the torch fallback."""
     if torch.device(device).type != "cuda":
         return None
@@ -122,7 +154,7 @@ def native(device):
 
 
 def triton(device):
-    """crit-labs/decode-gemv's Triton GEMV for `device`, or None (the torch fallback)."""
+    """decode-gemv's Triton GEMV for `device`, or None (the torch fallback)."""
     if torch.device(device).type != "cuda":
         return None
     module = rows_kernel()
@@ -330,16 +362,26 @@ def decode_fp8(codes, scales, factor, out, module=LOOKUP):
     return out
 
 
-def mm(x, dense, dtype=None, module=LOOKUP):
+def mm(x, dense, dtype=None, module=LOOKUP, split=False, cuda=False):
     """x [M][K] times dense [N][K] (both BF16 or both FP16) -> out [M][N] in dtype (x's by default), FP32
-    accumulation, each row's result independent of the rows beside it: crit-labs/fixed-tile-gemm's fixed tiles, or
-    one row at a time through torch where that kernel is not available (correct, much slower)."""
+    accumulation, each row's result independent of the rows beside it: fixed-tile-gemm's fixed tiles, or
+    one row at a time through torch where that kernel is not available (correct, much slower). split: its mm_split
+    (K split over programs for narrow matrices at a few rows, not row invariant) where the build has it. cuda: its
+    CUDA GEMM where the build has it and takes the operands (cuda_ok: rows 16-byte aligned, K a multiple of 8; out in
+    x's dtype or FP32): mm_cuda (row invariant), or with split mm_cuda_split."""
     M, K = x.shape
     N = dense.shape[0]
     if dense.shape[1] != K or dense.dtype != x.dtype:
         raise ValueError(f"activations [{M}][{K}] {x.dtype} for a matrix [{N}][{dense.shape[1]}] {dense.dtype}")
     module = tiles_kernel() if module is LOOKUP else module   # fixed-tile-gemm's, as the matrix holds it from load
     if module is not None and x.is_cuda:
-        _warmed(("mm", N, K, M, x.dtype, dtype), "the fixed-tile GEMM")
-        return module.mm(x if x.stride(-1) == 1 else x.contiguous(), dense, dtype or x.dtype)
+        _warmed(("mm", N, K, M, x.dtype, dtype, cuda), "the fixed-tile GEMM")
+        x = x if x.stride(-1) == 1 else x.contiguous()
+        if cuda and callable(getattr(module, "cuda_ok", None)) and dtype in (None, x.dtype, torch.float32):
+            if not module.cuda_ok(x, dense):
+                x = x.contiguous()
+            if module.cuda_ok(x, dense):
+                return (module.mm_cuda_split if split else module.mm_cuda)(x, dense, dtype or x.dtype)
+        call = module.mm_split if split and callable(getattr(module, "mm_split", None)) else module.mm
+        return call(x, dense, dtype or x.dtype)
     return one_row_at_a_time(x, dense, dtype or x.dtype)
