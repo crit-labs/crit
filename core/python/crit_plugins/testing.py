@@ -140,6 +140,17 @@ class PluginTestCase(unittest.TestCase):
         self.addCleanup(assembly.close)
         return assembly
 
+    def core_runtime(self):
+        """The crit_core_steps library a test that runs the engine on Core's runtime loads (crit_core.native's
+        step_library: CRIT_CORE_STEP_LIBRARY, else the checkout's build, else the one `crit core build` built). The
+        test is skipped, with how to build it, when there is none: crit plugins test lists it."""
+        from crit_core.native import step_library
+        found = step_library()
+        if found is None:
+            self.skipTest("Core's runtime crit_core_steps is not built: `crit core build` builds it "
+                          "(CRIT_CORE_STEP_LIBRARY names another)")
+        return found
+
     def device(self):
         """The device a test of a plugin's device form runs on, one of the devices its manifest names: CUDA when the
         plugin runs there and torch has it, else torch's CPU when the plugin runs there; a policy plugin running on the
@@ -305,6 +316,22 @@ class PluginTestCase(unittest.TestCase):
 
 
 RAN = re.compile(r"^Ran (\d+) tests? in", re.M)
+# A skipped test in unittest's verbose output: "name (module.Class.name)", its docstring's first line on the next
+# line when it has one, then " ... skipped 'reason'".
+SKIPPED = re.compile(r"^(\w+) \(([\w.]+?)(?:\.\1)?\)(?:\n[^\n]*?)? \.\.\. skipped (.*)$", re.M)
+
+
+def _skips(output):
+    """[{test, reason}] of the tests unittest's verbose output reports skipped."""
+    import ast
+    found = []
+    for name, where, reason in SKIPPED.findall(output):
+        try:
+            reason = ast.literal_eval(reason)
+        except (ValueError, SyntaxError):
+            pass   # shown as printed
+        found.append({"test": f"{where}.{name}", "reason": str(reason)})
+    return found
 
 
 def _tree_hash(digest, folder):
@@ -370,7 +397,9 @@ def cache_folder():
 
 def run_tests(registry, only=None, timeout=600, log=print, cache=False):
     """Each plugin's tests (unittest files test*.py in its tests folder), one plugin per process. Returns one item per
-    plugin: {name, state, detail, seconds}; a plugin without tests fails, since every plugin is checked on its own.
+    plugin: {name, state, detail, seconds, skipped}; a plugin without tests fails, since every plugin is checked on its
+    own. skipped lists the tests that skipped ({test, reason}), each also logged: a skip is no failure (a CUDA-only
+    plugin's tests skip without CUDA), but "passed" does not cover what it skipped.
     cache: skip a plugin whose tests passed before under the same key (test_key: its files, the plugins its tests
     use, crit's packages and the environment), reported as passed with `cached` true, and keep each new pass
     (cache_folder()); a library plugin copied unchanged into engine after engine is tested once per machine."""
@@ -390,9 +419,12 @@ def run_tests(registry, only=None, timeout=600, log=print, cache=False):
             except (OSError, ValueError):
                 found = None
             if found and found.get("state") == "passed":
+                skipped = found.get("skipped") or []
                 items.append({"name": manifest["id"], "state": "passed", "detail": found.get("detail", ""),
-                              "seconds": 0.0, "cached": True})
+                              "seconds": 0.0, "cached": True, "skipped": skipped})
                 log(f" passed  {manifest['id']:<32}   cached  {found.get('detail', '')} (unchanged since they passed)")
+                for skip in skipped:
+                    log(f"           skipped {skip['test']}: {skip['reason']}")
                 continue
         started = time.perf_counter()
         tests = Path(manifest["tests"]).resolve()   # the tests run in the plugin's folder, so never relative
@@ -407,27 +439,31 @@ def run_tests(registry, only=None, timeout=600, log=print, cache=False):
         env["PYTHONPATH"] = os.pathsep.join([package_root] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         try:
-            done = subprocess.run([sys.executable, "-B", "-m", "unittest", "discover", "-s", str(tests), "-t", str(tests),
-                                   "-p", "test*.py"], cwd=Path(manifest["folder"]).resolve(), env=env, capture_output=True, text=True,
-                                  timeout=timeout)
+            done = subprocess.run([sys.executable, "-B", "-m", "unittest", "discover", "-v", "-s", str(tests),
+                                   "-t", str(tests), "-p", "test*.py"], cwd=Path(manifest["folder"]).resolve(),
+                                  env=env, capture_output=True, text=True, timeout=timeout)
             output = done.stdout + done.stderr
             ran = RAN.search(output)
             count = int(ran.group(1)) if ran else 0
             passed = done.returncode == 0 and count > 0
-            detail = f"{count} tests" if passed else (output.strip()[-2000:] or f"exit code {done.returncode}")
+            skipped = _skips(output)
+            detail = (f"{count} tests" + (f", {len(skipped)} skipped" if skipped else "") if passed
+                      else (output.strip()[-2000:] or f"exit code {done.returncode}"))
         except subprocess.TimeoutExpired:
-            passed, detail = False, f"the tests ran past {timeout:g} s"
+            passed, detail, skipped = False, f"the tests ran past {timeout:g} s", []
         seconds = time.perf_counter() - started
         items.append({"name": manifest["id"], "state": "passed" if passed else "failed", "detail": detail,
-                      "seconds": round(seconds, 2)})
+                      "seconds": round(seconds, 2), "skipped": skipped})
         if passed and stored is not None:
             import json
             try:
                 stored.parent.mkdir(parents=True, exist_ok=True)
-                stored.write_text(json.dumps({"state": "passed", "detail": detail, "plugin": manifest["id"]}),
-                                  encoding="utf-8")
+                stored.write_text(json.dumps({"state": "passed", "detail": detail, "plugin": manifest["id"],
+                                              "skipped": skipped}), encoding="utf-8")
             except OSError:
                 pass   # a cache that cannot be written leaves the next run to test again
         log(f" {'passed' if passed else 'failed'}  {manifest['id']:<32} {seconds:6.2f}s  "
             f"{detail if passed else detail.splitlines()[-1]}")
+        for skip in skipped:
+            log(f"           skipped {skip['test']}: {skip['reason']}")
     return items

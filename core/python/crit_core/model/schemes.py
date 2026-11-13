@@ -19,6 +19,9 @@ tensors under `base.` and the model's quantization config (quantization_config, 
     bnb4          bitsandbytes NF4/FP4 (U8 base.weight with base.weight.absmax)
     bnb8          bitsandbytes LLM.int8 (I8 base.weight, base.SCB per row)
     nbits         ONNX Runtime's MatMulNBits (base.nbits_weight, as crit_core.model.onnx names a node's inputs)
+    exl3          EXL3 trellis codes (I16 base.trellis [in / 16, out / 16, 16 K] for K bits a weight, 1 to 8 or 1.5,
+                  2.5, 3.5) with the input and output sign vectors (base.suh / base.svh, or the bitfields base.su /
+                  base.sv) and a base.mcg or base.mul1 marker naming the codebook
 
 stored(tensors, base, quantization) gives the scheme's name, its GEMM rate key for the prefill floor and the
 matrix's element count. crit-eval decodes every scheme for its reference (crit_eval.limits.schemes); matrix_parts names the
@@ -43,7 +46,7 @@ def quantization_of(config):
 
 # Schemes whose only decoders are CUDA kernels, so the reference has no CPU dequantization to match, and
 # the tensor each stores per matrix in place of .weight.
-UNREAD = {"exl2": ".q_weight", "exl3": ".trellis"}
+UNREAD = {"exl2": ".q_weight"}
 
 
 def refuse_unread(quantization, names=()):
@@ -105,6 +108,13 @@ def ct_weight_args(quantization, base=None):
     groups = [group["weights"] for group in ((quantization or {}).get("config_groups") or {}).values()
               if isinstance(group, dict) and group.get("weights")]
     return groups[0] if groups else {}
+
+
+def _exl3_stored(tensors, base, quantization):
+    if _dtype(tensors, base + ".trellis") != "I16" or len(_shape(tensors, base + ".trellis") or ()) != 3:
+        return None
+    tiles_in, tiles_out, _ = _shape(tensors, base + ".trellis")
+    return "bf16", 256 * tiles_in * tiles_out
 
 
 def _plain_stored(tensors, base, quantization):
@@ -220,10 +230,11 @@ RECOGNISERS = {
     "bnb4": _bnb4_stored,
     "bnb8": _bnb8_stored,
     "nbits": _nbits_stored,
+    "exl3": _exl3_stored,
     "plain": _plain_stored,
 }
 # The tensor that names each scheme's matrix, for the ceiling's walk over a file's tensors.
-PRIMARY = (".weight_packed", ".qweight", ".nbits_weight", ".weight")
+PRIMARY = (".weight_packed", ".qweight", ".nbits_weight", ".trellis", ".weight")
 
 
 def stored(tensors, base, quantization=None):

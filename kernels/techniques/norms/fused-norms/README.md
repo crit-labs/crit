@@ -21,7 +21,7 @@ row in an order fixed by its width alone.
 
 | | |
 | --- | --- |
-| Functions | `rms_norm`, `rms_norm_heads`, `rms_norm_rope`, `gated_rms_norm`, `rope`, `silu_mul`, `gelu_mul`, `sigmoid_mul`, `l2_norm`, `stream_sum`, `stream_add`, `softplus_decay` (a gated delta layer's log-decay and beta gate), and fused forms of calls a layer runs back to back, each output with the bits of the separate calls: `rms_norm_rope_pair` and `rope_pair` (a layer's queries and keys in one launch), `stream_add_norm` (a row added into the residual streams, then their norms); signatures and semantics in the package docstrings. Every norm weight may be one row per group (`[groups][dim]` for x `[..., groups, dim]`: a weight per head or per residual stream) |
+| Functions | `rms_norm`, `rms_norm_heads`, `rms_norm_rope`, `gated_rms_norm`, `rope`, `silu_mul`, `gelu_mul`, `sigmoid_mul`, `l2_norm`, `stream_sum`, `stream_add`, `softplus_decay` (a gated delta layer's log-decay and beta gate), and fused forms of calls a layer runs back to back, each output with the bits of the separate calls: `rms_norm_rope_pair` and `rope_pair` (a layer's queries and keys in one launch), `stream_add_norm` (a row added into the residual streams, then their norms), `rms_norm_fp8_rows` and `rms_norm_nvfp4` (a norm quantized for a W8A8 or W4A4 projection: the codes and scales of `rms_norm`'s BF16 rows followed by mma-rows' `quantize_fp8_rows` or `quantize_nvfp4`, bit for bit, without writing the rows); signatures and semantics in the package docstrings. Every norm weight may be one row per group (`[groups][dim]` for x `[..., groups, dim]`: a weight per head or per residual stream) |
 | Dtypes | BF16, FP16, FP32 inputs, each read in its own dtype (a residual or gate may differ from the rows); FP32 inside; one rounding to `out_dtype` (BF16, FP16, FP32) |
 | Layouts | the last dimension contiguous (`out` too), the other dimensions any strides (a query beside its gate in one projection output, a slice of a fused projection); layouts whose leading dimensions do not merge into two levels, or whose base address or row stride is not a multiple of 16 (a width of 4,100, an odd token stride), are copied into aligned buffers first, so a launch never specializes on the rows given |
 | GPUs | NVIDIA GPUs Triton compiles for (sm_80 and newer; checked on sm_120); on sm_90 and newer the activation products and one-pass long rows launch with programmatic dependent launch (the kernel waits for the one before with griddepcontrol.wait before it reads anything) |
@@ -39,8 +39,8 @@ untuned build launches exactly what it launched then).
 
 | Structure | Kernel, functions | Key | Knobs (default) |
 | --- | --- | --- | --- |
-| `rows` | `rows_kernel` without rope: `rms_norm`, `rms_norm_heads`, `gated_rms_norm`, `l2_norm`, `stream_add_norm` | `D` | `ELEMENTS` values a program holds, HB = ELEMENTS / BD rows (4,096); `SPAN` values a warp covers, warps = BD x HB / SPAN within 1-16 (512). Both order knobs |
-| `rope` | `rows_kernel` with rope and `pair_kernel`: `rope`, `rms_norm_rope`, `rope_pair`, `rms_norm_rope_pair` | `D` | `ELEMENTS` (4,096; HB at most the heads rounded up to a power of two), `SPAN` (512). Both order knobs |
+| `rows` | `rows_kernel` without rope: `rms_norm`, `rms_norm_heads`, `gated_rms_norm`, `l2_norm`, `stream_add_norm`; `rows_quant_kernel` (`rms_norm_fp8_rows`, `rms_norm_nvfp4`) on the same knobs, so its rows have `rms_norm`'s bits | `D` | `ELEMENTS` values a program holds, HB = ELEMENTS / BD rows (4,096); `SPAN` values a warp covers, warps = BD x HB / SPAN within 1-16 (512). Both order knobs |
+| `rope` | `rows_kernel` with rope and `pair_kernel`: `rope`, `rms_norm_rope`, `rope_pair`, `rms_norm_rope_pair` | `D` | `ELEMENTS` (4,096; HB = ELEMENTS / the row's block whatever the head count, so a pair's tensors keep their separate calls' bits), `SPAN` (512). Both order knobs |
 | `long-rows` | `long_rows_kernel`: the norms of rows wider than 16,384 values | `D` | `CHUNK` (0: the row's block in one pass up to 32,768 values, else 4,096 values a step in two passes; a CHUNK at least the row's block: one pass), `WARPS` (0: 16 in one pass, 8 in two). Both order knobs. `PDL` (3, one-pass rows): programmatic dependent launch, speed only |
 | `act-mul` | `act_mul_kernel`: `silu_mul`, `gelu_mul`, `sigmoid_mul` | `N` | `BLOCK` values a program (1,024; by row count, `default_rows`: 512 at 1-8 rows, 2,048 past 96), `WARPS` (4; 8 past 96 rows), `PDL` programmatic dependent launch (0 none; 1, 2, 3: wait for the kernel before, let the next start after the program's loads, its stores or its exit; untuned: 1 up to 32 rows, 3 to 96, 2 past) |
 | `stream-sum`, `stream-add` | `stream_sum_kernel`, `stream_add_kernel` | `S`, `D` | `BLOCK` (1,024), `WARPS` (4) |
@@ -101,6 +101,19 @@ every input in L2 (the same 50-80 MB read 100 times) they are 0.96-1.0 of FlashI
 one pass took 0.59-0.69 -> 0.81-0.85 at 1-64 rows and 0.90-0.97 -> 1.01-1.02 at 512-4,096 rows; at a few rows the
 single program a row is bound by what one SM moves (FlashInfer's one program a row moves the same bytes about 0.5 us
 sooner); with an FP32 residual (12 bytes a value against FlashInfer's 8 on a BF16 copy) 0.45-0.65.
+
+## Quantizing norms
+
+A W8A8 or W4A4 projection quantizes its activations first. After a norm, that is a second pass over the hidden rows:
+the norm writes them, the quantizer reads them back. `rms_norm_fp8_rows` and `rms_norm_nvfp4` write the codes and
+scales in the norm's own launch. Their norm is `rows_kernel`'s on the `rows` knobs, rounded to BF16 as `rms_norm`
+writes it, and their quantization is that of mma-rows' quantizers (the FP8 row scale is the row's absolute maximum
+/ 448, at least 1e-12; NVFP4 takes one E4M3 scale a 16-value block under the input scale, in cuBLASLt's 128 x 4
+tiled layout). [tests/test_norm_quant.py](tests/test_norm_quant.py) checks codes, scales and residual against
+`rms_norm` followed by the quantizer, bit for bit, with NaN rows and rows of zeros. On an RTX 5090, in CUDA graphs
+with a residual, both formats are level with the two launches at rows of 5,120 values (about 4.5 us from 1 to 64
+rows) and faster where the rows are longer or more: 8,192 values, 64 rows 5.7 to 4.4 us (FP8); 2,048 rows
+145 to 114 us (FP8) and 140 to 83 us (NVFP4).
 
 ## Build, test, tune
 

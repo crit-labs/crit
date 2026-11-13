@@ -6,7 +6,8 @@ A request's tokens then do not depend on the requests sharing its step when the 
 invariance rules (core/src/batch/README.md).
 
     items = [step_item(row, len(session.prompt), session.frontier) for row, session in rows]
-    layout = StepLayout(items)          # layout.placements in row order, layout.logit_rows for the logits pass
+    layout = StepLayout(items)          # layout.placements in row order, layout.logit_rows for the logits pass,
+                                        # layout.read_rows for the last layer's rows past its state writes
 """
 from collections import namedtuple
 
@@ -15,11 +16,13 @@ READY, DEFERRED, INFEASIBLE = "ready", "deferred", "infeasible"
 MAX_STEP_ROWS = 2 ** 31 - 1
 
 # One item's rows in a step: a decode item stages its pending token (with a verify's drafts), a prefill item its prompt
-# chunk; the last `logits` rows produce logits.
-StepItem = namedtuple("StepItem", "key phase rows logits")
+# chunk; the last `logits` rows produce logits. `readers`: something besides the logits pass reads the item's last-layer
+# output on every row (a drafter's or MTP head's taps, a hidden-state readout).
+StepItem = namedtuple("StepItem", "key phase rows logits readers", defaults=(False,))
 # Where StepLayout put an item: step rows [first, first + rows), gathered logits rows [first_logit, first_logit + logits);
-# `item` is its index in the input.
-Placement = namedtuple("Placement", "key phase item first rows first_logit logits")
+# `item` is its index in the input; `read` counts its last rows whose last-layer output anything reads (its logits
+# rows, or every row with readers): the last layer's work past its state writes is needed on those rows alone.
+Placement = namedtuple("Placement", "key phase item first rows first_logit logits read", defaults=(0,))
 
 
 def step_item(row, prompt_tokens, frontier, decode_rows=1, key=None):
@@ -63,21 +66,23 @@ class StepLayout:
             total += item.rows
             if total > MAX_STEP_ROWS:
                 raise ValueError("a step holds at most 2^31 - 1 rows")
-        placements, logit_rows, by_item = [], [], [0] * len(items)
+        placements, logit_rows, read_rows, by_item = [], [], [], [0] * len(items)
         rows = logits = decode_rows = decode_items = 0
         for phase in (DECODE, PREFILL):
             for index, item in enumerate(items):
                 if item.phase != phase:
                     continue
                 by_item[index] = len(placements)
-                placements.append(Placement(item.key, phase, index, rows, item.rows, logits, item.logits))
+                read = item.rows if item.readers else item.logits
+                placements.append(Placement(item.key, phase, index, rows, item.rows, logits, item.logits, read))
                 logit_rows.extend(range(rows + item.rows - item.logits, rows + item.rows))
+                read_rows.extend(range(rows + item.rows - read, rows + item.rows))
                 rows += item.rows
                 logits += item.logits
                 if phase == DECODE:
                     decode_rows += item.rows
                     decode_items += 1
-        self.placements, self.logit_rows, self._by_item = placements, logit_rows, by_item
+        self.placements, self.logit_rows, self.read_rows, self._by_item = placements, logit_rows, read_rows, by_item
         self.rows, self.decode_rows, self.decode_items = rows, decode_rows, decode_items
         return self
 

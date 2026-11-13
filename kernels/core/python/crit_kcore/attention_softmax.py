@@ -70,9 +70,22 @@ def fold(m_run, l_run, m, l, BASE2: tl.constexpr):
 
 
 @triton.jit
+def sink(m_run, l_run, s, BASE2: tl.constexpr):
+    """A sink logit s (natural log, in the scaled scores' units; -inf: none) into a row's final state as one more
+    position that carries no value -> (maximum, sum, the output's factor): the output is acc * keep, then finish(),
+    and lse() of the returned state counts the sink. Folded once, after every partial state, so a split launch's merge
+    and a fused launch take the same steps."""
+    if BASE2:
+        s = s * 1.4426950408889634
+    m_new, l_new, keep, take = fold(m_run, l_run, s, 1.0, BASE2)
+    return m_new, l_new, keep
+
+
+@triton.jit
 def finish(acc, l):
-    """The normalized output acc / l per row, 0 where a row saw no position (l = 0)."""
-    ok = l > 0
+    """The normalized output acc / l per row, 0 where a row saw no position (l = 0); a NaN sum (a NaN score) stays
+    NaN."""
+    ok = l != 0
     return tl.where(ok[:, None], acc / tl.where(ok, l, 1.0)[:, None], 0.0)
 
 
@@ -85,4 +98,4 @@ def lse(m, l, BASE2: tl.constexpr):
         found = tl.fma(m, 0.6931471805599453, tl.log(l))
     else:
         found = m + tl.log(l)
-    return tl.where(l > 0, found, float("-inf"))
+    return tl.where(l != 0, found, float("-inf"))

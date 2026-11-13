@@ -1,0 +1,16 @@
+{
+  "kind": "crit-technique-operations",
+  "technique": "gguf-projections",
+  "operations": [
+    {
+      "id": "gguf-projection",
+      "what": "y = x W^T for W a GGUF matrix in a block format (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, MXFP4), W's values the stored ones (the format's own decoder in FP32)",
+      "reference": {
+        "path": "inference/gguf-projections/code/host.py",
+        "symbol": "project_rows, dense_rows"
+      },
+      "verify": "on the target: the stored values bit for bit against the host decoders; decode rows against the kernel's declared order bit for bit (gguf-rows' bench), and within the int8 activations' rounding of the exact sums",
+      "invariance": "a decode row's bits independent of the rows beside it; with prompt exact, a prompt row's bits those of its decode row"
+    }
+  ]
+}

@@ -44,13 +44,16 @@ __global__ void __launch_bounds__(PW * 32, 1) prompt_kernel(const Problem p) {
   const int steps = (p.K + STEP - 1) / STEP, units = steps * SUBS;
   const int na = min(r0 + gid, p.N - 1), nb = min(r0 + gid + 8, p.N - 1);   // a row past N reads row N - 1
   const __nv_bfloat16* x = static_cast<const __nv_bfloat16*>(p.x);
+  // MMA columns of 8 activation rows holding a row below M: a partly filled last tile stages and multiplies only
+  // those (the others' outputs are not stored), so a 65-row prompt's second CTA does one column's work, not eight.
+  const int live = min(kPromptGroups, (p.M - t0 + 7) / 8);
 
   // Sub-step u (step u / SUBS, sub-step u % SUBS) of the CTA's activation rows into buffer u & 1; zeros for a row past
   // M or a sub-step past K, as act_frags gives them.
   auto stage = [&](int u) {
     const int st = u / SUBS, q = u - st * SUBS;
     uint4* buffer = staged + (u & 1) * kBuffer;
-    for (int i = threadIdx.x; i < kBuffer; i += PW * 32) {
+    for (int i = threadIdx.x; i < live * 8 * kChunks; i += PW * 32) {
       const int tok = i / kChunks, c = i - tok * kChunks;
       const int kb = st * STEP + 32 * (SUBS * (c >> 2) + q);
       const bool valid = t0 + tok < p.M && kb < p.K;
@@ -100,14 +103,16 @@ __global__ void __launch_bounds__(PW * 32, 1) prompt_kernel(const Problem p) {
             wa.split_quad(q, w, pa, la);
             wb.split_quad(q, w, pb, lb);
 #pragma unroll
-            for (int t = 0; t < kPromptGroups; ++t) b[t] = buffer[chunk_at(8 * t + gid, 4 * tig + w)];
+            for (int t = 0; t < kPromptGroups; ++t) if (t < live) b[t] = buffer[chunk_at(8 * t + gid, 4 * tig + w)];
 #pragma unroll
             for (int t = 0; t < kPromptGroups; ++t) {
+              if (t >= live) continue;
               mma(c[t], pa[0], pb[0], pa[1], pb[1], b[t].x, b[t].y);
               mma(c[t], la[0], lb[0], la[1], lb[1], b[t].x, b[t].y);
             }
 #pragma unroll
             for (int t = 0; t < kPromptGroups; ++t) {
+              if (t >= live) continue;
               mma(c[t], pa[2], pb[2], pa[3], pb[3], b[t].z, b[t].w);
               mma(c[t], la[2], lb[2], la[3], lb[3], b[t].z, b[t].w);
             }
@@ -115,11 +120,11 @@ __global__ void __launch_bounds__(PW * 32, 1) prompt_kernel(const Problem p) {
             wa.quad(q, w, pa);
             wb.quad(q, w, pb);
 #pragma unroll
-            for (int t = 0; t < kPromptGroups; ++t) b[t] = buffer[chunk_at(8 * t + gid, 4 * tig + w)];
+            for (int t = 0; t < kPromptGroups; ++t) if (t < live) b[t] = buffer[chunk_at(8 * t + gid, 4 * tig + w)];
 #pragma unroll
-            for (int t = 0; t < kPromptGroups; ++t) mma(c[t], pa[0], pb[0], pa[1], pb[1], b[t].x, b[t].y);
+            for (int t = 0; t < kPromptGroups; ++t) if (t < live) mma(c[t], pa[0], pb[0], pa[1], pb[1], b[t].x, b[t].y);
 #pragma unroll
-            for (int t = 0; t < kPromptGroups; ++t) mma(c[t], pa[2], pb[2], pa[3], pb[3], b[t].z, b[t].w);
+            for (int t = 0; t < kPromptGroups; ++t) if (t < live) mma(c[t], pa[2], pb[2], pa[3], pb[3], b[t].z, b[t].w);
           }
         }
         __syncthreads();   // every warp is done with the buffer before stage() fills it again
@@ -137,6 +142,17 @@ __global__ void __launch_bounds__(PW * 32, 1) prompt_kernel(const Problem p) {
     }
   }
   // c0, c1: matrix row gid, columns 2 tig and 2 tig + 1; c2, c3: matrix row gid + 8.
+  if (p.glu) {
+#pragma unroll
+    for (int t = 0; t < kPromptGroups; ++t)
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const int n = r0 + gid, tok = t0 + 8 * t + 2 * tig + i;
+        if (n < p.N && tok < p.M)
+          finish_glu<WF, ACT>(p, tok, n, SPLIT ? total[t][i] : c[t][i], SPLIT ? total[t][i + 2] : c[t][i + 2]);
+      }
+    return;
+  }
 #pragma unroll
   for (int t = 0; t < kPromptGroups; ++t)
 #pragma unroll

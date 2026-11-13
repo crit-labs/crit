@@ -277,8 +277,13 @@ def test_the_quantizer_is_the_declared_one():
     x[1, 3] = float("nan")
     values, scales = gx.quantize_e2m1x2(x.to(dev), 37.5)
     signed, decoded = quantize_codes(torch.nan_to_num(x, nan=0.0), 37.5)
-    assert torch.equal(values.cpu(), (2 * signed).to(torch.int8).reshape(x.shape))
-    assert torch.equal(scales.cpu(), decoded / torch.tensor(37.5))
+    want = (2 * signed).to(torch.int8).reshape(x.shape)
+    want_scales = decoded / torch.tensor(37.5)
+    want[1, :16] = 0                      # the NaN's block: zero codes and a NaN scale, so its products carry it
+    want_scales[1, 0] = float("nan")
+    assert torch.equal(values.cpu(), want)
+    assert torch.equal(scales.cpu().nan_to_num(nan=-1.0), want_scales.nan_to_num(nan=-1.0))
+    assert bool(scales[1, 0].isnan())
 
 
 # ------------------------------------------------------------------------------------- the declared arithmetic

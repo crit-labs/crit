@@ -94,7 +94,13 @@ DEVICE_INTERFACES = {
                    "its own position; topk_blocks chooses them), attention:tree (parents [tokens]: each token's parent "
                    "column in its row, -1 for none, parents before children: a verify window's columns see the "
                    "positions before it and their ancestors and themselves in it), attention:lse (lse=True also "
-                   "returns each token's log-sum-exp [tokens][heads] FP32, natural log over the scaled scores)",
+                   "returns each token's log-sum-exp [tokens][heads] FP32, natural log over the scaled scores), "
+                   "attention:sinks (sinks [heads] FP32: each query head's sink logit, natural log in the scaled "
+                   "scores' units, one more position with no value in every token's softmax; -inf for none), "
+                   "attention:sliding (sliding: an int, a sliding window: a token sees its last `sliding` positions, "
+                   "its own included; 0 for all; never with blocks), attention:latent (latent=R: latent attention, "
+                   "queries [tokens][heads][R + P] over a pool of keys only with one KV head whose rows are each "
+                   "position's latent then its rotary key, the latent its value too; out [tokens][heads][R])",
     },
     "recurrence": {
         "pool": "pool(layers, heads, keys, values, device, sequences=None, widest=0, conv=None, key_heads=None, "
@@ -245,10 +251,21 @@ DEVICE_EXTENSIONS = {
     "attention:blocks": {},
     "attention:tree": {},
     "attention:lse": {},
+    "attention:sinks": {},
+    "attention:sliding": {},
+    "attention:latent": {},
     # A KV pool's static FP8 scales per layer (a checkpoint's k_scale and v_scale), on the pool.
     "kv:scales": {
         "set_scales": "set_scales(layer, key_scale, value_scale): the layer's stored = value / scale for its keys "
                       "and values (an fp8 pool), before the layer's first write",
+    },
+    # A pool of sliding-window layers: each sequence a ring of pages (its last positions), the attention reading it with
+    # its window (attention:sliding).
+    "kv:sliding": {
+        "pool": "pool(..., sliding=W, span=None, positions=N): the layers' tokens see their last W positions; each "
+                "sequence keeps a ring of about (W + span) / page pages whatever its length (span: the most positions "
+                "a row writes in one step; positions: the most a sequence reaches), so the pool's `sliding`, `ring` "
+                "and `table_pages`",
     },
     # Rows at chosen positions, on the pool: a pool of keys only (pool(..., value_dim=0): an indexer's keys) and a
     # per-block row cache (a pool whose positions are block numbers: pooled block keys written once per block).

@@ -88,6 +88,22 @@ __device__ __forceinline__ void fold16(int step, float a, float* x) {
     }
 }
 
+// The 32-lane halving tree (a warp's xor butterfly over 16, 8, 4, 2, 1, or shuffle-down from 16: lane 0 holds
+// ((((l0 + l16) + (l8 + l24)) + ((l4 + l20) + (l12 + l28))) + ...) computed by one thread from finished lanes as they
+// come: step s adds lane lane_at32(s) (a 5-bit reversal: 0, 16, 8, 24, 4, ...), x[0..5] the tree's partial sums (a
+// binary counter: x[5] the total after step 31). Unroll the 32 steps so `step` is a constant: then only the partial
+// sums still needed live. The bits equal the butterfly's (IEEE addition is commutative: only the tree's shape matters).
+__host__ __device__ constexpr int lane_at32(int at) {
+    return ((at & 1) << 4) | ((at & 2) << 2) | (at & 4) | ((at & 8) >> 2) | ((at & 16) >> 4);
+}
+__device__ __forceinline__ void fold32(int step, float a, float* x) {
+    float v = a;
+    int level = 0;
+#pragma unroll
+    for(int s = step; s & 1; s >>= 1) v = __fadd_rn(x[level++], v);
+    x[level] = v;
+}
+
 // ------------------------------------------------------------------------------------------- block reductions
 
 // The block's sum of v (blockDim.x a multiple of 32, every thread calls): each warp's butterfly, then warp 0 adds the

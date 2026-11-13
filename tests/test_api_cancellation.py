@@ -40,6 +40,26 @@ Engine.generate = gated_generate
 '''
 
 
+class AbortedClientTests(unittest.TestCase):
+    def test_a_client_gone_mid_request_is_one_line_and_other_errors_keep_their_traceback(self):
+        import contextlib
+        import io
+        server = Server(('127.0.0.1', 0), None)
+        self.addCleanup(server.server_close)
+        for error, traced in ((ConnectionAbortedError(10053, 'aborted'), False), (RuntimeError('a bug'), True)):
+            printed = io.StringIO()
+            with contextlib.redirect_stderr(printed):
+                try:
+                    raise error
+                except Exception:
+                    server.handle_error(None, ('127.0.0.1', 5000))
+            if traced:
+                self.assertIn('Traceback', printed.getvalue())
+            else:
+                self.assertEqual(printed.getvalue(),
+                                 'crit serve: 127.0.0.1 went away mid-request (ConnectionAbortedError)\n')
+
+
 class DisconnectTests(ServeFixture, unittest.TestCase):
     stream = True
     adapter_suffix = GATED_ADAPTER

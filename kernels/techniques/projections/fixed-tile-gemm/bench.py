@@ -3,6 +3,8 @@ plugin runs BF16 matrices and NVFP4 or MXFP8 ones decoded to BF16 through it), B
 by i alone (one set a K, sliced for every row count), an FP64 reference of the first rows."""
 import torch
 
+from crit_kernels.gates import shared_memory_optin
+
 MAX_ROWS = 8192     # the most rows tune_rows asks for
 CHECKED = 64        # rows of each call checked against the FP64 reference
 
@@ -85,13 +87,13 @@ class CudaMm(Mm):
     def valid(self, knobs):
         """Warp tiles of whole 16 x 16 tiles with at most 32 accumulator tiles (128 FP32 registers) a thread, 4 to 8
         warps whose tile copies cover whole 8-row groups (THREADS a multiple of 8 BK / 16), and the ring within a CTA's
-        shared memory (99 KB)."""
+        shared memory (the GPU's opt-in limit: 99 KB on an RTX 5090)."""
         tm, tn, wm, wn, bk = knobs["TM"], knobs["TN"], knobs["WM"], knobs["WN"], knobs["BK"]
         if tm % (16 * wm) or tn % (16 * wn) or (tm // wm // 16) * (tn // wn // 8) > 32 or not 4 <= wm * wn <= 8:
             return False
         if (32 * wm * wn) % (8 * bk // 16):
             return False
-        return knobs["STAGES"] * (tm + tn) * bk <= 101376
+        return knobs["STAGES"] * (tm + tn) * bk <= shared_memory_optin()
 
     def run(self, module, s):
         return module.mm_cuda(s["x"], s["dense"])

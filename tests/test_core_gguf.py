@@ -168,6 +168,21 @@ class FolderCheckTests(GgufFiles):
                                               "qwen3.attention.head_count_kv": [0, 2]}))
         self.assertEqual(check.errors, ())
 
+    def test_attention_geometry_per_layer_kind(self):
+        # Sliding layers have 2 KV heads of 8, the full layer 1 of 16 (its own keys), per-layer in the GGUF.
+        config = {**CONFIG, "layer_types": ["sliding_attention", "full_attention"], "sliding_window": 64,
+                  "num_global_key_value_heads": 1, "global_head_dim": 16}
+        metadata = {"qwen3.attention.head_count_kv": [2, 1], "qwen3.attention.key_length": 16,
+                    "qwen3.attention.key_length_swa": 8}
+        self.assertEqual(self.folder(model_metadata(**metadata), config).errors, ())
+        self.assertEqual(self.folder(model_metadata(**{**metadata, "qwen3.attention.head_count_kv": [2, 2]}),
+                                     config).errors,
+                         ("key/value heads: GGUF 2 at layer 1 (full_attention), config.json 1",))
+        self.assertEqual(self.folder(model_metadata(**{**metadata, "qwen3.attention.key_length_swa": 16}),
+                                     config).errors, ("sliding head size: GGUF 16, config.json 8",))
+        self.assertEqual(self.folder(model_metadata(**{**metadata, "qwen3.attention.key_length": 8}), config).errors,
+                         ("head size: GGUF 8, config.json 16",))
+
     def test_tokenizer_disagreements(self):
         self.assertEqual(self.folder(vocab={"a": 0, "b": 1, "x": 2, "ab": 3}).errors,
                          ("token 2: GGUF 'c', tokenizer.json 'x'",))
@@ -187,3 +202,24 @@ class FolderCheckTests(GgufFiles):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TensorBytesTests(GgufFiles):
+    def test_a_matrix_and_an_expert_stack_read_as_their_stored_rows(self):
+        import numpy as np
+        from crit_core.model.gguf_blocks import GgufTensors, stored_values
+        q4k = bytes(range(256)) * 2 + bytes(64)          # 4 rows of one 144-byte Q4_K block
+        iq3 = bytes((7 * i) % 256 for i in range(660))   # 2 experts x 3 rows of one 110-byte IQ3_S block
+        tensors = [("blk.0.attn_q.weight", "Q4_K", (4, 256), q4k),
+                   ("blk.0.ffn_up_exps.weight", "IQ3_S", (2, 3, 256), iq3)]
+        path = self.write(gguf_bytes(model_metadata(), tensors))
+        with GgufTensors(inspect_gguf_model(path)) as reader:
+            rows = reader.rows("blk.0.attn_q.weight")
+            self.assertEqual(rows.shape, (4, 144))
+            self.assertEqual(rows.tobytes(), q4k)
+            self.assertFalse(rows.flags.writeable)
+            stack = reader.rows("blk.0.ffn_up_exps.weight")
+            self.assertEqual((stack.shape, stack.tobytes()), ((2, 3, 110), iq3))
+            self.assertEqual(stored_values(np.array(rows), 12, 256).shape, (4, 256))
+            with self.assertRaisesRegex(KeyError, "no tensor 'missing'"):
+                reader.rows("missing")

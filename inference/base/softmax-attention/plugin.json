@@ -2,7 +2,7 @@
   "schema": "crit-plugin-v1",
   "id": "softmax-attention",
   "title": "Exact causal softmax attention over the KV rows (attention-state)",
-  "description": "attention-state's attend for each query over the rows at positions up to its own: the plain attention every attention plugin is compared with. On the device (attention-state's device_attention.py) it reads attention-state's pages in place: prompt rows of every page type through crit's paged-kv-attention prompt reader (FlashInfer's paged prefill over 16-bit and FP8 pages only with option flashinfer auto, a yardstick); decode and verify windows of every page type through crit's paged-kv-attention split-KV reader (built for the engine's device, tuned or default knobs) where it loads, in a step as in a captured round (no host work, its work following each row's length), so a row a step decodes (plain decoding, log-probabilities, replays) has the bits of the same row in a round (option decode flashinfer: a step's window rows through FlashInfer's decode instead), with tree masks and block-sparse lists; otherwise each row's queries over its sequence's KV gathered from the pool with torch's scaled dot product attention or a masked softmax, the plain path the others are tested against (option kernels: torch forces it). A captured prompt chunk (prompts:attention) reads the staged prompt table on the device: crit's prompt reader at a position read on the device, or the split-KV reader or its torch fallback; no FlashInfer plan inside a capture.",
+  "description": "attention-state's attend for each query over the rows at positions up to its own: the plain attention every attention plugin is compared with. On the device (attention-state's device_attention.py) it reads attention-state's pages in place: prompt rows of every page type through crit's paged-kv-attention prompt reader (FlashInfer's paged prefill over 16-bit and FP8 pages only with option flashinfer auto, a yardstick); decode and verify windows of every page type through crit's paged-kv-attention split-KV reader (built for the engine's device, tuned or default knobs) where it loads, in a step as in a captured round (no host work, its work following each row's length), so a row a step decodes (plain decoding, log-probabilities, replays) has the bits of the same row in a round (option decode flashinfer: a step's window rows through FlashInfer's decode instead), with tree masks, block-sparse lists, attention sinks (a query head's sink logit: one more position with no value) and sliding windows (a token sees its last W positions; FlashInfer and torch's SDPA give way to crit's readers or the masked softmax for either); otherwise each row's queries over its sequence's KV gathered from the pool with torch's scaled dot product attention or a masked softmax, the plain path the others are tested against (option kernels: torch forces it). A captured prompt chunk (prompts:attention) reads the staged prompt table on the device: crit's prompt reader at a position read on the device, or the split-KV reader or its torch fallback; no FlashInfer plan inside a capture.",
   "fills": [
     "attention"
   ],
@@ -17,6 +17,9 @@
     "attention:blocks",
     "attention:tree",
     "attention:lse",
+    "attention:sinks",
+    "attention:sliding",
+    "attention:latent",
     "prompts:attention"
   ],
   "devices": [
@@ -105,6 +108,10 @@
     }
   },
   "kernels": [
+    {
+      "name": "latent-attention",
+      "fallback": "latent attention of a step's rows in FP32 torch from the gathered rows (captured rounds and prompt chunks need the kernel)"
+    },
     {
       "name": "paged-kv-attention",
       "fallback": "window rows (decode, verify, trees, block lists, rounds) in a masked FP32 softmax over the pool's page tables in torch; prompt rows over fp8:row and INT8 pages gathered and multiplied by torch's SDPA"

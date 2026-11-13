@@ -1,4 +1,6 @@
 """Provisional Unicode text, final validation and real guarded-process streaming."""
+import contextlib
+import io
 import json
 from pathlib import Path
 import sys
@@ -248,6 +250,42 @@ class StreamingTests(StreamingFixture, unittest.TestCase):
 
     def test_consumer_interrupt_retires_before_unlock_and_preserves_interrupt(self):
         self.check_consumer_failure(KeyboardInterrupt("consumer interrupted"))
+
+    def test_a_failed_stream_write_cancels_the_turn_and_keeps_the_host(self):
+        # A client gone mid-stream fails the write with OSError: the turn is cancelled and settles, the error reaches
+        # the caller as raised, and the next turn runs on the same resident host and weights.
+        engine = self.engine()
+        (_, assistant, _), _ = self.streaming(engine, "hello")[2]()
+        before = json.loads(assistant.split("\n", 1)[1])
+        tree, error = engine.runtime.tree, BrokenPipeError("client gone")
+
+        def consume(text):
+            raise error
+
+        printed = io.StringIO()
+        with contextlib.redirect_stderr(printed), self.assertRaises(BrokenPipeError) as caught:
+            engine.generate([{"role": "user", "content": "hold"}], 128, threading.Event(), on_text=consume)
+        self.assertIs(caught.exception, error)
+        self.assertIs(engine.runtime.tree, tree)
+        self.assertIsNone(tree.process.poll())
+        self.assertEqual(printed.getvalue(), "")
+        (status, assistant, _), failure = self.streaming(engine, "hello")[2]()
+        self.assertEqual(status, "completed", failure)
+        after = json.loads(assistant.split("\n", 1)[1])
+        self.assertEqual((after["pid"], after["device"], after["private"]), (before["pid"], before["device"], 1))
+
+    def test_a_retired_host_says_so_on_stderr(self):
+        engine = self.engine()
+        pid = engine.runtime.tree.process.pid
+
+        def consume(text):
+            raise RuntimeError("consumer failed")
+
+        printed = io.StringIO()
+        with contextlib.redirect_stderr(printed), self.assertRaises(RuntimeError):
+            engine.generate([{"role": "user", "content": "hold"}], 128, threading.Event(), on_text=consume)
+        self.assertEqual(printed.getvalue(), f"crit serve: the engine host (process {pid}) is retired after an error, "
+                                             "its weights released: consumer failed\n")
 
     def test_consumer_failure_with_failed_retirement_blocks_reuse(self):
         engine = self.engine()

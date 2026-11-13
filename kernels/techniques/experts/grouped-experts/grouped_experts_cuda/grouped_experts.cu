@@ -385,15 +385,16 @@ __global__ void __launch_bounds__(WARPS * 32) expert_kernel(Pass p) {
                     for(int q = 0; q < kPairs; ++q) {
                         float amax = 0.0f;
 #pragma unroll
-                        for(int t = 2 * q; t < (TILES == 1 ? 1 : 2 * q + 2); ++t) amax = fmaxf(amax, fabsf(hv[t]));
+                        for(int t = 2 * q; t < (TILES == 1 ? 1 : 2 * q + 2); ++t) amax = kc::abs_max(amax, hv[t]);
 #pragma unroll
-                        amax = kc::warp_max_from<4>(amax);
+                        for(int o = 4; o < 32; o <<= 1)   // warp_max_from<4>, NaN-carrying
+                            amax = kc::abs_max(amax, __shfl_xor_sync(0xffffffffu, amax, o));
                         if constexpr(TILES == 1) {
                             __shared__ float pair[WARPS][8];
                             __syncthreads();
                             if(g == 0) pair[warp][2 * t4 + c] = amax;
                             __syncthreads();
-                            amax = fmaxf(amax, pair[warp ^ 1][2 * t4 + c]);
+                            amax = kc::abs_max(amax, pair[warp ^ 1][2 * t4 + c]);
                         }
                         decoded[q] = kc::nvfp4_block_scale(amax, g_dn);
                     }
@@ -523,7 +524,7 @@ __global__ void quantize_kernel(const float* x, int rows, int cols, float g, std
     if(i >= static_cast<long long>(rows) * blocks) return;
     const float* v = x + i * 16;
     float amax = 0.0f;
-    for(int k = 0; k < 16; ++k) amax = fmaxf(amax, fabsf(v[k]));
+    for(int k = 0; k < 16; ++k) amax = kc::abs_max(amax, v[k]);
     const float decoded = kc::nvfp4_block_scale(amax, g);
     for(int k = 0; k < 16; ++k) {
         float value = 0.0f;
@@ -558,7 +559,7 @@ __global__ void a4_inputs_kernel(const bf16* x, int top, const std::uint8_t* sto
         const float2 f = __bfloat1622float2(kc::bf162_of(words[q]));
         v[2 * q] = f.x;
         v[2 * q + 1] = f.y;
-        amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y)));
+        amax = kc::abs_max(kc::abs_max(amax, f.x), f.y);
     }
     const float decoded = kc::nvfp4_block_scale(amax, g);
     uint4 o[2];
@@ -599,7 +600,7 @@ __global__ void declared_inputs_kernel(const bf16* x, int top, const std::uint8_
 #pragma unroll
     for(int k = 0; k < B; ++k) {
         f[k] = __bfloat162float(v[k]);
-        amax = fmaxf(amax, fabsf(f[k]));
+        amax = kc::abs_max(amax, f[k]);
     }
     std::int8_t* out = values + static_cast<long long>(r) * H + b * B;
     if constexpr(INT4) {
@@ -705,7 +706,7 @@ __global__ void declared_intermediate_kernel(const float* gate_up, const std::ui
 #pragma unroll
     for(int k = 0; k < B; ++k) {
         h[k] = kc::swiglu_declared(gu[k], gu[I + k]);
-        amax = fmaxf(amax, fabsf(h[k]));
+        amax = kc::abs_max(amax, h[k]);
     }
     std::int8_t* out = values + static_cast<long long>(r) * I + b * B;
     if constexpr(INT4) {

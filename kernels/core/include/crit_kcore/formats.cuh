@@ -363,9 +363,20 @@ __device__ __forceinline__ void four_bit_pair_table(uint32_t* table) {
 
 // ------------------------------------------------------------------------------------------- NVFP4 quantizer steps
 
+// |v| folded into a block's running maximum magnitude m (from 0), compared as integers: non-negative floats order as
+// their bit patterns, and a NaN or an infinity in the block folds to NaN, above them all, so the block's scale comes
+// out NaN (amax / 127, amax g / 6) rather than a finite stand-in that hides it (fmaxf drops a NaN; a saturated
+// infinity looks like a large value). Two such maxima merge the same way (abs_max(m, other), as across a warp's lanes).
+__device__ __forceinline__ float abs_max(float m, float v) {
+    const int a = __float_as_int(fabsf(v));
+    return __int_as_float(max(__float_as_int(m), a >= 0x7f800000 ? 0x7fc00000 : a));
+}
+
 // crit's declared NVFP4 quantizer, step by step: a 16-value block of maximum magnitude amax under global scale g has
-// the decoded block scale e4m3(encode(amax g / 6)) (448 where that is not finite)...
+// the decoded block scale e4m3(encode(amax g / 6)) (448 where that overflows; NaN for a block holding a NaN or an
+// infinity, amax not finite, so the products it feeds carry it)...
 __device__ __forceinline__ float nvfp4_block_scale(float amax, float g) {
+    if(!(amax <= 3.402823466e38f)) return __int_as_float(0x7fc00000);
     float wanted = __fdiv_rn(__fmul_rn(amax, g), 6.0f);
     if(!isfinite(wanted)) wanted = 448.0f;
     return e4m3_value(e4m3_encode(wanted));

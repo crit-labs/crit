@@ -48,6 +48,19 @@ void layout_rules() {
     const auto rows = step.logit_rows();
     require(std::vector<std::uint32_t>(rows.begin(), rows.end()) == std::vector<std::uint32_t>{0, 1, 2, 3, 4, 7},
             "logits rows: both decodes, the verify's columns and the prompt's last row");
+    const auto read = step.read_rows();
+    require(std::vector<std::uint32_t>(read.begin(), read.end()) == std::vector<std::uint32_t>(rows.begin(), rows.end()) &&
+                step.placement(2).read == 0 && step.placement(0).read == 1,
+            "without readers the last layer is read on the logits rows alone");
+    // A chunk whose rows a drafter taps keeps every last-layer row, though it produces no logits.
+    const std::array<StepItem, 3> tapped{{{key(1), RowPhase::prefill, 4, 0, true}, {key(2), RowPhase::decode, 2, 2},
+                                          {key(3), RowPhase::prefill, 3, 1}}};
+    step.arrange(tapped);
+    const auto tapped_rows = step.read_rows();
+    require(std::vector<std::uint32_t>(tapped_rows.begin(), tapped_rows.end()) ==
+                    std::vector<std::uint32_t>{0, 1, 2, 3, 4, 5, 8} &&
+                step.placement(0).read == 4 && step.placement(0).logits == 0,
+            "readers keep a chunk's every last-layer row");
     // Rearranging reuses storage; a failed arrange changes nothing.
     const std::array<StepItem, 1> one{{{key(9), RowPhase::prefill, 2, 1}}};
     step.arrange(one);
@@ -64,7 +77,8 @@ void layout_rules() {
     rejects_as<std::invalid_argument>([&] { step.arrange(huge); }, "more than 2^31 - 1 rows");
     rejects_as<std::out_of_range>([&] { (void)step.placement(1); }, "a placement past the items");
     step.arrange({});
-    require(!step.rows() && step.placements().empty() && step.logit_rows().empty(), "an empty step");
+    require(!step.rows() && step.placements().empty() && step.logit_rows().empty() && step.read_rows().empty(),
+            "an empty step");
 }
 
 void item_rules() {

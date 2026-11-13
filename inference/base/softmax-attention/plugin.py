@@ -12,6 +12,7 @@ from .state import device_attention
 from .state import implementation as reference
 
 KERNELS = "paged-kv-attention"
+LATENT = "latent-attention"
 
 
 class SoftmaxAttention:
@@ -33,11 +34,13 @@ class SoftmaxAttention:
         return out
 
     # -- the device form ---------------------------------------------------------------------------------------------------
-    def forward(self, layer, queries, pool, batch, scale=None, blocks=None, block_size=None, parents=None, lse=False):
+    def forward(self, layer, queries, pool, batch, scale=None, blocks=None, block_size=None, parents=None, lse=False,
+                sinks=None, sliding=0, latent=0):
         """queries [tokens][heads][dim] of a StepBatch or a RoundBatch over the pool's KV (written for this step
         already); each token sees its sequence's positions up to its own (device_attention.DeviceAttention.forward:
-        blocks, parents, lse)."""
-        return self.device_form.forward(layer, queries, pool, batch, scale, blocks, block_size, parents, lse)
+        blocks, parents, lse, sinks, sliding, latent)."""
+        return self.device_form.forward(layer, queries, pool, batch, scale, blocks, block_size, parents, lse,
+                                        sinks=sinks, sliding=sliding, latent=latent)
 
     def facts(self):
         """The device form's engine facts (device_attention.DeviceAttention.facts)."""
@@ -71,5 +74,16 @@ def create(context, options, parts):
                                             options["decode"], options["partitions"], options["piece"],
                                             device_attention.engine_device(context), options["workspace_mib"],
                                             options["flashinfer"], options["flashinfer_mib"],
-                                            options["prompt_reader"], options["reader"])
+                                            options["prompt_reader"], options["reader"], _latent(options))
     return SoftmaxAttention(parts["kv_cache"], form)
+
+
+def _latent(options):
+    """A loader of crit's kernel latent-attention (built on the first latent call), or None (option kernels torch)."""
+    if options["kernels"] != "auto":
+        return None
+
+    def load():
+        from crit_plugins.kernels import load_kernel
+        return load_kernel(LATENT, folder=Path(__file__).parent)
+    return load

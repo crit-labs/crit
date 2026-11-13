@@ -180,7 +180,7 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(sorted(techniques | sourced | set(ENGINE_SERVICES)), ENTRIES)
         self.assertEqual(sorted(sourced - techniques), ["async-expert-contributions", "expert-streamed-prefill",
                                                         "host-work-mailbox"])
-        self.assertEqual((len(techniques), len(ENTRIES)), (21, 31))
+        self.assertEqual((len(techniques), len(ENTRIES)), (22, 32))
         self.assertEqual(list(INFERENCE.glob("*/plugins/*/plugin.json")), [])
 
 

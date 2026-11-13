@@ -21,6 +21,7 @@ class NativeServingOptionsTests(unittest.TestCase):
         engine = ResidentEngine.__new__(ResidentEngine)
         engine.configuration = {"temperature": .8}
         engine.capacity, engine.stop_ids = 2048, set()
+        engine.release_below = None   # no device memory to hand back after a request (release_threshold)
         engine.facts = {"sampling": {"temperature": True, "seed": True, "penalties": True, "logit_bias": True}}
         engine.sampling = ("temperature", "seed", "presence_penalty", "frequency_penalty", "repetition_penalty",
                            "logit_bias")

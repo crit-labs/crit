@@ -42,6 +42,13 @@
 //                448)), d = b * fp32(1 / g), code = nearest E2M1 magnitude of x / d (ties to the even code; 0 when d is
 //                0), value = e2m1(code) * b; out = (sum * row_scale[n]) * fp32(1 / g).
 // The quantizers are those of quantize_fp8_rows and quantize_nvfp4 (the same bits as the prompt rows' quantization).
+// glu 1 (an MLP's gate and up projections in one matrix, silu(gate) * up in the epilogue): the matrix's rows hold the
+// gate and up rows interleaved by eights (rows 16 j .. 16 j + 7 are gate rows 8 j .. 8 j + 7, rows 16 j + 8 ..
+// 16 j + 15 the up rows of the same eight; interleave_glu() in Python), N a multiple of 16, and out is [M][N / 2]: each
+// gate and up sum finished as without glu and rounded to out's type, then silu(gate) * up in FP32, rounded once. A
+// thread's fragment holds both rows of a pair, so the product needs no exchange; with splits, the tile's last CTA adds
+// both sums in split order first. The values are those of the two projections stored and an activation product
+// applied to them, to the activation's rounding.
 #pragma once
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -98,6 +105,7 @@ struct Problem {
   const float* act_scale = nullptr;  // set by enqueue: the FP8 row scales in scratch
   const std::uint8_t* zeros = nullptr;   // kInt4Zp: zero points [N][K / group]
   int group = 0;                         // kInt4Zp: inputs a scale and zero point cover
+  int glu = 0;                           // 1: silu(gate) * up of interleaved gate and up rows (above), out [M][N / 2]
 };
 
 cudaError_t enqueue(const Problem& p, cudaStream_t stream);

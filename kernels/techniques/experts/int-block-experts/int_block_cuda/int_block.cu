@@ -1194,9 +1194,8 @@ __global__ void quantize_e2m1x2_kernel(const float* x, int ld_x, int rows, int c
     const int row = i / blocks, b = i % blocks;
     const float* v = x + std::size_t(row) * ld_x + 16 * b;
     float amax = 0.0f;
-    for(int k = 0; k < 16; ++k) amax = fmaxf(amax, fabsf(v[k]));
-    const float wanted = __fdiv_rn(__fmul_rn(amax, global), 6.0f);
-    const float decoded = e4m3(e4m3_encode(isfinite(wanted) ? wanted : 448.0f));
+    for(int k = 0; k < 16; ++k) amax = kc::abs_max(amax, v[k]);
+    const float decoded = kc::nvfp4_block_scale(amax, global);   // NaN for a block holding a non-finite value
     std::int8_t* out = const_cast<std::int8_t*>(acts.values) + std::size_t(row) * acts.ld + 16 * b;
     for(int k = 0; k < 16; ++k) {
         const float q = __fdiv_rn(__fmul_rn(v[k], global), decoded);
@@ -1261,10 +1260,13 @@ __global__ void quantize_nvfp4_kernel(const void* x, int ld_x, int rows, int col
     }
     float amax = 0.0f;
 #pragma unroll
-    for(int k = 0; k < 16; ++k) amax = fmaxf(amax, fabsf(v[k]));
+    for(int k = 0; k < 16; ++k) amax = kc::abs_max(amax, v[k]);
+    // A block holding a NaN or an infinity gets the E4M3 NaN byte (the block-scaled MMA carries it into every product
+    // of the block) and zero codes.
+    const bool finite = amax <= 3.402823466e38f;
     const float wanted = __fdiv_rn(__fmul_rn(amax, global), 6.0f);
-    const unsigned byte = e4m3_encode_fast(isfinite(wanted) ? wanted : 448.0f);
-    const float decoded = e4m3(byte);
+    const unsigned byte = finite ? e4m3_encode_fast(isfinite(wanted) ? wanted : 448.0f) : 0x7Fu;
+    const float decoded = finite ? e4m3(byte) : 0.0f;
     uint32_t packed[2] = {0u, 0u};
 #pragma unroll
     for(int k = 0; k < 16; ++k) {
@@ -1293,8 +1295,8 @@ __global__ void quantize_int8_kernel(const float* x, int ld_x, int rows, int col
     const int row = i / blocks, b = i % blocks;
     const float* v = x + std::size_t(row) * ld_x + acts.block * b;
     float amax = 0.0f;
-    for(int k = 0; k < acts.block; ++k) amax = fmaxf(amax, fabsf(v[k]));
-    const float d = __fdiv_rn(amax, 127.0f);
+    for(int k = 0; k < acts.block; ++k) amax = kc::abs_max(amax, v[k]);
+    const float d = __fdiv_rn(amax, 127.0f);   // NaN for a block holding a non-finite value: zero codes, a NaN scale
     std::int8_t* out = const_cast<std::int8_t*>(acts.values) + std::size_t(row) * acts.ld + acts.block * b;
     for(int k = 0; k < acts.block; ++k) {
         float q = d > 0.0f ? rintf(__fdiv_rn(v[k], d)) : 0.0f;

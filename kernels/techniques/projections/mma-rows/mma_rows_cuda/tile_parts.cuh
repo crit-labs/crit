@@ -291,16 +291,39 @@ __device__ __forceinline__ uint32_t nvfp4_block(const uint32_t (&w)[8], float g,
   return sbits;
 }
 
-// A finished sum: its scales applied in a fixed order, then stored in out's type.
+// A sum with its scales applied in a fixed order.
 template <int WF, int ACT>
-__device__ __forceinline__ void finish(const Problem& p, int tok, int n, float v) {
+__device__ __forceinline__ float scaled(const Problem& p, int tok, int n, float v) {
   if constexpr (WF == kNvfp4 || WF == kFp8) v *= p.row_scale[n];
   if constexpr (ACT == kActNvfp4) v *= p.input_rcp;
   if constexpr (ACT == kActFp8Rows) v *= p.act_scale[tok];
-  const size_t at = (size_t)tok * p.ldo + n;
+  return v;
+}
+// v rounded to out's type (as a store and a load give it back).
+__device__ __forceinline__ float out_rounded(const Problem& p, float v) {
+  if (p.out_kind == kOutBf16) return __bfloat162float(__float2bfloat16_rn(v));
+  if (p.out_kind == kOutF16) return __half2float(__float2half_rn(v));
+  return v;
+}
+__device__ __forceinline__ void store_out(const Problem& p, size_t at, float v) {
   if (p.out_kind == kOutF32) static_cast<float*>(p.out)[at] = v;
   else if (p.out_kind == kOutBf16) static_cast<__nv_bfloat16*>(p.out)[at] = __float2bfloat16_rn(v);
   else static_cast<__half*>(p.out)[at] = __float2half_rn(v);
+}
+// A finished sum: its scales applied in a fixed order, then stored in out's type.
+template <int WF, int ACT>
+__device__ __forceinline__ void finish(const Problem& p, int tok, int n, float v) {
+  store_out(p, (size_t)tok * p.ldo + n, scaled<WF, ACT>(p, tok, n, v));
+}
+// The glu output of gate row n (n % 16 < 8 of the interleaved matrix) and its up row n + 8: each finished and rounded
+// to out's type, then silu(gate) * up, stored at column (n / 16) * 8 + n % 8.
+__device__ __forceinline__ void store_glu(const Problem& p, int tok, int n, float gate, float up) {
+  const float g = out_rounded(p, gate), u = out_rounded(p, up);
+  store_out(p, (size_t)tok * p.ldo + (n >> 4) * 8 + (n & 7), g * (1.0f / (1.0f + expf(-g))) * u);
+}
+template <int WF, int ACT>
+__device__ __forceinline__ void finish_glu(const Problem& p, int tok, int n, float gate, float up) {
+  store_glu(p, tok, n, scaled<WF, ACT>(p, tok, n, gate), scaled<WF, ACT>(p, tok, n + 8, up));
 }
 
 // A launch on `stream`, as the programmatic dependent of the kernel before it where the device has it (9.0 on).

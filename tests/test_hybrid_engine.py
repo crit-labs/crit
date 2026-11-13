@@ -14,7 +14,6 @@ checkpoint's recurrent outputs fall to a thousandth of its values, and every chu
 sharpened head turns into whole nats on a few positions."""
 from concurrent.futures import ThreadPoolExecutor
 import json
-import os
 from pathlib import Path
 import shutil
 import sys
@@ -25,11 +24,13 @@ ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("core/python", "cli"):
     sys.path.insert(0, str(ROOT / _folder))
 
+from crit_core.native import step_library  # noqa: E402
+
 try:
     import torch
     import transformers
     import safetensors  # noqa: F401
-    READY = (torch.cuda.is_available() and bool(os.environ.get("CRIT_CORE_STEP_LIBRARY"))
+    READY = (torch.cuda.is_available() and step_library() is not None
              and hasattr(transformers, "Qwen3NextForCausalLM"))
 except ImportError:
     READY = False

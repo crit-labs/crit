@@ -104,6 +104,27 @@ class CostTests(RunFixture, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "rates are any of"):
             self.store.cost(self.run_id, [transcript], prices=json.dumps({"future-model": {"tokens": 1}}))
 
+    def test_idle_stretches_leave_the_active_hours_and_synthetic_messages_are_no_requests(self):
+        created = datetime.fromisoformat(self.run["created_at"])
+        a, a_sealed = self.sealed()
+        usage = {"input_tokens": 1000, "output_tokens": 1000, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+        transcript = self.root / "idle.jsonl"
+        self.claude_code(transcript, [(created, "claude-opus-5-5", usage, "r1"), (created, "<synthetic>", {}, "r2")])
+        until = a_sealed + timedelta(hours=3)
+        idle = [f"{iso(a_sealed + timedelta(hours=2))}..{iso(a_sealed + timedelta(hours=2, minutes=30))}",
+                f"{iso(a_sealed + timedelta(minutes=10))}..{iso(a_sealed + timedelta(minutes=40))}"]
+        value = self.store.cost(self.run_id, [transcript], until=iso(until), idle=idle)
+        self.assertEqual(value["run"]["requests"], 1)
+        self.assertIsNotNone(value["run"]["usd"], "a synthetic message is priced at nothing, not unpriced")
+        wall = round((until - created).total_seconds())
+        self.assertEqual(value["run"]["active_seconds"], wall - 3600)
+        self.assertEqual([s["from"] for s in value["run"]["idle"]], [iso(a_sealed + timedelta(minutes=10)),
+                                                                     iso(a_sealed + timedelta(hours=2))])
+        self.assertEqual(value["candidates"][0]["active_seconds"], value["candidates"][0]["seconds"])
+        self.assertEqual(cost.built(value)["hours"], value["run"]["active_hours"])
+        with self.assertRaisesRegex(ValueError, "give FROM..UNTIL"):
+            self.store.cost(self.run_id, [transcript], until=iso(until), idle=[iso(created)])
+
     def test_codex_and_plain_transcripts_and_the_cli(self):
         created = datetime.fromisoformat(self.run["created_at"])
         a, a_sealed = self.sealed()

@@ -1,11 +1,15 @@
 {
-  "about": "Which config.json keys spell each field, in the order they are tried. The one copy both config readers use: crit_core.model.config loads it, core/CMakeLists.txt generates the C++ reader's arrays from it. A model family that spells a field its own way adds its key here, never a branch in a reader. layer_count_from: per-layer lists whose length is the layer count when num_hidden_layers is absent (configs that derive the count from them).",
+  "about": "Which config.json keys spell each field, in the order they are tried. The one copy both config readers use: crit_core.model.config loads it, core/CMakeLists.txt generates the C++ reader's arrays from it. A model family that spells a field its own way adds its key here, never a branch in a reader. layer_count_from: per-layer lists whose length is the layer count when num_hidden_layers is absent (configs that derive the count from them). full_attention_*: the geometry of full-attention layers where it differs from the other attention layers' (num_key_value_heads, head_dim), and a flag that their keys and values are one cached tensor; only the Python attention rules (attention_geometry, attention_shape, kv_elements_per_token) read them, the C++ reader types no attention geometry.",
   "text_sections": ["text_config", "llm_config"],
   "position_lengths": ["max_position_embeddings", "n_positions", "max_seq_len", "seq_length", "max_sequence_length",
                        "model_max_length"],
   "norm_eps": ["rms_norm_eps", "layer_norm_eps", "layer_norm_epsilon"],
   "dtype": ["dtype", "torch_dtype"],
   "experts": ["num_experts", "num_local_experts", "n_routed_experts"],
+  "experts_per_token": ["num_experts_per_tok", "top_k_experts"],
+  "full_attention_kv_heads": ["num_global_key_value_heads"],
+  "full_attention_head_dim": ["global_head_dim"],
+  "full_attention_keys_equal_values": ["attention_k_eq_v"],
   "layer_types": ["layer_types", "layers_block_type"],
   "layer_count_from": ["layers_block_type"]
 }

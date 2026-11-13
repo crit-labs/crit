@@ -411,13 +411,17 @@ class HostRows:
         self.last = table
         return table
 
-    def store(self, rows, format=None, scales=None, scale=1.0, dtype=None):
+    def store(self, rows, format=None, scales=None, scale=1.0, dtype=None, device=None):
         """A table on the device: rows [ids][width] (of its dtype), or format "nvfp4": rows the codes [ids][width / 2]
         uint8, scales the E4M3 scales [ids][width / 16] (uint8 or float8), dtype the rows' decoded dtype (BF16 by
-        default), scale the global scale (a multiplier). Returns the Table."""
+        default), scale the global scale (a multiplier). device: the device it serves, by default the one rows are on.
+        Returns the Table."""
         import torch
         if rows.dim() != 2 or rows.shape[0] < 1:
             raise ValueError("a table of rows of one width")
+        if device is not None and torch.device(device) != rows.device:
+            rows = rows.to(device)
+            scales = scales.to(device) if scales is not None else None
         if format is None:
             width, dtype, sources = rows.shape[1], rows.dtype, [rows]
         else:

@@ -23,9 +23,17 @@ class StepLayoutTests(unittest.TestCase):
         layout = StepLayout(items)
         self.assertEqual((layout.rows, layout.decode_rows, layout.decode_items), (12, 5, 3))
         self.assertEqual([p.key for p in layout.placements], [2, 4, 5, 1, 3])
-        self.assertEqual(layout.placement(4)[3:], (2, 3, 2, 3))
-        self.assertEqual(layout.placement(0)[3:], (5, 3, 5, 1))
+        self.assertEqual(layout.placement(4)[3:], (2, 3, 2, 3, 3))
+        self.assertEqual(layout.placement(0)[3:], (5, 3, 5, 1, 1))
         self.assertEqual(layout.logit_rows, [0, 1, 2, 3, 4, 7])
+        self.assertEqual(layout.read_rows, layout.logit_rows)
+        self.assertEqual(layout.placement(2).read, 0)
+
+    def test_readers_keep_every_last_layer_row(self):
+        layout = StepLayout([StepItem(1, PREFILL, 4, 0, True), StepItem(2, DECODE, 2, 2), StepItem(3, PREFILL, 3, 1)])
+        self.assertEqual(layout.logit_rows, [0, 1, 8])
+        self.assertEqual(layout.read_rows, [0, 1, 2, 3, 4, 5, 8])
+        self.assertEqual([p.read for p in layout.placements], [2, 4, 1])
 
     def test_invalid_items_leave_the_layout(self):
         layout = StepLayout([StepItem(9, PREFILL, 2, 1)])

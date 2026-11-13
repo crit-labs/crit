@@ -180,7 +180,7 @@ class ProductTests(unittest.TestCase):
     def test_real_inference_entries_are_generic_local_implementations(self):
         self.assertEqual(store.check(), [])
         entries = store.load()["entries"]
-        self.assertEqual(len(entries), 31)
+        self.assertEqual(len(entries), 32)
         for entry in entries:
             self.assertNotIn("donors", entry)
             self.assertNotIn("code_locations", entry)
@@ -226,7 +226,7 @@ class ProductTests(unittest.TestCase):
             if path.is_file() and path.suffix in {".txt", ".cmake", ".in", ".h", ".hpp", ".cpp", ".cu", ".py"}:
                 self.assertNotRegex(path.read_text(encoding="utf-8").lower(), r"inference/|crit_inference|crit::inference", path)
         for path in (ROOT / "tests/core").rglob("*"):
-            if path.is_file():
+            if path.is_file() and "__pycache__" not in path.parts:   # bytecode the suites leave
                 self.assertNotIn("inference/", path.read_text(encoding="utf-8"), path)
         cmake = (ROOT / "inference/CMakeLists.txt").read_text(encoding="utf-8")
         self.assertIn('add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../core"', cmake)

@@ -449,6 +449,42 @@ def _folder_template(directory):
     return None
 
 
+def _compare_attention(model, config, drafts, compare, errors):
+    """KV heads and head sizes of the GGUF's attention layers against config.json's per layer kind
+    (ModelConfig.attention_geometry): a per-layer head_count_kv list is compared layer by layer (0 marks a layer
+    without attention, draft blocks are not compared), and key_length_swa, where the GGUF has it, is the sliding
+    layers' head size beside key_length, the full layers'."""
+    from .config import FULL_ATTENTION, SLIDING_ATTENTION, ConfigError
+    get = model.get
+    geometry = config.attention_geometry()
+    try:
+        kinds = config.layer_kinds() if geometry else None
+    except ConfigError:
+        kinds = None
+    kv = get(".attention.head_count_kv")
+    if isinstance(kv, tuple) and kinds and len(kv) in (len(kinds), len(kinds) + drafts):
+        for index, (found, kind) in enumerate(zip(kv, kinds)):
+            expected = geometry[kind][0] if kind in geometry else None
+            if found and expected is not None and found != expected:
+                errors.append(f"key/value heads: GGUF {found} at layer {index} ({kind}), config.json {expected}")
+                break
+    elif geometry and kinds:
+        expected = {geometry[kind][0] for kind in set(kinds) if kind in geometry}
+        values = {v for v in _array_or(kv) if v} if kv is not None else set()
+        if values and expected and not values <= expected:
+            errors.append(f"key/value heads: GGUF {sorted(values) if len(values) > 1 else next(iter(values))}, "
+                          f"config.json {sorted(expected) if len(expected) > 1 else next(iter(expected))}")
+    else:
+        compare("key/value heads", kv, config.num_key_value_heads)
+    declared = config.head_dim is not None
+    full_dim = geometry[FULL_ATTENTION][1] if geometry and (declared or geometry[FULL_ATTENTION][1] != geometry[
+        SLIDING_ATTENTION][1]) else config.head_dim
+    swa = get(".attention.key_length_swa")
+    compare("head size", get(".attention.key_length"), full_dim)
+    if swa is not None:
+        compare("sliding head size", swa, geometry[SLIDING_ATTENTION][1] if geometry and declared else None)
+
+
 def check_gguf_folder(model, config, directory):
     """Compare a GgufModel with the config.json (crit_core.model.ModelConfig) and tokenizer.json beside it, when the
     folder holds them (otherwise crit_core.model.gguf_files derives them from the GGUF).
@@ -478,8 +514,7 @@ def check_gguf_folder(model, config, directory):
                       + f", config.json {config.num_hidden_layers}")
     compare("hidden size", get(".embedding_length"), config.hidden_size)
     compare("attention heads", get(".attention.head_count"), config.num_attention_heads)
-    compare("key/value heads", get(".attention.head_count_kv"), config.num_key_value_heads)
-    compare("head size", get(".attention.key_length"), config.head_dim)
+    _compare_attention(model, config, drafts, compare, errors)
     if config.moe is None:
         compare("MLP width", get(".feed_forward_length"), config.intermediate_size)
     else:

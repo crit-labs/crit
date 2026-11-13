@@ -923,5 +923,25 @@ class RunRootTests(unittest.TestCase):
             RunStore(workspace / "runs", workspace)
 
 
+class FieldCheckTests(unittest.TestCase):
+    def test_an_unknown_field_is_refused_with_the_fields_the_object_takes(self):
+        from crit.records import keys
+        cases = [
+            (({"fate": "built", "reason": "x"}, ("fate", "detail")), None),
+            (({"fate": "built", "detail": "x", "reason": "y"}, ("fate", "detail"), ("note",)),
+             "Unknown fields; use extensions: reason. Takes detail, fate; optionally note."),
+            (({"reason": "y"}, (), ("note", "detail")), "Unknown fields; use extensions: reason. Takes, optionally, detail, note."),
+            (({"reason": "y"}, ()), "Unknown fields; use extensions: reason. Takes no fields but extensions."),
+        ]
+        with self.assertRaisesRegex(ValueError, "Missing required fields: detail"):
+            keys(*cases[0][0])
+        for args, message in cases[1:]:
+            with self.subTest(message=message), self.assertRaises(ValueError) as caught:
+                keys(*args)
+            self.assertEqual(str(caught.exception), message)
+        self.assertEqual(keys({"fate": "built", "detail": "x", "extensions": {"reason": "y"}}, ("fate", "detail")),
+                         {"fate": "built", "detail": "x", "extensions": {"reason": "y"}})
+
+
 if __name__ == "__main__":
     unittest.main()

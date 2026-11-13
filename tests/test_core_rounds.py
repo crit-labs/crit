@@ -4,7 +4,6 @@ composed into one round. Its greedy rounds decode exactly what plain greedy deco
 as alone, through held rows, truncations and slot moves; it packs log-probabilities and each row's telemetry words; a
 selection whose plugins lack their round facts is refused before any capture; and on a GPU its captured rounds give the
 eager rounds' tokens and run as Core's native rounds, whose request facts count every round."""
-import os
 from pathlib import Path
 import sys
 import math
@@ -12,6 +11,8 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core" / "python"))
+
+from crit_core.native import step_library  # noqa: E402
 
 try:
     import torch
@@ -265,12 +266,13 @@ class RoundsTests(unittest.TestCase):
                       drafter=self.drafter if drafts else None, head=self.head if drafts else None,
                       pools=[self.pool], parts=Parts(USE, ROUNDS_FACTS), counters=COUNTERS, **options)
 
-    def decode(self, rounds, prompts, counts, widths, stops=(), hold=None, truncate=None):
+    def decode(self, rounds, prompts, counts, widths, stops=(), hold=None, truncate=None, row_widths=None, log=None):
         outputs = []
         for slot, prompt in enumerate(prompts):
             first = self.model.prefill(slot, prompt)
             rounds.bind(slot, ("sequence", slot), len(prompt), first, counts[slot] - 1, capacity=len(prompt) + counts[slot]
-                        + rounds.widest + 1, stops=stops, params={"temperature": 0.0})
+                        + rounds.widest + 1, stops=stops, params={"temperature": 0.0},
+                        width=row_widths[slot] if row_widths else None)
             outputs.append([first])
         cycle = 0
         while any(len(o) < c and (not o or o[-1] not in stops) for o, c in zip(outputs, counts)):
@@ -285,6 +287,8 @@ class RoundsTests(unittest.TestCase):
             for row, result in enumerate(found):
                 if row in held:
                     self.assertEqual(result["tokens"], [])
+                if log is not None and result["tokens"]:
+                    log.setdefault(row, []).append(len(result["tokens"]))
                 outputs[row] += result["tokens"]
             cycle += 1
             self.assertLess(cycle, 500)
@@ -392,6 +396,48 @@ class RoundsTests(unittest.TestCase):
         accepted = drafts["accepted_by_depth"]
         self.assertTrue(all(a >= b for a, b in zip(accepted, accepted[1:])), "a deeper draft is kept less often")
         self.assertEqual(sum(accepted) + drafts["rounds"], 2 * 119, "a row round emits its accepted drafts and one")
+
+    def test_a_row_keeps_only_its_own_widths_drafts_and_emits_plain_greedy(self):
+        # Rows of their own widths in rounds of width 6: a row at width 0 (a request that does not draft) emits one
+        # token a round, one at width 2 at most three, and each decodes plain greedy; only drafts a row's width keeps
+        # are offered.
+        rounds = self.build(3, 6)
+        prompts, counts, log = [[3, 1, 4], [2, 7], [5]], [60, 60, 60], {}
+        outputs, cycles = self.decode(rounds, prompts, counts, [6], row_widths=[0, 2, None], log=log)
+        self.assertEqual(outputs, [plain(p, c) for p, c in zip(prompts, counts)])
+        self.assertEqual(set(log[0]), {1})
+        self.assertLessEqual(max(log[1]), 3)
+        self.assertGreater(max(log[2]), 3, "the toy head drafts well: the full-width row keeps more")
+        offered = rounds.telemetry()["drafts"]["offered_by_depth"]
+        rounds_of = [len(log[row]) for row in range(3)]
+        self.assertEqual(offered, [rounds_of[1] + rounds_of[2]] * 2 + [rounds_of[2]] * 4)
+        with self.assertRaisesRegex(ValueError, "lies in 0 .. widest"):
+            rounds.start_row(0, 3, 1, 5, width=7)
+
+    def test_the_next_round_narrows_to_the_widest_rows_own_width(self):
+        # Rounds captured at widths 0, 2 and 6: rows that do not draft make the next round of their row count width 0,
+        # a row of width 1 the narrowest captured width holding it (2), and a full-width row the policy's (6); a row
+        # bound later raises its row count's width before its first round. Each still decodes plain greedy.
+        rounds = self.build(2, 6, widths=[0, 2, 6])
+        prompts, counts = [[3, 1, 4], [2, 7]], [20, 20]
+        for widths, want in (([0, 0], 0), ([1, 0], 2), ([0, None], 6)):
+            outputs = []
+            for slot, prompt in enumerate(prompts):
+                first = self.model.prefill(slot, prompt)
+                rounds.bind(slot, ("sequence", slot), len(prompt), first, counts[slot] - 1, capacity=64,
+                            params={"temperature": 0.0}, width=widths[slot])
+                outputs.append([first])
+            self.assertGreaterEqual(rounds.width(2), want, "the first round holds every bound row's width")
+            while any(len(o) < c for o, c in zip(outputs, counts)):
+                width = rounds.width(2)
+                rounds.launch(2, width)
+                for row, found in enumerate(rounds.read()):
+                    outputs[row] += found["tokens"]
+                if all(len(o) < c - 6 for o, c in zip(outputs, counts)):
+                    self.assertEqual(rounds.width(2), want, widths)
+            self.assertEqual(outputs, [plain(p, c) for p, c in zip(prompts, counts)], widths)
+            for slot in range(2):
+                rounds.unbind(slot)
 
     def test_held_rows_emit_nothing_and_keep_their_state(self):
         prompts, counts = [[1, 2], [3, 4, 5], [6]], [30, 30, 30]
@@ -971,7 +1017,7 @@ class RoundsTests(unittest.TestCase):
         self.assertEqual(results[False], [plain(p, c) for p, c in zip(prompts, counts)])
 
 
-@unittest.skipIf(torch is None or not torch.cuda.is_available() or not os.environ.get("CRIT_CORE_STEP_LIBRARY"),
+@unittest.skipIf(torch is None or not torch.cuda.is_available() or not step_library(),
                  "a CUDA device and Core's step library")
 class NativeLogprobReplayTests(unittest.TestCase):
     """Core's native rounds serve a request asking for log-probabilities (the driver's buffers, through Core's output
@@ -1108,7 +1154,7 @@ class NativeLogprobReplayTests(unittest.TestCase):
         self.assertLess(native_steps, python_steps / 3, (native_steps, python_steps))
 
 
-@unittest.skipIf(torch is None or not torch.cuda.is_available() or not os.environ.get("CRIT_CORE_STEP_LIBRARY"),
+@unittest.skipIf(torch is None or not torch.cuda.is_available() or not step_library(),
                  "native rounds need CUDA and Core's crit_core_steps (CRIT_CORE_STEP_LIBRARY)")
 class NativeComposedRoundTests(unittest.TestCase):
     """The composed driver handed to Core: a toy step model whose decode rows all run as Core's native rounds, whose

@@ -1510,6 +1510,9 @@ def _check_activations(plan):
     parent_plan = next((plan_id for plan_id, candidate in links(plan.root).items() if candidate == plan.parent), None)
     planned = load(plan.root, plan.run, parent_plan).get("prompt_activations") if parent_plan else None
     served = (plan.result.get("engine") or {}).get("prompt_activations")
+    if isinstance(planned, str) and isinstance(served, dict):
+        # One activation for every quantized format, as a plan may declare it, against the engine's per format.
+        planned = {name: planned for name in served}
     if planned is not None and served != planned and rejected is None:
         raise ValueError(f"{plan.parent} served prompt activations {served!r}, its plan {parent_plan} declared "
                          f"{planned!r}: build what the plan declares, or record the measurement that rejected it "

@@ -97,6 +97,7 @@ class Rows(_Bench):
     """rms_norm at each norm width of the model: the hidden width with a residual (BF16 rows, FP32 residual in place),
     the narrower ones without (several heads a token), a zero-centred FP32 weight, BF16 out."""
     structure = "rows"
+    restore = ("residual",)   # the FP32 residual takes the rows' sum in place
 
     def shapes(self, model):
         return [{"D": d, "per": per, "residual": res} for d, (per, res) in sorted(_norm_widths(model).items())
@@ -356,6 +357,7 @@ class StreamSum(_Bench):
 class StreamAdd(_Bench):
     """stream_add of one BF16 row into a token's residual streams (BF16) with an FP32 weight per stream, in place."""
     structure = "stream-add"
+    restore = ("h",)   # the streams take the weighted row in place
 
     def shapes(self, model):
         return _streams(model)

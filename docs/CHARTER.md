@@ -145,9 +145,15 @@ Rules hold for every run, every model and every machine. Where crit enforces one
    Shared knowledge (published formats, config conventions shared by families) lives once, in data.
 5. **Kernels are templates, never hosted.** crit's kernels are curated templates in `kernels/` with knobs an engine
    sweeps on its own device and shapes, each checked against a reference and measured against the best vendor or open
-   library at the same arithmetic. crit hosts no kernel builds. An engine's own kernel stays in the engine.
+   library at the same arithmetic. crit hosts no kernel builds. An engine's own kernel stays in the engine. A kernel's
+   speed is evidence about the GPU it was measured on, never about another: its speed-only constants are knobs, its
+   device limits are read from the device, an instruction one GPU generation has sits behind a feature check with a
+   path for the others beside it, and a new way of computing an operation is added as a structure beside the ones it
+   beat, which the sweep keeps choosing between on every GPU ([guarding against one
+   GPU](../kernels/README.md#one-gpu)). A tuning belongs to the GPU it was swept on.
 6. **One code path per concern.** When a general mechanism replaces a specific one, the specific one goes in the same
-   change.
+   change. A kernel's structures are not such copies: each is one way of computing its operation, kept while some GPU
+   and shape may pick it.
 
 ### Measurement
 
@@ -205,6 +211,11 @@ Things no run, agent or contribution may do. Most are enforced by crit; the rest
 - **Never change the model's sampling.** Not even to a model card's recommendation; only the user overrides it.
 - **Never invent measurements.** Without the target hardware, results are labelled unmeasured. Never claim a server
   was started on the user's machine.
+- **Never generalize one GPU's kernel results.** A kernel measured faster on one GPU is faster there, on those shapes:
+  no default, constant, removed structure or claim may rest on it for other GPUs. Every number names its device; a
+  capability a kernel was only compiled for is "compile-checked", not "runs"; a structure leaves a kernel only when it
+  loses on every GPU and shape it was measured on, more than one GPU among them, and another structure covers every
+  GPU it ran on.
 - **Never weaken a check to pass it.** Don't relax agreed criteria, demand byte-identical output where none is
   required, or bend required work into a speed lever.
 - **Keep run data out of crit.** Model-specific source, models, dependencies, builds and results live in the run
@@ -243,6 +254,9 @@ belongs in an engine, a run record or crit-hub.
 What the charter commits to that crit does not do today, so a reader knows the gap is known:
 
 - **Backends beyond CUDA.** ROCm, Metal, Vulkan and CPU backends; plugins can already declare them.
+- **Kernels run on more than one GPU.** Every kernel's tests, gates and measurements so far come from one RTX 5090
+  (sm_120). CI compiles every kernel for every architecture it claims, so the other architectures are compile-checked,
+  not run; Kernel Core's wgmma (sm_90) and tcgen05 (sm_100) wrappers are compile-checked and no technique uses them yet.
 - **Multi-GPU and CPU-only engines,** end to end and with Eval's limits for them.
 - **`crit serve` for a sealed external engine.** `crit run` records, checks, measures, ablates and traces an
   external engine started from its launch command, but `crit serve` runs plugin packages only: a sealed external

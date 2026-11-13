@@ -15,7 +15,7 @@ class Projections:
     def load(self, tensors, format):
         return tensors["weight"].float()
 
-    def matmul(self, x, matrix, out_dtype=None):
+    def matmul(self, x, matrix, out_dtype=None, prompt=False):
         # Row by row: a row's bits never depend on the rows beside it (the slot's row invariance).
         import torch
         y = torch.cat([x[r:r + 1].float() @ matrix.T for r in range(x.shape[0])])

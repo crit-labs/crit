@@ -149,12 +149,23 @@ def timestamp(value, name):
     return result
 
 
+def takes(required, optional=()):
+    """The fields an object takes, for a refusal: "Takes fate, detail; optionally note." (extensions always)."""
+    required, optional = sorted(set(required)), sorted(set(optional) - set(required))
+    if not required and not optional:
+        return "Takes no fields but extensions."
+    parts = ["Takes " + ", ".join(required)] if required else []
+    if optional:
+        parts.append(("optionally " if required else "Takes, optionally, ") + ", ".join(optional))
+    return "; ".join(parts) + "."
+
+
 def keys(value, required, optional=()):
     if not isinstance(value, dict) or not set(required) <= value.keys():
         raise ValueError("Missing required fields: " + ", ".join(sorted(set(required) - (value.keys() if isinstance(value, dict) else set()))))
     unknown = value.keys() - set(required) - set(optional) - {"extensions"}
     if unknown:
-        raise ValueError("Unknown fields; use extensions: " + ", ".join(sorted(unknown)))
+        raise ValueError("Unknown fields; use extensions: " + ", ".join(sorted(unknown)) + ". " + takes(required, optional))
     if "extensions" in value and not isinstance(value["extensions"], dict):
         raise ValueError("extensions must be an object")
     json.dumps(value, allow_nan=False)

@@ -1460,6 +1460,8 @@ void model_config_types() {
     require(!config_of(root, R"({"num_experts":0,"n_routed_experts":64})").moe, "zero experts is dense");
     config = config_of(root, R"({"n_routed_experts":256,"num_nextn_predict_layers":1})");
     require(config.moe && config.moe->experts_key == "n_routed_experts" && config.moe->experts_per_token == 0 && config.num_nextn_predict_layers == 1u, "routed experts");
+    config = config_of(root, R"({"num_experts":128,"top_k_experts":8})");   // experts_per_token's second spelling
+    require(config.moe && config.moe->experts_per_token == 8u, "top_k_experts");
     // Derived values reject inconsistent configs instead of rounding.
     rejects_as<FormatError>([&] { (void)config_of(root, R"({"num_attention_heads":3,"hidden_size":100})").effective_head_dim(); },
                             "key 'hidden_size': 100 is not divisible by num_attention_heads 3");

@@ -58,6 +58,16 @@ class RunSettingsTest(unittest.TestCase):
         self.assertEqual(limits["ram_headroom_bytes"], 8 * GIB)
         self.assertEqual(limits["vram_headroom_bytes"], 3 * GIB)
 
+    def test_create_says_when_eval_cannot_score_the_model(self):
+        for refusal, says in (("GGUF architecture 'x' has no layout rules", True), (None, False)):
+            err, out = io.StringIO(), io.StringIO()
+            with patch("crit_eval.quality.checkpoints.scoring_refusal", return_value=refusal) as check,                     contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = main(["--project", str(self.project), "create", "--record", str(self.request)])
+            self.assertEqual(code, 0)   # the run is created either way
+            self.assertEqual(check.call_args.args, (str(self.project / "model.fixture"),))
+            self.assertEqual("Eval cannot score this model: GGUF architecture 'x' has no layout rules" in err.getvalue(),
+                             says)
+
     def test_settings_quality_mode_fills_the_request_and_names_a_mode_crit_knows(self):
         for text, expected in (("", "speed"), ('quality_mode = "preserve"\n', "preserve")):
             (self.project / "settings.toml").write_text(text, encoding="utf-8")

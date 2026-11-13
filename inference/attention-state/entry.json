@@ -103,6 +103,10 @@
     {
       "path": "inference/attention-state/code/device_attention.py",
       "purpose": "The attention slot's device form over the pool, shared by the library's attention plugins: crit's paged-kv-attention kernels (split-KV decode and verify windows over every page type with tree masks and block lists, prompt rows and chunks over every page type), then torch fallbacks; FlashInfer only with the plugins' option flashinfer auto (a yardstick) (gathered SDPA, a capture-safe masked softmax over the page tables)"
+    },
+    {
+      "path": "inference/attention-state/code/latent_attention.py",
+      "purpose": "The float64 reference of latent attention (operation latent-attention): every query head over one cached latent and rotary key a position, the latent the value too, with optional sinks; what crit's kernel latent-attention is checked against"
     }
   ],
   "requires": {

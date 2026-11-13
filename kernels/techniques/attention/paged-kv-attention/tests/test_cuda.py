@@ -391,3 +391,43 @@ def test_a_cuda_ramp_splits_short_positions_finer_and_keeps_a_columns_bits_alone
             plain = cache.attend(q, [0] * T, list(range(T)), [pos0 + i for i in range(T)], 1, chunk=chunk, **CUDA)
             assert not torch.equal(plain, alone)
     assert pk.cuda_splits(4096, 384, (3, 16)) > pk.cuda_splits(4096, 384, (0, 16))
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("fused", [False, True])
+def test_a_graph_captured_before_the_workspace_grows_still_replays_its_own_bits(fused, monkeypatch):
+    # The module's workspace grows for a larger launch after a capture: the captured launch keeps the one it read,
+    # whose blocks no other tensor may take (a replay would read them, and write over that tensor).
+    if fused:   # every fused launch fused (not the window launch and its merge)
+        monkeypatch.setattr(pk, "FUSED_PARTIALS", 0)
+    monkeypatch.setattr(pk, "_workspaces", {})   # the module's workspaces as before any launch
+    monkeypatch.setattr(pk, "_fused_workspaces", {})
+    cache = Cache("bf16", 4, 256, 256, 16, [3100, 3100, 3100, 3100])
+
+    def launcher(columns, rows):
+        q = _q(columns * rows, 24, 256, 7).to(torch.bfloat16)
+        out = torch.empty(columns * rows, 24, 256, dtype=torch.bfloat16, device=dev)
+        args = dict(rows=torch.arange(rows, dtype=torch.int32, device=dev),
+                    starts=torch.arange(rows, dtype=torch.int32, device=dev) * columns,
+                    firsts=torch.full((rows,), 3000, dtype=torch.int64, device=dev))
+        counts = torch.full((rows,), columns, dtype=torch.int32, device=dev)
+        return out, lambda: pk.attend(q, cache.k, cache.v, "bf16", cache.tables, args["rows"], args["starts"],
+                                      args["firsts"], columns, 16, counts=counts, out=out, fused=fused, **CUDA)
+    out, small = launcher(8, 1)
+    small()
+    want = out.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        small()
+    held = pk._fused_workspaces if fused else pk._workspaces
+    before = [t.numel() for t in held[next(iter(held))]]
+    _, large = launcher(64, 4)
+    large()
+    assert [t.numel() for t in held[next(iter(held))]] != before   # it grew
+    torch.cuda.synchronize()
+    junk = [torch.full((n,), float("nan"), device=dev) for n in before]   # the sizes a freed workspace would give back
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, want)
+    assert all(torch.isnan(t).all() for t in junk)   # and other tensors keep their values

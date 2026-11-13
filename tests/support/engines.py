@@ -3,16 +3,21 @@
 fills every slot an engine fills. Its model is toy-model, a batched step model on Core's concurrent runtime,
 which needs Core's crit_core_steps library (STEP_LIBRARY)."""
 import json
-import os
 from pathlib import Path
 import shutil
+import sys
+
+# Core beside this checkout, as support/runs.py puts it: a test module imports this one first.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "core" / "python"))
+from crit_core.native import step_library  # noqa: E402
 
 TOY = Path(__file__).resolve().parents[2] / "inference" / "examples" / "plugin-engine" / "plugins"
 USE = {"model": "toy-model", "placement": "toy-placement", "projections": "toy-projections",
        "attention": "toy-attention", "kv_cache": "toy-kv", "sampler": "toy-sampler"}
 DRAFTING = {"drafter": "toy-drafter", "verifier": "toy-verifier"}
-# Core's runtime: the crit_core_steps library the engine tests load, from CRIT_CORE_STEP_LIBRARY.
-STEP_LIBRARY = os.environ.get("CRIT_CORE_STEP_LIBRARY")
+# Core's runtime: the crit_core_steps library the engine tests load, found as Core's loader finds it
+# (crit_core.native.step_library: CRIT_CORE_STEP_LIBRARY, else the checkout's build, else Core's cache).
+STEP_LIBRARY = step_library()
 
 
 def selection(drafting=False, options=None, **use):

@@ -34,7 +34,8 @@ beside the tuned record as name + UNTUNED.
 
 Each request is recorded (loaded()), and the engine's facts carry the record under "kernels": per kernel the source it
 came from (tuned: built with the engine's tuning table; built: built with its default knobs; fallback) and, for a
-fallback, why.
+fallback, why. A tuning table swept on a GPU of another compute capability (the sweep records it) is not applied: the
+kernel is built with its default knobs, recorded as built with the reason, and stderr says so once.
 """
 import os
 import threading
@@ -192,15 +193,25 @@ def load_kernel(name, *, folder, tuned=True):
             return None
         if hasattr(build_module, "use_tuning_source"):
             _connect(build_module)
+        foreign = None
         try:
-            module = load(name, tuning=read_tuning(tuning) if tuning else None)
+            data = read_tuning(tuning) if tuning else None
+            check = getattr(build_module, "foreign_tuning", None)
+            foreign = check(data) if (data and check) else None
+            if foreign:   # swept on another GPU: its choices are no evidence here, so the default knobs
+                build_module.warn_foreign_tuning(name, foreign)
+                data = None
+            module = load(name, tuning=data)
         except Exception as error:  # noqa: BLE001 - any failure to build or import is a fallback with its reason
             text = str(error).strip()
             reason = f"{type(error).__name__}: {text.splitlines()[-1] if text else ''}"[:300]
             _record(label, "fallback", plugin, reason)
             _modules[key] = None
             return None
-        _record(label, "tuned" if tuning else "built", plugin, tuning=tuning)
+        if foreign:
+            _record(label, "built", plugin, f"default knobs: {foreign}")
+        else:
+            _record(label, "tuned" if tuning else "built", plugin, tuning=tuning)
         if hasattr(build_module, "alias_loaded"):
             _report_aliases(build_module, module)
         _modules[key] = module

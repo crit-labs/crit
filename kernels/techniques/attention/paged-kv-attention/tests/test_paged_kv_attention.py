@@ -204,12 +204,13 @@ def _lowering(arch, group, d, kind, columns, fused=False, knob=0):
                  "out_ptr": "*bf16", "lse_ptr": "*fp32", "fk_ptr": "*bf16", "fv_ptr": "*bf16", "fshift_ptr": "*i64",
                  "ffirst_ptr": "*i64", "stride_qt": "i32", "stride_qh": "i32", "stride_ot": "i32", "stride_oh": "i32",
                  "stride_fk": "i32", "stride_fv": "i32", "stride_fr": "i32", "tab_stride": "i32", "tab_width": "i32",
-                 "n_parts": "i32", "sm_scale": "fp32", "k_mult": "fp32", "v_mult": "fp32", "count_all": "i32"}
+                 "n_parts": "i32", "sm_scale": "fp32", "k_mult": "fp32", "v_mult": "fp32", "count_all": "i32",
+                 "sink_ptr": "*fp32", "win": "i32"}
     constants = {"COLS": 8, "CPT": rows // group, "HQ": group * 2, "HKV": 2, "G": group, "D": d, "DV": d,
                  "BLOCK_M": rows, "PIECE": pk.piece_size(d, d, ["bf16", "fp8", "fp8:row", "int8"][kind]), "PAGE": 16,
                  "KIND": kind, "HW_FP8": arch >= 89, "TREE": False, "COUNTS": True, "OFFSETS": True, "DC": min(64, d),
                  "FUSED": fused, "LSE": fused, "FRESH": fused and kind >= 1,
-                 "DVP": d // pk.FUSED_VSPLIT if fused and d > 128 else d}
+                 "DVP": d // pk.FUSED_VSPLIT if fused and d > 128 else d, "SINKS": False}
     names = kernel.arg_names
     full = {n: signature.get(n, "constexpr") for n in names}
     attrs = {(i,): [["tt.divisibility", 16]] for i, n in enumerate(names) if full[n].startswith("*")}

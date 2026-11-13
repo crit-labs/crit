@@ -70,7 +70,8 @@ technique's algorithm does stays in that technique. A change to the core rebuild
   CUDA is the backend built today; another backend adds its language and capability names.
 - `capabilities`: compute capabilities it builds and runs on; an `a` suffix where it uses architecture-specific
   instructions. `crit kernels build ID --arch 80 --arch 86 --arch 89 --arch 90a --arch 100a --arch 120a` checks the
-  build for each.
+  build for each, and CI's kernels workflow builds every one listed. A build is not a run: the README says which
+  GPUs the kernel was run and measured on.
 - A **structure** is one way of computing an operation (a CUDA-core GEMV, a tensor-core tile, a split-K reader). Its
   `knobs` are the constants that only change speed (warps, rows a warp owns, tiles, stages, splits, loads in flight,
   Triton's `BLOCK_*`, `num_warps`, `num_stages`). Mark a knob `"order": true` when it changes the summation order: a
@@ -158,9 +159,41 @@ One class per tunable structure, the interface in `crit_kernels/sweep.py`'s docs
 `inputs(shape, rows, device)` (row 0's input independent of `rows`; cache matrices across calls, the sweep calls it for
 every configuration), `run(module, state)`, `reference(state)` (from the operation's reference, cached),
 `check(got, want, state)`, `first_row(out)`, optional `bytes(shape, rows)`, `valid(knobs)` and
-`valid_for(knobs, shape)` (a configuration that cannot run a shape, such as a split that does not divide K). The sweep
+`valid_for(knobs, shape)` (a configuration that cannot run a shape, such as a split that does not divide K). A limit
+`valid()` checks is the device's, never one GPU's figure: shared memory a block from
+`crit_kernels.gates.shared_memory_optin()` (it asks without initializing CUDA, so the sweep can fork its builders). The sweep
 sets `bench.default` to the untuned build before timing, for benches that compare bits with it (so a bench
 defines no method of that name).
+
+For the gates (`crit kernels gates`), a bench may also give `scratch` (names in the state of buffers a call may
+overwrite: workspaces), `restore` (names of buffers a call updates in place, as a residual it adds into: the gates put
+them back before every call), `nan_rule = "contained"` (outputs that keep a stated rule for NaN inputs instead of carrying
+them, as routing that ranks a NaN below every number) or `nan_rule = "causal"` (rows that are one sequence's tokens,
+each seeing the ones before it, as a recurrent scan: the NaN goes into the last row and every earlier row keeps its
+bytes; a chunked form that multiplies a chunk's triangular matrices densely adds `nan_block = B`, and then only the
+chunks before the NaN's must keep theirs), and `integer_inputs(shape, rows, device)` with
+`integer_reference(state)` (integer operands whose FP32 sums are exact in any order, None for a shape that has
+none). A structure whose bits may differ between calls declares `"repeatable": false` in kernel.json.
+
+## Gates
+
+`crit kernels gates ID --model CHECKPOINT` (or `--shapes FILE`) runs five gates beyond the reference check on the
+kernel's default build (or `--tuning FILE`), each proven by a planted control that must fail it
+(`crit kernels gates --controls`, `crit_kernels/gates.py`):
+
+| Gate | A structure passes when | Its control |
+| --- | --- | --- |
+| nonfinite | a NaN in row 0's inputs reaches row 0's output and leaves the other rows' bytes as they were | a row maximum that skips NaN |
+| repeat | five calls give the same bytes and leave the inputs as they were | sums by atomic adds; a call that writes into its input |
+| edges | the rows it serves pass the reference at 1, 2, 3 and at every power of two less one, itself and plus one | a tile loop that drops a partial last tile |
+| sums | integer operands whose partial sums pass FP16's range give the exact sum rounded to the output | a dot product summed in FP16 |
+| limits | every function built for every architecture in `capabilities` fits that architecture's registers a thread and static shared memory a block (`cuobjdump --dump-resource-usage`, no GPU; spills reported) | a record past each limit |
+
+A kernel's change runs its gates before it lands, beside its tests and an arch build. Code that orders memory across
+threads also gets these looked at, since no gate catches them reliably: a wait on a flag another block or cluster
+writes acquires at that scope; stores into another block's distributed shared memory wait for the cluster to sync
+first; a TMA store follows a fence after the shared-memory writes it reads; tensor memory is released only after
+every read from it (`tcgen05.ld`) has completed.
 
 ## Commands
 
@@ -168,6 +201,7 @@ defines no method of that name).
 crit kernels list
 crit kernels build ID [--tuning FILE] [--arch 80 ...]
 crit kernels sweep ID --model CHECKPOINT --out TUNING_DIR      # or --shapes FILE {structure: [shape, ...]}
+crit kernels gates ID --model CHECKPOINT [--tuning FILE]       # the gates beyond the reference check; --controls
 ```
 
 A plugin loads a kernel by id (`crit_plugins.kernels.load_kernel`), built with the engine's tuning

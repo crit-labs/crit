@@ -100,7 +100,8 @@ def variants(selection, registry=None, facts=None, names=None):
 def option_variants(selection, assignments, registry=None, facts=None):
     """Variants of the full selection with plugin options set: each of `assignments` is one variant, a text of
     PLUGIN.OPTION=JSON pairs joined by ";" (mtp-decode.override=0;attention-state.fresh_mib=64), named "set:" and that text.
-    A value that is no JSON is a string. With a registry each is checked like variants(), one the plugins refuse
+    A value that is no JSON is a string, and so is one an option declared as a string or a choice of strings takes as
+    written (tile_rows=0 is the choice "0"). With a registry each is checked like variants(), one the plugins refuse
     carrying its `error`. An in-process A/B of one option is the same engine served twice, as built and with it set,
     measured on the same cases."""
     import json
@@ -119,6 +120,11 @@ def option_variants(selection, assignments, registry=None, facts=None):
                 parsed = json.loads(value)
             except ValueError:
                 parsed = value
+            # A string option, or a choice among strings, takes the text as written: tile_rows=0 is the choice "0".
+            spec = (registry[plugin_id].get("options") or {}).get(option) or {}                 if registry is not None and plugin_id in registry else {}
+            if not isinstance(parsed, str) and (spec.get("type") == "str" or (
+                    spec.get("type") == "choice" and parsed not in spec["choices"] and value.strip() in spec["choices"])):
+                parsed = value.strip()
             options.setdefault(plugin_id, {})[option] = parsed
         variant = {"name": f"set:{text}",
                    "plugins": {"use": dict(selection["use"]), "base": selection["base"], "options": options}}

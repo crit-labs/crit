@@ -1,5 +1,7 @@
 """Resident lifetimes use synthetic model bytes and a fake device allocator only."""
+import contextlib
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -761,15 +763,30 @@ time.sleep(60)
                 time.sleep(.02)
             self.assertIsNone(process_identity(pid))
             self.assertFalse(group_alive(value['process']['pid']))
-            with self.assertRaises(ValueError):
+            # The owner is gone and its processes settled: the next owner recovers the runtime itself, one line on
+            # stderr, as crit serve --recover-runtime would.
+            printed = io.StringIO()
+            with contextlib.redirect_stderr(printed):
                 self.owner.acquire()
-            self.assertEqual(self.owner.recover()['status'], 'recovered')
+            self.assertIn('crit: recovered the runtime a stopped process left', printed.getvalue())
             self.assertEqual(len(list(self.owner.directory.glob('recovery-*.json'))), 1)
-            self.owner.acquire(); self.owner.release()
+            self.owner.release()
         finally:
             if client.poll() is None: client.kill(); client.wait(timeout=5)
             client.stderr.close()
             if self.owner.path.exists(): self.owner.recover()
+
+    def test_a_dead_owners_record_is_recovered_by_the_next_owner_and_a_live_ones_still_refuses(self):
+        self.owner.acquire()
+        self.owner.update(owner_pid=99999999, owner_identity='dead-fixture')
+        self.owner.token = None
+        other = RuntimeOwnership(self.owner.directory)
+        with contextlib.redirect_stderr(io.StringIO()):
+            other.acquire()
+        self.addCleanup(other.release)
+        self.assertEqual(read_json(other.path)['owner_pid'], os.getpid())
+        with self.assertRaisesRegex(ValueError, r'Another CRIT runtime .*\(The runtime owner is still alive'):
+            RuntimeOwnership(self.owner.directory).acquire()
 
     def test_unbound_dead_owner_recovers_without_starting_engine(self):
         self.owner.acquire()

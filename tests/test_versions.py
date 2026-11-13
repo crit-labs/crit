@@ -24,14 +24,13 @@ PLACES = {
     "tests/core/sdk_consumer/CMakeLists.txt": [r"find_package\(critCore " + NUMBER + " EXACT"],
     "tests/core/concurrency_consumer/CMakeLists.txt": [r"find_package\(critCore " + NUMBER + " EXACT"],
     "tests/core/concurrency_consumer/main.cpp": [r"crit " + NUMBER + " installed SDK"],
-    "README.md": [r"\[!\[Version " + NUMBER + r"\]"],
     "docs/CONTRIBUTING.md": [r"crit-" + NUMBER + r"-py3-none-any\.whl"],
-    "docs/assets/badge-version.svg": [r'aria-label="version: ' + NUMBER + '"', r"<title>version: " + NUMBER + "</title>",
-                                      r'<text x="75\.5" y="14">' + NUMBER + "</text>"],
     "mcp/server.json": [lambda text: json.loads(text)["version"], lambda text: json.loads(text)["packages"][0]["version"]],
 }
 # Files that name earlier versions too: the changelog's history.
 HISTORY = {"CHANGELOG.md"}
+# Files that name another package's version that equals crit's by chance (gguf-py's, in a hash's comment).
+OTHERS = {"tests/test_reusable_techniques.py"}
 
 
 def read(path, reader):
@@ -56,7 +55,7 @@ class VersionTests(unittest.TestCase):
         listed = subprocess.run(["git", "grep", "-l", "-I", "-F", version], cwd=ROOT, capture_output=True, text=True)
         if listed.returncode not in (0, 1):
             self.skipTest("needs a git checkout: " + listed.stderr.strip())
-        named = set(listed.stdout.split()) - HISTORY
+        named = set(listed.stdout.split()) - HISTORY - OTHERS
         self.assertEqual(named - set(PLACES), set(), "add these to PLACES, which a release changes")
 
 

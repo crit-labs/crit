@@ -37,9 +37,10 @@ class FileTableRows:
         return [list(struct.unpack(f"<{self.width}f", data)) for data in self.table.gather(ids)]
 
     # -- device form ---------------------------------------------------------------------------------------------
-    def store(self, rows, format=None, scales=None, scale=1.0, dtype=None):
-        """A device table; returns its handle (device_rows.Table: lookup, prefetch, close)."""
-        return self.device_rows.store(rows, format, scales, scale, dtype)
+    def store(self, rows, format=None, scales=None, scale=1.0, dtype=None, device=None):
+        """A device table (on `device`, by default the one rows are on); returns its handle (device_rows.Table: lookup,
+        prefetch, close)."""
+        return self.device_rows.store(rows, format, scales, scale, dtype, device)
 
     def open(self, source, width, dtype, device, mapped=False, format=None, scales=None, scale=1.0):
         """A table in host memory or files; returns its handle (device_rows.Table)."""

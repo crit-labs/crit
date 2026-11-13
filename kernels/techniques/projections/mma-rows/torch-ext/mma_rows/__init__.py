@@ -38,7 +38,7 @@ WARPS = 4          # warps a CTA, each its own 16 x groups matrix rows
 PROMPT_TOKENS = 64   # activation rows a CTA of mm_prompt takes, untuned (structure prompt-tile's PT)
 
 __all__ = ["ACTS", "FP4_STEP", "MAX_ROWS", "PROMPT_TOKENS", "STEP", "VALUES", "WEIGHTS", "eligible", "fp4_mma",
-           "mm_prompt", "mm_rows", "partial_elements", "plan", "quantize_fp8_rows", "quantize_nvfp4", "row_tiles",
+           "interleave_glu", "mm_prompt", "mm_rows", "partial_elements", "plan", "quantize_fp8_rows", "quantize_nvfp4", "row_tiles",
            "scratch_bytes"]
 
 
@@ -113,7 +113,7 @@ def partial_elements(tokens: int, rows: int, splits: int) -> int:
 
 def mm_rows(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, weights: str, scales=None, row_scale=None,
             acts: str = "bf16", input_scale: float = 1.0, blocked: bool = False, groups: int = 1, warps: int = WARPS,
-            splits: int = 1, scratch=None, partial=None, counters=None, zeros=None, group: int = 0):
+            splits: int = 1, scratch=None, partial=None, counters=None, zeros=None, group: int = 0, glu: bool = False):
     """out [M][N] (FP32, BF16 or FP16) = x [M][K] (M 1..64, BF16, rows on 16-byte boundaries) times the matrix w.
     acts: bf16 (x as it is), fp8_rows (FP8 weights: each row in E4M3 by its own scale amax * fp32(1 / 448), at least
     1e-12; out = sum * row_scale * the row's scale), nvfp4 (NVFP4 weights: each 16-value block in E2M1 under
@@ -121,22 +121,37 @@ def mm_rows(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, weights: str, s
     sum * row_scale * fp32(1 / input_scale)), nvfp4_mma (the same NVFP4 activations multiplied as codes with their
     block scales on the FP4 MMA, NVFP4 weights with blocked scales, K a multiple of FP4_STEP, where fp4_mma(); its own
     order). groups, warps, splits: plan()'s (with the acts). int4_zp weights: scales FP16 and zeros uint8 [N][K /
-    group]."""
+    group]. glu: w holds an MLP's gate and up rows interleaved by eights (interleave_glu), N a multiple of 16, and
+    out [M][N / 2] is silu(gate) * up of the two projections as they would be stored (each rounded to out's dtype),
+    one rounding after the product."""
     ops.mm_rows(x, w, scales, row_scale, WEIGHTS[weights], ACTS[acts], float(input_scale), blocked, groups, warps,
-                splits, scratch, partial, counters, out, zeros, int(group))
+                splits, scratch, partial, counters, out, zeros, int(group), int(bool(glu)))
     return out
 
 
 def mm_prompt(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, weights: str, scales=None, row_scale=None,
               acts: str = "bf16", input_scale: float = 1.0, blocked: bool = False, splits: int = 1, scratch=None,
-              zeros=None, group: int = 0):
+              zeros=None, group: int = 0, glu: bool = False):
     """out [M][N] = x [M][K] times the matrix w for any number of rows M >= 1 (the prompt tile), every element with
     the bits mm_rows gives it for the same matrix, acts and splits (plan()'s, the matrix's): a prompt row equals the
     same row decoded alone or batched, so a prompt's tokens score as they are served. Each decoded weight serves
-    PROMPT_TOKENS rows a CTA (a GEMM's reuse); quantized activations take scratch_bytes(M, K) of scratch."""
+    PROMPT_TOKENS rows a CTA (a GEMM's reuse); quantized activations take scratch_bytes(M, K) of scratch. glu: as
+    mm_rows'."""
     ops.mm_prompt(x, w, scales, row_scale, WEIGHTS[weights], ACTS[acts], float(input_scale), blocked, splits, scratch,
-                  out, zeros, int(group))
+                  out, zeros, int(group), int(bool(glu)))
     return out
+
+
+def interleave_glu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """An MLP's gate and up rows [I][...] each (codes, row-major block scales, row scales, zero points, BF16 weights:
+    any per-row tensor) as one matrix [2 I][...] interleaved by eights for glu: rows 16 j .. 16 j + 7 are gate rows
+    8 j .. 8 j + 7, rows 16 j + 8 .. 16 j + 15 the up rows of the same eight. I a multiple of 8. Interleave NVFP4 block
+    scales row major, then put them in the blocked layout."""
+    if gate.shape != up.shape or gate.dim() < 1 or gate.shape[0] % 8:
+        raise ValueError(f"gate and up rows of one shape, a multiple of 8 rows: {tuple(gate.shape)}, {tuple(up.shape)}")
+    rest = gate.shape[1:]
+    pairs = torch.stack((gate.reshape(-1, 8, *rest), up.reshape(-1, 8, *rest)), dim=1)
+    return pairs.reshape(2 * gate.shape[0], *rest).contiguous()
 
 
 def quantize_fp8_rows(x: torch.Tensor, q: torch.Tensor, scale: torch.Tensor):

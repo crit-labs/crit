@@ -6,6 +6,8 @@ import math
 
 import torch
 
+from crit_kernels.gates import shared_memory_optin
+
 MAX_TOKENS = 4096   # the most tokens the structures' tune_rows ask for
 CHECKED = 64        # tokens of each call checked against the FP64 reference
 GROUP = 32
@@ -132,14 +134,14 @@ class GemmStaged(Gemm):
     def valid(self, knobs):
         """A warp tile of whole 16 x 8 MMA tiles, at least 2 warps, a CTA's registers within an SM's (an output holds
         GROUP running lanes and the partial sums still needed: 5 registers, 6 with GROUP 4; about 48 more a thread),
-        and the ring within a CTA's shared memory (99 KB)."""
+        and the ring within a CTA's shared memory (the GPU's opt-in limit)."""
         bm, bn, wm, wn, group = knobs["BM"], knobs["BN"], knobs["WM"], knobs["WN"], knobs["GROUP"]
         if bm % (16 * wm) or bn % (8 * wn) or wm * wn < 2:
             return False
         outputs = 4 * (bm // wm // 16) * (bn // wn // 8)
         stage = group * knobs["RUN"] * ((bm + bn) * 36 + 4 * bm)
         regs = (outputs * (6 if group == 4 else 5) + 48 + 7) // 8 * 8
-        return regs <= 208 and 32 * wm * wn * regs <= 65536 and knobs["STAGES"] * stage <= 101376
+        return regs <= 208 and 32 * wm * wn * regs <= 65536 and knobs["STAGES"] * stage <= shared_memory_optin()
 
     def check(self, got, want, s):
         """Within FP32 accumulation of the FP64 reference, and the bits of the untuned build's `gemm` (the declared
@@ -178,7 +180,7 @@ class GemmNative(Gemm):
 
     def valid(self, knobs):
         """Warp tiles of whole 16 x 16 tiles with at most 32 accumulator tiles (128 FP32 registers) a thread, 4 or 8
-        warps (a multiple of BK / 2 threads: the tile copies' rows), and the ring within a CTA's shared memory (99 KB)."""
+        warps (a multiple of BK / 2 threads: the tile copies' rows), and the ring within a CTA's shared memory (the GPU's opt-in limit)."""
         tm, tn, wm, wn, bk = knobs["TM"], knobs["TN"], knobs["WM"], knobs["WN"], knobs["BK"]
         if tm % (16 * wm) or tn % (16 * wn) or (tm // wm // 16) * (tn // wn // 8) > 32 or not 4 <= wm * wn <= 8:
             return False
@@ -187,7 +189,7 @@ class GemmNative(Gemm):
         kb = bk // 32
         scales = max(tm * kb * 4 + tn * 4, (tm + tn) * kb * 4)
         stage = (tm * bk + tn * bk + scales + 127) // 128 * 128
-        return knobs["STAGES"] * stage <= 101376
+        return knobs["STAGES"] * stage <= shared_memory_optin()
 
     def check(self, got, want, s):
         """Within 1e-5 of the products' magnitude of the FP64 reference: the block-scaled MMA's own sum of a block is
@@ -322,13 +324,13 @@ class GemmNativeChannel:
 
     def valid(self, knobs):
         """Warp tiles of whole 16 x 16 tiles with at most 32 accumulator tiles (128 FP32 registers) a thread, 4 or 8
-        warps (a multiple of BK / 2 threads: the tile copies' rows), and the ring within a CTA's shared memory (99 KB)."""
+        warps (a multiple of BK / 2 threads: the tile copies' rows), and the ring within a CTA's shared memory (the GPU's opt-in limit)."""
         tm, tn, wm, wn, bk = knobs["TM"], knobs["TN"], knobs["WM"], knobs["WN"], knobs["BK"]
         if tm % (16 * wm) or tn % (16 * wn) or (tm // wm // 16) * (tn // wn // 8) > 32 or not 4 <= wm * wn <= 8:
             return False
         if (32 * wm * wn) % (bk // 2):
             return False
-        return knobs["STAGES"] * (tm + tn) * bk <= 101376
+        return knobs["STAGES"] * (tm + tn) * bk <= shared_memory_optin()
 
 
 class GemmNativeBlocks(GemmNativeChannel):
@@ -418,10 +420,10 @@ class GemmNativeBlocks(GemmNativeChannel):
     def valid(self, knobs):
         """GemmNativeChannel's with the span sums beside the outputs' (at most 16 accumulator tiles of each a thread)
         and the scale ring (STAGES + 1 slots of FP32 words for every token and row of a stage) within a CTA's shared
-        memory (99 KB)."""
+        memory (the GPU's opt-in limit)."""
         tm, tn, wm, wn, bk, stages = knobs["TM"], knobs["TN"], knobs["WM"], knobs["WN"], knobs["BK"], knobs["STAGES"]
         if tm % (16 * wm) or tn % (16 * wn) or (tm // wm // 16) * (tn // wn // 8) > 16 or not 4 <= wm * wn <= 8:
             return False
         if (32 * wm * wn) % (bk // 2):
             return False
-        return stages * (tm + tn) * bk + (stages + 1) * (tm + tn) * (bk // 32) * 4 <= 101376
+        return stages * (tm + tn) * bk + (stages + 1) * (tm + tn) * (bk // 32) * 4 <= shared_memory_optin()

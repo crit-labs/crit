@@ -123,7 +123,8 @@ The online softmax a flash-style attention loop is made of, with no attention al
 program reads and in what order are the kernel's): `step` (a block of scores into the running maximum, -inf safe,
 natural or base-2 exponents with the scale folded in), `row_sum` (a block's row sums on the tensor cores, a dot with a
 column of ones, so the order is the MMA's k-order whatever the tile, or `tl.sum` in FP32 where the order may follow
-the layout), `fold` (partial states from different key ranges combined in a fixed order), `finish` and `lse` (the
+the layout), `fold` (partial states from different key ranges combined in a fixed order), `sink` (a per-head sink
+logit folded into a row's final state as one more position with no value), `finish` and `lse` (the
 base-2 log-sum-exp turned back to natural log by one FMA, the same bits for every caller). After FlashAttention-2 and
 FlashInfer (Apache-2.0).
 
@@ -132,7 +133,30 @@ FlashInfer (Apache-2.0).
   the rows beside it: `ex2`, `softmax_step_m16` (a block of base-2 scores into the running maximum and the lane's
   partial sums, -inf safe, alpha exactly 1 where the maximum stays), `softmax_row_total` (the quad's parts once at the
   end), `probabilities_to_a` (two accumulators as the next m16n8k16 A operand), `softmax_fold2` / `fold_output` (a
-  partial state folded in order; an empty one changes no bit), `softmax_finish` and `softmax_lse2`.
+  partial state folded in order; an empty one changes no bit), `softmax_sink2` (a sink logit folded last),
+  `softmax_finish` and `softmax_lse2`.
+
+## exl3 (`exl3.cuh`)
+
+The EXL3 trellis format's decoder: `exl3_value<CB>` (a 16-bit state's FP16 value in the 3INST, MCG or MUL1
+codebook: integer arithmetic and one FP16 rounding), `exl3_state` (position p's 16-bit window of a tile's circular
+bitstream, most significant bit first, at a whole or half-integer bitrate), `exl3_words` and `exl3_row` /
+`exl3_col` (the fragment order that places a lane's eight positions in the 16 x 16 tile). `tests/exl3_tests.cu`
+checks every state of each codebook, every position's window at every bitrate and the order against host
+references; exl3-rows' tests check the decoded tiles against the format's own decoder bit for bit.
+
+## gguf (`gguf.cuh`)
+
+GGUF block formats' decoders, in `crit::kcore::gguf`: `subblock<F>(block, ib, q, s0, s1, m)` gives a block's 32-value
+sub-block `ib` as int8 codes four a word (what `dp4a` and the s8 MMA multiply) and its FP32 scales (the stored FP16
+scale times the sub-block's integer scale, rounded once; `s1` for values 16 to 31 with 16-value scales, `m` for a
+minimum, the negated offset of Q4_1 and Q5_1, and with Q2_K's minimum a 16 values `m0` and `m1`), so `value()` =
+`fsub(fmul(s, q), m)` is the stored value bit for bit; IQ1's offset of an eighth folds into the codes (8 g +- 1 over
+d l / 8, exact); `block_bytes`, `block_values`, `two_scales`, `has_min`, `two_mins` and `supported` by GGUF type id.
+Formats: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, MXFP4 (their own IQ grids, in `gguf_grids.cuh` beside IQ3_S's, and IQ4 values). gguf-rows' tests check every format's decoded values against the format's own reference
+decoder bit for bit. With it, `reduce.cuh`'s `lane_at32` and `fold32`: the 32-lane halving tree (the warp's xor
+butterfly) folded by one thread from finished lanes as they come, a binary counter of six partial sums, the bits of the
+butterfly, for a GEMM that keeps a warp-wide declared order.
 
 ## blockscaled (`blockscaled_order.cuh`, `blockscaled_mma.cuh`, `blockscaled_stage.cuh`)
 

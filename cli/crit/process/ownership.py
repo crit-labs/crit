@@ -6,6 +6,7 @@ from pathlib import Path
 import signal
 import re
 import shutil
+import sys
 import tempfile
 import time
 import uuid
@@ -107,6 +108,9 @@ class RuntimeOwnership:
         self.blocked = ""
 
     def acquire(self):
+        """Own the runtime. A record another owner left is recovered first when recover() proves that owner dead and
+        its processes settled (what crit serve --recover-runtime does), with one line on stderr; a live owner, or
+        cleanup recover() cannot prove, keeps the runtime refused."""
         if self.token:
             value = self.read_owned()
             if self.blocked or value["state"] == "blocked":
@@ -120,7 +124,19 @@ class RuntimeOwnership:
         try:
             write_json(self.path, value, immutable=True)
         except FileExistsError:
-            raise ValueError("Another CRIT runtime owns execution or left unresolved cleanup. Unload it or run crit serve --recover-runtime.") from None
+            try:
+                recovered = self.recover()["status"] == "recovered"
+            except (ValueError, OSError) as exc:
+                raise ValueError("Another CRIT runtime owns execution or left unresolved cleanup. Unload it or run "
+                                 f"crit serve --recover-runtime ({exc}).") from None
+            if recovered:
+                print(f"crit: recovered the runtime a stopped process left in {self.directory} (its owner is gone "
+                      "and its processes settled)", file=sys.stderr, flush=True)
+            try:
+                write_json(self.path, value | {"updated_at": now()}, immutable=True)
+            except FileExistsError:
+                raise ValueError("Another CRIT runtime owns execution or left unresolved cleanup. Unload it or run "
+                                 "crit serve --recover-runtime.") from None
         self.token = token
 
     def read_owned(self):

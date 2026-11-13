@@ -149,6 +149,18 @@ template <int WF, int ACT, int R, int T>
 __device__ __forceinline__ void sums_out(const Problem& p, const float (&c)[R][T][4], int tile, int split, int rows,
                                          int r0, int gid, int tig, int& last) {
   if (p.splits == 1) {
+    if (p.glu) {   // c0, c1 the gate row gid, c2, c3 its up row gid + 8: the same tokens
+#pragma unroll
+      for (int g = 0; g < R; ++g)
+#pragma unroll
+        for (int t = 0; t < T; ++t)
+#pragma unroll
+          for (int i = 0; i < 2; ++i) {
+            const int n = r0 + 16 * g + gid, tok = 8 * t + 2 * tig + i;
+            if (n < p.N && tok < p.M) finish_glu<WF, ACT>(p, tok, n, c[g][t][i], c[g][t][i + 2]);
+          }
+      return;
+    }
 #pragma unroll
     for (int g = 0; g < R; ++g)
 #pragma unroll
@@ -178,6 +190,20 @@ __device__ __forceinline__ void sums_out(const Problem& p, const float (&c)[R][T
   __threadfence();
   if (threadIdx.x == 0) p.counters[tile] = 0;   // every split has counted: ready for the next call
   const int first = tile * rows;
+  if (p.glu) {   // one thread a (gate, up) pair, every lane busy: gate rows n % 16 < 8, each up row 8 past it
+    const int pairs = rows / 2;
+    for (int i = threadIdx.x; i < p.M * pairs; i += blockDim.x) {
+      const int tok = i / pairs, h = i - tok * pairs, n = first + (h >> 3) * 16 + (h & 7);
+      if (n >= p.N) continue;
+      float v = __ldcg(p.partial + (size_t)tok * p.N + n), u = __ldcg(p.partial + (size_t)tok * p.N + n + 8);
+      for (int s = 1; s < p.splits; ++s) {
+        v += __ldcg(p.partial + ((size_t)s * p.M + tok) * p.N + n);
+        u += __ldcg(p.partial + ((size_t)s * p.M + tok) * p.N + n + 8);
+      }
+      finish_glu<WF, ACT>(p, tok, n, v, u);
+    }
+    return;
+  }
   for (int i = threadIdx.x; i < p.M * rows; i += blockDim.x) {
     const int tok = i / rows, n = first + (i - tok * rows);
     if (n >= p.N) continue;

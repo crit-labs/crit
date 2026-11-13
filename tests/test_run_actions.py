@@ -2,6 +2,7 @@
 import json
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import test_run_measure as run_measure
@@ -210,11 +211,56 @@ class ServeCheckTests(run_measure.MeasureFixture, unittest.TestCase):
         self.assertEqual(set(tested.values()), {"passed"}, tested)
         self.assertEqual({k: v for k, v in items.items() if k not in smoke and k not in tested},
                          {"consecutive": "passed", "system_message": "passed", "streaming": "passed",
-                          "stop_string": "passed", "cancel": "passed", "stop_engine": "passed"})
+                          "stop_string": "passed", "cancel": "passed", "draft_bytes": "passed", "stop_engine": "passed",
+                          # A scripted adapter's steps are not Core's, so nothing probes them.
+                          "full_context_prompt_step": "unverified", "full_context_device_memory": "unverified"})
         self.assertEqual(check["evidence"][1]["path"], f"candidates/{candidate}/logs/serve-attempt-0001.log")
         self.assertEqual(check["package_sha256"],
                          digest(read_json(self.directory / "candidates" / candidate / "package/manifest.json")))
         self.assertEqual(self.store.get(self.run_id)["errors"], [])
+
+    def test_the_full_context_pass_judges_the_slowest_prompt_step_and_the_least_free_memory(self):
+        from crit.run import checks
+        asked = []
+
+        class Client:
+            def __init__(self, port, timeout):
+                pass
+
+            def models(self):
+                return [{"id": "m"}]
+
+            def chat(self, body):
+                copies = body["messages"][0]["content"].count(checks.FILLER)
+                asked.append((copies, body["max_tokens"]))
+                return {"usage": {"prompt_tokens": 7 + 30 * copies}}
+
+        def run(probe, headroom=2 << 30):
+            # Before the request the engine had probed one slow warm-up step of each kind, which is not judged.
+            warm = {kind: {"steps": 1, "recent": [[5.0, 1]]} for kind in ("prompt", "decode")}
+            after = None if probe is None else {
+                kind: {"steps": 1 + value["steps"], "recent": [[5.0, 1]] + [[value["slowest_seconds"],
+                                                                             value["min_free_device_bytes"]]] *
+                       value["steps"]} for kind, value in probe.items()}
+            reads = iter([warm if probe is not None else None, after])
+            engine = SimpleNamespace(telemetry=lambda: {"core": {"probe": next(reads)}})
+            with patch.object(checks, "Client", Client):
+                return {i["name"]: i for i in checks.full_context_checks(0, engine, 1000, headroom, 1, 60,
+                                                                           lambda line: None)}
+        fits = {"prompt": {"steps": 4, "slowest_seconds": 0.4, "min_free_device_bytes": 3 << 30},
+                "decode": {"steps": 16, "slowest_seconds": 0.01, "min_free_device_bytes": 5 << 30}}
+        found = run(fits)
+        # Sized from one copy (37 tokens) and two (67): 1 + (1000 - 16 - 37) // 30 copies, then 16 tokens decoded.
+        self.assertEqual(asked, [(1, 8), (2, 8), (32, 16)])
+        self.assertEqual((found["full_context_prompt_step"]["state"], found["full_context_device_memory"]["state"]),
+                         ("passed", "passed"), found)
+        self.assertIn("up to a 967-token prompt, took 0.400 s", found["full_context_prompt_step"]["detail"])
+        slow = {**fits, "prompt": {**fits["prompt"], "slowest_seconds": 1.3}}
+        self.assertEqual(run(slow)["full_context_prompt_step"]["state"], "failed")
+        self.assertIn("prefill in smaller chunks", run(slow)["full_context_prompt_step"]["detail"])
+        # Below the headroom on a prompt step, or reporting no probe at all.
+        self.assertEqual(run(fits, headroom=4 << 30)["full_context_device_memory"]["state"], "failed")
+        self.assertEqual({i["state"] for i in run(None).values()}, {"unverified"})
 
     def test_serve_check_runs_crit_smoke_at_the_run_context_and_a_quarter_of_it(self):
         candidate = self.served()

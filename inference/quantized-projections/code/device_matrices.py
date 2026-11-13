@@ -1054,13 +1054,20 @@ def _tile(x, m, out_dtype, phase):
     return out if out_dtype is None or out.dtype == out_dtype else out.to(out_dtype)
 
 
-def matmul(x, m, out_dtype=None):
+def matmul(x, m, out_dtype=None, prompt=False):
     """y [tokens][rows] = x [tokens][columns] W^T, in BF16 (FP16 for a weight-only matrix's fp16_acc prompt rows,
     the format they accumulate in), or in out_dtype when given (FP32 for logits: every path accumulates in FP32, so
     the sums are not rounded to 16 bits first). Up to the matrix's decode_rows rows are decode rows, more prompt rows;
-    up to its invariant_rows rows, each row's bits are those of the row alone."""
+    up to its invariant_rows rows, each row's bits are those of the row alone. prompt: the rows are a prompt chunk,
+    which takes the prompt rows' arithmetic at every length: a chunk no longer than a decode call is padded past it
+    (zero rows, dropped from the result), so a short prompt's rows are those of the same rows in a longer prompt."""
     if x.shape[-1] != m.columns:
         raise ValueError(f"activations of width {x.shape[-1]} for a matrix of {m.columns} columns")
+    if prompt and x.shape[0] <= m.decode_rows:
+        import torch
+        padded = torch.zeros(m.decode_rows + 1, x.shape[1], dtype=x.dtype, device=x.device)
+        padded[:x.shape[0]] = x
+        return matmul(padded, m, out_dtype)[:x.shape[0]]
     if m.format == "int4_zp":
         return _int4_matmul(x, m, out_dtype)
     if m.format == "mxfp8" and m.activations == "mxfp8" and (
@@ -1588,6 +1595,14 @@ def _stored_values(tensors, format, device, first, last):
     return codes * scale[0].to(torch.float64)
 
 
+def _release(device):
+    """The encoders' FP64 slices go back to the device: torch's allocator would otherwise keep their blocks reserved
+    for the engine's lifetime."""
+    import torch
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
 def reencode(tensors, format, encode, device=None):
     """A draft-only matrix's stored tensors re-encoded to `encode`: (tensors, format) as load() takes them.
 
@@ -1625,6 +1640,7 @@ def reencode(tensors, format, encode, device=None):
             code = nearest(q.abs().clamp(max=codec.E4M3_MAX), e4m3, e4m3_mids)
             code = code | (((q < 0) & (code > 0)).to(code.dtype) << 7)
             codes[first:last], scale[first:last] = code.to(torch.uint8), s
+        _release(device)
         return {"weight": codes.view(torch.float8_e4m3fn), "scale": scale}, "fp8:channel"
     amax = 0.0
     for first, last in spans:
@@ -1645,4 +1661,5 @@ def reencode(tensors, format, encode, device=None):
         code = (code | (((q < 0) & (code > 0)).to(code.dtype) << 3)).view(last - first, columns)
         codes[first:last] = (code[:, 0::2] | (code[:, 1::2] << 4)).to(torch.uint8)
         scales[first:last] = s.to(torch.uint8)
+    _release(device)
     return {"weight": codes, "scale": scales, "global_scale": g32.to(device)}, "nvfp4"

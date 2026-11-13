@@ -9,6 +9,368 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-13
+
+### Overview
+
+crit 0.19.0 runs GGUF and EXL3 checkpoints at their stored bits and the attention of more model families. gguf-rows
+reads 20 GGUF block formats (all but the ternary TQ1_0 and TQ2_0) bit for bit with gguf-py, Core reads a GGUF
+checkpoint's quantized matrices as stored, and gguf-projections serves them in the projections slot, its prompt GEMM
+about twice as fast as before; exl3-rows runs EXL3 projections. Attention sinks and sliding windows work on every
+paged-kv-attention structure and through softmax-attention, and attention-state keeps sliding-window layers as rings,
+so local layers hold only their window's KV. latent-attention is a new kernel for multi-head latent attention (decode,
+prompt chunks, an E4M3 cache, sinks), read as `attention:latent`, at 0.8 to 1.8 times FlashInfer's MLA on an RTX 5090.
+CUDA prompt chunks over 8-bit pages are 38 to 55% faster with the same bits. A captured round's rows each keep their
+own draft width, so requests that do not draft ride the width-0 capture. Kernel work is guarded against fitting one
+GPU: CI builds every kernel for every architecture it claims, `crit kernels gates` checks NaN, repeat, tile-edge,
+FP32-sum and limit gates, `crit kernels report` times every kernel against its library on several models' shapes, a
+tuning swept on another GPU falls back to the default knobs, and a package carries its own tuning. `serve --check`
+sends one request at the full context, a runtime whose owner is gone is recovered by the next one to start, and a
+client that disconnects no longer costs the engine its weights. crit 0.19.0 needs crit-eval 0.7.0.
+
+### Changed
+
+- The charter, the kernels README and the contribution criteria say how kernel work avoids fitting one GPU: speed-only
+  constants are knobs and device limits are read from the device, an instruction one generation has sits behind a
+  feature check beside the other GPUs' path, a structure that wins is added beside the ones it beat, a tuning belongs
+  to the GPU it was swept on, every number names its device, and a structure leaves only on evidence from more than one
+  GPU (kernels/README.md, "Guarding against one GPU"). The charter's "Not built yet" says that every kernel has so far
+  run on one RTX 5090 and other architectures are compile-checked.
+
+- The sweep's benches check a configuration's shared memory against the GPU's own opt-in limit
+  (`crit_kernels.gates.shared_memory_optin()`, from the compute capability without initializing CUDA) instead of 99 KB,
+  an RTX 5090's: fixed-tile-gemm's cuda-mm, fp8-block-rows' staged and native GEMMs, int-block-experts' staged and
+  generic native GEMMs, exl3-rows and recurrent-scans' pool-delta-pipe. A GPU with more (an A100's 163 KB, an H100's or
+  B200's 227 KB) now also times the deeper rings that fit there.
+
+- A kernel tuning swept on a GPU of another compute capability is no longer applied where it is found implicitly
+  (an engine package's `kernel_tuning`, `CRIT_KERNEL_TUNING`): the kernel builds with its default knobs, its record in
+  the engine's facts says `built` with the reason, and stderr says so once. The sweep already wrote the GPU's name and
+  capability into each tuning, but nothing read them, so one GPU's knob choices applied on every GPU. Given explicitly
+  (`crit kernels build --tuning`, `gates --tuning`), a tuning is still used, with a warning.
+
+- A run record with an unknown field is refused with the fields that object takes, so it is fixed in one retry:
+  "Unknown fields; use extensions: reason. Takes detail, fate." (before, the unknown fields alone).
+
+- gguf-rows' gemm decodes the matrix's sub-blocks once a call into a staging buffer (gemv's codes and scales,
+  sub-block-major, in row chunks within 128 MiB), then multiplies them in the tree's lane order with the codes, scales
+  and tokens copied a stage ahead by cp.async (knobs WN, WT, TB, RUN and the new STAGES, defaults 4, 2, 4, 2, 2 from a
+  sweep); outputs keep gemv's bits. On an RTX 5090 at 14336 x 4096 it reaches 92 to 112 TOPS at 512 tokens (1.8 to 2.2
+  times dequantizing to BF16 for cuBLAS) and 107 to 129 at 2,048 (1.06 to 1.08 times it for Q8_0, IQ4_NL, IQ3_S and
+  IQ4_XS, 0.90 to 0.92 for Q4_K and Q6_K); before, 39 to 54. The quantizer writes gemm's activations sub-block-major
+  (`quantize(x, by_subblock=True)`).
+
+- A runtime a stopped process left behind is recovered by the next one to start: when the guard's owner is gone and
+  its processes have settled (the proof `crit serve --recover-runtime` runs), the runtime is released with one line on
+  stderr instead of refusing until `--recover-runtime` is run. A live owner, or cleanup that cannot be proven, still
+  refuses, now with the reason. A client that goes away mid-request, such as a readiness probe that gave up, prints
+  one line instead of a traceback.
+
+- Plugin and engine tests find Core's runtime as Core's loader does: `PluginTestCase.core_runtime()` gives the
+  `crit_core_steps` library (`CRIT_CORE_STEP_LIBRARY`, else the checkout's build, else what `crit core build` built)
+  and skips, saying to run `crit core build`, when there is none; crit's own engine tests gate on the same lookup.
+  Tests that checked the environment variable alone skipped even with Core built.
+
+- SERVING.md and AGENTS.md give crit serve's cancellation grace: one second, fixed, from the cancel the server sends.
+  An engine that has not returned by then is retired with its resident weights, so every prompt chunk at the full
+  context and every decode step must finish well inside it.
+
+- `crit plugins test` lists every skipped test with its reason, in its summary after the counts and under each
+  plugin's line (also in `serve --check`'s log); each item carries them as `skipped`, kept with a cached pass. A skip
+  still counts as no failure (a CUDA-only plugin's tests skip without CUDA), but a pass no longer hides what it
+  skipped, such as model tests that need the step library.
+
+- mma-rows: the prompt tile's last, partly filled CTA stages and multiplies only the columns of eight rows that hold a
+  row below M (outputs unchanged): 2 to 6% less time for prompts of 65 to 200 rows on an RTX 5090.
+
+- paged-kv-attention's CUDA prompt chunks over 8-bit pages (fp8, fp8:row, int8) convert the codes in registers, as
+  its decode windows do, instead of through a shared 16-bit buffer and a sync that left one CTA an SM and the tensor
+  cores idle. A chunk with fresh rows runs in passes chained by every thread's state: the blocks below the first fresh
+  position's block in registers, that block through the 16-bit block, then the all-fresh blocks through the 16-bit
+  pages' tile, which streams fresh rows asynchronously. Outputs and log-sum-exps keep the single pass's bits. On an RTX
+  5090 with Qwen3.8-27B's heads, 2,048 tokens at 32,768 positions over FP8 pages: 92 to 144 TFLOPS without fresh rows,
+  84 to 116 with them, and a first chunk at 1.18 times the Triton prompt chunk instead of 0.45. `prefill(splits=1)`
+  reads in one range (row-invariant), `cuda_prompt()` says where the tile serves, `workspace=` holds the passes' state
+  in the caller's memory, and an `out` of another dtype than the queries is refused instead of written as garbage.
+
+- attention-state's split reader reads prompt chunks on the CUDA flash tile in one range where the tile serves,
+  row-invariant like the Triton prompt chunk it replaces there (a token's bits follow its own positions): 1.2 to 1.65
+  times as fast on Qwen3.8-27B's heads over FP8 pages (1.55 at 131,072 positions), the passes' state in the split-KV
+  reader's declared workspace. The Triton chunk stays for `int8_qk`, outputs in another dtype than the queries, and
+  heads or GPUs the tile does not take.
+
+- Core's serving engine hands back the blocks torch's allocator caches and nothing uses after each request when the
+  device's free memory is below the run's or crit serve's `vram_headroom_bytes`: a long prompt's or score's
+  temporaries stayed reserved, and the next long request found no room. An engine's configuration may set
+  `release_below_mib` instead (0 never releases).
+
+- Kernel sweeps and gates on a model also take the stacked matrices engines load, siblings of one module that read the
+  same input (q, k and v; gate and up), as their rows together. crit Kernels' model reader takes a multimodal
+  checkpoint's `llm_config` and refuses a folder that holds no checkpoint instead of giving no shapes.
+
+- The kernel gates' NaN check follows a structure's causality: `nan_rule` `causal` puts the NaN in the last token and
+  requires every earlier row to keep its bytes, and `nan_block` lets a chunked form's dense chunk matmuls carry it
+  through their own chunk only, each proven by a planted control. recurrent-scans benches every structure it has (SSD
+  prefill and columns, delta columns, causal conv, conv segments).
+
+- Eval refuses a candidate whose newest `serve --check` failed: its build is a draft, to be sealed `check_failed` and
+  fixed as a new candidate, and an Eval would count it on the ladder.
+
+- `crit run ... serve --check` fails a drafting engine whose facts declare no `draft_bytes_per_step` (the bytes one
+  draft step reads): crit-eval cannot price the round's floor without it.
+
+- AGENTS.md: prompt chunks go to the projections with `prompt=True`; sweep with `--matrices` from the candidate's
+  serve --check report; a model plugin's test checkpoint has every part the real one ships. The README's case studies
+  are the Qwen3.8-27B plugin engines, speed and preserve, with their active development time.
+
+### Added
+
+- CI builds every CUDA kernel for every compute capability its kernel.json claims and checks each architecture's
+  register and shared-memory limits, with the CUDA 13.1 toolkit's wheels and no GPU (`.github/workflows/kernels.yml`,
+  one job a kernel, on changes to `kernels/`), and runs crit_kernels' host tests. `crit kernels gates ID
+  --limits-only` runs that check alone. Before, the every-architecture build ran only where someone ran it by hand.
+
+- latent-attention reads prompt chunks: `prefill(q, cache, table, position, page, rank=R)` (structure `prompt`), a
+  chunk of one sequence causal over the latent cache, its tokens times heads in tensor-core tiles that read each piece
+  of cached rows once, the output written directly (no partitions, no partials; a token's bits independent of the
+  chunk's length), at a device position for CUDA graphs, with sinks, lse and the E4M3 cache. 0.78 to 0.92 times
+  FlashInfer's MLA prefill on an RTX 5090 (16 and 128 heads, chunks of 512 and 2,048). An E4M3 cache takes one scale
+  a row too (a KV pool's fp8:row pages).
+- softmax-attention reads latent attention (`attention:latent`, `forward(..., latent=R)`): queries of the latent then
+  the rotary part over an attention-state pool of keys only with one KV head, whose rows are each position's latent
+  then its rotary key (BF16, FP16 or fp8:row pages; FP32 in torch). A step's decode tokens and verify windows and
+  captured rounds read through latent-attention's decode reader (a round's column equal to the step's decode of the
+  token), prompt rows and captured prompt chunks through its prompt reader. A model with multi-head latent attention
+  keeps one row of rank + rotary width a position instead of every head's keys and values.
+
+- attention-state keeps sliding-window layers as rings (`kv:sliding`): a pool made with `pool(..., sliding=W, span=S,
+  positions=N)` holds each sequence in ceil((W + S) / page) + 1 pages whatever its length, the attention's page tables
+  the ring expanded (a position older than the window aliases a newer one's page, which the window never shows), so
+  the kernels read it unchanged. Steps, prompt chunks, forks, rollbacks and captured rounds work over rings; `bind`
+  takes no page past the ring; softmax-attention reads such a pool with its window by itself. A model with local
+  layers (a window of 128 or 1,024 against a context of 128K) keeps their KV at the window's size: the fact
+  `kv_sliding_bytes_per_sequence` counts it a sequence, not a token.
+
+- paged-kv-attention takes sliding windows: `attend(..., sliding=W)` and `prefill(..., sliding=W)` (a token sees its
+  last W positions, its own included) on every structure but block lists, with the pieces, blocks and splits below a
+  tile's window skipped, so a decode row over a long cache reads only its window (on an RTX 5090 at 60,000
+  positions, a window of 128: 12 us against 49 on the split launch, 10 against 38 on flash, 10 against 31 on the
+  CUDA tile). Combined with sinks this is the attention of models that alternate local and full layers with learned
+  sinks. A fused launch keeps the split launch's bits. softmax-attention provides it as `attention:sliding`
+  (`forward(..., sliding=W)`), its torch fallbacks masking the same positions.
+
+- Kernels: latent-attention, multi-head latent attention in its absorbed form (operation `latent-attention`,
+  attention-state's float64 reference `latent_attention.py`): decode tokens and verify windows of up to 64 columns of
+  every query head over a paged cache of compressed rows (the latent, then the rotary key; the latent the value too, so
+  a piece of rows is read once for the scores and the values), split over KV partitions and merged in partition
+  order, with log-sum-exps and sinks; the cache in BF16, FP16 or E4M3 (a scale a part and position: twice the
+  positions in the same memory, as fast as BF16 with FP16 queries). A token's bits are the same alone, in a verify window and beside other rows; one
+  CUDA graph replays at every length. On an RTX 5090 at rank 512 it runs at 0.8 to 1.8 times the speed of
+  FlashInfer's MLA wrapper (16 and 128 heads, 4,096 to 32,768 positions), its yardstick.
+
+- paged-kv-attention takes attention sinks: `attend(..., sinks=)` and `prefill(..., sinks=)` (each query head's sink
+  logit, FP32 `[heads]`) on every structure (the split launch and merge, fused, flash, flash fused, the CUDA tile split
+  and fused, and the three prompt-chunk paths), one more position with no value in every row's softmax, folded into
+  the row's final state after its partials (the kernel core's `attention_softmax.sink` and `softmax_sink2`): a fused
+  launch keeps the split launch's bits, the log-sum-exp counts the sink, and sinks of -inf change no bit.
+  softmax-attention provides them as `attention:sinks` (`forward(..., sinks=)`, a new attention fact): every reader
+  of attention-state's device form takes them, its torch fallbacks fold them in after their passes, and FlashInfer
+  and torch's SDPA, which have no sinks, give way to crit's readers or the masked softmax.
+
+- gguf-rows reads every GGUF block format for weights but the ternary TQ1_0 and TQ2_0: Q4_0, Q4_1,
+  Q5_0, Q5_1, Q2_K, Q3_K, Q5_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS and MXFP4 join Q8_0, Q4_K, Q6_K, IQ4_NL,
+  IQ3_S and IQ4_XS, in gemv, the gathered gemv, gemm and dequantize, each a decoder in the kernel core
+  (`crit_kcore/gguf.cuh`, the IQ grids in `gguf_grids.cuh` from Core's `gguf_grids.json`). Every format's stored values
+  equal gguf-py's decoder bit for bit and its products the declared order. Q2_K, whose minimums cover 16 values,
+  multiplies its codes times their 4-bit scales and its minimums as two exact integer dots (91 and 105 TOPS at 512 and
+  2,048 tokens on an RTX 5090, 14336 x 4096); the formats with one scale a sub-block reach 117 to 132 TOPS, the rest 87
+  to 112. Core's `gguf_blocks` decodes the same formats on the host (`subblocks(..., halves=True)` gives Q2_K's two
+  minimums), and gguf-projections loads them all as `gguf:<TYPE>`.
+
+- A row of a captured round may have a width of its own (`crit_plugins.rounds` bind's and start_row's `width`): the
+  chain accept keeps at most that many of its drafts, so a request that does not draft (width 0) rides the same
+  captured round as drafting ones and emits one token a round, a greedy row plain greedy decoding's. The acceptance
+  counts offer only the drafts a row's width keeps. The next round of a row count runs at the narrowest captured width
+  that holds its decoding rows' own widths, so rounds of requests that do not draft run the width-0 capture where one
+  is captured.
+- `crit run create` says "Eval cannot score this model" with crit-eval's reason (`scoring_refusal`: no layout for its
+  GGUF architecture, no modeling code in the installed transformers, ...) before any candidate is built. The run is
+  created; a run found out only after its candidates were built that no reference could judge them.
+- `crit kernels sweep --model` (and `gates`) read a GGUF checkpoint: its matrices in a GGUF block format are its
+  shapes, by their GGUF type (an expert stack with its count), so gguf-rows tunes on the model's own shapes;
+  gguf-projections' facts list every matrix it loaded, for `--matrices` from a serve --check report.
+
+- Inference: gguf-projections, the projections slot over a GGUF checkpoint's matrices at their stored bits (every
+  format gguf-rows reads as `gguf:<TYPE>`, the file's dense tensors as `bf16`): decode rows on gguf-rows'
+  gemv (each row's bits its own), an expert stack's rows each against their expert (`matmul_experts`), prompt rows
+  dequantized to BF16 for cuBLAS (option `prompt` dequantize, the default) or on gguf-rows' gemm with the decode rows'
+  bits (`exact`); the host-decoded BF16 values through torch where the kernel cannot be built. A model plugin reads
+  the stored rows with Core's `GgufTensors`.
+
+- Core reads a GGUF checkpoint's quantized matrices as stored: `crit_core.model.gguf_blocks.GgufTensors` maps the
+  files and gives a tensor's bytes shaped as its rows (`[N][row bytes]`, an expert stack `[E][N][row bytes]`) without
+  copying, and `subblocks` / `stored_values` are the exact host decoders of every format gguf-rows reads
+  (each 32-value sub-block's codes and FP32 scales; the stored values bit for bit as the formats' own decoder gives
+  them). The IQ grids live in Core's `gguf_grids.json`, which the kernel core's tables are checked against;
+  gguf-rows' bench takes its decoders from Core.
+
+- gguf-rows: `gemm` multiplies any number of rows (a prompt) on the s8 tensor cores in gemv's declared order, so a
+  prompt's rows have the decode rows' bits: a part's sub-blocks are visited lane by lane in the order the 32-lane tree
+  takes the lanes, each visit decoding one sub-block of the CTA's weight rows into shared memory for one s8 m16n8k32
+  MMA a 16 x 8 tile, and finished lanes fold into the tree's partial sums (the kernel core's new `lane_at32` and
+  `fold32`). `matmul` takes gemv up to 8 rows and gemm beyond. On an RTX 5090 it reaches 20 to 34 TOPS on
+  14336 x 4096 at 512 and 2,048 tokens, below dequantizing to BF16 for cuBLAS (50 to 121 TFLOPS), which an engine can
+  still take where the prompt's bits need not equal the decode rows'.
+
+- Kernels: gguf-rows runs GGUF projections at their stored bits, in Q8_0, Q4_K, Q6_K, IQ4_NL, IQ3_S and IQ4_XS: `gemv`
+  for 1 to 8 rows quantizes each row to int8 per 32 values and takes each 32-value sub-block's exact integer dot with
+  the stored codes on `dp4a`, weighted in FP32 in a declared order (a row's bits independent of the rows beside it,
+  the split of a row's sub-blocks a function of the shape and device), plain or gathered over a stack of experts (each
+  row its expert's matrix, bit for bit the plain call); `dequantize` gives the stored values (FP32 exactly as the
+  format's own decoder gives them, BF16 one rounding) for prompts. The kernel core's `gguf.cuh` holds the formats'
+  decoders. On an RTX 5090 a 1-row call reads the weights at 1,056 to 1,429 GB/s cold on 14336 x 4096 and
+  4096 x 14336, against the probe's 1,487 GB/s.
+
+- `crit run serve --check` sends one request at the run's full context and judges it from Core's step probe:
+  `full_context_prompt_step` fails when the request's slowest prompt step takes crit serve's cancellation grace or
+  longer (a cancel settles only between steps, so the host would be retired with its weights), and
+  `full_context_device_memory` fails when the least free device memory at any of its prompt or decode steps' peaks is
+  below the run's `vram_headroom_bytes`. The prompt is sized from the tokens the engine counts, through the chat API,
+  so any package can take it; an engine that reports no probe leaves both unverified. `CRIT_CORE_STEP_PROBE=1` makes
+  Core's StepEngine time every step with its device work finished and sample the free memory at its peak, reported in
+  its telemetry's `core.probe` (serve --check sets it for its engine only; native rounds are not probed).
+
+- Kernels: exl3-rows runs EXL3 projections at their stored bits (1 to 8, or 1.5 to 3.5): `gemv` for 1 to 16 rows
+  stages each block's trellis slices and activations in shared memory by cp.async (several stages in flight), decodes
+  each tile once into the A operand of an FP16 tensor-core MMA whose B operand is the rows, between the matrix's
+  Hadamard rotations (FP32 sums, a row's bits independent of the rows beside it, the input split by the shape and
+  device; the three launches chained as programmatic dependents), `dequantize` gives the dense BF16 matrix for
+  prompts, `decode` the tiles' FP16 values, the format's own decoder's bits for every codebook and bitrate. The kernel
+  core's `exl3.cuh` holds the codebooks, the bitstream (three words and constant shifts a lane) and the tile order. On
+  an RTX 5090, reading from memory, a 4-bit 5120 x 17408 matrix takes 37 us at 1 row against 111 us for cuBLAS on the
+  dense BF16 matrix, level with or faster than the format's own GEMV at 1 to 4 rows on the shapes measured.
+
+- Core's checkpoint schemes recognise EXL3 matrices (`base.trellis` with their sign vectors and codebook marker) as
+  stored matrices instead of refusing the checkpoint; crit Eval decodes them for its reference. EXL2 stays refused.
+
+- mma-rows: `glu=True` on `mm_rows` and `mm_prompt` (and the FP4 MMA) takes an MLP's gate and up rows as one matrix
+  interleaved by eights (`interleave_glu`) and writes `silu(gate) * up` from the epilogue, out [M][N / 2], so the two
+  projections' outputs are not written and read back by a separate activation product. Within one BF16 step of the
+  projections followed by `silu_mul`; each row keeps its bits alone, beside others and in the prompt tile.
+
+- fused-norms: `rms_norm_fp8_rows` and `rms_norm_nvfp4` quantize a norm's rows for a W8A8 or W4A4 projection in the
+  norm's own launch, so the rows are not written and read back by a separate quantizer. The codes and scales are those
+  of `rms_norm` followed by mma-rows' `quantize_fp8_rows` or `quantize_nvfp4`, bit for bit, residual included.
+
+- `crit kernels gates ID`: five gates beyond a kernel's reference check, each proven by a planted control that must
+  fail it (`--controls`): a NaN in one row reaches that row's output and no other row's bytes; five calls give the
+  same bytes and leave the inputs untouched; the served rows pass at every tile edge (powers of two less one, itself,
+  plus one); integer operands whose partial sums pass FP16's range give the exact FP32 sum; every function built for
+  every claimed architecture fits its registers and static shared memory (read from the binaries, no GPU). Benches
+  may declare scratch buffers, a contained NaN rule and integer inputs (decode-gemv's BF16 weights have them).
+  kernels/TEMPLATES.md lists the gates and the memory-ordering points a review checks where no gate does.
+
+- Core: `StepLayout::read_rows()` (Python `layout.read_rows`) and each placement's `read` name the rows whose
+  last-layer output anything reads: the logits rows, or every row of an item that sets `readers` (taps, hidden-state
+  readouts). The last layer runs its query, attention, output projection and MLP on those rows only; the other rows
+  stop at the layer's state writes, and a prompt chunk inside its prompt stops there altogether.
+
+- `crit kernels report --model A --model B`: every kernel's gates and its speed against its yardstick library on
+  several models' shapes (each structure's distinct shapes over them, at most `--most`, by default the smallest, middle
+  and largest), the default build timed beside the library at its first and last `tune_rows` as the sweep times them,
+  as JSON (`--out`) and a markdown summary (`--markdown`), a line a kernel and then each point.
+
+- `crit kernels sweep --model CHECKPOINT --matrices REPORT`: exactly the shapes a candidate's engine loaded, from its
+  serve --check report (which now records the served engine's facts), an engine's facts or a list of `{N, K, format}`,
+  instead of the checkpoint's tensors and their likely stacks.
+
+- An engine package carries its kernel tuning: configuration `kernel_tuning` names a folder of `crit kernels sweep`
+  tables inside the package (`--out tuning` in the candidate's source), applied before any plugin is made, so the
+  package served, sealed and published is the one Eval measured. `CRIT_KERNEL_TUNING` stays for a quick try, which no
+  package carries.
+
+- Projections `matmul(x, matrix, out_dtype=None, prompt=False)`: `prompt=True` marks a prompt chunk, which takes the
+  prompt rows' arithmetic at every length, so a prompt of a few tokens is not multiplied as decode rows and its rows
+  equal the same rows in a longer prompt (padded past the decode rows where a plugin splits by count).
+
+- Embeddings `store(..., device=)`: the device a table serves, by default the one its rows are on, so a host table's
+  rows read on the CPU go to host memory without passing through the device.
+
+- `crit run ... cost --idle FROM..UNTIL` (repeatable) names stretches in which the build's session was offline with
+  nothing running; the record gives the active hours beside the wall hours.
+
+- CONTRIBUTING.md says how pull requests land (applied to the next release's squash commit with credit, then closed),
+  with a pull request template that says so. ROADMAP.md groups the roadmap's GitHub issues by theme, and a bounty issue
+  template's done-check is the exactness gates plus a re-run on the reference RTX 5090.
+
+### Fixed
+
+- paged-kv-attention turned a NaN query into a zero output on its decode and verify paths (split, fused, flash,
+  flash fused, the CUDA tile split and fused) and on the flash and CUDA prompt chunks: the final normalization took a
+  NaN sum for a row with no position. The kernel core's `finish` / `lse` and `softmax_finish` / `softmax_lse2` now
+  keep 0 only for a sum of 0, so a NaN reaches its token's output (and log-sum-exp) and no other token's; finite
+  outputs keep every bit.
+
+- paged-kv-attention keeps a module workspace it replaces when a larger launch outgrows it. A CUDA graph captured
+  over the old one replayed into its freed blocks, which other tensors then held: garbage attention and writes over
+  those tensors. softmax-attention's `reader: cuda` failed that way with "no selectable token" on a 27B engine above
+  about 66k tokens of context, where a prompt bucket's launch is fused and its workspace grew after the smaller
+  buckets were captured.
+- `crit kernels sweep` stopped during its builds (a `timeout`'s SIGTERM, Ctrl+C) ends the builds and still writes
+  the table of every structure's defaults, its report saying how many builds were done; before, it wrote nothing
+  (a stop while it measures already wrote what it measured).
+- The native serving options tests build their engine with the request-end release threshold `ResidentEngine` now
+  sets (none, as on a host without device memory); every one of them failed on the attribute it lacked.
+- crit serve keeps the engine when a stream write fails because the client is gone: the OSError cancels the turn as a
+  closed connection does, the host settles it and keeps its weights, and the caller gets the error as raised. It used
+  to unwind past the cancel and retire the host, so a fast engine whose next piece beat the disconnect watcher lost
+  its resident weights. crit serve now prints one stderr line whenever it retires or closes an engine host, with why
+  (a cancel not settled within the one-second grace, an engine error, shutdown).
+
+- Core's config rules read attention geometry per layer kind. Full-attention layers may declare their own KV heads and
+  head dim and that their keys equal their values (one cached tensor), through the new `full_attention_kv_heads`,
+  `full_attention_head_dim` and `full_attention_keys_equal_values` entries of `config_keys.json`; sliding layers keep
+  `num_key_value_heads` and `head_dim`. `attention_geometry()` gives both, and `attention_shape` and
+  `kv_elements_per_token` count the full layers' own. `experts_per_token` is also spelled `top_k_experts`, in the
+  Python and C++ readers alike. The GGUF folder check compares a per-layer `head_count_kv` list layer by layer and
+  `key_length_swa` with the sliding layers' head size.
+
+- mtp-decode: `AcceptanceEstimator` learns from confident drafts. `feature(q_max)` takes a probability, which rounds to 1
+  in FP32 once the other tokens' mass is under about 6e-8 and is clamped at 1e-6, so every confident draft had the same
+  feature. `feature_from_logits(scores, temperature)` computes logit(q_max) from the scores as the top score less the
+  log-sum-exp of the rest, in FP64, and `observe_feature`, `predict_feature` and `survival_features` take it.
+
+- Activation quantizers hid a NaN or an infinity: the block maximum dropped a NaN and an infinity saturated to the
+  largest scale, so a non-finite activation became finite products. The kernel core's `abs_max` folds both to NaN,
+  `nvfp4_block_scale` returns NaN for such a block and the NVFP4 byte path writes the E4M3 NaN byte (the block-scaled
+  MMA carries it), and INT8 and INT4 scales come out NaN; int-block-experts and grouped-experts use it in every
+  quantizer, across warp lanes too. Only that token's outputs turn NaN.
+
+- fused-norms' `rope` and `rms_norm_rope` pick their head block by the head width alone, so a q/k pair keeps its
+  separate calls' bits: with one key head one BF16 bit differed on a 512-wide head.
+
+- fixed-tile-gemm's `mm_split` failed to compile on a one-row call.
+
+- The kernel gates put in-place buffers (a residual, residual streams; `bench.restore`) back before every call, and the
+  NaN gate no longer poisons an output buffer the call then overwrites. Benches get the untuned build
+  (`bench.default`), as in the sweep.
+
+- The sweep's timer reads a second buffer after its L2 flush, so the flush's dirty lines are not written back during
+  the timed call: that took 10 to 20% of a weight-streaming call's DRAM time on an RTX 5090. Ratios to the libraries
+  held, but absolute rates and small-call picks were skewed.
+
+- quantized-projections records a draft-only role whose matrices are stored in two formats as a group a format
+  (`role:stored` for the second) instead of refusing it, and re-encoding hands its FP64 slices back to the device: a
+  whole-vocabulary head's re-encode kept several GiB reserved for the engine's lifetime.
+
+- `crit run ... ablate --set`: a string option, or a choice among strings, takes a number-like value as written
+  (`tile_rows=0` is the choice "0").
+
+- The plan check compares a plan's one prompt activation for every format with the engine's same activation per format
+  instead of failing it.
+
+- `crit run ... cost` counts no Claude Code `<synthetic>` messages as model requests.
+
 ## [0.18.0] - 2026-11-11
 
 ### Overview
@@ -3594,7 +3956,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/crit-labs/crit/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/crit-labs/crit/compare/v0.17.2...v0.18.0
 [0.17.2]: https://github.com/crit-labs/crit/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/crit-labs/crit/compare/v0.17.0...v0.17.1

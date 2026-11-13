@@ -195,3 +195,34 @@ def test_the_native_gemm_writes_bf16_with_column_scales_and_reads_tiled_scales(k
                 error = (outs[0].double() - value).abs()
                 assert bool((error <= magnitude * 2e-6 + value.abs() * 2.0 ** -8 + 1e-30).all()), (rows, cols, tiled, host)
                 assert torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16))
+
+
+@pytest.mark.kernels_ci
+def test_a_non_finite_activation_reaches_its_tokens_outputs_and_no_others():
+    """A NaN or an infinity in a token's activations quantizes to a NaN block scale (zero codes), so every path's
+    outputs for that token are NaN and the other tokens' stay finite: the quantizers must not hide it (fmaxf drops NaN,
+    a saturated infinity looks like a large finite value)."""
+    g = torch.Generator().manual_seed(8)
+    rows, cols, tokens = 96, 640, 5
+    codes = torch.randint(0, 256, (rows, cols // 2), dtype=torch.uint8, generator=g).to(dev)
+    scales = torch.randint(0x20, 0x5F, (rows, cols // 16), generator=g).to(torch.uint8).to(dev)
+    table = ib.matrix_table([(codes, scales, 0.5, False)])
+    for bad in (float("nan"), float("inf")):
+        x = torch.randn(tokens, cols, generator=g).to(dev)
+        x[1, 37] = bad
+        values, act_scales = ib.quantize_int8(x, 32)
+        e_values, e_scales = ib.quantize_e2m1x2(x, 3.0)
+        act_codes, act_bytes = ib.quantize_nvfp4(x, 3.0)
+        for name, s in (("int8", act_scales), ("e2m1x2", e_scales), ("nvfp4", act_bytes.view(torch.float8_e4m3fn).float())):
+            assert bool(s[1].isnan().any()) and bool(s[[0, 2, 3, 4]].isfinite().all()), (name, bad)
+        outs = {}
+        for name, call in (("rows", lambda o: ib.rows(table, ib.row_jobs([(0, list(range(tokens)), list(range(tokens)))],
+                                                                        dev), rows, values, act_scales, 32, o)),
+                           ("gemm", lambda o: ib.gemm(table, ib.gemm_jobs([(0, 0, tokens)], dev), rows, tokens, values,
+                                                      act_scales, 32, o)),
+                           ("native", lambda o: ib.gemm_native(table, ib.gemm_jobs([(0, 0, tokens)], dev), rows, tokens,
+                                                               act_codes, act_bytes, 3.0, o))):
+            out = torch.zeros(tokens, rows, device=dev)
+            call(out)
+            outs[name] = out
+            assert bool(out[1].isnan().all()) and bool(out[[0, 2, 3, 4]].isfinite().all()), (name, bad)

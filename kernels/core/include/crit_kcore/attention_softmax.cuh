@@ -111,12 +111,20 @@ __device__ __forceinline__ float fold_output(float out, float o, const SoftmaxFo
 }
 
 // The normalized output acc / l, 0 where the row saw no position (l = 0).
-__device__ __forceinline__ float softmax_finish(float acc, float l) { return l > 0.0f ? __fdiv_rn(acc, l) : 0.0f; }
+// 0 where a row saw no position (l = 0); a NaN sum (a NaN score) stays NaN.
+__device__ __forceinline__ float softmax_finish(float acc, float l) { return l != 0.0f ? __fdiv_rn(acc, l) : 0.0f; }
+
+// A sink logit s (natural log, in the scaled scores' units; -inf: none) into a row's final base-2 state as one more
+// position that carries no value: the output is fmul(acc, keep) before softmax_finish, the sum and maximum the
+// returned ones (softmax_lse2 then counts the sink). Folded once, after every partial state.
+__device__ __forceinline__ SoftmaxFold2 softmax_sink2(float m_run, float l_run, float s) {
+    return softmax_fold2(m_run, l_run, __fmul_rn(s, 1.4426950408889634f), 1.0f);
+}
 
 // The natural-log log-sum-exp of a row's scores from its base-2 maximum and sum (-inf where it saw no position): one
 // FMA, written out.
 __device__ __forceinline__ float softmax_lse2(float m, float l) {
-    return l > 0.0f ? fmaf(m, kAttnLn2, logf(l)) : -INFINITY;
+    return l != 0.0f ? fmaf(m, kAttnLn2, logf(l)) : -INFINITY;
 }
 
 }  // namespace crit::kcore

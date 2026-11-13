@@ -25,12 +25,22 @@ phase in input order:
 | `placement(i)` | The placement of input item `i` |
 | `decode_rows()`, `decode_items()` | Rows `[0, decode_rows())` are the decode block |
 | `logit_rows()` | The step row of every logits row, ascending: the gather index of one logits pass |
+| `read_rows()` | The step row of every row whose last-layer output anything reads, ascending (each placement's last `read` rows) |
 
 ```cpp
 std::vector<crit::core::StepItem> items;
 for(const auto& work:group) items.push_back(crit::core::step_item(work, prompt_size(work), committed(work)));
 layout.arrange(items);   // decode block, then prompt chunks; layout.logit_rows() feeds the logits pass
 ```
+
+Only the logits rows read the last layer's output, unless an item sets `readers`
+(a drafter's or MTP head's taps, a hidden-state readout read every row). So the last
+layer needs its query, attention, output projection and MLP only on `read_rows()`:
+every other row stops at the layer's state writes (its keys and values, or its
+recurrent state), and a prompt chunk that does not end its prompt stops there
+altogether. That saves about one layer in the model's layers of a cold prompt's work.
+An engine whose kernels run whole tiles takes the tile that holds the read rows, and
+one whose last layer fuses the query with the key and value projections keeps them.
 
 The engine's work then runs once over all `rows()` rows, so a step reads the model's
 weights once however many requests it holds; the decode block and the prompt chunks

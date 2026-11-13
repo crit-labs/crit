@@ -1436,6 +1436,14 @@ class PromptActivationTests(PlanFixture, unittest.TestCase):
         self.evaluated(parent, status(), engine={"prompt_activations": self.stored})
         self.assertEqual(self.store.plan(self.run_id, follow)["prompt_activations"], self.stored)
 
+    def test_one_planned_activation_holds_for_every_served_format(self):
+        recorded = self.store.plan(self.run_id, {**plan(levers=[], forecast=None), "prompt_activations": "stored"})
+        parent = self.candidate(plan_id=recorded["plan_id"])["candidate_id"]
+        self.evaluated(parent, status(), engine={"prompt_activations": {"nvfp4": "stored", "fp8": "stored"}})
+        forecast = {**plan()["forecast"], "prefill": {"low": 1100.0, "expected": 1500.0, "high": 2000.0}}
+        follow = {**plan(parent, forecast=forecast), "prompt_activations": "stored"}
+        self.assertEqual(self.store.plan(self.run_id, follow)["prompt_activations"], "stored")
+
 
 class PromptActivationDefaultModeTests(PromptActivationTests):
     """A request that names no quality mode is in speed: check 16 asks its plans."""

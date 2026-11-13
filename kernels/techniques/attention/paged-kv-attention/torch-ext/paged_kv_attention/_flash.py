@@ -29,13 +29,14 @@ from ._kernels import _ancestors, _values
 @triton.jit
 def _flash_range(acc, m_i, l_i, q, qi, qs, lo, hi, lim, anc, first, count, kvh, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr,
                  trow, tab_stride, tab_width, fk_ptr, fv_ptr, stride_fk, stride_fv, fshift, qk_scale, k_mult, v_mult,
-                 vofs, BLOCK_N: tl.constexpr, PAGE: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr,
+                 vofs, win, BLOCK_N: tl.constexpr, PAGE: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr,
                  DV: tl.constexpr, DVP: tl.constexpr, KIND: tl.constexpr, HW_FP8: tl.constexpr, TREE: tl.constexpr,
                  MASKED: tl.constexpr, FRESH_SRC: tl.constexpr, INT8_QK: tl.constexpr):
     """Positions lo .. hi - 1 in blocks of BLOCK_N from lo, into the running (acc, m_i, l_i). MASKED: each row sees
     positions up to its own (lim) or, with TREE, those before the window and its ancestors' (anc); else every block is
     seen by every row in full. FRESH_SRC: keys and values from the fresh 16-bit rows (row = position - fshift), else
-    through the page table at the page kind's precision."""
+    through the page table at the page kind's precision. win > 0 (masked blocks): each row sees the win positions up
+    to its own."""
     d = tl.arange(0, D)
     dv = vofs + tl.arange(0, DVP)
     for n0 in range(lo, hi, BLOCK_N):
@@ -65,6 +66,8 @@ def _flash_range(acc, m_i, l_i, q, qi, qs, lo, hi, lim, anc, first, count, kvh, 
                 vis = nm[None, :] & ((n < first)[None, :] | (inw[None, :] & (bit != 0)))
             else:
                 vis = nm[None, :] & (n[None, :] <= lim[:, None])
+            if win > 0:
+                vis = vis & (n[None, :] > (lim - win)[:, None])
             s = tl.where(vis, s, float("-inf"))
         p, alpha, m_new = asm.step(s, m_i, True)
         if FRESH_SRC:
@@ -95,44 +98,47 @@ def _aligned(lo, edge, hi, BLOCK_N: tl.constexpr):
 @triton.jit
 def _flash_split(lo, hi, nfree, ffirst, q, qi, qs, lim, anc, first, count, kvh, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr,
                  trow, tab_stride, tab_width, fk_ptr, fv_ptr, stride_fk, stride_fv, fshift, qk_scale, k_mult, v_mult,
-                 vofs, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, PAGE: tl.constexpr, HKV: tl.constexpr,
+                 vofs, win, wlo, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, PAGE: tl.constexpr, HKV: tl.constexpr,
                  D: tl.constexpr, DV: tl.constexpr, DVP: tl.constexpr, KIND: tl.constexpr, HW_FP8: tl.constexpr,
                  TREE: tl.constexpr, FRESH: tl.constexpr, INT8_QK: tl.constexpr, SKIP: tl.constexpr):
     """One split, positions lo .. hi - 1 -> its state (acc, m, l): with SKIP the whole blocks every row sees (below
     nfree) without the mask and the rest masked, else every block masked (one loop, fewer registers); with FRESH the
     positions from ffirst on from the fresh rows. SKIP changes bits: without a mask between them the scale's multiply
     and the maximum's subtraction may contract into one FMA, so a block read unmasked rounds otherwise than masked;
-    launches whose rows must agree (every window launch) mask every block."""
+    launches whose rows must agree (every window launch) mask every block. win > 0: each row sees the win positions up
+    to its own; the blocks wholly below wlo (the tile's lowest such position) are skipped and every block is masked."""
     m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
+    skip = tl.where(win > 0, wlo, lo)   # the blocks wholly below it are skipped
+    start = tl.minimum(hi, tl.where(skip > lo, lo + (skip - lo) // BLOCK_N * BLOCK_N, lo))
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc = tl.zeros([BLOCK_M, DVP], tl.float32)
     if FRESH:
-        paged = tl.minimum(hi, tl.maximum(ffirst, lo))
+        paged = tl.minimum(hi, tl.maximum(ffirst, start))
     else:
         paged = hi
-    edge = lo
+    edge = start
     if SKIP:
-        edge = _aligned(lo, nfree, paged, BLOCK_N)
-        acc, m_i, l_i = _flash_range(acc, m_i, l_i, q, qi, qs, lo, edge, lim, anc, first, count, kvh, k_ptr, v_ptr,
+        edge = tl.where(win > 0, start, _aligned(start, nfree, paged, BLOCK_N))
+        acc, m_i, l_i = _flash_range(acc, m_i, l_i, q, qi, qs, start, edge, lim, anc, first, count, kvh, k_ptr, v_ptr,
                                      ks_ptr, vs_ptr, tab_ptr, trow, tab_stride, tab_width, fk_ptr, fv_ptr, stride_fk,
-                                     stride_fv, fshift, qk_scale, k_mult, v_mult, vofs, BLOCK_N, PAGE, HKV, D, DV,
-                                     DVP, KIND, HW_FP8, TREE, False, False, INT8_QK)
+                                     stride_fv, fshift, qk_scale, k_mult, v_mult, vofs, win, BLOCK_N, PAGE, HKV, D,
+                                     DV, DVP, KIND, HW_FP8, TREE, False, False, INT8_QK)
     acc, m_i, l_i = _flash_range(acc, m_i, l_i, q, qi, qs, edge, paged, lim, anc, first, count, kvh, k_ptr, v_ptr,
                                  ks_ptr, vs_ptr, tab_ptr, trow, tab_stride, tab_width, fk_ptr, fv_ptr, stride_fk,
-                                 stride_fv, fshift, qk_scale, k_mult, v_mult, vofs, BLOCK_N, PAGE, HKV, D, DV, DVP,
-                                 KIND, HW_FP8, TREE, True, False, INT8_QK)
+                                 stride_fv, fshift, qk_scale, k_mult, v_mult, vofs, win, BLOCK_N, PAGE, HKV, D, DV,
+                                 DVP, KIND, HW_FP8, TREE, True, False, INT8_QK)
     if FRESH:
         edge = paged
         if SKIP:
-            edge = _aligned(paged, nfree, hi, BLOCK_N)
+            edge = tl.where(win > 0, paged, _aligned(paged, nfree, hi, BLOCK_N))
             acc, m_i, l_i = _flash_range(acc, m_i, l_i, q, qi, qs, paged, edge, lim, anc, first, count, kvh, k_ptr,
                                          v_ptr, ks_ptr, vs_ptr, tab_ptr, trow, tab_stride, tab_width, fk_ptr, fv_ptr,
-                                         stride_fk, stride_fv, fshift, qk_scale, k_mult, v_mult, vofs, BLOCK_N, PAGE,
-                                         HKV, D, DV, DVP, KIND, HW_FP8, TREE, False, True, False)
+                                         stride_fk, stride_fv, fshift, qk_scale, k_mult, v_mult, vofs, win, BLOCK_N,
+                                         PAGE, HKV, D, DV, DVP, KIND, HW_FP8, TREE, False, True, False)
         acc, m_i, l_i = _flash_range(acc, m_i, l_i, q, qi, qs, edge, hi, lim, anc, first, count, kvh, k_ptr, v_ptr,
                                      ks_ptr, vs_ptr, tab_ptr, trow, tab_stride, tab_width, fk_ptr, fv_ptr, stride_fk,
-                                     stride_fv, fshift, qk_scale, k_mult, v_mult, vofs, BLOCK_N, PAGE, HKV, D, DV,
-                                     DVP, KIND, HW_FP8, TREE, True, True, False)
+                                     stride_fv, fshift, qk_scale, k_mult, v_mult, vofs, win, BLOCK_N, PAGE, HKV, D,
+                                     DV, DVP, KIND, HW_FP8, TREE, True, True, False)
     return acc, m_i, l_i
 
 
@@ -149,14 +155,15 @@ def _row_chunk(first, count, n_parts, chunk, BLOCK_N: tl.constexpr, DEV_CHUNK: t
 @triton.jit(do_not_specialize=["first0", "ffirst0"])
 def _flash_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start_ptr, count_ptr, first_ptr, par_ptr,
                   off_ptr, po_ptr, pm_ptr, pl_ptr, out_ptr, lse_ptr, fk_ptr, fv_ptr, fshift_ptr, ffirst_ptr,
-                  stride_qt, stride_qh, stride_ot, stride_oh, stride_fk, stride_fv, stride_fr, tab_stride, tab_width,
-                  n_parts, chunk, qk_scale, k_mult, v_mult, cols, first0, ffirst0,
+                  sink_ptr, stride_qt, stride_qh, stride_ot, stride_oh, stride_fk, stride_fv, stride_fr, tab_stride,
+                  tab_width, n_parts, chunk, qk_scale, k_mult, v_mult, cols, first0, ffirst0, win,
                   HQ: tl.constexpr, HKV: tl.constexpr, G: tl.constexpr, D: tl.constexpr, DV: tl.constexpr,
                   DVP: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, PAGE: tl.constexpr,
                   KIND: tl.constexpr, HW_FP8: tl.constexpr, TREE: tl.constexpr, TREE_COLS: tl.constexpr,
                   COUNTS: tl.constexpr, OFFSETS: tl.constexpr, FUSED: tl.constexpr, ONE_SPLIT: tl.constexpr,
                   LSE: tl.constexpr, FRESH: tl.constexpr, ONE_ROW: tl.constexpr, POS_T: tl.constexpr,
-                  FIRST_T: tl.constexpr, DEV_CHUNK: tl.constexpr, INT8_QK: tl.constexpr, SKIP: tl.constexpr):
+                  FIRST_T: tl.constexpr, DEV_CHUNK: tl.constexpr, INT8_QK: tl.constexpr, SKIP: tl.constexpr,
+                  SINKS: tl.constexpr):
     """Program (query tile, split b or value part b, row x KV head). Tile rows j: packed index mt * BLOCK_M + j ->
     column // G, head % G of the row's KV head. Split launches: split b's positions (b * chunk ..) up to the tile's
     last column, its state into the partials; FUSED: every split in turn folded in split order (a column folds those
@@ -164,7 +171,8 @@ def _flash_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start_
     positions in one range, the output written. ONE_ROW: one sequence's chunk (prefill): row 0, token 0 on, table row
     0, its first position first0 (or with POS_T first_ptr[0] on the device), `cols` columns; FRESH: positions from
     ffirst on from the fresh rows (row = position - fshift: per row from fshift_ptr / ffirst_ptr stride_fr apart, or
-    with ONE_ROW fshift = first, ffirst = ffirst0 or with FIRST_T ffirst_ptr[0])."""
+    with ONE_ROW fshift = first, ffirst = ffirst0 or with FIRST_T ffirst_ptr[0]). SINKS (fused, one split): each
+    query head's sink logit (sink_ptr, FP32 [HQ]) folded into its rows' final states, as the merge folds it."""
     # The last tiles (the most positions under a causal edge) first: the GPU's last wave holds the short ones.
     mt = tl.num_programs(0) - 1 - tl.program_id(0)
     b = tl.program_id(1)
@@ -240,7 +248,7 @@ def _flash_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start_
                 out, m_run, l_run = _flash_split(0, n_keys, nfree, ffirst, q, qi, qs, lim, anc, first, count, kvh,
                                                  k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow, tab_stride, tab_width,
                                                  fk_ptr, fv_ptr, stride_fk, stride_fv, fshift, qk_scale, k_mult,
-                                                 v_mult, vofs, BLOCK_M, BLOCK_N, PAGE, HKV, D, DV, DVP, KIND, HW_FP8,
+                                                 v_mult, vofs, win, first + c_lo - win + 1, BLOCK_M, BLOCK_N, PAGE, HKV, D, DV, DVP, KIND, HW_FP8,
                                                  TREE, FRESH, INT8_QK, SKIP)
             else:
                 m_run = tl.full([BLOCK_M], float("-inf"), tl.float32)
@@ -254,10 +262,14 @@ def _flash_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start_
                     acc, m_i, l_i = _flash_split(lo, tl.minimum(lo + chunk, n_keys), nfree, ffirst, q, qi, qs, lim,
                                                  anc, first, count, kvh, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow,
                                                  tab_stride, tab_width, fk_ptr, fv_ptr, stride_fk, stride_fv, fshift,
-                                                 qk_scale, k_mult, v_mult, vofs, BLOCK_M, BLOCK_N, PAGE, HKV, D, DV,
+                                                 qk_scale, k_mult, v_mult, vofs, win, first + c_lo - win + 1, BLOCK_M, BLOCK_N, PAGE, HKV, D, DV,
                                                  DVP, KIND, HW_FP8, TREE, FRESH, INT8_QK, SKIP)
                     m_run, l_run, keep, take = asm.fold(m_run, l_run, m_i, l_i, True)
                     out = tl.fma(out, keep[:, None], acc * take[:, None])
+            if SINKS:
+                sk = tl.load(sink_ptr + kvh * G + g, mask=live, other=float("-inf"))
+                m_run, l_run, keep = asm.sink(m_run, l_run, sk, True)
+                out = out * keep[:, None]
             dvp = tl.arange(0, DVP)
             row = ((start + c) * stride_ot + (kvh * G + g) * stride_oh + vofs)[:, None] + dvp[None, :]
             tl.store(out_ptr + row, asm.finish(out, l_run).to(out_ptr.dtype.element_ty), mask=live[:, None])
@@ -268,7 +280,7 @@ def _flash_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start_
             acc, m_i, l_i = _flash_split(lo, tl.minimum(lo + chunk, n_keys), nfree, ffirst, q, qi, qs, lim, anc, first,
                                          count, kvh, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow, tab_stride,
                                          tab_width, fk_ptr, fv_ptr, stride_fk, stride_fv, fshift, qk_scale, k_mult,
-                                         v_mult, vofs, BLOCK_M, BLOCK_N, PAGE, HKV, D, DV, DVP, KIND, HW_FP8, TREE,
+                                         v_mult, vofs, win, first + c_lo - win + 1, BLOCK_M, BLOCK_N, PAGE, HKV, D, DV, DVP, KIND, HW_FP8, TREE,
                                          FRESH, INT8_QK, SKIP)
             if OFFSETS:
                 prow = (tl.load(off_ptr + r) - tl.load(off_ptr)).to(tl.int64)
@@ -282,13 +294,14 @@ def _flash_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start_
 
 
 @triton.jit(do_not_specialize=["first0"])
-def _flash_merge_kernel(po_ptr, pm_ptr, pl_ptr, out_ptr, lse_ptr, start_ptr, count_ptr, first_ptr, off_ptr, n_parts,
-                        chunk, cols, first0, stride_ot, stride_oh, HQ: tl.constexpr, DV: tl.constexpr,
+def _flash_merge_kernel(po_ptr, pm_ptr, pl_ptr, out_ptr, lse_ptr, start_ptr, count_ptr, first_ptr, off_ptr, sink_ptr,
+                        n_parts, chunk, cols, first0, stride_ot, stride_oh, HQ: tl.constexpr, DV: tl.constexpr,
                         BLOCK_N: tl.constexpr, COUNTS: tl.constexpr, OFFSETS: tl.constexpr, LSE: tl.constexpr,
-                        ONE_ROW: tl.constexpr, POS_T: tl.constexpr, DEV_CHUNK: tl.constexpr, CHUNK_P: tl.constexpr):
+                        ONE_ROW: tl.constexpr, POS_T: tl.constexpr, DEV_CHUNK: tl.constexpr, CHUNK_P: tl.constexpr,
+                        SINKS: tl.constexpr):
     """Program (column, query head, row): the partial states of the splits holding the column's positions folded in
     split order (attention_softmax.fold, base 2: a fused launch's rule), into the output row (and its log-sum-exp);
-    CHUNK_P partials loaded a turn, each folded in order."""
+    CHUNK_P partials loaded a turn, each folded in order. SINKS: the head's sink logit folded in last."""
     c = tl.program_id(0)
     h = tl.program_id(1)
     r = tl.program_id(2)
@@ -331,7 +344,10 @@ def _flash_merge_kernel(po_ptr, pm_ptr, pl_ptr, out_ptr, lse_ptr, start_ptr, cou
                 m_run = tl.where(use, m_new, m_run)
                 l_run = tl.where(use, l_new, l_run)
                 acc = tl.where(use, tl.fma(acc, keep, o * take), acc)
-        ok = l_run > 0
+        if SINKS:
+            m_run, l_run, keep = asm.sink(m_run, l_run, tl.load(sink_ptr + h), True)
+            acc = acc * keep
+        ok = l_run != 0   # 0 for a row with no position; a NaN sum (a NaN query) stays NaN
         o = tl.where(ok, acc / tl.where(ok, l_run, 1.0), 0.0)
         tl.store(out_ptr + (start + c) * stride_ot + h * stride_oh + dv, o.to(out_ptr.dtype.element_ty))
         if LSE:

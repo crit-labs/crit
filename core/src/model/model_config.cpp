@@ -17,8 +17,8 @@ constexpr std::uint64_t u32_max = std::numeric_limits<std::uint32_t>::max();
 constexpr std::uint64_t u64_max = std::numeric_limits<std::uint64_t>::max();
 constexpr std::uint32_t max_layers = 1u << 16;
 // Which keys spell each field, in order: text_sections_keys, position_lengths_keys, norm_eps_keys, dtype_keys,
-// experts_keys, layer_types_keys and layer_count_from_keys, generated from the table crit_core.model.config also
-// reads (python/crit_core/model/config_keys.json).
+// experts_keys, experts_per_token_keys, layer_types_keys and layer_count_from_keys, generated from the table
+// crit_core.model.config also reads (python/crit_core/model/config_keys.json).
 #include "crit_config_keys.inc"
 
 // The first key of `keys` the object has, or nullptr.
@@ -303,7 +303,8 @@ ModelConfig parse_model_config(json::Document document) {
             MoeConfig moe;
             moe.experts = *experts;
             moe.experts_key = key;
-            moe.experts_per_token = u32("num_experts_per_tok").value_or(0);
+            for(const char* per:experts_per_token_keys)
+                if(auto count = u32(per)) { moe.experts_per_token = *count; break; }
             moe.shared_experts = u32("n_shared_experts");
             if(!moe.shared_experts) moe.shared_experts = u32("num_shared_experts");
             moe.moe_intermediate_size = u32("moe_intermediate_size");

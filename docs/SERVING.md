@@ -327,10 +327,20 @@ closes, connection resets and other detected socket failures. This also applies 
 non-streaming requests and streaming requests that have not emitted text yet.
 Cooperative cancellation resets request state and keeps weights loaded; an adapter
 that does not settle within the cancellation grace period is retired before another
-turn can run.
+turn can run. The grace period is one second, fixed (no option changes it), counted
+from the cancel the server sends: the engine has to notice the cancel and return
+within it from wherever it is, so every prompt chunk, at the full context the engine
+serves, and every decode step must finish in well under a second. A slower chunk
+loses the resident weights on any cancel, and the next turn loads them again.
+`crit run serve --check` measures it: one request at the run's full context, on Core's
+steps probed (`CRIT_CORE_STEP_PROBE`), fails `full_context_prompt_step` when its slowest
+prompt step takes the grace or longer. crit
+serve prints one line on stderr whenever it retires or closes an engine host, saying
+why (a cancel not settled within the grace, an engine error, shutdown).
 Streaming writes also honor the command's deadline and shutdown while a connected
 client is not reading. If delivery cannot continue, the connection is closed and
-the existing cancellation path settles the request. A partially sent SSE event
+the existing cancellation path settles the request; a write that fails because the
+client is gone cancels the turn the same way, and the host keeps its weights. A partially sent SSE event
 is not followed by an error event or `[DONE]`. A responsive client can still
 receive the ordinary terminal error when generation times out.
 Cancellation also removes a request waiting for the engine without interrupting
@@ -456,7 +466,7 @@ running turn ends, and its client gets a 499 `Request cancelled` (a stream gets 
 last event before `[DONE]`), and a request [waiting for the engine](#a-busy-engine) leaves the queue
 without running, its client, a stream's too, getting the 499 as the response's status.
 As after a closed connection, a cooperative adapter keeps its weights loaded and one that does not
-settle within the grace period is retired. The answer is
+settle within the one-second grace period is retired. The answer is
 `{"object": "crit.abort", "found": true, "request_ids": [...]}`, crit's ids of the requests it
 cancelled; an id no request in flight has, or one already cancelled (by an earlier abort or its closed
 connection), is `"found": false`, not an error.
@@ -1561,8 +1571,12 @@ def effective_configuration(self):
 A per-user guard (`crit-runtime-USER` in the OS temp folder, or
 `CRIT_RUNTIME_DIRECTORY`, never to bypass an owner) lets one runtime own the machine.
 The engine runs in a Windows Job Object or POSIX process group retired on stop,
-timeout, shutdown or client death. After a crash, `crit serve --recover-runtime`
-verifies retirement before releasing admission; never delete the guard. A failed
+timeout, shutdown or client death. After a crash, the next runtime to start recovers
+the guard itself when its owner is gone and its processes have settled, the same proof
+`crit serve --recover-runtime` runs, and says so in one line; a live owner, or cleanup
+it cannot prove, keeps the guard refused and `--recover-runtime` names why. Never delete
+the guard. A client that goes away mid-request (a readiness probe that gave up) is one
+line on stderr, not a traceback. A failed
 request's records (`requests/<request_id>/` in the runtime directory, the id its response's
 `X-Request-Id` carried) stay for diagnosis; nothing is written to the run folder.
 On Windows the engine's process opts out of power throttling (`crit_core.machine.keep_full_speed`), so it keeps its

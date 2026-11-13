@@ -127,7 +127,7 @@ class PackageCheckTests(PackageFixture, unittest.TestCase):
                           "request (chat-plain-v1)"])
 
 
-@unittest.skipUnless(STEP_LIBRARY, "Core's runtime: set CRIT_CORE_STEP_LIBRARY to a crit_core_steps build")
+@unittest.skipUnless(STEP_LIBRARY, "Core's runtime crit_core_steps is not built: `crit core build` builds it")
 def _cuda():
     try:
         import torch
@@ -301,6 +301,22 @@ class LoadTests(PackageFixture, unittest.TestCase):
         engine = load(self.package, self.model, device="cpu", **options)
         self.addCleanup(engine.close)
         return engine
+
+    def test_a_probed_engine_reports_its_slowest_prompt_and_decode_steps(self):
+        # Without STEP_PROBE nothing is probed; with it, every step counts under its kind (a prompt step prefills a
+        # row), timed with its device work finished.
+        import os
+        from unittest import mock
+        from crit_core import native
+        self.assertNotIn("probe", self.open().telemetry()["core"])
+        with mock.patch.dict(os.environ, {native.STEP_PROBE: "1"}):
+            engine = self.open()
+        engine.generate(list(range(5, 45)), 4, stop_tokens=[])
+        probe = engine.telemetry()["core"]["probe"]
+        self.assertEqual(set(probe), {"prompt", "decode"})
+        for kind in ("prompt", "decode"):
+            self.assertGreater(probe[kind]["steps"], 0)
+            self.assertGreater(probe[kind]["slowest_seconds"], 0)
 
     def test_the_engine_runs_its_model_plugin_and_reports_its_plugins(self):
         engine = self.open()
@@ -673,3 +689,28 @@ class ImageTests(PackageFixture, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PackageTuningTests(unittest.TestCase):
+    def test_a_package_carries_its_kernel_tuning(self):
+        from crit_plugins import kernels
+        with tempfile.TemporaryDirectory() as temp:
+            package = Path(temp)
+            (package / "tuning").mkdir()
+            (package / "tuning" / "mma-rows.json").write_text("{}", encoding="utf-8")
+            self.addCleanup(kernels.use_tuning, None)
+            self.assertEqual(core_engine.package_tuning(package, {"kernel_tuning": "tuning"}),
+                             (package / "tuning").resolve())
+            self.assertEqual(kernels.tuning_file("mma-rows"), (package / "tuning" / "mma-rows.json").resolve())
+            for outside in ("..", "missing", 3):
+                with self.subTest(outside=outside), self.assertRaisesRegex(PluginError, "inside the package"):
+                    core_engine.package_tuning(package, {"kernel_tuning": outside})
+            self.assertIsNone(core_engine.package_tuning(package, {}))
+
+
+class ReleaseThresholdTests(unittest.TestCase):
+    def test_the_release_threshold_is_the_engines_or_the_runs_headroom_never_a_constant(self):
+        self.assertEqual(core_engine.release_threshold({}, {"vram_headroom_bytes": 3 << 30}), 3 << 30)
+        self.assertEqual(core_engine.release_threshold({"release_below_mib": 640}, {"vram_headroom_bytes": 1}), 640 << 20)
+        self.assertIsNone(core_engine.release_threshold({"release_below_mib": 0}, {"vram_headroom_bytes": 1 << 30}))
+        self.assertIsNone(core_engine.release_threshold({}, {}))

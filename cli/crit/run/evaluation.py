@@ -188,6 +188,10 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
     folder = unsealed(root, candidate_id)
     parts = tuple(parts or PARTS)
     packaged(folder, "measuring", "Eval measures")
+    if ladder.serve_check_failed(root, candidate_id):
+        raise ValueError(f"{candidate_id}'s newest serve --check failed, so it is a draft: seal it check_failed with "
+                         "what stopped it and build the fix as a new candidate from the same plan; an Eval of a draft "
+                         "would count it on the ladder")
     # The candidate ladder: the rung says how far Eval measures the candidate, and refuses more.
     stage, certify = ladder.eval_options(ladder.scope_of(root, candidate_id), stage, certify, candidate_id)
     model, data = run["spec"]["model_path"], data.absolute()

@@ -70,6 +70,15 @@ PIECE = 32          # positions per piece of FP8 or INT8 pages at a 256-wide hea
 MAX_COLUMNS = 64    # columns of one row a launch reads (a tree's ancestor masks are 64-bit)
 
 _workspaces = {}
+# Workspaces a launch outgrew. A CUDA graph captured over one keeps its pointers and replays into it, so a module
+# workspace is never freed once replaced: freed, its blocks would go to other tensors, which a replay then reads
+# and overwrites (garbage attention, NaN logits).
+_retired = []
+
+
+def _retire(found):
+    if found is not None:
+        _retired.append(found)
 
 
 @functools.lru_cache(maxsize=4096)
@@ -90,6 +99,23 @@ def _warps(knob, rule, rows, capability):
     if not knob or (rows >= 64 and capability[0] in WARPGROUP_MMA and knob % 4 == 0):
         return rule
     return int(knob)
+
+
+def _check_sliding(sliding, blocks):
+    """A sliding window is a whole number of positions, 0 (none) or more, and reads no block lists."""
+    sliding = int(sliding or 0)
+    if sliding < 0:
+        raise ValueError("a sliding window is 0 (none) or a number of positions")
+    if sliding and blocks is not None:
+        raise ValueError("a sliding window reads windows without block lists")
+    return sliding
+
+
+def _check_sinks(sinks, q):
+    """Sink logits are FP32 [heads], contiguous, on q's device."""
+    if sinks is not None and (sinks.dtype != torch.float32 or sinks.dim() != 1 or sinks.shape[0] != q.shape[1] or
+                              not sinks.is_contiguous() or sinks.device != q.device):
+        raise ValueError(f"sinks are contiguous FP32 [{q.shape[1]}] (one a query head) on q's device")
 
 
 def _check_kind(kind, key_scales):
@@ -234,7 +260,8 @@ def workspace_floats(tokens, heads, partitions, value_dim):
 
 def _workspace(device, tokens, heads, parts, dv, given=None):
     """Partials for tokens x heads x parts: outputs, maxima and sums, in `given` (one FP32 tensor of
-    workspace_floats or more) or in a module workspace that grows outside a capture only."""
+    workspace_floats or more) or in a module workspace that grows outside a capture only (the one it replaces is kept:
+    graphs captured over it replay into it)."""
     need = tokens * heads * parts
     if given is not None:
         if given.dtype != torch.float32 or given.numel() < need * (dv + 2):
@@ -247,6 +274,7 @@ def _workspace(device, tokens, heads, parts, dv, given=None):
             raise RuntimeError("paged_kv_attention.attend: run a launch of this size once before capturing it (its "
                                "partials' workspace is allocated outside the capture)")
         size = max(need, 4096)
+        _retire(found)
         found = (torch.empty(size * dv, dtype=torch.float32, device=device),
                  torch.empty(size, dtype=torch.float32, device=device),
                  torch.empty(size, dtype=torch.float32, device=device))
@@ -255,6 +283,7 @@ def _workspace(device, tokens, heads, parts, dv, given=None):
     if po.numel() < need * dv:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("paged_kv_attention.attend: run a launch of this size once before capturing it")
+        _retire(found)
         po = torch.empty(need * dv, dtype=torch.float32, device=device)
         _workspaces[device] = (po, pm, pl)
     return po, pm, pl
@@ -264,7 +293,7 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
            offsets=None, tokens=None, key_scales=None, value_scales=None, multipliers=(1.0, 1.0), scale=None,
            partitions=None, parents=None, blocks=None, block_size=None, out=None, lse=None, workspace=None, piece=None,
            fused=False, fresh=None, vsplit=None, tile=None, num_warps=None, num_stages=None, maxnreg=None,
-           flash=False, chunk=None, ramp=None):
+           flash=False, chunk=None, ramp=None, sinks=None, sliding=0):
     """Decode and verify windows over paged KV (see the module's description).
 
     q [tokens][heads][dim] BF16 or FP16 (FP16 for "fp16" pages); key_pages/value_pages one layer's pages, key_scales/
@@ -297,19 +326,29 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
     bits are the same alone and in any window of a flash launch over the cache, fused or not). partitions, piece and
     block lists do not apply (blocks: the split launch); its workspace takes flash_parts() splits a partial row.
     flash "cuda": the CUDA flash tile (cuda_window.cu), its splits cuda_chunk()'s positions with the cache's ramp
-    (cuda_ramp(), or `ramp` (R, K)); its workspace takes cuda_parts() splits a partial row."""
+    (cuda_ramp(), or `ramp` (R, K)); its workspace takes cuda_parts() splits a partial row.
+
+    sinks: FP32 [heads], each query head's sink logit (natural log, in the scaled scores' units; -inf: none): one more
+    position in every row's softmax that carries no value, out = sum p v / (sum p + e^sink), folded into each row's
+    final state after its partials (the same steps in a split launch's merge and a fused launch); lse counts it.
+
+    sliding: a sliding window (positions a token sees, its own included: position - sliding < n <= position; 0 for
+    all), on every structure but block lists; the pieces, blocks and splits below a tile's window are skipped, which
+    changes no bit, so a window over a long cache reads only the window's positions."""
     k_kind = _check_kind(kind, key_scales)
     T, hq, d = q.shape
+    _check_sinks(sinks, q)
+    sliding = _check_sliding(sliding, blocks)
     hkv, dv = key_pages.shape[-2], value_pages.shape[-1]
     R = int(starts.shape[0])
     if flash == "cuda" and blocks is None:
         return _attend_cuda(q, key_pages, value_pages, kind, k_kind, tables, rows, starts, firsts, columns, page,
                             counts, offsets, tokens, key_scales, value_scales, multipliers, scale, parents, out, lse,
-                            workspace, fused, fresh, vsplit, chunk, num_warps, num_stages, ramp)
+                            workspace, fused, fresh, vsplit, chunk, num_warps, num_stages, ramp, sinks, sliding)
     if flash and blocks is None:
         return _attend_flash(q, key_pages, value_pages, kind, k_kind, tables, rows, starts, firsts, columns, page,
                              counts, offsets, tokens, key_scales, value_scales, multipliers, scale, parents, out, lse,
-                             workspace, fused, fresh, vsplit, chunk, tile, num_warps, num_stages)
+                             workspace, fused, fresh, vsplit, chunk, tile, num_warps, num_stages, sinks, sliding)
     if hq % hkv or not 1 <= columns <= MAX_COLUMNS or R == 0:
         raise ValueError("query heads a multiple of the KV heads, 1..64 columns a row, one row or more")
     if q.stride(-1) != 1:
@@ -373,12 +412,12 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
                 split //= 2
         grid = (triton.cdiv(columns, cpt), split if fused else parts, R * hkv)
         _kernels._window_kernel[grid](q, kp, vp, ks, vs, tables, rows, starts, count_ptr, firsts, par, off_ptr, po, pm, pl,
-                     out, lse if lse is not None else ks, fk, fv, fshift, ffirst, q.stride(0), q.stride(1),
-                     out.stride(0), out.stride(1), fk.stride(0), fv.stride(0), fstride, tables.stride(0),
-                     tables.shape[1], parts, scale, float(multipliers[0]), float(multipliers[1]), columns,
-                     COLS=columns, CPT=cpt, BLOCK_M=bm, num_warps=warps, num_stages=stages, FUSED=bool(fused),
-                     LSE=bool(fused) and lse is not None, FRESH=fresh is not None, DVP=dv // split, **common,
-                     **launch)
+                     out, lse if lse is not None else ks, fk, fv, fshift, ffirst, sinks if sinks is not None else ks,
+                     q.stride(0), q.stride(1), out.stride(0), out.stride(1), fk.stride(0), fv.stride(0), fstride,
+                     tables.stride(0), tables.shape[1], parts, scale, float(multipliers[0]), float(multipliers[1]),
+                     columns, sliding, COLS=columns, CPT=cpt, BLOCK_M=bm, num_warps=warps, num_stages=stages,
+                     FUSED=bool(fused), LSE=bool(fused) and lse is not None, FRESH=fresh is not None, DVP=dv // split,
+                     SINKS=bool(fused) and sinks is not None, **common, **launch)
         if fused:
             return out
         fixed = 0
@@ -402,10 +441,12 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
     block_p = triton.next_power_of_2(parts)
     merge = _knobs("merge", key, columns)
     _kernels._merge_kernel[(columns, hq, R)](po, pm, pl, out, lse if lse is not None else pm, starts, count_ptr,
-                                             firsts, off_ptr, parts, fixed, out.stride(0), out.stride(1), columns,
-                                             COLS=columns, HQ=hq, DV=dv, PIECE=piece, COUNTS=counts is not None,
-                                             OFFSETS=offsets is not None, LSE=lse is not None, BLOCK_P=block_p,
-                                             CHUNK_P=min(merge["CHUNK"], block_p), num_warps=merge["WARPS"])
+                                             firsts, off_ptr, sinks if sinks is not None else pm, parts, fixed,
+                                             out.stride(0), out.stride(1), columns, COLS=columns, HQ=hq, DV=dv,
+                                             PIECE=piece, COUNTS=counts is not None, OFFSETS=offsets is not None,
+                                             LSE=lse is not None, BLOCK_P=block_p,
+                                             CHUNK_P=min(merge["CHUNK"], block_p), num_warps=merge["WARPS"],
+                                             SINKS=sinks is not None)
     return out
 
 
@@ -473,7 +514,7 @@ def _pow2(n):
 
 def _attend_flash(q, key_pages, value_pages, kind, k_kind, tables, rows, starts, firsts, columns, page, counts, offsets,
                   tokens, key_scales, value_scales, multipliers, scale, parents, out, lse, workspace, fused, fresh,
-                  vsplit, chunk, tile, num_warps, num_stages):
+                  vsplit, chunk, tile, num_warps, num_stages, sinks=None, sliding=0):
     """attend(..., flash=True): windows through the flash kernel (split launch and merge, or fused)."""
     T, hq, d = q.shape
     hkv, dv = key_pages.shape[-2], value_pages.shape[-1]
@@ -524,27 +565,29 @@ def _attend_flash(q, key_pages, value_pages, kind, k_kind, tables, rows, starts,
     grid = (triton.cdiv(columns * g, bm), split if fused else parts, R * hkv)
     _flash._flash_kernel[grid](
         q, kp, vp, ks, vs, tables, rows, starts, count_ptr, firsts, par, off_ptr, po, pm, pl, out,
-        lse if lse is not None else ks, fk, fv, fshift, ffirst, q.stride(0), q.stride(1), out.stride(0), out.stride(1),
-        fk.stride(0), fv.stride(0), fstride, tables.stride(0), tables.shape[1], parts, chunk,
-        scale * attention_softmax.LOG2E, float(multipliers[0]), float(multipliers[1]), columns, 0, 0,
+        lse if lse is not None else ks, fk, fv, fshift, ffirst, sinks if sinks is not None else ks, q.stride(0),
+        q.stride(1), out.stride(0), out.stride(1), fk.stride(0), fv.stride(0), fstride, tables.stride(0),
+        tables.shape[1], parts, chunk,
+        scale * attention_softmax.LOG2E, float(multipliers[0]), float(multipliers[1]), columns, 0, 0, sliding,
         HQ=hq, HKV=hkv, G=g, D=d, DV=dv, DVP=dv // split, BLOCK_M=bm, BLOCK_N=block_n, PAGE=page, KIND=k_kind,
         HW_FP8=_hardware_fp8(device), TREE=tree, TREE_COLS=columns if tree else 1, COUNTS=counts is not None,
         OFFSETS=offsets is not None, FUSED=bool(fused), ONE_SPLIT=False, LSE=lse is not None, FRESH=fresh is not None,
-        ONE_ROW=False, POS_T=False, FIRST_T=False, DEV_CHUNK=False, INT8_QK=False, SKIP=False, num_warps=warps,
-        num_stages=stages)
+        ONE_ROW=False, POS_T=False, FIRST_T=False, DEV_CHUNK=False, INT8_QK=False, SKIP=False,
+        SINKS=sinks is not None, num_warps=warps, num_stages=stages)
     if fused:
         return out
     merge = _knobs("merge", {"D": d, "DV": dv, "HQ": hq, "HKV": hkv, "PAGE": int(page), "KIND": k_kind}, columns)
     _flash._flash_merge_kernel[(columns, hq, R)](
-        po, pm, pl, out, lse if lse is not None else pm, starts, count_ptr, firsts, off_ptr, parts, chunk, columns, 0,
-        out.stride(0), out.stride(1), HQ=hq, DV=dv, BLOCK_N=block_n, COUNTS=counts is not None,
-        OFFSETS=offsets is not None, LSE=lse is not None, ONE_ROW=False, POS_T=False, DEV_CHUNK=False,
-        CHUNK_P=min(merge["CHUNK"], triton.next_power_of_2(parts)), num_warps=merge["WARPS"])
+        po, pm, pl, out, lse if lse is not None else pm, starts, count_ptr, firsts, off_ptr,
+        sinks if sinks is not None else pm, parts, chunk, columns, 0, out.stride(0), out.stride(1), HQ=hq, DV=dv,
+        BLOCK_N=block_n, COUNTS=counts is not None, OFFSETS=offsets is not None, LSE=lse is not None, ONE_ROW=False,
+        POS_T=False, DEV_CHUNK=False, CHUNK_P=min(merge["CHUNK"], triton.next_power_of_2(parts)),
+        num_warps=merge["WARPS"], SINKS=sinks is not None)
     return out
 
 
 def _prefill_flash(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multipliers, scale, out, lse, int8_qk,
-                   fresh, first):
+                   fresh, first, sinks=None, sliding=0):
     """prefill(..., flash=True): the chunk as one row of T columns through the flash kernel, its positions split on
     the device over SPLITS programs a tile (merged), or with one split read in one range and written directly."""
     T, hq, d = q.shape
@@ -582,20 +625,23 @@ def _prefill_flash(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multi
     qk = float(scale if scale is not None else d ** -0.5) * attention_softmax.LOG2E
     _flash._flash_kernel[(tiles, 1 if one else splits, hkv)](
         q, kp, vp, ks, vs, table, table, table, table, pos, table, table, po, pm, pl, out,
-        lse if lse is not None else ks, fk, fv, table, first if first_t else table, q.stride(0), q.stride(1),
+        lse if lse is not None else ks, fk, fv, table, first if first_t else table,
+        sinks if sinks is not None else ks, q.stride(0), q.stride(1),
         out.stride(0), out.stride(1), fk.stride(0), fv.stride(0), 0, 0, table.shape[0], splits, 0, qk,
         float(multipliers[0]), float(multipliers[1]), T, 0 if on_device else int(position),
-        0 if first_t else int(first),
+        0 if first_t else int(first), sliding,
         HQ=hq, HKV=hkv, G=g, D=d, DV=d, DVP=d, BLOCK_M=bm, BLOCK_N=block_n, PAGE=page, KIND=k_kind,
         HW_FP8=_hardware_fp8(device), TREE=False, TREE_COLS=1, COUNTS=False, OFFSETS=False, FUSED=False,
         ONE_SPLIT=one, LSE=lse is not None, FRESH=fresh is not None, ONE_ROW=True, POS_T=on_device, FIRST_T=first_t,
-        DEV_CHUNK=True, INT8_QK=bool(int8_qk), SKIP=True, num_warps=warps, num_stages=stages)
+        DEV_CHUNK=True, INT8_QK=bool(int8_qk), SKIP=True, SINKS=sinks is not None, num_warps=warps,
+        num_stages=stages)
     if not one:
         _flash._flash_merge_kernel[(T, hq, 1)](
-            po, pm, pl, out, lse if lse is not None else pm, table, table, pos, table, splits, 0, T,
-            0 if on_device else int(position), out.stride(0), out.stride(1), HQ=hq, DV=d, BLOCK_N=block_n,
-            COUNTS=False, OFFSETS=False, LSE=lse is not None, ONE_ROW=True, POS_T=on_device, DEV_CHUNK=True,
-            CHUNK_P=min(16, triton.next_power_of_2(splits)), num_warps=4)
+            po, pm, pl, out, lse if lse is not None else pm, table, table, pos, table,
+            sinks if sinks is not None else pm, splits, 0, T, 0 if on_device else int(position), out.stride(0),
+            out.stride(1), HQ=hq, DV=d, BLOCK_N=block_n, COUNTS=False, OFFSETS=False, LSE=lse is not None,
+            ONE_ROW=True, POS_T=on_device, DEV_CHUNK=True, CHUNK_P=min(16, triton.next_power_of_2(splits)),
+            num_warps=4, SINKS=sinks is not None)
     return out
 
 
@@ -606,7 +652,7 @@ CUDA_BLOCK = 32           # positions a step of its online softmax over 8-bit pa
 CUDA_RAMP_SPLITS = 16     # splits a band of a ramp (cuda_ramp)
 CUDA_WIDTHS = (64, 128, 256)
 CUDA_FLAGS = {"counts": 1, "offsets": 2, "tree": 4, "lse": 8, "fresh": 16, "one_row": 32, "pos_t": 64, "first_t": 128,
-              "dev_chunk": 256, "one_split": 512, "par64": 1024}
+              "dev_chunk": 256, "one_split": 512, "par64": 1024, "sinks": 2048, "state_out": 4096, "state_in": 8192}
 FUSED_GROUP = 16                  # splits a fused tile's program folds at once at most (scheduling only, never a bit)
 FUSED_WORKSPACE = 64 << 20        # bytes a fused launch's ring of states may take before its groups shrink
 FUSED_PARTIALS = 128 << 20        # workspace bytes (workspace_floats) a fused launch may take as a window launch
@@ -619,12 +665,12 @@ class _Params(ctypes.Structure):
     """cuda_window.cu's Params, field for field."""
     _fields_ = ([(n, ctypes.c_void_p) for n in ("q", "kp", "vp", "ks", "vs", "tables", "rows", "starts", "counts",
                                                 "firsts", "parents", "offsets", "po", "pm", "pl", "out", "lse", "fk",
-                                                "fv", "fshift", "ffirst", "run", "sync")]
+                                                "fv", "fshift", "ffirst", "run", "sync", "sinks", "state")]
                 + [(n, ctypes.c_longlong) for n in ("stride_qt", "stride_qh", "stride_ot", "stride_oh", "stride_fk",
                                                     "stride_fv", "first0", "ffirst0")]
                 + [(n, ctypes.c_int) for n in ("stride_fr", "tab_stride", "tab_width", "hq", "hkv", "g", "page",
                                                "n_parts", "chunk", "cols", "flags", "page_shift", "block", "group",
-                                               "tiles", "merge", "ring", "ramp", "ramp_k", "pad")]
+                                               "tiles", "merge", "ring", "ramp", "ramp_k", "window", "state_part")]
                 + [(n, ctypes.c_float) for n in ("qk_scale", "k_mult", "v_mult", "pad2")])
 
 
@@ -670,6 +716,26 @@ def _cuda_plan(lib, structure, hq, hkv, page, rows, fresh=False, length=-1):
     return tuple(out[:5])
 
 
+def _cuda_converts(lib, structure, hq, hkv, page, rows, fresh=False):
+    """(warps, block, codes converted in registers) of a call's plan (where its configuration fits the GPU)."""
+    out = (ctypes.c_int * 8)()
+    err = lib.crit_cw_plan(structure, hq, hkv, int(page), int(rows), int(bool(fresh)), -1, out)
+    return None if err else (out[1], out[3], bool(out[7]))
+
+
+_states = {}
+
+
+def _state(device, count):
+    """The two-pass prompt chunk's state buffer (FP32, `count` values), kept a device and grown, never shrunk: a
+    captured chunk's graph holds its address."""
+    found = _states.get(str(device))
+    if found is None or found.numel() < count:
+        found = torch.empty(count, dtype=torch.float32, device=device)
+        _states[str(device)] = found
+    return found
+
+
 def _cuda_launch(lib, structure, entry, params, device, grid):
     stream = torch.cuda.current_stream(device).cuda_stream
     err = lib.crit_cw_launch(structure, entry, ctypes.byref(params), ctypes.c_void_p(stream), *[int(x) for x in grid])
@@ -686,6 +752,19 @@ def _cuda_merge(lib, params, device, grid):
 
 def _cuda_split_knobs(head_dim, value_dim, heads, kv_heads, page, kind):
     return _knobs("cuda-window", _flash_key(head_dim, value_dim, heads, kv_heads, page, KINDS[kind]), 1)
+
+
+def cuda_prompt(head_dim, value_dim, dtype, kind, device):
+    """Whether prompt chunks of these heads, query dtype and page kind run on the CUDA flash tile on `device`
+    (prefill(..., flash="cuda", splits=1): one range a tile, row-invariant, faster than the Triton prompt chunk on the
+    GPUs measured): 64-, 128- or 256-wide heads, keys and values of one width, BF16 queries (FP16 over fp16 pages),
+    and a GPU of compute capability 8.0 or newer."""
+    import torch as _t
+    want = _t.float16 if kind == "fp16" else _t.bfloat16
+    ok = dtype == want if kind in ("bf16", "fp16") else dtype in (_t.bfloat16, _t.float16)
+    if head_dim not in CUDA_WIDTHS or value_dim != head_dim or not ok:
+        return False
+    return _t.cuda.is_available() and _t.cuda.get_device_capability(_t.device(device))[0] >= 8
 
 
 def cuda_block(head_dim, value_dim, heads, kv_heads, page, kind="bf16"):
@@ -790,6 +869,8 @@ def _as(t, dtype):
 
 
 def _cuda_rows_ok(q, out):
+    if out.dtype != q.dtype:   # the tile writes q's 16-bit type: another buffer would take its bits as garbage
+        raise ValueError(f"cuda launches write out in q's dtype ({q.dtype}), not {out.dtype}")
     if q.stride(-1) != 1 or q.stride(0) % 8 or q.stride(1) % 8 or out.stride(-1) != 1 or out.stride(0) % 2 or \
             out.stride(1) % 2 or q.data_ptr() % 16 or out.data_ptr() % 4:
         raise ValueError("cuda launches take q rows 16-byte aligned and out rows 4-byte aligned")
@@ -817,6 +898,7 @@ def _fused_workspace(device, chains, rows, dvp, parts):
             raise RuntimeError("paged_kv_attention.attend: run a fused launch of this size once before capturing it "
                                "(its workspace is allocated outside the capture)")
         size = max(ring + run, 4096, found[0].numel() if found else 0)
+        _retire(found)
         found = (torch.empty(size, dtype=torch.float32, device=device),
                  torch.zeros(max(words, 1024, found[1].numel() if found else 0), dtype=torch.int32, device=device))
         _fused_workspaces[device] = found
@@ -831,7 +913,7 @@ def _fused_as_window(partial_rows, heads, parts, dv):
 
 def _attend_cuda(q, key_pages, value_pages, kind, k_kind, tables, rows, starts, firsts, columns, page, counts, offsets,
                  tokens, key_scales, value_scales, multipliers, scale, parents, out, lse, workspace, fused, fresh,
-                 vsplit, chunk, num_warps, num_stages, ramp=None):
+                 vsplit, chunk, num_warps, num_stages, ramp=None, sinks=None, sliding=0):
     """attend(..., flash="cuda"): windows through the CUDA flash tile (split launch and merge, or fused)."""
     T, hq, d = q.shape
     hkv, dv = key_pages.shape[-2], value_pages.shape[-1]
@@ -912,6 +994,10 @@ def _attend_cuda(q, key_pages, value_pages, kind, k_kind, tables, rows, starts, 
         P.parents = par.data_ptr()
     if lse is not None:
         flags |= CUDA_FLAGS["lse"]
+    if sinks is not None:
+        flags |= CUDA_FLAGS["sinks"]
+        P.sinks = sinks.data_ptr()
+    P.window = sliding
     if fresh is not None:
         fk, fv, fshift, ffirst, fstride = _flash_fresh(fresh, R, hkv, d, dv)
         if fk.dtype != q.dtype or fv.dtype != q.dtype or fk.stride(0) % 8 or fv.stride(0) % 8 or not _aligned16(fk, fv):
@@ -930,7 +1016,8 @@ def _attend_cuda(q, key_pages, value_pages, kind, k_kind, tables, rows, starts, 
     return out
 
 
-def _prefill_cuda(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multipliers, scale, out, lse, fresh, first):
+def _prefill_cuda(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multipliers, scale, out, lse, fresh, first,
+                  sinks=None, sliding=0, splits=None, workspace=None):
     """prefill(..., flash="cuda"): the chunk as one row of T columns through the CUDA flash tile, its positions split on
     the device over SPLITS programs a tile (merged), or with one split read in one range and written directly."""
     T, hq, d = q.shape
@@ -947,9 +1034,9 @@ def _prefill_cuda(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multip
     tuned = _knobs("cuda-prefill", {"D": d, "HQ": hq, "HKV": hkv, "PAGE": int(page), "KIND": k_kind, "INT8": 0}, T)
     sms = _capability(device)[1]
     lib = _cuda_lib(device, T=t_kind, KIND=k_kind, D=d, DV=d, W=0, S=0, VS=0)
-    entry, warps, _, block, _ = _cuda_plan(lib, _CUDA_PREFILL, hq, hkv, page, T)
+    entry, warps, _, block, _ = _cuda_plan(lib, _CUDA_PREFILL, hq, hkv, page, T, fresh=fresh is not None)
     tiles = -(-T * g // (16 * warps))
-    splits = int(tuned["SPLITS"])
+    splits = int(splits if splits is not None else tuned["SPLITS"])
     if not splits:
         # About two programs an SM: the chunk's tiles times its KV heads, split while they are fewer.
         splits = max(1, min(64, (2 * sms) // max(1, tiles * hkv)))
@@ -965,6 +1052,10 @@ def _prefill_cuda(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multip
         P.first0 = int(position)
     if lse is not None:
         flags |= CUDA_FLAGS["lse"]
+    if sinks is not None:
+        flags |= CUDA_FLAGS["sinks"]
+        P.sinks = sinks.data_ptr()
+    P.window = sliding
     if fresh is not None:
         fk, fv = fresh[:2]
         if fk.dtype != q.dtype or fv.dtype != q.dtype or not _aligned16(fk, fv) or fk.stride(0) % 8 or \
@@ -981,6 +1072,37 @@ def _prefill_cuda(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multip
         po, pm, pl = _workspace(device, T, hq, splits, d)
         P.po, P.pm, P.pl = po.data_ptr(), pm.data_ptr(), pl.data_ptr()
     P.n_parts, P.chunk, P.cols, P.flags, P.block = splits, 0, T, flags, block
+    if fresh is not None and one and k_kind != 0:
+        # 8-bit pages and fresh rows in one range, three passes each continuing the state the one before it left: the
+        # blocks below the first fresh position's block with their codes converted in registers (no fresh rows), that
+        # block through the 16-bit block (its paged positions converted, its fresh ones copied), and the blocks past
+        # it, all fresh rows, through the 16-bit pages' tile (their rows staged as its pages are). Every position
+        # takes the one range's arithmetic (a code converted exactly to 16 bits times its scale; a fresh row times
+        # the softmax scale alone), in its order: the same bits.
+        plain = _cuda_converts(lib, _CUDA_PREFILL, hq, hkv, page, T, fresh=False)
+        lib16 = _cuda_lib(device, T=t_kind, KIND=0, D=d, DV=d, W=0, S=0, VS=0)
+        rows16 = _cuda_converts(lib16, _CUDA_PREFILL, hq, hkv, page, T, fresh=True)
+        if plain is not None and plain[2] and plain[:2] == (warps, block) and rows16 is not None and \
+                rows16[:2] == (warps, block):
+            a_entry = _cuda_plan(lib, _CUDA_PREFILL, hq, hkv, page, T)[0]
+            c_entry = _cuda_plan(lib16, _CUDA_PREFILL, hq, hkv, page, T, fresh=True)[0]
+            need = tiles * hkv * warps * 32 * (4 * (d // 8) + 4)
+            if workspace is None:
+                state = _state(device, need)
+            else:
+                fits = workspace.numel() >= need and workspace.dtype == torch.float32
+                state = workspace.view(-1)[:need] if fits else None
+        else:
+            state = None
+        if state is not None:
+            P.state = state.data_ptr()
+            P.flags, P.state_part = (flags & ~CUDA_FLAGS["fresh"]) | CUDA_FLAGS["state_out"], 0
+            _cuda_launch(lib, _CUDA_PREFILL, a_entry, P, device, (tiles, 1, hkv))
+            P.flags, P.state_part = flags | CUDA_FLAGS["state_in"] | CUDA_FLAGS["state_out"], 1
+            _cuda_launch(lib, _CUDA_PREFILL, entry, P, device, (tiles, 1, hkv))
+            P.flags, P.state_part = flags | CUDA_FLAGS["state_in"], 2
+            _cuda_launch(lib16, _CUDA_PREFILL, c_entry, P, device, (tiles, 1, hkv))
+            return out
     _cuda_launch(lib, _CUDA_PREFILL, entry, P, device, (tiles, 1 if one else splits, hkv))
     if not one:
         _cuda_merge(lib, P, device, (T, hq, 1))
@@ -988,7 +1110,8 @@ def _prefill_cuda(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multip
 
 
 def prefill(q, key_pages, value_pages, kind, table, position, page, *, key_scales=None, value_scales=None,
-            multipliers=(1.0, 1.0), scale=None, out=None, lse=None, int8_qk=False, fresh=None, flash=False):
+            multipliers=(1.0, 1.0), scale=None, out=None, lse=None, int8_qk=False, fresh=None, flash=False,
+            sinks=None, sliding=0, splits=None, workspace=None):
     """A prompt chunk of one sequence: q [T][heads][dim] at positions position.. (their keys and values written),
     table [pages] int32 -> out [T][heads][dim] in q's dtype (and lse [T][heads] FP32 when given), causal. position: an
     int, or a one-element int64 device tensor read on the device (one launch for every position: a captured graph of
@@ -1002,8 +1125,17 @@ def prefill(q, key_pages, value_pages, kind, table, position, page, *, key_scale
     query heads packed into tiles of up to 128 rows, its positions split on the device over the tuning's splits
     (0: about two programs an SM) and merged by their states, blocks every row of a tile sees in full read without
     the causal mask, exp2 with the scale folded in. Another reduction than the split launch's and than this one's:
-    a token's bits follow the chunk's length (its split), not only its own positions."""
+    a token's bits follow the chunk's length (its split), not only its own positions.
+
+    sinks: FP32 [heads] sink logits, as attend() takes them; sliding: a sliding window, as attend() takes it.
+    splits (flash "cuda"): the programs a tile's positions split over instead of the tuning's; 1 reads them in one
+    range, so a token's bits follow its own positions only, not the chunk's length (row-invariant: cuda_prompt).
+    workspace (flash "cuda"): an FP32 tensor the passes of a chunk over 8-bit pages with fresh rows keep their state in
+    (a caller's declared memory; one too small reads the chunk in one pass, the same bits); default: the package's
+    own buffer."""
     k_kind = _check_kind(kind, key_scales)
+    _check_sinks(sinks, q)
+    sliding = _check_sliding(sliding, None)
     if int8_qk and k_kind != 3:
         raise ValueError("int8_qk multiplies INT8 queries with INT8 keys: int8 pages only")
     T, hq, d = q.shape
@@ -1031,17 +1163,18 @@ def prefill(q, key_pages, value_pages, kind, table, position, page, *, key_scale
         fk = fv = q
     if flash == "cuda" and not int8_qk:
         return _prefill_cuda(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multipliers, scale, out, lse,
-                             fresh, first)
+                             fresh, first, sinks, sliding, splits, workspace)
     if flash:
         return _prefill_flash(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multipliers, scale, out, lse,
-                              int8_qk, fresh, first)
+                              int8_qk, fresh, first, sinks, sliding)
     first_t = torch.is_tensor(first)
     _kernels._prefill_kernel[(triton.cdiv(T, block_m), hq)](
         q, kp, vp, ks, vs, table, out, lse if lse is not None else ks, position if on_device else table, fk, fv,
-        first if first_t else table, T, 0 if on_device else int(position), 0 if first_t else int(first),
+        first if first_t else table, sinks if sinks is not None else ks, sliding, T, 0 if on_device else int(position),
+        0 if first_t else int(first),
         float(scale if scale is not None else d ** -0.5), float(multipliers[0]), float(multipliers[1]), q.stride(0),
         q.stride(1), out.stride(0), out.stride(1), fk.stride(0), fv.stride(0), HQ=hq, HKV=hkv, G=hq // hkv, D=d,
         BLOCK_M=block_m, BLOCK_N=block_n, PAGE=page, KIND=k_kind, HW_FP8=_hardware_fp8(device), INT8_QK=int8_qk,
-        LSE=lse is not None, POS_T=on_device, FRESH=fresh is not None, FIRST_T=first_t, num_warps=tuned["WARPS"],
-        num_stages=tuned["STAGES"] or (3 if int8_qk else 2))
+        LSE=lse is not None, POS_T=on_device, FRESH=fresh is not None, FIRST_T=first_t, SINKS=sinks is not None,
+        num_warps=tuned["WARPS"], num_stages=tuned["STAGES"] or (3 if int8_qk else 2))
     return out

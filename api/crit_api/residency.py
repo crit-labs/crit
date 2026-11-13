@@ -18,6 +18,10 @@ from .stream import StreamReader
 RESULT = {"kind", "command_id", "status", "error", "max_concurrent_requests", "cleanup_settled"}
 
 
+# Seconds a cancelled command has to settle before its host is retired (docs/SERVING.md): fixed, not an option.
+CANCEL_GRACE_SECONDS = 1
+
+
 class ResidentRuntime:
     def __init__(self, ownership, host_limit, device_limit):
         self.ownership = ownership
@@ -55,6 +59,13 @@ class ResidentRuntime:
         status = link.status
         return dict(status) if status is not None else {"state": "starting", "host_bytes": 0, "device_bytes": 0}
 
+    def announce(self, why):
+        """One stderr line naming why the running host is retired or closed; nothing when no host runs."""
+        with self.lifecycle:
+            tree = self.tree
+        if tree is not None:
+            print(f"crit serve: the engine host (process {tree.process.pid}) is {why}", file=sys.stderr, flush=True)
+
     def host_pid(self):
         """The resident host's process id once it has connected, else None."""
         with self.lifecycle:
@@ -64,7 +75,9 @@ class ResidentRuntime:
     def call(self, action, payload, stop, timeout, progress=None, request=None, progress_tools=None,
              progress_reasoning=None, on_started=None):
         """Run one command on the host. A generation's payload carries its request record; its result carries the
-        engine's response, and progress, progress_tools and progress_reasoning receive each streamed piece."""
+        engine's response, and progress, progress_tools and progress_reasoning receive each streamed piece. A piece
+        whose consumer raises OSError (its client is gone) cancels the command as a stop does: the result is then
+        "cancelled" with that error as "consumer_error", and the host stays loaded once the command settles."""
         if stop.is_set():
             return {"status": "cancelled", "error": "Stopped", "cleanup_settled": True}
         with self.lifecycle:
@@ -88,7 +101,7 @@ class ResidentRuntime:
         try:
             link.send({"kind": "command", "command_id": cid, "action": action, "payload": payload},
                       MAX_CHAT_RECORD + MAX_JSON_BYTES)
-            deadline, cancelled_at, timed_out = time.monotonic() + timeout, None, False
+            deadline, cancelled_at, timed_out, consumer = time.monotonic() + timeout, None, False, None
             if on_started:
                 on_started(deadline)
             while True:
@@ -101,15 +114,27 @@ class ResidentRuntime:
                             link.send({"kind": "cancel", "command_id": cid})
                         except ValueError:
                             pass  # a broken channel is reported below
-                    if stamp - cancelled_at >= 1:
-                        self.close()
-                        return {"status": "timed_out" if timed_out else "cancelled", "error": "Reply timed out" if timed_out else "Stopped", "cleanup_settled": True}
+                if cancelled_at is not None and stamp - cancelled_at >= CANCEL_GRACE_SECONDS:
+                    self.announce(f"retired: the engine settled no cancel within {CANCEL_GRACE_SECONDS} s")
+                    self.close()
+                    return self._cancelled({"status": "timed_out" if timed_out else "cancelled",
+                                            "error": "Reply timed out" if timed_out else "Stopped",
+                                            "cleanup_settled": True}, consumer)
                 if (root / "runtime.log").stat().st_size > 4 * 1024 * 1024:
                     raise ValueError("Resident diagnostic output limit exceeded")
                 pieces, result = link.take(box)
                 if stream and cancelled_at is None:
-                    for piece in pieces:  # every piece the host sent before its result
-                        stream.apply(piece)
+                    try:
+                        for piece in pieces:  # every piece the host sent before its result
+                            stream.apply(piece)
+                    except OSError as exc:
+                        # The client is gone (a failed write): cancel the turn as its stop would, and let the host
+                        # settle it and keep its weights, instead of unwinding past the cancel.
+                        consumer, cancelled_at = exc, time.monotonic()
+                        try:
+                            link.send({"kind": "cancel", "command_id": cid})
+                        except ValueError:
+                            pass  # a broken channel is reported below
                 if result is not None:
                     if (set(result) - {"response", "rejection"} != RESULT or type(result["cleanup_settled"]) is not bool
                             or result["status"] not in {"completed", "cancelled", "failed", "rejected"}
@@ -120,12 +145,14 @@ class ResidentRuntime:
                         raise ValueError("Resident completion identity/cleanup mismatch")
                     result = {k: v for k, v in result.items() if k not in {"kind", "command_id"}}
                     if not result["cleanup_settled"]:
+                        self.announce("retired: the engine did not settle its cleanup")
                         self.close()  # Retire the entire owner before admitting again.
                         result["cleanup_settled"] = True
                     if cancelled_at is not None and result["status"] != "failed":
                         result.update(status="timed_out" if timed_out else "cancelled", error="Reply timed out" if timed_out else "Stopped")
                         result.pop("response", None)
                         result.pop("rejection", None)
+                        return self._cancelled(result, consumer)
                     return result
                 if tree.process.poll() is not None or link.failure:
                     try:
@@ -138,6 +165,10 @@ class ResidentRuntime:
                 box.ready.wait(.02)
         finally:
             link.unregister(cid)
+
+    @staticmethod
+    def _cancelled(result, consumer):
+        return {**result, "consumer_error": consumer} if consumer is not None else result
 
     def close(self):
         self.on_retire()
