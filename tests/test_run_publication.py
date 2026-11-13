@@ -46,7 +46,7 @@ class PackagePublicationTests(RunFixture, unittest.TestCase):
 
     def test_rejected_recipe_does_not_strand_the_package_destination(self):
         candidate_id, source = self.prepare()
-        with self.assertRaisesRegex(ValueError, "Unknown fields; use extensions: launch"):
+        with self.assertRaisesRegex(ValueError, "Unknown fields; use extensions: launch; takes build"):
             self.publish(candidate_id, source, RECIPE | {"launch": ["absent.fixture"]})
         self.publish(candidate_id, source)
         self.assertEqual(self.store.get(self.run_id)["errors"], [])

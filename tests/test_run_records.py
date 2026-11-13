@@ -170,7 +170,7 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         (bare / "engine.py").write_text("def create_engine(context): ...", encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "The package is no engine Core can load"):
             self.store.package(self.run_id, candidate["candidate_id"], bare, recipe)
-        with self.assertRaisesRegex(ValueError, "Unknown fields; use extensions: capabilities, launch"):
+        with self.assertRaisesRegex(ValueError, "Unknown fields; use extensions: capabilities, launch; takes build"):
             self.store.package(self.run_id, candidate["candidate_id"], with_plugins(bare),
                                {**recipe, "launch": ["engine.py"], "capabilities": ["chat-json-v1"]})
         manifest = self.store.package(self.run_id, candidate["candidate_id"], bare, recipe)

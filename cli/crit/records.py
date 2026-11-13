@@ -154,7 +154,9 @@ def keys(value, required, optional=()):
         raise ValueError("Missing required fields: " + ", ".join(sorted(set(required) - (value.keys() if isinstance(value, dict) else set()))))
     unknown = value.keys() - set(required) - set(optional) - {"extensions"}
     if unknown:
-        raise ValueError("Unknown fields; use extensions: " + ", ".join(sorted(unknown)))
+        unknown_list = ", ".join(sorted(unknown))
+        takes = ", ".join(sorted(set(required) | set(optional)))
+        raise ValueError(f"Unknown fields; use extensions: {unknown_list}; takes {takes}")
     if "extensions" in value and not isinstance(value["extensions"], dict):
         raise ValueError("extensions must be an object")
     json.dumps(value, allow_nan=False)
