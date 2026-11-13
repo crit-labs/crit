@@ -1,20 +1,22 @@
 <!-- mcp-name: io.github.crit-labs/crit (the MCP Registry reads this line: mcp/server.json) -->
 <div align="center">
 
+<h1 align="center">
+  <img src="https://raw.githubusercontent.com/crit-labs/.github/main/brand/logo.png" width="88" alt="crit logo" /><br />
+  crit
+</h1>
+
+---
+
+### Agentic toolkit for building and optimizing high-performance inference engines tailored to your GPU and desired LLM.
+
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/crit-labs/crit/main/docs/assets/wordmark.png" />
-    <img src="https://raw.githubusercontent.com/crit-labs/crit/main/docs/assets/wordmark-light.png" width="200" alt="crit" />
-  </picture>
-  <br />
+  <a href="https://github.com/crit-labs/crit#documentation"><img src="https://raw.githubusercontent.com/crit-labs/.github/main/brand/button-docs.svg" alt="Docs" height="34" /></a>
+  <a href="https://crit-hub.dev"><img src="https://raw.githubusercontent.com/crit-labs/.github/main/brand/button-website.svg" alt="Website" height="34" /></a>
+  <a href="https://huggingface.co/crit-labs"><img src="https://raw.githubusercontent.com/crit-labs/.github/main/brand/button-huggingface.svg" alt="Hugging Face" height="34" /></a>
+  <a href="https://github.com/crit-labs/crit/releases"><img src="https://raw.githubusercontent.com/crit-labs/.github/main/brand/button-releases.svg" alt="Releases" height="34" /></a>
+  <a href="https://github.com/crit-labs/crit/blob/main/LICENSE"><img src="https://raw.githubusercontent.com/crit-labs/.github/main/brand/button-license.svg" alt="License" height="34" /></a>
 </p>
-
-### An agentic toolkit for building and optimizing high-performance inference engines tailored to your GPU and desired LLM.
-
-[![Version 0.18.0](https://raw.githubusercontent.com/crit-labs/crit/main/docs/assets/badge-version.svg)](https://github.com/crit-labs/crit/blob/main/CHANGELOG.md)
-[![License Apache-2.0](https://raw.githubusercontent.com/crit-labs/crit/main/docs/assets/badge-license.svg)](https://github.com/crit-labs/crit/blob/main/LICENSE)
-[![crit-hub engines](https://raw.githubusercontent.com/crit-labs/crit/main/docs/assets/badge-crit-hub.svg)](https://github.com/crit-labs/crit-hub)
-[![CI](https://github.com/crit-labs/crit/actions/workflows/ci.yml/badge.svg)](https://github.com/crit-labs/crit/actions/workflows/ci.yml)
 
 [Summary](#summary) • [Quick start](#quick-start) • [What `crit` solves](#what-crit-solves) • [Case studies](#case-study) •
 [How `crit` works](#how-crit-works) • [API](#api) • [CLI](#cli) • [MCP](#mcp) • [crit-hub](#crit-hub) • [Limitations](#limitations) • [Documentation](#documentation)
@@ -32,8 +34,8 @@
 > Combines a runtime foundation, reusable techniques as plugins, its own kernels built and tuned for your GPU
 > and physics-based evaluation. 
 >
-> In our latest case study, a coding agent built an engine for Qwen3.8-27B on one RTX 5090 in under 4 hours and 
-> five candidates, reaching 189 tok/s sampled decode and 8,295 tok/s prefill with the model's full 262,144-token context.
+> In our latest case study, a coding agent built an engine for Qwen3.8-27B on one RTX 5090 in 5h 28m of active work and
+> five candidates, reaching 199.5 tok/s sampled decode and 7,552 tok/s prefill with 200,000 tokens of context.
 > 
 > Give your coding agent the [agent instructions](https://github.com/crit-labs/crit/blob/main/AGENTS.md), target model and
 > hardware. crit is an agent toolkit: its records, checks and guides are written for an agent driving it.
@@ -82,18 +84,21 @@ Use github.com/crit-labs/crit to optimize my own inference engine in <engine_ref
 ## Case Studies
 
 > [!NOTE]
-> The engines of these case studies were built with crit 0.16, before the plugin architecture. They are being
-> rebuilt as plugin packages and return to [`crit-hub`](https://github.com/crit-labs/crit-hub) as they are.
+> Both engines of these case studies are plugin packages built with crit's plugin architecture, on crit's main after
+> 0.18.0, and are on [`crit-hub`](https://github.com/crit-labs/crit-hub) as
+> [`crit-labs/mtp5-nvfp4-drafts`](https://github.com/crit-labs/crit-hub/tree/main/engines/crit-labs/mtp5-nvfp4-drafts) and
+> [`crit-labs/mtp3-exact-prompt-rows`](https://github.com/crit-labs/crit-hub/tree/main/engines/crit-labs/mtp3-exact-prompt-rows).
 
 We gave `Claude Opus 5.5` a target LLM along with the `crit` repository and let it cook autonomously.
 
 | What it shows | Evidence |
 | --- | --- |
-| **Fast engines** | Qwen3.8-27B on one RTX 5090: 189 tok/s sampled decode, 4.4x its own first working candidate, and 8,295 tok/s prefill, with the full 262,144-token context |
-| **Quality is your call** | The same model built once per quality mode: `speed` prefills 2.3x faster, `preserve` stays within 0.4% of the exact reference's perplexity, and both decode at the same speed |
-| **Hours, not weeks** | 3h 55m and five candidates from the run's first command to the selected engine, $51 at API list prices |
+| **Fast engines** | Qwen3.8-27B on one RTX 5090: 199.5 tok/s sampled decode and 7,552 tok/s prefill with 200,000 tokens of context, +20% decode and +26% prefill over its first Eval-measured candidate |
+| **Quality is your call** | The same model built once per quality mode: `speed` prefills 3.2x faster and decodes 13% faster, `preserve` drifts a fifth as far from the checkpoint (mean KL divergence 0.018 against 0.087) |
+| **Hours, not weeks** | 5h 28m of active development and five candidates from the run's first command to the selected engine, $34 at API list prices |
+| **New architectures** | crit had no model plugin for Qwen3.8's hybrid gated-delta layout; each agent wrote its own and ran it on crit's library plugins |
 | **Every step is evidence** | Each candidate is sealed with its exact source and its Eval result, so the tables below are a record, not a recollection |
-| **Honest about what is left** | Decode runs at 53% of the ceiling Eval measures for it, prefill at 46%; Eval reports each gap next to the score |
+| **Honest about what is left** | Decode runs at 65% of the ceiling Eval measures for it, prefill at 43%; Eval reports each gap next to the score |
 | **Next** | Gemma 4 31B (dense), and Qwen3.8-Flash-Next and Nemotron 3.5 Super 120B, mixture-of-experts models larger than VRAM |
 
 <details>
@@ -126,42 +131,42 @@ We gave `Claude Opus 5.5` a target LLM along with the `crit` repository and let 
     <td align="center" width="16%">
       <strong>
 
-3h 55m</strong>
+5h 28m</strong>
 
 Development time
     </td>
     <td align="center" width="16%">
       <strong>
 
-189.0 tok/s</strong>
+199.5 tok/s</strong>
 
 Sampled decode
     </td>
     <td align="center" width="16%">
       <strong>
 
-8,295 tok/s</strong>
+7,552 tok/s</strong>
 
 Prefill
     </td>
     <td align="center" width="16%">
       <strong>
 
-154 ms</strong>
+204 ms</strong>
 
 TTFT
     </td>
     <td align="center" width="16%">
       <strong>
 
-+3.6%</strong>
++0.8%</strong>
 
 Perplexity vs reference
     </td>
     <td align="center" width="16%">
       <strong>
 
-0.134</strong>
+0.087</strong>
 
 Mean KL divergence
     </td>
@@ -171,49 +176,55 @@ Mean KL divergence
 
 <br />
 
-`mtp4-nvfp4-mma`
-runs Qwen3.8-27B in its original NVFP4 weights on one RTX 5090, with the model's full 262,144
-tokens of context, in the `speed` quality mode: the engine may trade more
-drift from the checkpoint for speed (crit-eval-v0.2.1, which measured it, judged that mode against the
-checkpoint run with the 4-bit and 8-bit activations it declares). One coding agent built it on crit's current main as a Python engine on Core:
-cuBLASLt for the prompt's 4-bit and 8-bit matrix multiplies, flash-linear-attention for the
-gated-delta layers, and its own Triton and CUDA kernels for attention and decode. Each round drafts 4
-tokens with the model's own built-in draft layer and verifies them with rejection sampling on the
-GPU, so sampled requests draft too. Its own tensor-core NVFP4 GEMV reads the 4-bit weights at
-1.2–1.4 TB/s, against 0.9–1.0 TB/s for cuBLASLt at the same shapes.
+`mtp5-nvfp4-drafts`
+runs Qwen3.8-27B in its stored NVFP4 and FP8 weights on one RTX 5090 with 200,000 tokens of context, in the
+`speed` quality mode: the engine may trade drift from the checkpoint for speed within a budget that only keeps
+out a broken engine. One coding agent built it from `crit` and `crit-eval` alone, as a plugin package: crit's
+library plugins for the projections (the stored 4-bit and 8-bit weights on crit's prompt GEMM and decode GEMV
+kernels), FP8 attention pages, the gated-delta recurrence, fused norms and token sampling, plus a model plugin it
+wrote for the checkpoint's architecture, which crit's library did not have. Each round drafts 5 tokens with the
+model's own MTP layer inside Core's captured rounds, from NVFP4 copies of that layer and of the output head that
+only the drafter reads; the verify pass keeps the stored weights and samples with rejection sampling on the
+GPU, so sampled requests draft too. Prompts run the gated-delta layers as chunked tensor-core scans.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/crit-labs/crit/main/docs/assets/case-qwen-speed.svg" width="720" alt="Sampled decode and prefill of each of the five candidates over the run's 3h 55m: decode jumps from 43 to 134 tok/s when drafting arrives with candidate 2 and ends at 189 tok/s; prefill climbs from 6,027 to 8,295 tok/s" />
+  <img src="https://raw.githubusercontent.com/crit-labs/crit/main/docs/assets/case-qwen-speed.svg" width="720" alt="Sampled decode and prefill of each Eval-measured candidate over the run's 5h 28m of active development: decode rises from 166 to 199.5 tok/s, prefill from 6,015 to 7,552 tok/s" />
 </p>
 
 | Candidate | What changed | Sampled decode | Prefill | TTFT | Dev time, cumulative | Agent tokens, cumulative | API equivalent, cumulative |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | Working engine: reads the checkpoint as stored, 8-bit KV cache, one CUDA graph per token, no drafting | 43 tok/s | 6,027 tok/s | 290 ms | 0h 55m | 39.2M | $13.96 |
-| 2 | Drafts 3 tokens ahead with the model's draft layer, 8-bit decode GEMVs, fused prompt kernels (missed a gate: short prompts reached their first token 12% later at 65,536 tokens of context than at 262,144) | 134 tok/s | 7,771 tok/s | 219 ms | 1h 49m | 69.6M | $23.26 |
-| 3 | Drafts 4 tokens ahead; short prompts run as captured CUDA graphs | 155 tok/s | 7,660 tok/s | 169 ms | 2h 44m | 97.7M | $31.51 |
-| 4 | Its own tensor-core NVFP4 GEMV for decode and verify, using the GPU's FP4 conversion instruction | 181 tok/s | 8,218 tok/s | 156 ms | 3h 27m | 135.3M | $47.15 |
-| **5** | **Drafts from NVFP4 copies of the draft layer and output head; the verify pass keeps the stored weights** | **189 tok/s** | **8,295 tok/s** | **154 ms** | **3h 55m** | **149.3M** | **$50.75** |
+| 1 | Working engine: its own model plugin on crit's library plugins, drafting 3 tokens with the model's MTP layer in captured rounds (two drafts before it failed checks: short prompt chunks took decode arithmetic, then short prompts' first tokens jittered) | – | – | – | 0h 59m | 41.4M | $12.60 |
+| 2 | Plugin round: the ablation kept fused norms (+14% decode) and an NVFP4 copy of the MTP layer (+4%); six other library plugins measured neutral and were dropped | 166 tok/s | 6,015 tok/s | 264 ms | 2h 59m | 61.9M | $21.83 |
+| 3 | Chunked tensor-core recurrence for prompts, an NVFP4 copy of the output head for drafting (a draft with crit's native prompt GEMMs failed smoke: it broke causality at 100 to 255 rows) | 173 tok/s | 7,620 tok/s | 202 ms | 4h 45m | 77.2M | $29.75 |
+| 4 | Drafts 5 tokens a round, 4,096-token prompt chunks (missed two gates: no device memory left after the long-context curve, one Japanese prompt in generality) | 199 tok/s | 7,742 tok/s | 198 ms | 5h 09m | 85.4M | $31.91 |
+| **5** | **2,048-token prompt chunks again for memory headroom; certified, every gate passed** | **199.5 tok/s** | **7,552 tok/s** | **204 ms** | **5h 28m** | **93.9M** | **$33.98** |
 
-The last three columns are running totals from the run's first command (06:28 UTC) to each
-candidate's seal, and for candidate 5 to its selection, so its row is the whole run. The run spent
-its budget of three candidates on 1 to 3, then resumed for two more; development time leaves out the
-3h 26m in between. Candidates 1 to 3 were built from `crit` and `crit-eval` alone; before planning 4 and
-5 the agent had read the notes of earlier runs on this model. Agent tokens and API equivalent count
-the agent's messages in that span, from its Claude Code session transcript: Claude Opus 5.5 for
-every message, priced at Anthropic's API list prices ($4/MTok input, $20/MTok output, $8/MTok 1-hour
-cache writes, $0.20/MTok cache reads; 99% of the tokens are cache reads).
+Each rung's first candidate seals its source and code; a draft that fails a check is fixed as a new candidate of
+the same rung, so the run sealed nine candidates on five rungs. Candidate 1 had no Eval, which the first rung
+skips. The last three columns are running totals from the run's first command to each rung's last seal, and for
+candidate 5 to the run's stop, so its row is the whole run. Development time counts only the time the build was
+active: the agent working, or a job it started running while its session was up. The session went offline twice
+overnight, from 02:32 to 05:18 and from 06:24 to 07:39 UTC, and those 4h 01m are left out, so the 9h 28m from the
+first command to the stop count as 5h 28m. (Kernel sweeps the agent started before the first stretch kept running
+in it, but nobody was there to use them, and their tuning later measured neutral.) Candidate 2 was sealed after
+the first stretch; its Eval had finished at 1h 50m. Agent tokens and API equivalent count the agent's messages in
+that span, from its Claude Code session transcript (`crit run cost`): Claude Opus 5.5 for every message, priced at
+Anthropic's API list prices ($4/MTok input, $20/MTok output, $8/MTok 1-hour cache writes, $0.20/MTok cache reads;
+98% of the tokens are cache reads).
 
-Measured with `crit-eval` (crit-eval-v0.2.1) at the full 262,144-token context. Decode is sampled at the
-model's own settings (temperature 1.0, top-p 0.95, top-k 20), the geometric mean over six prompts,
-from a chat question to a 14K-token agent session; Eval decodes each engine's own output.
+Measured with `crit-eval` (crit-eval-v0.6.0) at 200,000 tokens of context. Decode is sampled at the model's own
+settings (temperature 1.0, top-p 0.95, top-k 20), the geometric mean over Eval's speed cases; Eval decodes each
+engine's own output.
 
-- **Long context:** a prompt that fills all 262,144 tokens gets its first token after 144 s, then
-  decodes at 110 tok/s. On prompts outside Eval's speed suite, in 8 languages and code, it decodes
-  at 131 tok/s.
-- **Quality:** the worst path uses 70% of the `speed` drift budget. Greedy decoding reaches
-  194 tok/s, and drafting never changes the output: it is token for token what plain decoding produces.
-- **What is left:** a verify pass takes 15.1 ms against the 12.5 ms its weight reads need, and a draft
-  step 1.24 ms against 0.62 ms. Eval projects 251 tok/s if both reached their floors.
+- **Long context:** decode runs at 172 tok/s at 32K tokens and 110 tok/s at 200,000; a prompt that fills all
+  200,000 tokens gets its first token after 100 s. On held-out prompts in 10 languages it decodes at 135 tok/s.
+- **Quality:** the worst path uses 44% of the `speed` drift budget. Greedy decoding reaches 220 tok/s, and
+  drafting never changes the output: it is token for token what plain greedy decoding produces.
+- **Concurrency:** four clients together reach 250 tok/s. Each row runs its full 5-token draft chain, so that is
+  less than the 325 tok/s of candidate 2, which drafted 3.
+- **What is left:** a verify pass takes 42.9 ms against the 13.8 ms its weight reads need. The NVFP4 prompt GEMMs
+  run at about 40% of the GPU's FP4 rate on every GEMM structure crit offers, and the long-context prompt reader
+  takes 100 s at 200,000 tokens against a 26 s floor.
 
 </details>
 
@@ -232,59 +243,57 @@ checkpoint you select the engine may trade for speed, whatever format that check
 `speed`, the default: the engine picks its precision (4-bit and 8-bit
 activations, a lower-precision KV cache or head) within a budget that only keeps out a broken engine
 (mean KLD 0.4), and output differences that part at near-ties are allowed. `preserve` holds the output
-close to the checkpoint's, within a 5% drift budget, so the prompt's activations stay in 16 bits unless
-quality shows they can go lower. (The two engines below were built when the speed budget was 10% and
-that mode judged against the checkpoint run with its declared activations; today both modes judge
-against the same exact reference.) We built Qwen3.8-27B on one RTX
-5090 once in each mode: `mtp4-nvfp4-mma`
-from the case study above, and
-`mtp-adaptive-width`,
-which moves between 2 and 8 drafts per round: wider after a round that kept every draft, narrower
-after one that kept fewer.
+close to the checkpoint's, within a 5% drift budget (mean KLD 0.05), so the prompt's activations stay in 16 bits,
+and a served reply must score exactly as the same text scored as a prompt. Both modes judge against the same
+exact reference. We built Qwen3.8-27B on one RTX 5090 once in each mode, each from `crit` and `crit-eval` alone:
+`mtp5-nvfp4-drafts` from the case study above, and `mtp3-exact-prompt-rows`, which drafts 3 tokens a round from
+FP8 copies of the MTP layer's matrices and an NVFP4 copy of the output head, and runs prompt rows on the decode
+kernels' 16-bit arithmetic so that a prompt's tokens score exactly as the same tokens decoded.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/crit-labs/crit/main/docs/assets/case-quality-modes.svg" width="720" alt="Sampled decode and prefill of both runs' candidates over development time: decode rises to about 185-189 tok/s in both modes; prefill ends at 8,295 tok/s in speed and 3,580 tok/s in preserve" />
+  <img src="https://raw.githubusercontent.com/crit-labs/crit/main/docs/assets/case-quality-modes.svg" width="720" alt="Sampled decode and prefill of both runs' Eval-measured candidates over active development time: decode ends at 199.5 tok/s in speed and 177.2 in preserve; prefill at 7,552 tok/s in speed and 2,371 in preserve" />
 </p>
 
 | | `speed` | `preserve` |
 | --- | ---: | ---: |
-| Sampled decode | **189.0 tok/s** | 185.3 tok/s |
-| Greedy decode | 194.3 tok/s | **195.5 tok/s** |
-| Prefill | **8,295 tok/s** | 3,580 tok/s |
-| TTFT | **154 ms** | 337 ms |
-| Decode at 262,144 tokens of context | **110 tok/s** | 79 tok/s |
-| Perplexity vs its mode's reference | +3.6% | **+0.4%** |
-| Mean KL divergence, worst path | 0.134 | **0.022** |
-| Share of its mode's drift budget | 70% | 57% |
-| Development time, five candidates | 3h 55m | 3h 20m |
-| API equivalent | $50.75 | $36.81 |
+| Sampled decode | **199.5 tok/s** | 177.2 tok/s |
+| Greedy decode | **219.7 tok/s** | 186.7 tok/s |
+| Prefill | **7,552 tok/s** | 2,371 tok/s |
+| TTFT | **204 ms** | 423 ms |
+| Decode at 200,000 tokens of context | 110 tok/s | **114 tok/s** |
+| Four clients together | 250 tok/s | **310 tok/s** |
+| Perplexity vs reference | +0.8% | **+0.6%** |
+| Mean KL divergence, worst path | 0.087 | **0.018** |
+| Share of its mode's drift budget | 44% | 37% |
+| Development time, five candidates | 5h 28m | **3h 44m** |
+| API equivalent | $33.98 | **$29.99** |
 
-- **Decode is a tie.** A decode pass reads every weight once, and both engines read the same stored
-  4-bit and 8-bit weights, so the quality mode barely moves it.
-- **Prefill is where the modes split.** A long prompt is compute-bound. `speed` may feed 4-bit
-  activations to the GPU's 4-bit tensor cores; `preserve` keeps the 4-bit layers' activations in 16
-  bits and widens their weights to match. Eval prices each mode's ceiling accordingly: `preserve`
-  reaches 77% of its 4,676 tok/s, `speed` 46% of its 17,841 tok/s.
-- **Quality follows the reference.** `preserve` stays within 0.4% of the checkpoint's exact perplexity.
-  `speed` was measured against the checkpoint run with its declared 4-bit activations, whose own
-  run-to-run spread on long prompts is wide, so Eval judged each of its texts against twice that spread.
-- **Both runs were honest about failures.** Two of `preserve`'s five candidates failed before Eval:
-  one read log-probabilities at the wrong stride, and one kept its first engine in memory when Eval
-  reopened it at the full context. Each fix became the next candidate.
+- **Prefill is where the modes split.** A long prompt is compute-bound. `speed` feeds 4-bit activations to the
+  GPU's 4-bit tensor cores, as the checkpoint declares; `preserve` must sum a prompt row exactly like a decode row,
+  so its prompts run on the decode kernels' 16-bit arithmetic. Eval prices each mode's ceiling accordingly:
+  `speed` reaches 43% of its 17,577 tok/s, `preserve` 47% of the 5,018 tok/s that arithmetic allows.
+- **Decode is close.** A decode pass reads every weight once, and both engines read the same stored 4-bit and
+  8-bit weights. `speed` is 13% faster because it drafts 5 tokens a round from NVFP4 copies; `preserve` measured
+  widths 2, 4 and 5 and kept 3. At 200,000 tokens and with four clients, `preserve`'s shorter chains come out ahead.
+- **Quality follows the mode.** Both stay within 1% of the checkpoint's perplexity, but `preserve` drifts a fifth
+  as far by KL divergence, and its served replies score exactly as the same text scored as a prompt.
+- **Both runs were honest about failures.** `preserve`'s candidate 2 was sealed not qualified because its model
+  plugin's own test lacked an MTP layer, and candidate 3 left no device memory after the long-context curve, as did
+  `speed`'s candidate 4. Each fix became the next candidate.
 
 Pick `preserve` when answers must stay close to the checkpoint you selected; keep `speed`, the
 default, when speed matters more, as with agents that send long prompts.
 
 | `preserve` candidate | What changed | Sampled decode | Prefill | TTFT | Dev time, cumulative | Agent tokens, cumulative | API equivalent, cumulative |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | Working engine: its own GEMVs on the stored 8-bit and 4-bit weights in a CUDA-graphed step, 16-bit prompt matrix multiplies, 8-bit KV cache | 52 tok/s | 2,763 tok/s | 488 ms | 0h 45m | 31.1M | $11.41 |
-| 2 | Drafts with the model's draft layer, each round in one CUDA graph; the GPU's FP4 conversion instruction in the NVFP4 GEMV (failed the serving check: log-probabilities read at the wrong stride) | – | – | – | 1h 33m | 61.4M | $19.78 |
-| 3 | Candidate 2 with the stride fixed (failed Eval: the first engine stayed in memory when Eval reopened it at 262,144 tokens) | – | – | – | 1h 54m | 79.9M | $24.40 |
-| 4 | Memory released on close, an 8-bit draft layer, 8-bit prompt activations where quality allows | 160 tok/s | 3,269 tok/s | 361 ms | 2h 26m | 90.4M | $27.26 |
-| **5** | **Draft width moves between 2 and 8 with the previous round's acceptance, drafting up to the context's end, a faster prompt convolution** | **185 tok/s** | **3,580 tok/s** | **337 ms** | **3h 20m** | **127.2M** | **$36.81** |
+| 1 | Working engine: its own model plugin on crit's library plugins, the stored 4-bit and 8-bit weights with 16-bit activations, Core's captured rounds, no drafting (about 67 tok/s in process) | – | – | – | 0h 30m | 40.3M | $12.84 |
+| 2 | Drafts 3 tokens a round with the model's MTP layer, from FP8 copies of its matrices (sealed not qualified: the model plugin's own test lacked an MTP layer) | 163 tok/s | 2,226 tok/s | 521 ms | 1h 08m | 55.2M | $16.55 |
+| 3 | Captured prompt chunks, kernel tuning for the engine's shapes, neutral plugins pruned, the test fixed (missed the resources gate: no device memory left after the long-context curve) | 174 tok/s | 2,363 tok/s | 425 ms | 2h 44m | 86.0M | $24.27 |
+| 4 | An NVFP4 copy of the output head for drafting, in 8 row slices; cached memory released after long prompts | 178 tok/s | 2,370 tok/s | 497 ms | 3h 03m | 94.0M | $26.23 |
+| **5** | **FP8 KV pages for the MTP layer; certified, every gate passed** | **177 tok/s** | **2,371 tok/s** | **423 ms** | **3h 44m** | **108.3M** | **$29.99** |
 
-Measured like the case study above. The `preserve` run was built from `crit` and `crit-eval` alone, from
-its first candidate to its last.
+Measured like the case study above. The `preserve` run had no idle stretch: every pause of more than a few minutes
+in its transcript ended with a job it had started, so its 3h 44m is the whole run from first command to stop.
 
 </details>
 

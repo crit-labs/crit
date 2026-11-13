@@ -55,19 +55,23 @@ class KVStateCache:
     def release(self, sequence):
         self.states.pop(sequence, None)
 
-    def pool(self, layers, kv_heads, head_dim, tokens, device, dtype="bf16", *, page=None, value_dim=None, spare=0):
+    def pool(self, layers, kv_heads, head_dim, tokens, device, dtype="bf16", *, page=None, value_dim=None, spare=0,
+             sliding=0, span=None, positions=None):
         """The device form: a paged KV pool of every sequence (pages.KVPool), `page` tokens a page (the plugin's
         option unless given), value_dim the values' width (the keys' unless given; 0: a pool of keys only), its window
         rows up to the plugin's window, with step buffers at fixed addresses when the plugin's step_rows asks for them
         (a CUDA pool: a model captures its decode steps in CUDA graphs over them), and round slots for captured rounds.
         spare: bytes after the pages in the same allocation for a borrower's own use (a device expert cache's slots),
         which then also borrows the pages no sequence holds (lendable(), on_reserve()). A pool of FP8 or INT8 pages
-        keeps each prompt chunk's keys and values fresh in the plugin's fresh buffer for the chunk's attention."""
+        keeps each prompt chunk's keys and values fresh in the plugin's fresh buffer for the chunk's attention.
+        sliding (kv:sliding): the layers' sliding window, each sequence a ring of pages (pages.KVPool), span the most
+        positions a row writes in one step, positions the most a sequence reaches; the attention reads such a pool with
+        its window."""
         rows = self.step_rows if str(device).startswith("cuda") else 0
         made = pages.KVPool(layers, kv_heads, head_dim, tokens, device, dtype, page=page or self.page,
                             value_dim=value_dim, step_rows=rows, step_tokens=self.step_tokens if rows else 0,
                             window=self.window, round_rows=self.round_rows, kernels=self.kernels, spare=spare,
-                            fresh=self.fresh)
+                            fresh=self.fresh, sliding=sliding, span=span, positions=positions)
         self.pools.append(made)
         return made
 
@@ -78,12 +82,18 @@ class KVStateCache:
         FP8 or INT8 pools which keys and values a prompt row reads (a StepBatch row of more than `window` tokens, a
         PromptBatch's chunk of more than `window` real tokens): with the fresh buffer its own chunk's as the
         projections gave them (16-bit: steps of up to fresh_tokens tokens) and the earlier positions from the pages,
-        else everything from the pages. None before a pool is made."""
+        else everything from the pages. Sliding pools (kv:sliding) count as kv_sliding_bytes_per_sequence, the bytes
+        a sequence's rings hold at any length, not per token. None before a pool is made."""
         if not self.pools:
             return {}
-        found = {"kv_bytes_per_token": sum(tensor[:, 0, 0].numel() * tensor.element_size() for pool in self.pools
-                                           for tensor in (pool.k, pool.v, pool.k_scales, pool.v_scales)
-                                           if tensor is not None)}
+        def per_token(pool):
+            return sum(tensor[:, 0, 0].numel() * tensor.element_size()
+                       for tensor in (pool.k, pool.v, pool.k_scales, pool.v_scales) if tensor is not None)
+        # A sliding pool holds a ring a sequence, whatever its length: bytes a sequence, not a token.
+        found = {"kv_bytes_per_token": sum(per_token(pool) for pool in self.pools if not pool.sliding)}
+        rings = [pool for pool in self.pools if pool.sliding]
+        if rings:
+            found["kv_sliding_bytes_per_sequence"] = sum(per_token(pool) * pool.ring * pool.page for pool in rings)
         quantized = [p for p in self.pools if p.dtype in pages.QUANTIZED and p.value_dim]
         if not quantized:
             return found

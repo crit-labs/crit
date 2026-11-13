@@ -32,9 +32,14 @@ class DeviceMatrices:
             if encode != format.split(":")[0]:
                 tensors, format = device_matrices.reencode(tensors, format, encode, self.device)
                 activations = "bf16"
-            group = self.encodings.setdefault(role or "draft", {"stored": stored, "encoded": format, "matrices": 0,
-                                                                  "stored_bytes": 0, "encoded_bytes": 0})
-            if group["stored"] != stored or group["encoded"] != format:
+            # One group per role and stored format: a role whose matrices are stored in two formats (a draft layer's
+            # BF16 and FP8 matrices) records each apart, under role:stored for the second.
+            key = role or "draft"
+            if key in self.encodings and self.encodings[key]["stored"] != stored:
+                key = f"{key}:{stored}"
+            group = self.encodings.setdefault(key, {"stored": stored, "encoded": format, "matrices": 0,
+                                                    "stored_bytes": 0, "encoded_bytes": 0})
+            if group["encoded"] != format:
                 raise ValueError(f"quantized-projections: draft-only role {role or 'draft'} re-encodes "
                                  f"{group['stored']} to {group['encoded']}, not {stored} to {format}")
             group["matrices"] += 1
@@ -49,6 +54,8 @@ class DeviceMatrices:
                                      self.gemv, decode, self.rows, self.tile_rows, self.fp8_activations,
                                      self.mx_activations)
         format = "int4_zp" if found.format == "int4_zp" else format   # awq, gptq: crit's INT4 rows
+        # Every matrix shape as loaded (stacked ones as the model plugin stacked them), for crit kernels sweep.
+        self.shapes = self.shapes | {(found.rows, found.columns, format.split(":")[0])}
         rows = found.decode_rows
         self.decode_rows = rows if self.decode_rows is None else min(self.decode_rows, rows)
         self.invariant = found.invariant_rows if self.invariant is None else min(self.invariant, found.invariant_rows)
@@ -84,6 +91,7 @@ class DeviceMatrices:
         self.prompt_kernels = {**self.prompt_kernels, name: sorted({*entry, found.prompt_kernel})}
         return found
 
+    shapes = frozenset()
     paths = {}
     kernels = {}
     prompt_kernels = {}
@@ -129,8 +137,8 @@ class DeviceMatrices:
             self._encodings = {}
         return self._encodings
 
-    def matmul(self, x, matrix, out_dtype=None):
-        return device_matrices.matmul(x, matrix, out_dtype)
+    def matmul(self, x, matrix, out_dtype=None, prompt=False):
+        return device_matrices.matmul(x, matrix, out_dtype, prompt=prompt)
 
     def round_problems(self):
         """Why this plugin's matmul cannot run inside a captured round, [] when it can (rounds:projections): every
@@ -187,7 +195,8 @@ class DeviceMatrices:
                 **({"decode_kernels": dict(self.kernels)} if self.kernels else {}),
                 **({"decode_crossover": dict(self.crossovers)} if self.crossovers else {}),
                 **({"prompt_kernels": dict(self.prompt_kernels)} if self.prompt_kernels else {}),
-                **({"draft_encoding": draft} if draft else {})}
+                **({"draft_encoding": draft} if draft else {}),
+                **({"matrices": [{"N": n, "K": k, "format": f} for n, k, f in sorted(self.shapes)]} if self.shapes else {})}
 
 
 class GroupedIntProjections(DeviceMatrices):

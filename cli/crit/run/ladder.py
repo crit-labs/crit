@@ -78,6 +78,16 @@ def served_check(root, candidate_id):
     return False
 
 
+def serve_check_failed(root, candidate_id):
+    """Whether the candidate's newest crit run ... serve --check failed: its build is a draft, which no Eval or
+    measurement may count on the ladder."""
+    folder = safe_path(root, f"candidates/{ident(candidate_id, 'candidate')}")
+    checks = [read_json(path) for path in sorted(folder.glob("checks/check-*.json"))]
+    serve = [c for c in checks if c.get("gate") == "functional"
+             and (c.get("extensions") or {}).get("recorded_by") == SERVE_CHECK]
+    return bool(serve) and serve[-1].get("status") != "passed"
+
+
 def sealed_lifecycle(root, candidate_id):
     """The lifecycle a sealed candidate closed with, or None while it is open."""
     folder = safe_path(root, f"candidates/{ident(candidate_id, 'candidate')}")

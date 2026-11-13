@@ -559,6 +559,11 @@ class DraftEncodingTests(PluginTestCase):
         self.assertNotIn("prompt_activations", facts)    # the target's prompts are priced by the target's matrices
         with self.assertRaisesRegex(ValueError, "re-encodes bf16 to nvfp4, not bf16 to fp8:channel"):
             plugin.load({"weight": w}, "bf16", role="mtp.gate_up", encode="fp8")
+        # The same role's matrices stored in another format are a group of their own.
+        fp8 = plugin.load(self.matrices.reencode({"weight": w}, "bf16", "fp8")[0], "fp8:channel", role="mtp.gate_up",
+                          encode="nvfp4")
+        self.assertEqual(fp8.format, "nvfp4")
+        self.assertEqual(plugin.facts()["draft_encoding"]["mtp.gate_up:fp8:channel"]["encoded"], "nvfp4")
         stored = plugin.load({"weight": w}, "bf16", role="mtp.norm", encode="bf16")   # nothing to re-encode
         self.assertEqual(stored.format, "bf16")
         self.assertEqual(plugin.facts()["draft_encoding"]["mtp.norm"],   # draft-only all the same, as stored

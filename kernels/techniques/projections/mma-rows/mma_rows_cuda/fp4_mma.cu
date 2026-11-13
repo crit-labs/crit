@@ -27,11 +27,29 @@ __device__ __forceinline__ void wait_prior() {
 #endif
 }
 
-// A finished sum: the row's inverse global scale, then one over the input scale, stored in out's type.
-__device__ __forceinline__ void store(const Problem& p, int tok, int n, float v) {
+// A sum with the row's inverse global scale, then one over the input scale.
+__device__ __forceinline__ float fp4_scaled(const Problem& p, int n, float v) {
   v *= p.row_scale[n];
   v *= p.input_rcp;
+  return v;
+}
+// A finished sum, stored in out's type.
+__device__ __forceinline__ void store(const Problem& p, int tok, int n, float v) {
   const size_t at = (size_t)tok * p.ldo + n;
+  v = fp4_scaled(p, n, v);
+  if (p.out_kind == kOutF32) static_cast<float*>(p.out)[at] = v;
+  else if (p.out_kind == kOutBf16) static_cast<__nv_bfloat16*>(p.out)[at] = __float2bfloat16_rn(v);
+  else static_cast<__half*>(p.out)[at] = __float2half_rn(v);
+}
+// glu (mma_rows.h): gate row n and up row n + 8 finished, rounded to out's type, silu(gate) * up.
+__device__ __forceinline__ void store_glu(const Problem& p, int tok, int n, float gate, float up) {
+  auto rounded = [&](float v) {
+    if (p.out_kind == kOutBf16) return __bfloat162float(__float2bfloat16_rn(v));
+    if (p.out_kind == kOutF16) return __half2float(__float2half_rn(v));
+    return v;
+  };
+  const float g = rounded(fp4_scaled(p, n, gate)), u = rounded(fp4_scaled(p, n + 8, up)), v = g * (1.0f / (1.0f + expf(-g))) * u;
+  const size_t at = (size_t)tok * p.ldo + (n >> 4) * 8 + (n & 7);
   if (p.out_kind == kOutF32) static_cast<float*>(p.out)[at] = v;
   else if (p.out_kind == kOutBf16) static_cast<__nv_bfloat16*>(p.out)[at] = __float2bfloat16_rn(v);
   else static_cast<__half*>(p.out)[at] = __float2half_rn(v);
@@ -140,6 +158,16 @@ __global__ void __launch_bounds__(kMaxWarps * 32, 4) fp4_kernel(const Problem p)
 
   // c[t][i]: matrix row r0 + gid + 8 (i >> 1), token 8 t + 2 tig + (i & 1).
   if (p.splits == 1) {
+    if (p.glu) {
+#pragma unroll
+      for (int t = 0; t < T; ++t)
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+          const int n = r0 + gid, tok = 8 * t + 2 * tig + i;
+          if (n < p.N && tok < p.M) store_glu(p, tok, n, c[t][i], c[t][i + 2]);
+        }
+      return;
+    }
 #pragma unroll
     for (int t = 0; t < T; ++t)
 #pragma unroll
@@ -165,6 +193,20 @@ __global__ void __launch_bounds__(kMaxWarps * 32, 4) fp4_kernel(const Problem p)
   __threadfence();
   if (threadIdx.x == 0) p.counters[tile] = 0;
   const int first = tile * rows;
+  if (p.glu) {   // one thread a (gate, up) pair, every lane busy: gate rows n % 16 < 8, each up row 8 past it
+    const int pairs = rows / 2;
+    for (int i = threadIdx.x; i < p.M * pairs; i += blockDim.x) {
+      const int tok = i / pairs, h = i - tok * pairs, n = first + (h >> 3) * 16 + (h & 7);
+      if (n >= p.N) continue;
+      float v = __ldcg(p.partial + (size_t)tok * p.N + n), u = __ldcg(p.partial + (size_t)tok * p.N + n + 8);
+      for (int s = 1; s < p.splits; ++s) {
+        v += __ldcg(p.partial + ((size_t)s * p.M + tok) * p.N + n);
+        u += __ldcg(p.partial + ((size_t)s * p.M + tok) * p.N + n + 8);
+      }
+      store_glu(p, tok, n, v, u);
+    }
+    return;
+  }
   for (int i = threadIdx.x; i < p.M * rows; i += blockDim.x) {
     const int tok = i / rows, n = first + (i - tok * rows);
     if (n >= p.N) continue;

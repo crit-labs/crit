@@ -33,11 +33,12 @@ class DenseProjections:
             raise ValueError(f"projections-dense keeps matrices bf16; re-encoding to {encode} is quantized-projections'")
         return tensors["weight"].to(torch.bfloat16).contiguous()
 
-    def matmul(self, x, matrix, out_dtype=None):
-        """y = x W^T in BF16, or in out_dtype (FP32 for logits) from the same FP32 sums."""
+    def matmul(self, x, matrix, out_dtype=None, prompt=False):
+        """y = x W^T in BF16, or in out_dtype (FP32 for logits) from the same FP32 sums. prompt: a prompt chunk, which
+        multiplies as one GEMM at every length (a short one is not split into decode rows)."""
         import torch
         x = x.to(torch.bfloat16)
-        if x.shape[0] <= DECODE_ROWS and x.shape[0] > 1:
+        if x.shape[0] <= DECODE_ROWS and x.shape[0] > 1 and not prompt:
             return torch.cat([self.matmul(x[r:r + 1], matrix, out_dtype) for r in range(x.shape[0])])
         if out_dtype is not None and out_dtype != torch.bfloat16:
             if not x.is_cuda:   # torch has no CPU kernel for a BF16 GEMM into FP32: the same BF16 products in FP32

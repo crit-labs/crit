@@ -4,6 +4,7 @@ behind its chat API. One engine is served at a time, and the reservation's deadl
 in flight.
 """
 from contextlib import contextmanager
+import os
 import threading
 import time
 
@@ -176,15 +177,21 @@ def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None
         tested = _plugin_tests(folder, log) if check and plugin_tests and not external else []
         served = serving(store, run_id, candidate_id, attempt, kv_tokens, log, "crit run serve", address=(host, port))
         with served.until(attempt.deadline_at):
-            engine, _, bound = served.open()
+            with _probed(check and not external):
+                engine, _, bound = served.open()
             log(f"Serving {run_id}/{candidate_id} (not sealed, {attempt.id}) at http://{host}:{bound}/v1; Ctrl+C stops")
             if ready is not None:
                 ready(bound)
             if check:
-                from .checks import serve_checks
+                from .checks import full_context_checks, serve_checks
                 variables = (read_json(folder / "candidate.json")["configuration"].get("recon") or {}).get(
                     "template_variables") or {}
                 report = tested + serve_checks(bound, engine.spec()["capabilities"], variables, served.timeout, log)
+                if not external:
+                    from crit_api.residency import CANCEL_GRACE_SECONDS
+                    report += full_context_checks(bound, engine, kv_tokens,
+                                                  run["spec"]["hardware_constraints"]["vram_headroom_bytes"],
+                                                  CANCEL_GRACE_SECONDS, served.timeout, log)
                 if smoke:
                     report += _smoke(served, bound, log)
                 if data is not None:
@@ -208,6 +215,24 @@ def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None
                                                                      manifest, report, result["logs"])}
     attempt.finish()
     return result
+
+
+@contextmanager
+def _probed(on):
+    """With `on`, the engine host started in the block probes its Core steps (crit_core.native.STEP_PROBE): the host
+    process inherits the environment it starts with."""
+    from crit_core.native import STEP_PROBE
+    before = os.environ.get(STEP_PROBE)
+    if on:
+        os.environ[STEP_PROBE] = "1"
+    try:
+        yield
+    finally:
+        if on:
+            if before is None:
+                os.environ.pop(STEP_PROBE, None)
+            else:
+                os.environ[STEP_PROBE] = before
 
 
 def _plugin_tests(folder, log):

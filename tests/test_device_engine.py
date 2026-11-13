@@ -8,7 +8,6 @@ token, and requests in flight together decode what each decodes alone. Needs CUD
 Core's crit_core_steps (CRIT_CORE_STEP_LIBRARY)."""
 from concurrent.futures import ThreadPoolExecutor
 import json
-import os
 from pathlib import Path
 import shutil
 import sys
@@ -19,11 +18,13 @@ ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("core/python", "cli"):
     sys.path.insert(0, str(ROOT / _folder))
 
+from crit_core.native import step_library  # noqa: E402
+
 try:
     import torch
     import transformers
     import safetensors  # noqa: F401
-    READY = torch.cuda.is_available() and bool(os.environ.get("CRIT_CORE_STEP_LIBRARY"))
+    READY = torch.cuda.is_available() and step_library() is not None
 except ImportError:
     READY = False
 

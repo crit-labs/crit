@@ -83,7 +83,7 @@ static_assert(D % 64 == 0 && DV % 64 == 0 && D <= 256 && DV <= 256, "head widths
 
 enum : int {
     F_COUNTS = 1, F_OFFSETS = 2, F_TREE = 4, F_LSE = 8, F_FRESH = 16, F_ONE_ROW = 32, F_POS_T = 64, F_FIRST_T = 128,
-    F_DEV_CHUNK = 256, F_ONE_SPLIT = 512, F_PAR64 = 1024
+    F_DEV_CHUNK = 256, F_ONE_SPLIT = 512, F_PAR64 = 1024, F_SINKS = 2048, F_STATE_OUT = 4096, F_STATE_IN = 8192
 };
 
 }  // namespace
@@ -114,10 +114,14 @@ struct Params {
     const long long* ffirst;
     float* run;             // fused: each tile's running state (FP32 outputs, then maxima and sums)
     int* sync;              // fused: the ticket and done counters, then a tile's flag and two group counters
+    const float* sinks;     // F_SINKS: each query head's sink logit (FP32 [hq], natural log), folded in last
+    float* state;           // F_STATE_OUT / F_STATE_IN: every thread's running state between a chunk's two passes
     long long stride_qt, stride_qh, stride_ot, stride_oh, stride_fk, stride_fv;
     long long first0, ffirst0;
     int stride_fr, tab_stride, tab_width, hq, hkv, g, page, n_parts, chunk, cols, flags, page_shift;
-    int block, group, tiles, merge, ring, ramp, ramp_k, pad;
+    int block, group, tiles, merge, ring, ramp, ramp_k;
+    int window;             // a sliding window: positions a token sees, its own included (0: all)
+    int state_part;         // F_STATE_*: the pass's positions (0: below the cut, 1: the cut's block, 2: past it)
     float qk_scale, k_mult, v_mult, pad2;
 };
 
@@ -322,11 +326,35 @@ __device__ __forceinline__ void cw_tile(const Params& p, const Work w, unsigned 
     const int vofs = FUSED ? b * DVP : 0;
     if(one_split) {
         lo = 0, hi = n_keys;
+        if(flags & (F_STATE_OUT | F_STATE_IN)) {
+            // A chunk in passes over one range, each continuing the state the one before it left (F_STATE_IN) and
+            // leaving its own (F_STATE_OUT): the blocks below its first fresh position's block (part 0), that block
+            // (part 1), the blocks past it (part 2). The cut is a whole block: the passes run the one range's blocks
+            // in its order.
+            const long long ff = (flags & F_FIRST_T) ? p.ffirst[0] : p.ffirst0;
+            const int cut = int(min(ff, (long long)INT32_MAX - BN) / BN * BN);
+            const int part = p.state_part;
+            const int a = part == 0 ? 0 : part == 1 ? cut : cut + BN;
+            if(part < 2) hi = min(hi, part == 0 ? cut : cut + BN);
+            lo = min(a, hi);
+        }
     } else {
         const Split sp = split_of(w.split, chunk, p.ramp, p.ramp_k);
         lo = sp.lo;
         if(lo >= n_keys) return;
+        if(!FUSED && p.window > 0) {
+            // A split wholly below the tile's window (every column's) writes no state: the merge starts after it.
+            const int wlo = first + c_lo - p.window + 1;
+            if(wlo > 0 && w.split < splits_to(wlo, chunk, p.ramp, p.ramp_k) - 1) return;
+        }
         hi = min(lo + sp.size, n_keys);
+    }
+    const int win = p.window;
+    if(win > 0) {
+        // The blocks wholly below the tile's lowest seen position are skipped (a block no row sees changes no bit);
+        // a split left without positions keeps an empty state, which its merge folds as nothing.
+        const int wlo = first + c_lo - win + 1;
+        if(wlo > lo) lo = min(hi, lo + (wlo - lo) / BN * BN);
     }
     const long long start = one_row ? 0 : p.starts[r];
     const long long trow = one_row ? 0 : p.rows[r];
@@ -520,6 +548,20 @@ __device__ __forceinline__ void cw_tile(const Params& p, const Work w, unsigned 
 #pragma unroll
     for(int t = 0; t < NVW; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.0f;
     kc::softmax_rows_init(m, l);
+    // A chunk's second pass: every thread's state as the first pass left it (the same tile, block for block).
+    const long long state_at = ((long long)(blockIdx.z * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x) * THREADS + tid;
+    const long long state_n = (long long)gridDim.x * gridDim.y * gridDim.z * THREADS;
+    if(flags & F_STATE_IN) {
+#pragma unroll
+        for(int t = 0; t < NVW; ++t)
+#pragma unroll
+            for(int i = 0; i < 4; ++i) acc[t][i] = __ldcg(p.state + (4 * t + i) * state_n + state_at);
+#pragma unroll
+        for(int h = 0; h < 2; ++h) {
+            m[h] = __ldcg(p.state + (4 * NVW + h) * state_n + state_at);
+            l[h] = __ldcg(p.state + (4 * NVW + 2 + h) * state_n + state_at);
+        }
+    }
 
     const int nblk = (hi - lo + BN - 1) / BN;
     // The lane's ldmatrix offsets (elements), the same every block: k-step kk's chunk 2 kk + h of a swizzled row
@@ -634,7 +676,7 @@ __device__ __forceinline__ void cw_tile(const Params& p, const Work w, unsigned 
             }
         }
         // scale, mask (VW > 1: the warp's tiles, then shared with the group's other warps)
-        const bool full = __all_sync(0xffffffffu, n0 + BN - 1 <= warp_seen);
+        const bool full = __all_sync(0xffffffffu, n0 + BN - 1 <= warp_seen && (win == 0 || n0 > warp_last - win));
         auto scale_mask = [&](int t) {
             if(full) {
 #pragma unroll
@@ -656,6 +698,7 @@ __device__ __forceinline__ void cw_tile(const Params& p, const Work w, unsigned 
                 } else {
                     vis = vis && n <= lim[h];
                 }
+                if(win > 0) vis = vis && n > lim[h] - win;
                 sc[t][i] = vis ? __fmul_rn(sc[t][i], f) : -INFINITY;
             }
         };
@@ -776,6 +819,19 @@ __device__ __forceinline__ void cw_tile(const Params& p, const Work w, unsigned 
     }
     kc::cp_async_wait<0>();
 
+    if(flags & F_STATE_OUT) {   // a chunk's first pass: the state for its second
+#pragma unroll
+        for(int t = 0; t < NVW; ++t)
+#pragma unroll
+            for(int i = 0; i < 4; ++i) __stcg(p.state + (4 * t + i) * state_n + state_at, acc[t][i]);
+#pragma unroll
+        for(int h = 0; h < 2; ++h) {
+            __stcg(p.state + (4 * NVW + h) * state_n + state_at, m[h]);
+            __stcg(p.state + (4 * NVW + 2 + h) * state_n + state_at, l[h]);
+        }
+        return;
+    }
+
     // -- the result
     float lt[2];
 #pragma unroll
@@ -787,14 +843,22 @@ __device__ __forceinline__ void cw_tile(const Params& p, const Work w, unsigned 
         for(int h = 0; h < 2; ++h) {
             if(!live[h]) continue;
             T* row = out + (start + col[h]) * p.stride_ot + (long long)(kvh * G + hd[h]) * p.stride_oh;
+            float mh = m[h], lh = lt[h], keep = 1.0f;
+            const bool sink = flags & F_SINKS;
+            if(sink) {
+                const kc::SoftmaxFold2 f = kc::softmax_sink2(mh, lh, p.sinks[kvh * G + hd[h]]);
+                mh = f.m, lh = f.l, keep = f.keep;
+            }
 #pragma unroll
             for(int t = 0; t < NVW; ++t) {
-                const float x = kc::softmax_finish(acc[t][2 * h], lt[h]);
-                const float y = kc::softmax_finish(acc[t][2 * h + 1], lt[h]);
+                const float ax = sink ? __fmul_rn(acc[t][2 * h], keep) : acc[t][2 * h];
+                const float ay = sink ? __fmul_rn(acc[t][2 * h + 1], keep) : acc[t][2 * h + 1];
+                const float x = kc::softmax_finish(ax, lh);
+                const float y = kc::softmax_finish(ay, lh);
                 *reinterpret_cast<uint32_t*>(row + 8 * (tv0 + t) + 2 * tig) = pack_out(x, y);
             }
             if((flags & F_LSE) && tig == 0 && vw == 0)
-                p.lse[(start + col[h]) * p.hq + kvh * G + hd[h]] = kc::softmax_lse2(m[h], lt[h]);
+                p.lse[(start + col[h]) * p.hq + kvh * G + hd[h]] = kc::softmax_lse2(mh, lh);
         }
         return;
     }
@@ -892,6 +956,12 @@ __device__ __forceinline__ void cw_tile(const Params& p, const Work w, unsigned 
                 }
                 if(final) {
                     const int j = j0 + rr, c = j / G, hh = j % G;
+                    if(flags & F_SINKS) {
+                        const kc::SoftmaxFold2 f = kc::softmax_sink2(m_run, l_run, p.sinks[kvh * G + hh]);
+#pragma unroll
+                        for(int i = 0; i < 8; ++i) o[i] = __fmul_rn(o[i], f.keep);
+                        m_run = f.m, l_run = f.l;
+                    }
                     T* row = out + (start + c) * p.stride_ot + (long long)(kvh * G + hh) * p.stride_oh + vofs;
 #pragma unroll
                     for(int i = 0; i < 4; ++i)   // pair t = 4 u + i: columns 8 t + 2 tq
@@ -1015,11 +1085,17 @@ __global__ void __launch_bounds__(256) cw_merge(const Params p) {
     const long long start = one_row ? 0 : p.starts[r];
     long long chunk = p.chunk;
     if(flags & F_DEV_CHUNK) chunk = cdivll(cdivll(first + count, p.n_parts), p.block) * p.block;
-    const int nb = int(min((long long)p.n_parts, splits_to(first + c + 1, chunk, p.ramp, p.ramp_k)));
+    const int nb_all = int(min((long long)p.n_parts, splits_to(first + c + 1, chunk, p.ramp, p.ramp_k)));
+    // Under a sliding window the splits wholly below the column's window hold nothing (the window launch skips them):
+    // the fold starts after them, which changes no bit.
+    int below = 0;
+    if(p.window > 0 && first + c - p.window + 1 > 0)
+        below = int(min((long long)nb_all, splits_to(first + c - p.window + 1, chunk, p.ramp, p.ramp_k) - 1));
+    const int nb = nb_all - below;
     long long prow;
     if(flags & F_OFFSETS) prow = p.offsets[r] - p.offsets[0];
     else prow = (long long)r * p.cols;
-    const long long base = ((prow + c) * p.hq + h) * p.n_parts;
+    const long long base = ((prow + c) * p.hq + h) * p.n_parts + below;
     const int e = 4 * (int(threadIdx.x) % MERGE_LANES);
     float m_run = -INFINITY, l_run = 0.0f, acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     const uint32_t* pw = reinterpret_cast<const uint32_t*>(p.po);   // BF16 partial outputs (pairs, partial_word)
@@ -1055,6 +1131,12 @@ __global__ void __launch_bounds__(256) cw_merge(const Params p) {
                 m_run = f.m, l_run = f.l;
             }
         }
+    }
+    if(flags & F_SINKS) {
+        const kc::SoftmaxFold2 f = kc::softmax_sink2(m_run, l_run, p.sinks[h]);
+#pragma unroll
+        for(int i = 0; i < 4; ++i) acc[i] = __fmul_rn(acc[i], f.keep);
+        m_run = f.m, l_run = f.l;
     }
     T* out = reinterpret_cast<T*>(p.out) + (start + c) * p.stride_ot + (long long)h * p.stride_oh + e;
     uint32_t w2[2];
@@ -1096,11 +1178,17 @@ __global__ void __launch_bounds__(MERGE2_THREADS) cw_merge2(const Params p) {
     const long long start = one_row ? 0 : p.starts[r];
     long long chunk = p.chunk;
     if(flags & F_DEV_CHUNK) chunk = cdivll(cdivll(first + count, p.n_parts), p.block) * p.block;
-    const int nb = int(min((long long)p.n_parts, splits_to(first + c + 1, chunk, p.ramp, p.ramp_k)));
+    const int nb_all = int(min((long long)p.n_parts, splits_to(first + c + 1, chunk, p.ramp, p.ramp_k)));
+    // Under a sliding window the splits wholly below the column's window hold nothing (the window launch skips them):
+    // the fold starts after them, which changes no bit.
+    int below = 0;
+    if(p.window > 0 && first + c - p.window + 1 > 0)
+        below = int(min((long long)nb_all, splits_to(first + c - p.window + 1, chunk, p.ramp, p.ramp_k) - 1));
+    const int nb = nb_all - below;
     long long prow;
     if(flags & F_OFFSETS) prow = p.offsets[r] - p.offsets[0];
     else prow = (long long)r * p.cols;
-    const long long base = ((prow + c) * p.hq + h) * p.n_parts;
+    const long long base = ((prow + c) * p.hq + h) * p.n_parts + below;
     const int tid = threadIdx.x, lane = tid & 31;
     const bool factor_warp = tid < 32;
     // fold threads: word k of a split's row (consecutive words, no bank conflict), the head's pair e (values 2 e,
@@ -1176,13 +1264,21 @@ __global__ void __launch_bounds__(MERGE2_THREADS) cw_merge2(const Params p) {
         }
     }
     kc::cp_async_wait<0>();
-    if(tid == 0) ml[0] = m_run, ml[1] = l_run;
+    if(tid == 0) {
+        float keep = 1.0f;
+        if(flags & F_SINKS) {   // the head's sink folded into the final state, its factor shared with the fold threads
+            const kc::SoftmaxFold2 f = kc::softmax_sink2(m_run, l_run, p.sinks[h]);
+            m_run = f.m, l_run = f.l, keep = f.keep;
+        }
+        ml[0] = m_run, ml[1] = l_run, ml[2] = keep;
+    }
     __syncthreads();
     if(factor_warp) {
         if(tid == 0 && (flags & F_LSE)) p.lse[(start + c) * p.hq + h] = kc::softmax_lse2(m_run, l_run);
         return;
     }
     const float lt = ml[1];
+    if(flags & F_SINKS) acc0 = __fmul_rn(acc0, ml[2]), acc1 = __fmul_rn(acc1, ml[2]);
     T* out = reinterpret_cast<T*>(p.out) + (start + c) * p.stride_ot + (long long)h * p.stride_oh + 2 * e;
     *reinterpret_cast<uint32_t*>(out) = pack_out(kc::softmax_finish(acc0, lt), kc::softmax_finish(acc1, lt));
 }
@@ -1224,7 +1320,7 @@ constexpr Resolved resolve(int bn, int warps, int stages, int vsplit, bool fused
     const int dvp = DV / split;
     // 8-bit pages' codes converted in registers (convert 2, the rule) or in a shared 16-bit block (1, and every launch
     // with fresh rows: those positions come as 16-bit rows)
-    const bool ireg = BYTE_PAGES && !prefill && !fresh && convert != 1;
+    const bool ireg = BYTE_PAGES && !fresh && convert != 1;
     while(vw > 1 && (dvp / 8 % vw || dvp / 8 / vw < 4)) vw /= 2;
     while(vw > 1 && warps * vw > 16) vw /= 2;
     if(CRIT_VARIANT_S) stages = CRIT_VARIANT_S;
@@ -1325,12 +1421,15 @@ Launch fused_entry() {
 }
 template <int I>
 constexpr Resolved prefill_resolved() {
-    return resolve(kPrefill[I].bn, kPrefill[I].warps, kPrefill[I].stages, 0, false, true);
+    // Prompt entries: (configuration, fresh rows or not), NP x 2: without fresh rows 8-bit pages convert in registers.
+    return resolve(kPrefill[I / 2].bn, kPrefill[I / 2].warps, kPrefill[I / 2].stages, 0, false, true, 0,
+                   RULE_SHAPES - 1, 0, I % 2);
 }
 template <int I>
 Launch prefill_entry() {
     constexpr Resolved r = prefill_resolved<I>();
-    if constexpr(BUILD_PREFILL && D == DV && r.ok) return &launch_tile<r.dvp, r.bn, r.warps, 1, r.stages, false, false>;
+    if constexpr(BUILD_PREFILL && D == DV && r.ok)
+        return &launch_tile<r.dvp, r.bn, r.warps, 1, r.stages, r.ireg, false>;
     else return nullptr;
 }
 
@@ -1370,7 +1469,7 @@ enum : int { S_WINDOW = 0, S_FUSED = 1, S_PREFILL = 2 };
 static const Launch* table_of(int structure) {
     if(structure == S_WINDOW) return window_table(std::make_integer_sequence<int, NW * NW * VARIANTS>{});
     if(structure == S_FUSED) return fused_table(std::make_integer_sequence<int, NF * NW * VARIANTS>{});
-    return prefill_table(std::make_integer_sequence<int, NP>{});
+    return prefill_table(std::make_integer_sequence<int, NP * 2>{});
 }
 
 }  // namespace
@@ -1395,8 +1494,8 @@ extern "C" int crit_cw_plan(int structure, long long hq, long long hkv, long lon
         entry = (i * NW + j) * VARIANTS + variant;
         info = fused_info(std::make_integer_sequence<int, NF * NW * VARIANTS>{});
     } else {
-        entry = crit_lookup_cuda_prefill(D, hq, hkv, page, KIND, 0, rows);
-        info = prefill_info(std::make_integer_sequence<int, NP>{});
+        entry = crit_lookup_cuda_prefill(D, hq, hkv, page, KIND, 0, rows) * 2 + (fresh ? 1 : 0);
+        info = prefill_info(std::make_integer_sequence<int, NP * 2>{});
     }
     const Resolved r = info[entry];
     out[0] = entry, out[1] = r.warps, out[2] = r.stages, out[3] = r.bn, out[4] = r.vsplit;

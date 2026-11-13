@@ -6,6 +6,8 @@ import struct
 
 import torch
 
+from crit_kernels.gates import shared_memory_optin
+
 from crit_kernels import build as kbuild
 
 BLOCK = 32
@@ -174,14 +176,14 @@ class GemmStaged(Gemm):
     def valid(self, knobs):
         """A warp tile of whole 16 x 8 MMA tiles, at least 2 warps, a CTA's registers within an SM's (an output holds
         GROUP running lanes and the partial sums still needed: 5 registers, 6 with GROUP 4; about 48 more a thread),
-        and the ring within a CTA's shared memory (99 KB)."""
+        and the ring within a CTA's shared memory (the GPU's opt-in limit)."""
         bm, bn, wm, wn, group = knobs["BM"], knobs["BN"], knobs["WM"], knobs["WN"], knobs["GROUP"]
         if bm % (16 * wm) or bn % (8 * wn) or wm * wn < 2:
             return False
         outputs = 4 * (bm // wm // 16) * (bn // wn // 8)
         stage = group * knobs["RUN"] * (32 * bm + 20 * bn)
         regs = (outputs * (6 if group == 4 else 5) + 48 + 7) // 8 * 8
-        return regs <= 208 and 32 * wm * wn * regs <= 65536 and knobs["STAGES"] * stage <= 101376
+        return regs <= 208 and 32 * wm * wn * regs <= 65536 and knobs["STAGES"] * stage <= shared_memory_optin()
 
     def reference(self, s):
         if s["key"] not in self._references:
@@ -262,7 +264,7 @@ class GemmNative:
                      + (tn + 127) // 128 * (bk // 32) * 512 + 1023) // 1024 * 1024
             if regs > cap or epi is None:
                 return False
-            fit = min((101376 - 1024 - 256 - epi) // stage, 5)
+            fit = min((101376 - 1024 - 256 - epi) // stage, 5)   # int_block.cu's kFit: sm_120's 99 KB, this path's only GPU
             if knobs["STAGES"] != fit or fit < 2:
                 return False
             if tm < 128 or tn < 128:
@@ -271,7 +273,7 @@ class GemmNative:
         if mt * nt > 32 or (32 * wm * wn) % (bk // 2) or knobs["SPLIT"] != 0 or knobs["STAGES"] not in (3, 4):
             return False
         stage = ((tm + tn) * (bk + bk // 8) + 127) // 128 * 128
-        return knobs["STAGES"] * stage <= 101376
+        return knobs["STAGES"] * stage <= shared_memory_optin()
 
     def valid_for(self, knobs, shape):
         """Tiles under 128 tokens or rows only for matrices under 4,096 rows or inputs (an expert's): on larger ones

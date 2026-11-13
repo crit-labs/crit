@@ -14,24 +14,30 @@ namespace crit::core {
 enum class RowPhase : std::uint8_t { decode, prefill };
 // One work item's rows in a step. A decode item stages its pending token (with its drafts in a verify), a prefill item
 // its prompt chunk. The last `logits` rows produce logits: every row of a decode or verify item, the last row of a
-// chunk that ends its prompt, none of another chunk.
+// chunk that ends its prompt, none of another chunk. `readers` says something besides the logits pass reads the
+// item's last-layer output on every row (a drafter's or MTP head's taps, a hidden-state readout).
 struct StepItem {
     RequestKey key;
     RowPhase phase = RowPhase::decode;
     std::uint32_t rows = 1, logits = 1;
+    bool readers = false;
 };
 // Where arrange() put one item: step rows [first, first + rows) and gathered logits rows [first_logit, first_logit +
-// logits). `item` is its index in the arrange() input.
+// logits). `item` is its index in the arrange() input. `read` counts the item's last rows whose last-layer output
+// anything reads: its logits rows, or every row with readers. The engine's last layer needs its query, attention,
+// output projection and MLP only on those rows; the others stop at the layer's state writes (keys and values,
+// recurrent state), and a chunk with none read stops there altogether.
 struct StepPlacement {
     RequestKey key;
     RowPhase phase = RowPhase::decode;
-    std::uint32_t item = 0, first = 0, rows = 0, first_logit = 0, logits = 0;
+    std::uint32_t item = 0, first = 0, rows = 0, first_logit = 0, logits = 0, read = 0;
 };
 // One step's rows: decode items first, then prefill items, each phase in input order, so a step's decode rows are
 // one contiguous block ([0, decode_rows())) and its prompt chunks another, which an engine can compute by phase. A
 // row's work follows its phase, never the step's row counts. logit_rows() lists the step row of every logits row in
-// ascending order: the gather index of one logits pass over just those rows. Reuse one layout per engine; arrange()
-// keeps its storage.
+// ascending order: the gather index of one logits pass over just those rows. read_rows() lists, ascending, the step
+// rows whose last-layer output anything reads (every placement's last `read` rows), so the last layer runs its work
+// past the state writes on those rows alone. Reuse one layout per engine; arrange() keeps its storage.
 class StepLayout {
 public:
     // invalid_argument for an item without rows, more logits rows than rows, a decode item without logits, or more
@@ -40,12 +46,13 @@ public:
     std::span<const StepPlacement> placements() const noexcept; // row order
     const StepPlacement& placement(std::size_t item) const;    // by input index; out_of_range past the items
     std::span<const std::uint32_t> logit_rows() const noexcept;
+    std::span<const std::uint32_t> read_rows() const noexcept;
     std::uint32_t rows() const noexcept;
     std::uint32_t decode_rows() const noexcept;
     std::uint32_t decode_items() const noexcept;
 private:
     std::vector<StepPlacement> placements_;
-    std::vector<std::uint32_t> logit_rows_, by_item_;
+    std::vector<std::uint32_t> logit_rows_, read_rows_, by_item_;
     std::uint32_t rows_ = 0, decode_rows_ = 0, decode_items_ = 0;
 };
 // The StepItem of a WorkItem. A decode item (prefill complete) stages decode_rows rows (1, or a verify's drafts + 1),

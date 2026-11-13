@@ -11,6 +11,7 @@
     "kv:pages",
     "kv:scales",
     "kv:keys",
+    "kv:sliding",
     "rounds:kv_cache",
     "prompts:kv_cache"
   ],

@@ -65,7 +65,15 @@ Triton kernels for attention over paged KV caches, used by crit's attention-stat
   fragments take in registers (`CONVERT` 2, the rule: the keys' code pairs read from their rows, the values' by an
   ldmatrix `.trans` of 16-bit pairs and a quad shuffle, converted by the same function as the shared block), so no
   16-bit block, no pass converting it and no sync for it (`CONVERT` 1, and every launch with fresh rows: the codes
-  converted once a block into a shared 16-bit buffer, as before); the operands, and so the bits, are the same. A row's
+  converted once a block into a shared 16-bit buffer, as before); the operands, and so the bits, are the same. Prompt
+  chunks (`cuda-prefill`) take it too: without fresh rows in registers; with them, in one range, in three passes,
+  each continuing every thread's state the one before left at full precision (`workspace=`, or the package's own
+  buffer): the blocks below the first fresh position's block in registers, that block through the 16-bit block, the
+  blocks past it (all fresh rows) through the 16-bit pages' tile, the one range's blocks in its order (the same bits).
+  On an RTX 5090, Qwen3.8-27B's heads (256 wide, 24 over 4), a 2,048-token chunk at 32,768 positions over FP8 pages
+  went from 92 to 144 TFLOPS without fresh rows and from 84 to 132 with them (FP8 with a scale per layer). With
+  `splits=1` a chunk reads in one range (a token's bits follow its own positions only: `cuda_prompt()`), against the
+  Triton prompt chunk 1.2-1.65x as fast (1.55x at 131,072 positions, 1.18x for a first chunk). A row's
   positions split into contiguous ranges of `CHUNK` positions (`cuda_chunk()`, one per cache), one program a split,
   each split's state written with its output rounded to BF16 and folded in split order by the merge: the staged merge
   (`cw_merge2`), one program a column's query head, its splits' outputs streamed through shared memory in batches of 32
@@ -90,6 +98,20 @@ Triton kernels for attention over paged KV caches, used by crit's attention-stat
   over `SPLITS` programs a tile (merged) or one; a token's bits follow its chunk's length (int8_qk chunks stay on the
   Triton flash prompt chunk). A fused launch's sync words live in a module workspace of the device: fused launches of
   one device run on one stream at a time.
+
+- **Sliding windows** (`attend(..., sliding=W)`, `prefill(..., sliding=W)`, every structure but block lists): a
+  token at position t sees positions t - W + 1 .. t, as models with local layers define their window. The pieces,
+  blocks and splits wholly below a tile's window are skipped (a position no row sees changes no bit), so a decode row
+  over a long cache reads only its window's blocks: on an RTX 5090, 8 query and 2 KV heads of 128 over 60,000
+  positions, a window of 128 takes 12 us against 49 (split launch), 10 against 38 (flash) and 10 against 31 (CUDA
+  tile: its splits wholly below the window write nothing and its merge starts after them). A fused launch keeps its split launch's bits; a
+  window at least the row's length keeps every bit except on the flash prompt chunk, which masks every block under a
+  window (no unmasked fast path).
+- **Sinks** (`attend(..., sinks=)`, `prefill(..., sinks=)`, every structure): each query head's sink logit (FP32
+  `[heads]`, natural log, in the scaled scores' units; -inf for none) joins every row's softmax as one more position
+  that carries no value, `out = sum p v / (sum p + e^sink)`, as attention with learned sinks computes it. It is folded
+  into a row's final state once, after its partials (the kernel core's `sink` / `softmax_sink2`), so a fused launch
+  keeps its split launch's bits; the log-sum-exp counts it; sinks of -inf keep every bit of a launch without them.
 
 ## Numerics
 

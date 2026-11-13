@@ -329,7 +329,8 @@ int main() {
         for(int i = 0; i < n; ++i) {
             float wanted = (amax[i] * g[i]) / 6.0f;
             if(!std::isfinite(wanted)) wanted = 448.0f;
-            const float dec = float(host_e4m3(host_e4m3_encode(std::fmin(wanted, 448.0f))));
+            const float dec = std::isfinite(amax[i]) ? float(host_e4m3(host_e4m3_encode(std::fmin(wanted, 448.0f))))
+                                                     : NAN;   // a block holding a non-finite value: a NaN scale
             bad += !same(D[i], dec);
             float op = 0.0f;
             if(dec > 0.0f) {

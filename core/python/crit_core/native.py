@@ -15,7 +15,7 @@ import struct
 import sys
 import threading
 import time
-from collections import OrderedDict, namedtuple
+from collections import OrderedDict, deque, namedtuple
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
@@ -454,6 +454,10 @@ class _Attached:
 
 # Where Core's crit_core_steps library (crit/step_engine.h) is, when the loader is given none.
 STEP_LIBRARY = "CRIT_CORE_STEP_LIBRARY"
+# "1" makes every StepEngine probe its steps (StepEngine.telemetry's "probe"): crit run serve --check sets it for its
+# engine. PROBE_RECENT: the probed steps per kind whose samples the telemetry keeps.
+STEP_PROBE = "CRIT_CORE_STEP_PROBE"
+PROBE_RECENT = 8192
 # The library's file on each OS, and the folders of a crit checkout it is looked for in when STEP_LIBRARY names none:
 # where `crit core build` builds it (build/core-steps), and Core's build folder of core/README.md (build/core), each
 # with a multi-configuration generator's Release folder.
@@ -768,6 +772,7 @@ class StepEngine(_Runtime):
         self._request_facts = getattr(model, "request_facts", None)
         self._request_facts = self._request_facts if callable(self._request_facts) else None
         self._counted = {"steps": 0, "rows": 0, "step_s": 0.0}
+        self._probed = {} if os.environ.get(STEP_PROBE) == "1" else None   # StepEngine.probe's samples
         self._threads = set()   # Core's threads that keep their Python thread state (_keep_thread_state)
         info = dict(model.info())
         library = library or step_library()
@@ -941,8 +946,37 @@ class StepEngine(_Runtime):
         else:
             holder.pending = int(produced[0])
 
+    def _probe_start(self):
+        """At a probed step's start: the device's work so far finished and torch's peak reset, so the step's time
+        and peak are its own; None without CUDA."""
+        torch = sys.modules.get("torch")
+        if torch is None or not torch.cuda.is_initialized():
+            return None
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        return torch
+
+    def _probe_end(self, torch, kind, started):
+        """At a probed step's end: its seconds with its device work finished, and the free device memory at its peak
+        (the free memory now, less what torch reserved during the step beyond what it holds now), kept per kind."""
+        if torch is not None:
+            torch.cuda.synchronize()
+        seconds = round(time.perf_counter() - started, 6)
+        found = self._probed.setdefault(kind, {"steps": 0, "slowest_seconds": 0.0,
+                                               "recent": deque(maxlen=PROBE_RECENT)})
+        found["steps"] += 1
+        found["slowest_seconds"] = max(found["slowest_seconds"], seconds)
+        free = None
+        if torch is not None:
+            peak = torch.cuda.max_memory_reserved() - torch.cuda.memory_reserved()
+            free = int(torch.cuda.mem_get_info()[0] - max(0, peak))
+            found["min_free_device_bytes"] = min(found.get("min_free_device_bytes", free), free)
+        found["recent"].append((seconds, free))
+
     def _step(self, _user, rows, count, progress, tokens, logprobs, top_ids, top_logprobs):
         def run():
+            probing = self._probed is not None
+            torch = self._probe_start() if probing else None
             started = time.perf_counter()
             constrained, sessions = self._constrained, self._sessions
             packed = ctypes.string_at(rows, count * _ROW.size)
@@ -986,6 +1020,9 @@ class StepEngine(_Runtime):
             counted["steps"] += 1
             counted["rows"] += count
             counted["step_s"] += time.perf_counter() - started
+            if probing:
+                # A step that prefills any row is a prompt step: Core settles a cancel only between steps.
+                self._probe_end(torch, "prompt" if any(row.prefill_tokens for row in scheduled) else "decode", started)
         return self._guard(run)
 
     def _commit(self, _user, decisions, count):
@@ -1034,7 +1071,12 @@ class StepEngine(_Runtime):
         """The engine's work so far, for crit serve's /health and Eval (docs/PLUGINS.md): what its plugins report
         (the assembly's telemetry(), crit_plugins.Assembly) and Core's own counters ("core": steps and rows, native
         rounds included, the native rounds alone, those of them in the log-probability form, and the seconds the
-        Python steps took, the model's step included).
+        Python steps took, the model's step included). A probed engine (STEP_PROBE) adds "probe": per kind of step
+        ("prompt": any row prefills, else "decode") the steps probed, the slowest one's seconds with its device work
+        finished, the least free device memory at a step's peak (torch's reservations; CUDA only), and "recent": the
+        last PROBE_RECENT steps' [seconds, free bytes or None], so a caller can judge the steps of one request (those
+        past the count it read before). Probing waits
+        on the device at every step's start and end, so only checks turn it on; Core's native rounds are not probed.
         It may run on another thread while the engine steps (docs/PLUGINS.md, Facts and telemetry: a plugin's
         telemetry() reads its counters and does not wait on the device)."""
         found = dict(self._telemetry() or {}) if self._telemetry is not None else {}
@@ -1043,6 +1085,9 @@ class StepEngine(_Runtime):
         found["core"] = {**(found.get("core") or {}), "steps": counted["steps"] + native[0],
                          "rows": counted["rows"] + native[1], "native_rounds": native[0],
                          "native_logprob_rounds": native[2], "step_seconds": round(counted["step_s"], 6)}
+        if self._probed is not None:
+            found["core"]["probe"] = {kind: {**value, "recent": [list(sample) for sample in value["recent"]]}
+                                      for kind, value in list(self._probed.items())}
         return found
 
     def _retire(self, _user, session, finish):

@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT / "cli"))
 
 from crit_plugins import PluginError, Registry, assemble, check, model_problems  # noqa: E402
 from crit_plugins.assemble import plugins_root  # noqa: E402
-from crit_plugins.ablation import blame, describe, engine_facts, summary, toggles, variants  # noqa: E402
+from crit_plugins.ablation import blame, describe, engine_facts, option_variants, summary, toggles, variants  # noqa: E402
 from crit_plugins.testing import run_tests  # noqa: E402
 from crit.plugins import main  # noqa: E402
 from support.plugins import PLUGINS, write_plugins  # noqa: E402
@@ -467,6 +467,49 @@ class PluginTestRunnerTests(unittest.TestCase):
         self.assertIn("no tests", items["kv-fp8"]["detail"])
 
 
+    def test_skipped_tests_are_listed_with_their_reasons(self):
+        skipping = PASSING + '''
+    def test_against_the_model(self):
+        """Needs the step library."""
+        self.skipTest("no CRIT_CORE_STEP_LIBRARY")
+
+    def test_on_cuda(self):
+        self.skipTest("no CUDA device")
+'''
+        with tempfile.TemporaryDirectory() as temp:
+            root = write_plugins(Path(temp) / "plugins", {k: PLUGINS[k] for k in
+                                                          ("attn-fp8", "kv-fp8", "attn-kv-fused", "attn-plain", "kv-bf16")},
+                                 tests={"attn-kv-fused": {"test_fused.py": skipping}})
+            lines = []
+            items = {i["name"]: i for i in run_tests(root, only={"attn-kv-fused"}, log=lines.append)}
+            # crit plugins test's summary names each skipped test after the counts.
+            from unittest.mock import patch
+            from crit import plugins as cli
+            output = io.StringIO()
+            with patch.object(cli, "run_tests", lambda *a, **k: list(items.values())),                     contextlib.redirect_stdout(output):
+                self.assertEqual(cli.main(["test", str(root)]), 0)
+        found = items["attn-kv-fused"]
+        self.assertEqual((found["state"], found["detail"]), ("passed", "3 tests, 2 skipped"), found)
+        self.assertEqual(found["skipped"], [
+            {"test": "test_fused.FusedTests.test_against_the_model", "reason": "no CRIT_CORE_STEP_LIBRARY"},
+            {"test": "test_fused.FusedTests.test_on_cuda", "reason": "no CUDA device"}])
+        self.assertTrue(any("skipped test_fused.FusedTests.test_on_cuda: no CUDA device" in line for line in lines))
+        self.assertIn("1 passed, 0 failed; 2 tests skipped, which these passes do not cover:\n"
+                      "  attn-kv-fused: test_fused.FusedTests.test_against_the_model: no CRIT_CORE_STEP_LIBRARY\n",
+                      output.getvalue())
+
+
+class CoreRuntimeTests(unittest.TestCase):
+    def test_a_plugin_test_finds_cores_runtime_as_its_loader_does_and_skips_saying_how_to_build_it(self):
+        from unittest.mock import patch
+        from crit_plugins.testing import PluginTestCase
+        case = PluginTestCase()
+        with patch("crit_core.native.step_library", return_value="/built/crit_core_steps.dll"):
+            self.assertEqual(case.core_runtime(), "/built/crit_core_steps.dll")
+        with patch("crit_core.native.step_library", return_value=None),                 self.assertRaisesRegex(unittest.SkipTest, "`crit core build` builds it"):
+            case.core_runtime()
+
+
 class PluginTestCacheTests(unittest.TestCase):
     def test_a_plugin_whose_tests_passed_unchanged_is_reported_cached_and_a_change_runs_them_again(self):
         from unittest.mock import patch
@@ -522,6 +565,17 @@ class AblationTests(PluginFixture, unittest.TestCase):
         self.assertEqual([v["name"] for v in variants(FULL, names={"full", "base"})], ["full", "base"])
         with self.assertRaisesRegex(PluginError, "no variant only:x"):
             variants(FULL, names={"only:x"})
+
+    def test_an_option_set_to_a_number_like_text_takes_the_type_the_option_declares(self):
+        manifests = [dict(m) for m in self.registry]
+        eagle = next(m for m in manifests if m["id"] == "draft-eagle")
+        eagle["options"] = {**eagle.get("options", {}),
+                            "rows": {"type": "choice", "default": "auto", "choices": ["auto", "0", "64"]},
+                            "label": {"type": "str", "default": "x"}}
+        registry = Registry(manifests)
+        found = option_variants(FULL, ["draft-eagle.rows=0;draft-eagle.label=12;draft-eagle.width=2"], registry,
+                                facts=["taps:hidden"])
+        self.assertEqual(found[0]["plugins"]["options"]["draft-eagle"], {"width": 2, "rows": "0", "label": "12"})
 
     def test_blame_names_what_each_plugin_adds_costs_and_breaks(self):
         def measured(name, decode, prefill, failed=()):

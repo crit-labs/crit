@@ -431,6 +431,25 @@ void estimator() {
   check(kept==std::vector<std::size_t>{1,3,0},"Budget split is not the highest-survival prefixes");
   rejects([]{AcceptanceEstimator::admit(std::vector<std::vector<double>>{{.2,.5}},1);});
   rejects([&]{e.observe(4,.5,true);});rejects([]{AcceptanceEstimator::feature(1.5);});rejects([]{AcceptanceEstimator(0);});
+  // The feature from scores keeps a confident draft's value where a probability cannot: a top score of 0 with the
+  // other tokens sharing a complement mass m is log-odds -log(m) (to its rounding), past the probability path's clamp.
+  for (const double m:{1e-3,1e-6,1e-12}) {
+    std::vector<float> scores(4096,float(std::log(m/4095)));scores[17]=0;
+    const double got=AcceptanceEstimator::feature_from_logits(scores),want=-std::log(m);
+    check(std::abs(got-want)<1e-4*want,"Feature from scores lost a tiny complement mass");
+  }
+  check(AcceptanceEstimator::feature_from_logits(std::vector<float>{3,-std::numeric_limits<float>::infinity()})==
+        AcceptanceEstimator::max_log_odds,"A one-hot law is not at the bound");
+  check(std::abs(AcceptanceEstimator::feature_from_logits(std::vector<float>{1,1})) < 1e-12,"A tie is not log-odds 0");
+  check(std::abs(AcceptanceEstimator::feature_from_logits(std::vector<float>{2,0},2)-1)<1e-12,"Temperature not applied");
+  check(std::abs(AcceptanceEstimator::feature_from_logits(std::vector<float>{2,0})-AcceptanceEstimator::feature(1/(1+std::exp(-2.))))<1e-9,
+        "Feature from scores differs from the probability path where both resolve it");
+  rejects([]{AcceptanceEstimator::feature_from_logits(std::vector<float>{});});
+  rejects([]{AcceptanceEstimator::feature_from_logits(std::vector<float>{std::nanf("")});});
+  rejects([&]{e.observe_feature(0,std::numeric_limits<double>::infinity(),true);});
+  check(e.predict_feature(0,AcceptanceEstimator::feature(.9))==e.predict(0,.9),"Feature and probability predictions differ");
+  check(e.survival_features(std::vector<double>{30,30})[1]>e.survival(std::array<double,2>{1,1})[1] || e.slope()<=0,
+        "A confident draft past the clamp did not raise survival");
   std::cout<<"estimator: slope "<<e.slope()<<", intercepts "<<e.intercept(0)<<" "<<e.intercept(1)<<" "<<e.intercept(2)<<" "<<e.intercept(3)<<"\n";
 }
 int main(int argc,char** argv){try{std::string mode=argc>1?argv[1]:"all";if(mode=="all"||mode=="arithmetic")arithmetic();if(mode=="all"||mode=="statistical")statistical();if(mode=="all"||mode=="transactions")transactions();if(mode=="all"||mode=="adaptive"){adaptive();estimator();}std::cout<<"Sampled "<<mode<<" passed\n";}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

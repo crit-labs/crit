@@ -127,6 +127,29 @@ class Client:
             raise ValueError(f"crit serve answered {response.status}: {(data.get('error') or {}).get('message', data)}")
         return data
 
+    def post(self, path, body):
+        """POST a JSON body to crit serve; its JSON answer, ValueError for any status but 200."""
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=self.timeout)
+        try:
+            connection.request("POST", path, json.dumps(body), {"Content-Type": "application/json"})
+            response = connection.getresponse()
+            data = json.loads(response.read() or b"{}")
+        finally:
+            connection.close()
+        if response.status != 200:
+            raise ValueError(f"crit serve answered {response.status}: {(data.get('error') or {}).get('message', data)}")
+        return data
+
+    def models(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=self.timeout)
+        try:
+            connection.request("GET", "/v1/models")
+            response = connection.getresponse()
+            data = json.loads(response.read() or b"{}")
+        finally:
+            connection.close()
+        return data.get("data") or []
+
     def stream(self, body, cancel_after_first=False):
         """The streamed content and finish reason; with cancel_after_first, the client disconnects after the first
         content piece."""
@@ -163,6 +186,104 @@ class Client:
 def _reply(data):
     choice = data["choices"][0]
     return choice["message"].get("content") or "", choice.get("finish_reason")
+
+
+# Words the full-context prompt repeats: ordinary prose, so every prompt chunk is ordinary work.
+FILLER = ("The river runs past the old mill and under the stone bridge, where the town keeps its market on "
+          "Saturdays. Farmers bring apples, cheese and bread, and the children watch the boats go by. ")
+# Tokens the full-context pass decodes after its prompt.
+FULL_CONTEXT_DECODE = 16
+
+
+def full_context_checks(port, engine, kv_tokens, headroom, grace, timeout, log):
+    """One chat request at the full context: a user message of repeated FILLER, as many copies as fit in kv_tokens
+    less FULL_CONTEXT_DECODE tokens (sized from the prompt tokens the engine counts for one copy and two), then up to
+    FULL_CONTEXT_DECODE decoded tokens, on an engine whose Core steps are probed (crit_core.native.STEP_PROBE).
+    From Core's probe in the engine's telemetry, of this request's steps alone (_since): full_context_prompt_step
+    passes when the slowest prompt step finishes within `grace` (a cancel settles only between steps, and the host is
+    retired with its weights when a cancel does not settle within crit serve's grace), full_context_device_memory
+    when the least free device memory at any probed step's peak, prompt or decode, is at least `headroom` (the run's
+    vram_headroom_bytes). An engine that reports no probe (its steps not on Core's StepEngine, or no CUDA for
+    memory) leaves the item unverified."""
+    client = Client(port, timeout)
+    names = ("full_context_prompt_step", "full_context_device_memory")
+    started = time.perf_counter()
+    try:
+        model = (client.models() or [{}])[0].get("id")
+
+        def complete(copies, tokens):
+            return client.chat({"model": model, "messages": [{"role": "user", "content": FILLER * copies}],
+                                "max_tokens": tokens})["usage"]["prompt_tokens"]
+        # The filler's tokens per copy, from what the engine counts for one copy and two: any tokenizer, no
+        # tokenize call.
+        one = complete(1, 8)
+        per = complete(2, 8) - one
+        if per <= 0:
+            raise ValueError(f"two copies of the filler counted {one + per} prompt tokens, one {one}")
+        copies = 1 + (kv_tokens - FULL_CONTEXT_DECODE - one) // per
+        log(f"serve check full context: a prompt of about {one + (copies - 1) * per:,} tokens and up to "
+            f"{FULL_CONTEXT_DECODE} decoded tokens")
+        before = _probe(engine)
+        prompted = complete(copies, FULL_CONTEXT_DECODE)
+        probe = _since(before, _probe(engine))
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"[:2000]
+        items = [{"name": name, "state": "failed", "detail": detail} for name in names]
+    else:
+        items = [_prompt_step(probe, grace, prompted), _device_memory(probe, headroom)]
+    seconds = round(time.perf_counter() - started, 3)
+    for item in items:
+        item["seconds"] = seconds
+        log(f"serve check {item['name']}: {item['state']} ({item['detail']})")
+    return items
+
+
+def _probe(engine):
+    return ((engine.telemetry() or {}).get("core") or {}).get("probe")
+
+
+def _since(before, after):
+    """Core's probe of the steps between two telemetry reads, per kind: their count, the slowest's seconds and the
+    least free device memory, from the samples Core keeps (its recent ones). None when the engine reports no probe."""
+    if after is None:
+        return None
+    found = {}
+    for kind, value in after.items():
+        steps = value["steps"] - ((before or {}).get(kind) or {}).get("steps", 0)
+        samples = value.get("recent", [])[-steps:] if steps > 0 else []
+        if not samples:
+            continue
+        found[kind] = {"steps": steps, "slowest_seconds": max(s for s, _ in samples)}
+        free = [f for _, f in samples if f is not None]
+        if free:
+            found[kind]["min_free_device_bytes"] = min(free)
+    return found
+
+
+def _prompt_step(probe, grace, prompted):
+    prompt = (probe or {}).get("prompt")
+    if not prompt:
+        return {"name": "full_context_prompt_step", "state": "unverified",
+                "detail": "the engine reports no probed prompt steps (Core's StepEngine probes them)"}
+    slowest = prompt["slowest_seconds"]
+    return {"name": "full_context_prompt_step", "state": "passed" if slowest < grace else "failed",
+            "detail": f"the slowest of {prompt['steps']} prompt steps, up to a {prompted:,}-token prompt, took "
+                      f"{slowest:.3f} s; "
+                      f"a cancel settles between steps and crit serve retires the host after {grace:g} s"
+                      + ("" if slowest < grace else ": prefill in smaller chunks")}
+
+
+def _device_memory(probe, headroom):
+    found = {kind: value["min_free_device_bytes"] for kind, value in (probe or {}).items()
+             if "min_free_device_bytes" in value}
+    if not found:
+        return {"name": "full_context_device_memory", "state": "unverified",
+                "detail": "the engine reports no probed device memory (Core's StepEngine on CUDA probes it)"}
+    least = min(found.values())
+    shown = ", ".join(f"{kind} {value / 2**30:.2f} GiB" for kind, value in sorted(found.items()))
+    return {"name": "full_context_device_memory", "state": "passed" if least >= headroom else "failed",
+            "detail": f"least free device memory at a step's peak up to the full context: {shown}; the run's VRAM "
+                      f"headroom is {headroom / 2**30:.2f} GiB"}
 
 
 def serve_checks(port, capabilities, variables, timeout, log):
@@ -250,6 +371,22 @@ def serve_checks(port, capabilities, variables, timeout, log):
                 return "failed", f"{len(rows)} log-probability rows for {data['usage']['completion_tokens']} tokens"
             return "passed", f"{len(rows)} tokens with their log-probability and 2 alternatives"
         check("logprobs", logprobs)
+
+    seen = {}
+
+    def draft_bytes():
+        facts = seen["facts"] = next(iter(client.models()), {}).get("engine_facts") or {}
+        if not facts.get("speculative"):
+            return "passed", "the engine drafts nothing"
+        if not facts.get("draft_bytes_per_step"):
+            return "failed", ("the engine drafts but its facts declare no draft_bytes_per_step (the bytes one draft "
+                              "step reads: the draft layers and the head they read): crit-eval cannot price the round's "
+                              "floor, nor compare the draft step with the checkpoint's draft layers for the closed track")
+        return "passed", f"a draft step reads {facts['draft_bytes_per_step']} bytes"
+    check("draft_bytes", draft_bytes)
+    # The served engine's facts beside the check, for what reads them later (crit kernels sweep --matrices).
+    if seen.get("facts"):
+        items[-1]["engine_facts"] = seen["facts"]
 
     switches = {k: not v for k, v in variables.items() if isinstance(v, bool)}
     if switches and TEMPLATE_KWARGS_CAPABILITY in capabilities:

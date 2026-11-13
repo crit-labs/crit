@@ -1,0 +1,47 @@
+{
+  "schema": "crit-kernel-v1",
+  "id": "latent-attention",
+  "family": "attention",
+  "title": "Latent (MLA) attention in Triton: decode tokens and verify windows of every query head over a paged cache of compressed rows (a latent and a rotary key a position, the latent the value too), split over KV partitions and merged, with sinks",
+  "package": "latent_attention",
+  "language": "triton",
+  "capabilities": ["8.0", "8.6", "8.9", "9.0", "10.0", "11.0", "12.0"],
+  "operations": ["latent-attention"],
+  "structures": {
+    "window": {
+      "what": "a tile of BLOCK_M query rows (a row's columns times its heads) over pieces b, b + PARTS, ... of PIECE positions, each piece's latents loaded once for the scores and the values, the states merged in partition order",
+      "call": "attend",
+      "rows": [1, 64],
+      "tune_rows": [1, 2, 4, 8],
+      "key": ["R", "P", "H", "PAGE", "KIND"],
+      "row_invariant": true,
+      "knobs": {
+        "BLOCK_M": {"values": [16, 32, 64], "default": 64, "what": "query rows a program (at most the window's columns times the heads)"},
+        "PIECE": {"values": [16, 32, 64], "default": 16, "order": true, "what": "positions a piece: the unit a partition takes and its softmax's block"},
+        "PARTS": {"values": [0, 1, 2, 4, 8, 16, 32, 64, 128], "default": 0, "order": true, "what": "partitions a row's pieces go to, piece i to i mod PARTS (0: the rule, 2 x SMs over the heads' 16-row tiles, 1 to 128)"},
+        "WARPS": {"values": [2, 4, 8], "default": 4, "what": "warps a program"},
+        "STAGES": {"values": [1, 2, 3], "default": 3, "what": "Triton's software-pipeline stages over the pieces"},
+        "VSPLIT": {"values": [1, 2, 4], "default": 2, "what": "programs sharing a tile, each with R / VSPLIT of the latent output columns (each computes the tile's scores)"}
+      },
+      "yardstick": {"library": "FlashInfer BatchMLAPagedAttentionWrapper (paged latent and rotary caches, BF16)"},
+      "bench": "bench.py:Window"
+    },
+    "prompt": {
+      "what": "a prompt chunk of one sequence: its tokens times their heads in tiles of BLOCK_M rows over the pieces of PIECE positions in order, causal, one online softmax, the output written directly (no partitions)",
+      "call": "prefill",
+      "rows": [1, 1048576],
+      "tune_rows": [64, 512, 2048],
+      "key": ["R", "P", "H", "PAGE", "KIND"],
+      "row_invariant": true,
+      "knobs": {
+        "BLOCK_M": {"values": [16, 32, 64, 128], "default": 64, "what": "query rows a program (tokens times heads)"},
+        "PIECE": {"values": [16, 32, 64], "default": 16, "order": true, "what": "positions a piece: the softmax's block"},
+        "WARPS": {"values": [2, 4, 8], "default": 4, "what": "warps a program"},
+        "STAGES": {"values": [1, 2, 3], "default": 2, "what": "Triton's pipeline stages over the pieces"},
+        "VSPLIT": {"values": [1, 2, 4], "default": 2, "what": "programs sharing a tile, each with R / VSPLIT of the output columns (each computes the scores)"}
+      },
+      "yardstick": {"library": "FlashInfer BatchMLAPagedAttentionWrapper with causal prompt rows"},
+      "bench": "bench.py:Prompt"
+    }
+  }
+}

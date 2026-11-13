@@ -285,7 +285,7 @@ it (the shared slope makes the Hessian an arrowhead, so a step is a scalar solve
 the prefix whose survival stays at or above a floor, and `admit(survivals, budget)`
 splits one draft budget across a batch by survival, a prefix per request. The floor or
 budget is the engine's to measure, for example against `AdaptiveDraftBudget`'s seconds
-per published token. Before `minimum_samples` outcomes it predicts 1 and cuts nothing.
+per published token. Before `minimum_samples` outcomes it predicts 1 and cuts nothing. An engine that holds the draft scores passes `feature_from_logits(scores, temperature)` to `observe_feature`, `predict_feature` and `survival_features`: it is the top score less the log-sum-exp of the others, so a confident draft keeps its value, where a probability rounds to 1 in FP32 once the other tokens' mass is under about 6e-8 and `feature(q_max)` clamps every draft past 1e-6 to the same 13.8.
 A cut drops drafts only, so the output law is the verification rule's. The native check
 recovers a simulated law (slope 1.3, intercepts 0.5 to -1) from 4,096 drafts to 1.34
 and within 0.06. It is an estimator for adaptive verification without a

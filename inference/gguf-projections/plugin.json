@@ -1,0 +1,39 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "gguf-projections",
+  "title": "GGUF projections: a GGUF checkpoint's quantized matrices at their stored bits",
+  "description": "The projections slot over matrices as a GGUF checkpoint stores them: format gguf:<TYPE> (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, MXFP4) with the stored rows uint8 [N][row bytes] (crit_core.model.gguf_blocks.GgufTensors reads them from the file without copying), or a stack of experts [E][N][row bytes] for matmul_experts; the file's dense tensors as bf16. Decode rows (calls of up to 8 rows) run crit's kernel gguf-rows' gemv: each row quantized to int8 per 32 values, each stored sub-block's exact integer dot on dp4a, FP32 in a declared order, a row's bits its own (an expert stack's rows each against their expert, the plain call's bits). Prompt rows take option prompt: dequantize (the default: the matrix decoded to BF16 a call and cuBLAS's GEMM) or exact (gguf-rows' gemm on the s8 tensor cores: every prompt row with its decode row's bits, the facts' prompt_exact). Its host form encodes the slot's dense cases to Q8_0 and projects with exact sums over the stored values (Core's decoders, the formats' own decoders bit for bit).",
+  "fills": [
+    "projections"
+  ],
+  "provides": [
+    "rounds:projections"
+  ],
+  "devices": [
+    "cuda"
+  ],
+  "reference": [
+    "projections-dense"
+  ],
+  "options": {
+    "prompt": {
+      "type": "choice",
+      "default": "dequantize",
+      "choices": [
+        "dequantize",
+        "exact"
+      ],
+      "description": "prompt rows' path: dequantize, the matrix decoded to BF16 a call and cuBLAS's BF16 GEMM (FP32 sums; faster today, not the decode rows' bits); exact, gguf-rows' gemm in the decode rows' order (each prompt row's output the bits it has decoded)"
+    }
+  },
+  "kernels": [
+    {
+      "name": "gguf-rows",
+      "fallback": "the stored values decoded exactly on the host at load (crit_core.model.gguf_blocks) as a BF16 matrix through torch, one row a call for decode rows"
+    }
+  ],
+  "sources": {
+    "gguf": "code"
+  },
+  "entry": "plugin.py:create"
+}

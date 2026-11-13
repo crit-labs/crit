@@ -25,6 +25,15 @@ round's or a step's page table points there. unbind(slot) reads the length back 
 
 Every sequence's arithmetic depends only on its own pages, so a step's rows decode the same batched as alone.
 
+Sliding windows (sliding=W, the layers of a pool whose tokens see only their last W positions): each sequence keeps a
+ring of `ring` = ceil((W + span) / page) + 1 pages, span the most positions a row writes in one step (a prompt chunk, a
+verify window), and logical page p (positions p * page ..) lives in ring page p mod ring. The page tables the
+attention reads (device_tables, the step buffers', the rounds', the prompt chunk's) are the ring expanded to the
+logical pages, `table_pages` = ceil(positions / page) wide: a position older than the window aliases a newer one's
+page, which the window never shows (the attention reads such a pool with its sliding window). So a sequence holds at
+most `ring` pages whatever its length, and a captured round (bind) needs no page past the ring. keep() frees no page
+of a sequence that has wrapped its ring (its pages hold the window), and a fork shares the ring until either writes.
+
 Lending: the pool's page tensors and `spare` bytes after them are one allocation (`memory`), pages are taken lowest
 first, and every page at or past the floor (one past the highest page in use) holds no KV. A device expert cache
 borrows that memory (lendable(): the allocation, each page tensor's place in it, the spare bytes, the floor) and hears of
@@ -64,10 +73,14 @@ class KVPool:
     crit's paged-kv-attention module, or None (torch)."""
 
     def __init__(self, layers, kv_heads, head_dim, tokens, device, dtype="bf16", *, page=16, value_dim=None,
-                 step_rows=0, step_tokens=0, window=16, round_rows=8, kernels=None, spare=0, fresh=None):
+                 step_rows=0, step_tokens=0, window=16, round_rows=8, kernels=None, spare=0, fresh=None, sliding=0,
+                 span=None, positions=None):
         """spare: bytes after the pages, in the same allocation, that no page uses: a borrower's own (lendable()).
         fresh: a FreshBuffer (the kv_cache plugin's, declared in its memory()) a pool of FP8 or INT8 pages keeps a
-        prompt chunk's keys and values in, in the compute dtype, as write() was given them (fresh_rows)."""
+        prompt chunk's keys and values in, in the compute dtype, as write() was given them (fresh_rows). sliding: the
+        layers' sliding window (0: none), which makes each sequence a ring of pages (the module's description); span:
+        the most positions a row writes in one step (default: max(window, 64)); positions: the most positions a
+        sequence reaches, the page tables' width (default: the pool's tokens; required with sliding)."""
         import torch
         if dtype not in DTYPES:
             raise ValueError(f"a KV pool stores {', '.join(DTYPES)}, not {dtype!r}")
@@ -83,6 +96,18 @@ class KVPool:
                         "fp8": torch.float8_e4m3fn, "fp8:row": torch.float8_e4m3fn, "int8": torch.int8}[dtype]
         self.compute = torch.float32 if dtype == "fp32" else (torch.float16 if dtype == "fp16" else torch.bfloat16)
         self.pages = math.ceil(tokens / page)
+        self.sliding = int(sliding or 0)
+        if self.sliding < 0:
+            raise ValueError("a sliding window is 0 (none) or a number of positions")
+        if self.sliding and not positions:
+            raise ValueError("a sliding pool's page tables cover `positions`: give the most positions a sequence reaches")
+        self.span = int(span or max(int(window), 64))
+        self.ring = math.ceil((self.sliding + self.span) / page) + 1 if self.sliding else 0
+        # The logical pages a sequence's table covers: the page tables' width (the pool's pages without a window).
+        self.table_pages = math.ceil(int(positions) / page) if positions else self.pages
+        if not self.sliding:
+            self.table_pages = max(self.table_pages, self.pages)
+        self.reached = {}   # a sliding pool's sequences: the logical pages each has written up to
         # One allocation: the page tensors (keys, values, a row-scaled pool's scales), then `spare` bytes for a borrower.
         # Each tensor holds the sequences' pages and the dump page after them (index `pages`), which lies past every
         # region lendable() gives.
@@ -155,16 +180,16 @@ class KVPool:
             # step's window tokens (so the partials a launch needs follow its tokens).
             self.d_offsets = torch.zeros(self.step_rows, device=self.device, **int32)
             self.d_rows = torch.arange(self.step_rows, device=self.device, **int32)
-            self.d_tables = torch.full((self.step_rows, self.pages), self.dump, device=self.device, **int32)
+            self.d_tables = torch.full((self.step_rows, self.table_pages), self.dump, device=self.device, **int32)
             self._h_slots = torch.zeros(self.step_tokens, pin_memory=True, **long)
             self._h_meta = torch.zeros(self.step_rows, 4, pin_memory=True, **long)
-            self._h_tables = torch.full((self.step_rows, self.pages), self.dump, pin_memory=True, **int32)
+            self._h_tables = torch.full((self.step_rows, self.table_pages), self.dump, pin_memory=True, **int32)
         # Captured rounds: each round slot's page table, capacity and valid length at fixed device addresses, and the
         # lengths start_round found (a held row keeps its own).
         self.round_rows = int(round_rows)
         self.bound, self.slot_of = {}, {}
         slots = max(1, self.round_rows)
-        self.round_tables = torch.full((slots, self.pages), self.dump, dtype=torch.int32, device=self.device)
+        self.round_tables = torch.full((slots, self.table_pages), self.dump, dtype=torch.int32, device=self.device)
         self.round_capacity = torch.zeros(slots, dtype=torch.int64, device=self.device)
         self.round_lengths = torch.zeros(slots, dtype=torch.int64, device=self.device)
         self._start = torch.zeros(slots, dtype=torch.int64, device=self.device)
@@ -172,7 +197,7 @@ class KVPool:
         # Captured prompt chunks (prompts:kv_cache): the staged chunk's KV slots (made for the largest bucket at the
         # first stage_prompt) and its sequence's page table, at fixed addresses.
         self.prompt_slots = None
-        self.prompt_table = torch.full((1, self.pages), self.dump, dtype=torch.int32, device=self.device)
+        self.prompt_table = torch.full((1, self.table_pages), self.dump, dtype=torch.int32, device=self.device)
         # With a fresh buffer: the staged chunk's first position its attention reads fresh (its frontier, a chunk past
         # the window, a prompt row; else past the bucket: a chunk of up to `window` tokens reads its pages, as the same
         # chunk in a StepBatch does), [1] int64.
@@ -183,6 +208,7 @@ class KVPool:
         if sequence in self.tables:
             raise ValueError(f"sequence {sequence!r} is open already")
         self.tables[sequence], self.lengths[sequence] = [], 0
+        self.reached[sequence] = 0
 
     def close(self, sequence):
         if sequence in self.slot_of:
@@ -190,6 +216,7 @@ class KVPool:
         for page in self.tables.pop(sequence, []):
             self._drop(page)
         self.lengths.pop(sequence, None)
+        self.reached.pop(sequence, None)
         self.device_tables.pop(sequence, None)
 
     def fork(self, sequence, new):
@@ -198,12 +225,15 @@ class KVPool:
         if new in self.tables:
             raise ValueError(f"sequence {new!r} is open already")
         length = self.length(sequence)
-        table = self._table(sequence)[:math.ceil(length / self.page)]
+        table = self._table(sequence)[:self._held(math.ceil(length / self.page))]
         for page in table:
             self.refs[page] += 1
         self.tables[new], self.lengths[new] = list(table), length
+        self.reached[new] = min(self.reached.get(sequence, 0), math.ceil(length / self.page)) if not self._wrapped(
+            sequence) else self.reached[sequence]
         if sequence in self.slot_of and length % self.page:
-            self.tables[new][-1] = self._copy(table[-1])
+            tail = self._index((length - 1) // self.page)
+            self.tables[new][tail] = self._copy(table[tail])
 
     def length(self, sequence):
         self._table(sequence)
@@ -215,16 +245,21 @@ class KVPool:
         """The sequence's valid KV is its first `length` positions; pages past them are freed (a sequence a round slot
         holds keeps its pages up to its capacity)."""
         table = self._table(sequence)
-        if not 0 <= length <= len(table) * self.page:
-            raise ValueError(f"sequence {sequence!r} holds {len(table) * self.page} reserved positions, not {length}")
+        held = self._covered(sequence)
+        if not 0 <= length <= held * self.page:
+            raise ValueError(f"sequence {sequence!r} holds {held * self.page} reserved positions, not {length}")
         self.lengths[sequence] = length
         if sequence in self.slot_of:   # between rounds: the next round starts from it (start_round)
             self.round_lengths[self.slot_of[sequence]] = length
+            return
+        if self._wrapped(sequence):    # its ring holds the window: no page is past it
             return
         needed = math.ceil(length / self.page)
         for page in table[needed:]:
             self._drop(page)
         del table[needed:]
+        if self.sliding:
+            self.reached[sequence] = min(self.reached[sequence], needed)
 
     def set_scales(self, layer, key_scale, value_scale):
         """An fp8 pool's scales for a layer (stored = value / scale)."""
@@ -274,13 +309,12 @@ class KVPool:
             sequence, first, count, position = batch.row(r)
             table = self._table(sequence)
             last = position + count - 1
-            while len(table) * self.page <= last:
-                table.append(self._take())
-            for p in range(position // self.page, last // self.page + 1):
+            self._grow(sequence, table, count, last)
+            for p in self._indices(position // self.page, last // self.page + 1):
                 if self.refs[table[p]] > 1:   # shared with a fork: copy before writing
                     table[p] = self._copy(table[p])
-            slots += [table[q // self.page] * self.page + q % self.page for q in range(position, last + 1)]
-            tables.append((sequence, list(table)))
+            slots += [self._slot(table, q) for q in range(position, last + 1)]
+            tables.append((sequence, self._logical(table, max(self._covered(sequence), last // self.page + 1))))
         self._refresh_bound(tables)
         if self.step_rows:
             return self._step_buffers(batch, slots, tables)
@@ -391,13 +425,14 @@ class KVPool:
         """The sequence's first `count` positions of a layer: keys [count][kv_heads][head_dim] and values, in the
         compute dtype (dequantized from an fp8, fp8:row or int8 pool)."""
         table = self._table(sequence)
-        if count > len(table) * self.page:
-            raise ValueError(f"sequence {sequence!r} holds {len(table) * self.page} positions, not {count}")
+        held = self._covered(sequence)
+        if count > held * self.page:
+            raise ValueError(f"sequence {sequence!r} holds {held * self.page} positions, not {count}")
         i = self.layers[layer]
         needed = math.ceil(count / self.page)
         index = self.device_tables.get(sequence)
         if index is None or index.numel() < needed:   # not reserved since it was opened, forked or bound
-            index = self.device_tables[sequence] = self._to_device(table)
+            index = self.device_tables[sequence] = self._to_device(self._logical(table, held))
         index = index[:needed]
         n = needed * self.page
         k = self.k[i].index_select(0, index).reshape(n, self.kv_heads, self.head_dim)[:count]
@@ -435,8 +470,13 @@ class KVPool:
         return self._slots_at(round_slots.reshape(-1).long(), positions.reshape(-1).long()).view(shape)
 
     def table(self, sequence):
-        """The sequence's page ids, in order."""
-        return list(self._table(sequence))
+        """The sequence's page ids, in order: one a logical page it is reserved through (a sliding pool's ring
+        expanded: page p is ring page p mod ring)."""
+        return self._logical(self._table(sequence), self._covered(sequence))
+
+    def held(self, sequence):
+        """The pages the sequence holds (a sliding pool: at most its ring)."""
+        return len(self._table(sequence))
 
     def free_pages(self):
         return len(self.free)
@@ -464,18 +504,18 @@ class KVPool:
             if count:
                 last = frontier + count - 1
                 self._lend_rows([(sequence, count, frontier)])
-                while len(table) * self.page <= last:
-                    table.append(self._take())
-                for p in range(frontier // self.page, last // self.page + 1):
+                self._grow(sequence, table, count, last)
+                for p in self._indices(frontier // self.page, last // self.page + 1):
                     if self.refs[table[p]] > 1:   # shared with a fork: copy before writing
                         table[p] = self._copy(table[p])
-            slots = [table[q // self.page] * self.page + q % self.page for q in range(frontier, frontier + count)]
+            slots = [self._slot(table, q) for q in range(frontier, frontier + count)]
+            table = self._logical(table, max(self._covered(sequence), math.ceil((frontier + count) / self.page)))
             self.device_tables.pop(sequence, None)
         host = torch.full((batch.bucket,), self.dump * self.page, dtype=torch.int64)
         if slots:
             host[:len(slots)] = torch.tensor(slots, dtype=torch.int64)
         self.prompt_slots[:batch.bucket].copy_(host)
-        row = torch.full((self.pages,), self.dump, dtype=torch.int32)
+        row = torch.full((self.table_pages,), self.dump, dtype=torch.int32)
         if table:
             row[:len(table)] = torch.tensor(table, dtype=torch.int32)
         self.prompt_table[0].copy_(row)
@@ -503,17 +543,25 @@ class KVPool:
         capacity = int(capacity)
         if capacity < max(length, 1):
             raise ValueError(f"sequence {sequence!r} holds {length} positions: a capacity of {capacity} is too small")
-        wanted = max(0, math.ceil(capacity / self.page) - len(table))
+        if capacity > self.table_pages * self.page:
+            raise ValueError(f"a capacity of {capacity} positions is past the pool's page tables "
+                             f"({self.table_pages * self.page} positions: KVPool positions)")
+        logical = math.ceil(capacity / self.page)
+        wanted = max(0, self._held(logical) - len(table))
         if wanted > len(self.free):
             raise MemoryError(f"binding {sequence!r} up to {capacity} positions takes {wanted} pages; "
                               f"{len(self.free)} of the KV pool's {self.pages} are free")
-        while len(table) * self.page < capacity:
+        while len(table) < self._held(logical):
             table.append(self._take())
-        for p in range(length // self.page, len(table)):
+        reach = logical if self.sliding else max(logical, len(table))   # the logical pages the round may write
+        for p in self._indices(length // self.page, reach):
             if self.refs[table[p]] > 1:
                 table[p] = self._copy(table[p])
-        row = torch.full((self.pages,), self.dump, dtype=torch.int32)
-        row[:len(table)] = torch.tensor(table, dtype=torch.int32)
+        if self.sliding:
+            self.reached[sequence] = max(self.reached[sequence], logical)
+        row = torch.full((self.table_pages,), self.dump, dtype=torch.int32)
+        expanded = self._logical(table, reach)
+        row[:len(expanded)] = torch.tensor(expanded, dtype=torch.int32)
         self.round_tables[slot].copy_(row)
         self.round_capacity[slot] = capacity
         self.round_lengths[slot] = length
@@ -576,7 +624,7 @@ class KVPool:
         slot where a position lies outside its slot's capacity."""
         torch = self.torch
         capacity = self.round_capacity.index_select(0, slot)
-        page = self.round_tables[slot, (positions // self.page).clamp(0, self.pages - 1)]
+        page = self.round_tables[slot, (positions // self.page).clamp(0, self.table_pages - 1)]
         inside = (positions >= 0) & (positions < capacity)
         return torch.where(inside, page.long() * self.page + positions % self.page, self.dump * self.page)
 
@@ -616,6 +664,50 @@ class KVPool:
             slot = self.slot_of.get(sequence)
             if slot is not None:
                 self.round_tables[slot, :len(table)].copy_(self.torch.tensor(table, dtype=self.torch.int32))
+
+    # -- sliding rings ---------------------------------------------------------------------------------------------------
+    def _index(self, p):
+        """The table index of logical page p: p, or its ring page p mod ring."""
+        return p % self.ring if self.sliding else p
+
+    def _held(self, logical):
+        """The pages a sequence holds to cover `logical` logical pages: all of them, or at most its ring."""
+        return min(logical, self.ring) if self.sliding else logical
+
+    def _indices(self, lo, hi):
+        """The table indices of logical pages lo .. hi - 1, each once."""
+        if not self.sliding:
+            return range(lo, hi)
+        return sorted({p % self.ring for p in range(lo, hi)})
+
+    def _wrapped(self, sequence):
+        return bool(self.sliding) and self.reached.get(sequence, 0) > self.ring
+
+    def _covered(self, sequence):
+        """The logical pages a sequence's positions are reserved through."""
+        return self.reached.get(sequence, 0) if self.sliding else len(self._table(sequence))
+
+    def _slot(self, table, q):
+        return table[self._index(q // self.page)] * self.page + q % self.page
+
+    def _logical(self, table, n):
+        """The sequence's page ids for logical pages 0 .. n - 1 (a ring expanded, the table's prefix without one)."""
+        if not self.sliding:
+            return list(table[:n])
+        return [table[p % self.ring] for p in range(n)] if table else []
+
+    def _grow(self, sequence, table, count, last):
+        """The pages a row's positions up to `last` need, taken; a sliding pool checks its span and records them."""
+        if self.sliding:
+            if count > self.span:
+                raise ValueError(f"a row of {count} positions in one step is past the sliding pool's span "
+                                 f"({self.span}: KVPool span)")
+            if last >= self.table_pages * self.page:
+                raise ValueError(f"position {last} is past the pool's page tables ({self.table_pages * self.page} "
+                                 "positions: KVPool positions)")
+            self.reached[sequence] = max(self.reached[sequence], last // self.page + 1)
+        while len(table) < self._held(last // self.page + 1):
+            table.append(self._take())
 
     # -- pages -----------------------------------------------------------------------------------------------------------
     def _table(self, sequence):
@@ -660,9 +752,9 @@ class KVPool:
         for sequence, count, position in rows:
             table = self._table(sequence)
             last = position + count - 1
-            grow = max(0, last // self.page + 1 - len(table))
-            shared = sum(1 for p in range(position // self.page, min(len(table), last // self.page + 1))
-                         if self.refs[table[p]] > 1)
+            grow = max(0, self._held(last // self.page + 1) - len(table))
+            shared = sum(1 for p in self._indices(position // self.page, last // self.page + 1)
+                         if p < len(table) and self.refs[table[p]] > 1)
             need += grow + shared
         if need and self.free:
             top = max(heapq.nsmallest(min(need, len(self.free)), self.free))

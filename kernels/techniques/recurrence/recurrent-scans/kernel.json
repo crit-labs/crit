@@ -268,7 +268,12 @@
     },
     "delta-prefill-64": {
       "what": "gated_delta_prefill for 64 key dims: the same two passes as delta-prefill-rb with a thread per row and 16 columns (pass 1) or 16 value columns (pass 2), shared values one per FMA; untuned",
-      "call": "gated_delta_prefill"
+      "call": "gated_delta_prefill",
+      "rows": [1, 1048576],
+      "tune_rows": [1, 64, 700],
+      "key": ["k_heads", "v_heads", "dk", "dv"],
+      "row_invariant": false,
+      "bench": "bench.py:DeltaPrefill64"
     },
     "pool-replay": {
       "what": "pool_delta_replay: a round's commit over every layer, the accepted stashed steps replayed from the start state (recompute) or each sequence's pending count applied (flush), block per (value head, 32 value columns, row) walking the layers; untuned (its blocks are the pending counts' slots)",
@@ -284,23 +289,48 @@
     },
     "conv-segments": {
       "what": "conv_segments: one long row out of place, a thread per (channel, 32 rows), the bits of pool_conv's; untuned",
-      "call": "conv_segments"
+      "call": "conv_segments",
+      "rows": [1, 1048576],
+      "tune_rows": [1, 64, 700],
+      "key": ["channels", "width"],
+      "row_invariant": false,
+      "bench": "bench.py:ConvSegments"
     },
     "delta-columns": {
       "what": "gated_delta_scan: one sequence's column scan for decode and verify from FP32 inputs, block per (value head, 32 value columns), optionally writing the state after every token; untuned",
-      "call": "gated_delta_scan"
+      "call": "gated_delta_scan",
+      "rows": [1, 64],
+      "tune_rows": [1, 4, 16],
+      "key": ["k_heads", "v_heads", "dk", "dv"],
+      "row_invariant": false,
+      "bench": "bench.py:DeltaColumns"
     },
     "causal-conv": {
       "what": "causal_conv1d: one sequence's convolution with its carried window, a thread per channel (in place) or per (channel, 32 rows) out of place; untuned",
-      "call": "causal_conv1d"
+      "call": "causal_conv1d",
+      "rows": [1, 1048576],
+      "tune_rows": [1, 64, 700],
+      "key": ["channels", "width"],
+      "row_invariant": false,
+      "bench": "bench.py:CausalConv"
     },
     "ssd-prefill": {
       "what": "ssd_prefill: Mamba-2's two-pass chunked prefill (64-token chunks), block per head and chunk, then per head and 32 rows of head_dim; untuned",
-      "call": "ssd_prefill"
+      "call": "ssd_prefill",
+      "rows": [1, 1048576],
+      "tune_rows": [1, 64, 300],
+      "key": ["heads", "head_dim", "groups", "state"],
+      "row_invariant": false,
+      "bench": "bench.py:SsdPrefill"
     },
     "ssd-columns": {
       "what": "ssd_scan: Mamba-2's column scan, block per (head, 8 rows of head_dim), a warp a row; untuned",
-      "call": "ssd_scan"
+      "call": "ssd_scan",
+      "rows": [1, 64],
+      "tune_rows": [1, 4, 16],
+      "key": ["heads", "head_dim", "groups", "state"],
+      "row_invariant": false,
+      "bench": "bench.py:SsdColumns"
     }
   }
 }

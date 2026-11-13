@@ -83,13 +83,15 @@ its launch command in `configuration.engine`, and `crit run` records, checks, me
 - **Start from the selection.** Choose the `model` plugin for the checkpoint's architecture, then a plugin for each
   slot it calls, from crit's library and crit-hub (`crit plugins list --model MODEL --device cuda` lists what fits
   and the slots nothing fits; `crit plugins add`). Put your own device code inside a plugin where it pays, keep each
-  plugin's tests against its reference passing (`crit plugins test`) and declare the devices it runs on. The
-  library's host references are oracles and never serve.
+  plugin's tests against its reference passing (`crit plugins test`) and declare the devices it runs on. A model
+  plugin you write tests on a small random checkpoint with every part the real one ships (its draft layers too).
+  The library's host references are oracles and never serve.
 - **The slots do the work.** Core's loader refuses an engine whose model plugin never called a computing slot or
   never asked the placement plugin where its tensors live: a slot's arithmetic lives in that slot's plugin.
 - **Every engine batches.** The model plugin's `step(rows)` computes many requests' prompt chunks and decode rows at
   once and declares `max_concurrency` of 2 or more. A row's tokens never depend on the rows beside it: split decode
-  rows at `crit_plugins.device.invariant_rows(projections)` ([row invariance](docs/PLUGINS.md#row-invariance)). It
+  rows at `crit_plugins.device.invariant_rows(projections)` and pass each prompt chunk to `matmul` with `prompt=True`,
+  so a short prompt is not multiplied as decode rows ([row invariance](docs/PLUGINS.md#row-invariance)). It
   serves token log-probabilities with 20 alternatives, fixed-text scores and, when the selection drafts, plain
   decoding on request.
 - **Rounds and prompt chunks in graphs.** Decode rounds go through Core's round driver (`crit_plugins.rounds`,
@@ -103,8 +105,9 @@ its launch command in `configuration.engine`, and `crit run` records, checks, me
   `operations.json` says what each device operation computes and how a kernel is checked against it.
 - **[Kernels](kernels/README.md):** crit's kernels are templates in `kernels/techniques/<family>/<id>/`, built on this machine
   for its GPU; `crit kernels sweep ID --model MODEL` tunes each one's knobs (warps, tiles, splits, stages) on the
-  model's shapes against the operation's reference. Sweep the kernels the selection's plugins load and point the
-  engine at the tuning (`CRIT_KERNEL_TUNING`). Pick each operation's kernel in [three levels](kernels/README.md#levels):
+  model's shapes against the operation's reference. Sweep the kernels the selection's plugins load into the candidate's source
+  (`--out tuning`; `--matrices` with the candidate's serve --check report tunes exactly the shapes it loaded) and name that folder in the configuration (`"kernel_tuning": "tuning"`), so the package carries it;
+  `CRIT_KERNEL_TUNING` is for a quick try, and no package or launcher carries it. Pick each operation's kernel in [three levels](kernels/README.md#levels):
   (1) crit's kernel wherever one covers the operation, swept for the model; (2) only where crit has none, a
   [library's](kernels/README.md#libraries); (3) where neither fits, a kernel the engine writes. A crit kernel that trails its
   library yardstick is a lead for a better structure or knob, never a reason to swap in the library. Measure each
@@ -143,8 +146,9 @@ measures it:
 The segment's last budgeted candidate always takes the full Eval, and only the full Eval qualifies a candidate. A
 candidate that fails to build or pass `serve --check` is a draft: seal it with what stopped it and build the fix
 from the same plan, at no cost to the budget. So check a candidate fully before its Eval: an Eval of a broken engine
-spends a candidate. `serve --check --data EVAL_DATA` is that check: the plugin tests, the serving checks,
-[crit smoke](smoke/README.md) at the run's context and at a quarter of it, and Eval's pre-check of the gates rounds
+spends a candidate. `serve --check --data EVAL_DATA` is that check: the plugin tests, the serving checks, one
+request at the full context (its slowest prompt step against crit serve's one-second cancel grace, the least free
+device memory against the run's headroom), [crit smoke](smoke/README.md) at the run's context and at a quarter of it, and Eval's pre-check of the gates rounds
 most often fail on. Fix what it fails before spending a round. `crit smoke --url` runs the smoke suite against any
 served engine while you build.
 
@@ -241,7 +245,9 @@ How to judge a round:
 - **Long jobs.** Downloads, `crit eval reference`, Evals and builds take minutes to hours. Run each as a background
   command your harness tracks and wakes you on (never a detached `nohup`, `setsid` or `wsl ... &`, never a sleep
   loop), and never end a turn without such a wake pending. While one holds the GPU, do the next round's CPU work. An
-  Eval that stopped goes on with `crit run ... eval --resume`, never from the start.
+  Eval that stopped goes on with `crit run ... eval --resume`, never from the start. A session restart ends the
+  jobs it started: when you resume, read what each left (its log, its outputs) before anything else, and run again
+  what died.
 
 ## 4. Deliver a served engine
 
@@ -250,7 +256,9 @@ resident adapter ([serving](docs/SERVING.md#cores-resident-adapter)), which brin
 per-request sampling, streaming, log-probabilities, scores and concurrent requests for every engine. The plugins load
 weights once; keep model allocations across requests and switches through the serving context's device leases
 (`context.serving`); keep request state private to a session; honor cancellation and cleanup through Core's
-decisions (`commit`, `retire`). After sealing, verify candidate switching with `crit serve`. Report anything
+decisions (`commit`, `retire`). A cancel must settle within crit serve's fixed one-second grace, or the host is
+retired with its weights: size prompt chunks so the slowest, at the full context, finishes well inside it. After sealing, verify candidate switching with `crit serve`: serve the selected
+candidate, switch to another sealed one and back, and compare a greedy reply before and after. Report anything
 unverified.
 
 ## 5. Critique and hand off
@@ -264,7 +272,9 @@ distance. Effort, time and candidate count are not causes.
 Write `summary.md` at the run root and tell the user: target and workload; baseline versus recommended candidate;
 gains and tradeoffs; checks and limitations; techniques and kernels; Eval results and missing coverage; remaining
 work; source and package paths. Say when none qualified. Put toolkit feedback here, not into Core or Inference.
-Record the cost with `crit run ... cost --transcript <your session transcript> --agent "<agent and model>"`.
+Record the cost with `crit run ... cost --transcript <your session transcript> --agent "<agent and model>"`, and name
+with `--idle FROM..UNTIL` each stretch your session was offline with nothing running (a restart, a lost
+connection), so the record gives the active hours beside the wall hours.
 
 Always give the actual candidate and its serve command, and run it once with `--write-launchers` (it writes
 `serve.cmd` and `serve.sh` into the run folder):

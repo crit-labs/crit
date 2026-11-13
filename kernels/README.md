@@ -49,8 +49,8 @@ level 1 for every engine.
 
 | Family | Kernels |
 | --- | --- |
-| `projections` | [decode-gemv](techniques/projections/decode-gemv/README.md) (CUDA GEMVs and gemv-triton, one Triton GEMV for every weight format), [mma-rows](techniques/projections/mma-rows/README.md), [pinned-gemm](techniques/projections/pinned-gemm/README.md), [fixed-tile-gemm](techniques/projections/fixed-tile-gemm/README.md), [fp8-block-rows](techniques/projections/fp8-block-rows/README.md) |
-| `attention` | [paged-kv-attention](techniques/attention/paged-kv-attention/README.md) |
+| `projections` | [decode-gemv](techniques/projections/decode-gemv/README.md) (CUDA GEMVs and gemv-triton, one Triton GEMV for every weight format), [mma-rows](techniques/projections/mma-rows/README.md), [pinned-gemm](techniques/projections/pinned-gemm/README.md), [fixed-tile-gemm](techniques/projections/fixed-tile-gemm/README.md), [fp8-block-rows](techniques/projections/fp8-block-rows/README.md), [exl3-rows](techniques/projections/exl3-rows/README.md) (EXL3 checkpoints at their stored bits), [gguf-rows](techniques/projections/gguf-rows/README.md) (GGUF block formats at their stored bits) |
+| `attention` | [paged-kv-attention](techniques/attention/paged-kv-attention/README.md), [latent-attention](techniques/attention/latent-attention/README.md) (latent (MLA) decode and verify windows over a paged cache of compressed rows) |
 | `recurrence` | [recurrent-scans](techniques/recurrence/recurrent-scans/README.md) |
 | `experts` | [grouped-experts](techniques/experts/grouped-experts/README.md), [int-block-experts](techniques/experts/int-block-experts/README.md), [topk-routing](techniques/experts/topk-routing/README.md) |
 | `norms` | [fused-norms](techniques/norms/fused-norms/README.md) |
@@ -60,14 +60,20 @@ level 1 for every engine.
 crit kernels list                                        # every kernel: operations, structures
 crit kernels build ID                                    # build for this GPU with the default knobs (cached)
 crit kernels sweep ID --model CHECKPOINT --out TUNING    # tune the knobs for a model on this GPU
-CRIT_KERNEL_TUNING=TUNING crit serve ...                 # the engine's plugins build with that tuning
+crit kernels gates ID --model CHECKPOINT                 # NaN, repeats, tile edges, FP32 sums, every arch's limits
+crit kernels report --model A --model B --markdown R.md  # every kernel: gates and speed against its library
+"kernel_tuning": "tuning" in configuration.json            # the package's plugins build with its tuning folder
+CRIT_KERNEL_TUNING=TUNING crit serve ...                 # or, for a try, a folder no package carries
 ```
 
 `crit kernels sweep` builds every knob configuration of each structure a kernel declares (many configurations a
 build, picked at run time), checks each against the operation's reference and against crit's row-invariance contract
-(a row's bits never depend on the rows beside it), times it on the checkpoint's own shapes with a cold L2, and writes
+(a row's bits never depend on the rows beside it), times it on the checkpoint's own shapes (and the stacked matrices engines load, such as q, k and v together) with a cold L2 (`--matrices` with a candidate's serve --check report: exactly the shapes its engine loaded,
+from quantized-projections' `matrices` fact), and writes
 `TUNING/<ID>.json` (the table per shape and row count) and a report against the default knobs. A knob that changes
-the summation order keeps one value a shape for every row count. A library plugin loads a kernel by id
+the summation order keeps one value a shape for every row count. A sweep stopped part way (SIGTERM or Ctrl+C)
+writes its table from what it measured, every structure's defaults first, and its report names what it did not measure;
+stopped during its builds, it ends them and writes the table of every structure's defaults, saying how many builds were done. A library plugin loads a kernel by id
 (`crit_plugins.kernels.load_kernel`), built with the engine's tuning or with the default knobs, which reproduce the
 kernel as it was hand-tuned, and falls back to its torch path when the kernel cannot be built here (no CUDA toolkit,
 an architecture it does not cover). Builds need torch with CUDA, the CUDA toolkit (nvcc) and ninja; they are cached
@@ -82,6 +88,47 @@ A mechanism mined from an engineered kernel is welcome as a core block or a stru
 better](#salvage)), with the notice its license asks for where code is adapted.
 [TEMPLATES.md](TEMPLATES.md) is the contract: the folder, kernel.json, knobs in CUDA and Triton code, the core, the
 sweep's bench.
+
+<a id="one-gpu"></a>
+
+## Guarding against one GPU
+
+crit's kernels are written, tuned and measured mostly on one GPU, an RTX 5090 (sm_120), the reference device of
+crit's own tests and bounties. A kernel being faster there says nothing about another GPU: a tile, warp count or stage
+count that wins on one GPU loses on another, an instruction one generation has is missing on the next, and a library
+that is weak on one GPU is the best kernel on another. So the library keeps what is the same on every GPU and lets each
+GPU decide the rest:
+
+| What was found on one GPU | Where it goes | Never |
+| --- | --- | --- |
+| A faster warp count, tile, split or stage count | A knob value; the sweep picks it per GPU and shape | A constant, or a default other GPUs inherit as their tuning |
+| A device limit (shared memory a block, registers, SMs) | Read from the device (`crit_kernels.gates.shared_memory_optin()`, the device's properties) | One GPU's figure written into a kernel or a bench's `valid()` |
+| An instruction one GPU generation has (block-scaled FP4/FP8 MMA, TMA, hardware E2M1 conversion) | Behind a feature check (`crit_kcore/arch.cuh`'s `CRIT_KCORE_HAS_*`, or a probe), with the path for the other GPUs beside it | The only path; a dispatch on one GPU's name |
+| A new way of computing an operation that wins | A new structure beside the ones it beat; the sweep chooses between them on every GPU | Rewriting or removing the structure it beat |
+| A speedup | A number naming its device, model and workload | "Faster than library X" without the device |
+
+What enforces it:
+
+- **Tunings belong to the GPU they were swept on.** The sweep writes the GPU's name and compute capability into each
+  tuning. A tuning found implicitly (an engine package's `kernel_tuning`, `CRIT_KERNEL_TUNING`) that was swept on
+  another compute capability is not applied: the kernel builds with its default knobs, its record in the engine's
+  facts says `built` with the reason, and stderr says so once. Given explicitly (`crit kernels build --tuning`,
+  `gates --tuning`), it is used with a warning.
+- **The fallback path is tested on the reference GPU.** A structure with an architecture-specific path proves the
+  path the other GPUs run on the reference GPU too, against the same reference: a build for the plain target
+  (decode-gemv's plain sm_120 variant without the hardware E2M1 conversion), a software decode beside the hardware one,
+  or the generic path called directly.
+- **Every architecture a kernel claims builds in CI.** The [kernels workflow](../.github/workflows/kernels.yml)
+  compiles every CUDA kernel for every compute capability in its `kernel.json` and runs the `limits` gate, with the CUDA
+  toolkit and no GPU. Compiling is not running: a capability whose kernels have not run on a GPU of it is
+  compile-checked, and docs say so.
+- **Structures leave only on evidence from more than one GPU.** A structure is removed only when it loses on every
+  GPU and shape it was measured on, more than one GPU among them, and another structure covers every GPU it ran on.
+
+Where the library stands today: every measurement in these folders is from one RTX 5090. sm_80 to sm_121 are
+compile-checked; Kernel Core's wgmma (sm_90) and tcgen05 (sm_100) wrappers are compile-checked and no technique uses
+them yet, so Hopper and datacenter Blackwell run the same `mma.sync` paths as Ampere. A gate or test run on another GPU
+is a welcome contribution: its report names the device.
 
 <a id="libraries"></a>
 

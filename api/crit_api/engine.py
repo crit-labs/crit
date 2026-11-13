@@ -575,6 +575,7 @@ class ServedEngine:
             if self.ownership.failed_tree:
                 self.ownership.failed_tree.close()
                 self.ownership.failed_tree = None
+            self.runtime.announce("closed")
             self.runtime.close()
         except BaseException as exc:
             self.ownership.block("Engine cleanup failed: " + str(exc))
@@ -790,6 +791,8 @@ class ServedEngine:
         if result["status"] in {"cancelled", "timed_out"}:
             # Settled cooperative cancellation keeps the weights resident.
             self._check_stopping()
+            if result.get("consumer_error") is not None:
+                raise result["consumer_error"]   # a client gone mid-write: its turn is cancelled, the host kept
             return result["status"], None
         if result["status"] == "rejected":
             raise rejected(result)  # refused before running: the host settled and keeps the engine
@@ -1022,6 +1025,7 @@ class ServedEngine:
 
     def _retire(self, error):
         """A failed request retires the host process; the next request loads the engine again."""
+        self.runtime.announce(f"retired after an error, its weights released: {error}")
         try:
             self.runtime.close()
         except BaseException as exc:

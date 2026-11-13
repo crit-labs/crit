@@ -3,9 +3,9 @@ safetensors, GGUF, PyTorch state-dict and ONNX headers, safetensors tensor bytes
 weight matrices are stored (schemes), and config.json rules."""
 from .config import (CONFIG_NAME, FULL_ATTENTION, LINEAR_ATTENTION, OTHER, SLIDING_ATTENTION, ConfigError,
                      LinearAttentionConfig, MlaConfig, ModelConfig, MoeConfig, QuantizationConfig, RopeConfig,
-                     RopeLayer, attention_shape, effective_head_dim, effective_kv_heads, fixed_state_bytes,
-                     kv_elements_per_token, layer_kinds, load_model_config, parse_model_config, position_limit,
-                     text_section)
+                     RopeLayer, attention_geometry, attention_shape, effective_head_dim, effective_kv_heads,
+                     fixed_state_bytes, kv_elements_per_token, layer_kinds, load_model_config, parse_model_config,
+                     position_limit, text_section)
 from .gguf import (GGML_TYPES, GgufCheck, GgufError, GgufFile, GgufModel, check_gguf_folder, find_gguf,
                    inspect_gguf, inspect_gguf_model)
 from .source import FORMATS, ModelFormat, ModelSource, ModelSourceError, open_model
@@ -20,8 +20,9 @@ from .torch_pickle import TorchCheckpoint, TorchFile, TorchFileError, inspect_to
 __all__ = [
     "CONFIG_NAME", "FULL_ATTENTION", "LINEAR_ATTENTION", "OTHER", "SLIDING_ATTENTION", "ConfigError",
     "LinearAttentionConfig", "MlaConfig", "ModelConfig", "MoeConfig", "QuantizationConfig", "RopeConfig",
-    "RopeLayer", "attention_shape", "effective_head_dim", "effective_kv_heads", "fixed_state_bytes",
-    "kv_elements_per_token", "layer_kinds", "load_model_config", "parse_model_config", "position_limit", "text_section",
+    "RopeLayer", "attention_geometry", "attention_shape", "effective_head_dim", "effective_kv_heads",
+    "fixed_state_bytes", "kv_elements_per_token", "layer_kinds", "load_model_config", "parse_model_config",
+    "position_limit", "text_section",
     "DTYPE_BITS", "Checkpoint", "IndexPolicy", "Limits", "SafetensorsError", "ShardInfo", "TensorInfo",
     "inspect_model", "inspect_safetensors", "TensorReader", "open_tensors",
     "PART_SCHEMES", "RECOGNISERS", "SchemeError", "StoredMatrix", "csf_scale_shape", "fp8_block", "layer_prefix",

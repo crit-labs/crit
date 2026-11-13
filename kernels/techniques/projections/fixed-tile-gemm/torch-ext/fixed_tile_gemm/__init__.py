@@ -79,7 +79,7 @@ def _split_kernel(x_ptr, w_ptr, p_ptr, M, N, K, KC, stride_xm, stride_wn,
 def _split_sum_kernel(p_ptr, out_ptr, M, N, stride_om, S: tl.constexpr, BLOCK: tl.constexpr):
     """out = the partials p[0] + p[1] + ... in split order, rounded once to out's dtype."""
     i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    mn = M.to(tl.int64) * N
+    mn = tl.full([], M, tl.int64) * N   # M is a plain int where Triton specializes a 1 (one-row calls)
     m = i < mn
     acc = tl.load(p_ptr + i, mask=m, other=0.0)
     for s in tl.static_range(1, S):

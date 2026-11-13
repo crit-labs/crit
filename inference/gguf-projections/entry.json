@@ -1,0 +1,76 @@
+{
+  "id": "gguf-projections",
+  "category": "projections",
+  "summary": "A GGUF checkpoint's quantized matrices (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, MXFP4) in the projections slot at their stored bits: decode rows on crit's kernel gguf-rows, prompt rows dequantized for cuBLAS or on gguf-rows' GEMM with the decode rows' bits",
+  "implementation_status": "reference",
+  "implementation_scope": "The projections slot's host form over GGUF block formats (code/host.py: a Q8_0 encoder of dense rows, the stored values from Core's exact decoders crit_core.model.gguf_blocks, an exact-sum projection) and its device form (plugin.py): matrices loaded from the file's stored rows (GgufTensors), decode rows and expert stacks on crit's kernel gguf-rows' gemv, prompt rows either dequantized to BF16 for cuBLAS or on gguf-rows' gemm; the host-decoded BF16 values through torch where the kernel cannot be built. Every compute kernel is crit's gguf-rows or cuBLAS.",
+  "agent_guidance": {
+    "use_when": "An engine serves a GGUF checkpoint and its matrices are in the formats listed: decode reads the weights at their stored bits instead of a 16-bit copy",
+    "avoid_when": "The checkpoint's matrices are in other GGUF types (the ternary TQ1_0 and TQ2_0), or the engine fuses the projection with its neighbours in its own kernel",
+    "provides": [
+      "gguf:<TYPE> matrices loaded from their stored rows, on the device at the stored size",
+      "Decode rows on dp4a over the stored blocks, each row's bits its own",
+      "An expert stack's rows each against their own expert (matmul_experts)",
+      "Prompt rows dequantized for cuBLAS, or with the decode rows' bits (prompt exact)",
+      "A host-decoded BF16 fallback"
+    ],
+    "engine_supplies": [
+      "The tensor names and which matrices to load, stack and permute (the file's converter may reorder some rows)",
+      "The checkpoint's dense tensors (norms, embeddings) and everything else in the model"
+    ],
+    "preserve": [
+      "The stored blocks as the file has them",
+      "A decode row's bits independent of the rows beside it",
+      "prompt exact: a prompt row's bits those of its decode row"
+    ],
+    "adapt": [
+      "Which prompt path a model takes, by its speed and the honesty its quality mode asks",
+      "Fusing the activation quantization into the norm before the projection"
+    ]
+  },
+  "path": "inference/gguf-projections/README.md",
+  "code_path": "inference/gguf-projections/code",
+  "code_files": [
+    {
+      "path": "inference/gguf-projections/code/host.py",
+      "purpose": "The host form: Q8_0 encoding of dense rows, the stored values from Core's decoders, the exact-sum projection"
+    }
+  ],
+  "requires": {
+    "hardware": "Python 3.11+ and numpy for the host form; a CUDA GPU (sm_80 on) with torch for the device form, crit's kernel gguf-rows where it builds",
+    "model": "A GGUF checkpoint whose matrices are Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS or MXFP4",
+    "workload": "Decode rows, verify windows and prompt chunks"
+  },
+  "contract": {
+    "input": "A matrix's stored rows uint8 [N][row bytes] (or [experts][N][row bytes]) with its format gguf:<TYPE>, or a dense weight as bf16; activations [tokens][K] in BF16, FP16 or FP32",
+    "output": "y [tokens][N] in BF16, or out_dtype",
+    "ownership": "The plugin copies the stored rows to the device at load; the caller owns activations and outputs",
+    "failure": "Other formats, rows that are no whole number of the format's blocks and re-encoding requests raise ValueError at load",
+    "core_boundary": "Core reads the file's tensors (GgufTensors) and decodes the formats on the host (gguf_blocks); the model plugin chooses the tensors; this plugin multiplies"
+  },
+  "dependencies": [
+    "numpy",
+    "torch for the device form",
+    "crit's kernel gguf-rows (kernels/techniques/projections/gguf-rows) for the stored-bit paths"
+  ],
+  "symbols": [
+    "encode_q8_0",
+    "project_rows",
+    "dense_rows",
+    "GgufWeight",
+    "GgufProjections",
+    "matmul_experts"
+  ],
+  "interactions": [
+    "quantized-projections",
+    "grouped-experts"
+  ],
+  "techniques": [
+    "gguf-projections"
+  ],
+  "validation": {
+    "host": "Q8_0 encoding within half a block step of the dense rows; exact sums over the stored values",
+    "native": "tests/test_plugin.py on CUDA against gguf-rows' gemv and dequantize bit for bit, cuBLAS on the stored values, the decode rows' bits for exact prompt rows, expert stacks, the fallback",
+    "performance": "gguf-rows' README: decode rows at 71-96% of an RTX 5090's probed bandwidth; the dequantize prompt path at cuBLAS's BF16 speed plus one decode of the matrix a call"
+  }
+}

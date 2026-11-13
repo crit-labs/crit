@@ -96,7 +96,7 @@ THINKING_BUDGET_CAPABILITY = "chat-thinking-budget-v1"
 # keeps no prompt cache (crit-eval then sends it no follow-up turns). plugins: the plugin filling each slot of an
 # engine built from plugins (crit_plugins.Assembly.facts), so a client sees which ones the loaded engine runs.
 ENGINE_FACTS = ("speculative", "plain", "draft_width", "bytes_per_pass", "host_bytes_per_pass", "draft_bytes_per_step",
-                "draft_ms", "kv_bytes_per_token", "prompt_activations", "prompt_cache", "plugins", "kernels")
+                "draft_ms", "kv_bytes_per_token", "prompt_activations", "prompt_cache", "plugins", "kernels", "matrices")
 # What a generation's timing may report beside its phases, for crit serve's telemetry and an Eval adapter's results:
 # the drafting facts (drafts accepted and made per round, device time in verify passes and draft steps), which plain
 # decoding has none of, and the device expert cache's routed reads and hits, which every decode has.
@@ -243,6 +243,13 @@ def engine_facts(engine):
                                                v.get("source") in ("tuned", "built", "fallback") for k, v in value.items()):
                 out[key] = {k: {f: v[f] for f in ("source", "tuning", "reason", "plugins") if f in v}
                             for k, v in value.items()}
+        elif key == "matrices":
+            # The matrix shapes the projections loaded, as the model stacked them ({N, K, format}): crit kernels sweep
+            # --matrices tunes for exactly these.
+            if isinstance(value, list) and value and all(
+                    isinstance(m, dict) and isinstance(m.get("N"), int) and isinstance(m.get("K"), int)
+                    and isinstance(m.get("format"), str) for m in value):
+                out[key] = [{"N": m["N"], "K": m["K"], "format": m["format"]} for m in value]
         elif key == "host_bytes_per_pass":
             # The part of bytes_per_pass read from host memory: {"link": copied over the host link, "cpu": computed
             # by the CPU}, which crit-eval prices at the probe's host rates.

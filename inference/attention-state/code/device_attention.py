@@ -135,8 +135,12 @@ def _too_small(tokens):
 
 
 class DeviceAttention:
+    _sinks = None   # forward()'s sinks and sliding window for the call it is in
+    _sliding = 0
+
     def __init__(self, kernels=None, mode="auto", int8_qk=False, decode="split", partitions=0, piece=0, device=None,
-                 kernels_mib=128, flashinfer="off", flashinfer_mib=128, prompt_reader="prefill", reader="split"):
+                 kernels_mib=128, flashinfer="off", flashinfer_mib=128, prompt_reader="prefill", reader="split",
+                 latent=None):
         """decode: what reads a step's window rows: "split" (the split-KV reader, as captured rounds read them: a
         decode row's bits the same in a step and in a round) or "flashinfer" (FlashInfer's decode and prefill over
         16-bit and FP8 pages where it serves, another reduction than a round's). prompt_reader: "prefill" (prompt rows
@@ -148,7 +152,8 @@ class DeviceAttention:
         a KV head's query heads packed into tensor-core tiles, and the flash prompt chunk; partitions and piece do not
         apply; block lists stay on the split launch) or "cuda" (the same through the CUDA flash tile: cuda-window,
         cuda-fused and cuda-prefill, one chunk and block per pool, cuda_chunk(); int8_qk prompt chunks stay on the
-        Triton flash prompt chunk)."""
+        Triton flash prompt chunk). latent: a callable giving crit's latent-attention module (built on first use), or
+        None: latent attention (forward's latent) in torch."""
         if decode not in ("split", "flashinfer"):
             raise ValueError(f"decode is split or flashinfer, not {decode!r}")
         if prompt_reader not in ("prefill", "decode"):
@@ -159,6 +164,7 @@ class DeviceAttention:
             raise ValueError("int8_qk is the prompt reader's (INT8 query-key products): prompt_reader decode reads "
                              "prompt rows as decode rows")
         self.kernels = kernels          # crit's paged-kv-attention module, or None
+        self._latent_loader, self._latent_kernels = latent, False
         # flash: False (reader split), True (the Triton flash structures) or "cuda" (the CUDA flash tile), as the
         # kernel's attend and prefill take it.
         self.prompt_reader, self.flash = prompt_reader, {"split": False, "flash": True, "cuda": "cuda"}[reader]
@@ -170,6 +176,7 @@ class DeviceAttention:
             raise ValueError(f"a piece is a power of two of 16 to 128 positions (0: the kernel's own), not {piece}")
         self._steps = {}                # what a step plans at its first layer, by kind: kind -> (key, plan)
         self._parts, self._prompt_rows, self._widths, self._warmed = {}, {}, {}, set()
+        self._prompt_kernels = {}       # (head width, value width, query dtype, page kind, device) -> CUDA prompt chunk
         # Everything allocated now, as memory() declares it (device_memory): the split-KV reader's partials, and
         # FlashInfer's scheduling workspace and wrappers.
         self.split_workspace = self.flashinfer_workspace = None
@@ -223,7 +230,7 @@ class DeviceAttention:
                 found["prompt_rows"] = ("not row-invariant (reader cuda): crit's prompt reader is the CUDA flash "
                                         "prompt chunk, which splits a chunk's positions by its length, so a prompt "
                                         "token's bits follow the chunk it is read in (as FlashInfer's prefill, another "
-                                        "reduction than decode rows'); reader split keeps crit's earlier prompt "
+                                        "reduction than decode rows'); reader split keeps a row-invariant prompt "
                                         "reader")
         elif self.flash:
             found["reader"] = ("flash (reader flash): window rows (decode tokens, verify windows, trees, captured rounds, "
@@ -235,7 +242,7 @@ class DeviceAttention:
                 found["prompt_rows"] = ("not row-invariant (reader flash): crit's prompt reader is the flash prompt "
                                         "chunk, which splits a chunk's positions by its length, so a prompt token's "
                                         "bits follow the chunk it is read in (as FlashInfer's prefill, another "
-                                        "reduction than decode rows'); reader split keeps crit's earlier prompt "
+                                        "reduction than decode rows'); reader split keeps a row-invariant prompt "
                                         "reader")
         if self.kernels is None or self.device is None or not str(self.device).startswith("cuda"):
             return found
@@ -258,7 +265,40 @@ class DeviceAttention:
         self._warmed.clear()
 
     # -- the device form -------------------------------------------------------------------------------------------------
-    def forward(self, layer, queries, pool, batch, scale=None, blocks=None, block_size=None, parents=None, lse=False):
+    def forward(self, layer, queries, pool, batch, scale=None, blocks=None, block_size=None, parents=None, lse=False,
+                sinks=None, sliding=0, latent=0):
+        """See _forward; sinks: FP32 [heads] on the queries' device, each query head's sink logit (natural log, in
+        the scaled scores' units; -inf: none), one more position with no value in every token's softmax (crit's
+        kernels take it on every reader; FlashInfer and torch's SDPA do not, so a call with sinks reads through the
+        split-KV reader or the masked softmax in torch). sliding: a sliding window, the positions a token sees, its
+        own included (0: all), on crit's kernels and the torch fallbacks, never with block lists; a sliding pool
+        (kv:sliding) is read with its own window unless a narrower one is given. latent: the rank R of latent
+        attention (attention:latent, _latent): a pool of keys only with one KV head, each position's row its latent
+        then its rotary key, the latent its value too."""
+        if latent:
+            if blocks is not None or parents is not None or sliding or getattr(pool, "sliding", 0):
+                raise ValueError("latent attention reads causal rows: no block lists, draft trees or sliding windows")
+            return self._latent(layer, queries, pool, batch, int(latent), scale, lse, sinks)
+        if sinks is not None:
+            torch = _torch()
+            if sinks.dtype != torch.float32 or tuple(sinks.shape) != (queries.shape[1],) or not sinks.is_contiguous() \
+                    or sinks.device != queries.device:
+                raise ValueError(f"sinks are contiguous FP32 [{queries.shape[1]}] on the queries' device")
+        sliding = int(sliding or 0)
+        ring = int(getattr(pool, "sliding", 0) or 0)   # a pool of sliding layers (kv:sliding) holds only their window
+        if ring:
+            if sliding > ring:
+                raise ValueError(f"a window of {sliding} positions over a sliding pool that keeps {ring}")
+            sliding = sliding or ring
+        if sliding < 0 or (sliding and blocks is not None):
+            raise ValueError("a sliding window is 0 (none) or a number of positions, without block lists")
+        self._sinks, self._sliding = sinks, sliding
+        try:
+            return self._forward(layer, queries, pool, batch, scale, blocks, block_size, parents, lse)
+        finally:
+            self._sinks, self._sliding = None, 0
+
+    def _forward(self, layer, queries, pool, batch, scale=None, blocks=None, block_size=None, parents=None, lse=False):
         """queries [tokens][heads][dim] of a StepBatch or RoundBatch over the pool's KV (written for this step
         already); each token sees its sequence's positions up to its own. blocks [tokens][k] KV block ids (block_size
         positions each, -1 for none): a token sees only those blocks' positions; parents [tokens]: each token's parent
@@ -288,7 +328,7 @@ class DeviceAttention:
                         _fresh(pool, layer, tokens, blocks, parents))
             return (out, found) if lse else out
         q = self._queries(queries, pool) if paged else queries
-        special = blocks is not None or parents is not None or lse
+        special = blocks is not None or parents is not None or lse or self._sinks is not None or self._sliding > 0
         reader = self.reader(pool, q, special) if paged else "torch"
         if getattr(pool, "step_rows", 0):
             windows = pool.windows
@@ -312,6 +352,97 @@ class DeviceAttention:
         if rest:
             self._prompts(layer, q, pool, batch, rest, scale, blocks, block_size, parents, out, found, reader)
         return (out, found) if lse else out
+
+    # -- latent attention (attention:latent) -------------------------------------------------------------------------
+    def _latent(self, layer, queries, pool, batch, rank, scale, lse, sinks):
+        """Latent attention (multi-head latent attention, absorbed): queries [tokens][heads][R + P] (the latent
+        part, the key up-projection absorbed, then the rotary part) over a pool of keys only with one KV head whose
+        rows are each position's latent then its rotary key -> out [tokens][heads][R] in the latent space (the value
+        up-projection follows in the model), and lse. Decode tokens, verify windows (up to 64 tokens) and captured
+        rounds through crit's latent-attention decode reader (attend: split over KV partitions, merged); prompt rows
+        and captured prompt chunks through its prompt reader (prefill: the chunk's tokens times heads in tiles, its
+        output written directly; another reduction than the decode reader's). Pages BF16, FP16 or fp8:row (E4M3 with a
+        scale a position); FP32 pools and a GPU without the kernel in torch."""
+        torch = _torch()
+        if pool.value_dim or pool.kv_heads != 1 or queries.shape[-1] != pool.head_dim:
+            raise ValueError(f"latent attention reads a pool of keys only (value_dim 0) with one KV head of the queries' "
+                             f"width ({queries.shape[-1]}): each position's latent then its rotary key")
+        if not 0 < rank < pool.head_dim:
+            raise ValueError(f"a latent rank of {rank} in rows of {pool.head_dim}")
+        scale = scale if scale is not None else queries.shape[-1] ** -0.5
+        tokens, heads = queries.shape[0], queries.shape[1]
+        kernels = self._latent_module(pool, queries)
+        dtype = torch.float16 if pool.dtype == "fp16" else torch.bfloat16
+        if kernels is None:
+            dtype = queries.dtype if pool.dtype == "fp32" else dtype
+        q = queries if queries.dtype == dtype and queries.stride(-1) == 1 else queries.to(dtype).contiguous()
+        out = q.new_empty(tokens, heads, rank)
+        found = q.new_empty(tokens, heads, dtype=torch.float32) if lse else None
+        if kernels is None:
+            if batch.prompt or batch.round:
+                raise ValueError("latent attention in a captured round or prompt chunk reads through crit's "
+                                 "latent-attention kernel (a CUDA pool of BF16, FP16 or fp8:row pages)")
+            self._latent_torch(layer, q, pool, batch, rank, scale, sinks, out, found)
+            return (out, found) if lse else out
+        i = pool.layers[layer]
+        cache = pool.k[i].view(pool.pages + 1, pool.page, pool.head_dim)
+        scales = pool.k_scales[i] if pool.dtype == "fp8:row" else None
+        common = dict(rank=rank, scale=scale, sinks=sinks, scales=scales)
+        if batch.prompt:
+            table = pool.prompt_table[0]
+            kernels.prefill(q, cache, table, batch.frontier_t, pool.page, out=out, lse=found, **common)
+            return (out, found) if lse else out
+        if batch.round:
+            rows, cols = batch.rows, batch.width + 1
+            kernels.attend(q, cache, pool.round_tables, batch.slots_t, batch.starts_t[:rows], batch.frontier_t, cols,
+                           pool.page, out=out, lse=found, **common)
+            return (out, found) if lse else out
+        windows = [r for r in range(batch.rows) if batch.row(r)[2] <= kernels.MAX_COLUMNS]
+        if windows:
+            meta = _windows_of(pool, [batch.row(r) for r in windows], q.device)
+            kernels.attend(q, cache, meta.tables, meta.rows, meta.starts, meta.firsts, meta.columns, pool.page,
+                           counts=meta.counts, out=out, lse=found, **common)
+        for r in range(batch.rows):
+            sequence, first, count, position = batch.row(r)
+            if count <= kernels.MAX_COLUMNS:
+                continue
+            span = slice(first, first + count)
+            table = pool.device_tables.get(sequence)
+            if table is None:
+                table = pool.device_tables[sequence] = pool._to_device(pool.table(sequence))
+            kernels.prefill(q[span], cache, table.to(torch.int32), position, pool.page, out=out[span],
+                            lse=found[span] if found is not None else None, **common)
+        return (out, found) if lse else out
+
+    def _latent_module(self, pool, q):
+        """crit's latent-attention module where it reads this pool (a CUDA pool of 16-bit or fp8:row pages), else None."""
+        if self.mode == "torch" or not q.is_cuda or pool.dtype not in ("bf16", "fp16", "fp8:row"):
+            return None
+        if self._latent_kernels is False:
+            self._latent_kernels = self._latent_loader() if self._latent_loader is not None else None
+        return self._latent_kernels
+
+    def _latent_torch(self, layer, q, pool, batch, rank, scale, sinks, out, found):
+        """Latent attention in FP32 torch from each row's gathered rows."""
+        torch = _torch()
+        for r in range(batch.rows):
+            sequence, first, count, position = batch.row(r)
+            rows, _ = pool.gather(layer, sequence, position + count)
+            c = rows[:, 0].float()                                                      # [n][R + P]
+            qq = q[first:first + count].float()                                         # [count][heads][R + P]
+            s = torch.einsum("thd,nd->thn", qq, c) * scale
+            n = torch.arange(position + count, device=q.device)
+            seen = n[None, :] <= position + torch.arange(count, device=q.device)[:, None]
+            s = s.masked_fill(~seen[:, None, :], float("-inf"))
+            if sinks is not None:
+                s = torch.cat([s, sinks.float().view(1, -1, 1).expand(count, -1, 1)], dim=-1)
+            total = torch.logsumexp(s, dim=-1)
+            p = torch.exp(s - total[..., None])
+            if sinks is not None:
+                p = p[..., :-1]
+            out[first:first + count] = torch.einsum("thn,nr->thr", p, c[:, :rank]).to(out.dtype)
+            if found is not None:
+                found[first:first + count] = total
 
     def reader(self, pool, q, special=False):
         """What reads a step's window rows over this pool: "flashinfer" (its decode and prefill over 16-bit and FP8
@@ -366,7 +497,8 @@ class DeviceAttention:
                 self._fused(layer, q, pool, meta, scale, out, found, given)
             else:
                 windows_torch(layer, q, pool, meta, scale, None, None, None, out, found,
-                              None if capturing() else batch.frontier + batch.bucket, given)
+                              None if capturing() else batch.frontier + batch.bucket, given, sinks=self._sinks,
+                              sliding=self._sliding)
             return (out, found) if lse else out
         if paged and blocks is None and self._split_reads(pool, q) and pool.value_dim == pool.head_dim:
             pages = pool.layer_pages(layer)
@@ -375,7 +507,8 @@ class DeviceAttention:
             self.kernels.prefill(q, pages[0], pages[1], pool.dtype, table[0], batch.frontier_t, pool.page,
                                  key_scales=pages[2] if scaled else None, value_scales=pages[3] if scaled else None,
                                  multipliers=multipliers, scale=scale, out=out, lse=found,
-                                 int8_qk=self.int8_qk and pool.dtype == "int8", fresh=fresh, flash=self.flash)
+                                 int8_qk=self.int8_qk and pool.dtype == "int8", fresh=fresh,
+                                 sinks=self._sinks, sliding=self._sliding, **self._prompt_kernel(pool, q, out))
             return (out, found) if lse else out
         meta = self._prompt_windows(table, batch, q.device)
         extent = None if capturing() else batch.frontier + batch.bucket
@@ -425,7 +558,8 @@ class DeviceAttention:
         the rows reach, None: every position the tables hold; fresh: a prompt chunk's own keys and values, the torch
         fallback's)."""
         if not split:
-            windows_torch(layer, q, pool, meta, scale, blocks, block_size, parents, out, found, extent, fresh)
+            windows_torch(layer, q, pool, meta, scale, blocks, block_size, parents, out, found, extent, fresh,
+                          sinks=self._sinks, sliding=self._sliding)
             return
         pages = pool.layer_pages(layer)
         scaled = len(pages) == 4
@@ -458,7 +592,8 @@ class DeviceAttention:
                                 key_scales=pages[2] if scaled else None, value_scales=pages[3] if scaled else None,
                                 multipliers=multipliers, scale=scale, partitions=parts, piece=self.piece or None,
                                 parents=parents, blocks=blocks, block_size=block_size, out=out, lse=found,
-                                workspace=self.split_workspace, flash=flash, chunk=chunk)
+                                workspace=self.split_workspace, flash=flash, chunk=chunk, sinks=self._sinks,
+                                sliding=self._sliding)
 
     def _step_windows(self, pool, batch, chosen, device):
         """The chosen short rows' metadata and extent for one step (made at its first layer, kept for the others)."""
@@ -497,7 +632,7 @@ class DeviceAttention:
                 return
             self._eager(layer, q, pool, batch, rows, scale, blocks, block_size, parents, out, found)
             return
-        if self._flashinfer_reads(pool, q) and found is None:   # option flashinfer "auto" only (a yardstick)
+        if self._flashinfer_reads(pool, q) and found is None and self._sinks is None and not self._sliding:
             self._flashinfer_rows(layer, q, pool, batch, rows, scale, out)
             return
         if prefill:
@@ -530,7 +665,8 @@ class DeviceAttention:
             self._fused(layer, q, pool, meta, scale, out, found, given)
         else:
             windows_torch(layer, q, pool, meta, scale, None, None, None, out, found,
-                          max(position + count for _, _, count, position in pieces), given)
+                          max(position + count for _, _, count, position in pieces), given, sinks=self._sinks,
+                          sliding=self._sliding)
 
     def _warm(self, layer, queries, pool, lse):
         """Compile at load what a step's window rows launch. The first eager call over a pool and query geometry (a
@@ -540,7 +676,8 @@ class DeviceAttention:
         over the dump page. A request's window rows of any width and length then compile nothing (draft trees
         and block lists aside: their launches compile at their first step)."""
         q = self._queries(queries, pool)
-        key = (str(q.device), tuple(q.shape[1:]), q.dtype, id(pool), bool(lse))
+        key = (str(q.device), tuple(q.shape[1:]), q.dtype, id(pool), bool(lse), self._sinks is not None,
+               self._sliding)
         if key in self._warmed or not self._split_reads(pool, q):
             return
         self._warmed.add(key)
@@ -609,7 +746,30 @@ class DeviceAttention:
                             counts=meta.counts, key_scales=pages[2] if scaled else None,
                             value_scales=pages[3] if scaled else None, multipliers=multipliers, scale=scale,
                             partitions=self._partitions(pool, q.device), piece=self.piece or None, out=out, lse=found,
-                            fused=True, fresh=fresh, **flash)
+                            fused=True, fresh=fresh, sinks=self._sinks, sliding=self._sliding, **flash)
+
+    def _prompt_kernel(self, pool, q, out):
+        """crit's prompt reader for a pool: reader split's is the CUDA flash prompt chunk in one range where the
+        kernel serves the pool's heads, query dtype and page kind on this GPU (cuda_prompt; a token's bits follow its
+        own positions, whatever the chunk) and the outputs are in the queries' dtype (the tile writes that type),
+        else the Triton prompt chunk; int8_qk chunks stay on the Triton one. Readers flash and cuda keep their own
+        prompt chunks."""
+        if self.flash is not False:
+            return {"flash": self.flash}
+        if (self.int8_qk and pool.dtype == "int8") or out.dtype != q.dtype:
+            return {"flash": False}
+        key = (pool.head_dim, pool.value_dim, q.dtype, pool.dtype, str(q.device))
+        found = self._prompt_kernels.get(key)
+        if found is None:
+            serves = getattr(self.kernels, "cuda_prompt", None)
+            found = bool(serves and serves(pool.head_dim, pool.value_dim, q.dtype, pool.dtype, q.device))
+            self._prompt_kernels[key] = found
+        if not found:
+            return {"flash": False}
+        # A chunk's passes over 8-bit pages with fresh rows keep their state in the split-KV reader's workspace
+        # (declared memory, free between launches); without one, the chunk reads in one pass (the same bits).
+        workspace = self.split_workspace if self.split_workspace is not None else q.new_empty(0, dtype=_torch().float32)
+        return {"flash": "cuda", "splits": 1, "workspace": workspace}
 
     def _prefill_rows(self, layer, q, pool, batch, rows, scale, out, found, fresh):
         """Prompt rows through crit's prompt reader, one row a launch: with `fresh` (the step's keys and values
@@ -626,7 +786,7 @@ class DeviceAttention:
                                  out=out[span], lse=found[span] if found is not None else None,
                                  int8_qk=self.int8_qk and pool.dtype == "int8",
                                  fresh=(fresh[0][span], fresh[1][span]) if fresh is not None else None,
-                                 flash=self.flash)
+                                 sinks=self._sinks, sliding=self._sliding, **self._prompt_kernel(pool, q, out))
 
     def _sparse_pieces(self, layer, q, pool, batch, rows, scale, blocks, block_size, out, found):
         """Prompt rows with block lists through the sparse reader: pieces of up to PIECE_TOKENS tokens, PIECE_ROWS
@@ -644,7 +804,7 @@ class DeviceAttention:
     def _eager(self, layer, q, pool, batch, rows, scale, blocks, block_size, parents, out, found, fresh=None):
         """Rows in torch from the pool's gathered KV: SDPA, or the masked softmax for trees, blocks and lse; with
         `fresh` (the step's keys and values as write() got them) each prompt row's own positions from them."""
-        if blocks is None and parents is None and found is None:
+        if blocks is None and parents is None and found is None and self._sinks is None and not self._sliding:
             _gathered(layer, q, pool, batch, rows, scale, out, fresh)
             return
         for r in rows:
@@ -653,7 +813,7 @@ class DeviceAttention:
             span = slice(first, first + count)
             windows_dense(q[span], keys, values, position, scale, blocks[span] if blocks is not None else None,
                           block_size, parents[span] if parents is not None else None, out[span],
-                          found[span] if found is not None else None)
+                          found[span] if found is not None else None, sinks=self._sinks, sliding=self._sliding)
 
     # -- FlashInfer ------------------------------------------------------------------------------------------------------
     def _flashinfer_rows(self, layer, q, pool, batch, rows, scale, out):
@@ -914,12 +1074,15 @@ def _visible(n, first, counts, columns, anc, member):
     return seen
 
 
-def windows_torch(layer, q, pool, meta, scale, blocks, block_size, parents, out, found, extent=None, fresh=None):
+def windows_torch(layer, q, pool, meta, scale, blocks, block_size, parents, out, found, extent=None, fresh=None,
+                  sinks=None, sliding=0):
     """Window rows (Windows) in FP32 torch over the pool's page tables, a masked online softmax over passes of CHUNK
     positions up to `extent` (the positions the rows reach, a host number; None: every position the tables hold, as a
     capture needs): no host work, the plain arithmetic the split-KV reader is tested against. fresh: (keys, values,
     shift, first) of prompt chunks: a row's positions from first on read from keys[position - shift] instead of the
-    pages (shift and first int64 on the device, one a row or one for every row)."""
+    pages (shift and first int64 on the device, one a row or one for every row). sinks: FP32 [heads] sink logits,
+    each one more position with no value, folded in after the passes. sliding: each column sees the sliding
+    positions up to its own (0: all)."""
     torch = _torch()
     device = q.device
     R, C = int(meta.starts.shape[0]), meta.columns
@@ -970,6 +1133,8 @@ def windows_torch(layer, q, pool, meta, scale, blocks, block_size, parents, out,
             member = bitmap[r][:, 1 + n // block_size][None] if bitmap is not None else None
             seen = _visible(n, first[r:r + 1], counts[r:r + 1], C, anc[r:r + 1] if anc is not None else None,
                             member)[0] & live[r][:, None]
+            if sliding:
+                seen = seen & (n[None, :] > (first[r] + col)[:, None] - sliding)
             for c in range(C):
                 s = torch.einsum("kgd,nkd->kgn", qq[r, c], keys) * scale
                 s = s.masked_fill(~seen[c][None, None, :], float("-inf"))
@@ -981,6 +1146,8 @@ def windows_torch(layer, q, pool, meta, scale, blocks, block_size, parents, out,
                 acc[c] = acc[c] * alpha[..., None] + torch.einsum("kgn,nkd->kgd", p, values)
                 m[c] = top
         for c in range(C):
+            if sinks is not None:
+                m[c], l[c], acc[c] = _sink_fold(m[c], l[c], acc[c], sinks.view(hkv, g))
             outs.append(torch.where(l[c][..., None] > 0, acc[c] / l[c].clamp(min=1e-30)[..., None], 0.0))
             sums.append(torch.where(l[c] > 0, m[c] + torch.log(l[c].clamp(min=1e-30)), float("-inf")))
     o = torch.stack(outs).view(R * C, hq, dv)
@@ -994,7 +1161,17 @@ def windows_torch(layer, q, pool, meta, scale, blocks, block_size, parents, out,
         found.copy_(target[:tokens])
 
 
-def windows_dense(q, keys, values, position, scale, blocks, block_size, parents, out, found):
+def _sink_fold(m, l, acc, sink):
+    """A sink logit (one a head, shaped as m) into an online softmax's final state (m, l, acc[..., dv]) as one more
+    position with no value."""
+    torch = _torch()
+    top = torch.maximum(m, sink)
+    sub = torch.where(top == float("-inf"), 0.0, top)
+    keep = torch.exp(m - sub)
+    return top, l * keep + torch.exp(sink - sub), acc * keep[..., None]
+
+
+def windows_dense(q, keys, values, position, scale, blocks, block_size, parents, out, found, sinks=None, sliding=0):
     """One row of tokens at positions position.. over its gathered keys [n][kv_heads][dim] and values, in FP32: causal,
     or within the row's draft tree (parents), and within each token's listed blocks."""
     torch = _torch()
@@ -1012,13 +1189,19 @@ def windows_dense(q, keys, values, position, scale, blocks, block_size, parents,
         listed = blocks.long()
         member = ((n // block_size)[None, None, :] == listed[:, :, None]).any(1)[None]     # [1, count, n]
     seen = _visible(n, first, counts, count, anc, member)[0]                               # [count, n]
+    if sliding:
+        seen = seen & (n[None, :] > (position + torch.arange(count, device=q.device))[:, None] - sliding)
     qq = q.float().view(count, hkv, g, d)
     s = torch.einsum("ckgd,nkd->ckgn", qq, keys.float()) * scale
     s = s.masked_fill(~seen[:, None, None, :], float("-inf"))
     top = s.amax(-1)
+    if sinks is not None:   # one more position with no value a head
+        top = torch.maximum(top, sinks.view(1, hkv, g))
     sub = torch.where(top == float("-inf"), 0.0, top)
     p = torch.exp(s - sub[..., None])
     total = p.sum(-1)
+    if sinks is not None:
+        total = total + torch.exp(sinks.view(1, hkv, g) - sub)
     o = torch.einsum("ckgn,nkd->ckgd", p, values.float()) / total.clamp(min=1e-30)[..., None]
     out.copy_(torch.where(total[..., None] > 0, o, 0.0).view(count, hq, -1).to(out.dtype))
     if found is not None:

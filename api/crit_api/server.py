@@ -1816,6 +1816,16 @@ class Server(ThreadingHTTPServer):
         self.api = api
         self.tls = tls
 
+    def handle_error(self, request, client_address):
+        """A client that went away mid-request (a readiness probe that gave up, a closed tab) is one line, not a
+        traceback; any other error keeps socketserver's traceback."""
+        error = sys.exc_info()[1]
+        if isinstance(error, (ConnectionError, TimeoutError)):
+            print(f"crit serve: {client_address[0]} went away mid-request ({type(error).__name__})", file=sys.stderr,
+                  flush=True)
+            return
+        super().handle_error(request, client_address)
+
     def server_bind(self):
         if sys.platform == "win32":
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)

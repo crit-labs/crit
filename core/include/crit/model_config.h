@@ -30,7 +30,7 @@ struct RopeLayer { std::string layer_type = {}; RopeConfig rope = {}; };
 struct MoeConfig {
     std::uint32_t experts = 0;
     std::string experts_key = {};
-    std::uint32_t experts_per_token = 0;                       // num_experts_per_tok; 0 when absent
+    std::uint32_t experts_per_token = 0;                       // the first experts_per_token key present; 0 when absent
     std::optional<std::uint32_t> shared_experts = {}, moe_intermediate_size = {}, shared_expert_intermediate_size = {},
                                  first_k_dense_replace = {}, decoder_sparse_step = {}, n_group = {}, topk_group = {};
     std::vector<std::uint32_t> mlp_only_layers = {};

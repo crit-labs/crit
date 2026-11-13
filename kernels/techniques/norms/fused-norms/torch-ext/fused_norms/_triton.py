@@ -335,3 +335,79 @@ def stream_add_kernel(h_ptr, sht, shs, x_ptr, sxt, w_ptr, swt, sws, S, D, n_bloc
         else:
             add = x
         tl.store(at, (tl.load(at, mask=m, other=0.0).to(tl.float32) + add).to(h_ptr.dtype.element_ty), mask=m)
+
+
+# QUANT: 1 FP8 rows (E4M3 codes, one FP32 scale a row: amax / 448, at least 1e-12), 2 NVFP4 (E2M1 codes, one E4M3 scale
+# a 16-value block under the input scale g, in cuBLASLt's 128 x 4 tiled layout). The quantizers' arithmetic is that of
+# the projections' quantizers (mma-rows quantize_fp8_rows and quantize_nvfp4), on the normalized row rounded to BF16
+# as rms_norm would write it, so the codes and scales are those of rms_norm followed by the quantizer.
+
+@triton.jit
+def _e2m1_codes(v):
+    """The nearest E2M1 code of each v (already over its block's scale), ties to the even code, saturating at 6,
+    bit 3 set where v < 0; NaN gives 0."""
+    a = tl.abs(v)
+    code = ((a > 0.25).to(tl.int32) + (a >= 0.75).to(tl.int32) + (a > 1.25).to(tl.int32)
+            + (a >= 1.75).to(tl.int32) + (a > 2.5).to(tl.int32) + (a >= 3.5).to(tl.int32) + (a > 5.0).to(tl.int32))
+    return code | tl.where(v < 0, 8, 0)
+
+
+@triton.jit(do_not_specialize=["n_rows"])
+def rows_quant_kernel(x_ptr, sxa, sxb, r_ptr, sra, srb, w_ptr, q_ptr, sq, s_ptr, n_rows, B, D, eps, offset, g, g_rcp,
+                      ct, HAS_RES: tl.constexpr, HAS_W: tl.constexpr, QUANT: tl.constexpr, HB: tl.constexpr,
+                      BD: tl.constexpr):
+    """rms_norm's rows (_rows_body without rope, gates or groups: the same loads, sums and products in the same
+    layout, so the same bits) quantized for a projection: codes row r at q[r * sq], scales at s."""
+    pid = tl.program_id(0)
+    r = pid * HB + tl.arange(0, HB)
+    rm = r < n_rows
+    a_rows = (r // B).to(tl.int64)
+    b = (r % B).to(tl.int64)
+    d = tl.arange(0, BD)
+    dm = d < D
+    m = rm[:, None] & dm[None, :]
+    x_rows = a_rows * sxa + b * sxb
+    x = tl.load(x_ptr + x_rows[:, None] + d[None, :], mask=m, other=0.0).to(tl.float32)
+    if HAS_RES:
+        r_rows = a_rows * sra + b * srb
+        s = (tl.load(r_ptr + r_rows[:, None] + d[None, :], mask=m, other=0.0).to(tl.float32) + x)
+        s = s.to(r_ptr.dtype.element_ty)
+        tl.store(r_ptr + r_rows[:, None] + d[None, :], s, mask=m)
+        x = s.to(tl.float32)
+    inv = tl.math.rsqrt(tl.sum(x * x, axis=1) / D + eps)
+    y = x * inv[:, None]
+    if HAS_W:
+        y = y * (tl.load(w_ptr + d, mask=dm, other=0.0).to(tl.float32) + offset)[None, :]
+    y = tl.where(m, y.to(tl.bfloat16).to(tl.float32), 0.0)   # the BF16 row the quantizer would read
+    rows = r.to(tl.int64)
+    if QUANT == 1:
+        nan = tl.max(tl.where(y != y, 1, 0), axis=1)
+        amax = tl.where(nan > 0, float("nan"), tl.max(tl.abs(y), axis=1))
+        sc = amax * (1.0 / 448.0)
+        sc = tl.where(sc < 1e-12, 1e-12, sc)
+        v = tl.math.div_rn(y, sc[:, None])
+        v = tl.where(v > 448.0, 448.0, tl.where(v < -448.0, -448.0, v))
+        codes = v.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+        tl.store(q_ptr + rows[:, None] * sq + d[None, :], codes, mask=m)
+        tl.store(s_ptr + rows, sc, mask=rm)
+    else:
+        blocks = tl.reshape(y, (HB, BD // 16, 16))
+        nan = tl.max(tl.where(blocks != blocks, 1, 0), axis=2)
+        amax = tl.where(nan > 0, float("nan"), tl.max(tl.abs(blocks), axis=2))
+        bs = (amax * (1.0 / 6.0)) * g
+        bs = tl.where(bs > 448.0, 448.0, bs)
+        sb = bs.to(tl.float8e4nv)
+        unit = sb.to(tl.float32) * g_rcp
+        positive = unit > 0.0   # a zero (or NaN) scale gives code 0 for its block
+        unit = tl.where(unit < 1e-30, 1e-30, unit)
+        q = tl.where(positive[:, :, None], tl.math.div_rn(blocks, unit[:, :, None]), 0.0)
+        pairs = tl.reshape(_e2m1_codes(q), (HB, BD // 2, 2))
+        lo, hi = tl.split(pairs)
+        byte = (lo | (hi << 4)).to(tl.uint8)
+        h = tl.arange(0, BD // 2)
+        tl.store(q_ptr + rows[:, None] * sq + h[None, :], byte, mask=rm[:, None] & (h < D // 2)[None, :])
+        j = tl.arange(0, BD // 16)
+        rr = (r & 127)[:, None]
+        at = (((r >> 7)[:, None] * ct + (j >> 2)[None, :]).to(tl.int64) * 512 + (rr & 31) * 16 + (rr >> 5) * 4
+              + (j & 3)[None, :])
+        tl.store(s_ptr + at, sb.to(tl.uint8, bitcast=True), mask=rm[:, None] & (j < D // 16)[None, :])

@@ -7,7 +7,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "mm_rows(Tensor x, Tensor w, Tensor? scales, Tensor? row_scale, int weights, int acts, float input_scale, "
       "bool blocked, int groups, int warps, int splits, Tensor(c!)? scratch, Tensor(a!)? partial, Tensor(b!)? counters, "
-      "Tensor! out, Tensor? zeros=None, int group=0) -> ()");
+      "Tensor! out, Tensor? zeros=None, int group=0, int glu=0) -> ()");
   ops.def("quantize_fp8_rows(Tensor x, Tensor! q, Tensor! scale) -> ()");
   ops.def("quantize_nvfp4(Tensor x, float input_scale, Tensor! codes, Tensor! scales) -> ()");
   ops.def("step_values(int weights) -> int");
@@ -15,7 +15,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("fp4_scratch_bytes(int rows, int k) -> int");
   ops.def(
       "mm_prompt(Tensor x, Tensor w, Tensor? scales, Tensor? row_scale, int weights, int acts, float input_scale, "
-      "bool blocked, int splits, Tensor(c!)? scratch, Tensor! out, Tensor? zeros=None, int group=0) -> ()");
+      "bool blocked, int splits, Tensor(c!)? scratch, Tensor! out, Tensor? zeros=None, int group=0, int glu=0) -> ()");
   ops.def("decode_ctas(int weights, int acts) -> int");
 #if defined(CUDA_KERNEL)
   ops.impl("mm_rows", torch::kCUDA, &mm_rows);

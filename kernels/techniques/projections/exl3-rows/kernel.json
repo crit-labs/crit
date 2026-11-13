@@ -1,0 +1,103 @@
+{
+  "schema": "crit-kernel-v1",
+  "id": "exl3-rows",
+  "family": "projections",
+  "title": "EXL3 projections: 1 to 16 rows times trellis tiles decoded on the fly between the matrix's Hadamard rotations, and a dequantization to BF16 for prompts",
+  "package": "exl3_rows",
+  "language": "cuda",
+  "operations": [],
+  "sources": [
+    "exl3_rows_cuda/binding.cu",
+    "exl3_rows_cuda/exl3_rows.cu",
+    "torch-ext/torch_binding.cpp"
+  ],
+  "capabilities": [
+    "8.0",
+    "8.6",
+    "8.9",
+    "9.0",
+    "10.0",
+    "10.3",
+    "11.0",
+    "12.0",
+    "12.1"
+  ],
+  "libraries": [],
+  "structures": {
+    "gemv": {
+      "what": "the rows rotated (x su H in FP32, stored in FP16); a block's WARPS x STRIPS neighbouring 16-column tile strips over its split of the input tiles, their slices copied into shared memory by 16-byte cp.async, STAGES stages in flight; each tile decoded once into the A operand of an m16n8k16 MMA (FP16, FP32 accumulators) whose B operand is up to 8 activation rows a column group; the splits added in order and the result rotated (y' H sv)",
+      "call": "gemv",
+      "rows": [
+        1,
+        16
+      ],
+      "tune_rows": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "WARPS": {
+          "values": [
+            2,
+            4,
+            8
+          ],
+          "default": 8,
+          "what": "warps a block"
+        },
+        "SPLITS": {
+          "values": [
+            0,
+            1,
+            2,
+            4,
+            8,
+            16,
+            32
+          ],
+          "default": 0,
+          "order": true,
+          "what": "contiguous parts of the input's tiles, one a block row, added in part order (0: 48 warps a multiprocessor, each part at least two stages)"
+        },
+        "STRIPS": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 2,
+          "what": "neighbouring tile strips a warp decodes, the activations loaded once for them"
+        },
+        "ROWS": {
+          "values": [
+            1,
+            2,
+            4,
+            8
+          ],
+          "default": 4,
+          "what": "input rows of the block's tile slice a stage copies"
+        },
+        "STAGES": {
+          "values": [
+            2,
+            3,
+            4
+          ],
+          "default": 3,
+          "what": "stages of copies in flight"
+        }
+      },
+      "yardstick": null,
+      "bench": "bench.py:Gemv"
+    }
+  }
+}

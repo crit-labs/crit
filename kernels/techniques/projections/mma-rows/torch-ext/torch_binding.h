@@ -11,12 +11,13 @@
 // cuBLASLt's 128 x 4 tiled layout. groups (1, 2): 16-row groups a warp takes; warps (1..4): warps a CTA (speed only).
 // splits (1..32): contiguous parts of K, one a CTA, part of the sums' order; splits > 1 take partial (FP32,
 // splits * M * N) and counters (int32 zeros, one a row tile). Quantized activations take scratch (M * K * 2 + M * 4
-// bytes, rounded to 16). INT4 weights (4) take FP16 scales and uint8 zeros [N][K / group].
+// bytes, rounded to 16). INT4 weights (4) take FP16 scales and uint8 zeros [N][K / group]. glu 1: interleaved gate
+// and up rows (mma_rows.h), out [M][N / 2] = silu(gate) * up.
 void mm_rows(const torch::Tensor& x, const torch::Tensor& w, const std::optional<torch::Tensor>& scales,
              const std::optional<torch::Tensor>& row_scale, int64_t weights, int64_t acts, double input_scale,
              bool blocked, int64_t groups, int64_t warps, int64_t splits, const std::optional<torch::Tensor>& scratch,
              const std::optional<torch::Tensor>& partial, const std::optional<torch::Tensor>& counters,
-             torch::Tensor& out, const std::optional<torch::Tensor>& zeros, int64_t group);
+             torch::Tensor& out, const std::optional<torch::Tensor>& zeros, int64_t group, int64_t glu);
 // q [M][K] E4M3 bytes and scale [M] FP32: x [M][K] BF16 quantized per row as mm_rows' acts 1.
 void quantize_fp8_rows(const torch::Tensor& x, torch::Tensor& q, torch::Tensor& scale);
 // codes [M][K / 2] bytes and scales E4M3 bytes in cuBLASLt's 128 x 4 tiled layout: x [M][K] BF16 quantized per
@@ -34,7 +35,7 @@ int64_t fp4_scratch_bytes(int64_t rows, int64_t k);
 // + M * 4 bytes, rounded to 16); no partial sums or counters.
 void mm_prompt(const torch::Tensor& x, const torch::Tensor& w, const std::optional<torch::Tensor>& scales,
                const std::optional<torch::Tensor>& row_scale, int64_t weights, int64_t acts, double input_scale,
-               bool blocked, int64_t splits, const std::optional<torch::Tensor>& scratch, torch::Tensor& out, const std::optional<torch::Tensor>& zeros, int64_t group);
+               bool blocked, int64_t splits, const std::optional<torch::Tensor>& scratch, torch::Tensor& out, const std::optional<torch::Tensor>& zeros, int64_t group, int64_t glu);
 // CTAs a multiprocessor of the current device holds of mm_rows' one-row kernel for `weights` and `acts` (the FP4
 // MMA's for acts 3, the decode tile's otherwise): plan()'s splits fill them.
 int64_t decode_ctas(int64_t weights, int64_t acts);

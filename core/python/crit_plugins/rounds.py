@@ -60,6 +60,14 @@ which drafts are verified, never what a row emits: greedy rounds emit the target
 a sampled round's rejection sampling keeps the target's law at any width chosen from the rounds before it (each
 position's draws are keyed by the position, and no draw a choice read is read again).
 
+A row may have a width of its own (bind's and start_row's width): the chain accept keeps at most that many of its
+drafts, so rows of several widths ride one round at the round's width, and a row at width 0, a request that does not
+draft, emits one token a round, the target's own (a greedy row's is plain greedy decoding's). Only the drafts a row's
+width keeps are offered in the acceptance counts, and the width policy judges a row only at widths it keeps. The next
+round of a row count runs at the policy's width narrowed to the narrowest captured width that holds the widest own width
+among its decoding rows, so rounds of requests that do not draft run the width-0 capture where one is captured (a row
+bound later raises its row count's width before its first round).
+
 Rows of a greedy or sampled round may follow a continuation of their own (start_row's follow, with a driver sized for
 continuations): "replay" (the continuation is the row's prediction: its drafts are accepted while they equal it, a
 request replaying a fixed output, as Eval's replay) or "forced" (the continuation is its drafts too, so the round keeps
@@ -468,6 +476,10 @@ class SpeculativeRounds:
         self.continuation = torch.zeros(rows, max(continuation, 1), **long)
         self.following = continuation > 0   # rows may follow a continuation of their own (start_row's follow)
         self.follow = torch.zeros(rows, **long)
+        # Each row's own width (start_row's width): it keeps at most that many of a round's drafts, so a row at width 0
+        # emits the target's own next token inside a round of any width (a request that does not draft).
+        self.row_width = torch.full((rows,), widest, **long)
+        self.own_widths = [widest] * rows   # the same on the host
         # The forms rounds are captured in (the module's docstring, Forms): the plain one, and the log-probability one
         # when the driver scores tokens or rows may follow a continuation. Each slot's need of the latter (its request
         # asks for log-probabilities, or it follows a continuation), which a round of the model's own reads.
@@ -512,6 +524,10 @@ class SpeculativeRounds:
         start = self.width_policy.start(self.round_widths)
         self.width_table = torch.full((rows,), start, dtype=torch.int32, device=self.device)
         self.host_widths = torch.full((rows,), start, dtype=torch.int32, pin_memory=pinned)
+        # The captured widths, which a round's next widths come from: the policy's, narrowed to the narrowest captured
+        # width that holds every decoding row's own width (rows that do not draft ride a narrower round).
+        self.width_values = torch.tensor(self.round_widths, **long)
+        self.next_widths = torch.zeros(rows, dtype=torch.int32, device=self.device)
         self.width_policy.reserve(self)
         # A round's key: (rows, width, mode, logprobs), logprobs its form (the module's docstring, Forms).
         self.graphs = {}
@@ -528,7 +544,7 @@ class SpeculativeRounds:
     # Rows -----------------------------------------------------------------------------------------------------------
 
     def start_row(self, slot, frontier, token, allowance, stops=(), continuation=(), outputs=1, follow=None,
-                  logprobs=False):
+                  logprobs=False, width=None):
         """Row `slot` decodes from here: `token` is its pending token (the last output token it has, the prefill's
         first one after a prompt) at position `frontier`, `outputs` the output tokens it has so far (token included:
         Core's draw position of the next one), `allowance` the tokens it may still emit. The drafter's first catch-up
@@ -536,7 +552,8 @@ class SpeculativeRounds:
         forced rounds, the fixed text its output follows, from the first output token on; `follow` ("replay" or
         "forced", the module's docstring) has the row follow it inside greedy and sampled rounds too. `logprobs`: its
         request asks for log-probabilities, so a round of it runs the log-probability form (as does one of a row that
-        follows its continuation)."""
+        follows its continuation). `width`: the most drafts of a round the row keeps (None: every one; 0: none, so the
+        row emits one token a round, and a greedy row emits plain greedy decoding's tokens)."""
         torch = self.torch
         stops, continuation = list(stops), list(continuation)
         if len(stops) > self.stops.shape[1] or len(continuation) > self.continuation.shape[1]:
@@ -549,6 +566,17 @@ class SpeculativeRounds:
             raise ValueError("a row asking for log-probabilities needs a driver built with logprobs")
         if outputs < 1:
             raise ValueError("a decoding row has its pending token among its outputs")
+        width = self.widest if width is None else int(width)
+        if not 0 <= width <= self.widest:
+            raise ValueError(f"a row's width lies in 0 .. widest ({self.widest}), not {width}")
+        self.row_width[slot] = width
+        self.own_widths[slot] = width
+        if any(w < self.widest for w in self.own_widths):
+            # A narrowed round (_narrow) may be narrower than this row: its first round holds the row's width (the
+            # packs after it narrow again); row counts that go to step() stay there.
+            need = next((w for w in self.round_widths if w >= width), self.round_widths[-1])
+            later = self.host_widths[slot:]
+            later.copy_(self.torch.where(later < 0, later, later.clamp(min=need)))
         values = {"pending": token, "frontier": frontier, "allowance": allowance, "out_count": outputs,
                   "n_emitted": 1, "catch_up_count": 1, "n_matched": 0, "hold": 0}
         for name, value in values.items():
@@ -569,15 +597,18 @@ class SpeculativeRounds:
         """Row `slot` stops decoding: it emits nothing in later rounds until it starts again."""
         self.allowance[slot] = 0
         self.follow[slot] = 0
+        self.row_width[slot] = self.widest
+        self.own_widths[slot] = self.widest
         self.scoring[slot] = False
 
     def move(self, source, target):
         """Row `source`'s state moves to slot `target` (to keep the decoding rows at the front)."""
         for tensor in (self.pending, self.frontier, self.allowance, self.out_count, self.n_emitted, self.n_matched,
                        self.catch_up_count, self.catch_up, self.emitted, self.stops, self.continuation, self.predictions,
-                       self.drafts, self.hold, self.follow, *self.start.values(), *[t for t in (self.logprobs,) if t is not None]):
+                       self.drafts, self.hold, self.follow, self.row_width, *self.start.values(), *[t for t in (self.logprobs,) if t is not None]):
             tensor[target] = tensor[source]
         self.allowance[source] = 0
+        self.own_widths[target], self.own_widths[source] = self.own_widths[source], self.widest
         self.scoring[target], self.scoring[source] = self.scoring[source], False
 
     def logprob_form(self, rows, hold=()):
@@ -688,9 +719,11 @@ class SpeculativeRounds:
         self.rounds_by_form[int(bool(logprobs))] += decoded
         if width:
             drafted = active * (self.follow[:rows] < FOLLOW["forced"]).long()   # a forced row's drafts are its text
-            kept = (self.n_matched[:rows, None] > self.columns[None, :width]).long() * drafted[:, None]
+            # A row offers the drafts its own width keeps (start_row's width).
+            offered = (self.row_width[:rows, None] > self.columns[None, :width]).long() * drafted[:, None]
+            kept = (self.n_matched[:rows, None] > self.columns[None, :width]).long() * offered
             self.accepted_by_depth[:width] += kept.sum(0)
-            self.offered_by_depth[:width] += drafted.sum()
+            self.offered_by_depth[:width] += offered.sum(0)
 
     def _choose(self, view):
         """The width policy's choice of the next round's widths (capture-safe), from this round's judged rows: those
@@ -698,7 +731,7 @@ class SpeculativeRounds:
         rejected drafts."""
         rows, width = view.rows, view.width
         judged = ((self.hold[:rows] == 0) & (self.start["allowance"][:rows] > width)
-                  & (self.follow[:rows] < FOLLOW["forced"])).long()
+                  & (self.follow[:rows] < FOLLOW["forced"]) & (self.row_width[:rows] >= width)).long()
         self.width_policy.observe(self, view, judged)
 
     def telemetry(self):
@@ -739,6 +772,7 @@ class SpeculativeRounds:
         predictions = self.predictions[:rows, :width + 1]
         if width:
             matched = (self.drafts[:rows, :width] == predictions[:, :width]).long().cumprod(1).sum(1)
+            matched = torch.minimum(matched, self.row_width[:rows])   # each row keeps at most its own width's drafts
         else:
             matched = torch.zeros_like(self.n_emitted[:rows])
         stop = (predictions[:, :, None] == self.stops[:rows, None, :]).any(2)
@@ -766,6 +800,16 @@ class SpeculativeRounds:
         self.catch_up[:rows] = torch.where(held[:, None], self.catch_up[:rows], self.emitted[:rows].clamp(min=0))
         self.catch_up_count[:rows] = torch.where(held, self.catch_up_count[:rows], count)
 
+    def _narrow(self):
+        """The next round's width per row count (capture-safe): the policy's (width_table), narrowed to the narrowest
+        captured width that holds the widest own width of the decoding rows among that many slots, so a round whose
+        rows keep fewer drafts (requests that do not draft) runs a narrower capture; no decoding row: the policy's."""
+        torch = self.torch
+        own = torch.where(self.allowance > 0, self.row_width, -1).cummax(0).values
+        at = torch.searchsorted(self.width_values, own.clamp(min=0)).clamp(max=len(self.round_widths) - 1)
+        need = torch.where(own >= 0, self.width_values[at], self.width_values[-1])
+        self.next_widths.copy_(torch.minimum(self.width_table.long(), need).int())
+
     def _pack(self, rows, logprobs):
         block = self.block[:rows]
         block[:, 0] = self.n_emitted[:rows]
@@ -776,7 +820,8 @@ class SpeculativeRounds:
         if self.counter_names:
             block[:, self.words_at + 1:] = self.counters[:rows, :len(self.counter_names)]
         self.host[:rows].copy_(block, non_blocking=True)
-        self.host_widths.copy_(self.width_table, non_blocking=True)
+        self._narrow()
+        self.host_widths.copy_(self.next_widths, non_blocking=True)
         if self.host_counts is not None:
             self.host_counts.copy_(self.draft_counts, non_blocking=True)
         self.host_form.copy_(self.form_values[int(bool(logprobs)):int(bool(logprobs)) + 1], non_blocking=True)
@@ -1000,8 +1045,9 @@ class SpeculativeRounds:
                                  counters=len(self.counter_names), logprob_graphs=graphs.get(True), **ranked)
 
     def _native_graphs(self, widths):
-        """The (rows, width) rounds native rounds over `widths` may run: each row count given a width at it, and with
-        an adaptive width policy at every width of the driver's."""
+        """The (rows, width) rounds native rounds over `widths` may run: each row count given a width at it and at
+        every narrower width of the driver's (a round narrows to its rows' own widths), and with an adaptive width
+        policy at every width of the driver's."""
         if len(widths) != self.rows:
             raise ValueError(f"one width per row count, {self.rows}")
         needed = []
@@ -1012,7 +1058,8 @@ class SpeculativeRounds:
                 raise ValueError(f"the start width {width} of {rows} rows is none of the round widths "
                                  f"{list(self.round_widths)}, which the {self.width_policy.name} policy chooses among")
             self._check(rows, width, "greedy")
-            for w in (self.round_widths if self.width_policy.adaptive else (width,)):
+            for w in (self.round_widths if self.width_policy.adaptive
+                      else sorted({width} | {w for w in self.round_widths if w < width})):
                 needed.append((rows, w))
         return needed
 
@@ -1169,18 +1216,22 @@ class Rounds(SpeculativeRounds):
     # Slots ----------------------------------------------------------------------------------------------------------
 
     def bind(self, slot, sequence, frontier, token, allowance, capacity, *, stops=(), continuation=(), params=None,
-             session=None, tokens=None, outputs=1, follow=None, logprobs=False):
+             session=None, tokens=None, outputs=1, follow=None, logprobs=False, width=None):
         """Round slot `slot` decodes `sequence` from here (start_row's frontier, token, allowance, outputs, stops,
         continuation, follow: a replay or forced row, which needs the chain accept, and logprobs: its request asks for
         log-probabilities): every pool binds it (a KV pool reserves its pages up to `capacity` positions: the prompt,
         the output limit and the widest round), `tokens` (the sequence's tokens at positions 0 .. frontier: the prompt,
         the outputs so far, the pending token last) seed every pool and the drafter that have seed(slot, tokens), the
         sampler stages its rules (`params`, select()'s), the drafter binds it where it keeps state of its own, and
-        Core's native rounds run `session` in the slot."""
+        Core's native rounds run `session` in the slot. `width`: the row's own width (start_row's; 0 for a request that
+        does not draft), which the chain accept applies."""
+        if width is not None and int(width) < self.widest and self._accepts:
+            raise ValueError("a row of its own width is accepted by the chain: the selection's verifier accepts on the "
+                             "device (a tree)")
         if follow is not None and self._accepts:
             raise ValueError("a row that follows its continuation is accepted by the chain: the selection's verifier "
                              "accepts on the device (a tree)")
-        self.start_row(slot, frontier, token, allowance, stops, continuation, outputs, follow, logprobs)
+        self.start_row(slot, frontier, token, allowance, stops, continuation, outputs, follow, logprobs, width)
         for pool, arguments in self.pools:
             pool.bind(slot, sequence, capacity) if arguments is None or arguments >= 3 else pool.bind(slot, sequence)
         bind = _method(self.drafter, "bind")

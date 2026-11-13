@@ -149,7 +149,8 @@ class HostProjections:
             self.native_prompts = self.native_prompts or rows_.native_prompts(activations)
         return Matrix(format, rows, columns, found, activations)
 
-    def matmul(self, x, matrix, out_dtype=None):
+    def matmul(self, x, matrix, out_dtype=None, prompt=False):
+        # Row by row on the host, or on int-block-experts' rows: a prompt chunk's rows are those of decode rows.
         import torch
         on = matrix.tensors["weight" if matrix.format == "bf16" else "codes"].device
         if x.device != on:

@@ -36,7 +36,7 @@ ADDITIVE = {"crit_run_create", "crit_run_resolve", "crit_run_plan", "crit_run_ch
             "crit_run_ablate", "crit_run_kernels", "crit_run_resume", "crit_run_cost", "crit_run_replay", "crit_eval_run",
             "crit_eval_precheck", "crit_eval_probe", "crit_eval_prepare", "crit_eval_reference", "crit_eval_fetch",
             "crit_eval_pack", "crit_eval_pin", "crit_eval_ab", "crit_eval_kernels", "crit_eval_workbench", "crit_pull",
-            "crit_serve", "crit_kernels_new", "crit_kernels_build", "crit_kernels_sweep", "crit_models_ptq", "crit_models_drafter",
+            "crit_serve", "crit_kernels_new", "crit_kernels_build", "crit_kernels_sweep", "crit_kernels_gates", "crit_kernels_report", "crit_models_ptq", "crit_models_drafter",
             "crit_models_eval"}
 OPEN_WORLD = {"crit_pull", "crit_eval_fetch", "crit_eval_run", "crit_run_eval"}
 

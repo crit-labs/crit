@@ -128,6 +128,19 @@ context and query rows) and returns results in key order; stale, duplicate or
 missing identities fail before arithmetic. Limits cover request count, query rows,
 workspace, output and metadata. It executes plans serially on the CPU.
 
+**Sliding-window layers as rings (`kv:sliding`).** A pool made with `pool(..., sliding=W, span=S, positions=N)` holds
+the layers whose tokens see only their last W positions (local layers): each sequence keeps a ring of
+ceil((W + S) / page) + 1 pages (S: the most positions a row writes in one step, a prompt chunk or a verify window; N:
+the most positions a sequence reaches, the page tables' width), logical page p in ring page p mod ring. The tables the
+attention reads are the ring expanded to the logical pages, so a position older than the window aliases a newer
+one's page, which the window never shows; softmax-attention reads such a pool with its window (`attention:sliding`)
+and every kernel path of paged-kv-attention reads it unchanged. A sequence holds at most its ring whatever its length,
+`bind` takes no page past it for a captured round, a fork shares the ring until either writes, `keep` frees no page
+of a sequence that has wrapped, and the plugin's facts count these pools as `kv_sliding_bytes_per_sequence`. Tested
+in softmax-attention's `test_sliding_pool.py`: prompt chunks, decode steps, verify windows rolled back, forks and 120
+captured rounds over a ring read bit for bit as a full pool under the same window (BF16 on crit's kernels; FP32 on
+the torch fallback within 1e-5), and a captured round replays over it.
+
 **Lending the pool's unused pages.** The device pool ([pages.py](code/pages.py) `KVPool`) keeps its page tensors in
 one allocation, with `spare` bytes after them for a borrower, and takes the lowest free page first, so every page at
 or past its `floor` holds no KV. A device expert cache borrows that memory: `lendable()` gives the allocation, each

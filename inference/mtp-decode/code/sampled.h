@@ -1,6 +1,7 @@
 #pragma once
 #include "speculative.h"
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <random>
 
@@ -598,15 +599,44 @@ public:
       throw std::invalid_argument("Invalid estimator positions/window/ridge");
     window_.reserve(window);
   }
-  // logit(q_max), clamped away from 0 and 1 so a one-hot draft law stays finite.
+  // The feature's bound: log-odds past it (a complement mass under about 4e-18) carry no more information.
+  static constexpr double max_log_odds=40;
+  // logit(q_max) from a probability, clamped away from 0 and 1 so a one-hot draft law stays finite. A probability
+  // cannot tell confident drafts apart: in FP32 q_max rounds to 1 once the other tokens' mass falls under about
+  // 6e-8, and the clamp holds every draft past 1e-6 at about 13.8. Engines that hold the draft logits use
+  // feature_from_logits().
   static double feature(double q_max) {
     if (!(q_max>=0 && q_max<=1)) throw std::invalid_argument("Draft probability outside [0, 1]");
     const double q=std::clamp(q_max,1e-6,1-1e-6);
     return std::log(q/(1-q));
   }
-  void observe(std::size_t position,double q_max,bool accepted) {
+  // logit(q_max) of the law softmax(scores / temperature), from the scores: the top score less the log-sum-exp of
+  // every other score, in FP64, so 1 - q_max is never formed and a tiny complement mass keeps its value. One copy
+  // of the top score is left out (ties keep the rest). -inf scores carry no mass; a law with one finite score has
+  // the bound. Clamped to [-max_log_odds, max_log_odds].
+  static double feature_from_logits(std::span<const float> scores,double temperature=1) {
+    if (scores.empty() || !(temperature>0) || !std::isfinite(temperature))
+      throw std::invalid_argument("Invalid draft scores/temperature");
+    std::size_t top=0;
+    for (std::size_t i=0;i<scores.size();++i) {
+      if (std::isnan(scores[i])) throw std::invalid_argument("NaN draft score");
+      if (scores[i]>scores[top]) top=i;
+    }
+    const double best=double(scores[top])/temperature;
+    if (!std::isfinite(best)) throw std::invalid_argument("Draft scores hold no finite top score");
+    double rest_max=-std::numeric_limits<double>::infinity();
+    for (std::size_t i=0;i<scores.size();++i) if (i!=top) rest_max=std::max(rest_max,double(scores[i])/temperature);
+    if (rest_max==-std::numeric_limits<double>::infinity()) return max_log_odds;
+    double sum=0;
+    for (std::size_t i=0;i<scores.size();++i) if (i!=top) sum+=std::exp(double(scores[i])/temperature-rest_max);
+    return std::clamp(best-(rest_max+std::log(sum)),-max_log_odds,max_log_odds);
+  }
+  void observe(std::size_t position,double q_max,bool accepted) {observe_feature(position,feature(q_max),accepted);}
+  // As observe(), with the feature itself (feature_from_logits()).
+  void observe_feature(std::size_t position,double log_odds,bool accepted) {
     if (position>=intercept_.size()) throw std::out_of_range("Draft position outside the estimator");
-    const Sample sample{feature(q_max),static_cast<std::uint32_t>(position),accepted};
+    if (!std::isfinite(log_odds)) throw std::invalid_argument("Draft feature is not finite");
+    const Sample sample{std::clamp(log_odds,-max_log_odds,max_log_odds),static_cast<std::uint32_t>(position),accepted};
     if (window_.size()<window_.capacity()) window_.push_back(sample);
     else {window_[next_]=sample;next_=(next_+1)%window_.size();}
     ++samples_;
@@ -638,15 +668,23 @@ public:
   std::size_t samples() const noexcept {return samples_;}
   double slope() const noexcept {return slope_;}
   double intercept(std::size_t position) const {return intercept_.at(position);}
-  double predict(std::size_t position,double q_max) const {
+  double predict(std::size_t position,double q_max) const {return predict_feature(position,feature(q_max));}
+  double predict_feature(std::size_t position,double log_odds) const {
     if (position>=intercept_.size()) throw std::out_of_range("Draft position outside the estimator");
+    if (!std::isfinite(log_odds)) throw std::invalid_argument("Draft feature is not finite");
     if (!fitted_) return 1;
-    return 1/(1+std::exp(-(slope_*feature(q_max)+intercept_[position])));
+    return 1/(1+std::exp(-(slope_*std::clamp(log_odds,-max_log_odds,max_log_odds)+intercept_[position])));
   }
   // Survival of each draft: the product of the predicted acceptances up to it.
   std::vector<double> survival(std::span<const double> q_max) const {
     std::vector<double> result(q_max.size());double alive=1;
     for (std::size_t k=0;k<q_max.size();++k){alive*=predict(k,q_max[k]);result[k]=alive;}
+    return result;
+  }
+  // As survival(), from each draft's feature.
+  std::vector<double> survival_features(std::span<const double> log_odds) const {
+    std::vector<double> result(log_odds.size());double alive=1;
+    for (std::size_t k=0;k<log_odds.size();++k){alive*=predict_feature(k,log_odds[k]);result[k]=alive;}
     return result;
   }
   // Drafts to keep: the longest prefix whose survival stays at or above the floor.

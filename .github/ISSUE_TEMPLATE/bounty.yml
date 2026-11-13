@@ -1,0 +1,75 @@
+name: Bounty
+description: A paid task with a fixed done-check (maintainers open these). Comment on one to claim it.
+title: "[Bounty] "
+labels: ["bounty"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A bounty is written so that someone new to crit, or a coding agent told "solve this issue", has everything it
+        needs: setup, the files to change, the exact arithmetic, the tests that must pass and the commands that
+        decide it. It is paid when its done-check passes on the claimant's GPU, a maintainer re-runs the same commands
+        on the reference RTX 5090 with the same result, and the pull request is merged. Every change meets
+        docs/CONTRIBUTION_CRITERIA.md: a constant that only changes speed is a knob `crit kernels sweep` tunes, never
+        a number picked on one GPU.
+  - type: textarea
+    id: setup
+    attributes:
+      label: Setup (once)
+      description: Clone, environment, build and the test command that must pass before any change. The smallest GPU it fits.
+    validations:
+      required: true
+  - type: textarea
+    id: task
+    attributes:
+      label: Task
+      description: What crit does today (with the measurement or refusal that shows it) and what to build.
+    validations:
+      required: true
+  - type: textarea
+    id: spec
+    attributes:
+      label: The arithmetic or format
+      description: The exact definition the result must equal, and where its authoritative reference lives.
+    validations:
+      required: true
+  - type: textarea
+    id: files
+    attributes:
+      label: Where the code goes
+      description: Every file to change, and every existing test that has to change and why.
+    validations:
+      required: true
+  - type: textarea
+    id: gates
+    attributes:
+      label: Exactness gates
+      description: The tests that must pass, by file and name, and what each compares against (a reference decoder, a float64 reference, the declared order bit for bit). New tests to add.
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: Done-check
+      description: The exact commands, inputs and the result they must give; for speed tasks the before and after measurement and the target on the reference RTX 5090.
+    validations:
+      required: true
+  - type: textarea
+    id: rules
+    attributes:
+      label: Rules and submission
+      description: Claiming, knobs not constants, no loosened tests, docs and CHANGELOG, one pull request with "Closes #N" and the done-check's output pasted.
+      value: |
+        - Comment on this issue before you start, so nobody else works on it at the same time.
+        - Every constant that only changes speed is a knob in kernel.json with a default, tuned by `crit kernels sweep`.
+        - Do not loosen any existing test, tolerance or check; only the tests named above change.
+        - Update the kernel's README and add a line under the top section of CHANGELOG.md.
+        - One pull request from your fork into main, starting with `Closes #<this issue>`, with your GPU
+          (`nvidia-smi --query-gpu=name,compute_cap --format=csv`) and the full output of every done-check command.
+    validations:
+      required: true
+  - type: input
+    id: reward
+    attributes:
+      label: Reward
+      description: Set by a maintainer.

@@ -187,6 +187,22 @@ class GemvBf16(_Cached):
         return {"x": _activations(rows, k, device), "w": self._matrices[(n, k)],
                 "out": torch.empty(rows, n, device=device, dtype=torch.bfloat16), "key": (n, k, rows)}
 
+    def integer_inputs(self, shape, rows, device):
+        """The gates' sums inputs (crit_kernels.gates): integers 0 to 15 on both sides, the matrix's second half the
+        first half negated plus a small integer at its end, so partial sums pass FP16's range and BF16's precision
+        while every FP32 sum is exact and each output is a small integer."""
+        n, k = int(shape["N"]), int(shape["K"])
+        g = torch.Generator(device="cpu").manual_seed(n * 43 + k)
+        x = torch.randint(0, 16, (rows, k), generator=g).float()
+        w = torch.randint(0, 16, (n, k), generator=g).float()
+        w[:, k // 2:k // 2 * 2] = -w[:, :k // 2]
+        w[:, -1] += torch.arange(n).float() % 7
+        return {"x": x.to(device, torch.bfloat16), "w": w.to(device, torch.bfloat16),
+                "out": torch.empty(rows, n, device=device, dtype=torch.bfloat16), "key": ("integer", n, k, rows)}
+
+    def integer_reference(self, s):
+        return s["x"].double() @ s["w"].double().t()
+
     def run(self, module, s):
         return module.gemv_bf16(s["x"], s["w"], s["out"])
 
@@ -414,6 +430,15 @@ class GemvCuda(_Cached):
         else:
             s.update(codes=held[0], scales=held[1], zeros=held[2])
         return s
+
+    def integer_inputs(self, shape, rows, device):
+        """The gates' sums inputs for BF16 weights (GemvBf16's), None for the stored formats."""
+        if int(shape["weights"]) != 3:
+            return None
+        return dict(GemvBf16().integer_inputs(shape, rows, device), weights=3)
+
+    def integer_reference(self, s):
+        return GemvBf16().integer_reference(s)
 
     def run(self, module, s):
         w = s["weights"]

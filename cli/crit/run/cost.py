@@ -5,8 +5,9 @@ agent's session transcripts, attributes every model request to the candidate tha
 made, prices the tokens at the model's list prices (or the table passed with --prices) and writes `cost.json` at
 the run root. The spans are the run's own events: a candidate's span runs from the previous candidate's seal (the
 run's creation for the first) to its own seal, so a candidate's row is what it cost to reach it; requests after
-the last seal are the selection and handoff. Time is wall time between those events, tokens come from the
-transcripts, and the price is the agent's API-equivalent at the recorded rates: a fact about this run, never a
+the last seal are the selection and handoff. Time is wall time between those events, and active time is wall time
+less the idle stretches given with --idle (FROM..UNTIL, when the agent's session was offline and nothing ran); tokens
+come from the transcripts (Claude Code's own `<synthetic>` messages are no model requests), and the price is the agent's API-equivalent at the recorded rates: a fact about this run, never a
 goal.
 
 Transcript formats, detected per file: Claude Code session JSONL (one `assistant` line per response with
@@ -68,6 +69,8 @@ def _claude_code(lines, name):
         if line.get("type") != "assistant" or not isinstance(line.get("message"), dict):
             continue
         message = line["message"]
+        if message.get("model") == "<synthetic>":   # written by Claude Code itself, not a model's response
+            continue
         usage = message.get("usage")
         if not isinstance(usage, dict):
             continue
@@ -241,6 +244,32 @@ def _hours(seconds):
     return round(seconds / 3600, 3)
 
 
+def idle_stretches(texts):
+    """--idle FROM..UNTIL texts as sorted, non-overlapping (from, until) datetimes."""
+    found = []
+    for value in texts or []:
+        first, sep, last = str(value).partition("..")
+        if not sep:
+            raise ValueError(f"--idle {value!r}: give FROM..UNTIL, two UTC timestamps")
+        start, end = _when(first.strip(), "--idle from"), _when(last.strip(), "--idle until")
+        if end <= start:
+            raise ValueError(f"--idle {value!r}: the stretch ends before it starts")
+        found.append((start, end))
+    found.sort()
+    for (_, a), (b, _) in zip(found, found[1:]):
+        if b < a:
+            raise ValueError("--idle stretches overlap")
+    return found
+
+
+def _active(start, end, idle):
+    """Seconds of [start, end) outside the idle stretches."""
+    out = (end - start).total_seconds()
+    for a, b in idle:
+        out -= max(0.0, (min(end, b) - max(start, a)).total_seconds())
+    return round(out)
+
+
 def spans(root, run, candidates, until):
     """Each candidate's build span from the run's events: previous seal (or run creation) to its seal, or open."""
     created = _when(run["created_at"], "run created_at")
@@ -259,12 +288,13 @@ def spans(root, run, candidates, until):
     return created, rows, start
 
 
-def account(root, run, candidates, transcripts, agent=None, prices=None, until=None):
+def account(root, run, candidates, transcripts, agent=None, prices=None, until=None, idle=None):
     """The run_cost record: per candidate, the wall time from the previous seal to its own, the agent's requests and
     tokens in that span and their API-equivalent price, with running totals from the run's first event."""
     if agent is not None:
         text(agent, "agent", 200)
     table, source = price_table(prices)
+    idle = idle_stretches(idle)
     facts, requests = [], []
     for path in transcripts:
         found, rows = read_transcript(path)
@@ -308,22 +338,28 @@ def account(root, run, candidates, transcripts, agent=None, prices=None, until=N
         candidates_out.append({
             **{key: row[key] for key in ("candidate_id", "label", "sealed")},
             "from": row["from"].isoformat().replace("+00:00", "Z"), "until": row["until"].isoformat().replace("+00:00", "Z"),
-            "seconds": seconds, **bucket,
+            "seconds": seconds, **({"active_seconds": _active(row["from"], row["until"], idle)} if idle else {}), **bucket,
             "cumulative": {"seconds": round((row["until"] - created).total_seconds()),
                            "hours": _hours((row["until"] - created).total_seconds()),
+                           **({"active_hours": _hours(_active(created, row["until"], idle))} if idle else {}),
                            "tokens": cumulative_tokens, "usd": None if cumulative_incomplete else round(cumulative_usd, 4)}})
     run_seconds = round((close - created).total_seconds())
     value = record("run_cost", run["run_id"], recorded_at=now(), agent=agent,
                    transcripts=facts, prices={"source": source, "usd_per_million_tokens": table},
                    run={"from": created.isoformat().replace("+00:00", "Z"), "until": close.isoformat().replace("+00:00", "Z"),
                         "until_source": "given" if until else ("run_stopped" if stopped else "now"),
-                        "seconds": run_seconds, "hours": _hours(run_seconds), **_finish(total)},
+                        "seconds": run_seconds, "hours": _hours(run_seconds),
+                        **({"active_seconds": _active(created, close, idle),
+                            "active_hours": _hours(_active(created, close, idle)),
+                            "idle": [{"from": a.isoformat().replace("+00:00", "Z"),
+                                      "until": b.isoformat().replace("+00:00", "Z")} for a, b in idle]} if idle else {}),
+                        **_finish(total)},
                    candidates=candidates_out, selection=_finish(selection), before_run=_finish(before))
     return value
 
 
-def write(root, run, candidates, transcripts, agent=None, prices=None, until=None):
-    value = account(root, run, candidates, transcripts, agent, prices, until)
+def write(root, run, candidates, transcripts, agent=None, prices=None, until=None, idle=None):
+    value = account(root, run, candidates, transcripts, agent, prices, until, idle)
     path = safe_path(root, COST_JSON)
     write_json(path, value)
     return value
@@ -342,6 +378,7 @@ def load(root):
 
 
 def built(value):
-    """The card-sized summary of a run_cost record: hours, agent tokens, API-equivalent USD and the agent."""
-    return {"hours": value["run"]["hours"], "agent_tokens": value["run"]["tokens"]["total"], "api_usd": value["run"]["usd"],
+    """The card-sized summary of a run_cost record: hours (active hours where the record has them), agent tokens,
+    API-equivalent USD and the agent."""
+    return {"hours": value["run"].get("active_hours", value["run"]["hours"]), "agent_tokens": value["run"]["tokens"]["total"], "api_usd": value["run"]["usd"],
             "agent": value["agent"], "candidates": len(value["candidates"]), "cost_sha256": digest(value)}

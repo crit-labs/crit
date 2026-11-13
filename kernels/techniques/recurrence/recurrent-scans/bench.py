@@ -3,6 +3,8 @@ and value dims from its config), random inputs of the plugins' layout seeded per
 token-by-token reference of the recurrence (recurrent-state-recovery's gated-delta operation)."""
 import torch
 
+from crit_kernels.gates import shared_memory_optin
+
 BLOCK = 256   # prefill tokens generated per seed, so a prompt's first tokens do not depend on its length
 
 
@@ -41,8 +43,13 @@ def recurrence(q, k, v, g, b, state, scale, eps=None):
 
 class DeltaPrefillRb:
     """gated_delta_prefill at 128 key dims (the register-blocked passes), FP32 inputs as the plugin passes them
-    (normalized keys and queries), on a prompt of `rows` tokens from a random state."""
+    (normalized keys and queries), on a prompt of `rows` tokens from a random state (nan_rule causal: one sequence's
+    tokens, each seeing the ones before it)."""
     structure = "delta-prefill-rb"
+    nan_rule = "causal"
+    # The chunked forms multiply a 64-token chunk's triangular matrices densely (0 x NaN is NaN): a NaN reaches its own
+    # chunk's earlier tokens, never an earlier chunk's.
+    nan_block = 64
 
     def __init__(self):
         self._tokens, self._states, self._references = {}, {}, {}
@@ -149,6 +156,7 @@ class PoolDelta:
     decode; a verify window when the shape says so) from its own FP32 state in a pool; nothing pending, so the live
     state is read and not written and every call gives the same outputs."""
     structure = "pool-delta"
+    scratch = ("stash",)   # STASH rows keep their inputs there for the deferred commit
 
     def __init__(self):
         self._rows, self._pools, self._references = {}, {}, {}
@@ -269,10 +277,198 @@ class PoolDeltaPipe(PoolDelta):
     def valid_for(self, knobs, shape):
         rows = 32 * (1 if shape["dk"] <= 32 else 2 if shape["dk"] <= 64 else 4 if shape["dk"] <= 128 else 8)
         stage = rows * 32 * 4 + 8 * (2 * rows + 32) * 2 + 8 * 4   # the tile, 8 BF16 tokens and their betas
-        return knobs["STAGES"] * stage * max(knobs["MINB"], 1) <= 99 * 1024
+        return knobs["STAGES"] * stage * max(knobs["MINB"], 1) <= shared_memory_optin()
 
     def run(self, module, s):
         module.pool_delta(s["out"], s["states"], s["stash"], s["control"], None, s["q"], s["k"], s["v"], s["g"], s["b"],
                           meta=s["meta"], rows=s["rows"], kind=module.STASH, layer=0, capacity=s["tokens"],
                           epsilon=1e-6, scale=s["scale"], pipelined=True)
         return s["out"].view(s["rows"], s["tokens"], *s["out"].shape[1:])
+
+
+# -- the untuned structures: no knobs to sweep, benches for the gates (nonfinite, repeat, edges) on the model's shapes --
+def ssd_shapes(model):
+    """The Mamba-2 layers' shape of a hybrid model (heads, head_dim, groups, state), or none."""
+    heads, dim = model.get("mamba_num_heads"), model.get("mamba_head_dim")
+    groups, state = model.get("n_groups"), model.get("ssm_state_size")
+    if not all(isinstance(x, int) and x > 0 for x in (heads, dim, groups, state)) or heads % groups:
+        return []
+    return [{"heads": heads, "head_dim": dim, "groups": groups, "state": state}]
+
+
+def conv_shapes(model):
+    """The causal convolutions of a hybrid model's recurrent layers (channels, width): Mamba-2's (its inner width
+    plus B and C) and gated delta's (q, k and v)."""
+    found = []
+    for s in ssd_shapes(model):
+        found.append({"channels": s["heads"] * s["head_dim"] + 2 * s["groups"] * s["state"],
+                      "width": int(model.get("conv_kernel") or 4)})
+    for s in delta_shapes(model):
+        found.append({"channels": 2 * s["k_heads"] * s["dk"] + s["v_heads"] * s["dv"],
+                      "width": int(model.get("linear_conv_kernel_dim") or 4)})
+    return found
+
+
+def _seeded(rows, make, device, seed):
+    """Rows built BLOCK at a time, each block from its own seed: row t is the same at any row count."""
+    blocks = [make(torch.Generator(device="cpu").manual_seed(seed * 7919 + i)) for i in range((rows + BLOCK - 1) // BLOCK)]
+    return tuple(torch.cat(p)[:rows].to(device) for p in zip(*blocks))
+
+
+def ssd_recurrence(x, dt, B, C, A, D, state):
+    """FP64 Mamba-2 token by token: H' = e^(dt A) H + dt x B^T; y = H' C + D x (groups shared by heads / groups)."""
+    x, dt, B, C, A, D, H = (t.double() for t in (x, dt, B, C, A, D, state))
+    ratio = x.shape[1] // B.shape[1]
+    B, C = B.repeat_interleave(ratio, dim=1), C.repeat_interleave(ratio, dim=1)
+    out = torch.empty_like(x)
+    for t in range(x.shape[0]):
+        H = torch.exp(dt[t] * A)[:, None, None] * H + dt[t][:, None, None] * x[t][:, :, None] * B[t][:, None, :]
+        out[t] = torch.einsum("hpn,hn->hp", H, C[t]) + D[:, None] * x[t]
+    return out, H
+
+
+class _Untuned:
+    """The common part: one sequence's tokens as the rows (nan_rule causal: a token sees the ones before it), checked
+    within 1e-3 + 1e-3|x| of the FP64 recurrence, outputs and the state or window after."""
+    nan_rule = "causal"
+
+    def __init__(self):
+        self._cache, self._references = {}, {}
+
+    def valid(self, knobs):
+        return True
+
+    def check(self, got, want, s):
+        for name, x, y in (("outputs", got[0], want[0]), ("final state", got[1], want[1])):
+            bad = int(((x.double() - y).abs() > 1e-3 + 1e-3 * y.abs()).sum())
+            if bad:
+                return f"{bad} {name} beyond 1e-3 + 1e-3|x| of the FP64 recurrence"
+        return None
+
+    def first_row(self, out):
+        return out[0][0]
+
+    def reference(self, s):
+        if s["key"] not in self._references:
+            self._references[s["key"]] = self.recurrence(s)
+        return self._references[s["key"]]
+
+
+class SsdPrefill(_Untuned):
+    """ssd_prefill on a prompt of `rows` tokens from a random state, the plugin's FP32 inputs (dt after softplus)."""
+    structure = "ssd-prefill"
+    nan_block = 64   # 64-token chunks, as gated delta's prefill
+    call = "ssd_prefill"
+
+    def shapes(self, model):
+        return ssd_shapes(model)
+
+    def inputs(self, shape, rows, device):
+        h, p, g, n = (int(shape[f]) for f in ("heads", "head_dim", "groups", "state"))
+        key = (h, p, g, n)
+        if key not in self._cache or self._cache[key][0][0].shape[0] < rows:
+            tokens = _seeded(rows, lambda r: (torch.randn(BLOCK, h, p, generator=r), torch.rand(BLOCK, h, generator=r) * 0.1,
+                                              torch.randn(BLOCK, g, n, generator=r), torch.randn(BLOCK, g, n, generator=r)),
+                             device, 3)
+            r = torch.Generator(device="cpu").manual_seed(5)
+            fixed = ((-torch.rand(h, generator=r) - 0.1).to(device), torch.randn(h, generator=r).to(device),
+                     (torch.randn(h, p, n, generator=r) * 0.1).to(device))
+            self._cache[key] = (tokens, fixed)
+        (x, dt, B, C), (A, Dk, state0) = self._cache[key]
+        x, dt, B, C = x[:rows], dt[:rows], B[:rows], C[:rows]
+        return {"x": x, "dt": dt, "B": B, "C": C, "A": A, "D": Dk, "state0": state0, "state": state0.clone(),
+                "out": torch.empty_like(x), "key": (key, rows)}
+
+    def run(self, module, s):
+        s["state"].copy_(s["state0"])
+        getattr(module, self.call)(s["x"], s["dt"], s["B"], s["C"], s["A"], s["state"], D=s["D"], out=s["out"])
+        return s["out"], s["state"]
+
+    def recurrence(self, s):
+        return ssd_recurrence(s["x"], s["dt"], s["B"], s["C"], s["A"], s["D"], s["state0"])
+
+
+class SsdColumns(SsdPrefill):
+    """ssd_scan: the decode and verify columns, token by token."""
+    structure = "ssd-columns"
+    call = "ssd_scan"
+    nan_block = 0
+
+
+class DeltaColumns(_Untuned):
+    """gated_delta_scan: one sequence's decode and verify columns, from the plugin's FP32 inputs."""
+    structure = "delta-columns"
+
+    def __init__(self):
+        super().__init__()
+        self._prefill = DeltaPrefillRb()
+
+    def shapes(self, model):
+        return delta_shapes(model)
+
+    def inputs(self, shape, rows, device):
+        return self._prefill.inputs(shape, rows, device)
+
+    def run(self, module, s):
+        s["state"].copy_(s["state0"])
+        module.gated_delta_scan(s["q"], s["k"], s["v"], s["g"], s["b"], s["state"], scale=s["scale"], out=s["out"])
+        return s["out"], s["state"]
+
+    def recurrence(self, s):
+        return recurrence(s["q"], s["k"], s["v"], s["g"], s["b"], s["state0"], s["scale"])
+
+
+class DeltaPrefill64(DeltaColumns):
+    """gated_delta_prefill at 64 key dims (the thread-a-row passes)."""
+    structure = "delta-prefill-64"
+
+    def shapes(self, model):
+        return [s for s in delta_shapes(model) if s["dk"] == 64]
+
+    def run(self, module, s):
+        s["state"].copy_(s["state0"])
+        module.gated_delta_prefill(s["q"], s["k"], s["v"], s["g"], s["b"], s["state"], scale=s["scale"], out=s["out"])
+        return s["out"], s["state"]
+
+
+class CausalConv(_Untuned):
+    """causal_conv1d: one sequence's convolution with its carried window, SiLU, the model's channels and width."""
+    structure = "causal-conv"
+
+    def shapes(self, model):
+        return conv_shapes(model)
+
+    def inputs(self, shape, rows, device):
+        c, w = int(shape["channels"]), int(shape["width"])
+        key = (c, w)
+        if key not in self._cache or self._cache[key][0][0].shape[0] < rows:
+            tokens = _seeded(rows, lambda r: (torch.randn(BLOCK, c, generator=r),), device, 9)
+            r = torch.Generator(device="cpu").manual_seed(11)
+            fixed = (torch.randn(c, w, generator=r).to(device), torch.randn(c, generator=r).to(device),
+                     torch.randn(c, w - 1, generator=r).to(device))
+            self._cache[key] = (tokens, fixed)
+        (x,), (weight, bias, window0) = self._cache[key]
+        x = x[:rows]
+        return {"x": x, "weight": weight, "bias": bias, "window0": window0, "window": window0.clone(),
+                "after": torch.empty_like(window0), "out": torch.empty_like(x), "key": (key, rows)}
+
+    def run(self, module, s):
+        s["window"].copy_(s["window0"])
+        module.causal_conv1d(s["x"], s["weight"], s["window"], bias=s["bias"], silu=True, out=s["out"])
+        return s["out"], s["window"]
+
+    def recurrence(self, s):
+        w = s["weight"].shape[1]
+        padded = torch.cat([s["window0"].T.double(), s["x"].double()])
+        out = torch.stack([(padded[t:t + w].T * s["weight"].double()).sum(1) + s["bias"].double()
+                           for t in range(s["x"].shape[0])])
+        return torch.nn.functional.silu(out), padded[-(w - 1):].T
+
+
+class ConvSegments(CausalConv):
+    """conv_segments: one long row out of place (the window in, the window after it out), pool_conv's bits."""
+    structure = "conv-segments"
+
+    def run(self, module, s):
+        module.conv_segments(s["out"], s["window0"], s["after"], s["x"], s["weight"], s["bias"], True)
+        return s["out"], s["after"]

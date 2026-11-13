@@ -239,6 +239,9 @@ def parser():
     sub.add_argument("--prices", help="JSON object or file of {model: {input, cache_read, cache_write_5m, cache_write_1h, "
                                       "output}} in USD per million tokens, over the list prices")
     sub.add_argument("--until", help="Count requests up to this UTC timestamp (default: the run's stop, else now)")
+    sub.add_argument("--idle", action="append", metavar="FROM..UNTIL", help="A stretch in which the build was idle "
+                     "(the agent's session offline, nothing running), UTC timestamps (repeatable): left out of the "
+                     "active hours the record gives beside the wall hours")
     sub = subs.add_parser("replay", help="Copy the run as it stood when a candidate's Eval finished, for an agent to say "
                                          "what it would do next with today's crit and crit-eval (records nothing)")
     sub.add_argument("--at", metavar="CANDIDATE", help="The candidate whose newest completed Eval the replays start from")
@@ -269,6 +272,17 @@ def main(argv=None):
         return act(command, args)
 
 
+def eval_refusal(model_path):
+    """Why crit-eval's reference cannot score the run's model (crit_eval.quality.checkpoints.scoring_refusal: no
+    layout for its GGUF architecture, no modeling code in the installed transformers, ...), or None, also when the
+    installed crit-eval has no such check."""
+    try:
+        from crit_eval.quality.checkpoints import scoring_refusal
+    except ImportError:
+        return None
+    return scoring_refusal(model_path)
+
+
 def act(command, args):
     """Run the parsed action: its result as JSON on stdout and 0, or the error on stderr and 1."""
     try:
@@ -287,6 +301,10 @@ def act(command, args):
                     filled["device"] = str(device if device.is_absolute() else args.project / device)
                 payload = {**filled, **payload}
             result = store.create(payload, args.from_engine)
+            refusal = eval_refusal(result["run"]["spec"]["model_path"])
+            if refusal:
+                print(f"crit run create: Eval cannot score this model: {refusal}. Its candidates cannot be measured, "
+                      "qualified or certified until it can.", file=sys.stderr)
         elif args.action == "resolve":
             result = store.freeze_inputs(args.id, payload)
         elif args.action == "plan" and args.draft:
@@ -387,7 +405,7 @@ def act(command, args):
         elif args.action == "stop":
             result = store.stop(args.id, **payload)
         elif args.action == "cost":
-            result = store.cost(args.id, args.transcript, args.agent, args.prices, args.until)
+            result = store.cost(args.id, args.transcript, args.agent, args.prices, args.until, args.idle)
         elif args.action == "recover":
             result = store.recover(args.id)
         else:

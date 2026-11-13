@@ -48,6 +48,25 @@ TFLOPS), 7168 x 22016 8.1 ms (160), 34816 x 5120 8.7 ms (169), FP8 W8A16 16384 x
 1,024 rows, 114-160 at 256; against cuBLAS's BF16 GEMM over the same matrix decoded beforehand (its decode not
 counted) 75-80% of its rate, and twice the rate of the decode tile in calls of 64 rows (70-89 TFLOPS).
 
+A CTA whose 64 activation rows run past M (a prompt's last tile) stages and multiplies only its columns of eight
+rows that hold a row below M: a 65-row prompt's second CTA does one column's work instead of eight. Outputs are
+unchanged. On an RTX 5090, a 5120 x 5120 matrix at 65 to 200 rows took 2 to 6% less (BF16 at 65 rows 88 to 83 us), and
+full tiles stayed within the runs' spread.
+
+## Gate and up in one matrix (glu)
+
+An MLP's gate and up projections read the same activations, and the activation product after them reads both outputs
+back. `mm_rows(..., glu=True)` and `mm_prompt(..., glu=True)` (the FP4 MMA too) take the two as one matrix whose rows
+are interleaved by eights (`interleave_glu(gate, up)` for codes, row-major block scales, row scales or BF16 weights;
+NVFP4 scales go into the tiled layout after they are interleaved). A thread's MMA fragment then holds a gate row and
+its up row for the same tokens, so the epilogue writes `silu(gate) * up`, out [M][N / 2]: each sum finished as
+without glu and rounded to out's dtype, then the product in FP32, rounded once. With splits of K, the tile's last
+CTA adds both sums in split order, one thread a pair. Its outputs are within one BF16 step (the activation's
+exponential) of the two projections followed by `silu_mul`, and a row keeps its bits alone, beside others and in the
+prompt tile ([tests/test_glu.py](tests/test_glu.py)). On an RTX 5090, a 34816 x 5120 gate/up matrix in CUDA graphs:
+level with the projection and `silu_mul` from 1 to 16 rows (NVFP4 64 / 94 / 152 us at 1 / 4 / 16 rows), 2 to 6% faster
+at 64 rows (NVFP4 546 to 513 us, FP8 574 to 564, BF16 603 to 594).
+
 ## Structures and knobs
 
 kernel.json lists them; the default knobs run what the kernel ran before it had knobs. Order knobs in bold; plan()

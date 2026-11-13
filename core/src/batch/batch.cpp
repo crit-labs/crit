@@ -21,6 +21,7 @@ void StepLayout::arrange(std::span<const StepItem> items) {
     }
     placements_.clear();
     logit_rows_.clear();
+    read_rows_.clear();
     by_item_.assign(items.size(), 0);
     rows_ = decode_rows_ = decode_items_ = 0;
     std::uint32_t logits = 0;
@@ -29,8 +30,10 @@ void StepLayout::arrange(std::span<const StepItem> items) {
             const auto& item = items[i];
             if(item.phase != phase) continue;
             by_item_[i] = std::uint32_t(placements_.size());
-            placements_.push_back({item.key, phase, std::uint32_t(i), rows_, item.rows, logits, item.logits});
+            const std::uint32_t read = item.readers ? item.rows : item.logits;
+            placements_.push_back({item.key, phase, std::uint32_t(i), rows_, item.rows, logits, item.logits, read});
             for(std::uint32_t r = item.rows - item.logits; r < item.rows; ++r) logit_rows_.push_back(rows_ + r);
+            for(std::uint32_t r = item.rows - read; r < item.rows; ++r) read_rows_.push_back(rows_ + r);
             rows_ += item.rows;
             logits += item.logits;
             if(phase == RowPhase::decode) { decode_rows_ += item.rows; ++decode_items_; }
@@ -43,6 +46,7 @@ const StepPlacement& StepLayout::placement(std::size_t item) const {
     return placements_[by_item_[item]];
 }
 std::span<const std::uint32_t> StepLayout::logit_rows() const noexcept { return logit_rows_; }
+std::span<const std::uint32_t> StepLayout::read_rows() const noexcept { return read_rows_; }
 std::uint32_t StepLayout::rows() const noexcept { return rows_; }
 std::uint32_t StepLayout::decode_rows() const noexcept { return decode_rows_; }
 std::uint32_t StepLayout::decode_items() const noexcept { return decode_items_; }

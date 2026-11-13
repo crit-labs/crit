@@ -136,7 +136,9 @@ class LlamaModel:
                 "max_row_tokens": self.width + 1, "decode_token_work": self.width + 1, "stop_tokens": self.stops,
                 "sampling": dict.fromkeys(CORE_SAMPLING, True), "token_logprobs": True, "max_top_logprobs": TOP,
                 "scoring": True, "query_scoring": True, "score_paths": ["prefill"], "replay": True,
-                "speculative": drafts, "plain": drafts}
+                "speculative": drafts, "plain": drafts,
+                # A draft step reads the stub head's rows (one BF16 row of the model's width each).
+                **({"draft_bytes_per_step": 2 * self.vocabulary * max(1, int(getattr(self, "hidden", 1)))} if drafts else {})}
 
     def telemetry(self):
         """The round driver's counters (rounds, drafts by depth) when the model decodes in rounds."""

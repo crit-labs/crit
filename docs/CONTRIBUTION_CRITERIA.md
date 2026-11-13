@@ -46,7 +46,8 @@ crit and put the model's **instance** in its engine package.
 library where one covers it, and otherwise from one of crit's kernel templates (`kernels/techniques/<family>/<id>/`): source
 built for the engine's device, with every constant that only changes speed (warps, tiles, splits, stages) a knob that
 `crit kernels sweep` tunes for the model and GPU. A contribution to a kernel adds a structure or a knob value, never a
-constant chosen on one GPU. [Kernels and plugins](PLUGINS.md#kernels-and-plugins) gives the rule: what stays in a
+constant chosen on one GPU, and never removes a structure because a new one beat it on one GPU: the sweep picks
+between them on each device ([guarding against one GPU](../kernels/README.md#one-gpu)). [Kernels and plugins](PLUGINS.md#kernels-and-plugins) gives the rule: what stays in a
 technique as mechanism, how a plugin declares and loads a kernel with its fallback, and what a technique keeps
 instead of a list of kernels.
 
@@ -112,6 +113,10 @@ declares and the official code ignores).
   this unchanged or be unaffected by it?
 - Is anything named after one model, checkpoint or GPU? If so, is that only an
   example, or does the behavior depend on it?
+- For a kernel: is every speed-only constant a knob and every device limit read from
+  the device; is a new instruction behind a feature check with the other GPUs' path
+  beside it and tested on the reference GPU; does a new structure sit beside the one
+  it beat; does every number name its device?
 - Is the model-specific part, if there is one, in the engine package behind a general
   interface?
 - Does the change add a second copy of something crit already has?

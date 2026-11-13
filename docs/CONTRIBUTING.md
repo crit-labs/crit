@@ -9,6 +9,21 @@ Every change must meet the three criteria in [what belongs in crit](CONTRIBUTION
 it improves the platform measurably, it does not overfit to one model or machine, and it is
 valuable to almost any model on any hardware backend.
 
+## How pull requests land
+
+crit's `main` only receives release commits: each release is one squash commit, "crit X.Y.Z", whose description
+is that version's [CHANGELOG](../CHANGELOG.md) section. So a pull request is never merged as it is. When a change is
+accepted, a maintainer applies it to the next release as one focused commit, credits the author in its CHANGELOG
+line (and, if they want, with a `Co-authored-by:` line in the release commit), and closes the pull request once that
+release is out, naming the version it shipped in.
+
+- Open an issue first for anything larger than a small fix, and link it from the pull request (`Closes #N`).
+- Show the evidence the [criteria](CONTRIBUTION_CRITERIA.md) ask for: the tests you ran with their output, and for
+  speed changes the measurement before and after, with the GPU named.
+- Issues labeled `bounty` that are assigned to someone are reserved for them; claims and pull requests from anyone
+  else are closed.
+- Pull requests without evidence, or ones that change code only to touch it, are closed without review.
+
 ## Code boundaries
 
 | Folder | Responsibility |
@@ -64,7 +79,7 @@ a clean snapshot:
 mkdir -p build/package-source
 git archive HEAD | tar -x -C build/package-source
 python -B -c "import os; from setuptools.build_meta import build_sdist, build_wheel; os.chdir('build/package-source'); build_sdist('../dist'); build_wheel('../dist')"
-python -m pip install build/dist/crit-0.18.0-py3-none-any.whl
+python -m pip install build/dist/crit-0.19.0-py3-none-any.whl
 ```
 
 The `crit` wheel holds `crit`, `crit_api`, `crit_kernels`, `crit_mcp`, `crit_models` and `crit_smoke`, and

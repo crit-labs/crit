@@ -40,7 +40,7 @@ void mm_rows(const torch::Tensor& x, const torch::Tensor& w, const std::optional
              const std::optional<torch::Tensor>& row_scale, int64_t weights, int64_t acts, double input_scale,
              bool blocked, int64_t groups, int64_t warps, int64_t splits, const std::optional<torch::Tensor>& scratch,
              const std::optional<torch::Tensor>& partial, const std::optional<torch::Tensor>& counters,
-             torch::Tensor& out, const std::optional<torch::Tensor>& zeros, int64_t group) {
+             torch::Tensor& out, const std::optional<torch::Tensor>& zeros, int64_t group, int64_t glu) {
   check_x(x, mr::kMaxRows, "mm_rows");
   const int64_t m = x.size(0), k = x.size(1), n = w.size(0);
   TORCH_CHECK(k % mr::kStep == 0, "mm_rows: K is a multiple of ", mr::kStep, ", not ", k);
@@ -148,8 +148,12 @@ void mm_rows(const torch::Tensor& x, const torch::Tensor& w, const std::optional
     p.input_scale = static_cast<float>(input_scale);
     p.input_rcp = 1.0f / p.input_scale;
   }
-  TORCH_CHECK(out.is_cuda() && out.dim() == 2 && out.size(0) == m && out.size(1) == n && out.stride(1) == 1,
-              "mm_rows: out is [rows][N] with contiguous rows");
+  TORCH_CHECK(glu == 0 || (glu == 1 && n % 16 == 0),
+              "mm_rows: glu 1 takes interleaved gate and up rows, N a multiple of 16");
+  TORCH_CHECK(out.is_cuda() && out.dim() == 2 && out.size(0) == m && out.size(1) == (glu ? n / 2 : n) &&
+                  out.stride(1) == 1,
+              "mm_rows: out is [rows][N] with contiguous rows ([rows][N / 2] with glu)");
+  p.glu = static_cast<int>(glu);
   on_device(x, out, "mm_rows");
   p.out = out.data_ptr();
   p.ldo = out.stride(0);

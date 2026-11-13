@@ -13,6 +13,9 @@ def _logits(rows, experts, device):
 
 class WarpRows:
     structure = "warp-rows"
+    # A NaN ranks below every number and a row whose weights come out NaN gets weights 0 (README: junk positions of a
+    # captured decode round must still route to valid experts without poisoning their sums).
+    nan_rule = "contained"
 
     def __init__(self):
         self._logits, self._bias, self._references, self._default = {}, {}, {}, None

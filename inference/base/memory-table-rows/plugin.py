@@ -25,21 +25,23 @@ class MemoryTableRows:
             out.append(list(self.table[i]))
         return out
 
-    def store(self, rows, format=None, scales=None, scale=1.0, dtype=None):
+    def store(self, rows, format=None, scales=None, scale=1.0, dtype=None, device=None):
         """A table for lookup, returned as its handle (lookup(ids), close()): rows [ids][width] of their dtype, or format
         "nvfp4" (rows the E2M1 codes [ids][width / 2], scales the E4M3 scales [ids][width / 16], dtype the decoded
         dtype, scale the global scale), as lookup-table-rows' store() takes them. On the device, or (host) copied into
-        registered host memory, `rows` then free to go; the table serves the device `rows` are on."""
+        registered host memory, `rows` then free to go; the table serves `device`, by default the one `rows` are on
+        (with host, rows read on the CPU never pass through the device)."""
         import torch
         if rows.dim() != 2 or rows.shape[0] < 1:
             raise ValueError("a table of rows of one width")
         if not self.host:
-            return self.device_rows.store(rows, format, scales, scale, dtype)
+            return self.device_rows.store(rows, format, scales, scale, dtype, device)
+        device = rows.device if device is None else torch.device(device)
         if format is None:
-            return self.device_rows.open(rows.cpu(), rows.shape[1], rows.dtype, rows.device)
+            return self.device_rows.open(rows.cpu(), rows.shape[1], rows.dtype, device)
         if scales is None:
             raise ValueError("NVFP4 rows need their scales")
-        return self.device_rows.open(rows.cpu(), rows.shape[1] * 2, dtype or torch.bfloat16, rows.device,
+        return self.device_rows.open(rows.cpu(), rows.shape[1] * 2, dtype or torch.bfloat16, device,
                                      format=format, scales=scales.cpu(), scale=scale)
 
     def lookup(self, ids):

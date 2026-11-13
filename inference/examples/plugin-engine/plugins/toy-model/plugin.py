@@ -80,7 +80,9 @@ class ToyModel:
                 "max_pending": self.options["pending"], "max_batch_tokens": 64, "max_row_tokens": self.width,
                 "stop_tokens": self.stops, "sampling": {key: True for key in CORE_SAMPLING},
                 "token_logprobs": True, "max_top_logprobs": 20, "scoring": True, "query_scoring": True,
-                "score_paths": ["prefill"], "replay": True, "speculative": self.drafts, "plain": self.drafts}
+                "score_paths": ["prefill"], "replay": True, "speculative": self.drafts, "plain": self.drafts,
+                # A toy draft step reads one FP32 value a vocabulary entry.
+                **({"draft_bytes_per_step": 4 * self.vocabulary} if self.drafts else {})}
 
     def open(self, request):
         self.handles += 1

@@ -32,7 +32,8 @@ import torch
 
 from . import _crit_tuning, _triton
 
-__all__ = ["gated_rms_norm", "gelu_mul", "l2_norm", "rms_norm", "rms_norm_heads", "rms_norm_rope", "rms_norm_rope_pair",
+__all__ = ["gated_rms_norm", "gelu_mul", "l2_norm", "rms_norm", "rms_norm_fp8_rows", "rms_norm_heads", "rms_norm_nvfp4",
+           "rms_norm_rope", "rms_norm_rope_pair", "nvfp4_scale_bytes",
            "rope", "rope_pair", "sigmoid_mul", "silu_mul", "softplus_decay", "stream_add", "stream_add_norm",
            "stream_sum"]
 
@@ -256,6 +257,98 @@ def rms_norm(x: torch.Tensor, weight: Optional[torch.Tensor], eps: float, offset
     return y if residual is None else (y, residual)
 
 
+def _rows_quant(x, weight, eps, offset, residual, quant, q, scales, input_scale=1.0):
+    """rms_norm's rows quantized as the projections' quantizers do (quant 1: FP8 rows, 2: NVFP4) into q and scales."""
+    _check(x)
+    if x.dim() != 2:
+        raise ValueError(f"the quantizing norms take rows [M][K], not {tuple(x.shape)}")
+    M, K = x.shape
+    if _block(K) > WIDEST_BLOCK:
+        raise ValueError(f"the quantizing norms take rows of at most {WIDEST_BLOCK} values, not {K}")
+    if quant == 2 and K % 16:
+        raise ValueError(f"NVFP4 rows hold 16-value blocks: K a multiple of 16, not {K}")
+    groups, _, grouped = _weight(weight, x)
+    if grouped:
+        raise ValueError("the quantizing norms take one weight [K]")
+    if residual is not None:
+        _check(residual, "residual", x.device)
+        if residual.shape != x.shape:
+            raise ValueError(f"residual of shape {tuple(residual.shape)} for x of shape {tuple(x.shape)}")
+    width = K if quant == 1 else K // 2
+    if q.shape != (M, width) or q.dtype not in (torch.uint8, torch.float8_e4m3fn) + _FP4 or q.stride(-1) != 1 \
+            or q.device != x.device:
+        raise ValueError(f"codes are [{M}][{width}] bytes with contiguous rows on {x.device}")
+    if quant == 1:
+        if scales.shape != (M,) or scales.dtype != torch.float32 or not scales.is_contiguous():
+            raise ValueError(f"FP8 row scales are FP32 [{M}]")
+    else:
+        need = _cdiv(M, 128) * 128 * _cdiv(K // 16, 4) * 4
+        if scales.numel() != need or scales.element_size() != 1 or not scales.is_contiguous():
+            raise ValueError(f"NVFP4 block scales are {need} bytes: cuBLASLt's 128 x 4 tiled layout of [{M}][{K // 16}]")
+    present = [t for t in (x, residual) if t is not None]
+    tensors = present + ([weight] if weight is not None else [])
+    if not _aligned(tensors, [(t.stride(0), 0) for t in present]) or q.stride(0) % 16:
+        kept = None if residual is None else _padded(residual)
+        if weight is not None and weight.data_ptr() % 16:
+            weight = weight.clone()
+        aligned_q = _padded(q, copy=False) if q.stride(0) % 16 else q
+        _rows_quant(_padded(x), weight, eps, offset, kept, quant, aligned_q, scales, input_scale)
+        if kept is not None:
+            residual.copy_(kept)
+        if aligned_q is not q:
+            q.copy_(aligned_q)
+        return
+    if M == 0:
+        return
+    w = weight if weight is not None else x
+    r = residual if residual is not None else x
+    block, rows, span = _config(K)
+    with _on(x):
+        _triton.rows_quant_kernel[(_cdiv(M, rows),)](
+            x, x.stride(0), 0, r, r.stride(0), 0, w, q.view(torch.uint8), q.stride(0), scales.view(torch.uint8)
+            if quant == 2 else scales, M, 1, K, float(eps), float(offset), float(input_scale), 1.0 / float(input_scale),
+            _cdiv(K // 16, 4), HAS_RES=residual is not None, HAS_W=weight is not None, QUANT=quant, HB=rows, BD=block,
+            num_warps=_warps(block, rows, span))
+
+
+_FP4 = tuple(t for t in (getattr(torch, "float4_e2m1fn_x2", None),) if t is not None)
+
+
+def rms_norm_fp8_rows(x: torch.Tensor, weight: Optional[torch.Tensor], eps: float, offset: float = 0.0,
+                      residual: Optional[torch.Tensor] = None, q: Optional[torch.Tensor] = None,
+                      scale: Optional[torch.Tensor] = None):
+    """rms_norm of rows x [M][K] quantized for a W8A8 projection in the same launch: the E4M3 codes q [M][K] (uint8
+    or float8_e4m3fn) and one FP32 scale a row (scale [M]: the row's absolute maximum / 448, at least 1e-12), the
+    codes and scales of rms_norm's BF16 rows followed by the projections' FP8 row quantizer, without writing the rows.
+    With residual, the residual becomes residual + x first, as in rms_norm. Returns (q, scale), or (q, scale,
+    residual)."""
+    q = torch.empty(x.shape, dtype=torch.uint8, device=x.device) if q is None else q
+    scale = torch.empty(x.shape[0], dtype=torch.float32, device=x.device) if scale is None else scale
+    _rows_quant(x, weight, eps, offset, residual, 1, q, scale)
+    return (q, scale) if residual is None else (q, scale, residual)
+
+
+def nvfp4_scale_bytes(rows: int, width: int) -> int:
+    """Bytes of NVFP4 block scales for rows [rows][width] in cuBLASLt's 128 x 4 tiled layout."""
+    return _cdiv(rows, 128) * 128 * _cdiv(width // 16, 4) * 4
+
+
+def rms_norm_nvfp4(x: torch.Tensor, weight: Optional[torch.Tensor], eps: float, input_scale: float,
+                   offset: float = 0.0, residual: Optional[torch.Tensor] = None, codes: Optional[torch.Tensor] = None,
+                   scales: Optional[torch.Tensor] = None):
+    """rms_norm of rows x [M][K] (K a multiple of 16) quantized for a W4A4 projection in the same launch: E2M1 codes
+    [M][K / 2] (two a byte, the first in the low nibble) and one E4M3 scale a 16-value block under input_scale, in
+    cuBLASLt's 128 x 4 tiled layout (nvfp4_scale_bytes(M, K) bytes), the codes and scales of rms_norm's BF16 rows
+    followed by the projections' NVFP4 quantizer. Only real blocks' scales are written: give scales from torch.zeros
+    (the layout's padding stays zero). With residual, as rms_norm. Returns (codes, scales), or (codes, scales,
+    residual)."""
+    codes = torch.empty(x.shape[0], x.shape[1] // 2, dtype=torch.uint8, device=x.device) if codes is None else codes
+    if scales is None:
+        scales = torch.zeros(nvfp4_scale_bytes(x.shape[0], x.shape[1]), dtype=torch.uint8, device=x.device)
+    _rows_quant(x, weight, eps, offset, residual, 2, codes, scales, input_scale)
+    return (codes, scales) if residual is None else (codes, scales, residual)
+
+
 def rms_norm_heads(x: torch.Tensor, weight: Optional[torch.Tensor], eps: float, offset: float = 0.0,
                    out_dtype: Optional[torch.dtype] = None, out: Optional[torch.Tensor] = None) -> torch.Tensor:
     """rms_norm of each head of x [tokens][heads][dim] (query and key norms), weight [dim] or [heads][dim]."""
@@ -310,7 +403,9 @@ def _rope(x, positions, freqs, rotary_dim, style, scale, weight, eps, offset, no
     if _block(width) > WIDEST_BLOCK:
         raise ValueError(f"heads of {width} values are wider than rope's {WIDEST_BLOCK}")
     block, rows, span = _config(width, "rope")
-    rows = min(rows, 1 << (heads - 1).bit_length())
+    # HB (and so the warps) by the head width alone, never the head count: a block's sums of squares then run in the
+    # same order here and in rms_norm_rope_pair, whose queries and keys share one HB (a tensor of fewer heads than HB
+    # masks the rest).
     warps = _warps(block, rows, span)
     y = _result(x, x.shape, out_dtype, out)
     if tokens == 0 or heads == 0:
@@ -550,7 +645,7 @@ def _pair(q, k, q_weight, k_weight, eps, positions, freqs, offset, rotary_dim, s
         raise ValueError(f"heads of {width} values are wider than rope's {WIDEST_BLOCK}")
     block, rows, span = _config(width, "rope")
     heads, heads2 = q.shape[1], k.shape[1]
-    rows = min(rows, 1 << (max(heads, heads2, 1) - 1).bit_length())
+    # HB by the head width alone, as _rope's: each tensor's bits are its separate call's.
     warps = _warps(block, rows, span)
     yq = _result(q, q.shape, out_dtype, q_out)
     yk = _result(k, k.shape, out_dtype, k_out)

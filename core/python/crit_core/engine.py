@@ -74,6 +74,24 @@ def read_configuration(package):
     return value
 
 
+def package_tuning(package, configuration):
+    """The kernel tuning a package carries: configuration "kernel_tuning", a folder of crit kernels sweep's tables
+    inside the package (relative to it), which the kernels the plugins build use (crit_plugins.kernels.use_tuning)
+    before any plugin is made, so the package served is the package Eval measured; without it CRIT_KERNEL_TUNING, else
+    the kernels' default knobs. Returns the folder or None."""
+    from crit_plugins.kernels import use_tuning
+    name = configuration.get("kernel_tuning")
+    if name is None:
+        use_tuning(None)
+        return None
+    folder = (Path(package) / str(name)).resolve()
+    if not isinstance(name, str) or not folder.is_dir() or not folder.is_relative_to(Path(package).resolve()):
+        raise PluginError(f"kernel_tuning {name!r} is a folder of tuning tables inside the package (crit kernels sweep "
+                          "--out), relative to it")
+    use_tuning(folder)
+    return folder
+
+
 def selection(configuration, speculative=True):
     """The configuration's plugin selection in its full form (crit_plugins.assemble.normalize); speculative False
     empties the drafting slots, for an engine that decodes one token per target pass."""
@@ -347,6 +365,7 @@ def load(package, model, configuration=None, *, context_tokens=None, speculative
     runs."""
     package = Path(package)
     configuration = read_configuration(package) if configuration is None else dict(configuration)
+    package_tuning(package, configuration)
     chosen = selection(configuration, speculative)
     registry = registry_of(package)
     device = device or engine_device(registry, chosen["use"], configuration)
@@ -697,6 +716,24 @@ class EvalEngine:
         self.native.close()
 
 
+def release_threshold(configuration, limits):
+    """Bytes of free device memory below which a request's end hands back what torch's allocator caches and nothing
+    uses (a long prompt's or score's temporaries otherwise stay reserved, and the next long request finds no room):
+    configuration "release_below_mib" where the engine sets it (0 never releases), else the device memory headroom the
+    run or crit serve keeps (limits' vram_headroom_bytes, from the machine settings); None releases nothing."""
+    if "release_below_mib" in configuration:
+        below = int(configuration["release_below_mib"]) << 20
+    else:
+        below = int((limits or {}).get("vram_headroom_bytes") or 0)
+    return below or None
+
+
+def _release_after_request(below):
+    if below:
+        from crit_plugins.device import release_cached_under
+        release_cached_under(below)
+
+
 class ResidentEngine(ResidentChat):
     """chat-resident-v1 (docs/SERVING.md) over a package's engine, for crit serve: crit_core.serving.ResidentChat with
     the engine's stop tokens, context and sampling fields, token log-probabilities (chat-logprobs-v1), fixed-text
@@ -722,6 +759,7 @@ class ResidentEngine(ResidentChat):
         self.max_concurrent_requests = int(self.facts["max_concurrent_requests"])
         self._owns_native = True
         self.capacity = min(int(self.facts["context"]), int(limits.get("kv_tokens") or self.facts["context"]))
+        self.release_below = release_threshold(self.configuration, limits)
         self.stop_ids = set(self.facts.get("stop_tokens") or [])
         support = self.facts.get("sampling") or {}
         self.sampling = tuple(key for key in SAMPLING if support.get(PENALTY if key in PENALTIES else key))
@@ -773,9 +811,12 @@ class ResidentEngine(ResidentChat):
                         constraint=None, inputs=None):
         if constraint is not None:
             self._constrain()
-        tokens, result = self.native.generate(ids, max_new_tokens, on_tokens=on_tokens, sampling=sampling,
-                                              logprobs=logprobs, plain=plain, cancelled=cancelled,
-                                              constraint=constraint, inputs=inputs)
+        try:
+            tokens, result = self.native.generate(ids, max_new_tokens, on_tokens=on_tokens, sampling=sampling,
+                                                  logprobs=logprobs, plain=plain, cancelled=cancelled,
+                                                  constraint=constraint, inputs=inputs)
+        finally:
+            _release_after_request(self.release_below)
         if tokens is None:
             return None, {}
         timing = result["timing"]
@@ -792,6 +833,7 @@ class ResidentEngine(ResidentChat):
         # The engine's own arrays as ScoreRows (top_k > 0), which ResidentChat.score packs without a row loop.
         scored = (self.native.score(ids, 1, "prefill" if "prefill" in paths else "", top_k=top_k, packed=True)
                   if prompt_rows and len(ids) > 1 else None)
+        _release_after_request(self.release_below)
         prefill_ms = (time.monotonic() - started) * 1000
         rows = []
         if continuation:

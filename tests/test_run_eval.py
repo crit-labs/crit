@@ -238,6 +238,13 @@ class RunEvalTests(RunFixture, unittest.TestCase):
             evaluation.evaluate(self.store, self.run_id, self.candidate_id, self.root / "other")
         with self.assertRaisesRegex(ValueError, "holds no prepared.json"):
             evaluation.evaluate(self.store, self.run_id, self.candidate_id, self.root)
+        # A candidate whose newest serve --check failed is a draft: no Eval counts it on the ladder.
+        (self.folder / "checks").mkdir(exist_ok=True)
+        (self.folder / "checks/check-0099.json").write_text(json.dumps(
+            {"gate": "functional", "status": "failed", "extensions": {"recorded_by": "crit run serve --check"}}))
+        with self.assertRaisesRegex(ValueError, "newest serve --check failed, so it is a draft"):
+            self.evaluate()
+        (self.folder / "checks/check-0099.json").unlink()
         self.store.seal(self.run_id, self.candidate_id, "built")
         with self.assertRaisesRegex(ValueError, "Sealed candidate is immutable"):
             self.evaluate()

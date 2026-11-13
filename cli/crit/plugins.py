@@ -280,7 +280,11 @@ def main(argv=None):
         if args.action == "test":
             items = run_tests(registry, set(args.only or ()), args.timeout, cache=not args.no_cache)
             failed = sum(i["state"] == "failed" for i in items)
-            print(f"{len(items) - failed} passed, {failed} failed")
+            skipped = [(i["name"], skip) for i in items for skip in i.get("skipped") or ()]
+            print(f"{len(items) - failed} passed, {failed} failed"
+                  + (f"; {len(skipped)} tests skipped, which these passes do not cover:" if skipped else ""))
+            for name, skip in skipped:
+                print(f"  {name}: {skip['test']}: {skip['reason']}")
             return 1 if failed else 0
         for variant in variants(_selection(args.selection), registry, args.fact or None):
             switched = ", ".join(f"{slot}={pid or '-'}" for slot, pid in variant["plugins"]["use"].items())

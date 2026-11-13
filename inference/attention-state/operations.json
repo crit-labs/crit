@@ -11,6 +11,16 @@
       },
       "verify": "on the target, attend a few query rows over a real prompt's pages with the kernel and with PagedAttentionPlan on the same pages (FP8 pages decoded the same way): within BF16 probability rounding, a decode row equal to the same row inside a verify block when the build needs exactness, and the same bits on a repeat",
       "invariance": "a decode row's result equal to the same row inside a verify block (the same position, the same keys) where the build needs exactness; the same bits on a repeat"
+    },
+    {
+      "id": "latent-attention",
+      "what": "multi-head latent attention in its absorbed form: every query head of a token over one cached row a position it sees (a latent of rank R and a rotary key of width P shared by every head), the latent the value too, the output in the latent space; with sinks one more position with no value a head",
+      "reference": {
+        "path": "inference/attention-state/code/latent_attention.py",
+        "symbol": "latent_attention"
+      },
+      "verify": "on the target, attend decode rows and verify windows over a paged latent cache with the kernel and with latent_attention on the same cached rows: within BF16 probability rounding, log-sum-exps within FP32 error",
+      "invariance": "a token's result independent of the rows and columns beside it (a decode row equal to the same token inside a verify window); the same bits on a repeat"
     }
   ]
 }

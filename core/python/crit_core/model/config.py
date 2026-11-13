@@ -33,6 +33,10 @@ _KEYS = json.loads((Path(__file__).with_name("config_keys.json")).read_text(enco
 TEXT_SECTION_KEYS = tuple(_KEYS["text_sections"])
 LENGTH_KEYS = tuple(_KEYS["position_lengths"])
 EXPERT_KEYS = tuple(_KEYS["experts"])
+EXPERTS_PER_TOKEN_KEYS = tuple(_KEYS["experts_per_token"])
+FULL_KV_HEAD_KEYS = tuple(_KEYS["full_attention_kv_heads"])
+FULL_HEAD_DIM_KEYS = tuple(_KEYS["full_attention_head_dim"])
+FULL_KEYS_EQUAL_VALUES_KEYS = tuple(_KEYS["full_attention_keys_equal_values"])
 NORM_EPS_KEYS = tuple(_KEYS["norm_eps"])
 DTYPE_KEYS = tuple(_KEYS["dtype"])
 LAYER_TYPE_KEYS = tuple(_KEYS["layer_types"])
@@ -219,6 +223,9 @@ class ModelConfig(_Picklable):
 
     def attention_shape(self):
         return attention_shape(self.section, source=self.source)
+
+    def attention_geometry(self):
+        return attention_geometry(self.section, source=self.source)
 
     def layer_kinds(self):
         return layer_kinds(self.section, source=self.source)
@@ -543,7 +550,9 @@ def attention_shape(config, source=CONFIG_NAME):
     """(full-attention layers, query heads, head dim, KV heads), or None without layers, heads or a head dim.
 
     Full layers: layer_types entries "full_attention" or "attention", else layers // full_attention_interval,
-    else every layer. Head dim: head_dim, else hidden_size // heads. KV heads: num_key_value_heads, else heads.
+    else every layer. Head dim and KV heads are the full-attention layers' (attention_geometry): a
+    full_attention_head_dim / full_attention_kv_heads key (config_keys.json) where the config declares one, else
+    head_dim (else hidden_size // heads) and num_key_value_heads (else heads).
     """
     config = _mapping_of(config, source)
     layers = _layer_count(config, source)
@@ -559,7 +568,33 @@ def attention_shape(config, source=CONFIG_NAME):
     head_dim = _head_dim(config, source)
     if not heads or not head_dim:
         return None
-    return full, heads, head_dim, _integer(config, "num_key_value_heads", source) or heads
+    kv_heads = _integer(config, "num_key_value_heads", source) or heads
+    full_kv_heads, full_head_dim, _ = _full_geometry(config, source, kv_heads, head_dim)
+    return full, heads, full_head_dim, full_kv_heads
+
+
+def _full_geometry(config, source, kv_heads, head_dim):
+    # (KV heads, head dim, cached tensors) of full-attention layers: their own keys where declared, else the others'
+    own_heads = _first(config, FULL_KV_HEAD_KEYS, _integer, source)[0]
+    own_dim = _first(config, FULL_HEAD_DIM_KEYS, _integer, source)[0]
+    keys_only = _first(config, FULL_KEYS_EQUAL_VALUES_KEYS, _boolean, source)[0]
+    return own_heads or kv_heads, own_dim or head_dim, 1 if keys_only else 2
+
+
+def attention_geometry(config, source=CONFIG_NAME):
+    """{layer kind: (KV heads, head dim, cached tensors per token)} for FULL_ATTENTION and SLIDING_ATTENTION layers,
+    or None without query heads or a head dim. Sliding layers: num_key_value_heads (else num_attention_heads) and
+    head_dim (else hidden_size // heads), keys and values cached apart (2 tensors). Full layers: the same, except where
+    the config declares their own (config_keys.json full_attention_kv_heads, full_attention_head_dim), and one cached
+    tensor where full_attention_keys_equal_values is true (keys derived from the cached values)."""
+    config = _mapping_of(config, source)
+    heads = _integer(config, "num_attention_heads", source)
+    head_dim = _head_dim(config, source)
+    if not heads or not head_dim:
+        return None
+    kv_heads = _integer(config, "num_key_value_heads", source) or heads
+    return {FULL_ATTENTION: _full_geometry(config, source, kv_heads, head_dim),
+            SLIDING_ATTENTION: (kv_heads, head_dim, 2)}
 
 
 def _head_dim(config, source):
@@ -575,7 +610,8 @@ def _head_dim(config, source):
 def kv_elements_per_token(config, source=CONFIG_NAME):
     """K and V elements one token adds to the cache over every layer whose cache grows with the context, or None.
 
-    Multi-head latent attention (kv_lora_rank) caches the latent plus one shared rope key per layer.
+    Multi-head latent attention (kv_lora_rank) caches the latent plus one shared rope key per layer. Full-attention
+    layers cache their own geometry (attention_geometry), one tensor where their keys equal their values.
     """
     config = _mapping_of(config, source)
     layers = _integer(config, "num_hidden_layers", source)
@@ -586,7 +622,8 @@ def kv_elements_per_token(config, source=CONFIG_NAME):
     if not shape:
         return None
     full, _, head_dim, kv_heads = shape
-    return 2 * kv_heads * head_dim * full
+    tensors = attention_geometry(config, source)[FULL_ATTENTION][2]
+    return tensors * kv_heads * head_dim * full
 
 
 def fixed_state_bytes(config, kv_bytes_per_element, source=CONFIG_NAME):
@@ -738,7 +775,7 @@ def _moe(section, source):
         return None
     shared, _ = _first(section, ("n_shared_experts", "num_shared_experts"), _integer, source)
     return MoeConfig(experts=experts, experts_key=key,
-                     experts_per_token=_integer(section, "num_experts_per_tok", source) or 0,
+                     experts_per_token=_first(section, EXPERTS_PER_TOKEN_KEYS, _integer, source)[0] or 0,
                      shared_experts=shared,
                      moe_intermediate_size=_integer(section, "moe_intermediate_size", source),
                      shared_expert_intermediate_size=_integer(section, "shared_expert_intermediate_size", source),

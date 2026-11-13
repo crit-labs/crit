@@ -628,8 +628,9 @@ The resident host runs under `crit serve`'s launch guardian and runtime ownershi
 which retire its process tree on completion, failure, the reservation's deadline and
 interruption. The attempt settles once the server has stopped; a failed engine cleanup
 settles it with `cleanup_settled` false and blocks further measurement or serving.
-Once the coordinator has exited, use `crit serve --recover-runtime` from the same
-OS/user environment to verify retirement and release that guard. This does not settle
+Once the coordinator has exited, the next runtime started from the same OS/user
+environment verifies retirement and releases that guard itself (`crit serve
+--recover-runtime` does the same on its own). This does not settle
 the run's attempt: an abrupt kill can leave its reservation pending, requiring an
 explicit `crit run ... settle` record with the verified cleanup evidence. Existing
 unsettled attempt results remain retained; runtime recovery does not rewrite them.

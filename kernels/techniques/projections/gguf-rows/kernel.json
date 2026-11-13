@@ -1,0 +1,141 @@
+{
+  "schema": "crit-kernel-v1",
+  "id": "gguf-rows",
+  "family": "projections",
+  "title": "GGUF projections: rows quantized to int8 per 32 values times a matrix in its stored GGUF block format, 1 to 8 rows by dp4a (plain and gathered over experts) and any rows on the s8 tensor cores in the same order, and its dequantization",
+  "package": "gguf_rows",
+  "language": "cuda",
+  "operations": [],
+  "sources": [
+    "gguf_rows_cuda/binding.cu",
+    "gguf_rows_cuda/gguf_rows.cu",
+    "torch-ext/torch_binding.cpp"
+  ],
+  "capabilities": [
+    "8.0",
+    "8.6",
+    "8.9",
+    "9.0",
+    "10.0",
+    "10.3",
+    "11.0",
+    "12.0",
+    "12.1"
+  ],
+  "libraries": [],
+  "structures": {
+    "gemv": {
+      "what": "the rows quantized to int8 per 32 values; one warp an output column and part, lane l taking the part's sub-blocks l, l + 32, ...: each decoded once from its stored block into int8 words and multiplied by every row with dp4a, weighted in FP32, the lanes reduced by the xor butterfly and the parts added in order",
+      "call": "gemv",
+      "rows": [
+        1,
+        8
+      ],
+      "tune_rows": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "WARPS": {
+          "values": [
+            2,
+            4,
+            8
+          ],
+          "default": 4,
+          "what": "warps a block, one output column a warp"
+        },
+        "SPLITS": {
+          "values": [
+            0,
+            1,
+            2,
+            4,
+            8,
+            16
+          ],
+          "default": 0,
+          "order": true,
+          "what": "contiguous parts of a row's sub-blocks, added in part order (0: enough warps for 32 a multiprocessor, at least 32 sub-blocks a part)"
+        }
+      },
+      "yardstick": null,
+      "bench": "bench.py:Gemv"
+    },
+    "gemm": {
+      "what": "the prompt rows in gemv's order: the matrix's sub-blocks decoded once a call into a staging buffer (gemv's codes and scales, sub-block-major, in chunks of rows), then a CTA's 16 WN weight rows x 8 TB WT tokens; each part's sub-blocks visited lane by lane in the 32-lane tree's order, RUN of a lane's sub-blocks a stage copied into shared memory by cp.async STAGES - 1 stages ahead, one s8 m16n8k32 MMA a 16 x 8 tile and sub-block (two m16n8k16 with 16-value scales), the terms added to the outputs' running lanes and folded into the tree",
+      "call": "gemm",
+      "rows": [
+        9,
+        65536
+      ],
+      "tune_rows": [
+        16,
+        64,
+        256,
+        1024,
+        4096
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "row_invariant": true,
+      "knobs": {
+        "WN": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 4,
+          "what": "warps across the weight rows, 16 rows each"
+        },
+        "WT": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 2,
+          "what": "warps across the tokens"
+        },
+        "TB": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 4,
+          "what": "8-token MMA tiles a warp"
+        },
+        "RUN": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 2,
+          "what": "sub-blocks of a lane a stage decodes"
+        },
+        "STAGES": {
+          "values": [
+            2,
+            3
+          ],
+          "default": 2,
+          "what": "stages in flight, STAGES - 1 copied ahead by cp.async (the staged rows' codes and scales and the tokens' quantized sub-blocks)"
+        }
+      },
+      "yardstick": null,
+      "bench": "bench.py:Gemm"
+    }
+  }
+}

@@ -382,6 +382,49 @@ def device_arch():
     return (num + "a" if major >= 9 else num), f"{major}.{minor}"
 
 
+def device_capability():
+    """The current CUDA device's capability string ('12.0'), or None where there is no CUDA device to ask."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        return device_arch()[1]
+    except Exception:  # noqa: BLE001 - no torch, no driver: nothing to compare a tuning with
+        return None
+
+
+def foreign_tuning(tuning, capability=None):
+    """Why a tuning was not made on this GPU (a phrase), or None when it was or that cannot be told. The sweep writes the
+    GPU's name and compute capability into every tuning; knob choices measured on one GPU generation are no evidence
+    for another (docs/CONTRIBUTION_CRITERIA.md), so a tuning swept on another capability is not applied where the
+    tuning is found implicitly (an engine's tuning folder, CRIT_KERNEL_TUNING): the kernel builds with its default knobs
+    and says so. A tuning without a capability (written by hand, or before the sweep recorded it) is taken as it is.
+    capability: this GPU's ('12.0'), else the current CUDA device's."""
+    made = (tuning or {}).get("capability")
+    if not made:
+        return None
+    here = capability or device_capability()
+    if here is None or str(made) == str(here):
+        return None
+    return (f"its tuning was swept on {tuning.get('device') or 'another GPU'} (compute capability {made}), not on this "
+            f"GPU (compute capability {here})")
+
+
+_foreign_warned = set()   # kernels whose foreign tuning was reported on stderr
+
+
+def warn_foreign_tuning(kernel_id, reason, kept=False):
+    """Say once per process and kernel that its tuning comes from another GPU: dropped for the default knobs, or kept
+    (kept=True) where a command was given the tuning explicitly."""
+    if kernel_id in _foreign_warned:
+        return
+    _foreign_warned.add(kernel_id)
+    then = ("it is used as given, but its choices are not evidence for this GPU" if kept else
+            "it builds with its default knobs instead")
+    print(f"crit: kernel {kernel_id}: {reason}; {then}. `crit kernels sweep {kernel_id} --model CHECKPOINT --out "
+          f"TUNING` tunes it on this GPU.", file=sys.stderr)
+
+
 def cache_root():
     return Path(os.environ.get("CRIT_KERNEL_CACHE") or Path.home() / ".cache" / "crit" / "kernels")
 
@@ -485,7 +528,12 @@ def alias_build_args(spec, root=None):
         return {"configs": {spec["of"]: spec["configs"][1:]}, "sweep": True, "root": root}
     _, manifest = find(spec["kernel"], root)
     path = _target_tuning_file(spec["kernel"])
-    tuning = read_tuning(path) if path else default_tuning(manifest)
+    tuning = read_tuning(path) if path else None
+    foreign = foreign_tuning(tuning) if tuning else None
+    if foreign:   # found implicitly, in the engine's tuning folder: another GPU's choices are not applied here
+        warn_foreign_tuning(spec["kernel"], foreign)
+        tuning = None
+    tuning = tuning or default_tuning(manifest)
     if spec["table"] or len(spec["configs"]) > 1:   # a table, or configurations a select() picks from (configs=)
         tuning = dict(tuning, structures=dict(tuning.get("structures") or {},
                                               **{spec["of"]: {"configs": spec["configs"], "table": spec["table"]}}))
@@ -748,6 +796,9 @@ def build(kernel_id, *, tuning=None, knobs=None, configs=None, sweep=False, root
             structures[sid] = {"configs": listed, "table": []}
         tuning = check_tuning(manifest, {"schema": TUNING_SCHEMA, "kernel": kernel_id, "structures": structures})
     else:
+        foreign = foreign_tuning(tuning) if (tuning and not archs) else None
+        if foreign:   # given explicitly (crit kernels build --tuning, gates --tuning): kept, with a warning
+            warn_foreign_tuning(kernel_id, foreign, kept=True)
         tuning = check_tuning(manifest, tuning) if tuning else default_tuning(manifest)
     swept = sorted(configs) if (sweep and configs) else sorted(knobs) if (sweep and knobs) else []
     key = _build_key(folder, manifest, tuning, sweep, archs, swept)
@@ -896,6 +947,7 @@ def read_tuning(path):
 
 
 __all__ = ["SCHEMA", "TUNING_SCHEMA", "alias_build_args", "alias_loaded", "build", "cross_aliases", "observe_aliases",
-           "select", "use_tuning_source", "cache_root", "check_tuning", "core_root", "default_tuning", "defaults", "find",
+           "select", "use_tuning_source", "cache_root", "check_tuning", "core_root", "default_tuning", "defaults",
+           "device_capability", "find", "foreign_tuning",
            "import_build", "library", "load", "manifests", "read_tuning", "search_roots", "source_digest", "tuning_header",
-           "tuning_module"]
+           "tuning_module", "warn_foreign_tuning"]

@@ -926,13 +926,13 @@ class RunStore:
         return self.get(run_id)
 
     @store_operation
-    def cost(self, run_id, transcripts, agent=None, prices=None, until=None):
-        """Write cost.json: the run's wall time, agent tokens and API price per candidate (cost.py)."""
+    def cost(self, run_id, transcripts, agent=None, prices=None, until=None, idle=None):
+        """Write cost.json: the run's wall and active time, agent tokens and API price per candidate (cost.py)."""
         root = self._recording(run_id)
         with lease(root):
             run = load_run(root)
             candidates, _ = read_candidates(root, run)
-            return cost.write(root, run, candidates, transcripts, agent, prices, until)
+            return cost.write(root, run, candidates, transcripts, agent, prices, until, idle)
 
     @store_operation
     def recover(self, run_id):

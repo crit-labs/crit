@@ -37,8 +37,8 @@ a length is part of the shape's results, and the table keeps one value of every 
 lengths and row counts, its speed knobs per length range and row count (table entries' "length": [lo, hi]; the build
 looks them up by the call's length, tables without them hold for every length).
 
-Timing: cold L2 (a buffer of twice the L2 is written before each sample), one call between CUDA events, the median of
-`repeat` samples after `warmup` calls. The yardstick library is timed at the end paired with the configuration the
+Timing: cold L2 (a buffer of twice the L2 is written, then another as large read, before each sample), one call
+between CUDA events, the median of `repeat` samples after `warmup` calls. The yardstick library is timed at the end paired with the configuration the
 table picked for the same shape and row count, both as CUDA graph replays where they can be captured (a bench whose run
 replays its own graph, or cannot be captured, as it runs), the two in turn for YARDSTICK_ROUNDS rounds, the lower
 median of each kept: vs_library compares the two the same way and under the same conditions (a GPU that has run the whole sweep may clock lower than at
@@ -51,7 +51,7 @@ import os
 import statistics
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 
 from . import build as kbuild
@@ -95,6 +95,10 @@ class Timer:
         self.torch, self.warmup, self.repeat = torch, warmup, repeat
         l2 = getattr(torch.cuda.get_device_properties(0), "L2_cache_size", 64 << 20) or (64 << 20)
         self.flush = torch.empty(max(2 * l2, 64 << 20) // 4, dtype=torch.float32, device="cuda").fill_(1)
+        # A second buffer as large, read after the write: the flush's dirty lines go back to DRAM before the call,
+        # not during it (their write-back took 10-20% of a weight-streaming call's DRAM time on an RTX 5090).
+        self.clean = torch.ones_like(self.flush).view(-1, 4096)
+        self.sink = torch.empty(4096, dtype=torch.float32, device="cuda")
         self.start = torch.cuda.Event(enable_timing=True)
         self.stop = torch.cuda.Event(enable_timing=True)
         self.spin = int(torch.cuda.get_device_properties(0).clock_rate * 0.2) if hasattr(
@@ -106,6 +110,7 @@ class Timer:
             # A write, not a read: lines a call wrote back (a library's state) stay in L2 through a read flush, so a
             # kernel that writes its inputs would be timed warm against one that only reads them.
             self.flush.zero_()
+            self.torch.sum(self.clean, dim=0, out=self.sink)   # then the dirty lines out (__init__)
             # A spin on the GPU while the host queues the call, so the time is the GPU's, not the host's launch path
             # (a Triton launch from Python takes tens of microseconds, more on a busy CPU).
             self.torch.cuda._sleep(self.spin)
@@ -210,8 +215,72 @@ def _chunks(manifest, structure, configs, size):
     return out
 
 
+class _Stop:
+    """SIGTERM or Ctrl+C (a timeout, an agent stopping it) ends a sweep's builds, or its measuring after the build in
+    hand, instead of the sweep: what was measured is chosen from and written (every structure's defaults when the
+    builds were stopped), the rest is recorded as not measured."""
+
+    def __init__(self):
+        import signal
+        self.now = False
+        self._signal = signal
+        self._before = {}
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                self._before[sig] = signal.signal(sig, self._stop)
+            except ValueError:   # not the main thread: signals stay as they were
+                pass
+
+    def _stop(self, *_):
+        self.now = True
+
+    def restore(self):
+        for sig, handler in self._before.items():
+            self._signal.signal(sig, handler)
+        self._before = {}
+
+
+def _worker_signals():
+    """A build worker ends on SIGTERM or Ctrl+C (sent to the sweep's process group) instead of inheriting the sweep's
+    _Stop and building on."""
+    import signal
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, signal.SIG_DFL)
+
+
+def _collect(pool, futures, stopped, on_done):
+    """The builds as they finish (on_done(future, its result)); a stop cancels the builds not started and ends the
+    running ones. Returns how many builds finished."""
+    pending, finished = set(futures), 0
+
+    def take(done):
+        nonlocal finished
+        for future in done:
+            try:
+                result = future.result()
+            except Exception:  # noqa: BLE001 - a worker ended by the stop's signal breaks the pool
+                if stopped.now:
+                    continue
+                raise
+            finished += 1
+            on_done(future, result)
+    while pending and not stopped.now:
+        done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+        take(done)
+    if pending:
+        # the builds that finished as the stop came still count
+        take({f for f in pending if f.done() and not f.cancelled()})
+        pending = {f for f in pending if not f.done()}
+        for future in pending:
+            future.cancel()
+        for process in list((getattr(pool, "_processes", None) or {}).values()):
+            process.terminate()
+        pool.shutdown(wait=False, cancel_futures=True)
+    return finished
+
+
 def sweep(kernel_id, *, model=None, shapes=None, structures=None, out=None, jobs=None, root=None, lock=None,
-          warmup=3, repeat=25, chunk=24, log=print):
+          warmup=3, repeat=25, chunk=24, matrices=None, log=print):
     """Tune kernel_id. model: a checkpoint folder (its shapes come from each bench's shapes()); shapes: {structure:
     [shape dicts]} instead. Returns the tuning dict (also written to out/<kernel_id>.json with a report beside it)."""
     import torch
@@ -229,7 +298,8 @@ def sweep(kernel_id, *, model=None, shapes=None, structures=None, out=None, jobs
             + ([f"{', '.join(benchless)} has no bench (an alias is tuned through the structure it aliases)"]
                if benchless else [])) + f"; structures with a bench: {', '.join(swept)}")
     benches = {s: _bench_class(folder, manifest["structures"][s]["bench"]) for s in chosen}
-    loaded_model = Model(model) if model else None
+    # matrices: the shapes an engine loaded (crit_kernels.model.loaded_matrices) in place of the checkpoint's own.
+    loaded_model = Model(model, matrices) if model else None
     shape_sets = {}
     for s in chosen:
         given = (shapes or {}).get(s) if shapes else None
@@ -256,20 +326,30 @@ def sweep(kernel_id, *, model=None, shapes=None, structures=None, out=None, jobs
         total += len(found)
         for group, indices in _chunks(manifest, s, found, chunk):
             plan.append((s, group, indices))
+    # Every structure's defaults first (the first build of each holds them), so a sweep stopped part way has them all.
+    firsts = {}
+    for item in plan:
+        firsts.setdefault(item[0], item)
+    plan = list(firsts.values()) + [item for item in plan if firsts[item[0]] is not item]
     log(f"{kernel_id}: building {total} configurations in {len(plan)} builds")
     t0 = time.time()
     failed = {}
     jobs = jobs or max(1, (os.cpu_count() or 2) - 2)
+    # A stop (SIGTERM, Ctrl+C) during the builds ends them and writes the defaults' table; while measuring it ends the
+    # measuring and writes the table from what was measured.
+    stopped = _Stop()
+    builds, built = 0, 0
     if manifest["language"] == "cuda":
-        with ProcessPoolExecutor(max_workers=jobs) as pool:
+        with ProcessPoolExecutor(max_workers=jobs, initializer=_worker_signals) as pool:
             futures = {pool.submit(_build_one, (kernel_id, {s: group}, root)): (s, indices)
                        for s, group, indices in plan}
-            for future in as_completed(futures):
+
+            def built_cuda(future, result):
                 s, indices = futures[future]
-                _, error = future.result()
-                if error:
+                if result[1]:
                     for _, c in indices:
-                        failed[(s, json.dumps(c, sort_keys=True))] = error
+                        failed[(s, json.dumps(c, sort_keys=True))] = result[1]
+            builds, built = len(futures), _collect(pool, futures, stopped, built_cuda)
     elif kbuild._mixed(manifest):
         # A Triton kernel with CUDA sources: the builds of its CUDA structures compile the variants their benches call
         # (bench.variants(shape)), and the untuned build all of them, before the GPU is held; the Triton structures'
@@ -277,19 +357,53 @@ def sweep(kernel_id, *, model=None, shapes=None, structures=None, out=None, jobs
         cuda = set(manifest["cuda"].get("structures", []))
         variants = {s: _variants(benches[s], shape_sets[s]) for s in chosen if s in cuda}
         every = [v for s in sorted(variants) for v in variants[s]]
-        with ProcessPoolExecutor(max_workers=jobs) as pool:
+        with ProcessPoolExecutor(max_workers=jobs, initializer=_worker_signals) as pool:
             futures = {pool.submit(_build_one, (kernel_id, {s: group}, root, variants[s])): (s, indices)
                        for s, group, indices in plan if s in cuda and variants[s]}
             if every:
                 futures[pool.submit(_build_one, (kernel_id, None, root, every))] = (None, [])
-            for future in as_completed(futures):
+
+            def built_mixed(future, result):
                 s, indices = futures[future]
-                _, error = future.result()
+                error = result[1]
                 if error and s is None:
                     log(f"{kernel_id}: the untuned build's CUDA variants did not compile: {error}")
                 for _, c in indices if error else []:
                     failed[(s, json.dumps(c, sort_keys=True))] = error
-    log(f"{kernel_id}: built in {time.time() - t0:.0f} s, {len(failed)} configurations failed to build")
+            builds, built = len(futures), _collect(pool, futures, stopped, built_mixed)
+    results = {}   # (structure, shape key, rows, config json) -> us
+    dropped = dict(failed)
+    library = {}
+    swept = [s for s in chosen if shape_sets[s]]
+    if stopped.now:
+        stopped.restore()
+        for s, _, indices in plan:
+            for _, c in indices:
+                dropped.setdefault((s, json.dumps(c, sort_keys=True)),
+                                   f"not measured: the sweep was stopped during its builds ({built} of {builds} built)")
+        log(f"{kernel_id}: stopped during the builds after {time.time() - t0:.0f} s, {built} of {builds} builds done: "
+            "nothing measured, the table holds every structure's defaults")
+    else:
+        log(f"{kernel_id}: built in {time.time() - t0:.0f} s, {len(failed)} configurations failed to build")
+        _measure_all(kernel_id, root, lock, torch, warmup, repeat, manifest, plan, swept, shape_sets, benches,
+                     results, dropped, library, stopped, log)
+    tuning, report = choose(manifest, swept, shape_sets, results, dropped, benches)
+    _add_yardsticks(manifest, report, library)
+    tuning["source"] = kbuild.source_digest(kernel_id, root)
+    tuning["device"] = torch.cuda.get_device_name()
+    tuning["capability"] = kbuild.device_arch()[1]
+    if out:
+        out = Path(out)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / f"{kernel_id}.json").write_text(json.dumps(tuning, indent=1) + "\n")
+        (out / f"{kernel_id}.report.json").write_text(json.dumps(report, indent=1) + "\n")
+    return tuning, report
+
+
+def _measure_all(kernel_id, root, lock, torch, warmup, repeat, manifest, plan, swept, shape_sets, benches,
+                 results, dropped, library, stopped, log):
+    """Every build's configurations timed on the GPU (under the lock), then the picks confirmed and the yardsticks
+    timed; a stop while measuring ends the measuring after the build in hand (results and dropped say what was)."""
     # The untuned build, before the GPU is held: benches may compare bits with it or plan calls with it.
     default_module = kbuild.load(kernel_id, root=root)
     for bench in benches.values():
@@ -297,11 +411,13 @@ def sweep(kernel_id, *, model=None, shapes=None, structures=None, out=None, jobs
     handle = _lock(lock)
     try:
         timer = Timer(torch, warmup, repeat)
-        results = {}   # (structure, shape key, rows, config json) -> us
-        dropped = dict(failed)
         where = {}     # (structure, config json) -> (module, index in its build)
         t0 = time.time()
         for s, group, indices in plan:
+            if stopped.now:
+                for _, c in indices:
+                    dropped.setdefault((s, json.dumps(c, sort_keys=True)), "not measured: the sweep was stopped")
+                continue
             try:
                 module = kbuild.load(kernel_id, configs={s: group}, sweep=True, root=root)
             except Exception as error:  # noqa: BLE001
@@ -315,28 +431,19 @@ def sweep(kernel_id, *, model=None, shapes=None, structures=None, out=None, jobs
                     _measure(s, cj, module, manifest, benches, shape_sets, results, dropped, timer, torch)
                     where[(s, cj)] = (module, index)
             kbuild.select(module, s, -1)
-        log(f"{kernel_id}: measured in {time.time() - t0:.0f} s, {len(dropped)} configurations dropped")
-        swept = [s for s in chosen if shape_sets[s]]
+        stopped.restore()
+        log(f"{kernel_id}: measured in {time.time() - t0:.0f} s, {len(dropped)} configurations dropped"
+            + ("; stopped part way: the table is chosen from what was measured" if stopped.now else ""))
         # A median can still catch other work on the GPU: re-time the defaults and every pick once more and keep the
-        # lower of the two medians, then choose again with them.
-        tuning, report = choose(manifest, swept, shape_sets, results, dropped, benches)
-        _confirm(tuning, manifest, swept, shape_sets, results, dropped, where, benches, timer)
-        tuning, report = choose(manifest, swept, shape_sets, results, dropped, benches)
-        library = _yardsticks(manifest, swept, shape_sets, benches, timer, report, where, results)
+        # lower of the two medians, then choose again with them (a stopped sweep writes its table without them).
+        if not stopped.now:
+            tuning, report = choose(manifest, swept, shape_sets, results, dropped, benches)
+            _confirm(tuning, manifest, swept, shape_sets, results, dropped, where, benches, timer)
+            tuning, report = choose(manifest, swept, shape_sets, results, dropped, benches)
+            library.update(_yardsticks(manifest, swept, shape_sets, benches, timer, report, where, results))
     finally:
         if handle:
             handle.close()
-    tuning, report = choose(manifest, swept, shape_sets, results, dropped, benches)
-    _add_yardsticks(manifest, report, library)
-    tuning["source"] = kbuild.source_digest(kernel_id, root)
-    tuning["device"] = torch.cuda.get_device_name()
-    tuning["capability"] = kbuild.device_arch()[1]
-    if out:
-        out = Path(out)
-        out.mkdir(parents=True, exist_ok=True)
-        (out / f"{kernel_id}.json").write_text(json.dumps(tuning, indent=1) + "\n")
-        (out / f"{kernel_id}.report.json").write_text(json.dumps(report, indent=1) + "\n")
-    return tuning, report
 
 
 def _yardsticks(manifest, swept, shape_sets, benches, timer, report=None, where=None, results=None):

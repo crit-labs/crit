@@ -450,6 +450,30 @@ class ModelConfigTests(unittest.TestCase):
                          (mc.LINEAR_ATTENTION,) * 3 + (mc.FULL_ATTENTION,))
         self.assertEqual((model.effective_head_dim(), model.effective_kv_heads()), (256, 2))
 
+    def test_full_attention_layers_with_their_own_geometry_and_one_cached_tensor(self):
+        # Full layers declare their own KV heads and head dim and cache keys equal to values; sliding layers keep
+        # num_key_value_heads and head_dim, and their window's cache counts K and V apart.
+        config = {"num_hidden_layers": 6, "num_attention_heads": 16, "num_key_value_heads": 8, "head_dim": 256,
+                  "hidden_size": 2816, "sliding_window": 1024,
+                  "layer_types": ["sliding_attention"] * 5 + ["full_attention"],
+                  "num_global_key_value_heads": 2, "global_head_dim": 512, "attention_k_eq_v": True,
+                  "num_experts": 128, "top_k_experts": 8}
+        model = mc.parse_model_config(config)
+        self.assertEqual(model.attention_geometry(), {mc.FULL_ATTENTION: (2, 512, 1),
+                                                      mc.SLIDING_ATTENTION: (8, 256, 2)})
+        self.assertEqual(model.attention_shape(), (1, 16, 512, 2))
+        self.assertEqual(model.kv_elements_per_token(), 2 * 512)
+        self.assertEqual(model.fixed_state_bytes(1), 5 * 2 * 8 * 256 * 1024)
+        self.assertEqual(model.moe.experts_per_token, 8)
+        # Without the flag, full layers cache K and V apart; without their own keys, they take the others'.
+        self.assertEqual(mc.kv_elements_per_token({**config, "attention_k_eq_v": False}), 2 * 2 * 512)
+        plain = {k: v for k, v in config.items() if k not in ("num_global_key_value_heads", "global_head_dim",
+                                                               "attention_k_eq_v")}
+        self.assertEqual(mc.attention_shape(plain), (1, 16, 256, 8))
+        self.assertEqual(mc.kv_elements_per_token(plain), v2.kv_elements_per_token(plain))
+        with self.assertRaisesRegex(mc.ConfigError, "attention_k_eq_v"):
+            mc.kv_elements_per_token({**config, "attention_k_eq_v": "yes"})
+
     def test_latent_attention_experts_yarn_and_quantization(self):
         model = mc.parse_model_config(DEEPSEEK)
         self.assertEqual(model.mla, mc.MlaConfig(512, 64, 128, 128, 1536))
