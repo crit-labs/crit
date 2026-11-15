@@ -151,18 +151,30 @@ __device__ __forceinline__ uint32_t nibbles_of(uint32_t bytes, int shift) {
     const uint32_t n = (bytes >> shift) & 0x0f0f0f0fu;
     return (n & 0xfu) | ((n >> 4) & 0xf0u) | ((n >> 8) & 0xf00u) | ((n >> 12) & 0xf000u);
 }
-// Four int8 values (a grid's word) with value i negated where bit i of `bits` is set.
+// Four int8 values (a grid's word) with value i negated where bit i of `bits` is set. Every grid read through it
+// (IQ2_XXS's, IQ2_XS's, IQ2_S's, IQ3_S's; IQ3_XXS's too) has no zero byte, so a negated byte, (g ^ 0xff) + 1 = -g, never
+// carries into the next and one 32-bit add negates all four: one byte of `one` a set bit of bits 0..3 (the multiply
+// spreads bit i to bit 8 i; its other copies land on no byte's bit 0).
 __device__ __forceinline__ uint32_t signed_word(uint32_t grid, uint32_t bits) {
+    const uint32_t one = ((bits & 15u) * 0x00204081u) & 0x01010101u;
+    return (grid ^ (one * 0xffu)) + one;
+}
+// The same word by a byte mask and __vsub4 ((g ^ 0xff) - 0xff = -g in a byte): IQ3_XXS's, whose gemv measured slower
+// with signed_word's multiplies (RTX 5060 Ti, 4096 x 14336: 61.7 us against 57.4) while the IQ2 formats and IQ3_S
+// measured faster.
+__device__ __forceinline__ uint32_t signed_word_masked(uint32_t grid, uint32_t bits) {
     const uint32_t mask = ((bits & 1u) ? 0xffu : 0u) | ((bits & 2u) ? 0xff00u : 0u) | ((bits & 4u) ? 0xff0000u : 0u) |
                           ((bits & 8u) ? 0xff000000u : 0u);
-    return __vsub4(grid ^ mask, mask);   // (g ^ 0xff) - 0xff = -g in a byte
+    return __vsub4(grid ^ mask, mask);
 }
 // IQ2's and IQ3_XXS's eight signs from a 7-bit index: the eighth makes their count even.
 __device__ __forceinline__ uint32_t even_signs(uint32_t index) { return index | ((__popc(index) & 1u) << 7); }
-// IQ1's four int8 grid values g (-1, 0, 1) as 8 g + 1 (offset +1/8) or 8 g - 1 (-1/8).
+// IQ1's four int8 grid values g (-1, 0, 1) as 8 g + 1 (offset +1/8) or 8 g - 1 (-1/8), bytewise without carries:
+// 8 g is 0xf8, 0 or 0x08 and has bits 0..2 clear, so 8 g + 1 = 8 g ^ 0x01; 8 g - 1 is 8 g ^ 0x0f for g = +-1 and
+// 0xff = 0x0f + 0xf0 for g = 0 (bit 0 of g clear only for g = 0, whose 8 g is 0, so the add sets bits 4..7 alone).
 __device__ __forceinline__ uint32_t iq1_word(uint32_t grid, bool negative) {
     const uint32_t eight = (grid << 3) & 0xf8f8f8f8u;
-    return negative ? __vsub4(eight, 0x01010101u) : __vadd4(eight, 0x01010101u);
+    return (eight ^ (negative ? 0x0f0f0f0fu : 0x01010101u)) + (~grid & 0x01010101u) * (negative ? 0xf0u : 0u);
 }
 __device__ __forceinline__ uint32_t grid_half(uint64_t entry, int half) { return uint32_t(entry >> (32 * half)); }
 // Bits 0..3 of `bits` into bit 4 of bytes 0..3: a 5-bit format's high bits over four values.
@@ -185,10 +197,101 @@ __device__ __forceinline__ void q4k_scale_min(const uint8_t* scales, int j, int&
     }
 }
 
+// The 64-bit grid an IQ2 or IQ1 format reads (gguf_grids.cuh), its entries, and the table subblock() reads it from:
+// `grid` when given (a copy of the same table, such as gguf-rows' in shared memory), else the device table.
+__host__ __device__ constexpr int grid_entries(int type) {
+    return type == IQ2_XXS ? 256 : type == IQ2_XS ? 512 : type == IQ2_S ? 1024 : type == IQ1_S || type == IQ1_M ? 2048
+                                                                                                             : 0;
+}
+template <int F>
+__device__ __forceinline__ const uint64_t* grid_table() {
+    if constexpr(F == IQ2_XXS) return kIq2xxsGrid;
+    else if constexpr(F == IQ2_XS) return kIq2xsGrid;
+    else if constexpr(F == IQ2_S) return kIq2sGrid;
+    else if constexpr(F == IQ1_S || F == IQ1_M) return kIq1sGrid;
+    else return nullptr;
+}
+
+// Two and four little-endian bytes at p: by 16-bit loads when p is even (EVEN), else byte by byte.
+template <bool EVEN>
+__device__ __forceinline__ uint32_t u16_at(const uint8_t* p) {
+    if constexpr(EVEN) return *reinterpret_cast<const uint16_t*>(p);
+    else return uint32_t(p[0]) | (uint32_t(p[1]) << 8);
+}
+template <bool EVEN>
+__device__ __forceinline__ uint32_t u32_at(const uint8_t* p) {
+    if constexpr(EVEN) return u16_at<true>(p) | (u16_at<true>(p + 2) << 16);
+    else return word_at(p);
+}
+__device__ __forceinline__ float half_of(uint32_t bits) {
+    return __half2float(__ushort_as_half(static_cast<unsigned short>(bits)));
+}
+
+// IQ2_XXS's, IQ2_XS's, IQ2_S's and IQ1_S's sub-block ib (subblock()'s), its fields read by u16_at / u32_at.
+template <int F, bool EVEN>
+__device__ __forceinline__ void low_iq(const uint8_t* b, int ib, int32_t q[8], float& s0, float& s1,
+                                       const uint64_t* grid) {
+    const float d = half_of(u16_at<EVEN>(b));
+    if constexpr(F == IQ2_XXS) {
+        // 8 bytes a sub-block: four grid indices (eight values each), then a word of four 7-bit sign indices and the
+        // 4-bit scale (bits 28..31).
+        const uint32_t g = u32_at<EVEN>(b + 2 + 8 * ib), aux = u32_at<EVEN>(b + 6 + 8 * ib);
+        s0 = s1 = __fmul_rn(__fmul_rn(d, 0.5f + float(aux >> 28)), 0.25f);
+#pragma unroll
+        for(int w = 0; w < 8; ++w) {
+            const uint32_t signs = even_signs((aux >> (7 * (w / 2))) & 127u) >> (4 * (w & 1));
+            q[w] = static_cast<int32_t>(signed_word(grid_half(grid[(g >> (8 * (w / 2))) & 0xffu], w & 1), signs));
+        }
+    } else if constexpr(F == IQ2_XS) {
+        // Four 16-bit entries a sub-block: a 9-bit grid index and a 7-bit sign index; a 4-bit scale a 16 values.
+        const uint32_t e01 = u32_at<EVEN>(b + 2 + 8 * ib), e23 = u32_at<EVEN>(b + 6 + 8 * ib);
+        const int scales = b[66 + ib];
+        s0 = __fmul_rn(__fmul_rn(d, 0.5f + float(scales & 15)), 0.25f);
+        s1 = __fmul_rn(__fmul_rn(d, 0.5f + float(scales >> 4)), 0.25f);
+#pragma unroll
+        for(int w = 0; w < 8; ++w) {
+            const int l = w / 2;
+            const uint32_t entry = ((l < 2 ? e01 : e23) >> (16 * (l & 1))) & 0xffffu;
+            const uint32_t signs = even_signs(entry >> 9) >> (4 * (w & 1));
+            q[w] = static_cast<int32_t>(signed_word(grid_half(grid[entry & 511u], w & 1), signs));
+        }
+    } else if constexpr(F == IQ2_S) {
+        // qs 32 bytes (four grid indices' low 8 bits a sub-block), signs 32 (a byte an eight values), qh 8 (the
+        // indices' bits 8 and 9), scales 8 (a 4-bit scale a 16 values).
+        const uint32_t qs = u32_at<EVEN>(b + 2 + 4 * ib), sg = u32_at<EVEN>(b + 34 + 4 * ib);
+        const int scales = b[74 + ib], qh = b[66 + ib];
+        s0 = __fmul_rn(__fmul_rn(d, 0.5f + float(scales & 15)), 0.25f);
+        s1 = __fmul_rn(__fmul_rn(d, 0.5f + float(scales >> 4)), 0.25f);
+#pragma unroll
+        for(int w = 0; w < 8; ++w) {
+            const int l = w / 2;
+            const uint32_t index = ((qs >> (8 * l)) & 0xffu) | (((qh >> (2 * l)) & 3u) << 8);
+            const uint32_t signs = ((sg >> (8 * l)) & 0xffu) >> (4 * (w & 1));
+            q[w] = static_cast<int32_t>(signed_word(grid_half(grid[index], w & 1), signs));
+        }
+    } else {
+        static_assert(F == IQ1_S, "low_iq takes IQ2_XXS, IQ2_XS, IQ2_S and IQ1_S");
+        // qs 32 bytes (four 11-bit grid indices' low bits a sub-block), then a 16-bit qh a sub-block: the indices'
+        // bits 8..10 (3 each), the 3-bit scale (bits 12..14) and the offset's sign (bit 15).
+        const uint32_t qs = u32_at<EVEN>(b + 2 + 4 * ib), qh = u16_at<EVEN>(b + 34 + 2 * ib);
+        s0 = s1 = __fmul_rn(__fmul_rn(d, float(2 * ((qh >> 12) & 7u) + 1)), 0.125f);
+        const bool negative = (qh & 0x8000u) != 0;
+#pragma unroll
+        for(int w = 0; w < 8; ++w) {
+            const int l = w / 2;
+            const uint32_t index = ((qs >> (8 * l)) & 0xffu) | (((qh >> (3 * l)) & 7u) << 8);
+            q[w] = static_cast<int32_t>(iq1_word(grid_half(grid[index], w & 1), negative));
+        }
+    }
+}
+
 template <int F>
 __device__ __forceinline__ void subblock(const uint8_t* b, int ib, int32_t q[8], float& s0, float& s1, float& m,
-                                         float& m1) {
+                                         float& m1, const uint64_t* grid = nullptr) {
     m = m1 = 0.0f;
+    if constexpr(grid_entries(F) > 0) {
+        if(grid == nullptr) grid = grid_table<F>();
+    }
     if constexpr(F == Q8_0) {
         s0 = s1 = half_at(b);
 #pragma unroll
@@ -311,44 +414,10 @@ __device__ __forceinline__ void subblock(const uint8_t* b, int ib, int32_t q[8],
             const uint32_t hi = ((word_at(qh + 4 * w) >> hshift) & 0x03030303u) << 4;
             q[w] = static_cast<int32_t>(__vsub4(lo | hi, 0x20202020u));   // each byte less 32, as int8
         }
-    } else if constexpr(F == IQ2_XXS) {
-        // 8 bytes a sub-block: four grid indices (eight values each), then a word of four 7-bit sign indices and the
-        // 4-bit scale (bits 28..31).
-        const uint8_t* g = b + 2 + 8 * ib;
-        const uint32_t aux = word_at(g + 4);
-        s0 = s1 = __fmul_rn(__fmul_rn(half_at(b), 0.5f + float(aux >> 28)), 0.25f);
-#pragma unroll
-        for(int w = 0; w < 8; ++w) {
-            const uint32_t signs = even_signs((aux >> (7 * (w / 2))) & 127u) >> (4 * (w & 1));
-            q[w] = static_cast<int32_t>(signed_word(grid_half(kIq2xxsGrid[g[w / 2]], w & 1), signs));
-        }
-    } else if constexpr(F == IQ2_XS) {
-        // Four 16-bit entries a sub-block: a 9-bit grid index and a 7-bit sign index; a 4-bit scale a 16 values.
-        const uint8_t* g = b + 2 + 8 * ib;
-        const float d = half_at(b);
-        const int scales = b[66 + ib];
-        s0 = __fmul_rn(__fmul_rn(d, 0.5f + float(scales & 15)), 0.25f);
-        s1 = __fmul_rn(__fmul_rn(d, 0.5f + float(scales >> 4)), 0.25f);
-#pragma unroll
-        for(int w = 0; w < 8; ++w) {
-            const uint32_t entry = g[2 * (w / 2)] | (uint32_t(g[2 * (w / 2) + 1]) << 8);
-            const uint32_t signs = even_signs(entry >> 9) >> (4 * (w & 1));
-            q[w] = static_cast<int32_t>(signed_word(grid_half(kIq2xsGrid[entry & 511u], w & 1), signs));
-        }
-    } else if constexpr(F == IQ2_S) {
-        // qs 32 bytes (four grid indices' low 8 bits a sub-block), signs 32 (a byte an eight values), qh 8 (the
-        // indices' bits 8 and 9), scales 8 (a 4-bit scale a 16 values).
-        const float d = half_at(b);
-        const int scales = b[74 + ib], qh = b[66 + ib];
-        s0 = __fmul_rn(__fmul_rn(d, 0.5f + float(scales & 15)), 0.25f);
-        s1 = __fmul_rn(__fmul_rn(d, 0.5f + float(scales >> 4)), 0.25f);
-#pragma unroll
-        for(int w = 0; w < 8; ++w) {
-            const int l = w / 2;
-            const uint32_t index = b[2 + 4 * ib + l] | (((qh >> (2 * l)) & 3u) << 8);
-            const uint32_t signs = uint32_t(b[34 + 4 * ib + l]) >> (4 * (w & 1));
-            q[w] = static_cast<int32_t>(signed_word(grid_half(kIq2sGrid[index], w & 1), signs));
-        }
+    } else if constexpr(F == IQ2_XXS || F == IQ2_XS || F == IQ2_S || F == IQ1_S) {
+        // Their blocks (66, 74, 82 and 50 bytes) keep an even matrix's blocks even: 16-bit loads then.
+        if((reinterpret_cast<uintptr_t>(b) & 1u) == 0) low_iq<F, true>(b, ib, q, s0, s1, grid);
+        else low_iq<F, false>(b, ib, q, s0, s1, grid);
     } else if constexpr(F == IQ3_XXS) {
         // qs 64 bytes (eight grid indices of four values a sub-block), then a word a sub-block: four 7-bit sign
         // indices and the 4-bit scale.
@@ -357,38 +426,37 @@ __device__ __forceinline__ void subblock(const uint8_t* b, int ib, int32_t q[8],
 #pragma unroll
         for(int w = 0; w < 8; ++w) {
             const uint32_t signs = even_signs((aux >> (7 * (w / 2))) & 127u) >> (4 * (w & 1));
-            q[w] = static_cast<int32_t>(signed_word(kIq3xxsGrid[b[2 + 8 * ib + w]], signs));
-        }
-    } else if constexpr(F == IQ1_S) {
-        // qs 32 bytes (four 11-bit grid indices' low bits a sub-block), then a 16-bit qh a sub-block: the indices'
-        // bits 8..10 (3 each), the 3-bit scale (bits 12..14) and the offset's sign (bit 15).
-        const uint32_t qh = b[34 + 2 * ib] | (uint32_t(b[35 + 2 * ib]) << 8);
-        s0 = s1 = __fmul_rn(__fmul_rn(half_at(b), float(2 * ((qh >> 12) & 7u) + 1)), 0.125f);
-        const bool negative = (qh & 0x8000u) != 0;
-#pragma unroll
-        for(int w = 0; w < 8; ++w) {
-            const int l = w / 2;
-            const uint32_t index = b[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7u) << 8);
-            q[w] = static_cast<int32_t>(iq1_word(grid_half(kIq1sGrid[index], w & 1), negative));
+            q[w] = static_cast<int32_t>(signed_word_masked(kIq3xxsGrid[b[2 + 8 * ib + w]], signs));
         }
     } else if constexpr(F == IQ1_M) {
         // qs 32 bytes, qh 16 (a byte two indices: bits 8..10 of each and its group's offset sign, bits 3 and 7), and
         // four 16-bit scale words: four 3-bit scales each (one a 16 values) and, in their top nibbles, the FP16 d.
-        const uint8_t* sc = b + 48;
-        const uint32_t w0 = sc[0] | (sc[1] << 8), w1 = sc[2] | (sc[3] << 8), w2 = sc[4] | (sc[5] << 8),
-                       w3 = sc[6] | (sc[7] << 8);
+        // Its 56-byte blocks keep an 8-byte aligned matrix's blocks 8-byte aligned: then each field is one load.
+        uint32_t qs, qh, lo, hi;   // the sub-block's 4 qs bytes and 2 qh bytes, the 4 scale words (2 a word)
+        if((reinterpret_cast<uintptr_t>(b) & 7u) == 0) {
+            qs = *reinterpret_cast<const uint32_t*>(b + 4 * ib);
+            qh = *reinterpret_cast<const uint16_t*>(b + 32 + 2 * ib);
+            const uint2 sc = *reinterpret_cast<const uint2*>(b + 48);
+            lo = sc.x;
+            hi = sc.y;
+        } else {
+            qs = word_at(b + 4 * ib);
+            qh = b[32 + 2 * ib] | (uint32_t(b[33 + 2 * ib]) << 8);
+            lo = word_at(b + 48);
+            hi = word_at(b + 52);
+        }
         const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(
-            (w0 >> 12) | ((w1 >> 8) & 0x00f0u) | ((w2 >> 4) & 0x0f00u) | (w3 & 0xf000u))));
-        const uint32_t word = sc[2 * (ib / 2)] | (sc[2 * (ib / 2) + 1] << 8);
+            ((lo >> 12) & 0x000fu) | ((lo >> 24) & 0x00f0u) | ((hi >> 4) & 0x0f00u) | ((hi >> 16) & 0xf000u))));
+        const uint32_t word = ((ib < 4 ? lo : hi) >> (16 * ((ib / 2) & 1))) & 0xffffu;
         const int shift = 6 * (ib % 2);
         s0 = __fmul_rn(__fmul_rn(d, float(2 * ((word >> shift) & 7u) + 1)), 0.125f);
         s1 = __fmul_rn(__fmul_rn(d, float(2 * ((word >> (shift + 3)) & 7u) + 1)), 0.125f);
 #pragma unroll
         for(int w = 0; w < 8; ++w) {
             const int l = w / 2;
-            const uint32_t qh = b[32 + 2 * ib + l / 2] >> (4 * (l & 1));
-            const uint32_t index = b[4 * ib + l] | ((qh & 7u) << 8);
-            q[w] = static_cast<int32_t>(iq1_word(grid_half(kIq1sGrid[index], w & 1), (qh & 8u) != 0));
+            const uint32_t h = qh >> (4 * l);   // index l's qh nibble: byte l / 2, nibble l % 2
+            const uint32_t index = ((qs >> (8 * l)) & 0xffu) | ((h & 7u) << 8);
+            q[w] = static_cast<int32_t>(iq1_word(grid_half(grid[index], w & 1), (h & 8u) != 0));
         }
     } else if constexpr(F == IQ3_S) {
         const uint8_t* qs = b + 2 + 8 * ib;
@@ -426,10 +494,11 @@ __device__ __forceinline__ void q2k_scaled(const uint8_t* b, int ib, int32_t q[8
 
 // The formats with one minimum a sub-block (or none): m for every value.
 template <int F>
-__device__ __forceinline__ void subblock(const uint8_t* b, int ib, int32_t q[8], float& s0, float& s1, float& m) {
+__device__ __forceinline__ void subblock(const uint8_t* b, int ib, int32_t q[8], float& s0, float& s1, float& m,
+                                         const uint64_t* grid = nullptr) {
     static_assert(!two_mins(F), "a format with a minimum a 16 values takes subblock's m0 and m1");
     float m1;
-    subblock<F>(b, ib, q, s0, s1, m, m1);
+    subblock<F>(b, ib, q, s0, s1, m, m1, grid);
 }
 
 // Value e (0..31) of a decoded sub-block, as the format's reference decoder computes it in FP32.

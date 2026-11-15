@@ -123,13 +123,16 @@ class Gemv:
         return module.gemv(s["x"], s["w"])
 
     def reference(self, s):
-        if s["key"] not in self._references:
-            if "w" not in s:
-                s["raw"], s["w"] = self.matrix(s["module"], s["shape"], s["x"].device)
-            w = s["w"]
-            y = product(s["raw"], w.type, w.k, s["x"], s["module"].splits(w))
-            self._references[s["key"]] = y.to(s["x"].dtype).to(s["x"].device)
-        return self._references[s["key"]]
+        # The declared order for the configuration's parts (SPLITS, an order knob): one reference a split count.
+        if "w" not in s:
+            s["raw"], s["w"] = self.matrix(s["module"], s["shape"], s["x"].device)
+        w = s["w"]
+        parts = s["module"].splits(w)
+        key = s["key"] + (parts,)
+        if key not in self._references:
+            y = product(s["raw"], w.type, w.k, s["x"], parts)
+            self._references[key] = y.to(s["x"].dtype).to(s["x"].device)
+        return self._references[key]
 
     def check(self, got, want, s):
         bad = int((got.view(torch.int16) != want.view(torch.int16)).sum())

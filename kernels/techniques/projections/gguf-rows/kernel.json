@@ -47,7 +47,8 @@
           "values": [
             2,
             4,
-            8
+            8,
+            16
           ],
           "default": 4,
           "what": "warps a block, one output column a warp"
@@ -64,6 +65,23 @@
           "default": 0,
           "order": true,
           "what": "contiguous parts of a row's sub-blocks, added in part order (0: enough warps for 32 a multiprocessor, at least 32 sub-blocks a part)"
+        },
+        "COLS": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 1,
+          "what": "output columns a warp: a lane loads a sub-block's quantized activations once for each of its columns (each column's terms in its own order, the same bits); IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS and IQ2_S plain matrices only, the other formats and gathered calls one column a warp"
+        },
+        "GRID": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 0,
+          "what": "1: the format's grid copied into shared memory once a block (the same table word for word) and read from there, the blocks persistent (as many as fit on the device at once, each warp looping over its columns); IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS and IQ2_S only, the other formats the device table through L1"
         }
       },
       "yardstick": null,

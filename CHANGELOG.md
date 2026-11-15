@@ -9,6 +9,14 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+
+- gguf-rows: faster decode GEMVs for IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS and IQ2_S, bit for bit: the kernel core's IQ
+  decoders read a block's fields with 16-bit loads (IQ1_M's scales with one 8-byte load) where the address allows and
+  apply the signs and IQ1's offset with one 32-bit add a word; gemv's new knobs `COLS` (output columns a warp) and
+  `GRID` (the format's grid in shared memory, persistent blocks) and `WARPS` 16, swept per format, shape and GPU
+  (#52). bench.py checks each configuration against the declared order of its own split count.
+
 ## [0.19.0] - 2026-11-13
 
 ### Overview

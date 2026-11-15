@@ -22,7 +22,8 @@ plain call on its expert.
 | Numerics | `dequantize` in FP32 equals the format's own reference decoder bit for bit (and BF16 / FP16 one rounding of it); `gemv` and `gemm` are the declared order of `gguf_rows.h` bit for bit (bench.py's `product`, in torch on the host): a prompt row equals the same row decoded |
 | Determinism | same bits on a repeat; a row's output independent of the rows beside it and, gathered, of the other rows' experts |
 | Measured speed (gemm) | RTX 5090, 14336 x 4096, cold L2, default knobs (WN 4, WT 2, TB 4, RUN 2, STAGES 2), the call's staging and quantizing included; 512 tokens: Q8_0 107 TOPS, Q4_K 95, Q6_K 92, IQ4_NL 111, IQ3_S 112, IQ4_XS 111; 2,048 tokens: Q8_0 128, Q4_K 110, Q6_K 107, IQ4_NL 129, IQ3_S 129, IQ4_XS 129. Dequantizing to BF16 and cuBLAS's BF16 GEMM on the same matrices: 50-52 TFLOPS at 512 tokens (gemm 1.8 to 2.2 times faster), 119-121 at 2,048 (gemm 1.06 to 1.08 times faster for the formats with one scale, 0.90 to 0.92 for Q4_K and Q6_K, whose terms take a minimum or two scales) |
-| Measured speed, the other formats | the same RTX 5090 and setup, warm weights for gemm. gemm at 512 and 2,048 tokens: Q4_0 118 and 132 TOPS, Q5_0 117 and 131, MXFP4 118 and 132, IQ2_XXS 119 and 132, IQ3_XXS 119 and 131, IQ1_S 117 and 126-131 (one scale a sub-block: 1.07 times cuBLAS at 2,048); Q4_1 99 and 112, Q5_1 87-98 and 111, Q5_K 98 and 111, Q3_K 97 and 109, Q2_K 91 and 105, IQ2_XS 97 and 109, IQ2_S 96 and 109, IQ1_M 94-96 and 106 (two scales or a minimum: 0.86 to 0.92 times cuBLAS at 2,048, 1.7 to 2.3 times it at 512). gemv, 1 row on 14336 x 4096 and 4096 x 14336: Q4_0 1,355-1,365 GB/s, Q4_1 1,325-1,414, Q5_0 1,364-1,400, Q5_1 1,383-1,442, MXFP4 1,162-1,208, Q5_K 1,143-1,209, Q3_K 882-914, Q2_K 1,013-1,089, IQ3_XXS 1,096-1,130, IQ2_S 953-1,018, IQ2_XS 942-998, IQ2_XXS 930-948, IQ1_M 754-796, IQ1_S 732-771 (at 1.6 to 2.6 bits a weight the decode, not the read, sets the time: IQ1_S's 11.5 MB take 15 us against 7.7 us of reading) |
+| Measured speed, the other formats | the same RTX 5090 and setup, warm weights for gemm. gemm at 512 and 2,048 tokens: Q4_0 118 and 132 TOPS, Q5_0 117 and 131, MXFP4 118 and 132, IQ2_XXS 119 and 132, IQ3_XXS 119 and 131, IQ1_S 117 and 126-131 (one scale a sub-block: 1.07 times cuBLAS at 2,048); Q4_1 99 and 112, Q5_1 87-98 and 111, Q5_K 98 and 111, Q3_K 97 and 109, Q2_K 91 and 105, IQ2_XS 97 and 109, IQ2_S 96 and 109, IQ1_M 94-96 and 106 (two scales or a minimum: 0.86 to 0.92 times cuBLAS at 2,048, 1.7 to 2.3 times it at 512). gemv, 1 row on 14336 x 4096 and 4096 x 14336: Q4_0 1,355-1,365 GB/s, Q4_1 1,325-1,414, Q5_0 1,364-1,400, Q5_1 1,383-1,442, MXFP4 1,162-1,208, Q5_K 1,143-1,209, Q3_K 882-914, Q2_K 1,013-1,089, IQ3_XXS 1,096-1,130, IQ2_S 953-1,018, IQ2_XS 942-998, IQ2_XXS 930-948, IQ1_M 754-796, IQ1_S 732-771 (at 1.6 to 2.6 bits a weight the decode, not the read, sets the time: IQ1_S's 11.5 MB take 15 us against 7.7 us of reading; measured before the IQ decoders' 16-bit loads and one-add signs, not yet again on an RTX 5090) |
+| Measured speed (gemv), IQ1 and IQ2 | RTX 5060 Ti (sm_120, about 400 GB/s read: Q4_K's gemv at 383-399 GB/s), 1 row on 14336 x 4096 and 4096 x 14336, weights rotated past L2. The gemv kernel alone, before and after the decoders' 16-bit loads and one-add signs (default knobs): IQ1_S 41.5-42.8 to 38.1-38.4 us, IQ1_M 46.3-48.1 to 37.4-38.5, IQ2_XXS 46.5-47.2 to 38.7-41.1, IQ2_XS 49.2-49.8 to 42.6-45.3, IQ2_S 52.0-52.6 to 46.7-51.4; with GRID and 16 warps IQ1_S takes 33.6-36.1 us. The IQ2 formats now read at 365-400 GB/s, the card's bandwidth. The whole call (`crit kernels sweep`, its quantize and sum launches included, best configuration, a 2 us timer step): IQ1_S 54.7 to 50.6 us, IQ1_M 62.9-67.0 to 52.7, IQ2_XXS 58.8 to 52.7, IQ2_XS 62.9 to 56.8-58.8, IQ2_S 65.0-67.1 to 64.8-65.0. Q4_K, Q6_K, Q8_0 and IQ3_XXS unchanged, IQ3_S 1-2% faster |
 | Memory (gemm) | a staging buffer a call: K + K / 4 bytes a weight row (codes and two planes of scales; Q2_K three), the matrix's rows taken in chunks that fit 128 MiB (all of a 14336 x 4096 matrix: 75 MiB); half of what dequantizing to BF16 holds |
 | Measured speed (gemv) | RTX 5090 (crit eval probe: 1,487 GB/s copy bandwidth), weights read cold (matrices rotated past L2), the call's three launches timed in a CUDA graph: 1 row on 14336 x 4096 and 4096 x 14336 reads Q8_0 at 1,357-1,429 GB/s, Q4_K 1,236-1,257, Q6_K 1,247-1,250, IQ4_NL 1,124-1,177, IQ3_S 1,127-1,130, IQ4_XS 1,056-1,128 (71-96% of the probe); 4 rows 742-1,348 GB/s, 8 rows 545-1,032 GB/s; a 2816 x 2816 matrix (3.4-8.4 MB) takes 7.7-13.4 us for 1 row |
 
@@ -59,8 +60,17 @@ dense = gr.dequantize(w)                 # W [N][K] BF16 (torch.float32: the sto
 
 | Knob | Values | Effect |
 | --- | --- | --- |
-| `WARPS` | 2, 4, 8 | warps a block, one output column a warp |
+| `WARPS` | 2, 4, 8, 16 | warps a block, one output column a warp |
 | `SPLITS` | 0, 1, 2, 4, 8, 16 | contiguous parts of a row's sub-blocks (0: enough warps for 32 a multiprocessor, at least 32 sub-blocks a part); an order knob |
+| `COLS` | 1, 2, 4 | output columns a warp: a lane loads a sub-block's quantized activations once for each of its columns, each column's terms in its own order (the same bits); IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS and IQ2_S plain matrices only, the other formats and gathered calls one column a warp |
+| `GRID` | 0, 1 | 1: the format's grid copied into shared memory once a block (the same table word for word) and read from there, the blocks persistent (as many as fit on the device at once, each warp looping over its columns); IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS and IQ2_S only. 0: the device table through L1 |
+
+None of them changes a sub-block's term or a lane's order, so the bits stay the declared order's for every value. The
+IQ decoders (the kernel core's `gguf.cuh`, which gemm's staging and `dequantize` share) read a block's fields with
+16-bit loads where the block's address is even (IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S; IQ1_M with one 8-byte load of its
+scales where it is 8-byte aligned), byte by byte otherwise, and apply the IQ2 and IQ3 signs and IQ1's `8 g +- 1` with
+one 32-bit add a word (no grid byte is zero, so no byte carries into the next): the same codes as before with a third
+of the instructions.
 
 Structure `gemm` (the prompt rows, 9 rows and more), in two steps a call. First every sub-block of the matrix is
 decoded once, as gemv decodes it (the kernel core's decoders: int8 codes and FP32 scales, bit for bit), into a
@@ -98,7 +108,8 @@ engine's tuning picks.
 decoders against gguf-py's `dequantize` bit for bit; `gemv` against the declared order bit for bit at 1, 2, 3, 5 and 8
 rows, in BF16, FP16 and FP32, and at 1, 2, 3 and 8 parts; `gemm` against `gemv` and the declared order bit for bit
 at 1, 9, 33 and 100 rows, and staged in chunks against one staging; a row alone against the same row among others; a gathered row
-against the plain call on its expert; a NaN reaching its row only; and the shapes and formats it refuses.
+against the plain call on its expert; a matrix at a byte offset of 1, 2 and 4 (the decoders' byte-by-byte reads)
+against the same matrix aligned; a NaN reaching its row only; and the shapes and formats it refuses.
 `crit kernels gates gguf-rows --shapes FILE` (nonfinite, repeat, edges, sums, limits) and the build for every
 architecture in kernel.json.
 

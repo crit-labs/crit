@@ -59,6 +59,24 @@ def test_gemv_is_the_declared_order_bit_for_bit_and_a_rows_bits_its_own(fmt):
             assert torch.equal(gr.gemv(xd, w).cpu(), product(raw, fmt, k, xd, gr.splits(w)).to(dtype))
 
 
+@pytest.mark.parametrize("fmt", sorted(BLOCKS))
+def test_a_matrix_at_any_byte_offset_has_the_same_bits(fmt):
+    # The decoders read a block's fields by wider loads when its address allows (gguf.cuh's low_iq, IQ1_M) and byte by
+    # byte otherwise: the same values either way.
+    n, k = 40, 4608
+    raw = blocks(fmt, n, k, seed=fmt * 13)
+    aligned = gr.GgufMatrix(torch.from_numpy(raw).to(dev), fmt, k)
+    x = activations(3, k, dev)
+    want_y, want_v = gr.gemv(x, aligned).cpu(), gr.dequantize(aligned, torch.float32).cpu()
+    buffer = torch.zeros(raw.nbytes + 16, dtype=torch.uint8, device=dev)
+    for offset in (1, 2, 4):
+        view = buffer[offset:offset + raw.nbytes].view(raw.shape)
+        view.copy_(torch.from_numpy(raw).to(dev))
+        w = gr.GgufMatrix(view, fmt, k)
+        assert torch.equal(gr.gemv(x, w).cpu(), want_y), (NAMES[fmt], offset)
+        assert torch.equal(gr.dequantize(w, torch.float32).cpu().view(torch.int32), want_v.view(torch.int32))
+
+
 @pytest.mark.parametrize("parts", [1, 2, 3, 8])
 def test_every_split_is_its_own_declared_order(parts):
     # The part count is part of the order: each one the reference reproduces.
