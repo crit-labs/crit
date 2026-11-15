@@ -262,6 +262,63 @@ class ServeCheckTests(run_measure.MeasureFixture, unittest.TestCase):
         self.assertEqual(run(fits, headroom=4 << 30)["full_context_device_memory"]["state"], "failed")
         self.assertEqual({i["state"] for i in run(None).values()}, {"unverified"})
 
+    def test_the_full_context_request_waits_while_the_engine_steps_and_fails_when_it_stalls(self):
+        import threading
+        import time
+        from crit.run import checks
+
+        class Steps:
+            # Core's step count: moving while `moving` is set.
+            def __init__(self):
+                self.count, self.moving = 0, threading.Event()
+                self.moving.set()
+
+            def telemetry(self):
+                if self.moving.is_set():
+                    self.count += 1
+                return {"core": {"steps": self.count}}
+
+        class Waited:
+            # The client: abort closes the connection its request waits on.
+            def __init__(self):
+                self.aborted, self.closed = False, threading.Event()
+
+            def abort(self):
+                self.aborted = True
+                self.closed.set()
+
+            def hung(self):
+                self.closed.wait(5)
+                raise OSError("connection closed")
+
+        # A request lasting many times `stall` returns while the steps keep moving.
+        engine, client = Steps(), Waited()
+
+        def slow():
+            time.sleep(0.3)
+            return "answered"
+        self.assertEqual(checks._progressing(slow, client, engine, stall=0.1, poll=0.02), "answered")
+        self.assertFalse(client.aborted)
+        # A request whose engine stops stepping is aborted (crit serve cancels it) after `stall` without a step.
+        engine.moving.clear()
+
+        started = time.perf_counter()
+        with self.assertRaisesRegex(TimeoutError, "no engine step finished in 0.1 s"):
+            checks._progressing(client.hung, client, engine, stall=0.1, poll=0.02)
+        self.assertTrue(client.aborted)
+        self.assertLess(time.perf_counter() - started, 2)
+
+        # The request's own error is its error.
+        def refused():
+            raise ValueError("crit serve answered 500")
+        with self.assertRaisesRegex(ValueError, "answered 500"):
+            checks._progressing(refused, Waited(), engine, stall=0.1, poll=0.02)
+        # An engine that reports no step count is waited for `stall` seconds in all.
+        quiet = Waited()
+        with self.assertRaisesRegex(TimeoutError, "reports no step count"):
+            checks._progressing(quiet.hung, quiet, SimpleNamespace(telemetry=lambda: None), stall=0.1, poll=0.02)
+        self.assertTrue(quiet.aborted)
+
     def test_serve_check_runs_crit_smoke_at_the_run_context_and_a_quarter_of_it(self):
         candidate = self.served()
         calls = []

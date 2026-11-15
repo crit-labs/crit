@@ -9,6 +9,14 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- `crit run serve --check`'s full-context request no longer fails at a fixed 600 s: it waits while the engine keeps
+  finishing steps and fails only when none finishes for 600 s, and crit serve bounds it by the check attempt's
+  deadline, as for Eval. An engine whose prefill of the run's whole context takes longer than ten minutes (a large
+  context on a small device or a slow link) failed `full_context_prompt_step` and `full_context_device_memory` with
+  `TimeoutError` before any step was judged, and the cancel then retired its host.
+
 ## [0.19.0] - 2026-11-13
 
 ### Overview

@@ -8,6 +8,8 @@ context against the run's VRAM headroom. One check per case and gate cites the r
 """
 import http.client
 import json
+import socket
+import threading
 import time
 
 from crit_core.serving import LOGPROBS_CAPABILITY, TEMPLATE_KWARGS_CAPABILITY, TOOL_CHOICE_CAPABILITY, TOOLS_CAPABILITY
@@ -113,9 +115,11 @@ REQUIRED = ("consecutive", "system_message", "streaming", "stop_string", "cancel
 class Client:
     def __init__(self, port, timeout):
         self.port, self.timeout = port, timeout
+        self.connection = None   # chat's connection while it waits, for abort
 
     def chat(self, body):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=self.timeout)
+        self.connection = connection
         try:
             connection.request("POST", "/v1/chat/completions", json.dumps({"temperature": 0, "max_tokens": 48, **body}),
                                {"Content-Type": "application/json"})
@@ -126,6 +130,16 @@ class Client:
         if response.status != 200:
             raise ValueError(f"crit serve answered {response.status}: {(data.get('error') or {}).get('message', data)}")
         return data
+
+    def abort(self):
+        """Close the connection chat waits on (from another thread): crit serve cancels a request whose client
+        disconnects, and chat raises."""
+        connection = self.connection
+        if connection is not None and connection.sock is not None:
+            try:
+                connection.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     def post(self, path, body):
         """POST a JSON body to crit serve; its JSON answer, ValueError for any status but 200."""
@@ -193,12 +207,19 @@ FILLER = ("The river runs past the old mill and under the stone bridge, where th
           "Saturdays. Farmers bring apples, cheese and bread, and the children watch the boats go by. ")
 # Tokens the full-context pass decodes after its prompt.
 FULL_CONTEXT_DECODE = 16
+# Seconds a serving check waits for its request; the full-context request, for the engine's next step.
+CHECK_SECONDS = 600
+# Seconds between the full-context wait's reads of the engine's step count.
+PROGRESS_POLL_SECONDS = 5.0
 
 
 def full_context_checks(port, engine, kv_tokens, headroom, grace, timeout, log):
     """One chat request at the full context: a user message of repeated FILLER, as many copies as fit in kv_tokens
     less FULL_CONTEXT_DECODE tokens (sized from the prompt tokens the engine counts for one copy and two), then up to
     FULL_CONTEXT_DECODE decoded tokens, on an engine whose Core steps are probed (crit_core.native.STEP_PROBE).
+    That request takes as long as the engine's prefill of the whole context, which on a slow link or a small device
+    can be many times `timeout`: it waits while the engine keeps finishing steps (_progressing) and fails only when
+    none finishes for `timeout` seconds, crit serve's own bound on it being the attempt's deadline.
     From Core's probe in the engine's telemetry, of this request's steps alone (_since): full_context_prompt_step
     passes when the slowest prompt step finishes within `grace` (a cancel settles only between steps, and the host is
     retired with its weights when a cancel does not settle within crit serve's grace), full_context_device_memory
@@ -224,7 +245,10 @@ def full_context_checks(port, engine, kv_tokens, headroom, grace, timeout, log):
         log(f"serve check full context: a prompt of about {one + (copies - 1) * per:,} tokens and up to "
             f"{FULL_CONTEXT_DECODE} decoded tokens")
         before = _probe(engine)
-        prompted = complete(copies, FULL_CONTEXT_DECODE)
+        waiting = Client(port, None)   # bounded by the engine's steps instead (_progressing)
+        body = {"model": model, "messages": [{"role": "user", "content": FILLER * copies}],
+                "max_tokens": FULL_CONTEXT_DECODE}
+        prompted = _progressing(lambda: waiting.chat(body), waiting, engine, timeout)["usage"]["prompt_tokens"]
         probe = _since(before, _probe(engine))
     except Exception as exc:
         detail = f"{type(exc).__name__}: {exc}"[:2000]
@@ -236,6 +260,47 @@ def full_context_checks(port, engine, kv_tokens, headroom, grace, timeout, log):
         item["seconds"] = seconds
         log(f"serve check {item['name']}: {item['state']} ({item['detail']})")
     return items
+
+
+def _progressing(call, client, engine, stall, poll=None):
+    """call()'s result, run on a thread and waited for while the engine keeps stepping: Core's step count (its
+    telemetry's core.steps, prompt and decode steps alike) read every `poll` seconds. When it has not moved for `stall`
+    seconds, or for an engine that reports none `stall` seconds have passed, the client's connection is closed (crit
+    serve cancels the request) and TimeoutError raised. call()'s own error is raised as it is."""
+    poll = PROGRESS_POLL_SECONDS if poll is None else poll
+    found = {}
+
+    def run():
+        try:
+            found["value"] = call()
+        except BaseException as exc:   # re-raised on the caller's thread
+            found["error"] = exc
+    thread = threading.Thread(target=run, name="crit full-context request", daemon=True)
+    thread.start()
+    steps, moved = None, time.perf_counter()
+    while True:
+        thread.join(poll)
+        if not thread.is_alive():
+            break
+        counted = _steps(engine)
+        if counted is not None and counted != steps:
+            steps, moved = counted, time.perf_counter()
+        elif time.perf_counter() - moved >= stall:
+            client.abort()
+            thread.join(poll)
+            raise TimeoutError(f"no engine step finished in {stall:g} s" if steps is not None else
+                               f"timed out after {stall:g} s (the engine reports no step count)")
+    if "error" in found:
+        raise found["error"]
+    return found["value"]
+
+
+def _steps(engine):
+    """Core's steps so far (telemetry's core.steps), None when the engine reports none or its report fails."""
+    try:
+        return ((engine.telemetry() or {}).get("core") or {}).get("steps")
+    except Exception:
+        return None
 
 
 def _probe(engine):

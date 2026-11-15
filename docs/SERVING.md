@@ -334,7 +334,9 @@ serves, and every decode step must finish in well under a second. A slower chunk
 loses the resident weights on any cancel, and the next turn loads them again.
 `crit run serve --check` measures it: one request at the run's full context, on Core's
 steps probed (`CRIT_CORE_STEP_PROBE`), fails `full_context_prompt_step` when its slowest
-prompt step takes the grace or longer. crit
+prompt step takes the grace or longer. That request waits as long as the engine keeps
+finishing steps (its prefill of the whole context may take many minutes) and fails only when
+no step finishes for 600 seconds; crit serve bounds it by the check attempt's deadline. crit
 serve prints one line on stderr whenever it retires or closes an engine host, saying
 why (a cancel not settled within the grace, an engine error, shutdown).
 Streaming writes also honor the command's deadline and shutdown while a connected

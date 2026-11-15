@@ -175,7 +175,11 @@ def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None
     external = candidate_spec(folder) is not None
     with attempt.running() as log:
         tested = _plugin_tests(folder, log) if check and plugin_tests and not external else []
-        served = serving(store, run_id, candidate_id, attempt, kv_tokens, log, "crit run serve", address=(host, port))
+        # With --check crit serve's own bound on a request is the attempt's deadline, as for Eval: the full-context
+        # check's prefill can outlast any fixed one, and each check bounds its own requests (checks.CHECK_SECONDS).
+        served = serving(store, run_id, candidate_id, attempt, kv_tokens, log, "crit run serve",
+                         **({"timeout": min(86400, max(1.0, remaining(attempt.deadline_at)))} if check else {}),
+                         address=(host, port))
         with served.until(attempt.deadline_at):
             with _probed(check and not external):
                 engine, _, bound = served.open()
@@ -183,15 +187,15 @@ def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None
             if ready is not None:
                 ready(bound)
             if check:
-                from .checks import full_context_checks, serve_checks
+                from .checks import CHECK_SECONDS, full_context_checks, serve_checks
                 variables = (read_json(folder / "candidate.json")["configuration"].get("recon") or {}).get(
                     "template_variables") or {}
-                report = tested + serve_checks(bound, engine.spec()["capabilities"], variables, served.timeout, log)
+                report = tested + serve_checks(bound, engine.spec()["capabilities"], variables, CHECK_SECONDS, log)
                 if not external:
                     from crit_api.residency import CANCEL_GRACE_SECONDS
                     report += full_context_checks(bound, engine, kv_tokens,
                                                   run["spec"]["hardware_constraints"]["vram_headroom_bytes"],
-                                                  CANCEL_GRACE_SECONDS, served.timeout, log)
+                                                  CANCEL_GRACE_SECONDS, CHECK_SECONDS, log)
                 if smoke:
                     report += _smoke(served, bound, log)
                 if data is not None:
