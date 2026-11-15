@@ -153,7 +153,7 @@ scale times the sub-block's integer scale, rounded once; `s1` for values 16 to 3
 minimum, the negated offset of Q4_1 and Q5_1, and with Q2_K's minimum a 16 values `m0` and `m1`), so `value()` =
 `fsub(fmul(s, q), m)` is the stored value bit for bit; IQ1's offset of an eighth folds into the codes (8 g +- 1 over
 d l / 8, exact); `block_bytes`, `block_values`, `two_scales`, `has_min`, `two_mins` and `supported` by GGUF type id.
-Formats: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, MXFP4 (their own IQ grids, in `gguf_grids.cuh` beside IQ3_S's, and IQ4 values). gguf-rows' tests check every format's decoded values against the format's own reference
+Formats: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, MXFP4 (their own IQ grids, in `gguf_grids.cuh` beside IQ3_S's, and IQ4 values). gguf-rows' tests check every format's decoded values against the format's own reference
 decoder bit for bit. With it, `reduce.cuh`'s `lane_at32` and `fold32`: the 32-lane halving tree (the warp's xor
 butterfly) folded by one thread from finished lanes as they come, a binary counter of six partial sums, the bits of the
 butterfly, for a GEMM that keeps a warp-wide declared order.

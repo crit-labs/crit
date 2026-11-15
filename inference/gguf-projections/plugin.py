@@ -2,7 +2,7 @@
 decoders as the reference), on the device on crit's kernel gguf-rows.
 
 A model plugin reads a matrix's stored bytes with crit_core.model.gguf_blocks.GgufTensors and loads it here as format
-"gguf:<TYPE>" (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, MXFP4) with tensors {"weight": uint8 [N][row bytes]}, or a stack of
+"gguf:<TYPE>" (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, MXFP4) with tensors {"weight": uint8 [N][row bytes]}, or a stack of
 experts [E][N][row bytes] (matmul_experts); a GGUF file's dense tensors (F32, F16, BF16) load as "bf16". Decode rows
 (calls of up to DECODE_ROWS rows) run gguf-rows' gemv: int8 activations per 32 values against the stored blocks, each
 row's bits its own. Prompt rows (longer calls, or prompt=True) take the `prompt` option: dequantize (the default: the

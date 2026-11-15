@@ -1,6 +1,6 @@
 // GGUF projections: y = x W^T for W [N][K] stored in a GGUF block format (crit_kcore/gguf.cuh: Q4_0, Q4_1, Q5_0,
 // Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS,
-// MXFP4), read at its stored bits.
+// TQ1_0, TQ2_0, MXFP4), read at its stored bits.
 //
 // The declared order, the same bits on every GPU and for any rows beside a row:
 //  1. quantize: each row's 32-value blocks of x become int8 q = rint(x / d) (d = max |x| / 127 in FP32, q = 0 where

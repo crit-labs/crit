@@ -25,7 +25,7 @@ gr::Matrix matrix(const torch::Tensor& blocks, int64_t type, int64_t k) {
     TORCH_CHECK(gg::supported(static_cast<int>(type)), "GGUF type ", type, " is not one of Q4_0 (2), Q4_1 (3), "
                 "Q5_0 (6), Q5_1 (7), Q8_0 (8), Q2_K (10), Q3_K (11), Q4_K (12), Q5_K (13), Q6_K (14), IQ2_XXS (16), IQ2_XS (17), "
                 "IQ3_XXS (18), IQ1_S (19), IQ4_NL (20), IQ3_S (21), IQ2_S (22), IQ4_XS (23), IQ1_M (29), "
-                "MXFP4 (39)");
+                "TQ1_0 (34), TQ2_0 (35), MXFP4 (39)");
     TORCH_CHECK(blocks.is_cuda() && blocks.is_contiguous() && blocks.scalar_type() == torch::kUInt8 &&
                     (blocks.dim() == 2 || blocks.dim() == 3),
                 "blocks are contiguous uint8 [N][row bytes] or [experts][N][row bytes] on a CUDA device");

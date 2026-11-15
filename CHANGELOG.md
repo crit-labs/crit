@@ -9,6 +9,13 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- gguf-rows reads the ternary TQ1_0 (type 34) and TQ2_0 (35) in every call (`gemv` plain and gathered, `gemm`,
+  `dequantize`), bit for bit with gguf-py's decoder, with one scale `d` for every 32-value sub-block and codes -1, 0
+  and 1; Core's host decoders (`crit_core.model.gguf_blocks`) and the kernel core's (`crit_kcore/gguf.cuh`) read them,
+  and gguf-projections takes `gguf:TQ1_0` and `gguf:TQ2_0` matrices.
+
 ## [0.19.0] - 2026-11-13
 
 ### Overview

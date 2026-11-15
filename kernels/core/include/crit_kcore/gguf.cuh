@@ -15,7 +15,10 @@
 //
 // Formats (their GGUF type ids): Q4_0 (2), Q4_1 (3), Q5_0 (6), Q5_1 (7), Q8_0 (8), Q2_K (10), Q3_K (11), Q4_K (12), Q5_K (13),
 // Q6_K (14), IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ1_S (19), IQ4_NL (20), IQ3_S (21), IQ2_S (22), IQ4_XS (23),
-// IQ1_M (29), MXFP4 (39: E2M1 values doubled as integers, the E8M0 byte e halved: 2^(e - 128), exact). The IQ grids (here and in gguf_grids.cuh) and the IQ4 values are the formats' own tables.
+// IQ1_M (29), TQ1_0 (34), TQ2_0 (35), MXFP4 (39: E2M1 values doubled as integers, the E8M0 byte e halved: 2^(e - 128),
+// exact). The ternary TQ1_0 and TQ2_0 hold codes 0, 1, 2 (q = code - 1) and one FP16 scale d a 256-value block, so
+// s0 == s1 == d for every sub-block. The IQ grids (here and in gguf_grids.cuh) and the IQ4 values are the formats' own
+// tables.
 #pragma once
 #include <cstdint>
 #include <cuda_fp16.h>
@@ -27,7 +30,7 @@ namespace crit::kcore::gguf {
 enum Format : int {
     Q4_0 = 2, Q4_1 = 3, Q5_0 = 6, Q5_1 = 7, Q8_0 = 8, Q2_K = 10, Q3_K = 11, Q4_K = 12, Q5_K = 13, Q6_K = 14,
     IQ2_XXS = 16, IQ2_XS = 17, IQ3_XXS = 18, IQ1_S = 19, IQ4_NL = 20, IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23, IQ1_M = 29,
-    MXFP4 = 39
+    TQ1_0 = 34, TQ2_0 = 35, MXFP4 = 39
 };
 
 // A block's bytes in a GGUF type (0: not one of these formats), whether the type is one, and its block's values
@@ -36,7 +39,8 @@ __host__ __device__ constexpr int block_bytes(int type) {
     return type == Q4_0 ? 18 : type == Q4_1 ? 20 : type == Q5_0 ? 22 : type == Q5_1 ? 24 : type == Q8_0 ? 34
          : type == Q2_K ? 84 : type == Q3_K ? 110 : type == Q4_K ? 144 : type == Q5_K ? 176 : type == Q6_K ? 210 : type == IQ4_NL ? 18
          : type == IQ3_S ? 110 : type == IQ4_XS ? 136 : type == IQ2_XXS ? 66 : type == IQ2_XS ? 74 : type == IQ3_XXS ? 98
-         : type == IQ1_S ? 50 : type == IQ2_S ? 82 : type == IQ1_M ? 56 : type == MXFP4 ? 17 : 0;
+         : type == IQ1_S ? 50 : type == IQ2_S ? 82 : type == IQ1_M ? 56 : type == TQ1_0 ? 54 : type == TQ2_0 ? 66
+         : type == MXFP4 ? 17 : 0;
 }
 __host__ __device__ constexpr bool supported(int type) { return block_bytes(type) != 0; }
 __host__ __device__ constexpr int block_values(int type) {
@@ -185,6 +189,18 @@ __device__ __forceinline__ void q4k_scale_min(const uint8_t* scales, int j, int&
     }
 }
 
+// TQ1_0's base-3 codes of four bytes at once (value i of the word from byte i): each byte times 3^j kept to 8 bits,
+// times 3, shifted right by 8 (0, 1 or 2, as gguf-py decodes it), the even and odd bytes in 16-bit lanes (no lane's
+// product reaches 2^16, so no carry crosses lanes).
+__device__ __forceinline__ uint32_t tq1_codes(uint32_t bytes, uint32_t power) {
+    uint32_t even = ((bytes & 0x00ff00ffu) * power) & 0x00ff00ffu;
+    uint32_t odd = (((bytes >> 8) & 0x00ff00ffu) * power) & 0x00ff00ffu;
+    even = ((even * 3u) >> 8) & 0x00ff00ffu;
+    odd = ((odd * 3u) >> 8) & 0x00ff00ffu;
+    return even | (odd << 8);
+}
+__device__ __forceinline__ uint32_t power_of_3(int j) { return j == 0 ? 1u : j == 1 ? 3u : j == 2 ? 9u : j == 3 ? 27u : 81u; }
+
 template <int F>
 __device__ __forceinline__ void subblock(const uint8_t* b, int ib, int32_t q[8], float& s0, float& s1, float& m,
                                          float& m1) {
@@ -193,6 +209,34 @@ __device__ __forceinline__ void subblock(const uint8_t* b, int ib, int32_t q[8],
         s0 = s1 = half_at(b);
 #pragma unroll
         for(int w = 0; w < 8; ++w) q[w] = static_cast<int32_t>(word_at(b + 2 + 4 * w));
+    } else if constexpr(F == TQ2_0) {
+        // qs 64 bytes of 2-bit codes, then d. Sub-block ib = 4 h + g: value l is bits 2 g, 2 g + 1 of qs[32 h + l].
+        s0 = s1 = half_at(b + 64);
+        const uint8_t* qs = b + 32 * (ib / 4);
+        const int shift = 2 * (ib % 4);
+#pragma unroll
+        for(int w = 0; w < 8; ++w)
+            q[w] = static_cast<int32_t>(__vsub4((word_at(qs + 4 * w) >> shift) & 0x03030303u, 0x01010101u));
+    } else if constexpr(F == TQ1_0) {
+        // qs 48 bytes of five base-3 codes a byte (values 0..159: code j of bytes 0..31 is values 32 j .. 32 j + 31;
+        // 160..239: code j of bytes 32..47 is values 160 + 16 j ..), qh 4 bytes of four (240..255: code j of bytes
+        // 48..51 is values 240 + 4 j ..), then d. So word w of sub-block ib is four consecutive bytes at one power.
+        s0 = s1 = half_at(b + 52);
+#pragma unroll
+        for(int w = 0; w < 8; ++w) {
+            int at, j;
+            if(ib < 5) {
+                at = 4 * w;
+                j = ib;
+            } else if(ib < 7 || w < 4) {
+                at = 32 + 4 * (w & 3);
+                j = 2 * (ib - 5) + (w >> 2);
+            } else {
+                at = 48;
+                j = w - 4;
+            }
+            q[w] = static_cast<int32_t>(__vsub4(tq1_codes(word_at(b + at), power_of_3(j)), 0x01010101u));
+        }
     } else if constexpr(F == MXFP4) {
         // The E8M0 byte, then 16 bytes: values 0..15 their low nibbles, 16..31 their high ones. The scale is half the
         // byte's power of two (the values are doubled), 2^(e - 128), as the format's decoder builds it.

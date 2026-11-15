@@ -25,7 +25,7 @@ namespace gg = crit::kcore::gguf;
 // Every format the kernels take (gguf.cuh's), for the launches' switches.
 #define CRIT_GGUF_FORMATS(X) \
     X(Q4_0) X(Q4_1) X(Q5_0) X(Q5_1) X(Q8_0) X(Q2_K) X(Q3_K) X(Q4_K) X(Q5_K) X(Q6_K) X(IQ2_XXS) X(IQ2_XS) X(IQ3_XXS) \
-    X(IQ1_S) X(IQ4_NL) X(IQ3_S) X(IQ2_S) X(IQ4_XS) X(IQ1_M) X(MXFP4)
+    X(IQ1_S) X(IQ4_NL) X(IQ3_S) X(IQ2_S) X(IQ4_XS) X(IQ1_M) X(TQ1_0) X(TQ2_0) X(MXFP4)
 
 __device__ __forceinline__ float load(const void* p, int kind, int64_t i) {
     if(kind == 0) return static_cast<const float*>(p)[i];

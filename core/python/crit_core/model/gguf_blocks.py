@@ -13,7 +13,8 @@ rounded once, so stored_values() is the stored value bit for bit as the format's
 FP32. crit's kernel core decoders (crit_kcore/gguf.cuh) give the same codes and scales.
 
 Formats (TYPES: GGUF type ids): Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS,
-IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, MXFP4 (E2M1 doubled, its E8M0 byte e as 2^(e - 128), exact). IQ1's
+IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0 (ternary: codes 0, 1, 2 less 1, one FP16 scale d a
+256-value block, so s = d for every sub-block), MXFP4 (E2M1 doubled, its E8M0 byte e as 2^(e - 128), exact). IQ1's
 offset of an eighth is in the codes (8 g +- 1, the scale d l / 8,
 exact). Q4_1's
 and Q5_1's stored offset is added to s q, so m is its negation (exact). Q2_K has a minimum a 16 values:
@@ -27,14 +28,15 @@ from .gguf import GgufError
 
 TYPES = {"Q4_0": 2, "Q4_1": 3, "Q5_0": 6, "Q5_1": 7, "Q8_0": 8, "Q2_K": 10, "Q3_K": 11, "Q4_K": 12, "Q5_K": 13, "Q6_K": 14,
          "IQ2_XXS": 16, "IQ2_XS": 17, "IQ3_XXS": 18, "IQ1_S": 19, "IQ4_NL": 20, "IQ3_S": 21, "IQ2_S": 22, "IQ4_XS": 23,
-         "IQ1_M": 29, "MXFP4": 39}
+         "IQ1_M": 29, "TQ1_0": 34, "TQ2_0": 35, "MXFP4": 39}
 # Per type id: (values, bytes) a block.
 BLOCKS = {2: (32, 18), 3: (32, 20), 6: (32, 22), 7: (32, 24), 8: (32, 34), 10: (256, 84), 11: (256, 110), 12: (256, 144),
           13: (256, 176), 14: (256, 210), 16: (256, 66), 17: (256, 74), 18: (256, 98), 19: (256, 50), 20: (32, 18),
-          21: (256, 110), 22: (256, 82), 23: (256, 136), 29: (256, 56), 39: (32, 17)}
+          21: (256, 110), 22: (256, 82), 23: (256, 136), 29: (256, 56), 34: (256, 54), 35: (256, 66), 39: (32, 17)}
 # Where each format keeps its FP16 scales in a block.
 SCALE_BYTES = {2: (0,), 3: (0, 2), 6: (0,), 7: (0, 2), 8: (0,), 10: (80, 82), 11: (108,), 12: (0, 2), 13: (0, 2), 14: (208,),
-               16: (0,), 17: (0,), 18: (0,), 19: (0,), 20: (0,), 21: (0,), 22: (0,), 23: (0,), 29: (), 39: ()}
+               16: (0,), 17: (0,), 18: (0,), 19: (0,), 20: (0,), 21: (0,), 22: (0,), 23: (0,), 29: (), 34: (52,), 35: (64,),
+               39: ()}
 # Whether value e's scale is s0 for e < 16 and s1 for e >= 16, whether the format has a minimum, and whether its
 # minimum is m0 for e < 16 and m1 for e >= 16.
 TWO_SCALES = frozenset({10, 11, 14, 17, 22, 29})
@@ -150,6 +152,27 @@ def subblocks(raw, type_id, k, halves=False):
         ib = np.arange(8).reshape(1, 1, 8, 1)
         high = (hm >> ib) & 1                                                       # [n][blocks][ib][32]
         q = (low.reshape(n, -1, 8, 32) + 4 * high - 4).astype(np.int8)
+        m = zero
+    elif type_id == 35:
+        # 64 bytes of 2-bit codes: sub-block ib = 4 h + g, value l is bits 2 g, 2 g + 1 of qs[32 h + l]; then d.
+        d = _f16(blocks, 64)[..., None]
+        qs = blocks[..., 0:64].reshape(n, -1, 2, 1, 32)                              # half h, l
+        q = (((qs >> (2 * np.arange(4, dtype=np.uint8)).reshape(1, 1, 1, 4, 1)) & 3).astype(np.int8) - 1
+             ).astype(np.int8).reshape(n, -1, 8, 32)
+        s0 = s1 = d
+        m = zero
+    elif type_id == 34:
+        # 48 bytes of five base-3 codes a byte (values 0..159 from bytes 0..31, 160..239 from 32..47), 4 bytes of four
+        # (240..255), then d. Code j of a byte: the byte times 3^j kept to 8 bits, times 3, shifted right by 8 (the
+        # format's rule, as gguf-py decodes it).
+        d = _f16(blocks, 52)[..., None]
+        powers = np.array([1, 3, 9, 27, 81], dtype=np.uint8)
+        qs0 = (blocks[..., None, 0:32] * powers.reshape(5, 1)).reshape(n, -1, 160)
+        qs1 = (blocks[..., None, 32:48] * powers.reshape(5, 1)).reshape(n, -1, 80)
+        qh = (blocks[..., None, 48:52] * powers[:4].reshape(4, 1)).reshape(n, -1, 16)
+        codes = np.concatenate([qs0, qs1, qh], axis=-1).astype(np.uint16)
+        q = (((codes * 3) >> 8).astype(np.int8) - 1).astype(np.int8).reshape(n, -1, 8, 32)
+        s0 = s1 = d
         m = zero
     elif type_id == 39:
         e = blocks[..., 0].astype(np.uint32)

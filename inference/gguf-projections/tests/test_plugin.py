@@ -110,11 +110,12 @@ class DeviceTests(PluginTestCase):
         plugin = self.plugin(prompt="exact")
         if plugin.kernel is None:
             self.skipTest("gguf-rows is not built here")
-        raw = blocks(12, 32, 1024, seed=3)
-        matrix = plugin.load({"weight": raw}, "gguf:Q4_K")
         x = self.activations(20, 1024)
-        prompt = plugin.matmul(x, matrix)
-        self.assertTrue(torch.equal(prompt[:8], plugin.matmul(x[:8], matrix)))
+        for type_id, name in ((12, "Q4_K"), (35, "TQ2_0")):
+            raw = blocks(type_id, 32, 1024, seed=3)
+            matrix = plugin.load({"weight": raw}, f"gguf:{name}")
+            prompt = plugin.matmul(x, matrix)
+            self.assertTrue(torch.equal(prompt[:8], plugin.matmul(x[:8], matrix)), name)
         self.assertEqual(plugin.facts()["row_invariance"], {"rows": 8, "prompt_rows": True, "prompt_exact": True})
 
     def test_an_expert_stacks_rows_each_have_the_plain_calls_bits(self):
@@ -153,7 +154,7 @@ class DeviceTests(PluginTestCase):
                                     torch.mm(x[:1], w.to("cuda", torch.bfloat16).t(), out_dtype=torch.float32)
                                     .to(torch.bfloat16)))
         with self.assertRaisesRegex(ValueError, "gguf:<TYPE>"):
-            plugin.load({"weight": blocks(8, 4, 32, seed=1)}, "gguf:TQ1_0")
+            plugin.load({"weight": blocks(8, 4, 32, seed=1)}, "gguf:Q8_1")
         with self.assertRaisesRegex(ValueError, "144-byte blocks"):
             plugin.load({"weight": blocks(12, 4, 256, seed=1)[:, :100]}, "gguf:Q4_K")
         with self.assertRaisesRegex(ValueError, "keeps matrices as stored"):

@@ -129,8 +129,8 @@ def test_the_device_iq_grids_are_cores():
 def test_what_the_kernel_cannot_read_is_refused():
     raw = torch.from_numpy(blocks(12, 8, 256, seed=2)).to(dev)
     x = activations(1, 256, dev)
-    with pytest.raises(RuntimeError, match="GGUF type 34 is not one of"):
-        gr.gemv(x, gr.GgufMatrix(raw, 34, 256))
+    with pytest.raises(RuntimeError, match="GGUF type 1 is not one of"):
+        gr.gemv(x, gr.GgufMatrix(raw, 1, 256))
     with pytest.raises(RuntimeError, match="multiple of the format's 256"):
         gr.dequantize(gr.GgufMatrix(raw[:, :72].contiguous(), 12, 128))
     with pytest.raises(RuntimeError, match="holds 288 bytes, not 144"):

@@ -127,7 +127,8 @@ def test_a_gguf_checkpoints_block_format_matrices_are_its_shapes(tmp_path):
     found = {m["name"]: m for m in Model(tmp_path).matrices()}
     assert found == {"blk.0.attn_q": {"name": "blk.0.attn_q", "N": 4, "K": 256, "format": "Q4_K"},
                      "blk.0.ffn_up_exps": {"name": "blk.0.ffn_up_exps", "N": 3, "K": 256, "format": "IQ3_S",
-                                           "experts": 2}}
+                                           "experts": 2},
+                     "blk.0.attn_k": {"name": "blk.0.attn_k", "N": 4, "K": 256, "format": "TQ2_0"}}
 
 
 def test_a_stop_while_measuring_ends_the_measuring_not_the_sweep():

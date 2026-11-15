@@ -1,6 +1,6 @@
 """GGUF projections (a GGUF checkpoint's quantized matrices), crit's kernel gguf-rows, built on this GPU with the
 engine's tuning or the default knobs: y = x W^T for W [N][K] in a GGUF block format (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0,
-Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, MXFP4), read at
+Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, MXFP4), read at
 its stored bits.
 
     w = GgufMatrix(blocks, "Q4_K", k)           # blocks: uint8 [N][row bytes] as the file stores them
@@ -28,7 +28,7 @@ MAX_ROWS = 8
 # GGUF type ids of the formats, and each one's (values, bytes) a block.
 FORMATS = {"Q4_0": 2, "Q4_1": 3, "Q5_0": 6, "Q5_1": 7, "Q8_0": 8, "Q2_K": 10, "Q3_K": 11, "Q4_K": 12, "Q5_K": 13, "Q6_K": 14,
            "IQ2_XXS": 16, "IQ2_XS": 17, "IQ3_XXS": 18, "IQ1_S": 19, "IQ4_NL": 20, "IQ3_S": 21, "IQ2_S": 22,
-           "IQ4_XS": 23, "IQ1_M": 29, "MXFP4": 39}
+           "IQ4_XS": 23, "IQ1_M": 29, "TQ1_0": 34, "TQ2_0": 35, "MXFP4": 39}
 BLOCKS = {2: (32, 18), 3: (32, 20), 6: (32, 22), 7: (32, 24), 8: (32, 34), 10: (256, 84), 11: (256, 110), 12: (256, 144),
           13: (256, 176), 14: (256, 210), 16: (256, 66), 17: (256, 74), 18: (256, 98), 19: (256, 50), 20: (32, 18),
           21: (256, 110), 22: (256, 82), 23: (256, 136), 29: (256, 56), 39: (32, 17)}
