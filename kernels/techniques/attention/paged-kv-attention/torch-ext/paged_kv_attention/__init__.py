@@ -49,10 +49,18 @@ or in the caller's), and nothing waits for the host.
 Prompt chunks (prefill): one sequence's chunk of queries at positions position.. over its positions up to each query's
 own, causal, through its page table; int8_qk quantizes the queries to INT8 per token and head for integer tensor
 cores over INT8 pages (an approximation of the queries, twice the BF16 rate).
+
+Derived keys (derive=, a Derive): a layer that caches one row per position and KV head and uses it as both value and
+key keeps value pages only (write(None, values, ...)); attend (split and fused) and prefill read each row as its value
+and derive its key on read, k = rope(rms_norm(r) * weight, position): r the row at its page kind's precision (codes
+times their scale or multiplier), rms_norm(r) = r / sqrt(mean(r * r) + eps) and the weight in FP32, rope the "half"
+rotation over the first rotary_dim values at the angle fp32(position) * freqs[i] (fused-norms' rms_norm_rope), the FP32
+key multiplied on the tensor cores as two parts in q's dtype (its rounding, then the rounding of the rest); fresh rows are derived the same way. The flash structures refuse it.
 """
 import ctypes
 import functools
 import math
+from typing import NamedTuple
 
 import torch
 import triton
@@ -61,13 +69,60 @@ from crit_kcore import attention_softmax
 
 from . import _crit_cuda, _crit_tuning, _flash, _kernels
 
-__all__ = ["KINDS", "PIECE", "MAX_COLUMNS", "attend", "cuda_block", "cuda_chunk", "cuda_parts", "cuda_ramp",
+__all__ = ["KINDS", "PIECE", "MAX_COLUMNS", "Derive", "attend", "derive", "cuda_block", "cuda_chunk", "cuda_parts", "cuda_ramp",
            "cuda_splits", "flash_block", "flash_chunk", "flash_parts", "flash_tile",
            "partitions", "piece_size", "prefill", "tile_for", "workspace_floats", "write"]
 
 KINDS = {"bf16": 0, "fp16": 0, "fp8": 1, "fp8:row": 2, "int8": 3}
 PIECE = 32          # positions per piece of FP8 or INT8 pages at a 256-wide head (piece_size)
 MAX_COLUMNS = 64    # columns of one row a launch reads (a tree's ancestor masks are 64-bit)
+
+class Derive(NamedTuple):
+    """Keys derived from the value rows on read (attend's and prefill's derive=): weight FP32 [dim] (or None: all
+    ones), eps, freqs FP32 [rotary_dim / 2] inverse frequencies (attention-state's rope_table), rotary_dim (even, 2 up
+    to the head width). A Derive built once (derive(...)) holds its tables packed on the device, so a call allocates
+    nothing; a plain tuple of the four is packed at each call."""
+    weight: object
+    eps: float
+    freqs: object
+    rotary_dim: int
+    table: object = None
+
+
+def derive(weight, eps, freqs, rotary_dim):
+    """A Derive with its tables packed once (freqs, then the weight), for every call over the layer."""
+    return _derived(Derive(weight, eps, freqs, rotary_dim), None, None)[0]
+
+
+def _derived(given, d, device):
+    """given (a Derive or a tuple of its four fields) checked for heads of width d (None: not yet known) on `device`,
+    with its packed table: (Derive, has weight)."""
+    found = given if isinstance(given, Derive) else Derive(*given)
+    weight, eps, freqs, rot = found.weight, float(found.eps), found.freqs, int(found.rotary_dim)
+    device = device or freqs.device
+    if rot < 2 or rot % 2 or (d is not None and rot > d):
+        raise ValueError(f"derive's rotary_dim is even, 2 up to the head width {d}, not {rot}")
+    if not torch.is_tensor(freqs) or freqs.dtype != torch.float32 or tuple(freqs.shape) != (rot // 2,) or \
+            freqs.device != device:
+        raise ValueError(f"derive's freqs are FP32 [{rot // 2}] (rotary_dim / 2 inverse frequencies) on q's device")
+    if weight is not None and (not torch.is_tensor(weight) or weight.dtype != torch.float32 or weight.dim() != 1 or
+                               (d is not None and weight.shape[0] != d) or weight.device != device):
+        raise ValueError(f"derive's weight is FP32 [{d}] (the head width) on q's device, or None")
+    if not eps >= 0:
+        raise ValueError("derive's eps is 0 or more")
+    table = found.table
+    if table is None:
+        table = freqs.contiguous() if weight is None else torch.cat([freqs, weight.contiguous()])
+    elif table.numel() != rot // 2 + (0 if weight is None else weight.shape[0]):
+        raise ValueError("a Derive's packed table does not fit its freqs and weight")
+    return found._replace(eps=eps, rotary_dim=rot, table=table), weight is not None
+
+
+def _refuse_flash_derive(derive, flash):
+    if derive is not None and flash:
+        raise ValueError("derive= reads keys from the value rows on the split and fused launches and prefill's "
+                         "default one: the flash structures (flash=True, flash='cuda') take key pages")
+
 
 _workspaces = {}
 # Workspaces a launch outgrew. A CUDA graph captured over one keeps its pointers and replays into it, so a module
@@ -194,7 +249,13 @@ def write(keys, values, slots, key_pages, value_pages, kind, key_scales=None, va
     slots ([tokens] int64; a slot below 0 is skipped) of one layer's pages (any view whose storage is [slots][kv_heads]
     [dim]), encoded for the page kind (multipliers: an "fp8" layer's key and value multipliers, codes = x / multiplier
     clamped to +-448; the scales of "fp8:row" and "int8" pages are written beside their codes), in one launch.
-    values and value_pages None: keys only (a cache of keys alone, an indexer's)."""
+    values and value_pages None: keys only (a cache of keys alone, an indexer's). keys and key_pages None: values only
+    (a layer whose keys are derived from its values on read: attend's and prefill's derive=), at the value multiplier."""
+    if keys is None:
+        if values is None:
+            raise ValueError("write takes keys, values or both")
+        return write(values, None, slots, value_pages, None, kind, value_scales, None,
+                     multipliers=(multipliers[1], multipliers[1]))
     k_kind = _check_kind(kind, key_scales)
     T, hkv, d = keys.shape
     if T == 0:
@@ -293,7 +354,7 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
            offsets=None, tokens=None, key_scales=None, value_scales=None, multipliers=(1.0, 1.0), scale=None,
            partitions=None, parents=None, blocks=None, block_size=None, out=None, lse=None, workspace=None, piece=None,
            fused=False, fresh=None, vsplit=None, tile=None, num_warps=None, num_stages=None, maxnreg=None,
-           flash=False, chunk=None, ramp=None, sinks=None, sliding=0):
+           flash=False, chunk=None, ramp=None, sinks=None, sliding=0, derive=None):
     """Decode and verify windows over paged KV (see the module's description).
 
     q [tokens][heads][dim] BF16 or FP16 (FP16 for "fp16" pages); key_pages/value_pages one layer's pages, key_scales/
@@ -334,7 +395,20 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
 
     sliding: a sliding window (positions a token sees, its own included: position - sliding < n <= position; 0 for
     all), on every structure but block lists; the pieces, blocks and splits below a tile's window are skipped, which
-    changes no bit, so a window over a long cache reads only the window's positions."""
+    changes no bit, so a window over a long cache reads only the window's positions.
+
+    derive: a Derive (or the tuple (weight, eps, freqs, rotary_dim)): the keys derived from the value pages on read (the
+    module's "Derived keys"); key_pages and key_scales None (or the value ones), fresh (None, values, shift, first) or
+    with keys that are ignored, keys and values of one width; on the split and fused launches without block lists."""
+    if derive is not None:
+        _refuse_flash_derive(derive, flash)
+        if blocks is not None:
+            raise ValueError("derive= reads windows without block lists")
+        if key_pages is not None and key_pages is not value_pages:
+            raise ValueError("derive= reads the value pages as keys too: key_pages None")
+        key_pages, key_scales = value_pages, value_scales
+        if fresh is not None:
+            fresh = (fresh[1],) + tuple(fresh[1:])
     k_kind = _check_kind(kind, key_scales)
     T, hq, d = q.shape
     _check_sinks(sinks, q)
@@ -360,6 +434,9 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
     partial_rows = R * columns if offsets is None else int(tokens)
     g = hq // hkv
     device = q.device
+    derived, has_weight = (None, False) if derive is None else _derived(derive, d, device)
+    if derived is not None and d != dv:
+        raise ValueError("derive= reads one row as key and value: one head width")
     parts = int(partitions or globals()["partitions"](device, hkv, kind, d, dv))
     scale = float(scale if scale is not None else d ** -0.5)
     if fused and blocks is not None:
@@ -372,6 +449,9 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
     kp, vp = _codes(key_pages, kind, device), _codes(value_pages, kind, device)
     ks = key_scales if key_scales is not None else _dummy(device)
     vs = value_scales if value_scales is not None else ks
+    k_mult = float(multipliers[0])
+    if derived is not None:   # the tables in the keys' scale pointer, eps in their multiplier: neither read otherwise
+        ks, k_mult = derived.table, derived.eps
     tree = parents is not None
     par = parents.reshape(-1) if tree else starts
     count_ptr = counts if counts is not None else starts
@@ -387,6 +467,8 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
         tuned = _knobs("fused" if fused else "window", key, columns)
         warps, stages = _warps(tuned["WARPS"], warps, bm, capability), tuned["STAGES"] or stages
     warps, stages = num_warps or warps, num_stages or stages
+    if derived is not None and not num_stages:
+        stages = 1   # a derived piece holds its rows, their partners and two key parts: one stage (speed only)
     common = dict(HQ=hq, HKV=hkv, G=g, D=d, DV=dv, PIECE=piece, PAGE=page, KIND=k_kind,
                   HW_FP8=_hardware_fp8(device), TREE=tree, COUNTS=counts is not None, OFFSETS=offsets is not None,
                   DC=min(64, d, dv))
@@ -414,10 +496,11 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
         _kernels._window_kernel[grid](q, kp, vp, ks, vs, tables, rows, starts, count_ptr, firsts, par, off_ptr, po, pm, pl,
                      out, lse if lse is not None else ks, fk, fv, fshift, ffirst, sinks if sinks is not None else ks,
                      q.stride(0), q.stride(1), out.stride(0), out.stride(1), fk.stride(0), fv.stride(0), fstride,
-                     tables.stride(0), tables.shape[1], parts, scale, float(multipliers[0]), float(multipliers[1]),
+                     tables.stride(0), tables.shape[1], parts, scale, k_mult, float(multipliers[1]),
                      columns, sliding, COLS=columns, CPT=cpt, BLOCK_M=bm, num_warps=warps, num_stages=stages,
                      FUSED=bool(fused), LSE=bool(fused) and lse is not None, FRESH=fresh is not None, DVP=dv // split,
-                     SINKS=bool(fused) and sinks is not None, **common, **launch)
+                     SINKS=bool(fused) and sinks is not None, **common, **launch,
+                     **({} if derived is None else dict(DERIVE=True, DW=has_weight, ROT=derived.rotary_dim)))
         if fused:
             return out
         fixed = 0
@@ -1111,7 +1194,7 @@ def _prefill_cuda(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multip
 
 def prefill(q, key_pages, value_pages, kind, table, position, page, *, key_scales=None, value_scales=None,
             multipliers=(1.0, 1.0), scale=None, out=None, lse=None, int8_qk=False, fresh=None, flash=False,
-            sinks=None, sliding=0, splits=None, workspace=None):
+            sinks=None, sliding=0, splits=None, workspace=None, derive=None):
     """A prompt chunk of one sequence: q [T][heads][dim] at positions position.. (their keys and values written),
     table [pages] int32 -> out [T][heads][dim] in q's dtype (and lse [T][heads] FP32 when given), causal. position: an
     int, or a one-element int64 device tensor read on the device (one launch for every position: a captured graph of
@@ -1132,7 +1215,19 @@ def prefill(q, key_pages, value_pages, kind, table, position, page, *, key_scale
     range, so a token's bits follow its own positions only, not the chunk's length (row-invariant: cuda_prompt).
     workspace (flash "cuda"): an FP32 tensor the passes of a chunk over 8-bit pages with fresh rows keep their state in
     (a caller's declared memory; one too small reads the chunk in one pass, the same bits); default: the package's
-    own buffer."""
+    own buffer.
+
+    derive: a Derive (or its tuple), as attend() takes it: the keys derived from the value pages (and from the fresh
+    values: fresh (None, values) or (None, values, first)); key_pages and key_scales None; not with int8_qk or flash."""
+    if derive is not None:
+        _refuse_flash_derive(derive, flash)
+        if int8_qk:
+            raise ValueError("derive= derives 16-bit keys: not with int8_qk")
+        if key_pages is not None and key_pages is not value_pages:
+            raise ValueError("derive= reads the value pages as keys too: key_pages None")
+        key_pages, key_scales = value_pages, value_scales
+        if fresh is not None:
+            fresh = (fresh[1],) + tuple(fresh[1:])
     k_kind = _check_kind(kind, key_scales)
     _check_sinks(sinks, q)
     sliding = _check_sliding(sliding, None)
@@ -1147,10 +1242,14 @@ def prefill(q, key_pages, value_pages, kind, table, position, page, *, key_scale
     kp, vp = _codes(key_pages, kind, device), _codes(value_pages, kind, device)
     ks = key_scales if key_scales is not None else _dummy(device)
     vs = value_scales if value_scales is not None else ks
+    derived, has_weight = (None, False) if derive is None else _derived(derive, d, device)
+    k_mult = float(multipliers[0])
+    if derived is not None:   # the tables in the keys' scale pointer, eps in their multiplier
+        ks, k_mult = derived.table, derived.eps
     tuned = _knobs("prefill", {"D": d, "HQ": hq, "HKV": hkv, "PAGE": int(page), "KIND": k_kind,
                                "INT8": int(bool(int8_qk))}, T)
     block_m = tuned["BLOCK_M"]
-    block_n = tuned["BLOCK_N"] or (64 if d <= 128 else 32)
+    block_n = tuned["BLOCK_N"] or (64 if d <= 128 and derive is None else 32)
     on_device = torch.is_tensor(position)
     first = 0
     if fresh is not None:
@@ -1172,9 +1271,12 @@ def prefill(q, key_pages, value_pages, kind, table, position, page, *, key_scale
         q, kp, vp, ks, vs, table, out, lse if lse is not None else ks, position if on_device else table, fk, fv,
         first if first_t else table, sinks if sinks is not None else ks, sliding, T, 0 if on_device else int(position),
         0 if first_t else int(first),
-        float(scale if scale is not None else d ** -0.5), float(multipliers[0]), float(multipliers[1]), q.stride(0),
+        float(scale if scale is not None else d ** -0.5), k_mult, float(multipliers[1]), q.stride(0),
         q.stride(1), out.stride(0), out.stride(1), fk.stride(0), fv.stride(0), HQ=hq, HKV=hkv, G=hq // hkv, D=d,
         BLOCK_M=block_m, BLOCK_N=block_n, PAGE=page, KIND=k_kind, HW_FP8=_hardware_fp8(device), INT8_QK=int8_qk,
         LSE=lse is not None, POS_T=on_device, FRESH=fresh is not None, FIRST_T=first_t, SINKS=sinks is not None,
-        num_warps=tuned["WARPS"], num_stages=tuned["STAGES"] or (3 if int8_qk else 2))
+        num_warps=tuned["WARPS"],
+        # A derived chunk holds a block of rows, their partners and keys in FP32: one stage (speed only, the same bits)
+        num_stages=1 if derived is not None else tuned["STAGES"] or (3 if int8_qk else 2),
+        **({} if derived is None else dict(DERIVE=True, DW=has_weight, ROT=derived.rotary_dim)))
     return out

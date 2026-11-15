@@ -9,6 +9,15 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- paged-kv-attention derives keys from cached values on read (`derive=`, a `Derive(weight, eps, freqs, rotary_dim)`;
+  `derive()` packs its tables once): a layer that caches one row per position and KV head keeps value pages only
+  (`write(None, values, ...)`), and `attend` (split and fused) and `prefill` read each row as its value and as the key
+  `rope(rms_norm(r) * w, position)` in FP32, multiplied as two 16-bit parts, with sliding windows, sinks, trees,
+  `lse`, fresh rows and every page kind; a column keeps its bits alone, in any window, fused or split. The flash
+  structures, block lists and `int8_qk` refuse it.
+
 ## [0.19.0] - 2026-11-13
 
 ### Overview

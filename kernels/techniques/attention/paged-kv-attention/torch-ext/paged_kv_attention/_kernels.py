@@ -4,6 +4,10 @@ Page kinds (KIND): 0 16-bit pages (BF16 or FP16), 1 FP8 E4M3 codes with one mult
 for the values, 2 FP8 E4M3 codes with an FP32 scale per position and KV head, 3 INT8 codes with an FP32 scale per
 position and KV head. A position's slot is page * PAGE + offset, its keys at (slot * kv_heads + head) * dim.
 
+DERIVE (attend's and prefill's derive=): the keys are not read from key pages but derived from the value rows on read,
+k = rope(rms_norm(r) * w, position) in FP32 (_derived_keys), multiplied as two 16-bit parts (_split_dot); the derived tables (ROT / 2 inverse frequencies, then the weight's D values where DW) come in ks_ptr and eps
+in k_mult, which a derived launch does not read otherwise.
+
 The online softmax's steps, row sums and folds are the kernel core's (crit_kcore.attention_softmax, natural
 exponents: BASE2 False), the E4M3 conversions too (crit_kcore.formats).
 """
@@ -23,6 +27,85 @@ def _values(x, KIND: tl.constexpr, HW_FP8: tl.constexpr, OUT: tl.constexpr):
     else:
         y = x.to(OUT)
     return y
+
+
+@triton.jit
+def _row_values(rows, frows, onp, isf, cols, KIND: tl.constexpr, HW_FP8: tl.constexpr):
+    """Columns `cols` of cached rows in FP32 before their scale (codes or 16-bit values, exactly): from the pages where
+    onp, from the fresh 16-bit rows where isf."""
+    pg = tl.load(rows[:, None] + cols[None, :], mask=onp[:, None], other=0)
+    fr = tl.load(frows[:, None] + cols[None, :], mask=isf[:, None], other=0.0)
+    return tl.where(isf[:, None], fr.to(tl.float32), _values(pg, KIND, HW_FP8, tl.float32))
+
+
+@triton.jit
+def _derive_inv(rows, frows, onp, isf, rsc, eps, D: tl.constexpr, DC: tl.constexpr, KIND: tl.constexpr,
+                HW_FP8: tl.constexpr):
+    """Each cached row's 1 / sqrt(mean(r * r) + eps) in FP32, r its values times its scale rsc. The squares are summed
+    on the tensor cores, whatever the tile's layout: each as its BF16 rounding and the rounding of the rest, times a
+    16-row matrix of ones (16 rows: mma.sync on every GPU), chunk by chunk of DC in order, so a row's sum has one
+    order wherever it is read."""
+    dc = tl.arange(0, DC)
+    ones = tl.full([16, DC], 1.0, tl.bfloat16)
+    acc = tl.zeros([16, rsc.shape[0]], tl.float32)
+    for ci in tl.static_range(D // DC):
+        x = _row_values(rows, frows, onp, isf, ci * DC + dc, KIND, HW_FP8) * rsc[:, None]
+        x2 = x * x
+        hi = x2.to(tl.bfloat16)
+        lo = (x2 - hi.to(tl.float32)).to(tl.bfloat16)
+        acc = tl.dot(ones, tl.trans(hi), acc)
+        acc = tl.dot(ones, tl.trans(lo), acc)
+    ss = tl.max(acc, axis=0)
+    return libdevice.rsqrt(ss / D + eps)
+
+
+@triton.jit
+def _derived_keys(rows, frows, onp, isf, rsc, inv, pos, cols, dt_ptr, DW: tl.constexpr, ROT: tl.constexpr,
+                  KIND: tl.constexpr, HW_FP8: tl.constexpr):
+    """Columns `cols` of the keys derived from cached rows at positions `pos`: k = rope(r * inv * w, pos) in FP32, the
+    "half" rotation over the first ROT columns (column i < ROT / 2 with column i + ROT / 2: a cos - b sin and
+    b cos + a sin, the angle fp32(pos) * freq[i]), as fused-norms' rms_norm_rope computes it."""
+    H: tl.constexpr = ROT // 2
+    turn = cols < ROT
+    low = cols < H
+    part = tl.where(low, cols + H, tl.where(turn, cols - H, cols))
+    f = (rsc * inv)[:, None]
+    x = _row_values(rows, frows, onp, isf, cols, KIND, HW_FP8) * f
+    xp = _row_values(rows, frows, onp, isf, part, KIND, HW_FP8) * f
+    if DW:
+        x = x * tl.load(dt_ptr + H + cols)[None, :]
+        xp = xp * tl.load(dt_ptr + H + part)[None, :]
+    freq = tl.load(dt_ptr + tl.where(low, cols, cols - H), mask=turn, other=0.0)
+    angle = pos.to(tl.float32)[:, None] * freq[None, :]
+    c = libdevice.cos(angle)
+    sn = libdevice.sin(angle)
+    return tl.where(low[None, :], x * c - xp * sn, tl.where(turn[None, :], x * c + xp * sn, x))
+
+
+@triton.jit
+def _split_dot(q, k, s):
+    """s + q k^T for FP32 keys k on the 16-bit tensor cores: k as its 16-bit rounding hi and the rounding of k - hi,
+    two dots in that order (about 16 bits of each key's mantissa)."""
+    hi = k.to(q.dtype)
+    lo = (k - hi.to(tl.float32)).to(q.dtype)
+    s = tl.dot(q, tl.trans(hi), s)
+    return tl.dot(q, tl.trans(lo), s)
+
+
+@triton.jit
+def _derived_scores(qrow, live, vrow, frow, onp, isf, rsc, pos, dt_ptr, eps, BLOCK_M: tl.constexpr,
+                    PIECE: tl.constexpr, D: tl.constexpr, DC: tl.constexpr, KIND: tl.constexpr, HW_FP8: tl.constexpr,
+                    DW: tl.constexpr, ROT: tl.constexpr):
+    """_piece_scores over keys derived from the piece's value rows (scaled by rsc), the head dimension in chunks of DC
+    (the chained dots keep one dot's k-step order)."""
+    dc = tl.arange(0, DC)
+    inv = _derive_inv(vrow, frow, onp, isf, rsc, eps, D, DC, KIND, HW_FP8)
+    s = tl.zeros([BLOCK_M, PIECE], tl.float32)
+    for ci in tl.static_range(D // DC):
+        qc = tl.load(qrow[:, None] + (ci * DC + dc)[None, :], mask=live[:, None], other=0.0)
+        kc = _derived_keys(vrow, frow, onp, isf, rsc, inv, pos, ci * DC + dc, dt_ptr, DW, ROT, KIND, HW_FP8)
+        s = _split_dot(qc, kc, s)
+    return s
 
 
 # -- writes -----------------------------------------------------------------------------------------------------------
@@ -182,12 +265,14 @@ def _partition(b, n_pieces, n_parts, n_keys, qrow, live, lim, anc, first, count,
                tab_ptr, trow, tab_stride, tab_width, kvh, sm_scale, k_mult, v_mult, fk_ptr, fv_ptr, stride_fk,
                stride_fv, fshift, ffirst, ones, vofs, win, wlo, BLOCK_M: tl.constexpr, PIECE: tl.constexpr, PAGE: tl.constexpr,
                HKV: tl.constexpr, D: tl.constexpr, DV: tl.constexpr, DVP: tl.constexpr, DC: tl.constexpr,
-               KIND: tl.constexpr, HW_FP8: tl.constexpr, TREE: tl.constexpr, FRESH: tl.constexpr):
+               KIND: tl.constexpr, HW_FP8: tl.constexpr, TREE: tl.constexpr, FRESH: tl.constexpr,
+               DERIVE: tl.constexpr = False, DW: tl.constexpr = False, ROT: tl.constexpr = 0):
     """Partition b of a tile's query rows: pieces b, b + n_parts, ... of the row's keys (up to n_keys) in one online
     softmax -> (running maximum, sum, unnormalized output of the DVP value columns from vofs, in up to four DC-wide
     chunks). With FRESH the positions from ffirst on read their keys and values from the fresh rows (row = position -
     fshift; 16-bit, no page scales). win > 0: each row sees the win positions up to its own, and the pieces below
-    wlo (the tile's lowest such position) are skipped, a piece no row sees changing no bit."""
+    wlo (the tile's lowest such position) are skipped, a piece no row sees changing no bit. DERIVE: the keys derived
+    from the value rows (pages or fresh) at their positions, their scale in the rows (the scores times sm_scale only)."""
     m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc0 = tl.zeros([BLOCK_M, DC], tl.float32)
@@ -207,11 +292,28 @@ def _partition(b, n_pieces, n_parts, n_keys, qrow, live, lim, anc, first, count,
             isf = nm & (n >= ffirst)
             onp = nm & (n < ffirst)
             t = (n - fshift).to(tl.int64)
+        if DERIVE:
+            if KIND >= 2:
+                rsc = tl.load(vs_ptr + slot * HKV + kvh, mask=nm, other=0.0)
+            else:
+                rsc = tl.zeros([PIECE], tl.float32) + (v_mult if KIND == 1 else 1.0)
+            vrow = v_ptr + (slot * HKV + kvh) * DV
+            if FRESH:
+                s = _derived_scores(qrow, live, vrow, fv_ptr + t * stride_fv + kvh * DV, onp, isf,
+                                    tl.where(isf, 1.0, rsc), n, ks_ptr, k_mult, BLOCK_M, PIECE, D, DC, KIND, HW_FP8,
+                                    DW, ROT)
+            else:
+                s = _derived_scores(qrow, live, vrow, vrow, nm, n < 0, rsc, n, ks_ptr, k_mult, BLOCK_M, PIECE, D, DC,
+                                    KIND, HW_FP8, DW, ROT)
+            s = s * sm_scale
+        elif FRESH:
             s = _fresh_scores(qrow, live, k_ptr + (slot * HKV + kvh) * D, fk_ptr + t * stride_fk + kvh * D, onp, isf,
                               BLOCK_M, PIECE, D, DC, KIND, HW_FP8)
         else:
             s = _piece_scores(qrow, live, k_ptr + (slot * HKV + kvh) * D, nm, BLOCK_M, PIECE, D, DC, KIND, HW_FP8)
-        if KIND >= 2:
+        if DERIVE:
+            pass
+        elif KIND >= 2:
             ksc = tl.load(ks_ptr + slot * HKV + kvh, mask=nm, other=0.0)
             if FRESH:
                 ksc = tl.where(isf, 1.0, ksc)
@@ -263,7 +365,8 @@ def _window_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
                    BLOCK_M: tl.constexpr, PIECE: tl.constexpr, PAGE: tl.constexpr, KIND: tl.constexpr,
                    HW_FP8: tl.constexpr, TREE: tl.constexpr, COUNTS: tl.constexpr, OFFSETS: tl.constexpr,
                    DC: tl.constexpr, FUSED: tl.constexpr, LSE: tl.constexpr, FRESH: tl.constexpr,
-                   DVP: tl.constexpr, SINKS: tl.constexpr):
+                   DVP: tl.constexpr, SINKS: tl.constexpr, DERIVE: tl.constexpr = False, DW: tl.constexpr = False,
+                   ROT: tl.constexpr = 0):
     """Program (column tile, partition b, row x KV head): the tile's query rows (its columns x the KV head's query
     heads) over pieces b, b + n_parts, ... of the row's keys, up to its last column's position; writes each row's
     unnormalized output, running maximum and sum into the partials. FUSED (grid (tiles, DV / DVP, rows x KV heads)):
@@ -271,7 +374,8 @@ def _window_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
     log-sum-exps) itself: the same bits, no partials; program b holds value columns b * DVP .. b * DVP + DVP - 1 (its
     scores computed by each such program, the same in each). FRESH: per row, the positions from ffirst on from the
     fresh rows (fshift, ffirst: int64 per row, stride_fr apart, 0 for one for every row). SINKS (fused): each query
-    head's sink logit (sink_ptr, FP32 [HQ]) folded into its rows' final states, as the merge folds it."""
+    head's sink logit (sink_ptr, FP32 [HQ]) folded into its rows' final states, as the merge folds it. DERIVE: the
+    keys derived from the value rows (_partition)."""
     mt = tl.program_id(0)
     b = tl.program_id(1)
     rk = tl.program_id(2)
@@ -323,7 +427,7 @@ def _window_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
                     part, n_pieces, n_parts, n_keys, qrow, live, lim, anc, first, count, k_ptr, v_ptr, ks_ptr, vs_ptr,
                     tab_ptr, trow, tab_stride, tab_width, kvh, sm_scale, k_mult, v_mult, fk_ptr, fv_ptr, stride_fk,
                     stride_fv, fshift, ffirst, ones, vofs, win, first + c0 - win + 1, BLOCK_M, PIECE, PAGE, HKV, D,
-                    DV, DVP, DC, KIND, HW_FP8, TREE, FRESH)
+                    DV, DVP, DC, KIND, HW_FP8, TREE, FRESH, DERIVE, DW, ROT)
                 # One partition's state into the running one, in partition order (as the merge folds them).
                 m_new, l_new, keep, take = asm.fold(m_run, l_run, m_i, l_i, False)
                 use = part < held
@@ -367,7 +471,7 @@ def _window_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
                 b, n_pieces, n_parts, n_keys, qrow, live, lim, anc, first, count, k_ptr, v_ptr, ks_ptr, vs_ptr,
                 tab_ptr, trow, tab_stride, tab_width, kvh, sm_scale, k_mult, v_mult, fk_ptr, fv_ptr, stride_fk,
                 stride_fv, fshift, ffirst, ones, vofs, win, first + c0 - win + 1, BLOCK_M, PIECE, PAGE, HKV, D, DV,
-                DVP, DC, KIND, HW_FP8, TREE, FRESH)
+                DVP, DC, KIND, HW_FP8, TREE, FRESH, DERIVE, DW, ROT)
             idx = ((_partial_row(off_ptr, r, COLS, OFFSETS) + c) * HQ + kvh * G + g) * n_parts + b
             _store_partials(po_ptr, idx, live, acc0, acc1, acc2, acc3, DV, DC)
             tl.store(pm_ptr + idx, m_i, mask=live)
@@ -508,13 +612,15 @@ def _prefill_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, out_ptr, lse_p
                     HQ: tl.constexpr, HKV: tl.constexpr, G: tl.constexpr, D: tl.constexpr, BLOCK_M: tl.constexpr,
                     BLOCK_N: tl.constexpr, PAGE: tl.constexpr, KIND: tl.constexpr, HW_FP8: tl.constexpr,
                     INT8_QK: tl.constexpr, LSE: tl.constexpr, POS_T: tl.constexpr, FRESH: tl.constexpr,
-                    FIRST_T: tl.constexpr, SINKS: tl.constexpr):
+                    FIRST_T: tl.constexpr, SINKS: tl.constexpr, DERIVE: tl.constexpr = False,
+                    DW: tl.constexpr = False, ROT: tl.constexpr = 0):
     """Program (query block, query head): a chunk of one sequence's queries at positions pos0.. over its positions
     [0, own], causal: through its page table, or with FRESH the positions before `first` through it and the chunk's
     own from `first` on from its fresh keys and values (fk_ptr, fv_ptr: [T][HKV][D] in the queries' dtype, as the
     projections gave them; first: first0, or with FIRST_T read from first_ptr on the device, at least pos0); with POS_T
     pos0 is read from pos_ptr on the device. SINKS: the head's sink logit folded into every row's final state. win > 0:
-    each query sees the win positions up to its own, the blocks below the tile's window skipped."""
+    each query sees the win positions up to its own, the blocks below the tile's window skipped. DERIVE: the keys
+    derived from the value rows (pages or fresh) at their positions (_derived_keys; tables in ks_ptr, eps in k_mult)."""
     if POS_T:
         pos0 = tl.load(pos_ptr).to(tl.int32)
     if FIRST_T:
@@ -547,14 +653,26 @@ def _prefill_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, out_ptr, lse_p
         nm = n < paged
         pg = tl.load(tab_ptr + n // PAGE, mask=nm, other=0)
         slot = pg.to(tl.int64) * PAGE + n % PAGE
-        kc = tl.load(k_ptr + (slot * HKV + kvh)[:, None] * D + d[None, :], mask=nm[:, None], other=0)
-        if INT8_QK:
+        if DERIVE:
+            if KIND >= 2:
+                rsc = tl.load(vs_ptr + slot * HKV + kvh, mask=nm, other=0.0)
+            else:
+                rsc = tl.zeros([BLOCK_N], tl.float32) + (v_mult if KIND == 1 else 1.0)
+            vrow = v_ptr + (slot * HKV + kvh) * D
+            never = n < 0
+            inv = _derive_inv(vrow, vrow, nm, never, rsc, k_mult, D, D, KIND, HW_FP8)
+            kd = _derived_keys(vrow, vrow, nm, never, rsc, inv, n, d, ks_ptr, DW, ROT, KIND, HW_FP8)
+            s = _split_dot(q, kd, tl.zeros([BLOCK_M, BLOCK_N], tl.float32)) * sm_scale
+        elif INT8_QK:
+            kc = tl.load(k_ptr + (slot * HKV + kvh)[:, None] * D + d[None, :], mask=nm[:, None], other=0)
             ksc = tl.load(ks_ptr + slot * HKV + kvh, mask=nm, other=0.0)
             s = tl.dot(qi, tl.trans(kc)).to(tl.float32) * qs[:, None] * ksc[None, :]
         elif KIND >= 2:
+            kc = tl.load(k_ptr + (slot * HKV + kvh)[:, None] * D + d[None, :], mask=nm[:, None], other=0)
             ksc = tl.load(ks_ptr + slot * HKV + kvh, mask=nm, other=0.0)
             s = tl.dot(q, tl.trans(_values(kc, KIND, HW_FP8, q.dtype))) * (ksc * sm_scale)[None, :]
         else:
+            kc = tl.load(k_ptr + (slot * HKV + kvh)[:, None] * D + d[None, :], mask=nm[:, None], other=0)
             s = tl.dot(q, tl.trans(_values(kc, KIND, HW_FP8, q.dtype))) * (k_mult * sm_scale)
         vis = (n[None, :] <= qpos[:, None]) & nm[None, :]
         if win > 0:
@@ -576,8 +694,17 @@ def _prefill_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, out_ptr, lse_p
             n = n0 + tl.arange(0, BLOCK_N)
             nm = n < end
             t = (n - pos0).to(tl.int64)
-            kc = tl.load(fk_ptr + t[:, None] * stride_fk + kvh * D + d[None, :], mask=nm[:, None], other=0.0)
-            s = tl.dot(q, tl.trans(kc.to(q.dtype))) * sm_scale
+            if DERIVE:
+                frow = fv_ptr + t * stride_fv + kvh * D
+                never = n < 0
+                one = tl.full([BLOCK_N], 1.0, tl.float32)
+                # Fresh rows are 16-bit (KIND 0), whatever the pages hold.
+                inv = _derive_inv(frow, frow, never, nm, one, k_mult, D, D, 0, HW_FP8)
+                kd = _derived_keys(frow, frow, never, nm, one, inv, n, d, ks_ptr, DW, ROT, 0, HW_FP8)
+                s = _split_dot(q, kd, tl.zeros([BLOCK_M, BLOCK_N], tl.float32)) * sm_scale
+            else:
+                kc = tl.load(fk_ptr + t[:, None] * stride_fk + kvh * D + d[None, :], mask=nm[:, None], other=0.0)
+                s = tl.dot(q, tl.trans(kc.to(q.dtype))) * sm_scale
             vis = (n[None, :] <= qpos[:, None]) & nm[None, :]
             if win > 0:
                 vis = vis & (n[None, :] > (qpos - win)[:, None])
