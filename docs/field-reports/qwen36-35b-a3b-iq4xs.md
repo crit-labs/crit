@@ -1,7 +1,7 @@
 # Field report: Qwen3.6-35B-A3B UD-IQ4_XS at 262k context on a 16 GB GPU
 
 This report covers run `run-20261111T081913Z-40ce07fd`. It started under crit 0.17.1 with crit-eval 0.6.1 and was
-carried over to crit 0.19.0 with crit-eval 0.7.0 midway. It records what the run reached, what blocked it, and what
+carried over to crit 0.19 with crit-eval 0.7.0 midway. It records what the run reached, what blocked it, and what
 crit should change. Each gap is ranked and comes with a proposed fix.
 
 ## Setup
@@ -31,7 +31,7 @@ crit should change. Each gap is ranked and comes with a proposed fix.
 
 - candidate-0006 is the best engine of the run, 83% of the decode target. It did not qualify under crit-eval 0.6.1
   because of the honesty asymmetry (gap 8), which crit-eval 0.7.0 has since fixed.
-- candidate-0007 is candidate-0006 ported to crit 0.19.0's plugin manifests, with no change to the engine's values.
+- candidate-0007 is candidate-0006 ported to crit 0.19's plugin manifests, with no change to the engine's values.
   It builds, and every plugin test and standard serving check passes. Its `serve --check` fails on the new
   full-context check (gap 1). It is not sealed and has not been evaluated under crit-eval 0.7.0.
 
@@ -121,9 +121,9 @@ After the host was retired, smoke ran `fluent`, `causal` and `decode_matches_pre
 **Proposed fix:** when the first item fails with "Resident host exited", stop smoke for that context and report the
 remaining items as `not run: host retired`, with the retire reason.
 
-### 4. Moving to 0.19.0 breaks existing packages without a migration path
+### 4. Moving to 0.19 breaks existing packages without a migration path
 
-- 0.19.0 refuses the old kernel declarations (`"name": "crit-labs/..."` with version and revision) and accepts only
+- 0.19 refuses the old kernel declarations (`"name": "crit-labs/..."` with version and revision) and accepts only
   `{name, fallback}`. Every package built with 0.17/0.18 base plugins stops loading.
 - `crit plugins add --update` fails on the old manifest, because it validates the whole folder first.
 - Removing the plugins and adding them again fails for the same reason.
@@ -137,7 +137,7 @@ remaining items as `not run: host retired`, with the retire reason.
 
 ### 5. The Core step library is a new hard dependency that only shows up at serve time
 
-0.19.0 needs `crit_core_steps`, built with `crit core build`, which needs CMake 3.28+, a C++20 compiler and git. The
+0.19 needs `crit_core_steps`, built with `crit core build`, which needs CMake 3.28+, a C++20 compiler and git. The
 first `serve --check` failed only after the build, plugin tests and package step had all run. On Windows the build
 needs a vcvars64 and CUDA environment, which `crit core build` does not set up.
 
@@ -196,5 +196,5 @@ candidate must be rebuilt for the new toolkit".
 
 - Run: `runs/run-20261111T081913Z-40ce07fd`, with its summary in `summary.md`.
 - Best engine: candidate-0006, source in `work/candidate-0006-source`.
-- Port to 0.19.0: candidate-0007, source in `work/candidate-0007-source`. The failing check is in
+- Port to 0.19: candidate-0007, source in `work/candidate-0007-source`. The failing check is in
   `work/dev/serve-check-c7b.log`.
