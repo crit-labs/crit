@@ -1,7 +1,7 @@
 # Field report: full context, residency adaptation and a plan-check gap (Qwen3.6-35B-A3B UD-IQ4_XS)
 
 This report follows the first field report on the same run (`qwen36-35b-a3b-iq4xs.md`, PR #73). It covers
-candidates 7 to 11 on crit 0.19.0 and crit-eval 0.7.0, and the plan for candidate 12.
+candidates 7 to 11 on crit 0.19 and crit-eval 0.7.0, and the plan for candidate 12.
 
 - **Model:** Qwen3.6-35B-A3B, Unsloth UD-IQ4_XS GGUF, weights as stored.
 - **Machine:** RTX 5060 Ti 16 GB on PCIe 3.0 x16, Ryzen 5 3600, Windows 11.
@@ -12,7 +12,7 @@ candidates 7 to 11 on crit 0.19.0 and crit-eval 0.7.0, and the plan for candidat
 
 | Candidate | Change | Result |
 |---|---|---|
-| 7 | candidate 6 ported to crit 0.19.0 | serve `--check`: full-context checks hit the fixed 600 s timeout; steps reach 1.19 s above 160k context |
+| 7 | candidate 6 ported to crit 0.19 | serve `--check`: full-context checks hit the fixed 600 s timeout; steps reach 1.19 s above 160k context |
 | 8 | prompt step cost model with a context term (`step_budget_ms` 850, `step_key_ps` 17000) | every prompt step ≤ 0.94 s at 262k; lower-context pre-check fails (chat 68.7 → 61.0 tok/s) |
 | 9 | plus a warm phase for residency (96 swaps a call for the first 16 calls) | its own plugin test was wrong (assumed 6 host experts, fixture has 4) |
 | 10 | test fixed | lower-context pre-check fails on agent-long (57.0 → 45.9) |
