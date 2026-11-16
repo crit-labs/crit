@@ -1436,6 +1436,44 @@ class PromptActivationTests(PlanFixture, unittest.TestCase):
         self.evaluated(parent, status(), engine={"prompt_activations": self.stored})
         self.assertEqual(self.store.plan(self.run_id, follow)["prompt_activations"], self.stored)
 
+    def test_a_parent_that_served_no_bf16_beside_its_declaration_is_stated_not_rejected(self):
+        """A plan declared "stored" for every format while one format, having no kernel for its stored activations,
+        served FP8: the next plan states what was served (activation:served, answer cause). No quality rejection
+        is asked for it, but one is still asked where the parent served BF16."""
+        recorded = self.store.plan(self.run_id, {**plan(levers=[], forecast=None), "prompt_activations": "stored"})
+        parent = self.candidate(plan_id=recorded["plan_id"])["candidate_id"]
+        served = {"nvfp4": "stored", "fp8": "fp8"}
+        self.evaluated(parent, status(), engine={"prompt_activations": served})
+        forecast = {**plan()["forecast"], "prefill": {"low": 1100.0, "expected": 1500.0, "high": 2000.0}}
+        follow = {**plan(parent, forecast=forecast), "prompt_activations": served}
+        with self.assertRaisesRegex(ValueError, f"{parent} served prompt activations .*, its plan plan-0001 declared "
+                                                ".*state what it served and why \\(gaps entry activation:served"):
+            self.store.plan(self.run_id, follow)
+        stated = {"kpi": "prefill", "gap": "activation:served", "answer": "cause",
+                  "detail": "fp8 has no kernel for its stored activations; plan-0001's \"stored\" misstated it"}
+        with self.assertRaisesRegex(ValueError, "activation:served' states what the parent served .*answer cause"):
+            self.store.plan(self.run_id, {**follow, "gaps": [{**stated, "answer": "rejected"}]})
+        accepted = self.store.plan(self.run_id, {**follow, "gaps": [stated]})
+        self.assertEqual(accepted["inputs"]["served_activations"],
+                         {"plan_id": "plan-0001", "declared": {"nvfp4": "stored", "fp8": "stored"}, "served": served})
+
+    def test_activation_served_needs_a_difference_without_bf16(self):
+        recorded = self.store.plan(self.run_id, {**plan(levers=[], forecast=None), "prompt_activations": self.stored})
+        parent = self.candidate(plan_id=recorded["plan_id"])["candidate_id"]
+        forecast = {**plan()["forecast"], "prefill": {"low": 1100.0, "expected": 1500.0, "high": 2000.0}}
+        stated = {"kpi": "prefill", "gap": "activation:served", "answer": "cause", "detail": "what it served"}
+        follow = {**plan(parent, forecast=forecast), "prompt_activations": self.stored, "gaps": [stated]}
+        self.evaluated(parent, status(), engine={"prompt_activations": self.stored})
+        with self.assertRaisesRegex(ValueError, f"states a difference, but {parent} served the prompt activations"):
+            self.store.plan(self.run_id, follow)
+        self.evaluated(parent, status(), engine={"prompt_activations": {"nvfp4": "bf16", "fp8": "fp8"}})
+        with self.assertRaisesRegex(ValueError, f"activation:served: {parent} served nvfp4 at bf16, which stands "
+                                                "only on a measured rejection"):
+            self.store.plan(self.run_id, follow)
+        with self.assertRaises(ValueError) as refused:
+            self.store.plan(self.run_id, {**follow, "gaps": []})
+        self.assertNotIn("activation:served", str(refused.exception))
+
     def test_one_planned_activation_holds_for_every_served_format(self):
         recorded = self.store.plan(self.run_id, {**plan(levers=[], forecast=None), "prompt_activations": "stored"})
         parent = self.candidate(plan_id=recorded["plan_id"])["candidate_id"]
@@ -1466,6 +1504,8 @@ class PromptActivationPreserveTests(PromptActivationTests):
     test_candidate_1_starts_at_the_checkpoints_activation_format = None
     test_bf16_stands_on_a_measured_rejection_of_the_stored_format = None
     test_a_candidate_serves_what_its_plan_declared = None
+    test_a_parent_that_served_no_bf16_beside_its_declaration_is_stated_not_rejected = None
+    test_activation_served_needs_a_difference_without_bf16 = None
 
 
 class RoundAccountTests(PlanFixture, unittest.TestCase):

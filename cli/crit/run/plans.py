@@ -1132,6 +1132,11 @@ def _check_gap_names(plan):
     facts = plan.facts
     gap_names = {(gap["kpi"], gap["name"]) for gap in (facts or {}).get("gaps") or []}
     for row in plan.data["gaps"]:
+        if row["gap"] == SERVED_GAP:
+            if row["kpi"] != "prefill" or row["answer"] != "cause":
+                raise ValueError(f"gaps entry {SERVED_GAP!r} states what the parent served beside its plan's "
+                                 "declaration and why: kpi prefill, answer cause")
+            continue
         if row["gap"].startswith(ACTIVATION_GAP):
             if row["kpi"] != "prefill" or row["answer"] != "rejected" or "evidence" not in row:
                 raise ValueError(f"gaps entry {row['gap']!r} names a prompt activation format: kpi prefill, answer "
@@ -1463,6 +1468,9 @@ def _check_supersedes(plan):
 # In a speed run a prompt GEMM over quantized weights starts at a quantized activation format.
 EXACT_ACTIVATION = "bf16"
 STORED_GAP = ACTIVATION_GAP + "stored"
+# A parent that served other prompt activations than its plan declared, none at BF16 (a format with no kernel for its
+# stored activations, say): the plan states what was served and why, answer cause, without a quality rejection.
+SERVED_GAP = ACTIVATION_GAP + "served"
 
 
 def _bf16_formats(declared):
@@ -1484,7 +1492,9 @@ def _check_activations(plan):
     drift for speed), so a candidate reads prompts at the stored format (or fp8 / fp16_acc) from the first one on;
     BF16 stands only beside a gaps entry activation:stored whose evidence is a crit-eval result that measured the
     stored format outside the quality noise (_quality_rejection). The parent must have served what its plan
-    declared."""
+    declared, or, where it served no format at BF16, the plan states what it served (a gaps entry activation:served):
+    the rule keeps out a BF16 prompt path declared as the stored format's, and FP8 or the stored format need no
+    rejection to stand."""
     if plan.decision != "build" or quality_mode(plan.run["spec"]["correctness"]) != "speed":
         return
     declared = plan.data.get("prompt_activations")
@@ -1513,10 +1523,25 @@ def _check_activations(plan):
     if isinstance(planned, str) and isinstance(served, dict):
         # One activation for every quantized format, as a plan may declare it, against the engine's per format.
         planned = {name: planned for name in served}
-    if planned is not None and served != planned and rejected is None:
+    stated = next((row for row in plan.data["gaps"] if row["gap"] == SERVED_GAP), None)
+    differs = planned is not None and served != planned
+    if stated is not None:
+        if not differs:
+            raise ValueError(f"gaps entry {SERVED_GAP} states a difference, but {plan.parent} served the prompt "
+                             f"activations its plan {parent_plan} declared")
+        if _bf16_formats(served):
+            raise ValueError(f"gaps entry {SERVED_GAP}: {plan.parent} served {', '.join(_bf16_formats(served))} at "
+                             f"bf16, which stands only on a measured rejection of the stored format (gaps entry "
+                             f"{STORED_GAP})")
+        plan.inputs["served_activations"] = {"plan_id": parent_plan, "declared": planned, "served": served}
+        return
+    if differs and rejected is None:
+        stating = "" if _bf16_formats(served) else (
+            f", or, since it served no format at bf16, state what it served and why (gaps entry {SERVED_GAP}, "
+            "answer cause)")
         raise ValueError(f"{plan.parent} served prompt activations {served!r}, its plan {parent_plan} declared "
                          f"{planned!r}: build what the plan declares, or record the measurement that rejected it "
-                         f"(gaps entry {STORED_GAP})")
+                         f"(gaps entry {STORED_GAP}){stating}")
 
 
 # The round account. A term of at least ROUND_SHARE of the round that runs slower than FLOOR_RATE of its

@@ -331,7 +331,7 @@ There is one set of plan rules. Every run follows it, whatever crit release crea
 | `supersedes` | Optional: the plan this one replaces ([revisions](#revisions)) |
 | `decision` | `build` or `stop` |
 | `needed` | `{"decode": {"needed": bool, "evidence": text}, "prefill": {...}}` |
-| `gaps` | `[{kpi, gap, answer, detail}]` with optional `evidence` (a file in the run) and `cause_terms`. `gap` is an Eval gap's `name`, or one of crit's own: `limit` (why the rest of a family's limit is out of reach, answer `cause`), `activation:FORMAT` (a prompt activation format rejected on a quality measurement) or `placement:cpu` (the CPU expert tier rejected). `answer` is `cause` (its physical cause) or `rejected` (measured and rejected) |
+| `gaps` | `[{kpi, gap, answer, detail}]` with optional `evidence` (a file in the run) and `cause_terms`. `gap` is an Eval gap's `name`, or one of crit's own: `limit` (why the rest of a family's limit is out of reach, answer `cause`), `activation:FORMAT` (a prompt activation format rejected on a quality measurement), `activation:served` (answer `cause`: what the parent served beside its plan's `prompt_activations`, none at `bf16`, and why) or `placement:cpu` (the CPU expert tier rejected). `answer` is `cause` (its physical cause) or `rejected` (measured and rejected) |
 | `strategy` | `{current: {name, ceiling, evidence}, alternative: {name, ceiling, evidence, limits?}, choice, reason}`; `ceiling` is text: a number, its unit and where it comes from; `choice` is `current` or `alternative`; `limits` below |
 | `levers` | `[{id, technique, description, changes, group, confidence, provider, yardstick?, kind?, serves?}]`. `changes` maps KPIs (`decode`, `prefill`, `ttft`, `context_decode`, `context_ttft`) to `{change, source}`: the projected relative change in the KPI's improving direction (0.12 = 12% better), its source `measured:PATH` (a file of the run that measured it, such as an ablation report of the lever as an option variant), `eval-gap:NAME` or `estimate`. `group` names levers that only pay together; `confidence` is `low`, `medium` or `high`. `provider` says what supplies a speed lever's code: `inference:ENTRY`, `hub:ORG/NAME`, `lib:NAME` ([Kernels' sources](../kernels/SOURCES.md)) or `own: ...`, which carries `yardstick` `{evidence, detail}`: the measured best existing provider for the operation, or the providers checked and why none fits. `kind` `requirement` marks work a rule requires that Eval does not score, with `serves` naming it (`gate:NAME` or `check:NAME` for the repair of a gate or check the parent failed); its `changes` may be empty |
 | `rejected` | `[{name, reason, bound_by?, evidence?}]`: alternatives considered and not planned; `bound_by` `{family, term}` names the round term that bound the measurement |
@@ -420,7 +420,9 @@ fails refuses the plan with what to fix:
     forecast, what each lever delivered and the lesson. The parent's largest p1 lever, pruned or deferred, is planned
     again or rejected on a measurement of another kernel structure or a vendor library at the same arithmetic.
 13. `speed` runs declare `prompt_activations`; no quantized format starts at `bf16` without a rejection of the stored
-    format (`activation:stored`); the parent served what its plan declared.
+    format (`activation:stored`); the parent served what its plan declared, or, serving no format at `bf16`, the
+    plan states what it served and why (`activation:served`, answer `cause`; a format with no kernel for its
+    stored activations, say).
 14. A `limit` gap rests on the parent's `round` account: its terms and idle time add up to the measured round within
     10%, `cause_terms` names the terms that bind it, and every other term of 10% of the round or more runs at least
     at half its floor's rate (idle time too).

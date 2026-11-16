@@ -9,6 +9,15 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- `crit run plan` no longer leaves a speed run with no way past a parent plan whose `prompt_activations`
+  misstated what its engine served when no format ran at BF16, for example the shorthand `"stored"` beside a Q6_K
+  format that has no kernel for its stored activations and serves FP8. The check asked for a quality rejection of the
+  stored format that was never measured. The next plan now states what was served and why with a gaps entry
+  `activation:served` (answer `cause`), recorded as `inputs.served_activations`. A parent that served BF16 still needs
+  a measured rejection (`activation:stored`).
+
 ## [0.19.0] - 2026-11-13
 
 ### Overview
