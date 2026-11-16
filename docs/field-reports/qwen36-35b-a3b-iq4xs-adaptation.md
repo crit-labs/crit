@@ -84,7 +84,7 @@ rejected it (gaps entry activation:stored)
 
 The only remedy the check accepts is a gaps entry `activation:stored` with answer `rejected` and a crit-eval quality result that measured the stored format outside the noise. No such measurement exists, because the stored format was never served for Q6_K. The rule exists to stop a plan that declares stored activations while its engine serves BF16. Here the engine served FP8, which `speed` mode admits from candidate 1 on.
 
-**Proposed fix:** when the parent's served activations differ from its plan's declaration but put no format at BF16, accept the plan with a gaps entry `activation:stored` whose answer is `cause`, stating what was served and why. Keep the strict rule (a rejection with a quality measurement) when a format runs at BF16.
+**Proposed fix (PR #79):** when the parent's served activations differ from its plan's declaration but put no format at BF16, accept the plan with a gaps entry `activation:served` whose answer is `cause`, stating what was served and why. Keep the strict rule (`activation:stored`, a rejection with a quality measurement) when a format runs at BF16.
 
 ### 5. Smaller notes
 
