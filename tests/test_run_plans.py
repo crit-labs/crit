@@ -8,7 +8,7 @@ import unittest
 from support.runs import RunFixture
 from crit.run import plans
 from crit.run.cli import main
-from crit.run.records import digest, file_sha, now, read_json, write_json
+from crit.run.records import GIB, digest, file_sha, now, read_json, write_json
 
 # Eval's budget for each quality mode, a run's unless it sets its own.
 PRESERVE_BUDGET = {"ppl_ratio_max": 1.05, "kld_mean_max": 0.05, "kld_p99_max": 0.5}
@@ -1076,6 +1076,36 @@ class ObjectiveTests(PlanFixture, unittest.TestCase):
         candidate = next(c for c in self.store.get(self.run_id)["candidates"] if c["candidate_id"] == parent)
         self.assertEqual((candidate["gates"]["resources"], candidate["eligible"]), ("failed", False))
         with self.assertRaisesRegex(ValueError, "candidate-0001 is not eligible: required gate resources is failed"):
+            self.store.select(self.run_id, parent)
+
+    def test_a_resources_repair_cites_the_parents_benchmark_below_the_host_headroom(self):
+        # Every check of the parent passed, resources included (its Eval measured the device), but its benchmark kept
+        # less host memory free than the run's headroom: the benchmark fails resources by its own samples, select
+        # refuses the parent, and the repair cites that benchmark.
+        parent, attempt = self.packaged_parent()
+        checks = []
+        for gate in ("arithmetic", "functional", "resources"):
+            check_id = self.check(parent, attempt, gate, "passed")
+            path = self.directory / "candidates" / parent / "checks" / f"{check_id}.json"
+            checks.append({"path": path.relative_to(self.directory).as_posix(), "sha256": file_sha(path)})
+        package = read_json(self.directory / "candidates" / parent / "package/manifest.json")
+        with self.assertRaisesRegex(ValueError, f"did not fail: resources \\(its newest, check-0003 for case-0001, "
+                                                "passed\\)"):
+            self.store.plan(self.run_id, plan(parent, forecast=self.SAME, levers=[self.CHECK_REPAIR]))
+        within = self.benchmark_data(package, checks)
+        self.store.append(self.run_id, parent, "benchmark", within)
+        with self.assertRaisesRegex(ValueError, "did not fail: resources"):
+            self.store.plan(self.run_id, plan(parent, forecast=self.SAME, levers=[self.CHECK_REPAIR]))
+        short = self.benchmark_data(package, checks)
+        short["metrics"]["minimum_free_ram_bytes"] = {"samples": [GIB // 5] * 3, "unit": "bytes"}
+        bench = self.store.append(self.run_id, parent, "benchmark", short)["benchmark_id"]
+        recorded = self.store.plan(self.run_id, plan(parent, forecast=self.SAME, levers=[self.CHECK_REPAIR]))
+        path = f"candidates/{parent}/benchmarks/{bench}.json"
+        self.assertEqual(recorded["inputs"]["objective"]["check_repairs"], {"resources": [
+            {"path": path, "sha256": file_sha(self.directory / path), "benchmark_id": bench, "case_id": "case-0001",
+             "recorded_by": "benchmark"}]})
+        self.store.seal(self.run_id, parent, "completed")
+        with self.assertRaisesRegex(ValueError, f"{parent} is not eligible: required gate resources is failed"):
             self.store.select(self.run_id, parent)
 
     def test_a_check_repair_follows_the_parents_newest_check(self):

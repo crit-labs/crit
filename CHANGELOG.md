@@ -9,6 +9,14 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- `crit run plan` accepts a `check:resources` repair of a parent whose benchmark failed the resources gate by its
+  own memory samples (free host or device memory below the run's headroom) while every check record of it passed. A
+  candidate that passes its Eval and every check but runs the host short of RAM during `crit run measure` is never
+  eligible, and its repair was refused as "did not fail: resources". The plan now cites the benchmark in
+  `inputs.objective.check_repairs`.
+
 ## [0.19.0] - 2026-11-13
 
 ### Overview

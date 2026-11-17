@@ -1322,11 +1322,27 @@ def _newest_checks(root, candidate_id, gate):
     return newest
 
 
+def _memory_failed_benchmarks(root, run, candidate_id):
+    """The candidate's benchmarks whose free host or device memory fell below the run's headroom (the resources gate
+    they fail by their samples), as check repairs cite them: {path, sha256, benchmark_id, case_id, recorded_by}."""
+    from .records import memory_met
+    found = []
+    folder = safe_path(root, f"candidates/{ident(candidate_id, 'candidate')}/benchmarks")
+    for path in sorted(folder.glob("benchmark-*.json")) if folder.is_dir() else []:
+        value = read_json(path)
+        if value.get("outcome") == "completed" and not memory_met(run, value.get("metrics") or {}):
+            found.append({"path": path.relative_to(root).as_posix(), "sha256": file_sha(path),
+                          "benchmark_id": path.stem, "case_id": value.get("case_id"),
+                          "recorded_by": (value.get("extensions") or {}).get("measured_by") or "benchmark"})
+    return found
+
+
 def _check_repairs(plan):
     """The checks crit run requires that the plan's requirement levers repair (serves "check:NAME"): {NAME: the
-    parent's newest NAME check of each case that failed, {path, sha256, check_id, case_id, recorded_by}}. A named
-    check that is not a required one, that the parent has no record of, or whose newest records all did not fail is
-    refused."""
+    parent's newest NAME check of each case that failed, {path, sha256, check_id, case_id, recorded_by}}; resources
+    also by the parent's benchmarks below the run's memory headroom ({path, sha256, benchmark_id, case_id,
+    recorded_by}), when no check of it failed. A named check that is not a required one, that the parent has no record
+    of, or whose newest records all did not fail is refused."""
     named = {lever["serves"][len(CHECK_REPAIR):] for lever in plan.data["levers"]
              if lever.get("kind") == "requirement" and str(lever.get("serves", "")).startswith(CHECK_REPAIR)}
     if not named:
@@ -1342,6 +1358,13 @@ def _check_repairs(plan):
     for name in sorted(named):
         newest = _newest_checks(plan.root, plan.parent, name)
         failed = [(case, path, value) for case, (path, value) in sorted(newest.items()) if value.get("status") == "failed"]
+        if not failed and name == "resources":
+            # A benchmark fails resources by its own memory samples (records.series_gates: free host or device memory
+            # below the run's headroom), with no failed check record: select refuses the parent all the same.
+            measured = _memory_failed_benchmarks(plan.root, plan.run, plan.parent)
+            if measured:
+                found[name] = measured
+                continue
         if not failed:
             unrecorded |= not newest
             unfailed.append(f"{name} (" + ("; ".join(f"its newest, {path.stem} for {case}, {value.get('status')}"

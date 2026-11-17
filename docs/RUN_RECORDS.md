@@ -432,7 +432,9 @@ fails refuses the plan with what to fix:
 18. `supersedes` names a plan of the same segment and parent, neither linked to a candidate nor superseded.
 
 A gate repair (a requirement lever that `serves` `gate:NAME` for a gate the parent's Eval failed, or `check:NAME`
-for a [check](#check) crit run requires that the parent failed) is built for the repair whatever it forecasts:
+for a [check](#check) crit run requires that the parent failed; `check:resources` also repairs a parent whose
+benchmark kept less free host or device memory than the run's headroom, which fails the resources gate by its own
+samples and cites the benchmark) is built for the repair whatever it forecasts:
 checks 5, 6, 7's improvement, 11 and the warnings below do not apply to it. The run's first plan skips the checks
 that need a parent's Eval and may import a baseline as is.
 
