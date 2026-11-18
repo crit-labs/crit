@@ -99,14 +99,15 @@ class PromptChunkTests(PluginTestCase):
         self.assertEqual(prompts.prepare(), [])
         self.assertIsNone(prompts.run(0, 0, [1, 2, 3]))
 
-    def test_captures_that_would_hold_every_buffer_set_are_refused(self):
+    def test_a_captured_lookup_has_a_buffer_set_of_its_own_whatever_the_ring(self):
         if self.device() != "cuda":
             self.skipTest("CUDA graphs")
         assembly, rows = self.selection(ring=1)
         table = self.open(rows, "files")
         if not rows.device_rows.tables[-1].native:
             self.skipTest("the native row reader did not build")
-        import warnings
-        with warnings.catch_warnings(), self.assertRaisesRegex(RuntimeError, "larger ring"):
-            warnings.simplefilter("ignore")   # the refused capture ends empty
-            self.prompts(assembly, table).prepare()
+        prompts = self.prompts(assembly, table)
+        self.assertTrue(prompts.prepare())                      # every bucket captured beside one eager set a size
+        part = rows.device_rows.tables[-1].parts[0]
+        self.assertGreaterEqual(len(part._captured), len(prompts.graphs))
+        self.assertTrue(all(len(ring) == 1 for ring, _ in part._sites.values()))

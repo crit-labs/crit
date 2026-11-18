@@ -17,15 +17,16 @@ Don't use it when every expert fits on the device, or when the probed lane and a
 
 ## How it works
 
-**The pool.** `ExpertPool` keeps one worker per physical core minus the caller's core (the host loop and the
-mailbox's service thread), pinned on Linux to the first hardware thread of each core. A layer is one flat batch: a
-task is a row range of one expert, claimed with one compare-and-swap of a word that carries the batch's epoch, so a
-worker still leaving an earlier batch claims nothing of the next. The caller drains too. An idle worker spins (with
-a pause hint) as long as the recent gaps between batches, 1.5 times the longest of the last 16, at least `spin_us` and
-at most `spin_max_us` (3 ms by default, measured on one machine), then sleeps until the next batch: awake through a
-decode step's layers, a millisecond or so apart, asleep between steps. A batch published to sleeping workers pays one
-wake-up, tens to hundreds of microseconds under a loaded or virtualized OS (the pool counts them). Workers pin to cores
-of the process's CPU set after its first, none another pool of the process holds: give each engine process its own
+**The pool.** The tier runs on the host's worker pool, which is Core's ([`crit_plugins.host`](../../core/python/crit_plugins/host/__init__.py),
+[`pool.h`](../../core/python/crit_plugins/host/pool.h)): one a process, one worker per physical core minus the first,
+which is the caller's (the host's service thread, which answers the device's doorbells), pinned on Linux to the first
+hardware thread of each core. A layer is one flat batch: a task is a row range of one expert, claimed with one
+compare-and-swap of a word that carries the batch's epoch, so a worker still leaving an earlier batch claims nothing
+of the next. The caller drains too. An idle worker spins (with a pause hint) as long as the recent gaps between
+batches, 1.5 times the longest of the last 16, at least 100 us and at most 3 ms (measured on one machine), then
+sleeps until the next batch: awake through a decode step's layers, a millisecond or so apart, asleep between steps. A
+batch published to sleeping workers pays one wake-up, tens to hundreds of microseconds under a loaded or virtualized
+OS (the pool counts them). The workers' cores are those of the process's CPU set: give each engine process its own
 cores (taskset, cgroups) so processes never share one.
 
 **A layer.** `HostExpertTier::compute` groups the layer's CPU routes by expert (up to 8 tokens a chunk) and runs two
@@ -41,9 +42,10 @@ Outputs are per route and unweighted: the device multiplies by the routing weigh
 ([async-expert-contributions](../async-expert-contributions/README.md)), so the order of a token's sum never depends
 on the split. Any pool size, ISA or store layout gives the same bits.
 
-**The handoff.** The device posts a layer's CPU routes into a [host-work-mailbox](../host-work-mailbox/README.md) slot
-laid out as `input_layout(hidden, routes, tokens)`: a header {count, tokens, route capacity, token capacity}, each
-route's expert key and token, the tokens' FP32 rows, room for the output rows; the mailbox handler is
+**The handoff.** The device posts a layer's CPU routes into a slot of one of the host's handoffs (Core's, the
+[host-work-mailbox](../host-work-mailbox/README.md) technique) laid out as `input_layout(hidden, routes, tokens)`: a
+header {count, tokens, route capacity, token capacity}, each route's expert key and token, the tokens' FP32 rows,
+room for the output rows; the handoff's handler is
 `crit_tier_serve` (tier_capi.cpp), which calls `serve_inputs` ([heterogeneous-expert-dispatch](../heterogeneous-expert-dispatch/README.md)'s
 CUDA form wires it). Join with the poll kernel where
 `measure_joins()` says so (on one RTX 5090 under WSL2 a stream wait cost 50-60 µs more per join than the 2.8 µs poll,
@@ -56,8 +58,10 @@ with the other running, since both read host memory.
 **The store.** The tier reads each expert's bundle in place where the bundle store keeps it (the experts slot's
 layout: codes row-major as the checkpoint stores them, E4M3 scales, each row's 1 / global, the input scales), so the
 experts are not held twice in host memory; a bundle store of another encoding is refused. The rows layout reads at
-about 19-21 GB/s on 5 threads of one desktop CPU, the interleaved one (`interleave_matrix`) at 28-30, for a CPU-only
-store that can keep that layout.
+29-33 GB/s on 6 threads of one desktop CPU (97 to 83 us an expert of 2.78 MB at 2 to 8 experts a layer and one
+token), about what its host memory gives random experts: 4 threads read as fast, and more than 6 no faster. The
+interleaved layout (`interleave_matrix`) costs less arithmetic a byte, for a CPU-only store that can keep that
+layout on a CPU with more memory bandwidth than cores.
 
 ## The plugin
 
@@ -78,10 +82,9 @@ telemetry the tier's counters.
 
 | File | Supplies |
 | --- | --- |
-| [`expert_pool.h`](code/expert_pool.h), [`expert_pool.cpp`](code/expert_pool.cpp) | `ExpertPool`, `PoolOptions`, `physical_cores` |
 | [`host_tier.h`](code/host_tier.h), [`host_tier.cpp`](code/host_tier.cpp) | `TierExpert`, `TierBatch`, `InputBatch`, `HostExpertTier` (`set_expert`, `compute`, `compute_inputs`, `input_layout`, `serve_inputs`, `stats`), `interleave_matrix` |
 | [`implementation.py`](code/implementation.py) | Python model of the epoch-tagged claim, the chunking and the plan-order sum |
-| [`tier_capi.cpp`](code/tier_capi.cpp) | A C interface over the tier and its pool for ctypes, and `crit_tier_serve`, the host-work-mailbox handler |
+| [`tier_capi.cpp`](code/tier_capi.cpp) | A C interface over the tier for ctypes (it is given the host pool's entry and handle), and `crit_tier_serve`, the handler of a handoff |
 | [`bundles.py`](code/bundles.py) | The nvfp4 / int4 bundle layout and pack the tier reads in place; the declared arithmetic of each format |
 | [`cpu_tier.py`](code/cpu_tier.py) | `CpuTier`: the expert table, the native tier or the torch declared order, the handler's address and payload layout |
 
@@ -151,7 +154,9 @@ For scale only: on one Ryzen 5 9600 (6 threads, WSL2, AVX-512 VNNI) a layer of 6
 640) took 0.58-0.62, 0.72-0.77 and 0.89 ms at 1, 2 and 3 tokens an expert, 28-30, 23-24 and 20 GB/s of experts (the
 interleaved store, quantized inputs), against about 0.11 ms an expert over a 24.5 GB/s link. Bundles read in place
 (the rows layout) with FP32 inputs reached 146-154 µs an expert at 3-4 experts and one token on a machine busy with
-other work; time the tier where it serves (the dispatch's `quota_table` does). The quantizers find a block's codes by a
+other work, before the quantizer, the SwiGLU and the scale lookups ran on AVX-512; with them, 115 us a missed
+expert inside expert-offload's bench (about 1.5 missed experts a layer of a 49-layer model, 137 before). Time the
+tier where it serves, and alone: anything else that reads host memory or takes its cores slows it. The quantizers find a block's codes by a
 binary search over the E4M3 values and the E2M1 midpoints, the codes crit::nvfp4's linear searches give.
 
 `crit_host_expert_tier_tests` prints its own rates, and checks a layer's routes against a serial computation bit for

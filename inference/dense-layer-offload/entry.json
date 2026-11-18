@@ -2,8 +2,8 @@
   "id": "dense-layer-offload",
   "category": "memory-and-loading",
   "summary": "Layer-granular placement of dense models larger than device memory: a planner over measured device, upload and host rates choosing between host execution of layers (AVX2/AVX-512 BF16 GEMVs, host KV) and double-buffered weight streaming, with measured selection of the plan",
-  "implementation_status": "native_source",
-  "implementation_scope": "C++ and CUDA host code: a planner predicting each placement's decode step from measured rates and ranking resident, host and streaming plans, with selection by timing the leading candidates; a two-slot weight streamer on a copy stream ordered by events; an executor running a step's layers by placement through an engine-supplied LayerRunner; measurements of pinned upload bandwidth, host GEMV rate and activation round trips; host BF16 GEMV with scalar, AVX2 and AVX-512 paths chosen at run time over a persistent thread pool, and a host pre-norm block with host KV; a Python model of the planner. A real model's layers and partial-layer offload are engine work.",
+  "implementation_status": "reference",
+  "implementation_scope": "A Python planner predicting each placement's decode step from measured rates and ranking resident, host and streaming plans. Executing a plan (weight streaming, host layers) and a real model's layers are engine work.",
   "agent_guidance": {
     "use_when": "A dense model's weights do not fit the device memory left after KV cache and activations but fit host memory, and decode runs a single sequence or a few rows per step",
     "avoid_when": "The model is expert routed, its weights fit the device, or quantizing them to fit stays within the quality budget",
@@ -36,17 +36,10 @@
   "path": "inference/dense-layer-offload/README.md",
   "code_path": "inference/dense-layer-offload/code",
   "code_files": [
-    {"path": "inference/dense-layer-offload/code/offload_plan.h", "purpose": "Placements, measured rates, step prediction, candidate plans and measured selection"},
-    {"path": "inference/dense-layer-offload/code/offload_exec.h", "purpose": "Weight streamer, layer runner interface, executor and measurement interfaces"},
-    {"path": "inference/dense-layer-offload/code/offload_exec.cpp", "purpose": "Two-slot streaming, step execution by placement and rate measurements"},
-    {"path": "inference/dense-layer-offload/code/host_dense.h", "purpose": "Host GEMV ISAs, thread pool and the host pre-norm block"},
-    {"path": "inference/dense-layer-offload/code/host_dense.cpp", "purpose": "Scalar path, ISA dispatch, thread pool and host block operations"},
-    {"path": "inference/dense-layer-offload/code/host_dense_avx2.cpp", "purpose": "AVX2 + FMA BF16 GEMV rows"},
-    {"path": "inference/dense-layer-offload/code/host_dense_avx512.cpp", "purpose": "AVX-512F BF16 GEMV rows"},
     {"path": "inference/dense-layer-offload/code/planner.py", "purpose": "Python model of the prediction and candidate plans"}
   ],
   "requires": {
-    "hardware": "CUDA C++20; x86-64 with AVX2 or AVX-512F for the fast host paths (a scalar path runs elsewhere); pinned host memory for the weights; Python 3.11+ standard library for the planner model",
+    "hardware": "Python 3.11+ standard library",
     "model": "Dense decoder layers whose weights form one contiguous range each",
     "workload": "Decode with one sequence or a few rows per step, weights above the device budget"
   },
@@ -58,13 +51,10 @@
     "core_boundary": "No Core change; device rates come from crit eval probe"
   },
   "dependencies": [
-    "CUDA runtime",
-    "host-expert-arithmetic's host_isa (crit_host_isa) for run-time ISA detection",
     "Python standard library for the planner model"
   ],
   "symbols": [
-    "Place", "Measurements", "Plan", "predict", "candidates", "select_measured", "WeightStream", "LayerRunner", "LayerStore", "run_layers",
-    "measure_upload_gbs", "measure_host_gemv_gbs", "measure_round_trip_ns", "Isa", "best_isa", "gemv", "ThreadPool", "host_block"
+    "predict", "candidates"
   ],
   "interactions": [
     "host-expert-arithmetic",
@@ -77,7 +67,7 @@
   ],
   "validation": {
     "host": "The README example and test_reusable_techniques.py: candidate order and predicted times of the planner model",
-    "native": "Planner candidates and predictions, measured selection overriding the predicted order; scalar, AVX2 and AVX-512 host GEMVs within 1e-5 of FP64 and bit for bit across thread splits; host_block bit for bit across thread splits, batched within 1e-5 of single tokens, its cache holding only the positions written; on a CUDA device run_layers with a recording LayerRunner over device, streamed and host layers: calls in step order, the host run between to_host and to_device, each layer reading its own bytes through the two-slot weight stream, positive measured rates (no model: what each layer is handed, not a model's output)",
+    "native": "No native code",
     "performance": "Measured with an earlier fixture's synthetic model, on one machine (RTX 5090, 12 host threads with AVX-512), 16 layers of 436 MB, device budget set below the weights: rates device 1,131 GB/s, upload 28.8 GB/s, host GEMV 35 GB/s, round trip 21 us; 25% resident: host 12 layers predicted 147 ms / measured 171 ms per decode step, streaming 14 layers 214 / 212 ms; 60% resident: 91 / 94 ms and 139 / 137 ms; host execution selected; no claim for other machines"
   }
 }

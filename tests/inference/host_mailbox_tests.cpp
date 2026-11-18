@@ -1,7 +1,7 @@
 // Host-work mailbox on CUDA: captured graphs replayed with both capturable joins, the eager join, release of a
 // stuck window, handler failure answering every later doorbell, a window aborted between post and join, and the
 // join probe and cost measurement.
-#include "mailbox.h"
+#include "handoff.h"
 
 #include <atomic>
 #include <chrono>
@@ -13,7 +13,7 @@
 #include <thread>
 #include <vector>
 
-namespace hm = crit::techniques::host_mailbox;
+namespace hm = crit::host;
 
 cudaError_t fixture_produce(const hm::SlotView&, std::uint32_t* counter, bool skip, cudaStream_t);
 cudaError_t fixture_consume(const hm::SlotView&, unsigned long long* sums, cudaStream_t);
@@ -78,7 +78,7 @@ unsigned long long expected(unsigned long long first, unsigned long long last) {
 }
 
 // One window: every slot posts (slot `skip_slot` is answered by the device itself), joins and consumes.
-void window(hm::Mailbox& box, DeviceState& d, cudaStream_t s, std::size_t skip_slot = kSlots, bool join = true) {
+void window(hm::Handoff& box, DeviceState& d, cudaStream_t s, std::size_t skip_slot = kSlots, bool join = true) {
     for(std::size_t i = 0; i < box.slots(); ++i) {
         ok(fixture_produce(box.slot(i), d.counter, i == skip_slot, s), "produce");
         if(join) {
@@ -119,7 +119,7 @@ bool finishes(cudaStream_t s, std::chrono::milliseconds within) {
 void replay(hm::Join join) {
     Region r;
     DeviceState d;
-    hm::Mailbox box(r.view(), kSlots, kPayload, join, triple);
+    hm::Handoff box(r.view(), kSlots, kPayload, join, triple);
     cudaStream_t s;
     ok(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
     {
@@ -140,7 +140,7 @@ void replay(hm::Join join) {
 void eager() {
     Region r;
     DeviceState d;
-    hm::Mailbox box(r.view(), kSlots, kPayload, hm::Join::host_eager, triple);
+    hm::Handoff box(r.view(), kSlots, kPayload, hm::Join::host_eager, triple);
     cudaStream_t s;
     ok(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
     for(int i = 0; i < 3; ++i) window(box, d, s, 5);
@@ -164,7 +164,7 @@ void release(hm::Join join) {
     DeviceState d;
     std::atomic<bool> hold{true};
     std::atomic<int> calls{0};
-    hm::Mailbox box(r.view(), kSlots, kPayload, join, [&](std::size_t slot, std::span<std::byte> p) {
+    hm::Handoff box(r.view(), kSlots, kPayload, join, [&](std::size_t slot, std::span<std::byte> p) {
         if(calls.fetch_add(1) == 2)
             while(hold.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
         triple(slot, p);
@@ -195,7 +195,7 @@ void failure(hm::Join join) {
     Region r;
     DeviceState d;
     std::atomic<int> calls{0};
-    hm::Mailbox box(r.view(), kSlots, kPayload, join, [&](std::size_t slot, std::span<std::byte> p) {
+    hm::Handoff box(r.view(), kSlots, kPayload, join, [&](std::size_t slot, std::span<std::byte> p) {
         if(calls.fetch_add(1) == 4) throw std::runtime_error("injected handler failure");
         triple(slot, p);
     });
@@ -220,7 +220,7 @@ void failure(hm::Join join) {
 void aborted(hm::Join join) {
     Region r;
     DeviceState d;
-    hm::Mailbox box(r.view(), kSlots, kPayload, join, triple);
+    hm::Handoff box(r.view(), kSlots, kPayload, join, triple);
     cudaStream_t s;
     ok(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
     window(box, d, s, kSlots, false);  // posts only

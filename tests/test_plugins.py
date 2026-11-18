@@ -225,6 +225,52 @@ class AssemblyTests(PluginFixture, unittest.TestCase):
             fused["drafter"]
         self.assertIsNone(fused.get("drafter"))
 
+    def test_the_engines_exactness_is_what_it_asks_and_the_lowest_level_its_plugins_keep(self):
+        sys.path.insert(0, str(ROOT / "kernels"))   # crit_kernels.exactness, the levels
+        from crit_plugins import kernels
+        from crit_plugins.assemble import exactness_shortfalls
+        self.addCleanup(kernels.use_exactness, None)
+        assembly = assemble(FULL, self.registry, {}, facts=["taps:hidden"])
+        self.assertIsNone(assembly.exactness())   # nothing asked, no plugin states a level
+        self.assertEqual(exactness_shortfalls(None), [])
+        assembly.instances["kv-fp8"].exactness = lambda: {"decode": "declared"}
+        assembly.instances["attn-fp8"].exactness = lambda: {"decode": "exact", "prompt": "repeatable"}
+        assembly.instances["draft-eagle"].exactness = lambda: None   # computes no rows of the target
+        plugins = {"kv-fp8": {"decode": "declared"}, "attn-fp8": {"decode": "exact", "prompt": "repeatable"}}
+        self.assertEqual(assembly.exactness(), {"asked": None, "decode": "exact", "prompt": "repeatable",
+                                                "plugins": plugins})
+        self.assertEqual(assembly.facts()["exactness"], assembly.exactness())
+        self.assertEqual(exactness_shortfalls(assembly.exactness()), [])   # nothing asked, nothing short
+        # The levels asked: a decode row's exact is row-exact, which attn-fp8's exact keeps; its prompt rows fall short.
+        self.assertEqual(kernels.use_exactness("exact"), {"decode": "row-exact", "prompt": "exact"})
+        self.assertEqual((kernels.asks("decode"), kernels.asks("prompt")), ("row-exact", "exact"))
+        report = assembly.exactness()
+        self.assertEqual(report["asked"], {"decode": "row-exact", "prompt": "exact"})
+        self.assertEqual(exactness_shortfalls(report),
+                         ["attn-fp8 keeps its prompt rows repeatable where the configuration's exactness asks exact"])
+        kernels.use_exactness({"decode": "declared", "prompt": "repeatable"})
+        self.assertEqual(exactness_shortfalls(assembly.exactness()),
+                         ["attn-fp8 keeps its decode rows exact where the configuration's exactness asks declared"])
+        kernels.use_exactness({"decode": "row-exact", "prompt": "repeatable"})
+        self.assertEqual(exactness_shortfalls(assembly.exactness()), [])
+        # What a plugin may run in a phase: the level asked or a higher one; anything where nothing is asked.
+        self.assertTrue(kernels.allows("decode", "exact") and kernels.allows("prompt", "repeatable"))
+        self.assertFalse(kernels.allows("decode", "repeatable"))
+        kernels.use_exactness(None, "preserve")
+        self.assertEqual(kernels.exactness(), {"decode": "row-exact", "prompt": "exact"})
+        self.assertFalse(kernels.allows("prompt", "row-exact"))
+        kernels.use_exactness(None)
+        self.assertIsNone(kernels.exactness())
+        self.assertIsNone(kernels.asks("prompt"))
+        self.assertTrue(kernels.allows("prompt", "repeatable"))
+        with self.assertRaisesRegex(ValueError, "decode or the prompt phase"):
+            kernels.asks("verify")
+        with self.assertRaisesRegex(ValueError, "not one of"):
+            kernels.use_exactness("bitwise")
+        assembly.instances["attn-fp8"].exactness = lambda: {"prompt": "bitwise"}
+        with self.assertRaisesRegex(PluginError, "attn-fp8: exactness\\(\\) states prompt: bitwise"):
+            assembly.exactness()
+
     def test_memory_over_the_budget_is_refused_before_any_plugin_is_created(self):
         context = {}
         selection = {"use": {"attention": "attn-plain", "kv_cache": "kv-bf16"}}
@@ -576,6 +622,20 @@ class AblationTests(PluginFixture, unittest.TestCase):
         found = option_variants(FULL, ["draft-eagle.rows=0;draft-eagle.label=12;draft-eagle.width=2"], registry,
                                 facts=["taps:hidden"])
         self.assertEqual(found[0]["plugins"]["options"]["draft-eagle"], {"width": 2, "rows": "0", "label": "12"})
+
+    def test_an_option_variant_can_set_the_level_the_engine_asks_of_its_rows(self):
+        sys.path.insert(0, str(ROOT / "kernels"))   # crit_kernels.exactness, the levels
+        found = option_variants(FULL, ["exactness=exact", "exactness.prompt=repeatable;draft-eagle.width=2",
+                                       "draft-eagle.width=2"], self.registry, facts=["taps:hidden"])
+        self.assertEqual([v.get("exactness") for v in found],
+                         [{"decode": "exact", "prompt": "exact"}, {"prompt": "repeatable"}, None])
+        self.assertEqual(found[0]["plugins"]["options"], variants(FULL, self.registry, facts=["taps:hidden"], names={"full"})[0]["plugins"]["options"])
+        self.assertEqual(found[1]["plugins"]["options"]["draft-eagle"]["width"], 2)
+        for wrong in ("exactness=bitwise", "exactness.prompt=fast"):
+            with self.assertRaisesRegex(PluginError, "exactness is one of declared, exact, row-exact, repeatable"):
+                option_variants(FULL, [wrong], self.registry, facts=["taps:hidden"])
+        with self.assertRaisesRegex(PluginError, "PLUGIN.OPTION=VALUE"):   # no phase of that name: read as a plugin's option
+            option_variants(FULL, ["exactness.verify"], self.registry, facts=["taps:hidden"])
 
     def test_blame_names_what_each_plugin_adds_costs_and_breaks(self):
         def measured(name, decode, prefill, failed=()):

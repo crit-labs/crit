@@ -42,6 +42,8 @@ class HostRows:
         self._q4 = d("crit_hx_quantize_e2m1x2", c_int, c_ptr, c_int, c_size, c_float, c_ptr, c_ptr, c_ptr, c_size)
         self._q8 = d("crit_hx_quantize_int8", c_int, c_ptr, c_int, c_size, c_int, c_ptr, c_ptr, c_ptr, c_size)
         self._swiglu = d("crit_hx_swiglu", None, c_ptr, c_size, c_size, c_ptr)
+        self._q4_on = d("crit_hx_quantize_e2m1x2_on", c_int, c_int, c_ptr, c_size, c_float, c_ptr, c_ptr, c_ptr, c_size)
+        self._swiglu_on = d("crit_hx_swiglu_on", None, c_int, c_ptr, c_ptr, c_size, c_ptr)
         self._combine = d("crit_hx_combine", None, c_ptr, c_ptr, c_int, c_ptr, c_size, c_size, c_size, c_ptr)
         self._exp = d("crit_hx_exp", c_float, c_float)
         self._pool = None
@@ -117,6 +119,24 @@ class HostRows:
         scales = torch.empty(x.shape[0], x.shape[1] // 16, dtype=torch.float32)
         self._call(self._q4, ptr(x), x.shape[0], x.shape[1], float(global_scale), ptr(values), ptr(scales))
         return values, scales
+
+    def quantize_e2m1x2_on(self, isa, x, global_scale):
+        """quantize_e2m1x2 of one row ([n] FP32, n a multiple of 16) on a given ISA (ISA's names): the same bits on
+        each. Returns (values [n] int8, scales [n / 16])."""
+        import torch
+        x = x.float().contiguous()
+        values = torch.empty(x.numel(), dtype=torch.int8)
+        scales = torch.empty(x.numel() // 16, dtype=torch.float32)
+        self._call(self._q4_on, ISA[isa], ptr(x), x.numel(), float(global_scale), ptr(values), ptr(scales))
+        return values, scales
+
+    def swiglu_on(self, isa, gate, up):
+        """swiglu_declared(gate[k], up[k]) for every k ([n] FP32 each) on a given ISA: the same bits on each."""
+        import torch
+        gate, up = gate.float().contiguous(), up.float().contiguous()
+        out = torch.empty(gate.numel(), dtype=torch.float32)
+        self._swiglu_on(ISA[isa], ptr(gate), ptr(up), gate.numel(), ptr(out))
+        return out
 
     def quantize_int8(self, x, block=32):
         import torch

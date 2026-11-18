@@ -12,6 +12,12 @@
 // in place without touching the clock and gives the misses ring slots in route order. Per-row counters: each row's
 // distinct routed experts and those resident before the plan. Capture-safe: device counts only, no allocation.
 //
+// Recent residency (slot_last given; expert_cache._Recent, trace_replay.recent): every miss goes to the CPU tier (-2)
+// and, unless its copy is already under way, takes the next slot of the round's victim list that is still open and
+// was not routed this round: the slot is reserved, its old expert unmapped, the (key, slot) copy appended to the
+// round's pending list and this plan's range of it written for the fill beside the round. Hits stamp their slot with
+// the round. The round's start (torch ops) maps the copies that landed and lists the next victims.
+//
 // fill: the plan's copies (key -> slot), bundle words loaded from the store's device address (registered host memory
 // read over the link) and stored into the slots, by a fixed grid that exits once the copies are done. fill_program:
 // the same from a store in another layout (expert_store.csf_layout: CSF scales), rebuilt into the slot layout.
@@ -39,6 +45,10 @@ struct Directory {
   long long* route_counts;      // or null
   const int32_t* quota;         // by miss count, or null
   int quota_len, admit_quota, slots, experts;
+  int32_t* slot_last;           // recent residency: the round each slot's expert was last routed in, or null
+  const int32_t* victims;       // recent: the round's victim slots, the least recently routed first
+  int32_t* recent;              // recent: [0] the round, [1] the next victim, [2] the victims, [3] the pending copies
+  int32_t* pending;             // recent: the round's copies (key, slot), mapped at the next round's start
 };
 
 // Exclusive prefix of `flag` over the block, and the block's total.
@@ -63,7 +73,7 @@ __device__ __forceinline__ int block_scan(bool flag, int* total, int* s_warp) {
 template <typename Index>
 __global__ void __launch_bounds__(kThreads)
 plan_kernel(Directory d, int layer, const Index* ids, int n, int top, const int64_t* rows, long long* row_counters,
-            const int32_t* ring, int ring_count, int32_t* out, int32_t* jobs, int32_t* job_count) {
+            const int32_t* ring, int ring_count, int32_t* out, int32_t* jobs, int32_t* job_count, int32_t* range) {
   extern __shared__ int smem[];
   const int E = d.experts;
   int* first = smem;                                   // [E] first route of each expert (n: not routed); then admits
@@ -73,6 +83,8 @@ plan_kernel(Directory d, int layer, const Index* ids, int n, int top, const int6
   __shared__ int s_hits, s_stamp, s_bad, s_admitted, s_cpu;
   const int tid = threadIdx.x;
   const bool prompt = ring != nullptr;
+  const bool recent = d.slot_last != nullptr && !prompt;
+  const int round = recent ? d.recent[0] : 0;
   if (tid == 0) {
     s_hits = 0;
     s_bad = 0;
@@ -113,7 +125,9 @@ plan_kernel(Directory d, int layer, const Index* ids, int n, int top, const int6
       hit[e] = 1;
       out[e] = s;
       atomicAdd(&s_hits, 1);
-      if (!prompt) {
+      if (recent) {
+        d.slot_last[s] = round;
+      } else if (!prompt) {
         d.slot_ref[s] = 1;
         d.slot_pin[s] = s_stamp;
       }
@@ -168,6 +182,48 @@ plan_kernel(Directory d, int layer, const Index* ids, int n, int top, const int6
         if (hit[v]) atomicAdd(reinterpret_cast<unsigned long long*>(row_counters + 2 * r + 1), 1ull);
       }
     }
+  }
+
+  if (recent) {
+    if (tid == 0) {
+      const int listed = d.recent[2], begin = d.recent[3];
+      int cursor = d.recent[1], got = 0, cpu = 0;
+      for (int k = 0; k < D; ++k) {
+        const int e = list[k];
+        if (hit[e]) continue;
+        out[e] = kCpu;
+        ++cpu;
+        const int key = layer * E + e;
+        if (d.key_slot[key] != kEmpty) continue;   // its copy is under way
+        int c = -1;
+        while (cursor < listed) {
+          const int v = d.victims[cursor++];
+          if (d.slot_key[v] >= kEmpty && d.slot_last[v] != round) {
+            c = v;
+            break;
+          }
+        }
+        if (c < 0) continue;
+        const int old = d.slot_key[c];
+        if (old >= 0) d.key_slot[old] = kEmpty;
+        d.slot_key[c] = kReserved;
+        d.key_slot[key] = kReserved;
+        d.pending[2 * (begin + got)] = key;
+        d.pending[2 * (begin + got) + 1] = c;
+        ++got;
+      }
+      d.recent[1] = cursor;
+      d.recent[3] = begin + got;
+      range[0] = begin;
+      range[1] = got;
+      *job_count = 0;
+      if (s_bad) d.state[2] |= 1;
+      d.counters[0] += D;
+      d.counters[1] += s_hits;
+      d.counters[2] += got;
+      d.counters[3] += cpu;
+    }
+    return;
   }
 
   int* admit = first;   // the misses admitted, in route order (first[] is done)
@@ -259,12 +315,12 @@ plan_kernel(Directory d, int layer, const Index* ids, int n, int top, const int6
 
 template <typename Vec>
 __global__ void __launch_bounds__(kThreads)
-fill_kernel(const Vec* __restrict__ src, Vec* __restrict__ dst, const int32_t* jobs, const int32_t* job_count,
-            long long words) {
-  const int count = *job_count;
+fill_kernel(const Vec* __restrict__ src, Vec* __restrict__ dst, const int32_t* jobs, const int32_t* job_first,
+            const int32_t* job_count, long long words) {
+  const int begin = job_first ? *job_first : 0, count = begin + *job_count;
   const long long stride = static_cast<long long>(gridDim.x) * kThreads;
   const long long start = static_cast<long long>(blockIdx.x) * kThreads + threadIdx.x;
-  for (int j = 0; j < count; ++j) {
+  for (int j = begin; j < count; ++j) {
     const Vec* s = src + static_cast<long long>(jobs[2 * j]) * words;
     Vec* t = dst + static_cast<long long>(jobs[2 * j + 1]) * words;
     long long i = start;
@@ -364,7 +420,8 @@ void plan(torch::Tensor key_slot, torch::Tensor slot_key, torch::Tensor slot_ref
           torch::Tensor state, torch::Tensor counters, torch::Tensor seen, torch::Tensor route_counts,
           torch::Tensor quota, int64_t admit_quota, int64_t layer, int64_t experts, torch::Tensor ids, int64_t top,
           torch::Tensor rows, torch::Tensor row_counters, torch::Tensor ring, torch::Tensor out, torch::Tensor jobs,
-          torch::Tensor job_count) {
+          torch::Tensor job_count, torch::Tensor slot_last, torch::Tensor victims, torch::Tensor recent,
+          torch::Tensor pending, torch::Tensor range) {
   check(key_slot, torch::kInt32, "key_slot");
   check(slot_key, torch::kInt32, "slot_key");
   check(slot_ref, torch::kUInt8, "slot_ref");
@@ -380,6 +437,14 @@ void plan(torch::Tensor key_slot, torch::Tensor slot_key, torch::Tensor slot_ref
   check(out, torch::kInt32, "out");
   check(jobs, torch::kInt32, "jobs");
   check(job_count, torch::kInt32, "job_count");
+  check(slot_last, torch::kInt32, "slot_last");
+  check(victims, torch::kInt32, "victims");
+  check(recent, torch::kInt32, "recent");
+  check(pending, torch::kInt32, "pending");
+  check(range, torch::kInt32, "range");
+  TORCH_CHECK(slot_last.numel() == 0 || (slot_last.numel() == slot_key.numel() && recent.numel() >= 4 &&
+              pending.numel() >= 2 * victims.numel() && range.numel() >= 2),
+              "recent residency: a round stamp per slot, the round's state [4], pending copies per victim and a range");
   TORCH_CHECK(ids.is_cuda() && ids.is_contiguous() && (ids.scalar_type() == torch::kInt64 ||
               ids.scalar_type() == torch::kInt32), "ids are contiguous int64 or int32 CUDA routes");
   TORCH_CHECK(out.numel() == experts && jobs.numel() >= 2 * experts && top >= 1, "a table and copies per expert");
@@ -388,7 +453,10 @@ void plan(torch::Tensor key_slot, torch::Tensor slot_key, torch::Tensor slot_ref
               slot_pin.data_ptr<int32_t>(), state.data_ptr<int32_t>(),
               reinterpret_cast<long long*>(counters.data_ptr<int64_t>()), optional<uint8_t>(seen),
               optional<long long>(route_counts), optional<int32_t>(quota), static_cast<int>(quota.numel()),
-              static_cast<int>(admit_quota), static_cast<int>(slot_key.numel() - 1), static_cast<int>(experts)};
+              static_cast<int>(admit_quota), static_cast<int>(slot_key.numel() - 1), static_cast<int>(experts),
+              optional<int32_t>(slot_last), optional<const int32_t>(victims), optional<int32_t>(recent),
+              optional<int32_t>(pending)};
+  auto* range_out = optional<int32_t>(range);
   const int n = static_cast<int>(ids.numel());
   const size_t shared = static_cast<size_t>(experts) * 9;
   const auto stream = at::cuda::getCurrentCUDAStream();
@@ -402,20 +470,20 @@ void plan(torch::Tensor key_slot, torch::Tensor slot_key, torch::Tensor slot_ref
       C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(shared)));
     kernel<<<1, kThreads, shared, stream>>>(d, int(layer), ids.data_ptr<int64_t>(), n, int(top), row_ids, row_out,
                                             ring_ids, ring_count, out.data_ptr<int32_t>(), jobs.data_ptr<int32_t>(),
-                                            job_count.data_ptr<int32_t>());
+                                            job_count.data_ptr<int32_t>(), range_out);
   } else {
     auto kernel = plan_kernel<int32_t>;
     if (shared > 48 * 1024)
       C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(shared)));
     kernel<<<1, kThreads, shared, stream>>>(d, int(layer), ids.data_ptr<int32_t>(), n, int(top), row_ids, row_out,
                                             ring_ids, ring_count, out.data_ptr<int32_t>(), jobs.data_ptr<int32_t>(),
-                                            job_count.data_ptr<int32_t>());
+                                            job_count.data_ptr<int32_t>(), range_out);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void fill(torch::Tensor source, torch::Tensor store, torch::Tensor jobs, torch::Tensor job_count, int64_t blocks,
-          int64_t vector) {
+          int64_t vector, torch::Tensor job_first) {
   TORCH_CHECK(source.is_cuda() && store.is_cuda() && source.scalar_type() == torch::kUInt8 &&
               store.scalar_type() == torch::kUInt8 && source.is_contiguous() && store.is_contiguous(),
               "source and store are contiguous uint8 CUDA tensors");
@@ -425,6 +493,7 @@ void fill(torch::Tensor source, torch::Tensor store, torch::Tensor jobs, torch::
   TORCH_CHECK(vector == 4 || vector == 8 || vector == 16, "vector is 4, 8 or 16 bytes");
   check(jobs, torch::kInt32, "jobs");
   check(job_count, torch::kInt32, "job_count");
+  check(job_first, torch::kInt32, "job_first");
   const c10::cuda::CUDAGuard guard(store.device());
   if (blocks < 1) {
     int sms = 0;
@@ -435,15 +504,16 @@ void fill(torch::Tensor source, torch::Tensor store, torch::Tensor jobs, torch::
   const int grid = static_cast<int>(blocks);
   const int32_t* j = jobs.data_ptr<int32_t>();
   const int32_t* c = job_count.data_ptr<int32_t>();
+  const int32_t* f = optional<const int32_t>(job_first);   // the first job (a range of a longer list), or none: 0
   if (vector == 16)
     fill_kernel<uint4><<<grid, kThreads, 0, stream>>>(reinterpret_cast<const uint4*>(source.data_ptr()),
-                                                      reinterpret_cast<uint4*>(store.data_ptr()), j, c, bundle / 16);
+                                                      reinterpret_cast<uint4*>(store.data_ptr()), j, f, c, bundle / 16);
   else if (vector == 8)
     fill_kernel<uint2><<<grid, kThreads, 0, stream>>>(reinterpret_cast<const uint2*>(source.data_ptr()),
-                                                      reinterpret_cast<uint2*>(store.data_ptr()), j, c, bundle / 8);
+                                                      reinterpret_cast<uint2*>(store.data_ptr()), j, f, c, bundle / 8);
   else
     fill_kernel<uint32_t><<<grid, kThreads, 0, stream>>>(reinterpret_cast<const uint32_t*>(source.data_ptr()),
-                                                         reinterpret_cast<uint32_t*>(store.data_ptr()), j, c,
+                                                         reinterpret_cast<uint32_t*>(store.data_ptr()), j, f, c,
                                                          bundle / 4);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

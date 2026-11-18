@@ -42,9 +42,11 @@ def width_for(routes, experts):
 class Workspace:
     """The buffers of calls of `tokens` tokens with `top` routes each over `experts` experts of a [hidden][inter]
     shape: the items, the intermediate h and the unweighted route rows y. Allocated once; reuse it for every call of
-    the shape (and capture after one call)."""
+    the shape (and capture after one call). rows: where its row buffers come from, rows(name, count, width, dtype)
+    -> [count][width] of dtype on the device (any contents), for a caller whose workspaces of every shape share
+    their rows (calls of one stream run one after another); by default each workspace has its own."""
 
-    def __init__(self, tokens, top, experts, hidden, inter, device, width=None):
+    def __init__(self, tokens, top, experts, hidden, inter, device, width=None, rows=None):
         routes = tokens * top
         if not 1 <= experts <= MAX_EXPERTS:
             raise ValueError(f"a call names 1 to {MAX_EXPERTS} experts, not {experts}")
@@ -59,8 +61,9 @@ class Workspace:
         self.item_slot = torch.zeros(self.capacity, **ints)
         self.item_routes = torch.full((self.capacity, self.width), -1, **ints)
         self.item_count = torch.zeros(1, **ints)
-        self.h = torch.empty(routes, inter, dtype=torch.bfloat16, device=device)
-        self.y = torch.zeros(routes, hidden, dtype=torch.float32, device=device)
+        self._rows = rows or (lambda name, count, width, dtype: torch.zeros(count, width, dtype=dtype, device=device))
+        self.h = self._rows("h", routes, inter, torch.bfloat16)
+        self.y = self._rows("y", routes, hidden, torch.float32)
         self.ones = torch.ones(routes, **ints) if routes > SMALL_PLAN else None
         self.hidden, self.inter, self.device, self._declared, self.xa = hidden, inter, device, None, None
 
@@ -69,11 +72,11 @@ class Workspace:
         if self._declared is None:
             block = 32 if layout[0] == FORMATS["int4"] else 16
             n, H, I, dev = self.routes, self.hidden, self.inter, self.device
-            self._declared = {"x": torch.zeros(n, H, dtype=torch.int8, device=dev),
-                              "xs": torch.zeros(n, H // block, dtype=torch.float32, device=dev),
-                              "gu": torch.zeros(n, 2 * I, dtype=torch.float32, device=dev),
-                              "h": torch.zeros(n, I, dtype=torch.int8, device=dev),
-                              "hs": torch.zeros(n, I // block, dtype=torch.float32, device=dev)}
+            self._declared = {"x": self._rows("declared.x", n, H, torch.int8),
+                              "xs": self._rows("declared.xs", n, H // block, torch.float32),
+                              "gu": self._rows("declared.gu", n, 2 * I, torch.float32),
+                              "h": self._rows("declared.h", n, I, torch.int8),
+                              "hs": self._rows("declared.hs", n, I // block, torch.float32)}
         return self._declared
 
 
@@ -120,7 +123,7 @@ def route_outputs(x, ids, store, slots, layout, ws, a4=False, arithmetic="tensor
         return ws.y
     if a4:   # the W4A4 operands, quantized once per route at its expert's input scale
         if ws.xa is None:
-            ws.xa = torch.zeros(ws.routes, ws.hidden, dtype=torch.bfloat16, device=ws.device)
+            ws.xa = ws._rows("xa", ws.routes, ws.hidden, torch.bfloat16)
         ops.a4_inputs(x, ws.top, store, list(layout), *items, ws.xa)
         ops.gate_up(ws.xa, 1, store, list(layout), True, *items, ws.h, ws.tokens)
     else:

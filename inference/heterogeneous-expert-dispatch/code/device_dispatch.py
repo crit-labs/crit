@@ -1,9 +1,10 @@
 """Routed experts split between the device and the CPU inside one CUDA stream (captured graphs too).
 
 A layer's routes whose expert the slot table marks -2 (the expert cache's admission sent them to the CPU) are posted to
-the CPU tier through a host-work-mailbox slot (cpu_routes.cu: one post kernel, the tier's C handler on the mailbox's
-service thread, one join, one scatter kernel); every other route is the device part's (its route_outputs over the slot
-store); then the device part's combine sums each token's routes in route order. Both parts compute the same declared
+the CPU tier through a slot of one of the host's handoffs (Core's, crit_plugins.host; cpu_routes.cu: one post kernel,
+the tier's C handler on the host's service thread, the handoff's join, one scatter kernel); every other route is the
+device part's (its route_outputs over the slot store); then the device part's combine sums each token's routes in
+route order. Both parts compute the same declared
 order (host-expert-arithmetic's integer block rows) on bf16(x), so a token's bits never depend on which part computed
 which route.
 
@@ -12,51 +13,32 @@ which route.
     out = dispatch.forward(layer, x, ids, weights, store, slots)
 
 A call of up to max_tokens tokens posts once and joins once, capturably. A longer call (a prompt chunk, host-driven)
-looks for -2 routes first (one synchronization): none skips the mailbox, else they are posted in pieces of max_tokens
+looks for -2 routes first (one synchronization): none skips the handoff, else they are posted in pieces of max_tokens
 tokens. The device part is any object with route_outputs(layer, x, ids, store, slots) -> y [tokens * top][hidden]
 (routes of slot -2 and id -1 left as they were) and combine(y, ids, weights) (the experts plugin's fact experts:routes);
 DeclaredRoutes is the baseline one here: the declared order in torch on the device, exact and slow, until an experts
 plugin's own kernel takes its place. Without the native CPU tier or the CUDA build the CPU routes are computed on the
 host after a synchronization (the same bits); a capture then raises.
 """
-import hashlib
-import os
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-_BUILT = {}
 
 
-def extension(mailbox_code, arch=None):
-    """(module, None) for cpu_routes.cu with host-work-mailbox's mailbox.cu built for this device (or `arch`, e.g.
-    "12.0a") through torch's extension builder under a name hashed from the sources' paths and contents, or
-    (None, why) where it does not build."""
-    import torch
-    sources = [HERE / "cpu_routes.cu", Path(mailbox_code) / "mailbox.cu"]
-    digest = hashlib.sha256(b"".join(str(s).encode() + s.read_bytes() for s in sources) +
-                            (Path(mailbox_code) / "mailbox.h").read_bytes() +
-                            (Path(mailbox_code) / "mailbox_device.cuh").read_bytes()).hexdigest()[:12]
-    if arch is None:
-        major, minor = torch.cuda.get_device_capability()
-        arch = f"{major}.{minor}" + ("a" if major >= 9 else "")
-    key = (digest, arch)
-    if key not in _BUILT:
-        from torch.utils.cpp_extension import load
-        before = os.environ.get("TORCH_CUDA_ARCH_LIST")
-        os.environ["TORCH_CUDA_ARCH_LIST"] = arch
-        try:
-            _BUILT[key] = (load(name=f"crit_cpu_routes_{arch.replace('.', '_')}_{digest}",
-                                sources=[str(s) for s in sources], extra_include_paths=[str(mailbox_code)],
-                                extra_cflags=["-O3", "-std=c++20"], extra_cuda_cflags=["-O3", "-std=c++20"],
-                                verbose=False), None)
-        except Exception as error:  # noqa: BLE001 - no compiler or a header mismatch: the host path serves
-            _BUILT[key] = (None, f"the CPU routes' mailbox did not build: {str(error).splitlines()[0][:300]}")
-        finally:
-            if before is None:
-                os.environ.pop("TORCH_CUDA_ARCH_LIST", None)
-            else:
-                os.environ["TORCH_CUDA_ARCH_LIST"] = before
-    return _BUILT[key]
+def extension(arch=None):
+    """(module, None) for cpu_routes.cu built for this device (or `arch`, e.g. "12.0a") through Core's native build
+    (crit_plugins.native.extension) with Core's handoff header, or (None, why) where it does not build. For this
+    device it also asks Core for the device's joins, so Core's handoff is built and measured here too."""
+    from crit_plugins.host import INCLUDE, current
+    from crit_plugins.native import NativeUnavailable, extension as build
+    try:
+        module = build("crit_cpu_routes", [HERE / "cpu_routes.cu"], [INCLUDE], arch=arch)
+        if arch is None:
+            import torch
+            current().joins(torch.cuda.current_device())
+        return module, None
+    except NativeUnavailable as error:   # no compiler or a header mismatch: the host path serves
+        return None, f"the CPU routes' in-stream join did not build: {str(error).splitlines()[0][:300]}"
 
 
 def capturing():
@@ -108,26 +90,128 @@ class DeclaredRoutes:
         return self.declared.combine(y, ids, weights)
 
 
+class KernelRoutes:
+    """The device part on crit's grouped-experts kernel: every device route's unweighted row in the declared integer
+    order (the CPU tier's bits) and, for a call no CPU route takes part in, optionally in the kernel's tensor arithmetic
+    (BF16 tensor cores: the fast prompt path, other bits than the declared order). Routes to negative slots keep their
+    rows (the CPU's are scattered into them). One workspace per call shape, made outside a capture. scratch: the
+    engine's scratch (crit_plugins.memory's Scratch); with it a call's row buffers are scratch, taken by every
+    call (they are read before the call returns its sum), so the shapes a server meets cost the largest call's
+    bytes and not a set each, and they share those with every other plugin's calls. Without it each workspace has
+    rows of its own."""
+
+    SCRATCH_ROUTES = 1 << 16   # the routes a call's rows take from the scratch; a larger call has its own buffers
+
+    def __init__(self, kernel, layout, kernel_layout, format, hidden, inter, a4=None, scratch=None):
+        self.kernel, self.format = kernel, format
+        # W4A4 at the bundles' input scales: the tier's nvfp4 bundles carry them; a4=False runs weight-only W4A16 rows
+        # (tensor arithmetic only: the declared order is W4A4)
+        self.a4 = format == "nvfp4" if a4 is None else bool(a4)
+        self.layout = kernel_layout(layout)
+        self.hidden, self.inter = hidden, inter
+        self.workspaces = {}
+        self.scratch = scratch
+        self._packed = {}   # routes of a call -> {name: (first byte, bytes)} of its rows in the scratch, "end": bytes
+
+    def _rows(self, name, count, width, dtype):
+        """[count][width] of dtype for calls of `count` routes: the next bytes of such a call's scratch (a workspace
+        asks once for each buffer it uses, and every call takes them all: route_outputs)."""
+        import torch
+        nbytes = torch.empty(0, dtype=dtype).element_size() * width * count
+        if count > self.SCRATCH_ROUTES:
+            return torch.zeros(count, width, dtype=dtype, device=self.scratch.memory.device)
+        packed = self._packed.setdefault(count, {"end": 0})
+        if name not in packed:
+            first = -(-packed["end"] // 64) * 64
+            packed[name], packed["end"] = (first, nbytes), first + nbytes
+        first, nbytes = packed[name]
+        return self.scratch.take(packed["end"])[first:first + nbytes].view(dtype).view(count, width)
+
+    def close(self):
+        self.workspaces, self._packed = {}, {}
+
+    def prepare(self, tokens, top, experts, device, arithmetic="declared"):
+        """The workspace of calls of `tokens` tokens x `top` routes over a table of `experts` slots, with every row
+        buffer `arithmetic` uses, and the call's take of the scratch. A caller whose cache gives device memory back
+        calls it before it stages a call's experts: the first call of a shape grows the scratch, the cache releases
+        slots for that, and slots staged before would be among them. route_outputs calls it too."""
+        import torch
+        key = (tokens, top, experts, str(device))
+        ws = self.workspaces.get(key)
+        if ws is None:
+            if capturing():
+                raise RuntimeError(f"call the experts once at {tokens} tokens x {top} routes outside a capture first: "
+                                   "the device part's workspace is made then")
+            ws = self.workspaces[key] = self.kernel.Workspace(
+                tokens, top, experts, self.hidden, self.inter, device,
+                **({"rows": self._rows} if self.scratch is not None else {}))
+        if arithmetic == "declared":      # the rows the kernel makes at an arithmetic's first call, made here
+            ws.declared(self.layout)
+        elif self.a4 and ws.xa is None:
+            ws.xa = ws._rows("xa", ws.routes, ws.hidden, torch.bfloat16)
+        if tokens * top in self._packed:   # the call's rows: its take of the scratch, as every call's
+            self.scratch.take(self._packed[tokens * top]["end"])
+        return ws
+
+    def route_outputs(self, layer, x, ids, store, slots, arithmetic="declared"):
+        import torch
+        tokens, top = ids.shape
+        ws = self.prepare(tokens, top, slots.numel(), x.device, arithmetic)
+        xb = x if x.dtype == torch.bfloat16 and x.is_contiguous() else x.to(torch.bfloat16).contiguous()
+        s = (slots if slots.dtype == torch.int32 else slots.int()).contiguous()
+        return self.kernel.route_outputs(xb, ids.contiguous(), store, s, self.layout, ws, self.a4, arithmetic)
+
+    def combine(self, y, ids, weights):
+        import torch
+        w = weights if weights.dtype == torch.float32 and weights.is_contiguous() else weights.float().contiguous()
+        return self.kernel.combine(y, ids.contiguous(), w, None, (1 << 30) - 1, True)
+
+
+def kernel_part(kernel, tier_bundles, grouped_bundles, format, hidden, inter, scratch=None):
+    """KernelRoutes over the tier's bundles (its rows in `scratch`, the engine's), or None with the reason where the
+    kernel cannot read them as they are."""
+    if kernel is None:
+        return None, "the grouped-experts kernel is not built here"
+    theirs = tier_bundles.layout(format, hidden, inter)
+    try:
+        mine = grouped_bundles.layout(format, hidden, inter)
+    except ValueError as error:
+        return None, str(error)
+    def offsets(plan):
+        return plan["bundle_bytes"], {name: int(c[0]) for name, c in plan["components"].items()}
+    if offsets(mine) != offsets(theirs):
+        return None, f"grouped-experts' {format} bundle layout differs from the CPU tier's"
+    return KernelRoutes(kernel, mine, grouped_bundles.kernel_layout, format, hidden, inter, scratch=scratch), None
+
+
 class DeviceDispatch:
     """The CUDA dispatch over a CPU tier (host-expert-tier's CpuTier) and a device part. ext: extension()'s module or
     None (the host path); stride: experts per layer in the tier's key space (key = layer * stride + expert), the length
     every slot table must have; layers: the layers whose experts the tier holds."""
 
     def __init__(self, device, hidden, inter, format, tier, part, ext, stride, layers, max_tokens=64, join=None,
-                 mail_slots=2, idle_after_us=2000, idle_sleep_us=50, joins=None):
+                 mail_slots=2, joins=None, prompt_arithmetic="declared", owner="heterogeneous-expert-dispatch"):
         import torch
+        from crit_plugins.host import current
+        if prompt_arithmetic not in ("declared", "tensor"):
+            raise ValueError(f"prompt_arithmetic is declared or tensor, not {prompt_arithmetic!r}")
+        if prompt_arithmetic == "tensor" and not isinstance(part, KernelRoutes):
+            raise ValueError("prompt_arithmetic tensor needs the grouped-experts kernel's device part")
+        self.prompt_arithmetic = prompt_arithmetic
         self.device = torch.device(device)
         if self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
         self.hidden, self.inter, self.format = hidden, inter, format
         self.tier, self.part, self.stride, self.layers = tier, part, int(stride), set(layers)
         self.max_tokens, self.mail_slots = int(max_tokens), int(mail_slots)
-        self.idle_after_us, self.idle_sleep_us = int(idle_after_us), int(idle_sleep_us)
+        self.host, self.owner = current(), owner   # the host's handoffs (Core's): this dispatch's is owner/cpu-routes
         self.ext = ext if tier.native else None
-        self.box, self.top, self.joins, self.buffers, self.posted = None, 0, None, {}, set()
+        # box: the handoff; kernels: cpu_routes.cu's post and scatter over its slots
+        self.box, self.kernels, self.top, self.joins, self.buffers, self.posted = None, None, 0, None, {}, set()
         self.eager_calls = 0
+        self.tensor_calls = 0   # prompt calls past max_tokens run in the tensor arithmetic
         if self.ext is not None:
-            self.joins = joins or self.ext.measure_joins(self.device.index, 32, 50)
+            self.joins = joins or self.host.joins(self.device)
             self.join_kind = join or self.joins["choice"]
             self.counters = torch.zeros(2, dtype=torch.int64, device=self.device)   # jobs posted, routes posted
 
@@ -139,34 +223,36 @@ class DeviceDispatch:
         return layer % self.mail_slots
 
     def _box(self, top):
-        """The mailbox, sized for max_tokens tokens of `top` routes; built at the first post, rebuilt (outside a capture)
-        for a call with more routes a token."""
+        """The handoff (the host's, with the tier's handler) and the kernels over its slots, sized for max_tokens
+        tokens of `top` routes; made at the first post, made again (outside a capture) for a call with more routes
+        a token."""
         import torch
         if self.box is not None and top <= self.top:
-            return self.box
+            return self.kernels
         if capturing():
-            raise RuntimeError(f"post a call of {top} routes a token once outside a capture first: the mailbox is sized then")
+            raise RuntimeError(f"post a call of {top} routes a token once outside a capture first: the handoff is sized then")
         if self.box is not None:
             self.close_box()
         routes = self.max_tokens * top
         serve, context = self.tier.handler()
-        box = self.ext.Box(self.mail_slots, self.hidden, routes, self.max_tokens, self.join_kind, serve, context,
-                           self.idle_after_us, self.idle_sleep_us)
         tier_layout = self.tier.payload_layout(routes, self.max_tokens)
-        mine = dict(zip(("experts", "token", "x", "out", "bytes"), box.layout()))
+        box = self.host.handoff(self.device, self.owner, "cpu-routes", self.mail_slots, tier_layout["bytes"], serve,
+                                context, join=self.join_kind)
+        kernels = self.ext.Routes(self.hidden, routes, self.max_tokens, [box.words(s) for s in range(self.mail_slots)])
+        mine = dict(zip(("experts", "token", "x", "out", "bytes"), kernels.layout()))
         if mine != tier_layout:
-            box.release()
-            raise RuntimeError(f"the mailbox payload {mine} is not the CPU tier's {tier_layout}")
-        self.box, self.top, self.routes_cap = box, top, routes
+            box.close()
+            raise RuntimeError(f"the kernels' payload {mine} is not the CPU tier's {tier_layout}")
+        self.box, self.kernels, self.top, self.routes_cap = box, kernels, top, routes
         self.buffers = {s: {"routes": torch.zeros(routes, dtype=torch.int32, device=self.device),
                             "count": torch.zeros(2, dtype=torch.int32, device=self.device),
                             "status": torch.zeros(1, dtype=torch.int32, device=self.device)}
                         for s in range(self.mail_slots)}
-        return box
+        return kernels
 
     def _check(self, layer, ids, slots):
         if self.box is not None and self.box.failed():   # a host atomic: no synchronization
-            raise RuntimeError(f"the CPU tier failed and its mailbox answers every job as failed: {self.box.error()}")
+            raise RuntimeError(f"the CPU tier failed and its handoff answers every job as failed: {self.box.error()}")
         if layer not in self.layers:
             raise KeyError(f"the CPU tier holds no expert of layer {layer}")
         if slots.numel() != self.stride:
@@ -181,16 +267,16 @@ class DeviceDispatch:
         if ids.shape[0] > self.max_tokens:
             raise ValueError(f"post() takes up to {self.max_tokens} tokens (max_tokens); forward() posts longer calls "
                              "in pieces")
-        box = self._box(ids.shape[1])
+        kernels = self._box(ids.shape[1])
         b = self.buffers[self.slot_of(layer)]
-        box.post(self.slot_of(layer), ids.contiguous(), slots, x.contiguous(), int(layer) * self.stride, b["routes"],
-                 b["count"], self.counters)
+        kernels.post(self.slot_of(layer), ids.contiguous(), slots, x.contiguous(), int(layer) * self.stride,
+                     b["routes"], b["count"], self.counters)
         self.posted.add(layer)
 
     def forward(self, layer, x, ids, weights, store, slots):
         if not self.in_stream:
             if capturing():
-                raise RuntimeError("the CPU routes join inside a capture only through the in-stream mailbox, which is "
+                raise RuntimeError("the CPU routes join inside a capture only through the in-stream handoff, which is "
                                    "not built here (see the plugin's facts): decode without capturing")
             y = self.part.route_outputs(layer, x, ids, store, slots)
             self._host(layer, x, ids, slots, y)
@@ -203,30 +289,33 @@ class DeviceDispatch:
             s = self.slot_of(layer)
             b = self.buffers[s]
             self.box.join(s)
-            self.box.scatter(s, y, b["routes"], b["count"], b["status"], ids.numel())
+            self.kernels.scatter(s, y, b["routes"], b["count"], b["status"], ids.numel())
             self.posted.discard(layer)
             return self.part.combine(y, ids, weights)
         return self._long(layer, x, ids, weights, store, slots)
 
     def _long(self, layer, x, ids, weights, store, slots):
-        """A call past max_tokens (prompt chunks; host-driven, never captured): the mailbox only when it has -2 routes,
+        """A call past max_tokens (prompt chunks; host-driven, never captured): the handoff only when it has -2 routes,
         then in pieces of max_tokens tokens."""
         if capturing():
             raise RuntimeError(f"a captured call has at most {self.max_tokens} tokens (max_tokens)")
         flat = ids.reshape(-1).long()
         cpu = bool(((flat >= 0) & (slots.long()[flat.clamp(min=0)] == -2)).any())   # one synchronization
+        if not cpu and self.prompt_arithmetic == "tensor":   # no CPU route to match: the kernel's tensor arithmetic
+            self.tensor_calls += 1
+            return self.part.combine(self.part.route_outputs(layer, x, ids, store, slots, "tensor"), ids, weights)
         y = self.part.route_outputs(layer, x, ids, store, slots)
         if cpu:
             top = ids.shape[1]
-            box = self._box(top)
+            kernels = self._box(top)
             for t0 in range(0, ids.shape[0], self.max_tokens):
                 t1 = min(ids.shape[0], t0 + self.max_tokens)
                 s = self.slot_of(layer)
                 b = self.buffers[s]
-                box.post(s, ids[t0:t1].contiguous(), slots, x[t0:t1].contiguous(), int(layer) * self.stride,
-                         b["routes"], b["count"], self.counters)
-                box.join(s)
-                box.scatter(s, y[t0 * top:t1 * top], b["routes"], b["count"], b["status"], (t1 - t0) * top)
+                kernels.post(s, ids[t0:t1].contiguous(), slots, x[t0:t1].contiguous(), int(layer) * self.stride,
+                             b["routes"], b["count"], self.counters)
+                self.box.join(s)
+                kernels.scatter(s, y[t0 * top:t1 * top], b["routes"], b["count"], b["status"], (t1 - t0) * top)
         return self.part.combine(y, ids, weights)
 
     def _host(self, layer, x, ids, slots, y):
@@ -279,12 +368,12 @@ class DeviceDispatch:
             def body():
                 for g in range(graph_layers):
                     s, b = self.slot_of(g), self.buffers[self.slot_of(g)]
-                    self.box.post(s, ids, table, x, layers[g % len(layers)] * self.stride, b["routes"], b["count"],
-                                  self.counters)
+                    self.kernels.post(s, ids, table, x, layers[g % len(layers)] * self.stride, b["routes"], b["count"],
+                                      self.counters)
                     for i in range(k):
                         scratch[i].copy_(bundles[(g * most + i) % len(bundles)], non_blocking=True)
                     self.box.join(s)
-                    self.box.scatter(s, y, b["routes"], b["count"], b["status"], ids.numel())
+                    self.kernels.scatter(s, y, b["routes"], b["count"], b["status"], ids.numel())
 
             with torch.cuda.stream(stream):
                 body()
@@ -316,12 +405,13 @@ class DeviceDispatch:
         return timings, split.quota_table(timings)
 
     def status(self):
-        """The mailbox's state: join kind, failure and its error (host words, no synchronization), and, read on the
-        device (synchronizes), each mail slot's last answer (1 served, 2 skipped; others: the window is invalid), its
+        """The handoff's state: join kind, failure and its error (host words, no synchronization), and, read on the
+        device (synchronizes), each of its slots' last answer (1 served, 2 skipped; others: the window is invalid), its
         overflow flag and the jobs and routes the device posted (replays included)."""
         if not self.in_stream:
-            return {"in_stream": False, "host_calls": self.eager_calls}
-        out = {"in_stream": True, "join": self.join_kind, "jobs": int(self.counters[0]), "routes": int(self.counters[1])}
+            return {"in_stream": False, "host_calls": self.eager_calls, "tensor_calls": self.tensor_calls}
+        out = {"in_stream": True, "join": self.join_kind, "jobs": int(self.counters[0]), "routes": int(self.counters[1]),
+               "tensor_calls": self.tensor_calls}
         if self.box is not None:
             out.update({"failed": self.box.failed(), "error": self.box.error(), "served": self.box.served(),
                         "status": [int(self.buffers[s]["status"][0]) for s in range(self.mail_slots)],
@@ -329,12 +419,11 @@ class DeviceDispatch:
         return out
 
     def close_box(self):
-        """Answer every pending doorbell, let the streams drain, then drop the mailbox (before the tier it calls)."""
-        import torch
+        """Answer every pending doorbell, let the streams drain, then give the handoff back (before the tier it
+        calls)."""
         if self.box is not None:
-            self.box.release()
-            torch.cuda.synchronize(self.device)
-            self.box = None
+            self.box.close()
+            self.box = self.kernels = None
 
     def close(self):
         self.close_box()

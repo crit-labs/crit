@@ -178,8 +178,7 @@ absolute file offsets; `ShardInfo` adds the header SHA-256 and file identity;
 `tensor_bytes`. All results are read-only.
 
 **Tensor bytes** ([tensors.py](tensors.py)). `TensorReader(checkpoint)` (or
-`open_tensors(path, **inspect_options)`) reads the bytes the headers describe,
-as the native `Checkpoint::map` and `Checkpoint::read` do. `map(tensor)` is a
+`open_tensors(path, **inspect_options)`) reads the bytes the headers describe. `map(tensor)` is a
 zero-copy read-only `memoryview` into the shard's mapping that stays valid after
 `close()`; `read(tensor, out)` copies exactly the tensor's bytes into a writable
 buffer (pinned host memory, a numpy array) without mapping. `tensor` is a name
@@ -334,32 +333,3 @@ is a `ConfigError`; filesystem failures on safetensors files propagate as
 covers GGUF files, split sets, derivations and folder checks, `TorchFileError`
 PyTorch files and `OnnxError` ONNX graphs; `ModelSourceError` a path that does
 not exist or a folder of two formats.
-
-## Differences from the C++ port
-
-The model source, the GGUF reader and its derived files have no C++
-counterpart yet: `Checkpoint::open` reads safetensors only.
-
-The C++ loaders in [core/src/model](../../../src/model/README.md) (`load_model_config`,
-`Checkpoint::open`, `load_generation_config` and `stop_token_ids`) apply the
-same rules as this package and `crit_core.text`'s `GenerationConfig` and
-`legacy_eos_ids`. What differs on purpose:
-
-- Tensor order: `Checkpoint.tensors` is sorted by name; the C++
-  `Checkpoint::tensors()` is shard-major (header order within each shard).
-- Errors: Python raises `ConfigError`, `SafetensorsError` or `ModelTextError`
-  (all `ValueError`) where C++ throws `FormatError`, and `OSError` where C++
-  throws `std::system_error`. Python messages give line and column; C++ gives a
-  byte offset.
-- Limits: the C++ `retained_bytes` limit and JSON node limit
-  (`json::Limits::max_nodes`, 2^24 by default) have no Python counterpart;
-  Python bounds a document by bytes and depth. An integer longer than
-  `sys.get_int_max_str_digits()` (4300 by default) is a JSON error in Python
-  even under an unread key; C++ keeps it.
-- Stop ids: `legacy_eos_ids`, like crit eval, reads only the eos ids; the C++
-  `stop_token_ids` takes a validated `GenerationConfig`, so a malformed sampling
-  field fails before any stop id is read.
-- Sources: `load_model_config` also accepts a `ModelFiles` source, and
-  `GenerationConfig.from_files` follows transformers (falling back to
-  `config.json` and checking ids against a tokenizer); the C++
-  `GenerationConfig` is `generation_config.json` as written.

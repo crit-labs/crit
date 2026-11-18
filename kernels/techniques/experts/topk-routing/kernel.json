@@ -42,7 +42,7 @@
         "experts",
         "top"
       ],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "WARPS": {
           "values": [

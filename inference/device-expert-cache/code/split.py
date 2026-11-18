@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 import math
 from statistics import median
 
-MAX_MISSES = 32  # routes per plan (device_cache.h kMaxRoutes)
+MAX_MISSES = 32  # routes per plan
 
 
 def _ms(value):

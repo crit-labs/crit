@@ -1,7 +1,6 @@
-// A C interface over the CPU expert tier (host_tier.h) and its worker pool, for bindings that load the library at run
-// time (ctypes), and the host-work-mailbox handler a device engine's dispatch wires to it. Every function returning
-// int gives 0 on success or 1 with the error text in `error`.
-#include "expert_pool.h"
+// A C interface over the CPU expert tier (host_tier.h), for bindings that load the library at run time (ctypes), and
+// the handler a device engine's dispatch gives one of the host's handoffs (crit_plugins.host). Every function
+// returning int gives 0 on success or 1 with the error text in `error`.
 #include "host_tier.h"
 #include "nvfp4.h"
 
@@ -23,10 +22,10 @@ namespace ht = crit::techniques::host_tier;
 namespace {
 
 struct Tier {
-    ht::ExpertPool pool;
     ht::HostExpertTier tier;
-    Tier(std::size_t hidden, std::size_t inter, ht::PoolOptions options, hi::Isa isa, std::size_t rows_per_task)
-        : pool(options), tier(hidden, inter, pool, isa, rows_per_task) {}
+    hi::Layout layout = hi::Layout::rows;   // the codes layout of the experts set from now on (crit_tier_set_layout)
+    Tier(std::size_t hidden, std::size_t inter, ht::PoolRef pool, hi::Isa isa, std::size_t rows_per_task)
+        : tier(hidden, inter, pool, isa, rows_per_task) {}
 };
 
 const float* e4m3_table() {
@@ -62,28 +61,21 @@ template <class Fn> int guarded(char* error, std::size_t bytes, Fn&& fn) {
 
 extern "C" {
 
-// A tier for experts [2 * inter][hidden] and [hidden][inter] on a pool of `workers` threads (-1: physical cores but the
-// caller's), pinned when `pin`, idle workers spinning spin_us (or, with spin_max_us above it, as long as recent gaps
-// between layers, at most spin_max_us) then sleeping after sleep_after_us. isa: -1 the fastest
-// integer path, else host_isa's Isa (0 scalar, 2 avx2, 3 avx512). Null on failure.
-void* crit_tier_create(std::size_t hidden, std::size_t inter, int workers, int pin, int spin_us, int sleep_after_us,
-                       int spin_max_us, std::size_t rows_per_task, int isa, char* error, std::size_t error_bytes) {
+// A tier for experts [2 * inter][hidden] and [hidden][inter] on the host's worker pool: pool_run the pool's C entry
+// (crit_pool_run) and pool the pool, as crit_plugins.host's pool gives them (null: the calling thread alone). isa: -1
+// the fastest integer path, else host_isa's Isa (0 scalar, 2 avx2, 3 avx512). Null on failure.
+void* crit_tier_create(std::size_t hidden, std::size_t inter, void* pool_run, void* pool, std::size_t rows_per_task,
+                       int isa, char* error, std::size_t error_bytes) {
     void* out = nullptr;
     guarded(error, error_bytes, [&] {
-        ht::PoolOptions options;
-        options.workers = workers;
-        options.pin = pin != 0;
-        options.spin = std::chrono::microseconds(std::max(0, spin_us));
-        options.sleep_after = std::chrono::microseconds(std::max(spin_us, sleep_after_us));
-        options.spin_max = std::chrono::microseconds(std::max(0, spin_max_us));
-        out = new Tier(hidden, inter, options, isa < 0 ? hi::best_int_isa() : hi::Isa(isa), rows_per_task);
+        const ht::PoolRef ref(reinterpret_cast<ht::PoolRef::Entry>(pool_run), pool);
+        out = new Tier(hidden, inter, ref, isa < 0 ? hi::best_int_isa() : hi::Isa(isa), rows_per_task);
     });
     return out;
 }
 
 void crit_tier_destroy(void* tier) { delete static_cast<Tier*>(tier); }
 
-int crit_tier_workers(void* tier) { return static_cast<Tier*>(tier)->pool.workers(); }
 const char* crit_tier_isa(void* tier) { return hn::isa_name(static_cast<Tier*>(tier)->tier.isa()); }
 
 // Expert `index` read in place: gate_up codes [2 * inter][hidden / 2], E4M3 scales [2 * inter][hidden / 16], inverse
@@ -101,8 +93,8 @@ int crit_tier_set_expert(void* tier, std::size_t index, const std::uint8_t* gu_c
         hn::ScaleDecoder decoder;
         decoder.byte_table = e4m3_table();
         ht::TierExpert e;
-        e.gate_up = {gu_codes, gu_scales, 2 * inter, hidden, 0, 0, kind, hi::Layout::rows};
-        e.down = {dn_codes, dn_scales, hidden, inter, 0, 0, kind, hi::Layout::rows};
+        e.gate_up = {gu_codes, gu_scales, 2 * inter, hidden, 0, 0, kind, t->layout};
+        e.down = {dn_codes, dn_scales, hidden, inter, 0, 0, kind, t->layout};
         e.gate_up_scales = decoder;
         e.down_scales = decoder;
         e.gate_up_row_post = gu_inverse;
@@ -116,6 +108,29 @@ int crit_tier_set_expert(void* tier, std::size_t index, const std::uint8_t* gu_c
         e.intermediate_block = inter_block;
         if(!gu_inverse || !dn_inverse) throw std::invalid_argument("host tier: an expert's inverse rows");
         t->tier.set_expert(index, e);
+    });
+}
+
+// The codes layout of the experts crit_tier_set_expert sets from now on: 0 rows (the checkpoint's, read in place
+// where a device reads the same bundles), 1 interleaved (host_int.h Layout::interleaved: a CPU-side copy, one vector
+// lane per block, the faster rows; crit_tier_interleave converts). The bits are the same in both.
+int crit_tier_set_layout(void* tier, int interleaved) {
+    static_cast<Tier*>(tier)->layout = interleaved ? hi::Layout::interleaved : hi::Layout::rows;
+    return 0;
+}
+
+// The interleaved layout's bytes of a [rows][cols] code matrix, and the conversion of rows-layout codes into it.
+std::size_t crit_tier_interleaved_bytes(std::size_t rows, std::size_t cols) {
+    return rows * hi::row_bytes(hi::Layout::interleaved, cols);
+}
+int crit_tier_interleave(const std::uint8_t* codes, std::size_t rows, std::size_t cols, std::uint8_t* out, char* error,
+                         std::size_t error_bytes) {
+    return guarded(error, error_bytes, [&] {
+        hi::IntMatrix m;
+        m.codes = codes;
+        m.rows = rows;
+        m.cols = cols;
+        ht::interleave_matrix(m, out);
     });
 }
 
@@ -137,19 +152,17 @@ int crit_tier_compute(void* tier, int count, const std::int32_t* expert, const s
     });
 }
 
-// jobs, routes, expert chunks, ms inputs, ms gate/up, ms down, ms total, weight bytes, pool batches, pool wakes,
-// workers.
+// jobs, routes, expert chunks, ms inputs, ms gate/up, ms down, ms total, weight bytes.
 void crit_tier_stats(void* tier, double* out) {
     const Tier* t = static_cast<const Tier*>(tier);
     const ht::TierStats& s = t->tier.stats();
-    const double v[11] = {double(s.jobs), double(s.routes), double(s.expert_chunks), s.ms_inputs, s.ms_gate_up, s.ms_down,
-                          s.ms_total, s.weight_bytes, double(t->pool.batches()), double(t->pool.wakes()),
-                          double(t->pool.workers())};
+    const double v[8] = {double(s.jobs), double(s.routes), double(s.expert_chunks), s.ms_inputs, s.ms_gate_up, s.ms_down,
+                         s.ms_total, s.weight_bytes};
     std::memcpy(out, v, sizeof(v));
 }
 void crit_tier_reset_stats(void* tier) { static_cast<Tier*>(tier)->tier.reset_stats(); }
 
-// A mailbox payload of FP32 rows for capacities `routes` and `tokens`: offsets of experts, token, x, out and its bytes.
+// A handoff payload of FP32 rows for capacities `routes` and `tokens`: offsets of experts, token, x, out and its bytes.
 void crit_tier_payload_layout(std::size_t hidden, std::size_t routes, std::size_t tokens, std::int64_t* out) {
     const auto p = ht::HostExpertTier::input_layout(hidden, routes, tokens);
     out[0] = std::int64_t(p.experts);
@@ -159,7 +172,7 @@ void crit_tier_payload_layout(std::size_t hidden, std::size_t routes, std::size_
     out[4] = std::int64_t(p.bytes);
 }
 
-// The mailbox handler: the payload's header is {count, tokens, route capacity, token capacity} (uint32), then
+// The handoff's handler: the payload's header is {count, tokens, route capacity, token capacity} (uint32), then
 // input_layout(hidden, route capacity, token capacity). 0: served (every route's row written); 1: the error in `error`.
 int crit_tier_serve(void* tier, std::uint64_t, void* payload, std::uint64_t bytes, char* error, std::uint64_t error_bytes) {
     return guarded(error, std::size_t(error_bytes), [&] {

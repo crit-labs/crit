@@ -44,7 +44,7 @@
         "IN",
         "OUT"
       ],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "REP_ROWS": {
           "values": [
@@ -93,7 +93,7 @@
         "IN",
         "OUT"
       ],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "REP_ROWS": {
           "values": [
@@ -142,7 +142,7 @@
         "IN",
         "OUT"
       ],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "REP_ROWS": {
           "values": [

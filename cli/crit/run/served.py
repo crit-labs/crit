@@ -299,7 +299,7 @@ def _smoke(served, port, log):
 def _precheck(served, run, data, port, log):
     """crit-eval's gate pre-check on the served engine (Reopening), its items in the serving checks' shape."""
     from pathlib import Path
-    from crit_eval import load_json, machine_settings
+    from crit_eval import VRAM_HEADROOM_GIB, load_json, machine_settings
     from crit_eval.quality.prepare import PREPARED
     from crit_eval.run.precheck import run_precheck
     data = Path(data).absolute()
@@ -307,7 +307,7 @@ def _precheck(served, run, data, port, log):
         raise ValueError(f"{data} holds no {PREPARED}: prepare it from the run's model first (crit eval prepare)")
     headroom = run["spec"]["hardware_constraints"].get("vram_headroom_bytes")
     if headroom is None:
-        headroom = round(machine_settings().get("vram_headroom_gib", 1.0) * (1 << 30))
+        headroom = round(machine_settings().get("vram_headroom_gib", VRAM_HEADROOM_GIB) * (1 << 30))
     try:
         return run_precheck(Reopening(served, load_json(data / PREPARED), port), run["spec"]["model_path"], data,
                             served.kv_tokens, quality_mode(run["spec"]["correctness"]), log=log,

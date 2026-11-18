@@ -20,9 +20,7 @@ semantics, codecs and inference remain engine work.
 ## How it works
 
 **Container.** The audit calls Core's reader with `index_policy="strict"`,
-`follow_symlinks=False` and its own `Limits` (native engines get the same reader as
-`crit::core::Checkpoint` with `IndexPolicy::strict` and `follow_symlinks = false`,
-[crit/safetensors.h](../../core/include/crit/safetensors.h)). The reader parses the
+`follow_symlinks=False` and its own `Limits`. The reader parses the
 bounded header JSON (duplicate fields and non-integer numbers are errors), computes
 each tensor's storage bytes from its actual `dtype`, `shape` and `data_offsets`, and
 requires ordered, nonoverlapping, exact coverage of the payload with no truncation.

@@ -78,11 +78,7 @@ subset again (the `size` most emitted, lower ids first on a tie) in place, with 
   (mapping, validation, `ranges()`), first-maximum `argmax`, `target_argmax`,
   `draft_argmax`, `coverage`, `expected_tokens`, `draft_head_cost`
   (`DraftHeadCost`) and `choose_size` (most tokens per millisecond).
-- [subset_argmax.h](code/subset_argmax.h) / [subset_argmax.cu](code/subset_argmax.cu):
-  `enqueue_gather_argmax(GatherArgmax, stream)`, a reference CUDA kernel over FP32
-  rows with a row stride, fixed sequential dot products and first-maximum
-  reduction. Null `rows` selects the full head, so it also serves as the
-  verifier's argmax reference.
+
 
 ## What the engine supplies
 
@@ -143,8 +139,5 @@ ordinary decoding. Duplicate or unsorted rows are rejected.
 
 [Python fixtures](../../tests/test_device_rounds.py) cover subset choice, the
 prefix prior, mapping, the inside-subset equality including ties, and a
-speculative loop that reproduces ordinary greedy output token for token. The
-[CUDA fixture](../../tests/inference/draft_subset_tests.cpp) under
-`CRIT_INFERENCE_CUDA` checks on a 1,000-row padded head that gathered logits
-equal full-head logits bit for bit and the tie rule holds. Acceptance for a real
+speculative loop that reproduces ordinary greedy output token for token. Acceptance for a real
 model must be measured.

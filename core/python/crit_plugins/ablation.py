@@ -103,7 +103,11 @@ def option_variants(selection, assignments, registry=None, facts=None):
     A value that is no JSON is a string, and so is one an option declared as a string or a choice of strings takes as
     written (tile_rows=0 is the choice "0"). With a registry each is checked like variants(), one the plugins refuse
     carrying its `error`. An in-process A/B of one option is the same engine served twice, as built and with it set,
-    measured on the same cases."""
+    measured on the same cases.
+    exactness=LEVEL, exactness.decode=LEVEL and exactness.prompt=LEVEL are no plugin's option: they set the level the
+    engine asks of its rows (the configuration's exactness, crit_kernels.exactness), which the variant carries as
+    `exactness` ({phase: level}) for the engine to be served with, so what a level costs or gains is measured like
+    an option."""
     import json
     selection = normalize(selection, registry)
     if registry is not None and facts is None:
@@ -111,9 +115,16 @@ def option_variants(selection, assignments, registry=None, facts=None):
     out = []
     for text in assignments:
         options = {plugin_id: dict(given) for plugin_id, given in selection["options"].items()}
+        levels = {}
         for pair in [part.strip() for part in text.split(";") if part.strip()]:
             key, sep, value = pair.partition("=")
             plugin_id, dot, option = key.strip().rpartition(".")
+            if sep and (key.strip() == "exactness" or (plugin_id == "exactness" and option in ("decode", "prompt"))):
+                from crit_kernels.exactness import LEVELS
+                if value.strip() not in LEVELS:
+                    raise PluginError(f"--set {pair!r}: exactness is one of {', '.join(reversed(LEVELS))}")
+                levels.update({phase: value.strip() for phase in (("decode", "prompt") if not dot else (option,))})
+                continue
             if not sep or not dot or not plugin_id or not option:
                 raise PluginError(f"--set {pair!r}: give PLUGIN.OPTION=VALUE")
             try:
@@ -127,7 +138,8 @@ def option_variants(selection, assignments, registry=None, facts=None):
                 parsed = value.strip()
             options.setdefault(plugin_id, {})[option] = parsed
         variant = {"name": f"set:{text}",
-                   "plugins": {"use": dict(selection["use"]), "base": selection["base"], "options": options}}
+                   "plugins": {"use": dict(selection["use"]), "base": selection["base"], "options": options},
+                   **({"exactness": levels} if levels else {})}
         if registry is not None:
             try:
                 check(variant["plugins"], registry, facts)

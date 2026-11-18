@@ -6,8 +6,10 @@ diag(su) H Q H diag(sv): Q the trellis tiles, H the block-diagonal normalized 12
 vectors. `gemv` rotates 1 to 16 activation rows (x su H in FP32, stored in FP16), multiplies them by the tiles
 decoded on the fly on FP16 tensor cores (a block's tile slices and activations staged in shared memory by cp.async,
 each tile decoded once into an MMA's A operand, the rows its B operand, FP32 sums), and rotates the result (y' H sv).
-The three launches chain as programmatic dependents (9.0 on), so each starts while the one before finishes. `dequantize` gives W^T [out][in] in BF16 or FP16 for a prompt's GEMM on another kernel
-or a library.
+The three launches chain as programmatic dependents (9.0 on), so each starts while the one before finishes. `gemm` takes a prompt's rows through the same tiles kernel in slabs of up to 64, the tiles decoded once a slab
+and multiplied by every group of eight rows, so a prompt row has the bits of the same token decoded and the codes
+are read at their stored bits once a slab. `dequantize` gives W^T [out][in] in BF16 or FP16 for a GEMM on another
+kernel or a library, whose rows are other bits.
 
 **Built from the kernel core** (`kernels/core`): the codebooks, the tile's bitstream and the fragment order of its
 positions are `crit_kcore/exl3.cuh`'s, checked against host references in `core/tests/exl3_tests.cu`.
@@ -31,6 +33,7 @@ from crit_kernels.build import load
 er = load("exl3-rows")
 w = er.Exl3Matrix(trellis, suh, svh, codebook)   # suh / svh FP16, or er.unpack_signs(su, in) / (sv, out)
 y = er.gemv(x, w)                                # 1 to 16 rows
+y = er.gemm(x, w)                                # any rows (a prompt), each with gemv's bits
 dense = er.dequantize(w)                         # W^T [out][in] BF16
 q = er.decode(w)                                 # the tiles' stored FP16 values [in][out]
 ```
@@ -40,6 +43,8 @@ q = er.decode(w)                                 # the tiles' stored FP16 values
 | Structure | Call | Knobs |
 | --- | --- | --- |
 | gemv | `gemv` | `WARPS` (2, 4, 8: warps a block), `STRIPS` (1, 2, 4: neighbouring tile strips a warp decodes), `ROWS` (1, 2, 4, 8: input rows a stage copies), `STAGES` (2, 3, 4: stages in flight), all speed only (a configuration whose block would take more than 99 KiB of shared memory is not swept); `SPLITS` (0, 1 .. 32: contiguous parts of the input's tiles, one a block row, added in part order; 0 gives 48 warps a multiprocessor with at least two stages a part; an order knob) |
+
+| prompt | `gemm` | none of its own: gemv's configuration for the matrix at 16 rows, eight row groups a tile (`slab_rows(w)`: 64 rows a pass, or 16 where that block would take more than 99 KiB of shared memory); exact, the bits of gemv |
 
 `decode`, `dequantize` and `rotate` have no knobs.
 
@@ -64,6 +69,25 @@ before: a plain read of the same bytes on the shared GPU took 19 us at 2 bits an
 near the read and 2 bits is bound by the decode arithmetic (with the decode removed, 18.5 us). At 16 rows on wide
 matrices the default knobs leave it behind the format's GEMV: the sweep's table per shape and row count narrows it
 (5120 x 17408 at 4 bits, 16 rows: 45 us with SPLITS 4).
+
+A prompt's rows (`gemm`, default knobs, one matrix, the best of 10 calls, the GPU shared with other work). The
+yardsticks: cuBLAS on a dense BF16 copy that is already there (178 MB a 5120 x 17408 matrix, which a model stored at
+4 bits cannot keep for every matrix), and the same after a dequantize a call makes:
+
+| Matrix | Bits | Rows | gemm | BF16 GEMM on a dense copy | with its dequantize |
+| --- | --- | --- | --- | --- | --- |
+| 5120 x 17408 | 4 | 64 | 142 us | 178 us | 2,635 us |
+| 5120 x 17408 | 4 | 512 | 925 us | 550 us | 3,043 us |
+| 5120 x 17408 | 4 | 2,048 | 3,479 us | 1,788 us | 4,273 us |
+| 5120 x 17408 | 2 | 2,048 | 3,226 us | 1,752 us | 4,222 us |
+| 17408 x 5120 | 4 | 2,048 | 3,556 us | 1,896 us | 4,601 us |
+| 5120 x 5120 | 4 | 512 | 431 us | 181 us | 963 us |
+| 5120 x 5120 | 4 | 2,048 | 1,613 us | 575 us | 1,356 us |
+
+A slab of 64 rows costs about 110 us on the wide matrices where 16 decode rows cost 40 to 47: the tiles' read and
+decode are shared by the slab and the rest is its eight MMAs a tile, about 105 TFLOPS. Against a dense copy that is
+kept, the exact rows are 1.7 to 2.8 times slower at 512 rows and more; against a copy made for the call they are
+faster except on the square matrix at 2,048 rows, and they need no memory beside the codes.
 
 ## Build, test, tune
 

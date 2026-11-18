@@ -6,14 +6,14 @@ and ownership implementations (choose the one closest to the engine) and optiona
 host planners for admission, bank sizing and copy grouping.
 
 **What it is, and what serves.** This entry is a host planning tool: its directories are the eviction and
-publication state machines (leases, settled-only eviction, generations, slot loans) and its planners size banks and
+publication state machines (leases, settled-only eviction, generations) and its planners size banks and
 group copies, all on the host, with no device memory and no copies of their own. Its plugin (`LeasedExpertCache`)
 answers the expert_residency slot's host form with `ExpertCache` and fake loads, and names no devices: it is a host
 reference, which no engine serves. The device cache an engine serves is
 [device-expert-cache](../device-expert-cache/README.md)'s `ExpertCache` (its "experts:cache" device form: the directory,
 plans and fills on the device, a prompt ring, KV lending through attention-state's pool). Use this entry's code when
-an engine writes its own residency manager and wants these lifecycles checked on the host first; its
-[slot loans](#lending-owner-memory-to-the-cache) describe the reclaim lifecycle that device-expert-cache's lending
+an engine writes its own residency manager and wants these lifecycles checked on the host first;
+[lending](#lending-owner-memory-to-the-cache) describes the reclaim lifecycle that device-expert-cache's lending
 implements on the device (slots made unavailable before the pool's pages are handed out, and back once they are free).
 
 ## When to use it
@@ -49,7 +49,6 @@ current generation.
 | --- | --- | --- |
 | [`ExpertCache`](code/implementation.py) | Byte-bounded ready-object cache, acquisition-order eviction, leases and deferred-use receipts | `load(key, nbytes)` returning a ready owner; safe physical release; teardown |
 | [`BundleDirectory`](code/implementation.py) | Fixed-slot complete-bundle metadata, pinned uses, upload tickets, component validation, source retention and ordered publication | Reserved backing buffers, copies, completion receipts, native visibility and recovery |
-| [`crit::techniques::SettledSlots`](code/settled_slots.h) | C++ fixed-slot directory, content generations, protected uses, temporary region loans with transactional relocation, and slot loans by which owners reclaim memory lent to the cache | Slot geometry, reserved backing, physical completion, transfers and loan policy |
 | [`planning.py`](code/planning.py) | Phase-aware admission, compatible-layout bank sizing, dual-contiguous copy runs and demand/cost observations | Allocation, directory integration, exact fallback, native copies/projections and measured costs |
 
 `ExpertCache` capacity is in bytes; the two directories use slot counts. Neither
@@ -94,62 +93,17 @@ and records caller-measured upload bytes, calls and synchronization time.
 
 ## Worked example
 
-### Temporary cache memory loans
-
-The C++ directory can lend a contiguous region of its existing allocation to
-scratch work. Construct it with `(capacity, slot_bytes, backing_owner)`; the owner
-retains the allocation and its Core reservation, and slots must describe complete
-bundles in one contiguous bank.
-
-1. `begin_loan({first, count}, relocations)` claims adjacent slots and optional
-   survivor destinations. It rejects protected readers, uploading slots, overlap
-   or aliased destinations before mutating anything.
-2. Register each copy with `begin_relocation(loan, index, work_owner)` before
-   enqueueing it, and `settle_relocation` once dependencies physically settle.
-3. `activate_loan` publishes survivors at their new slots. Each scratch user
-   registers with `acquire_loan(loan, work_owner)`; `extent` gives its offset and
-   length. Scratch contents are uninitialized.
-4. `begin_return` stops new borrowers; settle existing users, then `reclaim_loan`
-   returns empty slots to the cache. Cancellation uses the same path.
-
-The backing reservation stays charged once; reclaim returns logical cache
-capacity, not memory to Core. Capture `binding()` with graph addresses and
-validate it before each replay; uploads and loan transitions invalidate it. A
-binding check grants no lease. `available_capacity()` reports slots not held by
-loans, not immediately evictable slots. The [native example](code/loan_example.cpp)
-runs real host copies and checks exact cache recovery:
-
-```sh
-cmake -S inference -B build/inference
-cmake --build build/inference --config Release --target crit_cache_loan_example
-ctest --test-dir build/inference -C Release -R crit_cache_loan_example --output-on-failure
-```
-
 ### Lending owner memory to the cache
 
-The reverse direction uses the same lifecycle. Memory another owner reserved but cannot use right now can
-hold cache slots, and the owner reclaims it before writing. Examples are KV positions beyond the longest
-request in flight and a prompt workspace between prompts. Build the directory over all slots, its own and
-the lent ones. The directory is address-agnostic, and the engine keeps each slot's address. The owner holds a
-loan while it uses its memory:
-
-1. Before the owner writes, for example when a request begins and reaches those positions or a prompt pass
-   starts, it calls `begin_slot_loan(slots, relocations)`. The slots can be any set and need not be adjacent.
-   Their contents are evicted, and protected readers or uploads reject the whole loan, so settle them and
-   retry. Optional survivors move to free slots with the same relocation protocol.
-2. `activate_loan`. The owner's writers register with `acquire_loan`. A slot loan has no `extent`, because
-   the owner addresses its own memory.
-3. When the owner is done (the request ends, the prompt pass finishes), call `begin_return`, settle the
-   writers, then `reclaim_loan`. The slots come back EMPTY, never with old contents.
-
-Every transition invalidates `binding()`. A device directory has to mirror `on_loan(slot)`: it drops the slot's
-key, keeps the slot out of victim selection and settles its readers before the owner's first write is enqueued,
-and makes the slot selectable again only after `reclaim_loan`. [device-expert-cache](../device-expert-cache/README.md)'s
+Memory another owner reserved but cannot use right now can hold cache slots, and the owner reclaims it before
+writing. Examples are KV positions beyond the longest request in flight and a prompt workspace between prompts.
+Before the owner writes, the slots under its memory leave the cache: their keys are dropped, no victim search takes
+them, and their readers settle before the owner's first write is enqueued. When the owner is done they come back
+empty, never with old contents. [device-expert-cache](../device-expert-cache/README.md)'s
 device form does this with attention-state's KV pool: the pool's pages and the cache's own slots are one allocation,
 so every slot is a row of one store tensor; a slot under pages in use is unavailable (its key dropped, no victim
-search takes it), made so before the pool hands those pages out, and empty again once they are free. Its C++
-component (device_cache.cu) still skips only slots pinned by the current plan. The owner keeps the memory charged
-once; the cache gains logical capacity, not memory.
+search takes it), made so before the pool hands those pages out, and empty again once they are free. The owner keeps
+the memory charged once; the cache gains logical capacity, not memory.
 
 ### Bundle publication
 
@@ -222,13 +176,11 @@ decisions. Rejecting admission in an exact consumer still runs the original expe
 | Implementation | Supplies | Engine supplies |
 | --- | --- | --- |
 | [mixed_source_plan / execute_mixed](../heterogeneous-expert-dispatch/code/implementation.py) | Occurrence-preserving source selection, exact fallback, one projection hook | Native staging, projection arithmetic, layouts and ordered readiness |
-| Core's [GraphCache](../../core/include/crit/device_graph.h), [CudaStagedGraph](../../core/include/crit/cuda_graph.h) | Binding identity, capture/replay, split phases and completion | Capture-safe arithmetic, stable pools and device ordering |
-| Core's [MappedSource](../../core/include/crit/device_memory.h), [cuda_map_host](../../core/include/crit/cuda_memory.h) | Full-range coverage, device alias continuity checks and CUDA host registration | Physical accounting and reader drain before unregister |
 | [FileExpertSource](../ssd-expert-materialization/code/implementation.py) | Read ownership and failed-upload staging retention | I/O/upload services and settlement |
 
 With [mixed-source dispatch](../heterogeneous-expert-dispatch/README.md), protect
 hits before resolving misses and keep an exact fallback. With
-[graph replay](../../core/src/backends/cuda/README.md#graph-capture), keep backing
+graph replay, keep backing
 addresses stable while publishing ordered content maps. With
 [file materialization](../ssd-expert-materialization/README.md), read-ahead is not
 residency until device content is complete. Budget every owner (weights, state,
@@ -249,14 +201,7 @@ into a smaller slot range, and treating a failed overwrite as valid old content.
 
 Host fixtures cover complete publication, duplicate/foreign tickets and uses,
 protected hits, pending reads, failed enqueue/copy and abandoned replacements.
-The [settled-slot fixture](../../tests/inference/settled_slots_tests.cpp) checks
-slot metadata, receipt identity, fragmented and protected regions, overlapping
-loans, stale identities, partial relocation failure, cancellation and binding
-invalidation over 1,250 loan/return cycles, and reverse loans: scattered slot loans, a live reader blocking a
-reclaim until it settles, a survivor relocated out of reclaimed owner memory, empty return and 500 repeated
-requests. In one MoE engine that lends unreachable KV positions and its prompt workspace, holding those as slot
-loans (one per request, one per prompt pass) and mirroring `on_loan` into its device valid flags gave
-token-identical output at unchanged speed. Planner fixtures check admission
+Planner fixtures check admission
 boundaries, bank grouping, guards, alignment and copy-range parity; run the bank
 example with `python -B code/example.py` from this entry's directory. Validate a
 combined engine on all-hit, all-miss, mixed and repeated routes, slot pressure with

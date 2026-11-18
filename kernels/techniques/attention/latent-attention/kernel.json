@@ -9,12 +9,12 @@
   "operations": ["latent-attention"],
   "structures": {
     "window": {
-      "what": "a tile of BLOCK_M query rows (a row's columns times its heads) over pieces b, b + PARTS, ... of PIECE positions, each piece's latents loaded once for the scores and the values, the states merged in partition order",
+      "what": "a tile of BLOCK_M query rows (a row's columns times its heads) over pieces b, b + PARTS, ... of PIECE positions, each piece's latents loaded once for the scores and the values, the states merged in partition order; attend(fused=True): a program a tile reading its partitions in turn and folding them as the merge does, the same bits with no partials (wide windows, prompt chunks as windows with their tokens' decode bits)",
       "call": "attend",
       "rows": [1, 64],
       "tune_rows": [1, 2, 4, 8],
       "key": ["R", "P", "H", "PAGE", "KIND"],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "BLOCK_M": {"values": [16, 32, 64], "default": 64, "what": "query rows a program (at most the window's columns times the heads)"},
         "PIECE": {"values": [16, 32, 64], "default": 16, "order": true, "what": "positions a piece: the unit a partition takes and its softmax's block"},
@@ -32,7 +32,7 @@
       "rows": [1, 1048576],
       "tune_rows": [64, 512, 2048],
       "key": ["R", "P", "H", "PAGE", "KIND"],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "BLOCK_M": {"values": [16, 32, 64, 128], "default": 64, "what": "query rows a program (tokens times heads)"},
         "PIECE": {"values": [16, 32, 64], "default": 16, "order": true, "what": "positions a piece: the softmax's block"},

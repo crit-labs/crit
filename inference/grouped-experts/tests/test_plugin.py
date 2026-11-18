@@ -9,6 +9,7 @@ USE = {"expert_source": "expert-tensors"}
 class GroupedExpertsTests(PluginTestCase):
     def test_it_has_the_experts_interface_and_its_extensions(self):
         self.assertImplements(self.assemble(USE))
+        self.assertEqual(self.assemble(USE)["experts"].exactness(), {})   # no layer loaded: it states no level yet
 
     def test_its_host_form_is_its_reference_on_the_cases(self):
         self.assertMatchesReference(USE, atol=1e-12, rtol=0.0)

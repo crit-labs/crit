@@ -530,6 +530,31 @@ class RoundsTests(unittest.TestCase):
                 self.assertGreater(logprob, -0.01)   # a logit of 10 over 49 of 0
                 self.assertEqual(len(top), 2)
 
+    def test_a_model_that_names_the_counter_gets_its_non_finite_columns_counted_row_by_row(self):
+        from crit_plugins.rounds import NONFINITE, Rounds
+        model = ToyModel(2, 3, "cpu")
+        self.model, self.head, self.drafter = model, ToyHead(model), ToyDrafter()
+        self.sampler, self.pool = ToySampler(), ToyPool(2, "cpu")
+        rounds = Rounds(model, self.sampler, rows=2, widest=3, device="cpu", drafter=self.drafter, head=self.head,
+                        pools=[self.pool], parts=Parts(USE, ROUNDS_FACTS), counters=(*COUNTERS, NONFINITE))
+        for slot, prompt in enumerate([[1, 2], [3]]):
+            rounds.bind(slot, slot, len(prompt), model.prefill(slot, prompt), 10, capacity=16)
+        rounds.launch(2, 3)
+        self.assertEqual([found[NONFINITE] for found in rounds.read()], [0, 0])
+        verify, poison = model.verify, [float("nan"), float("inf")]
+
+        def poisoned(view, batch):   # row 1: a NaN in one column, then an infinity in two
+            logits = verify(view, batch)
+            bad = poison.pop(0)
+            logits[1, :1 if bad != bad else 2, 7] = bad
+            return logits
+        model.verify = poisoned
+        for expected in ([0, 1], [0, 2]):
+            rounds.launch(2, 3)
+            self.assertEqual([found[NONFINITE] for found in rounds.read()], expected)
+        # A driver whose model does not name it counts nothing and reads the logits no further.
+        self.assertNotIn(NONFINITE, self.build(2, 3).counter_names)
+
     def test_a_round_runs_its_log_probability_form_only_for_a_row_that_asks(self):
         # Rows that ask for nothing run the plain form (no log-probabilities packed); a row asking for them, or one
         # following its continuation, makes the round's form the log-probability one, and the plain rows beside it
@@ -881,6 +906,31 @@ class RoundsTests(unittest.TestCase):
         self.assertEqual([c for c in calls if c[0] == "start"], [("start", n) for n in names], "once each: the pool too")
         self.assertEqual([c for c in calls if c[0] == "count"], [("count", n) for n in names])
         self.assertLess(calls.index(("start", "extra")), calls.index(("count", "sampler")))
+
+    def test_a_plugin_in_a_slot_the_round_uses_takes_part_without_being_registered(self):
+        from crit_plugins.rounds import Rounds
+        calls = []
+
+        def hooked(name):
+            part = type("Part", (), {})()
+            part.start_round = lambda view: calls.append(("start", name))
+            part.count_round = lambda view: calls.append(("count", name))
+            return part
+        experts, sampler_plugin, kv_plugin = hooked("experts"), hooked("sampler plugin"), hooked("kv plugin")
+        use = {**USE, "experts": "toy-experts"}
+        facts = {**ROUNDS_FACTS, "toy-experts": ["rounds:experts"]}
+        model = ToyModel(1, 2, "cpu")
+        for registered in ((), (experts,)):   # found in its slot, and once only when the model registers it too
+            calls.clear()
+            rounds = Rounds(model, ToySampler(), rows=1, widest=2, device="cpu", drafter=ToyDrafter(),
+                            head=ToyHead(model), pools=[ToyPool(1, "cpu")], extra_parts=list(registered),
+                            parts=Parts(use, facts, {"experts": experts, "sampler": sampler_plugin,
+                                                     "kv_cache": kv_plugin}), counters=COUNTERS)
+            rounds.bind(0, 0, 2, model.prefill(0, [1, 2]), 8, capacity=16)
+            rounds.launch(1, 2)
+            rounds.read()
+            # the sampler's and the KV cache's slots are the driver's own roles: their plugin objects are not asked
+            self.assertEqual(calls, [("start", "experts"), ("count", "experts")], registered)
 
     def test_a_truncation_commits_again_over_the_rounds_tree_path(self):
         from crit_plugins.rounds import Rounds

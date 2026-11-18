@@ -9,7 +9,7 @@ digests and sizes), so a store whose source is unchanged is reused instead of re
 open_store maps the file and register pins it for the device (mapped pinned memory, torch's cudart): registering a
 mapped file takes seconds where allocating and filling tens of GB of pinned memory took minutes on one machine. With
 unified addressing the device pointer of registered memory is its host pointer; a native engine maps the same file
-and calls Core's cuda_map_host, which returns both (expert_store.h).
+and registers the mapping, which returns both.
 
 A component names its tensor by a template over {group} and {expert} (for example
 "model.layers.{group}.mlp.experts.{expert}.down_proj.weight"); a template without {expert} names a tensor that
@@ -401,6 +401,11 @@ class BundleStore:
 
     region() -> (host uint8 tensor [keys * bundle_bytes], CUDA uint8 tensor over its device address); address(layer,
     expert) -> a bundle's device address; read(keys, into) copies bundles into a host or device tensor [n][bundle_bytes].
+
+    leave(keys), before the seal, names bundles the host is not to hold: a device cache keeps them for good (its
+    pinned core), so each expert is in one place. A store on a file maps their pages onto a filler (host_memory
+    leave_out) and the region stays one range with one device address; read(), bundle() and peek() give such a
+    bundle from the file, and the region's bytes there are the filler's, which nothing may read.
     """
 
     mapped = True    # region() and address() are device-readable (a file tier's are not)
@@ -426,6 +431,9 @@ class BundleStore:
         self._mapping = self._fd = None
         self._host = self._device = None
         self._registered = None
+        self.left = frozenset()    # keys whose bundles the host does not hold (leave())
+        self.left_bytes = 0        # the host bytes that saved
+        self._file = None          # the store file's reads (left bundles; peek())
         self.complete = False
         self._index = {"kind": BUNDLES, "layers": self.layers, "experts": self.experts, **_jsonable(self.layout),
                        "identity": _jsonable(identity)}
@@ -470,6 +478,46 @@ class BundleStore:
         else:
             ctypes.memmove(self._mapping.address + at, data, len(data))
 
+    def leave(self, keys):
+        """Bundles the host is not to hold (a cache's pinned core, layers kept whole on the device). Before the
+        seal, for a store on a file; returns the keys left (none where the store has no file to read them from
+        again, or is sealed already: every bundle stays on the host)."""
+        if self.path is None or self._registered is not None:
+            return self.left
+        keys = frozenset(int(key) for key in keys)
+        if any(not 0 <= key < self.keys for key in keys):
+            raise ValueError("a key to leave is outside the store")
+        self.left = self.left | keys
+        return self.left
+
+    def _leave_out(self):
+        """The left bundles' pages out of the mapping, before it is registered."""
+        if self.left:
+            B = self.bundle_bytes
+            self.left_bytes = self._memory.leave_out(self._mapping, [(key * B, (key + 1) * B) for key in self.left])
+
+    def _reader(self):
+        """The store file's reads (Core's host: positioned reads at a queue depth, past the OS's page cache where
+        the file system allows, so a bundle the host is not to hold does not stay in the cache either)."""
+        if self._file is None:
+            from crit_plugins.host import current
+            self._file = current().reads("device-expert-cache", self.path, direct=True)
+        return self._file
+
+    def _from_file(self, key):
+        """One bundle read from the store file (a host tensor of its own)."""
+        import torch
+        out = torch.empty(self.bundle_bytes, dtype=torch.uint8)
+        self._reader().read([(key * self.bundle_bytes, memoryview(out.numpy()))])
+        return out
+
+    def peek(self, layer, expert):
+        """One bundle's bytes read from the store file, without sealing the store (a copy); None for a store that
+        is not a complete file."""
+        if self.path is None or not self.complete:
+            return None
+        return self._from_file(self.key(layer, expert))
+
     def _seal(self):
         if self._registered is not None:
             return
@@ -487,6 +535,7 @@ class BundleStore:
         if cuda:
             import torch
             index = torch.device(self.device).index or 0
+            self._leave_out()
             if not self._mapping.writable and memory.read_only_supported(index):
                 try:
                     address = memory.register(self._mapping.address, self.size, read_only=True)
@@ -498,7 +547,10 @@ class BundleStore:
                     ctypes.memmove(copy.address, self._mapping.address, self.size)
                     self._mapping.close()
                     self._mapping = copy
+                    self._leave_out()
                 address = memory.register(self._mapping.address, self.size)
+        else:
+            self._leave_out()
         self._registered = address if address is not None else 0
         self._host = memory.host_tensor(self._mapping.address, self.size)
         self._device = memory.device_tensor(address, self.size, self.device) if cuda else None
@@ -515,22 +567,35 @@ class BundleStore:
         return base + self.key(layer, expert) * self.bundle_bytes
 
     def bundle(self, layer, expert):
-        """One bundle's bytes as a host tensor view."""
+        """One bundle's bytes as a host tensor view (a left bundle: its bytes read from the file)."""
         self._seal()
-        at = self.key(layer, expert) * self.bundle_bytes
+        key = self.key(layer, expert)
+        if key in self.left:
+            return self._from_file(key)
+        at = key * self.bundle_bytes
         return self._host[at:at + self.bundle_bytes]
 
     def read(self, keys, into):
         """Bundles of `keys` into `into` ([n][bundle_bytes] uint8, host or device), in order."""
         self._seal()
         host = self._host.view(self.keys, self.bundle_bytes)
+        keys = [int(key) for key in keys]
+        left = [i for i, key in enumerate(keys) if key in self.left]
+        if left and not into.is_cuda:   # from the file, all at once, into the caller's rows
+            self._reader().read([(keys[i] * self.bundle_bytes, memoryview(into[i].numpy())) for i in left])
         for i, key in enumerate(keys):
-            into[i].copy_(host[int(key)], non_blocking=into.is_cuda)
+            if key not in self.left:
+                into[i].copy_(host[key], non_blocking=into.is_cuda)
+            elif into.is_cuda:
+                into[i].copy_(self._from_file(key))
 
     def close(self):
         if self._fd is not None:
             os.close(self._fd)
             self._fd = None
+        if self._file is not None:
+            self._file.close()
+            self._file = None
         if self._registered:
             self._memory.unregister(self._mapping.address)
         self._registered = None

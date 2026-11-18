@@ -13,7 +13,7 @@
 #include <vector>
 
 // Optional structured-output service: languages over exact output bytes and request-private token matchers whose
-// allowed() set feeds Sampler::sample(logits, AllowedTokens{...}, ...). core/src/constraints/README.md has the rules.
+// allowed() set masks a row before the sampling rules. core/src/constraints/README.md has the rules.
 namespace crit::core {
 // Most vocabulary entries and total piece bytes one ByteVocabulary holds.
 inline constexpr std::size_t constraint_vocabulary_limit = 1048576;

@@ -48,15 +48,6 @@ escapes. Cancellation is checked between regions and at 1 MiB boundaries.
   `Materialization` with checked demand reads, executor read-ahead, pending-read reuse,
   upload handoff, `quiesce()` and failed-upload retention; `HostExpertTier`, the bounded host
   tier with `retain()` for device evictions and hit, miss, eviction and refusal counts.
-- [mapped_gather.h](code/mapped_gather.h): the C++20 sparse gather above.
-- [host_tier.h](code/host_tier.h): the native host tier and its read queue. `HostTier` is a
-  ledger over pinned host slots the engine owns, one bundle each: `find` serves a committed hit,
-  `admit(key, protect)` hands out a free slot or the least recently used unprotected one (or
-  refuses), `commit` publishes a slot once its fill landed and `abandon` frees a failed one; it
-  counts hits, misses, admissions, evictions and refusals. `ReadQueue` fills such slots from the
-  file with a pool of positioned readers (Core's `ReadOnlyFile` read slots): demand reads before
-  read-ahead, one read per pending key (a demand for a queued read-ahead moves it first), and a
-  `Ticket` per read to wait on before `commit`.
 - [bundle_file.py](code/bundle_file.py): `FileBundleStore`, the plugin's bundle store (`open_store`, the file tier
   of "experts:store"): every (layer, expert) bundle in one file in key order, written by `put()` (or a complete file
   with the same layout reopened, its index beside it), read by `read(keys, into)` through lookup-table-rows' native
@@ -156,9 +147,7 @@ behavior. Common failures: unbounded futures holding large arrays, treating pref
 completion as device readiness, dropping staging after enqueue failure, and closing
 files while producers can still submit.
 
-[Native fixtures](../../tests/inference/inference_io_codec_tests.cpp) check page
-boundaries, duplicate and overlapping regions, order, sequential/parallel equivalence,
-empty files, bounds and cancellation. Host fixtures cover exact bytes, pending reads,
+Host fixtures cover exact bytes, pending reads,
 failures, ambiguous upload recovery, host-tier hits after the file changed, checked retention
 of evicted experts, and that the current route is never evicted. Storage throughput, pinned memory, transfer
 overlap and cache profitability remain unmeasured.

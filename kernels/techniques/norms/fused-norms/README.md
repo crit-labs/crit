@@ -49,7 +49,8 @@ untuned build launches exactly what it launched then).
 Order knobs set how a row is laid out over a program's threads and so the order its sum of squares is added in: they
 are looked up by the width alone (never by the row count), so a tuning cannot make a row's bits depend on the rows
 beside it, and the sweep keeps one value of them per width. The elementwise structures' knobs change speed only (the
-tests check those bits equal the defaults'), so a tuning may pick them per row count. The queries and keys in one
+tests check those bits equal the defaults'), so a tuning may pick them per row count: a shape's first call compiles
+the kernel for every knob set its row counts can read, so a later call at another row count compiles nothing. The queries and keys in one
 launch must keep the bits of the separate calls: the `rope` bench drops a configuration where they differ.
 
 The long-rows defaults changed in round 4 (one pass in registers where the two passes re-read the row): a long row's

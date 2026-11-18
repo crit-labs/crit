@@ -4,6 +4,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/torch.h>
 
+#include "fp4_mma.h"
 #include "mma_rows.h"
 
 namespace mr = crit::kernels::mma_rows;
@@ -32,8 +33,16 @@ void mm_prompt(const torch::Tensor& x, const torch::Tensor& w, const std::option
   TORCH_CHECK(weights >= mr::kNvfp4 && weights <= mr::kInt4Zp,
               "mm_prompt: weights 0 NVFP4, 1 FP8, 2 MXFP8, 3 BF16, 4 INT4 with a zero point");
   const bool valid = acts == mr::kActBf16 || (acts == mr::kActNvfp4 && weights == mr::kNvfp4) ||
-                     (acts == mr::kActFp8Rows && weights == mr::kFp8);
-  TORCH_CHECK(valid, "mm_prompt: activations 0 BF16 (any weights), 1 FP8 rows (FP8 weights), 2 NVFP4 (NVFP4 weights)");
+                     (acts == mr::kActFp8Rows && weights == mr::kFp8) ||
+                     (acts == mr::kActNvfp4Mma && weights == mr::kNvfp4 && blocked);
+  TORCH_CHECK(valid, "mm_prompt: activations 0 BF16 (any weights), 1 FP8 rows (FP8 weights), 2 NVFP4 (NVFP4 weights), "
+                     "3 NVFP4 on the FP4 MMA (NVFP4 weights with blocked scales)");
+  if (acts == mr::kActNvfp4Mma) {
+    TORCH_CHECK(k % mr::kFp4Step == 0, "mm_prompt: the FP4 MMA takes K a multiple of ", mr::kFp4Step, ", not ", k);
+    TORCH_CHECK(splits <= k / mr::kFp4Step, "mm_prompt: at most one split a step of K (", k / mr::kFp4Step, ")");
+    const c10::cuda::CUDAGuard device(x.device());
+    TORCH_CHECK(mr::fp4_mma(at::cuda::getCurrentCUDAStream()), "mm_prompt: this device or build has no FP4 MMA");
+  }
   TORCH_CHECK(splits >= 1 && splits <= mr::kMaxSplits, "mm_prompt: 1 to ", mr::kMaxSplits, " splits");
   const int64_t row_bytes =
       weights == mr::kNvfp4 || weights == mr::kInt4Zp ? k / 2 : weights == mr::kBf16 ? 2 * k : k;
@@ -56,9 +65,11 @@ void mm_prompt(const torch::Tensor& x, const torch::Tensor& w, const std::option
     TORCH_CHECK(scratch.has_value(), "mm_prompt: quantized activations take a scratch buffer");
     const torch::Tensor& s = *scratch;
     same_device(x, s);
-    TORCH_CHECK(s.is_contiguous() && aligned_to(s, 16) &&
-                    s.numel() * s.element_size() >= (int64_t)mr::scratch_bytes((int)m, (int)k),
-                "mm_prompt: scratch is contiguous on 16 bytes with rows * K * 2 + rows * 4 bytes or more (rounded)");
+    const int64_t need = acts == mr::kActNvfp4Mma ? (int64_t)mr::fp4_scratch_bytes((int)m, (int)k)
+                                                  : (int64_t)mr::scratch_bytes((int)m, (int)k);
+    TORCH_CHECK(s.is_contiguous() && aligned_to(s, 16) && s.numel() * s.element_size() >= need,
+                "mm_prompt: scratch is contiguous on 16 bytes with scratch_bytes(rows, K, acts) = ", need,
+                " bytes or more");
     p.scratch = static_cast<std::uint8_t*>(s.data_ptr());
   }
   if (weights == mr::kNvfp4 || weights == mr::kMxfp8) {
@@ -73,6 +84,8 @@ void mm_prompt(const torch::Tensor& x, const torch::Tensor& w, const std::option
       TORCH_CHECK(s.numel() == ((n + 127) / 128) * 128 * ((k / 16 + 3) / 4) * 4,
                   "mm_prompt: blocked scales are cuBLASLt's 128 x 4 tiles of [N][K / 16]");
       p.ct = static_cast<int>((k / 16 + 3) / 4);
+      TORCH_CHECK(acts != mr::kActNvfp4Mma || aligned_to(s, 16),
+                  "mm_prompt: the FP4 MMA's prompt rows copy the scale tiles whole: scales on 16 bytes");
     } else {
       TORCH_CHECK(s.numel() == n * (k / 16), "mm_prompt: NVFP4 scales are E4M3 bytes [N][K / 16]");
     }
@@ -101,7 +114,7 @@ void mm_prompt(const torch::Tensor& x, const torch::Tensor& w, const std::option
                 "mm_prompt: row_scale is FP32 [N]");
     p.row_scale = r.data_ptr<float>();
   }
-  if (acts == mr::kActNvfp4) {
+  if (acts == mr::kActNvfp4 || acts == mr::kActNvfp4Mma) {
     TORCH_CHECK(input_scale > 0, "mm_prompt: NVFP4 activations take their input scale (> 0)");
     p.input_scale = static_cast<float>(input_scale);
     p.input_rcp = 1.0f / p.input_scale;

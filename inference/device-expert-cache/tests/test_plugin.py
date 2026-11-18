@@ -69,3 +69,24 @@ class RankedPolicyTests(ResidencyChecks, PluginTestCase):
         self.assertEqual(rounds[-1], [True, True])
         self.assertEqual(residency.resident(0), {3, 9})
         self.assertGreater(residency.schedule.swapped, 0)
+
+
+class RecentPolicyTests(ResidencyChecks, PluginTestCase):
+    OPTIONS = {"policy": "recent", "layers": 2, "experts": 16}
+
+    def test_a_miss_is_resident_from_the_next_round_and_the_expert_routed_longest_ago_leaves(self):
+        residency = self.residency(slots=3)
+        self.assertEqual(residency.plan(0, [3, 9]), [False, False])   # the CPU tier's now, copied in beside the round
+        self.assertEqual(residency.plan(1, [1]), [False])
+        self.assertEqual(residency.plan(0, [3, 9]), [True, True])     # the next round: they serve
+        self.assertEqual(residency.plan(1, [1]), [True])
+        self.assertEqual(residency.plan(0, [3, 4]), [True, False])    # 9 was not routed this round ...
+        self.assertEqual(residency.plan(1, [1]), [True])
+        self.assertEqual(residency.plan(0, [3, 4]), [True, True])     # ... so 4 took its slot
+        self.assertEqual(residency.resident(0), {3, 4})
+        self.assertEqual(residency.resident(1), {1})
+
+    def test_a_round_copies_at_most_max_swaps_misses(self):
+        residency = self.residency(slots=8, max_swaps=2)
+        residency.plan(0, [1, 2, 3, 4])
+        self.assertEqual(residency.plan(0, [1, 2, 3, 4]), [True, True, False, False])

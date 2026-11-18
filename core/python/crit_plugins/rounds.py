@@ -31,8 +31,9 @@ Two drivers share that round:
     pack     the result block, rows of [n_emitted, n_matched, frontier, tokens (widest + 1), accepted, the engine's
              counters], to pinned host memory
 
-A round's parts are the model, the sampler, the drafter, the head, the verifier, every pool and the extra parts the
-model registers (extra_parts: a device expert cache). Core's native rounds run no Python between rounds, so whatever
+A round's parts are the model, the sampler, the drafter, the head, the verifier, every pool, the plugins of the slots
+the round uses (with parts: an experts plugin that caches) and the extra parts the model registers (extra_parts: a
+device expert cache it made itself). Core's native rounds run no Python between rounds, so whatever
 bookkeeping a part does each round runs inside the captured round, in its two optional capture-safe hooks:
 start_round(view) at the round's start (before the draft) and count_round(view) after the commits (before the pack).
 
@@ -93,6 +94,7 @@ import warnings
 
 from .device import RoundBatch
 from .manifest import POLICY_SLOTS, PluginError
+from .memory import of as memory_of
 
 MODES = ("greedy", "sampled", "replay", "forced")
 FOLLOW = {None: 0, "replay": 1, "forced": 2}   # a row's own continuation inside a greedy or sampled round
@@ -136,6 +138,7 @@ def capture_workspaces(stream):
     pool = _WORKSPACE_POOLS.get(device)
     if pool is None:
         pool = _WORKSPACE_POOLS[device] = torch.cuda.MemPool()
+        memory_of(device).pool("captures", "matrix workspaces", pool.id)
     empty = torch.cuda.CUDAGraph()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")   # torch warns that the capture is empty
@@ -147,6 +150,15 @@ def capture_workspaces(stream):
     with torch.cuda.use_mem_pool(pool, device), torch.cuda.stream(stream):
         torch.mm(operand, operand, out=product)   # allocates nothing but the workspace
     return pool
+
+
+# The slots a round driver holds in a role of its own (their plugins, or the pools they made, are its parts already).
+ROLE_SLOTS = ("model", "sampler", "drafter", "verifier", "kv_cache", "recurrence")
+
+
+# A round counter the driver fills itself when the model names it among its round_counters: each row's verify columns
+# whose logits were not finite. Core fails the request (crit_core.native.StepEngine.generate).
+NONFINITE = "nonfinite"
 
 
 class RoundsRefused(PluginError):
@@ -439,13 +451,18 @@ class SpeculativeRounds:
     `stops` stop ids per row at most, `continuation` tokens per row for replay and forced rounds, `logprobs` to pack
     each emitted column's log-probability (True: the verify hook writes view.logprobs; a count k: k alternatives too,
     ranked as Core ranks them, the lower id first among equals) and `counters` the names of the engine's per-row round
-    counters (its info's round_counters). share_pool: the captured rounds share one CUDA graph memory pool (less memory; only for plugins
-    that keep no tensor made inside one capture for another), else each (rows, width, mode) round has its own, which
-    its two forms share (the module's docstring, Forms: a driver with logprobs or continuation captures both). widths:
+    counters (its info's round_counters). share_pool: the captured rounds share one CUDA graph memory pool: the
+    engine's (Rounds, where Core's loader assembled the engine: its prompt chunks capture into it too), else one of
+    the driver's own. Graphs never run at once, so each reuses the bytes of the others' temporaries and the pool
+    holds the largest round's, not their sum. It asks one thing of the plugins: a tensor made inside a capture that
+    anything reads later (another graph, the host after a replay) is kept for good, never dropped or replaced
+    (dropped, its bytes become another capture's temporaries). None (the default) shares where the engine has a
+    pool; False gives each (rows, width, mode) round its own, which its two forms share (the module's docstring,
+    Forms: a driver with logprobs or continuation captures both). widths:
     the widths rounds run at (each captured where rounds are captured; by default widest alone) and width_policy the
     policy choosing each round's (FixedWidth by default; the module's docstring)."""
 
-    def __init__(self, hooks, rows, widest, device, stops=4, continuation=0, logprobs=False, share_pool=False,
+    def __init__(self, hooks, rows, widest, device, stops=4, continuation=0, logprobs=False, share_pool=None,
                  counters=(), widths=None, width_policy=None):
         import torch
         if rows < 1 or widest < 0 or stops < 0 or continuation < 0:
@@ -531,7 +548,8 @@ class SpeculativeRounds:
         self.width_policy.reserve(self)
         # A round's key: (rows, width, mode, logprobs), logprobs its form (the module's docstring, Forms).
         self.graphs = {}
-        self.share_pool, self._pool, self._pools = bool(share_pool), None, {}
+        self.share_pool, self._pool, self._pools = share_pool, None, {}
+        self._engine_pool = None   # Rounds: the engine's graph pool (its factory parts' context), where it has one
         self.captured_bytes, self.captured_bytes_by_form = 0, dict.fromkeys(FORMS, 0)
         self.event = torch.cuda.Event() if pinned else None
         self.kept = {}         # key -> what the round's plugins set on its view (a truncation's view)
@@ -864,15 +882,18 @@ class SpeculativeRounds:
             stream.synchronize()
             restore()
             graph = torch.cuda.CUDAGraph()
-            # One pool for every round (share_pool), else one per (rows, width, mode) round for its two forms: they
-            # never run at once, and what one form's capture makes is read only right after its own replays (its kept
-            # view), never by the other's.
-            if self.share_pool:
+            # One pool for every round (share_pool: the engine's where it has one), else one per (rows, width, mode)
+            # round for its two forms: they never run at once, and what one form's capture makes is read only right
+            # after its own replays (its kept view), never by the other's.
+            memory = memory_of(self.device)
+            if self.share_pool or (self.share_pool is None and self._engine_pool is not None):
                 if self._pool is None:
-                    self._pool = torch.cuda.graph_pool_handle()
+                    self._pool = self._engine_pool or memory.pool("rounds", "every round")
                 pool = self._pool
             else:
-                pool = self._pools.setdefault((rows, width, mode), torch.cuda.graph_pool_handle())
+                if (rows, width, mode) not in self._pools:
+                    self._pools[(rows, width, mode)] = memory.pool("rounds", f"{rows} rows, width {width}, {mode}")
+                pool = self._pools[(rows, width, mode)]
             # No garbage collection while the round is captured: a collection there frees what dead cycles held (an
             # engine closed before this one: its pinned result buffers), and pinned host memory freed while its
             # stream captures leaves torch's host allocator a block it cannot settle, so the next capture's flush of
@@ -883,7 +904,7 @@ class SpeculativeRounds:
             observed = self._observer.snapshot() if self._observer is not None else None
             try:
                 capture_workspaces(stream)
-                with torch.cuda.graph(graph, pool=pool, stream=stream):
+                with memory.capturing(pool), torch.cuda.graph(graph, pool=pool, stream=stream):
                     self._round(rows, width, mode, logprobs)
             finally:
                 if collecting:
@@ -1015,7 +1036,7 @@ class SpeculativeRounds:
         go to the model's step()), which an adaptive width policy then chooses round by round among the driver's
         widths (a start width must be one of them); every width a round may run needs its graph captured first
         (_native_graphs). Launch rounds on the stream that was current here only. After a native round Core calls the
-        model's commit() only for rows it trims, ends, cancels or discards; adopt(rows, width) before truncate()
+        model's commit() only for rows it trims, ends or cancels; adopt(rows, width) before truncate()
         then. Core launches each round in its log-probability form when a row's request asks for log-probabilities
         or replays a continuation, else in its plain form (the module's docstring, Forms), each form's graph
         captured."""
@@ -1155,9 +1176,10 @@ class Rounds(SpeculativeRounds):
 
     def __init__(self, model, sampler, *, rows, widest, device, drafter=None, verifier=None, head=None, pools=(),
                  extra_parts=(), parts=None, uses=None, logprobs=0, stops=4, continuation=0, vocabulary=None,
-                 sampled=False, share_pool=False, counters=(), widths=None, width_policy=None):
+                 sampled=False, share_pool=None, counters=(), widths=None, width_policy=None):
         super().__init__(None, rows, widest, device, stops=stops, continuation=continuation, logprobs=logprobs,
                          share_pool=share_pool, counters=counters, widths=widths, width_policy=width_policy)
+        self._engine_pool = getattr(getattr(parts, "context", None), "graphs", None)
         if drafter is not None and head is None:
             raise ValueError("a drafter drafts from the model's draft head (draft:head-device): give the head")
         if isinstance(pools, dict):
@@ -1205,12 +1227,21 @@ class Rounds(SpeculativeRounds):
         self.sampled = bool(sampled)
 
     def _parts(self):
-        """Every part of the round once (a part in two roles is called once per hook)."""
+        """Every part of the round once (a part in two roles is called once per hook): the driver's own, the model's
+        extra parts, and the plugins of the slots the round uses that the driver holds in no role (an experts plugin
+        with a cache of its own takes part without the model registering it)."""
+        from .observe import unwrap
         found = {}
+        parts, uses, _ = self._checked
+        used = []
+        if parts is not None and callable(getattr(parts, "get", None)):
+            if uses is None and callable(getattr(parts, "slots", None)):
+                uses = [slot for slot in parts.slots() if parts.plugin(slot) and slot not in POLICY_SLOTS]
+            used = [parts.get(slot) for slot in (uses or ()) if slot not in ROLE_SLOTS]
         for part in (self.model, self.sampler, self.drafter, self.head, self.verifier, *(p for p, _ in self.pools),
-                     *self.extra_parts):
+                     *self.extra_parts, *used):
             if part is not None:
-                found.setdefault(id(part), part)
+                found.setdefault(id(unwrap(part)), part)
         return list(found.values())
 
     # Slots ----------------------------------------------------------------------------------------------------------
@@ -1304,6 +1335,10 @@ class Rounds(SpeculativeRounds):
         if tuple(logits.shape[:2]) != (rows, width + 1) or logits.dim() != 3:
             raise ValueError(f"verify returns the logits of every column, [{rows}][{width + 1}][vocabulary], "
                              f"not {list(logits.shape)}")
+        if NONFINITE in view.counter_names:
+            # The engine counts the columns whose logits hold a NaN or +inf (a row's largest value is then not
+            # finite): Core fails a request that saw one, since its tokens are not the model's.
+            view.counter(NONFINITE).add_((~self.torch.isfinite(logits.float().amax(-1))).sum(1))
         if view.mode in ("greedy", "sampled"):
             laws = view.draft_laws if view.mode == "sampled" else None
             found = self.sampler.predictions_device(view, logits, laws)

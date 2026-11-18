@@ -3,7 +3,7 @@
   "category": "projections",
   "summary": "Packed G32 integer CPU projections, a row-scaled FP8 host codec and the reference NVFP4 codec",
   "implementation_status": "native_source",
-  "implementation_scope": "Grouped integer reference, native G32 signed 4/8-bit storage, scalar/optional AVX2 projections with optional dynamic int8 activations, plus a row-scaled FP8 host codec and oracle; NVFP4 codec (E2M1 codes, E4M3 block-16 scales, FP32 divisor, adjacent packing) with an FP64 Python oracle and a scalar C++ batched projection that decodes each block once per batch; the host twin of a matched FP8 decode/prompt order (its activation quantizer, E8M0 scales, an FP64 projection); the projections slot's device form over stored BF16, FP8 and NVFP4 matrices through torch's scaled matmul and crit's kernels (W4A16 GEMVs, decoders, a fixed-tile GEMM, a tensor-core decode tile; built for the engine's device, tuned or with default knobs) with torch fallbacks, and draft-only re-encoding to NVFP4 or FP8 at load; every compute kernel comes from a library or crit's kernel library",
+  "implementation_scope": "Grouped integer reference, plus a row-scaled FP8 host codec and oracle; NVFP4 codec (E2M1 codes, E4M3 block-16 scales, FP32 divisor, adjacent packing) with an FP64 Python oracle and a scalar C++ batched projection that decodes each block once per batch; the host twin of a matched FP8 decode/prompt order (its activation quantizer, E8M0 scales, an FP64 projection); the projections slot's device form over stored BF16, FP8 and NVFP4 matrices through torch's scaled matmul and crit's kernels (W4A16 GEMVs, decoders, a fixed-tile GEMM, a tensor-core decode tile; built for the engine's device, tuned or with default knobs) with torch fallbacks, and draft-only re-encoding to NVFP4 or FP8 at load; every compute kernel comes from a library or crit's kernel library",
   "agent_guidance": {
     "use_when": "Use or adapt the grouped-integer codec, the row-scaled FP8 codec or the NVFP4 codec as the host reference of a format",
     "avoid_when": "The artifact uses another block format or activation encoding; this is not a universal quantized tensor decoder",
@@ -43,14 +43,6 @@
       "purpose": "Complete signed integer group codec with represented FP32 scales and host matrix-vector projection; other formats and optimized kernels are external"
     },
     {
-      "path": "inference/quantized-projections/code/grouped_int.h",
-      "purpose": "Native G32 packed row validation/encoding, row slices, scalar or AVX2 projection and optional int8 activation groups"
-    },
-    {
-      "path": "inference/quantized-projections/code/grouped_example.cpp",
-      "purpose": "Runnable portable W4/W8 and dynamic A8 projection with packed payload reporting"
-    },
-    {
       "path": "inference/quantized-projections/code/row_fp8.h",
       "purpose": "Portable BF16/E4M3FN codec, row conversion/validation and double projection oracle"
     },
@@ -76,7 +68,7 @@
     }
   ],
   "requires": {
-    "hardware": "Python 3.11+ for the general integer reference; C++20 for native G32/FP8; optional CRIT_GROUPED_INT_AVX2 requires an AVX2 build and CPU; the device form: torch with CUDA (FP8 needs sm_89+, NVFP4 W4A4 sm_100/sm_120), for crit's kernels the CUDA toolkit (nvcc) and ninja to build them on first use (else the torch fallbacks)",
+    "hardware": "Python 3.11+ for the general integer reference; C++20 for the FP8 and NVFP4 host codecs; the device form: torch with CUDA (FP8 needs sm_89+, NVFP4 W4A4 sm_100/sm_120), for crit's kernels the CUDA toolkit (nvcc) and ninja to build them on first use (else the torch fallbacks)",
     "model": "Exact grouped-integer format or separately validated row-scaled E4M3FN/BF16 format; arbitrary artifact codecs need adaptation; NVFP4 with adjacent packing and a divisor global scale (convert other layouts explicitly)",
     "workload": "Native G32 supports positive token batches, row-major tensors with width divisible by 32, FP32 or dynamic G32 int8 activations"
   },
@@ -100,7 +92,6 @@
     "crit::fp8::quantize",
     "crit::fp8::project",
     "crit::quant::Rows",
-    "crit::quant::PackedRows",
     "crit::quant::quantize",
     "crit::quant::project",
     "e2m1_value",

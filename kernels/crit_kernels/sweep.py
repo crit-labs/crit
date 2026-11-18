@@ -29,7 +29,8 @@ with:
 A knob with "order": true changes the kernel's summation order. A row's bits must not depend on the rows beside it
 (the operations' invariance contract), so one shape keeps one value of every order knob for all its row counts; the
 others (speed only) may differ per row count. Configurations whose result is wrong, or whose row 0 differs from row 0
-computed alone (for a structure whose kernel.json says "row_invariant": true), are dropped.
+computed alone (for a structure whose kernel.json "exactness" is row-exact or higher: crit_kernels.exactness), are
+dropped.
 
 A structure may declare "lengths": {"field": "N", "values": [...]} (a shape field the bench reads: the positions a
 row holds, for attention): every shape is swept at each of those lengths (a shape that gives the field keeps its own),
@@ -55,6 +56,7 @@ from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 
 from . import build as kbuild
+from . import exactness
 
 
 def _bench_class(folder, ref):
@@ -549,7 +551,7 @@ def _measure(s, cj, module, manifest, benches, shape_sets, results, dropped, tim
     the knobs cannot run (valid_for(knobs, shape) False) is skipped for it."""
     spec = manifest["structures"][s]
     bench, fields = benches[s], _fields(spec)
-    invariant = spec.get("row_invariant", False)
+    invariant = exactness.keeps(spec, "row-exact")
     knobs = json.loads(cj)
     for shape in shape_sets[s]:
         if hasattr(bench, "valid_for") and not bench.valid_for(knobs, shape):

@@ -212,8 +212,10 @@ class ServeFixture(RunFixture):
         package.mkdir(exist_ok=True)
         adapter = ADAPTER
         if self.reported is not None:
-            # Every configuration names its plugins, which the engine applies with the rest.
-            reported = {'plugins': candidate['configuration']['plugins'], **self.reported}
+            # Every configuration names its plugins and states the exactness of its rows (crit completes it), which
+            # the engine applies with the rest.
+            reported = {**{key: candidate['configuration'][key] for key in ('plugins', 'exactness')
+                           if key in candidate['configuration']}, **self.reported}
             adapter += '\nEngine.effective_configuration = lambda self: %r\n' % (reported,)
         scripted_package(package, adapter + self.adapter_suffix)
         return self.store.package(self.run_id, candidate['candidate_id'], package, RECIPE)

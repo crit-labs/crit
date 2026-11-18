@@ -83,6 +83,19 @@ Moves bytes, changes no value: `smem_u32`; `ldg16` (zeros when invalid), `ld_str
 output's tiles, for L2 reuse). Forms after CUTLASS (BSD-3-Clause) and FlashInfer (Apache-2.0), written from the PTX
 ISA.
 
+## device (`device.cuh`)
+
+What a launch keeps per device (host code). A kernel's raised shared-memory limit is set on the function as it is
+loaded on the thread's current device, and the CTAs a device holds and its multiprocessors are its own, so a value
+kept once a process is the first device's on every other one: a second GPU then refuses every launch above 48 KB of
+shared memory and sizes its grids by the first GPU's count. `PerDevice<T>` keeps one value a device (`get(make)`:
+`make()` on the device's first call, once also among threads); `current_device`, `multiprocessors`,
+`shared_memory_optin(slot, kernel, bytes)` (the opt-in above 48 KB, once a device; a refusal is kept and returned) and
+`resident_ctas(slot, kernel, threads, smem)` (multiprocessors times the blocks one holds) are its uses, each over a
+slot the launch function holds as a static, one a kernel. A kernel that launches with more than 48 KB of shared
+memory, or sizes a grid by the device, uses these instead of a static of its own. `tests/device_tests.cu` checks them
+on the device: a launch above 48 KB is refused before the opt-in and runs after it.
+
 ## reduce (`reduce.cuh`, `python/crit_kcore/reduce.py`)
 
 One order per reduction, fixed by its shape: `warp_sum` / `warp_max` / `warp_min` (xor butterflies over WIDTH lanes),

@@ -18,7 +18,7 @@ run the prompt kernel on a handful of rows to stay exact.
 | | |
 | --- | --- |
 | Weight formats | E4M3 codes [rows][cols]; scales FP32 or E8M0 bytes [ceil(rows / scale_rows)][cols / scale_k]: MXFP8 (1, 32), 128 x 128 blocks (128, 128), per row (1, cols); a post factor per matrix |
-| Activations | E4M3 codes per element and an FP32 scale per group (a multiple of 32); `quantize` makes them from FP32 or BF16 with crit's declared quantizer: MXFP8's 2^(floor(log2 amax) - 8) or amax / 448, round to nearest even, saturating |
+| Activations | E4M3 codes per element and an FP32 scale per group (a multiple of 32); `quantize` makes them from FP32 or BF16 with crit's declared quantizer: MXFP8's 2^(floor(log2 amax) - 8) or amax / 448, round to nearest even, saturating; `quantized_values` gives the same codes times their scales as BF16 in one launch, for a caller that multiplies 16-bit rows of them |
 | GPUs | NVIDIA sm_89 and newer (e4m3 `mma.sync`); not HIP |
 | Shapes | cols a multiple of 32; decode jobs of 1 to 8 tokens on one matrix; prompt jobs of any length; any rows |
 | Numerics | bitwise equal to the declared order's reference kernel on the target GPU (`tests/fp8_block_tests.cu`); within 2e-7 of FP64 relative to the products' magnitude on an RTX 5090. The tensor core's internal block sum is not specified by PTX, so the bits hold on one GPU architecture: check on yours |
@@ -47,7 +47,7 @@ blocks in increasing order and the tree is fixed whichever warp, pass, stage or 
 configuration gives the same bits (the tests check settings of every structure against the defaults; gemm-staged's
 defaults are its best configuration on the largest prompts swept). `gemm-native` is the exception: its knobs change
 which blocks the tensor core sums together, so its bits may change with them and with the token count (kernel.json
-`"row_invariant": false` and its `order`).
+`"exactness": "repeatable"` and its `order`).
 
 **`rows`** is an alias of decode-gemv's `rows-fp8-block` (kernel.json `"alias": {"kernel": "decode-gemv", "of": "rows-fp8-block"}`):
 this package's `rows()` forwards to decode-gemv's `rows_fp8_block`, built with this kernel's tuning table for `rows` (an old
@@ -181,7 +181,7 @@ gets NaN outputs (tests/test_fp8_block_rows.py checks both, and FP32 and BF16 ag
 Numerics: each MMA adds its 32-element block into the FP32 accumulator in increasing order of K, the scales applied
 once to the sum; within 1e-5 of the FP64 product relative to the products' magnitude (the block-scaled MMA's own block
 sum is not FP32 round to nearest), plus BF16's rounding with BF16 out. Not the declared order and not row invariant
-(kernel.json `"row_invariant": false`). There is no split of K and the configuration is the only thing the call's
+(kernel.json `"exactness": "repeatable"`). There is no split of K and the configuration is the only thing the call's
 token count chooses: at one configuration (a fixed max_count), an output's bits do not depend on the job's device-side
 token count or on which persistent CTA takes its tile.
 

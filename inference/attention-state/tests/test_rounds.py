@@ -305,3 +305,11 @@ class KeyRowsTests(PluginTestCase):
                                            + torch.arange(10, device=self.dev) % 16]
         want = (keys / torch.full_like(keys, 0.25)).clamp(-448, 448).to(torch.float8_e4m3fn)
         self.assertTrue(torch.equal(stored.view(torch.uint8), want.view(torch.uint8)))
+
+
+class ElasticRoundSlotTests(RoundSlotTests):
+    """The same round slots over pools whose pages lie in an elastic range (the plugin's `elastic` option)."""
+
+    def setUp(self):
+        super().setUp()
+        self.kv = self.assemble(options={"page": 16, "elastic": True})["kv_cache"]

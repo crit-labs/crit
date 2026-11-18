@@ -67,6 +67,13 @@
       ],
       "description": "on (with CUDA): each step's projection work runs as a captured prompt chunk (crit_plugins.prompt_graphs) of its rows, so a request reaches the projections plugin through replays only; skip: the captured chunk multiplies without the plugin, for the loader's checks"
     },
+    "prompt_cache": {
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 1024,
+      "description": "the ended requests' sequences kept in Core's prompt cache (crit_plugins.prompt_cache), 0 for none: a request that allows it and begins as a kept one did prefills only the rest"
+    },
     "prompt_width": {
       "type": "int",
       "default": 1,

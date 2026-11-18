@@ -10,10 +10,8 @@ a dynamic-batching backend.
 
 Use it when a grouped operation must publish per-request results safely. Core's
 [mixed scheduler](../../core/src/runtime/README.md#mixed-token-work-batches) supplies
-decode priority with prefill aging and bounded backfill, and the
-[paged batch reference](../attention-state/code/batch_attention.h) with its
-[Core example](../attention-state/code/batch_example.cpp) covers the attention part of
-such groups. Model arithmetic and kernels belong to the engine.
+decode priority with prefill aging and bounded backfill. Model arithmetic and kernels
+belong to the engine.
 
 ## How it works
 
@@ -42,13 +40,6 @@ release them after their readers settle.
   one candidate.
 - [metadata.py](code/metadata.py): `MetadataTable`, `MetadataSnapshot`,
   `MetadataReplica`, the host reference.
-- [device_metadata.h](code/device_metadata.h): the native form with the device upload. `MetadataTable`
-  (stable slots, lowest free slot reused, unchanged payloads changing nothing), `snapshot`, `diff`
-  (rows removed, rows new or changed, the gather order), and `DeviceReplica`. The replica stages the
-  changed rows in pinned host memory and has the engine copy each into its slot of the device table;
-  it uploads the order only when it changed (Core's `UploadShadow`). It alternates two staging
-  halves and reuses a half only after the copies that read it have finished.
-- [host_batch.h](code/host_batch.h): `HostBatch`, described below.
 
 ## What the engine supplies
 
@@ -119,7 +110,7 @@ assert held.rows[0].payload == b"first"
 
 Preserve the request/generation mapping, row and output bounds, borrowed versus owned
 lifetimes, and success before publication. Ordering, data structures, budgets and
-batching policy are free. [Graph reuse](../../core/src/backends/cuda/README.md#graph-capture)
+batching policy are free. Graph reuse
 must bind the same row mapping or a correctly updated indirection table; a stable
 physical row-selector table can allow reuse across logical requests at one captured
 width, but the selector only chooses storage, while row identity decides who commits.
@@ -127,48 +118,6 @@ width, but the selector only chooses storage, while row identity decides who com
 row; commit accepted states and tokens for the same requests. A native metadata replica
 needs bounded patch upload and must copy-on-write rows rather than overwrite active
 readers.
-
-## Native host pipeline
-
-[`HostBatch`](code/host_batch.h) implements Core's optional `BatchExecution` with one
-`std::async` CPU task per batch. Construct it in `prepare_batch` with copied work items,
-a worker returning `OwnedBatchRow` values, a commit callback, an optional stop callback
-and retained owners. `submit(notify)` starts the task and notifies Core; `ready` checks
-without blocking; `progress` materializes owned rows; commit is single use even if its
-callback throws; `quiesce` requests stop and joins, as does the destructor. Enable Core's
-mixed-batch and async capabilities with a bounded positive `max_inflight_batches`.
-Core's [pipeline contract](../../core/src/runtime/README.md#asynchronous-batch-pipeline)
-owns admission, completion, publication and quarantine.
-
-Workers need independent session and result storage, must not call Core callbacks
-recursively, and reserve task memory through the engine's budget. Stop callbacks must be
-idempotent; a timeout alone cannot release storage. Device execution implements the same
-contract with native events.
-
-## Dependent steps and recovery
-
-The [recurrent reference](code/recurrent_pipeline.h) integrates Core's
-[dependent execution contract](../../core/src/runtime/README.md#dependent-execution).
-Each asynchronous producer owns its recurrent state, accepted tokens and sampling
-history. A successor consumes that state through an established future before host
-publication, while Core bounds unresolved output grants and publishes steps in order.
-The example supports variable accepted widths and seeded sampling; requests requiring
-host-side context decisions explicitly fall back to depth one. Terminal predecessors
-discard descendant output, and retirement waits for physical settlement.
-
-Its bounded state pool also integrates memory preemption. A settled victim snapshots
-the complete approved state before returning its pool slot; restoration reserves the
-old state and a useful next step. The [fixtures](../../tests/inference/dependent_steps_tests.cpp)
-compare output against depth one and exercise stops, limits, cancellation, stale
-steps, failed commit, quarantine and recovery with a constrained physical pool.
-
-The optional [CUDA recurrence example](code/cuda_ahead_example.cu) uses device-carried
-state and accepted tokens, event dependencies and private readback slots. Its test
-blocks predecessor readback while a successor computes, then verifies ordered output
-against a host oracle and cancellation cleanup. Build Inference with
-`CRIT_INFERENCE_CUDA=ON` and run `crit_cuda_ahead` through CTest. Arithmetic is synthetic;
-real engines supply their own kernels, layouts, complete recovery images and private
-execution state. These examples establish integrated capabilities, not speedups.
 
 ## Costs and validation
 
@@ -182,9 +131,4 @@ completion.
 Host fixtures cover variable rows, duplicate identities, output limits, commit failures
 and independent retirement. The [portable mechanism fixtures](../../tests/test_portable_mechanisms.py)
 compare 500 metadata mutations with full reconstruction and check slot reuse, retained
-snapshots, malformed patches and stale deltas. The
-[native integration fixture](../../tests/inference/pipeline_tests.cpp) runs a full model
-adapter: a blocked producer stays alive while an independent request finishes, plus
-cancellation, refill, stale completions, failures, timeout and notification races. None
-of these establish throughput. The CUDA example qualifies only its own synthetic
-device arithmetic and dependency/readback lifetime.
+snapshots, malformed patches and stale deltas. None of these establish throughput.

@@ -36,6 +36,12 @@ Each request is recorded (loaded()), and the engine's facts carry the record und
 came from (tuned: built with the engine's tuning table; built: built with its default knobs; fallback) and, for a
 fallback, why. A tuning table swept on a GPU of another compute capability (the sweep records it) is not applied: the
 kernel is built with its default knobs, recorded as built with the reason, and stderr says so once.
+
+The engine also says how exact its rows must be (use_exactness(), from the configuration's "exactness": a level of
+crit_kernels.exactness for the decode rows and one for the prompt rows). A plugin that can compute a phase's rows in
+more than one way reads the level asked (asks("prompt")) where its own option leaves the choice open, takes the fastest
+way that keeps it, and says what its rows keep in its exactness(); Core refuses an engine whose plugin keeps less than
+the configuration asks. Where the configuration asks nothing, asks() is None and the plugin's options decide alone.
 """
 import os
 import threading
@@ -47,6 +53,7 @@ _lock = threading.RLock()   # re-entered when a kernel's alias loads its target 
 _loaded = {}     # kernel id -> the record of its last request
 _modules = {}    # (kernel id, tuning file) -> module
 _tuning = None   # the folder use_tuning() named
+_exactness = None   # the levels the engine asks ({"decode": level, "prompt": level}), None when it asks none
 
 
 def use_tuning(folder):
@@ -63,6 +70,45 @@ def tuning_file(name):
         return None
     path = folder / f"{name}.json"
     return path if path.is_file() else None
+
+
+def use_exactness(value, quality_mode=None):
+    """The exactness the engine asks of its rows (crit_kernels.exactness: declared, exact, row-exact, repeatable):
+    one level for both phases or {"decode": level, "prompt": level}; a phase left out takes the quality mode's level
+    when one is given (preserve: exact; speed: repeatable). None with no quality mode: the engine asks nothing.
+    Returns the levels asked, or None; ValueError for a level or phase that does not exist."""
+    global _exactness
+    if value is None and quality_mode is None:
+        _exactness = None
+        return None
+    from crit_kernels.exactness import setting
+    _exactness = setting(value, quality_mode)
+    return dict(_exactness)
+
+
+def exactness():
+    """The levels the engine asks, {"decode": level, "prompt": level}, or None when it asks none."""
+    return None if _exactness is None else dict(_exactness)
+
+
+def asks(phase):
+    """The level the engine asks for a phase ("decode": decode and verify rows; "prompt": prompt rows), or None when
+    it asks none: the plugin's own options then decide."""
+    if phase not in ("decode", "prompt"):
+        raise ValueError(f"exactness is asked for the decode or the prompt phase, not {phase!r}")
+    return None if _exactness is None else _exactness[phase]
+
+
+def allows(phase, level):
+    """Whether rows of this level may run in the phase: the engine asks nothing there, or asks that level or a lower
+    one. A plugin picks the fastest of its ways for which this holds."""
+    asked = asks(phase)
+    if asked is None:
+        return True
+    from crit_kernels.exactness import rank
+    if phase == "decode" and level == "exact":   # the decode rows' exact is row-exact: the bits prompts compare with
+        level = "row-exact"
+    return rank(level) >= rank(asked)
 
 
 _warned = set()   # kernels whose fallback was reported on stderr
@@ -248,5 +294,5 @@ def forget():
         _declared.clear()
 
 
-__all__ = ["SOURCES", "UNTUNED", "declared", "fallbacks", "forget", "load_kernel", "loaded", "record_fallback", "tuning_file",
-           "use_tuning"]
+__all__ = ["SOURCES", "UNTUNED", "allows", "asks", "declared", "exactness", "fallbacks", "forget", "load_kernel", "loaded",
+           "record_fallback", "tuning_file", "use_exactness", "use_tuning"]

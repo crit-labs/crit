@@ -52,8 +52,8 @@ whole 16-value blocks and reduce with a warp sum usually has this order, which a
 count isn't a multiple of the lanes.
 
 No other operation is fused or reordered. On the host, the files compile without FP contraction. On the
-device, [`dot_row_halving<L>`](code/host_nvfp4_device.cuh) and `dot_row_block<L>` use `__fmul_rn`,
-`__fmaf_rn` and a shuffle tree that pairs lanes the way the host's halving reduction does. A xor butterfly
+device, a kernel that declares this order uses `__fmul_rn`, `__fmaf_rn` and a shuffle tree that pairs lanes the
+way the host's halving reduction does (crit's kernel `int-block-experts` is one). A xor butterfly
 leaves lane 0 the same value.
 
 **Paths.** `rows_scalar` is the oracle. The portable path (`Isa::portable`, what `best_isa()` returns on a CPU without
@@ -94,11 +94,14 @@ the halving (or sequential) reduction, times post.
   change, with the FP32 rows as the drift-free order.
 - **The rest of the expert, declared too.** `quantize_e2m1x2`, `quantize_int8`, `exp_declared`, `silu_declared` and
   `swiglu_declared` use IEEE operations only (the exp is FMAs and an exact power-of-two scaling, no library `expf`), so
-  an expert's intermediate is quantized to the same codes on either processor. `host_int_device.cuh` has them for CUDA
-  and HIP, named `_device`, with `dot_row_int<L>`.
+  an expert's intermediate is quantized to the same codes on either processor.
 - **Paths.** The scalar oracle; AVX2 (vpmaddubsw) and AVX-512 with BW and VNNI (vpdpbusd), chosen at run time by
   `best_int_isa()`. A host store may keep experts in `Layout::interleaved` (`interleave_row`): a vector lane then
   holds one block, so the block sums need no reduction inside a vector. Every path and layout gives the oracle's bits.
+  On AVX-512 the E2M1 quantizer and the SwiGLU run 16 values at a time too (`quantize_e2m1x2(Isa, ...)`,
+  `swiglu_rows`), a group's weight scales come by one gather and a row's lanes reduce in registers: each the scalar
+  function's IEEE operations in its order, so every lane holds the scalar result (a CPU expert of 2.78 MB took 440 us
+  on one thread before and 328 after; six threads then read host memory as fast as it gives random experts).
 - **Kernels.** crit's kernel `int-block-experts` (`kernels/techniques/experts/int-block-experts`, built for the engine's device,
   tuned or default knobs, none of which changes a bit) runs the same order on the device
   ([operations.json](operations.json) says how to check one):
@@ -126,7 +129,9 @@ TwoSum's exact error, the FP64 sum rounded to FP32 and moved one step where it l
 On CUDA (`devices` also names `cuda`: matrices whose stored tensors are CUDA tensors) the same W4A4 and W4A8 matrices
 run on crit's kernel `int-block-experts` ([code/device_int.py](code/device_int.py)): decode rows (calls of up to 16
 rows) on its `rows`, the declared integer block order, every output the CPU rows' bits; prompt rows by option
-`prompt_gemm`: `native` (the default) runs W4A4 prompt rows on its `gemm-native` (the activations by its
+`prompt_gemm` (`auto`, the default, is `declared` where the engine asks `row-exact` or higher of its prompt rows and
+`native` otherwise, [exactness](../../docs/PLUGINS.md#exactness)): `native` runs W4A4 prompt rows on its
+`gemm-native` (the activations by its
 `quantize_nvfp4`, the declared quantizer's codes and scale bytes; block-scaled FP4 MMAs on sm_120a for NVFP4 weights, the
 s8 MMA a 16-block for INT4 weights), accumulated in the tensor cores: not the declared order, not row invariant and
 not the CPU rows' bits (the facts' `row_invariance` `prompt_rows` false), within 2e-6 of the FP64 product of the same
@@ -145,10 +150,7 @@ rows' bits and the native bound.
 | [`host_isa.h`](code/host_isa.h), [`host_isa.cpp`](code/host_isa.cpp) | `Isa`, `supported`, `best_isa`: cpuid/xgetbv detection shared with other host paths that compile AVX2 and AVX-512 files (`crit_inference_isa_sources`) |
 | [`host_nvfp4_avx2.cpp`](code/host_nvfp4_avx2.cpp), [`host_nvfp4_avx512.cpp`](code/host_nvfp4_avx512.cpp) | The two SIMD paths, bitwise equal to the oracle |
 | [`host_nvfp4_portable.inc`](code/host_nvfp4_portable.inc) | The portable rows, compiled for the baseline target and again with AVX2 and AVX-512 |
-| [`host_nvfp4_device.cuh`](code/host_nvfp4_device.cuh) | `dot_row_halving_format` and `dot_row_block_format<lanes, bits, block>` for any format, and the NVFP4 `dot_row_halving` and `dot_row_block`: the device side of both products with the halving reduction, one source for CUDA and HIP |
-| [`host_nvfp4_device.metal`](code/host_nvfp4_device.metal) | The same functions in the Metal Shading Language, for a library built with fast math off |
 | [`host_int.h`](code/host_int.h), [`host_int.cpp`](code/host_int.cpp), [`host_int_avx2.cpp`](code/host_int_avx2.cpp), [`host_int_avx512.cpp`](code/host_int_avx512.cpp) | The integer block order: `IntMatrix` (rows or interleaved), `IntActs`, `dot_rows_int`, `interleave_row`, the declared quantizers, exp, SiLU and SwiGLU; scalar oracle, AVX2 and AVX-512 VNNI paths, bitwise equal |
-| [`host_int_device.cuh`](code/host_int_device.cuh) | `dot_row_int<L>` and the declared functions on CUDA and HIP |
 | [`implementation.py`](code/implementation.py) | Exact FP32 reference of the declared order (one rounding per operation), standard library only |
 | [`host_capi.cpp`](code/host_capi.cpp) | A C interface over the rows, quantizers, SwiGLU and the route-order combine, for ctypes |
 | [`native.py`](code/native.py) | Builds the host rows (and a technique's own C++ beside them) into a shared library at load; `NativeUnavailable` without a compiler |
@@ -251,10 +253,7 @@ reductions and the two lane counts give different bits on most rows, and that ev
 reference's known answers for inputs from a portable generator. It passes with MSVC on Windows and GCC on
 Linux.
 
-The [CUDA fixture](../../tests/inference/host_nvfp4_cuda_tests.cu) checks 1408 `scaled_elements` rows and 1152
-`block_dot` rows, 512 to 4096 columns, on an RTX 5090 against the oracle and every host path: the device
-functions matched all of them bitwise, while a plainly written device loop, which nvcc may contract, differed
-on most. In one MoE engine on that machine, using these rows for its CPU-computed misses in place of its own
+In one MoE engine on that machine, using these rows for its CPU-computed misses in place of its own
 AVX-512 code (the same declared order) gave token-identical output in every run; decode was within 3% and
 short-prompt first tokens about 16% slower than the engine's hand-tuned rows. In a second MoE engine, whose kernels use the
 `block_dot` order and whose checkpoint stores CSF-encoded scales, `block_dot` rows through a scale hook for

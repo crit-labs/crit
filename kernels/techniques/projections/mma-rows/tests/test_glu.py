@@ -7,7 +7,7 @@ import torch
 
 from test_mma_rows import FORMATS, INPUT_SCALE, activations, buffers, dev, matrix, mr, to_blocked
 
-FP4 = pytest.mark.skipif(not mr.fp4_mma(torch.empty(1, device=dev)), reason="no FP4 MMA on this device or build")
+FP4 = pytest.mark.skipif(not mr.fp4_mma(dev), reason="no FP4 MMA on this device or build")
 
 
 def interleaved(weights, gate, up, blocked):

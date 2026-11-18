@@ -15,6 +15,16 @@
     "cpu"
   ],
   "options": {
+    "prompt_rows": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "chunked",
+        "scan"
+      ],
+      "description": "which prompt rows run the exact column scan: auto (the default), the faster way that keeps the level the engine's configuration asks of its prompt rows (exactness, docs/PLUGINS.md#exactness): chunked where it asks repeatable or nothing, scan where it asks row-exact, exact or declared; chunked, rows of up to exact_rows tokens the scan and longer ones the chunked kernel (a long row's bits follow the prompt's length and chunking); scan, every prompt row the scan whatever its length (the bits of decoding its tokens one by one, the slowest prefill); with fla set, auto keeps fla's chunked kernel"
+    },
     "exact_rows": {
       "type": "int",
       "default": 512,
@@ -64,6 +74,11 @@
       "type": "bool",
       "default": false,
       "description": "prompt rows past exact_rows through fla's chunked gated-delta kernel (where fla is installed) instead of recurrent-scans' chunked prefill: a library's kernel, a yardstick only"
+    },
+    "elastic": {
+      "type": "bool",
+      "default": false,
+      "description": "device form: what the pools keep per sequence (states, stash, convolution window and stash) in a paged range of the device's memory (crit_plugins.memory): a sequence's entries of every layer are backed when the sequence opens and goes back once the sequences past it closed, the device's givers (expert-offload's cache) holding the rest meanwhile. A pool sized for every sequence an engine may serve at once then takes device memory for those that are open"
     }
   },
   "kernels": [

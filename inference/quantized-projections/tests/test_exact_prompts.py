@@ -70,6 +70,7 @@ class ExactPromptTests(PluginTestCase):
             facts = plugin.facts()
             self.assertEqual(facts["row_invariance"]["prompt_exact"], True, (format, options))
             self.assertEqual(facts["row_invariance"]["prompt_rows"], True)
+            self.assertEqual(plugin.exactness(), {"decode": "row-exact", "prompt": "exact"}, (format, options))
             arithmetic = facts["prompt_arithmetic"][format.split(":")[0]]
             self.assertEqual(arithmetic["activations"], facts["decode_activations"][format.split(":")[0]]
                              if format != "bf16" else "bf16", (format, options, facts))
@@ -82,6 +83,55 @@ class ExactPromptTests(PluginTestCase):
         found = plugin.matmul(x, m, torch.float32)
         alone = torch.cat([plugin.matmul(x[r:r + 1].clone(), m, torch.float32) for r in range(2048)])
         self.assertTrue(torch.equal(found, alone))
+
+    def test_w4a4_rows_on_the_fp4_mma_keep_their_decode_bits_in_prompts(self):
+        """gemv fp4: W4A4 decode rows on the block-scaled FP4 MMA, their prompt rows through mma-rows' FP4 prompt tile
+        with the same bits, in any chunk and past a scratch's rows; a matrix the FP4 MMA does not take keeps the tile."""
+        torch = self.torch
+        if not self.nvfp4.mma("cuda").fp4_mma(torch.device("cuda")):
+            self.skipTest("the FP4 MMA runs on the sm_120 family")
+        plugin = self.assemble(options={"prompt_gemm": "tile", "gemv": "fp4"}, context=OnCuda())["projections"]
+        for n, k in SHAPES:
+            with self.subTest(shape=(n, k)):
+                m = plugin.load(self.stored("nvfp4", n, k), "nvfp4")
+                self.assertEqual((m.path, m.gemm, m.prompt_kernel), ("mma_fp4", "tile", "mma-rows fp4-prompt-tile"))
+                x = torch.randn(1100, k, generator=self.g).cuda().to(torch.bfloat16)
+                for out in (torch.float32, None):
+                    alone = torch.cat([plugin.matmul(x[r:r + 1].clone(), m, out) for r in range(300)])
+                    for rows in (17, 64, 65, 129, 300):
+                        self.assertTrue(torch.equal(plugin.matmul(x[:rows], m, out), alone[:rows]), ((n, k), rows, out))
+                    decode = torch.cat([plugin.matmul(x[r:r + 16], m, out) for r in range(0, 288, 16)])
+                    self.assertTrue(torch.equal(decode, alone[:288]), "decode calls of 16 rows")
+                long = plugin.matmul(x, m)
+                self.assertTrue(torch.equal(long[:300], plugin.matmul(x[:300], m)))
+                self.assertTrue(torch.equal(long[1000:], torch.cat([plugin.matmul(x[r:r + 1].clone(), m)
+                                                                    for r in range(1000, 1100)])))
+                del m
+        other = plugin.load(self.stored("fp8:channel", 1024, 2048), "fp8:channel")
+        self.assertEqual((other.path, other.gemm), ("mma", "tile"))
+        self.assertEqual(plugin.facts()["row_invariance"]["prompt_exact"], True)
+
+    def test_an_engine_that_asks_exact_prompt_rows_gets_the_prompt_tile_by_auto(self):
+        """prompt_gemm auto under the configuration's exactness: exact prompt rows run the prompt tile with the
+        decode rows on the tile, row-exact ones the pinned GEMMs, and with nothing asked auto is the native GEMMs."""
+        from crit_plugins import kernels
+        self.addCleanup(kernels.use_exactness, None)
+        torch = self.torch
+        kept = {}
+        for asked in ("exact", "row-exact", None):
+            kernels.use_exactness(asked and {"decode": "row-exact", "prompt": asked})
+            plugin = self.assemble(context=OnCuda())["projections"]
+            m = plugin.load(self.stored("fp8:channel", 1024, 2048), "fp8:channel")
+            kept[asked] = (m.gemm, plugin.exactness())
+            if asked == "exact":
+                x = torch.randn(40, 2048, generator=self.g).cuda().to(torch.bfloat16)
+                alone = torch.cat([plugin.matmul(x[r:r + 1].clone(), m) for r in range(40)])
+                self.assertTrue(torch.equal(plugin.matmul(x, m), alone))
+            del m
+        self.assertEqual(kept["exact"], ("tile", {"decode": "row-exact", "prompt": "exact"}))
+        self.assertEqual(kept["row-exact"][1], {"decode": "row-exact", "prompt": "row-exact"})
+        self.assertEqual(kept[None][1]["decode"], "row-exact")
+        self.assertIn(kept[None][1]["prompt"], ("repeatable", "row-exact"))   # row-exact where the GEMM kernels are not here
 
     def test_without_the_prompt_tile_the_facts_say_prompt_rows_are_not_exact(self):
         torch = self.torch

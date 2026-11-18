@@ -87,6 +87,7 @@ class PinnedTests(PluginTestCase):
                 self.assertEqual(kernels.loaded()[name]["source"], "built", name)
                 self.assertIn("quantized-projections", kernels.loaded()[name]["plugins"])
             self.assertTrue(plugin.facts()["row_invariance"]["prompt_rows"], (format, options))
+            self.assertEqual(plugin.exactness(), {"decode": "row-exact", "prompt": "row-exact"}, (format, options))
             x = torch.randn(4096, k, generator=self.g).cuda().to(torch.bfloat16)
             for out in (None, torch.float32):
                 with self.subTest(format=format, options=options, out=out):
@@ -187,6 +188,7 @@ class PinnedTests(PluginTestCase):
         provider = self.assemble(options={"prompt_gemm": "provider"}, context=OnCuda())["projections"]
         provider.load(self.stored("nvfp4", 256, 256), "nvfp4")
         self.assertFalse(provider.facts()["row_invariance"]["prompt_rows"])
+        self.assertEqual(provider.exactness(), {"decode": "row-exact", "prompt": "repeatable"})
 
     def test_the_pinned_workspace_is_declared(self):
         plugin = self.registry()["quantized-projections"]

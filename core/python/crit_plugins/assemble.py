@@ -10,6 +10,7 @@ import types
 
 from .manifest import HOST, ID, MANIFEST, REQUIRED_SLOTS, SLOT, SLOTS, PluginError, load_manifest, options_for
 from .device import DEVICE_EXTENSIONS, POOL_EXTENSIONS, device_missing, extension_missing
+from .memory import device_bytes, device_memory, release_cached   # noqa: F401 - the loader reads them from here too
 from .observe import PLUGIN_MODULES, Observed, unobserve
 
 # The DEVICE_EXTENSIONS facts whose methods live on an object the device form returns (a pool), which the assembly cannot
@@ -404,6 +405,42 @@ class Assembly:
         kernels = {name: record for name, record in loaded().items() if set(record.get("plugins") or ()) & set(self.order)}
         if kernels:
             found["kernels"] = kernels
+        # The exactness the engine asks and what its plugins' rows keep (exactness()).
+        kept = self.exactness()
+        if kept is not None:
+            found["exactness"] = kept
+        return found
+
+    def exactness(self):
+        """The exactness of the engine's rows (crit_kernels.exactness's levels): {"asked": the levels the
+        configuration asks per phase (crit_plugins.kernels.exactness()) or None, "decode" and "prompt": the lowest
+        level any plugin keeps there, "plugins": {plugin id: {phase: level}}}, from each plugin object's optional
+        exactness() (the level its rows keep as it is loaded, a phase it computes nothing in left out). None where
+        the configuration asks nothing and no plugin states a level; a phase no plugin states is left out. A level
+        that does not exist is the plugin's error (PluginError)."""
+        from .kernels import exactness as asked_levels
+        asked, plugins = asked_levels(), {}
+        for plugin_id in self.order:
+            report = getattr(self.instances.get(plugin_id), "exactness", None)
+            stated = dict(report() or {}) if callable(report) else {}
+            if stated:
+                plugins[plugin_id] = stated
+        if asked is None and not plugins:
+            return None
+        found = {"asked": asked}
+        if plugins:
+            from crit_kernels.exactness import LEVELS, PHASES
+            for plugin_id, stated in plugins.items():
+                wrong = [f"{phase}: {level}" for phase, level in stated.items()
+                         if phase not in PHASES or level not in LEVELS]
+                if wrong:
+                    raise PluginError(f"{plugin_id}: exactness() states {', '.join(wrong)}: a level ({', '.join(LEVELS)}) "
+                                      f"per phase ({', '.join(PHASES)})")
+            for phase in PHASES:
+                levels = [stated[phase] for stated in plugins.values() if phase in stated]
+                if levels:
+                    found[phase] = min(levels, key=LEVELS.index)
+            found["plugins"] = plugins
         return found
 
     def telemetry(self):
@@ -452,6 +489,20 @@ class Assembly:
             raise failure
 
 
+def exactness_shortfalls(report):
+    """Where an engine's plugins keep less than its configuration asks, as sentences ([] where they keep it, or
+    nothing is asked): report is Assembly.exactness(). For the decode rows exact and row-exact are one level."""
+    asked = (report or {}).get("asked")
+    if not asked:
+        return []
+    from crit_kernels.exactness import LEVELS
+    def rank(phase, level):
+        return LEVELS.index("row-exact" if phase == "decode" and level == "exact" else level)
+    return [f"{plugin_id} keeps its {phase} rows {stated[phase]} where the configuration's exactness asks {asked[phase]}"
+            for plugin_id, stated in (report.get("plugins") or {}).items() for phase in asked
+            if phase in stated and rank(phase, stated[phase]) < rank(phase, asked[phase])]
+
+
 def _measure(assembly, plugin_id, held, now, plans):
     """The device memory plugin_id's factory took (now - held) beyond the placement plans made while it ran, into
     assembly.measured; a plugin that took more than its memory() declares, DECLARED_SLACK aside, is refused."""
@@ -474,8 +525,11 @@ class _Parts:
     has run its checks (Assembly.unobserve). slots(), plugin(slot) and facts(slot) tell what fills each slot and the
     facts its plugin provides, which a model plugin's round driver checks (crit_plugins.rounds.round_problems)."""
 
-    def __init__(self, use, instances, calls=None, registry=None):
+    def __init__(self, use, instances, calls=None, registry=None, context=None):
         self._use, self._instances, self._calls, self._registry = use, instances, calls, registry
+        # The engine's context, as every factory got it: Core's drivers find the engine's own services there (its
+        # graph pool: crit_plugins.rounds, crit_plugins.prompt_graphs).
+        self.context = context
         # The loader's call counter (None without one): a driver that captures graphs over these parts counts its
         # replays there as the calls its captures made (crit_plugins.observe.Calls.replayed).
         self.observer = calls
@@ -514,40 +568,6 @@ class _Parts:
 # it ran: small tables, the allocator's rounding and a math library's workspace (a first matrix product on a CUDA
 # stream takes 32 MiB), as a share of the declaration plus a fixed amount.
 DECLARED_SLACK = (0.05, 64 << 20)
-
-
-def device_bytes(device="cuda"):
-    """The bytes torch holds allocated on every CUDA device of the process, or None where Core cannot read them (another
-    device, no CUDA, torch not loaded by a plugin). It never initializes CUDA."""
-    torch = sys.modules.get("torch")
-    if device != "cuda" or torch is None or not torch.cuda.is_available():
-        return None
-    return sum(torch.cuda.memory_allocated(i) for i in range(torch.cuda.device_count()))
-
-
-def device_memory(device="cuda"):
-    """{"allocated": bytes, "reserved": bytes} torch holds on every CUDA device of the process (reserved: what its
-    caching allocator took from the device, allocated within it), or None where they cannot be read, as device_bytes.
-    It never initializes CUDA."""
-    torch = sys.modules.get("torch")
-    if device != "cuda" or torch is None or not torch.cuda.is_available():
-        return None
-    devices = range(torch.cuda.device_count())
-    return {"allocated": sum(torch.cuda.memory_allocated(i) for i in devices),
-            "reserved": sum(torch.cuda.memory_reserved(i) for i in devices)}
-
-
-def release_cached(device="cuda"):
-    """Hand the device back what torch's caching allocator holds and nothing uses (a load's temporaries: checkpoint
-    conversions, warm-ups), where torch is loaded and the device is CUDA: returns the bytes released, or None where the
-    device's memory cannot be read. Live tensors stay where they are."""
-    before = device_memory(device)
-    if before is None:
-        return None
-    torch = sys.modules["torch"]
-    if torch.cuda.is_initialized():
-        torch.cuda.empty_cache()
-    return max(0, before["reserved"] - device_memory(device)["reserved"])
 
 
 def _device_planned(plans):
@@ -592,7 +612,7 @@ def assemble(selection, registry, context=None, facts=(), budget=None, device=No
                               f"{limit / 2**30:.2f} GiB ({shares})")
     instances = {}
     assembly = Assembly(use, order, options, instances, memory)
-    parts = assembly.parts = _Parts(use, instances, observe, registry)
+    parts = assembly.parts = _Parts(use, instances, observe, registry, context)
     measure = measure or device_bytes
     try:
         for plugin_id in order:

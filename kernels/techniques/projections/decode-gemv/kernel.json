@@ -49,7 +49,7 @@
         "N",
         "K"
       ],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "WARPS": {
           "values": [
@@ -122,7 +122,7 @@
         "N",
         "K"
       ],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "WARPS": {
           "values": [
@@ -196,7 +196,7 @@
         "N",
         "K"
       ],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "WARPS": {
           "values": [
@@ -262,7 +262,7 @@
         "N",
         "K"
       ],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "WARPS": {
           "values": [
@@ -327,7 +327,7 @@
         "N",
         "K"
       ],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "MUL": {
           "values": [
@@ -421,7 +421,7 @@
         "N",
         "K"
       ],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "BLOCK_N": {
           "values": [
@@ -492,7 +492,7 @@
         "N",
         "K"
       ],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "BN": {
           "values": [
@@ -569,7 +569,7 @@
         "N",
         "K"
       ],
-      "row_invariant": true,
+      "exactness": "declared",
       "knobs": {
         "THREADS": {
           "values": [
@@ -629,7 +629,7 @@
         "N",
         "K"
       ],
-      "row_invariant": true,
+      "exactness": "declared",
       "knobs": {
         "WARPS": {
           "values": [
@@ -666,6 +666,7 @@
     },
     "decode-nvfp4": {
       "what": "the decoders (Triton): an NVFP4 matrix's values in BF16/FP16, or as FP8 rows in units of a row scale, one FP32 product rounded once; elementwise, nothing to tune",
+      "exactness": "row-exact",
       "call": "decode"
     }
   }

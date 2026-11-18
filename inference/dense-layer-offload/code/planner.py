@@ -1,4 +1,4 @@
-"""Host model of the layer placement planner (offload_plan.h).
+"""The layer placement planner.
 
 A layer is resident on the device, streamed through one of two device staging slots, or executed on the host. With
 measured rates (GB/s = bytes per ns): a resident layer costs bytes / device_gbs; a streamed layer costs

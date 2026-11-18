@@ -201,6 +201,23 @@ class PromptGraphTests(unittest.TestCase):
             self.assertGreater(prompts.costs[bucket]["graph_ns"], 0)
 
     @unittest.skipIf(not CUDA, "no CUDA device")
+    def test_buckets_capture_into_the_engines_pool_where_their_parts_carry_one(self):
+        import types
+        from crit_plugins import memory
+        engine = types.SimpleNamespace(graphs=memory.of("cuda").pool("core", "graphs"))
+        parts = Parts(USE, FACTS)
+        parts.context = engine                                  # as Core's loader hands a factory its parts
+        prompts = self.build("cuda", buckets=(16, 64), parts=parts)
+        self.assertEqual(prompts.prepare(), [16, 64])
+        self.compare(prompts, lambda p, s, f, chunk: p.run(s, f, chunk).clone())   # one pool, the same outputs
+        self.assertEqual({tuple(prompts.graphs[b][0].pool()) for b in (16, 64)}, {tuple(engine.graphs)})
+        own = self.build("cuda", buckets=(16, 64), parts=parts, share_pool=False)
+        own.prepare()
+        pools = {tuple(own.graphs[b][0].pool()) for b in (16, 64)}
+        self.assertEqual(len(pools), 2)                         # share_pool False: a pool a bucket
+        self.assertNotIn(tuple(engine.graphs), pools)
+
+    @unittest.skipIf(not CUDA, "no CUDA device")
     def test_the_offers_carry_the_buckets_steady_replay_times(self):
         import statistics
         import time

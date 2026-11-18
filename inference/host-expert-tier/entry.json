@@ -1,14 +1,14 @@
 {
   "id": "host-expert-tier",
   "category": "experts",
-  "summary": "A ready CPU expert tier: one layer's CPU-computed routed experts in the integer block order (the device's bits), split over a pinned worker pool, served from a host-work-mailbox payload",
+  "summary": "A ready CPU expert tier: one layer's CPU-computed routed experts in the integer block order (the device's bits), split over the host's pinned worker pool (Core's), served from a handoff's payload",
   "implementation_status": "native_source",
-  "implementation_scope": "C++20 ExpertPool (one thread per physical core minus the caller's, pinned on Linux; flat batches with epoch-tagged lock-free claims; spin then sleep) and HostExpertTier (an expert table over bundles read in place, routes grouped by expert in chunks of up to 8 tokens, gate/up rows with the declared SwiGLU and intermediate quantization in one pooled phase, down rows, per-row posts, FP32 inputs quantized per route by each expert's declared quantizer, unweighted per-route rows), the mailbox payloads and crit_tier_serve, a C interface for ctypes; the experts slot's device form on the CPU (cpu_tier.py, bundles.py) over the native tier or host-expert-arithmetic's torch declared order. The device's post and join live in heterogeneous-expert-dispatch.",
+  "implementation_scope": "C++20 HostExpertTier on the host's worker pool, which is Core's (crit_plugins.host, pool.h: one thread per physical core minus the caller's, pinned on Linux; flat batches with epoch-tagged lock-free claims; spin then sleep) (an expert table over bundles read in place, routes grouped by expert in chunks of up to 8 tokens, gate/up rows with the declared SwiGLU and intermediate quantization in one pooled phase, down rows, per-row posts, FP32 inputs quantized per route by each expert's declared quantizer, unweighted per-route rows), the mailbox payloads and crit_tier_serve, a C interface for ctypes; the experts slot's device form on the CPU (cpu_tier.py, bundles.py) over the native tier or host-expert-arithmetic's torch declared order. The device's post and join live in heterogeneous-expert-dispatch.",
   "agent_guidance": {
     "use_when": "Experts do not all fit on the device and crit eval probe's CPU expert lane, alone or beside the link, beats copying misses over the link (recon's placement prints both); start candidate 1 on it there",
     "avoid_when": "Every expert fits on the device, or the probed lane and a measured layer give the CPU no share on the target machine",
     "provides": [
-      "ExpertPool: one worker per physical core minus the caller's, pinned, flat batches claimed with one compare-and-swap of an epoch-tagged word, spin then yield then sleep, a task's exception rethrown after the batch drains",
+      "The host's pool (Core's): one worker per physical core minus the caller's, pinned, flat batches claimed with one compare-and-swap of an epoch-tagged word, spin then yield then sleep; a task's exception is rethrown after the batch drains (PoolRef)",
       "HostExpertTier::compute: a layer's CPU routes, each expert's rows read once for all of its tokens (up to 8 a chunk), rows split over the pool, bitwise equal to a serial computation for any pool size, ISA or store layout",
       "The expert composition declared end to end: host_int's integer rows, swiglu_declared and the intermediate's declared quantizer (E2M1 x 2 or INT8), so the device's kernels give the same bits",
       "A host-work-mailbox payload of FP32 token rows (route keys and tokens, the rows, room for the outputs: input_layout) and crit_tier_serve, the mailbox handler that serves it",
@@ -33,14 +33,6 @@
   "code_path": "inference/host-expert-tier/code",
   "code_files": [
     {
-      "path": "inference/host-expert-tier/code/expert_pool.h",
-      "purpose": "ExpertPool, PoolOptions and physical_cores"
-    },
-    {
-      "path": "inference/host-expert-tier/code/expert_pool.cpp",
-      "purpose": "Epoch-tagged claims, pinning from sysfs, spin/yield/sleep parking"
-    },
-    {
       "path": "inference/host-expert-tier/code/host_tier.h",
       "purpose": "TierExpert, TierBatch, HostExpertTier, the payload layout, interleave_matrix, TierStats"
     },
@@ -54,7 +46,7 @@
     },
     {
       "path": "inference/host-expert-tier/code/tier_capi.cpp",
-      "purpose": "A C interface over the tier and its pool, and crit_tier_serve, the host-work-mailbox handler"
+      "purpose": "A C interface over the tier (given the host pool's entry and handle), and crit_tier_serve, the handler of a handoff"
     },
     {
       "path": "inference/host-expert-tier/code/bundles.py",
@@ -71,20 +63,17 @@
     "workload": "Decode and verify rounds whose expert misses measured dispatch gives the CPU"
   },
   "contract": {
-    "input": "TierExperts sharing [2 * inter][hidden] and [hidden][inter] (an expert table filled by set_expert, views of bundles the engine keeps), an ExpertPool, and per call a TierBatch (quantized inputs), an InputBatch (FP32 token rows) or a mailbox payload of FP32 rows",
+    "input": "TierExperts sharing [2 * inter][hidden] and [hidden][inter] (an expert table filled by set_expert, views of bundles the engine keeps), the host's pool (a PoolRef), and per call a TierBatch (quantized inputs), an InputBatch (FP32 token rows) or a handoff payload of FP32 rows",
     "output": "Each route's unweighted expert output row in FP32, bitwise equal to the declared arithmetic computed serially",
-    "ownership": "Views only: the engine owns the experts, the payload and the outputs; the pool's threads live with the pool",
+    "ownership": "Views only: the engine owns the experts, the payload and the outputs; the pool is the host's (Core's)",
     "failure": "Mismatched expert shapes, an unsupported ISA, a bad batch geometry or an expert id out of range throw std::invalid_argument; a task's exception is rethrown by the pool after its batch drains",
-    "core_boundary": "No Core change; engines own the pool and the tier beside their mailbox"
+    "core_boundary": "The pool and the handoff are Core's (crit_plugins.host); the engine owns the tier"
   },
   "dependencies": [
     "host-expert-arithmetic's host_int.h integer rows (crit_host_nvfp4)",
     "C++20 standard library and threads"
   ],
   "symbols": [
-    "crit::techniques::host_tier::ExpertPool",
-    "crit::techniques::host_tier::PoolOptions",
-    "crit::techniques::host_tier::physical_cores",
     "crit::techniques::host_tier::HostExpertTier",
     "crit::techniques::host_tier::TierExpert",
     "crit::techniques::host_tier::TierBatch",

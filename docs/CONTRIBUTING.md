@@ -28,7 +28,7 @@ release is out, naming the version it shipped in.
 
 | Folder | Responsibility |
 | --- | --- |
-| `core/` | C++ request lifecycle, scheduling, resources and retirement; text, sampling, state cache, file and model libraries; the `crit_core` Python package (`python/`) |
+| `core/` | C++ request lifecycle, scheduling, resources and retirement, with its text, file and structured-output libraries; the `crit_core` and `crit_plugins` Python packages (`python/`) |
 | `inference/` | Reusable technique descriptions, contracts and code |
 | `kernels/` | Kernel inspection/retention, the `crit_kernels` package behind `crit kernels`, integration examples |
 | `models/` | Weight transforms (PTQ), their recipes and records, the `crit_models` package behind `crit models` |
@@ -79,7 +79,7 @@ a clean snapshot:
 mkdir -p build/package-source
 git archive HEAD | tar -x -C build/package-source
 python -B -c "import os; from setuptools.build_meta import build_sdist, build_wheel; os.chdir('build/package-source'); build_sdist('../dist'); build_wheel('../dist')"
-python -m pip install build/dist/crit-0.19.0-py3-none-any.whl
+python -m pip install build/dist/crit-0.20.0-py3-none-any.whl
 ```
 
 The `crit` wheel holds `crit`, `crit_api`, `crit_kernels`, `crit_mcp`, `crit_models` and `crit_smoke`, and

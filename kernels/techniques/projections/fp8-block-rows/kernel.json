@@ -37,7 +37,7 @@
         "N",
         "K"
       ],
-      "row_invariant": true,
+      "exactness": "declared",
       "knobs": {
         "WARPS": {
           "values": [
@@ -93,7 +93,7 @@
         "N",
         "K"
       ],
-      "row_invariant": true,
+      "exactness": "declared",
       "knobs": {
         "WARPS": {
           "values": [
@@ -148,7 +148,7 @@
         "N",
         "K"
       ],
-      "row_invariant": true,
+      "exactness": "declared",
       "knobs": {
         "BM": {
           "values": [
@@ -231,7 +231,7 @@
         "N",
         "K"
       ],
-      "row_invariant": false,
+      "exactness": "repeatable",
       "knobs": {
         "TM": {
           "values": [
@@ -323,7 +323,7 @@
         "N",
         "K"
       ],
-      "row_invariant": false,
+      "exactness": "repeatable",
       "knobs": {
         "TM": {
           "values": [
@@ -416,7 +416,7 @@
         "N",
         "K"
       ],
-      "row_invariant": false,
+      "exactness": "repeatable",
       "knobs": {
         "TM": {
           "values": [

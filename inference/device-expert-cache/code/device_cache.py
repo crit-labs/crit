@@ -1,4 +1,4 @@
-"""Host reference of the device expert cache directory (same rules as device_cache.cu).
+"""Host reference of the device expert cache directory.
 
 A plan for one routed group pins every resident expert first, then admits each miss
 in route order with a clock: starting at the hand, a slot pinned by this plan is

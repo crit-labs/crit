@@ -190,6 +190,39 @@ def test_an_e4m3_cache_matches_float64_over_its_stored_values_and_keeps_a_tokens
                                                  (torch.int32, torch.int32, torch.int64)), 1, 64, rank=512)
 
 
+@pytest.mark.parametrize("rank,rope,heads,page,fp8", [(512, 64, 16, 64, False), (512, 64, 128, 16, False),
+                                                     (128, 32, 20, 16, False), (512, 64, 16, 64, True)])
+def test_a_fused_launch_has_the_split_launchs_bits(rank, rope, heads, page, fp8):
+    """attend(fused=True) folds a tile's partitions in the reading program: every token's output and log-sum-exp are
+    the split launch's bit for bit (rows of several lengths, sinks), and a prompt chunk read as windows of 64 columns
+    has the bits of its tokens decoded one by one."""
+    cache = (Fp8Cache if fp8 else Cache)(rank, rope, page, [700, 300, 2100], seed=4)
+    width = rank + rope
+    q = _q(24, heads, width, 6)
+    sinks = torch.randn(heads, generator=torch.Generator().manual_seed(7)).to(dev)
+    found = {}
+    for fused in (False, True):
+        lse = torch.empty(24, heads, device=dev)
+        out = cache.attend(q, [0, 1, 2], [0, 8, 16], [690, 290, 2090], 8, lse=lse, sinks=sinks, fused=fused)
+        found[fused] = (out, lse)
+    assert torch.equal(found[True][0], found[False][0])
+    assert torch.equal(found[True][1].view(torch.int32), found[False][1].view(torch.int32))
+    chunk = _q(150, heads, width, 9)
+    counts = torch.tensor([64, 64, 22], dtype=torch.int32, device=dev)
+    windows = cache.attend(chunk, [2, 2, 2], [0, 64, 128], [1900, 1964, 2028], 64, counts=counts, fused=True)
+    for t in (0, 1, 63, 64, 100, 127, 128, 149):
+        alone = cache.attend(chunk[t:t + 1], [2], [0], [1900 + t], 1, fused=False)
+        assert torch.equal(alone[0], windows[t]), t
+    # None: the split launch for a decode row, the fused one where the partials would not fit PARTIAL_BYTES.
+    limit = la.PARTIAL_BYTES
+    try:
+        la.PARTIAL_BYTES = 0
+        auto = cache.attend(q, [0, 1, 2], [0, 8, 16], [690, 290, 2090], 8, sinks=sinks)
+    finally:
+        la.PARTIAL_BYTES = limit
+    assert torch.equal(auto, found[False][0])
+
+
 @pytest.mark.parametrize("rank,rope,heads,page", [(512, 64, 16, 64), (512, 64, 128, 16), (128, 32, 20, 16)])
 def test_prompt_chunks_match_float64_latent_attention(rank, rope, heads, page):
     cache = Cache(rank, rope, page, [900], seed=11)

@@ -69,19 +69,13 @@ parent's prediction and its parent stands; siblings hold distinct tokens), write
 keeps, and the logits rows each emitted token's log-probability is read from) and rewrites the round's predictions in
 path order, so what the driver reads by column afterwards (a truncation, the result block) is the path's. Its buffers
 (parents, depths, path) are the plugin's own, reserved once. The verify pass needs ancestor masks in attention (`attention:tree`); in a sampled round each node predicts
-the target's own draw at its depth (token-sampling's `predictions_device` over `view.tree_depths`). draft_tree.cu's kernels (over
-device-speculative-round's control block) are not needed by it.
+the target's own draw at its depth (token-sampling's `predictions_device` over `view.tree_depths`).
 
 ## What the code supplies
 
 | File | Supplies |
 | --- | --- |
 | [tree.py](code/tree.py) | Host reference: `expand`, `draft` (EAGLE-2 candidates and the kept tree), `build`, `chain`, `accept`, `compaction`, `apply`, `draft_rank` and `DraftRanks` |
-| [draft_tree.h](code/draft_tree.h) / [draft_tree.cu](code/draft_tree.cu) | CUDA `enqueue_expand` (top-`branch` children with log-softmax scores, fixed candidate order), `enqueue_select` (beam or kept nodes by score, index tie-break), `enqueue_build` (tokens, parents, masks, depths, padding nodes), `enqueue_tree_accept` (device-round control and packed-result contract), `enqueue_compact`, `enqueue_settle` and `enqueue_draft_ranks` (per-position rank histogram) |
-
-`device_round::RoundSteps::accept` lets [device-speculative-round](../device-speculative-round/README.md)
-run the tree walk in its Finish graph instead of the greedy kernel, with the same control
-block, truncation and single readback.
 
 ## What the engine supplies
 
@@ -168,12 +162,6 @@ columns instead of `K + 1`, small selection kernels and the row moves of compact
 `depth` rows per array). The kernels are reference speed; `enqueue_expand` makes `branch`
 passes over each frontier row.
 
-[draft_tree_tests.cpp](../../tests/inference/draft_tree_tests.cpp) compares beams, kept
-nodes and built trees (tokens, parents, masks, depths, padding) with a host mirror on a
-synthetic drafter; the walk's tokens, path and control fields on 200 random trees with
-budgets and stops, and on chains against the greedy accept kernel; and compaction of
-contiguous and slot-mapped rows, including a rerun after a smaller count; and draft rank
-histograms over four rounds of chain walks, with tied logits, against a host mirror.
 [test_draft_trees.py](../../tests/test_draft_trees.py) checks the reference: kept sets are
 ancestor closed, chains walk as greedy speculation does, emitted tokens are always the
 target's, compaction places exactly the kept rows, and a draft rank below `w` at the first

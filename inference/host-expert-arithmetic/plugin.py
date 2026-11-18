@@ -14,7 +14,9 @@ Device form on CUDA (matrices whose stored tensors are CUDA tensors): the same W
 matrices on crit's kernel int-block-experts (code/device_int.py): decode rows in the declared integer block order (the
 CPU rows' bits), prompt rows on its gemm_native with prompt_gemm native (W4A4: accumulated in the tensor cores, not the
 declared order, not row invariant: the facts' row_invariance prompt_rows false) or in the declared order with
-prompt_gemm declared (gemm_staged; W4A8 always)."""
+prompt_gemm declared (gemm_staged; W4A8 always). prompt_gemm auto, the default, is native where the engine's
+configuration asks repeatable prompt rows or nothing and declared where it asks more (its exactness,
+crit_plugins.kernels.asks)."""
 import os
 from pathlib import Path
 
@@ -49,6 +51,13 @@ class HostProjections:
         self.code, self.quantized = code, quantized
         self.native, self.reason = None, None
         self.cuda_rows, self.native_prompts, self.cuda_reason = None, False, None
+        # prompt_gemm auto: the faster CUDA prompt GEMM that keeps the level the engine asks of its prompt rows.
+        # gemm-native follows the tile and the row count (repeatable); gemm-staged is the declared order.
+        self.prompt_gemm = options["prompt_gemm"]
+        if self.prompt_gemm == "auto":
+            from crit_plugins.kernels import asks
+            self.prompt_gemm = "native" if asks("prompt") in (None, "repeatable") else "declared"
+        self.loaded = set()   # the formats of the matrices loaded
         self.threads = options["threads"] if options["threads"] > 0 else max(1, (os.cpu_count() or 2) // 2)
 
     # ------------------------------------------------------------------ host form (the oracle)
@@ -93,8 +102,7 @@ class HostProjections:
             if module is None:
                 self.cuda_reason = loaded().get("int-block-experts", {}).get("reason") or "it did not load"
                 return None
-            self.cuda_rows = import_module(f"{self.code.__name__}.device_int").CudaRows(module,
-                                                                                       self.options["prompt_gemm"])
+            self.cuda_rows = import_module(f"{self.code.__name__}.device_int").CudaRows(module, self.prompt_gemm)
         return self.cuda_rows
 
     def _declared(self):
@@ -114,6 +122,7 @@ class HostProjections:
         device = weight.device if weight.device.type == "cuda" else torch.device("cpu")   # CUDA tensors: CUDA form
         if format == "bf16":
             w = weight.detach().to(device, torch.bfloat16).contiguous()
+            self.loaded.add(format)
             return Matrix(format, w.shape[0], w.shape[1], {"weight": w}, "bf16")
         codes = _bytes(weight)
         rows, columns = codes.shape[0], codes.shape[1] * 2
@@ -147,6 +156,7 @@ class HostProjections:
             found = rows_.load(codes, scales, inverse, "int4" if format == "int4" else "e2m1x2", activations,
                                found.get("input"), device)
             self.native_prompts = self.native_prompts or rows_.native_prompts(activations)
+        self.loaded.add(format)
         return Matrix(format, rows, columns, found, activations)
 
     def matmul(self, x, matrix, out_dtype=None, prompt=False):
@@ -199,9 +209,24 @@ class HostProjections:
         if self.cuda_rows is not None:   # CUDA matrices: decode rows declared, prompt rows by prompt_gemm
             found["cuda_rows"] = {"decode": "int-block-experts rows (declared)",
                                   "prompt": "int-block-experts gemm-native (W4A4, not the declared order)"
-                                  if self.options["prompt_gemm"] == "native" else
+                                  if self.prompt_gemm == "native" else
                                   "int-block-experts gemm-staged (declared)"}
         return found
+
+    def exactness(self):
+        """The level the loaded matrices' rows keep (crit_kernels.exactness; Core compares it with the level the
+        configuration asks). Block-scaled matrices run the declared order on the CPU and on int-block-experts, a
+        prompt row among them, but W4A4 prompt rows on CUDA through gemm-native (prompt_gemm native), whose sums
+        follow the tile and the row count: repeatable. A 16-bit matrix multiplies through torch one row at a time,
+        in an order torch chooses: a row's bits its own (row-exact), and a prompt row those of the same row decoded
+        (exact). Nothing before a matrix is loaded."""
+        if not self.loaded:
+            return {}
+        if self.native_prompts:
+            prompt = "repeatable"
+        else:
+            prompt = "exact" if "bf16" in self.loaded else "declared"
+        return {"decode": "row-exact" if "bf16" in self.loaded else "declared", "prompt": prompt}
 
 
 def create(context, options, parts):

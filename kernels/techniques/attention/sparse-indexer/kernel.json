@@ -1,0 +1,152 @@
+{
+  "schema": "crit-kernel-v1",
+  "id": "sparse-indexer",
+  "family": "attention",
+  "title": "Sparse indexer in Triton: each query token's score over the compressed keys it may see (index heads' weighted ReLU of their query-key products, on the tensor cores), then the positions of its top k keys, by radix select",
+  "package": "sparse_indexer",
+  "language": "triton",
+  "capabilities": [
+    "8.0",
+    "8.6",
+    "8.9",
+    "9.0",
+    "10.0",
+    "11.0",
+    "12.0"
+  ],
+  "operations": [
+    "sparse-index"
+  ],
+  "cuda": {
+    "sources": [
+      "torch-ext/sparse_indexer/cuda_select.cu"
+    ],
+    "structures": [],
+    "variant": {},
+    "check": [
+      {}
+    ]
+  },
+  "structures": {
+    "scores": {
+      "what": "a tile of TM tokens times their index heads (TM x H rows) over a block of BN keys: the products on the tensor cores, ReLU, each head's factor and the sum over the heads in FP32 as an explicit tree (heads 2 i and 2 i + 1, then the pairs' sums: the same order whatever the tile), -inf past a token's end",
+      "call": "scores",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        1,
+        4,
+        512
+      ],
+      "key": [
+        "H",
+        "D",
+        "KIND"
+      ],
+      "exactness": "row-exact",
+      "knobs": {
+        "TM": {
+          "values": [
+            1,
+            2
+          ],
+          "default": 2,
+          "what": "tokens a program (TM x heads tile rows, at most 128; no more than the call's tokens)"
+        },
+        "BN": {
+          "values": [
+            32,
+            64,
+            128
+          ],
+          "default": 64,
+          "what": "keys a program"
+        },
+        "WARPS": {
+          "values": [
+            4,
+            8
+          ],
+          "default": 4,
+          "what": "warps a program"
+        },
+        "STAGES": {
+          "values": [
+            1,
+            2,
+            3
+          ],
+          "default": 2,
+          "what": "Triton's pipeline stages"
+        }
+      },
+      "yardstick": {
+        "library": "torch: the products as one batched matmul (cuBLAS), then ReLU, the head weights and the head sum as tensor ops"
+      },
+      "bench": "bench.py:Scores"
+    },
+    "topk": {
+      "what": "one token's k best scores among its valid keys by radix select (four 8-bit passes of digit histograms, then one pass writing the positions in ascending order, ties to the lower position); calls of few tokens in a CUDA kernel that holds a slice's scores in shared memory for the five passes (cuda_select.cu), the same picks",
+      "call": "topk",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        1,
+        4,
+        512
+      ],
+      "key": [
+        "K"
+      ],
+      "exactness": "row-exact",
+      "knobs": {
+        "BLOCK": {
+          "values": [
+            1024,
+            2048,
+            4096
+          ],
+          "default": 2048,
+          "what": "scores a step of each pass"
+        },
+        "WARPS": {
+          "values": [
+            4,
+            8,
+            16
+          ],
+          "default": 8,
+          "what": "warps a program"
+        },
+        "SLICE": {
+          "values": [
+            0,
+            1024,
+            2048,
+            4096,
+            8192,
+            16384
+          ],
+          "default": 0,
+          "what": "positions a program selects among before a second pass over the slices' picks (0: the rule, max(4,096, 4 k) where the tokens leave most multiprocessors idle; speed only, the same picks)"
+        },
+        "CUDA": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 1,
+          "what": "1: calls of few tokens (fewer than half the multiprocessors) select in the CUDA kernel (cuda_select.cu), a slice's scores held in shared memory for the five passes; 0: every call in the Triton programs. The same picks"
+        }
+      },
+      "yardstick": {
+        "library": "torch.topk over the masked scores (sorted), then the positions sorted ascending"
+      },
+      "bench": "bench.py:TopK"
+    }
+  }
+}

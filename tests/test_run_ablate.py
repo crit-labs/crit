@@ -83,6 +83,25 @@ def create(context, options, parts):
     return Plugin(options)
 '''
 
+# An attention plugin that follows the level the engine asks of its prompt rows: its exact way is slower.
+LEVEL_PLUGIN = '''
+from crit_plugins.kernels import asks
+
+
+class Plugin:
+    def __init__(self, options):
+        self.exact = asks("prompt") == "exact"
+        self.seconds_per_token = 0.004 if self.exact else 0.0
+        self.tokens_per_round = 1
+
+    def exactness(self):
+        return {"prompt": "exact" if self.exact else "repeatable"}
+
+
+def create(context, options, parts):
+    return Plugin(options)
+'''
+
 TEST = '''from crit_plugins.testing import PluginTestCase
 
 
@@ -181,6 +200,46 @@ class AblateTests(run_measure.MeasureFixture, unittest.TestCase):
         (row,) = report["blame"]
         self.assertEqual((row["plugin"], row["verdict"]), ("set:draft-three.width=1", "slows"), row)
         self.assertLess(row["in_engine"]["decode_tps"], -0.10)
+
+    def test_a_level_variant_serves_the_engine_asking_that_level_of_its_rows(self):
+        # An in-process A/B of the engine's exactness: the attention plugin takes its slow, exact way where the engine
+        # asks exact prompt rows and its fast one otherwise, as a plugin whose option is auto does, and says what its
+        # rows keep. The run is in speed, so the candidate as built asks repeatable rows.
+        engine = ENGINE.replace("        self.parts = assemble(",
+                                "        from crit_plugins.kernels import use_exactness\n"
+                                "        use_exactness(context.configuration.get('exactness'))\n"
+                                "        self.parts = assemble(")
+        self.assertIn("use_exactness", engine)
+
+        def write_plugins(package):
+            AblateTests.write_plugins(package)
+            folder = package / "plugins" / "attn-level"
+            (folder / "tests").mkdir(parents=True, exist_ok=True)
+            (folder / "plugin.json").write_text(json.dumps({
+                "schema": "crit-plugin-v1", "id": "attn-level", "title": "attn-level", "fills": ["attention"],
+                "entry": "plugin.py:create", "options": {}, "needs": [], "devices": ["cpu"]}), encoding="utf-8")
+            (folder / "plugin.py").write_text(LEVEL_PLUGIN, encoding="utf-8")
+            (folder / "tests" / "test_plugin.py").write_text(TEST, encoding="utf-8")
+        self.write_plugins = write_plugins
+        selection = {"use": {**USE, "attention": "attn-level", "drafter": "draft-three"},
+                     "base": {"attention": "attn-plain", "drafter": None}}
+        candidate = self.plugin_package(engine=engine, selection=selection)
+        fast = {"decode": "repeatable", "prompt": "repeatable"}
+        self.assertEqual(read_json(self.folder / "candidate.json")["configuration"]["exactness"], fast)
+        result = ablate(self.store, self.run_id, candidate, repetitions=2, smoke=False, noise=0.10,
+                        sets=["exactness.prompt=exact"])
+        self.assertEqual([row["name"] for row in result["variants"]], ["full", "set:exactness.prompt=exact"])
+        report = read_json(self.directory / result["report"])
+        full, exact = report["variants"]
+        self.assertEqual((full["state"], exact["state"]), ("measured", "measured"), report["variants"])
+        self.assertEqual(full["exactness"], {"asked": fast, "prompt": "repeatable",
+                                             "plugins": {"attn-level": {"prompt": "repeatable"}}})
+        self.assertEqual(exact["exactness"], {"asked": {"decode": "repeatable", "prompt": "exact"}, "prompt": "exact",
+                                              "plugins": {"attn-level": {"prompt": "exact"}}})
+        (row,) = report["blame"]
+        self.assertEqual((row["plugin"], row["verdict"]), ("set:exactness.prompt=exact", "slows"), row)
+        with self.assertRaisesRegex(Exception, "exactness is one of declared, exact, row-exact, repeatable"):
+            ablate(self.store, self.run_id, candidate, smoke=False, sets=["exactness=bitwise"])
 
     def test_a_variant_is_warmed_until_its_decode_rounds_take_a_steady_time(self):
         # A rebuilt engine whose first three requests run cold, each less than the one before, as a real engine's

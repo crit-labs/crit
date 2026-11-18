@@ -5,12 +5,15 @@ ContributionGroup (implementation.py), each route's contribution from expert-str
 (reference.py): the oracle, bitwise the reference whichever side ran a route.
 
 Device form on CUDA (device_dispatch.py): nvfp4 / int4 experts as bundles; the routes whose slot is -2 go to
-host-expert-tier's CPU tier, posted and joined inside the stream through host-work-mailbox (one post and one join a
-layer), the rest to the device part, and every token's routes are summed in route order by the device part's combine.
+host-expert-tier's CPU tier, posted and joined inside the stream through one of the host's handoffs (Core's,
+crit_plugins.host: one post and one join a layer), the rest to the device part, and every token's routes are summed in route order by the device part's combine.
 Both parts compute host-expert-arithmetic's declared integer block order, so a token's bits are the same whichever part
 computed which route. Without a store and slot table of its own (forward(), not forward_bundles()), the plugin keeps the
 first `resident` experts of each layer in a device store and sends the others to the CPU."""
 from pathlib import Path
+
+KERNEL = "grouped-experts"
+HERE = Path(__file__).resolve().parent
 
 from .contributions import implementation as contributions
 from .dispatch import implementation as dispatch
@@ -62,8 +65,9 @@ class Settled:
 
 
 class SplitExperts:
-    def __init__(self, source, residency, options, code, built):
+    def __init__(self, source, residency, options, code, built, scratch=None):
         self.source, self.residency, self.device_slots = source, residency, options["device_slots"]
+        self.scratch = scratch   # the engine's scratch: the device part's route rows are taken from it
         self.options, self.code, self.built = options, code, built
         self.routes = {"device": 0, "host": 0}
         self.loaded = {}         # (layer, expert) -> host bundle
@@ -73,6 +77,22 @@ class SplitExperts:
         self.quotas = {}         # (tokens, misses) -> (SplitTimings, quota table)
         self.binding = None      # (source, layers, experts) of bind_source()
         self.quota_tensors = {}  # (tokens, misses, device) -> int32 [33] on the device
+        from crit_plugins.kernels import asks
+        self.asked = asks("prompt")   # the level the engine asks of its prompt rows, None where it asks nothing
+        self.kernel, self.kernel_reason = None, "no CUDA device"
+        if options["device_part"] != "torch":
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    from crit_plugins.kernels import load_kernel
+                    self.kernel, self.kernel_reason = load_kernel(KERNEL, folder=HERE), None
+            except Exception as error:   # the torch device part serves (the facts say why)
+                if options["device_part"] == "kernel":
+                    raise
+                self.kernel, self.kernel_reason = None, str(error).splitlines()[0] if str(error) else type(error).__name__
+        else:
+            self.kernel_reason = "option device_part torch"
+        self.part_reason = None
 
     # ------------------------------------------------------------------ host form (the oracle)
 
@@ -177,17 +197,23 @@ class SplitExperts:
             stride, host_bundles = self._host_bundles()
             native = {"on": True, "off": False}.get(o["native"])
             tier = c["cpu_tier"].CpuTier(hidden, inter, format, c["arithmetic"], c["quantized"], native=native,
-                                         workers=o["workers"], pin=o["pin"], spin_us=o["spin_us"],
-                                         spin_max_us=o["spin_max_us"], rows_per_task=o["rows_per_task"])
+                                         workers=o["workers"], pin=o["pin"], rows_per_task=o["rows_per_task"])
             for (layer, expert), bundle in host_bundles.items():
                 tier.add(layer * stride + expert, bundle)
             device = torch.device(device)
-            part = c["dispatch"].DeclaredRoutes(c["declared"], c["bundles"], format, hidden, inter, device)
+            part, self.part_reason = c["dispatch"].kernel_part(self.kernel, c["bundles"], c["gbundles"], format,
+                                                               hidden, inter, self.scratch)
+            arithmetic = self._prompt_arithmetic(part is not None)
+            if part is None:
+                if o["device_part"] == "kernel" or arithmetic == "tensor":
+                    raise ValueError(f"heterogeneous-expert-dispatch: the kernel device part is not here "
+                                     f"({self.part_reason or self.kernel_reason})")
+                part = c["dispatch"].DeclaredRoutes(c["declared"], c["bundles"], format, hidden, inter, device)
             join = None if o["join"] == "auto" else o["join"]
             self.engine = c["dispatch"].DeviceDispatch(
                 device, hidden, inter, format, tier, part, self.built["ext"], stride, {l for l, _ in host_bundles},
-                max_tokens=o["max_tokens"], join=join, idle_after_us=o["idle_after_us"],
-                idle_sleep_us=o["idle_sleep_us"], joins=self.built["joins"])
+                max_tokens=o["max_tokens"], join=join, joins=self.built["joins"],
+                prompt_arithmetic=arithmetic)
             for layer in sorted({layer for layer, _ in self.loaded}):
                 experts = sorted(e for l, e in self.loaded if l == layer)
                 keep = experts if o["resident"] < 0 else experts[:o["resident"]]
@@ -251,6 +277,30 @@ class SplitExperts:
     def forward_bundles(self, layer, x, ids, weights, store, slots, format=None):
         return self._engine(x.device).forward(layer, x, ids, weights, store, slots)
 
+    def _prompt_arithmetic(self, kernel_part=None):
+        """The prompt_arithmetic option, declared or tensor. auto is the faster one that keeps the level the engine
+        asks of its prompt rows (crit_plugins.kernels.asks, the configuration's exactness): tensor only where it asks
+        repeatable and the kernel device part is here (a call's rows are then the tensor arithmetic or the declared
+        order by whether one of its routes goes to the CPU, so a row's bits follow the rows beside it), declared
+        otherwise. kernel_part: whether the device part is the kernel's (None: before the engine is made, whether the
+        kernel loaded)."""
+        chosen = self.options["prompt_arithmetic"]
+        if chosen != "auto":
+            return chosen
+        if kernel_part is None:
+            kernel_part = (type(self.engine.part).__name__ == "KernelRoutes" if self.engine is not None
+                           else self.kernel is not None)
+        return "tensor" if self.asked == "repeatable" and kernel_part else "declared"
+
+    def exactness(self):
+        """The level its rows keep (crit_kernels.exactness; Core compares it with the level the configuration asks):
+        the declared order, the CPU tier's bits, on the CPU and on the device part alike; with prompt_arithmetic
+        tensor a call past max_tokens that sends no route to the CPU runs the kernel's tensor arithmetic, so a prompt
+        row's bits follow the call it is in (repeatable). Nothing before an expert is loaded."""
+        if self.shape is None:
+            return {}
+        return {"decode": "declared", "prompt": "repeatable" if self._prompt_arithmetic() == "tensor" else "declared"}
+
     def facts(self):
         """What serves, known when the engine loads: the CPU rows (native or torch, and why), the join (or the host path,
         and why), whether a capture can join the CPU routes, the device part, and the quota's state."""
@@ -261,8 +311,20 @@ class SplitExperts:
         else:
             join = "host, after a synchronization (" + (b["ext_reason"] or "no native CPU tier") + ")"
         return {"cpu_expert_rows": rows, "cpu_join": join, "cpu_routes_capture": b["ext"] is not None and b["native"],
-                "device_expert_rows": "torch, the declared order (baseline device part)",
+                "device_expert_rows": self._device_rows(),
+                "prompt_expert_rows": ("the kernel's tensor arithmetic where no CPU route takes part (calls past "
+                                       "max_tokens), the declared order otherwise" if self._prompt_arithmetic()
+                                       == "tensor" else "the declared order"),
                 "cpu_quota": "provisional: measured with copy-engine copies, not the expert cache's fills"}
+
+    def _device_rows(self):
+        reason = self.part_reason or self.kernel_reason
+        if self.engine is not None:
+            kernel = type(self.engine.part).__name__ == "KernelRoutes"
+        else:
+            kernel = self.kernel is not None
+        return ("grouped-experts kernel, the declared order" if kernel
+                else f"torch, the declared order, one route at a time ({reason})")
 
     def telemetry(self):
         if self.engine is None:
@@ -273,14 +335,14 @@ class SplitExperts:
 
     def close(self):
         if self.engine is not None:
-            self.engine.close()        # the mailbox answers, the streams drain, the mailbox goes
+            self.engine.close()        # the handoff answers, the streams drain, the handoff goes
             self.engine.tier.close()   # then the tier its handler called
             self.engine = None
 
 
 def build(code, options):
-    """At load: the native CPU tier's library and the CUDA mailbox extension (built and cached by content), and the
-    joins measured on the engine's device, so the facts say what serves before the first forward."""
+    """At load: the native CPU tier's library and the CPU routes' kernels (built and cached by content), and the
+    joins the host measured on the engine's device, so the facts say what serves before the first forward."""
     built = {"native": False, "native_reason": "", "isa": "", "ext": None, "ext_reason": None, "joins": None}
     if options["native"] != "off":
         native = __import__(f"{code['arithmetic'].__name__}.native", fromlist=["native"])
@@ -300,9 +362,10 @@ def build(code, options):
     except ImportError:
         cuda = False
     if cuda and built["native"]:
-        built["ext"], built["ext_reason"] = code["dispatch"].extension(code["mailbox"])
+        built["ext"], built["ext_reason"] = code["dispatch"].extension()
         if built["ext"] is not None:
-            built["joins"] = built["ext"].measure_joins(torch.cuda.current_device(), 32, 50)
+            from crit_plugins.host import current
+            built["joins"] = current().joins(torch.cuda.current_device())
     elif not cuda:
         built["ext_reason"] = "no CUDA device"
     return built
@@ -310,10 +373,12 @@ def build(code, options):
 
 def create(context, options, parts):
     from importlib import import_module
-    from . import arithmetic, dispatch as dispatch_code, mailbox, quantized, split, tier
-    code = {"bundles": import_module(f"{tier.__name__}.bundles"), "cpu_tier": import_module(f"{tier.__name__}.cpu_tier"),
+    from . import arithmetic, dispatch as dispatch_code, quantized, split, tier
+    from . import grouped
+    code = {"gbundles": import_module(f"{grouped.__name__}.bundles"), "bundles": import_module(f"{tier.__name__}.bundles"), "cpu_tier": import_module(f"{tier.__name__}.cpu_tier"),
             "declared": import_module(f"{arithmetic.__name__}.declared"), "arithmetic": arithmetic,
-            "quantized": Path(quantized.__path__[0]), "mailbox": Path(mailbox.__path__[0]),
+            "quantized": Path(quantized.__path__[0]),
             "dispatch": import_module(f"{dispatch_code.__name__}.device_dispatch"),
             "split": import_module(f"{split.__name__}.split")}
-    return SplitExperts(parts["expert_source"], parts["expert_residency"], options, code, build(code, options))
+    return SplitExperts(parts["expert_source"], parts["expert_residency"], options, code, build(code, options),
+                        getattr(context, "scratch", None))

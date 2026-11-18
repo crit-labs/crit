@@ -1229,6 +1229,20 @@ class DeviceExpertCacheTests(unittest.TestCase):
             self.assertEqual(len(asked), 3)   # cached
             self.assertIn("web-en HuggingFaceFW/fineweb-edu/default/train rows 0+150 @ abcdef123456",
                           m.describe(small, found))
+        failures, waits = [503, 429], []
+
+        def flaky(url):   # the rows API under load: a 503, then a 429, then the answer
+            if failures:
+                import urllib.error
+                raise urllib.error.HTTPError(url, failures.pop(0), "busy", {}, None)
+            return Response({"sha": "abc"})
+        self.assertEqual(m._get(m.DATASETS + "x", flaky, sleep=waits.append), {"sha": "abc"})
+        self.assertEqual(waits, [2, 4])
+        with self.assertRaises(Exception):   # a 404 is not retried
+            import urllib.error
+            m._get("u", lambda url: (_ for _ in ()).throw(urllib.error.HTTPError(url, 404, "no", {}, None)),
+                   sleep=waits.append)
+        self.assertEqual(waits, [2, 4])
         with tempfile.TemporaryDirectory() as folder:
             bad = Path(folder) / "corpus.json"
             bad.write_text(json.dumps({**manifest, "held_out": manifest["held_out"][:1]}), encoding="utf-8")
@@ -1477,7 +1491,7 @@ class TokenSamplingTests(unittest.TestCase):
         self.assertEqual([t for t, _ in pool], [0, 2, 1])
         self.assertAlmostEqual(math.fsum(p for _, p in pool), 1.0)
         self.assertEqual(len(m.nucleus(row, 1.0, top_k=2)), 2)
-        # crit::core::Sampler draws these for seed 1 at positions 0..7 (temperature 0.7, top_p 0.9).
+        # Core's rules draw these for seed 1 at positions 0..7 (temperature 0.7, top_p 0.9).
         draws = [m.select(row, 0.7, 0.9, 0, seed=1, position=c) for c in range(8)]
         self.assertEqual(draws, [2, 2, 0, 2, 0, 0, 0, 2])
         self.assertNotEqual(draws, [m.select(row, 0.7, 0.9, 0, seed=1, position=c, stream=1) for c in range(8)])

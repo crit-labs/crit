@@ -1,6 +1,5 @@
 """attention-state's rope_table.py against Hugging Face's ROPE_INIT_FUNCTIONS (when transformers is installed) and
-against fixed values, for default, linear, dynamic NTK, YaRN (with mscale and attention_factor), Llama 3 and LongRoPE.
-tests/inference/rope_oracle.py checks its C++ twin, rope_table.h, against it on the same configs."""
+against fixed values, for default, linear, dynamic NTK, YaRN (with mscale and attention_factor), Llama 3 and LongRoPE."""
 import importlib.util
 import math
 from pathlib import Path

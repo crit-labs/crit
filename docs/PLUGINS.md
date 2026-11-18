@@ -38,6 +38,8 @@ crit plugins list ENGINE/plugins
 crit plugins check ENGINE/plugins --selection configuration.json
 crit plugins test ENGINE/plugins
 crit plugins variants ENGINE/plugins --selection configuration.json
+crit plugins memory ENGINE --model MODEL            # what each device buffer really holds (the memory audit)
+crit plugins decisions ENGINE --model MODEL         # record the choices its plugins time at load (measured decisions)
 crit run --id RUN_ID ablate --candidate CANDIDATE_ID
 ```
 
@@ -204,6 +206,34 @@ which only the decode kernel gives ([building engines](BUILDING_ENGINES.md#3-bui
 honesty check). The attention, recurrence, router, experts and norms device forms keep a row's bits whatever rows share
 the call.
 
+#### Measured decisions
+
+Nothing an engine computes may depend on how fast something ran in this process. A plugin that chooses between two
+ways by timing both as it loads (who computes a missed expert, how a layer's work splits) resolves a near-tie
+differently in the next process, and where the two ways give other bits the same request gets another text there:
+no repeat check inside one process sees it. A choice that only changes speed (a spin time, a thread count) is free.
+One that can change a bit is a decision, settled through
+[crit_plugins.decisions](../core/python/crit_plugins/decisions.py):
+
+```python
+from crit_plugins import decisions
+way = decisions.settle("my-plugin", "misses",
+                       key={"device": name, "hidden": hidden, "format": format},   # what else the choice depends on
+                       measure=lambda: {"cpu_us": cpu, "link_us": link},           # runs only when no record answers
+                       decide=lambda found: "cpu" if found["cpu_us"] < 0.8 * found["link_us"] else "link")
+```
+
+`settle` replays the package's record where it holds the decision with the same key and measures otherwise.
+`crit plugins decisions PACKAGE --model MODEL` loads the engine once and writes the record into the package; the
+configuration names it (`"decisions": "decisions.json"`), as it names the kernel tuning, and Core's loader applies it
+before any plugin is made, so the package Eval measured decides as the package served does. The engine's telemetry
+carries every decision under `decisions` (key, choice, `recorded` or `measured`, the measurement) with one digest
+over the choices: two processes whose texts part show different digests when a decision is why. Kernel choices have
+their own record, the [tuning tables](#kernels-and-plugins) and a prompt GEMM's
+[recorded algorithm](../inference/recorded-selection/README.md); this is the same rule for everything else. The
+same holds while an engine serves: a placement or a width that follows a measurement changes at a boundary the
+requests fix (a round's end, a count of rounds), never when a copy or a timer happens to finish.
+
 ### Device extensions
 
 A plugin may offer device forms beyond its slot's, each named by the fact it provides
@@ -225,7 +255,7 @@ pool the slot's device form returns, the others on the plugin.
 | `experts:store` | `open_store(layout, layers, experts, device, path=None, identity=None)`, the store's `put(layer, expert, bundle, compressed=None)` | Bundles of the experts plugin's slot layout in host memory or files, which a device expert cache fills its slots from; a store file is bound to the checkpoint's identity; with the expert_source plugin's `csf_scales` option the store keeps the named scale components CSF-compressed (its own layout, a fill program the cache runs to rebuild the slot layout) |
 | `embeddings:host` | `open(source, width, dtype, device)`, `prefetch(ids)` | Lookup-table rows kept in host memory or files, staged to the device |
 | `kv:scales` | `set_scales(layer, key_scale, value_scale)` | An FP8 pool's static per-layer scales (a checkpoint's k_scale and v_scale) |
-| `kv:keys` | `rows_at(layer, slots)`, `slots_at(round_slots, positions)` | Rows at chosen positions: a pool of keys only (an indexer's keys) or a per-block row cache, read and written inside a captured round |
+| `kv:keys` | `rows_at(layer, slots)`, `slots_at(round_slots, positions)` | Rows at chosen positions: a pool of keys only (an indexer's keys) or a per-block row cache, read and written inside a captured round. `rows_at` gathers a copy; a kernel reads the rows where they lie, from `layer_pages(layer)` through the slots (crit's sparse-indexer takes them as `slots=`), which copies nothing |
 | `kv:sliding` | `pool(..., sliding=W, span=, positions=)` | A pool of sliding-window layers: each sequence a ring of pages holding its last positions, whatever its length; the attention reads it with its window |
 | `attention:blocks`, `attention:tree`, `attention:lse`, `attention:sinks`, `attention:sliding`, `attention:latent` | forward's keywords | Block-sparse attention, draft-tree masks, log-sum-exps, attention sinks, sliding windows, latent attention (the attention row above) |
 | `norms:fused` | `rms_norm_rope_pair`, `rope_pair`, `stream_add_norm` | One call where a layer's separate norms calls take two, each output with the separate calls' bits |
@@ -275,6 +305,67 @@ plugin's plugin.json is the only place a pin lives. A plugin may hold several ke
 format; a selection never names a kernel. Kernels are measured by the kernel workbench against a CPU reference (`crit
 kernels`, `crit eval workbench`), plugins by their tests and an ablation, engines by Eval. An engine's own kernel lives
 in the engine's own plugin.
+
+<a id="exactness"></a>
+
+### Exactness
+
+The fastest way to compute a phase's rows is often not the most exact one, and an engine says which it wants. Its
+configuration asks for a level of [the kernels' scale](../kernels/README.md#exactness) (`declared`, `exact`,
+`row-exact`, `repeatable`), one for both phases or one each:
+
+```json
+"exactness": {"decode": "row-exact", "prompt": "repeatable"}
+```
+
+`decode` is the decode and verify rows, `prompt` the prompt rows; for the decode rows `exact` and `row-exact` are one
+level, the bits a prompt row is compared with. Core's loader reads it before any plugin is made
+(`crit_plugins.kernels.use_exactness`), as it does the kernel tuning, and a package that asks for a level that does
+not exist is refused when it is checked. A plugin that can compute a phase's rows in more than one way then follows
+two rules:
+
+1. Where its own option leaves the choice open (`auto`), it takes its fastest way that keeps the level asked:
+   `crit_plugins.kernels.asks("prompt")` is the level, or None where the configuration asks nothing, and
+   `allows("prompt", "repeatable")` says whether rows of a level may run there. An option set to one way is that way,
+   whatever is asked.
+2. Its object's `exactness()` states what its rows keep as it is loaded, `{"decode": level, "prompt": level}` (a
+   phase it computes nothing in left out): the level of the kernel structures it runs
+   (`crit_kernels.exactness.level`), or of its provider's path.
+
+The engine's facts carry both under `exactness`: `asked` (the configuration's levels, or null), the lowest level any
+plugin keeps in each phase, and each plugin's own. Core refuses an engine whose plugin keeps less than the
+configuration asks, naming the plugin, so an engine never serves below the level it states. A configuration that asks
+nothing is served as its plugins' options say, and its facts still state what the plugins keep.
+
+The library's plugins that follow the level, each through the option it leaves open (`auto`, the default), and what
+that option becomes for the prompt rows:
+
+| Plugin | Option | Nothing asked, or `repeatable` | `row-exact` | `exact`, `declared` |
+|---|---|---|---|---|
+| quantized-projections | `prompt_gemm` | the native GEMM | `pinned` | `tile` |
+| gguf-projections | `prompt` | `dequantize` | `exact` | `exact` |
+| softmax-attention, partitioned-attention | `prompt_reader` | `prefill` | `prefill` (the split reader on the kernel, no FlashInfer), else `decode` | `decode` |
+| host-expert-arithmetic | `prompt_gemm` | `native` | `declared` | `declared` |
+| expert-offload | `prompt_arithmetic` | `tensor` when `repeatable` is asked, `declared` with nothing asked | `tensor` | `declared` |
+| heterogeneous-expert-dispatch | `prompt_arithmetic` | `declared` (`tensor` when `repeatable` is asked and the device kernel is there) | `declared` | `declared` |
+| sequential-recurrence, recurrent-state-recovery | `prompt_rows` | `chunked` | `scan` | `scan` |
+
+With nothing asked each is what it was before the option had an `auto`. The others state what they keep and have one
+way: projections-dense (decode `row-exact`, prompt `repeatable`: its prompt GEMM is the library's), fused-norms
+(decode `row-exact`, prompt `exact`), grouped-experts (decode `row-exact` and prompt `exact` with tensor arithmetic,
+`declared` with the declared one, which is another precision and so never chosen for a level), attention-state
+(`repeatable` prompt rows while a quantized pool keeps fresh chunk keys, `fresh_mib`). An engine over one of these
+that cannot keep the level it is asked is refused with the plugin named, and asks the level it keeps instead.
+
+A plugin whose prompt rows run the arithmetic of its decode rows, in an order that never follows the row count,
+states its prompt rows `exact`, not `row-exact`: a prompt row then has the bits of the same row decoded, which is
+what `exact` asks. fused-norms on its kernel, grouped-experts' tensor arithmetic and host-expert-arithmetic's 16-bit
+matrices are such, so an engine of a `preserve` run loads over them. `row-exact` is for prompt rows with an order of
+their own (a pinned GEMM beside a decode GEMV, the split reader's prompt launch).
+
+A candidate of a run always asks: `crit run ... candidate` completes its configuration's `exactness` to a level for
+each phase, with the run's [quality mode's](RUN_RECORDS.md#quality-modes) level where the configuration states none
+(`preserve`: `exact`; `speed`: `repeatable`), and the package carries it.
 
 ### When two plugins only pay together
 
@@ -355,7 +446,7 @@ engine runs:
    when the selection drafts, plain decoding on request (`plain`).
 5. Once every factory has run, it hands torch's cached, unused device memory back (the load's temporaries,
    [memory](#memory)) and runs the model plugin's object on Core's concurrent runtime (`crit_core.native.StepEngine`
-   over the `crit_core_steps` library, `CRIT_CORE_STEP_LIBRARY`, which exports Core's engine C ABI version 3), whose
+   over the `crit_core_steps` library, `CRIT_CORE_STEP_LIBRARY`, which exports Core's engine C ABI), whose
    facts carry `{"plugins": use}` and the plugins' own facts ([facts and telemetry](#facts-and-telemetry)). A model
    plugin with `native_rounds(library)` hands Core its captured decode rounds as the engine opens.
 6. It checks that the engine is its plugins. Every plugin's factory got the other slots' plugins behind counting
@@ -397,7 +488,7 @@ The placement plan is the placement, not advice: the model plugin plans every te
 KV, state, an optional draft-only copy) through the placement plugin, and on CUDA the loader refuses an engine that
 holds more device memory after its first requests than its plans and the plugins' declarations put there
 (`plan_problems`, with `PLAN_SLACK`, 5% and 64 MiB, for small tensors). The device bytes a plan is given are
-`crit_plugins.device.free_device_bytes()`: the free memory after torch's allocator hands back what it caches for
+`crit_plugins.device.free_device_bytes()` (the device memory's `free(release=True)`): the free memory after torch's allocator hands back what it caches for
 nothing, since a model plugin that re-encodes or converts weights before planning its pools leaves those temporaries
 cached, and `torch.cuda.mem_get_info` alone counts them as taken (one engine's KV pool refused to fit for it). Where
 a request's temporaries end (a prompt's last chunk, a long score), `crit_plugins.device.release_cached_under(free_below)`
@@ -420,12 +511,185 @@ the plan's count honest:
   caching allocator holds for nothing (checkpoint conversions, warm-ups; `crit_plugins.assemble.release_cached`, CUDA
   only), before the engine opens and its captures are measured and before the plan check, so neither sees memory the
   engine does not keep. The engine's telemetry reports the device memory allocated and reserved at each step of the
-  load (`"load"`: `made` after the factories, `released_cached`, `opened` after the release, `released_after_warm`
-  after the warm requests, `checked` after the first requests; None where the device's memory cannot be read).
+  load (`"load"`: `made` after the factories, `released_cached`, `opened` after the release, `warm` and
+  `released_after_warm` after the warm requests, `checked` after the first requests; None where the device's memory
+  cannot be read), each with `other`: the device memory neither torch nor an elastic range holds and that is not
+  free (the process's CUDA context, libraries, modules and graphs, and other processes), so what a stage took
+  outside torch shows.
 - **Captures are planned.** Core's round driver and prompt graphs measure the device memory their captures take (the
   warm-ups' lasting allocations, the graph pools, the capture stream's workspaces) and plan it through the placement
   plugin as their own entries, `"rounds:captures"` and `"prompts:captures"`; a placement that puts them off the device
   refuses the captures. A model plans no fixed capture workspace of its own.
+
+**The device's memory.** Every byte of a device is somebody's, and one object knows whose:
+`crit_plugins.memory.of(device)`, the same for Core and for every plugin (a plugin's factory also finds it as
+`context.memory`). Core's loader and the plugins read and move device memory through it and nowhere else.
+
+- **Readings.** `total`, `free()` (the driver's free bytes; blocks torch's allocator holds unused count as taken),
+  `torch()` (its allocator here: allocated, reserved, and `unused`, the whole blocks nothing uses and
+  `release()` hands back; the empty segments of captured graphs' own pools are not among them), `release()`
+  (hand those back; `release(below=n)` only when fewer than n bytes are free), `mark()` and `peak()` (the most
+  torch held since the mark: what a step took at its peak).
+- **Elastic ranges.** `elastic(owner, name, max_bytes)` reserves an address range and backs it granule by granule
+  through the driver's virtual memory API: `grow(n)` and `shrink(n)` back more or less of it while every address
+  stays, so a tensor over it, a captured round and a kernel's arguments stay valid; `back(first, end)` and
+  `release(first, end)` back it in places. `elastic_ranges` says whether the device and driver have the API; a
+  plugin keeps one fixed allocation where they do not. `back(first, end, host=True)` backs granules from host
+  memory, which the driver pins and maps into the range: kernels read and write them at the same addresses, over
+  the link and at no device memory (a range's `host_mapped`, its `host` bytes in the report).
+- **Paged ranges.** A pool's units are what its sequences take as they come: a KV pool's pages, a state pool's
+  sequences. `paged(owner, name, nbytes, planes)` is an elastic range of planes (a layer's tensor each: first
+  byte, bytes a unit, units) whose units are backed together: `back(units)` asks the givers first and says
+  whether the device had the memory, `trim(units)` gives back what lies past and lets the givers grow into it.
+  A range made with `host_bytes` may back units from host memory when the device has none (`back(units,
+  host=True)`): attention-state's `host_pages_mib` serves a context the device does not hold that way, exact
+  and at the link's rate, instead of refusing it.
+  attention-state's and the recurrence plugins' `elastic` option put their pools on it, so a pool sized for the
+  longest context and every sequence at once takes device memory only for what is open.
+- **Growing buffers.** A workspace a plugin makes for each call shape it meets (a prompt chunk of every size)
+  adds up, and a captured graph keeps each one's address for good. `growing(owner, name, max_bytes)` is one
+  buffer at a fixed address: `take(nbytes)` backs its first `nbytes`, the givers making room first, and returns
+  that prefix. Calls of one stream run one after another, so the shapes share its rows and cost the largest's
+  bytes, not their sum. An engine's scratch is one.
+- **Scratch.** What a call only computes in (a kernel's partial sums, route rows, a decoded tile) and nothing
+  reads once it has returned is scratch, and an engine's calls run one after another on its stream, so they all
+  compute in the same bytes. `context.scratch` is the engine's (`crit_plugins.memory.Scratch`, made by Core's
+  loader and closed with the engine; `memory.scratch()` makes one for code that runs without an engine):
+  `take(nbytes)` gives the first bytes of one growing buffer, `take(a, b, ...)` a call's buffers together. A call
+  takes its scratch every time it runs, all of it in one take, and holds nothing there across calls: the next
+  call's take is the same bytes. The scratch therefore costs the engine its largest call's bytes, where a
+  workspace per plugin costs their sum, and its address never moves, so a captured call keeps it. It grows
+  outside captures only (a capture's warm-ups take a call's size first; a take that would grow it inside a
+  capture raises). `crit plugins test` runs with `CRIT_SCRATCH_POISON=1`: every take then hands out bytes
+  filled with 0xFF (NaN as a float, -1 as an index), inside captured graphs too, so a call that reads what an
+  earlier call left there fails its test. A plugin keeps a buffer of its own only for what outlives a call
+  (state, results, tables). The split-KV reader's partials, the sampler's launch scratch, the route rows of
+  expert-offload's and heterogeneous-expert-dispatch's device part and quantized-projections' tile activations
+  and partial sums are taken from it.
+- **State is read where it lies.** A pool's rows are its own (KV pages, index keys, recurrent states), at the
+  slots its sequences hold. A kernel takes the pool's store and the slots (`layer_pages(layer)` and a reservation's
+  or `slots_at()`'s slots, as the attention reads KV through page tables) and loads what it needs from there. A
+  gathered copy of a sequence's rows for a kernel to read is a buffer the size of the state, written every call,
+  and inside a captured graph it stays in the graph's pool for good: on Qwen3.8-Flash-Next the gathers of whole
+  sequences' index keys were 146 of the 174 MiB the largest round's graph took.
+- **The ledger.** A plugin that can give memory back is a giver, `give(name, release, regrow, keep)`, and says what
+  it keeps free (bytes, or a callable that follows the requests in flight); whoever is about to take device memory
+  it cannot do without calls `need(bytes)` first, and the givers release what the device lacks to hold those bytes
+  with what they keep still free; `settle()` lets them grow back down to what they keep. Nothing is taken from a
+  giver while the device has room.
+- **Load, then serve.** While an engine loads, what its plugins left free at their creation is the load's (graphs,
+  workspaces, first prompts) and `settle()` does nothing. Once the warm requests ran, Core calls `serve()`: torch's
+  unused blocks go back to the driver and the givers take what is left. No plugin is called for it.
+- **Other programs.** The device is not the engine's alone. When a desktop or another process takes memory while
+  the engine serves, nothing in the engine asked for it, and under WDDM the driver then moves allocations to system
+  memory without an error. Core calls `relieve()` before each step it runs: where less is free than the givers
+  keep, they release the difference at once, and when what other programs hold has grown since the last look they
+  wait five seconds before `settle()` lets them grow back. The report counts it (`outside`). A tier of copies
+  loses speed by this and never a token. Rounds Core launches without the engine's Python run no step: a
+  thread of Core's (`watch()`) reads the free memory five times a second and, when it fell under what the givers
+  keep, asks the engine for a step (`NativeRounds.ask_step()`): the next decode step then runs through `step()`
+  once, where `relieve()` gives the memory back, and the rounds go on.
+- **The census.** When the load is over Core walks the plugin objects and counts each live tensor of torch's
+  allocator for the plugin whose code made the object holding it (`census(plugins)`). The engine's telemetry
+  carries the device as it stands (`"memory"`, from `report()`): free, torch's allocator, each elastic range's
+  backed bytes, each plugin's bytes, the largest tensors one by one (`tensors`: plugin, bytes, shape and dtype,
+  so a table a pass gathers a few rows of, or a pool sized past what is served, shows by its shape), what captured
+  graphs' own pools hold (torch keeps a pool for its graph's replays, in use or not), what no plugin object holds,
+  and what is neither torch's nor a range's nor free (the CUDA context, other processes, a desktop). The walk
+  (`holdings(plugins)`) starts at the plugin objects and at the globals of the plugins' own modules, so a buffer
+  a module keeps for all its objects is its plugin's too.
+- **One pool for an engine's graphs.** A captured graph's temporaries live in a memory pool torch keeps for its
+  replays. An engine's graphs never run at once, so they share one: `context.graphs`, the engine's pool, which
+  Core's round driver and prompt graphs capture into by default (they find it through the factory's `parts`).
+  Each capture reuses the bytes of the temporaries captured before it, so the pool holds far less than their
+  sum (four rounds' pools of 494 MiB became one of 270 on Qwen3.8-Flash-Next, where the largest graph alone
+  takes 174), and after the load nothing a replay touches is allocated again. It asks one thing of the plugins: a tensor made inside a capture that anything
+  reads later is kept for good, never dropped or replaced (`share_pool=False` gives a driver's graphs pools of
+  their own). Pools are made through `pool(owner, name)` and captures run inside `capturing(pool)`, so the
+  census lists each pool's bytes by name (`pools`: `core/graphs`, `captures/matrix workspaces`).
+- **Steps that allocate.** `made()` counts the allocations torch's allocator has made on the device. A step that
+  only replays graphs makes none, and Core holds an engine to that where asked: with
+  `CRIT_CORE_STEP_ALLOCATIONS=0` a step that allocates on the device once the load is over ends the engine
+  with the count, and a probed engine (`CRIT_CORE_STEP_PROBE=1`) reports each kind of step's allocations in its
+  telemetry (`core.probe`: `allocations`, `most_allocations`). Native rounds run no Python and allocate nothing.
+- **The audit.** The census says who holds a byte; the audit says what the engine does with it.
+  `crit plugins memory PACKAGE --model MODEL` loads the engine in process, serves two short prompt sets of its
+  own and fingerprints every page of the device memory the process holds before and after
+  (`crit_plugins.audit`): torch's blocks and every backed granule of the elastic ranges, read by the engine's own
+  thread as a request ends, before its sequence closes (`StepEngine.audit`). It reports each buffer
+  by the plugin and attribute that hold it with the bytes the workload wrote, how far into it the writes reach
+  and what stayed zero, and draws the verdicts that are certain (dead: all zero at every reading; oversized: a
+  part never written) apart from those that are not (unchanged bytes that hold something: weights, a table, or a
+  workspace only the load wrote). The bytes Core knows to be scratch (a capture's temporaries, growing buffers)
+  it fills with a mark first, so there every unwritten byte is certain, and a greedy reply repeated after the
+  workload must come out the same. Each graph's pool is listed with the allocations its captures made, by the
+  code that made them (`record()` turns torch's allocation history on for the audit's load), each paged range
+  with the units backed and written, and each kind of step with its graph replays, allocations and transient
+  peak. It needs nothing from the engine's plugins. Run it when a plan is about device memory (a larger expert
+  cache, a longer context, a workspace to shrink) and after a change that adds a buffer; its verdicts hold for
+  its workload, one request at a time, which the report states.
+
+Some memory is worth more in use than in reserve: a device expert cache hits more with every slot it has, yet a
+prompt step needs room for its temporaries, and under WDDM (Windows, WSL) an allocation past the device's memory
+does not fail: it moves to system memory, and every kernel that reads it slows down. So that such a plugin holds
+every byte the requests in flight do not need and none they do, Core also tells it of every step it runs:
+
+- **Step frames** (`crit_plugins.device.STEP_FRAMES`). A plugin object of any slot that has the method is told of
+  every step Core runs: `begin_step(prompt_tokens)` before the model's `step()` (the prompt tokens its rows
+  prefill, 0 for decode rows alone) or its `score()`, and `end_step(prompts_open)` after it (whether a row is
+  still prefilling, so another prompt step follows). The model plugin makes neither call. Native rounds run no
+  Python, so a frame is a step the model runs: prompt chunks, scores, eager decode.
+
+expert-offload's cache is the first giver: it opens with a reserve, takes every free byte but its margin (the
+run's VRAM headroom) once the load is over, makes room for a prompt step out of what a chunk of its size was
+measured to take, and grows back after the prompt's last step. A probed step's free device memory (the run's
+full-context checks) is read when the model's step returns, before the end frames.
+
+### The host
+
+**The host's processors.** An engine's threads share one machine: the workers that compute what the device does not
+hold, the thread that answers the device's doorbells, the loop that drives the device. Left to each plugin, every one
+starts its own pool and picks its own cores, and the threads of an engine outnumber them. So the host is one object,
+as a device's memory is: `crit_plugins.host.current()`, which every plugin also gets as `context.host`.
+
+- **The plan.** `cores` are the physical cores the process may run on, `plan()` says who runs where: the first core
+  is the service's (the thread that answers the device's doorbells and runs their jobs), each other core has one
+  worker of the pool, pinned to it (Linux). Nothing else of the engine computes on the host while the device waits
+  for a job, so a job has every core, each once.
+- **The pool.** `pool()` is the process's worker pool, one for Core and every plugin: one batch at a time, claimed
+  by the workers and the caller without a lock, batches of different callers one after the other. Native code built
+  apart from Core runs on it through two addresses, `pool().native` (the pool's C entry and the pool: `PoolRef` in
+  Core's `pool.h`, whose folder is `crit_plugins.host.INCLUDE`); Python has `pool().run(tasks, fn)`. The first
+  `pool(workers, pin)` may size it; what it is serves everyone after that, since any split of a batch gives the same
+  result. A plugin never starts worker threads of its own.
+- **File reads.** `reads(owner, path)` reads one file at a queue depth: positioned reads from 8 threads at once,
+  each with its own handle, opened past the OS's page cache where the file system allows (`direct=False` for
+  buffered reads). It is for a tier that keeps bytes of a file larger than host memory itself, so that the drive is
+  busy and nothing is held twice. The threads wait in the kernel and compute nothing, so they are no workers of the
+  pool; the report lists each open file's reads, bytes and whether they are direct.
+- **Handoffs.** Work the device decides and the host does inside one CUDA stream, captured graphs included
+  (the [host-work-mailbox](../inference/host-work-mailbox/README.md) technique): `handoff(device, owner, name,
+  slots, payload_bytes, serve, context)` gives slots in mapped pinned memory; a plugin's kernel writes a job into a
+  slot's payload and raises its doorbell (`handoff_device.cuh`, with the slot's device addresses `words(slot)`), the
+  service thread runs the handler (a C function of the plugin's host library) and answers, and `join(slot)` makes
+  the stream wait where the device reads the result. The join is the cheaper capturable one measured on the device
+  (`joins(device)`): the driver's stream wait or a one-thread poll kernel. A stream's wait has no clock, so a
+  job that never returned would hang the device for good: the service has a second thread that only watches, and
+  a job that runs past the job budget (20 s; `job_budget(ms)`) fails its handoff. Its waits are answered at once,
+  `failures()` names it with the reason, and Core ends the engine at its next step (also between rounds it
+  launches itself) instead of serving on what such a window computed. The plan and the pool know no device; a
+  handoff's device side is a runtime service of the device's backend (CUDA is the one built today, and
+  `handoff()` raises `NativeUnavailable` for any other device).
+- **The report.** The engine's telemetry carries the host as it stands (`"host"`, from `report()`): cores and
+  memory (total, available), the pool's workers and batches, the service thread's CPU, each handoff's join and jobs,
+  and what was built on the machine.
+
+**Native code built at load** (`crit_plugins.native`). A plugin's C++ and device code is source, compiled on the
+machine the first time it is needed, cached by content and recorded: `library(name, units, includes)` builds a shared
+library with the system's C++ compiler and opens it with ctypes; `extension(name, sources, includes)` builds a torch
+extension for the device's architecture. Both raise `NativeUnavailable` where they cannot build, and the plugin runs
+its fallback or refuses to load; `built()` (in the host's report as `"native"`) says what was built and what was not.
+A plugin does not carry a build of its own.
 
 ### Compiling at load
 
@@ -447,7 +711,7 @@ widths.
 
 An engine's facts are what it states about itself for crit serve's `/v1/models` card (`engine_facts`), Eval and the
 ablation: the model plugin's info, then each plugin object's optional `facts()` for the keys the info states none of
-(the first plugin in creation order winning a key), then `plugins` (the plugin filling each slot) and `kernels` (crit's kernels its plugins asked for and how each was built: tuned, built or fallback). The facts Eval reads
+(the first plugin in creation order winning a key), then `plugins` (the plugin filling each slot), `kernels` (crit's kernels its plugins asked for and how each was built: tuned, built or fallback) and `exactness` (the levels the configuration asks and the ones its plugins keep: [exactness](#exactness)). The facts Eval reads
 (`crit_core.serving.ENGINE_FACTS`) include a projections plugin's `prompt_activations`, which crit-eval prices
 prefill by, and the kv_cache plugin's `kv_bytes_per_token`: the device bytes one more token of context takes in the
 pools it made (every layer's keys and values at its pool's precision, their scales too, summed over every pool, a
@@ -456,7 +720,10 @@ count Eval leaves the KV term out and names it missing rather than assume a prec
 
 A generation's result carries its rounds: Core counts every decode row as one round (`rounds`); when the request
 drafted it lists per round `accepted` and `drafted`, and it sums each of the engine's named round counters (the model
-info's `round_counters`, such as `expert_reads` and `expert_hits`) over its native rounds. The model plugin's
+info's `round_counters`, such as `expert_reads` and `expert_hits`) over its native rounds. A model that names
+`nonfinite` among them has the round driver count, row by row, the verified columns whose logits held a NaN or an
+infinity (one reduction over the logits a round), and Core fails a request that saw one instead of returning tokens
+that are not the model's; the engine's telemetry counts them (`core.nonfinite_requests`). The model plugin's
 optional `request_facts(session)` (keys of `crit_core.serving.REQUEST_FACTS`), which Core asks for when a session
 ends with a length or stop finish, is merged in round by round: its step() rounds' entries take their places in Core's
 lists, its count of a round counter adds to the native rounds', and its other facts stand as given.
@@ -481,9 +748,9 @@ computes Core's batched step over the other slots' plugins. Its object implement
 | Method | What Core calls it for |
 | --- | --- |
 | `info()` | Core's settings (`vocabulary`, `context`, `max_concurrency` of 2 or more, `max_pending`, `max_batch_tokens`, `prefill_chunk`, `max_row_tokens`, `stop_tokens`, `sampling`, `token_logprobs`, `max_top_logprobs`, `scoring`, `score_paths`) and facts (`implementation`, `speculative`, `plain`, `replay`, `prompt_activations`, ...) |
-| `open(request)` | A session for a `StepRequest` (key, prompt, output limit, sampling, stop tokens, log-probabilities, replay, plain) |
+| `open(request)` | A session for a `StepRequest` (key, prompt, output limit, sampling, stop tokens, log-probabilities, replay, plain, and `prompt_cache`: whether it may be served from the [prompt cache](#the-prompt-cache)) |
 | `step(rows)` | One `StepResult` per scheduled `StepRow`: prompt chunks and decode rows of many requests in one step, each row's tokens independent of the other rows; a constrained row's `allowed` goes to the sampler as its `params["allowed"]` |
-| `commit(decisions)` | Core's decision per row of the last step: the tokens kept, an end, a cancel, a discard |
+| `commit(decisions)` | Core's decision per row of the last step: the tokens kept, an end, a cancel |
 | `retire(session, finish)` | The request ended; its state goes |
 | `score(ids, first_target, path, queries, top_k)` | Fixed text scored alone on the engine |
 | `admission(request)`, `native_rounds(library)` | Optional: page-reserving admission, decode rounds Core launches without calling `step()` ([captured rounds](#captured-rounds)) |
@@ -496,6 +763,73 @@ matcher of its constraint (json mode or a compiled grammar over the model's byte
 puts the tokens it may take next on its row as `StepRow.allowed`, a `crit_plugins.Allowed`. The model plugin hands it
 to the sampler with the row's params, the sampler masks every other token before its rules, and Core checks the token
 the row produced: one outside the mask, or more than one, fails that request.
+
+#### The prompt cache
+
+The prompt cache is Core's, as the scheduler is: `crit_plugins.prompt_cache.PromptCache` keeps ended requests'
+sequences in the model plugin's pools, so a prompt that begins as one of them did (a conversation's next turn, an
+agent's next tool step) prefills only the rest. It is a ledger over the pools' own `open`, `fork`, `keep` and
+`close` and touches no KV byte. A model plugin gives it its pools and calls it where it opened and closed
+sequences:
+
+```python
+self.cache = PromptCache(pools=[kv_pool], states=[state_pool], entries=8)
+reused = self.cache.open(session.handle, request.prompt, request.prompt_cache)   # open(): the prefix it reuses
+self.cache.mark(session.handle, position)        # optional: the state pools stand at `position` of the prompt
+self.cache.retire(session.handle, tokens)        # retire(): the tokens whose rows the pools hold; None drops it
+```
+
+Prefill starts after the reused prefix, and the prompt's first step reports it as
+`StepResult.reused_prompt_tokens` with the rows it computed, which Core counts as a retained prefix and crit serve
+as the request's cached prompt tokens. `pools` are cut anywhere: the kept sequence is forked, its pages shared until
+one of the two writes, and the fork kept to the shared prefix. `states` hold one state per sequence that nothing
+rolls back (a recurrence's state pool, a sliding window's ring), so they resume only where they stood: at a kept
+sequence's end, or at a position the model marked while it prefilled, a copy of the state per mark (`marks`, 2 by
+default, the newest). A sequence that resumed at a mark holds that mark too, the same copy, beside the ones it
+makes, so a conversation keeps the place its last turn resumed from. Which marks stay is the cache's rule, since the
+model marks every chunk's end: the newest by default, or with `spread` (a token count) marks that lie about twice as
+far apart with each step back from the newest, so a long prompt changed in its middle resumes near the change
+instead of nowhere. With `shared_least` the cache learns where conversations part: a prompt that shares that many
+tokens more with a kept sequence than the place it can resume from (a system prompt and tool list every
+conversation of a client repeats) gets that place as its first stop (`cache.stop(handle, frontier)`), and the mark
+the model makes there is a shared one, kept outside the count of `marks` and held by every sequence that resumes
+from it, so it outlives the conversations that made it. A later prompt rarely repeats a prompt to its last token: the same
+prompt sent again computes its last token anew, and a chat template may end a prompt otherwise than it renders
+that turn in the next one (a thinking model's opening tag). A model with states therefore gives the cache a
+`tail` (8 tokens, say) and passes `stop=cache.stop(session.handle)` to `step_item`: the prompt chunk then ends
+that many tokens before the prompt's end, the model marks there as it commits, and the tail is the next step's
+chunk, which marks the prompt's end. The shorter chunk costs the prompt a step (about 45 ms on a 27B model's
+engines), so `stop()` is None where it would not pay: for a prompt that resumed at a kept prompt's end, whose
+conversation repeats its prompts whole and which holds that place for the turn sent again, and for a prompt
+shorter than `tail_least` (a prefill chunk, say), prefilled whole in about a step's time. The last prompt token is
+always computed: its row gives the first output token. Kept sequences leave least recently used first, past
+`entries` or `tokens`, and on `evict()`: the model calls it when its page reservations run short, and a pool that
+offers `on_exhausted(callback)` (attention-state's) calls it itself before it refuses a page, so a kept sequence
+never costs a request its pages. One that a newer sequence extends leaves too. A request that decoded in Core's
+native rounds, which publish its output without the model seeing it, is kept to its prompt: with states it retires
+with `stands=False`, since its state is past the tokens it can name, and later prompts resume at its marks. A model
+with state of its own beside the pools (a hidden row its draft layer reads) hands it over where it stood,
+`mark(sequence, position, payload)` and `retire(sequence, tokens, payload)`, gets it back from
+`resumed(sequence)` after `open()`, and resumes at those places only (`at_marks`). A state is large where a KV
+page is small, so `marking` bounds the open sequences that hold marks at once, and a model need not size its
+state pool for the marks: they may stand in the states no open request uses, a mark the pool has no room for
+takes a kept sequence's (and is refused when none is left), and the model takes the copies back when a request
+or a score needs a state, with `evict()` for the
+kept sequences' and then `unmark()` for the open ones'. The cache then costs no device memory, and keeps
+nothing while every state is a request's.
+
+A request allows the cache with `StepRequest.prompt_cache`. crit serve's requests do, unless they carry
+`"crit": {"prompt_cache": false}` (`chat-prompt-cache-v1`, which every plugin package declares); a request that
+does not reuses nothing, marks nothing and is not kept, so it runs as on an engine without a cache. Everything that
+measures sends it so: Eval's timed, scored and concurrent requests, crit smoke, `crit run measure` and the
+ablation's benches. Eval's follow-up turns allow the cache: a model plugin that keeps one states `prompt_cache:
+true` in its info, Eval measures the turns against their floor with a prompt cache (its goal `followup_ttft`) and
+its prompt_cache gate holds the cached path to the answers the fresh one gave.
+[test_prompt_cache.py](../tests/test_prompt_cache.py) shows the ledger and the toy engine that keeps one
+(`toy-model`'s `prompt_cache` option): a follow-up turn reuses the kept turn, answers as fresh, and requests at
+once each fork the kept sequence. [test_device_prompt_cache.py](../tests/test_device_prompt_cache.py) does the same
+on a GPU over attention-state's paged pool, through `step()`, captured rounds and drafting rounds, and for a hybrid
+model whose recurrent state resumes at the marks it set as it committed each prompt chunk.
 
 A model plugin `needs` the architectures it implements, `requires` the slots its architecture calls beyond the
 required ones, fills only `model`, and is created last; the facts it `provides` (`draft:head`, `taps:hidden-states`)
@@ -578,14 +912,16 @@ column, `[rows][width + 1][vocabulary]` FP32. One round of R rows at width W the
 - count and pack: `count_round(view)` on every part that has it adds the part's counts of the round into the engine's
   named counters (`view.counter(name)`), and one block of results reaches pinned host memory.
 
-The parts are the model, sampler, drafter, head, verifier, every pool and the extra parts the model registers
-(`extra_parts`: a device expert cache), each once; with no Python between native rounds, a part's per-round
+The parts are the model, sampler, drafter, head, verifier, every pool, the plugins of the slots the round uses
+(expert-offload in the experts slot) and the extra parts the model registers (`extra_parts`: a device expert cache
+the model made itself), each once; with no Python between native rounds, a part's per-round
 bookkeeping runs in its two hooks. `bind(slot, sequence, frontier, token, allowance, capacity, stops=, params=,
 session=, tokens=, outputs=)` puts a sequence into a round slot in every pool (a KV pool reserves its pages up to
 `capacity`, so a captured round never allocates; pools and the drafter with `seed(slot, tokens)` get its tokens so
 far; the sampler stages its rules), `unbind` and `move` keep the decoding rows packed at the front, and a row a step
 does not schedule sits a round out (`view.hold`: it emits nothing, and every commit keeps it as it was). Each (rows,
-width, mode) is one graph with its own memory pool, captured at load on one capture stream per device, two eager
+width, mode) is one graph, captured at load into the engine's graph pool ([memory](#memory); a pool of its own with
+`share_pool=False`, or where no loader made the engine) on one capture stream per device, two eager
 warm-ups first, with cuBLAS workspaces made in a pool Core keeps for them (`capture_workspaces`: torch frees a
 stream's workspaces whenever a graph captured on it goes, and an engine closed beside another must not free what the
 other's graphs write); the memory the captures take is planned as `"rounds:captures"` ([memory](#memory)). Inputs a
@@ -688,7 +1024,7 @@ that use its code.
 | `attention` | `softmax-attention` | `partitioned-attention` (against `softmax-attention`) |
 | `kv_cache` | | `attention-state` |
 | `projections` | `projections-dense` | `quantized-projections` (`format` int8, int4 or nvfp4, against `projections-dense`); `host-expert-arithmetic` (against `quantized-projections` in nvfp4) |
-| `experts` | `experts-reference` | `grouped-experts` (against `experts-reference`); `heterogeneous-expert-dispatch` (with async-expert-contributions' code, bitwise against `experts-reference`); `host-expert-tier` (against `experts-reference`) |
+| `experts` | `experts-reference` | `expert-offload` (bitwise against `experts-reference` on the host; experts of any size against the device); `grouped-experts` (against `experts-reference`); `heterogeneous-expert-dispatch` (with async-expert-contributions' code, bitwise against `experts-reference`); `host-expert-tier` (against `experts-reference`) |
 | `expert_residency` | | `device-expert-cache` (`policy` clock or ranked); `expert-residency` |
 | `expert_source` | `expert-tensors` | `ssd-expert-materialization` (exactly against `expert-tensors`) |
 | `router` | `topk-router` | |
@@ -701,13 +1037,12 @@ that use its code.
 | `embeddings` | `memory-table-rows` | `lookup-table-rows` (against `memory-table-rows`) |
 | `norms` | `torch-norms` | `fused-norms` (against `torch-norms`) |
 
-Three entries fill no slot themselves and lend their code to plugins that do: async-expert-contributions,
-expert-streamed-prefill (whose moe_block is `experts-reference`) and host-work-mailbox (heterogeneous-expert-dispatch's
-in-stream join of its CPU routes). Seven entries are no plugin (`ENGINE_SERVICES` in
+Two entries fill no slot themselves and lend their code to plugins that do: async-expert-contributions and
+expert-streamed-prefill (whose moe_block is `experts-reference`). Eight entries are no plugin (`ENGINE_SERVICES` in
 [cli/crit/plugins.py](../cli/crit/plugins.py)): artifact-loading, model-import-audit, checkpoint-storage,
 host-memory-admission and device-speculative-round, since a model plugin calls them and no slot holds them, and
-session-scheduling and concurrent-request-execution, since Core's concurrent runtime does what they describe for every
-engine.
+session-scheduling, concurrent-request-execution and host-work-mailbox, since Core does what they describe for every
+engine (its concurrent runtime, and the host's handoffs).
 The plugin system itself is Core's, since an engine loads with it: `crit_plugins` in
 [core/python](../core/python/README.md) holds the manifest, the assembly, the slot interfaces and device forms, the
 kernel loader, Core's round driver and prompt graphs, the test helpers and the ablation's variants, and
@@ -727,6 +1062,17 @@ needs no plugin of the engine provides:
 the engine's own facts (`draft:head`), or a slot whose plugin is still to be chosen. The copy is the engine's from
 then on: it changes it like the rest of its source.
 
+The library goes on changing after the copy. `crit plugins status ENGINE/plugins` says how each of the engine's
+plugins, and each folder of code under `_sources`, stands to it: `current` (the library's files as they are now),
+`behind` (a copy of an earlier library version, which the engine did not change: it names that version's commit
+and date and counts the library's changes since), `changed` (a copy of no library version, so the engine changed
+it) or `own`. It reads the versions from the history of the crit checkout the library lies in; with the library
+of an installed wheel, which has none, a copy that is not current `differs`. `--json` prints the rows.
+`crit plugins update ENGINE/plugins` replaces every copy that is behind with the library's current one, the code
+under `_sources` too, and leaves the copies the engine changed and its own plugins as they are (`--dry-run` says
+what it would replace). An engine that took a library plugin unchanged gets the library's fixes that way; its
+tests and its Eval then say whether it keeps its results.
+
 Every slot but `model` has library plugins that run on the device, each with its host form as before and the slot's
 [device form](#device-form) in torch, over providers where one covers the arithmetic and crit's own kernels
 where none does, each with its torch fallback ([kernels and plugins](#kernels-and-plugins)). Their facts say which
@@ -739,7 +1085,7 @@ where none does, each with its torch fallback ([kernels and plugins](#kernels-an
 | `projections` | `projections-dense` (base), `quantized-projections`, `host-expert-arithmetic` (cpu) | BF16 matrices (`out_dtype` FP32 for logits, on the CPU too). quantized-projections: stored BF16, FP8 (per channel or tensor), MXFP8, NVFP4 and AWQ / GPTQ INT4 matrices (INT4 with a zero point a group, repacked at load); with `prompt_gemm: native` the quantized prompt GEMMs on crit's own kernels, and with `auto` (the default) only where they measured faster than the provider path; MXFP8 checkpoints' own activations with `mxfp8_activations: mxfp8`; prompt rows through cuBLASLt (torch's scaled matmul) with FP8 or NVFP4 activations, or with 16-bit activations on the matrix decoded a chunk of rows at a time (BF16, FP16 accumulation or FP8 rows by `prompt` and `prompt_roles`; FP8 matrices' W8A16 with `fp8_activations: bf16`); with `prompt_gemm: pinned` every format's prompt GEMMs on one split-K-free cuBLASLt algorithm per shape and format, chosen at load (pinned-gemm), and with `fixed_tiles` the BF16 and weight-only ones through fixed-tile-gemm, so a prompt row's bits are the same at every prompt length, chunk and padded bucket (`row_invariance` `prompt_rows`); decode rows (up to `decode_rows`, 16) through mma-rows' tensor-core tile or decode-gemv's GEMVs at the prompt rows' activations (`decode_activations: prompt`) or 16-bit ones, each row's bits alone and batched; short prompts through the tile as far as it measured faster (`tile_rows: auto`); every call path of a matrix run once at load, so no request compiles; the prompt arithmetic of every format in its facts (`prompt_arithmetic`); draft-only matrices re-encoded at load (`encode`). host-expert-arithmetic: stored NVFP4 / INT4 matrices weight only (the FP32 order) or W4A4 / W4A8 (the integer block order) on the CPU, BF16 a row at a time, every row's bits those of the row alone at any count |
 | `recurrence` | `sequential-recurrence` (base), `recurrent-state-recovery` | Every sequence's FP32 state and convolution window in a pool; decode tokens and verify windows of a step or a captured round in one column-scan launch (recurrent-scans where installed, else torch), the accepted prefix kept on the device (`commit`: deferred, checkpoints or recompute); prompt rows of up to `exact_rows` tokens (a stated value, 512 by default: the largest default prompt bucket; 0: none) through the same scan, so their bits are a decode's, and longer ones through fla's chunked kernel (sequential-recurrence; each of its autotuned Triton kernels pinned to one stated tile, `FLA_TILES`, since fla's autotune picks among tiles of other bits) or recurrent-scans' two-pass prefill (recurrent-state-recovery); which one a chunk runs and on which tiles follows from the configuration, never from a timing (a model whose chunk grid stays within `exact_rows` keeps every prompt row exact and a prefix's rows equal to the whole prompt's) |
 | `router` | `topk-router` (base) | Softmax or sigmoid routing, correction bias, group limits, renormalization: one launch of crit's kernel topk-routing where it loads and the rule has no group limit, torch otherwise; capture-safe (a row of NaN logits still picks valid distinct experts, NaN ranking below -inf) |
-| `experts` | `experts-reference` (base), `grouped-experts`, `host-expert-tier` (cpu), `heterogeneous-expert-dispatch` | experts-reference: the routed SwiGLU block over the experts' dense matrices, FP64 products in fixed chunks, capture-safe. grouped-experts: each expert one bundle in its stored format (bf16, fp8 channel or block, nvfp4 W4A16, or with `activations: nvfp4` each NVFP4 layer as its stored matrices declare, W4A4 where they carry input scales, int4, mxfp4), the routes grouped by expert on the device over the plugin's bundles or a residency cache's slot store, through crit's kernel grouped-experts or its torch fallback; a route's bits independent of the rows beside it and of decode against prompt; a long prompt chunk runs in parts, each combined into its tokens' rows as it goes, one prompt workspace serving the shorter prompt-sized calls of its shape. host-expert-tier: NVFP4 W4A4 / INT4 W4A8 experts in host-expert-arithmetic's declared integer block order on the CPU (a native tier built at load over a pinned worker pool, or torch with the same bits). heterogeneous-expert-dispatch: on CUDA, the routes an expert cache sends to the CPU (slot -2) computed by host-expert-tier's tier and joined inside the stream through host-work-mailbox, the split never changing a bit |
+| `experts` | `experts-reference` (base), `expert-offload`, `grouped-experts`, `host-expert-tier` (cpu), `heterogeneous-expert-dispatch` | expert-offload: experts larger than the device in one plugin, the model calling it as for experts that fit (begin, load, open, forward), its decision tree placing them on the device, in host memory behind a device cache in every byte the device has free while the engine serves, or in a file, misses computed by the CPU tier while the link copies them in beside the round (or copied over the link), prompt chunks staged, a diagnosis in its telemetry. experts-reference: the routed SwiGLU block over the experts' dense matrices, FP64 products in fixed chunks, capture-safe. grouped-experts: each expert one bundle in its stored format (bf16, fp8 channel or block, nvfp4 W4A16, or with `activations: nvfp4` each NVFP4 layer as its stored matrices declare, W4A4 where they carry input scales, int4, mxfp4), the routes grouped by expert on the device over the plugin's bundles or a residency cache's slot store, through crit's kernel grouped-experts or its torch fallback; a route's bits independent of the rows beside it and of decode against prompt; a long prompt chunk runs in parts, each combined into its tokens' rows as it goes, one prompt workspace serving the shorter prompt-sized calls of its shape. host-expert-tier: NVFP4 W4A4 / INT4 W4A8 experts in host-expert-arithmetic's declared integer block order on the CPU (a native tier built at load over a pinned worker pool, or torch with the same bits). heterogeneous-expert-dispatch: on CUDA, the routes an expert cache sends to the CPU (slot -2) computed by host-expert-tier's tier and joined inside the stream through host-work-mailbox, the split never changing a bit |
 | `expert_residency` | `device-expert-cache` | The directory on the device (`experts:cache`): one capture-safe plan launch and one fill launch per routed layer (a slot table: slot, -1 not routed, -2 the CPU tier), fills by SM loads from a registered host store, prompt chunks through a copy-engine ring that never admits, a KV pool's unused pages as slots, clock or ranked policy, telemetry and per-row counters through `count_round` |
 | `expert_source` | `expert-tensors` (base), `ssd-expert-materialization` | Bundle stores (`experts:store`, `open_store`): bundles in registered host memory with a device view, or a file tier read by a native reader behind a host tier, which a cache fills from on the host; `csf_scales` keeps NVFP4 scale components CSF-compressed in the store |
 | `embeddings` | `memory-table-rows` (base), `lookup-table-rows` | A device table, or (memory-table-rows' `host`, lookup-table-rows' `open`) a table in registered host memory gathered over the link; lookup-table-rows also reads tables in files (native positioned reads, prefetch into a hot-row cache, the gather a host function a CUDA graph captures) and stored NVFP4 rows decoded on the device |
@@ -803,6 +1149,12 @@ selection with those options changed, on the same cases. With `--set` and no `--
 variants run, so `ablate --data EVAL_DATA --set mtp-decode.override=0 --set attention-state.fresh_mib=64` is an
 in-process A/B of two options against the engine as built, on Eval's text, without writing a probe script. Each
 option variant gets a row like a plugin's, its `in_engine` changes against `full`.
+
+The level the engine asks of its rows ([exactness](#exactness)) is set the same way: `--set exactness.prompt=repeatable`
+(or `exactness.decode=LEVEL`, or `exactness=LEVEL` for both phases) serves the candidate asking that level over its
+own, so the report says what a level costs or gains before a candidate is built for it. Each variant's row carries the
+engine's `exactness` fact, what was asked and what each plugin kept; a variant whose plugins keep less than it asks
+fails with Core's refusal.
 
 The ablation is one check attempt, so it has the run's check process cap (an hour by default) for two variants
 and two more per plugin, each built again, benched and smoke-tested (crit smoke takes a minute or two on a working

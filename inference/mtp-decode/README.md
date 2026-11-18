@@ -12,9 +12,9 @@ predictor heads or trained draft models here.
 Use prompt/history copying for repeated or edited text when it proposes useful
 continuations cheaply. Any draft source can use the greedy verifier. Compare
 proposal, verification and repair cost with ordinary decoding; acceptance rate
-alone does not establish a speedup. Sampling needs the probability-based
-acceptance in [sampled.h](code/sampled.h), not the greedy verifier; its device path is
-[token-sampling](../token-sampling/README.md)'s `enqueue_verify`, with this loop as the oracle.
+alone does not establish a speedup. Sampling needs probability-based
+acceptance, not the greedy verifier: [token-sampling](../token-sampling/README.md)'s
+verify predictions, on the device.
 
 Use the checkpoint's drafter (MTP head or companion draft model) as published. It
 may be re-encoded or given a vocabulary subset, but never trained or fine-tuned:
@@ -37,7 +37,7 @@ generated-history matches require the longer `history_window`. The newest
 full-length candidate wins, otherwise the longest. Stops, vocabulary bounds and
 output budgets truncate it; no match returns an empty draft. `append` adds
 accepted tokens; `rewind` truncates and rebuilds, restoring evicted occurrences.
-`propose_matched(..., longest=64)` (C++ `propose_matched`, a `Proposal`) returns the
+`propose_matched(..., longest=64)` returns the
 same draft and how many accepted tokens before the copied continuation equal the
 context's last ones: at least `window`, at most `longest`, 0 without a draft. A long
 match is the evidence for letting a copy override another drafter's tokens
@@ -48,14 +48,6 @@ Prediction `i` must use the committed prefix plus the first `i` draft tokens.
 Accept the matching prefix, then the first target correction; if all match, emit
 the bonus when budget permits. Stop after an accepted stop token. Predictions
 conditioned on rejected tokens are discarded.
-
-A native `GreedySpeculator` round has two phases. `prepare(output_budget,
-draft_budget, proposer)` forks the target, verifies the draft on the fork and
-returns provisional output and a round ID. `commit(id, accepted)` rewinds the
-branch to the accepted prefix, materializes any correction/bonus with `append`,
-and only then replaces the committed target. Any prefix may be committed,
-including zero, so Core can truncate at a stop. A failed commit consumes the round;
-`discard(id)` rejects it. Stale IDs and duplicate commits are errors.
 
 ## On the device inside captured rounds
 
@@ -85,43 +77,19 @@ law: in sampled rounds its column's law is cleared and the verify takes the targ
 | --- | --- |
 | [prompt_copy.py](code/prompt_copy.py) | `PromptCopyIndex`, `CopyBatch`, `propose_batch` (charges `requests * (shared_width + 1)` target positions, drafts stay ragged) |
 | [implementation.py](code/implementation.py) | `verify`, `CommitPlan`, `commit(plan, apply)` |
-| [speculative.h](code/speculative.h) | C++20 `GreedySpeculator`, the `GreedyTargetState` contract and a stateless `PromptCopyProposer(window, lookback)` |
-| [prompt_copy.h](code/prompt_copy.h) | C++20 `IndexedPromptCopy`: keeps all occurrences for exact rewind, bounded by `max_tokens`, `max_matches`, `max_draft` |
-| [sampled.h](code/sampled.h) | `SampledSpeculator`, `Distribution`, `SparseDistribution`, `VerifyRule`, `block_verify`, `AdaptiveDraftBudget`, `AcceptanceEstimator` |
 
 ## What the engine supplies
 
-Target arithmetic, causal masking and model-state repair. For the native loop,
-implement `GreedyTargetState` for the exact target:
+Target arithmetic, causal masking and model-state repair: `D + 1` predictions, each conditioned on the committed
+prefix plus the drafts before it, and the state at the accepted length restored after a round, next-token logits
+and non-KV state included.
 
-| Method | Required behavior |
-| --- | --- |
-| `fork()` | Distinct owner with identical weights, representation, prefix and next prediction; isolate every mutable component (COW allowed) |
-| `tokens()` | Borrow the materialized prefix; no throw or mutation |
-| `next_token()` | The ordinary greedy argmax, same tie rule |
-| `verify(drafts)` | Materialize the block privately and return `D+1` predictions conditioned on prefix plus `drafts[:i]` |
-| `rewind(length)` | Restore all state at that length, including next-token logits and non-KV state |
-| `append(token)` | Materialize one correction/bonus token and its next prediction |
+Keep one private `PromptCopyIndex` per request and `append` only published accepted tokens (including
+corrections), never unverified drafts. `rewind(length)` follows an already-restored model state; it does not rewind
+KV. Window choices are content-dependent: tune on general data, never Eval.
 
-The default `verify` is a serial fallback; override it with a causal block pass
-and qualify its masks and KV numerically against ordinary execution. The
-[native attention fixture](../../tests/inference/speculative_attention_fixture.h)
-shows a block implementation over paged CPU attention.
-
-Calls are synchronous and settle physical work before returning. A branch may be
-left partially mutated on an exception; the committed parent never. Serialize all
-access. A device adaptation needs its own readiness and drain. In a Core `Session`,
-return `round.tokens` from `advance`, keep the ID and call `loop.commit(id,
-accepted)` from `Session::commit`; Core withholds publication until it succeeds.
-
-For `IndexedPromptCopy`, keep one private index per request and `append` only
-published accepted tokens (including corrections), never unverified drafts.
-`rewind(length)` follows an already-restored model state; it does not rewind KV.
-Window choices are content-dependent: tune on general data, never Eval.
-
-This synchronous loop is the **correctness oracle** for greedy speculation. The
-GPU fast path is [device-speculative-round](../device-speculative-round/README.md),
-whose accept kernel is tested against it.
+`verify` is the **correctness oracle** for greedy speculation. The GPU fast path is
+[device-speculative-round](../device-speculative-round/README.md).
 
 ## Worked example
 
@@ -142,16 +110,6 @@ index.rewind(6)
 assert index.propose(2) == (3, 4)
 assert index.propose(2, stop_tokens=(3,)) == (3,)
 assert verify((3, 4), (3, 4, 5), remaining=3).tokens == (3, 4, 5)
-```
-
-The [native example](code/speculative_example.cpp) generates 20 tokens from a
-synthetic cyclic target with copied drafts and checks each against ordinary
-greedy decoding:
-
-```sh
-cmake -S core -B build/core -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build/core --config Release
-ctest --test-dir build/core -C Release -R crit_speculative --output-on-failure
 ```
 
 ## Adapting it
@@ -175,129 +133,20 @@ Measure `(proposal + verification + repair + publication) / emitted tokens`. For
 MoE targets streaming experts from host memory, verification loads the union of
 the drafts' experts, so rejected drafts add transfer time. Zero draft budget is
 ordinary decoding. Target forks add their real KV/logit/state cost (a shared
-partial KV page may need COW space); reserve it in Core, since `SpeculationLimits`
-is not a memory cap.
+partial KV page may need COW space).
 
 Python fixtures (`tests/test_reusable_techniques.py`, `tests/test_techniques.py`)
-cover proposals and verification. [Native fixtures](../../tests/inference/speculative_tests.cpp)
-cover multi-round repair, bonus, partial/zero commits, stops, stale rounds,
-cancellation, failures and poisoned mutation; the paged-cache fixture compares
-2,400 generated tokens with ordinary decoding, `crit_speculative_matrix` runs each of
-these ways of proposing on its own (none, prompt copy with windows 1 and 3, a self
-draft, a stateful drafter model, always wrong and random drafts, with and without
-stops) and requires each to emit ordinary
-greedy output token for token, and `ctest -R crit_prompt_copy`
-checks the native index against a reverse-scan oracle. All use synthetic weights
-on the CPU: trained-model quality, device completion and performance are
-unqualified. The approach follows
+cover proposals and verification on synthetic targets: trained-model quality, device
+completion and performance are unqualified. The approach follows
 [Leviathan, Kalman and Matias](https://arxiv.org/abs/2211.17192).
 
-## Physical batch size is independent of proposal width
+## Sampled requests
 
-Use the [physical batch planner](../session-scheduling/README.md#independent-physical-batches-and-workspace)
-for independent target and draft execution shapes, keeping
-`SpeculationLimits.max_draft` and the per-round draft budget unchanged. With a
-target cap of 16 and a draft override of 4, a 23-column draft prompt runs as five
-calls of 4 plus 3; the target still uses 16 plus 7. An override of zero inherits
-the target cap. Sequential autoregressive draft steps keep their dependency.
-
-Split only operations the adapter declares safe, deciding separately for
-ingestion, catch-up, verification and repair. Causal verification must keep D+1
-predictions in order across calls and carry KV, recurrent state and positions;
-padding must not affect state or random draws.
-
-[physical_batches_example.cpp](code/physical_batches_example.cpp) runs separate
-target/draft scratch with synthetic integer projections and recurrent state. At
-context 96, lowering the draft cap from 16 to 4 cuts its scratch from **1,024 to
-256 bytes** with identical outputs (toy counts, not an LLM saving), and records
-the choice with [recorded selection](../recorded-selection/README.md). Rebuild
-workspace and graphs at a settled boundary when caps change, and discard a
-partially advanced branch on failure.
-
-```sh
-cmake -S core -B build/physical-batch-demo -DBUILD_TESTING=ON
-cmake --build build/physical-batch-demo --config Release --target crit_physical_speculative_example
-ctest --test-dir build/physical-batch-demo -C Release --output-on-failure -R crit_physical_speculative_example
-```
-
-It checks 48-token greedy equivalence across draft caps 1–17. Qualify peak memory,
-round latency and quality on the real engine; smaller calls can cost more launches
-and weight reads.
-
-## Sampled target and draft models
-
-`SampledSpeculator` owns two `ProbabilityState` models (same tokenizer and
-positions), private RNG and one provisional round. At position i, draw x from the
-draft q_i and accept with probability `min(1, p_i[x]/q_i[x])`; on rejection sample
-the correction from normalized `max(p_i - q_i, 0)`; after all accepts, sample a
-bonus. This preserves the target distribution, not the seeded token sequence.
-Discard or failure consumes no committed random draws.
-
-`VerifyRule::block` (the constructor's last argument) verifies the round as a block
-([Sun et al.](https://arxiv.org/abs/2403.10444)) instead: with prefix weights
-`w_0 = 1`, `w_i = min(1, w_(i-1) p_(i-1)[x_i] / q_(i-1)[x_i])`, draft count `i`
-stands with probability `h_D = w_D` at the top and `h_i = Z_i / (Z_i + 1 - w_i)`
-below it, where `Z_i` is the mass of `max(w_i p_i - q_i, 0)` (`h_i = 1` when
-`w_i = 1`). Scanning from `D` down, the first success fixes the standing count
-`tau`; the next token is the bonus from `p_D` when `tau = D`, else a draw from the
-normalized `max(w_tau p_tau - q_tau, 0)`. A later draft can then stand even though
-an earlier one would have been rejected on its own, so the expected standing count
-is at least the token rule's, with the same output law. `block_verify` is the rule
-on its own, for engines with their own controller. It needs every row's residual
-mass, a full-vocabulary pass per position; its draws must be fresh for each round,
-since a later round that revisits a position with the same draws biases the law (a
-private RNG, as here, is fresh). The native checks compute the round's law exactly
-on a three-token Markov fixture (equal to the target's for widths 1 to 3, with 0.865
-expected standing drafts at width 3 against the token rule's 0.723) and run the
-90,000-history chi-square check through the block rule.
-
-`Distribution::logits(scores, temperature, top_k, top_p, min_p)` applies
-temperature, top-k, top-p, then min-p, ranking ties by ascending token ID;
-temperature zero selects the first maximum. The target p must match ordinary
-sampling; the draft may use other filters if proposal and acceptance both use its
-actual q.
-
-`SparseDistribution` stores sorted positive `{token, weight}` pairs. If support
-exceeds `sparse_capacity` it keeps the **complete dense law**: capacity limits
-representation, never probability support. `SparseSampledSpeculator` shares the
-same contract. Sparse rows cost O(S) storage; fallback costs O(V).
-
-`AdaptiveDraftBudget(supported, maximum_pending=64)` explores the given widths
-(include zero) and minimizes an EWMA of round seconds per published token. For
-delayed timings, take a ticket from `begin_observation(actual_width)` and call
-`observe(ticket, published, seconds)` after completion. `record_preparation(width,
-seconds)` resets a width after graph rebuilds.
-
-A budget that includes zero mixes speculative rounds and plain steps by acceptance,
-so a sampled request's time per round depends on its seed. Report the drafts each
-round made (`drafted` beside `accepted`; crit serve passes it in `crit_telemetry`):
-crit Eval then reads each repetition's time per round at the median drafts per round.
-Without it, Eval reads that spread across a sampled case's seeds as a disturbed device
-and stops the round (protocol `sampled_speed.disturbed`).
-
-`AcceptanceEstimator(positions)` predicts each draft's acceptance from the drafter's
-own confidence, for drafters without a confidence head: `p(k) = sigmoid(slope *
-logit(q_max) + intercept[k])` with `q_max` the draft law's largest probability at
-draft position `k`, one shared slope and one intercept per position. `observe(k, q_max,
-accepted)` keeps a bounded window of verified drafts and `refit()` runs Newton steps on
-it (the shared slope makes the Hessian an arrowhead, so a step is a scalar solve).
-`survival(q_max)` multiplies the predictions along a round; `cut(q_max, floor)` keeps
-the prefix whose survival stays at or above a floor, and `admit(survivals, budget)`
-splits one draft budget across a batch by survival, a prefix per request. The floor or
-budget is the engine's to measure, for example against `AdaptiveDraftBudget`'s seconds
-per published token. Before `minimum_samples` outcomes it predicts 1 and cuts nothing. An engine that holds the draft scores passes `feature_from_logits(scores, temperature)` to `observe_feature`, `predict_feature` and `survival_features`: it is the top score less the log-sum-exp of the others, so a confident draft keeps its value, where a probability rounds to 1 in FP32 once the other tokens' mass is under about 6e-8 and `feature(q_max)` clamps every draft past 1e-6 to the same 13.8.
-A cut drops drafts only, so the output law is the verification rule's. The native check
-recovers a simulated law (slope 1.3, intercepts 0.5 to -1) from 4,096 drafts to 1.34
-and within 0.06. It is an estimator for adaptive verification without a
-head; a drafter that publishes a confidence head uses
-[confidence cuts](../hidden-state-drafters/README.md) instead.
-
-The [sampled example](code/sampled_example.cpp) and
-[native checks](../../tests/inference/sampled_tests.cpp) (`ctest -R crit_sampled`)
-cover exhaustive small-support path mass, filters, sparse/dense coupling,
-transaction rollback and budget tickets, without a model or GPU. A statistical
-check runs 90,000 seeded three-token generations through draft and verify (draft
-budgets 0 to 3 in effect, the allowance capping 4) and compares their frequencies with sampling the target directly, per cell and with a chi-square
-bound, so a wrong residual law after accepted drafts fails it. It runs on the dense,
-sparse and sparse-fallback laws; those are coupled draw for draw (the sparse/dense
-coupling check), so they replicate one trajectory rather than add independent samples.
+A sampled request's drafts are verified by rejection sampling: accept draft `x` at position `i` with probability
+`min(1, p_i[x] / q_i[x])`, on rejection draw the correction from the normalized `max(p_i - q_i, 0)`, and after
+all accepts draw a bonus. This preserves the target distribution, not the seeded token sequence.
+[token-sampling](../token-sampling/README.md) supplies the predictions under which the greedy accept rule is this
+rule, on the device and in its Python mirror; [device-speculative-round](../device-speculative-round/README.md)'s
+`WidthPolicy` chooses the draft width per round from measured acceptance, and
+[hidden-state-drafters](../hidden-state-drafters/README.md)' confidence cuts shorten a draft by its drafter's own
+confidence.

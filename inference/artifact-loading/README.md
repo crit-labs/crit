@@ -41,8 +41,8 @@ are admitted.
 Native engines use Core's files library ([io](../../core/src/io/README.md#read-only-files)).
 `crit::core::ReadOnlyFile::open(path).read_chunks(offset, length, consume, options)`
 calls `consume(bytes, file_offset)` per fixed chunk in file order on the calling thread
-while the next chunk is read on another thread. The consumer can hash
-(`crit::core::Sha256`), copy to pinned memory or submit an upload; a chunk span is valid
+while the next chunk is read on another thread. The consumer can hash,
+copy to pinned memory or submit an upload; a chunk span is valid
 only during the call. `ReadOptions::direct = true` reads unbuffered (`O_DIRECT`,
 `FILE_FLAG_NO_BUFFERING`) through aligned buffers so large weights do not evict the page
 cache; file systems that refuse fall back to buffered reads with
@@ -51,10 +51,9 @@ cache; file systems that refuse fall back to buffered reads with
 is a multiple of the alignment, and pair large staging with
 [host memory admission](../host-memory-admission/README.md).
 
-For safetensors, `crit::core::Checkpoint` ([model](../../core/src/model/README.md#tensor-bytes))
-supplies descriptors, per-tensor `read_chunks`, per-shard `stream_shard` and file
-digests. Manifest digest checks and representation metadata stay with `ArtifactReader`
-and the engine's descriptors.
+For safetensors, `crit_core.model` ([model files](../../core/python/crit_core/model/README.md#safetensors))
+supplies descriptors and tensor bytes. Manifest digest checks and representation metadata
+stay with `ArtifactReader` and the engine's descriptors.
 
 ## What the engine supplies
 

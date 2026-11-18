@@ -39,6 +39,7 @@ class SequentialRecurrence:
         self.exact_rows, self.chunk_fp32, self.commit = exact_rows, chunk_fp32, commit
         self.use_kernels, self.folder, self.arithmetic, self.scan = kernels, folder, prefill, scan
         self.prompts = []   # each pool's prompt rows: where the scan hands them to the chunked kernel
+        self.elastic = False   # the pools' states backed for the sequences that are open (the elastic option)
 
     def kernels(self, device, keys, conv=None):
         """crit's kernel recurrent-scans (built for this GPU, tuned or default knobs) for a CUDA pool of `keys` key
@@ -65,7 +66,8 @@ class SequentialRecurrence:
     def pool(self, layers, heads, keys, values, device, sequences=None, widest=0, conv=None, key_heads=None, rows=None):
         """The device form: every sequence's state per layer (device_states.StatePool)."""
         pool = device_states.StatePool(layers, heads, keys, values, device, sequences, widest, conv, key_heads, rows,
-                                       self.commit, self.kernels(device, keys, conv))
+                                       self.commit, self.kernels(device, keys, conv), elastic=self.elastic,
+                                       owner="sequential-recurrence")
         self.prompted(pool)
         return pool
 
@@ -96,6 +98,12 @@ class SequentialRecurrence:
         return {"recurrence_prompts": {"pools": list(self.prompts), "scan": device_states.SCAN_AGREEMENT,
                                        "chunked": device_states.CHUNKED_AGREEMENT, "captured": device_states.CAPTURED}}
 
+    def exactness(self):
+        """The level its rows keep (device_states.prompt_exactness): prompt rows exact where every one runs the scan
+        (prompt_rows scan, or no chunked kernel for the pools' shapes), repeatable where long ones reach a chunked
+        kernel."""
+        return device_states.prompt_exactness(self.prompts)
+
     def forward(self, layer, query, key, value, log_decay, beta, pool, batch, geometry, out=None):
         return device_states.forward(layer, query, key, value, log_decay, beta, pool, batch, geometry, None,
                                      self.chunk_fp32, self.prompt, out)
@@ -114,4 +122,8 @@ def create(context, options, parts):
                                  prefill=options["prefill"], scan=options["scan"])
     if options.get("fla"):
         found.prompt = "fla"   # the yardstick: fla's chunked kernel where it is installed
+    found.elastic = bool(options["elastic"])
+    # prompt_rows: scan gives every prompt row the scan; auto follows the level the engine asks of its prompt rows,
+    # but keeps fla where the option names it
+    found.prompt = device_states.asked_prompt(options["prompt_rows"], found.prompt, pinned=bool(options.get("fla")))
     return found

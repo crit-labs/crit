@@ -44,6 +44,7 @@ SPLIT_TOKENS, CHUNK, PIECE_TOKENS, PIECE_ROWS and PIECE_PARTITIONS are defaults 
 5090), as the kernel's own partitions, piece and tiles are where the engine has not tuned it (crit kernels sweep).
 """
 from crit_plugins.device import capturing
+import itertools
 import math
 
 from . import pages as kv_pages
@@ -75,16 +76,15 @@ def engine_device(context):
 
 def device_memory(device, mode, kernels_loaded, kernels_mib, flashinfer, flashinfer_mib, decode,
                   prompt_reader="prefill"):
-    """(device bytes, host bytes) the device form allocates when it is made: the split-KV reader's partials
-    (kernels_mib, where crit's kernel loaded), and where FlashInfer serves (mode auto, option flashinfer auto,
-    FlashInfer installed) its scheduling workspace (flashinfer_mib) and its wrappers (one per prefill tile class, and
-    a decode wrapper with decode "flashinfer"), each FLASHINFER_INT_BYTES on the device and on the host (pinned), a
-    prefill wrapper FLASHINFER_PREFILL_BYTES more on the device; none with prompt_reader "decode" (every row the
-    split-KV reader's). A plugin's memory() declares them."""
+    """(device bytes, host bytes) the device form allocates when it is made: where FlashInfer serves (mode auto,
+    option flashinfer auto, FlashInfer installed) its scheduling workspace (flashinfer_mib) and its wrappers (one per
+    prefill tile class, and a decode wrapper with decode "flashinfer"), each FLASHINFER_INT_BYTES on the device and
+    on the host (pinned), a prefill wrapper FLASHINFER_PREFILL_BYTES more on the device; none with prompt_reader
+    "decode" (every row the split-KV reader's). A plugin's memory() declares them. The split-KV reader's partials
+    are none of it: each launch takes them from the engine's scratch (kernels_mib at most)."""
     if mode == "torch" or not str(device).startswith("cuda"):
         return 0, 0
-    found = (int(kernels_mib) << 20) if kernels_loaded and kernels_mib else 0
-    host = 0
+    found = host = 0
     if _flashinfer_serves(mode, flashinfer) and prompt_reader != "decode":
         wrappers = len(PREFILL_TILES) + (decode == "flashinfer")
         found += (int(flashinfer_mib) << 20) + wrappers * FLASHINFER_INT_BYTES
@@ -95,6 +95,29 @@ def device_memory(device, mode, kernels_loaded, kernels_mib, flashinfer, flashin
 
 def _flashinfer_serves(mode, flashinfer):
     return mode != "torch" and flashinfer == "auto" and _flashinfer_installed()
+
+
+def asked_prompt_reader(prompt_reader, reader="split", flashinfer="off", kernels_loaded=True, int8_qk=False):
+    """The plugins' prompt_reader option as the device form takes it, prefill or decode. auto follows the level the
+    engine asks of its prompt rows (crit_plugins.kernels.asks, the configuration's exactness) with the fastest
+    reader that keeps it: repeatable, or nothing asked, the prompt reader (prefill); row-exact, the prompt reader
+    where it is crit's own of reader split (a token's bits follow its own positions, whatever the chunk) and the
+    decode's reduction where the prompt reader would be a flash prompt chunk, FlashInfer's or torch's (their sums
+    follow the chunk); exact (and declared, which no reader keeps: the loader then says so), the decode's reduction, a
+    prompt row the bits of the same token decoded. An option set to prefill or decode is that reader."""
+    if prompt_reader != "auto":
+        return prompt_reader
+    from crit_plugins.kernels import asks
+    asked = asks("prompt")
+    if asked in (None, "repeatable"):
+        return "prefill"
+    if asked == "row-exact" and reader == "split" and flashinfer == "off" and kernels_loaded:
+        return "prefill"
+    if int8_qk:
+        raise ValueError(f"prompt_reader decode (auto, for the {asked} prompt rows the configuration's exactness "
+                         "asks) reads prompt rows as decode rows, and int8_qk is the prompt reader's (INT8 query-key "
+                         "products): turn int8_qk off or ask repeatable prompt rows")
+    return "decode"
 
 
 class Windows:
@@ -134,13 +157,40 @@ def _too_small(tokens):
                       "the attention plugin's workspace_mib")
 
 
+_OWNERS = itertools.count(1)
+
+
+class _OwnedKernels:
+    """crit's paged-kv-attention module for one DeviceAttention: every launch runs inside the module's owner() of this
+    reader, so its partials, its fused launches' ring and sync words and its prompt chunks' state are never another
+    reader's (two engines of a process may launch and replay their graphs side by side). Everything else is the
+    module's."""
+
+    def __init__(self, kernels):
+        self._kernels, self._key = kernels, ("attention-state", next(_OWNERS))
+
+    def __getattr__(self, name):
+        return getattr(self._kernels, name)
+
+    def attend(self, *args, **kwargs):
+        with self._kernels.owner(self._key):
+            return self._kernels.attend(*args, **kwargs)
+
+    def prefill(self, *args, **kwargs):
+        with self._kernels.owner(self._key):
+            return self._kernels.prefill(*args, **kwargs)
+
+    def release(self):
+        self._kernels.release(self._key)
+
+
 class DeviceAttention:
     _sinks = None   # forward()'s sinks and sliding window for the call it is in
     _sliding = 0
 
     def __init__(self, kernels=None, mode="auto", int8_qk=False, decode="split", partitions=0, piece=0, device=None,
                  kernels_mib=128, flashinfer="off", flashinfer_mib=128, prompt_reader="prefill", reader="split",
-                 latent=None):
+                 latent=None, scratch=None):
         """decode: what reads a step's window rows: "split" (the split-KV reader, as captured rounds read them: a
         decode row's bits the same in a step and in a round) or "flashinfer" (FlashInfer's decode and prefill over
         16-bit and FP8 pages where it serves, another reduction than a round's). prompt_reader: "prefill" (prompt rows
@@ -153,7 +203,8 @@ class DeviceAttention:
         apply; block lists stay on the split launch) or "cuda" (the same through the CUDA flash tile: cuda-window,
         cuda-fused and cuda-prefill, one chunk and block per pool, cuda_chunk(); int8_qk prompt chunks stay on the
         Triton flash prompt chunk). latent: a callable giving crit's latent-attention module (built on first use), or
-        None: latent attention (forward's latent) in torch."""
+        None: latent attention (forward's latent) in torch. kernels_mib: the most partials a launch of the split-KV
+        reader takes from `scratch`, the engine's (crit_plugins.memory's Scratch; one of the form's own without)."""
         if decode not in ("split", "flashinfer"):
             raise ValueError(f"decode is split or flashinfer, not {decode!r}")
         if prompt_reader not in ("prefill", "decode"):
@@ -163,7 +214,9 @@ class DeviceAttention:
         if prompt_reader == "decode" and int8_qk:
             raise ValueError("int8_qk is the prompt reader's (INT8 query-key products): prompt_reader decode reads "
                              "prompt rows as decode rows")
-        self.kernels = kernels          # crit's paged-kv-attention module, or None
+        # crit's paged-kv-attention module (launching in this reader's own workspaces where the build has owners), or
+        # None
+        self.kernels = _OwnedKernels(kernels) if hasattr(kernels, "owner") else kernels
         self._latent_loader, self._latent_kernels = latent, False
         # flash: False (reader split), True (the Triton flash structures) or "cuda" (the CUDA flash tile), as the
         # kernel's attend and prefill take it.
@@ -177,14 +230,20 @@ class DeviceAttention:
         self._steps = {}                # what a step plans at its first layer, by kind: kind -> (key, plan)
         self._parts, self._prompt_rows, self._widths, self._warmed = {}, {}, {}, set()
         self._prompt_kernels = {}       # (head width, value width, query dtype, page kind, device) -> CUDA prompt chunk
-        # Everything allocated now, as memory() declares it (device_memory): the split-KV reader's partials, and
-        # FlashInfer's scheduling workspace and wrappers.
-        self.split_workspace = self.flashinfer_workspace = None
+        # The split-KV reader's partials are scratch: a launch writes and merges them and nothing reads them after.
+        # Each launch takes what its rows need, partial_bytes at most, so a launch reads as many rows as those hold.
+        self.partial_bytes, self.scratch, self._own_scratch = 0, scratch, False
+        # Everything allocated now, as memory() declares it (device_memory): FlashInfer's scheduling workspace and
+        # wrappers.
+        self.flashinfer_workspace = None
         self._wrappers = {}
         if mode != "torch" and device is not None and str(device).startswith("cuda"):
             torch = _torch()
             if kernels is not None and kernels_mib:
-                self.split_workspace = torch.empty((int(kernels_mib) << 20) // 4, dtype=torch.float32, device=device)
+                self.partial_bytes = int(kernels_mib) << 20
+                if scratch is None:
+                    from crit_plugins.memory import of as memory_of
+                    self.scratch, self._own_scratch = memory_of(device).scratch("attention-state"), True
             if _flashinfer_serves(mode, flashinfer):
                 import flashinfer as fi
                 self.flashinfer_workspace = torch.empty(int(flashinfer_mib) << 20, dtype=torch.uint8, device=device)
@@ -258,8 +317,36 @@ class DeviceAttention:
         found["split_kv_wide_windows"] = wide
         return found
 
+    def _partials(self, floats=None):
+        """A launch's partials: `floats` FP32 of the engine's scratch (None: as many as partial_bytes holds), taken
+        by every launch."""
+        nbytes = self.partial_bytes if floats is None else min(self.partial_bytes, 4 * int(floats))
+        return self.scratch.take(nbytes).view(_torch().float32)
+
+    def exactness(self):
+        """The level this reader's rows keep (crit_kernels.exactness; a plugin's exactness() returns it, and Core
+        compares it with the level the configuration asks). With prompt_reader decode a prompt row has the bits of
+        the same token decoded, on the kernel and in torch: exact, beside row-exact decode rows. Through a prompt
+        reader, where crit's kernel reads the pages: decode rows row-exact (the split-KV reader, or a flash tile:
+        a column's bits the same alone, in any window, in a step and in a round) unless FlashInfer decodes them
+        (another reduction than a round's: repeatable); prompt rows row-exact through reader split's prompt reader
+        and repeatable through a flash prompt chunk or FlashInfer's prefill, whose sums follow the chunk. The torch
+        path through a prompt reader states nothing: no test holds its rows to a level."""
+        if self.prompt_reader == "decode":
+            return {"decode": "row-exact", "prompt": "exact"}
+        if self.kernels is None or self.mode == "torch" or not str(self.device).startswith("cuda"):
+            return {}
+        library = self.flashinfer_workspace is not None
+        return {"decode": "repeatable" if library and self.decode == "flashinfer" else "row-exact",
+                "prompt": "repeatable" if library or self.flash else "row-exact"}
+
     def close(self):
-        self.split_workspace = self.flashinfer_workspace = None
+        self.flashinfer_workspace = None
+        if self._own_scratch:
+            self.scratch.close()
+        self.scratch, self._own_scratch = None, False
+        if isinstance(self.kernels, _OwnedKernels):
+            self.kernels.release()
         self._wrappers.clear()
         self._steps.clear()
         self._warmed.clear()
@@ -361,8 +448,10 @@ class DeviceAttention:
         up-projection follows in the model), and lse. Decode tokens, verify windows (up to 64 tokens) and captured
         rounds through crit's latent-attention decode reader (attend: split over KV partitions, merged); prompt rows
         and captured prompt chunks through its prompt reader (prefill: the chunk's tokens times heads in tiles, its
-        output written directly; another reduction than the decode reader's). Pages BF16, FP16 or fp8:row (E4M3 with a
-        scale a position); FP32 pools and a GPU without the kernel in torch."""
+        output written directly; another reduction than the decode reader's), or, with prompt_reader "decode", as
+        window rows of up to 64 columns through the decode reader's fused launch (each program folding its partitions
+        as the merge does: a prompt token's bits are those of the same position decoded). Pages BF16, FP16 or fp8:row
+        (E4M3 with a scale a position); FP32 pools and a GPU without the kernel in torch."""
         torch = _torch()
         if pool.value_dim or pool.kv_heads != 1 or queries.shape[-1] != pool.head_dim:
             raise ValueError(f"latent attention reads a pool of keys only (value_dim 0) with one KV head of the queries' "
@@ -388,9 +477,15 @@ class DeviceAttention:
         cache = pool.k[i].view(pool.pages + 1, pool.page, pool.head_dim)
         scales = pool.k_scales[i] if pool.dtype == "fp8:row" else None
         common = dict(rank=rank, scale=scale, sinks=sinks, scales=scales)
+        decode = self.prompt_reader == "decode"
         if batch.prompt:
-            table = pool.prompt_table[0]
-            kernels.prefill(q, cache, table, batch.frontier_t, pool.page, out=out, lse=found, **common)
+            if decode:   # the bucket as window rows of up to 64 columns, in the decode's reduction
+                meta = self._prompt_windows(pool.prompt_table, batch, q.device)
+                kernels.attend(q, cache, meta.tables, meta.rows, meta.starts, meta.firsts, meta.columns, pool.page,
+                               counts=meta.counts, out=out, lse=found, fused=True, **common)
+            else:
+                kernels.prefill(q, cache, pool.prompt_table[0], batch.frontier_t, pool.page, out=out, lse=found,
+                                **common)
             return (out, found) if lse else out
         if batch.round:
             rows, cols = batch.rows, batch.width + 1
@@ -402,9 +497,14 @@ class DeviceAttention:
             meta = _windows_of(pool, [batch.row(r) for r in windows], q.device)
             kernels.attend(q, cache, meta.tables, meta.rows, meta.starts, meta.firsts, meta.columns, pool.page,
                            counts=meta.counts, out=out, lse=found, **common)
+        pieces = []   # prompt_reader decode: a prompt row as pieces of up to 64 tokens, window rows of the fused launch
         for r in range(batch.rows):
             sequence, first, count, position = batch.row(r)
             if count <= kernels.MAX_COLUMNS:
+                continue
+            if decode:
+                pieces.extend((sequence, first + at, min(kernels.MAX_COLUMNS, count - at), position + at)
+                              for at in range(0, count, kernels.MAX_COLUMNS))
                 continue
             span = slice(first, first + count)
             table = pool.device_tables.get(sequence)
@@ -412,6 +512,10 @@ class DeviceAttention:
                 table = pool.device_tables[sequence] = pool._to_device(pool.table(sequence))
             kernels.prefill(q[span], cache, table.to(torch.int32), position, pool.page, out=out[span],
                             lse=found[span] if found is not None else None, **common)
+        if pieces:
+            meta = _windows_of(pool, pieces, q.device)
+            kernels.attend(q, cache, meta.tables, meta.rows, meta.starts, meta.firsts, meta.columns, pool.page,
+                           counts=meta.counts, out=out, lse=found, fused=True, **common)
         return (out, found) if lse else out
 
     def _latent_module(self, pool, q):
@@ -576,12 +680,16 @@ class DeviceAttention:
                      if flash == "cuda" else self.kernels.flash_parts(meta.tables.shape[1] * pool.page, chunk))
         else:
             parts = partitions or (PIECE_PARTITIONS if blocks is not None else self._partitions(pool, q.device))
-        capacity = None
-        if self.split_workspace is not None:
-            capacity = self.split_workspace.numel() // self.kernels.workspace_floats(1, q.shape[1], parts,
-                                                                                     pool.value_dim)
+        capacity = workspace = None
+        if self.partial_bytes:
+            per = self.kernels.workspace_floats(1, q.shape[1], parts, pool.value_dim)   # floats a partial row
+            capacity = self.partial_bytes // 4 // per
         columns = self._launch_columns(q, pool, meta, flash=flash)
-        for cut, tokens in meta.launches(capacity):
+        launches = meta.launches(capacity)
+        if self.partial_bytes:   # the largest launch's partials: the launches run one after another in them
+            workspace = self._partials(per * max((cut.stop - cut.start) * columns if tokens is None else tokens
+                                                 for cut, tokens in launches))
+        for cut, tokens in launches:
             # A later launch's slices start inside the tensors: copied, they keep the alignment the kernel was
             # compiled for at load (Triton specializes a pointer by its 16-byte alignment).
             part = (lambda t: t[cut]) if not cut.start else (lambda t: t[cut].clone())
@@ -592,7 +700,7 @@ class DeviceAttention:
                                 key_scales=pages[2] if scaled else None, value_scales=pages[3] if scaled else None,
                                 multipliers=multipliers, scale=scale, partitions=parts, piece=self.piece or None,
                                 parents=parents, blocks=blocks, block_size=block_size, out=out, lse=found,
-                                workspace=self.split_workspace, flash=flash, chunk=chunk, sinks=self._sinks,
+                                workspace=workspace, flash=flash, chunk=chunk, sinks=self._sinks,
                                 sliding=self._sliding)
 
     def _step_windows(self, pool, batch, chosen, device):
@@ -669,12 +777,15 @@ class DeviceAttention:
                           sliding=self._sliding)
 
     def _warm(self, layer, queries, pool, lse):
-        """Compile at load what a step's window rows launch. The first eager call over a pool and query geometry (a
+        """Compile at load what a step's rows launch. The first eager call over a pool and query geometry (a
         prompt chunk's or a round's warm-up, or Core's first request: an engine makes them all at load) launches the
         split-KV reader once for each query tile a window row of 1 .. pool.window columns gets (_launch_columns),
         and with prompt_reader decode each tile a prompt piece of 1 .. 64 tokens gets in its fused launch, one row
-        over the dump page. A request's window rows of any width and length then compile nothing (draft trees
-        and block lists aside: their launches compile at their first step)."""
+        over the dump page; with crit's prompt reader, the launch a prompt row past the window gets (_prefill_rows:
+        one token over the dump page, and again with fresh rows where the pool keeps them), which compiles the
+        kernel for every tuned block size a row's length can read. A request's window rows of any width and length
+        and its prompt rows of any length then compile nothing (draft trees and block lists aside: their launches
+        compile at their first step)."""
         q = self._queries(queries, pool)
         key = (str(q.device), tuple(q.shape[1:]), q.dtype, id(pool), bool(lse), self._sinks is not None,
                self._sliding)
@@ -716,6 +827,22 @@ class DeviceAttention:
                     if width not in launched:
                         launched.add(width)
                         self._fused(layer, q, pool, meta, scale, out, found, None)
+        if self.prompt_reader != "decode" and q.shape[-1] == pool.value_dim:
+            pages = pool.layer_pages(layer)
+            scaled = len(pages) == 4
+            multipliers = pool.scale_values[pool.layers[layer]] if pool.dtype == "fp8" else (1.0, 1.0)
+            table = torch.full((1,), pool.dump, dtype=torch.int64, device=device)
+            given = []
+            if not (self._flashinfer_reads(pool, q) and found is None and self._sinks is None and not self._sliding):
+                given.append(None)   # rows without fresh keys and values that FlashInfer does not take (_prompts)
+            if getattr(pool, "fresh_k", None) is not None:
+                given.append((pool.fresh_k[:1], pool.fresh_v[:1]))
+            for fresh in given:
+                self.kernels.prefill(q, pages[0], pages[1], pool.dtype, table, 0, pool.page,
+                                     key_scales=pages[2] if scaled else None,
+                                     value_scales=pages[3] if scaled else None, multipliers=multipliers, scale=scale,
+                                     out=out, lse=found, int8_qk=self.int8_qk and pool.dtype == "int8", fresh=fresh,
+                                     sinks=self._sinks, sliding=self._sliding, **self._prompt_kernel(pool, q, out))
 
     def _launch_columns(self, q, pool, meta, fused=False, flash=False):
         """The width a launch of window rows takes: rows packed by their tokens (meta.offsets) take their widest row's
@@ -766,9 +893,9 @@ class DeviceAttention:
             self._prompt_kernels[key] = found
         if not found:
             return {"flash": False}
-        # A chunk's passes over 8-bit pages with fresh rows keep their state in the split-KV reader's workspace
-        # (declared memory, free between launches); without one, the chunk reads in one pass (the same bits).
-        workspace = self.split_workspace if self.split_workspace is not None else q.new_empty(0, dtype=_torch().float32)
+        # A chunk's passes over 8-bit pages with fresh rows keep their state in the split-KV reader's partials
+        # (the engine's scratch, free between launches); without them, the chunk reads in one pass (the same bits).
+        workspace = self._partials() if self.partial_bytes else q.new_empty(0, dtype=_torch().float32)
         return {"flash": "cuda", "splits": 1, "workspace": workspace}
 
     def _prefill_rows(self, layer, q, pool, batch, rows, scale, out, found, fresh):

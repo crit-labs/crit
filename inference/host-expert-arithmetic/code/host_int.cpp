@@ -55,10 +55,20 @@ std::uint8_t e2m1_code(float x) {
     return std::uint8_t(code | (x < 0.0f && code ? 8u : 0u));
 }
 
+// The fastest integer ISA of this CPU, read once.
+Isa fast_isa() {
+    static const Isa isa = best_int_isa();
+    return isa;
+}
+
+}  // namespace
+
+namespace detail {
+
 // crit::nvfp4::e4m3_encode of a finite value: its linear search over the 127 codes keeps the code at the least FP32
 // distance (ties to the even code); the nearest is one of the two ascending values around the magnitude, and a binary
 // search finds them, so the code is the same at a fraction of the work (one search a block, not 127 decodes).
-std::uint8_t e4m3_code(float x) {
+std::uint8_t e4m3_code(float x, float* decoded) noexcept {
     struct Values {
         float v[127];
         Values() {
@@ -76,12 +86,10 @@ std::uint8_t e4m3_code(float x) {
     const int h = lo < 1 ? 1 : lo > 126 ? 126 : lo, l = h - 1;
     const float dl = std::fabs(m - table.v[l]), dh = std::fabs(m - table.v[h]);
     const int best = (dh < dl || (dh == dl && h % 2 == 0)) ? h : l;
-    return std::uint8_t(best | (x < 0.0f && best ? 0x80 : 0));
+    const bool negative = x < 0.0f && best;
+    if(decoded) *decoded = negative ? -table.v[best] : table.v[best];
+    return std::uint8_t(best | (negative ? 0x80 : 0));
 }
-
-}  // namespace
-
-namespace detail {
 
 const std::int8_t* weight_values(Weights w) noexcept { return w == Weights::int4 ? kInt4 : kE2m1x2; }
 
@@ -178,14 +186,25 @@ void dot_rows_int(Isa isa, const IntOrder& order, const IntMatrix& m, const host
 
 void quantize_e2m1x2(const float* x, std::size_t n, float global, std::int8_t* values, float* scales,
                      std::uint8_t* scale_bytes) {
+    quantize_e2m1x2(fast_isa(), x, n, global, values, scales, scale_bytes);
+}
+
+void quantize_e2m1x2(Isa isa, const float* x, std::size_t n, float global, std::int8_t* values, float* scales,
+                     std::uint8_t* scale_bytes) {
     if(n % 16 || !(global > 0.0f) || !std::isfinite(global)) throw std::invalid_argument("host_int: e2m1 quantizer");
+#if defined(CRIT_HOST_ISA_FILES)
+    if(isa == Isa::avx512 && int_supported(isa)) {
+        detail::quantize_e2m1x2_avx512(x, n, global, values, scales, scale_bytes);
+        return;
+    }
+#endif
     for(std::size_t b = 0; b < n / 16; ++b) {
         const float* v = x + 16 * b;
         float amax = 0.0f;
         for(int i = 0; i < 16; ++i) amax = std::fmax(amax, std::fabs(v[i]));
         const float wanted = (amax * global) / 6.0f;
-        const std::uint8_t byte = e4m3_code(std::isfinite(wanted) ? wanted : 448.0f);
-        const float decoded = crit::nvfp4::e4m3(byte);
+        float decoded;
+        const std::uint8_t byte = detail::e4m3_code(std::isfinite(wanted) ? wanted : 448.0f, &decoded);
         for(int i = 0; i < 16; ++i)
             values[16 * b + std::size_t(i)] =
                 decoded > 0.0f ? kE2m1x2[e2m1_code((v[i] * global) / decoded)] : std::int8_t(0);
@@ -234,5 +253,20 @@ float exp_declared(float x) noexcept {
 float silu_declared(float x) noexcept { return x / (1.0f + exp_declared(-x)); }
 
 float swiglu_declared(float gate, float up) noexcept { return silu_declared(gate) * up; }
+
+void swiglu_rows(const float* gate, const float* up, std::size_t n, float* out) {
+    swiglu_rows(fast_isa(), gate, up, n, out);
+}
+
+void swiglu_rows(Isa isa, const float* gate, const float* up, std::size_t n, float* out) {
+    std::size_t k = 0;
+#if defined(CRIT_HOST_ISA_FILES)
+    if(isa == Isa::avx512 && int_supported(isa)) {
+        k = n / 16 * 16;
+        detail::swiglu_rows_avx512(gate, up, k, out);
+    }
+#endif
+    for(; k < n; ++k) out[k] = swiglu_declared(gate[k], up[k]);
+}
 
 }  // namespace crit::techniques::host_int

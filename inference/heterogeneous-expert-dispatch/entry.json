@@ -55,7 +55,7 @@
     },
     {
       "path": "inference/heterogeneous-expert-dispatch/code/cpu_routes.cu",
-      "purpose": "The post and scatter kernels of a layer's CPU routes over host-work-mailbox's Mailbox, and their torch binding, built at load"
+      "purpose": "The post and scatter kernels of a layer's CPU routes over the slots of one of the host's handoffs (Core's crit_plugins.host), and their torch binding, built at load"
     },
     {
       "path": "inference/heterogeneous-expert-dispatch/code/device_dispatch.py",

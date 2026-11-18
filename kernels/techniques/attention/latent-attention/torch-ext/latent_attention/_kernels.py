@@ -6,7 +6,8 @@ b + n_parts, ... of PIECE positions each, up to the tile's last column; each pie
 serve the scores and the values. Its state (running maximum, sum, unnormalized latent output) goes into the partials,
 which the merge folds in partition order (the kernel core's attention_softmax). The row sums run on the tensor cores
 (a dot with ones): a fixed order whatever the tile, so a token's bits depend only on its own query and positions, the
-piece and the partition count, not on the rows or columns beside it."""
+piece and the partition count, not on the rows or columns beside it. The fused kernel takes the partitions of a tile
+one after another in one program and folds them as the merge does: the same bits with no partials."""
 import triton
 import triton.language as tl
 
@@ -94,6 +95,100 @@ def _window_kernel(q_ptr, c_ptr, cs_ptr, tab_ptr, trow_ptr, start_ptr, count_ptr
         tl.store(po_ptr + idx[:, None] * R + vv[None, :], acc, mask=live[:, None])
         tl.store(pm_ptr + idx, m_i, mask=live & (vs == 0))
         tl.store(pl_ptr + idx, l_i, mask=live & (vs == 0))
+
+
+@triton.jit
+def _fused_kernel(q_ptr, c_ptr, cs_ptr, tab_ptr, trow_ptr, start_ptr, count_ptr, first_ptr, out_ptr, lse_ptr, sink_ptr,
+                  stride_qt, stride_qh, tab_stride, tab_width, n_parts, sm_scale, count_all, stride_ot, stride_oh,
+                  H: tl.constexpr, R: tl.constexpr, P: tl.constexpr, COLS: tl.constexpr, BLOCK_M: tl.constexpr,
+                  PIECE: tl.constexpr, PAGE: tl.constexpr, COUNTS: tl.constexpr, VSPLIT: tl.constexpr,
+                  FP8: tl.constexpr, HW_FP8: tl.constexpr, SCALES: tl.constexpr, LSE: tl.constexpr,
+                  SINKS: tl.constexpr):
+    """Program (query tile, row): the window kernel's work for every partition of the tile in turn, each partition's
+    state folded into the running one as the merge folds the partials (partition order, a column only the partitions
+    that hold its positions, the sink last), and the output written: the split launch's bits with no partials. A
+    prompt chunk read through it as windows has the bits of its tokens decoded one by one."""
+    mt = tl.program_id(0) // VSPLIT
+    vs = tl.program_id(0) % VSPLIT
+    DVP: tl.constexpr = R // VSPLIT
+    r = tl.program_id(1)
+    if COUNTS:
+        count = tl.minimum(tl.load(count_ptr + r), COLS)
+    else:
+        count = count_all
+    j0 = mt * BLOCK_M
+    first = tl.load(first_ptr + r).to(tl.int64)
+    c_hi = tl.minimum((j0 + BLOCK_M - 1) // H, count - 1)
+    n_keys = first + c_hi + 1
+    n_pieces = tl.cdiv(n_keys, PIECE).to(tl.int32)
+    if j0 // H < count:
+        start = tl.load(start_ptr + r).to(tl.int64)
+        trow = tl.load(trow_ptr + r).to(tl.int64)
+        j = j0 + tl.arange(0, BLOCK_M)
+        c = (j // H).to(tl.int64)
+        h = j % H
+        live = c < count
+        rr = tl.arange(0, R)
+        pp = tl.arange(0, P)
+        qrow = q_ptr + (start + c) * stride_qt + h * stride_qh
+        ql = tl.load(qrow[:, None] + rr[None, :], mask=live[:, None], other=0.0)
+        qr = tl.load(qrow[:, None] + R + pp[None, :], mask=live[:, None], other=0.0)
+        lim = first + c
+        nb = tl.minimum(n_parts, tl.cdiv(first + c + 1, PIECE)).to(tl.int32)   # the partitions a column's merge folds
+        vv = vs * DVP + tl.arange(0, DVP)
+        ones = tl.full([PIECE, 16], 1.0, q_ptr.dtype.element_ty)
+        m_run = tl.full([BLOCK_M], float("-inf"), tl.float32)
+        l_run = tl.zeros([BLOCK_M], tl.float32)
+        out = tl.zeros([BLOCK_M, DVP], tl.float32)
+        for b in range(0, tl.minimum(n_parts, n_pieces)):
+            m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
+            l_i = tl.zeros([BLOCK_M], tl.float32)
+            acc = tl.zeros([BLOCK_M, DVP], tl.float32)
+            for i in range(b, n_pieces, n_parts):
+                n = i * PIECE + tl.arange(0, PIECE)
+                nm = n < n_keys
+                pg = tl.load(tab_ptr + trow * tab_stride + tl.minimum(n // PAGE, tab_width - 1), mask=nm, other=0)
+                slot = pg.to(tl.int64) * PAGE + n % PAGE
+                row = c_ptr + slot * (R + P)
+                kl = tl.load(row[:, None] + rr[None, :], mask=nm[:, None], other=0)
+                kr = tl.load(row[:, None] + R + pp[None, :], mask=nm[:, None], other=0)
+                if FP8:
+                    kl = formats.e4m3_to(kl, ql.dtype, HW_FP8)
+                    kr = formats.e4m3_to(kr, ql.dtype, HW_FP8)
+                    sl = tl.load(cs_ptr + slot * SCALES, mask=nm, other=0.0)
+                    sr = tl.load(cs_ptr + slot * SCALES + (SCALES - 1), mask=nm, other=0.0)
+                    s = (tl.dot(ql, tl.trans(kl)) * sl[None, :] + tl.dot(qr, tl.trans(kr)) * sr[None, :]) * sm_scale
+                else:
+                    s = tl.dot(qr, tl.trans(kr), tl.dot(ql, tl.trans(kl))) * sm_scale
+                s = tl.where(nm[None, :] & (n[None, :] <= lim[:, None]), s, float("-inf"))
+                p, alpha, m_new = asm.step(s, m_i, False)
+                if VSPLIT == 1:
+                    kv = kl
+                else:
+                    kv = tl.load(row[:, None] + vv[None, :], mask=nm[:, None], other=0)
+                    if FP8:
+                        kv = formats.e4m3_to(kv, ql.dtype, HW_FP8)
+                if FP8:
+                    pv = (p * sl[None, :]).to(ql.dtype)
+                else:
+                    pv = p.to(ql.dtype)
+                acc = acc * alpha[:, None] + tl.dot(pv, kv)
+                l_i = l_i * alpha + asm.row_sum(p, ones, True)
+                m_i = m_new
+            use = live & (b < nb)
+            m_new, l_new, keep, take = asm.fold(m_run, l_run, m_i, l_i, False)
+            m_run = tl.where(use, m_new, m_run)
+            l_run = tl.where(use, l_new, l_run)
+            out = tl.where(use[:, None], tl.fma(out, keep[:, None], acc * take[:, None]), out)
+        if SINKS:
+            m_run, l_run, keep = asm.sink(m_run, l_run, tl.load(sink_ptr + h, mask=live, other=float("-inf")), False)
+            out = out * keep[:, None]
+        ok = l_run != 0.0   # a row with no position is 0; a NaN sum (a NaN query) stays NaN
+        o = tl.where(ok[:, None], out / tl.where(ok, l_run, 1.0)[:, None], 0.0)
+        orow = out_ptr + (start + c) * stride_ot + h * stride_oh
+        tl.store(orow[:, None] + vv[None, :], o.to(out_ptr.dtype.element_ty), mask=live[:, None])
+        if LSE:
+            tl.store(lse_ptr + (start + c) * H + h, asm.lse(m_run, l_run, False), mask=live & (vs == 0))
 
 
 @triton.jit(do_not_specialize=["pos0", "T"])

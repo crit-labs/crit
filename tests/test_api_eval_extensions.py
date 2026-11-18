@@ -200,6 +200,23 @@ class ResidentPlainTests(unittest.TestCase):
             Engine.facts = {"draft_width": 2, "host_bytes_per_pass": wrong}
             self.assertNotIn("host_bytes_per_pass", engine_facts(Engine.__new__(Engine)))
 
+    def test_the_engines_exactness_reaches_eval(self):
+        class Engine(ResidentChat):
+            plain = False
+            facts = {"draft_width": 2}
+        asked = {"decode": "row-exact", "prompt": "exact"}
+        for stated in ({"asked": asked}, {"asked": None, "prompt": "repeatable",
+                                          "plugins": {"quantized-projections": {"prompt": "repeatable"}}},
+                       {"asked": asked, "decode": "declared", "prompt": "exact",
+                        "plugins": {"a": {"decode": "declared", "prompt": "exact"}, "b": {"prompt": "exact"}}}):
+            Engine.facts = {"draft_width": 2, "exactness": stated}
+            self.assertEqual(engine_facts(Engine.__new__(Engine))["exactness"], stated)
+        for wrong in ("exact", {"asked": "exact"}, {"asked": {"prompt": "exact"}}, {"asked": {**asked, "verify": "exact"}},
+                      {"asked": None, "plugins": {"a": {"prompt": "bitwise"}}}, {"asked": None, "plugins": ["a"]}, 3):
+            with self.subTest(wrong=wrong):
+                Engine.facts = {"draft_width": 2, "exactness": wrong}
+                self.assertNotIn("exactness", engine_facts(Engine.__new__(Engine)))
+
     def test_the_engines_declared_prompt_activations_reach_eval(self):
         class Engine(ResidentChat):
             plain = False

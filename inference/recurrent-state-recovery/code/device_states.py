@@ -43,6 +43,8 @@ operation on rows and commits takes fixed shapes from the batch and reads sequen
 captured round replays it; a step's row tables reach the device by asynchronous copies from pinned host memory.
 """
 
+import heapq
+import math
 import time
 
 from crit_plugins.device import StepBatch, capturing
@@ -81,10 +83,15 @@ class StatePool:
     (channels, kernel, dilation) for the causal convolution (its window: the last (kernel - 1) * dilation inputs of each
     channel), or None; rows: round slots (sequences by default; given for the checkpoints and recompute
     strategies, which keep a state per slot); commit: a round's strategy; kernels: recurrent-scans' module, or None for
-    the torch formula."""
+    the torch formula. elastic: the states in a paged range of the device's memory (crit_plugins.memory, listed
+    there as owner/states): a sequence's state of every layer is backed when the sequence opens, the device's
+    givers (an expert cache) making room first, and goes back once the sequences past it closed (one sequence's
+    room kept), so a pool sized for every sequence an engine may serve at once takes device memory for those that
+    are open; sequence 0, which a padding prompt chunk reads and writes back, and a spare sequence stay backed.
+    Where the driver has no virtual memory API the pool is one allocation as before."""
 
     def __init__(self, layers, heads, keys, values, device, sequences=None, widest=0, conv=None, key_heads=None,
-                 rows=None, commit="deferred", kernels=None):
+                 rows=None, commit="deferred", kernels=None, elastic=False, owner="recurrent-state-recovery"):
         import torch
         if commit not in COMMITS:
             raise ValueError(f"commit is one of {', '.join(COMMITS)}, not {commit!r}")
@@ -118,17 +125,55 @@ class StatePool:
             self.blocks = 1
             self.half = self.capacity * (key_heads * keys + heads + heads * values)
             halves, conv_blocks = 1, 1
-        self.states = torch.zeros(count, n + max(spare, int(commit == "checkpoints")), heads, keys, values, **f32)
-        self.stash = torch.zeros(count, n + spare, halves * self.half, **f32)
-        self.control = torch.zeros(count, n + 1, 2 * self.blocks, **i32)
+        slots, unit = n + max(spare, int(commit == "checkpoints")), heads * keys * values * 4
         self.channels = self.width = self.span = 0
         self.dilation = 1
         if conv is not None:
-            channels, width, dilation = conv_shape(conv)
-            self.channels, self.width, self.dilation = channels, width, dilation
-            self.span = (width - 1) * dilation   # the window: the last span inputs of each channel, oldest first
-            self.windows = torch.zeros(count, n + spare, channels, self.span, **f32)
-            self.conv_stash = torch.zeros(count, n + spare, self.capacity, channels, **f32)
+            self.channels, self.width, self.dilation = conv_shape(conv)
+            self.span = (self.width - 1) * self.dilation   # the window: each channel's last span inputs, oldest first
+        channels = self.channels
+        # What a sequence keeps beside its states, per layer: the stash, and with a convolution its window and the
+        # convolution's stash. With the kernels (which reach an entry by the tensors' strides) an elastic pool keeps
+        # each sequence's layers together and backs them with its states.
+        beside = {"stash": (halves * self.half,)}
+        if conv is not None:
+            beside.update(windows=(channels, self.span), conv_stash=(self.capacity, channels))
+        floats = {name: math.prod(shape) for name, shape in beside.items()}
+        self.elastic, paged = None, {}
+        if elastic and self.device.type == "cuda":
+            from crit_plugins.memory import of
+            memory = of(self.device)
+            if memory.elastic_ranges:   # a plane a layer: [slots] states of `unit` bytes, the open sequences' backed
+                planes = [(layer * slots * unit, unit, n) for layer in range(count)]
+                kept = [(layer * slots * unit + n * unit, (layer + 1) * slots * unit) for layer in range(count)
+                        if slots > n]
+                end = count * slots * unit
+                if self.kernels is not None:   # then a plane a kind: [sequences] of its [layers] entries
+                    for name, entry in floats.items():
+                        paged[name] = end
+                        planes.append((end, count * entry * 4, n))
+                        end += n * count * entry * 4
+                self.elastic = memory.paged(owner, "states", end, planes, kept)
+                if not self.elastic.back(1):
+                    raise MemoryError("the device has no memory for one sequence's recurrent state")
+        if self.elastic is not None:
+            self.states = self.elastic.tensor[:count * slots * unit].view(torch.float32).view(
+                count, slots, heads, keys, values)
+        else:
+            self.states = torch.zeros(count, slots, heads, keys, values, **f32)
+
+        def kept_beside(name):   # [layers][sequences][...]: its own tensor, or the view of the paged plane
+            if name not in paged:
+                return torch.zeros(count, n + spare, *beside[name], **f32)
+            first = paged[name]
+            plane = self.elastic.tensor[first:first + n * count * floats[name] * 4].view(torch.float32)
+            return plane.view(n, count, *beside[name]).transpose(0, 1)
+        self.stash = kept_beside("stash")
+        self.control = torch.zeros(count, n + 1, 2 * self.blocks, **i32)
+        if conv is not None:
+            width = self.width
+            self.windows = kept_beside("windows")
+            self.conv_stash = kept_beside("conv_stash")
             self.conv_pending = torch.zeros(count, n + 1, conv_blocks, **i32)
             self._conv_none = (torch.zeros(0, channels, **f32), torch.zeros(0, channels, **f32),
                                torch.zeros(channels, width, **f32))
@@ -138,10 +183,11 @@ class StatePool:
         self.checkpoints = (torch.zeros(count, self.round_rows, self.capacity + 1, size, **f32)
                             if commit == "checkpoints" else None)
         self.starts = torch.zeros(count, self.round_rows, size, **f32) if commit == "recompute" else None
-        self.free = list(range(n - 1, -1, -1))
+        self.free = list(range(n))   # a heap: the lowest free sequence first, so the open ones stay at the front
         self.index, self.bound = {}, {}
         self.last = {}            # sequence -> (tokens of its last row, prompt row) since its last accept
         self.finals, self.final_windows = {}, {}   # sequence -> {layer index: state / window after its prompt row}
+        self.final_units = {}     # sequence -> the free pool unit that holds its prompt row's final states till accept
         self._plans = None        # the last StepBatch's plan (the same for every layer of a step)
         # Prompt rows up to this many tokens run the scan (forward): in an eager call, and inside a captured graph. The
         # plugin that makes the pool sets both from its exact_rows option; never measured here.
@@ -170,7 +216,19 @@ class StatePool:
             raise ValueError(f"sequence {sequence!r} is open already")
         if not self.free:
             raise MemoryError(f"the state pool's {self.sequences} sequences are all open")
-        i = self.index[sequence] = self.free.pop()
+        held = set(self.final_units.values())   # units a prompt row's final states wait in: not this sequence's
+        skipped = []
+        while self.free and self.free[0] in held:
+            skipped.append(heapq.heappop(self.free))
+        i = heapq.heappop(self.free) if self.free else None
+        for unit in skipped:
+            heapq.heappush(self.free, unit)
+        if i is None:
+            raise MemoryError(f"the state pool's {self.sequences} sequences are open or hold a prompt row's states")
+        if self.elastic is not None and not self.elastic.back(i + 1):   # the givers of the device make room first
+            heapq.heappush(self.free, i)
+            raise MemoryError(f"the device has no memory to back sequence {i + 1} of the state pool")
+        self.index[sequence] = i
         self.states[:, i].zero_()
         self.control[:, i].zero_()
         if self.channels:
@@ -183,9 +241,11 @@ class StatePool:
             return
         for slot in [s for s, held in self.bound.items() if held == sequence]:
             self.unbind(slot)
-        self.free.append(i)
-        for kept in (self.last, self.finals, self.final_windows):
+        heapq.heappush(self.free, i)
+        for kept in (self.last, self.finals, self.final_windows, self.final_units):
             kept.pop(sequence, None)
+        if self.elastic is not None:   # what lies past the highest open sequence goes back, one sequence's room kept
+            self.elastic.trim(max(self.index.values(), default=-1) + 2)
 
     def fork(self, sequence, new):
         """A new sequence with the sequence's committed state and window (a flush first)."""
@@ -213,6 +273,7 @@ class StatePool:
         of a row of up to widest + 1 tokens, all or none of a longer one."""
         tokens, prompt = self.last.pop(sequence, (0, False))
         finals, windows = self.finals.pop(sequence, {}), self.final_windows.pop(sequence, {})
+        self.final_units.pop(sequence, None)
         if count == 0:
             return
         i = self._index(sequence)
@@ -270,6 +331,7 @@ class StatePool:
             self.last.pop(sequence, None)
             self.finals.pop(sequence, None)
             self.final_windows.pop(sequence, None)
+            self.final_units.pop(sequence, None)
 
     def commit_prompt(self, batch):
         """The sequence's state and window now cover batch.frontier + batch.count positions: the chunk wrote them in
@@ -383,19 +445,30 @@ class StatePool:
         return plan
 
     def delta_rows(self, plan, exact_rows, chunked):
-        """(row table, kinds, scratch slots) of the state's rows: a prompt row runs the scan keeping its last state
-        (FINAL, in a scratch slot of its own) when it is at most exact_rows tokens or no chunked kernel runs, else the
-        chunked kernel after a flush (FLUSH)."""
+        """(row table, kinds, scratch slots, in the pool) of the state's rows: a prompt row runs the scan keeping
+        its last state (FINAL, in a scratch slot of its own) when it is at most exact_rows tokens or no chunked
+        kernel runs, else the chunked kernel after a flush (FLUSH). in the pool: the scratch slots are free units of
+        the pool itself (final_units: a sequence's states that no sequence holds, backed for the step), so the
+        final states wait for their accept where states live and the step allocates none; where the pool has no
+        free unit for every FINAL row (or no memory to back them), they are slots of a scratch the step makes."""
         key = (exact_rows, chunked)
         if key not in plan["delta"]:
             kinds = [STASH if count <= self.capacity else FINAL if count <= exact_rows or chunked is None else FLUSH
                      for _, _, _, count in plan["rows"]]
+            finals = [sequence for (sequence, _, _, _), kind in zip(plan["rows"], kinds) if kind == FINAL]
+            units = sorted(self.free)[:len(finals)]
+            pooled = bool(finals) and len(units) == len(finals) and (
+                self.elastic is None or self.elastic.back(units[-1] + 1))
+            if pooled:
+                self.final_units.update(zip(finals, units))
             slots, table = [], []
-            for (_, i, first, count), kind in zip(plan["rows"], kinds):
-                slot = len([s for s in slots if s >= 0]) if kind == FINAL else -1
+            for (sequence, i, first, count), kind in zip(plan["rows"], kinds):
+                slot = -1
+                if kind == FINAL:
+                    slot = self.final_units[sequence] if pooled else len([s for s in slots if s >= 0])
                 slots.append(slot)
                 table.append([first, count, i, kind, slot])
-            plan["delta"][key] = (self._meta(table), kinds, slots)
+            plan["delta"][key] = (self._meta(table), kinds, slots, pooled)
         return plan["delta"][key]
 
 
@@ -467,8 +540,8 @@ def chunked_kind(pool, geometry, prompt):
     """The chunked kernel prompt rows run through: "fla" (prompt "fla", fla installed and pinned to FLA_TILES, its
     normalization), else recurrent-scans' chunked prefill by the pool's prefill: "tensor_cores" (prefill
     "tensor_cores", keys 64 or 128, values a multiple of 16), "two_pass" (its FP32 prefill, values a multiple of 64), or
-    None (the scan)."""
-    if pool.device.type != "cuda":
+    None (the scan: also every row with prompt "scan", the plugins' prompt_rows)."""
+    if pool.device.type != "cuda" or prompt == "scan":
         return None
     if prompt == "fla" and geometry["normalize_keys"] == geometry["normalize_queries"] and geometry["epsilon"] == 1e-6:
         if fla_pinned():
@@ -479,6 +552,33 @@ def chunked_kind(pool, geometry, prompt):
         if pool.values % 64 == 0:
             return "two_pass"
     return None
+
+
+def asked_prompt(prompt_rows, prompt, pinned=False):
+    """The plugins' prompt_rows option as forward() and chunked_kind() take it. scan: every prompt row the column
+    scan, whatever its length ("scan"); chunked: the scan up to exact_rows tokens and the chunked kernel past it
+    (`prompt` as it is); auto follows the level the engine asks of its prompt rows (crit_plugins.kernels.asks, the
+    configuration's exactness): chunked where it asks repeatable or nothing, scan where it asks more, since a chunked
+    row's bits follow the prompt's length and chunking and a scanned row's are those of decoding its tokens one by
+    one. pinned: an option of the plugin names the chunked kernel (sequential-recurrence's fla), which auto keeps."""
+    if prompt_rows == "scan":
+        return "scan"
+    if prompt_rows == "auto" and not pinned:
+        from crit_plugins.kernels import asks
+        if asks("prompt") not in (None, "repeatable"):
+            return "scan"
+    return prompt
+
+
+def prompt_exactness(prompts):
+    """The level a recurrence plugin's rows keep, from its pools' prompt records (a plugin's exactness() returns it;
+    crit_kernels.exactness): decode and verify rows row-exact; prompt rows exact where every pool's run the scan
+    (the bits of decoding their tokens one by one) and repeatable where a pool's long rows reach a chunked kernel,
+    whose sums follow the prompt's length and chunking. Nothing before a pool is made."""
+    if not prompts:
+        return {}
+    chunked = any(pool["chunked"] is not None for pool in prompts)
+    return {"decode": "row-exact", "prompt": "repeatable" if chunked else "exact"}
 
 
 STANDARD = {"epsilon": 1e-6, "normalize_keys": True, "normalize_queries": True}   # the models' normalization
@@ -637,10 +737,13 @@ def forward(layer, query, key, value, log_decay, beta, pool, batch, geometry, ex
     rows, prompts, index = plan["rows"], plan["prompts"], plan["index"]
     if exact_rows is None:   # the pool's stated crossover (the plugin's exact_rows)
         exact_rows = pool.scan_rows_captured if capturing() else pool.scan_rows
-    meta, kinds, slots = pool.delta_rows(plan, exact_rows, chunked)
+    meta, kinds, slots, pooled = pool.delta_rows(plan, exact_rows, chunked)
     finals = [r for r, kind in enumerate(kinds) if kind == FINAL]
     size = pool.heads * pool.keys * pool.values
-    scratch = torch.empty(len(finals), size, dtype=torch.float32, device=pool.device) if finals else None
+    if pooled:     # FINAL's scratch slot j: the pool's free unit j of this layer
+        scratch = pool.states[li].view(pool.states.shape[1], size)
+    else:
+        scratch = torch.empty(len(finals), size, dtype=torch.float32, device=pool.device) if finals else None
     if pool.kernels is not None:
         pool.kernels.pool_delta(out, pool.states, pool.stash, pool.control, scratch, q, k, v, g, b, meta=meta,
                                 rows=batch.rows, kind=STASH, layer=li, capacity=pool.capacity, epsilon=args[0],

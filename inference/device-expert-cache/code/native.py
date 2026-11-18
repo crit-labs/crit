@@ -1,8 +1,6 @@
-"""directory_ops.cu built at load through torch's extension builder, once a process for the device's architecture and
-cached across processes under a name hashed from the source's path and bytes (each engine has its own copy of the
-plugin); None where it does not build, and device_directory.py runs its torch ops instead."""
-import hashlib
-import os
+"""directory_ops.cu built at load through Core's native build (crit_plugins.native.extension), once a process for the
+device's architecture and cached across processes under a name hashed from the source's path and bytes (each engine
+has its own copy of the plugin); None where it does not build, and device_directory.py runs its torch ops instead."""
 from pathlib import Path
 import threading
 import warnings
@@ -32,21 +30,11 @@ def why(arch):
 
 
 def _build(arch):
-    from torch.utils.cpp_extension import load
-    source = HERE / "directory_ops.cu"
-    copy = hashlib.sha256(str(source).encode() + source.read_bytes()).hexdigest()[:12]
-    before = os.environ.get("TORCH_CUDA_ARCH_LIST")
-    os.environ["TORCH_CUDA_ARCH_LIST"] = arch
+    from crit_plugins.native import NativeUnavailable, extension
     try:
-        return load(name=f"crit_expert_directory_{arch.replace('.', '_')}_{copy}", sources=[str(source)],
-                    extra_cuda_cflags=["-O3", "-std=c++20"], extra_cflags=["-O3", "-std=c++20"], verbose=False)
-    except Exception as error:   # no compiler, or headers that do not match: the torch ops serve
-        _WHY[arch] = f"{type(error).__name__}: {error}".splitlines()[0][:300]
+        return extension("crit_expert_directory", [HERE / "directory_ops.cu"], arch=arch)
+    except NativeUnavailable as error:   # no compiler, or headers that do not match: the torch ops serve
+        _WHY[arch] = str(error).splitlines()[0][:300]
         warnings.warn(f"device-expert-cache: the directory's CUDA ops did not build for {arch} ({_WHY[arch]}); its "
                       "torch ops plan and fill instead (slower, same rule)")
         return None
-    finally:
-        if before is None:
-            os.environ.pop("TORCH_CUDA_ARCH_LIST", None)
-        else:
-            os.environ["TORCH_CUDA_ARCH_LIST"] = before

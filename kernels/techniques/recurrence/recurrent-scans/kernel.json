@@ -47,7 +47,7 @@
         "dk",
         "dv"
       ],
-      "row_invariant": false,
+      "exactness": "repeatable",
       "knobs": {
         "COLS": {
           "values": [
@@ -100,7 +100,7 @@
         "dk",
         "dv"
       ],
-      "row_invariant": false,
+      "exactness": "repeatable",
       "knobs": {
         "WARPS": {
           "values": [
@@ -155,7 +155,7 @@
         "dk",
         "dv"
       ],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "SLOTS": {
           "values": [
@@ -221,7 +221,8 @@
         "dk",
         "dv"
       ],
-      "row_invariant": true,
+      "exactness": "exact",
+      "bits_of": "pool-delta",
       "knobs": {
         "LANE_COLS": {
           "values": [
@@ -272,19 +273,24 @@
       "rows": [1, 1048576],
       "tune_rows": [1, 64, 700],
       "key": ["k_heads", "v_heads", "dk", "dv"],
-      "row_invariant": false,
+      "exactness": "repeatable",
       "bench": "bench.py:DeltaPrefill64"
     },
     "pool-replay": {
       "what": "pool_delta_replay: a round's commit over every layer, the accepted stashed steps replayed from the start state (recompute) or each sequence's pending count applied (flush), block per (value head, 32 value columns, row) walking the layers; untuned (its blocks are the pending counts' slots)",
+      "exactness": "exact",
+      "bits_of": "pool-delta",
       "call": "pool_delta_replay"
     },
     "pool-conv": {
       "what": "pool_conv: the causal depthwise convolution of rows over their sequences' windows, a thread per channel (128 a block, one pending count each) with the window in registers, 2 to 8 taps or 2 to 4 at dilation 2 to 4; untuned",
+      "exactness": "row-exact",
       "call": "pool_conv"
     },
     "pool-conv-prompt": {
       "what": "pool_conv_prompt: one sequence's prompt chunk padded to a captured graph's bucket, a thread per (channel, 32 rows); untuned",
+      "exactness": "exact",
+      "bits_of": "pool-conv",
       "call": "pool_conv_prompt"
     },
     "conv-segments": {
@@ -293,7 +299,8 @@
       "rows": [1, 1048576],
       "tune_rows": [1, 64, 700],
       "key": ["channels", "width"],
-      "row_invariant": false,
+      "exactness": "exact",
+      "bits_of": "pool-conv",
       "bench": "bench.py:ConvSegments"
     },
     "delta-columns": {
@@ -302,7 +309,7 @@
       "rows": [1, 64],
       "tune_rows": [1, 4, 16],
       "key": ["k_heads", "v_heads", "dk", "dv"],
-      "row_invariant": false,
+      "exactness": "row-exact",
       "bench": "bench.py:DeltaColumns"
     },
     "causal-conv": {
@@ -311,7 +318,7 @@
       "rows": [1, 1048576],
       "tune_rows": [1, 64, 700],
       "key": ["channels", "width"],
-      "row_invariant": false,
+      "exactness": "repeatable",
       "bench": "bench.py:CausalConv"
     },
     "ssd-prefill": {
@@ -320,7 +327,7 @@
       "rows": [1, 1048576],
       "tune_rows": [1, 64, 300],
       "key": ["heads", "head_dim", "groups", "state"],
-      "row_invariant": false,
+      "exactness": "repeatable",
       "bench": "bench.py:SsdPrefill"
     },
     "ssd-columns": {
@@ -329,7 +336,7 @@
       "rows": [1, 64],
       "tune_rows": [1, 4, 16],
       "key": ["heads", "head_dim", "groups", "state"],
-      "row_invariant": false,
+      "exactness": "row-exact",
       "bench": "bench.py:SsdColumns"
     }
   }

@@ -2,7 +2,7 @@
   "schema": "crit-kernel-v1",
   "id": "exl3-rows",
   "family": "projections",
-  "title": "EXL3 projections: 1 to 16 rows times trellis tiles decoded on the fly between the matrix's Hadamard rotations, and a dequantization to BF16 for prompts",
+  "title": "EXL3 projections: 1 to 16 rows times trellis tiles decoded on the fly between the matrix's Hadamard rotations, a prompt's rows with the same bits, and a dequantization to BF16",
   "package": "exl3_rows",
   "language": "cuda",
   "operations": [],
@@ -42,7 +42,7 @@
         "N",
         "K"
       ],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "WARPS": {
           "values": [
@@ -98,6 +98,12 @@
       },
       "yardstick": null,
       "bench": "bench.py:Gemv"
+    },
+    "prompt": {
+      "what": "a prompt's rows in slabs of up to 64 through gemv's tiles kernel at the matrix's 16-row configuration: the tiles decoded once a slab, each the A operand of one MMA a group of 8 rows, the splits a decode call takes added in the same order, so a row's instructions are a decode row's",
+      "call": "gemm",
+      "exactness": "exact",
+      "bits_of": "gemv"
     }
   }
 }

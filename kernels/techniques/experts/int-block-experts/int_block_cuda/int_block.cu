@@ -1,4 +1,4 @@
-// Integer block expert projections (int_block.h). The device arithmetic is crit's host_int_device.cuh, operation for
+// Integer block expert projections (int_block.h). The device arithmetic follows crit's host_int.h, operation for
 // operation: exact integer block sums, then one rounded product and one FMA per block on lane b % 16, the halving
 // tree, post. Explicit round-to-nearest intrinsics keep the compiler from contracting anything. The code decoder, the
 // block MMAs, the step, the tree's fold, the E4M3 decoder and SwiGLU are crit's kernel core blocks
@@ -16,6 +16,7 @@
 #include "crit_kcore/blockscaled_order.cuh"
 #include "crit_kcore/blockscaled_stage.cuh"
 #include "crit_kcore/declared_rows.cuh"
+#include "crit_kcore/device.cuh"
 #include "crit_kcore/epilogue.cuh"
 #include "crit_kcore/formats.cuh"
 #include "crit_kcore/load.cuh"
@@ -387,8 +388,8 @@ __global__ void __launch_bounds__(32 * WM * WN, (Staged<BM, BN, WM, WN, G, RUN, 
 //   generic (INT4 weights, and every architecture without block-scaled MMAs): each 16-block's exact integer sum on
 //           the s8 MMA (blockscaled_mma.cuh's block_sum_s8 on codes widened by nibbles_to_s8x4), then
 //           acc += sum * (weight scale * activation scale) on the CUDA cores.
-// An output's sum depends on the CTA tile, so its bits may change with the knobs and the token count: row_invariant
-// false. Within FP32 accumulation of the FP64 product.
+// An output's sum depends on the CTA tile, so its bits may change with the knobs and the token count: exactness
+// repeatable. Within FP32 accumulation of the FP64 product.
 // Two adjacent outputs (columns col, col + 1; the second only when `two`) of row `row`: times the column scales when
 // given, then FP32 or BF16 (one rounding to nearest even), in one store where the alignment allows.
 __device__ __forceinline__ void store_pair(const NativeOut& o, std::size_t row, int col, float v0, float v1, bool two) {
@@ -1345,12 +1346,9 @@ cudaError_t launch_staged(const Matrix* matrices, const GemmJob* jobs, int job_c
                           const Acts& acts, float* out, int out_ld, cudaStream_t stream) {
     using S = Staged<BM, BN, WM, WN, G, RUN, STAGES>;
     auto kernel = staged_kernel<BM, BN, WM, WN, G, RUN, STAGES>;
-    static const cudaError_t attribute =
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, S::kSmem);
-    if(attribute != cudaSuccess) {   // more shared memory than the device gives a CTA
-        (void)cudaGetLastError();
-        return attribute;
-    }
+    static kc::PerDevice<cudaError_t> optin;   // the kernel's shared memory, raised once a device
+    const cudaError_t attribute = kc::shared_memory_optin(optin, kernel, S::kSmem);
+    if(attribute != cudaSuccess) return attribute;   // more shared memory than the device gives a CTA
     const int tiles = (max_count + BN - 1) / BN;
     const dim3 grid(unsigned((max_rows + BM - 1) / BM), unsigned(job_count), unsigned(tiles < 65535 ? tiles : 65535));
     kernel<<<grid, S::kThreads, S::kSmem, stream>>>(matrices, jobs, acts, out, out_ld);
@@ -1362,33 +1360,17 @@ cudaError_t launch_native(const Matrix* matrices, const GemmJob* jobs, int job_c
                           const ActsFp4& acts, const NativeOut& out, cudaStream_t stream) {
     using C = Native<TM, TN, WM, WN, BK, STAGES, GROUP>;
     auto kernel = native_kernel<TM, TN, WM, WN, BK, STAGES, GROUP, EPI, NATIVE>;
-    static const cudaError_t attribute =
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, C::kSmem);
-    if(attribute != cudaSuccess) {   // more shared memory than the device gives a CTA
-        (void)cudaGetLastError();
-        return attribute;
-    }
+    static kc::PerDevice<cudaError_t> optin;   // the kernel's shared memory, raised once a device
+    const cudaError_t attribute = kc::shared_memory_optin(optin, kernel, C::kSmem);
+    if(attribute != cudaSuccess) return attribute;   // more shared memory than the device gives a CTA
     // Persistent CTAs: at most as many a job as the device holds at once, each taking tiles gridDim.x apart.
-    static const int resident = [kernel] {
-        int device = 0, sms = 0, per = 0;
-        (void)cudaGetDevice(&device);
-        (void)cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
-        (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, kernel, C::kThreads, C::kSmem);
-        (void)cudaGetLastError();
-        return sms * (per > 0 ? per : 1);
-    }();
+    static kc::PerDevice<int> held;
+    const int resident = kc::resident_ctas(held, kernel, C::kThreads, C::kSmem);
     const long long tiles = (long long)((max_count + TM - 1) / TM) * ((max_rows + TN - 1) / TN);
     if(tiles > 0x7fffffffLL) return cudaErrorInvalidValue;
     const dim3 grid{unsigned(tiles < resident ? tiles : resident), unsigned(job_count), 1u};
     kernel<<<grid, C::kThreads, C::kSmem, stream>>>(matrices, jobs, acts, out);
     return cudaSuccess;
-}
-
-int device_sms() {
-    int device = 0, sms = 0;
-    (void)cudaGetDevice(&device);
-    if(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) (void)cudaGetLastError();
-    return sms > 0 ? sms : 1;
 }
 
 // Whether the current device runs the warp-specialized block-scaled path (compute capability 12.x: crit builds it as
@@ -1476,22 +1458,16 @@ bool weight_map(CUtensorMap* map, const HostMatrix& h) {
     return true;
 }
 
-// The configuration's kernel with its shared memory set, and the CTAs the device holds at once (0: it cannot run).
+// The configuration's kernel with its shared memory set, and the CTAs the current device holds at once (0: it cannot
+// run there), each once a device.
 template <int TM, int TN, int WM, int WN, int BK, int STAGES, int GROUP, int EPI>
 int ws_resident() {
     using C = Ws<TM, TN, WM, WN, BK, STAGES, EPI>;
-    static const int resident = [] {
-        auto kernel = ws_kernel<TM, TN, WM, WN, BK, STAGES, GROUP, EPI>;
-        if(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, C::kSmem) != cudaSuccess) {
-            (void)cudaGetLastError();
-            return 0;
-        }
-        int per = 0;
-        (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, kernel, C::kThreads, C::kSmem);
-        (void)cudaGetLastError();
-        return device_sms() * (per > 0 ? per : 1);
-    }();
-    return resident;
+    auto kernel = ws_kernel<TM, TN, WM, WN, BK, STAGES, GROUP, EPI>;
+    static kc::PerDevice<cudaError_t> optin;
+    if(kc::shared_memory_optin(optin, kernel, C::kSmem) != cudaSuccess) return 0;
+    static kc::PerDevice<int> held;
+    return kc::resident_ctas(held, kernel, C::kThreads, C::kSmem);
 }
 
 template <int TM, int TN, int WM, int WN, int BK, int STAGES, int GROUP, int EPI>
@@ -1599,6 +1575,7 @@ cudaError_t enqueue_gemm_staged(const Matrix* matrices, const GemmJob* jobs, int
 cudaError_t enqueue_quantize_e2m1x2(const float* x, int ld_x, int rows, int cols, float global, const Acts& acts,
                                     cudaStream_t stream) {
     if(!x || rows < 0 || cols % 16 || !(global > 0.0f) || bad_acts(acts)) return cudaErrorInvalidValue;
+    if((long long)rows * (cols / 16) > 0x7fffffffLL) return cudaErrorInvalidValue;   // a thread a block, counted in int
     const int n = rows * (cols / 16);
     if(n == 0) return cudaSuccess;
     quantize_e2m1x2_kernel<<<(n + 255) / 256, 256, 0, stream>>>(x, ld_x, rows, cols, global, acts);
@@ -1670,6 +1647,7 @@ cudaError_t enqueue_quantize_nvfp4(const void* x, bool bf16, int ld_x, int rows,
     if(!x || rows < 0 || cols % 16 || !(global > 0.0f) || !acts.codes || !acts.scales ||
        ((acts.tiled & kTiledActs) && acts.lds % 4))
         return cudaErrorInvalidValue;
+    if((long long)rows * (cols / 16) > 0x7fffffffLL) return cudaErrorInvalidValue;   // a thread a block, counted in int
     const int n = rows * (cols / 16);
     if(n == 0) return cudaSuccess;
     if(bf16)
@@ -1681,6 +1659,7 @@ cudaError_t enqueue_quantize_nvfp4(const void* x, bool bf16, int ld_x, int rows,
 
 cudaError_t enqueue_quantize_int8(const float* x, int ld_x, int rows, int cols, const Acts& acts, cudaStream_t stream) {
     if(!x || rows < 0 || bad_acts(acts) || cols % acts.block) return cudaErrorInvalidValue;
+    if((long long)rows * (cols / acts.block) > 0x7fffffffLL) return cudaErrorInvalidValue;   // counted in int
     const int n = rows * (cols / acts.block);
     if(n == 0) return cudaSuccess;
     quantize_int8_kernel<<<(n + 255) / 256, 256, 0, stream>>>(x, ld_x, rows, cols, acts);
@@ -1689,6 +1668,7 @@ cudaError_t enqueue_quantize_int8(const float* x, int ld_x, int rows, int cols, 
 
 cudaError_t enqueue_swiglu(const float* gate_up, int inter, int rows, float* out, cudaStream_t stream) {
     if(!gate_up || !out || inter < 0 || rows < 0) return cudaErrorInvalidValue;
+    if((long long)rows * inter > 0x7fffffffLL) return cudaErrorInvalidValue;   // a thread an element, counted in int
     const int n = rows * inter;
     if(n == 0) return cudaSuccess;
     swiglu_kernel<<<(n + 255) / 256, 256, 0, stream>>>(gate_up, inter, rows, out);

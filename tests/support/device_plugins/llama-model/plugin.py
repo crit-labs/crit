@@ -11,7 +11,12 @@ and launched by Core natively. A request asking for log-probabilities decodes in
 round in its log-probability form as well, which scores every emitted token with the alternatives the model's info
 offers (max_top_logprobs), and Core runs that form for a round with such a row. The draft head is a stub
 (draft:head-device): the target itself one token a row per depth, drafting its second choice where a position p has
-p % draft_miss == 2, so rounds accept some drafts and reject others."""
+p % draft_miss == 2, so rounds accept some drafts and reject others.
+
+With the option `prompt_cache` it keeps that many ended requests' sequences in Core's prompt cache
+(crit_plugins.prompt_cache) over its KV pool: a request that allows it and begins as one of them did prefills only
+the rest. A request that decoded in round slots is kept to its prompt, since Core's native rounds publish its
+output without the model seeing it."""
 import json
 import math
 
@@ -19,6 +24,7 @@ from crit_core.batch import DECODE, PREFILL, StepLayout, step_item
 from crit_core.native import Scores, StepResult
 from crit_plugins import StepBatch
 from crit_plugins.device import DECODE_ROWS, RoundBatch, free_device_bytes
+from crit_plugins.prompt_cache import PromptCache
 
 CORE_SAMPLING = ("temperature", "top_p", "top_k", "min_p", "seed")
 STOPS = 8   # stop ids a row in a round slot holds
@@ -31,6 +37,7 @@ class Session:
         self.done, self.outputs, self.pending = 0, [], None    # KV rows committed; published outputs
         self.phase, self.produced, self.rows = None, [], 0
         self.slot = None                                         # its round slot once it decodes in rounds
+        self.reused, self.rounded = 0, False                     # the prompt cache's prefix; decoded in rounds
 
 
 class StubHead:
@@ -113,6 +120,7 @@ class LlamaModel:
         eos = json.loads(generation.read_text(encoding="utf-8")).get("eos_token_id") if generation.is_file() else None
         self.stops = sorted(set(eos if isinstance(eos, list) else [eos])) if eos is not None else []
         self.handles = 0
+        self.cache = PromptCache([self.pool], entries=options["prompt_cache"]) if options["prompt_cache"] else None
         # Device memory the plan does not list (a test of Core's loader): Core refuses an engine holding it.
         self.unplanned = torch.empty(options["unplanned_mib"] << 20, dtype=torch.uint8, device=self.device)
         self.drafter, self.rounds, self.width, self.slots = parts.get("drafter"), None, 0, []
@@ -138,11 +146,13 @@ class LlamaModel:
                 "scoring": True, "query_scoring": True, "score_paths": ["prefill"], "replay": True,
                 "speculative": drafts, "plain": drafts,
                 # A draft step reads the stub head's rows (one BF16 row of the model's width each).
-                **({"draft_bytes_per_step": 2 * self.vocabulary * max(1, int(getattr(self, "hidden", 1)))} if drafts else {})}
+                **({"draft_bytes_per_step": 2 * self.vocabulary * max(1, int(getattr(self, "hidden", 1)))} if drafts else {}),
+                **({"prompt_cache": True} if self.cache is not None else {})}
 
     def telemetry(self):
         """The round driver's counters (rounds, drafts by depth) when the model decodes in rounds."""
-        return self.rounds.telemetry() if self.rounds is not None else {}
+        return {**(self.rounds.telemetry() if self.rounds is not None else {}),
+                **(self.cache.telemetry() if self.cache is not None else {})}
 
     def native_rounds(self, library):
         """Core's native rounds over the round driver's graphs (one per row count, at the model's width), or None
@@ -215,7 +225,10 @@ class LlamaModel:
     def open(self, request):
         self.handles += 1
         session = Session(self.handles, request)
-        self.pool.open(session.handle)
+        if self.cache is None:
+            self.pool.open(session.handle)
+        else:   # the rows a kept sequence holds for this prompt: prefill starts after them
+            session.done = session.reused = self.cache.open(session.handle, session.prompt, request.prompt_cache)
         return session
 
     def step(self, rows):
@@ -273,8 +286,10 @@ class LlamaModel:
                     top = torch.topk(row, min(int(s.request.logprobs), TOP))
                     logprobs = [(float(row[token]), list(zip(top.indices.tolist(), top.values.tolist())))]
                 j += 1
-            results[placement.item] = StepResult(placement.rows if placement.phase == PREFILL else 0, s.produced, has,
-                                                 0, placement.rows, logprobs)
+            # A prompt's first step reports the prefix the prompt cache gave it with the rows it computed.
+            reused, s.reused = (s.reused, 0) if placement.phase == PREFILL else (0, s.reused)
+            results[placement.item] = StepResult(placement.rows + reused if placement.phase == PREFILL else 0,
+                                                 s.produced, has, reused, placement.rows, logprobs)
         return results
 
     def _roundable(self, s):
@@ -294,20 +309,20 @@ class LlamaModel:
             s = d.session
             if s.slot is not None:
                 # A row in a round slot keeps its state on the device; a trim Core made (not an end) goes back there.
-                if not (d.terminal or d.cancelled or d.discard):
+                if not (d.terminal or d.cancelled):
                     trims[s.slot] = d.accepted
                 continue
             if s.phase is None:
                 continue
             completed = s.phase == PREFILL and s.done + s.rows == len(s.prompt)
-            if not (d.cancelled or d.discard):
+            if not d.cancelled:
                 s.done += s.rows
                 if d.accepted:
                     s.pending = s.produced[d.accepted - 1]
                     s.outputs += s.produced[:d.accepted]
             self.pool.keep(s.handle, s.done)
             s.phase, s.produced = None, []
-            if completed and d.accepted and not (d.terminal or d.cancelled or d.discard) and self._roundable(s):
+            if completed and d.accepted and not (d.terminal or d.cancelled) and self._roundable(s):
                 self._bind(s)
         if trims:
             ran_natively = native is not None and native.last[2]
@@ -323,7 +338,7 @@ class LlamaModel:
     def _bind(self, s):
         """The session decodes in the next free round slot: its pending token (the first output) at the prompt's
         end, the rest of its output limit, its stop tokens, and whether its request asks for log-probabilities."""
-        s.slot = len(self.slots)
+        s.slot, s.rounded = len(self.slots), True
         self.slots.append(s)
         r = s.request
         self.rounds.bind(s.slot, s.handle, len(s.prompt), s.pending, r.output_tokens - len(s.outputs),
@@ -342,7 +357,19 @@ class LlamaModel:
                 self.slots[slot] = moved
             self.slots.pop()
             session.slot = None
-        self.pool.close(session.handle)
+        if self.cache is None:
+            self.pool.close(session.handle)
+        elif finish == "failed":
+            self.cache.retire(session.handle, None)
+        else:
+            # The tokens whose rows the pool holds: the prompt and the outputs written as rows. Rounds publish
+            # their output through Core, so a request that decoded in them is kept to its prompt.
+            held = self.pool.length(session.handle)
+            known = session.prompt if session.rounded else session.prompt + session.outputs
+            if held > len(known):
+                held = len(known)
+                self.pool.keep(session.handle, held)
+            self.cache.retire(session.handle, known[:held])
 
     def score(self, ids, first_target, path="", queries=None, top_k=0):
         """A fixed text's scores through the prompt path: its tokens a prefill_chunk at a time, as a prompt's chunks

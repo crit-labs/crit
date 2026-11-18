@@ -28,6 +28,7 @@ import time
 
 from .device import PromptBatch
 from .manifest import POLICY_SLOTS, PluginError
+from .memory import of as memory_of
 from .rounds import _method, _own_problems, capture_stream, capture_workspaces
 
 BUCKETS = (16, 64, 128, 512)
@@ -78,10 +79,13 @@ class PromptGraphs:
     (stage_prompt(batch) before, commit_prompt(batch) after each run) and put back what the warm-ups changed
     (reset_capture()); parts (the model factory's) and uses (the slots forward calls) check the selection's prompt facts
     (prompt_problems), give the graphs slot's plugin (parts.get("graphs")) its choice and the placement plugin the
-    captures' memory. share_pool: the buckets share one graph memory pool."""
+    captures' memory. share_pool: the buckets share one graph memory pool, the engine's where Core's loader
+    assembled the engine (its rounds capture into it too: crit_plugins.rounds' rule for the plugins holds), else
+    one of the driver's own; None (the default) shares where the engine has a pool, False gives each bucket its
+    own."""
 
     def __init__(self, forward, *, device, buckets=BUCKETS, parts=None, uses=None, pools=(), extra_parts=(),
-                 share_pool=False):
+                 share_pool=None):
         import torch
         self.torch, self.forward, self.device = torch, forward, torch.device(device)
         buckets = sorted({int(b) for b in buckets})
@@ -104,7 +108,9 @@ class PromptGraphs:
         self.graphs = {}      # bucket -> (graph, its output)
         self.costs = {}       # bucket -> {"eager_ns", "graph_ns", "bytes"}
         self.captured_bytes, self._planned = 0, 0
-        self.share_pool, self._pool = bool(share_pool), None
+        self._engine_pool = getattr(getattr(parts, "context", None), "graphs", None)
+        self.share_pool = bool(share_pool) or (share_pool is None and self._engine_pool is not None)
+        self._pool = None
         self.counts = {"graph_chunks": 0, "eager_chunks": 0, "tokens": 0, "padding": 0}
         self._chosen = {}     # chunk size -> its bucket or None, while the offers stay as they are
 
@@ -250,8 +256,10 @@ class PromptGraphs:
                 eager_ns = time.perf_counter_ns() - started
             self._reset()
             graph = torch.cuda.CUDAGraph()
+            memory = memory_of(self.device)
             if self.share_pool and self._pool is None:
-                self._pool = torch.cuda.graph_pool_handle()
+                self._pool = self._engine_pool or memory.pool("prompts", "every bucket")
+            pool = self._pool if self.share_pool else memory.pool("prompts", f"{bucket} tokens")
             self._stage(bucket, None, 0, [], derive=False)
             collecting = gc.isenabled()
             gc.collect()   # nothing dead is freed inside the capture (pinned host memory freed there breaks the next)
@@ -259,7 +267,7 @@ class PromptGraphs:
             observed = self._observer.snapshot() if self._observer is not None else None
             try:
                 capture_workspaces(stream)
-                with torch.cuda.graph(graph, pool=self._pool if self.share_pool else None, stream=stream):
+                with memory.capturing(pool), torch.cuda.graph(graph, pool=pool, stream=stream):
                     self.batch.derive()
                     output = self.forward(self.batch)
             finally:

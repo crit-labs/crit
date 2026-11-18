@@ -103,3 +103,11 @@ class FreshBufferTests(PluginTestCase):
         facts = kv.facts()
         self.assertIn("as the projections gave them", facts["prompt_kv"])
         self.assertEqual(facts["prompt_kv_fresh_tokens"], pool.fresh_tokens)
+
+
+class ElasticPromptStagingTests(PromptStagingTests):
+    """The same staged prompt chunks over pools whose pages lie in an elastic range (the plugin's `elastic` option)."""
+
+    def setUp(self):
+        super().setUp()
+        self.kv = self.assemble(options={"page": 16, "elastic": True})["kv_cache"]

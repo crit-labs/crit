@@ -1,0 +1,68 @@
+{
+  "families": {
+    "deepseek": {
+      "core/python/crit_core/model/gguf_files.py": 7,
+      "core/python/crit_core/model/schemes.py": 2,
+      "core/python/crit_core/serving.py": 1,
+      "core/python/crit_core/text/reasoning.py": 1
+    },
+    "gemma": {
+      "core/python/crit_core/model/config.py": 3
+    },
+    "glm": {
+      "core/python/crit_core/serving.py": 1,
+      "core/python/crit_core/text/reasoning.py": 1
+    },
+    "gpt": {
+      "core/python/crit_core/constraints/vocabulary.py": 1,
+      "core/python/crit_core/model/gguf_files.py": 5,
+      "core/python/crit_core/serving.py": 1,
+      "core/python/crit_core/text/tokenizer.py": 1
+    },
+    "granite": {
+      "core/python/crit_core/serving.py": 1
+    },
+    "hermes": {
+      "core/python/crit_core/text/tools.py": 1
+    },
+    "llama": {
+      "core/python/crit_core/model/gguf_files.py": 13
+    },
+    "qwen": {
+      "core/python/crit_core/model/gguf_files.py": 9,
+      "core/python/crit_core/model/schemes.py": 1,
+      "core/python/crit_core/serving.py": 1,
+      "core/python/crit_core/text/reasoning.py": 1,
+      "core/python/crit_core/text/tools.py": 4
+    }
+  },
+  "plugins": {
+    "attention-state": {
+      "core/python/crit_plugins/ablation.py": 1,
+      "core/python/crit_plugins/memory.py": 1,
+      "core/python/crit_plugins/testing.py": 1
+    },
+    "device-placement": {
+      "core/python/crit_core/native.py": 1
+    },
+    "device-speculative-round": {
+      "core/python/crit_plugins/rounds.py": 1
+    },
+    "expert-offload": {
+      "core/python/crit_plugins/device.py": 1,
+      "core/python/crit_plugins/memory.py": 3
+    },
+    "expert-residency": {
+      "core/contracts/CONTRACTS.json": 1
+    },
+    "grouped-experts": {
+      "core/python/crit_plugins/kernels.py": 2
+    },
+    "mtp-decode": {
+      "core/python/crit_plugins/ablation.py": 1
+    },
+    "sparse-indexer": {
+      "core/python/crit_plugins/device.py": 2
+    }
+  }
+}

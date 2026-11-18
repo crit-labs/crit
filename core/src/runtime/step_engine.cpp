@@ -178,11 +178,6 @@ std::string options_json(const RequestView& view, const ModelInfo& info) {
     return out + "}";
 }
 
-struct Host final : Backend {
-    void bind_thread() override {}
-    void drain() override {}
-};
-
 // Each retired request's facts until its waiter merges them into its result (NativeEngine::result), by request id: only
 // requests that end with a result (length, stop) are stored, so every entry is taken; `limit` bounds it all the same.
 class RequestFacts {
@@ -254,9 +249,8 @@ struct RoundFacts {
     }
 };
 
-class StepModel final : public ConcurrentModel {
-    struct Receipt final : Retirement { bool ready() override { return true; } };
-    struct Session final : ConcurrentSession {
+class StepModel final : public Model {
+    struct Row final : Session {
         StepModel* model;
         std::uint64_t handle;
         std::optional<std::uint32_t> logprobs;
@@ -266,10 +260,9 @@ class StepModel final : public ConcurrentModel {
         std::vector<Token> tokens;
         std::vector<float> token_logprobs;
         std::vector<TokenLogprob> top;
-        Session(StepModel* m, std::uint64_t h, std::optional<std::uint32_t> n, bool c, bool r)
+        Row(StepModel* m, std::uint64_t h, std::optional<std::uint32_t> n, bool c, bool r)
             : model(m), handle(h), logprobs(n), constrained(c), replay(r) {}
-        ~Session() override { model->release(handle); }
-        void close(Finish) noexcept override {}
+        ~Row() override { model->release(handle); }
     };
 
     StepCallbacks cb_;
@@ -297,6 +290,7 @@ class StepModel final : public ConcurrentModel {
     bool native(std::span<const WorkItem> items, bool mixed) {
         const auto* r = rounds_;
         if(!r || !r->launch || !r->wait || !r->block || !r->slot_session || !r->widths) return false;
+        if(r->boundary && *static_cast<const volatile std::uint32_t*>(r->boundary)) return false;   // the engine asked for a step
         const auto n = items.size();
         if(!n || n > r->max_rows || r->widths[n - 1] < 0 || !opened_[n - 1]) return false;
         if(r->widths[n - 1] > std::int32_t(r->widest))
@@ -307,7 +301,7 @@ class StepModel final : public ConcurrentModel {
         logprobs_round_ = false;
         std::vector<char> taken(n, 0);
         for(std::size_t i = 0; i < n; ++i) {
-            const auto& session = *static_cast<Session*>(items[i].session);
+            const auto& session = *static_cast<Row*>(items[i].session);
             if(!items[i].budget.prefill_complete || session.constrained) return false;
             if(session.logprobs && !(r->logprobs && settings_.info.token_logprobs && *session.logprobs <= r->top))
                 return false;
@@ -358,7 +352,7 @@ class StepModel final : public ConcurrentModel {
             for(std::uint32_t t = 0; t < count; ++t) tokens_[i * row + t] = std::int32_t(entry(slot, 3 + t));
             for(std::uint32_t w = 0; w < per; ++w) words_[i * per + w] = entry(slot, words + w);
             // The round's log-probabilities of its emitted tokens, for a request that asked (native() checked them).
-            if(static_cast<const Session*>(items[i].session)->logprobs) {
+            if(static_cast<const Row*>(items[i].session)->logprobs) {
                 const std::size_t columns = std::size_t(r->widest) + 1, top = settings_.info.max_top_logprobs;
                 const auto alternatives = std::min<std::size_t>(top, r->top);
                 for(std::uint32_t t = 0; t < count; ++t) {
@@ -421,7 +415,7 @@ class StepModel final : public ConcurrentModel {
         }
         for(std::size_t i = 0; i < n; ++i) {
             const auto& budget = items[i].budget;
-            rows_[i] = {static_cast<Session*>(items[i].session)->handle, budget.prefill_tokens, budget.output_tokens,
+            rows_[i] = {static_cast<Row*>(items[i].session)->handle, budget.prefill_tokens, budget.output_tokens,
                         mixed ? budget.token_work : 0, budget.prefill_complete ? 1 : 0};
         }
         native_last_ = native(items, mixed);
@@ -436,7 +430,7 @@ class StepModel final : public ConcurrentModel {
         out.reserve(n);
         for(std::size_t i = 0; i < n; ++i) {
             const auto& p = progress_[i];
-            auto& session = *static_cast<Session*>(items[i].session);
+            auto& session = *static_cast<Row*>(items[i].session);
             if(p.tokens > row) throw std::runtime_error("step engine reported more tokens than max_row_tokens");
             if(p.reused_prompt_tokens > p.prompt_tokens) throw std::runtime_error("step engine reused more prompt tokens than it reported");
             session.tokens.assign(tokens_.begin() + std::ptrdiff_t(i * row), tokens_.begin() + std::ptrdiff_t(i * row + p.tokens));
@@ -471,7 +465,7 @@ class StepModel final : public ConcurrentModel {
                 progress.logprobs = session.token_logprobs;
                 progress.top_logprobs = session.top;
             }
-            out.push_back({items[i].key, progress, items[i].step});
+            out.push_back({items[i].key, progress});
         }
         return out;
     }
@@ -498,9 +492,9 @@ class StepModel final : public ConcurrentModel {
         return out;
     }
 public:
-    StepModel(const StepCallbacks& callbacks, const StepRounds* rounds, Settings configured, Services services,
+    StepModel(const StepCallbacks& callbacks, const StepRounds* rounds, Settings configured, Resources& resources,
               std::shared_ptr<RequestFacts> facts)
-        : cb_(callbacks), rounds_(rounds), settings_(std::move(configured)), resources_(services.resources),
+        : cb_(callbacks), rounds_(rounds), settings_(std::move(configured)), resources_(resources),
           facts_(std::move(facts)) {
         if(rounds_ && rounds_->widths)
             for(std::uint32_t r = 0; r < rounds_->max_rows; ++r) opened_.push_back(rounds_->widths[r] >= 0 ? 1 : 0);
@@ -518,7 +512,7 @@ public:
             default: failed("admission");
         }
     }
-    std::unique_ptr<ConcurrentSession> open(const RequestView& view) override {
+    std::unique_ptr<Session> open(const RequestView& view) override {
         ordinary();
         const auto options = options_json(view, settings_.info);
         const auto r = request(view, options);
@@ -527,7 +521,7 @@ public:
         try {
             const auto* context = view.options->context.get();
             const auto* attachment = dynamic_cast<const HostAttachment*>(context);
-            return std::make_unique<Session>(this, handle, view.options->logprobs, attachment && attachment->constrained,
+            return std::make_unique<Row>(this, handle, view.options->logprobs, attachment && attachment->constrained,
                                              dynamic_cast<const ReplayContinuation*>(context) != nullptr);
         } catch(...) {
             release(handle);
@@ -539,33 +533,28 @@ public:
     std::vector<RowProgress> execute(std::span<const WorkItem> items) override { return run(items, true); }
     void commit(std::span<const CommitDecision> decisions) override {
         ordinary();
-        // Discards mark descendants of steps still in flight, and a step engine runs one step at a time: every step it
-        // ran is kept or ends its request (crit/step_engine.h, StepDecision). A model need not undo a step.
-        if(std::any_of(decisions.begin(), decisions.end(), [](const CommitDecision& d) { return d.discard; }))
-            throw std::logic_error("Core discarded a step a step engine ran, which runs one step at a time");
         if(!cb_.commit) return;
-        // After a native round the engine hears only of rows Core trimmed, ended, cancelled or discarded.
+        // After a native round the engine hears only of rows Core trimmed, ended or cancelled.
         if(native_last_ && std::all_of(decisions.begin(), decisions.end(), [](const CommitDecision& d) {
-               return !d.terminal && !d.cancelled && !d.discard &&
-                      d.accepted == static_cast<const Session*>(d.session)->tokens.size();
+               return !d.terminal && !d.cancelled &&
+                      d.accepted == static_cast<const Row*>(d.session)->tokens.size();
            }))
             return;
         decisions_.clear();
         for(const auto& d:decisions)
-            decisions_.push_back({static_cast<Session*>(d.session)->handle, d.accepted, d.terminal ? 1 : 0, d.cancelled ? 1 : 0, d.discard ? 1 : 0});
+            decisions_.push_back({static_cast<Row*>(d.session)->handle, d.accepted, d.terminal ? 1 : 0, d.cancelled ? 1 : 0});
         call(cb_.commit(cb_.user, decisions_.data(), std::uint32_t(decisions_.size())), "commit");
     }
-    std::unique_ptr<Retirement> retire(RequestKey key, ConcurrentSession& session, Finish finish) override {
+    void retire(RequestKey key, Session& session, Finish finish) override {
         ordinary();
-        auto& s = static_cast<Session&>(session);
+        auto& s = static_cast<Row&>(session);
         // Only a request that ends with a result has its facts read: a cancelled or failed one's waiter never merges them.
         if(finish == Finish::length || finish == Finish::stop) facts_->put(key.request, request_facts(s));
         if(cb_.retire) call(cb_.retire(cb_.user, s.handle, int(finish)), "retire");
-        return std::make_unique<Receipt>();
     }
     // The retiring session's facts: Core's of its rounds, with the engine's (StepCallbacks::facts) where it has them. The
     // callback writes into a buffer of the length it asks for; asked again, it writes what it wrote the first time.
-    std::string request_facts(const Session& s) const {
+    std::string request_facts(const Row& s) const {
         if(!cb_.facts) return s.rounds.json(settings_.counters, false);
         const auto core = s.rounds.json(settings_.counters, true);
         std::vector<char> buffer(std::max<std::size_t>(std::size_t(1) << 16, 2 * core.size() + 1));
@@ -582,7 +571,6 @@ public:
         }
         throw std::runtime_error("request facts grew while they were written");
     }
-    void quiesce() override {}  // every callback returns with its work done
     std::vector<float> score_request(std::span<const Token> prompt, std::uint32_t first_target, const RequestOptions&) override {
         return scored(prompt, first_target, nullptr).target;
     }
@@ -645,8 +633,8 @@ NativeEngine step_engine(std::string_view configuration_json, const StepCallback
     const auto cb = callbacks;
     auto requests = std::make_shared<RequestFacts>();
     NativeEngine native;
-    native.engine = std::make_unique<Engine>(profile, std::make_shared<Host>(), [cb, rounds, s, requests](const Profile&, Services services) {
-        return std::unique_ptr<Model>(std::make_unique<StepModel>(cb, rounds, s, services, requests));
+    native.engine = std::make_unique<Engine>(profile, [cb, rounds, s, requests](const Profile&, Resources& resources) {
+        return std::unique_ptr<Model>(std::make_unique<StepModel>(cb, rounds, s, resources, requests));
     });
     native.concurrent_requests = true;
     native.info = [facts] { return facts; };

@@ -174,7 +174,7 @@ def bench(engine, store, data, out=None, project=ROOT, device=None, parts=None, 
     file). The card's stats compare only when its result was judged in the quality mode measured here: with
     quality_mode naming another, they are left out (None) and the label says the card's mode."""
     from crit_core.machine import engine_lock
-    from crit_eval import load_json
+    from crit_eval import VRAM_HEADROOM_GIB, load_json
     from crit_eval.quality.fixed import STORE
     from crit_eval.quality.prepare import PREPARED
     from crit_eval.run.runner import run as run_eval
@@ -225,7 +225,7 @@ def bench(engine, store, data, out=None, project=ROOT, device=None, parts=None, 
             result = run_eval(engines, str(model), data, out, {}, parts, label=f"{engine} @ {source['revision'][:12]}",
                               device=probe, context_tokens=kv_tokens, quality_mode=mode, stage=stage,
                               budget_seconds=budget_minutes * 60 if budget_minutes else None,
-                              vram_headroom_bytes=round(settings.get("vram_headroom_gib", 1.0) * GIB),
+                              vram_headroom_bytes=round(settings.get("vram_headroom_gib", VRAM_HEADROOM_GIB) * GIB),
                               identity={"engine": engine, "package_sha256": spec["package_sha256"]}, log=log)
     finally:
         engines.stop()

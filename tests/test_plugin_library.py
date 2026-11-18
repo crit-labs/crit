@@ -9,9 +9,12 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -29,11 +32,15 @@ def source_files(name):
 sys.path.insert(0, str(ROOT / "core" / "python"))
 sys.path.insert(0, str(ROOT / "cli"))
 sys.path.insert(0, str(ROOT / "kernels"))
+# The plugins' own tests run in subprocesses (crit_plugins.testing), which see PYTHONPATH, not this sys.path: Core's
+# kernel settings (crit_plugins.kernels) import crit_kernels, and it crit: an installed crit has both beside crit_core.
+os.environ["PYTHONPATH"] = os.pathsep.join([str(ROOT / folder) for folder in ("kernels", "cli", "core/python")]
+                                           + ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else []))
 
 from crit_plugins import SLOTS, PluginError, Registry  # noqa: E402
 from crit_plugins.slots import CASES, INTERFACES  # noqa: E402
 from crit_plugins.testing import run_tests  # noqa: E402
-from crit.plugins import ENGINE_SERVICES, SOURCES, add, library, main  # noqa: E402
+from crit.plugins import ENGINE_SERVICES, SOURCES, add, library, main, status, update  # noqa: E402
 
 INFERENCE = ROOT / "inference"
 ENTRIES = sorted(p.parent.name for p in INFERENCE.glob("*/entry.json"))
@@ -178,9 +185,8 @@ class LibraryTests(unittest.TestCase):
         sourced = {Path(s["folder"]).parent.name for m in self.registry for s in m["sources"].values()}
         self.assertEqual(set(ENGINE_SERVICES) & (techniques | sourced), set())
         self.assertEqual(sorted(techniques | sourced | set(ENGINE_SERVICES)), ENTRIES)
-        self.assertEqual(sorted(sourced - techniques), ["async-expert-contributions", "expert-streamed-prefill",
-                                                        "host-work-mailbox"])
-        self.assertEqual((len(techniques), len(ENTRIES)), (22, 32))
+        self.assertEqual(sorted(sourced - techniques), ["async-expert-contributions", "expert-streamed-prefill"])
+        self.assertEqual((len(techniques), len(ENTRIES)), (23, 33))
         self.assertEqual(list(INFERENCE.glob("*/plugins/*/plugin.json")), [])
 
 
@@ -192,12 +198,12 @@ class AddTests(unittest.TestCase):
 
     def test_an_update_copies_the_code_its_plugins_import_again(self):
         add(self.dest, ["heterogeneous-expert-dispatch"])
-        stale = self.dest / SOURCES / "host-work-mailbox" / "code"
+        stale = self.dest / SOURCES / "host-expert-tier" / "code"
         files = sorted(p for p in stale.rglob("*.py"))
         self.assertTrue(files)
         files[0].write_text("# a stale copy\n", encoding="utf-8")
         report = add(self.dest, ["heterogeneous-expert-dispatch"], update=True)
-        self.assertIn(f"{SOURCES}/host-work-mailbox/code", report["sources"])
+        self.assertIn(f"{SOURCES}/host-expert-tier/code", report["sources"])
         self.assertNotEqual(files[0].read_text(encoding="utf-8"), "# a stale copy\n")
 
     def test_added_plugins_bring_their_references_tests_and_code_and_pass_there(self):
@@ -211,8 +217,8 @@ class AddTests(unittest.TestCase):
         self.assertEqual(added["attention-state"], "the tests of softmax-attention use it")
         self.assertEqual(sorted(report["sources"]), [f"{SOURCES}/async-expert-contributions/code",
                                                      f"{SOURCES}/expert-streamed-prefill/code",
+                                                     f"{SOURCES}/grouped-experts/code",
                                                      f"{SOURCES}/host-expert-tier/code",
-                                                     f"{SOURCES}/host-work-mailbox/code",
                                                      f"{SOURCES}/lookup-table-rows/code"])   # memory-table-rows' rows
         engine = Registry.discover(self.dest)
         self.assertEqual(set(engine.manifests), set(added))
@@ -226,7 +232,8 @@ class AddTests(unittest.TestCase):
             "dispatch": "code", "contributions": f"../{SOURCES}/async-expert-contributions/code",
             "prefill": f"../{SOURCES}/expert-streamed-prefill/code", "tier": f"../{SOURCES}/host-expert-tier/code",
             "arithmetic": "../host-expert-arithmetic/code", "quantized": "../quantized-projections/code",
-            "mailbox": f"../{SOURCES}/host-work-mailbox/code", "split": "../device-expert-cache/code"})
+            "split": "../device-expert-cache/code",
+            "grouped": f"../{SOURCES}/grouped-experts/code"})
         self.assertEqual(sources("host-expert-arithmetic"), {"arithmetic": "code",
                                                              "quantized": "../quantized-projections/code"})
         self.assertEqual(sources("base/softmax-attention"), {"state": "../../attention-state/code"})
@@ -273,6 +280,100 @@ class AddTests(unittest.TestCase):
         self.assertIn("my-attention", Registry.discover(self.dest))
         with self.assertRaisesRegex(PluginError, "my-attention is the engine's own plugin"):
             add(self.dest, ["my-attention"], update=True)
+
+    def test_status_says_how_each_copy_stands_to_the_library(self):
+        add(self.dest, ["softmax-attention"])
+        rows = {row["name"]: row for row in status(self.dest)}
+        self.assertEqual({row["state"] for row in rows.values()}, {"current"})
+        self.assertEqual(set(rows), {"softmax-attention", "attention-state"})
+        # A copy the engine changed, and a plugin of its own.
+        own = self.dest / "attention-state" / "plugin.py"
+        own.write_text("# the engine's change\n" + own.read_text(encoding="utf-8"), encoding="utf-8")
+        mine = self.dest / "my-sampler"
+        mine.mkdir()
+        (mine / "plugin.json").write_text(json.dumps({
+            "schema": "crit-plugin-v1", "id": "my-sampler", "title": "The engine's sampler", "fills": ["sampler"],
+            "entry": "plugin.py:create"}), encoding="utf-8")
+        (mine / "plugin.py").write_text("def create(context, options, parts):\n    return None\n", encoding="utf-8")
+        rows = {row["name"]: row for row in status(self.dest)}
+        self.assertEqual({name: row["state"] for name, row in rows.items()},
+                         {"softmax-attention": "current", "attention-state": "changed", "my-sampler": "own"})
+        self.assertEqual(rows["attention-state"]["files"], ["plugin.py"])
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(main(["status", str(self.dest)]), 0)
+        self.assertRegex(out.getvalue(), r"changed +attention-state +the engine changed it.*plugin\.py")
+        self.assertIn("1 current, 1 changed", out.getvalue())
+
+    @unittest.skipUnless(shutil.which("git"), "git")
+    def test_status_finds_the_library_version_a_copy_that_is_behind_came_from(self):
+        # A library of its own in a git checkout: one plugin that imports another technique's code.
+        root = Path(self.dest).parents[1] / "library"
+        inference = root / "inference"
+        (inference / "tiny-sampler").mkdir(parents=True)
+        (inference / "lent" / "code").mkdir(parents=True)
+        (inference / "tiny-sampler" / "plugin.json").write_text(json.dumps({
+            "schema": "crit-plugin-v1", "id": "tiny-sampler", "title": "A sampler", "fills": ["sampler"],
+            "sources": {"lent": "../lent/code"}, "entry": "plugin.py:create"}), encoding="utf-8")
+        plugin = inference / "tiny-sampler" / "plugin.py"
+        plugin.write_text("def create(context, options, parts):\n    return None\n", encoding="utf-8")
+        (inference / "lent" / "code" / "rows.py").write_text("ROWS = 1\n", encoding="utf-8")
+
+        def git(*args):
+            subprocess.run(["git", "-C", str(root), "-c", "user.name=crit tests", "-c", "user.email=tests@crit.invalid",
+                            "-c", "core.autocrlf=false", *args], check=True, capture_output=True)
+
+        git("init", "-q")
+        git("add", "-A")
+        git("commit", "-q", "-m", "a library")
+        add(self.dest, ["tiny-sampler"], inference=inference)
+        self.assertEqual({row["name"]: row["state"] for row in status(self.dest, inference)},
+                         {"tiny-sampler": "current", f"{SOURCES}/lent/code": "current"})
+        # The library moves on twice; the engine's copy stays as it was copied.
+        for change in ("# faster\n", "# faster still\n"):
+            plugin.write_text(change + plugin.read_text(encoding="utf-8"), encoding="utf-8")
+            git("commit", "-q", "-am", "the sampler changes")
+        (inference / "lent" / "code" / "rows.py").write_text("ROWS = 2\n", encoding="utf-8")   # not committed yet
+        rows = {row["name"]: row for row in status(self.dest, inference)}
+        self.assertEqual((rows["tiny-sampler"]["state"], rows["tiny-sampler"]["changes"],
+                          rows["tiny-sampler"]["files"]), ("behind", 2, ["plugin.py"]))
+        self.assertEqual((rows[f"{SOURCES}/lent/code"]["state"], rows[f"{SOURCES}/lent/code"]["changes"]),
+                         ("behind", 0))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(main(["status", str(self.dest), "--inference", str(inference)]), 0)
+        self.assertRegex(out.getvalue(), r"behind +tiny-sampler +the library's of \d{4}-\d\d-\d\d \(\w{8}\); 2 library "
+                                         r"changes since: plugin\.py")
+        self.assertIn("crit plugins update", out.getvalue())
+        # A copy the engine changed equals no library version; the update brings the library's.
+        copy = self.dest / "tiny-sampler" / "plugin.py"
+        copy.write_text("# the engine's\n" + copy.read_text(encoding="utf-8"), encoding="utf-8")
+        self.assertEqual({row["name"]: row["state"] for row in status(self.dest, inference)}["tiny-sampler"], "changed")
+        add(self.dest, ["tiny-sampler"], inference=inference, update=True)
+        self.assertEqual({row["state"] for row in status(self.dest, inference)}, {"current"})
+        # crit plugins update brings a copy that is behind up to the library and leaves a changed one.
+        add(self.dest, ["tiny-sampler"], inference=inference, update=True)
+        plugin.write_text("# faster again\n" + plugin.read_text(encoding="utf-8"), encoding="utf-8")
+        git("commit", "-q", "-am", "the sampler and the lent code change")
+        self.assertEqual(update(self.dest, inference, dry_run=True)["updated"], ["tiny-sampler"])
+        self.assertEqual({row["name"]: row["state"] for row in status(self.dest, inference)},
+                         {"tiny-sampler": "behind", f"{SOURCES}/lent/code": "current"})
+        lent = self.dest / SOURCES / "lent" / "code" / "rows.py"
+        lent.write_text("ROWS = 3   # the engine's\n", encoding="utf-8")
+        report = update(self.dest, inference)
+        self.assertEqual(report["updated"], [])
+        self.assertRegex(dict(report["kept"])["tiny-sampler"], "imports _sources/lent/code, which the engine changed")
+        lent.write_text("ROWS = 2\n", encoding="utf-8", newline="\n")   # as it was copied
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(main(["update", str(self.dest), "--inference", str(inference)]), 0)
+        self.assertIn("updated tiny-sampler", out.getvalue())
+        self.assertEqual({row["state"] for row in status(self.dest, inference)}, {"current"})
+        self.assertEqual(update(self.dest, inference)["updated"], [])
+        # A library that is no checkout cannot say which of the two it is.
+        loose = Path(self.dest).parents[1] / "loose"
+        shutil.copytree(inference, loose / "inference")
+        copy.write_text("# another\n" + copy.read_text(encoding="utf-8"), encoding="utf-8")
+        with unittest.mock.patch("crit.plugins._checkout", return_value=None):
+            found = {row["name"]: row["state"] for row in status(self.dest, loose / "inference")}
+        self.assertEqual(found["tiny-sampler"], "differs")
 
     def test_needs_no_plugin_of_the_engine_provides_are_reported(self):
         report = add(self.dest, ["draft-trees", "experts-reference"])

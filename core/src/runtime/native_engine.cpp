@@ -180,10 +180,7 @@ int settle(void* handle, std::int32_t* out, char* result, int capacity, Wait&& w
                            ",\"decode_ms\":" + ms(t.decode_ns) + ",\"total_ms\":" + ms(t.total_ns) +
                            ",\"prefill_tokens\":" + std::to_string(t.prefill_tokens) +
                            ",\"reused_prompt_tokens\":" + std::to_string(t.reused_prompt_tokens) +
-                           ",\"decode_steps\":" + std::to_string(t.decode_steps) +
-                           ",\"preemptions\":" + std::to_string(t.preemptions) +
-                           ",\"recovery_ms\":" + ms(t.recovery_ns) +
-                           ",\"recomputed_tokens\":" + std::to_string(t.recomputed_tokens) + "}}";
+                           ",\"decode_steps\":" + std::to_string(t.decode_steps) + "}}";
         if(r.finish == Finish::cancelled) return -2;
         text = merged(std::move(text), native.request);
         if(native.result) text = merged(std::move(text), [&] { return native.result(r); });

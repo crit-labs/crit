@@ -53,7 +53,9 @@ Read the plugins in this order:
 4. **Drafting is two more slots.** With `toy-drafter` and `toy-verifier` in the selection, a decode round emits the
    drafter's tokens per round, the shape a real drafter and verifier take.
 
-Some options of `toy-model` (`skip`, `prompt_graphs`, `prompt_width`) exist only so crit's tests can check the loader's
+`toy-model`'s `prompt_cache` keeps that many ended requests' sequences in Core's
+[prompt cache](../../../docs/PLUGINS.md#the-prompt-cache): a request that begins as one of them did prefills only the
+rest. Some options of `toy-model` (`skip`, `prompt_graphs`, `prompt_width`) exist only so crit's tests can check the loader's
 refusals and captured prompt chunks; a real engine has no such switches.
 
 ## From here to a real engine

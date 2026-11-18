@@ -50,6 +50,13 @@ class DenseProjections:
         """Calls of up to DECODE_ROWS rows keep each row's bits; longer ones (prompt rows) do not promise it."""
         return {"row_invariance": {"rows": DECODE_ROWS, "prompt_rows": False}}
 
+    def exactness(self):
+        """The level its rows keep (crit_kernels.exactness; Core compares it with the level the configuration asks):
+        decode rows one row a call, each row's bits those of the row alone (row-exact); prompt rows one GEMM, whose
+        kernel cuBLAS picks by the row count (repeatable). It has one way to compute each, so an engine on it asks
+        repeatable prompt rows."""
+        return {"decode": "row-exact", "prompt": "repeatable"}
+
 
 def create(context, options, parts):
     return DenseProjections()

@@ -12,10 +12,13 @@ KERNELS = "paged-kv-attention"
 
 
 class KVStateCache:
-    def __init__(self, page=16, step_rows=0, step_tokens=0, window=16, round_rows=8, kernels=None, fresh=None):
+    def __init__(self, page=16, step_rows=0, step_tokens=0, window=16, round_rows=8, kernels=None, fresh=None,
+                 elastic=False, host_pages_mib=0):
         self.states, self.page = {}, page
         self.step_rows, self.step_tokens, self.window = step_rows, step_tokens, window
         self.round_rows, self.kernels, self.fresh = round_rows, kernels, fresh
+        self.elastic = bool(elastic)   # the pools' pages backed only where sequences hold them (pages.KVPool)
+        self.host_bytes = int(host_pages_mib) << 20   # of an elastic pool's pages, the most kept in host memory
         self.pools = []   # the device pools made, whose bytes per token and prompt reads facts() reports
 
     def _state(self, sequence):
@@ -64,6 +67,7 @@ class KVStateCache:
         spare: bytes after the pages in the same allocation for a borrower's own use (a device expert cache's slots),
         which then also borrows the pages no sequence holds (lendable(), on_reserve()). A pool of FP8 or INT8 pages
         keeps each prompt chunk's keys and values fresh in the plugin's fresh buffer for the chunk's attention.
+        With the plugin's `elastic` option (and no spare bytes) the pages are backed only where sequences hold them.
         sliding (kv:sliding): the layers' sliding window, each sequence a ring of pages (pages.KVPool), span the most
         positions a row writes in one step, positions the most a sequence reaches; the attention reads such a pool with
         its window."""
@@ -71,7 +75,8 @@ class KVStateCache:
         made = pages.KVPool(layers, kv_heads, head_dim, tokens, device, dtype, page=page or self.page,
                             value_dim=value_dim, step_rows=rows, step_tokens=self.step_tokens if rows else 0,
                             window=self.window, round_rows=self.round_rows, kernels=self.kernels, spare=spare,
-                            fresh=self.fresh, sliding=sliding, span=span, positions=positions)
+                            fresh=self.fresh, sliding=sliding, span=span, positions=positions,
+                            elastic=self.elastic and not spare, host_bytes=self.host_bytes)
         self.pools.append(made)
         return made
 
@@ -112,6 +117,18 @@ class KVStateCache:
         return found
 
 
+    def exactness(self):
+        """The level the pools' pages leave a prompt row (crit_kernels.exactness; Core compares it with the level the
+        configuration asks): over FP8 or INT8 pools with the fresh buffer (fresh_mib) a prompt row reads its own
+        chunk's keys and values as the projections gave them and the earlier positions from the pages, so its bits
+        follow the chunk it is read in: repeatable prompt rows, whatever reader the attention plugin takes. Without
+        it the pages state nothing of their own: the attention plugin states the level of the rows it reads."""
+        quantized = [p for p in self.pools if p.dtype in pages.QUANTIZED and p.value_dim]
+        if quantized and min(p.fresh_tokens for p in quantized):
+            return {"prompt": "repeatable"}
+        return {}
+
+
 def memory(context, options):
     """The fresh buffer the plugin makes on a CUDA engine (fresh_mib), exactly: a prompt chunk's 16-bit keys and
     values, which a pool of FP8 or INT8 pages keeps for the chunk's attention (shared by its pools, one layer at a
@@ -131,4 +148,4 @@ def create(context, options, parts):
         import torch
         fresh = pages.FreshBuffer(torch.empty(int(options["fresh_mib"]) << 20, dtype=torch.uint8, device=device))
     return KVStateCache(options["page"], options["step_rows"], options["step_tokens"], options["window"],
-                        options["round_rows"], kernels, fresh)
+                        options["round_rows"], kernels, fresh, options["elastic"], options["host_pages_mib"])

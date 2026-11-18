@@ -379,6 +379,18 @@ class GroupedExperts:
                             "path": "kernel" if self.kernel is not None else "torch",
                             "row_invariance": {"rows": True, "prompt_rows": True}}}
 
+    def exactness(self):
+        """The level its rows keep (crit_kernels.exactness; Core compares it with the level the configuration asks).
+        arithmetic declared is crit's integer block order, the CPU expert tier's bits, for every row. arithmetic
+        tensor: decode rows row-exact and a prompt row the bits of the same route decoded (exact). On the kernel the
+        prompt structures have the decode structure's bits; the torch arithmetic is one computation for both, which
+        keeps a route's bits at every row count. Nothing before a layer is loaded, packed for or read."""
+        if not (self.layers or self.declared or self.paths):
+            return {}
+        if self.arithmetic == "declared":
+            return {"decode": "declared", "prompt": "declared"}
+        return {"decode": "row-exact", "prompt": "exact"}
+
     def _named(self, format, layer):
         if format != "nvfp4" or self.activations != "nvfp4":
             return "bf16"

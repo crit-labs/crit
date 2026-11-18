@@ -16,6 +16,7 @@ import unittest
 from .assemble import Registry, assemble, plugins_root
 from .device import DEVICE_EXTENSIONS, POOL_EXTENSIONS, StepBatch, device_missing, extension_missing, pool_missing
 from .manifest import HOST, MANIFEST
+from .memory import POISON
 from .slots import CASES, compare, missing, model_problems
 
 
@@ -438,6 +439,7 @@ def run_tests(registry, only=None, timeout=600, log=print, cache=False):
         env = dict(os.environ)
         env["PYTHONPATH"] = os.pathsep.join([package_root] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env.setdefault(POISON, "1")   # a scratch hands out poisoned bytes: no call may read what another left
         try:
             done = subprocess.run([sys.executable, "-B", "-m", "unittest", "discover", "-v", "-s", str(tests),
                                    "-t", str(tests), "-p", "test*.py"], cwd=Path(manifest["folder"]).resolve(),

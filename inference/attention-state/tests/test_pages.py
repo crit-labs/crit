@@ -124,3 +124,94 @@ class KVPoolTests(PluginTestCase):
         pool.open("a")
         with self.assertRaisesRegex(MemoryError, "2 pages of 16 tokens are all in use"):
             self.step(pool, device, [("a", 0, 40)])
+
+
+class ElasticKVPoolTests(KVPoolTests):
+    """The same pool with its pages in an elastic range (the plugin's `elastic` option): what it stores and frees is
+    the same, and it backs only the pages its sequences hold."""
+
+    def pool(self, dtype="fp32", tokens=256, page=16, layers=(0, 3), kernels="auto", dim=4):
+        self.torch = __import__("torch")
+        device = self.device()
+        kv = self.assemble(options={"page": page, "kernels": kernels, "elastic": True})["kv_cache"]
+        return kv.pool(list(layers), 2, dim, tokens, device, dtype), device
+
+    def test_an_elastic_pool_backs_the_pages_its_sequences_hold_and_gives_them_back(self):
+        from crit_plugins import memory
+        if self.device() != "cuda" or not memory.of("cuda").elastic_ranges:
+            self.skipTest("an elastic range is the CUDA driver's")
+        pool, device = self.pool(tokens=16 * 1024, dim=512)   # 64 KB a page and layer tensor: 262 MB of address space
+        self.assertIsNotNone(pool.elastic)
+        whole = pool.memory.numel()
+        self.assertEqual(pool.backed, 0)
+        self.assertLess(pool.backed_bytes(), whole // 8)        # the dump pages alone
+        pool.open("a")
+        _, a_keys, a_values = self.step(pool, device, [("a", 0, 20)])
+        self.assertEqual(pool.backed, 256)                      # 4,096 tokens of every layer at a time
+        small = pool.backed_bytes()
+        self.assertLess(small, whole // 2)
+        pool.open("b")
+        _, b_keys, _ = self.step(pool, device, [("b", 0, 12000)], seed=5)
+        self.assertEqual(pool.backed, 768)                      # 2 + 750 pages held: backed up to the next 256
+        self.assertGreater(pool.backed_bytes(), 2 * small)
+        self.assertTrue(self.torch.equal(pool.gather(3, "b", 12000)[0].cpu(), b_keys.cpu()))
+        pool.close("b")                                         # its pages go back, a BACK of room kept
+        self.assertEqual(pool.backed, 512)
+        self.assertLess(pool.backed_bytes(), small * 2 + (8 << 20))
+        k, v = pool.gather(3, "a", 20)                          # what stayed backed kept its rows
+        self.assertTrue(self.torch.equal(k.cpu(), a_keys.cpu()) and self.torch.equal(v.cpu(), a_values.cpu()))
+        pool.open("c")
+        _, c_keys, _ = self.step(pool, device, [("c", 0, 9000)], seed=7)   # the pages backed again come usable
+        self.assertTrue(self.torch.equal(pool.gather(3, "c", 9000)[0].cpu(), c_keys.cpu()))
+
+    def test_host_memory_holds_the_pages_the_device_cannot_and_every_row_reads_the_same(self):
+        from unittest import mock
+        from crit_plugins import memory
+        if self.device() != "cuda" or not memory.of("cuda").elastic_ranges:
+            self.skipTest("an elastic range is the CUDA driver's")
+        self.torch = __import__("torch")
+        kv = self.assemble(options={"page": 16, "elastic": True, "host_pages_mib": 512})["kv_cache"]
+        pool = kv.pool([0, 3], 2, 512, 16 * 1024, "cuda", "fp32")
+        pool.open("a")
+        _, keys, values = self.step(pool, "cuda", [("a", 0, 20)])
+        self.assertEqual((pool.backed, pool.host_bytes), (256, 0))
+        pool.open("b")
+        device_bytes = pool.backed_bytes()
+        with mock.patch.object(memory.of("cuda").readings, "free", lambda: 0):   # a full device, nobody to give
+            _, b_keys, b_values = self.step(pool, "cuda", [("b", 0, 5000)], seed=5)   # past the 256 pages backed
+        self.assertEqual(pool.backed, 512)
+        self.assertGreater(pool.host_bytes, 0)
+        self.assertEqual(pool.backed_bytes(), device_bytes)                       # no device memory was taken for it
+        k, v = pool.gather(3, "b", 5000)                                          # rows on the device and on the host
+        self.assertTrue(self.torch.equal(k.cpu(), b_keys.cpu()) and self.torch.equal(v.cpu(), b_values.cpu()))
+        k, v = pool.gather(3, "a", 20)
+        self.assertTrue(self.torch.equal(k.cpu(), keys.cpu()) and self.torch.equal(v.cpu(), values.cpu()))
+        held = pool.host_bytes
+        pool.close("b")                 # the host's pages go back with theirs, but for a granule a tensor's end shares
+        self.assertLessEqual(pool.host_bytes, 4 * memory.granularity(0))
+        self.assertLess(pool.host_bytes, held // 4)
+
+    def test_an_elastic_pool_refuses_pages_the_device_has_no_memory_for(self):
+        from unittest import mock
+        from crit_plugins import memory
+        if self.device() != "cuda" or not memory.of("cuda").elastic_ranges:
+            self.skipTest("an elastic range is the CUDA driver's")
+        pool, device = self.pool(tokens=16 * 1024, dim=512)
+        pool.open("a")
+        _, keys, _ = self.step(pool, device, [("a", 0, 20)])
+        pool.open("b")
+        with mock.patch.object(memory.of("cuda").readings, "free", lambda: 0):   # a full device, nobody to give
+            with self.assertRaises(MemoryError):
+                self.step(pool, device, [("b", 0, 5000)], seed=5)                 # past the 256 pages backed
+            self.assertEqual(pool.backed, 256)                                    # nothing was backed for it
+            closed = []
+            pool.on_exhausted(lambda: not closed and (pool.close("b"), closed.append("b")) is not None)
+            pool.open("c")
+            self.step(pool, device, [("c", 0, 4000)], seed=7)    # what could close closed: its pages serve
+        self.assertEqual((closed, pool.backed), (["b"], 256))
+        self.assertTrue(self.torch.equal(pool.gather(3, "a", 20)[0].cpu(), keys.cpu()))
+
+    def test_an_elastic_pool_lends_nothing(self):
+        kv = self.assemble(options={"elastic": True})["kv_cache"]
+        pool = kv.pool([0], 2, 4, 256, self.device(), "fp32", spare=4096)   # spare bytes for a borrower: one allocation
+        self.assertIsNone(pool.elastic)

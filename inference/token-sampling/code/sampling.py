@@ -1,7 +1,6 @@
 """Python mirror of the device token selection and verification (same rules as sampling.cu).
 
-The host oracle is Core's crit::core::Sampler; this mirror lets Python tools and the
-worked example reproduce device tokens. Processing follows Core's steps 2 to 5 (bias,
+This mirror lets Python tools and the worked example reproduce device tokens. Processing follows Core's steps 2 to 5 (bias,
 min_tokens suppression, repetition, frequency and presence over committed plus staged
 outputs). Candidates rank by (value descending, index ascending). Greedy (temperature
 <= 0) returns the first. Otherwise weights are exp((value - best) / temperature); top_k
@@ -59,8 +58,8 @@ def process(logits, *, bias=None, repetition=1.0, frequency=0.0, presence=0.0, c
     """Core's steps 2 to 5: values after bias, suppression and penalties.
 
     counts maps tokens to committed output counts; `staged` tokens count as outputs too (the drafts
-    before a verify column); `outputs` is Core's outputs() + column for the min_tokens rule. `yields` skips
-    suppression, as Core does for a constraint that allows only suppressed tokens (suppression_yields)."""
+    before a verify column); `outputs` is the committed outputs + column for the min_tokens rule. `yields` skips
+    suppression, as Core's rules do for a constraint that allows only suppressed tokens."""
     n = dict(counts or {})
     for t in staged:
         n[t] = n.get(t, 0) + 1

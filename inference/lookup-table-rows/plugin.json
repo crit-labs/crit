@@ -42,7 +42,7 @@
       "default": 4,
       "min": 1,
       "max": 64,
-      "description": "device form: buffer sets per lookup size of a file table, used in turn by eager lookups (a lookup's rows stay valid until this many later lookups of its size); each captured lookup (a round, a prompt bucket) keeps one for its graph, so give one more than the captures of a size"
+      "description": "device form: buffer sets of a file table's eager lookups, used in turn (a lookup's rows stay valid until this many later lookups of its size class: sets hold a power of two of rows, so the prompt lengths a server meets share a few). A captured lookup (a round, a prompt bucket) has a set of its own, made as it is captured"
     },
     "native": {
       "type": "bool",

@@ -1,4 +1,4 @@
-"""Background ranked residency, the host policy (ranked_residency.h is its twin): the cache adapts off the decode step's
+"""Background ranked residency, the host policy: the cache adapts off the decode step's
 critical path.
 
 Plans count every route and admit no misses (admission quota 0: misses go to the CPU tier or the store). Every `period`

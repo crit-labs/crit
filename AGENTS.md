@@ -59,10 +59,14 @@ release's tag: records go in the folder `--project` names (default the current o
   `sparse_device_host` (routed experts beyond device memory fit host memory), `sparse_device_host_disk`,
   `dense_device_host` or `beyond_host`, with one plain pass's floor per expert source (device, link, CPU). Write
   recon.md's placement plan from the scenario's starting design: candidate 1 is a proof of concept of the scenario,
-  not a placeholder below it. In `sparse_device_host` that means a device expert cache and the checkpoint's drafter
-  from candidate 1 on, misses on the faster of the link and the CPU (the CPU expert tier,
-  `inference:host-expert-tier`, where the probe prices it below the link), and a KV pool made with `spare` bytes for
-  the cache's slots ([device-expert-cache](inference/device-expert-cache/README.md) has the recipe). In
+  not a placeholder below it. In `sparse_device_host` and `sparse_device_host_disk` that means the routed experts
+  through [expert-offload](inference/expert-offload/README.md) and the checkpoint's drafter from candidate 1 on: the
+  model plugin calls it as for experts that fit, and it places the experts, keeps those routed last in a device
+  cache that takes every byte the device has free past the run's VRAM headroom while the engine serves, computes
+  misses on the CPU and says why.
+  Give the pools their `elastic` option beside it (attention-state's KV pools, the recurrence plugin's states): they
+  then hold only what their open sequences use, and the expert cache the rest. `crit plugins offload` gives the
+  options. In
   `dense_device_host` and `beyond_host`, tell the user what speed to expect before building.
 - **Write recon.md's plans** before the first candidate: the drafting plan for both decode modes, the prefill
   arithmetic plan (each matrix group's prompt activation format and, in `preserve`, its quality measurement), and the
@@ -82,7 +86,9 @@ its launch command in `configuration.engine`, and `crit run` records, checks, me
 
 - **Start from the selection.** Choose the `model` plugin for the checkpoint's architecture, then a plugin for each
   slot it calls, from crit's library and crit-hub (`crit plugins list --model MODEL --device cuda` lists what fits
-  and the slots nothing fits; `crit plugins add`). Put your own device code inside a plugin where it pays, keep each
+  and the slots nothing fits; `crit plugins add`; `crit plugins status ENGINE/plugins` says which copies the
+  library has changed since and which the engine changed, and `crit plugins update` brings the unchanged ones up
+  to the library). Put your own device code inside a plugin where it pays, keep each
   plugin's tests against its reference passing (`crit plugins test`) and declare the devices it runs on. A model
   plugin you write tests on a small random checkpoint with every part the real one ships (its draft layers too).
   The library's host references are oracles and never serve.
@@ -100,6 +106,24 @@ its launch command in `configuration.engine`, and `crit run` records, checks, me
   driver's `problems` after loading. Requests that ask for log-probabilities, replays and constrained requests go
   through the rounds too; a drafting engine that sends them through `step()` measures one token a pass on Eval's
   long-context point.
+- **The host is Core's.** A plugin starts no threads and carries no build of its own: its C++ and device code is
+  built at load through `crit_plugins.native`, its CPU work runs on the host's one worker pool, and host work the
+  device decides inside a round goes through a handoff, both from `crit_plugins.host` (`context.host`,
+  [the host](docs/PLUGINS.md#the-host)). The engine's telemetry shows the cores, the pool and each handoff
+  (`"host"`).
+- **Record what the plugins time at load.** A plugin that picks a path by a measurement (expert-offload's
+  `misses: auto`) can pick the other one in the next process, and the paths need not give the same bits. Before
+  sealing a candidate whose telemetry shows `decisions` with `measured` above 0, run
+  `crit plugins decisions PACKAGE --model MODEL` in its source and name the file in the configuration
+  (`"decisions": "decisions.json"`): the package then decides alike wherever it loads
+  ([measured decisions](docs/PLUGINS.md#measured-decisions)).
+- **Audit the device's memory before planning it.** `crit plugins memory PACKAGE --model MODEL --context TOKENS`
+  loads the engine, serves two short prompt sets and says what each device buffer really holds: the ones nothing
+  writes (dead), the ones written in a small part (oversized), each captured graph's pool by the code whose
+  allocations fill it, each paged pool's units in use, and each step's allocations and transient peak
+  ([memory](docs/PLUGINS.md#memory), `--out` for JSON). Run it when device memory is the lever (an expert cache
+  that could be larger, a longer context) and after adding a buffer. Its verdicts are for its workload, one
+  request at a time: a pool it calls oversized may be sized for requests it did not send.
 - **[Inference](inference/README.md)** holds techniques (each a plugin of the same id) and their references; adapt,
   combine or fuse them, preserving correctness and ownership invariants. Nothing is mandatory. A technique's
   `operations.json` says what each device operation computes and how a kernel is checked against it.
@@ -191,7 +215,9 @@ How to judge a round:
   physical limit with its noise. The headline decode is the sampled one. Decode and prefill are each *needed* while
   a lever can still raise it by more than its noise; the needed one further from its limit is p1, the other p2, both
   p1 when within noise of each other. Time to first token is never p1 and never the reason for a candidate on its
-  own. crit computes the priorities in each plan ([plan](docs/RUN_RECORDS.md#plan)). Priorities decide conflicts and
+  own. Eval also states the follow-up turns' first token
+  against its floor with a prompt cache and the most clients' aggregate against its batched ceiling: neither is
+  ranked or forecast, but each gap gets a fate in the plan, a lever that improves it or an answer in `gaps`. crit computes the priorities in each plan ([plan](docs/RUN_RECORDS.md#plan)). Priorities decide conflicts and
   order, never what is left out. Never weigh by the end-to-end score.
 - **The limit is the ceiling, not the engine's own speed.** Decode = tokens per round / round time. A pass cannot
   beat bytes read / bandwidth (weights plus KV and recurrent state); a draft step has its own bytes floor. Prefill is
@@ -227,6 +253,13 @@ How to judge a round:
   one by one. In `preserve`, measure each precision change per group of layers before building on it: `crit eval run
   --package P --only quality --quality-mode preserve --attribute-drift` with the model plugin's `exact_variants`.
   A difference inside the quality spread (`budget_spread`) is no measurement.
+- **Exactness is a setting.** `configuration.exactness` says how exact the engine's rows are, for the `decode` and
+  the `prompt` rows, on [the kernels' scale](kernels/README.md#exactness): `declared`, `exact`, `row-exact` or
+  `repeatable`. A candidate that sets none takes its run's quality mode's: `preserve` asks `exact` (a prompt row has
+  the bits of the same token decoded), `speed` asks `repeatable` (every plugin's fastest way). A plugin whose option
+  is `auto` takes its fastest way that keeps the level, the engine's facts say what each plugin keeps, and Core
+  refuses an engine that keeps less than it asks ([exactness](docs/PLUGINS.md#exactness)). A phase's level is a lever
+  like any other: change it with its speed and its drift measured.
 - **Output differences are bugs until explained.** A drop in plain-greedy equality against an earlier candidate,
   or a difference between repeated identical requests (Eval's `repeatable` and `request_history` gates), is a bug
   until its root cause is demonstrated: the differing kernel or state located and the difference reproduced. Never
@@ -254,7 +287,9 @@ How to judge a round:
 Include serving unless the user asked for less. crit serve runs the plugin package through Core's loader and Core's
 resident adapter ([serving](docs/SERVING.md#cores-resident-adapter)), which brings the chat template, tools,
 per-request sampling, streaming, log-probabilities, scores and concurrent requests for every engine. The plugins load
-weights once; keep model allocations across requests and switches through the serving context's device leases
+weights once; keep ended requests' sequences in Core's prompt cache ([the prompt cache](docs/PLUGINS.md#the-prompt-cache)),
+so a conversation's next turn prefills only what is new (Eval states the follow-up turns against that floor, and
+holds the cached path to the fresh one's answers); keep model allocations across requests and switches through the serving context's device leases
 (`context.serving`); keep request state private to a session; honor cancellation and cleanup through Core's
 decisions (`commit`, `retire`). A cancel must settle within crit serve's fixed one-second grace, or the host is
 retired with its weights: size prompt chunks so the slowest, at the full context, finishes well inside it. After sealing, verify candidate switching with `crit serve`: serve the selected

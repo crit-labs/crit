@@ -12,6 +12,7 @@
 // split of K itself, one after another, adding each split's chain into a running total as the decode tile's last CTA
 // adds the partial sums, so it needs no partial or counter buffers.
 #include "mma_rows.h"
+#include "fp4_mma.h"
 #include "tile_parts.cuh"
 #include "crit_tuning.h"
 
@@ -188,7 +189,7 @@ cudaError_t enqueue_prompt(const Problem& given, cudaStream_t stream) {
   Problem p = given;
   if (p.M < 1 || p.K < kStep || p.K % kStep || p.N < 1 || p.splits < 1 || p.splits > kMaxSplits)
     return cudaErrorInvalidValue;
-  if (p.acts == kActNvfp4Mma) return cudaErrorInvalidValue;   // the FP4 MMA sums in an order of its own: no prompt tile
+  if (p.acts == kActNvfp4Mma) return enqueue_prompt_fp4(p, stream);   // the FP4 MMA's own prompt tile (fp4_mma.cu)
   if (const cudaError_t e = prepass(p, stream); e != cudaSuccess) return e;
   if (p.weights == kNvfp4 && p.acts == kActBf16) return launch_prompt<kNvfp4, kActBf16>(p, stream);
 #ifndef CRIT_SWEEP_BUILD   // a sweep build times the activations as they are (the bench's call)

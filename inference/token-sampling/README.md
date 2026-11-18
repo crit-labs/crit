@@ -22,7 +22,7 @@ where bit identity with an existing greedy kernel matters.
 **Rank order and the law.** Candidates rank by (value descending, id ascending). Values
 are the logits after Core's steps 2 to 5: `+bias` (a -inf bias bans), suppression of the
 `suppress_ids` while `position + column < min_tokens` (skipped on rows whose `Rows::yield` is set:
-Core's `suppression_yields`, a constraint mask that allows only suppressed tokens), repetition (`v / r` for positive,
+a constraint mask that allows only suppressed tokens), repetition (`v / r` for positive,
 `v * r` for negative values) for tokens in the prompt or the outputs, then
 `v -= frequency * n + presence` for tokens with `n > 0` outputs. The rules are Core's doubles
 (0.8 or 0.3 is not a float, and its float rounding would move a top-p boundary, or a draw near
@@ -30,7 +30,7 @@ one, by ~1e-8) and the steps run in IEEE double as Core runs them, without contr
 the full law then rounds each value to the nearest float, clamped to the finite range, so a value
 Core holds beyond the float range stays selectable. Column `c` of a verify or
 draft step counts its staged tokens (the drafts before it) as outputs, so each column has
-the law Core's `Sampler` would use with those tokens staged. Weights are
+the law of Core's rules with those tokens staged. Weights are
 `exp((v - max) / temperature)`; top-k keeps a rank prefix, top-p the shortest rank prefix
 whose weight reaches `top_p` of the top-k weight, min-p the weights `>= min_p`. The draw
 `u = uniform(seed, position + column, stream, purpose)` picks the first kept token whose
@@ -139,7 +139,7 @@ resolves the tie group exactly as Core ranks it. `enqueue_sample` and `enqueue_v
 the same work (`Logprobs`): the stage blocks also write the raw lists, extra blocks of the law
 kernel rank them beside the law blocks, and the full-law kernel writes every row's chosen
 token's log-probability once the token is known. Rows masked by `enqueue_mask` report over the
-masked row; Core's constrained `Sampler` reports over the unmasked one. `enqueue_ranked_logprobs`
+masked row; Core's rules report over the unmasked one. `enqueue_ranked_logprobs`
 takes rows that are log-probabilities already (a torch engine's FP32 `log_softmax`, the
 arithmetic of its step and score paths) and reports each value as given, the alternatives
 ranked the same way, so a captured round reports the bits the engine's steps report.
@@ -201,13 +201,14 @@ than the rejection rule.
 fallback.
 
 [sampling.py](code/sampling.py) mirrors the processing, law, draw and verification in FP64
-with Core's bit-identical draw. The host oracle is `crit::core::Sampler`.
+with Core's bit-identical draw. The fixtures' host oracle is
+[host_sampler.h](../../tests/inference/host_sampler.h).
 
 ## What the engine supplies
 
-One `Request` per sequence, filled from `crit::core::resolve_sampling` (merge duplicate
+One `Request` per sequence, filled from the request's resolved rules (merge duplicate
 bias ids, sort them), with `position` set to the committed output count and `counts` /
-`prompt_seen` built from `TokenHistory` at request start. Scratch of
+`prompt_seen` built from the prompt and the outputs at request start. Scratch of
 `scratch_floats(vocab, rows)` floats (or `select_scratch_bytes(vocab, rows)` bytes for
 `enqueue_select`), 8-byte aligned, target logits as FP32 rows (the verify step writes
 logits instead of argmax for sampled requests), and for sampled drafts the dense `q` rows
@@ -219,7 +220,7 @@ Forward: enqueue_commit(previous round's result tokens, control[commit_tokens])
          draft (greedy argmax, or enqueue_sample with DrawPurpose::draft and q rows or sparse laws)
          verify writing K + 1 target logit rows, then enqueue_verify -> predictions
                 (with Verify::logprobs -> the round's logprob rows, when RoundConfig::logprobs)
-Finish:  enqueue_greedy_accept, commit_state       (device-speculative-round, unchanged)
+Finish:  greedy accept, commit_state               (device-speculative-round, unchanged)
 ```
 
 ## Worked example
@@ -233,7 +234,7 @@ row = [2.0, 1.0, 2.0, -1.0, 0.5]
 assert s.select(row) == 0                  # tie between 0 and 2, lowest index wins
 assert [t for t, _ in s.nucleus(row, 0.7, top_p=0.9)] == [0, 2, 1]   # 0.446, 0.446, 0.107
 draws = [s.select(row, 0.7, 0.9, 0, seed=1, position=c) for c in range(8)]
-assert draws == [2, 2, 0, 2, 0, 0, 0, 2]   # crit::core::Sampler draws the same tokens
+assert draws == [2, 2, 0, 2, 0, 0, 0, 2]   # the fixtures' host oracle draws the same tokens
 
 flat = [0.0] * 100                         # top_k 0 keeps the whole vocabulary, not 64 candidates
 assert len(s.nucleus(flat, 1.0)) == 100
@@ -284,7 +285,7 @@ shapes (moderate, peaked, flat, ties, masked, large and negative logits) with `n
 rows whose boundary candidates collapse to one float, rows independent of their launch, and
 the fused values equal to `enqueue_logprobs` bit for bit.
 [token_law_tests.cpp](../../tests/inference/token_law_tests.cpp) checks the law against
-`Sampler::distribution` with bias, suppression, penalties over staged columns, top-k,
+the host oracle's `Sampler::distribution` with bias, suppression, penalties over staged columns, top-k,
 top-p and min-p; Core's double rules at exact top-p boundaries and values beyond the float
 range; the fast path's draws equal to `Sampler::sample` on vocabularies of 7, 100, 12,288
 and 200,003 tokens; open rows settled by the fast kernels or the full law; a group of

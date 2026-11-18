@@ -85,11 +85,19 @@ The library's plugins are meant to give a fast engine from candidate 1 with only
 checkpoint ([the model plugin](PLUGINS.md#the-model-plugin)): decode rounds captured through Core's round driver,
 short prompt chunks through Core's prompt graphs, the drafter over the model's device draft head, and the KV pool,
 attention, projections, recurrence and experts plugins each in its stored format with crit's kernel (built for the
-GPU, tuned by `crit kernels sweep`) or its torch fallback. A mixture of experts larger than the device needs no engine code for its experts' residency:
-device-placement's `off_device` puts the routed experts' bundles in host memory, the expert source's `open_store`
-holds them where the device reads them, and expert-residency's `cache(...)` keeps the hot ones in device slots. Make
-the KV pool with `spare` bytes for the cache's slots and pass it as `lend`, so the cache also uses pages no sequence
-holds; warm it from a residency profile and read the engine's `telemetry()` for its hit rate. A drafting model plugin
+GPU, tuned by `crit kernels sweep`) or its torch fallback. A mixture of experts larger than the device needs no engine
+code for its experts: [expert-offload](../inference/expert-offload/README.md) in the experts slot takes the same calls as
+experts that fit (begin(), load(), open() after the model's pools, forward()) and decides by itself where the experts
+live (device, host memory, a file), keeps those routed last in a device expert cache that takes every byte the device
+has free past the run's VRAM headroom while the engine serves (it gives a prompt step its measured room and grows
+back), computes misses on the
+CPU tier while the link copies them in beside the round, stages prompt chunks, and says what it decided and why.
+With their `elastic` option the pools hold only what their open sequences use (attention-state's KV pages, the
+recurrence plugin's states), and the expert cache the rest. `crit plugins offload --model M --device-file DEVICE --context TOKENS` gives the options from config.json
+and the probe, and with `--trace` (the routes expert-offload's `record_routes` keeps) replays the cache's residency at
+several sizes and copy budgets in seconds, and with `--profile` also with a pinned core of the profile's hottest
+experts (expert-offload's `pinned`, for a host short of memory: those experts are held on the device alone and the
+replay shows what the core costs in hits); expert-offload's `bench.py` times the plugin alone on the engine's store. A drafting model plugin
 may let its rounds choose their draft width among several captured ones (`Rounds(widths=..., width_policy=...)`),
 sizing every buffer for the widest.
 
@@ -100,7 +108,10 @@ against a GEMV for decode rows, a prompt reader against the split-KV reader) mis
 nat. The library keeps one arithmetic on both paths with three settings: the attention plugin's `prompt_reader:
 decode`; attention-state's `fresh_mib: 0`, so a prompt chunk over FP8 or INT8 pages reads its own keys and values
 from the pages; and prompt calls through the projections' decode kernel (chunks of at most
-`invariant_rows(projections)` tokens, or quantized-projections' `tile_rows`). Prefill then runs at the decode kernels'
+`invariant_rows(projections)` tokens, or quantized-projections' `tile_rows`). An engine that asks `exact` prompt rows
+(a `preserve` run's candidates do) gets the first and the third from the plugins' `auto` options
+([plugins and exactness](PLUGINS.md#exactness)) and is refused while `fresh_mib` keeps fresh keys. Prefill then runs
+at the decode kernels'
 rate: on a 33B NVFP4 model on one RTX 5090, 385 tokens a second through the GEMV and 1,024 through the tile, against
 about 2,150 on the prompt path. A `speed` engine's honesty bound is looser, so the prompt reader, fresh chunk keys
 and pinned prompt GEMMs fit it.
@@ -134,11 +145,10 @@ needs:
 
 | Need | Core |
 | --- | --- |
-| A step's row layout and logits rows; a WorkItem's rows | [Batched steps](../core/src/batch/README.md): `StepLayout`, `step_item` |
+| A step's row layout and logits rows; a scheduled row's rows | [Batched steps](../core/python/crit_core/batch.md): `StepLayout`, `step_item` |
 | Admission that keeps every admitted request able to finish | `PageReservations` |
-| Batched rows that keep their serial bits | The [batch invariance rules](../core/src/batch/README.md#batch-invariance) |
-| KV pages, prefix reuse, copy-on-write forks | [State cache](../core/src/state/README.md) |
-| Speculative rounds per request in a shared step | [Speculative rows](../core/src/batch/README.md#speculative-rows) |
+| Batched rows that keep their serial bits | The [batch invariance rules](../core/python/crit_core/batch.md#batch-invariance) |
+| KV pages, copy-on-write forks, round slots | The [attention-state](../inference/attention-state/README.md#on-the-device) plugin's paged pool |
 | Serving | Core's loader runs the model plugin on its [step engine](../core/src/runtime/README.md#step-engines); crit serve serves it as `chat-concurrent-v1` |
 
 A request's tokens must not depend on the requests sharing its steps: every kernel on the step path follows the

@@ -143,7 +143,7 @@ NATIVE_AUTO = {"mx": True, "fp8_rows": True, "nvfp4": True, "bf16": True, "fp8_d
 PIN_ROWS = 8192
 MX_ACTIVATIONS = ("bf16", "mxfp8")   # MXFP8 matrices' activations: 16-bit (W8A16) or MXFP8's own (W8A8, group 32)
 MX_GROUP = 32
-GEMVS = ("auto", "mma", "native", "triton", "crossover")
+GEMVS = ("auto", "mma", "fp4", "native", "triton", "crossover")
 TILE_ROWS = 64       # mma-rows' rows a call: longer tile calls go 64 rows at a time
 PROMPT_TILES = ("auto", 0, 64, 128, 192, 256)   # tile_rows: the most prompt rows a call sends through the tile
 # tile_rows "auto": by a matrix's prompt arithmetic, the prompt rows the tile takes before its prompt path is the
@@ -153,9 +153,11 @@ PROMPT_TILES = ("auto", 0, 64, 128, 192, 256)   # tile_rows: the most prompt row
 # whose prompt paths are cuBLASLt GEMMs on the stored or quantized values, none past the decode rows.
 AUTO_TILES = {"weight_only": 64, "w4a4": 0, "w8a8": 0, "bf16": 0}
 
-# Buffers every matrix on a device shares, made by the plugin's factory and declared by its memory(): the decoded
-# rows of a prompt GEMM (a chunk of matrix rows at a time), mma-rows' quantized activations, its partial sums and its
-# row tiles' counters. Calls run in stream order (a projection at a time), as a model's forward makes them.
+# Buffers every matrix on a device shares, declared by the plugin's memory(): the decoded rows of a prompt GEMM (a
+# chunk of matrix rows at a time), mma-rows' quantized activations, its partial sums and its row tiles' counters.
+# Calls run in stream order (a projection at a time), as a model's forward makes them. Each buffer is made at its
+# first use, which is a matrix's load (it runs every path it takes once): a device whose matrices never decode a
+# chunk of rows or pin a GEMM holds neither's workspace.
 WORKSPACE_BYTES = 64 << 20
 SCRATCH_BYTES = (TILE_ROWS * 32768 * 2 + 15) // 16 * 16 + TILE_ROWS * 4   # tile activations of up to 32768 columns
 PARTIAL_BYTES = 64 << 20   # a 64-row tile call's partial sums for the splits plan() gives up to N of ~65536
@@ -208,9 +210,9 @@ def load(tensors, format, device=None, activations="nvfp4", prompt="bf16", gemm=
     if gemm in ("pinned", "pinned_cublaslt", "tile") and format == "nvfp4" and activations == "bf16" and \
             prompt != "bf16":
         raise ValueError(f"{gemm} prompt GEMMs multiply weight-only NVFP4 prompts in bf16, not {prompt!r}")
-    if gemm == "tile" and gemv != "mma":
-        raise ValueError(f"tile prompt GEMMs give prompt rows the decode tile's bits: decode rows on gemv mma, not "
-                         f"{gemv!r}")
+    if gemm == "tile" and gemv not in ("mma", "fp4"):
+        raise ValueError(f"tile prompt GEMMs give prompt rows the decode tile's bits: decode rows on gemv mma or fp4, "
+                         f"not {gemv!r}")
     if decode not in DECODES:
         raise ValueError(f"decode rows take {', '.join(DECODES)} activations, not {decode!r}")
     if gemm == "auto":   # crit's prompt GEMM where it measured at least the provider's speed (NATIVE_AUTO)
@@ -226,9 +228,9 @@ def load(tensors, format, device=None, activations="nvfp4", prompt="bf16", gemm=
         raise ValueError(f"fp8 activations are {', '.join(FP8_ACTIVATIONS)}, not {fp8_activations!r}")
     if mx_activations not in MX_ACTIVATIONS:
         raise ValueError(f"mxfp8 activations are {', '.join(MX_ACTIVATIONS)}, not {mx_activations!r}")
-    # mma-rows (auto: the dot GEMV and the FP4 MMA where they are; crossover: decode-gemv's GEMVs up to the measured
-    # crossover, the tile past it)
-    tile = gemv if gemv in ("auto", "mma", "crossover") else None
+    # mma-rows (auto: the dot GEMV and the FP4 MMA where they are; fp4: the FP4 MMA where it is, every other matrix on
+    # the tile; crossover: decode-gemv's GEMVs up to the measured crossover, the tile past it)
+    tile = gemv if gemv in ("auto", "mma", "fp4", "crossover") else None
     gemv = "native" if tile else gemv
     weight = tensors["qweight" if format in INT4_FORMATS else "weight"]
     device = torch.device(device) if device is not None else weight.device
@@ -367,7 +369,7 @@ def _finish(matrix, rows, device, tile, tile_rows, modules):
     if getattr(matrix, "path", None) == "dot":
         matrix.decode_rows = min(matrix.decode_rows, matrix.dot.DOT_ROWS)
     if tile:
-        _tile_plan(matrix, device, tile_rows, tile in ("auto", "crossover"))
+        _tile_plan(matrix, device, tile_rows, tile in ("auto", "fp4", "crossover"))
     matrix.gemv_rows = _crossover(matrix, device) if tile == "crossover" else 0
     if matrix.gemv_rows:
         matrix.path = "gemv_" + matrix.path
@@ -386,7 +388,7 @@ def _finish(matrix, rows, device, tile, tile_rows, modules):
     # (prompt_exact): the fixed-tile, pinned (crit's in one configuration a shape, or cuBLASLt's pinned algorithms)
     # and prompt-tile GEMMs keep them, cuBLAS(Lt)'s choice by the row count and the native GEMMs (the tuning's
     # configuration by the token count) do not.
-    prompt_tile = matrix.prompt_kernel == "mma-rows prompt-tile"
+    prompt_tile = matrix.prompt_kernel in ("mma-rows prompt-tile", "mma-rows fp4-prompt-tile")
     matrix.prompt_invariant = gemm in ("fixed_tiles", "pinned", "pinned_cublaslt", "tile") or prompt_tile
     matrix.prompt_exact = gemm == "tile" or (prompt_tile and matrix.mma is not None and not matrix.gemv_rows)
     same = matrix.mma is not None and matrix.mma_acts["decode"] == matrix.mma_acts["prompt"]
@@ -766,6 +768,8 @@ def mx_values(x, module=None):
     fp8-block-rows' quantizer (module) where it is here, else from mx_codes (the same bits)."""
     import torch
     if module is not None and x.is_cuda:
+        if hasattr(module, "quantized_values"):   # the values in one launch (a decode call makes them every time)
+            return module.quantized_values(_mx_input(x), MX_GROUP, module.MX)
         codes, scale = module.quantize(_mx_input(x), MX_GROUP, module.MX)
         codes = codes.view(torch.float8_e4m3fn)
     else:
@@ -907,7 +911,7 @@ def _int4_matmul(x, m, out_dtype):
         x16 = device_nvfp4._aligned(x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16))
         t = m.tensors
         module.mm_prompt(x16, t["codes"], out, "int4_zp", t["scales"], None, "bf16", 1.0, False, splits,
-                         buffers(x.device)["scratch"], t["zeros"], m.group)
+                         call_buffers(x.device, "scratch")[0], t["zeros"], m.group)
         return _out(out, out_dtype)
     flags = torch.backends.cuda.matmul
     before, flags.allow_tf32 = flags.allow_tf32, False   # FP32 products, not TF32
@@ -929,7 +933,7 @@ def _prompt_kernel(m):
     if m.native_gemm is not None:
         return NATIVE_KERNELS[m.native_gemm["kind"]] + (" pinned" if getattr(m, "pin_rows", None) else "")
     if gemm == "tile":
-        return "mma-rows prompt-tile"
+        return "mma-rows fp4-prompt-tile" if m.mma_acts["decode"] == "nvfp4_mma" else "mma-rows prompt-tile"
     if gemm == "pinned_cublaslt":
         return "pinned-gemm" if m.pinned is not None else "provider, one row a call"
     if _sixteen_bit(m) and _fixed_tiles(m):
@@ -989,18 +993,59 @@ def _fixed_tiles(m):
 _BUFFERS = {}
 
 
+class _Buffers(dict):
+    """A device's shared buffers by name, each made the first time it is asked for."""
+
+    def __init__(self, device):
+        super().__init__()
+        self.device = device
+
+    def __missing__(self, name):
+        import torch
+        made = {"workspace": lambda: torch.empty(WORKSPACE_BYTES // 2, dtype=torch.bfloat16, device=self.device),
+                "scratch": lambda: torch.empty(SCRATCH_BYTES, dtype=torch.uint8, device=self.device),
+                "partial": lambda: torch.empty(PARTIAL_BYTES // 4, dtype=torch.float32, device=self.device),
+                "counters": lambda: torch.zeros(COUNTERS, dtype=torch.int32, device=self.device),
+                "gemm": lambda: torch.empty(GEMM_BYTES, dtype=torch.uint8, device=self.device)}[name]()
+        self[name] = made
+        return made
+
+
 def buffers(device):
-    """The buffers every matrix on `device` shares (BUFFER_BYTES), made once: by the plugin's factory, which its
-    memory() declares, or by a first load on a device the factory did not make them for."""
-    import torch
+    """The buffers every matrix on `device` shares (BUFFER_BYTES at most, which the plugin's memory() declares):
+    {name: tensor}, each made at its first use."""
     key = device_key(device)
     if key not in _BUFFERS:
-        _BUFFERS[key] = {"workspace": torch.empty(WORKSPACE_BYTES // 2, dtype=torch.bfloat16, device=device),
-                         "scratch": torch.empty(SCRATCH_BYTES, dtype=torch.uint8, device=device),
-                         "partial": torch.empty(PARTIAL_BYTES // 4, dtype=torch.float32, device=device),
-                         "counters": torch.zeros(COUNTERS, dtype=torch.int32, device=device),
-                         "gemm": torch.empty(GEMM_BYTES, dtype=torch.uint8, device=device)}
+        _BUFFERS[key] = _Buffers(device)
     return _BUFFERS[key]
+
+
+_SCRATCH = {}   # device -> the engines' scratches there (crit_plugins.memory's Scratch), the last made first
+CALL_BUFFERS = {"scratch": SCRATCH_BYTES, "partial": PARTIAL_BYTES}   # what a call only computes in, by name
+
+
+def use_scratch(device, scratch, use=True):
+    """An engine's scratch for the calls on `device` (use False: the engine closes, its scratch is used no more).
+    The tile activations and the partial sums of a call are scratch: written and read inside the call."""
+    held = _SCRATCH.setdefault(device_key(device), [])
+    if scratch in held:
+        held.remove(scratch)
+    if use:
+        held.insert(0, scratch)
+
+
+def call_buffers(device, *names):
+    """A call's scratch buffers by name, together ("scratch": mma-rows' tile activations, uint8; "partial": its
+    partial sums, FP32): taken from the engine's scratch by every call where an engine gave one (use_scratch), else
+    the device's shared buffers of those names."""
+    held = _SCRATCH.get(device_key(device))
+    if not held:
+        shared = buffers(device)
+        return [shared[name] for name in names]
+    import torch
+    found = held[0].take(*(CALL_BUFFERS[name] for name in names))
+    found = [found] if len(names) == 1 else found
+    return [taken.view(torch.float32) if name == "partial" else taken for name, taken in zip(names, found)]
 
 
 def row_chunks(m):
@@ -1039,7 +1084,8 @@ def _tile(x, m, out_dtype, phase):
     `phase` (decode or prompt) takes them."""
     import torch
     from . import device_nvfp4
-    b = buffers(x.device)
+    scratch, partial = call_buffers(x.device, "scratch", "partial")
+    counters = buffers(x.device)["counters"]
     groups, warps, splits = m.mma_plan
     acts = m.mma_acts[phase]
     dtype = out_dtype if out_dtype in (torch.float32, torch.float16) else torch.bfloat16
@@ -1050,7 +1096,7 @@ def _tile(x, m, out_dtype, phase):
     for r0 in range(0, x.shape[0], TILE_ROWS):
         r1 = min(x.shape[0], r0 + TILE_ROWS)
         m.mma.mm_rows(x16[r0:r1], w, out[r0:r1], m.mma_weights, scales, row_scale, acts, g, blocked, groups, warps,
-                      splits, b["scratch"], b["partial"], b["counters"], **zp)
+                      splits, scratch, partial, counters, **zp)
     return out if out_dtype is None or out.dtype == out_dtype else out.to(out_dtype)
 
 
@@ -1097,18 +1143,21 @@ def _prompt_tile(x, m, out_dtype):
     Quantized activations go through the shared scratch, as many rows a call as it holds (64 at least)."""
     import torch
     from . import device_nvfp4
-    b = buffers(x.device)
+    scratch = call_buffers(x.device, "scratch")[0]
     _, _, splits = m.mma_plan
     acts = m.mma_acts["decode"]
     dtype = out_dtype if out_dtype in (torch.float32, torch.float16) else torch.bfloat16
     out = torch.empty(x.shape[0], m.rows, dtype=dtype, device=x.device)
     x16 = device_nvfp4._aligned(x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16))
     w, scales, row_scale, blocked, g = _tile_operands(m)
-    step = x.shape[0] if acts == "bf16" else max(TILE_ROWS, SCRATCH_BYTES // (m.columns * 2 + 4) // 16 * 16)
+    if acts == "nvfp4_mma":   # the FP4 prompt tile's scratch: codes, then block scales of rows padded to 128
+        step = max(TILE_ROWS, SCRATCH_BYTES // (m.columns // 2 + (m.columns // 16 + 3) // 4 * 4) // 128 * 128 - 128)
+    else:
+        step = x.shape[0] if acts == "bf16" else max(TILE_ROWS, SCRATCH_BYTES // (m.columns * 2 + 4) // 16 * 16)
     for r0 in range(0, x.shape[0], step):
         r1 = min(x.shape[0], r0 + step)
         m.mma.mm_prompt(x16[r0:r1], w, out[r0:r1], m.mma_weights, scales, row_scale, acts, g, blocked, splits,
-                        b["scratch"])
+                        scratch)
     return out if out_dtype is None or out.dtype == out_dtype else out.to(out_dtype)
 
 
@@ -1155,7 +1204,8 @@ def _decode_rows(x, m, out_dtype):
         out = torch.empty(x.shape[0], m.rows, dtype=torch.float32 if out_dtype == torch.float32 else torch.bfloat16,
                           device=x.device)
         device_nvfp4._warmed(("dot", m.rows, m.columns, x16.dtype, out.dtype), "the FP8 dot GEMV")
-        m.dot.gemv_fp8_dot(x16, m.tensors["weight"], m.tensors["scale"], out, m.dot_plan, buffers(x.device)["partial"])
+        m.dot.gemv_fp8_dot(x16, m.tensors["weight"], m.tensors["scale"], out, m.dot_plan,
+                           call_buffers(x.device, "partial")[0])
         return _out(out, out_dtype)
     if m.path == "cublaslt":
         return torch.cat([_prompt_rows(x[r:r + 1], m, out_dtype) for r in range(x.shape[0])])

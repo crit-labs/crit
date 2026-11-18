@@ -44,6 +44,14 @@ class HostArithmeticDeviceTests(PluginTestCase):
                     self.assertTrue(torch.equal(p.matmul(x[first:first + count].clone(), m, torch.float32),
                                                 whole[first:first + count]))
 
+    def test_it_states_the_level_its_loaded_rows_keep(self):
+        p = self.assemble(options={"activations": "int8"})["projections"]
+        self.assertEqual(p.exactness(), {})
+        p.load(stored(torch.Generator().manual_seed(2), 96, 256), "nvfp4")
+        self.assertEqual(p.exactness(), {"decode": "declared", "prompt": "declared"})   # the declared order, on the CPU
+        p.load({"weight": torch.randn(4, 64)}, "bf16")   # a 16-bit matrix: torch, one row at a time, in both phases
+        self.assertEqual(p.exactness(), {"decode": "row-exact", "prompt": "exact"})
+
     def test_the_native_rows_and_the_torch_path_give_the_same_bits(self):
         generator = torch.Generator().manual_seed(5)
         for format, activations in (("nvfp4", "fp32"), ("nvfp4", "e2m1x2"), ("nvfp4", "int8"), ("int4", "int8"),
@@ -58,6 +66,32 @@ class HostArithmeticDeviceTests(PluginTestCase):
                 a = native.matmul(x, native.load(tensors, format), torch.float32)
                 b = fallback.matmul(x, fallback.load(tensors, format), torch.float32)
                 self.assertTrue(torch.equal(a.view(torch.int32), b.view(torch.int32)))
+
+    def test_the_quantizer_and_the_swiglu_keep_their_bits_on_every_isa(self):
+        rows = self.assemble(options={"activations": "e2m1x2"})["projections"]._rows()
+        if not rows or rows.int_isa() == "scalar":
+            self.skipTest("no vector integer path here to compare with the scalar order")
+        fast, inf, nan = rows.int_isa(), float("inf"), float("nan")
+        g = torch.Generator().manual_seed(11)
+        # A block whose scale is 1: its values are the quotients, the E2M1 midpoints among them (ties go to the even
+        # code), and blocks of zeros, of infinities and NaNs, of values no scale reaches.
+        ties = torch.tensor([6.0, 0.25, -0.25, 0.75, -0.75, 1.25, -1.25, 1.75, -1.75, 2.5, -2.5, 3.5, -3.5, 5.0, -5.0, 0.0])
+        odd = torch.tensor([0.0, -0.0, 1e-30, -1e-30, inf, -inf, nan, 1e30, -1e30, 3.4e38, 448.0, -448.0, 7.0, -7.0,
+                            6.0001, -5.9999])
+        for spread in (1e-3, 1.0, 37.5, 1e4):
+            x = torch.cat([ties, torch.zeros(16), odd, torch.full((16,), nan), torch.randn(60 * 16, generator=g) * spread])
+            for global_scale in (1.0, 0.5, 30.0, 977.0):
+                want = rows.quantize_e2m1x2_on("scalar", x, global_scale)
+                got = rows.quantize_e2m1x2_on(fast, x, global_scale)
+                self.assertTrue(torch.equal(got[0], want[0]), (spread, global_scale))
+                self.assertTrue(torch.equal(got[1].view(torch.int32), want[1].view(torch.int32)), (spread, global_scale))
+        self.assertEqual(rows.quantize_e2m1x2_on(fast, ties, 1.0)[0].tolist(),
+                         [12, 0, 0, 2, -2, 2, -2, 4, -4, 4, -4, 8, -8, 8, -8, 0])   # twice E2M1: ties to the even code
+        gate = torch.cat([torch.randn(4096, generator=g) * 8,
+                          torch.tensor([0.0, -0.0, 88.0, 88.5, -87.0, -87.5, 200.0, -200.0, 1e-20, -1e-20, inf, -inf, 0.5])])
+        up = torch.randn(gate.numel(), generator=g) * 3    # 4109 values: a tail shorter than a vector too
+        self.assertTrue(torch.equal(rows.swiglu_on(fast, gate, up).view(torch.int32),
+                                    rows.swiglu_on("scalar", gate, up).view(torch.int32)))
 
     def test_weight_only_rows_are_the_host_forms_fp32_order(self):
         p = self.assemble()["projections"]

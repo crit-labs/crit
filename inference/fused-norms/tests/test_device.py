@@ -30,10 +30,13 @@ class FusedNormsDeviceTests(PluginTestCase):
         if record["source"] == "fallback":
             self.assertIsNone(self.norms.kernel)
             self.assertTrue(record["reason"])
+            self.assertEqual(self.norms.exactness(), {})   # the torch fallback states no level
         else:   # tuned (the engine's tuning table) or built (the default knobs)
             self.assertEqual(record["source"] == "tuned", kernels.tuning_file(KERNEL) is not None, record)
             self.assertIsNotNone(self.norms.kernel)
             self.assertIs(self.norms.rope, self.norms.kernel.rope)
+            # Decode and prompt calls run the same row-exact structures: a prompt row has the decoded row's bits.
+            self.assertEqual(self.norms.exactness(), {"decode": "row-exact", "prompt": "exact"})
         self.assertEqual(record["plugins"], ["fused-norms"])
 
     def test_no_library_serves_a_call(self):

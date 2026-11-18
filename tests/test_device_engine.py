@@ -140,7 +140,8 @@ class DeviceEngineTests(unittest.TestCase):
         self.assertGreaterEqual(made["reserved"] - made["allocated"], 256 << 20, "the factory left its temporaries")
         self.assertGreaterEqual(found["released_cached"], 256 << 20)
         self.assertLess(opened["reserved"] - opened["allocated"], 256 << 20, "handed back before the engine opened")
-        self.assertEqual(set(found["checked"]), {"allocated", "reserved"})
+        for stage in ("made", "opened", "warm", "checked"):   # torch's bytes and what the process holds beside them
+            self.assertEqual(set(found[stage]), {"allocated", "reserved", "other"})
 
     def test_the_base_norms_plugin_serves_the_same_greedy_tokens(self):
         # torch-norms, the norms slot's base (what an ablation falls back to), in fused-norms' place. Their sums round

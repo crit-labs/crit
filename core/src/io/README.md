@@ -1,17 +1,13 @@
-# Files, JSON and digests
+# Files and JSON
 
 Dependency-free building blocks for reading model artifacts: a strict JSON
-reader, read-only files with change detection, chunked and mapped reads, and
-SHA-256. They know nothing about model formats; the safetensors and config
-readers build on them.
+reader and read-only files with change detection, chunked and mapped reads. They
+know nothing about model formats.
 
 | Header | Source | Ships |
 | --- | --- | --- |
 | [json.h](../../include/crit/json.h) | [json.cpp](json.cpp) | `FormatError`, `json::Limits`, `json::Kind`, `json::Value`, `json::Member`, `json::Document` |
 | [file.h](../../include/crit/file.h) | [file.cpp](file.cpp) | `FileIdentity`, `ReadOptions`, `ReadStats`, `ChunkConsumer`, `ReadOnlyFile`, `display_path` |
-| [sha256.h](../../include/crit/sha256.h) | [sha256.cpp](sha256.cpp) | `Sha256`, `to_hex`, `sha256_hex`, `sha256_file` |
-
-Host memory admission lives in [memory](../memory/README.md#host-memory-admission).
 
 ## Strict JSON
 
@@ -84,14 +80,6 @@ after verifying the handle identity. `mapping_owner()` keeps the mapping alive
 after the `ReadOnlyFile` is gone. On POSIX, truncating a mapped file raises
 `SIGBUS` on access, so pair mappings with `verify_unchanged()` and controlled
 storage. `advise_willneed` hints a range and never fails.
-
-## SHA-256
-
-`Sha256` is a portable FIPS 180-4 implementation; `finish()` returns the digest
-and resets. `to_hex` is lowercase, equal to Python's `hexdigest()`.
-`sha256_file(file, options)` hashes through `read_chunks` (direct I/O by default)
-and then calls `verify_unchanged()`, giving the digest of crit run-record
-manifest rows (`path`, `bytes`, `sha256`).
 
 ## Errors
 

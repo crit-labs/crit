@@ -37,6 +37,20 @@
       "min": 16,
       "max": 1048576
     },
+    "prompt_cache": {
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 64,
+      "description": "the ended requests' sequences kept in Core's prompt cache over the KV and recurrence pools, 0 for none"
+    },
+    "prompt_cache_tail": {
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 64,
+      "description": "a prompt chunk ends this many tokens before the prompt's end, a place the prompt cache marks beside the end"
+    },
     "widest": {
       "type": "int",
       "default": 0,

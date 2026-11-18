@@ -1,4 +1,4 @@
-"""Tensor bytes of an inspected safetensors Checkpoint: Core's Checkpoint::map and Checkpoint::read in Python.
+"""Tensor bytes of an inspected safetensors Checkpoint.
 
 inspect_model validates the headers and never reads tensor bytes; TensorReader reads them from the same files. Each
 shard is opened on first use and must still be the file the header was read from (its descriptor's identity equals

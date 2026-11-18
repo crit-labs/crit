@@ -24,6 +24,24 @@ LONG_PREFIXES = (1025, 2049, 3001, 4097, 6001, 8193)
 WINDOW = 64
 
 
+# The levels (crit_kernels.exactness) at which a prompt row's bits follow nothing but the row, and at which they are
+# the bits of the same token decoded.
+KEEPS_ROWS, KEEPS_DECODE = ("row-exact", "exact", "declared"), ("exact", "declared")
+
+
+def asked_note(ctx, decode=False):
+    """Why a comparison was judged strictly, for a failed item: the level the engine asks of its rows ("" when the
+    profile judged it)."""
+    level = ctx.asked["prompt"]
+    if decode and ctx.decode_tolerance is DECODE["strict"] and ctx.profile != "strict":
+        return (f"; judged strictly: the engine asks {level} prompt rows (configuration.exactness), the bits of the "
+                "same token decoded; a lower level is judged by the drift decoding may round by")
+    if not decode and ctx.prompt_tolerance is TOLERANCES["strict"] and ctx.profile != "strict":
+        return (f"; judged strictly: the engine asks {level} prompt rows (configuration.exactness), whose bits no "
+                "prompt length changes; repeatable prompt rows are judged by the drift a length may round by")
+    return ""
+
+
 def test(*needs):
     """Register a test that needs these capabilities."""
     def register(function):
@@ -36,6 +54,17 @@ class Context:
     def __init__(self, client, profile="loose", long=4096):
         self.client, self.profile = client, profile
         self.tolerance, self.decode_tolerance = TOLERANCES[profile], DECODE[profile]
+        # An engine that states the exactness it asks of its rows (its facts' exactness.asked, from its
+        # configuration) is judged by it where the level promises bits: prompt rows that are row-exact or higher never
+        # change with the prompt's length, so prefill against prefill is strict; exact (or declared) prompt rows have
+        # the bits of the same token decoded, so decode against prefill is strict too. A lower level, or none stated,
+        # is judged by the profile: the drift a path may round by.
+        asked = (client.facts().get("exactness") or {}).get("asked")
+        asked = asked if isinstance(asked, dict) else {}
+        self.asked = {phase: asked.get(phase) for phase in ("decode", "prompt")}
+        self.prompt_tolerance = TOLERANCES["strict"] if self.asked["prompt"] in KEEPS_ROWS else self.tolerance
+        if self.asked["prompt"] in KEEPS_DECODE and self.asked["decode"] in KEEPS_ROWS:
+            self.decode_tolerance = DECODE["strict"]
         self.capabilities = client.capabilities()
         context = client.context() or long + 64
         self.long = max(256, min(long, context - 64))
@@ -146,10 +175,10 @@ def causal(ctx):
     worst = None
     for n in lengths:
         rows = ctx.client.score(ids[:n])[0]
-        ok, summary = compare(rows, full[:n - 1], ctx.tolerance)
+        ok, summary = compare(rows, full[:n - 1], ctx.prompt_tolerance)
         if not ok:
             return "failed", f"prefix of {n} tokens against the whole prompt of {len(ids)}: {summary}" \
-                + row_paths(ctx.client.facts())
+                + row_paths(ctx.client.facts()) + asked_note(ctx)
         worst = worst or summary
     return "passed", f"{len(lengths)} prefixes ({lengths[0]} to {lengths[-1]} tokens) match the whole prompt"
 
@@ -169,7 +198,7 @@ def decode_matches_prefill(ctx):
             return "failed", problem
         ok, summary = compare(rows, full[split - 1:split - 1 + steps], ctx.decode_tolerance)
         if not ok:
-            return "failed", f"{steps} tokens decoded after {split}: {summary}"
+            return "failed", f"{steps} tokens decoded after {split}: {summary}" + asked_note(ctx, decode=True)
         details.append(f"after {split}: {summary}")
     return "passed", "; ".join(details)
 
@@ -188,10 +217,10 @@ def causal_long(ctx):
         if len(rows) != n - 1:
             return "failed", f"{len(rows)} rows for a prompt of {n} tokens"
         start = max(0, n - 1 - WINDOW)
-        ok, summary = compare(rows[start:], full[start:n - 1], ctx.tolerance)
+        ok, summary = compare(rows[start:], full[start:n - 1], ctx.prompt_tolerance)
         if not ok:
             return "failed", f"prefix of {n} tokens against the whole prompt of {len(ids)}, rows {start} to {n - 2}: " \
-                             + summary + row_paths(ctx.client.facts())
+                             + summary + row_paths(ctx.client.facts()) + asked_note(ctx)
     return "passed", f"{len(lengths)} prefixes ({lengths[0]} to {lengths[-1]} tokens) match the whole prompt of " \
                      f"{len(ids)} on their last {WINDOW} rows"
 
@@ -213,7 +242,7 @@ def decode_long(ctx):
             return "failed", f"after {split}: {problem}"
         ok, summary = compare(rows, full[split - 1:split - 1 + steps], ctx.decode_tolerance)
         if not ok:
-            return "failed", f"{steps} tokens decoded after {split}: {summary}"
+            return "failed", f"{steps} tokens decoded after {split}: {summary}" + asked_note(ctx, decode=True)
         details.append(f"after {split}: mean delta {summary.split('mean delta ')[1].split(',')[0]}")
     return "passed", "; ".join(details)
 

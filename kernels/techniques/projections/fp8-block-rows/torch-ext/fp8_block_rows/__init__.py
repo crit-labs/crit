@@ -13,7 +13,7 @@ from ._crit_aliases import module as _alias
 from ._ops import ops
 
 __all__ = ["NATIVE_BF16_OUT", "matrix_table", "row_jobs", "gemm_jobs", "rows", "gemm", "gemm_staged", "gemm_native",
-           "gemm_native_channel", "quantize", "MX", "AMAX"]
+           "gemm_native_channel", "quantize", "quantized_values", "MX", "AMAX"]
 
 NATIVE_BF16_OUT = True   # gemm_native and gemm_native_channel take a BF16 out (the FP32 sums rounded once)
 MX, AMAX = 0, 1                          # activation scale kinds: MXFP8's 2^(floor(log2 amax) - 8), or amax / 448
@@ -103,3 +103,12 @@ def quantize(x: torch.Tensor, group: int = 32, kind: int = MX):
     scales = torch.empty(x.size(0), x.size(1) // group, dtype=torch.float32, device=x.device)
     ops.quantize(x.contiguous(), group, kind, codes, scales)
     return codes, scales
+
+
+def quantized_values(x: torch.Tensor, group: int = 32, kind: int = MX):
+    """x [rows, cols] fp32 or bf16 -> bf16 [rows, cols]: each element's code of quantize() times its group's scale
+    (the FP32 product rounded to BF16: exact for MXFP8's powers of two), in one launch. For a caller that multiplies
+    16-bit rows of quantized activations: the bits of (codes.float() * scales).to(bfloat16)."""
+    out = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
+    ops.quantized_values(x.contiguous(), group, kind, out)
+    return out

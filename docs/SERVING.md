@@ -288,7 +288,7 @@ refuses them ([a busy engine](#a-busy-engine): `--max-queue`, `--queue-timeout`)
 | `tools`, `tool_choice`, `parallel_tool_calls` | Function calls for packages declaring `chat-tools-v1`; `tool_choice` `auto` or `none`, and `required` or a named function for packages that also declare `chat-tool-choice-v1` (otherwise 400 `unsupported_parameter`; [ResidentChat](#forced-calls) declares it when its engine decodes to a grammar). Tool-result history is preserved |
 | `logprobs`, `top_logprobs` | [Token log-probabilities](#token-log-probabilities) for packages declaring `chat-logprobs-v1`: every token's own and up to 20 alternatives. Not with `stop` |
 | `chat_template_kwargs`, `reasoning_effort` | [Thinking controls](#thinking-controls) for packages declaring `chat-template-kwargs-v1`: the chat-template variables the package declares (`enable_thinking`, `thinking`, `reasoning_effort`), and `reasoning_effort` `none`, `minimal`, `low`, `medium`, `high` or `xhigh` mapped onto them; otherwise 400 `unsupported_parameter` (ignored with `--lenient`) |
-| `crit` | crit's own extension: `{"decode": "plain"}` decodes the reply one token per target pass, without drafting, for packages declaring `chat-plain-v1` ([plain decoding](#engine-facts-and-plain-decoding)); `{"timeout": SECONDS}`, a positive number, limits this request's turn as `--timeout` does, at most `--timeout` (a larger value keeps it): a turn that runs out is a 504 and a cooperative engine stays loaded |
+| `crit` | crit's own extension: `{"decode": "plain"}` decodes the reply one token per target pass, without drafting, for packages declaring `chat-plain-v1` ([plain decoding](#engine-facts-and-plain-decoding)); `{"timeout": SECONDS}`, a positive number, limits this request's turn as `--timeout` does, at most `--timeout` (a larger value keeps it): a turn that runs out is a 504 and a cooperative engine stays loaded; `{"prompt_cache": false}` has the engine prefill every prompt token, whatever its [prompt cache](PLUGINS.md#the-prompt-cache) holds, for packages declaring `chat-prompt-cache-v1` (a measured request: without it a prompt that begins as an earlier request did is served from the cache, and `usage.prompt_tokens_details.cached_tokens` counts the tokens it did not compute) |
 | `priority` | An extension to the OpenAI API: an integer, default 0 (also when null). Requests waiting for the engine go lower values first, then in arrival order, and are reordered only among requests for the same model: a request never moves ahead of a queued model switch, nor a switch ahead of requests queued before it, so priority adds no model loads. A running request is never preempted, and a higher value waits while lower ones keep arriving. Anthropic and `/api/chat` requests, whose APIs have no such field, and fixed-text scores wait at 0 |
 
 Responses carry `usage` when measured and `crit_telemetry`: prompt and output tokens, the
@@ -780,7 +780,9 @@ for a fallback, why: [kernels and plugins](PLUGINS.md#kernels-and-plugins)), eac
 reports it in a valid form; `null` when the candidate is not loaded or reports none. A speculative engine that declares
 `chat-plain-v1` decodes a request carrying `"crit": {"decode": "plain"}` one token per
 target pass without drafting, which is how Eval compares speculative output with plain
-greedy on the served engine.
+greedy on the served engine. A plugin package declares `chat-prompt-cache-v1`: a request carrying
+`"crit": {"prompt_cache": false}` prefills every prompt token, which is how Eval, crit smoke and
+`crit run measure` time and score an engine that keeps a [prompt cache](PLUGINS.md#the-prompt-cache).
 
 ### Continuing the final message
 

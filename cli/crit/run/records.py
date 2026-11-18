@@ -131,10 +131,13 @@ def validate_origin(value, stored=None):
     if not isinstance(value["evidence"], list):
         raise ValueError("origin_engine.evidence is a list")
     for ref in value["evidence"]:
-        keys(ref, {"file", "sha256", "measured_with", "gpu", "model", "quality_mode"}, {"source", "path"})
+        keys(ref, {"file", "sha256", "measured_with", "gpu", "model", "quality_mode"}, {"source", "path", "exactness"})
         text(ref["file"], "origin evidence file", 512)
         if ref["quality_mode"] not in QUALITY_MODES:
             raise ValueError(f"origin_engine.evidence quality_mode requires {' or '.join(QUALITY_MODES)}")
+        if "exactness" in ref and row_exactness(ref["exactness"], "origin_engine.evidence exactness") != ref["exactness"]:
+            raise ValueError("origin_engine.evidence exactness is written {decode, prompt}, the decode rows' exact as "
+                             "row-exact")
         sha(ref["sha256"], "origin evidence sha256")
         has_path, has_source = "path" in ref, "source" in ref
         if has_path == has_source:
@@ -144,6 +147,19 @@ def validate_origin(value, stored=None):
         if has_path and not str(ref["path"]).startswith(ORIGIN_DIR + "/"):
             raise ValueError(f"origin_engine.evidence is kept under {ORIGIN_DIR}/")
     return value
+
+
+def row_exactness(value, what):
+    """The exactness an engine asks of its rows, as a crit-hub card's result or an origin's evidence states it: one
+    level, or a level per phase, returned as {"decode": level, "prompt": level} (crit_kernels.exactness.setting; `what`
+    names the value in the error)."""
+    from crit_kernels.exactness import PHASES, setting
+    if not isinstance(value, (str, dict)) or (isinstance(value, dict) and set(value) != set(PHASES)):
+        raise ValueError(f"{what} is a level (declared, exact, row-exact, repeatable) or one each for decode and prompt")
+    try:
+        return setting(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{what}: {exc}") from None
 
 
 def quality_mode(correctness):
@@ -342,8 +358,10 @@ def request_spec(data):
     keys(workload, set(), {name for name, *_ in WORKLOAD} | {"mode"})
     workload = validate_workload({**{name: default for name, default, *_ in WORKLOAD}, "mode": WORKLOAD_MODES[0],
                                   **workload})
-    headroom = {kind + "_headroom_bytes": round(number(data.get(kind + "_headroom_gib", default), kind + " headroom", high=65536) * GIB)
-                for kind, default in (("vram", 1), ("ram", 2))}
+    from crit_eval import VRAM_HEADROOM_GIB
+    headroom = {kind + "_headroom_bytes": round(number(data.get(kind + "_headroom_gib", default), kind + " headroom",
+                                                       high=65536) * GIB)
+                for kind, default in (("vram", VRAM_HEADROOM_GIB), ("ram", 2))}
     reserve = (round(number(data["context_reserve_gib"], "context reserve", 0, 65536) * GIB)
                if "context_reserve_gib" in data else None)
     capacity, context = kv_capacity(data, path, headroom["vram_headroom_bytes"], reserve, cases_need(data, workload))

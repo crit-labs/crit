@@ -47,7 +47,8 @@ class ServeEndToEndTests(MeasureFixture, unittest.TestCase):
         self.run, self.run_id = self.view["run"], self.view["run"]["run_id"]
         self.directory = self.store.directory(self.run_id)
         self.store.recon(self.run_id)
-        record = self.candidate(configuration={"plugins": selection(options={"toy-model": {"concurrency": 4}})})
+        record = self.candidate(configuration={"plugins": selection(options={"toy-model": {"concurrency": 4,
+                                                                                           "prompt_cache": 4}})})
         candidate = record["candidate_id"]
         package = with_plugins(self.root / ("package-" + candidate))
         manifest = self.store.package(self.run_id, candidate, package, {"build": {"toolchain": {"fixture": "host-python"},
@@ -105,6 +106,26 @@ class ServeEndToEndTests(MeasureFixture, unittest.TestCase):
         text = "".join(json.loads(e)["choices"][0]["delta"].get("content") or "" for e in events[:-1]
                        if json.loads(e)["choices"])
         self.assertEqual(text, reply["choices"][0]["message"]["content"])
+
+    def test_a_follow_up_turn_is_served_from_the_prompt_cache_unless_the_request_says_no(self):
+        status, text = self.call("/v1/models")
+        (card,) = json.loads(text)["data"]
+        self.assertTrue(card["engine_facts"]["prompt_cache"])
+        ask = [{"role": "user", "content": "tell me about the harbour and its boats"}]
+        first = self.chat(messages=ask)
+        self.assertEqual(first["usage"]["prompt_tokens_details"]["cached_tokens"], 0)
+        turn = ask + [{"role": "assistant", "content": first["choices"][0]["message"]["content"]},
+                      {"role": "user", "content": "and the lighthouse"}]
+        again = self.chat(messages=turn)
+        cached = again["usage"]["prompt_tokens_details"]["cached_tokens"]
+        self.assertGreater(cached, first["usage"]["prompt_tokens"] // 2)   # the first turn's prompt, at least most of it
+        self.assertLess(cached, again["usage"]["prompt_tokens"])
+        # A measured request asks for every prompt token prefilled, and gets the same reply.
+        fresh = self.chat(messages=turn, crit={"prompt_cache": False})
+        self.assertEqual(fresh["usage"]["prompt_tokens_details"]["cached_tokens"], 0)
+        self.assertEqual(fresh["choices"][0]["message"]["content"], again["choices"][0]["message"]["content"])
+        status, text = self.call("/v1/chat/completions", {"model": "default", "messages": ask, "crit": {"prompt_cache": 1}})
+        self.assertEqual(status, 400, text)
 
     def test_structured_output_keeps_to_its_schema(self):
         reply = self.chat(max_tokens=32, response_format={"type": "json_schema", "json_schema": {

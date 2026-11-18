@@ -1,5 +1,4 @@
-"""crit_core.batch, the Python twin of Core's crit/batch.h: the same layouts, rows and reservations as
-tests/core/batch_tests.cpp checks for the C++ library."""
+"""crit_core.batch: a batched step's layouts, rows and page reservations (core/python/crit_core/batch.md)."""
 from pathlib import Path
 import sys
 import types
@@ -58,6 +57,11 @@ class StepItemTests(unittest.TestCase):
         self.assertEqual(step_item(row(16), 40, 0, key="r"), StepItem("r", PREFILL, 16, 0))
         self.assertEqual(step_item(row(16), 40, 30), StepItem(None, PREFILL, 10, 1))
         self.assertEqual(step_item(row(16, token_work=4), 40, 30), StepItem(None, PREFILL, 4, 0))
+        # A stop the chunk does not pass: the rows up to it, then the prompt's tail with its logits.
+        self.assertEqual(step_item(row(16), 40, 30, stop=36), StepItem(None, PREFILL, 6, 0))
+        self.assertEqual(step_item(row(16), 40, 36, stop=36), StepItem(None, PREFILL, 4, 1))
+        self.assertEqual(step_item(row(16), 40, 0, stop=36), StepItem(None, PREFILL, 16, 0))
+        self.assertEqual(step_item(row(16), 40, 38, stop=36), StepItem(None, PREFILL, 2, 1))
         for bad in ((row(16), 40, 40), (row(0), 40, 0)):
             with self.assertRaises(ValueError):
                 step_item(*bad)

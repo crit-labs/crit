@@ -1,9 +1,9 @@
-"""Batched steps for Python engines: the twin of Core's crit/batch.h (core/src/batch/README.md).
+"""Batched steps for a model plugin's step model (batch.md beside this file).
 
-A step model (crit_core.native.StepEngine) gets one row per scheduled request; it lays the rows out as a C++ engine
-does: decode rows first, then prompt chunks, each phase in the order given, and runs its work once over all of them.
+A step model (crit_core.native.StepEngine) gets one row per scheduled request; it lays the rows out:
+decode rows first, then prompt chunks, each phase in the order given, and runs its work once over all of them.
 A request's tokens then do not depend on the requests sharing its step when the model's arithmetic follows the batch
-invariance rules (core/src/batch/README.md).
+invariance rules (batch.md).
 
     items = [step_item(row, len(session.prompt), session.frontier) for row, session in rows]
     layout = StepLayout(items)          # layout.placements in row order, layout.logit_rows for the logits pass,
@@ -25,11 +25,13 @@ StepItem = namedtuple("StepItem", "key phase rows logits readers", defaults=(Fal
 Placement = namedtuple("Placement", "key phase item first rows first_logit logits read", defaults=(0,))
 
 
-def step_item(row, prompt_tokens, frontier, decode_rows=1, key=None):
+def step_item(row, prompt_tokens, frontier, decode_rows=1, key=None, stop=None):
     """The StepItem of a scheduled row (prefill_tokens, token_work, prefill_complete, as crit_core.native.StepRow):
     a decode row stages decode_rows rows (1, or a verify's drafts + 1), at most its token work and at least one; a
     prefill row computes the prompt left after `frontier`, at most its grant and token work, with logits when it ends
-    the prompt."""
+    the prompt. `stop`: a position a prefill row before it does not pass, where the model wants a chunk to end (a
+    prompt cache's mark, crit_plugins.prompt_cache PromptCache.stop): the row then computes fewer rows than its
+    grant, which Core takes from the prompt tokens its StepResult reports."""
     if row.prefill_complete:
         if decode_rows < 1:
             raise ValueError("a decode item stages at least one row")
@@ -40,6 +42,8 @@ def step_item(row, prompt_tokens, frontier, decode_rows=1, key=None):
     rows = min(row.prefill_tokens, prompt_tokens - frontier)
     if row.token_work:
         rows = min(rows, row.token_work)
+    if stop is not None and frontier < stop:
+        rows = min(rows, stop - frontier)
     if rows < 1:
         raise ValueError("a prefill item without prompt rows")
     return StepItem(key, PREFILL, rows, 1 if frontier + rows == prompt_tokens else 0)

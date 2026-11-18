@@ -789,6 +789,33 @@ class PlanRecordTests(PlanFixture, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "tiny changes no KPI by more than its noise"):
             self.store.plan(self.run_id, plan(parent, levers=plan()["levers"] + [tiny]))
 
+    FOLLOWUP = "follow-up turns' first token at its floor with a prompt cache"
+
+    def test_a_gap_eval_states_outside_the_priorities_is_answered_in_the_plan(self):
+        parent = self.first()["candidate_id"]
+        # Eval's follow-up turns stand at a hundredth of their floor with a prompt cache: no KPI the priorities rank.
+        self.evaluated(parent, status(gaps=[("followup_ttft", self.FOLLOWUP, 77.9), ("concurrency", "batching", 2.0)]))
+        with self.assertRaisesRegex(ValueError, r"Eval states the followup_ttft gap .* \(\+7790%\) and the plan gives "
+                                                r"it no fate"):
+            self.store.plan(self.run_id, plan(parent))
+        answers = [{"kpi": "followup_ttft", "gap": self.FOLLOWUP, "answer": "rejected", "evidence": "run.json",
+                    "detail": "measured: the cached path parted from the fresh one beyond a near-tie"}]
+        with self.assertRaisesRegex(ValueError, "Eval states the concurrency gap 'batching'"):
+            self.store.plan(self.run_id, plan(parent, gaps=answers))
+        answers.append({"kpi": "concurrency", "gap": "batching", "answer": "cause",
+                        "detail": "the verify pass is compute bound at four rows of six columns"})
+        recorded = self.store.plan(self.run_id, plan(parent, gaps=answers))
+        self.assertEqual([row["kpi"] for row in recorded["gaps"]], ["followup_ttft", "concurrency"])
+
+    def test_a_lever_that_improves_a_stated_goal_is_its_fate_but_no_reason_for_a_candidate(self):
+        parent = self.first()["candidate_id"]
+        self.evaluated(parent, status(gaps=[("followup_ttft", self.FOLLOWUP, 77.9)]))
+        cache = lever("prompt-cache", {"followup_ttft": {"change": 50.0, "source": "eval-gap:" + self.FOLLOWUP}})
+        with self.assertRaisesRegex(ValueError, "No lever improves decode, prefill, context_decode or context_ttft"):
+            self.store.plan(self.run_id, plan(parent, levers=[cache]))
+        recorded = self.store.plan(self.run_id, plan(parent, levers=plan()["levers"] + [cache]))
+        self.assertIn("prompt-cache", [row["id"] for row in recorded["levers"]])
+
     def test_answer_why_a_family_short_of_its_limit_is_not_needed(self):
         parent = self.first()["candidate_id"]
         # Prefill at 25% of its limit, marked not needed with no Eval gap above its noise.

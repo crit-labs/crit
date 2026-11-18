@@ -35,7 +35,7 @@ class TokenLawTests(unittest.TestCase):
         suppressed = m.process(row, min_tokens=3, suppress=(3, 99), outputs=2)
         self.assertEqual(suppressed[3], -math.inf)
         self.assertEqual(m.process(row, min_tokens=3, suppress=(3,), outputs=3)[3], 3.0)
-        # Core's suppression_yields: a constraint allowing only suppressed tokens keeps them selectable
+        # Core's rule: a constraint allowing only suppressed tokens keeps them selectable
         self.assertEqual(m.process(row, min_tokens=3, suppress=(3,), outputs=2, yields=True)[3], 3.0)
 
     def test_full_vocabulary_and_min_p(self):

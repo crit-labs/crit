@@ -29,6 +29,18 @@ class PartitionedDeviceTests(PluginTestCase):
     def test_it_has_the_attention_interface(self):
         self.assertImplements(self.assemble(USE))
 
+    def test_prompt_reader_auto_follows_the_level_the_engine_asks_of_its_prompt_rows(self):
+        from crit_plugins import kernels
+        self.addCleanup(kernels.use_exactness, None)
+        kernels.use_exactness("exact")
+        attention = self.assemble(USE)["attention"]
+        self.assertEqual(attention.device_form.prompt_reader, "decode")
+        self.assertEqual(attention.exactness(), {"decode": "row-exact", "prompt": "exact"})
+        kernels.use_exactness("repeatable")
+        self.assertEqual(self.assemble(USE)["attention"].device_form.prompt_reader, "prefill")
+        self.assertEqual(self.assemble(USE, options={"prompt_reader": "decode"})["attention"].device_form.prompt_reader,
+                         "decode")
+
     def test_merged_shards_equal_attention_over_the_whole_sequence(self):
         torch = self.torch
         g = torch.Generator().manual_seed(1)

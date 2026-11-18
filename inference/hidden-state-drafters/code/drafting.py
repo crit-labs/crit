@@ -1,6 +1,6 @@
 """Host reference for drafters that read the target's hidden states (EAGLE-3) or draft a block per pass (DFlash,
 DSpark): which target hidden states and tokens feed the drafter after a round, the block a block drafter fills,
-draft-vocabulary mapping and confidence truncation. Every rule here has a kernel in hidden_drafters.cu.
+draft-vocabulary mapping and confidence truncation.
 
 Taps are residual-stream indices (the hidden state after k target decoder layers); crit_core.model.drafters reads
 them, and every other drafter fact, from the published config formats.

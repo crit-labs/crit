@@ -29,9 +29,9 @@ def bits(t):
 
 @unittest.skipIf(torch is None or not torch.cuda.is_available(), "the device form runs on CUDA")
 class DispatchDeviceTests(PluginTestCase):
-    def dispatch(self, resident=-1, format="nvfp4", seed=4, native="auto"):
+    def dispatch(self, resident=-1, format="nvfp4", seed=4, native="auto", **options):
         parts = self.assemble(USE, {"resident": resident, "workers": 3, "pin": False, "max_tokens": 16,
-                                    "native": native})
+                                    "native": native, **options})
         experts, generator = parts["experts"], torch.Generator().manual_seed(seed)
         for layer in range(LAYERS):
             for e in range(EXPERTS):
@@ -87,7 +87,7 @@ class DispatchDeviceTests(PluginTestCase):
         table = slots.clone()
         experts.forward_bundles(0, x, ids, weights, store, table)
         if not experts.engine.in_stream:
-            self.skipTest("the CPU routes' mailbox did not build here")
+            self.skipTest("the CPU routes' in-stream join did not build here")
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -181,7 +181,7 @@ class DispatchDeviceTests(PluginTestCase):
     def test_a_prompt_chunk_past_max_tokens_gives_the_all_device_bits(self):
         everything = self.dispatch(-1)   # max_tokens 16
         x, ids, weights = self.routes(random.Random(8), tokens=37)
-        want = everything.forward(0, x, ids, weights)   # no -2: the mailbox is skipped
+        want = everything.forward(0, x, ids, weights)   # no -2: the handoff is skipped
         jobs = everything.engine.status()["jobs"]
         store, slots = everything.stores[0]
         table = slots.clone()
@@ -189,6 +189,48 @@ class DispatchDeviceTests(PluginTestCase):
         got = everything.forward_bundles(0, x, ids, weights, store, table)   # in pieces of 16, 16 and 5 tokens
         self.assertTrue(torch.equal(bits(got), bits(want)))
         self.assertEqual(everything.engine.status()["jobs"], jobs + 3)
+
+    def test_the_kernel_device_part_gives_the_torch_parts_bits(self):
+        for format in ("nvfp4", "int4"):
+            with self.subTest(format=format):
+                kernel, torch_part = self.dispatch(3, format, device_part="kernel"), self.dispatch(3, format,
+                                                                                                device_part="torch")
+                for tokens in (1, 4, 37):
+                    x, ids, weights = self.routes(random.Random(tokens), tokens=tokens)
+                    self.assertTrue(torch.equal(bits(kernel.forward(0, x, ids, weights)),
+                                                bits(torch_part.forward(0, x, ids, weights))))
+                self.assertEqual(type(kernel.engine.part).__name__, "KernelRoutes")
+                self.assertEqual(type(torch_part.engine.part).__name__, "DeclaredRoutes")
+                self.assertIn("kernel", kernel.facts()["device_expert_rows"])
+
+    def test_a_prompt_chunk_without_cpu_routes_runs_the_tensor_arithmetic(self):
+        declared, tensor = self.dispatch(-1), self.dispatch(-1, prompt_arithmetic="tensor")
+        x, ids, weights = self.routes(random.Random(9), tokens=37)   # past max_tokens 16, every route on the device
+        want, got = declared.forward(0, x, ids, weights), tensor.forward(0, x, ids, weights)
+        self.assertEqual(tensor.engine.status()["tensor_calls"], 1)
+        self.assertLess(float((got - want).abs().max()), 0.05 * float(want.abs().max()) + 1e-3)
+        decode = self.routes(random.Random(10), tokens=4)   # decode rows keep the declared order's bits
+        self.assertTrue(torch.equal(bits(tensor.forward(0, *decode)), bits(declared.forward(0, *decode))))
+        store, slots = tensor.stores[0]
+        table = slots.clone()
+        table[:3] = -2   # a CPU route takes part: the declared order, the CPU's bits
+        self.assertTrue(torch.equal(bits(tensor.forward_bundles(0, x, ids, weights, store, table)), bits(want)))
+        self.assertEqual(tensor.engine.status()["tensor_calls"], 1)
+        # What the rows keep: the declared order, but prompt rows that follow the call they are in with tensor.
+        self.assertEqual(declared.exactness(), {"decode": "declared", "prompt": "declared"})
+        self.assertEqual(tensor.exactness(), {"decode": "declared", "prompt": "repeatable"})
+        # auto takes the tensor arithmetic only where the engine asks repeatable prompt rows.
+        from crit_plugins import kernels
+        self.addCleanup(kernels.use_exactness, None)
+        kernels.use_exactness("repeatable")
+        fast = self.dispatch(-1)
+        self.assertTrue(torch.equal(bits(fast.forward(0, x, ids, weights)), bits(got)))
+        self.assertEqual(fast.engine.status()["tensor_calls"], 1)
+        self.assertEqual(fast.exactness(), {"decode": "declared", "prompt": "repeatable"})
+        kernels.use_exactness({"decode": "row-exact", "prompt": "row-exact"})
+        kept = self.dispatch(-1)
+        self.assertTrue(torch.equal(bits(kept.forward(0, x, ids, weights)), bits(want)))
+        self.assertEqual(kept.exactness(), {"decode": "declared", "prompt": "declared"})
 
     def test_a_slot_table_of_another_length_is_refused(self):
         experts = self.dispatch(-1)
@@ -243,7 +285,7 @@ class DispatchDeviceTests(PluginTestCase):
         want = experts.forward_bundles(0, x, ids, weights, store, table)   # the host path: the same bits
         self.assertTrue(torch.equal(bits(want), bits(self.dispatch(-1).forward(0, x, ids, weights))))
         graph = torch.cuda.CUDAGraph()
-        with self.assertRaisesRegex(RuntimeError, "in-stream mailbox"):
+        with self.assertRaisesRegex(RuntimeError, "in-stream handoff"):
             with torch.cuda.graph(graph):
                 experts.forward_bundles(0, x, ids, weights, store, table)
 

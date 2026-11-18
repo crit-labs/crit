@@ -74,8 +74,9 @@ int64_t splits(const torch::Tensor& trellis, int64_t codebook, int64_t rows) {
 void tiles(const torch::Tensor& trellis, int64_t codebook, const torch::Tensor& xr, torch::Tensor& yr) {
     const er::Matrix w = matrix(trellis, codebook);
     TORCH_CHECK(xr.is_cuda() && xr.is_contiguous() && xr.scalar_type() == torch::kFloat16 && xr.dim() == 2 &&
-                    xr.size(1) == w.in && xr.size(0) >= 1 && xr.size(0) <= er::kMaxRows && xr.device() == trellis.device(),
-                "tiles: xr is contiguous FP16 [1..", er::kMaxRows, "][in] (the rotated activations)");
+                    xr.size(1) == w.in && xr.size(0) >= 1 && xr.size(0) <= er::slab_rows(w) &&
+                    xr.device() == trellis.device(),
+                "tiles: xr is contiguous FP16 [1..", er::slab_rows(w), "][in] (the rotated activations)");
     TORCH_CHECK(yr.is_cuda() && yr.is_contiguous() && yr.scalar_type() == torch::kFloat32 && yr.dim() == 3 &&
                     yr.size(1) == xr.size(0) && yr.size(2) == w.out && yr.device() == trellis.device(),
                 "tiles: yr is contiguous FP32 [splits][rows][out]");
@@ -85,6 +86,8 @@ void tiles(const torch::Tensor& trellis, int64_t codebook, const torch::Tensor& 
     TORCH_CHECK(e == cudaSuccess, "tiles: ", cudaGetErrorString(e), " (in and out multiples of 128, K 1 to 8, a half "
                 "K only with codebook 2 up to 3.5)");
 }
+
+int64_t slab_rows(const torch::Tensor& trellis, int64_t codebook) { return er::slab_rows(matrix(trellis, codebook)); }
 
 void decode(const torch::Tensor& trellis, int64_t codebook, torch::Tensor& q) {
     const er::Matrix w = matrix(trellis, codebook);

@@ -51,7 +51,7 @@ technique's algorithm does stays in that technique. A change to the core rebuild
       "rows": [1, 16],
       "tune_rows": [1, 2, 4, 8, 16],
       "key": ["N", "K"],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "WARPS": {"values": [2, 4, 8], "default": 4, "what": "warps a block"},
         "WPR": {"values": [1, 2, 4], "default": 1, "order": true, "what": "..."}
@@ -77,6 +77,18 @@ technique's algorithm does stays in that technique. A change to the core rebuild
   Triton's `BLOCK_*`, `num_warps`, `num_stages`). Mark a knob `"order": true` when it changes the summation order: a
   shape then keeps one value of it for every row count, so a row's bits never depend on the rows beside it. A knob a
   per-matrix plan reads (one choice a matrix, whatever the row count) is marked the same way.
+- `exactness`: what the bits of a row may depend on, the structure's promise
+  ([the levels](README.md#exactness), `crit_kernels/exactness.py`). `declared`: the kernel's declared order, the bits
+  every implementation of that order gives (the CPU tier's rows, the decode rows, a prompt GEMM in the same order).
+  `exact`: the bits of another structure of the kernel, which `bits_of` names (a prompt tile with its decode tile's
+  bits, a fused launch with the split launch's). `row-exact`: an order of its own that follows the shape and the
+  tuning only, so a row's bits never depend on the rows beside it, the row count or a prompt chunk's length.
+  `repeatable`: the same call gives the same bits again and nothing more (a split of K that follows the row count,
+  the tensor cores' own order over a tile that follows the token count); say the order it sums in under `order`. A
+  level keeps what the levels below it keep. Every structure states one, the fast ones too: an engine chooses
+  between them by the level it asks for, and the sweep drops a configuration of a row-exact or higher structure
+  whose row 0 differs from row 0 computed alone. Precision is not a level: quantized activations or 16-bit operands
+  are the structure's arithmetic, in its `what`.
 - `default` knobs plus `default_rows` (knob overrides by row range, shape independent) must reproduce the kernel's
   behavior before it had knobs: an untuned build runs exactly what crit ran before.
 - `yardstick`: the best vendor or open library at the structure's arithmetic, which the sweep times on the same
@@ -143,14 +155,22 @@ the sweep's hundreds of builds compiles in seconds.
 
 Triton: the package gets `_crit_tuning.py`; read a call's knobs with
 `from ._crit_tuning import knobs; k = knobs("structure-id", {"N": n, "K": k}, rows)` and pass them as `tl.constexpr`
-block sizes and `num_warps`/`num_stages`.
+block sizes and `num_warps`/`num_stages`. A structure whose knobs follow the row count launches through
+`_crit_tuning.launch(kernel, "structure-id", key, k, call)`, where `call(knobs)` gives the launch's
+`(grid, arguments, options)` for a knob set: a compiled kernel's first launch then compiles the shape key's other knob
+sets too (`variants("structure-id", key)`), so a request after load compiles nothing whatever its row count. A
+structure whose row count is a constant of its kernel compiles per row count anyway: its caller warms the counts it
+serves.
 
 A Triton kernel with CUDA sources (kernel.json `cuda`): the package gets `_crit_cuda.py` too, and
 `_crit_cuda.library(device, **variant)` returns the variant's library (ctypes, compiled into the build folder on first
 use; call it on the caller's stream so CUDA graphs capture its launches). Its sources include `crit_tuning.h` and
 dispatch on `CRIT_CONFIGS_S` and `crit_lookup_S` like a CUDA kernel's, for the structures in `cuda.structures`;
 `select()` reaches every library of the build, loaded or not yet. Its bench gives `variants(shape)` (the variants a
-call on that shape uses) so the sweep compiles them first.
+call on that shape uses) so the sweep compiles them first. One library serves every GPU of its kind in the process:
+call it inside `with torch.cuda.device(x.device)` (it launches on the thread's current device), and keep what it
+remembers about a device (a kernel's shared-memory opt-in, the CTAs the device holds, its multiprocessors) in the
+kernel core's `PerDevice` (`crit_kcore/device.cuh`), never in a static of the process.
 
 ## bench.py
 
@@ -173,7 +193,8 @@ each seeing the ones before it, as a recurrent scan: the NaN goes into the last 
 bytes; a chunked form that multiplies a chunk's triangular matrices densely adds `nan_block = B`, and then only the
 chunks before the NaN's must keep theirs), and `integer_inputs(shape, rows, device)` with
 `integer_reference(state)` (integer operands whose FP32 sums are exact in any order, None for a shape that has
-none). A structure whose bits may differ between calls declares `"repeatable": false` in kernel.json.
+none). A structure whose bits may differ between calls declares `"repeatable": false` in kernel.json: it is below
+every exactness level (the lowest, `repeatable`, is what the repeat gate checks), and none of crit's kernels is.
 
 ## Gates
 

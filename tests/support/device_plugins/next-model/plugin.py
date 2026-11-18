@@ -7,13 +7,21 @@ query/key norms with their rotary positions, the gated norm, the attention outpu
 product are the norms slot's, and every token comes from the sampler; a step of many sequences' rows is one batch, its
 matrices multiplied a prompt chunk alone and one-token rows DECODE_ROWS at a time, so a row's bits are those it has
 alone. verify(view, batch) is its target pass over a crit_plugins.rounds RoundBatch (every column's logits), for the
-round driver's tests of a hybrid model: the recurrence pool and the KV pool both follow the round slots."""
+round driver's tests of a hybrid model: the recurrence pool and the KV pool both follow the round slots.
+
+With the option `prompt_cache` it keeps that many ended requests' sequences in Core's prompt cache
+(crit_plugins.prompt_cache): the KV pool is cut at any shared prefix, and the recurrence pool, whose state nothing
+rolls back, resumes where it stood, at a kept sequence's end or at a prompt chunk's end, which the model marks as
+it commits the chunk (the cache keeps the newest two: a prompt's end and the chunk boundary before it). With the
+option `prompt_cache_tail` a chunk ends that many tokens before a prompt's end and is marked: the same prompt
+sent again, or a turn the template ends otherwise than it renders it later, resumes there."""
 import json
 
 from crit_core.batch import DECODE, PREFILL, StepLayout, step_item
 from crit_core.native import Scores, StepResult
 from crit_plugins import StepBatch
 from crit_plugins.device import DECODE_ROWS, free_device_bytes
+from crit_plugins.prompt_cache import PromptCache
 
 CORE_SAMPLING = ("temperature", "top_p", "top_k", "min_p", "seed")
 
@@ -23,6 +31,7 @@ class Session:
         self.handle, self.request, self.prompt = handle, request, list(request.prompt)
         self.done, self.outputs, self.pending = 0, [], None    # rows committed; published outputs
         self.phase, self.produced, self.rows = None, [], 0
+        self.reused = 0                                         # the prompt cache's prefix, until a step reports it
 
 
 class NextModel:
@@ -47,6 +56,8 @@ class NextModel:
         self.full = [i for i, t in enumerate(self.types) if t == "full_attention"]
         self.context = int(context.context_tokens or options["context"])
         sequences = options["concurrency"] + 9   # every session Core holds at once, and a score's
+        # A kept sequence holds a state and two marks' states; an open one may hold two marks more.
+        sequences += 3 * options["prompt_cache"] + (2 * (options["concurrency"] + 8) if options["prompt_cache"] else 0)
         tensors = {}
         for path in sorted(context.model.glob("*.safetensors")):
             tensors.update(load_file(str(path), device="cpu"))
@@ -103,6 +114,8 @@ class NextModel:
         eos = json.loads(generation.read_text(encoding="utf-8")).get("eos_token_id") if generation.is_file() else None
         self.stops = sorted(set(eos if isinstance(eos, list) else [eos])) if eos is not None else []
         self.handles = 0
+        self.cache = (PromptCache([self.pool], states=[self.states], entries=options["prompt_cache"],
+                                  tail=options["prompt_cache_tail"]) if options["prompt_cache"] else None)
 
     def info(self):
         return {"implementation": "qwen3-next-layout hybrid MoE decoder (device plugins)", "vocabulary": self.vocabulary,
@@ -110,7 +123,11 @@ class NextModel:
                 "max_concurrency": self.options["concurrency"], "max_pending": 8, "max_batch_tokens": 512,
                 "stop_tokens": self.stops, "sampling": dict.fromkeys(CORE_SAMPLING, True), "token_logprobs": True,
                 "max_top_logprobs": 20, "scoring": True, "query_scoring": True, "score_paths": ["prefill"],
-                "replay": True, "speculative": False}
+                "replay": True, "speculative": False,
+                **({"prompt_cache": True} if self.cache is not None else {})}
+
+    def telemetry(self):
+        return self.cache.telemetry() if self.cache is not None else {}
 
     # -- the arithmetic --------------------------------------------------------------------------------------------------
     def _norm(self, x, weight, residual=None):
@@ -226,12 +243,18 @@ class NextModel:
     def open(self, request):
         self.handles += 1
         session = Session(self.handles, request)
-        self._open(session.handle)
+        if self.cache is None:
+            self._open(session.handle)
+        else:   # the rows a kept sequence holds for this prompt, where its recurrent state stood
+            session.done = session.reused = self.cache.open(session.handle, session.prompt, request.prompt_cache)
         return session
 
     def step(self, rows):
         torch = self.torch
-        layout = StepLayout(step_item(row, len(row.session.prompt), row.session.done) for row in rows)
+        # A prompt chunk does not pass the place the prompt cache marks before the prompt's end.
+        stop = (lambda s: None) if self.cache is None else (lambda s: self.cache.stop(s.handle, s.done))  # noqa: E731
+        layout = StepLayout(step_item(row, len(row.session.prompt), row.session.done, stop=stop(row.session))
+                            for row in rows)
         packed, ids, logit_rows, placed = [], [], [], []
         for placement in layout.placements:
             s = rows[placement.item].session
@@ -260,8 +283,10 @@ class NextModel:
                     top = torch.topk(row, min(int(s.request.logprobs), 20))
                     logprobs = [(float(row[token]), list(zip(top.indices.tolist(), top.values.tolist())))]
                 j += 1
-            results[placement.item] = StepResult(placement.rows if placement.phase == PREFILL else 0, s.produced, has,
-                                                 0, placement.rows, logprobs)
+            # A prompt's first step reports the prefix the prompt cache gave it with the rows it computed.
+            reused, s.reused = (s.reused, 0) if placement.phase == PREFILL else (0, s.reused)
+            results[placement.item] = StepResult(placement.rows + reused if placement.phase == PREFILL else 0,
+                                                 s.produced, has, reused, placement.rows, logprobs)
         return results
 
     def commit(self, decisions):
@@ -269,7 +294,7 @@ class NextModel:
             s = d.session
             if s.phase is None:
                 continue
-            kept = not (d.cancelled or d.discard)
+            kept = not d.cancelled
             if kept:
                 s.done += s.rows
                 if d.accepted:
@@ -277,10 +302,16 @@ class NextModel:
                     s.outputs += s.produced[:d.accepted]
             self.states.accept(s.handle, s.rows if kept else 0)   # the state and the convolution window
             self.pool.keep(s.handle, s.done)
+            if self.cache is not None and kept and s.phase == PREFILL:
+                self.cache.mark(s.handle, s.done)   # the state stands at this chunk's end: a later prompt resumes here
             s.phase, s.produced = None, []
 
     def retire(self, session, finish):
-        self._close(session.handle)
+        if self.cache is None:
+            self._close(session.handle)
+        else:   # the pools hold the prompt and every output written as a row: all but the last, still pending
+            held = (session.prompt + session.outputs)[:session.done]
+            self.cache.retire(session.handle, None if finish == "failed" else held)
 
     def score(self, ids, first_target, path="", queries=None, top_k=0):
         """A fixed text's scores through the prompt path: its tokens a prefill_chunk at a time, as a prompt's chunks

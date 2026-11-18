@@ -76,6 +76,19 @@ class PackageCheckTests(PackageFixture, unittest.TestCase):
         with self.assertRaisesRegex(PluginError, "holds no configuration.json"):
             check_package(self.package, self.model, device="cpu")
 
+    def test_a_configuration_asks_for_exactness_by_level(self):
+        sys.path.insert(0, str(ROOT / "kernels"))   # crit_kernels.exactness, the levels
+        from crit_core.engine import exactness_levels
+        self.assertIsNone(exactness_levels({}))
+        self.assertEqual(exactness_levels({"exactness": "exact"}), {"decode": "row-exact", "prompt": "exact"})
+        self.assertEqual(exactness_levels({"exactness": {"decode": "declared", "prompt": "repeatable"}}),
+                         {"decode": "declared", "prompt": "repeatable"})
+        for wrong in ("bitwise", {"prompt": "exact"}, {"decode": "exact", "prompt": "exact", "verify": "exact"}, 3,
+                      ["exact"]):
+            with self.subTest(wrong=wrong), self.assertRaisesRegex(PluginError, 'configuration "exactness"'):
+                check_package(self.package, self.model, {**self.configuration(), "exactness": wrong}, device="cpu")
+        check_package(self.package, self.model, {**self.configuration(), "exactness": "row-exact"}, device="cpu")
+
     def test_an_engine_fills_every_required_slot_on_its_device(self):
         configuration = self.configuration()
         del configuration["plugins"]["use"]["sampler"]
@@ -318,6 +331,29 @@ class LoadTests(PackageFixture, unittest.TestCase):
             self.assertGreater(probe[kind]["steps"], 0)
             self.assertGreater(probe[kind]["slowest_seconds"], 0)
 
+    def test_an_engine_told_to_allocate_nothing_fails_at_the_step_that_allocates_while_it_serves(self):
+        # STEP_ALLOCATIONS=0: a step during which the device's allocator made an allocation ends the engine with
+        # that step's kind and count, once the engine serves (its load's steps may allocate).
+        import os
+        from unittest import mock
+        from crit_core import native
+
+        device, count = native.memory_of("cuda"), [0, 0]   # the allocations so far, and what each reading adds
+
+        def made():
+            count[0] += count[1]
+            return count[0]
+        patches = (mock.patch.dict(os.environ, {native.STEP_ALLOCATIONS: "0"}),
+                   mock.patch.object(device, "made", made), mock.patch.object(device, "serving", True))
+        with patches[0], patches[1], patches[2]:
+            engine = self.open()
+            self.assertEqual(engine.generate([5, 6, 7], 4, stop_tokens=[])[0], oracle([5, 6, 7], 4, stops=()))
+            device.serving, count[1] = False, 3      # a load's steps may allocate
+            self.assertEqual(engine.generate([5, 6, 7], 4, stop_tokens=[])[0], oracle([5, 6, 7], 4, stops=()))
+            device.serving = True
+            with self.assertRaisesRegex(Exception, "a prompt step made 3 device allocations while the engine serves"):
+                engine.generate([5, 6, 7], 4, stop_tokens=[])
+
     def test_the_engine_runs_its_model_plugin_and_reports_its_plugins(self):
         engine = self.open()
         info = engine.info()
@@ -337,9 +373,8 @@ class LoadTests(PackageFixture, unittest.TestCase):
         self.assertTrue(any(rows > 1 for rows, _ in model.steps), "no step held two requests")
 
     def test_every_step_a_step_engine_runs_is_kept_or_ends_its_request(self):
-        # Core never discards a step engine's step (crit/step_engine.h, StepDecision): it runs one step at a time, so no
-        # step is a discard-only descendant of another in flight; a prompt chunk it ran (its state written in place, as a
-        # replayed one's is) is kept, or its request ends. Here under stops, output limits, cancellations and prompts
+        # Core runs one step at a time (crit/step_engine.h, StepDecision): a prompt chunk it ran (its state written in
+        # place, as a replayed one's is) is kept, or its request ends. Here under stops, output limits, cancellations and prompts
         # of several chunks, many requests at once.
         engine = self.open()
         model, order, decisions = engine.model, [], []
@@ -364,7 +399,6 @@ class LoadTests(PackageFixture, unittest.TestCase):
         with ThreadPoolExecutor(12) as pool:
             found = list(pool.map(run, range(12)))
         self.assertTrue(decisions)
-        self.assertFalse(any(d.discard for d in decisions))
         self.assertEqual(order, ["step", "commit"] * (len(order) // 2), "one step at a time, each committed")
         for r, (tokens, result) in enumerate(found):
             if r % 4 != 3:
@@ -417,7 +451,8 @@ class LoadTests(PackageFixture, unittest.TestCase):
         from unittest import mock
         from crit_core import native
         reserved, free = [10 << 30], [8 << 30]
-        cuda = types.SimpleNamespace(is_initialized=lambda: True, device_count=lambda: 1,
+        # what Core's reading of the device (crit_plugins.memory) asks torch for
+        cuda = types.SimpleNamespace(is_initialized=lambda: True, is_available=lambda: True, device_count=lambda: 1,
                                      max_memory_reserved=lambda device: reserved[0],
                                      get_device_properties=lambda device: types.SimpleNamespace(total_memory=32 << 30),
                                      mem_get_info=lambda device: (free[0], 32 << 30), empty_cache=lambda: None)
@@ -689,6 +724,50 @@ class ImageTests(PackageFixture, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PackageExactnessTests(PackageFixture, unittest.TestCase):
+    """The exactness a package asks reaches its plugins before any is made, the engine's facts carry what is asked and
+    what the plugins keep, and an engine whose plugin keeps less than it asks is refused."""
+
+    def setUp(self):
+        super().setUp()
+        sys.path.insert(0, str(ROOT / "kernels"))   # crit_kernels.exactness, the levels
+        from crit_plugins import kernels
+        self.kernels = kernels
+        self.addCleanup(kernels.use_exactness, None)
+
+    def test_the_levels_are_told_to_the_plugins(self):
+        self.assertEqual(core_engine.package_exactness({"exactness": {"decode": "row-exact", "prompt": "repeatable"}}),
+                         {"decode": "row-exact", "prompt": "repeatable"})
+        self.assertEqual(self.kernels.asks("prompt"), "repeatable")
+        self.assertIsNone(core_engine.package_exactness({}))
+        self.assertIsNone(self.kernels.exactness())
+
+    @unittest.skipUnless(STEP_LIBRARY, "Core's runtime crit_core_steps is not built: `crit core build` builds it")
+    def test_an_engine_says_what_it_asks_and_one_that_keeps_less_is_refused(self):
+        from unittest import mock
+        from crit_plugins.assemble import Assembly
+        asked = {"decode": "row-exact", "prompt": "exact"}
+        configuration = {**self.configuration(), "exactness": "exact"}
+        engine = load(self.package, self.model, configuration, device="cpu")
+        try:   # the toy's plugins state no level: the engine says what it asks
+            self.assertEqual(engine.facts["exactness"], {"asked": asked})
+            self.assertEqual(self.kernels.exactness(), asked)
+        finally:
+            engine.close()
+        kept = {"asked": asked, "decode": "row-exact", "prompt": "repeatable",
+                "plugins": {"toy-projections": {"decode": "row-exact", "prompt": "repeatable"}}}
+        with mock.patch.object(Assembly, "exactness", lambda assembly: kept):
+            with self.assertRaisesRegex(PluginError, "keeps less than it asks: toy-projections keeps its prompt rows "
+                                                     "repeatable where the configuration's exactness asks exact"):
+                load(self.package, self.model, configuration, device="cpu")
+        engine = load(self.package, self.model, device="cpu")   # a package that asks nothing
+        try:
+            self.assertNotIn("exactness", engine.facts)
+            self.assertIsNone(self.kernels.exactness())
+        finally:
+            engine.close()
 
 
 class PackageTuningTests(unittest.TestCase):

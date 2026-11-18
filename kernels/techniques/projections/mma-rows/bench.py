@@ -6,6 +6,8 @@ import math
 
 import torch
 
+from crit_kernels.gates import shared_memory_optin
+
 E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
 WEIGHTS = {"nvfp4": 0, "fp8": 1, "bf16": 3, "int4_zp": 4}
 INT4_GROUP = 128   # a shape's group where it names none (AWQ's and GPTQ's usual)
@@ -298,3 +300,44 @@ class PromptTile(DecodeTile):
             s["plan"] = module.plan(w.shape[0], s["x"].shape[1], s["weights"], s["x"].device)
         return module.mm_prompt(s["x"], w, s["out"], s["weights"], scales, row_scale, "bf16", INPUT_SCALE, False,
                                 s["plan"][2], None, s["zeros"], s["group"])
+
+
+class Fp4PromptTile(Fp4Tile):
+    """mm_prompt on the FP4 MMA (acts nvfp4_mma) with the matrix's FP4 plan (its splits), 64 to 8,192 rows: the
+    activations quantized by its pre-pass, the check on the first, a middle and the last row against FP64 over the
+    quantized activations (the tests check every row against the FP4 decode tile bit for bit). The yardstick is
+    Fp4Tile's: cuBLASLt's NVFP4 GEMM on the same weight bytes."""
+    structure = "fp4-prompt-tile"
+
+    def valid(self, knobs):
+        """A warp's accumulators, half its running totals and its fragments within its registers (168 a thread with 8
+        consumer warps beside the producer), and two stages of the tile, the totals' other half and a tile of outputs
+        within a CTA's shared memory."""
+        pw, pr, pt = knobs["PW"], knobs["PR"], knobs["PT"]
+        rows, outputs = 16 * pw * pr, 4 * pr * (pt // 8)
+        tiles = 1 if 128 % rows == 0 else rows // 128 if rows % 128 == 0 else (rows + 126) // 128 + 1
+        stage = 64 * (rows + pt) + 1024 * (tiles + 1)
+        totals = outputs // 2 * 128 * pw   # half of a thread's running totals in shared memory
+        fits = 2 * stage + totals <= shared_memory_optin() - 1280 and pt * (rows + 8) * 2 <= 2 * stage
+        return outputs + outputs // 2 + 20 * pr + 40 <= 160 and fits
+
+    def _sampled(self, s):
+        rows = s["x"].shape[0]
+        return sorted({0, rows // 2, rows - 1})
+
+    def _reference_input(self, s):
+        return super()._reference_input(s)[self._sampled(s)]
+
+    def check(self, got, want, s):
+        return super().check(got[self._sampled(s)], want, s)
+
+    def run(self, module, s):
+        s["module"] = module
+        w, scales, row_scale = s["stored"]
+        if "plan" not in s:
+            s["plan"] = module.plan(w.shape[0], s["x"].shape[1], "nvfp4", s["x"].device, acts="nvfp4_mma")
+            rows, k = s["x"].shape
+            s["scratch"] = torch.empty(module.scratch_bytes(rows, k, "nvfp4_mma"), dtype=torch.uint8,
+                                       device=s["x"].device)
+        return module.mm_prompt(s["x"], w, s["out"], "nvfp4", scales, row_scale, "nvfp4_mma", INPUT_SCALE, True,
+                                s["plan"][2], s["scratch"])

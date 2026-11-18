@@ -20,12 +20,11 @@ plugins are crit's [Inference](../../inference/README.md) techniques and an engi
 | --- | --- | --- |
 | [files.py](crit_core/files.py) | `ModelFiles` sources (`DirectoryFiles`, `MappingFiles`, `CallableFiles`), `model_files`, `FileRecord`, `ModelFilesError` | `ReadOnlyFile` ([io](../src/io/README.md)) |
 | [jsonfile.py](crit_core/jsonfile.py) | `loads`, `read`, `JsonError`: strict JSON | [crit/json.h](../include/crit/json.h) |
-| [model](crit_core/model/README.md) | `load_model_config`, `ModelConfig`, crit eval's config rules, `inspect_safetensors`, `inspect_model`, `TensorReader` (tensor bytes), `matrix_parts` and `layer_prefix` (stored weight matrices) | [crit/model_config.h](../include/crit/model_config.h), [crit/safetensors.h](../include/crit/safetensors.h) |
-| [text](crit_core/text/README.md) | `Tokenizer`, chat templates, `GenerationConfig`, `IncrementalDetokenizer`, `PromptTokenCache`, `StopMatcher`, `TextStream`, `load_model_text` | [crit/text.h](../include/crit/text.h) |
+| [model](crit_core/model/README.md) | `load_model_config`, `ModelConfig`, crit eval's config rules, `inspect_safetensors`, `inspect_model`, `TensorReader` (tensor bytes), `matrix_parts` and `layer_prefix` (stored weight matrices) | |
+| [text](crit_core/text/README.md) | `Tokenizer`, chat templates, `GenerationConfig`, `IncrementalDetokenizer`, `PromptTokenCache`, `StopMatcher`, `TextStream`, `load_model_text` | |
 | [engine.py](crit_core/engine.py) | Core's engine loader, the one way an engine runs: `load` (a plugin package assembled as a whole engine and run on Core's concurrent runtime), `check_package`, `capabilities`, `serving_problems`, `LoadContext`, and Core's adapters over it, `resident` (chat-resident-v1, crit serve) and `eval_v1` (eval-v1, crit-eval's `--package`, through [eval_adapter.py](crit_core/eval_adapter.py)) ([crit plugins](../../docs/PLUGINS.md#the-engine)) | |
 | [native.py](crit_core/native.py) | `StepEngine`: a model plugin's step model on Core's concurrent runtime, the `crit_core_steps` library ([step engines](../src/runtime/README.md#step-engines)), with `NativeRounds` for decode rounds Core launches itself | [crit/native_engine.h](../include/crit/native_engine.h), [crit/step_engine.h](../include/crit/step_engine.h) |
-| [batch.py](crit_core/batch.py) | `StepLayout`, `step_item`, `row_pages`, `PageReservations`: a batched step's rows for a model plugin | [crit/batch.h](../include/crit/batch.h) |
-| [buffers.py](crit_core/buffers.py) | `plan_buffers`, `BufferRequest`, `BufferPlan` (views, slots and scratch as slices of one allocation), `ScratchArena`: [fixed buffer plans](../src/backends/cuda/README.md#fixed-buffer-plans) | [crit/device_memory.h](../include/crit/device_memory.h) |
+| [batch.py](crit_core/batch.py) | `StepLayout`, `step_item`, `row_pages`, `PageReservations`: a batched step's rows for a model plugin ([batched steps](crit_core/batch.md)) | |
 | [constraints](crit_core/constraints) | `compile_language`, `CompilerCache`, `PreparationService`, `byte_vocabulary`, `matches`, `json_object_matches` ([guide](../src/constraints/README.md)) | [crit/constraints.h](../include/crit/constraints.h) |
 
 Everything but `crit_core.text` uses the standard library only. The text layer
@@ -37,7 +36,7 @@ first used.
 
 Loaders take a model directory path or a `ModelFiles` source; anything else
 raises `TypeError`. Each read passes a size cap (16 MiB for `config.json` and
-`generation_config.json`, as the native loaders use). A source records a
+`generation_config.json`). A source records a
 `FileRecord` (path, bytes, sha256) for each file read, in the shape of crit
 run-record model manifests, and refuses a file whose bytes change between reads.
 Names are relative `/` paths; absolute names, `.`/`..`, backslashes, NUL, `:` and
@@ -45,16 +44,11 @@ Windows device names are refused on every platform.
 
 ## Parity with the native parts
 
-The same files give the same values, or are refused, in both languages: strict
-JSON follows the native reader (non-finite numbers only for the config readers),
-`crit_core.model` uses the native loaders' rules and limits, and `StopMatcher` and
-`IncrementalDetokenizer` follow the native stop rule and `offset_decoder`.
-Deliberate differences are listed in [Differences from the Python
-port](../src/model/README.md#differences-from-the-python-port) and [Differences
-from the C++ port](crit_core/model/README.md#differences-from-the-c-port). The
-tokenizer, chat templates, OpenAI message conversion and `GenerationConfig.from_files`
-exist only in Python; a native engine tokenizes through its `TextFrontend`
-([text services](../src/runtime/README.md#text-services)).
+The same input gives the same values, or is refused, in both languages: strict
+JSON follows the native reader (non-finite numbers only for the config readers).
+Model files (`config.json`, safetensors, GGUF), the tokenizer, chat templates, stop
+strings, streamed reply text, OpenAI message conversion and
+`GenerationConfig.from_files` exist only in Python.
 
 ## Tests
 
@@ -68,5 +62,4 @@ and `jinja2`; the model tests compare the config rules with crit-eval-v2's own
 tested by Core's CTest with a toy step model on `crit_core_steps`
 ([step_engine_check.py](../../tests/core/step_engine_check.py)), and `crit_core.engine` with the toy engine's
 plugin package through Core's loader and adapters ([test_core_engine.py](../../tests/test_core_engine.py));
-[test_core_batch.py](../../tests/test_core_batch.py) checks `crit_core.batch`
-against the C++ library's cases, and [test_core_buffers.py](../../tests/test_core_buffers.py) `crit_core.buffers`.
+[test_core_batch.py](../../tests/test_core_batch.py) checks `crit_core.batch`.

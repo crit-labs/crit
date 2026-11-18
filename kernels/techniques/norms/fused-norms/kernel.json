@@ -20,7 +20,7 @@
       "rows": [1, 1048576],
       "tune_rows": [1, 8, 64, 512, 4096],
       "key": ["D"],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "ELEMENTS": {"values": [1024, 2048, 4096, 8192, 16384], "default": 4096, "order": true,
                      "what": "values a program holds: HB = max(1, ELEMENTS / BD) rows a program"},
@@ -36,7 +36,7 @@
       "rows": [1, 1048576],
       "tune_rows": [1, 8, 64, 512, 4096],
       "key": ["D"],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "ELEMENTS": {"values": [1024, 2048, 4096, 8192, 16384], "default": 4096, "order": true,
                      "what": "values a program holds: HB = max(1, ELEMENTS / BD) heads a program, at most the heads rounded up to a power of two"},
@@ -52,7 +52,7 @@
       "rows": [1, 1048576],
       "tune_rows": [1, 8, 64, 512],
       "key": ["D"],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "CHUNK": {"values": [0, 1024, 2048, 4096, 8192, 32768], "default": 0, "order": true,
                   "what": "values a pass step reads; the sums of squares accumulate CHUNK lanes (0: the row's block, its width rounded up to a power of two, in one pass up to 32,768 values, else 4,096 in two passes; a CHUNK at least the row's block: one pass)"},
@@ -68,7 +68,7 @@
       "rows": [1, 1048576],
       "tune_rows": [1, 8, 64, 512, 4096],
       "key": ["N"],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "BLOCK": {"values": [256, 512, 1024, 2048, 4096], "default": 1024, "what": "values a program"},
         "WARPS": {"values": [1, 2, 4, 8, 16], "default": 4, "what": "warps a program"},
@@ -87,7 +87,7 @@
       "rows": [1, 1048576],
       "tune_rows": [1, 8, 64, 512, 4096],
       "key": ["S", "D"],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "BLOCK": {"values": [256, 512, 1024, 2048, 4096], "default": 1024, "what": "values a program"},
         "WARPS": {"values": [1, 2, 4, 8, 16], "default": 4, "what": "warps a program"}
@@ -101,7 +101,7 @@
       "rows": [1, 1048576],
       "tune_rows": [1, 8, 64, 512, 4096],
       "key": ["S", "D"],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "BLOCK": {"values": [256, 512, 1024, 2048, 4096], "default": 1024, "what": "values a program"},
         "WARPS": {"values": [1, 2, 4, 8, 16], "default": 4, "what": "warps a program"}
@@ -115,7 +115,7 @@
       "rows": [1, 1048576],
       "tune_rows": [1, 8, 64, 512, 4096],
       "key": ["N"],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "BLOCK": {"values": [32, 64, 128, 256, 512, 1024], "default": 1024, "what": "values a program"},
         "WARPS": {"values": [1, 2, 4, 8], "default": 4, "what": "warps a program"}

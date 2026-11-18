@@ -6,8 +6,10 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace crit::inference_tests {
@@ -28,6 +30,21 @@ template<class T> struct Device {
         ok(cudaMemcpy(v.data(), p, sizeof(T) * n, cudaMemcpyDeviceToHost), "download");
         return v;
     }
+};
+
+// Untyped device bytes (at least one), for fixtures that hand kernels raw pointers: upload and download are
+// synchronous copies, so they wait for the work enqueued before them on the default stream.
+struct DeviceBytes {
+    void* p = nullptr;
+    std::size_t n = 0;
+    explicit DeviceBytes(std::size_t bytes) : n(bytes) { ok(cudaMalloc(&p, std::max<std::size_t>(bytes, 1)), "malloc"); }
+    ~DeviceBytes() { cudaFree(p); }
+    DeviceBytes(DeviceBytes&& other) noexcept : p(std::exchange(other.p, nullptr)), n(other.n) {}
+    DeviceBytes(const DeviceBytes&) = delete;
+    DeviceBytes& operator=(const DeviceBytes&) = delete;
+    void* data() const noexcept { return p; }
+    void upload(std::span<const std::byte> bytes) { ok(cudaMemcpy(p, bytes.data(), bytes.size(), cudaMemcpyHostToDevice), "upload"); }
+    void download(std::span<std::byte> bytes) const { ok(cudaMemcpy(bytes.data(), p, bytes.size(), cudaMemcpyDeviceToHost), "download"); }
 };
 
 }  // namespace crit::inference_tests

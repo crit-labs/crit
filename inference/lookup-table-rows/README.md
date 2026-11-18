@@ -42,8 +42,6 @@ how long waits blocked, the idle time a round account charges to the table.
 | File | Supplies |
 | --- | --- |
 | [`table_rows.py`](code/table_rows.py) | `TableRegion`; `advise_random` (file) and `advise_mapping_random` (mapping); `RowTable` with `gather(rows)` in request order, a worker pool for cold rows, an LRU of hot rows, and `reads`, `bytes_read`, `hits` counters; `RowPrefetch` (`start`, `ready`, `wait`) |
-| [`table_rows.h`](code/table_rows.h) | The same in C++20 for native engines: `Region`, `RowGather` (random-access advice, positioned reads by a persistent worker pool with the calling thread, rows asked for twice read once, an LRU of hot rows, `Counters`) writing rows in request order straight into the caller's buffer, `StagingRing`, slots of pinned host memory a gather fills and the engine copies to the device, each reused only once its last copy has finished, and `RowPrefetch`: tickets started as tokens appear, queued requests gathered in one batch, `wait` per ticket, `stats` |
-
 | [`device_rows.py`](code/device_rows.py) | `HostRows`, the plugin's device form ("embeddings:host", "rounds:embeddings"): `store(rows)` (a device table), `open(source, width, dtype, device, mapped=False)` (a CPU tensor's rows copied once into registered host memory, one file mapped and registered, or files read by the native reader), `prefetch(ids)`, `lookup(ids)`, `stats()` |
 | [`row_reader.cpp`](code/row_reader.cpp) / [`row_reader.py`](code/row_reader.py) | The native reader the device form reads files with, built at load (host C++; no device code): files of rows in id order opened with POSIX_FADV_RANDOM, a persistent pool of `readers` threads taking rows off an atomic counter, rows asked for twice read once, one gather or prefetch batch at a time, a hot-row cache `prefetch` fills in the background, and `enqueue`: a gather as a CUDA host function on the stream |
 
@@ -54,9 +52,10 @@ the link by `index_select` on a CUDA view of it: no device memory for the table,
 ids into pinned memory, enqueues the reader's gather as a host function on the stream (a CUDA graph captures it as a
 host node), and copies the rows to the device, so a captured round reads its rows with no Python on the way.
 `prefetch(ids)` starts reading rows known ahead (the next prompt chunk's, a round's pending tokens') into the hot-row
-cache (`prefetch_rows`), and the gather then copies them from memory. Each lookup size has `ring` sets of pinned and
-device buffers used in turn, made at its first lookup outside a capture; a lookup's rows stay valid until `ring`
-later lookups of that size. Without the native reader (it did not build, or `native: false`), Python threads read
+cache (`prefetch_rows`), and the gather then copies them from memory. Eager lookups use `ring` sets of pinned and
+device buffers in turn, sized by powers of two of rows (a lookup uses the first of them), so the prompt lengths a
+server meets share a few sets; a lookup's rows stay valid until `ring` later lookups of its size class. A captured
+lookup has a set of its own, made as it is captured and kept for its graph. Without the native reader (it did not build, or `native: false`), Python threads read
 the rows, which a graph cannot capture.
 
 `store()` and `open()` return a `Table` handle (`lookup`, `prefetch`, `drain`, `stats`, `close`), so one plugin
@@ -69,8 +68,7 @@ the device; the copy, host node and copy above are the graph asking the host for
 but the stream waits for the reads: rows the host knows ahead (the pending tokens, the next prompt chunk) belong in
 `prefetch` so the host node only copies them.
 
-**Into the device.** Gather each step's rows into a `StagingRing` slot over pinned host memory (a Core `HostBlock`
-registered with `cuda_pin_host_block`), copy the slot to the device on the step's stream, and record an event after
+**Into the device.** Gather each step's rows into a `StagingRing` slot over pinned host memory, copy the slot to the device on the step's stream, and record an event after
 the copy; the ring's `finished(slot)` is `cudaEventQuery` on that event, so a slot is overwritten only after its copy
 has read it. Two or three slots let the next step's gather run while the current copy is in flight.
 

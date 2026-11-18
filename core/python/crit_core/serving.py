@@ -83,6 +83,9 @@ GRAMMAR_CAPABILITY = "chat-constraints-grammar-v1"
 LOGPROBS_CAPABILITY = "chat-logprobs-v1"
 SCORE_CAPABILITY = "chat-score-v1"
 PLAIN_CAPABILITY = "chat-plain-v1"
+# A request may turn the engine's prompt cache off (crit serve's crit.prompt_cache false): it then prefills every
+# prompt token, as a measured request must. Without the request's word the cache serves it.
+PROMPT_CACHE_CAPABILITY = "chat-prompt-cache-v1"
 # A request with limits.fit_output cuts its output cap to the room the prompt leaves in the context.
 FIT_OUTPUT_CAPABILITY = "chat-fit-output-v1"
 CONTINUE_CAPABILITY = "chat-continue-v1"
@@ -96,7 +99,8 @@ THINKING_BUDGET_CAPABILITY = "chat-thinking-budget-v1"
 # keeps no prompt cache (crit-eval then sends it no follow-up turns). plugins: the plugin filling each slot of an
 # engine built from plugins (crit_plugins.Assembly.facts), so a client sees which ones the loaded engine runs.
 ENGINE_FACTS = ("speculative", "plain", "draft_width", "bytes_per_pass", "host_bytes_per_pass", "draft_bytes_per_step",
-                "draft_ms", "kv_bytes_per_token", "prompt_activations", "prompt_cache", "plugins", "kernels", "matrices")
+                "draft_ms", "kv_bytes_per_token", "prompt_activations", "prompt_cache", "plugins", "kernels", "matrices",
+                "exactness")
 # What a generation's timing may report beside its phases, for crit serve's telemetry and an Eval adapter's results:
 # the drafting facts (drafts accepted and made per round, device time in verify passes and draft steps), which plain
 # decoding has none of, and the device expert cache's routed reads and hits, which every decode has.
@@ -178,7 +182,7 @@ def forces_calls(text, tool_format=None):
 
 def capabilities(text, sampling=(), *, stream=True, config=True, tool_format=None, images=False, concurrent=False,
                  logprobs=False, score=False, plain=False, grammars=False, constraints=False, continuation=True,
-                 completion=None, tokenize=True, reasoning_format=None):
+                 completion=None, tokenize=True, reasoning_format=None, prompt_cache=False):
     """The serving capabilities a package built on ResidentChat declares, for a model's ModelText and the package's
     own `tool_format` (ResidentChat.tool_format) and `reasoning_format` (ResidentChat.reasoning_format), if any; a
     reasoning format, its own or the one the templates teach, declares chat-thinking-budget-v1, and False declares
@@ -189,7 +193,8 @@ def capabilities(text, sampling=(), *, stream=True, config=True, tool_format=Non
     unless `images`: an images engine passes True when its generate_prepared also takes PreparedPrompt(ids) without
     inputs; tokenize False: its prompt_ids() override is not safe to call beside generation (ResidentChat.render).
     The TEMPLATE_KWARGS the chat templates read are declared with chat-template-kwargs-v1. Every ResidentChat fits
-    its output to the context (chat-fit-output-v1)."""
+    its output to the context (chat-fit-output-v1). prompt_cache: it sets ResidentChat.prompt_cache and its
+    generate_tokens takes prompt_cache (chat-prompt-cache-v1)."""
     unknown = sorted(set(sampling) - set(SAMPLING))
     if unknown:
         raise ValueError("Unknown sampling fields: " + ", ".join(unknown))
@@ -204,6 +209,7 @@ def capabilities(text, sampling=(), *, stream=True, config=True, tool_format=Non
     result += [LOGPROBS_CAPABILITY] if logprobs else []
     result += [SCORE_CAPABILITY] if score else []
     result += [PLAIN_CAPABILITY] if plain else []
+    result += [PROMPT_CACHE_CAPABILITY] if prompt_cache else []
     result += [CONSTRAINTS_CAPABILITY, GRAMMAR_CAPABILITY] if constraints else []
     if tool_format is not None or template_tool_format(text):
         result += [TOOLS_CAPABILITY] + ([TOOL_STREAM_CAPABILITY] if stream else [])
@@ -243,6 +249,12 @@ def engine_facts(engine):
                                                v.get("source") in ("tuned", "built", "fallback") for k, v in value.items()):
                 out[key] = {k: {f: v[f] for f in ("source", "tuning", "reason", "plugins") if f in v}
                             for k, v in value.items()}
+        elif key == "exactness":
+            # The exactness of the engine's rows (crit_plugins.Assembly.exactness): the levels its configuration
+            # asks per phase (or None), the lowest level its plugins keep in each, and each plugin's own.
+            report = exactness_fact(value)
+            if report is not None:
+                out[key] = report
         elif key == "matrices":
             # The matrix shapes the projections loaded, as the model stacked them ({N, K, format}): crit kernels sweep
             # --matrices tunes for exactly these.
@@ -262,6 +274,30 @@ def engine_facts(engine):
     if "plain" in out:
         out["plain"] = bool(out["plain"] and out.get("speculative") and getattr(engine, "plain", False))
     return out or None
+
+
+EXACTNESS_LEVELS = ("repeatable", "row-exact", "exact", "declared")   # crit_kernels.exactness.LEVELS
+
+
+def exactness_fact(value):
+    """The engine fact "exactness" as crit serve publishes it, or None where it is not one: {"asked": {"decode":
+    level, "prompt": level} or None, "decode" and "prompt": the lowest level the plugins keep (a phase none states
+    left out), "plugins": {plugin: {phase: level}}}."""
+    def levels(found, whole=False):
+        return (isinstance(found, dict) and set(found) <= {"decode", "prompt"} and (len(found) == 2 or not whole)
+                and all(level in EXACTNESS_LEVELS for level in found.values()))
+    if not isinstance(value, dict) or not (value.get("asked") is None or levels(value["asked"], whole=True)):
+        return None
+    plugins = value.get("plugins") or {}
+    if not isinstance(plugins, dict) or not all(isinstance(k, str) and levels(v) for k, v in plugins.items()):
+        return None
+    out = {"asked": dict(value["asked"]) if value.get("asked") else None}
+    for phase in ("decode", "prompt"):
+        if value.get(phase) in EXACTNESS_LEVELS:
+            out[phase] = value[phase]
+    if plugins:
+        out["plugins"] = {k: dict(v) for k, v in plugins.items()}
+    return out
 
 
 def prompt_activations(value):
@@ -495,6 +531,7 @@ class ResidentChat:
     logprobs = False
     scores = False
     plain = False
+    prompt_cache = False
     grammars = False
     constraints = False
     tool_format = None
@@ -732,6 +769,9 @@ class ResidentChat:
             raise ValueError("decode must be plain")
         if plain and not self.plain:
             raise ValueError("This engine does not decode plainly (plain)")
+        cached = request.get("prompt_cache")
+        if cached is not None and (type(cached) is not bool or not self.prompt_cache):
+            raise ValueError("prompt_cache is true or false, on an engine that takes it (chat-prompt-cache-v1)")
         if alternatives is not None and not (type(alternatives) is int and 0 <= alternatives <= TOP_LOGPROBS):
             raise ValueError(f"logprobs must be an integer in [0, {TOP_LOGPROBS}]")
         echo, prompt_rows = raw and bool(request.get("echo")), None
@@ -848,6 +888,8 @@ class ResidentChat:
         options = {} if alternatives is None else {"logprobs": alternatives}
         if plain:
             options["plain"] = True
+        if cached is False:
+            options["prompt_cache"] = False   # every prompt token prefilled (chat-prompt-cache-v1)
         if constraint is not None:
             options["constraint"] = constraint
         # Without a budget the reply is one generation. With one, a generation ends where the reasoning would pass
@@ -1010,7 +1052,7 @@ __all__ = ["ResidentChat", "PreparedPrompt", "RequestRejected", "ContextExceeded
            "RESIDENT_CAPABILITY", "STREAM_CAPABILITY", "CONFIG_CAPABILITY", "IMAGES_CAPABILITY", "CONCURRENT_CAPABILITY",
            "TOOLS_CAPABILITY", "STRICT_TOOLS_CAPABILITY", "TOOL_STREAM_CAPABILITY", "TOOL_CHOICE_CAPABILITY",
            "TOOL_TEMPLATE_CAPABILITY", "CONSTRAINTS_CAPABILITY", "GRAMMAR_CAPABILITY", "LOGPROBS_CAPABILITY",
-           "SCORE_CAPABILITY", "PLAIN_CAPABILITY",
+           "SCORE_CAPABILITY", "PLAIN_CAPABILITY", "PROMPT_CACHE_CAPABILITY",
            "COMPLETION_CAPABILITY", "CONTINUE_CAPABILITY", "FIT_OUTPUT_CAPABILITY", "TEMPLATE_KWARGS_CAPABILITY",
            "TOKENIZE_CAPABILITY", "THINKING_BUDGET_CAPABILITY",
            "TEMPLATE_KWARGS", "ENGINE_FACTS", "DRAFT_FACTS", "EXPERT_FACTS", "REQUEST_FACTS", "TOP_LOGPROBS",

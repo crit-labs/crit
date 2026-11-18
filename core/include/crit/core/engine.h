@@ -1,10 +1,9 @@
 #pragma once
-#include "crit/core/concurrent.h"
+#include "crit/core/scheduling.h"
 #include "crit/core/model.h"
 #include "crit/core/profile.h"
 #include "crit/core/request.h"
 #include "crit/core/resources.h"
-#include "crit/trace.h"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -18,33 +17,12 @@
 
 namespace crit::core {
 namespace detail { struct RequestWakeup; }
-enum class TracePhase { submitted, admission, open, step, prefill, decode, score,
-                        readiness, commit, publication, retirement, quiesce, drain, completion, device, mixed };
-enum class TraceMark { point, begin, end, failed };
-struct TraceEvent {
-    std::uint64_t sequence = 0, operation = 0, timestamp_ns = 0;
-    RequestKey key; // Zero request denotes engine-wide work; generation zero has no generation lane (queued or scoring).
-    TracePhase phase = TracePhase::submitted;
-    TraceMark mark = TraceMark::point;
-    std::uint64_t duration_ns = 0, gap_ns = 0;
-    bool slow = false;
-    Finish finish = Finish::length; // Meaningful on completion events.
-    DeviceStage stage = DeviceStage::other; // Device events: adapter stage and index;
-    std::uint32_t index = 0;                // operation is the enclosing step's.
-};
-struct TraceSnapshot {
-    bool enabled = false;
-    std::uint64_t overwritten = 0, dropped = 0, slow_steps = 0;
-    std::vector<TraceEvent> events; // Recording order; loss is counted separately.
-    // Operator ranges (TraceConfig::operators), timed on the same clock as events.
-    ::crit::trace::Snapshot operators;
-};
-using Factory = std::function<std::unique_ptr<Model>(const Profile&, Services)>;
+// Builds the model; it may keep the ledger for its own reservations.
+using Factory = std::function<std::unique_ptr<Model>(const Profile&, Resources&)>;
 // Host steady-clock phase durations Core observed for one request, in
 // nanoseconds; zero when a phase did not occur. Admission is when the worker
-// starts (or, for concurrent models, opens) the request. Prefill ends when Core
-// accepts progress reporting prefill complete; token times are publications.
-// These are host observations around the model's readiness, not device timings.
+// opens the request. Prefill ends when Core accepts progress reporting prefill
+// complete; token times are publications. These are host observations.
 struct RequestTiming {
     std::uint64_t queued_ns = 0;      // submission -> admission
     std::uint64_t prefill_ns = 0;     // admission -> prefill complete
@@ -54,9 +32,6 @@ struct RequestTiming {
     std::uint32_t prefill_tokens = 0; // prompt tokens the model reported consuming
     std::uint32_t reused_prompt_tokens = 0; // of prefill_tokens, restored without computation
     std::uint32_t decode_steps = 0;   // generation steps after prefill completed
-    std::uint32_t preemptions = 0;
-    // Successful restoration prepare -> readiness; excludes time suspended.
-    std::uint64_t recovery_ns = 0, recomputed_tokens = 0;
 };
 struct Result {
     std::vector<Token> tokens;
@@ -71,22 +46,16 @@ struct Result {
     // tokens x n alternatives for generation, or targets x ScoreQueries::top_k for scoring.
     std::vector<float> logprobs = {};
     std::vector<TokenLogprob> top_logprobs = {};
-    // With RequestOptions::text or stop_strings: the released text, and for each token the
-    // end offset in `text` of the text released when that token was published.
-    std::string text = {};
-    std::vector<std::uint32_t> text_ends = {};
 };
 using TokenSink = std::function<void(Token)>;
 // The tokens published since the last call, in order; the span is valid only during the call.
 using TokensSink = std::function<void(std::span<const Token>)>;
-// One published token. Spans and text are valid only during the sink call.
+// One published token. Spans are valid only during the sink call.
 struct OutputEvent {
     std::size_t index = 0;
     Token token = 0;
     std::optional<float> logprob = {};
     std::span<const TokenLogprob> top_logprobs = {};
-    // Text released when this token was published; may be empty.
-    std::string_view text = {};
 };
 using OutputSink = std::function<void(const OutputEvent&)>;
 class Handle {
@@ -101,12 +70,12 @@ public:
     void cancel() noexcept;
     std::uint64_t id() const noexcept;
     // When wait()/wait_output() returns or throws, or the destructor returns, the request's host charges are
-    // released as seen from this thread; a quarantined runtime keeps them instead. Whatever leaves a sink (an
+    // released as seen from this thread. Whatever leaves a sink (an
     // exception, a foreign exception or forced unwinding) cancels the request and propagates unchanged after that.
     Result wait(TokenSink sink = {});
     // Like wait(), with every token published since the last call in one call: a step's (or a round's) tokens at once.
     Result wait_tokens(TokensSink sink);
-    // Like wait(), with log-probabilities and text per published token.
+    // Like wait(), with log-probabilities per published token.
     Result wait_output(OutputSink sink);
 private:
     struct Impl;
@@ -119,7 +88,7 @@ private:
 };
 class Engine {
 public:
-    Engine(Profile, std::shared_ptr<Backend>, Factory);
+    Engine(Profile, Factory);
     ~Engine();
     Engine(Engine&&) noexcept;
     Engine& operator=(Engine&&) noexcept;
@@ -129,17 +98,9 @@ public:
     Handle submit_score(std::vector<Token> prompt, std::uint32_t first_target, RequestOptions = {});
     // Requires ModelInfo::query_scoring; queries.ids holds queries.per_target ids for every target.
     Handle submit_score(std::vector<Token> prompt, std::uint32_t first_target, ScoreQueries queries, RequestOptions = {});
-    std::vector<Token> tokenize(std::string_view);
-    std::string detokenize(std::span<const Token>);
-    // Requires an independent frontend with an incremental decoder. The returned
-    // decoder retains its frontend, validates token IDs, and may outlive Engine.
-    std::unique_ptr<TextDecoder> create_decoder();
     ModelInfo info() const;
     Profile profile() const; // Actual core admission/budget/resource settings.
     Usage usage(Memory) const;
-    // Safe while the worker is running, including a stuck callback. Allocates
-    // only in the reading thread. Does not fence device work or invoke the model.
-    TraceSnapshot trace() const;
 private:
     struct Impl;
     std::shared_ptr<Impl> impl_;
