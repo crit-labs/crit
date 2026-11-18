@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 project(crit_concurrency_consumer LANGUAGES CXX)
-find_package(critCore 0.19.0 EXACT CONFIG REQUIRED)
+find_package(critCore 0.20.0 EXACT CONFIG REQUIRED)
 add_executable(crit_concurrency_consumer main.cpp)
 target_link_libraries(crit_concurrency_consumer PRIVATE crit::core)
 if(MSVC)
@@ -8,13 +8,12 @@ if(MSVC)
 else()
   target_compile_options(crit_concurrency_consumer PRIVATE -Wall -Wextra -Wpedantic -Werror)
 endif()
-add_executable(crit_frontend_consumer ../frontend_tests.cpp)
-target_link_libraries(crit_frontend_consumer PRIVATE crit::core)
+add_executable(crit_options_consumer ../request_options_tests.cpp)
+target_link_libraries(crit_options_consumer PRIVATE crit::core)
 # Every installed header, compiled as ordinary (not system) includes under strict warnings, with one call per
 # component. The checkout's core/include/crit headers, the installed crit headers and the includes in
 # installed_headers.cpp must be the same set, so a public header missing from Core's install(FILES ...), or one
-# installed without updating this consumer, fails here. The cuda*.h headers and gpu_runtime.h are installed only with
-# CRIT_CORE_CUDA or CRIT_CORE_HIP and are built by the CUDA SDK consumer.
+# installed without updating this consumer, fails here. gpu_runtime.h needs a device runtime's headers and is left out.
 get_filename_component(_crit_public_dir "${CMAKE_CURRENT_SOURCE_DIR}/../../../core/include/crit" ABSOLUTE)
 if(NOT IS_DIRECTORY "${_crit_public_dir}")
   message(FATAL_ERROR "this consumer builds from a crit checkout: ${_crit_public_dir} is missing")
@@ -28,7 +27,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_crit_source}"
 file(STRINGS "${_crit_source}" _crit_included REGEX "^#include <crit/[a-z0-9_/]+\\.h>")
 list(TRANSFORM _crit_included REPLACE "^#include <crit/([a-z0-9_/]+\\.h)>.*$" "\\1")
 foreach(_crit_list IN ITEMS _crit_public _crit_installed)
-  list(FILTER ${_crit_list} EXCLUDE REGEX "^(cuda.*|gpu_runtime)\\.h$")
+  list(FILTER ${_crit_list} EXCLUDE REGEX "^gpu_runtime\\.h$")
   list(SORT ${_crit_list})
 endforeach()
 list(SORT _crit_included)
@@ -55,7 +54,7 @@ else()
 endif()
 include(CTest)
 add_test(NAME installed_concurrent_consumer COMMAND crit_concurrency_consumer)
-add_test(NAME installed_frontend_consumer COMMAND crit_frontend_consumer)
+add_test(NAME installed_options_consumer COMMAND crit_options_consumer)
 add_test(NAME installed_headers_consumer COMMAND crit_installed_headers)
-set_tests_properties(installed_concurrent_consumer installed_frontend_consumer installed_headers_consumer
+set_tests_properties(installed_concurrent_consumer installed_options_consumer installed_headers_consumer
   PROPERTIES TIMEOUT 30)

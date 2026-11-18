@@ -34,9 +34,24 @@ def load_manifest(path=MANIFEST):
     return manifest
 
 
-def _get(url, open_url):
-    with open_url(url) as response:
-        return json.loads(response.read().decode("utf-8"))
+RETRIES = 6   # the rows API answers 429 and 503 under load: wait and ask again, 2, 4, 8, ... seconds
+
+
+def _get(url, open_url, sleep=None):
+    import time
+    import urllib.error
+    sleep = sleep or time.sleep
+    for attempt in range(RETRIES + 1):
+        try:
+            with open_url(url) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            if error.code not in (429, 500, 502, 503, 504) or attempt == RETRIES:
+                raise
+        except urllib.error.URLError:
+            if attempt == RETRIES:
+                raise
+        sleep(2 ** (attempt + 1))
 
 
 def fetch(manifest, cache, part="tuning", open_url=urllib.request.urlopen):

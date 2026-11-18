@@ -347,16 +347,13 @@ fast: the model, its kernels, its layouts and its execution strategy.
 | --- | --- |
 | [Runtime](https://github.com/crit-labs/crit/blob/main/core/src/runtime/README.md) | Admits, schedules, cancels and retires requests, and publishes their output |
 | [Engine ABI](https://github.com/crit-labs/crit/blob/main/core/src/runtime/README.md#engine-abi) | Core's engine C ABI, which `crit_core_steps` exports for the engines Core's loader assembles |
-| [Memory](https://github.com/crit-labs/crit/blob/main/core/src/memory/README.md) | Resource budgets, reservations and host-memory admission |
+| [Memory](https://github.com/crit-labs/crit/blob/main/core/src/memory/README.md) | Resource budgets and reservations |
 | [Text](https://github.com/crit-labs/crit/blob/main/core/python/crit_core/text/README.md) | Tokenizer and chat template loading, stop strings and streamed reply text |
-| [Sampling](https://github.com/crit-labs/crit/blob/main/core/src/sampling/README.md) | Sampling rules, penalties, log-probabilities and greedy draft acceptance |
-| [State cache](https://github.com/crit-labs/crit/blob/main/core/src/state/README.md) | KV pages, recurrent state slots and prefix-cache snapshots |
+| [Sampling](https://github.com/crit-labs/crit/blob/main/core/src/sampling/README.md) | The seeded draw and the sampling rules every sampler follows |
 | [Model files](https://github.com/crit-labs/crit/blob/main/core/python/crit_core/model/README.md) | Safetensors and GGUF checkpoints, `config.json`, generation defaults and stop tokens |
-| [Files](https://github.com/crit-labs/crit/blob/main/core/src/io/README.md) | Strict JSON, read-only, chunked and mapped file reads, SHA-256 |
+| [Files](https://github.com/crit-labs/crit/blob/main/core/src/io/README.md) | Strict JSON, read-only, chunked and mapped file reads |
 | [Structured output](https://github.com/crit-labs/crit/blob/main/core/src/constraints/README.md) | Token masks for choices, JSON schemas and grammars |
-| [Device graphs](https://github.com/crit-labs/crit/blob/main/core/src/backends/cuda/README.md#graph-capture) | CUDA graph capture and replay to cut launch overhead |
-| [CUDA backend](https://github.com/crit-labs/crit/blob/main/core/src/backends/cuda/README.md) | Allocations, streams, shared device memory and device time per category |
-| [Tracing](https://github.com/crit-labs/crit/blob/main/core/src/runtime/README.md#lifecycle-tracing) | A bounded lifecycle trace with operator ranges and NVTX |
+| [CUDA backend](https://github.com/crit-labs/crit/blob/main/core/src/backends/cuda/README.md) | The launcher of an engine's captured decode rounds |
 | [Contracts](https://github.com/crit-labs/crit/blob/main/core/contracts/README.md) | Who owns what between Core and your engine |
 | [Plugins](https://github.com/crit-labs/crit/blob/main/docs/PLUGINS.md) | Slots and their interfaces, plugin manifests and the checked assembly an engine built from plugins loads with |
 

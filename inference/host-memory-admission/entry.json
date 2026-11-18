@@ -3,7 +3,7 @@
   "category": "memory-and-loading",
   "summary": "Admit large host allocations against physical, commit and cgroup headroom the OS reports, not only a logical budget",
   "implementation_status": "reference",
-  "implementation_scope": "Python read-only observations of physical available memory, enforced commit headroom and the tightest ancestor cgroup headroom against min(memory.max, memory.high) (clean page cache only as reclaimable, never shmem), plus admission of a request and reserve against the tightest known observation. Python admit_working_set also distinguishes incremental anonymous, pinned and clean file-backed bytes, checking each applicable domain and defaulting to required physical observation. Native engines use Core's observe_host_memory and admit_host (crit/host_memory.h), which implement the same rules. Reserve policy and denial handling are engine supplied.",
+  "implementation_scope": "Python read-only observations of physical available memory, enforced commit headroom and the tightest ancestor cgroup headroom against min(memory.max, memory.high) (clean page cache only as reclaimable, never shmem), plus admission of a request and reserve against the tightest known observation. Python admit_working_set also distinguishes incremental anonymous, pinned and clean file-backed bytes, checking each applicable domain and defaulting to required physical observation. Reserve policy and denial handling are engine supplied.",
   "agent_guidance": {
     "use_when": "Large host allocations (pinned staging, resident weights, CPU KV) may share the host with other workloads or run inside a container",
     "avoid_when": "The engine owns a dedicated machine with fixed measured headroom, or allocations are small relative to free memory",
@@ -13,8 +13,7 @@
       "Tightest cgroup v2/v1 ancestor headroom against min(memory.max, memory.high), counting only clean page cache (file LRUs, else file - shmem, minus dirty and writeback) as reclaimable",
       "Admission of request plus reserve against the tightest known observation, naming it",
       "Unknown observations reported with reasons and denied by default",
-      "Python working-set admission: RAM/cgroup charges all incremental extents, enforced commit charges anonymous plus pinned (Core's admit_host rule)",
-      "Guidance for native admission through Core's observe_host_memory and admit_host"
+      "Python working-set admission: RAM/cgroup charges all incremental extents, enforced commit charges anonymous plus pinned"
     ],
     "engine_supplies": [
       "Reserve for the OS, other processes and unaccounted growth",
@@ -42,7 +41,7 @@
     }
   ],
   "requires": {
-    "hardware": "Python 3.11+ standard library; native engines use Core's host_memory.h (crit::core)",
+    "hardware": "Python 3.11+ standard library",
     "model": "No model requirement",
     "workload": "Any engine making large host allocations on Linux or Windows; other platforms report unknown"
   },
@@ -51,11 +50,10 @@
     "output": "Observation(physical, commit, cgroup, notes) and Decision(admitted, binding, limit, reason)",
     "ownership": "Read-only; nothing is allocated, reserved or changed",
     "failure": "Unreadable or absent sources yield unknown observations with notes; negative requests or reserves are rejected; with no known observation admission is denied unless explicitly allowed; working-set admission requires physical observation by default for nonzero incremental demand and rejects malformed extents",
-    "core_boundary": "Native observations and working-set admission are Core's (observe_host_memory, admit_host in crit/host_memory.h); this entry keeps the Python reference and admission guidance. Both complement Core's logical resource reservations with OS observations before allocation"
+    "core_boundary": "The observations and the admission rule are this entry's; they complement Core's logical resource reservations with OS observations before allocation"
   },
   "dependencies": [
-    "Python standard library",
-    "Core's host_memory.h for native engines"
+    "Python standard library"
   ],
   "symbols": [
     "Observation",
@@ -77,7 +75,7 @@
   ],
   "validation": {
     "host": "Synthetic /proc and /sys trees: enforced and unenforced commit, cgroup v2 ancestors with dirty, writeback and shmem pages, memory.high, cgroup v1, malformed counters and limits, missing sources, reserve and exact-fit admission, unknown policy, and a live observation; working-set tests independently bind RAM, commit and cgroup headroom, including unknown and zero-demand paths",
-    "native": "No native code here; Core's io fixture covers observe_host_memory_linux over synthetic trees (cgroup v1, nested and hybrid v2, shmem, memory.high, malformed values) with the same cases as the Python fixtures, admit_host and a live observation",
+    "native": "No native code",
     "performance": "No claim that an admitted allocation succeeds or avoids paging"
   }
 }

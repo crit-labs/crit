@@ -4,7 +4,9 @@ token as its key), its logits rows go to the sampler slot, and with a drafter in
 the drafter's drafts: it emits the drafter's tokens_per_round (2 by default) a round, each computed after the one
 before, as an engine whose drafts are always accepted. A step takes step_ms, plus the attention plugin's
 seconds_per_token for each token a row of it emits, if it names one. A row's allowed set (a constrained request's)
-goes to the sampler with the row's params."""
+goes to the sampler with the row's params. With prompt_cache it keeps that many ended requests' sequences in Core's
+prompt cache (crit_plugins.prompt_cache): a request that allows it and begins as one of them did prefills only the
+rest, and reports the prefix it reused."""
 import json
 from pathlib import Path
 import time
@@ -12,6 +14,7 @@ import time
 from crit_core.batch import DECODE, PREFILL, StepLayout, step_item
 from crit_core.native import Scores, StepResult
 from crit_plugins import StepBatch
+from crit_plugins.prompt_cache import PromptCache
 
 CORE_SAMPLING = ("temperature", "top_p", "top_k", "min_p", "seed")
 
@@ -27,6 +30,7 @@ class Session:
     def __init__(self, handle, request):
         self.handle, self.request, self.prompt = handle, request, list(request.prompt)
         self.done, self.outputs = 0, []          # KV rows kept; published outputs
+        self.reused = 0                          # the prefix the prompt cache gave it, until its first step reports it
         self.pending, self.produced, self.phase, self.rows = None, [], None, 0
 
 
@@ -57,6 +61,7 @@ class ToyModel:
             parts["placement"].plan({"toy.table": 4 * self.vocabulary}, {"device": 1 << 40, "host": 1 << 40})
         self.pool = parts["kv_cache"].pool([0], 1, 1, self.context, self.device, dtype="fp32")
         self.handles, self.steps, self.closed = 0, [], False
+        self.cache = PromptCache([self.pool], entries=options["prompt_cache"]) if options.get("prompt_cache") else None
         # prompt_graphs: the step's projection work as a captured chunk of its rows, replayed (a test of Core's loader,
         # which counts a replay as the calls its capture made). prompt_width: the columns each row's product sums (wide,
         # cuBLAS splits the sum through its workspace: a test of engines side by side).
@@ -82,12 +87,17 @@ class ToyModel:
                 "token_logprobs": True, "max_top_logprobs": 20, "scoring": True, "query_scoring": True,
                 "score_paths": ["prefill"], "replay": True, "speculative": self.drafts, "plain": self.drafts,
                 # A toy draft step reads one FP32 value a vocabulary entry.
-                **({"draft_bytes_per_step": 4 * self.vocabulary} if self.drafts else {})}
+                **({"draft_bytes_per_step": 4 * self.vocabulary} if self.drafts else {}),
+                **({"prompt_cache": True} if self.cache is not None else {})}
 
     def open(self, request):
         self.handles += 1
         session = Session(self.handles, request)
-        self.pool.open(session.handle)
+        if self.cache is None:
+            self.pool.open(session.handle)
+        else:
+            # The rows a kept sequence already holds for this prompt: prefill starts after them.
+            session.done = session.reused = self.cache.open(session.handle, session.prompt, request.prompt_cache)
         return session
 
     # -- the pool holds each token as its key ----------------------------------------------------------------------------
@@ -153,8 +163,10 @@ class ToyModel:
                 width = min(int(s.request.logprobs), 20)
                 logprobs = [(-0.5, [((t + a) % self.vocabulary, -0.5 - 0.25 * a) for a in range(width)])
                             for t in s.produced]
-            results[placement.item] = StepResult(placement.rows if placement.phase == PREFILL else 0, s.produced,
-                                                 placement.logits > 0, 0, placement.rows, logprobs)
+            # A prompt's first step reports the reused prefix with the rows it computed (Core's retained prefixes).
+            reused, s.reused = (s.reused, 0) if placement.phase == PREFILL else (0, s.reused)
+            results[placement.item] = StepResult(placement.rows + reused if placement.phase == PREFILL else 0, s.produced,
+                                                 placement.logits > 0, reused, placement.rows, logprobs)
         return results
 
     def commit(self, decisions):
@@ -162,7 +174,7 @@ class ToyModel:
             s = d.session
             if s.phase is None:
                 continue
-            if d.cancelled or d.discard:
+            if d.cancelled:
                 self.pool.keep(s.handle, s.done)
             elif s.phase == PREFILL:
                 # A prompt chunk keeps every row it wrote.
@@ -171,13 +183,21 @@ class ToyModel:
                 # A decode round keeps the pending token and the drafts Core accepted after it.
                 self.pool.keep(s.handle, s.done + d.accepted)
             s.done = self.pool.length(s.handle)
-            if not (d.cancelled or d.discard) and d.accepted:
+            if not d.cancelled and d.accepted:
                 s.pending = s.produced[d.accepted - 1]
                 s.outputs += s.produced[:d.accepted]
             s.phase, s.produced = None, []
 
     def retire(self, session, finish):
-        self.pool.close(session.handle)
+        if self.cache is None:
+            self.pool.close(session.handle)
+        else:
+            # The pool holds the prompt and every output written as a row: all but the last, still pending.
+            held = (session.prompt + session.outputs)[:session.done]
+            self.cache.retire(session.handle, None if finish == "failed" else held)
+
+    def telemetry(self):
+        return self.cache.telemetry() if self.cache is not None else {}
 
     def score(self, ids, first_target, path="", queries=None, top_k=0):
         targets = range(first_target, len(ids))

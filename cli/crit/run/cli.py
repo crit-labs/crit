@@ -206,6 +206,8 @@ def parser():
     sub.add_argument("--set", action="append", metavar="PLUGIN.OPTION=VALUE[;...]", help="An option variant "
                      "(repeatable): the full selection with these options set, served beside it on the same cases (an "
                      "in-process A/B); with --set only full and the option variants run, unless --variant names others. "
+                     "exactness=LEVEL, exactness.prompt=LEVEL or exactness.decode=LEVEL among them asks that level of the engine's "
+                     "rows (declared, exact, row-exact, repeatable). "
                      "An external candidate takes OPTION=VALUE[;...] on the options its configuration.engine declares")
     sub.add_argument("--no-smoke", action="store_true", help="Leave out crit smoke on each variant")
     sub.add_argument("--smoke-test", action="append", help="Run only this crit smoke test on each variant (repeatable)")

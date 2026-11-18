@@ -8,9 +8,15 @@ native.py) and otherwise the torch ops below: fixed shapes, no host synchronizat
 the plan's most possible copies (the rest into the scratch slot); outside capture it reads the copy count and copies
 only those. The host-driven changes are torch ops either way.
 
-Tensors (int32 unless said): key_slot [keys + 1] (slot or -1; the last entry a dummy), slot_key [slots + 1] (key, -1
-empty, -2 reserved by a swap, -3 unavailable), slot_ref uint8 [slots + 1], slot_pin [slots + 1] (stamp of the last plan
-using the slot), state [4] (clock hand, plan stamp, failure bits: 1 a route outside the experts, 2 a miss without a
+Recent residency (plan(recent=...), expert_cache._Recent): a plan sends every miss to the CPU tier and gives it the
+next slot of the round's victim list that is still open and was not routed this round; the slot and the key are
+reserved (-2) until the round after maps the copy, the (key, slot) copies appended to the round's pending list.
+
+Tensors (int32 unless said): key_slot [keys + 1] (slot, -1 none, -2 its copy under way; the last entry a dummy),
+slot_key [slots + 1] (key, -1 empty, -2 reserved by a swap or a copy under way, -3 unavailable), slot_ref uint8
+[slots + 1], slot_pin [slots + 1] (stamp of the last plan using the slot), slot_last [slots + 1] (the round the slot's
+expert was last routed in, NEVER for none: recent residency), state [4] (clock hand, plan stamp, failure bits: 1 a
+route outside the experts, 2 a miss without a
 victim), counters int64 [8] (COUNTERS), seen uint8 [keys + 1], route_counts int64 [keys + 1] (or empty), quota tables
 int32 [q] by miss count, one per token bucket (a plan of t tokens reads the table of the largest bucket <= t; below
 every bucket, or with none, admit_quota), per layer the slot table [experts], copies [experts + 1][2] (key, slot; the last a dummy)
@@ -18,6 +24,7 @@ and copy count [1].
 """
 EMPTY, RESERVED, UNAVAILABLE = -1, -2, -3
 NOT_ROUTED, CPU = -1, -2
+NEVER = -(1 << 31)
 COUNTERS = ("reads", "hits", "fills", "cpu", "prompt_reads", "prompt_hits", "prompt_copies", "spare")
 
 
@@ -91,6 +98,7 @@ class DeviceDirectory:
         self.slot_key = torch.full((slots + 1,), EMPTY, **i32)
         self.slot_ref = torch.zeros(slots + 1, dtype=torch.uint8, device=self.device)
         self.slot_pin = torch.full((slots + 1,), -1, **i32)
+        self.slot_last = torch.full((slots + 1,), NEVER, **i32)
         self.state = torch.zeros(4, **i32)
         self.counters = torch.zeros(len(COUNTERS), dtype=torch.int64, device=self.device)
         self.seen = torch.zeros(self.keys + 1, dtype=torch.uint8, device=self.device)
@@ -114,28 +122,36 @@ class DeviceDirectory:
         self.kernel = _kernel(self.device) if kernel and self.device.type == "cuda" else None
 
     # -- the plans ---------------------------------------------------------------------------------------------------
-    def plan(self, layer, ids, top, rows=None, row_counters=None, ring=None):
+    def plan(self, layer, ids, top, rows=None, row_counters=None, ring=None, recent=None):
         """Plans layer `layer` over ids ([tokens][top] or flat, int64 or int32, on the device): the slot table goes to
         tables[layer], the copies to copies[layer] and their count to copy_count[layer]. ring (an int32 device tensor
         of ring slots) makes it a prompt plan. rows ([tokens] int64) and row_counters ([rows][2] int64) add each row's
-        reads and hits."""
+        reads and hits. recent ((victims, state, pending, range) int32 device tensors: expert_cache._Recent) plans by
+        recent residency: the plan's copies go to pending and their range of it to range ([2]: first, count)."""
         if not 0 <= layer < self.layers:
             raise ValueError(f"layer {layer} outside the directory's {self.layers}")
         flat = ids.reshape(-1)
         quota = self.quota_for(flat.numel() // int(top))
+        if ring is not None:
+            recent = None
         if self.kernel is not None:
+            none = self._empty_i32
+            victims, state, pending, span = recent if recent is not None else (none, none, none, none)
             self.kernel.plan(self.key_slot, self.slot_key, self.slot_ref, self.slot_pin, self.state, self.counters,
                              self.seen if self.second_touch else self._empty_u8(), self.route_counts, quota,
                              self.admit_quota, layer, self.experts, flat, int(top),
                              self._empty_i64 if rows is None else rows,
                              self._empty_i64 if row_counters is None else row_counters,
                              self._empty_i32 if ring is None else ring,
-                             self.tables[layer], self.copies[layer], self.copy_count[layer:layer + 1])
+                             self.tables[layer], self.copies[layer], self.copy_count[layer:layer + 1],
+                             self.slot_last if recent is not None else none, victims, state, pending, span)
             return
-        if ring is None:
-            self._plan_torch(layer, flat.long(), int(top), rows, row_counters, quota)
-        else:
+        if ring is not None:
             self._prompt_torch(layer, flat.long(), ring)
+        elif recent is not None:
+            self._recent_torch(layer, flat.long(), int(top), rows, row_counters, *recent)
+        else:
+            self._plan_torch(layer, flat.long(), int(top), rows, row_counters, quota)
 
     def quota_for(self, tokens):
         """The quota table of a plan of `tokens` tokens (empty: admit_quota)."""
@@ -214,6 +230,51 @@ class DeviceDirectory:
         self.copy_count[layer:layer + 1].copy_(found.view(1))
         self.state[2:3].bitwise_or_(((count > found).int() * 2).view(1))
         self.counters[0:4].add_(torch.stack([routed.sum(), hit.sum(), found, misses - found]))
+        if rows is not None and row_counters is not None:
+            self._row_counts(flat, valid, hit, top, rows, row_counters)
+
+    def _recent_torch(self, layer, flat, top, rows, row_counters, victims, state, pending, span):
+        """The recent plan in torch ops (the kernel's rule): the victims still open and not routed this round, in list
+        order, go to the misses whose copy is not under way, in route order."""
+        torch = self.torch
+        E, S, K, n = self.experts, self.slots, self.keys, flat.numel()
+        first, valid = self._first(flat)
+        routed = first < n
+        keys = layer * E + self._ar_e
+        slot_of = self.key_slot[keys].long()
+        hit = routed & (slot_of >= 0)
+        miss = routed & ~hit
+        now = state[0]
+        self.slot_last.index_copy_(0, torch.where(hit, slot_of, S), now.expand(E).contiguous())
+        self.slot_last[S:].fill_(NEVER)
+        if self.route_counts.numel():
+            self.route_counts.index_add_(0, torch.where(routed, keys, K), routed.long())
+        new = miss & (slot_of == EMPTY)
+        order = torch.argsort(torch.where(new, first, n), stable=True)
+        rank = torch.empty_like(order)
+        rank[order] = torch.cumsum(new[order].long(), 0) - 1
+        R = victims.numel() - 1
+        v = victims[:R].long()
+        usable = (torch.arange(R, device=self.device) < state[2]) & (self.slot_key[v] >= EMPTY) & \
+            (self.slot_last[v] != now)
+        ranked = torch.full((R + 1,), S, dtype=torch.int64, device=self.device)
+        ranked.scatter_(0, torch.where(usable, torch.cumsum(usable.long(), 0) - 1, R), v)
+        ranked[R:].fill_(S)
+        ok = new & (rank < usable.sum())
+        victim = torch.where(ok, ranked[rank.clamp(0, R)], S)
+        old = self.slot_key[victim].long()
+        self.key_slot.index_fill_(0, torch.where(ok & (old >= 0), old, K), EMPTY)
+        self.slot_key.index_fill_(0, victim, RESERVED)
+        self.key_slot.index_fill_(0, torch.where(ok, keys, K), RESERVED)
+        self.key_slot[K:].fill_(EMPTY)
+        self.slot_key[S:].fill_(EMPTY)
+        got, begin = ok.sum(), state[3].long()
+        pending.index_copy_(0, torch.where(ok, begin + rank, R), torch.stack([keys, victim], 1).int())
+        span.copy_(torch.stack([begin, got]).int())
+        state[3:4].add_(got.int())
+        self.tables[layer].copy_(torch.where(hit, slot_of, torch.where(miss, CPU, NOT_ROUTED)))
+        self.copy_count[layer:layer + 1].zero_()
+        self.counters[0:4].add_(torch.stack([routed.sum(), hit.sum(), got, miss.sum()]))
         if rows is not None and row_counters is not None:
             self._row_counts(flat, valid, hit, top, rows, row_counters)
 
@@ -298,15 +359,19 @@ class DeviceDirectory:
         self.fill_counted(self.copies[layer], self.copy_count[layer:layer + 1], store, source, scratch, limit, blocks,
                           vector, program)
 
-    def fill_counted(self, jobs, count, store, source, scratch, limit, blocks=0, vector=16, program=None):
-        """fill() over given copies: jobs [n + 1][2] (key, slot) int32 and their count [1] int32, on the device."""
+    def fill_counted(self, jobs, count, store, source, scratch, limit, blocks=0, vector=16, program=None, first=None):
+        """fill() over given copies: jobs [n + 1][2] (key, slot) int32 and their count [1] int32, on the device; with
+        first ([1] int32, the kernel only) the copies are jobs[first : first + count]."""
         if program is not None:
             program.fill(self, store, source, jobs, count, scratch, limit, blocks)
             return
         torch = self.torch
         if self.kernel is not None:
-            self.kernel.fill(source, store, jobs, count, int(blocks), int(vector))
+            self.kernel.fill(source, store, jobs, count, int(blocks), int(vector),
+                             self._empty_i32 if first is None else first)
             return
+        if first is not None:
+            raise ValueError("a range of a job list is filled by the directory's kernel")
         if self.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
             m = max(1, min(int(limit), jobs.shape[0] - 1))
             live = torch.arange(m, device=self.device) < count
@@ -327,7 +392,7 @@ class DeviceDirectory:
         if program is not None:
             program.fill(self, store, source, jobs, count, scratch, len(pairs), blocks)
         elif self.kernel is not None:
-            self.kernel.fill(source, store, jobs, count, int(blocks), int(vector))
+            self.kernel.fill(source, store, jobs, count, int(blocks), int(vector), self._empty_i32)
         else:
             for key, slot in pairs:
                 store[slot].copy_(source[key])
@@ -358,18 +423,24 @@ class DeviceDirectory:
         self.slot_key.index_fill_(0, s, EMPTY)
         self.slot_ref.index_fill_(0, s, 0)
         self.slot_pin.index_fill_(0, s, -1)
+        self.slot_last.index_fill_(0, s, NEVER)
         self.slot_key[self.slots:].fill_(EMPTY)
 
     def snapshot(self):
         """(key_slot [keys], slot_key [slots]) as host lists: synchronizes."""
         return self.key_slot[:self.keys].tolist(), self.slot_key[:self.slots].tolist()
 
-    def assign(self, pairs, referenced=False):
-        """Maps each (key, slot): the slot's old key and the key's old slot are dropped (preload, swap commits)."""
+    def assign(self, pairs, referenced=False, last=None):
+        """Maps each (key, slot): the slot's old key and the key's old slot are dropped (preload, swap commits). last:
+        each slot's round stamp (recent residency), NEVER by default."""
         if not pairs:
             return
         keys = self._list(k for k, _ in pairs)
         slots = self._list(s for _, s in pairs)
+        if last is None:
+            self.slot_last.index_fill_(0, slots, NEVER)
+        else:
+            self.slot_last.index_copy_(0, slots, self._list(last).int())
         old = self.slot_key[slots].long()
         self.key_slot.index_fill_(0, self.torch.where(old >= 0, old, self.keys), EMPTY)
         held = self.key_slot[keys].long()

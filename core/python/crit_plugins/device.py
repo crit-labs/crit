@@ -24,16 +24,12 @@ DECODE_ROWS = 8
 
 def free_device_bytes(device="cuda"):
     """The device's free bytes for a placement plan or a pool's size, after handing back what torch's caching allocator
-    holds and nothing uses (crit_plugins.assemble.release_cached): a model plugin that re-encodes or converts weights
-    at load leaves those temporaries cached, and torch.cuda.mem_get_info alone counts them as taken, so a KV pool
+    holds and nothing uses (crit_plugins.memory: of(device).free(release=True)): a model plugin that re-encodes or
+    converts weights at load leaves those temporaries cached, and the driver counts them as taken, so a KV pool
     planned from it comes out smaller than the device allows, or refuses to fit. None where the device's memory
     cannot be read."""
-    import torch
-    from .assemble import release_cached
-    if not torch.cuda.is_available():
-        return None
-    release_cached(device)
-    return int(torch.cuda.mem_get_info(torch.device(device))[0])
+    from .memory import of
+    return of(device).free(release=True)
 
 
 def release_cached_under(free_below, device="cuda"):
@@ -42,15 +38,12 @@ def release_cached_under(free_below, device="cuda"):
     score), so that blocks cached from one request leave room for the next one's allocations, the KV a longer prompt
     takes among them, without releasing after every step (each release waits for the device, and the allocations
     after it go back to the driver). Returns the bytes released (0 above the threshold), or None where the device's
-    memory cannot be read."""
+    memory cannot be read (crit_plugins.memory: of(device).release(below=free_below))."""
     import torch
-    from .assemble import release_cached
-    device = torch.device(device)
-    if device.type != "cuda" or not torch.cuda.is_available() or not torch.cuda.is_initialized():
+    from .memory import of
+    if torch.device(device).type != "cuda" or not torch.cuda.is_available() or not torch.cuda.is_initialized():
         return None
-    if torch.cuda.mem_get_info(device)[0] >= free_below:
-        return 0
-    return release_cached("cuda")
+    return of(device).release(below=free_below)
 
 
 def invariant_rows(projections):
@@ -380,6 +373,22 @@ DEVICE_EXTENSIONS = {
                    "row, sum) over its routes in route order with id >= 0 (and a slot >= 0 when slots are given); "
                    "forward_bundles is combine(route_outputs(...), ids, weights, slots)",
     },
+    # Routed experts of any size against the device in the experts slot (expert-offload): the plugin decides where they
+    # live and who computes each miss; the model calls it as for experts that fit, with begin() before the loads and
+    # open() after its own pools.
+    "experts:offload": {
+        "begin": "begin(layers, experts, format, hidden, inter, device_bytes=0, identity=None, device='cuda') -> tier: "
+                 "the routed experts' geometry before the first load() (every layer whose experts load, a draft "
+                 "layer's included), the device bytes the model still allocates after the loads (KV, state, prompt "
+                 "pools); returns device, ram or disk",
+        "open": "open(lend=None): after the model's pools, the cache in the free memory past its reserve (or in a KV "
+                "pool's spare bytes and idle pages) and the CPU tier; forward() opens it at its first call otherwise "
+                "(outside capture)",
+        "end_step": "end_step(prompts_open=False): a step that ran prompt chunks ended. Core calls it (STEP_FRAMES); a "
+                    "model served outside Core calls it itself (the next decode plan ends the step too)",
+        "routes": "routes() -> [(layer, [experts])]: the recorded decode routes (record_routes option), the trace crit "
+                  "plugins offload --trace replays",
+    },
     # A device expert cache in the expert_residency slot.
     "experts:cache": {
         "cache": "cache(layers, experts, layout, slots, device, source, lend=None) -> ExpertCache: store (uint8 [S]"
@@ -443,7 +452,9 @@ def topk_blocks(scores, k, positions=None, block_size=None):
     than k scores above -inf). The same scores give the same ids on any device and in any batch: each score of 32 bits
     or fewer and its block id become one distinct int64 key, so the order torch.topk leaves equal values in never
     matters; wider scores (FP64) are compared as they are, by a stable sort (no rounding to FP32 makes new ties).
-    Device work only, so a captured round selects with it.
+    Device work only, so a captured round selects with it. It is the rule in torch operations, some forty launches a
+    call: a sparse attention that scores its own index keys has crit's kernel sparse-indexer, which scores and selects
+    in one launch with the same tie rule and order (kernels/techniques/attention/sparse-indexer).
 
     With positions ([tokens] int64, each query's position) and block_size (positions per block: an indexer's own
     block, not the KV page), only the blocks complete at the query's position compete, and the incomplete block
@@ -484,6 +495,17 @@ def topk_blocks(scores, k, positions=None, block_size=None):
         ids = torch.cat([ids, ids.new_full((tokens, k - blocks), -1)], dim=1)
     return ids
 
+
+# Step frames: what Core tells a plugin object, whatever its slot, when it has the method. A plugin whose memory or
+# state follows the requests in flight (an elastic expert cache making room for a prompt step) needs no call from
+# the model plugin for it. Core's native rounds run no Python: a frame is a step() or a score() the model runs.
+# What a plugin takes once the load is over is the ledger's (crit_plugins.memory: Core calls serve()).
+STEP_FRAMES = {
+    "begin_step": "begin_step(prompt_tokens): Core is about to call the model's step() (prompt_tokens: the prompt "
+                  "tokens its rows prefill, 0 for decode rows alone) or its score() (the text's tokens)",
+    "end_step": "end_step(prompts_open): the call returned; prompts_open: whether a row of the step is still "
+                "prefilling, so another prompt step follows",
+}
 
 # The DEVICE_EXTENSIONS facts whose methods live on an object a slot's device form returns: fact -> that slot (its
 # pool). The assembly cannot see them before the model plugin makes one; PluginTestCase.assertImplements checks them.

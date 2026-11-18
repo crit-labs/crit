@@ -32,6 +32,7 @@ static inline int crit_lookup_gemm_native_blocks(long long, long long, int) { re
 #include "crit_kcore/blockscaled_order.cuh"
 #include "crit_kcore/blockscaled_stage.cuh"
 #include "crit_kcore/declared_rows.cuh"
+#include "crit_kcore/device.cuh"
 #include "crit_kcore/formats.cuh"
 #include "crit_kcore/gemm_epilogue.cuh"
 #include "crit_kcore/mma_fp8.cuh"
@@ -395,7 +396,7 @@ __global__ void __launch_bounds__(32 * WM * WN, (Staged<BM, BN, WM, WN, G, RUN, 
 //           accumulator a 32-element block (the products' sum), then acc += sum * (weight scale * activation scale)
 //           on the CUDA cores; the stage's scales copied as words and decoded to FP32 in shared memory.
 // An output's sum depends on the CTA tile (which blocks the tensor core sums together, in its own order), so its bits
-// may change with the knobs and the token count: row_invariant false. Within 1e-5 of the FP64 product's magnitude
+// may change with the knobs and the token count: exactness repeatable. Within 1e-5 of the FP64 product's magnitude
 // (the block-scaled MMA's own block sum is not FP32 round to nearest), 2e-6 on the generic path.
 template<int TM, int TN, int WM, int WN, int BK, int STAGES, int GROUP>
 struct Native {
@@ -1214,6 +1215,71 @@ __global__ void quantize_kernel(const void* x, int bf16, int ld_x, int rows, int
     const_cast<float*>(acts.scales)[std::size_t(row) * std::size_t(acts.lds) + std::size_t(i % groups)] = scale;
 }
 
+// quantize_kernel's codes decoded and scaled at once: out = BF16(FP32(code) * scale), a thread a group.
+__global__ void quantized_values_kernel(const void* x, int bf16, int ld_x, int rows, int cols, int group,
+                                        ScaleKind kind, __nv_bfloat16* out, int ld_out) {
+    const int groups = cols / group;
+    const int i = int(blockIdx.x * blockDim.x + threadIdx.x);
+    if(i >= rows * groups) return;
+    const int row = i / groups, k0 = (i % groups) * group;
+    auto value = [&](int k) {
+        const std::size_t at = std::size_t(row) * std::size_t(ld_x) + std::size_t(k0 + k);
+        return bf16 ? __bfloat162float(static_cast<const __nv_bfloat16*>(x)[at]) : static_cast<const float*>(x)[at];
+    };
+    float amax = 0.0f;
+    for(int k = 0; k < group; ++k) amax = fmaxf(amax, fabsf(value(k)));
+    float scale;
+    if(kind == ScaleKind::mx) {
+        int e = 0;
+        (void)frexpf(amax, &e);
+        int shared = amax > 0.0f ? e - 1 - 8 : 0;
+        shared = shared < -127 ? -127 : shared > 127 ? 127 : shared;
+        scale = ldexpf(1.0f, shared);
+    } else {
+        scale = __fdiv_rn(amax, 448.0f);
+    }
+    __nv_bfloat16* to = out + std::size_t(row) * std::size_t(ld_out) + std::size_t(k0);
+    for(int k = 0; k < group; ++k) {
+        float decoded = 0.0f;
+        if(scale > 0.0f) {
+            const __nv_fp8_storage_t code = __nv_cvt_float_to_fp8(__fdiv_rn(value(k), scale), __NV_SATFINITE, __NV_E4M3);
+            decoded = kc::e4m3_value(code);
+        }
+        to[k] = __float2bfloat16(__fmul_rn(decoded, scale));
+    }
+}
+
+// The same values for groups of 32, a warp a group: lane k holds element k and the group's amax is a warp reduction
+// (the maximum of the same 32 magnitudes, a NaN read as 0 as the loop above reads it), so a decode call's few rows
+// take one load and one division a thread instead of a thread's loop over its group.
+__global__ void quantized_values_warp_kernel(const void* x, int bf16, int ld_x, int rows, int cols, ScaleKind kind,
+                                             __nv_bfloat16* out, int ld_out) {
+    const int groups = cols / 32;
+    const long long warp = (static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
+    if(warp >= static_cast<long long>(rows) * groups) return;   // whole warps leave together
+    const int row = int(warp / groups), k = int(warp % groups) * 32 + int(threadIdx.x & 31);
+    const std::size_t at = std::size_t(row) * std::size_t(ld_x) + std::size_t(k);
+    const float v = bf16 ? __bfloat162float(static_cast<const __nv_bfloat16*>(x)[at]) : static_cast<const float*>(x)[at];
+    float amax = fmaxf(0.0f, fabsf(v));
+    for(int step = 16; step > 0; step >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, step));
+    float scale;
+    if(kind == ScaleKind::mx) {
+        int e = 0;
+        (void)frexpf(amax, &e);
+        int shared = amax > 0.0f ? e - 1 - 8 : 0;
+        shared = shared < -127 ? -127 : shared > 127 ? 127 : shared;
+        scale = ldexpf(1.0f, shared);
+    } else {
+        scale = __fdiv_rn(amax, 448.0f);
+    }
+    float decoded = 0.0f;
+    if(scale > 0.0f) {
+        const __nv_fp8_storage_t code = __nv_cvt_float_to_fp8(__fdiv_rn(v, scale), __NV_SATFINITE, __NV_E4M3);
+        decoded = kc::e4m3_value(code);
+    }
+    out[std::size_t(row) * std::size_t(ld_out) + std::size_t(k)] = __float2bfloat16(__fmul_rn(decoded, scale));
+}
+
 bool bad_acts(const Acts& a) { return !a.codes || !a.scales || a.group <= 0 || a.group % kBlock || a.ld % 8; }
 
 template<int kRowWarps, int kAhead, int STREAM>
@@ -1238,12 +1304,9 @@ cudaError_t launch_staged(const Matrix* matrices, const GemmJob* jobs, int job_c
                           const Acts& acts, float* out, int out_ld, cudaStream_t stream) {
     using S = Staged<BM, BN, WM, WN, G, RUN, STAGES>;
     auto kernel = staged_kernel<BM, BN, WM, WN, G, RUN, STAGES>;
-    static const cudaError_t attribute =
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, S::kSmem);
-    if(attribute != cudaSuccess) {   // more shared memory than the device gives a CTA
-        (void)cudaGetLastError();
-        return attribute;
-    }
+    static kc::PerDevice<cudaError_t> optin;   // the kernel's shared memory, raised once a device
+    const cudaError_t attribute = kc::shared_memory_optin(optin, kernel, S::kSmem);
+    if(attribute != cudaSuccess) return attribute;   // more shared memory than the device gives a CTA
     const int tiles = (max_count + BN - 1) / BN;
     const dim3 grid(unsigned((max_rows + BM - 1) / BM), unsigned(job_count), unsigned(tiles < 65535 ? tiles : 65535));
     kernel<<<grid, S::kThreads, S::kSmem, stream>>>(matrices, jobs, acts, out, out_ld);
@@ -1251,17 +1314,13 @@ cudaError_t launch_staged(const Matrix* matrices, const GemmJob* jobs, int job_c
 }
 
 // Persistent CTAs: at most as many a job as the device holds at once (kernel at `threads` and `smem`), each taking
-// tiles gridDim.x apart; cudaErrorInvalidValue past 2^31 tiles.
+// tiles gridDim.x apart; cudaErrorInvalidValue past 2^31 tiles. `held` is the caller's count for this kernel, one a
+// device: a static of the launch function, so each configuration has its own (kernels of one signature are one
+// KERNEL type here, and a static of this function was the first configuration's count for all of them).
 template<class KERNEL>
-cudaError_t persistent_grid(KERNEL kernel, int threads, int smem, long long tiles, int job_count, dim3& grid) {
-    static const int resident = [kernel, threads, smem] {
-        int device = 0, sms = 0, per = 0;
-        (void)cudaGetDevice(&device);
-        (void)cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
-        (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, kernel, threads, smem);
-        (void)cudaGetLastError();
-        return sms * (per > 0 ? per : 1);
-    }();
+cudaError_t persistent_grid(kc::PerDevice<int>& held, KERNEL kernel, int threads, int smem, long long tiles,
+                            int job_count, dim3& grid) {
+    const int resident = kc::resident_ctas(held, kernel, threads, smem);
     if(tiles > 0x7fffffffLL) return cudaErrorInvalidValue;
     grid = dim3{unsigned(tiles < resident ? tiles : resident), unsigned(job_count), 1u};
     return cudaSuccess;
@@ -1272,14 +1331,12 @@ cudaError_t launch_channel(const Matrix* matrices, const GemmJob* jobs, int job_
                            const Acts& acts, OUT* out, int out_ld, cudaStream_t stream) {
     using C = Channel<TM, TN, WM, WN, BK, STAGES>;
     auto kernel = channel_kernel<TM, TN, WM, WN, BK, STAGES, GROUP, EPI, OUT>;
-    static const cudaError_t attribute =
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, C::kSmem);
-    if(attribute != cudaSuccess) {   // more shared memory than the device gives a CTA
-        (void)cudaGetLastError();
-        return attribute;
-    }
+    static kc::PerDevice<cudaError_t> optin;   // the kernel's shared memory, raised once a device
+    const cudaError_t attribute = kc::shared_memory_optin(optin, kernel, C::kSmem);
+    if(attribute != cudaSuccess) return attribute;   // more shared memory than the device gives a CTA
+    static kc::PerDevice<int> held;
     dim3 grid;
-    const cudaError_t e = persistent_grid(kernel, C::kThreads, C::kSmem,
+    const cudaError_t e = persistent_grid(held, kernel, C::kThreads, C::kSmem,
                                           (long long)((max_count + TM - 1) / TM) * ((max_rows + TN - 1) / TN),
                                           job_count, grid);
     if(e != cudaSuccess) return e;
@@ -1292,14 +1349,12 @@ cudaError_t launch_blocks(const Matrix* matrices, const GemmJob* jobs, int job_c
                           const Acts& acts, OUT* out, int out_ld, cudaStream_t stream) {
     using C = Blocks<TM, TN, WM, WN, BK, STAGES>;
     auto kernel = blocks_kernel<TM, TN, WM, WN, BK, STAGES, GROUP, EPI, OUT>;
-    static const cudaError_t attribute =
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, C::kSmem);
-    if(attribute != cudaSuccess) {   // more shared memory than the device gives a CTA
-        (void)cudaGetLastError();
-        return attribute;
-    }
+    static kc::PerDevice<cudaError_t> optin;   // the kernel's shared memory, raised once a device
+    const cudaError_t attribute = kc::shared_memory_optin(optin, kernel, C::kSmem);
+    if(attribute != cudaSuccess) return attribute;   // more shared memory than the device gives a CTA
+    static kc::PerDevice<int> held;
     dim3 grid;
-    const cudaError_t e = persistent_grid(kernel, C::kThreads, C::kSmem,
+    const cudaError_t e = persistent_grid(held, kernel, C::kThreads, C::kSmem,
                                           (long long)((max_count + TM - 1) / TM) * ((max_rows + TN - 1) / TN),
                                           job_count, grid);
     if(e != cudaSuccess) return e;
@@ -1312,21 +1367,12 @@ cudaError_t launch_native(const Matrix* matrices, const GemmJob* jobs, int job_c
                           const Acts& acts, OUT* out, int out_ld, cudaStream_t stream) {
     using C = Native<TM, TN, WM, WN, BK, STAGES, GROUP>;
     auto kernel = native_kernel<TM, TN, WM, WN, BK, STAGES, GROUP, EPI, NATIVE, OUT>;
-    static const cudaError_t attribute =
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, C::kSmem);
-    if(attribute != cudaSuccess) {   // more shared memory than the device gives a CTA
-        (void)cudaGetLastError();
-        return attribute;
-    }
+    static kc::PerDevice<cudaError_t> optin;   // the kernel's shared memory, raised once a device
+    const cudaError_t attribute = kc::shared_memory_optin(optin, kernel, C::kSmem);
+    if(attribute != cudaSuccess) return attribute;   // more shared memory than the device gives a CTA
     // Persistent CTAs: at most as many a job as the device holds at once, each taking tiles gridDim.x apart.
-    static const int resident = [kernel] {
-        int device = 0, sms = 0, per = 0;
-        (void)cudaGetDevice(&device);
-        (void)cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
-        (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, kernel, C::kThreads, C::kSmem);
-        (void)cudaGetLastError();
-        return sms * (per > 0 ? per : 1);
-    }();
+    static kc::PerDevice<int> held;
+    const int resident = kc::resident_ctas(held, kernel, C::kThreads, C::kSmem);
     const long long tiles = (long long)((max_count + TM - 1) / TM) * ((max_rows + TN - 1) / TN);
     if(tiles > 0x7fffffffLL) return cudaErrorInvalidValue;
     const dim3 grid{unsigned(tiles < resident ? tiles : resident), unsigned(job_count), 1u};
@@ -1474,6 +1520,22 @@ cudaError_t enqueue_quantize(const void* x, bool bf16, int ld_x, int rows, int c
     const int n = rows * (cols / acts.group);
     if(n == 0) return cudaSuccess;
     quantize_kernel<<<(n + 127) / 128, 128, 0, stream>>>(x, bf16 ? 1 : 0, ld_x, rows, cols, kind, acts);
+    return cudaGetLastError();
+}
+
+cudaError_t enqueue_quantized_values(const void* x, bool bf16, int ld_x, int rows, int cols, int group, ScaleKind kind,
+                                     void* out, int ld_out, cudaStream_t stream) {
+    if(!x || !out || rows < 0 || cols < 0 || group <= 0 || cols % group) return cudaErrorInvalidValue;
+    const int n = rows * (cols / group);
+    if(n == 0) return cudaSuccess;
+    if(group == 32) {
+        const long long threads = static_cast<long long>(rows) * cols;
+        quantized_values_warp_kernel<<<unsigned((threads + 255) / 256), 256, 0, stream>>>(
+            x, bf16 ? 1 : 0, ld_x, rows, cols, kind, static_cast<__nv_bfloat16*>(out), ld_out);
+        return cudaGetLastError();
+    }
+    quantized_values_kernel<<<(n + 127) / 128, 128, 0, stream>>>(x, bf16 ? 1 : 0, ld_x, rows, cols, group, kind,
+                                                                static_cast<__nv_bfloat16*>(out), ld_out);
     return cudaGetLastError();
 }
 

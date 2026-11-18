@@ -13,7 +13,9 @@ columns). The scores are scale (q_latent . latent + q_rope . rope) in FP32 from 
 cores, the probabilities in the operands' dtype for the value product, the softmax in FP32. A row's positions split
 into pieces of PIECE positions, piece i to partition i mod PARTS (both order knobs, one value a shape: a token's bits
 depend on its own query and positions, the piece and the partition count, never on the rows or columns beside it),
-each partition's state folded by the merge in partition order. sinks: FP32 [heads], each head's sink logit (natural
+each partition's state folded by the merge in partition order; attend(..., fused=True) folds them in the reading
+program itself (the same bits, no partials: wide windows, and prompt chunks read as windows of MAX_COLUMNS columns
+with their tokens' decode bits). sinks: FP32 [heads], each head's sink logit (natural
 log, in the scaled scores' units; -inf: none), one more position with no value, folded in last. lse: FP32
 [tokens][heads], the natural log-sum-exp of each token's scaled scores (the sink counted). Every allocation comes from
 torch's caching allocator and nothing syncs with the host, so CUDA graphs capture a call once its shape has run.
@@ -29,9 +31,10 @@ import triton
 
 from . import _crit_tuning, _kernels
 
-__all__ = ["MAX_COLUMNS", "attend", "partitions", "prefill", "write"]
+__all__ = ["MAX_COLUMNS", "PARTIAL_BYTES", "attend", "partitions", "prefill", "write"]
 
 MAX_COLUMNS = 64
+PARTIAL_BYTES = 512 << 20   # a split launch's partials past this take the fused launch (attend's fused=None)
 FP8 = torch.float8_e4m3fn
 MAX_PARTS = 128
 _KNOBS = {}
@@ -151,7 +154,8 @@ def prefill(q, cache, table, position, page, *, rank, scale=None, out: Optional[
 
 def attend(q, cache, tables, rows, starts, firsts, columns, page, *, rank, counts=None, scale=None,
            out: Optional[torch.Tensor] = None, lse: Optional[torch.Tensor] = None,
-           sinks: Optional[torch.Tensor] = None, scales: Optional[torch.Tensor] = None) -> torch.Tensor:
+           sinks: Optional[torch.Tensor] = None, scales: Optional[torch.Tensor] = None,
+           fused: Optional[bool] = None) -> torch.Tensor:
     """Decode tokens and verify windows over the latent cache (see the module's description). q [tokens][heads][R + P]
     BF16 or FP16 in the cache's dtype, the last dimension contiguous; cache [pages][page][R + P] contiguous; tables
     [S][width] int32; rows, starts [B] int32; firsts [B] int64; counts [B] int32 (None: `columns` each); columns the
@@ -159,7 +163,11 @@ def attend(q, cache, tables, rows, starts, firsts, columns, page, *, rank, count
     tokens); lse [tokens][heads] FP32 when given; sinks FP32 [heads]. scale defaults to (R + P) ** -0.5 (pass the
     model's: the softmax scale of its un-absorbed query and key width). An E4M3 cache takes its scales, with BF16 or
     FP16 queries: write()'s two a position, or one a position for the whole row ([pages][page][1], a KV pool's fp8:row
-    pages of one head)."""
+    pages of one head). fused: False, a program a partition and the merge over their partials (FP32, rank wide, a
+    query head, column and partition: the launch for decode rows, whose partitions fill the device); True, a program
+    a tile that reads its partitions in turn and folds them itself, the same bits with no partials (wide windows, and
+    a prompt chunk read as windows of MAX_COLUMNS columns, whose tokens then have their decode bits); None, fused
+    where the partials would take more than PARTIAL_BYTES."""
     T, H, width = q.shape
     R, P = int(rank), width - int(rank)
     B = int(starts.shape[0])
@@ -187,14 +195,26 @@ def attend(q, cache, tables, rows, starts, firsts, columns, page, *, rank, count
     piece = int(knobs["PIECE"])
     out = torch.empty(T, H, R, dtype=q.dtype, device=device) if out is None else out
     partial = B * columns * H * parts
-    po = torch.empty(partial * R, dtype=torch.float32, device=device)
-    pm = torch.empty(partial, dtype=torch.float32, device=device)
-    pl = torch.empty(partial, dtype=torch.float32, device=device)
     scale = float(scale if scale is not None else width ** -0.5)
     count_ptr = counts if counts is not None else starts
     vsplit = int(knobs["VSPLIT"])
-    grid = (triton.cdiv(columns * H, bm) * vsplit, parts, B)
     codes = cache.view(torch.uint8) if fp8 else cache
+    if fused is None:
+        fused = partial * (R + 2) * 4 > PARTIAL_BYTES
+    if fused:
+        dummy = out if lse is None else lse
+        _kernels._fused_kernel[(triton.cdiv(columns * H, bm) * vsplit, B)](
+            q, codes, scales if fp8 else dummy, tables, rows, starts, count_ptr, firsts, out,
+            lse if lse is not None else dummy, sinks if sinks is not None else dummy, q.stride(0), q.stride(1),
+            tables.stride(0), tables.shape[1], parts, scale, columns, out.stride(0), out.stride(1), H=H, R=R, P=P,
+            COLS=columns, BLOCK_M=bm, PIECE=piece, PAGE=page, COUNTS=counts is not None, VSPLIT=vsplit, FP8=fp8,
+            HW_FP8=_hardware_fp8(device), SCALES=int(scales.shape[-1]) if fp8 else 2, LSE=lse is not None,
+            SINKS=sinks is not None, num_warps=int(knobs["WARPS"]), num_stages=int(knobs["STAGES"]))
+        return out
+    po = torch.empty(partial * R, dtype=torch.float32, device=device)
+    pm = torch.empty(partial, dtype=torch.float32, device=device)
+    pl = torch.empty(partial, dtype=torch.float32, device=device)
+    grid = (triton.cdiv(columns * H, bm) * vsplit, parts, B)
     _kernels._window_kernel[grid](q, codes, scales if fp8 else pm, tables, rows, starts, count_ptr, firsts, po, pm, pl, q.stride(0),
                                   q.stride(1), tables.stride(0), tables.shape[1], parts, scale, columns, H=H, R=R, P=P,
                                   COLS=columns, BLOCK_M=bm, PIECE=piece, PAGE=page, COUNTS=counts is not None,

@@ -26,7 +26,7 @@
       "what": "y[columns][N] = x[columns][K] . w[N][K]^T on CUDA cores: one warp an output row with every column (up to 16), each lane a strided share of K, FP32 sums in a fixed order and one xor-shuffle tree; a correct starting point a workbench copies, nothing to tune",
       "call": "run_bf16",
       "rows": [1, 16],
-      "row_invariant": true
+      "exactness": "row-exact"
     }
   }
 }

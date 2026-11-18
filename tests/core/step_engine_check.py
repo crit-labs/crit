@@ -2,8 +2,8 @@
 the crit_core_steps library): requests decode the same tokens batched as one at a time, steps hold several requests
 and mix prompt chunks with decode rows, cancellation and retirement reach the model and release every session,
 page-reserving admission defers requests, log-probabilities, replay and stop tokens pass through, scores run as Core's
-barrier, and a failing step fails the engine. Core's loader and its adapters over a model plugin are
-tests/test_core_engine.py's."""
+barrier, parts with step frames hear of every step and score, and a failing step fails the engine. Core's loader and
+its adapters over a model plugin are tests/test_core_engine.py's."""
 import ctypes
 import sys
 import threading
@@ -106,7 +106,7 @@ class ToyStepModel:
             s = d.session
             if s.staged is None:
                 continue
-            if d.cancelled or d.discard:
+            if d.cancelled:
                 s.staged = None
                 self.cancelled += d.cancelled
                 continue
@@ -391,6 +391,48 @@ def native_rounds(library):
     expect(native_commits and all(any(t for _, t in d) for _, d in native_commits),
            ("after a native round, commit only for a decision that ends a row", model.commits))
     engine.close()
+    # A step asked for between two rounds (ask_step, from any thread: here inside a round) runs the model's step()
+    # once, with Core's relieve before it, and the rounds go on natively with the same tokens.
+    model, relieved = RoundModel(), []
+    launch = model.launch
+
+    def asking(user, rows, width, logprobs):
+        if model.native_rounds_run == 1:
+            engine.ask_step()
+        return launch(user, rows, width, logprobs)
+    model._launch = _LAUNCH(asking)   # before the engine opens: its rounds launch through it
+    engine = StepEngine(model, library, relieve=lambda: relieved.append(model.native_rounds_run))
+    got = run_all(engine, 12)
+    expect(got == [oracle(p, 12) for p in prompts()], "a step asked for between rounds keeps the tokens")
+    expect(model.decode_steps == 1 and model.native_rounds_run > 2, ("one decode step through step()",
+                                                                     model.decode_steps, model.native_rounds_run))
+    expect(2 in relieved and not model.native.asked(), ("relieve ran in the step that was asked for", relieved))
+    engine.close()
+    # An engine whose health says it cannot serve on fails at its next step, with the reason.
+    model, sick = RoundModel(), []
+    engine = StepEngine(model, library, health=lambda: sick[0] if sick else None)
+    expect(engine.generate([5, 6], 4)[0] == oracle([5, 6], 4), "a healthy engine serves")
+    sick.append("the host handoff test/slow failed: a host job ran past the job budget")
+    try:
+        engine.generate([5, 6], 4)
+    except NativeError as error:
+        expect("cannot serve on" in str(error) and "job budget" in str(error), error)
+    else:
+        raise AssertionError("an engine that cannot serve on must fail its requests")
+    engine.close()
+    # A request whose rounds count logits that were not finite (the round counter "nonfinite") fails: its tokens are
+    # not the model's. The engine goes on serving.
+    model = RoundModel(telemetry=True)
+    model.COUNTERS = ("expert_reads", "nonfinite")   # the toy's second word is one a token
+    engine = StepEngine(model, library)
+    try:
+        engine.generate([5, 6], 6)
+    except NativeError as error:
+        expect("not finite" in str(error), error)
+    else:
+        raise AssertionError("a request with non-finite logits must fail")
+    expect(engine.telemetry()["core"]["nonfinite_requests"] == 1, engine.telemetry()["core"])
+    engine.close()
     # A row count the model gives no width decodes through step(), the others natively.
     model = RoundModel(widths=[2, None, 2, 2])
     engine = StepEngine(model, library)
@@ -574,6 +616,52 @@ def request_facts(library):
     expect(kept["accepted"] == [2, 0, 1, 0] and "drafted" not in kept and "_native" not in kept, kept)
 
 
+def step_frames(library):
+    # A part with begin_step / end_step hears of every step Core runs: the prompt tokens it prefills and whether a row
+    # is still prefilling after it, so another prompt step follows; a score counts as a prompt of its text.
+    class Frame:
+        def __init__(self):
+            self.calls = []
+
+        def begin_step(self, prompt_tokens):
+            self.calls.append(("begin", prompt_tokens))
+
+        def end_step(self, prompts_open):
+            self.calls.append(("end", prompts_open))
+
+    class Older:   # an engine's older copy of a plugin: end_step() took no argument
+        def __init__(self):
+            self.ended = 0
+
+        def end_step(self):
+            self.ended += 1
+
+    model, frame, older = ToyStepModel(1), Frame(), Older()
+    engine = StepEngine(model, library, frames=[frame, older, object()])   # a part without the methods is left alone
+    try:
+        prompt = list(range(10, 30))   # 20 tokens: prompt chunks of 8, 8 and 4
+        tokens, _ = engine.generate(prompt, 3, stop_tokens=[])
+        expect(tokens == oracle(prompt, 3), tokens)
+        expect([kind for kind, _ in frame.calls] == ["begin", "end"] * len(model.steps), frame.calls)
+        begins = [value for kind, value in frame.calls if kind == "begin"]
+        ends = [value for kind, value in frame.calls if kind == "end"]
+        expect([n for n in begins if n] == [8, 8, 4], begins)
+        expect(older.ended == len(model.steps), (older.ended, len(model.steps)))
+        expect(ends[:3] == [True, True, False] and not any(ends[3:]), ends)
+        frame.calls.clear()
+        engine.score([1, 2, 3, 4], 2, "prefill", top_k=2)
+        expect(frame.calls == [("begin", 4), ("end", False)], frame.calls)
+        frame.calls.clear()
+        model.fail_on = 2
+        try:
+            engine.generate([1, 2], 2, stop_tokens=[])
+        except NativeError:
+            pass
+        expect(frame.calls[-1][0] == "end", ("a failing step still ends its frame", frame.calls))
+    finally:
+        engine.close()
+
+
 def main(library):
     batched_equals_serial(library)
     native_rounds(library)
@@ -583,6 +671,7 @@ def main(library):
     cancellation_and_retirement(library)
     admission(library)
     options(library)
+    step_frames(library)
     failure(library)
     print("step engine checks passed")
 

@@ -14,6 +14,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("gemm_native_channel(Tensor table, Tensor jobs, int max_rows, int max_count, Tensor codes, Tensor scales, "
           "Tensor! out) -> ()");
   ops.def("quantize(Tensor x, int group, int kind, Tensor! codes, Tensor! scales) -> ()");
+  ops.def("quantized_values(Tensor x, int group, int kind, Tensor! out) -> ()");
 #if defined(CUDA_KERNEL)
   ops.impl("rows", torch::kCUDA, &rows);
   ops.impl("gemm", torch::kCUDA, &gemm);
@@ -21,6 +22,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("gemm_native", torch::kCUDA, &gemm_native);
   ops.impl("gemm_native_channel", torch::kCUDA, &gemm_native_channel);
   ops.impl("quantize", torch::kCUDA, &quantize);
+  ops.impl("quantized_values", torch::kCUDA, &quantized_values);
 #endif
 }
 

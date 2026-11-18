@@ -70,6 +70,17 @@
         "torch"
       ],
       "description": "auto: pages written by crit's paged-kv-attention kernels where they load; torch: in torch"
+    },
+    "host_pages_mib": {
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "description": "device form, with elastic: when the device has no memory for more KV pages and nothing is left to close, up to this many MiB of a pool's pages are backed from host memory instead of refusing the request. The driver maps them into the pool's address range, so every attention kernel reads them as it reads the rest, with the same bits, at the host link's rate: a context the device does not hold is served slower instead of not at all. 0: such a request is refused, as before"
+    },
+    "elastic": {
+      "type": "bool",
+      "default": false,
+      "description": "device form: the pools' pages in elastic ranges (crit_plugins.memory): address space for the whole context, backed only where sequences hold pages, 4,096 tokens of every layer at a time. A pool sized for a long context then takes device memory as its sequences grow and gives it back as they close, and the device's givers (expert-offload's cache) hold the rest meanwhile. A pool made with spare bytes for a borrower stays one allocation"
     }
   },
   "kernels": [

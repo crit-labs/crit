@@ -96,7 +96,7 @@ class RunSettingsTest(unittest.TestCase):
         self.assertFalse(set(active) & commented)
         from crit_eval import EVAL_DIR
         protocol = json.loads((EVAL_DIR / "protocol.json").read_text(encoding="utf-8"))
-        self.assertEqual(active, {"ram_headroom_gib": 2, "vram_headroom_gib": 1,
+        self.assertEqual(active, {"ram_headroom_gib": 2, "vram_headroom_gib": crit_eval.VRAM_HEADROOM_GIB,
                                   "context_reserve_gib": protocol["context"]["reserve_gib"],
                                   "context_tokens": crit_eval.DEFAULT_CONTEXT_TOKENS})
         # crit eval reads a subset of the same keys.

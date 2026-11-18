@@ -20,7 +20,8 @@ def main(argv=None):
                         help="Run only this test (repeatable)")
     parser.add_argument("--strict", action="store_true",
                         help="Tolerances for an engine that keeps one arithmetic on every path (preserve); the "
-                             "default fits engines in quality mode speed")
+                             "default fits engines in quality mode speed. An engine that states the exactness it "
+                             "asks of its rows is judged strictly where that level promises bits, either way")
     parser.add_argument("--long", type=int, default=4096,
                         help="Longest prompt the recall test sends, capped by the context (default %(default)s)")
     parser.add_argument("--timeout", type=float, default=120, help="Seconds per request (default %(default)s)")

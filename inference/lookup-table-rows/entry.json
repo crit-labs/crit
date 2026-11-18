@@ -3,7 +3,7 @@
   "category": "memory-and-loading",
   "summary": "Gather rows of a file-backed embedding or n-gram table with random-access advice, exact positioned reads and a hot-row cache",
   "implementation_status": "native_source",
-  "implementation_scope": "Python reference and a native C++20 form (table_rows.h): random-access advice on the table's file region (POSIX_FADV_RANDOM) or on a mapping (MADV_RANDOM), exact positioned reads of the rows a gather needs in a worker pool, duplicate rows read once, request order kept, an optional LRU of hot rows and counters for reads, bytes and hits. Native reads and the destination of the rows are engine choices. The native RowGather writes rows into the caller's buffer and StagingRing hands out pinned slots for the device copy. RowPrefetch (Python and C++) starts a token's rows when it exists and gathers queued requests in one batch, so a speculative round's rows are read while drafting.",
+  "implementation_scope": "Python reference: random-access advice on the table's file region (POSIX_FADV_RANDOM) or on a mapping (MADV_RANDOM), exact positioned reads of the rows a gather needs in a worker pool, duplicate rows read once, request order kept, an optional LRU of hot rows and counters for reads, bytes and hits. RowPrefetch starts a token's rows when it exists and gathers queued requests in one batch, so a speculative round's rows are read while drafting. The device form reads files through a native reader built at load (row_reader.cpp).",
   "agent_guidance": {
     "use_when": "A gathered lookup table (token embeddings, hashed n-gram embeddings) stays in a file or mapping, as recon's placement scenario puts lookup tables on disk",
     "avoid_when": "The table is loaded once into host or device memory, or it is small enough that its reads never show in a pass",
@@ -41,10 +41,6 @@
       "purpose": "TableRegion, random-access advice for files and mappings, and RowTable's parallel exact row gather with a hot-row cache"
     },
     {
-      "path": "inference/lookup-table-rows/code/table_rows.h",
-      "purpose": "Native RowGather (random-access advice, worker-pool positioned reads, hot-row LRU, request order into the caller's buffer) and StagingRing over pinned slots"
-    },
-    {
       "path": "inference/lookup-table-rows/code/device_rows.py",
       "purpose": "HostRows, the device form (embeddings:host, rounds:embeddings): a table on the device, in registered host memory gathered over the link, or in files read by the native reader as a host function on the stream; prefetch into a hot-row cache"
     },
@@ -77,10 +73,6 @@
     "RowTable",
     "advise_random",
     "advise_mapping_random",
-    "Region",
-    "RowGather",
-    "Counters",
-    "StagingRing",
     "RowPrefetch",
     "HostRows",
     "Reader"
@@ -94,8 +86,8 @@
     "ssd-expert-materialization"
   ],
   "validation": {
-    "host": "Python fixtures check request order, duplicates, cache hits and eviction, counters, rows outside the table, short files and short reads; native gather in request order with repeats, cache counters, one and four workers, refusals and the staging ring's waits (table_rows_tests.cpp); RowPrefetch per token, tickets handed out once, failed reads raised in their wait",
-    "native": "table_rows_tests.cpp on the host: the native gather in request order with repeats, its cache and workers, and the staging ring; RowPrefetch with 40 draft tokens of 16 rows sharing batches; the device form (tests/test_device.py): rows byte-exact from the device, registered host memory, a mapped file and many files through the native reader and its Python fallback, prefetched rows from the cache and the others read, a lookup over files and over host memory captured in a CUDA graph",
+    "host": "Python fixtures check request order, duplicates, cache hits and eviction, counters, rows outside the table, short files and short reads; RowPrefetch per token, tickets handed out once, failed reads raised in their wait",
+    "native": "The device form (tests/test_device.py): rows byte-exact from the device, registered host memory, a mapped file and many files through the native reader and its Python fallback, prefetched rows from the cache and the others read, a lookup over files and over host memory captured in a CUDA graph",
     "performance": "Unmeasured here; one engine's 51 GB n-gram table went from 500-700 ms to 2-5 ms per token of cold rows with random-access advice"
   }
 }

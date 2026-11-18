@@ -180,7 +180,7 @@ class ProductTests(unittest.TestCase):
     def test_real_inference_entries_are_generic_local_implementations(self):
         self.assertEqual(store.check(), [])
         entries = store.load()["entries"]
-        self.assertEqual(len(entries), 32)
+        self.assertEqual(len(entries), 33)
         for entry in entries:
             self.assertNotIn("donors", entry)
             self.assertNotIn("code_locations", entry)
@@ -216,8 +216,8 @@ class ProductTests(unittest.TestCase):
 
     def test_native_build_source_and_test_paths_exist(self):
         cmake = (ROOT / "core/CMakeLists.txt").read_text(encoding="utf-8")
-        for path in ("src/runtime/engine.cpp", "src/memory/resources.cpp", "src/backends/cuda/cuda.cpp",
-                     "../tests/core/runtime_tests.cpp", "../tests/core/concurrency_tests.cpp", "../tests/core/cuda_tests.cpp"):
+        for path in ("src/runtime/engine.cpp", "src/memory/resources.cpp", "src/backends/cuda/driver_rounds.cpp",
+                     "../tests/core/request_options_tests.cpp", "../tests/core/concurrency_tests.cpp"):
             self.assertIn(path, cmake)
             self.assertTrue((ROOT / "core" / path).is_file())
 
@@ -261,7 +261,7 @@ class ProductTests(unittest.TestCase):
         self.assertEqual({p.name for p in (ROOT / "api").iterdir() if p.is_dir()}, {"crit_api"})
         self.assertEqual({p.name for p in (ROOT / "mcp").iterdir() if p.is_dir()}, {"crit_mcp"})
         self.assertEqual({p.name for p in (ROOT / "kernels").iterdir() if p.is_dir()},
-                         {"crit_kernels", "core", "examples", "techniques", "starters"})
+                         {"crit_kernels", "core", "techniques", "starters"})
         self.assertEqual({p.name for p in (ROOT / "kernels/techniques").iterdir() if p.is_dir()},
                          {"attention", "experts", "norms", "projections", "recurrence"})
         self.assertEqual({p.name for p in (ROOT / "models").iterdir() if p.is_dir()}, {"crit_models"})

@@ -12,7 +12,8 @@ import ctypes
 import os
 
 PROT_READ, PROT_WRITE = 0x1, 0x2
-MAP_SHARED, MAP_PRIVATE, MAP_ANONYMOUS, MAP_NORESERVE = 0x01, 0x02, 0x20, 0x4000
+MAP_SHARED, MAP_PRIVATE, MAP_FIXED, MAP_ANONYMOUS, MAP_NORESERVE = 0x01, 0x02, 0x10, 0x20, 0x4000
+FILLER_BYTES = 4 << 20   # the shared memory mapped over ranges a mapping leaves out, piece by piece
 MADV_RANDOM, MADV_WILLNEED, MADV_HUGEPAGE = 1, 3, 14
 REGISTER_PORTABLE, REGISTER_MAPPED, REGISTER_READ_ONLY = 0x01, 0x02, 0x08
 CAPTURE_RELAXED = 2   # cudaStreamCaptureModeRelaxed
@@ -85,6 +86,78 @@ def map_anonymous(size):
     mapping = Mapping(address, int(size), None, True)
     mapping.advise(MADV_HUGEPAGE)
     return mapping
+
+
+def whole_pages(ranges, size):
+    """The whole pages inside byte ranges [first, end) of `size` bytes, as merged spans [(first, end)] in order."""
+    page = os.sysconf("SC_PAGE_SIZE")
+    spans, last = [], None
+    for first, end in sorted((int(first), int(end)) for first, end in ranges):
+        first, end = -(-max(0, first) // page) * page, min(end, int(size)) // page * page
+        if last is not None and first <= last[1]:
+            last[1] = max(last[1], end)
+        elif end > first:
+            last = [first, end]
+            spans.append(last)
+    return [tuple(span) for span in spans]
+
+
+def read_in(mapping, spans):
+    """A mapped file's pages outside `spans` (whole_pages: what leave_out took out of the mapping) read into the
+    OS's page cache, and none of the others. A mapping's faults read ahead, megabytes at a time, in blocks that
+    lie across the left-out ranges, and the OS will not drop part of such a block again; so the kept ranges are
+    asked for first (POSIX_FADV_WILLNEED, in pieces of the device's read-ahead size: a request for more is cut to
+    it) and the mapping's own read-ahead is turned off (MADV_RANDOM). The faults of a registration then find every
+    kept page there and read nothing beside it. Where the OS cannot be asked the faults read each page alone:
+    slower, the same bytes."""
+    if not spans or mapping.path is None or not hasattr(os, "posix_fadvise"):
+        return
+    mapping.advise(MADV_RANDOM)
+    fd = os.open(mapping.path, os.O_RDONLY)
+    try:
+        device = os.fstat(fd).st_dev
+        try:
+            with open(f"/sys/class/bdi/{os.major(device)}:{os.minor(device)}/read_ahead_kb") as found:
+                piece = int(found.read()) << 10
+        except (OSError, ValueError):
+            piece = 0
+        piece = max(piece, 128 << 10)
+        at = 0
+        for first, end in list(spans) + [(mapping.size, mapping.size)]:
+            for start in range(at, first, piece):
+                os.posix_fadvise(fd, start, min(piece, first - start), os.POSIX_FADV_WILLNEED)
+            at = end
+    finally:
+        os.close(fd)
+
+
+def leave_out(mapping, ranges):
+    """Takes byte ranges [first, end) of a mapping out of host memory: the whole pages inside each are mapped anew,
+    onto one small piece of shared memory (FILLER_BYTES, zero) again and again. The mapping stays one range of
+    addresses, so it is registered once and read through one device address, and the ranges cost the filler alone:
+    a file's pages there are never read (read_in reads the others in) and anonymous pages there go back. What they
+    held is gone from the mapping, so the caller keeps it elsewhere (a device cache that holds those bundles for
+    good). Before the mapping is registered: a registration holds the pages it found. Returns the bytes left
+    out."""
+    libc, spans = _c(), whole_pages(ranges, mapping.size)
+    if not spans:
+        return 0
+    fd = os.memfd_create("crit-left-out")
+    try:
+        os.ftruncate(fd, FILLER_BYTES)
+        prot = PROT_READ | (PROT_WRITE if mapping.writable else 0)
+        for first, end in spans:
+            for at in range(first, end, FILLER_BYTES):
+                size = min(FILLER_BYTES, end - at)
+                found = libc.mmap(mapping.address + at, size, prot, MAP_SHARED | MAP_FIXED, fd, 0)
+                if found in (None, ctypes.c_void_p(-1).value):
+                    error = ctypes.get_errno()
+                    raise OSError(error, f"mmap of a left-out range ({len(spans):,} ranges; the kernel's "
+                                         f"vm.max_map_count bounds a process's mappings): {os.strerror(error)}")
+    finally:
+        os.close(fd)
+    read_in(mapping, spans)
+    return sum(end - first for first, end in spans)
 
 
 def host_tensor(address, size):

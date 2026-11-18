@@ -52,7 +52,9 @@ and which matrices to stack are the model plugin's: this plugin multiplies rows 
   (`d = max |x| / 127`), each stored 32-value sub-block's integer dot is exact (`dp4a`), and the terms add in FP32 in a
   declared order, so a row's bits are its own whatever rows share the call; an expert stack's rows each have the
   plain call's bits on their expert.
-- **Prompt rows**, option `prompt`: `dequantize` (the default) decodes the matrix to BF16 on each call (exactly, then one
+- **Prompt rows**, option `prompt` (`auto`, the default, is `exact` where the engine asks `row-exact` or higher of
+  its prompt rows and `dequantize` otherwise, [exactness](../../docs/PLUGINS.md#exactness)): `dequantize` decodes the
+  matrix to BF16 on each call (exactly, then one
   rounding) and runs cuBLAS's BF16 GEMM with FP32 sums, a prompt row's bits not its decode row's; `exact` runs
   gguf-rows' `gemm` in the decode rows' order, every prompt row with its decode row's bits (the facts'
   `prompt_exact`), which on an RTX 5090 is faster at a few hundred prompt rows and level or a little behind at

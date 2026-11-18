@@ -2,8 +2,8 @@
   "id": "draft-vocabulary-subset",
   "category": "speculation",
   "summary": "Draft against an indexed row subset of the existing output head while verifying with the full head; greedy output unchanged",
-  "implementation_status": "native_source",
-  "implementation_scope": "Python frequency-based or ID-prefix subset choice, index/token mapping, first-maximum gather argmax, coverage, expected tokens and draft-head cost; size choice from measured rounds; reference CUDA gather-argmax kernel over FP32 head rows for a subset or the full head. Head encodings, subset size and draft integration are engine supplied.",
+  "implementation_status": "reference",
+  "implementation_scope": "Python frequency-based or ID-prefix subset choice, index/token mapping, first-maximum gather argmax, coverage, expected tokens and draft-head cost; size choice from measured rounds. Head encodings, subset size and draft integration are engine supplied.",
   "agent_guidance": {
     "use_when": "The draft head is a measurable share of draft cost and a modest subset of token IDs covers most of the workload's target tokens",
     "avoid_when": "Drafting is dominated by other work, target tokens are spread evenly across the vocabulary, or the draft head is already cheap relative to verification",
@@ -39,12 +39,10 @@
   "path": "inference/draft-vocabulary-subset/README.md",
   "code_path": "inference/draft-vocabulary-subset/code",
   "code_files": [
-    {"path": "inference/draft-vocabulary-subset/code/subset.py", "purpose": "Host reference subset choice, mapping, gather argmax, coverage, expected tokens, draft-head cost and measured size choice"},
-    {"path": "inference/draft-vocabulary-subset/code/subset_argmax.h", "purpose": "CUDA gather-argmax launch interface over subset or full head rows"},
-    {"path": "inference/draft-vocabulary-subset/code/subset_argmax.cu", "purpose": "Reference one-block-per-state gather-argmax kernel with first-maximum reduction, not for performance"}
+    {"path": "inference/draft-vocabulary-subset/code/subset.py", "purpose": "Host reference subset choice, mapping, gather argmax, coverage, expected tokens, draft-head cost and measured size choice"}
   ],
   "requires": {
-    "hardware": "Python 3.11+ standard library; CUDA C++20 with Core CRIT_CORE_CUDA for the device reference",
+    "hardware": "Python 3.11+ standard library",
     "model": "A drafter that projects through the target's output head rows (shared vocabulary), with a greedy target verifier",
     "workload": "Greedy speculative decoding where a frequency-ranked subset covers most target tokens"
   },
@@ -56,8 +54,7 @@
     "core_boundary": "No Core change; the subset affects only proposals inside the engine draft step, and published tokens come from full-head verification"
   },
   "dependencies": [
-    "Python standard library",
-    "CUDA runtime for the device reference"
+    "Python standard library"
   ],
   "symbols": [
     "choose_subset", "prior_subset",
@@ -68,8 +65,6 @@
     "expected_tokens",
     "draft_head_cost",
     "DraftHeadCost",
-    "GatherArgmax",
-    "enqueue_gather_argmax",
     "choose_size"
   ],
   "interactions": [
@@ -83,7 +78,7 @@
   ],
   "validation": {
     "host": "Frequency choice, required tokens and ties, mapping validation, inside-subset equality with an exact tie, subset-drafted speculation equal to ordinary greedy output, cost, coverage and expected tokens; size choice from measured rounds with ties to the smaller size",
-    "native": "CUDA gather-argmax on a 1000-row padded FP32 head for subset sizes 1 to the full vocabulary: gathered logits bitwise equal to full-head logits, subset argmax equal to the full argmax whenever inside, first-maximum ties, FP64 dot comparison and invalid launches",
+    "native": "No native code",
     "performance": "No speed claim; acceptance and draft savings depend on the model, workload and chosen subset size"
   }
 }

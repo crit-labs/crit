@@ -136,6 +136,19 @@ void crit_hx_swiglu(const float* gate_up, std::size_t rows, std::size_t inter, f
 }
 float crit_hx_exp(float x) { return hi::exp_declared(x); }
 
+// The same two on a given ISA (rows.ISA; -1 the fastest here), so a test compares the ISAs' bits.
+int crit_hx_quantize_e2m1x2_on(int isa, const float* x, std::size_t n, float global, std::int8_t* values, float* scales,
+                               char* error, std::size_t error_bytes) {
+    return guarded(error, error_bytes, [&] {
+        if(isa < 0) hi::quantize_e2m1x2(x, n, global, values, scales);
+        else hi::quantize_e2m1x2(hn::Isa(isa), x, n, global, values, scales);
+    });
+}
+void crit_hx_swiglu_on(int isa, const float* gate, const float* up, std::size_t n, float* out) {
+    if(isa < 0) hi::swiglu_rows(gate, up, n, out);
+    else hi::swiglu_rows(hn::Isa(isa), gate, up, n, out);
+}
+
 // The routed sum in route order: out[t][h] = acc, acc = fma(weights[t][j], y[t * top + j][h], acc) for j ascending
 // over ids[t][j] >= 0 (ids int64 when wide, else int32), acc from 0.
 void crit_hx_combine(const float* y, const void* ids, int wide, const float* weights, std::size_t tokens, std::size_t top,

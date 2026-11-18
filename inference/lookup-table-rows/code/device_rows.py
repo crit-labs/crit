@@ -40,7 +40,12 @@ except ImportError:   # run from code/
     import row_reader
 
 
+SITE_ROWS = 64   # the fewest rows a buffer set holds: sets are sized by powers of two
+
+
 class _Site:
+    """One buffer set of lookups: pinned ids and rows the host function fills, the rows' device copy. native: the
+    native reader's site over the set's first n ids and rows, by n (a lookup reads exactly its rows)."""
     __slots__ = ("ids", "rows", "out", "native", "event")
 
 
@@ -212,49 +217,50 @@ class _Part:
             out = torch.empty(ids.numel(), self.row_bytes, dtype=torch.uint8)
             self.reader.gather(ids.reshape(-1).to(torch.int64).contiguous(), out)
             return out
-        site = self._site(ids.numel(), capturing)
+        n = ids.numel()
+        site = self._site(n, capturing)
         if not capturing and site.event is not None:
             site.event.synchronize()   # the site's last lookup ran (its host function read site.ids)
         stream = torch.cuda.current_stream(self.device)
-        site.ids.copy_(ids.reshape(-1), non_blocking=True)
+        site.ids[:n].copy_(ids.reshape(-1), non_blocking=True)
         if site.native is not None:
-            self.reader.enqueue(site.native, stream.cuda_stream)
+            if n not in site.native:   # the reader's site over this lookup's rows of the set
+                site.native[n] = self.reader.site(site.ids[:n], site.rows[:n])
+            self.reader.enqueue(site.native[n], stream.cuda_stream)
         else:
             if capturing:
                 raise RuntimeError("the Python row reader cannot run inside a CUDA graph: build the native reader")
             stream.synchronize()
-            self.reader.gather(site.ids, site.rows)
-        site.out.copy_(site.rows, non_blocking=True)
+            self.reader.gather(site.ids[:n], site.rows[:n])
+        site.out[:n].copy_(site.rows[:n], non_blocking=True)
         if not capturing:
             site.event = torch.cuda.Event()
             site.event.record(stream)
-        return site.out
+        return site.out[:n]
+
+    def _set(self, rows):
+        import torch
+        site = _Site()
+        site.ids = torch.empty(rows, dtype=torch.int64, pin_memory=True)
+        site.rows = torch.empty(rows, self.row_bytes, dtype=torch.uint8, pin_memory=True)
+        site.out = torch.empty(rows, self.row_bytes, dtype=torch.uint8, device=self.device)
+        site.native = {} if self.native else None
+        site.event = None
+        return site
 
     def _site(self, n, capturing):
-        import torch
+        """A buffer set for a lookup of `n` rows. A captured lookup has one of its own, made as it is captured and
+        kept for its graph's life (the graph replays into it, and no eager lookup ever writes it). Eager lookups use
+        `ring` sets in turn, sized by powers of two of rows (SITE_ROWS at least), a lookup using the first n: the
+        prompt lengths a server meets share a few sets where each length would keep its own for good."""
+        if capturing:
+            self._captured.append(self._set(int(n)))
+            return self._captured[-1]
+        n = max(SITE_ROWS, 1 << (int(n) - 1).bit_length())
         sites = self._sites.get(n)
         if sites is None:
-            if capturing:
-                raise RuntimeError(f"no lookup of {n} rows ran before the capture: run one first (its buffers)")
-            ring = []
-            for _ in range(self.owner.ring):
-                site = _Site()
-                site.ids = torch.zeros(n, dtype=torch.int64, pin_memory=True)
-                site.rows = torch.zeros(n, self.row_bytes, dtype=torch.uint8, pin_memory=True)
-                site.out = torch.zeros(n, self.row_bytes, dtype=torch.uint8, device=self.device)
-                site.native = self.reader.site(site.ids, site.rows) if self.native else None
-                site.event = None
-                ring.append(site)
-            sites = self._sites[n] = [ring, 0]
+            sites = self._sites[n] = [[self._set(n) for _ in range(self.owner.ring)], 0]
         ring, at = sites
-        if capturing:   # the graph keeps this site: an eager lookup of its size never writes its buffers again
-            if len(ring) < 2:
-                raise RuntimeError(f"every buffer set for lookups of {n} rows is held by a captured graph: give the "
-                                   "plugin a larger ring")
-            site = ring.pop(at % len(ring))
-            sites[1] = at % len(ring)
-            self._captured.append(site)
-            return site
         sites[1] = (at + 1) % len(ring)
         return ring[at]
 

@@ -33,7 +33,7 @@ UNKNOWN_SHOWN = 8   # unknown index keys named in one error or note
 JSON_DEPTH = 64     # nesting limit of headers and indexes (the native reader's at both call sites)
 
 # Storage width in bits. Values are never decoded here; sub-byte dtypes must fill whole bytes. safetensors_dtypes.json is
-# the one table this reader and the C++ reader share.
+# the table.
 DTYPE_BITS = MappingProxyType(dict(jsonfile.read(Path(__file__).with_name("safetensors_dtypes.json"))["dtypes"]))
 
 

@@ -187,22 +187,29 @@ class ReleaseCachedTests(unittest.TestCase):
     def test_cached_blocks_go_back_only_below_the_free_threshold(self):
         import types
         from unittest import mock
+        from crit_plugins import memory
         from crit_plugins.device import release_cached_under
-        state = {"free": 4 << 30, "reserved": 3 << 30, "emptied": 0}
 
-        def empty():   # torch's cache of 3 GiB, 1 GiB of it in use
-            state["emptied"] += 1
-            state["free"] += state["reserved"] - (1 << 30)
-            state["reserved"] = 1 << 30
-        cuda = types.SimpleNamespace(is_available=lambda: True, is_initialized=lambda: True, device_count=lambda: 1,
-                                     mem_get_info=lambda device: (state["free"], 32 << 30), empty_cache=empty,
-                                     memory_allocated=lambda i: 1 << 30, memory_reserved=lambda i: state["reserved"])
+        class Readings:   # 4 GiB free; torch holds 3 GiB, 1 GiB of it in use
+            total, bytes, reserved, emptied = 32 << 30, 4 << 30, 3 << 30, 0
+
+            def free(self):
+                return self.bytes
+
+            def torch(self):
+                return {"allocated": 1 << 30, "reserved": self.reserved, "unused": self.reserved - (1 << 30)}
+
+            def release(self):
+                self.emptied, self.bytes, self.reserved = self.emptied + 1, self.bytes + self.reserved - (1 << 30), 1 << 30
+        readings = Readings()
+        cuda = types.SimpleNamespace(is_available=lambda: True, is_initialized=lambda: True)
         fake = types.SimpleNamespace(cuda=cuda, device=lambda name: types.SimpleNamespace(type=str(name).split(":")[0]))
-        with mock.patch.dict(sys.modules, {"torch": fake}):
+        # the helper is the device memory's release(below=): crit_plugins.memory's object for the device
+        with mock.patch.dict(sys.modules, {"torch": fake}),                 mock.patch.object(memory, "of", lambda device="cuda": memory.DeviceMemory(device, readings)):
             self.assertEqual(release_cached_under(1 << 30), 0)         # 4 GiB free: the cache stays
-            self.assertEqual(state["emptied"], 0)
+            self.assertEqual(readings.emptied, 0)
             self.assertEqual(release_cached_under(8 << 30), 2 << 30)   # under 8 GiB: the 2 GiB nothing uses
-            self.assertEqual((state["emptied"], state["free"]), (1, 6 << 30))
+            self.assertEqual((readings.emptied, readings.bytes), (1, 6 << 30))
             self.assertIsNone(release_cached_under(8 << 30, "cpu"))
 
 

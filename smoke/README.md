@@ -68,6 +68,14 @@ that keeps one arithmetic on every path, `preserve`. Greedy replies may part onl
 A stale cache, a position offset or a mask a decode step gets wrong moves rows by nats. A test that fails on an
 engine known to be right means a limit needs to move, so report it.
 
+An engine that states the [exactness](../docs/PLUGINS.md#exactness) it asks of its rows (its card's
+`engine_facts.exactness.asked`, from `configuration.exactness`) is judged by it where the level promises bits,
+whatever the profile. Prompt rows asked `row-exact` or higher never change with the prompt's length, so `causal` and
+`causal_long` are judged strict; prompt rows asked `exact` (or `declared`), beside decode rows asked `row-exact` or
+higher, have the bits of the same token decoded, so `decode_matches_prefill` and `decode_long` are judged strict too.
+A lower level, or an engine that states none, is judged by the profile: the drift a path may round by. A failed item
+names the level that made it strict.
+
 ## What it does not check
 
 Quality drift that stays inside the run's quality budget, speed, device memory, behaviour past thresholds beyond

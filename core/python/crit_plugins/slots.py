@@ -23,7 +23,7 @@ INTERFACES = {
                 "prefill_complete, allowed), prompt and decode rows of many sessions computed together; a row's tokens "
                 "never depend on the other rows of its step; a constrained row's allowed (crit_plugins.Allowed) goes "
                 "to the sampler as its params['allowed']",
-        "commit": "commit(decisions): Core's StepDecision (session, accepted, terminal, cancelled, discard) for each "
+        "commit": "commit(decisions): Core's StepDecision (session, accepted, terminal, cancelled) for each "
                   "row of the last step",
         "retire": "retire(session, finish): the request ended (length, stop, cancelled or failed); its state goes",
         "score": "score(ids, first_target, path, queries, top_k) -> Scores (target, query, argmax, top): fixed text "

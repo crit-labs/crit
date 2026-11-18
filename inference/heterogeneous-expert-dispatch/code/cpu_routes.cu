@@ -1,34 +1,33 @@
-// A routed layer's CPU share joined inside a CUDA stream (captured graphs too), over host-work-mailbox's Mailbox: one
-// kernel finds the routes whose expert the slot table sends to the CPU tier (slot -2), writes them into a mailbox slot's
-// payload (each route's expert key and token, the tokens' rows in FP32) and posts the slot, or answers it itself when
-// there is nothing for the CPU; after the stream's join a second kernel copies the CPU's rows into the device part's
-// route rows, where the device part's combine sums every route in route order. One post and one join per layer: the
-// next layer's input needs this layer's sum, so a decode step cannot join less often; a layer with no CPU routes costs
-// its post kernel and a join that passes at once.
+// A routed layer's CPU share joined inside a CUDA stream (captured graphs too), over one of the host's handoffs
+// (Core's, crit_plugins.host): one kernel finds the routes whose expert the slot table sends to the CPU tier (slot
+// -2), writes them into a handoff slot's payload (each route's expert key and token, the tokens' rows in FP32) and
+// posts the slot, or answers it itself when there is nothing for the CPU; after the stream's join (the handoff's) a
+// second kernel copies the CPU's rows into the device part's route rows, where the device part's combine sums every
+// route in route order. One post and one join per layer: the next layer's input needs this layer's sum, so a decode
+// step cannot join less often; a layer with no CPU routes costs its post kernel and a join that passes at once.
 //
 // The payload is host-expert-tier's InputLayout: header {count, tokens, route capacity, token capacity} (uint32), experts
 // int32 [routes], token int32 [routes], x FP32 [tokens][hidden], out FP32 [routes][hidden], each part 64-byte aligned;
-// its handler is host-expert-tier's crit_tier_serve, given to the mailbox as a C function and its context.
+// its handler is host-expert-tier's crit_tier_serve, given to the handoff as a C function and its context.
 //
-// Mechanism code, built at load through torch's extension builder with host-work-mailbox's mailbox.cu (the Python layer:
-// device_dispatch.py). Bindings: pybind11 over torch tensors on the current stream.
+// Mechanism code, built at load through Core's native build (crit_plugins.native.extension; the Python layer:
+// device_dispatch.py) with Core's handoff_device.cuh. Bindings: pybind11 over torch tensors on the current stream.
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <pybind11/stl.h>
 #include <torch/extension.h>
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 #include <cstdint>
-#include <memory>
 #include <stdexcept>
-#include <string>
+#include <tuple>
 #include <vector>
 
-#include "mailbox.h"
-#include "mailbox_device.cuh"
+#include "handoff_device.cuh"
 
-namespace hm = crit::techniques::host_mailbox;
+namespace hm = crit::host;
 
 namespace {
 
@@ -58,7 +57,7 @@ __device__ inline float as_float(__half v) { return __bfloat162float(__float2bfl
 // tokens' rows, all fence to system scope, then thread 0 posts the slot (or skips it).
 template <class Id, class X>
 __global__ void post_kernel(const Id* ids, int tokens, int top, const std::int32_t* slots, int experts, const X* x,
-                            int hidden, int key_base, hm::SlotView slot, Layout layout, int cap_routes, int cap_tokens,
+                            int hidden, int key_base, hm::DeviceSlot slot, Layout layout, int cap_routes, int cap_tokens,
                             std::int32_t* cpu_routes, std::int32_t* cpu_count, unsigned long long* counters) {
     extern __shared__ int shared[];
     int* token_map = shared;              // [tokens]
@@ -69,7 +68,7 @@ __global__ void post_kernel(const Id* ids, int tokens, int top, const std::int32
         cpu_expert[r] = id >= 0 && id < experts && slots[id] == -2 ? int(id) : -1;
     }
     __syncthreads();
-    std::byte* payload = slot.device_payload;
+    std::byte* payload = slot.payload;
     auto* head = reinterpret_cast<std::uint32_t*>(payload);
     auto* expert_out = reinterpret_cast<std::int32_t*>(payload + layout.experts);
     auto* token_out = reinterpret_cast<std::int32_t*>(payload + layout.token);
@@ -113,8 +112,8 @@ __global__ void post_kernel(const Id* ids, int tokens, int top, const std::int32
     if(count > 0) __threadfence_system();   // the rows each thread wrote, before the doorbell
     __syncthreads();
     if(threadIdx.x == 0) {
-        if(count > 0) hm::post_job(slot.device_ready, slot.device_done, slot.device_status);
-        else hm::skip_job(slot.device_done, slot.device_status);
+        if(count > 0) hm::post_job(slot);
+        else hm::skip_job(slot);
     }
 }
 
@@ -122,7 +121,7 @@ __global__ void post_kernel(const Id* ids, int tokens, int top, const std::int32
 // NaN rows (never a silent partial sum) and sets the status word the caller checks. Reads of mapped host memory cross
 // the link and serialize, so only the blocks of real routes read the status, once each, after the route count (device
 // memory) says whether they have work; a slot the post answered itself (no CPU routes) is read from nowhere.
-__global__ void scatter_kernel(float* y, int hidden, hm::SlotView slot, Layout layout, const std::int32_t* cpu_routes,
+__global__ void scatter_kernel(float* y, int hidden, hm::DeviceSlot slot, Layout layout, const std::int32_t* cpu_routes,
                                const std::int32_t* cpu_count, std::int32_t* status_out) {
     const int i = int(blockIdx.x);
     const int count = cpu_count[0];
@@ -133,48 +132,29 @@ __global__ void scatter_kernel(float* y, int hidden, hm::SlotView slot, Layout l
     if(i >= count) return;
     __shared__ std::uint32_t status;
     if(threadIdx.x == 0) {
-        status = hm::read_status(slot.device_status);
+        status = hm::read_status(slot);
         if(i == 0) status_out[0] = int(status);
     }
     __syncthreads();
     const bool good = status == hm::served;
-    const auto* out = reinterpret_cast<const float*>(slot.device_payload + layout.out);
+    const auto* out = reinterpret_cast<const float*>(slot.payload + layout.out);
     const int r = cpu_routes[i];
     for(int h = int(threadIdx.x); h < hidden; h += int(blockDim.x))
         y[std::size_t(r) * std::size_t(hidden) + std::size_t(h)] =
             good ? hm::read_result(out + std::size_t(i) * std::size_t(hidden) + std::size_t(h)) : __int_as_float(0x7fc00000);
 }
 
-using Serve = int (*)(void*, std::uint64_t, void*, std::uint64_t, char*, std::uint64_t);
-
-// A mailbox over mapped pinned memory this object owns, whose handler is a C function of a host library (the tier).
-class Box {
+// The post and scatter kernels over one handoff's slots: words holds each slot's device addresses (ready, done,
+// status, payload), as crit_plugins.host's Handoff.words(slot) gives them. The handoff and its join are the host's.
+class Routes {
 public:
-    Box(std::int64_t slots, std::int64_t hidden, std::int64_t routes, std::int64_t tokens, const std::string& join,
-        std::int64_t serve, std::int64_t context, std::int64_t idle_after_us, std::int64_t idle_sleep_us)
+    Routes(std::int64_t hidden, std::int64_t routes, std::int64_t tokens,
+           const std::vector<std::tuple<std::int64_t, std::int64_t, std::int64_t, std::int64_t>>& words)
         : hidden_(hidden), routes_(routes), tokens_(tokens), layout_(layout_of(hidden, routes, tokens)) {
-        const hm::Join kind = join == "stream_wait" ? hm::Join::stream_wait
-                              : join == "device_poll" ? hm::Join::device_poll : hm::Join::host_eager;
-        const std::size_t bytes = hm::region_bytes(std::size_t(slots), std::size_t(layout_.bytes));
-        void* host = nullptr;
-        void* device = nullptr;
-        if(cudaHostAlloc(&host, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess)
-            throw std::runtime_error("cpu routes: mapped pinned memory for the mailbox");
-        std::shared_ptr<void> owner(host, [](void* p) { cudaFreeHost(p); });
-        if(cudaHostGetDevicePointer(&device, host, 0) != cudaSuccess)
-            throw std::runtime_error("cpu routes: no device address for the mailbox's mapped memory");
-        const Serve fn = reinterpret_cast<Serve>(serve);
-        void* ctx = reinterpret_cast<void*>(context);
-        hm::Handler handler = [fn, ctx](std::size_t slot, std::span<std::byte> payload) {
-            char error[1024] = {};
-            if(fn(ctx, slot, payload.data(), payload.size(), error, sizeof(error)))
-                throw std::runtime_error(std::string("CPU tier: ") + error);
-        };
-        hm::Options options;
-        options.idle_after = std::chrono::microseconds(idle_after_us);
-        options.idle_sleep = std::chrono::microseconds(idle_sleep_us);
-        box_ = std::make_unique<hm::Mailbox>(hm::MappedRegion{host, device, bytes, owner}, std::size_t(slots),
-                                             std::size_t(layout_.bytes), kind, std::move(handler), options);
+        for(const auto& [ready, done, status, payload] : words)
+            slots_.push_back(hm::DeviceSlot{reinterpret_cast<std::uint32_t*>(ready), reinterpret_cast<std::uint32_t*>(done),
+                                            reinterpret_cast<std::uint32_t*>(status), reinterpret_cast<std::byte*>(payload)});
+        if(slots_.empty()) throw std::invalid_argument("cpu routes: a handoff's slots");
     }
 
     void post(std::int64_t slot, const torch::Tensor& ids, const torch::Tensor& slots, const torch::Tensor& x,
@@ -192,8 +172,8 @@ public:
         const int tokens = int(ids.size(0)), top = int(ids.size(1));
         const std::size_t shared = std::size_t(tokens) * std::size_t(top + 1) * sizeof(int);
         TORCH_CHECK(tokens <= tokens_ && shared <= 48 * 1024, "cpu routes: at most ", tokens_, " tokens a call (the "
-                    "mailbox's capacity), and tokens x (top + 1) x 4 bytes within 48 KiB");
-        const hm::SlotView& v = box_->slot(std::size_t(slot));
+                    "handoff's capacity), and tokens x (top + 1) x 4 bytes within 48 KiB");
+        const hm::DeviceSlot v = slots_.at(std::size_t(slot));
         auto stream = at::cuda::getCurrentCUDAStream();
         auto launch = [&](auto* id_ptr, auto* x_ptr) {
             post_kernel<<<1, 256, shared, stream>>>(id_ptr, tokens, top, slots.data_ptr<std::int32_t>(), int(slots.numel()),
@@ -214,11 +194,6 @@ public:
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
-    void join(std::int64_t slot) {
-        const cudaError_t e = box_->join(std::size_t(slot), at::cuda::getCurrentCUDAStream());
-        TORCH_CHECK(e == cudaSuccess, "cpu routes: join: ", cudaGetErrorString(e));
-    }
-
     // routes: the call's route count (tokens x top), the most its post can list.
     void scatter(std::int64_t slot, torch::Tensor& y, const torch::Tensor& cpu_routes, const torch::Tensor& cpu_count,
                  torch::Tensor& status, std::int64_t routes) {
@@ -226,19 +201,13 @@ public:
                     "cpu routes: y FP32 [routes][hidden] on the device");
         TORCH_CHECK(routes >= 1 && routes <= routes_ && routes <= y.size(0), "cpu routes: a call's routes within capacity");
         const c10::cuda::CUDAGuard guard(y.device());
-        const hm::SlotView& v = box_->slot(std::size_t(slot));
+        const hm::DeviceSlot v = slots_.at(std::size_t(slot));
         scatter_kernel<<<unsigned(routes), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
             y.data_ptr<float>(), int(hidden_), v, layout_, cpu_routes.data_ptr<std::int32_t>(),
             cpu_count.data_ptr<std::int32_t>(), status.data_ptr<std::int32_t>());
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
-    void release() { box_->release(); }
-    bool rearm(std::int64_t timeout_ms) { return box_->rearm(std::chrono::milliseconds(timeout_ms)); }
-    bool failed() const { return box_->failed(); }
-    std::string error() const { return box_->error(); }
-    std::int64_t served() const { return std::int64_t(box_->served_jobs()); }
-    std::string join_kind() const { return hm::join_name(box_->join_kind()); }
     std::int64_t payload_bytes() const { return layout_.bytes; }
     // The payload's offsets (experts, token, x, out, bytes), to check against the tier's input_layout.
     std::vector<std::int64_t> layout() const { return {layout_.experts, layout_.token, layout_.x, layout_.out, layout_.bytes}; }
@@ -246,37 +215,17 @@ public:
 private:
     std::int64_t hidden_, routes_, tokens_;
     Layout layout_;
-    std::unique_ptr<hm::Mailbox> box_;
+    std::vector<hm::DeviceSlot> slots_;
 };
-
-pybind11::dict measure(std::int64_t device, std::int64_t joins, std::int64_t replays) {
-    const hm::JoinCosts c = hm::measure_joins(int(device), int(joins), int(replays));
-    pybind11::dict out;
-    out["mapped"] = c.support.mapped;
-    out["stream_wait"] = c.support.stream_wait_captured;
-    out["detail"] = c.support.detail;
-    out["stream_wait_us"] = c.stream_wait_us ? pybind11::cast(*c.stream_wait_us) : pybind11::none();
-    out["device_poll_us"] = c.device_poll_us ? pybind11::cast(*c.device_poll_us) : pybind11::none();
-    out["choice"] = std::string(hm::join_name(c.choice()));
-    return out;
-}
 
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    pybind11::class_<Box>(m, "Box")
-        .def(pybind11::init<std::int64_t, std::int64_t, std::int64_t, std::int64_t, const std::string&, std::int64_t,
-                            std::int64_t, std::int64_t, std::int64_t>())
-        .def("post", &Box::post)
-        .def("join", &Box::join)
-        .def("scatter", &Box::scatter)
-        .def("release", &Box::release)
-        .def("rearm", &Box::rearm)
-        .def("failed", &Box::failed)
-        .def("error", &Box::error)
-        .def("served", &Box::served)
-        .def("join_kind", &Box::join_kind)
-        .def("payload_bytes", &Box::payload_bytes)
-        .def("layout", &Box::layout);
-    m.def("measure_joins", &measure);
+    pybind11::class_<Routes>(m, "Routes")
+        .def(pybind11::init<std::int64_t, std::int64_t, std::int64_t,
+                            const std::vector<std::tuple<std::int64_t, std::int64_t, std::int64_t, std::int64_t>>&>())
+        .def("post", &Routes::post)
+        .def("scatter", &Routes::scatter)
+        .def("payload_bytes", &Routes::payload_bytes)
+        .def("layout", &Routes::layout);
 }

@@ -46,6 +46,10 @@ class SoftmaxAttention:
         """The device form's engine facts (device_attention.DeviceAttention.facts)."""
         return self.device_form.facts()
 
+    def exactness(self):
+        """The level the device form's rows keep (device_attention.DeviceAttention.exactness)."""
+        return self.device_form.exactness()
+
     def close(self):
         self.device_form.close()
 
@@ -59,22 +63,32 @@ def _kernels(options):
     return load_kernel(KERNELS, folder=Path(__file__).parent)
 
 
+def _prompt_reader(options, kernels_loaded):
+    """The prompt_reader option as the device form takes it: auto follows the level the engine asks of its prompt
+    rows (device_attention.asked_prompt_reader)."""
+    return device_attention.asked_prompt_reader(options["prompt_reader"], options.get("reader", "split"),
+                                                options["flashinfer"], kernels_loaded, options.get("int8_qk", False))
+
+
 def memory(context, options):
-    """What the device form allocates when it is made (device_attention.device_memory), exactly: the split-KV reader's
-    partials where crit's paged-kv-attention kernel loads, FlashInfer's workspaces where it serves, on a CUDA engine."""
+    """What the device form allocates when it is made (device_attention.device_memory), exactly: FlashInfer's
+    workspaces where it serves, on a CUDA engine. The split-KV reader's partials are the engine's scratch."""
+    loaded = _kernels(options) is not None
     found, host = device_attention.device_memory(device_attention.engine_device(context), options["kernels"],
-                                                 _kernels(options) is not None, options["workspace_mib"],
+                                                 loaded, options["workspace_mib"],
                                                  options["flashinfer"], options["flashinfer_mib"], options["decode"],
-                                                 options["prompt_reader"])
+                                                 _prompt_reader(options, loaded))
     return {"device": found, "host": host}
 
 
 def create(context, options, parts):
-    form = device_attention.DeviceAttention(_kernels(options), options["kernels"], options["int8_qk"],
+    kernels = _kernels(options)
+    form = device_attention.DeviceAttention(kernels, options["kernels"], options["int8_qk"],
                                             options["decode"], options["partitions"], options["piece"],
                                             device_attention.engine_device(context), options["workspace_mib"],
                                             options["flashinfer"], options["flashinfer_mib"],
-                                            options["prompt_reader"], options["reader"], _latent(options))
+                                            _prompt_reader(options, kernels is not None), options["reader"],
+                                            _latent(options), scratch=getattr(context, "scratch", None))
     return SoftmaxAttention(parts["kv_cache"], form)
 
 

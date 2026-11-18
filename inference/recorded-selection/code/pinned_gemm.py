@@ -18,9 +18,8 @@ rowscale (FP32 vectors of a's M rows and b's N rows). OUTPUT is bf16, fp16 or fp
 in cuBLASLt's blocked layout: blocked_scales() turns row-major [rows, K / block] scales into it, so a prefix a[:m]
 takes blocked_scales(row_scales[:m]). The old names bf16 and fp8 still read as bf16:bf16 and
 fp8e4m3-tensorscale:bf16 under their old keys. Importing needs no torch or CUDA; building (once per process,
-torch.utils.cpp_extension), record() and pinned_mm() need both.
+Core's native build, crit_plugins.native.extension), record() and pinned_mm() need both.
 """
-import hashlib
 import json
 import os
 import sys
@@ -214,18 +213,13 @@ def _torch_dtype(element):
 
 
 def extension():
-    """pinned_gemm.cpp, built once per process (torch.utils.cpp_extension caches the build across processes)."""
+    """pinned_gemm.cpp, built once per process through Core's native build (cached across processes, one build a
+    copy of the source: each engine has its own copy of the plugin)."""
     global _ext
     if _ext is None:
-        from torch.utils.cpp_extension import load
+        from crit_plugins.native import extension as build
         lib = "cublasLt.lib" if sys.platform == "win32" else "-lcublasLt"
-        source = os.path.join(HERE, "pinned_gemm.cpp")
-        # One build cache per copy of the source (each engine has its own copy of the plugin): under one name, every
-        # switch between copies would build it again.
-        with open(source, "rb") as f:
-            copy = hashlib.sha256(source.encode() + f.read()).hexdigest()[:12]
-        _ext = load(name=f"crit_pinned_gemm_{copy}", sources=[source], with_cuda=True, extra_cflags=["-O2"],
-                    extra_ldflags=[lib], verbose=False)
+        _ext = build("crit_pinned_gemm", [os.path.join(HERE, "pinned_gemm.cpp")], flags=("-O2",), link=(lib,))
     return _ext
 
 

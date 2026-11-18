@@ -65,12 +65,13 @@
     },
     "prompt_gemm": {
       "type": "choice",
-      "default": "native",
+      "default": "auto",
       "choices": [
+        "auto",
         "native",
         "declared"
       ],
-      "description": "CUDA form, prompt rows (calls of more than 16 rows): native, W4A4 prompt rows on int-block-experts' gemm-native (the activations by its quantize_nvfp4, block-scaled FP4 MMAs on sm_120a, the s8 MMA a 16-block for INT4 weights): NOT the declared order and not row invariant (a prompt row's bits may change with the prompt's length and are not the CPU rows'; the facts' row_invariance prompt_rows false), W4A8 ones as declared; declared, every prompt row on gemm-staged in the declared integer block order, the CPU rows' bits"
+      "description": "CUDA form, prompt rows (calls of more than 16 rows): auto (the default), the faster GEMM that keeps the level the engine's configuration asks of its prompt rows (exactness, docs/PLUGINS.md#exactness): native where it asks repeatable or nothing, declared where it asks row-exact, exact or declared; native, W4A4 prompt rows on int-block-experts' gemm-native (the activations by its quantize_nvfp4, block-scaled FP4 MMAs on sm_120a, the s8 MMA a 16-block for INT4 weights): NOT the declared order and not row invariant (a prompt row's bits may change with the prompt's length and are not the CPU rows'; the facts' row_invariance prompt_rows false), W4A8 ones as declared; declared, every prompt row on gemm-staged in the declared integer block order, the CPU rows' bits"
     }
   },
   "sources": {

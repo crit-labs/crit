@@ -9,6 +9,660 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-18
+
+### Overview
+
+crit 0.20.0 serves a mixture of experts larger than the device and rebuilds Core around the device's memory and the
+host. expert-offload is one plugin in the experts slot for such a model: recent residency in an elastic device cache,
+misses computed on an AVX-512 CPU tier or copied over the link (`misses: auto` measures both at load), a host tier
+between the store file and the cache, a pinned core held on the device alone, and `crit plugins offload` derives its
+options from config.json, a probe file and the context. On Qwen3.8-Flash-Next on an RTX 5090 fresh prompts decode at
+73 tok/s sampled and 78 greedy, where the run engine it replaced gave 24.8 and 32.5. Core's device memory is one
+object (`crit_plugins.memory`) with elastic and paged ranges, step frames, a givers' ledger that gives way to other
+programs, one scratch buffer and one graph pool an engine, so KV and recurrent pools are backed only where sequences
+hold them and KV pages may lie in host memory; the host is another (`crit_plugins.host`: one worker pool, watched
+handoffs, reads at a queue depth past the page cache), and native builds are a service. Core has a prompt cache: a
+ledger that keeps ended conversations in a model plugin's pools, hybrid models included, with marks that thin out and
+places conversations share. Exactness is stated end to end: kernels state how exact their rows are (replacing
+`row_invariant`), an engine states the level it asks of its decode and prompt rows, a run's quality mode sets it, and
+Core, crit smoke and Eval hold the engine to it; `crit run ... ablate` measures what a level costs. Measured load
+decisions are recorded in the package and replayed, and `crit plugins status` and `crit plugins memory` say how an
+engine's plugin copies and device memory stand. New kernel paths: W4A4 prompt rows on the FP4 tensor cores with the
+decode tile's bits, sparse-indexer for a sparse attention's key selection, a fused latent-attention launch and EXL3
+prompt GEMMs. Core's C++ that no engine linked is gone, with the scheduler features and the second model interface no
+step engine reaches (Core's C++ falls from about 15,000 lines to 6,000); `StepDecision.discard` went with them and
+rounds give way to other programs, so the engine ABI is 7 and `crit_core_steps` must be rebuilt. The default VRAM
+headroom is 0.25 GiB. crit 0.20.0 needs crit-eval 0.7.1.
+
+### Added
+
+- Experts in one place: expert-offload's `pinned` core. In the ram tier host memory held every expert and the
+  device held the resident ones a second time. With `pinned` (a share of the cache's slots at `open()`, off by
+  default) the experts the `profile` file ranks hottest are read once from the store file straight into slots
+  that no plan lists as a victim, no shrink gives back and no preload or prompt ring takes
+  (device-expert-cache's `ExpertCache.pin`), and the store leaves them out of host memory: `BundleStore.leave`
+  maps a small shared filler over their pages before the one registration (`host_memory.leave_out`), so the
+  store stays one range with one device address and each of those experts is held once. Layers kept whole on
+  the device (W4A16 beside W4A4) leave host memory the same way. An exchange instead of a fixed core was
+  measured and set aside: taking a bundle's pages out of the registered store and back costs 470 to 540 us and
+  240 to 280 us an expert beside the 166 us copy, tens of milliseconds a round. The core comes from `profile`
+  alone (routing recorded on general text), never from `profile_save`, and needs `misses: cpu`, the recent
+  policy and a store file. `crit plugins offload --trace T --profile P` replays a trace with cores of 25, 50 and
+  75% of the slots against none (`trace_replay.recent(pinned=)`). On the Qwen3.8-Flash-Next test engine
+  `pinned: 0.5` holds 3,991 experts (10.3 GiB) on the device alone: 89.3% hits where the plain rule has 90.7%,
+  greedy decode 68.3 tok/s against 68.8, every reply's tokens unchanged. On that PC (an 84 GB Linux VM that
+  leaves Windows 10 GB) Windows kept 10.6 GiB available and paged nothing out where it had fallen to 0.1 GiB and
+  313,000 pages a second during the load, and the first reply after a cold load ran at 64 tok/s against 22.
+  Getting there took two things beside the core: the left-out bundles are read past the OS's page cache
+  (Core's host reads), and the kept ones are read in before the registration with the mapping's read-ahead off
+  (`host_memory.read_in`), because a fault's read-ahead pulls the left-out pages into the cache in blocks the OS
+  does not drop again.
+- One pool for an engine's captured graphs, and steps that count their allocations. An engine's load has a
+  memory pool of its own for graphs (`context.graphs`, `crit_plugins.memory`'s `pool("core", "graphs")`), and
+  Core's round driver and prompt graphs capture into it by default wherever their factory's `parts` carry the
+  load (`share_pool=False` gives a driver's graphs pools of their own, as before; the rule a shared pool asks of
+  the plugins is unchanged). An engine's graphs never run at once, so a capture reuses the bytes of the temporaries captured
+  before it and the pool holds far less than their sum: on the Qwen3.8-Flash-Next test engine the four rounds'
+  pools of 494 MiB are one of 270 MiB with the same greedy replies (the largest round's graph alone takes 174;
+  the rounds are captured smallest first, and a larger round's temporaries do not fit the blocks of a smaller
+  one), and the expert cache takes what that frees. `made()` counts the
+  allocations torch's allocator has made on a device; a probed engine (`CRIT_CORE_STEP_PROBE=1`) reports them
+  for each kind of step (`core.probe`: `allocations`, `most_allocations`), and with
+  `CRIT_CORE_STEP_ALLOCATIONS=0` Core ends an engine at the first step that allocates on the device once its
+  load is over, which holds an engine whose every step replays graphs to "nothing allocates while serving".
+  The test engine is not such an engine yet: expert-offload stages a prompt chunk's experts from the host, which
+  no graph captures, so its prompt steps run eagerly (4,100 to 6,400 allocations a step, 287 MiB at their peak)
+  and the audit reports them as such; its rounds allocate nothing.
+- State is read where it lies: sparse-indexer scores keys in a pool's store. `scores(..., slots=)` and
+  `select(..., slots=)` take the store's rows and each key's slot (`[n]`, or `[groups][n]` for a round whose rows
+  are sequences) and load every block of keys through the slots, so a caller no longer gathers a sequence's keys
+  for the kernel to read: the same products in the same order, the gathered keys' bits, for BF16, FP16 and E4M3
+  keys. A gathered copy is a buffer the size of the state, written every call, and inside a captured round it
+  stays in the round's pool for good; docs/PLUGINS.md states the rule for `kv:keys` and for pool state in
+  general. On a copy of the Qwen3.8-Flash-Next test engine whose model plugin scores its rounds' block keys this
+  way (it gathered every sequence's keys: 146 of the 174 MiB of its largest round's graph), the captured graphs'
+  pool went from 0.28 to 0.06 GiB, the expert cache from 22.43 to 22.64 GiB and greedy decode from 68.8 to
+  72.6 tok/s (a round 2 ms shorter), with all ten probe replies unchanged.
+- KV pages the device has no memory for can lie in host memory (attention-state `host_pages_mib`, with `elastic`).
+  A pool that finds the device full and nothing left to close backs its next pages from host memory instead of
+  refusing the request: `crit_plugins.memory`'s elastic ranges back granules from the host (`back(first, end,
+  host=True)`, a paged range's `host_bytes`), which the driver pins and maps into the range, so every reader, writer
+  and captured round uses the addresses it always used and each row has the bits it has on the device. A context
+  the device does not hold is served at the link's rate where it was refused. On an RTX 5090 (PCIe 5.0) kernels
+  read such pages at 28 GB/s where pages on the device go at 690; the mapping works under the Linux (WSL) and
+  the Windows driver. The device's report lists a range's host bytes (`host`). Off by default.
+- Measured decisions (`crit_plugins.decisions`, `crit plugins decisions PACKAGE --model MODEL`). A plugin that
+  chooses between two ways by timing both at load can choose the other one in the next process, and where the two
+  do not give the same bits the same request then gets another text, which no repeat check inside one process
+  sees. Such a choice is now settled through Core: `decisions.settle(plugin, name, key=..., measure=...,
+  decide=...)` replays the package's record where it holds the decision with the same key and measures otherwise.
+  The command loads the engine once and writes the record into the package; the configuration names it
+  (`"decisions": "decisions.json"`), as it names the kernel tuning, and Core's loader applies it before any plugin
+  is made. The engine's telemetry carries every decision (`decisions`: key, choice, `recorded` or `measured`, the
+  measurement) with one digest over the choices. expert-offload's `misses: auto` (the CPU tier or the link for a
+  missed expert, which changes the device rows' arithmetic) is the first decision settled this way
+  (`miss_times_from`).
+- Prompt cache: `spread` and `shared_least`. A model marks every chunk's end and the cache decides which marks
+  stay. With `spread` (a token count) they thin out with their distance from the newest, about twice as far apart
+  with each step back, so a long prompt changed in its middle resumes near the change where the newest marks
+  alone resumed nowhere. With `shared_least` the cache learns where conversations part: a prompt that shares that
+  many tokens more with a kept sequence than the place it can resume from (a system prompt and tool list every
+  conversation of a client repeats) gets that place as its first stop (`stop(sequence, frontier)`), and the mark
+  made there is a shared one, kept outside the count of `marks` and held by every sequence that resumes from it.
+  Both are off by default.
+- Core's host reads a file at a queue depth (`crit_plugins.host` `reads(owner, path)`): positioned reads from 8
+  threads at once, each with its own handle, opened past the OS's page cache where the file system allows
+  (`O_DIRECT`, `FILE_FLAG_NO_BUFFERING`), for a tier that keeps bytes of a file larger than host memory itself.
+  The host's report lists each open file's reads.
+- expert-offload's disk tier holds each expert once (`host_tier_mib`, by default the host memory free beside
+  `ram_headroom_mib`). A host tier between the store file and the device cache takes the experts the cache evicts
+  (the cache copies them back down the link and hands them over: a store that sets `retains`), and an expert that
+  goes up into a cache slot leaves it, so the device's slots and the host's add up instead of holding the same
+  experts twice. The file is read through Core's reads, a layer's misses all at once. `telemetry()`'s `file_store`
+  counts the host tier's hits, the file's reads and the experts handed back. The disk tier also loads on Windows
+  now (its store was written with a call Windows does not have). Not measured on a model larger than host memory.
+- Core's device memory gives way to other programs (`crit_plugins.memory` `relieve()`, `watch()`). When a desktop
+  or another process takes device memory while an engine serves, the givers (an elastic expert cache) release
+  what they keep free and no longer have before the engine's next step, and wait five seconds before they grow
+  back when what others hold has grown. Under WDDM the driver would otherwise move allocations to system memory
+  without an error. Rounds Core launches itself run no step of the engine, so a watch thread reads the free memory
+  five times a second and asks for one: `NativeRounds.ask_step()` sets a word Core's runtime reads before each
+  round (`StepRounds::boundary`), and the next decode step runs through `step()` once. The engine ABI is 7 for
+  it: an engine's `crit_core_steps` is rebuilt (`crit core build`); model plugins do not change. The device's
+  report counts the releases (`outside`).
+- A request whose rounds saw logits that were not finite fails instead of returning tokens that are not the
+  model's: a model that names `nonfinite` among its round counters has the round driver count, row by row, the
+  verified columns whose logits held a NaN or an infinity, and the engine's telemetry counts such requests
+  (`core.nonfinite_requests`).
+- A host job that does not return no longer hangs the device. A stream's wait on a handoff has no clock, so the
+  handoff service has a second thread that only watches: a job that runs past the job budget (20 s;
+  `crit_plugins.host` `job_budget(ms)`) fails its handoff, its waits are answered at once, `failures()` names it,
+  and Core ends the engine at its next step (its watch asks for one between rounds) instead of serving on what
+  such a window computed.
+- exl3-rows: `gemm`, a prompt's rows with their decode bits (structure `prompt`, exact, the bits of `gemv`). The
+  rows go through the tiles kernel in slabs of up to 64, the tiles decoded once a slab and multiplied by every
+  group of eight rows, so the codes are read at their stored bits once a slab and no dense copy is made.
+- expert-offload: `keep_routes`, an approximation that is off by default. N keeps each token's first N routes of
+  the router's order and leaves the rest out, in every tier and for decode rows and prompt chunks alike, so a
+  row's result never depends on what the cache holds and replies stay repeatable. On Qwen3.8-Flash-Next's recorded
+  routing (10 routes a token, 8,408 cache slots, replayed) 9 routes miss 119 experts a round where 10 miss 143,
+  and 8 miss 98. On the model itself (RTX 5090, six greedy replies of 256 tokens) greedy decode goes from 59.6
+  tok/s to 68.9 with 9 routes and 72.8 with 8, the most likely token stays the same at 95.2% and 95.1% of 1,536
+  positions (mean total variation 0.039 and 0.045 over the top 20 tokens), and every greedy reply leaves the
+  all-routes reply within its first 80 tokens: a changed model, which the run's drift budget judges in quality
+  mode `speed`.
+- Core's layering is a test ([test_core_layering.py](tests/test_core_layering.py)): Core's Python imports nothing
+  above it, its C++ includes no header outside it, and it names no library plugin and no model family beyond the
+  names counted in an allowlist that may only shrink.
+- sequential-recurrence: a test that a prompt chunk right after a round that rejected drafts starts from the
+  state of the kept tokens, by every commit strategy.
+- A run started from a crit-hub engine keeps the exactness the engine was measured at. A card's result may state
+  `exactness`, the level the engine asked of its rows (one level, or one each for `decode` and `prompt`), beside its
+  `quality_mode`; `crit run create --from-engine` checks it, records it with the result in
+  `origin_engine.evidence` as `{decode, prompt}`, and the agent request names it with each published result and
+  says where the engine was measured below the level the run's quality mode gives, so its numbers are read as what
+  they are. A card that states none is read as before.
+- The library's other plugins state the exactness they keep, and those with more than one way to compute a
+  phase's rows follow the level the engine asks. Twelve plugins' objects gain `exactness()`: softmax-attention,
+  partitioned-attention, attention-state, gguf-projections, projections-dense, fused-norms, host-expert-arithmetic,
+  grouped-experts, expert-offload, heterogeneous-expert-dispatch, sequential-recurrence and
+  recurrent-state-recovery report what their loaded rows keep, so the engine's `exactness` fact covers the whole
+  engine and Core's refusal names the plugin that keeps less than is asked. Eight plugins' options gain `auto` and
+  default to it: the attention plugins' `prompt_reader` (`decode` where the prompt rows are asked `exact`), gguf-projections'
+  `prompt` (`exact` from `row-exact` up), host-expert-arithmetic's `prompt_gemm` (`declared` from `row-exact` up),
+  expert-offload's `prompt_arithmetic` (`tensor` at `repeatable` and `row-exact`), heterogeneous-expert-dispatch's
+  `prompt_arithmetic` (`tensor` at `repeatable`), and a new `prompt_rows` of both recurrences (`scan` from
+  `row-exact` up). With nothing asked each resolves to its former default, so an engine that states no `exactness`
+  runs as before. A candidate of a `speed` run now gets expert-offload's and the dispatch's tensor-core prompt
+  chunks without setting the option; a candidate of a `preserve` run gets the exact prompt paths, and where a
+  plugin has none (projections-dense, BF16 matrices, quantized KV pools with fresh chunk keys) Core refuses it
+  until the configuration asks the level it keeps. A plugin whose prompt rows run its decode rows' arithmetic in
+  an order that never follows the row count (fused-norms on its kernel, grouped-experts' tensor arithmetic,
+  host-expert-arithmetic's 16-bit matrices) states its prompt rows `exact`, so a `preserve` candidate loads over
+  it. docs/PLUGINS.md has the table.
+- crit smoke judges an engine by the level it asks. An engine whose facts state the exactness it asks of its rows
+  is held to it where the level promises bits, whatever the profile: prompt rows asked `row-exact` or higher must not
+  change with the prompt's length, so `causal` and `causal_long` are judged with the strict tolerances, and prompt
+  rows asked `exact` or `declared` (beside decode rows asked `row-exact` or higher) are the bits of the same token
+  decoded, so `decode_matches_prefill` and `decode_long` are too. A lower level keeps the profile's tolerances, the
+  drift a path may round by, and a failed item names the level that made it strict. With a run's quality mode giving
+  the level, `crit run serve --check` and `ablate` now check a `preserve` candidate's rows strictly and a `speed`
+  candidate's as before; a candidate that cannot keep `exact` says so by asking a lower level.
+- `crit run ... ablate` measures what a level costs or gains. Among an option variant's settings
+  (`--set`), `exactness=LEVEL`, `exactness.prompt=LEVEL` and `exactness.decode=LEVEL` are the level the engine asks
+  of its rows, laid over the candidate's own: `ablate --set exactness.prompt=repeatable` serves the candidate as
+  built and again asking repeatable prompt rows, in the same host on the same cases, and the report's verdict says
+  whether the level pays, slows or breaks. Each variant's row carries the engine's `exactness` fact (what was asked
+  and what each plugin kept), so a variant whose plugins could not follow shows it, and one that keeps less than it
+  asks fails with Core's refusal as its detail.
+- A run's quality mode sets the exactness of the engines it builds. `crit run ... candidate` completes a plugin
+  package's `configuration.exactness` to a level for the decode rows and one for the prompt rows: the levels the
+  configuration states, and for a phase it leaves out the run's quality mode's, `exact` in `preserve` (decode rows
+  `row-exact`, each prompt row the bits of the same token decoded) and `repeatable` in `speed` (every plugin's
+  fastest way, as before). The package carries the completed configuration, so Core holds the engine to the level
+  it was measured at wherever it is served, and a supplied configuration.json that lacks it is refused with the keys
+  that differ named. The run's brief states the levels its mode gives and how to ask another, and AGENTS.md treats
+  a phase's level as a lever: changed with its speed and its drift measured. An external engine's configuration is
+  left as it is. In a `preserve` run this changes what a new candidate runs: a plugin that follows the level takes
+  its exact path unless the configuration asks a lower one (quantized-projections' `prompt_gemm: auto` becomes the
+  prompt tile), and an engine whose options keep less than `exact` must say so in `exactness`. Candidates recorded
+  before this ask nothing and are served as they were.
+- quantized-projections follows the level the engine asks. Its `prompt_gemm: auto` (the default) now takes the
+  fastest prompt GEMM that keeps the level the configuration's `exactness` asks of the prompt rows: `tile` where it
+  asks `exact` (each prompt row the bits of the row decoded, with `gemv: auto` as `fp4` so every decode row runs
+  the tile), `pinned` where it asks `row-exact`, and crit's native GEMMs, as before, where it asks `repeatable` or
+  nothing. A `prompt_gemm` set to one way is that way. The plugin's `exactness()` states what the loaded matrices
+  keep: decode rows row-exact; prompt rows exact on the prompt tile, row-exact through `fixed_tiles`, `pinned` and
+  `pinned_cublaslt`, repeatable through `native` and `provider`. So an engine that asks `exact` and sets
+  `prompt_gemm: native` is refused at load, and one that asks nothing runs as it did. Where auto's choice cannot run
+  with another option (a `gemv` the prompt tile does not take, a prompt arithmetic the pinned GEMMs do not run), the
+  error names the level that chose it.
+- An engine states the exactness it wants, and Core holds it to it. A configuration.json may now carry
+  `"exactness"`: one level of the kernels' scale for both phases, or one each
+  (`{"decode": "row-exact", "prompt": "repeatable"}`; `decode` is the decode and verify rows, `prompt` the prompt
+  rows). Core's loader reads it before any plugin is made (`crit_plugins.kernels.use_exactness`), so a plugin that
+  can compute a phase's rows in more than one way asks what the phase needs (`asks(phase)`, `allows(phase, level)`)
+  where its own option leaves the choice open, and each plugin object may state what its rows keep as loaded
+  (`exactness()`). The engine's facts carry both under `exactness`: what the configuration asked, the lowest level
+  any plugin keeps in each phase, and each plugin's own; crit serve's facts and Eval's engine facts pass it on. An
+  engine whose plugin keeps less than its configuration asks is refused at load, naming the plugin and the phase,
+  and a package that asks for a level that does not exist is refused when it is checked. A configuration that asks
+  nothing is served exactly as before, by its plugins' options. quantized-projections is the first
+  plugin to follow it, and a run's quality mode completes it (the entries above; docs/PLUGINS.md#exactness).
+- Kernel structures state how exact they are. The fastest way to compute a row is often not the most exact one,
+  and until now a kernel said so with one flag (`row_invariant`), a free-text `order` and the names of its
+  structures, which every plugin read its own way. Each structure in a kernel.json now declares its `exactness`,
+  one of four levels that each keep what the ones below keep: `declared` (the kernel's declared order: the bits
+  the CPU tier's rows, the decode rows and a prompt GEMM of that order all give), `exact` (the bits of another
+  structure, named by `bits_of`: a prompt row with the bits of the same token decoded), `row-exact` (an order of
+  its own fixed by the shape and the tuning, so a row's bits never follow the rows beside it, the row count or a
+  chunk's length) and `repeatable` (the same call gives the same bits, which may follow the row count, the
+  chunk's length or the tile). Of the 80 structures 12 are declared, 11 exact, 44 row-exact and 13 repeatable.
+  `crit_kernels.exactness` reads them: `level()` and `keeps()` for one structure, `same_bits()` and `choices()`
+  for the structures of a kernel a phase may run at a level given the structure its decode rows run, and
+  `setting()` for an engine's choice per phase (`decode`, `prompt`), which takes what the engine leaves out from
+  the run's quality mode (`preserve` asks exact, `speed` repeatable). `crit kernels list` shows each structure's
+  level and, for an exact one, whose bits it has; a kernel.json with a level that does not exist, or an exact
+  structure that names no other, is refused when it is read. This is the scale only: no kernel computes anything
+  differently and no plugin chooses by it yet (kernels/README.md#exactness). A kernel.json is part of its
+  kernel's build, so every kernel builds once more on its next use; tunings apply as before.
+
+- Scratch is a Core service: `context.scratch` (`crit_plugins.memory.Scratch`). What a call only computes in and
+  nothing reads after it returns (a kernel's partial sums, a launch's sorted rows) was a fixed workspace of each
+  plugin, allocated at load at its largest size, so an engine paid their sum. An engine's calls run one after
+  another on its stream, so they can all compute in the same bytes: the engine has one growing buffer at a fixed
+  address (a captured graph keeps it), each call takes what it needs from its start every time it runs
+  (`take(nbytes)`, or `take(a, b, ...)` for a call's buffers together) and holds nothing there across calls. It
+  costs the largest call's bytes, grows outside captures only, belongs to one engine (two engines of a process
+  never share bytes) and shows in the census as `core/scratch`. That nobody relies on what an earlier call left
+  is now something a test proves: with `CRIT_SCRATCH_POISON=1`, which `crit plugins test` sets, every take is
+  filled with 0xFF bytes first (NaN as a float, -1 as an index), inside captured graphs at every replay too. The
+  split-KV reader's partials (attention-state's device form, behind softmax-attention and partitioned-attention:
+  `workspace_mib` is now the most a launch may take, 128 MiB held from the load until now), token-sampling's
+  launch scratch (16 MiB on a 248,320-token vocabulary), the route rows of the experts' device part
+  (heterogeneous-expert-dispatch's `KernelRoutes(scratch=)`, which expert-offload uses: eight growing buffers of
+  its own until now, 174 MiB after a 1,024-token chunk) and quantized-projections' tile activations and partial
+  sums (68 MiB, `device_matrices.use_scratch()`) are taken from it; the attention plugins and the sampler declare
+  and allocate no workspace of their own any more. On the Qwen3.8-Flash-Next test engine one scratch of 164 MiB
+  (the route rows of a 1,024-token chunk) serves what took 322 MiB in those workspaces, the expert cache gained
+  0.17 GiB, and the greedy replies are the same, also in a run with every take poisoned.
+- `crit plugins memory PACKAGE --model MODEL`: the memory audit. The census says who holds each byte of a
+  device; the audit says what the engine does with it, with no word from the engine's plugins. It loads the
+  package in process, serves two short prompt sets of its own (a long prompt and three chats each, none of
+  Eval's text) and fingerprints every page of the device memory the process holds before and after
+  (`crit_plugins.audit`: torch's blocks in 512-byte pages, every granule the elastic ranges back on the device
+  in 4 KiB pages, a range's granules in host memory counted as `host` and never read; a reading writes nothing and allocates nothing but its own 32 MiB, and the engine's own thread takes it
+  as a request ends, before the request's sequence closes). Each buffer is reported by the plugin
+  and attribute that hold it with the bytes the workload wrote, how far into it the writes reach and what stayed
+  zero. Two verdicts are certain, dead (all zero at every reading) and oversized (a part never written), and the
+  report keeps them apart from what it cannot know (unchanged bytes that hold something: weights, a table, or a
+  workspace only the load wrote). The bytes Core knows to be scratch (the temporaries of captured graphs, growing
+  buffers) are filled with a mark first, so every unwritten byte there is certain, and a greedy reply repeated
+  after the workload must be the same (`--no-mark` leaves them alone). Each captured graph's pool is listed with
+  the allocations its captures made by the code that made them, each paged range with the units backed and
+  written, each kind of step with its graph replays, allocations and transient peak; `--out` writes it all as
+  JSON. For this, Core's device memory names things it only summed before: `holdings(plugins)` gives every
+  reachable tensor with its plugin and where it is held (the census walks it, and now starts at the plugins'
+  module globals too, so a module's shared buffers count for their plugin instead of "held by no plugin
+  object"), `pool(owner, name)` and `capturing(pool)` name the captured graphs' pools (Core's round driver and
+  prompt graphs use them; the census lists `pools` by name), and `record()` turns on torch's allocation history
+  for a tool, and Core's step engine has an `audit` a tool sets to see every step and every request's end on the
+  engine's thread. On the Qwen3.8-Flash-Next test engine the audit finds by itself what a day of hand-written
+  probes found: the split-KV workspace, of which 1,024-token chunks write 43 of 128 MiB; a recurrence pool not
+  yet paged, 215 of 864 MiB of states and an eighth of each stash written (the units one request uses); the
+  projections' 64 MiB buffer with 3 MiB written; the sampler's scratch (0.2 of 16 MiB); and the rounds' pools,
+  492 MiB, filled by the model plugin's gathers of whole sequences' indexer keys (one request at a time replays
+  the one-row round's 48 MiB and never the 444 MiB of the two-, three- and four-row rounds). It also shows every
+  prompt step running eagerly with 4,100 to 6,400 allocations and up to 287 MiB of transient peak, the native
+  rounds allocating nothing, and a lookup table's output buffer made anew and kept for every prompt length met.
+  The greedy replies of an audited run are those of a run without it.
+- What holds a device beside an expert cache is named tensor by tensor. Core's census of the device
+  (`crit_plugins.memory`, the engine's `"memory"` telemetry) lists the largest tensors one by one (`tensors`:
+  plugin, bytes, shape, dtype), expert-offload's `device` telemetry and its diagnosis carry the three largest, and
+  the load's telemetry (`"load"`) gives at each stage (`made`, `opened`, the new `warm`, `checked`) `other`: the
+  device memory outside torch and the elastic ranges that is not free, so what the CUDA context, libraries and
+  captured graphs take shows per stage. `crit plugins offload` says in a note what its `tables.` placement means
+  for the model plugin: every table a pass gathers a few rows of, the token embeddings among them, is planned as a
+  `tables.` group and opened through the embeddings slot. On Qwen3.8-Flash-Next the test engine's model plugin
+  held its token table (1.2 GiB, `[248320][2560]` BF16) on the device while the n-gram tables were read from the
+  host; opened from the host it gave the expert cache 1.1 GiB (19.8 to 20.9 GiB), the replies bit for bit the
+  same and a round's lookup at a device table's cost.
+- The host is one Core object, `crit_plugins.host`, as a device's memory is: the plan of who runs where (the first
+  physical core answers the device's doorbells, each other core has one worker), the process's one worker pool,
+  and handoffs, the work a device's stream posts to the host and joins inside a captured graph. Every plugin gets
+  it as `context.host` and the engine's telemetry carries it as `"host"` (cores, host memory, the pool's workers
+  and batches, each handoff's join and jobs). Until now host-expert-tier brought its own pool and
+  heterogeneous-expert-dispatch built the mailbox into its own extension with a service thread that ran unpinned
+  beside the pinned workers; a second plugin with CPU work would have started a second pool on the same cores.
+  host-expert-tier's rows now run on Core's pool (given as two addresses, `PoolRef` in Core's `pool.h`),
+  heterogeneous-expert-dispatch and expert-offload post through Core's handoff (their `cpu_routes.cu` keeps only
+  its post and scatter kernels), and one service thread a process, on the plan's first core, answers every handoff.
+  The host-work-mailbox entry describes the technique and Core runs it; the pool and service options `spin_us`,
+  `spin_max_us`, `idle_after_us` and `idle_sleep_us` of the two plugins are gone (Core's pool and service keep the
+  values they had), and `workers` and `pin` size Core's pool when a plugin is the first to ask for it.
+- Native code built at load is a Core service, `crit_plugins.native`: `library()` (C++ by the system's compiler,
+  opened with ctypes) and `extension()` (a torch extension for the device's architecture), cached by content, a
+  failed build remembered for the process, and every build recorded (`built()`, in the host's telemetry as
+  `"native"`). Six plugins carried a build of their own (host-expert-arithmetic's library; the torch extensions
+  of heterogeneous-expert-dispatch, device-expert-cache, lookup-table-rows, recorded-selection and token-sampling,
+  each with its own cache name and architecture handling): all of them build through Core now.
+- A plan gives the goals Eval states outside the priorities a fate: a gap on `followup_ttft` (the follow-up turns'
+  first token against its floor with a prompt cache) or `concurrency` (the most clients' aggregate against its
+  batched ceiling) is met by a lever whose `changes` improve that KPI or answered in `gaps`, in every plan after
+  the Eval that states it. Neither is ranked or forecast, and no candidate is built for one alone. Until now
+  plans read five KPIs and dropped every other gap, so no build worked on a prompt cache or on batching.
+- `crit plugins status ENGINE/plugins` says how an engine's copies of library plugins stand to the library:
+  current, behind (a copy of an earlier library version the engine did not change, with that version's commit
+  and the library's changes since), changed by the engine, or the engine's own. An engine holds a copy of every
+  library plugin it uses, and until now nothing said which copies had fallen behind the library and which the
+  engine had changed: on the two Qwen3.8-27B hub engines 8 and 9 of 17 copies are behind, and none is changed.
+  `crit plugins update ENGINE/plugins` replaces the copies that are behind with the library's current ones and
+  leaves the ones the engine changed.
+- Core has a prompt cache, `crit_plugins.prompt_cache.PromptCache`: a ledger that keeps ended requests' sequences
+  in a model plugin's pools, so a prompt that begins as one of them did (a conversation's next turn, an agent's next
+  tool step) prefills only the rest. It works through the pools' own `open`, `fork`, `keep` and `close`: KV pools are
+  forked and kept to the shared prefix; pools of one state per sequence (a recurrence's, a sliding ring) resume where
+  they stood, at a kept sequence's end or a position the model marked. The model plugin calls it in `open()` and
+  `retire()` and reports the prefix as `StepResult.reused_prompt_tokens`. Until now no plugin engine kept KV between
+  requests: a follow-up turn of 48 new tokens on 8,192 prefilled all of them (1.1 s and 3.5 s on two Qwen3.8-27B
+  engines on an RTX 5090, against a floor of 14 ms). `toy-model`'s `prompt_cache` option keeps one, and the device
+  tests' Llama-layout model plugin keeps one over attention-state's paged pool, through `step()`, captured rounds
+  and drafting rounds. attention-state's pool asks `on_exhausted(callback)` for room before it refuses a page, so
+  kept sequences give their pages back to a request that needs them.
+- The prompt cache of a model with recurrent state also serves prompts that do not repeat a kept prompt to its
+  last token: the same prompt sent again, and a turn whose template ends a prompt otherwise than it renders it
+  later (Qwen's thinking tag: the next turn repeats all but the last token). With `tail` the cache marks a place
+  that many tokens before a prompt's end beside the end itself, where the model's prompt chunk ends
+  (`step_item(..., stop=cache.stop(handle))`; Core takes the shorter chunk from the prompt tokens the step
+  reports). The shorter chunk costs a step, so a prompt that resumed at a kept prompt's end has none, nor one
+  shorter than `tail_least`. A sequence that resumed at a mark holds it too, without a second state copy, so a
+  turn sent again, with the same or another last message, resumes where the turn before did. Marks take no
+  state of their own: they may stand in the states no open request uses, and `evict()` and `unmark()` take them
+  back. Until now such prompts prefilled everything.
+- A request says whether it may be served from the prompt cache: `StepRequest.prompt_cache`, which crit serve sets
+  unless the request carries `"crit": {"prompt_cache": false}` (`chat-prompt-cache-v1`, declared for every
+  plugin package). crit smoke, `crit run measure` and the ablation's benches send it, as crit-eval's timed and
+  scored requests do, so a measurement prefills every prompt token and a repetition is no cache hit; a request
+  that does not allow the cache runs as on an engine without one. Core's eval-v1 adapter, scores and replays never
+  read it.
+- expert-offload: one plugin in the experts slot for a mixture of experts larger than the device. The model plugin
+  calls it as for experts that fit (begin, load, open after its pools, forward per routed layer); its decision tree
+  places the routed experts on the device, in host memory behind a device expert cache, or in a store file read on
+  the host, computes misses on the CPU tier in the device's bits while the link copies them into the cache beside
+  the round (else copies every miss, with the device's rows on tensor cores), stages prompt chunks through the
+  cache's ring, and reports what it decided and why, with a one-line diagnosis in its telemetry. recon's starting
+  designs and AGENTS.md start candidate 1 on it.
+- Recent residency for expert caches (device-expert-cache's `policy: recent`, expert-offload's default beside the CPU
+  tier): what is resident is what was routed last. A missed expert is computed by the CPU tier, copied in beside the
+  round and served from the next round, in the slot of the expert routed longest ago. The ranked policy ported
+  before it ranked decayed route counts every few rounds and lagged the routing: on Qwen3.8-Flash-Next's experts
+  alone on an RTX 5090 it hit 85% at 40.5 ms a round against 94% at 16.4 ms, and an engine on the plugin decodes
+  45.8 tok/s sampled and 59.5 greedy against 36.6 and 41.5 (24.8 and 32.5 for the run engine it replaced).
+- The device's memory is one object, `crit_plugins.memory.of(device)` (a plugin's `context.memory`), for Core and
+  every plugin: its readings (free, torch's allocator, the blocks it holds unused), elastic ranges on the driver's
+  virtual memory API, a givers' ledger, and a census. Core tells it when an engine's load starts and when it is
+  over (the givers then take what the load left) and counts, once, which plugin's objects hold which of torch's
+  bytes; the engine's telemetry carries the whole device (`"memory"`: free, torch, each elastic range, each
+  plugin, the rest). Until now those readings lived in three modules, and nothing said who held a device's bytes:
+  on Qwen3.8-Flash-Next it is 6.0 GiB of projection weights, 1.2 of an embedding table and 0.9 of recurrent states
+  beside the experts. The census also names what captured graphs' own pools hold (`"graphs"`): torch keeps a pool
+  for each graph's replays, in use or not, and on that engine the rounds' and prompt chunks' pools are 0.50 GiB of
+  which 0.03 are allocated (the round driver's and the prompt graphs' `share_pool` is the lever).
+- Pools take device memory as their sequences come: `crit_plugins.memory`'s paged ranges (`paged()`, `back(units)`,
+  `trim(units)`) back the units of a pool's layer tensors together, after asking the device's givers.
+  attention-state's elastic KV pools run on them, and sequential-recurrence and recurrent-state-recovery have an
+  `elastic` option: a sequence's recurrent state is backed when it opens and goes back when the sequences past it
+  closed. On Qwen3.8-Flash-Next a state pool of 8 sequences takes 0.14 GiB instead of 1.0 with one request in
+  flight, which the expert cache holds instead (about 300 more slots, 6% fewer misses).
+- Device memory that follows the requests: that memory's elastic ranges and ledger, and Core's step frames
+  (`begin_step`, `end_step` on any slot's plugin). An
+  expert cache holds every byte the requests in flight do not need: expert-offload's cache takes the free memory
+  once the load is over, gives a prompt step the bytes a chunk of its size was measured to take and grows back.
+  Until now a cache was sized once at load against a guessed margin, and under WDDM a guess too small spilled into
+  system memory (rounds of 130 ms instead of 17). A giver says what it keeps free and `need()` leaves it free, so
+  KV pages a step reserves never come out of that step's own room; expert-offload keeps `margin_mib` free at
+  every moment (the run's VRAM headroom: `crit plugins offload` writes it), counts the blocks torch's allocator
+  kept from earlier prompts as the next prompt's room (a prompt of many steps, or one chat turn after another,
+  takes nothing from the cache), and a step without prompt tokens costs nothing. Core reads a probed step's free
+  device memory when the model's step returns, before the end frames take the step's memory back.
+- attention-state's `elastic` option: the KV pools' pages in elastic ranges, backed only where sequences hold them
+  (4,096 tokens of every layer at a time), the device's givers asked for the bytes before a pool grows. A pool
+  sized for a 200K context held its whole allocation whatever the requests; now what it does not hold is the expert
+  cache's, with no lending between the two and no change to the model plugin: Qwen3.8-Flash-Next's engine keeps
+  7,250 cache slots beside elastic pools against 6,050 beside whole ones, and decodes 53.5 tok/s sampled and 60.0
+  greedy against 39.5 and 49.7 (45.8 and 59.5 with the pool lending its idle pages to a cache of fixed size).
+- expert-offload's telemetry and diagnosis say who holds the device's memory (the cache, the model's weights,
+  pools and workspaces, what is free) and what a GiB more for the cache is in slots: on Qwen3.8-Flash-Next each
+  GiB is about 7% fewer misses, more than any cache setting gives.
+- device-expert-cache's `trace_replay` replays a recorded routing trace through recent, ranked and static residency
+  in about two seconds a setting, and expert-offload's `bench.py` times the plugin alone on an engine's store file
+  and trace (a captured graph a round) in two minutes a setting: a cache setting is judged without an engine build.
+- A plugin in a slot a captured round uses takes part in the round (`start_round`, `count_round`) without the model
+  plugin passing it in `extra_parts`.
+- The CPU expert tier's scalar parts run on AVX-512 (host-expert-arithmetic's E2M1 quantizer and SwiGLU 16 values at a
+  time, a group's weight scales by one gather, a row's lanes reduced in registers), every bit the scalar order's:
+  a missed expert of 2.78 MB takes 328 us on one thread against 440, and 115 us against 137 inside expert-offload's
+  bench, where six threads now read host memory as fast as it gives random experts.
+- `crit plugins offload` derives expert-offload's selection and options for a mixture of experts larger than the
+  device from config.json, a `crit eval probe` device file and the context (the miss path, the cache's policy, the
+  prompt arithmetic, the CPU tier's workers), and `--trace` replays a routing trace through the cache's residency
+  at several sizes and copy budgets.
+- device-expert-cache's `side_swaps`: a ranked boundary's swapped bundles copied on a side stream beside the round
+  (joined at its end, mapped by the next round) instead of before its first layer.
+- device-expert-cache's `record_routes` keeps the last decode routes on the device, inside captured rounds too, and
+  the cache's `routes()` returns them as the routing trace `crit plugins offload --trace` replays.
+- mma-rows: `mm_prompt` takes acts `nvfp4_mma` (structure `fp4-prompt-tile`, the sm_120 family): any number of W4A4
+  rows on the block-scaled FP4 tensor cores, every output with the bits the FP4 MMA decode tile gives the same row
+  (the same m16n8k64 MMAs in the same order, the plan's splits of K added in split order). Until now a W4A4 engine
+  whose scored and served outputs must be the same bits ran its prompt rows on the BF16 MMA at 150 to 170 TFLOPS, and
+  the FP4 MMA served decode rows only. The tile is a warp-specialized GEMM (a producer warp's TMA tile copies into a
+  ring of stages, consumer warps reading fragments by ldmatrix, a split's chains joining running totals inside the
+  MMA stream, whole tiles stored through shared memory). RTX 5090, the quantizer included, at 2,048 rows: a 27B's
+  34816 x 5120 gate/up 886 us (824 TFLOPS) against 4,134 us on the BF16 path, its 5120 x 17408 down 458 us (797)
+  against 2,243; 4.3 to 5.2 times the BF16 path from 512 rows and 0.78 to 0.86 of cuBLASLt's NVFP4 GEMM, whose rows
+  have other bits. Default knobs, not swept.
+- quantized-projections: `gemv: fp4` puts W4A4 decode rows on the FP4 MMA where the device has it and every other
+  matrix on the tile, and with `prompt_gemm: tile` sends those matrices' prompt rows through the FP4 prompt tile:
+  `prompt_exact` stays true with the prompt rows on FP4 tensor cores.
+
+### Changed
+
+- kernel.json's `row_invariant` is replaced by `exactness` (above): true became `row-exact` or a higher level,
+  false `repeatable`, and a kernel.json written before still reads by its flag. `crit kernels sweep` runs its
+  row check (row 0 beside other rows against row 0 alone) on the structures that are row-exact or higher, the
+  ones it checked before. Three of recurrent-scans' structures whose README and tests already promised more
+  than their flag said now state it: `delta-columns` and `ssd-columns` (the column scans) are row-exact and
+  `conv-segments` has pool_conv's bits. They have no knobs, so no sweep builds them.
+
+- expert-offload's `misses: auto` is measured, no longer the CPU tier wherever it builds. At load it times a missed
+  expert on the CPU tier and over the link and takes the CPU tier only where it needs under four fifths of the
+  link's time (`miss_times_us` in its telemetry, and the reason it gives). Beside the CPU tier every device row
+  runs the declared integer order and the tier's first replies after a load or a pause are slow; over the link
+  every expert runs on the tensor cores. On Qwen3.8-Flash-Next (RTX 5090, Ryzen 5 9600) both serve a warm round
+  in the same time and the link wins the measurement: five fresh prompts decode at 73 sampled and 78 greedy tok/s
+  where the CPU tier gave 45 and 73 (its first replies 24, 40 and 51). An engine that chose the CPU tier by `auto`
+  gives other tokens after this change (the link's rows are the tensor cores'); `misses: cpu` pins it.
+- MXFP8 activations for a decode call come from one kernel. quantized-projections multiplies 16-bit rows of the
+  quantized values (`mxfp8_activations: mxfp8`, `decode_activations: prompt`), and made them with the quantizer
+  and three torch kernels a call (the codes as FP32, times their scales, as BF16); fp8-block-rows gains
+  `quantized_values`, which writes those bits in one launch. On Qwen3.8-Flash-Next a decode round has 264 such
+  products: the captured round goes from 21.6 to 19.4 ms and a reply from 66.5 to 69.1 tok/s, the same tokens.
+  For groups of 32 a warp takes a group (a load and a division a thread, the group's amax a warp reduction): 1.1 us
+  a call where a thread looping over its group took 6.5, another 1.4 ms of the round's kernel time.
+- A prompt step allocates no copy of its sequence's recurrent state. A prompt row that runs the scan keeps its
+  final state of every layer until its accept (a cancelled step must leave the sequence as it was, for a prompt
+  cache's next turn); the recurrence pools now keep it in the pool's lowest free unit, where a sequence's states
+  live, backed for the step. On Qwen3.8-Flash-Next that copy was 108 of the 122 MiB a short prompt step took: a
+  step now leaves 5 MiB allocated when it returns instead of 113.
+- Two workspaces follow their use instead of standing for good, each through a service of Core's device memory.
+  `crit_plugins.memory` gains growing buffers (`growing(owner, name, max_bytes)`, `take(nbytes)`): one buffer at a
+  fixed address that holds what its largest user asked for. expert-offload's device part keeps its route rows
+  there, so the workspaces of every prompt chunk size share them (grouped-experts' `Workspace(rows=...)`,
+  heterogeneous-expert-dispatch's `KernelRoutes(memory=...)`); until now each chunk size a server met left a
+  set of rows behind, 95 MiB for a 601-token chunk and 160 MiB for a 1,024-token one on Qwen3.8-Flash-Next. And
+  the recurrence pools' `elastic` option backs everything a sequence keeps with it, the stash, the convolution
+  window and the convolution's stash beside the states: they are stored with a sequence's layers together and
+  handed to the kernels as `[layers][sequences]` views, which recurrent-scans' pool entry points take by their
+  strides (an entry of one layer and sequence contiguous). On that engine torch's allocation falls by 0.48 GiB and
+  the expert cache holds 22.0 GiB after a long prompt, the replies the same bit for bit.
+- quantized-projections makes each of its shared buffers at its first use (a matrix's load runs every path it
+  takes) instead of all five in the factory: a device whose matrices never decode a chunk of rows or pin a GEMM
+  holds neither the 64 MiB decode workspace nor the 32 MiB GEMM workspace. `memory()` declares the same bytes, now
+  the most the buffers take.
+- The VRAM headroom's default is 0.25 GiB, no longer 1 GiB: the device memory an engine leaves free at its peak
+  where neither the request nor `settings.toml`'s `vram_headroom_gib` says otherwise (crit Eval's
+  `VRAM_HEADROOM_GIB`, read by `crit run create`, `crit run eval`, the served pre-check, `crit pull`, `crit bench`
+  and `crit plugins offload`, whose `--vram-headroom-gib` now defaults to the machine's setting), and
+  expert-offload's `margin_mib` defaults to 256. It is the user's knob: every GiB of it is a GiB the engine's
+  weights, KV cache or expert cache do not get. On Qwen3.8-Flash-Next the expert cache holds 21.8 GiB at 0.25 GiB
+  against 21.1 at 1 GiB (8,408 against 8,052 slots). A machine whose desktop takes device memory in bursts sets
+  it higher: an elastic expert cache gives memory back at the next prompt step, not during a reply's decode
+  rounds.
+- heterogeneous-expert-dispatch's device part is crit's grouped-experts kernel in its declared arithmetic, reading the
+  CPU tier's bundles in place (`device_part: auto`); the torch DeclaredRoutes, one route at a time, is only the fallback
+  where the kernel does not build, and the facts say which serves. `prompt_arithmetic: tensor` runs a prompt chunk that
+  sends no route to the CPU in the kernel's tensor arithmetic instead of the CPU's integer order, for speed engines
+  whose prefill the declared order bounds.
+- grouped-experts' decode items ask for their weights 128 bytes of a row at a time (4 blocks of a 4-bit format, 2 of
+  FP8, loaded together) instead of a 64-k block at a time (32 or 64 bytes). A decode pass is a few warps a
+  multiprocessor, each waiting on its own chain of weight requests, so what a request brings was the pass's rate:
+  NVFP4 experts moved at 0.6 to 0.9 TB/s where BF16 experts and the dense decode kernels move 1.5. RTX 5090, a decode
+  layer call (plan, gate/up, down, combine) of 512 NVFP4 experts (2560 x 640, top 10) at 1 / 2 / 4 / 8 tokens: 42.9 /
+  74.3 / 131.7 / 243.2 us before, 30.4 / 48.9 / 84.9 / 152.3 now; W4A4 46.8 to 248.4 before, 33.9 to 159.6 now; MXFP4
+  and INT4 the same; FP8 experts (4096 x 1536, top 8) 122.2 to 681.3 us per channel and 141.7 to 787.6 per block
+  before, 109.1 to 589.7 and 106.7 to 581.0 now. Every route keeps its bits (the same operands in the same MMAs). The
+  new knob READ of the `decode` structure picks the reads (1 the blocks, 2 the 128 bytes, 0 by the pass's K, the
+  default); BF16 experts and prompt items are unchanged.
+- sparse-indexer selects a decode call's top k in a CUDA kernel (`cuda_select.cu`, knob `CUDA` of the `topk`
+  structure, on by default for calls of fewer tokens than half the multiprocessors): a slice's scores are copied to
+  shared memory once and the radix select's five passes run there, where the Triton program read them from global
+  memory in every pass. RTX 5090, k 512, one token: 26.5 us before and 14.5 now at 50,000 keys, 65.1 and 19.5 at
+  200,000, 13.3 and 10.7 at 8,192. The picks are the same (no arithmetic in a select; the tests compare the two
+  paths). Prompt chunks keep the Triton programs. A mixed kernel without CUDA variants names its library `all`.
+- sparse-indexer sums a token's heads in an explicit tree (heads 2 i and 2 i + 1, then the pairs' sums) instead of
+  `tl.sum` over the tile's head axis, whose tree followed the tile's register layout. TM, BN and WARPS of the `scores`
+  structure therefore change no bit any more: they are speed knobs a sweep picks per token count, not order knobs
+  held at one value a shape, and a call takes no more tokens a program than it has, so a one-token decode call no
+  longer multiplies a tile padded with a second token. A token's scores differ from the earlier kernel's in their
+  last bits (another order of the same FP32 terms); decode and prompt rows agree as before. RTX 5090, 64 heads of 128
+  over 50,000 keys: one token 13.4 us before, 10.2 now; prompt chunks unchanged (9.7 ms at 2,048 tokens). With the
+  CUDA select a decode token's whole selection step takes 24 us where it took 40.
+- latent-attention's `attend` takes `fused`: one program a tile reads its partitions in turn and folds them as the
+  merge does, so every token has the split launch's bits and no partials are stored (a 64-column window at 128 heads
+  and rank 512 held 675 MB of them). By default a launch whose partials would pass 512 MB is fused. A prompt chunk
+  read through it as windows of 64 columns has the bits of its tokens decoded one by one, which the kernel's prompt
+  reader (`prefill`, another reduction) never gave: attention-state's `prompt_reader: decode` now covers latent
+  attention too (a step's prompt rows and captured prompt chunks), at 1.1 to 2.1 times `prefill`'s time.
+
+### Removed
+
+- Core's C++ that no engine links. An engine runs `crit_core_steps` (the runtime, text, structured output, JSON and
+  files) and its plugins; the libraries below date from engines written in C++ against Core's SDK, and only their
+  own fixtures still built them.
+  - `crit/batch.h` (`StepLayout`, `PageReservations`, `SpeculativeRow`, `peak_pages`). A model plugin's step model
+    lays its rows out with `crit_core.batch`, and the batched-steps guide with the batch invariance rules moved
+    beside it (`core/python/crit_core/batch.md`).
+  - `crit/host_memory.h` (`observe_host_memory`, `admit_host`). The host-memory-admission entry's Python
+    observations and admission rule are the ones engines use.
+  - `crit/safetensors.h`, `crit/model_config.h` and `crit/sha256.h` (`Checkpoint`, `load_model_config`,
+    `load_generation_config`, `stop_token_ids`, `Sha256`), with attention-state's `rope_table.h`, which read
+    its config through them. `crit_core.model` reads model files and `rope_table.py` derives the rotary table.
+  - The host sampler of `crit/sampling.h` (`Sampler`, `SamplingParams`, `resolve_sampling`, `TokenHistory`,
+    `log_softmax`, `top_logprobs`, `score_logit_rows`, `accept_greedy`). Engines sample through a sampler
+    plugin. The header keeps the draw (`philox4x32`, `uniform`, `DrawPurpose`), which token-sampling's kernel
+    includes; the host implementation of the rules lives on as the oracle of token-sampling's CUDA fixtures
+    (`tests/inference/host_sampler.h`), and Core's sampling guide keeps the draw and the rules.
+  - `crit/state.h` (`StateCache`: KV page, round, prefix and recurrent slot bookkeeping) and the C++ of
+    attention-state that stored pages for it (`state_pages.h`, `encoded_kv.h`, `host_page_tier.h`, the CPU
+    attention of `attention.h` and `batch_attention.h`, the batch and recovery engines and their examples).
+    An engine's KV is the attention-state plugin's paged pool on Core's memory. The operation
+    `paged-attention` names the torch arithmetic the kernels are tested against as its reference
+    (`device_attention.py`'s `windows_torch`), and recurrent-state-recovery's header carries its own
+    `checkpoint_node`.
+  - The device services no engine built: `crit/device_graph.h`, `crit/device_memory.h`, `crit/host_block.h` and
+    the CUDA backend `crit::cuda` (`crit/cuda.h`, `cuda_graph.h`, `cuda_memory.h`, `cuda_launch.h`,
+    `cuda_devices.h`), with the build options `CRIT_CORE_CUDA` and `CRIT_CORE_HIP`, the installed-SDK CUDA consumer,
+    `crit_core.buffers` and the references built on them: device-speculative-round's C++ round controller and its
+    toy, concurrent-request-execution's `device_metadata.h` and CUDA recurrence example, device-expert-cache's
+    `expert_store.h` and the kernels' foreign-stream example. A device's memory, captured rounds and prompt
+    chunks, the host's handoffs and native builds are Core's Python services over torch (`crit_plugins.memory`,
+    `rounds`, `prompt_graphs`, `host`, `native`). What stays of the CUDA backend is the launcher of captured decode
+    rounds, which loads the driver at run time, and `crit/gpu_runtime.h`, the CUDA-to-HIP name map native sources
+    include. Inference's CUDA fixtures no longer need a Core CUDA build (`CRIT_INFERENCE_CUDA` needs only the
+    toolkit).
+- The plugin library's C++ and CUDA that no plugin builds at load, about 7,300 lines, with the fixtures that tested
+  only them: the reference loops, controllers and kernels written for engines in C++ (mtp-decode's `speculative.h`,
+  `sampled.h` and `prompt_copy.h`, session-scheduling's chunk selector and physical batches, dense-layer-offload's
+  executor, expert-residency's `SettledSlots`, device-expert-cache's `device_cache.cu` and `runtime.cu` with their
+  Metal version, device-speculative-round's `greedy_accept.cu`, draft-trees', hidden-state-drafters',
+  draft-vocabulary-subset's and recurrent-state-recovery's reference kernels, host-expert-arithmetic's device twins,
+  the C++ twins of lookup-table-rows, recorded-selection, ssd-expert-materialization and token-constraints, and
+  concurrent-request-execution's `host_batch.h` and recurrent reference). What stays is what a plugin builds
+  (host-expert-arithmetic's rows, host-expert-tier, device-expert-cache's `directory_ops.cu`, lookup-table-rows'
+  reader, recorded-selection's pinned GEMM, token-sampling's law) and the host codecs the operations name as their
+  references (`nvfp4.h`, `row_fp8.h`, `fp8_block.h`). Entries without native code left are `reference` entries.
+- The scheduler features no engine can reach. Core's loader runs every engine on a step engine, which runs one step
+  at a time and declares none of them: the asynchronous batch pipeline (`BatchExecution`, `prepare_batch`,
+  `Profile.max_inflight_batches`), dependent execution (`StepContinuation`, `execution_depth`,
+  `max_request_steps`), memory preemption (`Suspension`, `Restoration`, `prepare_incremental`), reuse-aware
+  admission and admission lookahead (`scheduling_hint`, `AdmissionPolicy`, `admission_lookahead`) and prefill
+  latency advice (`prefill_limit`, `prefill_target_ns`). Admission is first in, first out. `RequestTiming` and a
+  result's `timing` lose `preemptions`, `recovery_ms` and `recomputed_tokens`, which were always zero.
+- The runtime's second way to run a model and the layers only C++ models needed. Core's loader runs every engine
+  on a step engine, whose callbacks return with their work done, so the runtime keeps one interface (`Model` and
+  `Session` in `crit/core/scheduling.h`, formerly `ConcurrentModel`, `ConcurrentSession` and `concurrent.h`) and
+  one worker. Gone are the one-request-at-a-time path (the old `Model`/`Session` with `advance`, `open_request`
+  and the legacy text callbacks), `Backend`, `Services` and the backend drain (the factory is given the resource
+  ledger), `Readiness` and deferred tokens (`Progress::readiness`, `deferred_tokens`, `ready_tokens`), retirement
+  receipts with `Session::close`, `quiesce` and `Profile.retirement_timeout_ms` (`Model::retire` returns nothing
+  and the session is destroyed after it), quarantined runtimes (`quarantined_engines`), `Resources`' `Arena`,
+  lifecycle tracing and operator ranges (`Profile.trace`, `Engine::trace()`, `device_timings`, `crit/trace.h`,
+  `CRIT_CORE_NVTX`), and the C++ text path (`TextFrontend`, `TextDecoder`, `crit/text.h`, `RequestOptions`'
+  `stop_strings` and `text`, `Result::text`, `Engine::tokenize`, `detokenize` and `create_decoder`): the engine
+  ABI never passed text, which `crit_core.text` handles in Python. The engine ABI and the step ABI are unchanged.
+- `StepDecision.discard`, which was always 0 since Core runs one step at a time: the step ABI's decision is
+  session, accepted, terminal and cancelled, and the engine ABI is version 6 (rebuild `crit_core_steps`). A model
+  plugin that read `d.discard` in `commit` drops it; nothing else changes for it. The runtime's per-row failure
+  path, which only a text decoder could take, went with it.
+
+### Fixed
+
+- A request after load no longer compiles a kernel for a prompt row or a row count load had not run. An eager
+  step's prompt row past the window launched paged-kv-attention's prompt chunk kernel, which no load had compiled,
+  and fused-norms' activation product compiled again at more rows than load had run. attention-state's warm-up
+  now launches the prompt reader as such a row does (with and without fresh rows); the prompt chunk kernel no
+  longer takes a chunk of one token or at position 1 as a constant; and the build's tuning module lists a shape
+  key's knob sets (`variants`) and launches a Triton kernel through `launch`, which compiles the other knob sets
+  at a compiled kernel's first launch, so a row count that reads another entry of a tuning table compiles
+  nothing (paged-kv-attention's `write` and `prefill`, fused-norms' activation, stream and decay kernels).
+- lookup-table-rows no longer keeps a buffer set for every prompt length. A table read from files made `ring`
+  sets of pinned ids, pinned rows and device rows for each lookup size it met and kept them for good, and a
+  server's prompt chunks come in every length: the memory audit showed four new 1.2 MiB sets after two prompts.
+  Eager lookups now share sets sized by powers of two of rows (a lookup reads exactly its rows of one), and a
+  captured lookup has a set of its own, made as it is captured, where it took one of its size's ring (so a
+  capture no longer fails for want of a larger `ring`).
+- expert-offload makes a prompt chunk's row buffers before it stages the chunk's experts. The first chunk of a
+  new size grew the device part's rows after the cache had planned the chunk, the growth asked the device's
+  givers for memory, and the cache released slots the plan had just named: the device rows then read released
+  slots (an illegal memory access on a device filled to its margin, found by a run with the scratch poisoned).
+  The device part has `prepare()` for it (heterogeneous-expert-dispatch's `KernelRoutes`).
+- Core's memory readings no longer count the empty segments of captured graphs' own pools among the blocks torch
+  holds unused (`torch()["unused"]`): `release()` cannot hand them back and no step can take them. On
+  Qwen3.8-Flash-Next 234 MiB of them were read as a prompt's room already in hand, and every prompt step's peak
+  as that much more than it took (236 MiB for a step that takes 6 to 92), so expert-offload's telemetry and the
+  room it keeps for a chat turn were wrong by the same amount in opposite directions.
+- An elastic expert cache no longer stays small after a long prompt. Torch's allocator kept the prompt's blocks,
+  expert-offload measured a prompt step's need as everything the allocator held during it, and so the blocks a
+  1,024-token chunk left were counted as the need of every later short prompt: on Qwen3.8-Flash-Next a 35-token
+  prompt after a 6,316-token one "took" 1,328 MiB, the cache kept that much free for the next chat turn and held
+  20.4 to 20.75 GiB instead of 21.7. A prompt's blocks now go back to the device when its last step ends (3 ms,
+  no change in time to first token), so each prompt is measured on its own, and a need measured while the engine
+  loaded (a first step, whose graph captures took memory too) is forgotten once a served prompt of that size or
+  larger took less. The rule that kept a workspace under a 32nd of the cache in the allocator is gone.
+- Six kernels kept once a process what belongs to a device: paged-kv-attention's CUDA tile and its staged merge,
+  int-block-experts, fp8-block-rows, fixed-tile-gemm's CUDA GEMM, recurrent-scans' pool-delta-pipe and exl3-rows
+  raised a kernel's shared-memory limit (the opt-in above 48 KB) on the first device that launched it and remembered
+  that for the process, and int-block-experts, fp8-block-rows and fixed-tile-gemm also the CTAs that device holds and
+  its multiprocessors. The limit is set on the function as loaded on a device, so a second GPU in the process refused
+  their launches above 48 KB and sized its grids by the first GPU's count. The kernel core's new `device.cuh`
+  (`PerDevice`, `shared_memory_optin`, `resident_ctas`, `multiprocessors`) keeps each once a device, with a device
+  test (a launch above 48 KB is refused before the opt-in and runs after it). The two kernels called through ctypes
+  (paged-kv-attention's CUDA tile, fixed-tile-gemm's CUDA GEMM) now launch on their operands' device instead of the
+  thread's current one. fp8-block-rows' channel and blocks GEMMs also shared one CTA count among every configuration
+  of both (the first one launched): each configuration has its own. Outputs are unchanged. Checked on one RTX 5090;
+  no second GPU ran it.
+- paged-kv-attention's module workspaces (a split launch's partials where the caller gives none, a fused launch's
+  ring of states and sync words, a prompt chunk's state between its passes) were one a device for the whole process:
+  two engines launching, or replaying their captured graphs, side by side would have read each other's states and
+  tickets (wrong outputs, or programs waiting for ever). They are one a device and owner now: launches inside
+  `with owner(key):` take workspaces of their own and `release(key)` drops them, and attention-state gives every
+  DeviceAttention its own owner (released at close). A prompt chunk's state buffer that a larger chunk replaced was
+  freed while an earlier captured graph still wrote into it: it is kept, as the other workspaces are.
+- The CUDA attention tile's tree walk ends at a parent past the window's columns (it shifted a 64-bit mask by it and
+  read the parents past the row), and int-block-experts' quantizers and SwiGLU refuse a call of 2^31 elements or more
+  instead of counting them in a wrapped int.
+
 ## [0.19.0] - 2026-11-13
 
 ### Overview
@@ -3956,7 +4610,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/crit-labs/crit/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/crit-labs/crit/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/crit-labs/crit/compare/v0.17.2...v0.18.0
 [0.17.2]: https://github.com/crit-labs/crit/compare/v0.17.1...v0.17.2

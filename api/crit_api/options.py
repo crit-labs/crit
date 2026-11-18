@@ -7,7 +7,7 @@ from functools import lru_cache
 from crit_core.constraints import ByteGrammar, GrammarState, UnsupportedConstraint, compile_language, matches
 from crit_core.jsonfile import reject_constant as _reject_constant
 from crit_core.serving import SAMPLING as SAMPLING_FIELDS
-from crit_core.serving import (PLAIN_CAPABILITY, STREAM_CAPABILITY, STRICT_TOOLS_CAPABILITY, TEMPLATE_KWARGS,
+from crit_core.serving import (PLAIN_CAPABILITY, PROMPT_CACHE_CAPABILITY, STREAM_CAPABILITY, STRICT_TOOLS_CAPABILITY, TEMPLATE_KWARGS,
                                TEMPLATE_KWARGS_CAPABILITY, TOOL_CHOICE_CAPABILITY, TOOL_STREAM_CAPABILITY,
                                TOOL_TEMPLATE_CAPABILITY, TOOLS_CAPABILITY, sampling_capability,
                                template_kwarg_capability, template_value)
@@ -119,12 +119,18 @@ def sampling_options(body, capabilities, ignored=None):
 def crit_options(value, capabilities):
     """crit's own request extension, the body's "crit" object: {"decode": "plain"} decodes the reply one token per
     target pass, without drafting, on an engine that declares chat-plain-v1; {"timeout": seconds} gives the request
-    less time than the server's --timeout. Returns {"decode", "timeout"}, None where unset."""
+    less time than the server's --timeout; {"prompt_cache": false} has the engine prefill every prompt token,
+    whatever its prompt cache holds, on an engine that declares chat-prompt-cache-v1 (a measured request; without
+    it the cache serves the request). Returns {"decode", "timeout", "prompt_cache"}, None where unset."""
     if value is None:
-        return {"decode": None, "timeout": None}
-    if not isinstance(value, dict) or set(value) - {"decode", "timeout"}:
-        raise RequestError("crit takes an object with decode and timeout", param="crit")
-    decode, timeout = value.get("decode"), value.get("timeout")
+        return {"decode": None, "timeout": None, "prompt_cache": None}
+    if not isinstance(value, dict) or set(value) - {"decode", "timeout", "prompt_cache"}:
+        raise RequestError("crit takes an object with decode, timeout and prompt_cache", param="crit")
+    decode, timeout, cached = value.get("decode"), value.get("timeout"), value.get("prompt_cache")
+    if cached is not None:
+        if type(cached) is not bool:
+            raise RequestError("crit.prompt_cache must be true or false", param="crit.prompt_cache")
+        require(capabilities, PROMPT_CACHE_CAPABILITY, "crit.prompt_cache")
     if decode is not None:
         if decode != "plain":
             raise RequestError("crit.decode must be plain", param="crit.decode")
@@ -132,7 +138,7 @@ def crit_options(value, capabilities):
     if timeout is not None and (type(timeout) not in (int, float) or timeout <= 0
                                 or (type(timeout) is float and not math.isfinite(timeout))):
         raise RequestError("crit.timeout must be a positive number of seconds", param="crit.timeout")
-    return {"decode": decode, "timeout": timeout}
+    return {"decode": decode, "timeout": timeout, "prompt_cache": cached}
 
 
 def template_variables(capabilities):

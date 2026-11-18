@@ -3,9 +3,11 @@ LayerDirectory's slots, copies, counters, reference bits and hand bit for bit ov
 -1, routes outside the experts, unavailable slots, quotas, second touch, failures); the cache's slots hold their
 experts' bundles byte for byte; a plan and its fill capture in a CUDA graph and replay (the torch ops too, with a quota
 table and second touch); the prompt ring never hands a layer a segment its copies have not reached and never
-overwrites one a layer has not read; ranked residency swaps inside captured rounds by RankedPolicy's decisions; a KV
-pool's unused pages serve as slots and are reclaimed before KV lands there, whatever the bundle size; a cache that
-could lose a route refuses to be made."""
+overwrites one a layer has not read; ranked residency swaps inside captured rounds by RankedPolicy's decisions; recent
+residency gives RecentResidency's hits, copies and slots plan for plan (CUDA ops and torch ops, eager and in a
+captured round, across a prompt's borrowed ring); a KV pool's unused pages serve as slots and are reclaimed before KV
+lands there, whatever the bundle size; an elastic cache grows and shrinks with its addresses fixed and keeps its
+hottest experts; a cache that could lose a route refuses to be made."""
 from pathlib import Path
 import random
 import sys
@@ -18,6 +20,7 @@ if str(CODE) not in sys.path:
 import device_cache as dc  # noqa: E402
 import device_directory as dd  # noqa: E402
 import ranked_residency  # noqa: E402
+import recent_residency  # noqa: E402
 
 
 def _twin_of(cache):
@@ -34,6 +37,13 @@ def _twin_state(twin, keys):
     return key_slot, slot_key, list(twin.slot_ref)
 
 
+def _recent_twin(cache, swaps):
+    """The host twin of a recent cache: its slot positions, the slots it cannot use closed."""
+    twin = recent_residency.RecentResidency(cache.layers * cache.experts, cache.total, swaps)
+    twin.close_slots([s for s in range(cache.total) if cache.directory.slot_key[s].item() == dd.UNAVAILABLE])
+    return twin
+
+
 class _View:
     """A round's counters as crit_plugins.rounds' RoundView gives them (counter(name) -> [rows] int64)."""
 
@@ -43,6 +53,36 @@ class _View:
 
     def counter(self, name):
         return self.counters[:, self.counter_names.index(name)]
+
+
+class _Retaining:
+    """A file tier as the cache sees one: no device mapping, read() on the host, and retains set, so the cache hands
+    back the bundles it evicts. It keeps each bundle once, as such a store does: a bundle read for a cache slot
+    leaves `held`, one read for a prompt's ring (keep) stays."""
+
+    mapped, retains = False, True
+
+    def __init__(self, torch, layers, experts, bundle=64, seed=3):
+        g = torch.Generator().manual_seed(seed)
+        self.keys, self.bundle_bytes, self.layout = layers * experts, bundle, {"bundle_bytes": bundle}
+        self.all = torch.randint(0, 256, (self.keys, bundle), dtype=torch.uint8, generator=g)
+        self.held = {}                      # key -> the bytes the cache handed back
+        self.file_reads, self.host_hits, self.kept = [], [], []
+
+    def read(self, keys, into, keep=False):
+        for i, key in enumerate(keys):
+            if key in self.held:
+                into[i].copy_(self.held[key] if keep else self.held.pop(key))
+                self.host_hits.append(key)
+            else:
+                into[i].copy_(self.all[key])
+                self.file_reads.append(key)
+            if keep:
+                self.kept.append(key)
+
+    def retain(self, keys, rows):
+        for key, row in zip(keys, rows):
+            self.held[int(key)] = row.clone()
 
 
 class DeviceTests(PluginTestCase):
@@ -184,6 +224,43 @@ class DeviceTests(PluginTestCase):
             self.assertEqual(seen["resident"], len(twin.key_slot))
             self.assertEqual(plugin.facts()["expert_cache"]["directory"], "cuda" if native else "torch")
 
+    def test_a_store_that_retains_gets_every_evicted_bundle_back_and_holds_each_expert_once(self):
+        torch, device = self.torch, self.device()
+        layers, experts, slots = 4, 24, 30   # fewer slots than the 96 experts, a prompt's ring among them
+        for native in self.kernels():
+            with self.subTest(native=native):
+                source = _Retaining(torch, layers, experts)
+                plugin = self.assemble(options={"native": native, "ring_slots": experts})["expert_residency"]
+                cache = plugin.cache(layers, experts, source.layout, slots + experts, device, source)
+                self.assertTrue(cache.round_problems())            # a file tier: read on the host, not captured
+                rng = random.Random(8)
+                for step in range(120):
+                    layer = rng.randrange(layers)
+                    ids = torch.tensor([rng.randrange(experts) for _ in range(6)], device=device).view(2, 3)
+                    table = cache.plan(layer, ids).tolist()
+                    for e in set(ids.reshape(-1).tolist()):
+                        self.assertTrue(torch.equal(cache.store[table[e]].cpu(), source.all[layer * experts + e]))
+                    _, slot_key = cache.directory.snapshot()
+                    resident = {key for key in slot_key if key >= 0}
+                    # Each expert is in a cache slot or in the store's hands, never both, and what came back is
+                    # the expert's own bytes.
+                    self.assertFalse(resident & set(source.held), f"step {step}")
+                    for key, row in source.held.items():
+                        self.assertTrue(torch.equal(row, source.all[key]))
+                # Every expert that was ever read and is not resident came back: nothing was dropped on the way.
+                self.assertEqual(set(source.file_reads) - resident, set(source.held))
+                self.assertTrue(source.host_hits)                  # and evicted experts came up again from the host
+                self.assertEqual(len(set(source.file_reads)), len(source.file_reads))   # the file once an expert
+                # A prompt chunk's ring slots keep nothing: the store keeps its copy of what it hands them.
+                held = dict(source.held)
+                ids = torch.tensor(sorted(key % experts for key in held if key < experts)[:3], device=device).view(1, -1)
+                if ids.numel():
+                    _, table = cache.prompt(0, ids)
+                    self.assertEqual(sorted(source.kept), ids.reshape(-1).tolist())
+                    self.assertEqual(set(source.held), set(held))
+                    cache.end_prompt()
+                cache.close()
+
     def test_a_plan_and_its_fill_capture_and_replay(self):
         if self.device() != "cuda":
             self.skipTest("CUDA graphs")
@@ -218,6 +295,27 @@ class DeviceTests(PluginTestCase):
                     expected = twin.plan_layer(1, routes, 2).table
                     self.assertEqual(table.tolist(), expected)
                     self.check_slots(cache, store, 1, expected)
+
+    def test_a_recording_cache_keeps_its_last_decode_routes_in_order(self):
+        torch, device = self.torch, self.device()
+        store = self.store(2, 16)
+        cache = self.cache(store, 2, 16, 20, ring_slots=0, record_routes=5)
+        self.assertEqual(self.cache(store, 2, 16, 20, ring_slots=0).routes(), [])
+        cache.plan(0, torch.tensor([[1, 2], [3, -1]], device=device))
+        cache.plan(1, torch.tensor([[4, 5], [-1, -1]], device=device))   # a held row records nothing
+        self.assertEqual(cache.routes(), [(0, [1, 2]), (0, [3]), (1, [4, 5])])
+        cache.plan(0, torch.tensor([[6, 7], [8, 9]], device=device))   # past the ring of 5 rows: the oldest goes
+        self.assertEqual(cache.routes(), [(0, [3]), (1, [4, 5]), (0, [6, 7]), (0, [8, 9])])
+        if device == "cuda":
+            ids = torch.tensor([[10, 11]], device=device)
+            cache.plan(1, ids)   # once at the shape outside a capture
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                cache.plan(1, ids)
+            ids.copy_(torch.tensor([[12, 13]], device=device))
+            graph.replay()
+            torch.cuda.synchronize()
+            self.assertEqual(cache.routes()[-2:], [(1, [10, 11]), (1, [12, 13])])
 
     def test_count_round_adds_each_rows_reads_and_hits_into_the_rounds_counters(self):
         torch, device = self.torch, self.device()
@@ -329,8 +427,6 @@ class DeviceTests(PluginTestCase):
                         for layer in range(layers):
                             cache.plan(layer, torch.tensor([rng.randrange(experts) for _ in range(6)], device="cuda"))
                     before = cache.directory.snapshot()[0]
-                    ring_slots = set(cache.ring_slots)
-                    before = [-1 if slot in ring_slots else slot for slot in before]   # the borrowed ring empties
                     for layer in (range(layers) if chunk < 3 else (2, 0, 3, 1)):
                         routes = 30 if chunk != 1 else 4    # long chunks stage every miss, a short one its routed misses
                         ids = torch.tensor([rng.randrange(experts) for _ in range(routes)], device="cuda").view(-1, 2)
@@ -343,13 +439,344 @@ class DeviceTests(PluginTestCase):
                         sums[chunk, layer] = torch.where(routed, got, expected[layer])
                     if chunk == 0:
                         self.assertEqual(cache.telemetry(sync=True)["slots"], 80 - 2 * experts)
-                    self.assertEqual(cache.directory.snapshot()[0], before)   # nothing admitted, nothing evicted
+                    # a borrowed ring: the whole of it for long chunks, a slot a route for the short one
+                    held = cache._ring_now
+                    self.assertEqual(len(held), 4 if chunk == 1 and ring == "borrow" else 2 * experts)
+                    before = [-1 if slot in set(held) else slot for slot in before]   # the borrowed slots empty
+                    self.assertEqual(cache.directory.snapshot()[0], before)   # nothing admitted, nothing else evicted
                     cache.end_prompt()
                 torch.cuda.synchronize()
                 self.assertTrue(torch.equal(sums, expected.expand(4, -1, -1)), (native, ring))
                 seen = cache.telemetry(sync=True)
                 self.assertGreater(seen["prompt_copies"], 0)
                 self.assertEqual(seen["slots"], 80 if ring == "borrow" else 80 - 2 * experts)
+
+    def test_an_elastic_cache_grows_and_shrinks_with_its_addresses_fixed(self):
+        device = self.device()
+        if device != "cuda":
+            self.skipTest("an elastic range is the CUDA driver's")
+        from crit_plugins.memory import of
+        if not of(device).elastic_ranges:
+            self.skipTest("the driver's virtual memory API is not reachable here")
+        layers, experts = 2, 32
+        store = self.store(layers, experts, bundle=1 << 20)   # 1 MiB bundles: a 2 MiB granule holds two
+        for policy, side in (("ranked", False), ("ranked", True), ("recent", True)):
+            with self.subTest(policy=policy, side_swaps=side):
+                self.elastic_case(store, layers, experts, policy, side)
+
+    def elastic_case(self, store, layers, experts, policy, side):
+        torch, device = self.torch, self.device()
+        cache = self.cache(store, layers, experts, 4, policy=policy, cpu_tier=True, ring_slots=0, max_slots=48,
+                           max_swaps=8, burst_swaps=8, period=1, side_swaps=side)
+        base = cache.store.data_ptr()
+        self.assertEqual(cache.backed_slots(), 4)
+        rng = random.Random(3)
+
+        def plans(rounds):
+            for _ in range(rounds):
+                cache.start_round(None)
+                for layer in range(layers):
+                    ids = torch.tensor([rng.randrange(experts) for _ in range(6)], device=device).view(2, 3)
+                    table = cache.plan(layer, ids).tolist()
+                    torch.cuda.synchronize()
+                    self.check_slots(cache, store, layer, table)
+                    self.assertTrue(all(s < cache.backed for s in table if s >= 0))
+                for held in (cache._ranked, cache._recent):
+                    if held is not None:
+                        held.join()
+        plans(8)
+        self.assertEqual(cache.grow(40), 40)
+        self.assertEqual(cache.store.data_ptr(), base)   # the addresses stay
+        plans(12)
+        resident = sum(int(x >= 0) for x in cache.directory.key_slot[:layers * experts].tolist())
+        self.assertGreater(resident, 4)
+        self.assertEqual(cache.shrink(10), 10)
+        plans(8)
+        self.assertEqual(cache.grow(30), 30)
+        plans(6)
+        self.assertEqual(cache.shrink(6), 6)   # right after a boundary that copied swaps on the side stream
+        plans(6)
+        # a shrink keeps the hottest experts: those in the leaving slots take the coldest kept experts' slots
+        self.assertEqual(cache.grow(30), 30)
+        plans(10)
+        torch.cuda.synchronize()
+        if cache._recent is not None:
+            cache._recent.settle()
+        elif cache._ranked.pending is not None:
+            cache._ranked.join()
+            cache._ranked._apply_pending()
+
+        def ranks():   # each resident expert's rank under the policy: its score, or the round it was last routed in
+            keys = cache.directory.slot_key[:cache.backed].tolist()
+            if cache._recent is not None:
+                last = cache.directory.slot_last[:cache.backed].tolist()
+                return [last[s] for s, k in enumerate(keys) if k >= 0]
+            scores = cache._ranked.scores.tolist()
+            return [scores[k] for k in keys if k >= 0]
+        held = sorted(ranks(), reverse=True)
+        self.assertEqual(cache.shrink(8), 8)
+        after = ranks()
+        self.assertEqual(sorted(after, reverse=True), held[:len(after)])
+        self.assertEqual(len(after), min(8, len(held)))
+        for slot, key in enumerate(cache.directory.slot_key[:cache.backed].tolist()):
+            if key >= 0:   # a moved expert's slot holds its bundle
+                self.assertTrue(torch.equal(cache.store[slot].cpu(), store.bundle(key // experts, key % experts)))
+        plans(4)
+        torch.cuda.synchronize()
+        cache.close()
+
+    def test_recent_residency_plans_and_copies_by_its_rule(self):
+        cuda = self.device() == "cuda"
+        for native in self.kernels():
+            for captured in ((False, True) if cuda and native else (False,)):
+                with self.subTest(native=native, captured=captured):
+                    self.recent_case(native, captured)
+
+    def recent_case(self, native, captured, layers=3, experts=24, slots=20, swaps=6, rounds=40):
+        torch, device = self.torch, self.device()
+        store = self.store(layers, experts, bundle=1024)
+        cache = self.cache(store, layers, experts, slots, native=native, policy="recent", cpu_tier=True, ring_slots=0,
+                           max_swaps=swaps)
+        twin = _recent_twin(cache, swaps)
+        profile = [5, 30, 31, 60, 7, 5, 900]
+        self.assertEqual([k for k, _ in cache.preload(profile)], twin.preload(profile))
+        tokens, top = 3, 4
+        ids = [torch.full((tokens, top), -1, dtype=torch.int64, device=device) for _ in range(layers)]
+        view = _View(torch, device, 4)
+
+        def one_round():
+            cache.start_round(view)
+            tables = [cache.plan(layer, ids[layer]).clone() for layer in range(layers)]
+            cache.count_round(view)
+            return tables
+
+        graph = tables = None
+        if captured:
+            one_round()   # the shapes once outside capture: a round without routes
+            twin.start_round()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    tables = one_round()
+        rng = random.Random(21)
+        hot = [rng.sample(range(experts), 8) for _ in range(layers)]
+        for r in range(rounds):
+            if r == rounds // 2:   # the routing moves on
+                hot = [rng.sample(range(experts), 8) for _ in range(layers)]
+            routes = [[[rng.choice(hot[layer]) if rng.random() < 0.8 else rng.choice([-1, rng.randrange(experts)])
+                        for _ in range(top)] for _ in range(tokens)] for layer in range(layers)]
+            for layer in range(layers):
+                ids[layer].copy_(torch.tensor(routes[layer], device=device))
+            if graph is not None:
+                graph.replay()
+            else:
+                tables = one_round()
+            if device == "cuda":
+                torch.cuda.synchronize()
+            twin.start_round()
+            for layer in range(layers):
+                flat = [e for row in routes[layer] for e in row if e >= 0]
+                distinct = list(dict.fromkeys(flat))
+                hits = twin.plan([layer * experts + e for e in distinct])
+                expected = [-1] * experts
+                for e, hit in zip(distinct, hits):
+                    expected[e] = int(twin.key_slot[layer * experts + e]) if hit else -2
+                self.assertEqual(tables[layer].tolist(), expected, (r, layer))
+                self.check_slots(cache, store, layer, expected)   # a hit's slot holds its bundle: its copy landed
+            count = int(cache._recent.state[3])
+            self.assertEqual([tuple(job) for job in cache._recent.pending[:count].tolist()], twin.pending, r)
+        seen = cache.telemetry(sync=True)
+        self.assertEqual((seen["reads"], seen["hits"], seen["fills"]), (twin.reads, twin.hits, twin.copies))
+        self.assertEqual(seen["cpu"], twin.reads - twin.hits)
+        self.assertGreater(twin.copies, swaps)
+        self.assertGreater(twin.hits, twin.reads // 3)
+
+    def test_recent_residency_lends_a_prompt_its_ring_and_takes_it_back(self):
+        torch, device = self.torch, self.device()
+        layers, experts, slots, swaps = 2, 8, 20, 8   # 16 experts over 4 slots beside the ring's 16
+        store = self.store(layers, experts, bundle=1024)
+        cache = self.cache(store, layers, experts, slots, policy="recent", cpu_tier=True, max_swaps=swaps)
+        self.assertEqual(len(cache.ring_slots), 2 * experts)
+        twin = _recent_twin(cache, swaps)
+        rng = random.Random(4)
+
+        def decode(rounds):
+            for _ in range(rounds):
+                cache.start_round(None)
+                twin.start_round()
+                for layer in range(layers):
+                    routed = rng.sample(range(experts), 5)
+                    table = cache.plan(layer, torch.tensor(routed, device=device)).tolist()
+                    hits = twin.plan([layer * experts + e for e in routed])
+                    for e, hit in zip(routed, hits):
+                        self.assertEqual(table[e], int(twin.key_slot[layer * experts + e]) if hit else -2)
+                    self.check_slots(cache, store, layer, table)
+                cache._recent.join()
+        decode(6)   # the cache fills every slot it has, the ring's among them
+        self.assertTrue(any(cache.directory.slot_key[s].item() >= 0 for s in cache.ring_slots))
+        for layer in range(layers):   # a prompt chunk routing every expert: staged through the ring, nothing admitted
+            ids = torch.arange(experts, device=device).repeat(4, 1)
+            held, table = cache.prompt(layer, ids)
+            if device == "cuda":
+                torch.cuda.synchronize()
+            for e, slot in enumerate(table.tolist()):
+                self.assertTrue(torch.equal(held[slot].cpu(), store.bundle(layer, e)))
+        twin.close_slots(cache.ring_slots)
+        cache.end_prompt()
+        twin.open_slots(cache.ring_slots)
+        decode(6)   # the ring's slots serve experts again
+        self.assertTrue(any(cache.directory.slot_key[s].item() >= 0 for s in cache.ring_slots))
+        before = sum(int(k >= 0) for k in cache.directory.slot_key[:cache.total].tolist())
+        for layer in range(layers):   # a short chunk borrows as many ring slots as it has routes, not the ring
+            held, table = cache.prompt(layer, torch.tensor([[0, 3, 5]], device=device))
+            if device == "cuda":
+                torch.cuda.synchronize()
+            for e in (0, 3, 5):
+                self.assertTrue(torch.equal(held[table[e].item()].cpu(), store.bundle(layer, e)))
+        self.assertEqual(cache._ring_now, cache.ring_slots[:3])
+        self.assertGreaterEqual(sum(int(k >= 0) for k in cache.directory.slot_key[:cache.total].tolist()), before - 3)
+        twin.close_slots(cache.ring_slots[:3])
+        cache.end_prompt()
+        twin.open_slots(cache.ring_slots[:3])
+        decode(4)
+        self.assertEqual(sorted(cache.directory.key_slot[:layers * experts].tolist()),
+                         sorted(int(v) if v >= 0 else -1 for v in twin.key_slot))
+
+    def test_a_pinned_core_keeps_its_slots_and_its_bundles_leave_host_memory(self):
+        # Experts in one place: the store leaves the core's bundles out of host memory (a store on a file reads them
+        # from it again), the cache holds them in slots no plan, preload, prompt or shrink takes.
+        import tempfile
+        import expert_store
+        torch, device = self.torch, self.device()
+        layers, experts, B, swaps = 2, 16, 1 << 16, 6    # bundles of 16 pages
+        folder = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(folder.cleanup)
+        store = expert_store.BundleStore({"bundle_bytes": B}, layers, experts, device,
+                                         path=Path(folder.name) / "experts.bin", identity={"test": 1})
+        self.addCleanup(store.close)
+        g = torch.Generator().manual_seed(5)
+        bundles = torch.randint(1, 256, (layers * experts, B), dtype=torch.uint8, generator=g)
+        for key in range(layers * experts):
+            store.put(key // experts, key % experts, bundles[key])
+        core = [3, 17, 4, 30, 9, 21]
+        self.assertEqual(store.leave(core), frozenset(core))
+        from crit_plugins.memory import of
+        elastic = device == "cuda" and bool(of(device).elastic_ranges)
+        cache = self.cache(store, layers, experts, 28, policy="recent", cpu_tier=True, max_swaps=swaps,
+                           ring_slots=experts, **({"max_slots": 40} if elastic else {}))
+        host, _ = store.region()
+        self.assertEqual(store.left_bytes, len(core) * B)
+        for key in range(layers * experts):   # the host holds every other bundle, and the filler where the core was
+            held = host.view(layers * experts, B)[key]
+            self.assertEqual(torch.equal(held, bundles[key]), key not in core)
+            self.assertEqual(int(held.max()) == 0, key in core)
+            self.assertTrue(torch.equal(store.bundle(key // experts, key % experts), bundles[key]))
+        with self.assertRaisesRegex(ValueError, "pin before any preload|empty"):
+            cache.pin(range(layers * experts))
+        pairs = cache.pin(core)
+        self.assertEqual([k for k, _ in pairs], core)
+        self.assertFalse({s for _, s in pairs} & (set(cache.ring_slots) | {cache.scratch}))
+        with self.assertRaisesRegex(ValueError, "has its pinned core already"):
+            cache.pin([1])
+
+        def intact():
+            if device == "cuda":
+                torch.cuda.synchronize()
+            self.assertTrue(cache.pinned_intact())
+            for key, slot in pairs:
+                self.assertEqual(int(cache.directory.key_slot[key]), slot)
+                self.assertTrue(torch.equal(cache.store[slot].cpu(), bundles[key]))
+        intact()
+        loaded = cache.preload([5, 3, 6, 17, 40])    # a profile beside the core: its keys take other slots
+        self.assertEqual([k for k, _ in loaded], [5, 6])
+        self.assertFalse({s for _, s in loaded} & set(cache.pinned))
+        intact()
+        rng = random.Random(8)
+
+        def decode(rounds):
+            for _ in range(rounds):
+                cache.start_round(None)
+                for layer in range(layers):
+                    routed = rng.sample(range(experts), 9)
+                    table = cache.plan(layer, torch.tensor(routed, device=device)).tolist()
+                    for e in routed:
+                        if layer * experts + e in core:
+                            self.assertGreaterEqual(table[e], 0)    # an expert of the core never misses
+                    self.check_slots(cache, store, layer, table)
+                cache._recent.join()
+        decode(30)    # every other slot turns over many times
+        intact()
+        for layer in range(layers):   # a prompt chunk routing every expert: the core is read in place
+            held, table = cache.prompt(layer, torch.arange(experts, device=device).repeat(4, 1))
+            if device == "cuda":
+                torch.cuda.synchronize()
+            for e, slot in enumerate(table.tolist()):
+                self.assertTrue(torch.equal(held[slot].cpu(), bundles[layer * experts + e]))
+                if layer * experts + e in core:
+                    self.assertEqual(slot, dict(pairs)[layer * experts + e])
+        cache.end_prompt()
+        decode(6)
+        intact()
+        if elastic:   # a shrink never reaches the core, and compaction leaves it where it is
+            self.assertEqual(cache.grow(40), 40)
+            decode(10)
+            kept = cache.shrink(1)
+            self.assertGreater(kept, max(cache.pinned) - 1)
+            self.assertLess(kept, 40)
+            intact()
+            decode(6)
+            intact()
+        self.assertEqual(cache.telemetry(sync=True)["pinned"], len(core))
+        cache.close()
+
+    def test_side_stream_swaps_land_before_a_plan_reads_them_in_captured_rounds(self):
+        torch, device = self.torch, self.device()
+        if device != "cuda":
+            self.skipTest("a side stream is CUDA's")
+        layers, experts, slots = 2, 16, 6
+        store = self.store(layers, experts, bundle=4096)
+        cache = self.cache(store, layers, experts, slots, policy="ranked", cpu_tier=True, period=2, ring_slots=0,
+                           max_swaps=3, burst_swaps=4)
+        side = self.cache(store, layers, experts, slots, policy="ranked", cpu_tier=True, period=2, ring_slots=0,
+                          max_swaps=3, burst_swaps=4, side_swaps=True)
+        ids = [torch.zeros(3, dtype=torch.int64, device=device) for _ in range(layers)]
+        view = _View(torch, device, 4)
+
+        def one_round(c):
+            c.start_round(view)
+            tables = [c.plan(layer, ids[layer]).clone() for layer in range(layers)]
+            c.count_round(view)
+            return tables
+
+        graphs = {}
+        for c in (cache, side):
+            one_round(c)   # the shapes once outside capture
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                torch.cuda.synchronize()
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, stream=stream):
+                    tables = one_round(c)
+            graphs[id(c)] = (g, tables)
+        rng = random.Random(9)
+        resident = {}
+        for r in range(16):
+            hot = [[3, 9, rng.randrange(experts)], [1, 4, rng.randrange(experts)]] if r < 8 else                 [[11, 12, rng.randrange(experts)], [13, 14, rng.randrange(experts)]]
+            for layer in range(layers):
+                ids[layer].copy_(torch.tensor(hot[layer], device=device))
+            for c in (cache, side):
+                g, tables = graphs[id(c)]
+                g.replay()
+                torch.cuda.synchronize()
+                for layer in range(layers):
+                    self.check_slots(c, store, layer, tables[layer].tolist())   # every slot a plan names holds its bundle
+                resident[id(c)] = sum(int(x >= 0) for x in c.directory.key_slot[:layers * experts].tolist())
+        self.assertGreater(int(side._ranked.swapped.item()), 0)
+        self.assertEqual(resident[id(side)], resident[id(cache)])   # the same residency, one round later at most
 
     def test_ranked_residency_swaps_inside_captured_rounds_by_its_policy(self):
         torch, device = self.torch, self.device()

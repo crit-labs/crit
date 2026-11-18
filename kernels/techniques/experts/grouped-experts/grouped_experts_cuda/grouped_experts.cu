@@ -40,6 +40,20 @@ __host__ __device__ constexpr int depth() {   // 64-k blocks of weights in fligh
            : (TILES == 1 ? 6 : 4);
 }
 
+// The lane's scale word of a 4-bit format's weights k .. k + 15 of `row` (int4_zp: its scale and zero point).
+template <int F>
+__device__ __forceinline__ uint32_t load_scale(const std::uint8_t* scales, int row, int K, int k,
+                                               const std::uint8_t* zeros = nullptr, int group = 0) {
+    if constexpr(kZp<F>) {
+        const long long at = static_cast<long long>(row) * (K / group) + k / group;
+        return uint32_t(__ldg(reinterpret_cast<const uint16_t*>(scales) + at)) | (uint32_t(__ldg(zeros + at)) << 16);
+    } else if constexpr(F == int(Format::mxfp4)) {
+        return __ldg(scales + static_cast<long long>(row) * (K / 32) + k / 32);
+    } else {
+        return __ldg(scales + static_cast<long long>(row) * (K / 16) + k / 16);
+    }
+}
+
 // The lane's 16 weights k .. k + 15 of `row` (k a multiple of 16).
 template <int F>
 __device__ __forceinline__ Raw<F> load_raw(const std::uint8_t* codes, const std::uint8_t* scales, int row, int K,
@@ -58,11 +72,7 @@ __device__ __forceinline__ Raw<F> load_raw(const std::uint8_t* codes, const std:
     } else {
         const uint2 a = __ldg(reinterpret_cast<const uint2*>(codes + static_cast<long long>(row) * (K / 2) + k / 2));
         r.w[0] = a.x; r.w[1] = a.y;
-        if constexpr(kZp<F>) {
-            const long long at = static_cast<long long>(row) * (K / group) + k / group;
-            r.s = uint32_t(__ldg(reinterpret_cast<const uint16_t*>(scales) + at)) | (uint32_t(__ldg(zeros + at)) << 16);
-        } else if constexpr(F == int(Format::mxfp4)) r.s = __ldg(scales + static_cast<long long>(row) * (K / 32) + k / 32);
-        else r.s = __ldg(scales + static_cast<long long>(row) * (K / 16) + k / 16);
+        r.s = load_scale<F>(scales, row, K, k, zeros, group);
     }
     return r;
 }
@@ -177,10 +187,14 @@ __device__ __forceinline__ int block_row(int row, int inter) {
 // One block: item blockIdx.y, WARPS warps of TILES MMA row tiles each: down, 16 output rows a tile; gate/up, 8 inter
 // rows a tile, its 8 gate rows over the same 8 up rows, so a lane holds both halves of its SwiGLU. Which rows a warp
 // owns changes no output's MMA chain, so decode (TILES 1: more warps an expert) and prompt (TILES 2) agree bit for bit.
-// DEPTH: 64-k blocks of weights in flight per warp (0: the format's depth<F, TILES>()). The knobs (kernel.json's
-// structures decode, prompt and prompt-wide: WARPS, TILES, DEPTH and the staged chunk) change no output's operations or
-// their order: every configuration gives the same bits.
-template <int F, int NT, int TILES, int WARPS, int DEPTH, bool GATEUP, bool A4>
+// DEPTH: 64-k blocks of weights in flight per warp (0: the format's depth<F, TILES>()). READ (decode items; the
+// kernel's 1 or 2): how a warp asks for its weights, 1 a 64-k block at a time (8 bytes a lane of a 4-bit format, 16 of
+// FP8), 2 128 bytes of a row at a time (4 blocks of a 4-bit format, 2 of FP8; BF16's blocks are 128 bytes already);
+// the knob's 0 is the launch's choice by the pass's K (2 from kLineK on). The knobs (kernel.json's structures decode,
+// prompt and prompt-wide: WARPS, TILES, DEPTH, READ and the staged chunk) change no output's operations or their
+// order: every configuration gives the same bits.
+constexpr int kLineK = 256;   // READ 0: a pass of this many k values or more (a whole request of either format)
+template <int F, int NT, int TILES, int WARPS, int DEPTH, bool GATEUP, bool A4, int READ>
 __global__ void __launch_bounds__(WARPS * 32) expert_kernel(Pass p) {
     constexpr int R = 8 * NT, ROWS = 2 * TILES, D = DEPTH > 0 ? DEPTH : depth<F, TILES>();
     static_assert(TILES == 1 || TILES % 2 == 0, "W4A4's 16-row blocks are a warp pair (TILES 1) or tile pairs");
@@ -248,114 +262,247 @@ __global__ void __launch_bounds__(WARPS * 32) expert_kernel(Pass p) {
         const int r = routes[g];
         brow = r >= 0 ? p.in + static_cast<long long>(r / p.in_div) * K + 16 * t4 : nullptr;
     }
-    Raw<F> ring[D][ROWS];
-    uint4 bring[kDirect ? D : 1][2];   // decode items: B operands in flight as deep as the weights
-    if(live) {
+    // One 64-k block's decode and MMAs from its operands in registers: the weights `raw` of the warp's rows and (decode
+    // items) the routes' inputs `b_now`. Every path below runs it for blocks 0 .. blocks - 1 in order.
+    const int tile_elems = 8 * NT * width;
+    auto block = [&](int kb, const Raw<F>* raw, const uint4* b_now) {
+        const int k = 64 * kb, kk = k % p.chunk;
+        uint32_t fr[ROWS][8], fl[kZp<F> ? ROWS : 1][8];
 #pragma unroll
-        for(int d = 0; d < D; ++d)
-            if(d < blocks) {
+        for(int r = 0; r < ROWS; ++r) {
+            if constexpr(kZp<F>) decode_split<F>(raw[r], fr[r], fl[r]);
+            else if constexpr(kTable) decode_table<F>(raw[r], table, fr[r]);
+            else decode<F>(raw[r], fr[r]);
+        }
+#pragma unroll
+        for(int n = 0; n < NT; ++n) {
+            if(n >= active) break;
+            uint4 v0, v1;
+            if constexpr(kDirect) {
+                v0 = b_now[0];
+                v1 = b_now[1];
+            } else {
+                const bf16* half = kAsync ? tile + ((k / p.chunk) & 1) * tile_elems : tile;
+                const uint4* bp = reinterpret_cast<const uint4*>(half + (8 * n + g) * width + kk + 16 * t4);
+                v0 = bp[0];
+                v1 = bp[1];
+            }
+            const uint32_t bw[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};   // route 8n + g
+#pragma unroll
+            for(int t = 0; t < TILES; ++t)
+#pragma unroll
+                for(int s = 0; s < 4; ++s) {
+                    kc::mma_bf16_m16n8k16(kBlock ? part[kBlock ? t : 0][kBlock ? n : 0] : acc[t][n],
+                                          fr[2 * t][2 * s], fr[2 * t + 1][2 * s], fr[2 * t][2 * s + 1],
+                                          fr[2 * t + 1][2 * s + 1], bw[2 * s], bw[2 * s + 1]);
+                    if constexpr(kZp<F>)   // the same MMA on the weights' lo parts
+                        kc::mma_bf16_m16n8k16(acc[t][n], fl[2 * t][2 * s], fl[2 * t + 1][2 * s],
+                                              fl[2 * t][2 * s + 1], fl[2 * t + 1][2 * s + 1], bw[2 * s],
+                                              bw[2 * s + 1]);
+                }
+        }
+        if constexpr(kBlock) {
+            if((kb & 1) || kb + 1 == blocks) {   // the end of a 128-k scale block
+                const int kblocks = (K + 127) / 128;
+                const float* bs = reinterpret_cast<const float*>(scales);
+#pragma unroll
+                for(int t = 0; t < TILES; ++t) {
+                    const float s_lo = bs[block_row<GATEUP>(rows[2 * t], I) * kblocks + kb / 2];
+                    const float s_hi = bs[block_row<GATEUP>(rows[2 * t + 1], I) * kblocks + kb / 2];
+#pragma unroll
+                    for(int n = 0; n < NT; ++n) {
+                        if(n >= active) break;
+#pragma unroll
+                        for(int i = 0; i < 4; ++i) {
+                            acc[t][n][i] = __fmaf_rn(part[t][n][i], i < 2 ? s_lo : s_hi, acc[t][n][i]);
+                            part[t][n][i] = 0.0f;
+                        }
+                    }
+                }
+            }
+        }
+    };
+    // The routes' inputs of block kb (decode items), zeros for a lane without a route.
+    auto inputs = [&](int kb, uint4* into) {
+        if(brow) {
+            into[0] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * kb));
+            into[1] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * kb) + 1);
+        } else {
+            into[0] = into[1] = make_uint4(0u, 0u, 0u, 0u);
+        }
+    };
+    // Decode items may ask for 128 bytes of a row at a time (READ 2): the weights of kGroup blocks loaded together
+    // (each lane its bytes of every one, as load_raw gives them), S such steps in flight (the D blocks of the other
+    // path); the blocks past the last whole step are read alone. The same operands in the same MMAs: the other path's
+    // bits. What it buys is the size of a request: a block at a time, a warp asks for 32 bytes of a row (a 4-bit
+    // format) or 64 (FP8), the rest of the same cache lines one block later, and a decode pass is a few warps a
+    // multiprocessor, each waiting on its own chain of such requests. RTX 5090, weights from DRAM, by blocks and by
+    // 128 bytes: NVFP4 2560 x 640 experts, gate/up at 1 / 4 / 8 tokens 28.4 / 93.2 / 182.5 us and 16.8 / 50.2 / 95.9
+    // (0.65 and 1.1 to 1.5 TB/s), down 10.5 / 29.3 / 50.0 and 10.2 / 26.6 / 46.0; FP8 4096 x 1536 gate/up at 1 / 4
+    // tokens 74.5 / 263.7 and 63.0 / 217.6. 64 bytes a request (two 4-bit blocks) gave 20.3 us where 128 give 16.8,
+    // 192 and 256 give 18; BF16 blocks are 128 bytes and gain nothing from 256.
+    constexpr bool kLines = kDirect && F != int(Format::bf16) && READ == 2;
+    auto by_lines = [&]() {
+        if constexpr(kLines) {   // (the other kernels instantiate nothing here)
+            constexpr int kGroup = (kFour<F> || kZp<F>) ? 4 : 2, S = D > kGroup ? D / kGroup : 1;
+            const int steps = live ? blocks / kGroup : 0;   // a warp past the matrix's rows multiplies nothing
+            Raw<F> ring[S][kGroup][ROWS];
+            uint4 bring[S][kGroup][2];
+            auto fetch = [&](int st, int slot) {
+#pragma unroll
+                for(int h = 0; h < kGroup; ++h) {
+#pragma unroll
+                    for(int r = 0; r < ROWS; ++r)
+                        ring[slot][h][r] = load_raw<F>(codes, scales, rows[r], K, 64 * (kGroup * st + h) + 16 * t4, zeros,
+                                                       L.group);
+                    inputs(kGroup * st + h, bring[slot][h]);
+                }
+            };
+#pragma unroll
+            for(int d = 0; d < S; ++d)
+                if(d < steps) fetch(d, d);
+            for(int s0 = 0; s0 < steps; s0 += S) {
+#pragma unroll
+                for(int d = 0; d < S; ++d) {
+                    const int st = s0 + d;
+                    if(st >= steps) break;
+                    Raw<F> raw[kGroup][ROWS];
+                    uint4 b_now[kGroup][2];
+#pragma unroll
+                    for(int h = 0; h < kGroup; ++h) {
+#pragma unroll
+                        for(int r = 0; r < ROWS; ++r) raw[h][r] = ring[d][h][r];
+                        b_now[h][0] = bring[d][h][0];
+                        b_now[h][1] = bring[d][h][1];
+                    }
+                    if(st + S < steps) fetch(st + S, d);
+#pragma unroll
+                    for(int h = 0; h < kGroup; ++h) block(kGroup * st + h, raw[h], b_now[h]);
+                }
+            }
+            for(int kb = steps * kGroup; live && kb < blocks; ++kb) {
+                Raw<F> raw[ROWS];
+                uint4 b_now[2];
 #pragma unroll
                 for(int r = 0; r < ROWS; ++r)
-                    ring[d][r] = load_raw<F>(codes, scales, rows[r], K, 64 * d + 16 * t4, zeros, L.group);
+                    raw[r] = load_raw<F>(codes, scales, rows[r], K, 64 * kb + 16 * t4, zeros, L.group);
+                inputs(kb, b_now);
+                block(kb, raw, b_now);
+            }
+        }
+    };
+    // A block at a time (READ 1, prompt items, BF16): D blocks of weights in flight.
+    auto by_blocks = [&]() {
+        Raw<F> ring[D][ROWS];
+        uint4 bring[kDirect ? D : 1][2];   // decode items: B operands in flight as deep as the weights
+        if(live) {
+#pragma unroll
+            for(int d = 0; d < D; ++d)
+                if(d < blocks) {
+#pragma unroll
+                    for(int r = 0; r < ROWS; ++r)
+                        ring[d][r] = load_raw<F>(codes, scales, rows[r], K, 64 * d + 16 * t4, zeros, L.group);
+                    if constexpr(kDirect) {
+                        if(brow) {
+                            bring[d][0] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * d));
+                            bring[d][1] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * d) + 1);
+                        } else {
+                            bring[d][0] = bring[d][1] = make_uint4(0u, 0u, 0u, 0u);
+                        }
+                    }
+                }
+        }
+        if constexpr(kAsync) stage_async(p, routes, 8 * active, K, 0, K < p.chunk ? K : p.chunk, tile);
+        for(int b0 = 0; b0 < blocks; b0 += D) {
+#pragma unroll
+            for(int d = 0; d < D; ++d) {
+                const int kb = b0 + d;
+                if(kb >= blocks) break;
+                const int k = 64 * kb, kk = k % p.chunk;
+                if(kAsync && kk == 0) {   // chunk k / chunk landed; every warp is done with the other half
+                    kc::cp_async_wait_all();
+                    __syncthreads();
+                    const int next = k + p.chunk;
+                    if(next < K)
+                        stage_async(p, routes, 8 * active, K, next, K - next < p.chunk ? K - next : p.chunk,
+                                    tile + ((next / p.chunk) & 1) * tile_elems);
+                }
+                if(!live) continue;
+                uint32_t fr[ROWS][8], fl[kZp<F> ? ROWS : 1][8];
+#pragma unroll
+                for(int r = 0; r < ROWS; ++r) {
+                    if constexpr(kZp<F>) decode_split<F>(ring[d][r], fr[r], fl[r]);
+                    else if constexpr(kTable) decode_table<F>(ring[d][r], table, fr[r]);
+                    else decode<F>(ring[d][r], fr[r]);
+                }
+                uint4 b_now[2];
                 if constexpr(kDirect) {
-                    if(brow) {
-                        bring[d][0] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * d));
-                        bring[d][1] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * d) + 1);
+                    b_now[0] = bring[d][0];
+                    b_now[1] = bring[d][1];
+                }
+                if(kb + D < blocks) {
+#pragma unroll
+                    for(int r = 0; r < ROWS; ++r) ring[d][r] =
+                            load_raw<F>(codes, scales, rows[r], K, 64 * (kb + D) + 16 * t4, zeros, L.group);
+                    if constexpr(kDirect) {
+                        if(brow) {
+                            bring[d][0] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * (kb + D)));
+                            bring[d][1] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * (kb + D)) + 1);
+                        }
+                    }
+                }
+#pragma unroll
+                for(int n = 0; n < NT; ++n) {
+                    if(n >= active) break;
+                    uint4 v0, v1;
+                    if constexpr(kDirect) {
+                        v0 = b_now[0];
+                        v1 = b_now[1];
                     } else {
-                        bring[d][0] = bring[d][1] = make_uint4(0u, 0u, 0u, 0u);
+                        const bf16* half = kAsync ? tile + ((k / p.chunk) & 1) * tile_elems : tile;
+                        const uint4* bp = reinterpret_cast<const uint4*>(half + (8 * n + g) * width + kk + 16 * t4);
+                        v0 = bp[0];
+                        v1 = bp[1];
                     }
+                    const uint32_t bw[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};   // route 8n + g
+#pragma unroll
+                    for(int t = 0; t < TILES; ++t)
+#pragma unroll
+                        for(int s = 0; s < 4; ++s) {
+                            kc::mma_bf16_m16n8k16(kBlock ? part[kBlock ? t : 0][kBlock ? n : 0] : acc[t][n],
+                                                  fr[2 * t][2 * s], fr[2 * t + 1][2 * s], fr[2 * t][2 * s + 1],
+                                                  fr[2 * t + 1][2 * s + 1], bw[2 * s], bw[2 * s + 1]);
+                            if constexpr(kZp<F>)   // the same MMA on the weights' lo parts
+                                kc::mma_bf16_m16n8k16(acc[t][n], fl[2 * t][2 * s], fl[2 * t + 1][2 * s],
+                                                      fl[2 * t][2 * s + 1], fl[2 * t + 1][2 * s + 1], bw[2 * s],
+                                                      bw[2 * s + 1]);
+                        }
                 }
-            }
-    }
-    const int tile_elems = 8 * NT * width;
-    if constexpr(kAsync) stage_async(p, routes, 8 * active, K, 0, K < p.chunk ? K : p.chunk, tile);
-    for(int b0 = 0; b0 < blocks; b0 += D) {
+                if constexpr(kBlock) {
+                    if((kb & 1) || kb + 1 == blocks) {   // the end of a 128-k scale block
+                        const int kblocks = (K + 127) / 128;
+                        const float* bs = reinterpret_cast<const float*>(scales);
 #pragma unroll
-        for(int d = 0; d < D; ++d) {
-            const int kb = b0 + d;
-            if(kb >= blocks) break;
-            const int k = 64 * kb, kk = k % p.chunk;
-            if(kAsync && kk == 0) {   // chunk k / chunk landed; every warp is done with the other half
-                kc::cp_async_wait_all();
-                __syncthreads();
-                const int next = k + p.chunk;
-                if(next < K)
-                    stage_async(p, routes, 8 * active, K, next, K - next < p.chunk ? K - next : p.chunk,
-                                tile + ((next / p.chunk) & 1) * tile_elems);
-            }
-            if(!live) continue;
-            uint32_t fr[ROWS][8], fl[kZp<F> ? ROWS : 1][8];
+                        for(int t = 0; t < TILES; ++t) {
+                            const float s_lo = bs[block_row<GATEUP>(rows[2 * t], I) * kblocks + kb / 2];
+                            const float s_hi = bs[block_row<GATEUP>(rows[2 * t + 1], I) * kblocks + kb / 2];
 #pragma unroll
-            for(int r = 0; r < ROWS; ++r) {
-                if constexpr(kZp<F>) decode_split<F>(ring[d][r], fr[r], fl[r]);
-                else if constexpr(kTable) decode_table<F>(ring[d][r], table, fr[r]);
-                else decode<F>(ring[d][r], fr[r]);
-            }
-            uint4 b_now[2];
-            if constexpr(kDirect) {
-                b_now[0] = bring[d][0];
-                b_now[1] = bring[d][1];
-            }
-            if(kb + D < blocks) {
+                            for(int n = 0; n < NT; ++n) {
+                                if(n >= active) break;
 #pragma unroll
-                for(int r = 0; r < ROWS; ++r) ring[d][r] =
-                        load_raw<F>(codes, scales, rows[r], K, 64 * (kb + D) + 16 * t4, zeros, L.group);
-                if constexpr(kDirect) {
-                    if(brow) {
-                        bring[d][0] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * (kb + D)));
-                        bring[d][1] = __ldg(reinterpret_cast<const uint4*>(brow + 64 * (kb + D)) + 1);
-                    }
-                }
-            }
-#pragma unroll
-            for(int n = 0; n < NT; ++n) {
-                if(n >= active) break;
-                uint4 v0, v1;
-                if constexpr(kDirect) {
-                    v0 = b_now[0];
-                    v1 = b_now[1];
-                } else {
-                    const bf16* half = kAsync ? tile + ((k / p.chunk) & 1) * tile_elems : tile;
-                    const uint4* bp = reinterpret_cast<const uint4*>(half + (8 * n + g) * width + kk + 16 * t4);
-                    v0 = bp[0];
-                    v1 = bp[1];
-                }
-                const uint32_t bw[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};   // route 8n + g
-#pragma unroll
-                for(int t = 0; t < TILES; ++t)
-#pragma unroll
-                    for(int s = 0; s < 4; ++s) {
-                        kc::mma_bf16_m16n8k16(kBlock ? part[kBlock ? t : 0][kBlock ? n : 0] : acc[t][n],
-                                              fr[2 * t][2 * s], fr[2 * t + 1][2 * s], fr[2 * t][2 * s + 1],
-                                              fr[2 * t + 1][2 * s + 1], bw[2 * s], bw[2 * s + 1]);
-                        if constexpr(kZp<F>)   // the same MMA on the weights' lo parts
-                            kc::mma_bf16_m16n8k16(acc[t][n], fl[2 * t][2 * s], fl[2 * t + 1][2 * s],
-                                                  fl[2 * t][2 * s + 1], fl[2 * t + 1][2 * s + 1], bw[2 * s],
-                                                  bw[2 * s + 1]);
-                    }
-            }
-            if constexpr(kBlock) {
-                if((kb & 1) || kb + 1 == blocks) {   // the end of a 128-k scale block
-                    const int kblocks = (K + 127) / 128;
-                    const float* bs = reinterpret_cast<const float*>(scales);
-#pragma unroll
-                    for(int t = 0; t < TILES; ++t) {
-                        const float s_lo = bs[block_row<GATEUP>(rows[2 * t], I) * kblocks + kb / 2];
-                        const float s_hi = bs[block_row<GATEUP>(rows[2 * t + 1], I) * kblocks + kb / 2];
-#pragma unroll
-                        for(int n = 0; n < NT; ++n) {
-                            if(n >= active) break;
-#pragma unroll
-                            for(int i = 0; i < 4; ++i) {
-                                acc[t][n][i] = __fmaf_rn(part[t][n][i], i < 2 ? s_lo : s_hi, acc[t][n][i]);
-                                part[t][n][i] = 0.0f;
+                                for(int i = 0; i < 4; ++i) {
+                                    acc[t][n][i] = __fmaf_rn(part[t][n][i], i < 2 ? s_lo : s_hi, acc[t][n][i]);
+                                    part[t][n][i] = 0.0f;
+                                }
                             }
                         }
                     }
                 }
             }
         }
-    }
+    };
+    if constexpr(kLines) by_lines();
+    else by_blocks();
     if(!live && !(A4 && GATEUP && TILES == 1)) return;   // a W4A4 pair meets at its barriers (every gate/up warp lives)
     if constexpr(GATEUP) {
         // C fragment: c0, c1 = gate row rows[2t] for routes 2 t4, 2 t4 + 1; c2, c3 = up row rows[2t + 1], same routes.
@@ -747,7 +894,7 @@ int chunk_for(int width, int K) {   // k values staged per pass (a multiple of 6
 // One configuration of one width: NT n-tiles of 8 routes an item (1: decode items of 8 routes, read straight from global
 // memory; 4: prompt items of 32; 8: wide prompt items of 64), WARPS warps of TILES row tiles, DEPTH blocks in flight,
 // CHUNK k values staged per pass (prompt items; decode items stage nothing).
-template <int F, int NT, bool GATEUP, bool A4, int WARPS, int TILES, int DEPTH, int CHUNK>
+template <int F, int NT, bool GATEUP, bool A4, int WARPS, int TILES, int DEPTH, int CHUNK, int READ>
 cudaError_t launch(const Pass& base, const Items& items, cudaStream_t stream) {
     Pass p = base;
     const int K = GATEUP ? p.layout.hidden : p.layout.inter, M = GATEUP ? p.layout.inter : p.layout.hidden;
@@ -755,19 +902,24 @@ cudaError_t launch(const Pass& base, const Items& items, cudaStream_t stream) {
     const int rows_per_block = WARPS * (GATEUP ? 8 : 16) * TILES;
     const dim3 grid((M + rows_per_block - 1) / rows_per_block, items.capacity);
     const size_t bytes = NT == 1 ? 0 : static_cast<size_t>(2) * (8 * NT) * (p.chunk + kPad) * sizeof(bf16);
-    expert_kernel<F, NT, TILES, WARPS, DEPTH, GATEUP, A4><<<grid, WARPS * 32, bytes, stream>>>(p);
+    if constexpr(READ == 0 && NT == 1 && F != int(Format::bf16)) {   // decode items below 128 bytes a block: by K
+        if(K >= kLineK) expert_kernel<F, NT, TILES, WARPS, DEPTH, GATEUP, A4, 2><<<grid, WARPS * 32, bytes, stream>>>(p);
+        else expert_kernel<F, NT, TILES, WARPS, DEPTH, GATEUP, A4, 1><<<grid, WARPS * 32, bytes, stream>>>(p);
+    } else {
+        expert_kernel<F, NT, TILES, WARPS, DEPTH, GATEUP, A4, READ == 2 ? 2 : 1><<<grid, WARPS * 32, bytes, stream>>>(p);
+    }
     return cudaGetLastError();
 }
 
 // The format's kernel of one configuration; BUILT false (a sweep build of another structure) instantiates nothing.
-template <bool BUILT, int NT, bool GATEUP, int WARPS, int TILES, int DEPTH, int CHUNK>
+template <bool BUILT, int NT, bool GATEUP, int WARPS, int TILES, int DEPTH, int CHUNK, int READ = 1>
 cudaError_t formats(const Pass& p, bool a4, const Items& items, cudaStream_t stream) {
     if constexpr(!BUILT) {
         return cudaErrorNotSupported;
     } else {
-        if(a4) return launch<int(Format::nvfp4), NT, GATEUP, true, WARPS, TILES, DEPTH, CHUNK>(p, items, stream);
+        if(a4) return launch<int(Format::nvfp4), NT, GATEUP, true, WARPS, TILES, DEPTH, CHUNK, READ>(p, items, stream);
 #define CRIT_GX_CASE(FMT) \
-    case int(FMT): return launch<int(FMT), NT, GATEUP, false, WARPS, TILES, DEPTH, CHUNK>(p, items, stream);
+    case int(FMT): return launch<int(FMT), NT, GATEUP, false, WARPS, TILES, DEPTH, CHUNK, READ>(p, items, stream);
         switch(static_cast<int>(p.layout.format)) {
             CRIT_GX_CASE(Format::bf16)
             CRIT_GX_CASE(Format::fp8_channel)
@@ -806,8 +958,8 @@ cudaError_t dispatch(const Pass& p, bool a4, const Items& items, int tokens, cud
     switch(items.width) {
         case 8:
             switch(crit_lookup_decode(f, a4 ? 1 : 0, GATEUP ? 1 : 0, H, I, rows)) {
-#define CRIT_GX_DECODE(index, warps, tiles, depth) \
-    case index: return formats<kBuiltDecode, 1, GATEUP, warps, tiles, depth, 0>(p, a4, items, stream);
+#define CRIT_GX_DECODE(index, warps, tiles, depth, read) \
+    case index: return formats<kBuiltDecode, 1, GATEUP, warps, tiles, depth, 0, read>(p, a4, items, stream);
                 CRIT_CONFIGS_decode(CRIT_GX_DECODE)
 #undef CRIT_GX_DECODE
                 default: return cudaErrorInvalidConfiguration;

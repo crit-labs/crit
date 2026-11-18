@@ -23,6 +23,19 @@ void check_contiguous(const torch::Tensor& t, const char* name, torch::ScalarTyp
     TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
 }
 
+// A pool tensor [layers][sequences][...] whose entry of one layer and sequence is contiguous: the kernels reach an
+// entry by the tensor's layer and sequence strides, so a pool may keep a sequence's layers together (a view of
+// [sequences][layers][...] storage, which it backs sequence by sequence).
+void check_entries(const torch::Tensor& t, const char* name, torch::ScalarType type, int dims) {
+    check_on(t, name, type, dims);
+    int64_t inner = 1;
+    for(int d = dims - 1; d >= 2; --d) {
+        TORCH_CHECK(t.stride(d) == inner, name, ": the entry of a layer and a sequence must be contiguous");
+        inner *= t.size(d);
+    }
+    TORCH_CHECK(t.stride(0) >= inner && t.stride(1) >= inner, name, ": entries must not overlap");
+}
+
 rk::Scalar scalar_of(const torch::Tensor& t) {
     switch(t.scalar_type()) {
     case torch::kFloat32: return rk::Scalar::f32;
@@ -65,7 +78,7 @@ rk::RowSource source_of(const std::optional<torch::Tensor>& meta, const std::opt
 // states [layers][sequences][v_heads][dk][dv], stash [layers][sequences][2 * half], control [layers][sequences][2 * blocks].
 rk::PoolDelta pool_of(const rk::DeltaShape& d, torch::Tensor& states, torch::Tensor& stash, torch::Tensor& control, int64_t capacity) {
     check_contiguous(states, "states", torch::kFloat32, 5);
-    check_contiguous(stash, "stash", torch::kFloat32, 3);
+    check_entries(stash, "stash", torch::kFloat32, 3);
     check_contiguous(control, "control", torch::kInt32, 3);
     TORCH_CHECK(capacity >= 1, "the stash holds one column or more");
     // Every tensor has the layers; the sequence counts may differ (a pool keeps a spare sequence in some of them):
@@ -242,8 +255,8 @@ void pool_conv(torch::Tensor& out, torch::Tensor& window, torch::Tensor& stash, 
                int64_t capacity, bool silu) {
     const c10::cuda::CUDAGuard guard(window.device());
     rk::ConvInputs c = conv_inputs(out, x, weight, bias, silu);
-    check_contiguous(window, "window", torch::kFloat32, 4);
-    check_contiguous(stash, "stash", torch::kFloat32, 4);
+    check_entries(window, "window", torch::kFloat32, 4);
+    check_entries(stash, "stash", torch::kFloat32, 4);
     check_contiguous(pending, "pending", torch::kInt32, 3);
     TORCH_CHECK(window.size(2) == c.channels, "window must be [layers][sequences][channels][(width - 1) * dilation]");
     set_dilation(c, window.size(3));
@@ -280,8 +293,8 @@ void pool_conv_prompt(torch::Tensor& out, torch::Tensor& window, const torch::Te
                       const torch::Tensor& meta, int64_t layer, int64_t capacity, bool silu) {
     const c10::cuda::CUDAGuard guard(window.device());
     rk::ConvInputs c = conv_inputs(out, x, weight, bias, silu);
-    check_contiguous(window, "window", torch::kFloat32, 4);
-    check_contiguous(stash, "stash", torch::kFloat32, 4);
+    check_entries(window, "window", torch::kFloat32, 4);
+    check_entries(stash, "stash", torch::kFloat32, 4);
     check_contiguous(pending, "pending", torch::kInt32, 3);
     TORCH_CHECK(window.size(2) == c.channels, "window must be [layers][sequences][channels][(width - 1) * dilation]");
     set_dilation(c, window.size(3));

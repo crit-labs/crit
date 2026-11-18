@@ -679,6 +679,7 @@ class Api:
                 "include_usage": bool(options.get("include_usage")), "stop": stops(body.get("stop")),
                 "include_stop": body.get("include_stop_str_in_output", False), "response_format": constraint,
                 "sampling": sampling, "tool_options": tools, "logprobs": logprobs, "decode": extension["decode"],
+                "prompt_cache": extension["prompt_cache"],
                 "timeout": extension["timeout"], "template_kwargs": template, "priority": body.get("priority") or 0,
                 "continue_final_message": continuing, "thinking_tokens": budget, "ignored": ignored}
 
@@ -744,6 +745,7 @@ class Api:
                 "include_usage": bool(options.get("include_usage")), "stop": stops(body.get("stop")),
                 "include_stop": body.get("include_stop_str_in_output", False), "response_format": None,
                 "sampling": sampling, "tool_options": {}, "logprobs": logprobs, "decode": extension["decode"],
+                "prompt_cache": extension["prompt_cache"],
                 "timeout": extension["timeout"], "priority": body.get("priority") or 0,
                 "ignored": sorted(ignored | set(lenient or ()))}
 
@@ -903,6 +905,7 @@ class Api:
                                                                on_reasoning=reasoned if request["stream"] else None,
                                                                on_started=started, logprobs=request.get("logprobs"),
                                                                decode=request.get("decode"),
+                                                               prompt_cache=request.get("prompt_cache"),
                                                                template_kwargs=request.get("template_kwargs"),
                                                                fit_output=request.get("fit_output", False),
                                                                on_admitted=on_admitted,

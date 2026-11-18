@@ -53,6 +53,32 @@ class SoftmaxAttentionTests(PluginTestCase):
                 self.assertEqual(declared, {"device": 0, "host": 0})
             form.close()
 
+    def test_prompt_reader_auto_follows_the_level_the_engine_asks_of_its_prompt_rows(self):
+        from crit_plugins import kernels
+        self.addCleanup(kernels.use_exactness, None)
+
+        def made(asked, **options):
+            kernels.use_exactness(asked and {"decode": "row-exact", "prompt": asked})
+            return self.assemble(USE, options=options)["attention"]
+        # crit's kernel reads the pages: reader split's own prompt reader keeps a token's bits at every chunk length
+        kernel = made(None).device_form.kernels is not None and self.device() == "cuda"
+        for asked, reader in ((None, "prefill"), ("repeatable", "prefill"),
+                              ("row-exact", "prefill" if kernel else "decode"), ("exact", "decode"),
+                              ("declared", "decode")):
+            self.assertEqual(made(asked).device_form.prompt_reader, reader, asked)
+        self.assertEqual(made("row-exact", reader="flash").device_form.prompt_reader, "decode")   # a flash prompt chunk
+        # What the rows keep, for Core to compare with what is asked.
+        self.assertEqual(made("exact").exactness(), {"decode": "row-exact", "prompt": "exact"})
+        self.assertEqual(made(None).exactness(), {"decode": "row-exact", "prompt": "row-exact"} if kernel else {})
+        self.assertEqual(made(None, reader="flash").exactness(),
+                         {"decode": "row-exact", "prompt": "repeatable"} if kernel else {})
+        # An option set to one reader is that reader, whatever is asked.
+        self.assertEqual(made("exact", prompt_reader="prefill").device_form.prompt_reader, "prefill")
+        self.assertEqual(made("repeatable", prompt_reader="decode").device_form.prompt_reader, "decode")
+        with self.assertRaisesRegex(ValueError, "prompt_reader decode \\(auto, for the exact prompt rows the "
+                                                "configuration's exactness asks\\).*int8_qk"):
+            made("exact", int8_qk=True)
+
     def test_its_facts_say_how_this_gpu_reads_wide_windows(self):
         attention = self.assemble(USE)["attention"]
         facts = attention.facts()

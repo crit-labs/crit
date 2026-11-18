@@ -4,7 +4,7 @@
 // of a serial computation, and so does the mailbox payload; the pool runs many small batches, started and stopped, and
 // rethrows a task's exception. Prints ms per layer and GB/s of expert
 // bytes for Flash-sized experts (not asserted).
-#include "expert_pool.h"
+#include "pool.h"
 #include "host_tier.h"
 
 #include <atomic>
@@ -132,7 +132,7 @@ void check_tier() {
         for(int workers : {0, 2, 5})
             for(auto isa : {hi::Isa::scalar, hi::best_int_isa()})
                 for(bool interleaved : {false, true}) {
-                    ht::ExpertPool pool({workers, false});
+                    crit::host::Pool pool({workers, false});
                     ht::HostExpertTier tier(store.experts(interleaved, kind), pool, isa, 64);
                     std::vector<float> out(in.expert.size() * hidden, -1.0f);
                     tier.compute({int(in.expert.size()), in.expert.data(), in.values.data(), hidden, in.scales.data(),
@@ -149,7 +149,7 @@ void check_tier() {
 }
 
 void check_pool() {
-    ht::ExpertPool pool({3, false});
+    crit::host::Pool pool({3, false});
     std::vector<int> hits(1000);
     for(int round = 0; round < 2000; ++round) {
         const std::size_t n = std::size_t(round % 37 + 1);
@@ -226,7 +226,7 @@ void check_inputs_and_row_posts() {
         for(int workers : {0, 3, 5})
             for(auto isa : {hi::Isa::scalar, hi::best_int_isa()})
                 for(std::size_t rows_per_task : {std::size_t(64), std::size_t(128), std::size_t(384)}) {
-                    ht::ExpertPool pool({workers, false});
+                    crit::host::Pool pool({workers, false});
                     ht::HostExpertTier tier(hidden, inter, pool, isa, rows_per_task);
                     for(std::size_t e = 0; e < experts; ++e) tier.set_expert(e, list[e]);
                     std::vector<float> out(std::size_t(routes) * hidden, -1.0f);
@@ -236,7 +236,7 @@ void check_inputs_and_row_posts() {
                                                                      std::to_string(workers) + ", " + hn::isa_name(isa) + ")");
                     ++compared;
                 }
-        ht::ExpertPool pool({2, false});
+        crit::host::Pool pool({2, false});
         ht::HostExpertTier tier(hidden, inter, pool);
         for(std::size_t e = 0; e < experts; ++e) tier.set_expert(e, list[e]);
         const auto layout = ht::HostExpertTier::input_layout(hidden, 32, 8);
@@ -273,7 +273,7 @@ void check_pool_races(int pools) {
     std::mt19937 rng(77);
     std::uint64_t batches = 0, wakes = 0;
     for(int p = 0; p < pools; ++p) {
-        ht::PoolOptions options;
+        crit::host::PoolOptions options;
         options.workers = 1 + p % 5;
         options.pin = false;
         options.spin = std::chrono::microseconds(p % 3 == 0 ? 0 : 5 * (p % 7));
@@ -283,7 +283,7 @@ void check_pool_races(int pools) {
         std::vector<std::vector<std::atomic<int>>> runs(static_cast<std::size_t>(rounds));
         std::vector<std::size_t> sizes(static_cast<std::size_t>(rounds));
         {
-            ht::ExpertPool pool(options);
+            crit::host::Pool pool(options);
             for(int b = 0; b < rounds; ++b) {
                 const std::size_t n = 1 + std::size_t(rng()) % 64;
                 sizes[std::size_t(b)] = n;
@@ -313,7 +313,7 @@ void throughput() {
     std::mt19937 rng(5);
     const std::size_t hidden = 2560, inter = 640, experts = 64;   // 2.76 MB each, past the caches
     Store store = make_store(experts, hidden, inter, rng);
-    ht::ExpertPool pool;
+    crit::host::Pool pool;
     ht::HostExpertTier tier(store.experts(true, ht::Intermediate::e2m1x2), pool);
     for(int per_expert : {1, 2, 3}) {
         // A layer's CPU share: 6 experts with `per_expert` tokens each, a different set every layer.

@@ -2,8 +2,8 @@
   "id": "session-scheduling",
   "category": "execution",
   "summary": "Transactional prefill cursors, latency chunk policy, independent physical batch/workspace limits and borrowed-progress staging",
-  "implementation_status": "native_source",
-  "implementation_scope": "Adapter-side pending/committed chunk cursor with optional short-tail folding, immutable token staging and bounded exact-word repeated-passage observation over accepted reasoning; scheduling, model state and recovery/stop policy remain external; C++20 monotonic shape-cost chunk selector with fixed/linear/attention-pair/decode costs, hard bounds and fixed fallback; portable ordered physical batch plans with explicit atomic/padding rules, per-shape workspace bounds and an owned synchronous host scratch executor",
+  "implementation_status": "reference",
+  "implementation_scope": "Adapter-side pending/committed chunk cursor with optional short-tail folding, immutable token staging and bounded exact-word repeated-passage observation over accepted reasoning; scheduling, model state and recovery/stop policy remain external",
   "agent_guidance": {
     "use_when": "Expose bounded prompt work and preserve borrowed output tokens through model commit",
     "avoid_when": "Existing engine/session helpers already meet the core handoff; this is not a scheduler replacement",
@@ -48,18 +48,10 @@
     {
       "path": "inference/session-scheduling/code/reasoning_guard.py",
       "purpose": "Bounded streaming Unicode word history and exact repeated-passage coverage; observation only, without model mutation or automatic stopping"
-    },
-    {
-      "path": "inference/session-scheduling/code/latency_chunks.h",
-      "purpose": "Hardware/model-neutral latency chunk policy with explicit cost coefficients, exhaustive-oracle native tests and safe fallback"
-    },
-    {
-      "path": "inference/session-scheduling/code/physical_batches.h",
-      "purpose": "Portable physical caps, ordered atomic/padded shapes, exact per-shape scratch planning and synchronous owned host workspace"
     }
   ],
   "requires": {
-    "hardware": "Python 3.11+ standard library for host cursors; C++20 standard library for native policies and host scratch; backend hardware is an engine choice",
+    "hardware": "Python 3.11+ standard library for host cursors; backend hardware is an engine choice",
     "model": "Engine exposes incremental prompt work and generated token candidates",
     "workload": "Bounded work opportunities and signed 32-bit token staging with declared output limits"
   },
@@ -71,8 +63,7 @@
     "core_boundary": "Map next_chunk and staged progress to Session.advance/commit; return borrowed progress only under its lifetime contract."
   },
   "dependencies": [
-    "Python standard library",
-    "C++20 standard library for native policies and host scratch execution"
+    "Python standard library"
   ],
   "symbols": [
     "PrefillCursor",
@@ -80,19 +71,7 @@
     "stage_progress",
     "ReasoningLoopGuard",
     "LoopObservation",
-    "chunk_plan",
-    "ChunkLatency",
-    "ChunkWindow",
-    "ChunkChoice",
-    "choose_prefill_chunk",
-    "BatchLimit",
-    "SplitRules",
-    "BatchShape",
-    "PhysicalBatch",
-    "LinearWorkspace",
-    "BatchPlan",
-    "HostWorkspace",
-    "BatchCancelled"
+    "chunk_plan"
   ],
   "interactions": [
     "attention-state",
@@ -107,7 +86,7 @@
   ],
   "validation": {
     "host": "Host fixtures and worked example cover chunk rollback, empty prompt, staging order and token-byte accounting; repetition fixtures cover Unicode fragment equivalence, warmup, overlap union, bounded aging, unique text and atomic word-overflow failure",
-    "native": "Native chunk policy checked against 6000 exhaustive feasible searches, linear/context-dependent models and malformed calibration; Core integration tests enforce advice/grant bounds. No device or model qualification. Physical batches: 5000 shape-oracle cases, atomic/padded boundaries, independent caps, nonlinear workspace sizing, overflow, empty work, real scratch allocation/reuse and cancellation/failure/concurrent-use rejection.",
+    "native": "No native code",
     "performance": "Unmeasured for a native engine; host fixture success is not a speed claim"
   }
 }

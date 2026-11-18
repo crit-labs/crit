@@ -52,7 +52,7 @@
     "output": "Immutable ModelInventory metadata and AuditResult bindings/capability_status, with an optional separate ProposerProbe",
     "ownership": "Metadata file descriptors close after inspection. The engine freezes source bytes, rechecks identity before loading and retains actual allocations through completion.",
     "failure": "Reject duplicate/malformed JSON, invalid extents, holes/overlap/truncation, index escapes/contradictions, missing roles and inconsistent packed shard geometry. I/O and probe hook failures propagate.",
-    "core_boundary": "Container parsing is Core's strict safetensors reader (crit_core.model inspect_safetensors/inspect_model; natively crit::core::Checkpoint); the audit adds its policy and keeps architecture roles and encoding interpretation outside Core. Audited metadata is not an allocation, readiness or model-correctness receipt."
+    "core_boundary": "Container parsing is Core's strict safetensors reader (crit_core.model inspect_safetensors/inspect_model); the audit adds its policy and keeps architecture roles and encoding interpretation outside Core. Audited metadata is not an allocation, readiness or model-correctness receipt."
   },
   "dependencies": ["Python standard library", "crit_core.model (Core's Python package)"],
   "symbols": [

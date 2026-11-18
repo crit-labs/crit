@@ -14,10 +14,7 @@ reports three independent observations, each possibly unknown:
 `admit` compares a request plus an explicit reserve with the tightest known
 observation. Standard library only; nothing is allocated or changed.
 
-This is the Python host reference. Native engines call Core's
-crit::core::observe_host_memory and crit::core::admit_host (crit/host_memory.h),
-which apply the same observation rules, including malformed values becoming
-unknowns (or no reclaimable pages) with a note; admit_working_set follows admit_host.
+Malformed values become unknowns (or no reclaimable pages) with a note.
 """
 from dataclasses import dataclass, field
 import os
@@ -111,7 +108,7 @@ def cgroup_headroom(root="/"):
     """Tightest headroom over this process's cgroup and its ancestors, and a note
     (None when there is nothing to say). v2: min(memory.max, memory.high) -
     memory.current + clean page cache; v1: the memory controller's hierarchical
-    limit with the same reclaimable rule. Follows Core's observe_host_memory_linux."""
+    limit with the same reclaimable rule. """
     notes = []
     membership = _read(_join(root, "/proc/self/cgroup"))
     if membership is None:

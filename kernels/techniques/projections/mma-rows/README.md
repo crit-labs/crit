@@ -26,7 +26,7 @@ serial decoding.
 | Shapes | K a multiple of 32, any N |
 | GPUs | NVIDIA sm_80 and newer (mma.m16n8k16 with BF16 operands); the hardware E2M1 conversion on sm_100a, 103a, 110a, 120a, 121a, the bit-pattern decode elsewhere (the same values); the pre-pass overlaps the weight stream through programmatic dependent launch from sm_90 |
 | Numerics | every value enters the MMA exactly in BF16 (an E2M1 code times its E4M3 scale, an E4M3 code, times its power of two for MXFP8, a BF16 weight; a BF16 activation or its quantized value), FP32 accumulation, the row, activation and global scales after the sum. Within 2e-5 of the FP64 product relative to the products' magnitude (`tests/test_mma_rows.py`) |
-| Determinism | a sum's order is fixed by N, K and the plan's splits of K (plan(): the build's tuning for the matrix, or untuned from the shape, the device's multiprocessor count and the decode tile's occupancy there, decode_ctas); the rows a call takes, `groups`, `warps`, the FP4 MMA's HOIST and the prompt tile's PW and PT change no bits. The split CTAs' partial sums add in split order (the last CTA of a row tile adds them). A row's bits are the same alone and among up to 63 others, and on a repeat; `mm_prompt` gives every row of a call of any length the same bits |
+| Determinism | a sum's order is fixed by N, K and the plan's splits of K (plan(): the build's tuning for the matrix, or untuned from the shape, the device's multiprocessor count and the decode tile's occupancy there, decode_ctas); the rows a call takes, `groups`, `warps`, the FP4 MMA's HOIST and the prompt tiles' PW, PR and PT change no bits. The split CTAs' partial sums add in split order (the last CTA of a row tile adds them). A row's bits are the same alone and among up to 63 others, and on a repeat; `mm_prompt` gives every row of a call of any length the same bits |
 | Capture | no allocation and no host synchronization (the caller gives scratch, partial-sum and counter buffers; the counters are left zero): a CUDA graph captures a call |
 | Measured speed | RTX 5090, a call's GPU time in a captured graph over matrices that leave the 96 MB L2, at 1 / 4 / 16 rows: NVFP4 W4A16 34816 x 5120 68 / 70 / 99 us (1.47 / 1.43 / 1.02 TB/s), 5120 x 17408 36 / 39 / 56 us; W4A4 (the activations quantized by the pre-pass) the same within 2%; FP8 W8A8 16384 x 5120 55 / 56 / 66 us (1.54 TB/s at 1 row), 5120 x 6144 24 / 25 / 32 us, a 248320 x 5120 head 774 / 778 / 797 us (1.64 / 1.59 TB/s); with plan()'s splits, a 33B llama-layout model's four NVFP4 roles (qkv 9216, o 7168, gate/up 44032 x 7168, down 7168 x 22016) take 220.7 / 223.5 / 230.6 us at 1 / 2 / 4 rows against a CUDA-core GEMV's (decode-gemv) 210.3 / 224.4 / 241.5, and its 44032 x 7168 gate/up 114.8 us at 1 row (125.4 with the earlier plan's 688 CTAs for 680 resident); about twice the GEMV's speed at 16 rows; FP8 W8A16 within 1-5% of the GEMV at 1-4 rows. Past 16 rows the MMAs and decodes grow with the rows (64 rows: 3-5x the 1-row time), so a provider's GEMM wins sooner for activations it takes as they are |
 | INT4 speed | RTX 5090, INT4 with a zero point (group 128, FP16 scales), one call in a captured graph over 4 copies of the matrix (weights from DRAM), plan()'s splits, at 1 / 2 / 4 / 8 / 16 rows: 34816 x 5120 73.8 / 85.4 / 78.1 / 88.6 / 134.3 us against torch's W4A16 INT4 GEMM (torch._weight_int4pack_mm, tinygemm) 60.9 / 72.7 / 68.4 / 125.0 / 253.5 (0.83 / 0.85 / 0.88 / 1.41 / 1.89x its speed); 5120 x 17408 40.4 / 40.5 / 53.0 / 47.7 / 69.8 against 32.1 / 33.6 / 39.8 / 64.0 / 149.8 (0.79 / 0.83 / 0.75 / 1.34 / 2.15x); 17408 x 5120 39.5 / 40.2 / 41.8 / 45.1 / 69.6 against 32.4 / 33.1 / 35.0 / 66.7 / 170.0 (0.82-0.84x to 4 rows, 1.48 / 2.44x at 8 / 16). The two MMAs a step (hi and lo) and the scale and zero decode make the 1-4 row calls 15-25% slower than the library; decode-gemv's CUDA-core GEMV takes those rows level with it (its README) |
@@ -47,6 +47,31 @@ Measured on an RTX 5090 (one call in a captured graph, BF16 out) at 4,096 rows: 
 TFLOPS), 7168 x 22016 8.1 ms (160), 34816 x 5120 8.7 ms (169), FP8 W8A16 16384 x 5120 4.3 ms (160); 150-170 TFLOPS from
 1,024 rows, 114-160 at 256; against cuBLAS's BF16 GEMM over the same matrix decoded beforehand (its decode not
 counted) 75-80% of its rate, and twice the rate of the decode tile in calls of 64 rows (70-89 TFLOPS).
+
+**W4A4 rows on the FP4 MMA.** With acts `nvfp4_mma`, `mm_prompt` gives every row the bits the FP4 MMA decode tile
+gives it (`mm_rows` with the same acts and splits): the same block-scaled m16n8k64 MMAs with the weights the A operand
+and the tokens the B operand, each step's two k64 blocks in order, each split of K a chain from zero, the splits added
+in split order, the same scales after the sum. Until this tile, a W4A4 engine that scored and served the same bits ran
+its prompt rows on the BF16 MMA path above (150-170 TFLOPS); it now runs them on the FP4 tensor cores. The data
+movement is a warp-specialized GEMM's (structure `fp4-prompt-tile`): a producer warp copies one step (128 values) of
+the CTA's matrix rows and of its tokens by two TMA tile copies, and both operands' scale tiles by bulk copies, into a
+ring of mbarrier-guarded shared-memory stages; PW consumer warps of PR 16-row tiles each read their fragments by
+ldmatrix (a pair of token columns ahead of its MMAs, the next step's weights during a step's last MMAs) and multiply
+the CTA's PT tokens. A CTA runs every split itself: a chain's first MMA of a split starts from zero right after the
+chain before it joined its running total, so a split's boundary costs the MMAs no pause; half of a thread's totals
+stay in registers and half in shared memory (all in registers leave too few for the chains and fragments, all in
+shared memory too little of its 99 KB for the ring). Whole tiles of BF16 or F16 outputs leave through shared memory in
+16-byte stores. The operands' codes and scale tiles must be on 16-byte addresses (as the decode tile reads them).
+Measured on an RTX 5090, calls back to back, the tile's time with its quantizer and cuBLASLt's NVFP4 GEMM
+(`torch._scaled_mm`, not bit-equal to any decode row) without one, at 64 / 512 / 2,048 / 8,192 rows and the plan's
+splits (14 and 21): 34816 x 5120 73 / 261 / 886 / 3,520 us (314 / 700 / 824 / 830 TFLOPS) against the BF16 path's 204 /
+1,093 / 4,134 / 17,588 and cuBLASLt's 67 / 211 / 722 / 3,028 (0.92 / 0.81 / 0.81 / 0.86 of its speed); 5120 x 17408
+72 / 120 / 458 / 1,860 us (758-797 TFLOPS from 512 rows) against 296 / 573 / 2,243 / 9,581 and 66 / 94 / 362 / 1,467
+(0.91 / 0.78 / 0.79 / 0.79): 4.3 to 5.2 times the BF16 path from 512 rows. With one split the same tile runs at 0.93 of
+cuBLASLt (2,048 rows, 34816 x 5120): what is left of the gap is the splits' totals (the decode plan's order) and the
+exact chain's two MMAs a step. Default knobs, not swept; cp.async staging by every warp reached 0.4 of cuBLASLt, the
+producer warp with all totals in registers 0.76 (the registers spill), a grid of consumers reading a whole k64 block
+ahead 0.7.
 
 A CTA whose 64 activation rows run past M (a prompt's last tile) stages and multiplies only its columns of eight
 rows that hold a row below M: a 65-row prompt's second CTA does one column's work instead of eight. Outputs are
@@ -77,11 +102,12 @@ reads decode-tile's and fp4-tile's per matrix (one plan for every row count), so
 | decode-tile | `mm_rows`, 1 to 64 rows on mma.m16n8k16, every weight format (the key's weights code; a format is a `Row` decoder over the kernel core's, `tile_parts.cuh`) and activation quantization; up to 16 rows also the staged tile | **GROUPS**, **WARPS**, **SPLITS** (0: plan()'s occupancy rule), SW (0, or the staged tile's warps a CTA: 4, 8), SPF (the staged tile's weights a step ahead) |
 | fp4-tile | `mm_rows` with acts nvfp4_mma, the block-scaled FP4 MMA (sm_120 family) | **WARPS**, **SPLITS** (0: the rule), HOIST (steps of weights loaded together) |
 | prompt-tile | `mm_prompt`, any number of rows with the decode tile's bits | PW (warps a CTA), PT (rows a CTA) |
+| fp4-prompt-tile | `mm_prompt` with acts nvfp4_mma, any number of W4A4 rows with the FP4 MMA decode tile's bits (sm_120 family) | PW (consumer warps a CTA), PR (16-row tiles a warp), PT (tokens a CTA) |
 | quantizers | `quantize_fp8_rows`, `quantize_nvfp4` | none |
 
 GROUPS, WARPS and SPLITS are arguments of a call, which plan() takes from the build's `_crit_tuning.knobs()`; SW,
-SPF, HOIST, PW and PT are template parameters the build's `crit_tuning.h` picks per matrix and row count (a build holds
-only the staged tiles its tuning names).
+SPF, HOIST, PW, PR and PT are template parameters the build's `crit_tuning.h` picks per matrix and row count (a build
+holds only the staged tiles its tuning names).
 
 ## The staged decode tile
 
@@ -124,7 +150,8 @@ to 16, groups, warps and splits of 1 to all of K's steps, a partial last step an
 the register tile's, the split counters left zero. `tests/test_prompt_tile.py`: `mm_prompt` against `mm_rows` bit for bit for every format and activation
 quantization, splits 1 to the steps of K, rows alone and in decode calls of 2 to 16 and 64, chunks of 1 to 129 rows,
 every output type, graph capture; at the role shapes of two checkpoints with plan()'s splits, chunks of 1 to 4,096
-rows.
+rows; where the FP4 MMA runs, `mm_prompt` with acts nvfp4_mma against the FP4 decode tile bit for bit at every row
+count, at real shapes with their plans from one row to 4,096, with glu, and a captured call's replay and refusals.
 
 The NVFP4 decode follows a crit-labs engine's tensor-core NVFP4 GEMV (Apache-2.0), generalized to every format, split
 K and the quantized activations.

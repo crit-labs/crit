@@ -27,6 +27,9 @@ from crit.pull.requirements import nvidia_smi
 from .attempt import Attempt, packaged, remaining, unsealed
 from .records import ALL_METRICS, digest, inputs, load_run, now, read_json, safe_path, series_gates
 
+# A served engine that declares it takes crit.prompt_cache false (crit_core.serving.PROMPT_CACHE_CAPABILITY).
+PROMPT_CACHE_CAPABILITY = "chat-prompt-cache-v1"
+
 TIMED = ("prefill_tps", "decode_tps", "request_ms", "ttft_ms")
 PER_REQUEST = TIMED + ("accepted_tokens_per_round",)
 MEMORY = ("peak_ram_bytes", "minimum_free_ram_bytes", "peak_vram_bytes", "minimum_free_vram_bytes")
@@ -222,10 +225,31 @@ def _measure(store, run_id, candidate_id, attempt, deadline_at, kv_tokens, cases
                 sampler.stop()
 
 
-def case_body(case):
-    """The streamed chat request a case sends: greedy unless the captured request names its own sampling."""
+def switches_cache(port):
+    """Whether the engine served on `port` takes crit.prompt_cache false (chat-prompt-cache-v1 on its /v1/models
+    card: the default model's, else the first): a crit engine packaged since Core has a prompt cache. False for a
+    server that lists no such card, an external engine among them."""
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    try:
+        connection.request("GET", "/v1/models")
+        response = connection.getresponse()
+        cards = (json.loads(response.read()).get("data") or []) if response.status == 200 else []
+    except (OSError, ValueError, http.client.HTTPException):
+        cards = []
+    finally:
+        connection.close()
+    cards = [card for card in cards if isinstance(card, dict)]
+    card = next((c for c in cards if c.get("default")), cards[0] if cards else {})
+    return PROMPT_CACHE_CAPABILITY in (card.get("capabilities") or [])
+
+
+def case_body(case, port=None):
+    """The streamed chat request a case sends: greedy unless the captured request names its own sampling. port: the
+    crit engine it goes to, which prefills every prompt token of a measured request where it has a prompt cache to
+    turn off (switches_cache): a repetition is no cache hit of the one before it."""
+    fresh = {"crit": {"prompt_cache": False}} if port is not None and switches_cache(port) else {}
     return {"temperature": 0, **case["request"], "max_tokens": case["output_tokens"], "stream": True,
-            "stream_options": {"include_usage": True}}
+            "stream_options": {"include_usage": True}, **fresh}
 
 
 def _case(port, case, load_ms, sampler, timeout, log, capacity=None):
@@ -233,7 +257,7 @@ def _case(port, case, load_ms, sampler, timeout, log, capacity=None):
     a case of concurrency N is a wave of N requests started together (_wave); capacity: the requests the served engine
     runs at once (crit serve's max_concurrent_requests)."""
     from crit_eval.reports.metrics import speed_sample
-    body = case_body(case)
+    body = case_body(case, port)
     clients = case.get("concurrency", 1)
     samples = {name: [] for name in PER_REQUEST + MEMORY + (("aggregate_tps",) if clients > 1 else ())}
     outputs, peaks, begun = [], [], now()

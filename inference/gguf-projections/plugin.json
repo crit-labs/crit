@@ -18,12 +18,13 @@
   "options": {
     "prompt": {
       "type": "choice",
-      "default": "dequantize",
+      "default": "auto",
       "choices": [
+        "auto",
         "dequantize",
         "exact"
       ],
-      "description": "prompt rows' path: dequantize, the matrix decoded to BF16 a call and cuBLAS's BF16 GEMM (FP32 sums; faster today, not the decode rows' bits); exact, gguf-rows' gemm in the decode rows' order (each prompt row's output the bits it has decoded)"
+      "description": "prompt rows' path: auto (the default), the faster path that keeps the level the engine's configuration asks of its prompt rows (exactness, docs/PLUGINS.md#exactness): dequantize where it asks repeatable or nothing, exact where it asks row-exact, exact or declared; dequantize, the matrix decoded to BF16 a call and cuBLAS's BF16 GEMM (FP32 sums; faster today, not the decode rows' bits); exact, gguf-rows' gemm in the decode rows' order (each prompt row's output the bits it has decoded)"
     }
   },
   "kernels": [

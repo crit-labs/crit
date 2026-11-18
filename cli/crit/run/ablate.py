@@ -6,7 +6,9 @@ adds, costs or breaks before Eval spends a round on the engine. With crit-eval's
 also decodes Eval's speed cases and held-out prompts at the model's sampling, one request per seed: a plugin whose
 effect depends on the text (drafts, copies, draft widths) is measured on the text Eval scores, not on the run's cases
 alone. Option variants (--set PLUGIN.OPTION=VALUE) serve the full selection with options changed: an in-process A/B on
-the same cases. Development evidence under a check attempt: it records no check and no benchmark.
+the same cases; exactness=LEVEL (or exactness.prompt=LEVEL, exactness.decode=LEVEL) among them serves the engine
+asking that level of its rows, so the report says what a level costs or gains. Development evidence under a check
+attempt: it records no check and no benchmark.
 
 An external candidate (crit.run.external) has no plugins to switch: it is ablated only on the options its
 configuration declares (configuration.engine.options), each a flag of its launch command. --set NAME=VALUE serves it
@@ -97,6 +99,15 @@ def ablate(store, run_id, candidate_id, seconds=None, names=None, repetitions=RE
     if sets:
         found = ablation.variants(selection, registry, names=set(names) if names else {"full"})
         found += ablation.option_variants(selection, sets, registry)
+        # A variant that sets the engine's exactness is served asking those levels over the candidate's own (which a
+        # candidate recorded before crit stated them takes from the run's quality mode).
+        if any(variant.get("exactness") for variant in found):
+            from crit_kernels.exactness import setting
+            from .records import quality_mode
+            own = setting(configuration.get("exactness"), quality_mode(run["spec"]["correctness"]))
+            for variant in found:
+                if variant.get("exactness"):
+                    variant["exactness"] = setting({**own, **variant["exactness"]})
     else:
         found = ablation.variants(selection, registry, names=set(names) if names else None)
     cases = _cases(root, run, repetitions, data, seeds)
@@ -251,7 +262,7 @@ def _warm(port, case, timeout):
     WARMUPS of them; returns how many it sent. A case whose workload has no warmup is not warmed."""
     if not case["warm"]:
         return 0
-    body, previous = case_body(case), None
+    body, previous = case_body(case, port), None
     for sent in range(1, WARMUPS + 1):
         current = _round_seconds(_wave(port, body, timeout, case.get("concurrency", 1)))
         if current is None or previous is not None and abs(current - previous) <= STEADY * previous:
@@ -294,11 +305,15 @@ def _variant(store, run_id, served, variant, cases, smoke, smoke_tests, log):
     log(f"crit run ablate: {variant['name']}: {shown}")
     try:
         started = time.perf_counter()
-        engine, _, port = served.open(configuration={"plugins": variant["plugins"]})
+        engine, _, port = served.open(configuration={"plugins": variant["plugins"], **(
+            {"exactness": variant["exactness"]} if variant.get("exactness") else {})})
         load_ms = (time.perf_counter() - started) * 1000
         smoke_module = _import("crit_smoke")
         client = smoke_module.Client(f"http://127.0.0.1:{port}", timeout=min(served.timeout, 120))
-        reported = client.facts().get("plugins")
+        facts = client.facts()
+        reported = facts.get("plugins")
+        if facts.get("exactness"):   # what the variant was asked and what each of its plugins keeps
+            row["exactness"] = facts["exactness"]
         if reported != use:
             raise ValueError(f"the engine reports the plugins {reported}, the variant asked for {use}: assemble "
                              "configuration.plugins with crit_plugins.assemble and report assembly.facts() in the "

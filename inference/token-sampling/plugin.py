@@ -48,6 +48,7 @@ class CoreSampler:
             from .token_sampling import device_rounds
             self._rounds = device_rounds.RoundSampling()
             self._rounds.kernel = getattr(self, "kernel", "native")
+            self._rounds.scratch = getattr(self, "scratch", None)
         return self._rounds
 
     def reserve(self, rows, widest, vocab, device, logprobs=0):
@@ -114,4 +115,5 @@ class CoreSampler:
 def create(context, options, parts):
     found = CoreSampler()
     found.kernel = options["rounds"]
+    found.scratch = getattr(context, "scratch", None)   # the engine's scratch: every launch computes in it
     return found

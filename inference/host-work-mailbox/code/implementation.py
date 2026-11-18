@@ -1,4 +1,4 @@
-"""Host reference of the in-stream host-work mailbox protocol (mailbox.h).
+"""Host reference of the in-stream host-work mailbox protocol (Core's handoff.h, crit_plugins.host).
 
 A captured program is a list of operations whose arguments were fixed at capture, as CUDA stream memory
 operations are. Replaying it shows why the device, not the host, resets the done word before each doorbell.

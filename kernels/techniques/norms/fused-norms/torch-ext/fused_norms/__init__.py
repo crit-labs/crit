@@ -63,6 +63,13 @@ def _knobs(structure, rows, **key):
     return found
 
 
+def _launch(kernel, structure, rows, call, **key):
+    """Launch a kernel of a structure whose knobs follow the row count: call(knobs) gives the launch's (grid,
+    arguments, options). A compiled kernel's first launch compiles the shape key's other knob sets too
+    (_crit_tuning.launch), so a later row count compiles nothing: a request after load launches what load compiled."""
+    return _crit_tuning.launch(kernel, structure, key, _knobs(structure, rows, **key), call)
+
+
 _PDL = {}
 
 
@@ -479,15 +486,18 @@ def _product(gate, up, activation, out_dtype, out, interleaved=False, source=Non
     sg = strides[0]
     su = strides[1] if not interleaved else (0, 0)
     sy = strides[-1]
-    k = _knobs("act-mul", n_rows, N=width)
-    n_blocks = _cdiv(width, k["BLOCK"])
     first = source if interleaved else gate
-    pdl = k.get("PDL", 0) if _pdl(first.device) else 0
+    has_pdl = _pdl(first.device)
+
+    def call(k):
+        n_blocks = _cdiv(width, k["BLOCK"])
+        pdl = k.get("PDL", 0) if has_pdl else 0
+        return ((n_rows * n_blocks,),
+                (first, *sg, first if interleaved else up, *su, y, *sy, n_rows, B, width, n_blocks),
+                dict(ACT=activation, INTERLEAVED=interleaved, BLOCK=k["BLOCK"], PDL=pdl, num_warps=k["WARPS"],
+                     launch_pdl=bool(pdl)))
     with _on(first):
-        _triton.act_mul_kernel[(n_rows * n_blocks,)](
-            first, *sg, first if interleaved else up, *su, y, *sy, n_rows, B, width, n_blocks,
-            ACT=activation, INTERLEAVED=interleaved, BLOCK=k["BLOCK"], PDL=pdl, num_warps=k["WARPS"],
-            launch_pdl=bool(pdl))
+        _launch(_triton.act_mul_kernel, "act-mul", n_rows, call, N=width)
     return y
 
 
@@ -561,13 +571,14 @@ def stream_sum(x: torch.Tensor, gate: Optional[torch.Tensor] = None, activation:
     y = _result(x, (tokens, width), out_dtype, out)
     if tokens == 0 or streams == 0:
         return y.zero_()
-    k = _knobs("stream-sum", tokens, S=streams, D=width)
-    n_blocks = _cdiv(width, k["BLOCK"])
+    def call(k):
+        n_blocks = _cdiv(width, k["BLOCK"])
+        return ((tokens * n_blocks,),
+                (x, x.stride(0), x.stride(1), gate if gate is not None else x, *sg, y, y.stride(0), streams, width,
+                 n_blocks, float(scale)),
+                dict(HAS_GATE=gate is not None, ACT=STREAM_GATES[activation], BLOCK=k["BLOCK"], num_warps=k["WARPS"]))
     with _on(x):
-        _triton.stream_sum_kernel[(tokens * n_blocks,)](
-            x, x.stride(0), x.stride(1), gate if gate is not None else x, *sg, y, y.stride(0), streams, width,
-            n_blocks, float(scale), HAS_GATE=gate is not None, ACT=STREAM_GATES[activation], BLOCK=k["BLOCK"],
-            num_warps=k["WARPS"])
+        _launch(_triton.stream_sum_kernel, "stream-sum", tokens, call, S=streams, D=width)
     return y
 
 
@@ -584,13 +595,16 @@ def stream_add(streams: torch.Tensor, x: torch.Tensor, weights: Optional[torch.T
                          f"{streams.device}")
     if tokens == 0:
         return streams
-    k = _knobs("stream-add", tokens, S=count, D=width)
-    n_blocks = _cdiv(width, k["BLOCK"])
     sw = (weights.stride(0), weights.stride(1)) if weights is not None else (0, 0)
+
+    def call(k):
+        n_blocks = _cdiv(width, k["BLOCK"])
+        return ((tokens * n_blocks,),
+                (streams, streams.stride(0), streams.stride(1), x, x.stride(0),
+                 weights if weights is not None else x, *sw, count, width, n_blocks),
+                dict(HAS_W=weights is not None, BLOCK=k["BLOCK"], num_warps=k["WARPS"]))
     with _on(streams):
-        _triton.stream_add_kernel[(tokens * n_blocks,)](
-            streams, streams.stride(0), streams.stride(1), x, x.stride(0), weights if weights is not None else x,
-            *sw, count, width, n_blocks, HAS_W=weights is not None, BLOCK=k["BLOCK"], num_warps=k["WARPS"])
+        _launch(_triton.stream_add_kernel, "stream-add", tokens, call, S=count, D=width)
     return streams
 
 
@@ -705,14 +719,16 @@ def softplus_decay(x: torch.Tensor, bias: torch.Tensor, rate: torch.Tensor, gate
     y = _result(x, x.shape, out_dtype, out)
     beta = _result(x, x.shape, out_dtype, gate_out) if gate is not None else None
     if tokens and n:
-        k = _knobs("softplus-decay", tokens, N=n)
-        n_blocks = _cdiv(n, k["BLOCK"])
         g = gate if gate is not None else x
         b = beta if beta is not None else y
+
+        def call(k):
+            n_blocks = _cdiv(n, k["BLOCK"])
+            return ((tokens * n_blocks,),
+                    (x, x.stride(0), bias, rate, g, g.stride(0), y, y.stride(0), b, b.stride(0), n, n_blocks),
+                    dict(HAS_GATE=gate is not None, BLOCK=k["BLOCK"], num_warps=k["WARPS"]))
         with _on(x):
-            _triton.softplus_decay_kernel[(tokens * n_blocks,)](
-                x, x.stride(0), bias, rate, g, g.stride(0), y, y.stride(0), b, b.stride(0), n, n_blocks,
-                HAS_GATE=gate is not None, BLOCK=k["BLOCK"], num_warps=k["WARPS"])
+            _launch(_triton.softplus_decay_kernel, "softplus-decay", tokens, call, N=n)
     return y if gate is None else (y, beta)
 
 

@@ -207,7 +207,7 @@ prepare`: the sorted union of `eos_token_id` at the top level and in
 ## Streaming text
 
 `IncrementalDetokenizer(tokenizer, prompt_ids, *, skip_special_tokens=True, context_tokens=5)`
-mirrors Core's `TextDecoder`: `push(ids)` returns newly stable text, `finish()`
+is the reply's decoder: `push(ids)` returns newly stable text, `finish()`
 flushes the rest, and the decoder is closed after `finish()` or any error. Each
 step decodes a short window starting a few tokens back, so byte-level splits,
 SentencePiece byte fallback and leading spaces come out exactly, and text is

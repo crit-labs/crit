@@ -8,6 +8,20 @@ class HeterogeneousExpertDispatchTests(PluginTestCase):
     def test_it_has_the_experts_interface(self):
         self.assertImplements(self.assemble(USE))
 
+    def test_prompt_arithmetic_auto_follows_the_level_the_engine_asks_of_its_prompt_rows(self):
+        from crit_plugins import kernels
+        self.addCleanup(kernels.use_exactness, None)
+        for asked, arithmetic in ((None, "declared"), ("repeatable", "tensor"), ("row-exact", "declared"),
+                                  ("exact", "declared"), ("declared", "declared")):
+            kernels.use_exactness(asked and {"decode": "row-exact", "prompt": asked})
+            experts = self.assemble(USE)["experts"]
+            self.assertEqual(experts._prompt_arithmetic(True), arithmetic, asked)
+            self.assertEqual(experts._prompt_arithmetic(False), "declared", asked)   # no kernel device part: declared
+            self.assertEqual(experts.exactness(), {})   # no expert loaded: it states no level yet
+        kernels.use_exactness("exact")   # an option set to one arithmetic is that arithmetic, whatever is asked
+        self.assertEqual(self.assemble(USE, {"prompt_arithmetic": "tensor"})["experts"]._prompt_arithmetic(True),
+                         "tensor")
+
     def test_it_is_bitwise_the_reference_however_the_routes_split(self):
         for residency, policy in (("device-expert-cache", {"policy": "clock"}), ("expert-residency", {}),
                                   ("device-expert-cache", {"policy": "ranked"})):

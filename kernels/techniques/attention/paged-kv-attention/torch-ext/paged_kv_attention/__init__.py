@@ -50,9 +50,11 @@ Prompt chunks (prefill): one sequence's chunk of queries at positions position..
 own, causal, through its page table; int8_qk quantizes the queries to INT8 per token and head for integer tensor
 cores over INT8 pages (an approximation of the queries, twice the BF16 rate).
 """
+import contextlib
 import ctypes
 import functools
 import math
+import threading
 
 import torch
 import triton
@@ -63,7 +65,7 @@ from . import _crit_cuda, _crit_tuning, _flash, _kernels
 
 __all__ = ["KINDS", "PIECE", "MAX_COLUMNS", "attend", "cuda_block", "cuda_chunk", "cuda_parts", "cuda_ramp",
            "cuda_splits", "flash_block", "flash_chunk", "flash_parts", "flash_tile",
-           "partitions", "piece_size", "prefill", "tile_for", "workspace_floats", "write"]
+           "owner", "partitions", "piece_size", "prefill", "release", "tile_for", "workspace_floats", "write"]
 
 KINDS = {"bf16": 0, "fp16": 0, "fp8": 1, "fp8:row": 2, "int8": 3}
 PIECE = 32          # positions per piece of FP8 or INT8 pages at a 256-wide head (piece_size)
@@ -78,7 +80,40 @@ _retired = []
 
 def _retire(found):
     if found is not None:
-        _retired.append(found)
+        _retired.append((getattr(_owner, "key", None), found))
+
+
+# Who launches (owner()): the module's workspaces are one a device and owner. A launch writes its partials, a fused
+# launch its ring of states and sync words, a prompt chunk in passes its state, and reads them back, so two launches in
+# flight over one workspace (two engines of a process on two streams, their captured graphs replayed side by side)
+# would read each other's. Launches of one owner run one at a time; different owners never share a workspace.
+_owner = threading.local()
+
+
+@contextlib.contextmanager
+def owner(key):
+    """Launches inside this block take module workspaces of their own, apart from every other owner's and from the
+    launches outside any block (key: any hashable; None: the module's own). A graph captured inside replays into its
+    owner's workspaces. release(key) drops them once nothing of that owner replays any more."""
+    before = getattr(_owner, "key", None)
+    _owner.key = key
+    try:
+        yield
+    finally:
+        _owner.key = before
+
+
+def release(key):
+    """Drop an owner's module workspaces (its captured graphs must be gone: they replay into them)."""
+    for held in (_workspaces, _fused_workspaces, _states):
+        for at in [at for at in held if at[1] == key]:
+            del held[at]
+    _retired[:] = [(k, found) for k, found in _retired if k != key]
+
+
+def _held(device):
+    """The key of the current owner's workspace on a device."""
+    return (str(device), getattr(_owner, "key", None))
 
 
 @functools.lru_cache(maxsize=4096)
@@ -91,6 +126,14 @@ def _knobs(structure, key, rows):
     (kept per call shape; a sweep's selection, _crit_tuning.SELECTED, read at every call)."""
     selected = getattr(_crit_tuning, "SELECTED", {}).get(structure)
     return _tuned(structure, None if key is None else tuple(sorted(key.items())), int(rows), selected)
+
+
+def _launch(kernel, structure, key, rows, call):
+    """Launch a Triton kernel of a structure whose knobs follow a row count that is no constant of its kernel (write,
+    prefill): call(knobs) gives the launch's (grid, arguments, options). A compiled kernel's first launch compiles the
+    shape key's other knob sets too (_crit_tuning.launch), so a later row count compiles nothing: a prompt chunk of
+    any length after load launches what load compiled."""
+    return _crit_tuning.launch(kernel, structure, key, _knobs(structure, key, rows), call)
 
 
 def _warps(knob, rule, rows, capability):
@@ -213,11 +256,11 @@ def write(keys, values, slots, key_pages, value_pages, kind, key_scales=None, va
     ks = key_scales if key_scales is not None else _dummy(keys.device)
     vs = value_scales if value_scales is not None else ks
     bd = triton.next_power_of_2(max(d, dv))
-    warps = _knobs("write", {"D": d, "DV": dv, "HKV": hkv, "KIND": k_kind}, T)["WARPS"] or (1 if bd <= 128 else 2)
-    _kernels._write_kernel[(T, heads)](keys, values, slots, kp, vp, ks, vs, keys.stride(0), keys.stride(1),
-                                       values.stride(0), values.stride(1), float(multipliers[0]),
-                                       float(multipliers[1]), HKV=hkv, D=d, DV=dv, BD=bd, KIND=k_kind,
-                                       num_warps=warps)
+    args = (keys, values, slots, kp, vp, ks, vs, keys.stride(0), keys.stride(1), values.stride(0), values.stride(1),
+            float(multipliers[0]), float(multipliers[1]))
+    _launch(_kernels._write_kernel, "write", {"D": d, "DV": dv, "HKV": hkv, "KIND": k_kind}, T, lambda tuned: (
+        (T, heads), args, dict(HKV=hkv, D=d, DV=dv, BD=bd, KIND=k_kind,
+                               num_warps=tuned["WARPS"] or (1 if bd <= 128 else 2))))
 
 
 NARROW_ROWS = 32                 # rows of the tiles every GPU multiplies with mma.sync
@@ -268,7 +311,7 @@ def _workspace(device, tokens, heads, parts, dv, given=None):
             raise ValueError(f"attend's workspace holds {given.numel()} floats; this launch needs {need * (dv + 2)} "
                              "(workspace_floats)")
         return given[:need * dv], given[need * dv:need * (dv + 1)], given[need * (dv + 1):need * (dv + 2)]
-    found = _workspaces.get(device)
+    found = _workspaces.get(_held(device))
     if found is None or found[1].numel() < need:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("paged_kv_attention.attend: run a launch of this size once before capturing it (its "
@@ -278,14 +321,14 @@ def _workspace(device, tokens, heads, parts, dv, given=None):
         found = (torch.empty(size * dv, dtype=torch.float32, device=device),
                  torch.empty(size, dtype=torch.float32, device=device),
                  torch.empty(size, dtype=torch.float32, device=device))
-        _workspaces[device] = found
+        _workspaces[_held(device)] = found
     po, pm, pl = found
     if po.numel() < need * dv:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("paged_kv_attention.attend: run a launch of this size once before capturing it")
         _retire(found)
         po = torch.empty(need * dv, dtype=torch.float32, device=device)
-        _workspaces[device] = (po, pm, pl)
+        _workspaces[_held(device)] = (po, pm, pl)
     return po, pm, pl
 
 
@@ -727,25 +770,32 @@ _states = {}
 
 
 def _state(device, count):
-    """The two-pass prompt chunk's state buffer (FP32, `count` values), kept a device and grown, never shrunk: a
-    captured chunk's graph holds its address."""
-    found = _states.get(str(device))
+    """The two-pass prompt chunk's state buffer (FP32, `count` values), kept a device and owner and grown, never
+    shrunk: a captured chunk's graph holds its address, so the one a larger chunk replaces is kept (retired), not
+    freed."""
+    found = _states.get(_held(device))
     if found is None or found.numel() < count:
+        _retire(found)
         found = torch.empty(count, dtype=torch.float32, device=device)
-        _states[str(device)] = found
+        _states[_held(device)] = found
     return found
 
 
 def _cuda_launch(lib, structure, entry, params, device, grid):
+    # The library launches on the thread's current device (the tile's shared-memory limit is that device's): the
+    # operands' device, not whichever one is current.
     stream = torch.cuda.current_stream(device).cuda_stream
-    err = lib.crit_cw_launch(structure, entry, ctypes.byref(params), ctypes.c_void_p(stream), *[int(x) for x in grid])
+    with torch.cuda.device(device):
+        err = lib.crit_cw_launch(structure, entry, ctypes.byref(params), ctypes.c_void_p(stream),
+                                 *[int(x) for x in grid])
     if err:
         raise RuntimeError(f"paged-kv-attention cuda launch: {lib.crit_cw_error(err).decode()}")
 
 
 def _cuda_merge(lib, params, device, grid):
     stream = torch.cuda.current_stream(device).cuda_stream
-    err = lib.crit_cw_merge(ctypes.byref(params), ctypes.c_void_p(stream), *[int(x) for x in grid])
+    with torch.cuda.device(device):
+        err = lib.crit_cw_merge(ctypes.byref(params), ctypes.c_void_p(stream), *[int(x) for x in grid])
     if err:
         raise RuntimeError(f"paged-kv-attention cuda merge: {lib.crit_cw_error(err).decode()}")
 
@@ -892,7 +942,7 @@ def _fused_workspace(device, chains, rows, dvp, parts):
         group //= 2
     ring, run = floats(group, depth)
     words = 2 + (1 + depth) * chains
-    found = _fused_workspaces.get(device)
+    found = _fused_workspaces.get(_held(device))
     if found is None or found[0].numel() < ring + run or found[1].numel() < words:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("paged_kv_attention.attend: run a fused launch of this size once before capturing it "
@@ -901,7 +951,7 @@ def _fused_workspace(device, chains, rows, dvp, parts):
         _retire(found)
         found = (torch.empty(size, dtype=torch.float32, device=device),
                  torch.zeros(max(words, 1024, found[1].numel() if found else 0), dtype=torch.int32, device=device))
-        _fused_workspaces[device] = found
+        _fused_workspaces[_held(device)] = found
     return group, depth, found[0][:ring], found[0][ring:ring + run], found[1]
 
 
@@ -1147,10 +1197,6 @@ def prefill(q, key_pages, value_pages, kind, table, position, page, *, key_scale
     kp, vp = _codes(key_pages, kind, device), _codes(value_pages, kind, device)
     ks = key_scales if key_scales is not None else _dummy(device)
     vs = value_scales if value_scales is not None else ks
-    tuned = _knobs("prefill", {"D": d, "HQ": hq, "HKV": hkv, "PAGE": int(page), "KIND": k_kind,
-                               "INT8": int(bool(int8_qk))}, T)
-    block_m = tuned["BLOCK_M"]
-    block_n = tuned["BLOCK_N"] or (64 if d <= 128 else 32)
     on_device = torch.is_tensor(position)
     first = 0
     if fresh is not None:
@@ -1168,13 +1214,17 @@ def prefill(q, key_pages, value_pages, kind, table, position, page, *, key_scale
         return _prefill_flash(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multipliers, scale, out, lse,
                               int8_qk, fresh, first, sinks, sliding)
     first_t = torch.is_tensor(first)
-    _kernels._prefill_kernel[(triton.cdiv(T, block_m), hq)](
-        q, kp, vp, ks, vs, table, out, lse if lse is not None else ks, position if on_device else table, fk, fv,
-        first if first_t else table, sinks if sinks is not None else ks, sliding, T, 0 if on_device else int(position),
-        0 if first_t else int(first),
-        float(scale if scale is not None else d ** -0.5), float(multipliers[0]), float(multipliers[1]), q.stride(0),
-        q.stride(1), out.stride(0), out.stride(1), fk.stride(0), fv.stride(0), HQ=hq, HKV=hkv, G=hq // hkv, D=d,
-        BLOCK_M=block_m, BLOCK_N=block_n, PAGE=page, KIND=k_kind, HW_FP8=_hardware_fp8(device), INT8_QK=int8_qk,
-        LSE=lse is not None, POS_T=on_device, FRESH=fresh is not None, FIRST_T=first_t, SINKS=sinks is not None,
-        num_warps=tuned["WARPS"], num_stages=tuned["STAGES"] or (3 if int8_qk else 2))
+    args = (q, kp, vp, ks, vs, table, out, lse if lse is not None else ks, position if on_device else table, fk, fv,
+            first if first_t else table, sinks if sinks is not None else ks, sliding, T,
+            0 if on_device else int(position), 0 if first_t else int(first),
+            float(scale if scale is not None else d ** -0.5), float(multipliers[0]), float(multipliers[1]),
+            q.stride(0), q.stride(1), out.stride(0), out.stride(1), fk.stride(0), fv.stride(0))
+    fixed = dict(HQ=hq, HKV=hkv, G=hq // hkv, D=d, PAGE=page, KIND=k_kind, HW_FP8=_hardware_fp8(device),
+                 INT8_QK=int8_qk, LSE=lse is not None, POS_T=on_device, FRESH=fresh is not None, FIRST_T=first_t,
+                 SINKS=sinks is not None)
+    key = {"D": d, "HQ": hq, "HKV": hkv, "PAGE": int(page), "KIND": k_kind, "INT8": int(bool(int8_qk))}
+    _launch(_kernels._prefill_kernel, "prefill", key, T, lambda tuned: (
+        (triton.cdiv(T, tuned["BLOCK_M"]), hq), args,
+        dict(fixed, BLOCK_M=tuned["BLOCK_M"], BLOCK_N=tuned["BLOCK_N"] or (64 if d <= 128 else 32),
+             num_warps=tuned["WARPS"], num_stages=tuned["STAGES"] or (3 if int8_qk else 2))))
     return out

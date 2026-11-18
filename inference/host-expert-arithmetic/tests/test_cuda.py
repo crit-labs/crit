@@ -49,6 +49,7 @@ class CudaFormTests(PluginTestCase):
                     part = p.matmul(x[:rows].cuda(), cuda, torch.float32).cpu()
                     self.assertTrue(torch.equal(part.view(torch.int32), want[:rows].view(torch.int32)), rows)
                 self.assertTrue(p.facts()["row_invariance"]["prompt_rows"])
+                self.assertEqual(p.exactness(), {"decode": "declared", "prompt": "declared"})
 
     def test_native_w4a4_prompt_rows_are_within_fp32_accumulation_of_the_exact_product(self):
         generator = torch.Generator().manual_seed(9)
@@ -77,6 +78,7 @@ class CudaFormTests(PluginTestCase):
                 want = declared.matmul(x, d, torch.float32).double()
                 self.assertLess(float((got - want).abs().max() / want.abs().max()), 1e-5)
                 self.assertFalse(p.facts()["row_invariance"]["prompt_rows"])
+                self.assertEqual(p.exactness(), {"decode": "declared", "prompt": "repeatable"})
                 # decode rows keep the declared order (the CPU rows' bits) under prompt_gemm native too
                 self.assertTrue(torch.equal(p.matmul(x[:9], m, torch.float32), declared.matmul(x[:9], d, torch.float32)))
 

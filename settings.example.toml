@@ -11,7 +11,7 @@
 ram_headroom_gib = 2
 
 # Device memory left free at the engine's peak, in GiB.
-vram_headroom_gib = 1
+vram_headroom_gib = 0.25
 
 # Device memory kept out of the KV cache when Eval computes the max context, in GiB: activations,
 # workspaces, graphs and speed techniques. A larger reserve trades context for that room.

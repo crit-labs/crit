@@ -2,7 +2,7 @@
 
 GenerationConfig keeps "unset" distinct from transformers' implicit fallbacks (top_k=50, temperature=1.0, ...):
 a field is None unless a file sets it. legacy_eos_ids reproduces crit Eval's stop_ids rule for well-formed files.
-Both files are read as the native loaders read them: at most 16 MiB, NaN and Infinity literals allowed where no typed
+Both files are read with crit_core.model's rules: at most 16 MiB, NaN and Infinity literals allowed where no typed
 field reads them, integers checked against the same ranges (eos ids in [0, 2^31), bos and pad any 32-bit id, counts
 32-bit unsigned, max_length included, nothing beyond 64 bits).
 """

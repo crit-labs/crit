@@ -83,6 +83,42 @@ def test_a_tuning_without_lengths_loads_and_holds_for_every_length():
     assert "{0, 64, 1, 64, 1, 0, 4611686018427387904}" in kbuild.tuning_header(MANIFEST, checked)
 
 
+def test_a_first_launch_compiles_every_knob_set_its_shape_key_can_read():
+    tuning = {"schema": kbuild.TUNING_SCHEMA, "kernel": "toy",
+              "structures": {"s": {"configs": [{"CHUNK": 0, "STAGES": 0}, {"CHUNK": 256, "STAGES": 3},
+                                               {"CHUNK": 256, "STAGES": 0}],
+                                   "table": [{"key": {"D": 64}, "rows": [1, 8], "config": 1},
+                                             {"key": {"D": 128}, "rows": [1, 8], "config": 2},
+                                             {"key": None, "rows": [9, 64], "config": 2}]}}}
+    ns = {}
+    exec(kbuild.tuning_module(MANIFEST, kbuild.check_tuning(MANIFEST, tuning)), ns)
+    knobs, variants, launch = ns["knobs"], ns["variants"], ns["launch"]
+    assert variants("s", {"D": 64}) == [{"CHUNK": 0, "STAGES": 0}, {"CHUNK": 256, "STAGES": 3},
+                                        {"CHUNK": 256, "STAGES": 0}]
+    assert variants("s", {"D": 32}) == [{"CHUNK": 0, "STAGES": 0}, {"CHUNK": 256, "STAGES": 0}]
+
+    class Kernel:   # a Triton kernel's run(): one compiled object a specialization, launched unless warming
+        def __init__(self):
+            self.compiled, self.launched = {}, []
+
+        def run(self, *args, grid, warmup, **options):
+            if not warmup:
+                self.launched.append((grid, args, options))
+            return self.compiled.setdefault((args, tuple(options.items())), object())
+
+    kernel = Kernel()
+    call = lambda k: ((4 if k["CHUNK"] else 1,), ("x", k["CHUNK"] or 1024), dict(STAGES=k["STAGES"] or 2))
+    key = {"D": 64}
+    launch(kernel, "s", key, knobs("s", key, 4), call)
+    assert kernel.launched == [((4,), ("x", 256), {"STAGES": 3})]     # the call's own knobs, launched once
+    assert len(kernel.compiled) == 3                                  # and the key's two other knob sets, compiled
+    for rows in (4, 32, 500):
+        launch(kernel, "s", key, knobs("s", key, rows), call)
+    assert len(kernel.compiled) == 3 and len(kernel.launched) == 4    # another row count compiles nothing
+    ns["SELECTED"]["s"] = 1                                           # a sweep's selection: that configuration alone
+    assert variants("s", key) == [{"CHUNK": 256, "STAGES": 3}]
+
+
 def test_without_lengths_the_table_is_as_before():
     manifest = json.loads(json.dumps(MANIFEST))
     del manifest["structures"]["s"]["lengths"]

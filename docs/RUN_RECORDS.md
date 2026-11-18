@@ -31,7 +31,7 @@ default and a comment. In short:
 wsl_run_root = "/srv/crit/runs"  # folder for work that must run under WSL; empty: none
 device = "device.json"              # crit eval probe result (relative: from CRIT_ROOT)
 ram_headroom_gib = 2                # host memory free at the engine's peak (default 2)
-vram_headroom_gib = 1               # device memory free at the engine's peak (default 1)
+vram_headroom_gib = 0.25            # device memory free at the engine's peak (default 0.25)
 context_reserve_gib = 3             # device memory kept out of the KV cache (default 3)
 context_tokens = 200000             # the context wanted, prompt plus output (default 200,000)
 eval_packages = "/srv/crit/packages" # reference package source, a folder or https URL; unset: none
@@ -85,7 +85,7 @@ hashes; add them only where a field below requires one.
 | `device` | A `crit eval probe` result. Without `kv_tokens`, `create` freezes Eval's [max context](https://github.com/crit-labs/crit-eval/blob/main/docs/CONTEXT.md) on it as `kv_tokens`, with the basis (limits, KV precision, memory, device file sha256) in `hardware_constraints.context` |
 | `kv_tokens` | Capacity for prompt + output; overrides the max context. One of `kv_tokens`, `device` is required |
 | `context_tokens` | The context the user wants (default 200,000, from `settings.toml` when the request omits it). With `device`, `kv_tokens` is the smaller of it, the model's positions and the KV cache that fits; `hardware_constraints.context` records `requested`, the `bound` (`requested`, `model` or `device`) and a `note` when the model or device allow less |
-| `ram_headroom_gib`, `vram_headroom_gib` | Physical free-memory requirements; defaults 2 and 1 |
+| `ram_headroom_gib`, `vram_headroom_gib` | Physical free-memory requirements; defaults 2 and 0.25 |
 | `context_reserve_gib` | Device memory kept out of the KV cache when deriving `kv_tokens` from `device`; default the protocol's 3 |
 | `drafters` | Up to 8 companion drafter folders (EAGLE-3, DFlash, DSpark) a candidate may load beside the model. With `device`, their stored weights are kept out of the KV cache too, so a speculating candidate still fits `kv_tokens`; `hardware_constraints.context` records `companion_drafter_bytes` and each drafter. Name the same folders to `recon --drafter` |
 | (devices) | A `device` file of several GPUs (`crit eval probe --devices`) sizes `kv_tokens` from their memory together, and `hardware_constraints.context.devices` names them (`index`, `device`); `crit run measure` samples device memory on every one of them |
@@ -123,6 +123,13 @@ activations ([Eval's quality](https://github.com/crit-labs/crit-eval/blob/main/d
   arithmetic, judged together by the candidate's Eval.
 - `preserve`: a budget that keeps the output close to the checkpoint's (1.05, 0.05, 0.5), every precision change
   measured against it, and prefill's limits priced at 16-bit prompt activations.
+
+The mode also gives the exactness of the rows of an engine that asks for none
+([exactness](PLUGINS.md#exactness)): crit completes every candidate's `configuration.exactness` to a level for the
+decode rows and one for the prompt rows, taking the configuration's own where it states one and the mode's otherwise.
+`preserve` asks `exact` (decode rows `row-exact`, each prompt row the bits of the same token decoded), `speed` asks
+`repeatable` (every plugin's fastest way). The package carries the completed configuration, so the engine is held to
+the level it was measured at wherever it is served.
 
 Every run record, Eval result and crit-hub result states its mode, and one that states none, or another (the speed
 mode's former name `as_quantized` among them), is refused. Results compare only within one mode. The mode is a choice
@@ -214,7 +221,7 @@ Provider spend limits are the caller's responsibility.
 | Payload | Fields |
 | --- | --- |
 | Inputs | Nonempty `hardware_manifest`, `environment_manifest`; `case_manifests` mapping **every** fixed case ID to an ordered nonempty list of `{path, bytes, sha256}` under the run's `captured/`. In a run with an origin engine, crit adds `origin_checkpoint`: whether the model is the exact checkpoint the engine was measured on |
-| Proposal | `label`, `rationale`, `strategy`, `configuration` object, `store_decisions` object; `plan_id` (the [plan](#plan) it is built from); `lever_fates` (every lever of the plan `built`, `pruned` or `deferred`, with the reason unless built); optional `parent_candidate_id`, `origin_candidate_id` (earlier retained candidates); `weights` (`as_stored` or `transformed`, required when `weights_policy` is `as_stored`); `lineage` (`origin-engine`: the candidate is the origin engine's source as imported, in a run created with `--from-engine`). A run whose model is a folder needs `work/recon.json` (`recon`) before its first candidate; crit adds its `frozen` block as `configuration.recon` (a supplied `recon` must equal it) and `extensions.recon` with its path and SHA-256 |
+| Proposal | `label`, `rationale`, `strategy`, `configuration` object, `store_decisions` object; `plan_id` (the [plan](#plan) it is built from); `lever_fates` (every lever of the plan `built`, `pruned` or `deferred`, with the reason unless built); optional `parent_candidate_id`, `origin_candidate_id` (earlier retained candidates); `weights` (`as_stored` or `transformed`, required when `weights_policy` is `as_stored`); `lineage` (`origin-engine`: the candidate is the origin engine's source as imported, in a run created with `--from-engine`). A run whose model is a folder needs `work/recon.json` (`recon`) before its first candidate; crit adds its `frozen` block as `configuration.recon` (a supplied `recon` must equal it) and `extensions.recon` with its path and SHA-256. crit also completes a plugin package's `configuration.exactness` to `{"decode": level, "prompt": level}`: the levels it states, and the [quality mode's](#quality-modes) for a phase it leaves out |
 | Package recipe | `build: {toolchain: {...}, dependencies: [...], command: [...]}`, nothing else: Core's loader runs the package and says what it serves |
 
 In an `as_stored` run, a candidate declaring `transformed` weights (requantized,
@@ -404,6 +411,10 @@ fails refuses the plan with what to fix:
    it adds a `limit` entry with the physical cause; below half its limit every entry on it carries `evidence` and an
    Eval gap answers `rejected`, and for prefill every faster prompt activation format Eval prices is rejected by a
    crit-eval result that measured it outside the quality noise (`activation:FORMAT`), under the run's quality terms.
+   A gap Eval states on a goal outside the priorities (`followup_ttft`, the follow-up turns' first token against its
+   floor with a prompt cache; `concurrency`, the most clients' aggregate against its batched ceiling) has a fate in
+   every plan after that Eval, whatever is needed: a lever whose `changes` improve that KPI, or an answer in `gaps`.
+   Such a KPI is never ranked or forecast, and no candidate is built for it alone.
 5. A build plan names at least one speed lever, each with a KPI change; one improves more than time to first token;
    every needed p1 family has one.
 6. A lever whose changes are all within their KPIs' noise shares a `group` with a lever above it. Measure an option
@@ -701,9 +712,12 @@ crit-hub: `ENGINE_DIR` is its `engines/<owner>/<name>/` folder in a crit-hub che
 `origin_engine` then records the engine (`<owner>/<name>`, title, origin, contributor), the repository,
 commit and folder of its source, the card's and lock's hashes, every checkpoint it was measured on with
 each file's size and SHA-256, its sealed provenance and its published crit Eval results, each with the
-quality mode it was judged in (a card's result that states none is refused), which are copied into the run
-under `captured/origin/` as the numbers before the run's work; the agent request names each one's mode, and
-says that a result judged in another mode than the run's does not compare with its Evals. The agent request tells the
+quality mode it was judged in (a card's result that states none is refused) and, where the card states it, the
+[exactness](PLUGINS.md#exactness) the engine asked of its rows when it was measured (`exactness`, a level or one
+each for `decode` and `prompt`, kept as `{decode, prompt}`), which are copied into the run
+under `captured/origin/` as the numbers before the run's work; the agent request names each one's mode and levels,
+says that a result judged in another mode than the run's does not compare with its Evals, and names a level the
+engine was measured at that is below the one the run's mode gives. The agent request tells the
 agent to check the source out at that commit and make it the first candidate, declared with
 `"lineage": "origin-engine"` in its proposal: its rung takes a small Eval (stage 1), so the run has a baseline
 measured in its own mode before any change. At

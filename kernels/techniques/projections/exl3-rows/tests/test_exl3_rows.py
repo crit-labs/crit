@@ -1,7 +1,8 @@
 """exl3-rows on this GPU: the decoded tiles equal the format's own decoder bit for bit for every codebook and bitrate
 (the SHA-256 of a 128 x 128 matrix decoded from seeded codes, as crit-eval's CPU decoder's tests record it), gemv
 within FP32 sums of its FP64 reference (FP16 rotated rows times the tiles) and within FP16 activations' rounding of the
-exact product, a row's bits the same alone and among up to 16, dequantize
+exact product, a row's bits the same alone and among up to 16, a prompt's rows (gemm) with the bits gemv gives each
+alone at every length, dequantize
 within one BF16 rounding, the rotation its own inverse, and what the kernel cannot read refused."""
 import hashlib
 import sys
@@ -89,6 +90,21 @@ def test_gemv_is_the_product_with_the_dense_matrix_and_keeps_a_rows_bits(codeboo
     for rows in (1, 3, 9):
         part = er.gemv(x[:rows].clone(), w)
         assert torch.equal(part.view(torch.int16), got[:rows].view(torch.int16))
+
+
+@pytest.mark.parametrize("codebook,bits", [(0, 2), (1, 4), (2, 2.5), (1, 8)])
+@pytest.mark.parametrize("shape", [(256, 384), (1024, 512)])
+def test_a_prompts_rows_have_the_bits_of_the_same_rows_decoded(codebook, bits, shape):
+    k, n = shape
+    w = matrix(k, n, bits, codebook)
+    x = activations(150, k)
+    assert er.slab_rows(w) in (16, 64)
+    serial = torch.cat([er.gemv(x[i:i + 1].clone(), w) for i in range(x.shape[0])])
+    for rows in (17, 64, 65, 150):   # under a slab, a whole one, a slab and a row, two slabs and a part
+        got = er.gemm(x[:rows].clone(), w)
+        assert got.shape == (rows, n) and got.dtype == x.dtype
+        assert torch.equal(got.view(torch.int16), serial[:rows].view(torch.int16))
+    assert torch.equal(er.gemm(x[:5].clone(), w).view(torch.int16), serial[:5].view(torch.int16))   # gemv's rows
 
 
 def test_dequantize_and_the_rotation():

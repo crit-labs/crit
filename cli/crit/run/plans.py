@@ -27,6 +27,11 @@ FAMILIES = {"decode": ("decode", "context_decode"), "prefill": ("prefill", "cont
 FAMILY = {member: family for family, members in FAMILIES.items() for member in members}
 # Numbers outside the priorities whose drop beyond their noise an outcome flags, and whether lower is better.
 UNTIERED = {"greedy_decode": False, "heldout_decode": False, "followup_ttft": True}
+# Goals Eval states outside the priorities (crit-eval's followup_ttft, the follow-up turns' first token against its
+# floor with a prompt cache, and concurrency, the most clients' aggregate against its batched ceiling): never ranked
+# or forecast, but a gap on one gets a fate in every plan after its Eval, a lever that improves that KPI or an
+# answer in gaps (_check_stated_gaps). Priorities order work, never what is left out.
+STATED = ("followup_ttft", "concurrency")
 MS = {"ttft", "context_ttft"}
 # A lever change measured before the plan: the source names its evidence file in the run.
 MEASURED_SOURCE = "measured:"
@@ -94,7 +99,7 @@ def extract(status):
                                   "noise": _positive(end_to_end.get("ttft_noise"))}}
     gaps = [{"kpi": gap["kpi"], "name": gap["name"], "projected_gain": gap.get("projected_gain")}
             for gap in status.get("gaps") or []
-            if isinstance(gap, dict) and gap.get("kpi") in KPIS and isinstance(gap.get("name"), str)]
+            if isinstance(gap, dict) and gap.get("kpi") in KPIS + STATED and isinstance(gap.get("name"), str)]
     return {"kpis": {kpi: {"score": _positive(score), "limit": _positive(limit),
                            "fraction": fraction if type(fraction) in (int, float) and fraction > 0 else None}
                      for kpi, (score, limit, fraction) in rows.items()},
@@ -723,8 +728,8 @@ def _fields(data):
         if "cause_terms" in row and (not isinstance(row["cause_terms"], list) or not row["cause_terms"]
                                      or not all(isinstance(term, str) for term in row["cause_terms"])):
             raise ValueError(f"gaps {row['gap']} cause_terms lists the terms of the plan's round account that bound it")
-        if row["kpi"] not in KPIS or row["answer"] not in ("cause", "rejected"):
-            raise ValueError("gaps entries name a KPI (" + ", ".join(KPIS) + ") and answer cause or rejected")
+        if row["kpi"] not in KPIS + STATED or row["answer"] not in ("cause", "rejected"):
+            raise ValueError("gaps entries name a KPI (" + ", ".join(KPIS + STATED) + ") and answer cause or rejected")
         text(row["gap"], "gaps.gap (the Eval gap's name)", 400)
         text(row["detail"], f"gaps detail for {row['gap']}", 8000)
     strategy = data["strategy"]
@@ -787,8 +792,8 @@ def _fields(data):
             text(lever["group"], f"{lever['id']} group", 100)
         if lever["confidence"] not in CONFIDENCE:
             raise ValueError(f"{lever['id']} confidence is low, medium or high")
-        if not isinstance(lever["changes"], dict) or not set(lever["changes"]) <= set(KPIS):
-            raise ValueError(f"{lever['id']} changes map KPIs (" + ", ".join(KPIS) + ") to {change, source}")
+        if not isinstance(lever["changes"], dict) or not set(lever["changes"]) <= set(KPIS + STATED):
+            raise ValueError(f"{lever['id']} changes map KPIs (" + ", ".join(KPIS + STATED) + ") to {change, source}")
         for kpi, change in lever["changes"].items():
             keys(change, {"change", "source"})
             number(change["change"], f"{lever['id']} {kpi} change (relative, in the KPI's improving direction)", -100, 1000)
@@ -1174,6 +1179,24 @@ def _check_answered_gaps(plan):
                                  "its measured rejection")
 
 
+def _check_stated_gaps(plan):
+    """Every gap the parent's Eval states on a goal outside the priorities (STATED) has a fate in the plan: a lever
+    that improves that KPI, or an answer in gaps (cause: what bounds it; rejected: measured and rejected). A gate
+    repair is built for its gate and answers none."""
+    facts = plan.facts
+    if plan.first or facts is None or plan.repairing:
+        return
+    answered = {(row["kpi"], row["gap"]) for row in plan.data["gaps"]}
+    improved = {kpi for lever in plan.levers for kpi, row in lever["changes"].items() if row["change"] > 0}
+    for gap in facts["gaps"]:
+        gain = gap["projected_gain"]
+        if gap["kpi"] in STATED and type(gain) in (int, float) and gain > 0 and gap["kpi"] not in improved \
+                and (gap["kpi"], gap["name"]) not in answered:
+            raise ValueError(f"Eval states the {gap['kpi']} gap {gap['name']!r} (+{gain:.0%}) and the plan gives it "
+                             f"no fate: plan a lever that improves {gap['kpi']}, or answer it in gaps with its "
+                             "cause or its measured rejection")
+
+
 def _check_limit_gaps(plan):
     """A family marked not needed below NEAR_LIMIT answers why its own limit is not reachable."""
     if plan.facts is None:
@@ -1233,7 +1256,8 @@ def _check_levers(plan):
                                  "--data EVAL_DATA --set PLUGIN.OPTION=VALUE, or --set OPTION=VALUE on an external "
                                  "engine's declared options, rather than raising its estimate)")
     # No plan targets time to first token alone.
-    if levers and not any(row["change"] > 0 for lever in levers for kpi, row in lever["changes"].items() if kpi != "ttft"):
+    if levers and not any(row["change"] > 0 for lever in levers for kpi, row in lever["changes"].items()
+                          if kpi != "ttft" and kpi not in STATED):
         raise ValueError("No lever improves decode, prefill, context_decode or context_ttft: time to first token is "
                          "never the reason for a candidate on its own")
     # Every needed p1 KPI has a lever on its family.
@@ -1630,8 +1654,10 @@ def _check_stale_rejections(plan):
 
 
 # Where recon's placement prices misses computed on the CPU (alone or split with the link) below misses
-# copied over the link, candidate 1 starts with the CPU expert tier, or the plan names the measurement that rejects it.
+# copied over the link, candidate 1 starts with the CPU expert tier (expert-offload, which decides it itself, or the
+# tier on its own), or the plan names the measurement that rejects it.
 CPU_TIER = "inference:host-expert-tier"
+CPU_TIER_PROVIDERS = ("inference:expert-offload", CPU_TIER)
 CPU_TIER_GAP = "placement:cpu"
 
 
@@ -1657,13 +1683,13 @@ def _check_cpu_tier(plan):
     if floors is None:
         return
     plan.inputs["cpu_tier"] = {"floors_ms": floors}
-    if any(lever.get("provider", "").startswith(CPU_TIER) for lever in plan.data["levers"]):
+    if any(lever.get("provider", "").startswith(CPU_TIER_PROVIDERS) for lever in plan.data["levers"]):
         return
     rejected = next((row for row in plan.data["gaps"] if row["gap"] == CPU_TIER_GAP), None)
     if rejected is None or rejected["answer"] != "rejected" or "evidence" not in rejected:
         raise ValueError("recon's placement prices misses computed on the CPU below misses copied over the link "
                          f"(plain-pass floors {floors} ms): candidate 1 starts with the CPU expert tier. Add a lever "
-                         f"(speed or requirement) with provider {CPU_TIER!r}, or a gaps entry {{\"kpi\": \"decode\", "
+                         f"(speed or requirement) with provider 'inference:expert-offload' (or {CPU_TIER!r}), or a gaps entry {{\"kpi\": \"decode\", "
                          f"\"gap\": \"{CPU_TIER_GAP}\", \"answer\": \"rejected\", \"evidence\": <a measurement in the "
                          "run>, \"detail\": ...} with the layer times that reject it on this machine")
     plan.inputs["cpu_tier"]["rejection"] = _evidence_file(plan.root, rejected["evidence"], f"gaps entry {CPU_TIER_GAP}")
@@ -1684,7 +1710,8 @@ def _check_lever_sources(plan):
 
 # The checks build runs on a plan, in order: a check raises ValueError for a plan that breaks it, may record what crit
 # derived in the plan's inputs, and adds to plan.warnings what it judges on a forecast alone.
-CHECKS = (_check_decision, _check_gap_names, _check_answered_gaps, _check_limit_gaps, _check_measured_only,
+CHECKS = (_check_decision, _check_gap_names, _check_answered_gaps, _check_stated_gaps, _check_limit_gaps,
+          _check_measured_only,
           _prioritize, _check_levers, _check_forecast, _check_forecast_priorities, _check_reach, _check_objective,
           _check_review, _check_activations, _check_round, _check_stale_rejections, _check_cpu_tier,
           _check_lever_sources, _check_supersedes)

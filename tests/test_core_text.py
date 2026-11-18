@@ -708,7 +708,7 @@ class CappedReads(MappingFiles):
 
 
 class NativeParityTests(unittest.TestCase):
-    """The text layer reads generation_config.json and config.json with the rules of the native loaders."""
+    """The text layer reads generation_config.json and config.json with crit_core.model's rules."""
 
     def test_a_dangling_or_non_regular_generation_config_fails_loudly(self):
         with tempfile.TemporaryDirectory() as directory:

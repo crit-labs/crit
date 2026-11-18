@@ -135,7 +135,9 @@ def mm_prompt(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, weights: str,
     """out [M][N] = x [M][K] times the matrix w for any number of rows M >= 1 (the prompt tile), every element with
     the bits mm_rows gives it for the same matrix, acts and splits (plan()'s, the matrix's): a prompt row equals the
     same row decoded alone or batched, so a prompt's tokens score as they are served. Each decoded weight serves
-    PROMPT_TOKENS rows a CTA (a GEMM's reuse); quantized activations take scratch_bytes(M, K) of scratch. glu: as
+    PROMPT_TOKENS rows a CTA (a GEMM's reuse); quantized activations take scratch_bytes(M, K, acts) of scratch. acts
+    nvfp4_mma (NVFP4 weights with blocked scales, K a multiple of FP4_STEP, where fp4_mma()): the FP4 prompt tile, every
+    element with the bits mm_rows gives it on the FP4 MMA with plan(..., acts="nvfp4_mma")'s splits. glu: as
     mm_rows'."""
     ops.mm_prompt(x, w, scales, row_scale, WEIGHTS[weights], ACTS[acts], float(input_scale), blocked, splits, scratch,
                   out, zeros, int(group), int(bool(glu)))

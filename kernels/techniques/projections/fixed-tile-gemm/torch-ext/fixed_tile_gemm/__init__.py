@@ -10,7 +10,7 @@ pick which outputs a program computes and how its loads are staged; BLOCK_K, the
 knob, the same for every row count of a shape. The defaults are MM_TILE with SMALL on: an untuned build runs the tiles
 it ran before knobs; at 1 to 32 rows (default_rows) a 16 x 64 tile in 4 warps and 6 stages, no switch.
 
-mm_split (structure mm-split, row_invariant false): the same GEMM with K split over SPLIT programs a tile, each
+mm_split (structure mm-split, exactness repeatable): the same GEMM with K split over SPLIT programs a tile, each
 writing its FP32 partial sums, then one pass adding the partials in split order and rounding once: more programs for
 narrow matrices at a few rows (a matrix of 5,120 outputs has 40 to 80 tiles on a device of 170 multiprocessors). The
 sums follow the split, which a tuning may choose by the row count: a row's bits may change with the rows beside it
@@ -235,14 +235,17 @@ def _cuda_mm(structure, x, dense, dtype):
         return out
     lib = _cuda_lib(x.device, x.dtype)
     plan = (ctypes.c_int * 4)()
-    if lib.crit_ftg_plan(structure, N, K, M, plan):
-        raise RuntimeError(f"fixed-tile-gemm cuda: {_ERRORS[1]}")
-    splits, chunk = plan[2], plan[3]
-    part = torch.empty(splits * M * N, dtype=torch.float32, device=x.device) if splits > 1 else None
-    stream = torch.cuda.current_stream(x.device).cuda_stream
-    err = lib.crit_ftg_mm(structure, x.data_ptr(), x.stride(0), dense.data_ptr(), dense.stride(0), out.data_ptr(),
-                          out.stride(0), int(dtype == torch.float32), M, N, K,
-                          part.data_ptr() if part is not None else None, splits, chunk, stream)
+    # The library plans and launches on the thread's current device (its multiprocessors, the kernel's shared-memory
+    # limit and the CTAs it holds are that device's): the operands' device, not whichever one is current.
+    with torch.cuda.device(x.device):
+        if lib.crit_ftg_plan(structure, N, K, M, plan):
+            raise RuntimeError(f"fixed-tile-gemm cuda: {_ERRORS[1]}")
+        splits, chunk = plan[2], plan[3]
+        part = torch.empty(splits * M * N, dtype=torch.float32, device=x.device) if splits > 1 else None
+        stream = torch.cuda.current_stream(x.device).cuda_stream
+        err = lib.crit_ftg_mm(structure, x.data_ptr(), x.stride(0), dense.data_ptr(), dense.stride(0), out.data_ptr(),
+                              out.stride(0), int(dtype == torch.float32), M, N, K,
+                              part.data_ptr() if part is not None else None, splits, chunk, stream)
     if err:
         raise RuntimeError(f"fixed-tile-gemm cuda: {_ERRORS.get(err, err)}")
     return out

@@ -67,7 +67,7 @@ The tuned structures are keyed by the matrix shape (N: the largest matrix's rows
 count (activation rows for `rows`, tuned at 1, 2, 4 and 8; the job's tokens for `gemm` and `gemm-staged`, tuned at 16,
 128, 1,024 and 4,096; `gemm-native` at 128, 512, 1,024, 2,048, 4,096 and 8,192). No knob of the declared structures changes an
 output's operations or their order (no order knob): every configuration gives the declared order's bits; `gemm-native`
-is outside that promise (kernel.json `"row_invariant": false` and its `order`). The defaults of `rows` and `gemm` are
+is outside that promise (kernel.json `"exactness": "repeatable"` and its `order`). The defaults of `rows` and `gemm` are
 the launches the kernels had before they had knobs; those of `gemm-staged` its best configuration on the largest prompts
 swept.
 

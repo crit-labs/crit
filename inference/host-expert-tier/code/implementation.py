@@ -1,4 +1,5 @@
-"""Python model of the CPU expert tier's two contracts (expert_pool.h, host_tier.h), standard library only.
+"""Python model of the CPU expert tier's contract (host_tier.h) and of the claim of the host's pool it runs on (Core's
+pool.h, crit_plugins.host), standard library only.
 
 The pool: a batch's head is one word, epoch << 32 | next task, and a claim is a compare-and-swap that succeeds only
 for the epoch the worker woke for, so a worker still leaving an earlier batch claims nothing of the next one.

@@ -61,9 +61,7 @@ original. `discard(id)` drops a round without publication.
 
 **After-token counts.** Starting at `P`, verify ordinal `i` is the state after
 `P + i + 1` materialized tokens. `checkpoint_node(P, accepted_nodes, B)` maps a
-checkpoint count `B > P` to its physical node (`B == P` is the initial state);
-natively this is Core's `crit::core::checkpoint_node`
-([crit/state.h](../../core/include/crit/state.h)). Nodes are topologically
+checkpoint count `B > P` to its physical node (`B == P` is the initial state). Nodes are topologically
 numbered and a chain may skip siblings, so an ordinal never equals a node by
 assumption.
 
@@ -87,12 +85,8 @@ per 2,048 tokens without a measurable change in time to first token.
 
 | File | Supplies |
 | --- | --- |
-| [recurrent_recovery.h](code/recurrent_recovery.h) | Header-only C++20 `Recovery`, `Geometry`, `Limits`, `Snapshot`, `Node`; includes `<crit/state.h>`, so users link `crit::core` |
-| [example.cpp](code/example.cpp), [CMakeLists.txt](code/CMakeLists.txt) | Native example and regression target |
 | [reference.py](code/reference.py) | Python formula, output-only verification and accepted-prefix reconstruction |
 | [chunked_prefill.py](code/chunked_prefill.py) | `prepare_chunk`, `apply_chunk`, `two_pass`, `sequential`, `max_difference` |
-| [stochastic_round.h](code/stochastic_round.h) | Host and device `bf16_stochastic` and `state_rounding_bits`: unbiased BF16 state storage from Core's keyed Philox draws |
-| [recurrent_cuda.h](code/recurrent_cuda.h) / [.cu](code/recurrent_cuda.cu) | The device commit: `enqueue_select_accepted` (the state after the accepted columns from per-column checkpoints) and `enqueue_record_accepted` (the count of a deferred commit, one or many per-block counts), from a device-held count |
 | [device_states.py](code/device_states.py) | The recurrence slot's device form: `StatePool` (states, stashes, convolution windows, round slot table), `forward`, `convolve`, `accept`, `commit_round` by strategy, over recurrent-scans' pool kernels or a capture-safe torch formula; `FLA_TILES` and `fla_pinned`, the stated tiles fla's chunked kernels run on |
 
 Default native limits (65,536 state elements, 1,024 nodes, chain length 64,
@@ -215,7 +209,9 @@ layer, 0.12 ms of GPU time at 16 tokens and ~0.7 ms of host time), the column sc
 whose time grows with the tokens (0.03 ms at 16, 0.12 at 128, 0.45 at 512 a layer, with the
 convolution). A prompt row of up to `exact_rows` tokens runs the scan, a longer one the
 chunked kernel, in an eager call and in a captured prompt bucket alike (`exact_rows: 0`: every
-prompt row the chunked kernel). The two paths give other bits, so the configuration states
+prompt row the chunked kernel; `prompt_rows: scan`: every prompt row the scan, which `auto`
+takes where the engine asks `row-exact` or higher of its prompt rows,
+[exactness](../../docs/PLUGINS.md#exactness)). The two paths give other bits, so the configuration states
 the value (default 512, the largest of `crit_plugins.prompt_graphs`' default buckets) and no
 pool measures it when it is made: a crossover measured at load moved with the machine's load
 (eager 861 to 1,044 tokens from one process to the next on one RTX 5090), and where it fell
@@ -259,13 +255,6 @@ each kernel to one stated tile (`device_states.FLA_TILES`, one of fla's own conf
 autotuner's FP32 pick at that shape): fla then times nothing and a prompt row gets the same
 bits on every run, at the autotuner's speed in FP32 and about 3% more kernel time in BF16.
 
-With Core's `StateCache` ([Core state cache](../../core/src/state/README.md)),
-declare the layers as a `StateComponent` whose `RecurrentCommit` matches the
-strategy: `column_checkpoints` (verify writes `scratch[i]`, commit swaps
-`scratch[n - 1]` live by id), `recompute` (writes `start` advanced by `n` into
-`scratch[0]`) or `in_place` (deferred). Core's commit takes `n` on the host; the
-device-count kernels remain for captured rounds that never read `n` back.
-
 ## The device form (the recurrence slot)
 
 [device_states.py](code/device_states.py) is the slot's device form
@@ -281,6 +270,24 @@ dilation 2 to 4 (a model's dilated n-gram convolution, Flash-Next's PLE: 4 taps 
 convolution alone takes a one-value state (`heads = keys = values = 1`). Queries and keys
 come at the checkpoint's key heads (`key_heads`, value head `h` reading key head
 `h // (heads / key_heads)`).
+
+With the plugin's `elastic` option (this technique's plugin and `sequential-recurrence`)
+everything a sequence keeps lies in a paged range of the device's memory
+([crit_plugins.memory](../../core/python/crit_plugins/memory.py)): its states and, with
+the kernels, its stash, its convolution window and the convolution's stash, each stored
+with a sequence's layers together (the kernels reach an entry by the tensors' layer and
+sequence strides, so the pool hands them `[layers][sequences]` views). A pool sized for
+every sequence an engine may serve at once backs a sequence when it opens, the device's
+givers (an expert cache) making room first, and gives it back once the sequences past
+it closed, keeping one sequence's room. A prompt row that runs the scan keeps its final
+state until its accept (a cancelled step leaves the sequence as it was); it waits in
+the pool's lowest free unit, where a sequence's states live, so the step allocates no
+copy of them: on Qwen3.8-Flash-Next that copy was 108 of the 122 MiB a short prompt
+step took. Sequence 0 and a spare sequence stay backed (a
+padding prompt chunk reads and writes them back), sequences open lowest first, and the
+kernels skip a row without a sequence, so no row touches a state that is not backed. On
+Qwen3.8-Flash-Next a pool of 8 sequences (0.99 GiB) takes 0.17 GiB with one request in
+flight. Where the driver has no virtual memory API the pool is one allocation.
 
 - **step() rows.** `forward` and `convolve` run every row of a `StepBatch` in one launch:
   a row of up to `widest + 1` tokens (decode, verify) applies its sequence's pending
@@ -383,10 +390,7 @@ retained round uses `O(S + nodes*I + D*V)` instead of `O(D*S)` snapshots, but
 recovery still recomputes the recurrence. The device strategies' costs are measured
 above (which strategy suits which regime).
 
-The [CUDA fixture](../../tests/inference/recurrent_cuda_tests.cpp) under
-`CRIT_INFERENCE_CUDA` checks the device commit: the select chooses the start or the
-accepted checkpoint for every count (clamped below 0 and above the columns) bit for
-bit, and the many-count record writes every group's counts and nothing else. The
+The
 reference scans its strategies were proven with (checkpoints, recompute and deferred
 against the FP64 host oracle over 96 geometries, deferred for 96 rounds bit for bit
 against checkpoints) moved to crit's kernel recurrent-scans with their fixture. The
@@ -394,8 +398,5 @@ plugin's tests check the device form as stated above, on CPU, on CUDA with
 recurrent-scans and with the torch formula; `sequential-recurrence`'s, that every
 autotuned kernel fla's chunked path reaches holds its stated tile, so nothing times a tile
 and a prompt row keeps its bits with the autotuners' picks cleared.
-[Native fixtures](../../tests/inference/recurrent_recovery_tests.cpp) compare
-every accepted length with a long-double oracle, covering nonsequential paths,
-63/64/65 boundaries, stale commits, sibling failure, cancellation, reentry and
-malformed inputs. Full-model continuation, device casts and performance remain
+Full-model continuation, device casts and performance remain
 engine qualification work.

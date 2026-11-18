@@ -52,12 +52,13 @@
     },
     "prompt_reader": {
       "type": "choice",
-      "default": "prefill",
+      "default": "auto",
       "choices": [
+        "auto",
         "prefill",
         "decode"
       ],
-      "description": "prefill: prompt rows through a prompt reader (FlashInfer's prefill or crit's), fastest, another reduction than decode rows' (a scored token may differ from the served one by more than 0.001 nats); decode: prompt rows (a step's and a captured chunk's) in the decode's reduction, the split-KV reader as window rows of up to 64 columns (each program folding its partitions as the merge does) or its torch fallback over the page tables: a scored token equals the same token served, bit for bit, over every page type (window rows through the split-KV reader too, no FlashInfer)"
+      "description": "auto (the default): the fastest reader that keeps the level the engine's configuration asks of its prompt rows (exactness, docs/PLUGINS.md#exactness): prefill where it asks repeatable or nothing, and where it asks row-exact and reader split's own prompt reader reads the pages (crit's kernel loaded, no FlashInfer); decode where it asks exact, and where it asks row-exact with reader flash or cuda, FlashInfer or torch; prefill: prompt rows through a prompt reader (FlashInfer's prefill or crit's), fastest, another reduction than decode rows' (a scored token may differ from the served one by more than 0.001 nats); decode: prompt rows (a step's and a captured chunk's) in the decode's reduction, the split-KV reader as window rows of up to 64 columns (each program folding its partitions as the merge does) or its torch fallback over the page tables: a scored token equals the same token served, bit for bit, over every page type (window rows through the split-KV reader too, no FlashInfer); latent attention's prompt rows likewise, as window rows through latent-attention's fused launch"
     },
     "reader": {
       "type": "choice",
@@ -88,7 +89,7 @@
       "default": 128,
       "min": 1,
       "max": 65536,
-      "description": "MiB of partials the split-KV reader allocates when the plugin is made (memory() declares them): a launch reads as many rows as they hold"
+      "description": "MiB of partials a launch of the split-KV reader may take from the engine's scratch (crit_plugins.memory: each launch takes what its rows need, nothing is held between launches): a launch reads as many rows as they hold"
     },
     "flashinfer": {
       "type": "choice",

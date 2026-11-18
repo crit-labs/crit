@@ -1,8 +1,8 @@
 # Run a whole speculative round on the device
 
-One Core `Session::advance()` runs a complete speculative round on the GPU (draft
+One decode step runs a complete speculative round on the GPU (draft
 K tokens, verify K+1 columns, accept, select the accepted state, advance the
-frontier); the host waits once, on one `readback_async`. Greedy requests compare
+frontier); the host waits once, on one readback. Greedy requests compare
 drafts with the target's argmax; sampled requests verify by rejection sampling
 through [token-sampling](../token-sampling/README.md), which writes predictions the
 same accept kernel consumes, so both decode modes share one round.
@@ -11,8 +11,8 @@ same accept kernel consumes, so both decode modes share one round.
 
 Use it once a synchronous speculative loop is correct and the remaining cost is
 host round trips: per-token readbacks, host acceptance and bookkeeping, or many
-small launches. Keep the synchronous loops in [mtp-decode](../mtp-decode/README.md)
-(`GreedySpeculator`, `SampledSpeculator`) as the correctness oracles.
+small launches. Keep the synchronous rule in [mtp-decode](../mtp-decode/README.md)
+(`verify`) as the correctness oracle.
 
 It does not help when verifying K+1 columns costs about K+1 ordinary steps.
 
@@ -25,25 +25,25 @@ still to take in); the host only mirrors counts it reads back. A round is two
 captured graphs and one copy:
 
 1. **Forward**: copy the round allowance from pinned memory into
-   `control[output_budget]` (with `RoundConfig::zero_copy`, `enqueue_set_budget`
+   `control[output_budget]` (with zero copy a kernel
    reads it in place), run the engine's `draft` step (writes `drafts[K]`
    from `last_token`), then `verify`. Verify feeds `last_token, d1..dK` at
    positions `frontier..frontier+K`, writes `predictions[i]` (the target's greedy
    argmax after `last, d1..di`) and retains whatever provisional state selecting
    any accepted prefix needs: KV columns, recurrent checkpoints or saved inputs.
-2. **Finish**: the device greedy-accept kernel, `enqueue_pack` (the readback
-   block), then the engine's `commit_state`.
-3. **Readback**: one `readback_async` of the block into pinned memory: the packed
+2. **Finish**: the device greedy accept, the pack of the readback
+   block, then the engine's `commit_state`.
+3. **Readback**: one copy of the block into pinned memory: the packed
    result `{n_emitted, tokens[K+1]}`, `n_matched` and the frontier after the round,
    then optionally each column's log-probability and ranked alternatives (columns
-   past `n_emitted` hold -1 and -inf). Its completion event is `Progress::readiness`.
+   past `n_emitted` hold -1 and -inf).
    The host checks the frontier against its mirror plus the count, reads the
    accepted drafts for acceptance statistics, and hands Core the log-probabilities
-   without a second copy. With `RoundConfig::zero_copy` the pack kernel writes the
+   without a second copy. With zero copy the pack kernel writes the
    block straight into mapped pinned memory and the completion event follows
    Finish: a round has no copy at all.
 
-Acceptance is the host `GreedySpeculator` rule. With remaining allowance `R`:
+Acceptance is mtp-decode's greedy rule (`verify`). With remaining allowance `R`:
 
 ```text
 out = 0, matched = 0
@@ -60,7 +60,7 @@ selects column `m - 1` (or the round start when `m == 0`), reading `n_emitted`
 from device memory.
 
 `commit(accepted)` publishes only what the device chose. When Core trims the row
-(for example at a request stop the device did not know), the controller enqueues
+(for example at a request stop the device did not know), the round enqueues
 a device truncation that recomputes frontier, pending token and count from
 `base_*` and reruns `commit_state` eagerly. Because `commit_state` is a pure
 function of round-start state and verify outputs, this is exact. Draft width zero
@@ -88,13 +88,13 @@ Forward: copy the allowance
          token_sampling::enqueue_commit(result + 1, control + commit_tokens)   # the previous round's tokens
          draft: greedy argmax (q one-hot), or enqueue_sample(DrawPurpose::draft) writing q rows
          verify: K + 1 target logit rows, then enqueue_verify -> predictions
-Finish:  enqueue_greedy_accept, commit_state
+Finish:  greedy accept, commit_state
 ```
 
 The commit kernel runs first in Forward because Core can still trim the previous
 round after Finish; `control[commit_tokens]` holds the kept count by the next
-launch (the accept and the truncation set it to `n_emitted`), and `start()` and
-`seed()` zero it, so the engine initializes `Request.position`, `counts` and
+launch (the accept and the truncation set it to `n_emitted`), and a round's start and
+its seed zero it, so the engine initializes `Request.position`, `counts` and
 `prompt_seen` (including the pending first output) at request start. Never pass
 `n_emitted` instead: after a seed it is 1 for the drafter's catch-up while the seed's
 token is already in the history, which would count it twice.
@@ -115,7 +115,7 @@ continuation, and Core's allowance, capped at the tokens left, ends it. Verify s
 computes and keeps every column's state, so the accepted prefix is materialized as
 usual, and log-probability rows for the forced tokens come from the same logits with
 `predictions` as the chosen ids. A forced verify is a different step, so give it its
-own controller (or a device flag its step reads); the control block and the accept
+own capture (or a device flag its step reads); the control block and the accept
 stay as they are.
 
 ### Column-invariant arithmetic
@@ -141,7 +141,7 @@ batch. Masking keeps them out of the real rows only while everything they hold i
 finite. A masked key enters attention, like any masked term of a weighted sum, with
 weight 0, and `0 * NaN` and `0 * inf` are NaN, so one non-finite key or value in a
 junk column silently poisons every real row that reads it. Zero such buffers when
-allocating them (the controller fills its own) instead of leaving them uninitialized,
+allocating them instead of leaving them uninitialized,
 keep stale values finite (a row that turned non-finite can be read as zeros where it
 enters), and give junk columns a valid token id and position when a fixed-width step
 gathers an embedding or writes a cache row for them (hidden-state-drafters' catch-up
@@ -150,78 +150,52 @@ marks them -1: use the pending token and the plan's position
 
 ## What the code supplies
 
-Reference code, not tuned for performance:
+The technique's host pieces:
 
 | File | Supplies |
 | --- | --- |
-| [greedy_accept.h](code/greedy_accept.h) / [.cu](code/greedy_accept.cu) | `control` layout, `result_width(K)`, batched `AcceptRows`, `enqueue_greedy_accept` (one thread per row), `enqueue_truncate`, `enqueue_seed`, `PackedLayout`/`PackRows`/`enqueue_pack` (the readback block), `enqueue_set_budget` (zero copy); unused result slots are -1 |
-| [device_round.h](code/device_round.h) / [.cpp](code/device_round.cpp) | `DeviceSpeculativeRound`, a single-row controller: `start()` or `seed()`, `prepare([K])` captures Forward and Finish (`RoundConfig::graphs = false` runs eagerly), `launch(output_tokens[, K])` with K up to the configured widest over one set of buffers, `tokens()`, `matched()`, `logprobs()`/`top_logprobs()` (`RoundConfig::logprobs`, `set_top_logprobs`), `RoundConfig::zero_copy`, `commit(accepted)`, `timings()` (`DeviceStage::forward`/`accept`) |
-| [toy_model.h](code/toy_model.h), [toy_model.cu](code/toy_model.cu), [toy_example.cpp](code/toy_example.cpp) | Synthetic target (attention over a device KV cache, a gated-delta layer of its own committed by [recurrent-state-recovery](../recurrent-state-recovery/README.md)'s `select_accepted`, output head) and a bigram drafter through a real Core `Engine` |
 | [catch_up.py](code/catch_up.py) | `catch_up_plan` and a `PositionalDrafter` toy for stateful drafters |
-| [round_budget.h](code/round_budget.h), [round_budget.py](code/round_budget.py) | `RoundBudget`: tokens per round, round/step ratio, speedup `tokens_per_round / ratio`, pass/fail at 1.3 |
+| [round_budget.py](code/round_budget.py) | `RoundBudget`: tokens per round, round/step ratio, speedup `tokens_per_round / ratio`, pass/fail at 1.3 |
 | [python_round.py](code/python_round.py) | The technique's pieces for rounds on Core's round driver (`crit_plugins.rounds`, [Python engines](#python-engines)): `rejection_predictions` and `draw` for sampled rounds, `override_drafts` and `CopyDrafts` for copied drafts |
 | [width_policy.py](code/width_policy.py) | `WidthPolicy`: the draft width per round from each row's per-depth acceptance (decayed) over the measured round cost, for the rows that decode together |
 
 ## What the engine supplies
 
-Three capture-safe `DeviceStep` callables over the stable `RoundView` pointers,
-plus all model arithmetic, KV layout, sampling and batching across requests:
+Three capture-safe steps over pointers that stay the same between rounds, plus all model arithmetic, KV layout,
+sampling and batching across requests:
 
 | Step | Contract |
 | --- | --- |
 | `draft` | Write `drafts[0..K)` from `control[last_token]` at `control[frontier]`, plus any private draft state |
-| `verify` | Feed `last_token` then the drafts at `frontier..frontier+K`; write `predictions[0..K]`; keep per-column state or inputs; with `RoundConfig::logprobs`, write `RoundView::logprob`/`top_ids`/`top_logprobs` for columns `0..K` (Core's `TokenLogprob` definition: raw logits, alternatives by log-probability then id) |
+| `verify` | Feed `last_token` then the drafts at `frontier..frontier+K`; write `predictions[0..K]`; keep per-column state or inputs; with log-probabilities, write each column's chosen value and alternatives (Core's `TokenLogprob` definition: raw logits, alternatives by log-probability then id) |
 | `commit_state` | Select model state for `control[n_emitted]` relative to the round start; idempotent, may run twice |
 
-An optional fourth step, `accept`, replaces the greedy accept kernel in Finish
-with another walk that keeps its control and packed-result contract, such as the
-tree walk of [draft trees](../draft-trees/README.md); truncation, commit and the
+An optional fourth step, `accept`, replaces the greedy accept kernel with another walk that keeps its control and
+packed-result contract, such as the tree walk of [draft trees](../draft-trees/README.md); truncation, commit and the
 single readback stay unchanged.
 
-Steps submit only to the supplied stream: no host synchronization, readback,
-allocation or pointer that changes between rounds. A recurrent layer can use the
-device commit in [recurrent-state-recovery](../recurrent-state-recovery/README.md);
-a KV cache advances its provisional frontier as in
-[attention-state](../attention-state/README.md). In a Core `Session`:
-
-```text
-open_request:     round.set_stops(effective request stops)   # device list, no recapture
-                  round.set_top_logprobs(options.logprobs)   # with RequestOptions::logprobs
-advance(budget):  prefill as usual; on the last prefill chunk call start(frontier, last)
-                  (or seed(frontier, first, previous) for a stateful drafter, below)
-                  decode: ready = round.launch(budget.output_tokens)    # or (.., K) per round
-                          return {0, true, {}, ready, deferred_tokens = true,
-                                  logprobs = round.logprobs(), top_logprobs = round.top_logprobs()}
-ready_tokens():   return round.tokens()                       # after Core's one wait
-device_timings(): return round.timings()
-commit(accepted): round.commit(accepted)
-close(finish):    if round.pending(): round.abandon()        # cancelled after launch
-```
-
-Core reads the span from `ready_tokens()` after its single wait, so the round's
-GPU time appears in the `readiness` span. The pinned result stays valid until
-`commit`. Core may close a cancelled session without a commit; `abandon()` waits
-for the readback and requires a fresh `start()`, and an engine reusing one
-controller must call it or the next `set_stops()`/`start()` rejects the pending
-round. Stops live in device memory, up to `max_stops`.
+Steps submit only to the round's stream: no host synchronization, readback, allocation or pointer that changes
+between rounds. A recurrent layer can use the device commit in
+[recurrent-state-recovery](../recurrent-state-recovery/README.md); a KV cache advances its provisional frontier as in
+[attention-state](../attention-state/README.md). [Python engines](#python-engines) run these steps on Core's round
+driver. Stops live in device memory.
 
 One capture serves every frontier only if launch shapes do not depend on context
 length. When a kernel takes a host-side length bound (a split count or grid sized
-from the maximum visible keys), capture one Forward/Finish pair per frontier range
-and select it from the host frontier mirror. Reserve the controller's buffers and
-per-column state in Core resources; the controller allocates through the backend.
+from the maximum visible keys), capture one pair of graphs per frontier range
+and select it from the host frontier mirror.
 
 **Stateful drafters.** A drafter with its own per-position state must first
 ingest what the previous round accepted, a count only the device knows. Process a
-fixed `K + 1` columns (with widths chosen per round, `RoundView::max_draft_tokens + 1`:
+fixed `K + 1` columns (with widths chosen per round, the widest round's `K + 1`:
 the previous round may have emitted more than a narrower round's `K + 1`; see
 [hidden-state-drafters](../hidden-state-drafters/README.md)' `enqueue_eagle_ingest`
 with `columns`) and mask by position: column `c` holds the previous verify's
 feature `c` and the `c`-th emitted token at position `frontier - n_emitted + c`;
 columns `c >= n_emitted` are junk at positions `>= frontier`, overwritten before
 any read. Seed the first draft from column `n_emitted - 1`. When the prefill
-materializes the whole prompt and produces the first output itself, call
-`seed(frontier, first, previous)` (kernel `enqueue_seed`) instead of `start()`: the
+materializes the whole prompt and produces the first output itself, seed the round
+with the first output and the token before it: the
 state a one-column round at `frontier - 1` leaves after emitting `first`, so the first
 catch-up ingests (last prefilled feature, `first`), with `commit_tokens` 0 because the
 engine has put `first` in its sampling history.
@@ -270,20 +244,6 @@ probabilities, values = [0.25, 0.75, 0.0], [1.0, 2.0, float("nan")]   # the last
 assert math.isnan(sum(p * v for p, v in zip(probabilities, values)))  # the real row is poisoned
 values[2] = 0.0                                                         # finite junk: the mask holds
 assert sum(p * v for p, v in zip(probabilities, values)) == 1.75
-```
-
-The native [toy example](code/toy_example.cpp) checks through a Core `Engine`:
-output equal to one-token greedy decoding for two prompts in graph and eager mode
-and for width 0; exactly one readback per round (counted at the CUDA API with
-`--wrap`); one Forward and one Finish `device` event per round; and a Core-trimmed
-stop applied through `commit(accepted)`. With its serial reference kernels it
-usually fails the 1.3 threshold even at about 3.4 tokens per round, which is the
-signal to fix round structure first. Build and run:
-
-```sh
-cmake -S inference -B build/inference-cuda -DCRIT_INFERENCE_CUDA=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build/inference-cuda --config Release
-ctest --test-dir build/inference-cuda -C Release -R "crit_device_round|crit_toy_round" --output-on-failure
 ```
 
 ## Python engines
@@ -411,12 +371,10 @@ selection, the pack kernel, two graph launches and a `4 * (K + 4)` byte copy
 storage and any per-column state verify keeps. With zero copy the allowance copy
 becomes a one-thread kernel reading host memory and the readback copy disappears;
 the pack kernel's writes then cross the bus. Copies next to kernels cost more on
-some platforms than others, so time rounds both ways on the target
-(`crit_device_round_tests timing` for the round mechanics alone, `RoundBudget` for
-the engine). For illustration, on one RTX 5090 under WSL2 (driver 596.49, CUDA
-13.1) the hash fixture's graph-captured rounds took 170 to 215 us copying and 65
-to 100 us zero copy (medians of 7 x 500 rounds, K 0 and 4, three runs): about
-50 us per copy there. Tokens and device state are the same either way.
+some platforms than others, so time rounds both ways on the target (`RoundBudget`).
+For illustration, on one RTX 5090 under WSL2 (driver 596.49, CUDA 13.1) graph-captured
+rounds of a synthetic step took 170 to 215 us copying and 65 to 100 us zero copy
+(K 0 and 4): about 50 us per copy there. Tokens and device state are the same either way.
 
 **Profile a whole round first.** Feed `RoundBudget` the ordinary step time (K = 0
 or the engine's normal decode) and the round time. A failing ratio usually means
@@ -425,7 +383,7 @@ kernels; a passing ratio with few tokens per round points at the drafter. See
 [the profiling recipe](#profile-a-whole-round).
 
 **Report acceptance with every speed** (`accepted_tokens_per_round` beside
-`decode_tps`; `matched()` is each round's accepted drafts), and compare round time
+`decode_tps`), and compare round time
 when generated text differs.
 
 **Choose draft width on mixed text.** Measure several widths (K = 2..8) on prose,
@@ -433,19 +391,14 @@ code, reasoning and another language, such as the
 [crit eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md) speed suite. Each extra position adds a
 draft step and a verify column, so widen K and cheapen the drafter together (a
 cheaper drafter encoding or a [draft vocabulary subset](../draft-vocabulary-subset/README.md)
-changes acceptance only). Per-round K from recent acceptance: size the controller
-for the widest K and pass each round's K to `launch(output_tokens, draft_tokens)`;
-the buffers are shared and each width captures its own Forward/Finish pair on its
-first launch (steps see the width in `RoundView::draft_tokens`). With routed experts offloaded to host memory, each column routes
+changes acceptance only). Per-round K from recent acceptance: size the round's buffers
+for the widest K and choose each round's K; the buffers are shared and each width
+captures its own graphs on its first launch. With routed experts offloaded to host memory, each column routes
 independently, so measure expert misses per round before adding draft tokens.
 
 ### Profile a whole round
 
-Enable tracing (`Profile::trace.capacity`), time graph launches with
-`CudaStageTimer` and return them from `Session::device_timings()`; Core records
-each as a `device` event under the step's `operation`, and the gap to the host
-`step` span is host work. `CudaCategoryTimer` splits device time by category
-([CUDA services](../../core/src/backends/cuda/README.md#device-time-by-category)).
+Time the round's graph launches against the host step around them: the gap is host work.
 Confirm the shape with Nsight Systems:
 
 ```sh
@@ -458,27 +411,12 @@ Compare two runs differing only in generated tokens: each extra round should add
 `cudaEventSynchronize` (1 blocking). Only after the ratio passes, use `--cuda-graph-trace=node` or Nsight
 Compute for individual kernels.
 
-Failure modes: steps that are not capture-safe fail at `prepare()`; a device count
+Failure modes: steps that are not capture-safe fail at capture; a device count
 outside `1..allowance`, an out-of-vocabulary token, a matched count above it or a
-device frontier other than the host mirror plus the count rejects `tokens()`; `launch`
-rejects a round that could write past `context`; a failed truncation leaves device
+device frontier other than the host mirror plus the count is refused; a round that
+could write past the context is refused; a failed truncation leaves device
 state undefined, so the request must fail.
 
-[Python](../../tests/test_device_rounds.py) and
-[native fixtures](../../tests/inference/device_round_tests.cpp) check catch-up
-against exact ingestion, the accept kernel against `GreedySpeculator` on 4,000
-random rows, graph replay against eager and greedy for K = 0..4 and for widths
-chosen per round (0..6) over one controller, truncation and one copy per round,
-and a sampling-history stand-in that takes in exactly the
-tokens Core kept after `start()` and after `seed()`, zero-copy rounds equal to
-copying ones with no device-to-host copy, forced replay of a continuation that departs
-from greedy decoding emitting exactly that continuation, the readback block against the
-result and control block with masked log-probability rows, and log-probability rows
-through the controller. The toy example's log-probabilities and alternatives reach
-Core's result equal to ordinary decoding's.
-[sampled_round_tests.cpp](../../tests/inference/sampled_round_tests.cpp)
-runs token-sampling's verify predictions through the accept, truncation and commit
-kernels from seeded rows (whose first history commit takes in nothing) and compares each request with a host round over Core's laws and draws (the
-target's draw per column, drafts kept while they match, stops, allowances), and
-checks that a zero-width round is one ordinary draw. They qualify round mechanics, not
-model arithmetic or speed.
+[Python fixtures](../../tests/test_device_rounds.py) check catch-up against exact
+ingestion and the round's budget.
+They qualify round mechanics, not model arithmetic or speed.

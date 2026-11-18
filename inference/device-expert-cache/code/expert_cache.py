@@ -22,13 +22,22 @@ A step plans every routed layer with plan() or every one with prompt(), on one s
 stages every expert its residency snapshot (read once per prompt step) says is not resident, by the copy engine on a
 side stream into ring slots, the next layer under the current one; a ring segment is reused only after the layer that
 read it ran (events). A shorter chunk copies its routed misses into ring slots on the device. The ring is borrowed from
-the own slots for a prompt step and given back by end_prompt() at its end (ring="borrow"), or kept apart
-(ring="fixed"). A decode plan outside a capture ends a prompt step the model left open.
+the own slots for a prompt step and given back by end_prompt() at its end (ring="borrow": the whole ring for a staged
+chunk, as many slots as it has routes for a shorter one, so a short prompt costs the cache few experts), or kept
+apart (ring="fixed"). A decode plan outside a capture ends a prompt step the model left open.
 
-Rounds (crit_plugins.rounds): start_round(view) at a round's start keeps ranked residency on the device (every
-`period`-th round the decayed route counts of every key are ranked and up to max_swaps of the top keys swapped in,
-burst_swaps after a topic change, copied in the round like misses); count_round(view) adds each row's reads and hits
-into the round's counters. plan() outside a capture calls start_round itself when it sees a new round.
+Rounds (crit_plugins.rounds): start_round(view) at a round's start keeps the policy's residency on the device;
+count_round(view) adds each row's reads and hits into the round's counters. plan() outside a capture calls start_round
+itself when it sees a new round.
+
+    recent   (with a CPU tier) every expert a plan misses is computed by the CPU tier and copied in beside the round
+             (a side stream), serving from the next round; it takes an empty slot, else the slot of the expert routed
+             longest ago, from the max_swaps such slots listed at the round's start (never one routed this round).
+             What is resident is what was routed last: the rule trace_replay.recent replays.
+    ranked   every `period`-th round the decayed route counts of every key are ranked and up to max_swaps of the top
+             keys swapped in, burst_swaps after a topic change, copied in the round like misses or beside it
+             (side_swaps).
+    clock    every miss a plan admits takes the clock's victim and is copied in before the layer reads it.
 """
 from collections import deque
 
@@ -38,6 +47,21 @@ try:
 except ImportError:   # run from code/
     import device_directory as dd
     import host_memory
+
+
+def residency_profile_keys(path, layers, experts):
+    """Every key a residency profile file names, hottest first (residency_profile.load_profile)."""
+    try:
+        from . import residency_profile
+    except ImportError:
+        import residency_profile
+    return residency_profile.load_profile(path, layers, experts, layers * experts)
+
+
+def ring_for(room, experts, keep=0, elastic=False):
+    """The prompt ring a cache of `room` own slots gives itself: two layers' experts, or one's, or none, as far as
+    `keep` slots stay beside it (and one more in an elastic cache)."""
+    return next((r for r in (2 * experts, experts) if room - r >= keep and (not elastic or room > r)), 0)
 
 
 class _Segment:
@@ -54,16 +78,26 @@ class ExpertCache:
     def __init__(self, layers, experts, layout, slots, device, source, lend=None, policy="clock", admit_quota=-1,
                  quota_tables=None, second_touch=False, cpu_tier=False, ring_slots=None, ring="borrow",
                  stage_routes=None, fill_blocks=0, fill_vector=16, decay=0.85, period=3, max_swaps=96,
-                 burst_swaps=384, burst_fraction=0.25, kernel=True, raw_chunk=32, rows=64):
+                 burst_swaps=384, burst_fraction=0.25, kernel=True, raw_chunk=32, rows=64, record_routes=0,
+                 side_swaps=False, max_slots=0, owner="device-expert-cache"):
         import torch
         self.torch = torch
         self.device = torch.device(device)
+        # A ring of the last `record_routes` decode routes, one row per token and layer: [layer, ids...] on the device,
+        # written inside plan() (captured rounds too), read by routes() for crit plugins offload --trace.
+        self._trace = self._trace_pos = None
+        if record_routes:
+            self._trace_rows = int(record_routes)
+            self._trace_pos = torch.zeros(1, dtype=torch.int64, device=self.device)
         self.layers, self.experts = int(layers), int(experts)
         self.bundle_bytes = int(layout["bundle_bytes"])
         if self.layers < 1 or self.experts < 1 or self.bundle_bytes < 16 or self.bundle_bytes % 16:
             raise ValueError("a cache has layers, experts and bundles of a multiple of 16 bytes")
-        if policy not in ("clock", "ranked"):
-            raise ValueError(f"policy is clock or ranked, not {policy!r}")
+        if policy not in ("clock", "ranked", "recent"):
+            raise ValueError(f"policy is clock, ranked or recent, not {policy!r}")
+        if policy == "recent" and not cpu_tier:
+            raise ValueError("recent residency copies a miss in beside the round while the CPU tier computes it: give "
+                             "cpu_tier=True with a CPU half beside the experts plugin")
         if ring not in ("borrow", "fixed"):
             raise ValueError(f"ring is borrow or fixed, not {ring!r}")
         if (admit_quota >= 0 or quota_tables or second_touch) and not cpu_tier:
@@ -88,7 +122,18 @@ class ExpertCache:
         # -- slot memory: own slots (the ring among them), a scratch slot; lent page tails --------------------------
         self.lend = lend
         self._threshold = {}      # lent slot -> the floor up to which it is free (its first page)
-        if lend is None:
+        # max_slots: the slots live in an elastic range of the device's memory (crit_plugins.memory, listed there
+        # as owner/slots) reserved for that many, backed for `slots` now; grow()/shrink() back more or fewer while
+        # every slot's address stays. The scratch slot and the ring sit at the range's start, so the backed prefix
+        # always holds them.
+        self.elastic = None
+        if lend is None and int(max_slots) > int(slots):
+            from crit_plugins.memory import of
+            total = int(max_slots) + 1
+            self.elastic = of(self.device).elastic(owner, "slots", total * B)
+            self.memory = self.elastic.tensor
+            base, own = 0, list(range(1, total)) + [0]   # the scratch slot is the last of own: slot 0
+        elif lend is None:
             total = int(slots) + 1
             self.memory = torch.empty(total * B, dtype=torch.uint8, device=self.device)
             base, own = 0, list(range(total))
@@ -119,27 +164,40 @@ class ExpertCache:
             raise ValueError("a cache needs at least one slot of its own")
         swaps = max(burst_swaps, max_swaps) if policy == "ranked" else 0
         keep = 0 if cpu_tier else self.experts + swaps     # own slots a plan may need beside the ring
+        room = int(slots) if self.elastic is not None else len(self.own)   # an elastic cache: the slots backed first
         if ring_slots is None:
-            ring_slots = next((r for r in (2 * self.experts, self.experts) if len(self.own) - r >= keep), 0)
+            ring_slots = ring_for(room, self.experts, keep, self.elastic is not None)
         ring_slots = int(ring_slots)
         if ring_slots and ring_slots < self.experts:
             raise ValueError(f"a prompt ring holds a layer's every expert: {self.experts} slots or more, not "
                              f"{ring_slots} (or 0: no prompts)")
-        if not cpu_tier and len(self.own) - ring_slots < keep:
-            raise ValueError(f"without a CPU tier every miss takes a slot: the cache's {len(self.own)} own slots less "
+        if not cpu_tier and room - ring_slots < keep:
+            raise ValueError(f"without a CPU tier every miss takes a slot: the cache's {room} own slots less "
                              f"its ring of {ring_slots} and {swaps} swaps leave fewer than the {self.experts} experts "
                              "of a layer")
-        self.ring_slots = self.own[len(self.own) - ring_slots:] if ring_slots else []
+        if self.elastic is not None:   # the ring at the front, in the prefix that stays backed
+            self.ring_slots = self.own[:ring_slots] if ring_slots else []
+        else:
+            self.ring_slots = self.own[len(self.own) - ring_slots:] if ring_slots else []
+        if policy == "recent":
+            admit_quota, quota_tables = 0, None
         if policy == "ranked":
             admit_quota = 0 if cpu_tier else -1   # ranked without a CPU tier: the clock admits misses as well
         tables = None
         if quota_tables:
             tables = quota_tables if isinstance(quota_tables, dict) else {1: quota_tables}
         self.directory = dd.DeviceDirectory(self.layers, self.experts, total, self.device, second_touch=second_touch,
-                                            count_routes=policy == "ranked", admit_quota=admit_quota, quota=tables,
+                                            count_routes=policy != "clock", admit_quota=admit_quota, quota=tables,
                                             kernel=kernel)
         self.floor = info["floor"] if lend is not None else None
         available = set(self.own) | {s for s, t in self._threshold.items() if t >= (self.floor or 0)}
+        if self.elastic is not None:   # backed: slot 0 (scratch), then `slots` own slots, the ring their first
+            if int(slots) <= len(self.ring_slots):
+                raise ValueError(f"an elastic cache of {int(slots)} slots holds no slot beside its ring of "
+                                 f"{len(self.ring_slots)}")
+            self.backed = 1 + int(slots)
+            self.elastic.grow(self.backed * B)
+            available &= set(range(self.backed))
         if ring == "fixed":
             available -= set(self.ring_slots)
         self.directory.set_unavailable([s for s in range(total) if s not in available])
@@ -150,6 +208,7 @@ class ExpertCache:
         self._row_counters = torch.zeros(max(1, int(rows)), 2, dtype=torch.int64, device=self.device)
         # prompt state
         self._prompt_open = ring == "fixed"
+        self._ring_now = list(self.ring_slots) if ring == "fixed" else []   # the ring slots this prompt step holds
         self._snapshot = None
         self._prompt_layer = None
         self._ring = deque()        # live segments, oldest first
@@ -163,9 +222,13 @@ class ExpertCache:
         self._table_next = 0
         self.staged_copies = 0
         self._last_layer = None
-        self._ranked = None
+        self._ranked = self._recent = None
+        self.pinned = {}            # slot -> key: the pinned core (pin()), which no plan, shrink or preload takes
         if policy == "ranked":
-            self._ranked = _Ranked(self, decay, period, max_swaps, max(burst_swaps, max_swaps), burst_fraction)
+            self._ranked = _Ranked(self, decay, period, max_swaps, max(burst_swaps, max_swaps), burst_fraction,
+                                   side=bool(side_swaps))
+        if policy == "recent":
+            self._recent = _Recent(self, max_swaps)
         if lend is not None:
             lend.on_reserve(self._lend_changed)
 
@@ -181,6 +244,84 @@ class ExpertCache:
 
     def _mapped(self):
         return self._region is not None and self._region[1] is not None
+
+    def backed_slots(self):
+        """Own slots backed now (an elastic cache), else every own slot; the prompt ring's are among them."""
+        return self.backed - 1 if self.elastic is not None else len(self.own)
+
+    def grow(self, slots):
+        """An elastic cache backs `slots` own slots (more than now): the new ones come empty and available. Between
+        steps, never captured. Returns the slots backed."""
+        if self.elastic is None:
+            return len(self.own)
+        want = min(self.total, 1 + int(slots))
+        if want <= self.backed:
+            return self.backed_slots()
+        got = self.elastic.grow(want * self.bundle_bytes) // self.bundle_bytes
+        new = [s for s in range(self.backed, min(want, got))]
+        self.backed = self.backed + len(new)
+        if new:
+            self.directory.set_available(new)
+            self._snapshot = None
+        return self.backed_slots()
+
+    def shrink(self, slots):
+        """An elastic cache gives back own slots past `slots`. Under the ranked policy the experts in those slots
+        that outrank the coldest experts kept first move into those experts' slots (device to device), so a shrink
+        loses the coldest experts, not whatever the last slots held. Between steps."""
+        if self.elastic is None:
+            return len(self.own)
+        want = max(1 + len(self.ring_slots) + 1, 1 + int(slots), max(self.pinned, default=0) + 2)
+        if want >= self.backed:
+            return self.backed_slots()
+        self.torch.cuda.synchronize(self.device)
+        if self._recent is not None:
+            self._recent.settle()
+        if self._ranked is not None and self._ranked.pending is not None:
+            # swaps copied on the side stream into slots that go now are dropped, never mapped
+            self._ranked.join()
+            p = self._ranked.pending
+            gone = p[:, 1] >= want
+            p[:, 0].masked_fill_(gone, self.directory.keys)
+            p[:, 1].masked_fill_(gone, self.directory.slots)
+        self._compact(want)
+        self.directory.set_unavailable(list(range(want, self.backed)))
+        self._snapshot = None      # a prompt step's residency names slots that are gone or hold another expert now
+        granule = self.elastic.gran
+        keep = -(-want * self.bundle_bytes // granule) * granule   # whole granules: a slot past `want` may stay backed
+        self.elastic.shrink(keep)
+        self.backed = want
+        return self.backed_slots()
+
+    def _compact(self, want):
+        """The experts in the slots from `want` on that outrank the coldest experts (or empty slots) below it take
+        those slots: the hottest leaving expert against the coldest kept one, while it ranks higher (ranked: its
+        score; recent: the round it was last routed in)."""
+        if self._ranked is None and self._recent is None:
+            return 0
+        torch, d = self.torch, self.directory
+        keys = d.slot_key[:self.backed].long()
+        last = d.slot_last[:self.backed]
+        rank = last.double() if self._recent is not None else self._ranked.scores[keys.clamp(min=0)]
+        rank = torch.where(keys >= 0, rank, torch.full_like(rank, float("-inf")))
+        if self.pinned:   # the pinned core stays where it is
+            rank[torch.tensor(sorted(self.pinned), device=self.device)] = float("inf")
+        at = torch.arange(self.backed, device=self.device)
+        leaving = torch.nonzero((at >= want) & (keys >= 0)).flatten()
+        kept = torch.nonzero((at >= 1) & (at < want) & (keys >= dd.EMPTY)).flatten()   # slot 0 is the scratch slot
+        if not leaving.numel() or not kept.numel():
+            return 0
+        leaving = leaving[torch.argsort(rank[leaving], descending=True, stable=True)]
+        kept = kept[torch.argsort(rank[kept], stable=True)]
+        n = min(leaving.numel(), kept.numel())
+        moves = int(torch.cumprod((rank[leaving[:n]] > rank[kept[:n]]).long(), 0).sum())
+        if not moves:
+            return 0
+        src, dst = leaving[:moves], kept[:moves]
+        for i in range(0, moves, 32):
+            self.store.index_copy_(0, dst[i:i + 32], self.store.index_select(0, src[i:i + 32]))
+        d.assign(list(zip(keys[src].tolist(), dst.tolist())), last=last[src].tolist())
+        return moves
 
     def round_problems(self):
         """Why a round that plans through this cache cannot be captured, or [] (crit_plugins.rounds)."""
@@ -199,23 +340,73 @@ class ExpertCache:
         if not capturing:
             if self._prompt_open and self.ring_mode == "borrow":
                 self.end_prompt()
-            if self._last_layer is not None and layer <= self._last_layer:
+            if (self._last_layer is not None and layer <= self._last_layer) or \
+                    (self._recent is not None and not self._recent.listed):
                 self.start_round(None)
             self._last_layer = layer
             self._snapshot = None
             if rows is not None and rows.numel() and int(rows.max()) >= self._row_counters.shape[0]:
                 raise ValueError(f"a row past the cache's {self._row_counters.shape[0]} row counters (rows=)")
         top = ids.shape[-1] if ids.dim() > 1 else 1
-        self.directory.plan(layer, ids, top, rows, self._row_counters if rows is not None else None)
+        if self._trace_pos is not None:
+            self._record(layer, ids.reshape(-1, top), capturing)
+        recent = self._recent.call(capturing) if self._recent is not None else None
+        # A store that keeps what the cache evicts (a file tier's host tier) is told which slots held what before
+        # the plan gave them away.
+        prior = (self.directory.slot_key.clone()
+                 if not capturing and self.program is None and getattr(self.source, "retains", False) else None)
+        self.directory.plan(layer, ids, top, rows, self._row_counters if rows is not None else None, recent=recent)
         table = self.directory.tables[layer]
         if decided is not None:
             decided(table)
-        self._fill(layer, min(ids.numel(), self.experts), capturing)
+        if recent is not None:
+            self._recent.fill(recent[3], capturing)   # beside the round: the CPU tier computes these misses now
+            return table
+        self._fill(layer, min(ids.numel(), self.experts), capturing, prior)
         if not capturing and not self.cpu_tier and int(self.directory.state[2]) & 2:
             raise RuntimeError("a plan found no victim for a miss and no CPU tier computes it: the cache lost a route")
         return table
 
-    def _fill(self, layer, limit, capturing):
+    def _record(self, layer, ids, capturing):
+        torch = self.torch
+        top = ids.shape[1]
+        if self._trace is None:
+            if capturing:
+                raise RuntimeError("plan once outside a capture before capturing a recording cache")
+            self._trace = torch.full((self._trace_rows, 1 + top), -1, dtype=torch.int32, device=self.device)
+            self._trace_steps = {}
+        if self._trace.shape[1] != 1 + top:
+            raise ValueError(f"a recording cache records {self._trace.shape[1] - 1} routes a token, not {top}")
+        n = ids.shape[0]
+        step = self._trace_steps.get(n)
+        if step is None:
+            if capturing:
+                raise RuntimeError(f"plan {n} tokens once outside a capture before capturing a recording cache")
+            step = self._trace_steps[n] = torch.arange(n, dtype=torch.int64, device=self.device)
+        at = (self._trace_pos + step) % self._trace_rows
+        row = torch.cat([torch.full((n, 1), int(layer), dtype=torch.int32, device=self.device), ids.to(torch.int32)], 1)
+        self._trace.index_copy_(0, at, row)
+        self._trace_pos.add_(n)
+
+    def routes(self):
+        """The recorded decode routes, oldest first: [(layer, [experts])], one per token and routed layer (ids -1, rows a
+        round holds, left out); synchronizes. Empty without record_routes."""
+        if self._trace is None:
+            return []
+        total, rows = int(self._trace_pos.item()), self._trace_rows
+        data = self._trace.cpu().tolist()
+        order = range(total) if total <= rows else range(total - rows, total)
+        out = []
+        for i in order:
+            layer, *ids = data[i % rows]
+            kept = [e for e in ids if e >= 0]
+            if kept:
+                out.append((layer, kept))
+        return out
+
+    def _fill(self, layer, limit, capturing, prior=None, ring=False):
+        """The copies of the layer's plan. prior: the slots' keys before the plan (a store that retains evicted
+        bundles gets them back first); ring: the copies go to a prompt's ring slots, which nothing keeps."""
         if self._mapped():
             self.directory.fill(layer, self.store, self._region[1], self.scratch, limit, self.fill_blocks,
                                 self.fill_vector, self.program)
@@ -225,7 +416,20 @@ class ExpertCache:
                                "on the host and cannot be captured; give the cache a mapped store for captured rounds")
         count = int(self.directory.copy_count[layer].item())
         if count:
-            self._copy_bundles([tuple(job) for job in self.directory.copies[layer][:count].tolist()])
+            pairs = [tuple(job) for job in self.directory.copies[layer][:count].tolist()]
+            if prior is not None:
+                self._retain(pairs, prior)
+            self._copy_bundles(pairs, keep=ring)
+
+    def _retain(self, pairs, prior):
+        """The bundles the plan's copies replace go back to the store on the host before their slots are written."""
+        torch = self.torch
+        slots = torch.tensor([slot for _, slot in pairs], dtype=torch.int64, device=self.device)
+        held = prior[slots].tolist()
+        evicted = [(key, slot) for key, (_, slot) in zip(held, pairs) if key >= 0]
+        if evicted:
+            rows = self.store[torch.tensor([slot for _, slot in evicted], dtype=torch.int64, device=self.device)]
+            self.source.retain([key for key, _ in evicted], rows.cpu())
 
     def row_counters(self):
         """The per-row reads and hits plans with rows= add ([rows][2] int64 on the device: rows the constructor's)."""
@@ -243,12 +447,16 @@ class ExpertCache:
         reads.add_(self._row_counters[:rows, 0])
         hits.add_(self._row_counters[:rows, 1])
         self._row_counters.zero_()
+        for policy in (self._ranked, self._recent):
+            if policy is not None:
+                policy.join()   # a side stream's copies rejoin inside the round
 
     def start_round(self, view):
         """A decode or verify round starts (crit_plugins.rounds calls it inside the captured round; plan() outside a
         capture when it sees a new round): ranked residency's boundary work on the device, capture-safe."""
-        if self._ranked is not None:
-            self._ranked.round()
+        for policy in (self._ranked, self._recent):
+            if policy is not None:
+                policy.round()
         if not (self.device.type == "cuda" and self.torch.cuda.is_current_stream_capturing()):
             self._last_layer = None   # the round's first plan does not start another
 
@@ -264,15 +472,19 @@ class ExpertCache:
                                "cannot be captured: a prompt forward that calls it runs eagerly (the cache provides no "
                                "prompts:expert_residency; name expert_residency among the prompt forward's slots)")
         stream = stream or (torch.cuda.current_stream(self.device) if self.device.type == "cuda" else None)
+        staged = ids.numel() >= self.stage_routes and self._region is not None and self.copy_stream is not None
+        want = len(self.ring_slots) if staged else min(len(self.ring_slots), self.experts, max(1, ids.numel()))
+        if self._prompt_open and want > len(self._ring_now):
+            self.end_prompt()          # a longer chunk than the step began with: the ring is borrowed again, larger
         if not self._prompt_open:
-            self._open_prompt()
+            self._open_prompt(want)
         if self._prompt_layer is not None and layer <= self._prompt_layer:
             self._snapshot = None      # a new prompt step: rounds may have run since (captured ones too)
         self._prompt_layer = layer
         for segment in self._reading:  # the layer before read its segments: everything on the stream so far
             segment.consumed = self._event(stream) or True
         self._reading = []
-        if ids.numel() >= self.stage_routes and self._region is not None and self.copy_stream is not None:
+        if staged:
             return self.store, self._prompt_staged(layer, stream)
         return self.store, self._prompt_routed(layer, ids, stream)
 
@@ -283,8 +495,12 @@ class ExpertCache:
         event.record(stream)
         return event
 
-    def _open_prompt(self):
-        self.directory.set_unavailable(self.ring_slots)
+    def _open_prompt(self, count):
+        """A prompt step borrows the ring's first `count` slots: their experts are dropped until end_prompt()."""
+        if self._recent is not None:
+            self._recent.settle()
+        self._ring_now = self.ring_slots[:count]
+        self.directory.set_unavailable(self._ring_now)
         self._snapshot = None
         self._prompt_open = True
 
@@ -308,7 +524,8 @@ class ExpertCache:
         self._prompt_layer = None
         self._snapshot = None
         if self.ring_mode == "borrow":
-            self.directory.set_available(self.ring_slots)
+            self.directory.set_available(self._ring_now)
+            self._ring_now = []
             self._prompt_open = False
 
     def _residency(self, stream):
@@ -321,7 +538,7 @@ class ExpertCache:
     def _allocate(self, layer, count, waiter):
         """A ring segment of `count` slots for `layer`, reusing the oldest consumed segments' slots (`waiter`, a stream,
         waits for the layers that read them). None when segments not yet read hold the room."""
-        size = len(self.ring_slots)
+        size = len(self._ring_now)
         if count > size:
             raise ValueError(f"{count} prompt misses of one layer do not fit the ring's {size} slots")
         while size - self._ring_used < count:
@@ -345,7 +562,7 @@ class ExpertCache:
         segment = self._allocate(layer, len(missing), self.copy_stream)
         if segment is None:
             return None
-        ring = [self.ring_slots[p] for p in segment.positions]
+        ring = [self._ring_now[p] for p in segment.positions]
         keys = [layer * self.experts + e for e in missing]
         segment.ring_of = dict(zip(missing, ring))
         host = self._region[0]
@@ -444,11 +661,11 @@ class ExpertCache:
         segment = self._allocate(layer, max(1, len(self._missing(layer, snapshot, routed))), stream)
         if segment is None:
             raise RuntimeError("the prompt ring is held by segments not yet read")
-        ring = torch.tensor([self.ring_slots[p] for p in segment.positions], dtype=torch.int32, device=self.device)
+        ring = torch.tensor([self._ring_now[p] for p in segment.positions], dtype=torch.int32, device=self.device)
         context = torch.cuda.stream(stream) if stream is not None else _Nothing()
         with context:
             self.directory.plan(layer, ids, ids.shape[-1] if ids.dim() > 1 else 1, ring=ring)
-            self._fill(layer, ring.numel(), False)
+            self._fill(layer, ring.numel(), False, ring=True)
         self._reading = [segment]
         return self.directory.tables[layer]
 
@@ -457,8 +674,11 @@ class ExpertCache:
         """Maps keys (layer * experts + expert, a residency profile's order) to the available slots in slot order,
         copies their bundles and waits; the clock starts after the last. Between requests, never captured."""
         self.end_prompt()
+        if self._recent is not None:
+            self._recent.settle()
         key_slot, slot_key = self.directory.snapshot()
-        slots = [s for s in range(self.total) if slot_key[s] not in (dd.RESERVED, dd.UNAVAILABLE)]
+        slots = [s for s in range(self.total) if slot_key[s] not in (dd.RESERVED, dd.UNAVAILABLE)
+                 and s not in self.pinned]
         pairs, seen = [], set()
         for k in keys:
             if len(pairs) == len(slots):
@@ -468,7 +688,8 @@ class ExpertCache:
                 continue
             seen.add(k)
             pairs.append((k, slots[len(pairs)]))
-        self.directory.assign(pairs)
+        # recent residency: a preloaded expert leaves before any routed one, the profile's coldest first
+        self.directory.assign(pairs, last=[-1 - i for i in range(len(pairs))])
         if pairs:
             self.directory.set_hand(pairs[-1][1] + 1)
         self._copy_bundles(pairs)
@@ -476,6 +697,56 @@ class ExpertCache:
             self.torch.cuda.current_stream(self.device).synchronize()
         self._snapshot = None
         return pairs
+
+    def pin(self, keys):
+        """The pinned core: these keys' bundles in slots of their own for good. No plan lists such a slot as a
+        victim, no shrink gives it back (the cache never shrinks below its core) and no preload or prompt ring
+        takes it, so an expert of the core never misses and its bundle is never read from the store again: a store
+        that left it out (leave()) holds each of them once, on the device. Under the recent policy, before anything
+        is resident (right after the cache is made); each bundle is read with the store's read(). Returns the
+        (key, slot) pairs."""
+        torch = self.torch
+        if self._recent is None:
+            raise ValueError("a pinned core needs the recent policy: its rule lists victims among the other slots")
+        if self.pinned:
+            raise ValueError("the cache has its pinned core already")
+        keys = list(dict.fromkeys(int(k) for k in keys))
+        if any(not 0 <= k < self.layers * self.experts for k in keys):
+            raise ValueError("a key to pin is outside the cache's layers and experts")
+        self.end_prompt()
+        self._recent.settle()
+        key_slot, slot_key = self.directory.snapshot()
+        ring = set(self.ring_slots)
+        slots = [s for s in range(self.total) if slot_key[s] == dd.EMPTY and s != self.scratch and s not in ring]
+        if any(key_slot[k] >= 0 for k in keys) or len(keys) > len(slots) - 1:
+            raise ValueError(f"a pinned core of {len(keys):,} experts needs as many empty slots beside the ring and "
+                             f"one more for the experts that come and go: {len(slots):,} are empty (pin before any "
+                             "preload)")
+        pairs = list(zip(keys, slots))
+        cuda = self.device.type == "cuda"
+        for first in range(0, len(pairs), 64):   # through read(): a store that left them out reads its file
+            part = pairs[first:first + 64]
+            staging = torch.empty(len(part), self.bundle_bytes, dtype=torch.uint8, pin_memory=cuda)
+            self.source.read([k for k, _ in part], staging)
+            for i, (_, slot) in enumerate(part):
+                self.store[slot].copy_(staging[i], non_blocking=True)
+            if cuda:
+                torch.cuda.current_stream(self.device).synchronize()   # the staging buffer is read before it goes
+        self.directory.assign(pairs)
+        self.pinned = {slot: key for key, slot in pairs}
+        if pairs:
+            self._recent.eligible[torch.tensor([slot for _, slot in pairs], device=self.device)] = False
+        self._snapshot = None
+        return pairs
+
+    def pinned_intact(self):
+        """Whether every slot of the pinned core still holds its key (synchronizes): a check for tests and reports."""
+        if not self.pinned:
+            return True
+        slots = self.torch.tensor(sorted(self.pinned), device=self.device)
+        keys = self.torch.tensor([self.pinned[s] for s in sorted(self.pinned)], dtype=self.directory.slot_key.dtype,
+                                 device=self.device)
+        return bool((self.directory.slot_key[slots] == keys).all())
 
     def warm(self, profile):
         """preload() from a residency profile: a list of keys, a dict with "keys", or a profile file
@@ -489,8 +760,9 @@ class ExpertCache:
         keys = profile["keys"] if isinstance(profile, dict) else profile
         return self.preload(keys)
 
-    def _copy_bundles(self, pairs, stream=None):
-        """(key, slot) bundles copied from the source by the copy engine on `stream` (the current one by default)."""
+    def _copy_bundles(self, pairs, stream=None, keep=False):
+        """(key, slot) bundles copied from the source by the copy engine on `stream` (the current one by default).
+        keep: the slots are a prompt's ring, so a store with a host tier keeps its copy."""
         torch = self.torch
         if not pairs:
             return
@@ -501,7 +773,10 @@ class ExpertCache:
             return
         if self._region is None:
             staging = torch.empty(len(pairs), self.bundle_bytes, dtype=torch.uint8, pin_memory=cuda)
-            self.source.read([k for k, _ in pairs], staging)
+            if keep and getattr(self.source, "retains", False):
+                self.source.read([k for k, _ in pairs], staging, keep=True)
+            else:
+                self.source.read([k for k, _ in pairs], staging)
             with (torch.cuda.stream(stream) if cuda else _Nothing()):
                 for i, (_, slot) in enumerate(pairs):
                     self.store[slot].copy_(staging[i], non_blocking=True)
@@ -538,6 +813,8 @@ class ExpertCache:
         page at or past high is handed out. Host work between steps, never inside a capture."""
         if self.device.type == "cuda" and self.torch.cuda.is_current_stream_capturing():
             raise RuntimeError("the KV pool changed its pages inside a capture: lent slots are reclaimed between steps")
+        if self._recent is not None:
+            self._recent.settle()
         reclaim = sorted(s for s in self._lent if self._threshold[s] < floor)
         relend = sorted(s for s, t in self._threshold.items() if t >= floor and s not in self._lent)
         if reclaim:
@@ -579,7 +856,8 @@ class ExpertCache:
         return {"slots": c["slots"], "resident": c["resident"], "lent": len(self._lent), "reads": c["reads"],
                 "hits": c["hits"], "fills": c["fills"], "fill_bytes": fills * self.bundle_bytes, "cpu": c["cpu"],
                 "prompt_reads": c["prompt_reads"], "prompt_hits": c["prompt_hits"], "prompt_copies": prompt_copies,
-                "failure": c["failure"], "swaps": c["swaps"], "kernel": self.directory.kernel is not None}
+                "failure": c["failure"], "swaps": c["swaps"], "kernel": self.directory.kernel is not None,
+                "pinned": len(self.pinned)}
 
     def _gather(self, d):
         torch = self.torch
@@ -616,11 +894,122 @@ class ExpertCache:
         return t["values"]
 
     def close(self):
+        if getattr(self, "elastic", None) is not None:
+            self.torch.cuda.synchronize(self.device)
+            self.elastic.close()
+            self.elastic = None
         if self.lend is not None:
             self.lend.on_reserve(None)
             self.lend = None
         self._staged.clear()
         self._ring.clear()
+
+
+class _Recent:
+    """Recent residency on the device (the rule trace_replay.recent replays). A plan sends every miss to the CPU tier
+    and gives it the next slot of the round's victim list that is still open and was not routed this round (the
+    directory's plan); its bundle is copied into the slot on a side stream beside the round, the slot and the key
+    reserved meanwhile. A round's start maps the copies of the round before (each expert stamped with the round it
+    was missed in) and lists the victims: the `swaps` open slots whose expert was routed longest ago, empty slots
+    first, ties to the lower slot. Fixed shapes, capture-safe; the copies need the directory's kernel in a capture."""
+
+    def __init__(self, cache, swaps):
+        torch = cache.torch
+        d, dev = cache.directory, cache.device
+        if int(swaps) < 1:
+            raise ValueError("recent residency copies at least one miss a round (max_swaps)")
+        self.cache = cache
+        S = d.slots
+        R = self.swaps = min(int(swaps), S)
+        i32 = dict(dtype=torch.int32, device=dev)
+        self.victims = torch.full((R + 1,), S, **i32)        # the last a dummy
+        self.state = torch.zeros(4, **i32)                   # the round, the next victim, the victims, the copies
+        self.pending = torch.zeros(R + 1, 2, **i32)          # the round's copies (key, slot); the last a dummy
+        self.ranges = torch.zeros(4 * cache.layers, 2, **i32)   # each plan call's range of pending (first, count)
+        self.calls = 0
+        fixed = set(cache.ring_slots) if cache.ring_mode == "fixed" else set()
+        self.eligible = torch.tensor([s != cache.scratch and s not in fixed for s in range(S)], dtype=torch.bool,
+                                     device=dev)
+        self._ar_r = torch.arange(R, device=dev)
+        self._ar_s = torch.arange(S, device=dev)
+        self.side = torch.cuda.Stream(dev) if dev.type == "cuda" else None
+        self._forked = False
+        self.listed = False      # the victims are listed for the round under way
+
+    def call(self, capturing):
+        """The directory's recent tensors for one plan call: (victims, state, pending, this call's range)."""
+        if self.calls >= self.ranges.shape[0]:
+            raise ValueError(f"a round plans at most {self.ranges.shape[0]} times through a recent cache "
+                             "(start_round() at each round's start)")
+        span = self.ranges[self.calls]
+        self.calls += 1
+        return self.victims, self.state, self.pending, span
+
+    def fill(self, span, capturing):
+        """A plan call's copies, beside the round: on the side stream, after the plan that listed them."""
+        cache, torch = self.cache, self.cache.torch
+        d = cache.directory
+        if cache._mapped() and d.kernel is not None:
+            if self.side is None:
+                d.fill_counted(self.pending, span[1:2], cache.store, cache._region[1], cache.scratch, self.swaps,
+                               cache.fill_blocks, cache.fill_vector, first=span[0:1])
+                return
+            self.side.wait_stream(torch.cuda.current_stream(cache.device))
+            with torch.cuda.stream(self.side):
+                d.fill_counted(self.pending, span[1:2], cache.store, cache._region[1], cache.scratch, self.swaps,
+                               cache.fill_blocks, cache.fill_vector, first=span[0:1])
+            self._forked = True
+            return
+        if capturing:
+            raise RuntimeError("recent residency copies its misses by the directory's kernel from a mapped store in a "
+                               "captured round; here they are copied on the host")
+        first, count = span.tolist()
+        if count:
+            cache._copy_bundles([tuple(job) for job in self.pending[first:first + count].tolist()])
+
+    def join(self):
+        """The side stream's copies land before anything later on the current stream."""
+        if self._forked:
+            self.cache.torch.cuda.current_stream(self.cache.device).wait_stream(self.side)
+            self._forked = False
+
+    def commit(self):
+        """The copies that landed are mapped: each pending (key, slot) resident, stamped with the round it missed in."""
+        torch, d = self.cache.torch, self.cache.directory
+        K, S, R = d.keys, d.slots, self.swaps
+        live = self._ar_r < self.state[3]
+        keys = torch.where(live, self.pending[:R, 0].long(), K)
+        slots = torch.where(live, self.pending[:R, 1].long(), S)
+        d.slot_key.index_copy_(0, slots, keys.int())
+        d.key_slot.index_copy_(0, keys, slots.int())
+        d.slot_last.index_copy_(0, slots, self.state[0].expand(R).contiguous())
+        d.key_slot[K:].fill_(dd.EMPTY)
+        d.slot_key[S:].fill_(dd.EMPTY)
+        d.slot_last[S:].fill_(dd.NEVER)
+        self.state[3:4].zero_()
+
+    def settle(self):
+        """Before a host-driven change of the slots (a prompt's ring, a shrink, a preload): the copies under way land
+        and are mapped; the next plan lists the victims again. Between steps, never captured."""
+        self.join()
+        self.commit()
+        self.listed = False
+
+    def round(self):
+        torch, d = self.cache.torch, self.cache.directory
+        S, R = d.slots, self.swaps
+        self.join()
+        self.commit()
+        self.state[0:1].add_(1)
+        open_slot = self.eligible & (d.slot_key[:S] >= dd.EMPTY)      # not reserved, reclaimed or a prompt's ring now
+        stamp = (d.slot_last[:S].long() + (1 << 31)) * (1 << 21) + self._ar_s
+        first = torch.sort(torch.where(open_slot, stamp, 1 << 62)).values[:R]
+        found = first < (1 << 62)
+        self.victims[:R].copy_(torch.where(found, first % (1 << 21), S).int())
+        self.state[1:2].zero_()
+        self.state[2:3].copy_(found.sum().int().view(1))
+        self.calls = 0
+        self.listed = True
 
 
 class _Ranked:
@@ -632,7 +1021,7 @@ class _Ranked:
     than burst_fraction of the slots' worth of top keys is missing). The swaps map at once and their bundles are copied
     in the round like misses. Torch ops: fixed shapes, capture-safe."""
 
-    def __init__(self, cache, decay, period, max_swaps, burst_swaps, fraction):
+    def __init__(self, cache, decay, period, max_swaps, burst_swaps, fraction, side=False):
         torch = cache.torch
         d, dev = cache.directory, cache.device
         if not 0 < decay <= 1 or period < 1 or max_swaps < 0 or not 0 <= fraction <= 1:
@@ -653,10 +1042,36 @@ class _Ranked:
         self._ar_m = torch.arange(M, device=dev)
         self._ar_k = torch.arange(K, device=dev)
         self._ar_s = torch.arange(S, device=dev)
+        # side: a boundary's bundles are copied on a side stream beside the round, the
+        # victims unavailable meanwhile; the round joins it at its end (count_round) and the next round maps them.
+        self.side = torch.cuda.Stream(dev) if side and dev.type == "cuda" else None
+        self.pending = torch.stack([torch.full((M + 1,), K, dtype=torch.int64, device=dev),
+                                    torch.full((M + 1,), S, dtype=torch.int64, device=dev)], 1) if self.side else None
+        self._forked = False
+
+    def join(self):
+        """The side stream's swap copies land before anything later on the current stream."""
+        if self._forked:
+            self.cache.torch.cuda.current_stream(self.cache.device).wait_stream(self.side)
+            self._forked = False
+
+    def _apply_pending(self):
+        """Last boundary's copied swaps mapped: each pending (key, slot) now resident, sentinels after."""
+        d, K, S = self.cache.directory, self.cache.directory.keys, self.cache.directory.slots
+        new, vs = self.pending[:, 0], self.pending[:, 1]
+        d.slot_key.index_copy_(0, vs, torch_where(self.cache.torch, new < K, new, dd.EMPTY).int())
+        d.key_slot.index_copy_(0, new, vs.int())
+        d.key_slot[K:].fill_(dd.EMPTY)
+        d.slot_key[S:].fill_(dd.EMPTY)
+        self.pending[:, 0].fill_(K)
+        self.pending[:, 1].fill_(S)
 
     def round(self):
         torch, cache = self.cache.torch, self.cache
         d = cache.directory
+        if self.side is not None:
+            self.join()
+            self._apply_pending()
         K, S, M = d.keys, d.slots, self.jobs.shape[0] - 1
         boundary = (self.rounds > 0) & (self.rounds % self.period == 0)          # [1]
         self.rounds.add_(1)
@@ -706,8 +1121,12 @@ class _Ranked:
         new = torch.where(ok, admits, K)
         old = d.slot_key[vs].long()
         d.key_slot.index_fill_(0, torch.where(ok & (old >= 0), old, K), dd.EMPTY)
-        d.slot_key.index_copy_(0, vs, torch.where(ok, new, dd.EMPTY).int())
-        d.key_slot.index_copy_(0, new, vs.int())
+        if self.side is not None:   # the victims out of use until their new bundles land (the next round maps them)
+            d.slot_key.index_copy_(0, vs, torch.where(ok, dd.UNAVAILABLE, dd.EMPTY).int())
+            self.pending.index_copy_(0, torch.where(ok, i, M), torch.stack([new, vs], 1))
+        else:
+            d.slot_key.index_copy_(0, vs, torch.where(ok, new, dd.EMPTY).int())
+            d.key_slot.index_copy_(0, new, vs.int())
         d.slot_ref.index_fill_(0, vs, 0)
         d.key_slot[K:].fill_(dd.EMPTY)
         d.slot_key[S:].fill_(dd.EMPTY)
@@ -715,7 +1134,13 @@ class _Ranked:
         self.count.copy_(found.view(1))
         self.swapped.add_(found)
         self.bursts.add_((burst & boundary & (found > 0)).long())
-        if cache._mapped():
+        if cache._mapped() and self.side is not None:
+            self.side.wait_stream(torch.cuda.current_stream(cache.device))
+            with torch.cuda.stream(self.side):
+                d.fill_counted(self.jobs, self.count, cache.store, cache._region[1], cache.scratch, M,
+                               cache.fill_blocks, cache.fill_vector, cache.program)
+            self._forked = True
+        elif cache._mapped():
             d.fill_counted(self.jobs, self.count, cache.store, cache._region[1], cache.scratch, M,
                            cache.fill_blocks, cache.fill_vector, cache.program)
         elif not (cache.device.type == "cuda" and torch.cuda.is_current_stream_capturing()):
@@ -724,6 +1149,10 @@ class _Ranked:
                 cache._copy_bundles([tuple(job) for job in self.jobs[:g].tolist()])
         else:
             raise RuntimeError("ranked swaps over a file tier read on the host: no captured rounds")
+
+
+def torch_where(torch, condition, a, b):
+    return torch.where(condition, a, b)
 
 
 class _Nothing:

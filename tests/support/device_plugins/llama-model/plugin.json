@@ -48,6 +48,13 @@
       "max": 65536,
       "description": "MiB of device temporaries the factory makes and drops last, left in torch's cache"
     },
+    "prompt_cache": {
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 1024,
+      "description": "the ended requests' sequences kept in Core's prompt cache over the KV pool, 0 for none"
+    },
     "rounds": {
       "type": "bool",
       "default": false,

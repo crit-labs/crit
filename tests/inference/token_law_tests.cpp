@@ -5,6 +5,7 @@
 #include "sampling.h"
 #include "device_buffer.h"
 
+#include "host_sampler.h"
 #include <crit/sampling.h>
 
 #include <algorithm>
@@ -20,7 +21,7 @@
 #include <tuple>
 #include <vector>
 
-namespace cc = crit::core;
+namespace cc { using namespace crit::core; using namespace crit::oracle; }   // Core and the host oracle
 namespace ts = crit::techniques::token_sampling;
 
 namespace {

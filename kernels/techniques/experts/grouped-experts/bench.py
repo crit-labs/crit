@@ -179,7 +179,9 @@ class _Bench:
         return expert_shapes(model)
 
     def valid(self, knobs):
-        return knobs["DEPTH"] * knobs["TILES"] <= 8   # weights in flight beyond this spill registers
+        """Weights in flight beyond DEPTH x TILES 8 spill registers; a fixed read pattern (decode's READ 1 or 2) is
+        swept at the format's own depth only."""
+        return knobs["DEPTH"] * knobs["TILES"] <= 8 and (knobs.get("READ", 0) == 0 or knobs["DEPTH"] == 0)
 
     def untuned(self):
         if self.default is None:

@@ -40,7 +40,7 @@
         "N",
         "K"
       ],
-      "row_invariant": true,
+      "exactness": "declared",
       "knobs": {
         "THREADS": {
           "values": [
@@ -104,7 +104,7 @@
         "N",
         "K"
       ],
-      "row_invariant": true,
+      "exactness": "declared",
       "knobs": {
         "WARPS": {
           "values": [
@@ -157,7 +157,7 @@
         "N",
         "K"
       ],
-      "row_invariant": true,
+      "exactness": "declared",
       "knobs": {
         "BM": {
           "values": [
@@ -224,7 +224,8 @@
       "bench": "bench.py:GemmStaged"
     },
     "declared-quantizers": {
-      "what": "the declared E2M1 x 2 and INT8 activation quantizers and SwiGLU, a thread per block or element"
+      "what": "the declared E2M1 x 2 and INT8 activation quantizers and SwiGLU, a thread per block or element",
+      "exactness": "declared"
     },
     "gemm-native": {
       "what": "prompt GEMM accumulated in the tensor cores, NOT the declared order, on NVFP4-packed activations (quantize_nvfp4): a CTA TM tokens x TN weight rows. E2M1 weights on sm_120a: warp-specialized (a producer warp's bulk copies into a STAGES-deep ring of mbarrier-guarded stages, rows padded for conflict-free ldmatrix; WM x WN consumer warps' kind::mxf4nvf4 block-scaled m16n8k64 MMAs with UE4M3 scales per 16 on both operands), persistent CTAs in a grouped order, split-K for short prompts, FP32 or BF16 output with the global scale and optional column scales in the epilogue, row-major or cuBLASLt-tiled scale bytes. INT4 weights and other GPUs: a cp.async ring of swizzled BK-byte tiles (kernel core tile.cuh) and the s8 MMA a 16-block with the scales on the CUDA cores. An output's bits depend on the tile, the split and the token count",
@@ -245,7 +246,7 @@
         "N",
         "K"
       ],
-      "row_invariant": false,
+      "exactness": "repeatable",
       "knobs": {
         "TM": {
           "values": [

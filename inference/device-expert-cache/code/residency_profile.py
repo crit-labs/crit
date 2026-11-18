@@ -1,7 +1,7 @@
 """Residency profiles: which experts a device expert cache holds before its first request.
 
 A profile is the engine's own file in its package: the cache's geometry, the keys
-(group * experts + expert) to preload in order (device_cache.h enqueue_preload,
+(group * experts + expert) to preload in order (the cache's preload,
 ClockDirectory.preload), the corpus its routes came from and a held-out check.
 Routing depends on content, so a profile is a content-dependent choice: build it from
 router logs over a general corpus unrelated to Eval (never Eval's prompts, pinned

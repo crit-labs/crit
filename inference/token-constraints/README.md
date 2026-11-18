@@ -8,8 +8,8 @@ verifies and repairs.
 
 ## When to use it
 
-When a request carries a constraint and the engine decodes with `SampledSpeculator`. Ordinary one-token decoding
-needs only Core: `Sampler::sample(logits, AllowedTokens{matcher.allowed()}, ...)`, then append to the matcher.
+When a request carries a constraint and the engine verifies sampled drafts. Ordinary one-token decoding
+needs only Core's matcher and the sampler plugin: mask the row to `matcher.allowed()`, sample, then append to the matcher.
 
 ## How it works
 
@@ -24,19 +24,8 @@ keeping terminal verification defined.
 
 ## What the code supplies
 
-[`constrained_state.h`](code/constrained_state.h) (header-only: `constrained_logits`, `LogitState`,
-`ConstraintSampling`, `ConstrainedProbabilityState`), [`example.cpp`](code/example.cpp) (run
-`crit_constraint_example` after `cmake -S inference -B build/inference`) and the host reference
-[`constrained.py`](code/constrained.py). The engine supplies the raw target and draft states and the vocabulary:
-
-```cpp
-auto vocabulary = std::make_shared<const crit::core::ByteVocabulary>(decoded_pieces, eos);
-auto target = std::make_unique<ConstrainedProbabilityState>(std::move(raw_target),
-    std::make_unique<crit::core::JsonObjectMatcher>(vocabulary));
-auto draft = std::make_unique<ConstrainedProbabilityState>(std::move(raw_draft),
-    std::make_unique<crit::core::JsonObjectMatcher>(vocabulary));
-SampledSpeculator loop(std::move(target), std::move(draft), limits, seed, stops /* include eos */);
-```
+The host reference [`constrained.py`](code/constrained.py): `constrained_law`, `accept_probability` and `residual`.
+The engine supplies the raw target and draft laws and the vocabulary.
 
 ## Worked example
 
@@ -93,6 +82,5 @@ restore the matcher with accepted KV/recurrent state.
 ## Costs and validation
 
 Every `next()` reads the matcher's allowed set (Core walks the vocabulary's piece trie, or hits its allowed-set cache for a repeated state) and every append copies matcher history. Empty
-support throws; it never falls back to unconstrained generation. [Native fixtures](../../tests/inference/constraint_tests.cpp)
-check masking, branches, poisoned states and speculative answer frequencies against exact probabilities. No model
+support throws; it never falls back to unconstrained generation. No model
 or device speed qualification.

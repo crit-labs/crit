@@ -18,6 +18,12 @@ class DeviceMatrices:
     decode, decode_rows, rows, tile_rows, invariant = "prompt", None, device_matrices.GEMV_ROWS, "auto", None
     fp8_activations = "fp8"
     decode_formats = {}   # decode_formats: a format's decode activations where they differ from decode_activations
+    scratch = None        # the engine's scratch (context.scratch), which the calls on its device compute in
+
+    def close(self):
+        if self.scratch is not None:   # the engine closes: its scratch is used no more
+            device_matrices.use_scratch(self.device, self.scratch, use=False)
+            self.scratch = None
 
     def load(self, tensors, format, role=None, encode=None):
         """role: the matrix's role in the model, as the model plugin names it (qkv, gate_up, ...), which picks its
@@ -140,6 +146,18 @@ class DeviceMatrices:
     def matmul(self, x, matrix, out_dtype=None, prompt=False):
         return device_matrices.matmul(x, matrix, out_dtype, prompt=prompt)
 
+    def exactness(self):
+        """The level the loaded matrices' rows keep (crit_kernels.exactness; Core's facts carry it and its loader
+        compares it with the level the configuration asks). Decode rows are row-exact: in a call of up to the
+        facts' row_invariance rows each row has the bits of the row alone. Prompt rows are exact where every target
+        matrix runs the prompt tile (the bits of the same row decoded), row-exact through the fixed-tile and pinned
+        GEMMs (the same bits at every prompt length), and repeatable through the native GEMMs and the provider,
+        whose sums follow the tile or the row count. Nothing before a matrix is loaded."""
+        if not self.loaded:
+            return {}
+        prompt = "exact" if self.exact() else "row-exact" if getattr(self, "prompt_invariant", False) else "repeatable"
+        return {"decode": "row-exact", "prompt": prompt}
+
     def round_problems(self):
         """Why this plugin's matmul cannot run inside a captured round, [] when it can (rounds:projections): every
         decode and prompt path is device work on buffers sized at load, without host synchronization. The Triton
@@ -227,23 +245,41 @@ class NVFP4Projections(DeviceMatrices):
         return [weight.row(n) for n in range(weight.rows)]
 
 
+def asked_gemm(gemm, gemv, asked):
+    """prompt_gemm auto and gemv auto under the level the engine asks of its prompt rows (crit_plugins.kernels.asks):
+    the fastest prompt GEMM that keeps it. exact (and declared, which no GEMM here keeps: the loader then says so):
+    the prompt tile, each prompt row the bits of the row decoded, with the decode rows on the tile (gemv auto as fp4:
+    the FP4 MMA where it is, the tile elsewhere); row-exact: the pinned GEMMs, one configuration a matrix shape;
+    repeatable, or nothing asked: auto as it was, crit's native GEMMs. A prompt_gemm set to one way is that way.
+    Returns (prompt_gemm, gemv, the level that chose them or None)."""
+    if gemm != "auto" or asked in (None, "repeatable"):
+        return gemm, gemv, None
+    if asked == "row-exact":
+        return "pinned", gemv, asked
+    return "tile", "fp4" if gemv == "auto" else gemv, asked
+
+
 def create(context, options, parts):
+    from crit_plugins.kernels import asks
     if options["format"] == "nvfp4":
         found = NVFP4Projections(options["four_over_six"])
     else:
         found = GroupedIntProjections(int(options["format"][3:]), options["group"])
     found.device = getattr(context, "device", None)
-    found.activations, found.prompt, found.gemm = options["activations"], options["prompt"], options["prompt_gemm"]
+    found.activations, found.prompt = options["activations"], options["prompt"]
+    found.gemm, gemv, asked = asked_gemm(options["prompt_gemm"], options["gemv"], asks("prompt"))
+    how = f"prompt_gemm {found.gemm}" + (f" (auto, for the {asked} prompt rows the configuration's exactness asks)"
+                                         if asked else "")
     if found.gemm == "fixed_tiles" and found.prompt != "bf16":
         raise ValueError("quantized-projections: prompt_gemm fixed_tiles runs bf16 prompts, not " + found.prompt)
     if found.gemm in ("pinned", "pinned_cublaslt", "tile") and found.activations == "bf16" and found.prompt != "bf16":
-        raise ValueError(f"quantized-projections: prompt_gemm {found.gemm} runs weight-only NVFP4 prompts in bf16, "
+        raise ValueError(f"quantized-projections: {how} runs weight-only NVFP4 prompts in bf16, "
                          f"not {found.prompt}")
-    if found.gemm == "tile" and options["gemv"] != "mma":
-        raise ValueError("quantized-projections: prompt_gemm tile gives prompt rows the decode tile's bits: gemv mma, "
-                         "not " + options["gemv"])
+    if found.gemm == "tile" and gemv not in ("mma", "fp4"):
+        raise ValueError(f"quantized-projections: {how} gives prompt rows the decode tile's bits: gemv mma "
+                         "or fp4, not " + gemv)
     found.roles = prompt_roles(options["prompt_roles"])
-    found.gemv = options["gemv"]
+    found.gemv = gemv
     found.decode = options["decode_activations"]
     found.decode_formats = decode_formats(options["decode_formats"])
     found.rows = options["decode_rows"]
@@ -251,15 +287,17 @@ def create(context, options, parts):
     found.fp8_activations = options["fp8_activations"]
     found.mx_activations = options["mxfp8_activations"]
     if found.device is not None and str(found.device).startswith("cuda"):
-        device_matrices.buffers(found.device)   # the shared buffers memory() declares, made here
+        device_matrices.buffers(found.device)   # the shared buffers memory() declares: each made at its first use
+        found.scratch = getattr(context, "scratch", None)
+        if found.scratch is not None:   # the engine's scratch: a call's activations and partial sums are taken there
+            device_matrices.use_scratch(found.device, found.scratch)
     return found
 
 
 def memory(context, options):
-    """The device bytes the factory takes: the buffers every matrix on the device shares (device_matrices.buffers:
-    a prompt GEMM's decode workspace, mma-rows' activations, partial sums and counters, the pinned GEMMs' cuBLASLt
-    workspace), on a CUDA device. Matrices
-    are the model's tensors and go through its plan."""
+    """The device bytes the plugin's shared buffers take at most (device_matrices.buffers: a prompt GEMM's decode
+    workspace, mma-rows' activations, partial sums and counters, the pinned GEMMs' cuBLASLt workspace; each made
+    when a matrix first uses it), on a CUDA device. Matrices are the model's tensors and go through its plan."""
     device = getattr(context, "device", None)
     return {"device": device_matrices.BUFFER_BYTES} if device is not None and str(device).startswith("cuda") else {}
 

@@ -1,6 +1,6 @@
 """Host reference for constrained speculative laws: mask first, then filter; accept and repair with those laws.
 
-Mirrors constrained_logits in constrained_state.h (mtp-decode's Distribution filters applied to the allowed ids).
+The constrained law: the sampling filters applied to the allowed ids.
 `allowed` is a matcher's sorted allowed set (Core's TokenMatcher::allowed()).
 """
 import math

@@ -41,7 +41,7 @@
         "N",
         "K"
       ],
-      "row_invariant": true,
+      "exactness": "declared",
       "knobs": {
         "WARPS": {
           "values": [
@@ -87,7 +87,7 @@
         "N",
         "K"
       ],
-      "row_invariant": true,
+      "exactness": "declared",
       "knobs": {
         "WN": {
           "values": [

@@ -5,11 +5,16 @@ matrix's sign vectors.
 
     w = Exl3Matrix(trellis, suh, svh, codebook)      # suh / svh: FP16 signs, or the bitfields' unpack_signs()
     y = gemv(x, w)                                   # 1 to 16 rows: the tiles decoded on the fly, FP32 sums
-    dense = dequantize(w)                            # W^T [out][in] BF16 for a prompt's GEMM
+    y = gemm(x, w)                                   # any rows (a prompt): each row with the bits gemv gives it
+    dense = dequantize(w)                            # W^T [out][in] BF16 for a GEMM elsewhere (other bits)
 
 gemv rotates the rows (x su H in FP32, stored in FP16), multiplies them by the tiles decoded once each on FP16 tensor
 cores (a warp a 16-column strip over its split of the input tiles, FP32 sums: a row's bits never depend on the rows
-beside it), and rotates the result (y' H sv) into x's dtype. decode gives the tiles' stored FP16 values, the bits of the format's own decoder.
+beside it), and rotates the result (y' H sv) into x's dtype. gemm runs a prompt's rows through the same kernel in
+slabs of up to 64 rows, the tiles decoded once a slab and multiplied by each group of eight rows: a row's
+instructions are those of a decode call, so a prompt row has the bits of the same token decoded, and the codes are
+read at their stored bits once a slab instead of a dense copy once a call. decode gives the tiles' stored FP16
+values, the bits of the format's own decoder.
 """
 from dataclasses import dataclass
 from typing import Optional
@@ -18,7 +23,8 @@ import torch
 
 from ._ops import ops
 
-__all__ = ["CODEBOOKS", "Exl3Matrix", "MAX_ROWS", "decode", "dequantize", "gemv", "rotate", "splits", "unpack_signs"]
+__all__ = ["CODEBOOKS", "Exl3Matrix", "MAX_ROWS", "decode", "dequantize", "gemm", "gemv", "rotate", "slab_rows",
+           "splits", "unpack_signs"]
 
 MAX_ROWS = 16
 CODEBOOKS = {"3inst": 0, "mcg": 1, "mul1": 2}
@@ -73,6 +79,33 @@ def gemv(x: torch.Tensor, w: Exl3Matrix, out: Optional[torch.Tensor] = None) -> 
     ops.tiles(w.trellis, int(w.codebook), xr, yr)
     out = torch.empty(rows, w.shape[1], dtype=x.dtype, device=x.device) if out is None else out
     ops.rotate(yr, None, w.svh, out)   # the splits' sums added in order, then rotated
+    return out
+
+
+def slab_rows(w: Exl3Matrix) -> int:
+    """The rows of a prompt one pass over w's tiles takes (64, or 16 where its tuned block would be too large)."""
+    key = (w.trellis.device, tuple(w.trellis.shape), int(w.codebook), "slab")
+    if key not in _SPLITS:
+        _SPLITS[key] = int(ops.slab_rows(w.trellis, int(w.codebook)))
+    return _SPLITS[key]
+
+
+def gemm(x: torch.Tensor, w: Exl3Matrix, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """y [M][out] = x [M][in] times W for any M (a prompt's rows), in x's dtype, each row's bits those gemv gives the
+    row alone: the rows rotated at once, then slabs of slab_rows(w) rows through the tiles kernel (the splits a
+    decode call of this matrix takes, added in the same order) and each slab's sums rotated into its rows of out."""
+    rows = x.shape[0]
+    if rows <= MAX_ROWS:
+        return gemv(x, w, out)
+    xr = rotate(x, pre=w.suh, dtype=torch.float16)
+    slab, parts = slab_rows(w), splits(w, MAX_ROWS)
+    out = torch.empty(rows, w.shape[1], dtype=x.dtype, device=x.device) if out is None else out
+    yr = torch.empty(parts, slab, w.shape[1], dtype=torch.float32, device=x.device)
+    for lo in range(0, rows, slab):
+        count = min(slab, rows - lo)
+        sums = yr if count == slab else torch.empty(parts, count, w.shape[1], dtype=torch.float32, device=x.device)
+        ops.tiles(w.trellis, int(w.codebook), xr[lo:lo + count], sums)
+        ops.rotate(sums, None, w.svh, out[lo:lo + count])
     return out
 
 

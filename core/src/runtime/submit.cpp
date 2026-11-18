@@ -20,7 +20,7 @@ constexpr std::size_t logit_bias_limit = 1024;
 void validate_penalty(const std::optional<double>& value, const char* message) {
     if(value && (!std::isfinite(*value) || *value < -2 || *value > 2)) throw std::invalid_argument(message);
 }
-void validate_options(const RequestOptions& options, const ModelInfo& info, bool scoring, bool frontend) {
+void validate_options(const RequestOptions& options, const ModelInfo& info, bool scoring) {
     const auto& s = options.sampling;
     const auto& support = info.sampling;
     if(scoring && detail::has_generation_options(options))
@@ -66,14 +66,6 @@ void validate_options(const RequestOptions& options, const ModelInfo& info, bool
         throw std::invalid_argument("model does not support request context");
     if(options.logprobs && !info.token_logprobs) throw std::invalid_argument("model does not support generation logprobs");
     if(options.logprobs && *options.logprobs > info.max_top_logprobs) throw std::invalid_argument("logprobs exceeds max_top_logprobs");
-    if(options.stop_strings.size() > stop_strings_limit) throw std::invalid_argument("stop_strings exceeds 16 entries");
-    for(const auto& stop:options.stop_strings) {
-        if(stop.empty()) throw std::invalid_argument("stop_strings entries must be nonempty");
-        if(stop.size() > stop_string_bytes_limit) throw std::invalid_argument("stop_strings entry exceeds 256 bytes");
-        if(!valid_utf8(stop)) throw std::invalid_argument("stop_strings entry is not valid utf-8");
-    }
-    if(!options.stop_strings.empty() && !frontend) throw std::invalid_argument("stop strings require an independent text frontend");
-    if(options.text && !frontend) throw std::invalid_argument("text output requires an independent text frontend");
 }
 void charge_bytes(std::size_t& total, std::size_t count, std::size_t width = 1) {
     if(width && count > (std::numeric_limits<std::size_t>::max()-total)/width)
@@ -116,19 +108,13 @@ Handle Engine::Impl::submit(std::vector<Token> prompt,std::uint32_t output,bool 
     if(prompt.empty() || prompt.size() > profile.context || output > profile.context-prompt.size())
         throw std::invalid_argument("prompt plus output exceeds context");
     detail::validate_tokens(prompt,declaration.vocabulary);
-    validate_options(options,declaration,scoring,bool(frontend));
-    // The text stream exists before admission so decoder creation failures reject the submission. The frontend
-    // is thread-safe; its decoder is used serially, by the worker after publication below.
-    const bool text = options.text || !options.stop_strings.empty();
-    std::unique_ptr<TextStream> text_stream;
-    if(text) text_stream = detail::make_text_stream(frontend,prompt,options.stop_strings,declaration.vocabulary);
+    validate_options(options,declaration,scoring);
     // Reject overload before charging request memory. Keep the allowance check
     // and publication atomic with other submitters; failed construction leaves
     // neither an outstanding slot nor a retained reservation.
     std::lock_guard lock(wakeup->mutex);
     if(stopping || poisoned) throw std::runtime_error("engine unavailable");
-    if(!concurrent && busy) throw std::runtime_error("single-request core is busy");
-    if(concurrent && outstanding->load() >= std::size_t(profile.max_concurrency)+profile.max_pending)
+    if(outstanding->load() >= std::size_t(profile.max_concurrency)+profile.max_pending)
         throw std::runtime_error("outstanding request allowance exhausted");
     if(next_request == std::numeric_limits<std::uint64_t>::max()) throw std::overflow_error("request identity exhausted");
     auto request = std::make_shared<Request>();
@@ -147,25 +133,13 @@ Handle Engine::Impl::submit(std::vector<Token> prompt,std::uint32_t output,bool 
     if(options.stop_tokens) charge_bytes(bytes,options.stop_tokens->capacity(),sizeof(Token));
     if(options.context) charge_bytes(bytes,options.context->host_bytes());
     charge_bytes(bytes,options.sampling.logit_bias.capacity(),sizeof(LogitBias));
-    charge_bytes(bytes,options.stop_strings.capacity(),sizeof(std::string));
-    for(const auto& stop:options.stop_strings) charge_bytes(bytes,stop.capacity());
     if(options.logprobs) {
         charge_bytes(bytes,output,sizeof(float));                              // chosen log-probabilities
         charge_bytes(bytes,output,*options.logprobs*sizeof(TokenLogprob));     // ranked alternatives
     }
-    if(text) {
-        charge_bytes(bytes,output,sizeof(std::uint32_t));                      // text_ends
-        // The stream's matcher copy: each stop byte with its border byte, offsets, states and the holdback.
-        // Released text is charged as it grows (reserve_text).
-        for(const auto& stop:options.stop_strings) charge_bytes(bytes,stop.size(),2);
-        charge_bytes(bytes,options.stop_strings.size()+1,sizeof(std::uint32_t)+sizeof(std::uint16_t));
-        charge_bytes(bytes,stop_string_bytes_limit);
-    }
     request->storage = resources.reserve(Memory::host,bytes);
-    if(concurrent) {
-        request->staging_storage = resources.reserve(Memory::host,std::size_t(output)*sizeof(Token));
-        request->staging.reserve(output);
-    }
+    request->staging_storage = resources.reserve(Memory::host,std::size_t(output)*sizeof(Token));
+    request->staging.reserve(output);
     request->prompt = std::move(prompt);
     request->options = std::move(options);
     request->output = output; request->scoring = scoring; request->first_target = first;
@@ -174,11 +148,6 @@ Handle Engine::Impl::submit(std::vector<Token> prompt,std::uint32_t output,bool 
     if(request->options.logprobs) {
         request->result.logprobs.reserve(output);
         request->result.top_logprobs.reserve(std::size_t(output)**request->options.logprobs);
-    }
-    if(text) {
-        request->result.text_ends.reserve(output);
-        request->text = true;
-        request->text_stream = std::move(text_stream);
     }
     if(queries) {
         request->result.query_scores.reserve(queries->ids.size());
@@ -191,17 +160,13 @@ Handle Engine::Impl::submit(std::vector<Token> prompt,std::uint32_t output,bool 
     auto handle = std::make_unique<Handle::Impl>();
     handle->engine = shared_from_this();
     request->id = ++next_request; request->result.request_id=request->id;
-    request->trace_key={request->id,0,0};
     request->submitted=std::chrono::steady_clock::now();
-    if(concurrent) {
-        waiting.push_back(request);
-        ++*outstanding; handle->outstanding=outstanding;
-    } else pending=request;
+    waiting.push_back(request);
+    ++*outstanding; handle->outstanding=outstanding;
     // No throwing operation may follow attaching an uncompleted request to a
     // handle: its destructor waits. In particular queue growth precedes this.
     handle->request = request;
     busy = true;
-    trace_buffer.point(TracePhase::submitted,request->trace_key);
     wakeup->changed=true;
     wakeup->cv.notify_one();
     return Handle(std::move(handle));

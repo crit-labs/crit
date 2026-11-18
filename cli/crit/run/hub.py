@@ -3,7 +3,8 @@
 `crit run create --record request.json --from-engine ENGINE_DIR` takes an engine folder of a crit-hub checkout
 (`engines/<owner>/<name>/`: card.yaml, card.lock.json, evidence/) and records it as the run's `origin_engine`: the
 engine's identity and contributor, the repository, commit and folder that hold its source, the exact checkpoint
-files it was measured on, its sealed provenance, and its published crit Eval results, copied into the run under
+files it was measured on, its sealed provenance, and its published crit Eval results (each with the quality mode it
+was judged in and, where the card states it, the exactness the engine asked of its rows), copied into the run under
 `captured/origin/`. `resolve` then records whether the run's model is that exact checkpoint, the first candidate
 declares `"lineage": "origin-engine"` to say it is the imported source re-measured, and the engine exported from
 the run says which engine it derives from.
@@ -12,7 +13,7 @@ from pathlib import Path
 import shutil
 
 from ..card import CARD, LOCK, NAME, REPOSITORY, check_source, read_folder
-from .records import ORIGIN_DIR, QUALITY_MODES, digest, file_sha, safe_path, sha, text
+from .records import ORIGIN_DIR, QUALITY_MODES, digest, file_sha, row_exactness, safe_path, sha, text
 
 
 def describe_engine(folder):
@@ -56,6 +57,8 @@ def describe_engine(folder):
         if result.get("evidence") and result.get("quality_mode") not in QUALITY_MODES:
             raise ValueError(f"{card_path}: a result states the quality mode it was judged in, quality_mode "
                              f"{' or '.join(QUALITY_MODES)}; found {result.get('quality_mode')!r}")
+        # The exactness the engine asked of its rows when it was measured, where the card's result states it.
+        asked = row_exactness(result["exactness"], f"{card_path}: a result's exactness") if "exactness" in result else None
         for ref in result.get("evidence") or []:
             if not isinstance(ref, dict) or not isinstance(ref.get("file"), str):
                 raise ValueError(f"{card_path}: evidence entries are {{file, sha256}}")
@@ -67,7 +70,8 @@ def describe_engine(folder):
                 raise ValueError(f"{folder}: evidence {ref['file']} does not match its sha256 in {CARD}")
             evidence.append({"file": ref["file"], "sha256": found, "measured_with": result.get("measured_with"),
                              "gpu": result.get("gpu"), "model": result.get("model"),
-                             "quality_mode": result["quality_mode"], "source": str(path)})
+                             "quality_mode": result["quality_mode"], **({"exactness": asked} if asked else {}),
+                             "source": str(path)})
     return {
         "engine": engine, "title": text(str(card["title"]), "card title", 400), "origin": card["origin"],
         "summary": card.get("summary") if isinstance(card.get("summary"), str) else None,
@@ -95,7 +99,8 @@ def store_evidence(origin, root):
         shutil.copyfile(source, destination)
         if file_sha(destination) != ref["sha256"]:
             raise ValueError(f"{ref['file']} changed while it was copied")
-        stored.append({key: ref[key] for key in ("file", "sha256", "measured_with", "gpu", "model", "quality_mode")}
+        stored.append({key: ref[key] for key in ("file", "sha256", "measured_with", "gpu", "model", "quality_mode",
+                                                 "exactness") if key in ref}
                       | {"path": f"{ORIGIN_DIR}/{destination.name}"})
     return {**origin, "evidence": stored}
 

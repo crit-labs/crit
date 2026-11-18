@@ -168,6 +168,20 @@ class HostRowsTests(PluginTestCase):
                 for want, out in zip(wants, got):
                     self.assertTrue(torch.equal(out.cpu(), self.table[want]), want)
 
+    def test_lookups_of_every_length_share_buffer_sets_sized_by_powers_of_two(self):
+        if self.device() != "cuda":
+            self.skipTest("lookups on a stream")
+        torch = self.torch
+        rows = self.plugin(ring=2)
+        part = rows.open(self.paths, 90, torch.uint8, "cuda").parts[0]
+        for count in (70, 3, 128, 100, 65, 1, 129, 64):      # as a server's prompt lengths come: any order
+            want = [(7 * i + count) % 1000 for i in range(count)]
+            got = rows.lookup(torch.tensor(want))
+            torch.cuda.synchronize()
+            self.assertEqual(tuple(got.shape), (count, 90))
+            self.assertTrue(torch.equal(got.cpu(), self.table[want]), count)
+        self.assertEqual(sorted(part._sites), [64, 128, 256])       # three sets' sizes for eight lengths
+
     def test_a_failed_read_is_never_served_as_rows(self):
         torch, device = self.torch, self.device()
         rows = self.plugin(native=True, prefetch_rows=0)

@@ -8,11 +8,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("splits(Tensor trellis, int codebook, int rows) -> int");
   ops.def("tiles(Tensor trellis, int codebook, Tensor xr, Tensor! yr) -> ()");
   ops.def("decode(Tensor trellis, int codebook, Tensor! q) -> ()");
+  ops.def("slab_rows(Tensor trellis, int codebook) -> int");
 #if defined(CUDA_KERNEL)
   ops.impl("rotate", torch::kCUDA, &rotate);
   ops.impl("splits", torch::kCUDA, &splits);
   ops.impl("tiles", torch::kCUDA, &tiles);
   ops.impl("decode", torch::kCUDA, &decode);
+  ops.impl("slab_rows", torch::kCUDA, &slab_rows);
 #endif
 }
 

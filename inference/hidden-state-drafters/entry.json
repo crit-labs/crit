@@ -2,8 +2,8 @@
   "id": "hidden-state-drafters",
   "category": "speculation",
   "summary": "Published drafters that read the target's hidden states (EAGLE-3) or draft a block per pass (DFlash, DSpark): one Core description of every published format with one tap convention, and device glue for catch-up, block input, draft-vocabulary mapping and confidence truncation in the device speculative round",
-  "implementation_status": "native_source",
-  "implementation_scope": "Core's crit_core.model.drafters reads speculators (eagle3, peagle, dflash, dflash2, dspark), native EAGLE-3, native DFlash and native DSpark configs into one Drafter with taps as residual-stream indices. A Python reference and CUDA reference kernels supply EAGLE-3 catch-up columns from the round's packed result and settled count, block-drafter input, d2t mapping, draft-law scatter to the target vocabulary and confidence truncation. An engine attention kernel with causal = false runs a block drafter's non-causal block. Drafter arithmetic and the target's tap writes are engine supplied.",
+  "implementation_status": "reference",
+  "implementation_scope": "Core's crit_core.model.drafters reads speculators (eagle3, peagle, dflash, dflash2, dspark), native EAGLE-3, native DFlash and native DSpark configs into one Drafter with taps as residual-stream indices. A Python reference and the device form supply EAGLE-3 catch-up columns from the round's packed result and settled count, block-drafter input, d2t mapping, draft-law scatter to the target vocabulary and confidence truncation. An engine attention kernel with causal = false runs a block drafter's non-causal block. Drafter arithmetic and the target's tap writes are engine supplied.",
   "agent_guidance": {
     "use_when": "A drafter trained for the target is published (speculators, EAGLE-3, DFlash or DSpark checkpoints) and the target has no built-in draft head or its head accepts less",
     "avoid_when": "No published drafter matches the target (crit never trains one), the drafter needs another model family's state, or the measured tap writes and drafter passes cost more than the tokens they add",
@@ -37,12 +37,10 @@
   "code_path": "inference/hidden-state-drafters/code",
   "code_files": [
     {"path": "inference/hidden-state-drafters/code/drafting.py", "purpose": "Host reference: catch-up columns, block input and drafts, d2t mapping, law scatter and confidence truncation"},
-    {"path": "inference/hidden-state-drafters/code/hidden_drafters.h", "purpose": "Launch interfaces over device-speculative-round's control block and packed result"},
-    {"path": "inference/hidden-state-drafters/code/hidden_drafters.cu", "purpose": "Reference CUDA kernels for catch-up, block input, mapping, scatter and truncation"},
     {"path": "inference/hidden-state-drafters/code/device_drafting.py", "purpose": "drafting.py's d2t mapping, confidences, truncation and ConfidenceCut (bins, labels, threshold) over device tensors for captured rounds"}
   ],
   "requires": {
-    "hardware": "CUDA C++20 and device-speculative-round's greedy_accept.h; Python 3.11+ for Core's reader and the reference",
+    "hardware": "Python 3.11+ for Core's reader and the reference; PyTorch for the device form",
     "model": "A target with a published hidden-state drafter sharing its tokenizer (or a d2t table into it)",
     "workload": "Speculative decoding through the device round, greedy or sampled"
   },
@@ -55,8 +53,6 @@
   },
   "dependencies": [
     "Core crit_core.model (ConfigError, jsonfile)",
-    "CUDA runtime",
-    "device-speculative-round (greedy_accept.h)",
     "Python standard library"
   ],
   "symbols": [
@@ -69,12 +65,7 @@
     "block_drafts",
     "map_tokens",
     "scatter_law",
-    "truncate",
-    "enqueue_eagle_ingest",
-    "enqueue_block_input",
-    "enqueue_map_tokens",
-    "enqueue_scatter_law",
-    "enqueue_truncate_drafts"
+    "truncate"
   ],
   "interactions": [
     "device-speculative-round",
@@ -88,7 +79,7 @@
   ],
   "validation": {
     "host": "Core's reader on speculators EAGLE-3, DFlash and DSpark, native EAGLE-3 with default taps, native DFlash and DSpark agreeing on one tap convention, rejected and foreign configs and a drafter directory; the drafting reference's rules",
-    "native": "Catch-up tokens and positions from the packed result, including after a Core truncation and at the widest width + 1 after a wider round (a narrower round's K + 1 drops its tokens); block input; d2t mapping and law scatter keeping mass; confidence truncation",
+    "native": "No native code; the plugin's tests run the device form",
     "performance": "No drafter arithmetic or speedup is qualified"
   }
 }

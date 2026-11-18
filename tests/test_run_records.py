@@ -79,8 +79,9 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         (model / "config.json").write_text(json.dumps({"num_hidden_layers": 2, "num_attention_heads": 2, "num_key_value_heads": 1,
                                                        "head_dim": 8, "max_position_embeddings": 262144}), encoding="utf-8")
         device = self.root / "device.json"
-        # 1 GiB headroom and the 3 GiB reserve leave the weights and 100,000 tokens of KV cache.
-        device.write_text(json.dumps({"device": "fixture gpu", "memory_free_bytes": 4 * GIB + 8192 + 32 * 100000}), encoding="utf-8")
+        # The 0.25 GiB headroom and the 3 GiB reserve leave the weights and 100,000 tokens of KV cache.
+        device.write_text(json.dumps({"device": "fixture gpu",
+                                      "memory_free_bytes": 13 * GIB // 4 + 8192 + 32 * 100000}), encoding="utf-8")
         data = {key: value for key, value in self.data.items() if key != "kv_tokens"} | {"model_path": str(model)}
         with self.assertRaisesRegex(ValueError, "Request needs device"):
             self.store.create(data)
@@ -106,13 +107,13 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         self.assertEqual(explicit["kv_tokens"], 65536)
         self.assertNotIn("context", explicit)
         # A device file of two GPUs (crit eval probe --devices) names them, and their memory holds more context.
-        one = {"device": "fixture gpu", "memory_free_bytes": 4 * GIB + 8192 + 32 * 100000}
+        one = {"device": "fixture gpu", "memory_free_bytes": 13 * GIB // 4 + 8192 + 32 * 100000}
         device.write_text(json.dumps({**one, "devices": [{**one, "index": 0}, {**one, "index": 1}]}), encoding="utf-8")
         pair = self.store.create(data | {"device": str(device)})["run"]["spec"]["hardware_constraints"]
         self.assertEqual(pair["context"]["devices"], [{"index": 0, "device": "fixture gpu"},
                                                       {"index": 1, "device": "fixture gpu"}])
         self.assertGreater(pair["kv_tokens"], hardware["kv_tokens"])
-        device.write_text(json.dumps({"memory_free_bytes": 4 * GIB}), encoding="utf-8")
+        device.write_text(json.dumps({"memory_free_bytes": 13 * GIB // 4}), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "Eval cannot derive the max context: the weights read on every pass"):
             self.store.create(data | {"device": str(device)})
 
@@ -144,6 +145,49 @@ class RunRecordTests(RunFixture, unittest.TestCase):
             self.store.package(self.run_id, other["candidate_id"], source,
                 {"build": {"toolchain": {"identity": "host fixture"}, "dependencies": [], "command": ["fixture"]}})
         self.assertFalse((self.directory / "candidates" / other["candidate_id"] / "package").exists())
+
+    def test_a_candidate_states_the_exactness_of_its_rows(self):
+        """crit completes a candidate's configuration with the exactness of its rows: what it asks, and the run's
+        quality mode's level for a phase it leaves out (speed: repeatable, every plugin's fastest way)."""
+        fast = {"decode": "repeatable", "prompt": "repeatable"}
+        first = self.candidate()
+        self.assertEqual(first["configuration"]["exactness"], fast)
+        asked = self.candidate(configuration={"batch": 2, "exactness": {"prompt": "exact"}})
+        self.assertEqual(asked["configuration"]["exactness"], {"decode": "repeatable", "prompt": "exact"})
+        whole = self.candidate(configuration={"batch": 3, "exactness": "exact"})   # a decode row's exact is row-exact
+        self.assertEqual(whole["configuration"]["exactness"], {"decode": "row-exact", "prompt": "exact"})
+        for wrong, said in (("bitwise", "not one of"), ({"verify": "exact"}, "per phase"), (3, "is a level"),
+                            ({"prompt": "fast"}, "not one of")):
+            with self.subTest(wrong=wrong), self.assertRaisesRegex(ValueError, "configuration.exactness.*" + said):
+                self.candidate(configuration={"batch": 4, "exactness": wrong})
+        # The package carries the levels: a supplied configuration.json without them is not the candidate's.
+        self.package(whole)
+        folder = self.directory / "candidates" / whole["candidate_id"] / "package"
+        self.assertEqual(read_json(folder / "configuration.json")["exactness"], {"decode": "row-exact", "prompt": "exact"})
+        source = with_plugins(self.root / "package-without-levels")
+        (source / "configuration.json").write_text(json.dumps(
+            {k: v for k, v in asked["configuration"].items() if k != "exactness"}), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "differs from the candidate configuration in exactness"):
+            self.store.package(self.run_id, asked["candidate_id"], source,
+                {"build": {"toolchain": {"identity": "host fixture"}, "dependencies": [], "command": ["fixture"]}})
+        # An external engine is not Core's to hold to a level: its configuration is left as it is.
+        from crit.run.store import with_exactness
+        external = {"engine": {"kind": "external", "launch": {"command": ["serve"]}}}
+        with patch("crit.run.external.spec_of", lambda configuration: object()):
+            self.assertEqual(with_exactness(external, "preserve"), external)
+        brief = (self.directory / "agent_request.md").read_text(encoding="utf-8")
+        self.assertIn("decode rows repeatable and prompt rows repeatable, so every plugin takes its fastest way", brief)
+
+    def test_a_preserve_run_asks_exact_rows_of_a_candidate_that_sets_none(self):
+        run = self.store.create(self.data | {"quality_mode": "preserve"})["run"]
+        self.run, self.run_id, self.directory = run, run["run_id"], self.store.directory(run["run_id"])
+        kept = {"decode": "row-exact", "prompt": "exact"}
+        self.assertEqual(self.candidate()["configuration"]["exactness"], kept)
+        lower = self.candidate(configuration={"batch": 2, "exactness": {"prompt": "repeatable"}})
+        self.assertEqual(lower["configuration"]["exactness"], {"decode": "row-exact", "prompt": "repeatable"})
+        brief = (self.directory / "agent_request.md").read_text(encoding="utf-8")
+        self.assertIn("decode rows row-exact and prompt rows exact, so each prompt row has the bits of the same token "
+                      "decoded", brief)
 
     def test_a_candidate_and_its_package_are_plugin_packages(self):
         """crit run takes an engine only as Core's loader runs it: plugins/ and a configuration whose plugins
@@ -399,7 +443,7 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         package = self.package(candidate)
         checks = self.checks(candidate, package)
         data = self.benchmark_data(package, checks)
-        data["metrics"]["minimum_free_vram_bytes"]["samples"][0] = GIB - 1
+        data["metrics"]["minimum_free_vram_bytes"]["samples"][0] = GIB // 4 - 1   # under the run's VRAM headroom
         del data["metrics"]["prefill_tps"]
         data["missing_metrics"]["prefill_tps"] = "Not measured by fixture"
         self.store.append(self.run_id, candidate["candidate_id"], "benchmark", data)

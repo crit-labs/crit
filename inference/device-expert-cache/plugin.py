@@ -1,8 +1,9 @@
 """Device expert slots in the expert_residency slot. Host form: device-expert-cache's clock directory (device_cache.py)
-under its clock policy, or under its RankedSchedule (ranked_residency.py), as the `policy` option chooses. Device form
+under its clock policy or under its RankedSchedule (ranked_residency.py), or recent residency's rule
+(recent_residency.py), as the `policy` option chooses. Device form
 (the "experts:cache" extension): cache(...) -> expert_cache.ExpertCache, the directory on the device, misses filled from
 a bundle store in device-readable host memory, prompt chunks through a staging ring, a KV pool's unused pages lent."""
-from .cache import device_cache, expert_cache, ranked_residency
+from .cache import device_cache, expert_cache, ranked_residency, recent_residency
 
 
 class _Device:
@@ -22,7 +23,8 @@ class _Device:
             ring_slots=None if o["ring_slots"] < 0 else o["ring_slots"], ring=o["ring"],
             stage_routes=o["stage_routes"] or None, fill_blocks=o["fill_blocks"], fill_vector=int(o["fill_vector"]),
             decay=o["decay"], period=o["period"], max_swaps=o["max_swaps"], burst_swaps=o["burst_swaps"],
-            kernel=o["native"], rows=o["round_rows"])
+            kernel=o["native"], rows=o["round_rows"], record_routes=o["record_routes"],
+            side_swaps=o["side_swaps"], max_slots=o["max_slots"])
         self.caches.append(cache)
         return cache
 
@@ -121,5 +123,31 @@ class RankedExpertCache(_Device):
         return {key - layer * experts for key in self.directory.key_slot if key // experts == layer}
 
 
+class RecentExpertCache(_Device):
+    """Recent residency: a miss is the CPU tier's now and resident from the next round (a plan for a layer at or below
+    the previous plan's layer starts one), in the slot of the expert routed longest ago."""
+
+    def __init__(self, options):
+        self._setup(options)
+        self.experts = options["experts"]
+        self.directory = recent_residency.RecentResidency(options["layers"] * options["experts"], options["slots"],
+                                                          max(1, options["max_swaps"]))
+        self.last = None
+
+    def plan(self, layer, experts):
+        experts = list(experts)
+        if len(set(experts)) != len(experts):
+            raise ValueError("the experts of one plan must be distinct")
+        if self.last is None or layer <= self.last:
+            self.directory.start_round()
+        self.last = layer
+        return [bool(hit) for hit in self.directory.plan([layer * self.experts + e for e in experts])]
+
+    def resident(self, layer):
+        return {int(key) - layer * self.experts for key in self.directory.resident()
+                if int(key) // self.experts == layer}
+
+
 def create(context, options, parts):
-    return (RankedExpertCache if options["policy"] == "ranked" else ClockExpertCache)(options)
+    forms = {"ranked": RankedExpertCache, "recent": RecentExpertCache}
+    return forms.get(options["policy"], ClockExpertCache)(options)

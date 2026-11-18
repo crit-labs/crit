@@ -1972,7 +1972,7 @@ class PackageTests(unittest.TestCase):
 
 
 class TensorReaderTests(SafetensorsFixture):
-    """crit_core.model.TensorReader: tensor bytes from the files inspect_model validated (Checkpoint::map/read)."""
+    """crit_core.model.TensorReader: tensor bytes from the files inspect_model validated."""
 
     def payload(self, specs, name="model.safetensors"):
         header, payload = {}, bytearray()

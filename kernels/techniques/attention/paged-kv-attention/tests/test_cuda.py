@@ -395,6 +395,35 @@ def test_a_cuda_ramp_splits_short_positions_finer_and_keeps_a_columns_bits_alone
 
 @pytest.mark.kernels_ci
 @pytest.mark.parametrize("fused", [False, True])
+def test_each_owner_launches_in_workspaces_of_its_own(fused, monkeypatch):
+    # Two engines of a process must never share a launch's partials, ring or sync words: launches inside owner(key)
+    # take the module's workspaces of that key, the same bits as outside, and release(key) drops them.
+    if fused:
+        monkeypatch.setattr(pk, "FUSED_PARTIALS", 0)
+    monkeypatch.setattr(pk, "_workspaces", {})
+    monkeypatch.setattr(pk, "_fused_workspaces", {})
+    cache = Cache("bf16", 2, 128, 128, 16, [700, 700])
+    q = _q(8, 8, 128, 3).to(torch.bfloat16)
+    rows = torch.arange(2, dtype=torch.int32, device=dev)
+    starts, firsts = rows * 4, torch.full((2,), 640, dtype=torch.int64, device=dev)
+
+    def launch():
+        return pk.attend(q, cache.k, cache.v, "bf16", cache.tables, rows, starts, firsts, 4, 16, fused=fused, **CUDA)
+    held = pk._fused_workspaces if fused else pk._workspaces
+    want = launch()
+    with pk.owner("a"):
+        a = launch()
+    with pk.owner("b"):
+        b = launch()
+    assert torch.equal(a, want) and torch.equal(b, want)
+    assert sorted(str(key[1]) for key in held) == ["None", "a", "b"]
+    assert len({held[key][0].data_ptr() for key in held}) == 3   # three workspaces, none shared
+    pk.release("a")
+    assert sorted(str(key[1]) for key in held) == ["None", "b"]
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("fused", [False, True])
 def test_a_graph_captured_before_the_workspace_grows_still_replays_its_own_bits(fused, monkeypatch):
     # The module's workspace grows for a larger launch after a capture: the captured launch keeps the one it read,
     # whose blocks no other tensor may take (a replay would read them, and write over that tensor).

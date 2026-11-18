@@ -40,19 +40,12 @@ margin. Physical observation is required by default; zero demand is admitted wit
 
 ## What the code supplies
 
-Native engines call Core: `crit::core::observe_host_memory()`,
-`observe_host_memory_linux(root)` and `admit_host(demand, observation, reserve,
-require_physical)` in [host_memory.h](../../core/include/crit/host_memory.h)
-([Core host memory admission](../../core/src/memory/README.md#host-memory-admission)),
-with the working set as `HostWorkingSet{anonymous, pinned, file}`. This entry keeps the
-Python reference and the guidance on what to count.
-
 [memory.py](code/memory.py): `parse_meminfo`, `parse_stat`, `cgroup_headroom(root)`,
 `observe_linux(root)` (any root, so fixtures can supply synthetic `/proc` and `/sys`),
 `observe_windows()` via `GlobalMemoryStatusEx`, `observe()`, `Observation.limits()`,
 `admit(request, observation, reserve, require_known)` returning
-`Decision(admitted, binding, limit, reason)`, and `admit_working_set`, which follows
-Core's `admit_host` rule and tie order.
+`Decision(admitted, binding, limit, reason)`, and `admit_working_set` for a working set
+of anonymous, pinned and file-backed bytes.
 
 ## What the engine supplies
 

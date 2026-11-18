@@ -36,6 +36,17 @@ VSPLIT programs share a tile, each with R / VSPLIT of the output columns (each c
 the same bits). The partitions' states fold in partition order in the merge, the sink last, and the output rounds
 once.
 
+**Fused** (`attend(..., fused=True)`): one program a tile (and value part) reads the tile's partitions one after
+another, each from a fresh state as the split launch's program does, and folds it into the running state as the merge
+folds the partials (partition order, a column only the partitions that hold its positions, the sink last), then
+writes the output. Every token has the split launch's bits, and nothing is stored between: a split launch's partials
+are FP32 at the rank's width for every query head, column and partition (a 64-column window at 128 heads and rank
+512: 675 MB with the rule's 42 partitions). It is the launch for wide windows and for prompt chunks that must have
+their tokens' decode bits (a chunk as rows of 64 columns: a served token and the same token scored in a prompt then
+agree bit for bit, which `prefill`'s reduction does not give). For a decode row it is the wrong launch: one program
+walks every piece the partitions' programs share out. `fused=None` (the default) takes it where the partials would
+pass `PARTIAL_BYTES` (512 MB).
+
 **Prompt chunks** (`prefill(q, cache, table, position, page, rank=R)`, structure `prompt`): a chunk of one sequence
 at positions `position ..` (an int or a one-element device tensor: one CUDA graph for every position), causal. The
 chunk's tokens times their heads are packed into tiles of BLOCK_M rows (row j: token j // H, head j % H), so each piece
@@ -100,6 +111,13 @@ FlashInfer's MLA wrapper with causal prompt rows on the same cache (the two agre
 | 128 | 2,048 x 0 | 5.47 ms (107 TFLOPS) | 4.78 ms (122) |
 | 128 | 1,024 x 7,168 | 20.7 ms | 19.0 ms |
 
+Read through `attend(fused=True)` as windows of 64 columns (the tokens' decode bits) the same chunks take, at 128
+heads: 0.93 ms (512 x 0), 9.9 ms (2,048 x 0), 26.1 ms (1,024 x 7,168), against `prefill`'s 0.47, 6.0 and 23.2 ms on the
+same day; at 16 heads 0.19, 1.82 and 4.55 ms against 0.10, 0.87 and 3.52: 1.1 to 2.1 times `prefill`'s time, the most
+on short contexts, where a tile's 42 (or 128) partitions hold a piece or two each. A verify window of 64 columns at
+8,192 positions and 128 heads takes 2.11 ms fused and 2.19 ms split (with its 675 MB of partials); at 16 columns 1.06
+against 0.56 ms, at one column 1.06 ms against 45 us.
+
 That is 0.78 to 0.92 times FlashInfer. Both run the absorbed form, about 1,090 multiply-adds a head and position;
 engines that expand the latents into per-head keys and values for prompts (192-wide keys, 128-wide values) do about
 a third of that arithmetic but expand and hold the expansion first.
@@ -113,7 +131,9 @@ values (codes times scales), its tokens alone and in a window bit for bit; every
 beside other rows bit for bit; the speed knobs bit for bit; one CUDA graph replayed at five lengths; the inputs it
 refuses; prompt chunks at three geometries and three positions against the float64 reference, with and without
 sinks, over an E4M3 cache, a token's bits the same at five chunk lengths, and one CUDA graph replayed at three device
-positions. The kernel gates (nonfinite, repeat, edges) on both structures at 16 and 128 heads over both cache kinds.
+positions; the fused launch against the split one bit for bit (outputs and log-sum-exps, rows of several lengths,
+sinks, an E4M3 cache), a prompt chunk read through it as windows against its tokens decoded alone, and the automatic
+choice. The kernel gates (nonfinite, repeat, edges) on both structures at 16 and 128 heads over both cache kinds.
 
 ## Yardstick
 

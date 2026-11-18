@@ -62,7 +62,7 @@ FP64 result (`moe_block`, from weights decoded with `decode_matrix`).
 **Chunking is free to change** when the projection splits no reduction by the row count,
 fills short tiles with zero rows and combines a token's routes in a fixed order. A token's
 result then does not depend on the other tokens of its chunk, and the
-[batch invariance rules](../../core/src/batch/README.md#batch-invariance) hold for any
+[batch invariance rules](../../core/python/crit_core/batch.md#batch-invariance) hold for any
 chunk size the schedule picks. Check that on the target too: the same token's output with
 two chunk sizes.
 

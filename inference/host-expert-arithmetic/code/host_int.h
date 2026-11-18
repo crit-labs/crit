@@ -7,7 +7,7 @@
 // AVX2's maddubs, Arm's SDOT, CUDA's dp4a and int8 tensor cores all give the same block sums. Only the FP32 part
 // is declared: block b goes to lane b % lanes; lane = fma(float(sum_b), wscale_b * ascale_b, lane) with the scale
 // product rounded first; blocks in order; the lanes reduced by host_nvfp4's halving tree (or sequentially); the
-// result times post. A device row or a device GEMM that declares the same (host_nvfp4_device.cuh's dot_row_int, the
+// result times post. A device row or a device GEMM that declares the same (the
 // int-block-experts kernel in crit's kernels/techniques/experts) gives the same bits, so the CPU can take an expert's rows at its
 // integer speed (DRAM-bound with a few threads) and the output does not depend on where they ran.
 //
@@ -91,16 +91,23 @@ void dot_rows_int(Isa, const IntOrder&, const IntMatrix&, const host_nvfp4::Scal
 // `global` is crit::nvfp4's divisor. The 2 of the codes is the arithmetic's: put 0.5 per E2M1 side in post.
 void quantize_e2m1x2(const float* x, std::size_t n, float global, std::int8_t* values, float* scales,
                      std::uint8_t* scale_bytes = nullptr);
+// The same on a given ISA (avx512 where int_supported says so, else the scalar order): the same bits on each. The
+// form without an ISA runs the fastest this CPU has.
+void quantize_e2m1x2(Isa, const float* x, std::size_t n, float global, std::int8_t* values, float* scales,
+                     std::uint8_t* scale_bytes = nullptr);
 // INT8 (W4A8): d = amax / 127 (rounded); value_i = round-half-even(x_i / d), clamped to +-127 (0 when d is 0);
 // scales[b] = d.
 void quantize_int8(const float* x, std::size_t n, int block, std::int8_t* values, float* scales);
 
 // IEEE-only exp, SiLU and SwiGLU: the same bits wherever an IEEE FP32 FMA runs (std::fma here, __fmaf_rn on the
-// device, host_nvfp4_device.cuh's exp_declared). exp: n = rint(x * log2(e)), r = x - n * ln2 (two FMAs, hi and lo
+// device, the kernel's exp_declared). exp: n = rint(x * log2(e)), r = x - n * ln2 (two FMAs, hi and lo
 // parts), a degree-7 polynomial in r by FMAs, scaled by 2^n through the exponent bits; x clamped to [-87, 88].
 float exp_declared(float x) noexcept;
 float silu_declared(float x) noexcept;                 // x / (1 + exp(-x)), each step rounded
 float swiglu_declared(float gate, float up) noexcept;  // silu(gate) * up
+// out[k] = swiglu_declared(gate[k], up[k]) for k < n: the fastest ISA this CPU has, or a given one, the same bits.
+void swiglu_rows(const float* gate, const float* up, std::size_t n, float* out);
+void swiglu_rows(Isa, const float* gate, const float* up, std::size_t n, float* out);
 
 namespace detail {
 // One implementation per ISA. `scales` holds row r's decoded weight block scales at (r - row0) * (cols / 16), or
@@ -116,6 +123,12 @@ void int_rows_avx512(const IntOrder&, const IntMatrix&, const float*, const floa
                      std::size_t, std::size_t, float, float*, std::size_t);
 // The integer weight values by code (16 entries, int8).
 const std::int8_t* weight_values(Weights) noexcept;
+// e4m3_encode of a finite value as its code (the nearest E4M3 value, ties to the even code) and that code's value.
+std::uint8_t e4m3_code(float x, float* decoded) noexcept;
+// The declared quantizer and SwiGLU on AVX-512 (host_int_avx512.cpp): the scalar functions' operations, 16 at a time.
+void quantize_e2m1x2_avx512(const float* x, std::size_t n, float global, std::int8_t* values, float* scales,
+                            std::uint8_t* scale_bytes);
+void swiglu_rows_avx512(const float* gate, const float* up, std::size_t n, float* out);
 }  // namespace detail
 
 }  // namespace crit::techniques::host_int

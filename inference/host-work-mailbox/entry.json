@@ -3,7 +3,7 @@
   "category": "execution",
   "summary": "Host work posted by the device and joined inside a CUDA stream or captured graph, with a measured choice of wait",
   "implementation_status": "native_source",
-  "implementation_scope": "C++/CUDA mailbox over caller-owned mapped pinned memory: device-reset doorbells (done = 0 before ready = 1, survive graph replay), device-answered skips, host service thread, stream-front-end and poll-kernel joins plus an eager host join, release with a sweeper for stuck windows, rearm, terminal failure answering, functional support probe and replayed-graph join cost measurement; Python host reference of the protocol. Payload layout, handler arithmetic and worker pools remain engine supplied.",
+  "implementation_scope": "Core runs it for every plugin (crit_plugins.host's handoffs: core/python/crit_plugins/host/handoff.h, handoff.cu, handoff_device.cuh, built at first use). C++/CUDA mailbox over mapped pinned memory: device-reset doorbells (done = 0 before ready = 1, survive graph replay), device-answered skips, one host service thread a process, stream-front-end and poll-kernel joins plus an eager host join, release with a sweeper for stuck windows, rearm, terminal failure answering, functional support probe and replayed-graph join cost measurement; Python host reference of the protocol. The payload layout and the handler's arithmetic are the plugin's; its batches run on the host's worker pool.",
   "agent_guidance": {
     "use_when": "A graph-captured step needs host computation or host-issued work that the device decides on at run time (host-computed experts, host lookups, copies), and splitting the graph with a host synchronization per decision costs too much",
     "avoid_when": "The host work is known before launch, fits on the device, or the measured join cost exceeds the work moved; never assume the stream wait is free on a platform without measuring it",
@@ -17,7 +17,7 @@
       "Functional probe of stream-wait support, eagerly and captured, and per-join cost measured in a replayed graph"
     ],
     "engine_supplies": [
-      "Mapped pinned bytes allocated and accounted through Core (CudaBackend host buffers or cuda_map_host)",
+      "Mapped pinned bytes allocated and accounted through Core (crit_plugins.host's handoffs)",
       "Payload layout, system-fenced payload writes before each post, and volatile reads of results after the join",
       "The handler and any worker pool it uses; handlers must return",
       "Join choice from measure_joins on the target machine, ideally re-checked within the engine's own step",
@@ -40,18 +40,6 @@
   "code_path": "inference/host-work-mailbox/code",
   "code_files": [
     {
-      "path": "inference/host-work-mailbox/code/mailbox.h",
-      "purpose": "Mailbox, slot views, join kinds, release/rearm/failure contract, probe and cost measurement"
-    },
-    {
-      "path": "inference/host-work-mailbox/code/mailbox.cu",
-      "purpose": "Post/skip/poll kernels, stream wait through a runtime-resolved driver entry point, service and sweeper threads, probe and measurement"
-    },
-    {
-      "path": "inference/host-work-mailbox/code/mailbox_device.cuh",
-      "purpose": "Device-side post, skip and result reads for engine kernels"
-    },
-    {
       "path": "inference/host-work-mailbox/code/implementation.py",
       "purpose": "Host reference of the protocol with captured programs replayed in order"
     }
@@ -62,26 +50,26 @@
     "workload": "Graph-captured or eager steps with host work decided on the device"
   },
   "contract": {
-    "input": "Caller-owned mapped region of region_bytes(slots, payload), slot count, payload bytes, join kind and handler; device posts with system-fenced payloads",
+    "input": "Slot count, payload bytes, the handler (a C function and its context) and optionally the join kind, to crit_plugins.host's handoff(); device posts with system-fenced payloads",
     "output": "Per slot a status (served, skipped, failed, released) and the handler's payload outputs, visible to the stream after its join",
-    "ownership": "The caller keeps the mapped region and its accounting alive past the mailbox; the stream reads results only after the join; one outstanding job per slot",
+    "ownership": "Core owns the mapped region, the service thread and the join; the plugin keeps its handler's library alive until it closed the handoff; the stream reads results only after the join; one outstanding job per slot",
     "failure": "A throwing handler fails the mailbox for good and answers every later doorbell with status failed; release() answers pending and later doorbells with status released; rearm() refuses while a job runs or after failure; the eager join rejects capture and reports a join of an unposted slot",
-    "core_boundary": "Engines allocate the region through Core resources and include release() in drain and cancellation; Core is not changed"
+    "core_boundary": "Core's service (crit_plugins.host): plugins ask for a handoff and include release() in drain and cancellation"
   },
   "dependencies": [
     "CUDA runtime 12.0+ (driver entry points), C++20",
     "Python standard library for the host reference"
   ],
   "symbols": [
-    "crit::techniques::host_mailbox::Mailbox",
-    "crit::techniques::host_mailbox::MappedRegion",
-    "crit::techniques::host_mailbox::region_bytes",
-    "crit::techniques::host_mailbox::Join",
-    "crit::techniques::host_mailbox::probe_joins",
-    "crit::techniques::host_mailbox::measure_joins",
-    "crit::techniques::host_mailbox::JoinCosts",
-    "crit::techniques::host_mailbox::post_job",
-    "crit::techniques::host_mailbox::skip_job",
+    "crit::host::Handoff",
+    "crit::host::MappedRegion",
+    "crit::host::region_bytes",
+    "crit::host::Join",
+    "crit::host::probe_joins",
+    "crit::host::measure_joins",
+    "crit::host::JoinCosts",
+    "crit::host::post_job",
+    "crit::host::skip_job",
     "Mailbox",
     "Stream"
   ],

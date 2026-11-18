@@ -1,7 +1,8 @@
 """attention:latent: forward(..., latent=R) over a pool of keys only with one KV head (each position's latent, then its
 rotary key) against a float64 reference over the stored rows: decode tokens, verify windows and prompt rows of a
 step on crit's latent-attention kernel (BF16 and fp8:row pages) and in torch (FP32 pages); a captured round's column
-equal to the step's decode of the same token; a captured prompt chunk equal to the padded eager chunk."""
+equal to the step's decode of the same token; a captured prompt chunk equal to the padded eager chunk; with
+prompt_reader decode, a prompt row's tokens with the bits of the same tokens decoded."""
 from types import SimpleNamespace
 
 from crit_plugins import StepBatch
@@ -109,26 +110,55 @@ class LatentTests(PluginTestCase):
     def test_a_captured_prompt_chunk_equals_the_padded_eager_chunk(self):
         from crit_plugins.prompt_graphs import PromptGraphs
         torch = self.torch
-        models, queries = [], self.queries(1024, 31)
+        queries = self.queries(1024, 31)
         self._rows = self.rows(range(1024))
-        for _ in range(2):
-            pool = self.pool("bf16")
-            pool.open(0)
+        readers = (self.attention, self.assemble(USE, options={"prompt_reader": "decode"})["attention"])
+        for attention in readers:   # the prompt reader's chunks, and the decode reader's fused windows
+            models = []
+            for _ in range(2):
+                pool = self.pool("bf16")
+                pool.open(0)
 
-            def forward(batch, pool=pool):
-                self.write(pool, batch)
-                q = queries.index_select(0, batch.positions_t)
-                out = self.attention.forward(0, q, pool, batch, scale=SCALE, latent=R)
-                last = batch.last_t if batch.prompt else torch.tensor([batch.tokens - 1], device=self.device())
-                return out.index_select(0, last)
-            models.append((forward, pool))
-        graphs = PromptGraphs(models[0][0], device="cuda", buckets=(128, 256), pools=[models[0][1]])
-        eager = PromptGraphs(models[1][0], device="cuda", buckets=(128, 256), pools=[models[1][1]])
-        graphs.prepare()
-        for frontier, count in ((0, 100), (100, 200), (300, 60)):
-            found = graphs.run(0, frontier, list(range(count))).clone()
-            want = eager.run_eager(0, frontier, list(range(count)), 128 if count <= 128 else 256)
-            self.assertTrue(torch.equal(found, want), (frontier, count))
+                def forward(batch, pool=pool, attention=attention):
+                    self.write(pool, batch)
+                    q = queries.index_select(0, batch.positions_t)
+                    out = attention.forward(0, q, pool, batch, scale=SCALE, latent=R)
+                    last = batch.last_t if batch.prompt else torch.tensor([batch.tokens - 1], device=self.device())
+                    return out.index_select(0, last)
+                models.append((forward, pool))
+            graphs = PromptGraphs(models[0][0], device="cuda", buckets=(128, 256), pools=[models[0][1]])
+            eager = PromptGraphs(models[1][0], device="cuda", buckets=(128, 256), pools=[models[1][1]])
+            graphs.prepare()
+            for frontier, count in ((0, 100), (100, 200), (300, 60)):
+                found = graphs.run(0, frontier, list(range(count))).clone()
+                want = eager.run_eager(0, frontier, list(range(count)), 128 if count <= 128 else 256)
+                self.assertTrue(torch.equal(found, want), (frontier, count, attention is readers[1]))
+
+    def test_prompt_reader_decode_gives_prompt_rows_their_decode_bits(self):
+        """prompt_reader decode: a step's prompt row reads through the latent kernel's fused launch as window rows of
+        64 columns, in the decode's reduction, so every token's output is the bits of the same token decoded alone in
+        a step; the default prompt reader's are another reduction."""
+        torch = self.torch
+        attention = self.assemble(USE, options={"prompt_reader": "decode"})["attention"]
+        for dtype in ("bf16", "fp8:row"):
+            pool = self.pool(dtype)
+            pool.open("a")
+            batch = StepBatch.build([("a", 0, 150)], self.device())
+            self.write(pool, batch)
+            q = self.queries(150, 41)
+            out = attention.forward(0, q, pool, batch, scale=SCALE, latent=R)
+            other = self.attention.forward(0, q, pool, batch, scale=SCALE, latent=R)
+            self.assertFalse(torch.equal(out, other), dtype)
+            self.assertLess(float((out.double() - other.double()).abs().max()), 2e-2, dtype)
+            for t in (0, 1, 63, 64, 100, 149):   # the token decoded alone, in a sequence of the same rows before it
+                pool.open(t)                      # (a position's row is a function of the position)
+                if t:
+                    self.write(pool, StepBatch.build([(t, 0, t)], self.device()))
+                    pool.keep(t, t)
+                one = StepBatch.build([(t, t, 1)], self.device())
+                self.write(pool, one)
+                alone = attention.forward(0, q[t:t + 1], pool, one, scale=SCALE, latent=R)
+                self.assertTrue(torch.equal(alone[0], out[t]), (dtype, t))
 
     def test_what_latent_attention_cannot_read_is_refused(self):
         pool = self.kv.pool([0], 2, 64, 256, self.device(), "bf16", page=16)

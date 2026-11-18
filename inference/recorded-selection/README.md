@@ -94,16 +94,13 @@ available bytes, then ranked by `run_ns * expected_uses + setup_ns` (zero setup 
 ready offer); ties keep offer order and rejected offers carry reasons. Padding needs
 explicit model permission and a measured cost that includes it. Cold offers must fit
 capture peak and retained bytes plus workspace; ready offers only their workspace. If
-nothing fits, selection raises. The selector does not capture, launch or allocate; use
-Core's [graph capture harness](../../core/src/backends/cuda/README.md#graph-capture).
+nothing fits, selection raises. The selector does not capture, launch or allocate.
 
 ## What the code supplies
 
 - [selection.py](code/selection.py): `bucket(width, minimum, cap)`,
   `key(operation, dims, bucket)`, `validate(table)` and `Table(recorded, tuning)` with
   `choose(key, count, time)` returning `(index, source)` and `export()`.
-- [selection.h](code/selection.h): header-only C++20 `bucket`, `Table::choose` with a
-  timing callback, `to_json()` and a strict `Table::parse`.
 - [repeatability.py](code/repeatability.py): `first_difference`, `compare` and a runner
   (`--runs`, `--timeout`, `--report`) exiting 0 identical, 1 different, 2 a run failed.
 - [replay.py](code/replay.py): the replay-mode selector above.
@@ -183,9 +180,7 @@ nondeterminism.
 
 [Python fixtures](../../tests/test_techniques.py) cover buckets, keys, validation, tuning
 ties, unavailable candidates, replay without timing, out-of-range indices, difference
-reporting and the runner in fresh processes. The
-[native fixture](../../tests/inference/selection_tests.cpp) covers the same rules, the
-JSON round trip and malformed tables. [Portable policy fixtures](../../tests/test_portable_mechanisms.py)
+reporting and the runner in fresh processes. [Portable policy fixtures](../../tests/test_portable_mechanisms.py)
 check capture amortization, memory limits, padding permission, partial fallback and
 stale identities. [Pinned GEMM tests](tests/test_pinned_gemm.py) check the table's keys, file
 round trip, refusals, format parsing and the blocked scale layout's padding without CUDA, and with

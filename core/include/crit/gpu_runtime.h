@@ -1,9 +1,8 @@
 #pragma once
-// The device runtime Core's GPU backend is built on: the CUDA runtime, or with CRIT_CORE_HIP the HIP runtime of
-// ROCm under the CUDA runtime's names. The backend (crit/cuda.h, crit/cuda_graph.h, crit/cuda_memory.h,
-// crit/cuda_launch.h) is one source for both: built with CRIT_CORE_HIP=ON it is crit::hip, and an engine that
-// includes these headers in a HIP build sees cudaStream_t, cudaMemcpyAsync and the rest as their HIP equivalents.
-// The table names only what Core's backend uses; an engine's own CUDA code is hipified as usual.
+// The device runtime of native sources that build on CUDA and on ROCm's HIP: the CUDA runtime, or with CRIT_CORE_HIP
+// defined the HIP runtime under the CUDA runtime's names, so a source that includes this header in a HIP build sees
+// cudaStream_t, cudaMemcpyAsync and the rest as their HIP equivalents. The table names a fixed set of runtime
+// calls; other CUDA code is hipified as usual.
 #if defined(CRIT_CORE_HIP)
 #include <hip/hip_runtime.h>
 

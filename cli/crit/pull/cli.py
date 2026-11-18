@@ -394,9 +394,10 @@ def pull(engine, store, project=ROOT, hub=None, index=None, checkout=None, model
             log(f"crit pull: the prebuilt {download['repository']} does not match this machine ("
                 + "; ".join(machine.unmet(missed)) + "); building from source")
     from crit.run.cli import load_settings
+    from crit_eval import VRAM_HEADROOM_GIB
     settings = load_settings(project)
     limits = {"kv_tokens": context_tokens(card, model_id, probe, context),
-              "vram_headroom_bytes": round(settings.get("vram_headroom_gib", 1) * GIB),
+              "vram_headroom_bytes": round(settings.get("vram_headroom_gib", VRAM_HEADROOM_GIB) * GIB),
               "ram_headroom_bytes": round(settings.get("ram_headroom_gib", 2) * GIB)}
     staging = Path(tempfile.mkdtemp(dir=store.root, prefix=".pull-"))
     try:

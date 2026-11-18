@@ -23,9 +23,10 @@ REVISION = "0123456789abcdef0123456789abcdef01234567"
 class OriginTests(RunFixture, unittest.TestCase):
     model_files = {"README.md": "# Fixture model\n"}
 
-    def hub_engine(self, owner="someone", name="fast-engine", files=None, quality_mode="speed"):
+    def hub_engine(self, owner="someone", name="fast-engine", files=None, quality_mode="speed", exactness=None):
         """A crit-hub engine folder for the fixture model: card.yaml, card.lock.json and one evidence file, its result
-        judged in `quality_mode` (None: a result that states none)."""
+        judged in `quality_mode` (None: a result that states none), the engine asking `exactness` of its rows (None: a
+        result that states none)."""
         folder = self.root / "hub" / "engines" / owner / name
         (folder / "evidence").mkdir(parents=True)
         evidence = folder / "evidence/crit-eval.json"
@@ -39,6 +40,7 @@ class OriginTests(RunFixture, unittest.TestCase):
             "checkpoints": {"fixture@BF16": {"repository": "fixture/model", "revision": REVISION}},
             "results": [{"gpu": "rtx5090", "model": "fixture@BF16", "measured_with": "crit-eval-v7", "measured_on": "2026-10-23",
                          **({"quality_mode": quality_mode} if quality_mode else {}),
+                         **({"exactness": exactness} if exactness is not None else {}),
                          "stats": {"decode_tok_s": 100.0}, "evidence": [{"file": "evidence/crit-eval.json", "sha256": file_sha(evidence)}]}],
             "readme": {"intro": "An engine."},
         }
@@ -51,9 +53,11 @@ class OriginTests(RunFixture, unittest.TestCase):
                            "source_manifest_sha256": "a" * 64}})
         return folder
 
-    def start(self, folder):
-        """Create a run from the engine and point the fixture helpers at it."""
-        self.view = self.store.create(self.data, origin=folder)
+    def start(self, folder, quality_mode=None):
+        """Create a run from the engine (in `quality_mode`, the fixture's own when None) and point the fixture helpers
+        at it."""
+        data = {**self.data, "quality_mode": quality_mode} if quality_mode else self.data
+        self.view = self.store.create(data, origin=folder)
         self.run = self.view["run"]
         self.run_id = self.run["run_id"]
         self.directory = self.store.directory(self.run_id)
@@ -144,6 +148,31 @@ class OriginTests(RunFixture, unittest.TestCase):
         origin["evidence"] = [{k: v for k, v in e.items() if k != "quality_mode"} for e in origin["evidence"]]
         with self.assertRaisesRegex(ValueError, "Missing required fields: quality_mode"):
             records.validate_origin(origin)
+
+    def test_a_results_row_exactness_is_kept_and_a_lower_level_than_the_runs_is_named(self):
+        # The run is in preserve, which gives exact prompt rows; the origin was measured asking repeatable ones.
+        self.start(self.hub_engine(quality_mode="preserve", exactness={"decode": "row-exact", "prompt": "repeatable"}),
+                   quality_mode="preserve")
+        evidence = self.run["spec"]["origin_engine"]["evidence"]
+        self.assertEqual(evidence[0]["exactness"], {"decode": "row-exact", "prompt": "repeatable"})
+        request = (self.directory / "segments/segment-0001/agent_request.md").read_text(encoding="utf-8")
+        self.assertIn("quality mode preserve, decode rows row-exact, prompt rows repeatable)", request)
+        self.assertIn("It was measured asking prompt rows repeatable, below the row-exact decode rows and exact prompt "
+                      "rows this run's mode gives", request)
+        # One level for both phases is written per phase, the decode rows' exact as row-exact; a level the run's mode
+        # gives or keeps is not flagged, and a card that states none is read as before.
+        origin = hub.describe_engine(self.hub_engine(name="exact-engine", exactness="exact"))
+        self.assertEqual(origin["evidence"][0]["exactness"], {"decode": "row-exact", "prompt": "exact"})
+        self.assertNotIn("exactness", hub.describe_engine(self.hub_engine(name="plain-engine"))["evidence"][0])
+        for stated in ("bitwise", {"prompt": "exact"}, {"decode": "exact", "prompt": "exact", "verify": "exact"}, 3):
+            with self.subTest(stated=stated):
+                with self.assertRaisesRegex(ValueError, "a result's exactness"):
+                    hub.describe_engine(self.hub_engine(name=f"engine-{abs(hash(str(stated)))}", exactness=stated))
+        from crit.run import records
+        stored = dict(self.run["spec"]["origin_engine"])
+        stored["evidence"] = [dict(e, exactness={"decode": "exact", "prompt": "exact"}) for e in stored["evidence"]]
+        with self.assertRaisesRegex(ValueError, "origin_engine.evidence exactness is written"):
+            records.validate_origin(stored)
 
     def test_a_damaged_or_incomplete_hub_folder_is_refused(self):
         folder = self.hub_engine()

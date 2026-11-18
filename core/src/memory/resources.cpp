@@ -47,27 +47,4 @@ Usage Resources::usage(Memory memory) const {
     std::lock_guard lock(impl_->mutex);
     return impl_->values[i];
 }
-Arena::Arena(void* storage, std::size_t capacity):storage_(static_cast<std::byte*>(storage)),capacity_(capacity) {
-    if(!storage || !capacity) throw std::invalid_argument("arena requires nonempty borrowed storage");
-    const auto base = reinterpret_cast<std::uintptr_t>(storage);
-    if(capacity > std::numeric_limits<std::uintptr_t>::max()-base) throw std::overflow_error("arena address overflow");
-}
-std::span<std::byte> Arena::allocate(std::size_t bytes, std::size_t alignment) {
-    if(!alignment || (alignment & (alignment-1))) throw std::invalid_argument("arena alignment must be a power of two");
-    const auto address = reinterpret_cast<std::uintptr_t>(storage_)+offset_;
-    const auto mask = alignment-1;
-    if(mask > std::numeric_limits<std::uintptr_t>::max()-address) throw std::overflow_error("arena alignment overflow");
-    const auto aligned = (address+mask)&~mask;
-    const auto start = aligned-reinterpret_cast<std::uintptr_t>(storage_);
-    if(start > capacity_ || bytes > capacity_-start) throw std::runtime_error("arena capacity exceeded");
-    offset_ = start+bytes;
-    peak_ = std::max(peak_,offset_);
-    return {storage_+start,bytes};
-}
-std::size_t Arena::mark() const noexcept { return offset_; }
-void Arena::rewind(std::size_t mark) {
-    if(mark > offset_) throw std::invalid_argument("arena cannot rewind to a future mark");
-    offset_ = mark;
-}
-std::size_t Arena::peak() const noexcept { return peak_; }
 }

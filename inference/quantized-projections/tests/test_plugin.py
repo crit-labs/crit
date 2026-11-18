@@ -34,6 +34,32 @@ class QuantizedProjectionsTests(PluginTestCase):
             error = max(abs(a - b) for ra, rb in zip(decoded, original) for a, b in zip(ra, rb))
             self.assertLess(error, bound, options)
 
+    def test_prompt_gemm_auto_follows_the_level_the_engine_asks_of_its_prompt_rows(self):
+        from crit_plugins import kernels
+        self.addCleanup(kernels.use_exactness, None)
+        for asked, gemm, gemv in ((None, "auto", "auto"), ("repeatable", "auto", "auto"),
+                                  ("row-exact", "pinned", "auto"), ("exact", "tile", "fp4"),
+                                  ("declared", "tile", "fp4")):
+            kernels.use_exactness(asked and {"decode": "row-exact", "prompt": asked})
+            p = self.assemble()["projections"]
+            self.assertEqual((p.gemm, p.gemv), (gemm, gemv), asked)
+            self.assertEqual(p.exactness(), {})   # no matrix loaded: it states no level yet
+        kernels.use_exactness("exact")
+        # An option set to one way is that way (the loader then compares what it keeps with what is asked); a decode
+        # kernel named with it is kept where the prompt tile takes it and refused, naming the level, where it cannot.
+        self.assertEqual(self.assemble(options={"prompt_gemm": "native"})["projections"].gemm, "native")
+        p = self.assemble(options={"gemv": "mma"})["projections"]
+        self.assertEqual((p.gemm, p.gemv), ("tile", "mma"))
+        with self.assertRaisesRegex(ValueError, "prompt_gemm tile \\(auto, for the exact prompt rows the "
+                                                "configuration's exactness asks\\) gives prompt rows the decode "
+                                                "tile's bits: gemv mma or fp4, not triton"):
+            self.assemble(options={"gemv": "triton"})
+        kernels.use_exactness({"decode": "row-exact", "prompt": "row-exact"})
+        with self.assertRaisesRegex(ValueError, "prompt_gemm pinned \\(auto, for the row-exact prompt rows the "
+                                                "configuration's exactness asks\\) runs weight-only NVFP4 prompts "
+                                                "in bf16, not fp8"):
+            self.assemble(options={"activations": "bf16", "prompt": "fp8"})
+
     def test_the_formats_differ(self):
         w = matrix(2, 64, seed=4)
         decoded = {options.get("format", "int8"): self.assemble(options=options)["projections"]

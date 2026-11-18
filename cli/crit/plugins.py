@@ -1,12 +1,15 @@
 """crit plugins: list, check and test an engine's plugins (by default crit's library, its Inference folder: every
 technique that fills a slot is one plugin, inference/ID, beside the base plugins, inference/base/ID), copy library
-plugins into an engine (add), and show the variants an ablation serves. The plugin contract itself, which an engine
+plugins into an engine (add), say how an engine's copies stand to the library since (status), bring the ones the
+engine did not change up to it (update), and show the variants an ablation serves. The plugin contract itself, which an engine
 loads with, is Core's crit_plugins (docs/PLUGINS.md)."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 
 try:
@@ -35,6 +38,8 @@ ENGINE_SERVICES = {
                                 "readback a round) and python_round's rejection and copy-draft helpers, which Core's "
                                 "round driver (crit_plugins.rounds) runs for a model plugin's captured rounds",
     "session-scheduling": "prefill chunks and physical batches: Core's concurrent runtime schedules every engine's steps",
+    "host-work-mailbox": "host work a device's stream posts and joins, captured graphs included: Core's handoffs "
+                         "(crit_plugins.host) run it for every plugin",
     "concurrent-request-execution": "requests in flight at once, admission and compact ready rows: Core's concurrent "
                                     "runtime",
 }
@@ -145,7 +150,7 @@ def add(dest, ids, inference=INFERENCE, update=False):
         for owner, name, target in plans:
             if owner == plugin_id:
                 data["sources"][name] = Path(os.path.relpath(target, dest / place[plugin_id])).as_posix()
-        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        path.write_bytes((json.dumps(data, indent=2) + "\n").encode("utf-8"))   # the same bytes on every OS
     engine = Registry.discover(dest)
     provided = {fact for manifest in engine for fact in manifest["provides"]}
     unmet = {}
@@ -155,6 +160,193 @@ def add(dest, ids, inference=INFERENCE, update=False):
                 need = " or ".join(alternatives)
                 unmet[need] = sorted(m["id"] for m in registry if set(m["provides"]) & set(alternatives))
     return {"added": added, "kept": kept, "sources": sources, "unmet": unmet, "replaced": replaced}
+
+
+def _tree(folder):
+    """{path in the folder: bytes} of a plugin's or a source folder's files, caches aside."""
+    folder = Path(folder)
+    return {path.relative_to(folder).as_posix(): path.read_bytes()
+            for path in sorted(folder.rglob("*"))
+            if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"}
+
+
+def _same(name, mine, theirs):
+    """Whether a copied file is the library's, whatever the line ends of either: a plugin's manifest but for its
+    sources, whose paths crit plugins add rewrites for the engine."""
+    mine, theirs = mine.replace(b"\r\n", b"\n"), theirs.replace(b"\r\n", b"\n")
+    if name == MANIFEST:
+        try:
+            mine, theirs = ({key: value for key, value in json.loads(data).items() if key != "sources"}
+                            for data in (mine, theirs))
+        except ValueError:
+            pass
+    return mine == theirs
+
+
+def _git(folder, *args):
+    try:
+        done = subprocess.run(["git", "-C", str(folder), *args], capture_output=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def _checkout(inference):
+    """(the git checkout holding the library, the library's path in it), or None for a library that is no checkout
+    (the copy crit's wheel ships), whose history cannot say where a copy came from."""
+    top = _git(inference, "rev-parse", "--show-toplevel")
+    if not top:
+        return None
+    root = Path(top.decode("utf-8").strip()).resolve()
+    try:
+        return root, Path(inference).resolve().relative_to(root).as_posix()
+    except ValueError:
+        return None
+
+
+def _version(checkout, relative, mine, limit):
+    """The library's newest version of `relative` that the engine's files `mine` are a copy of: {commit, date,
+    changes} with the library commits that changed it since, or None when none of its last `limit` versions is."""
+    root, prefix = checkout
+    path = f"{prefix}/{relative}".strip("/")
+    log = _git(root, "log", f"-{limit}", "--format=%H %cs", "--", path)
+    if not log:
+        return None
+    def blob(data):
+        return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+    # a file as the engine holds it, or with the line ends a checkout stores
+    wanted = {name: {blob(data), blob(data.replace(b"\r\n", b"\n"))}
+              for name, data in mine.items() if name != MANIFEST}
+    for later, line in enumerate(log.decode("utf-8").splitlines()):
+        commit, date = line.split()
+        listed = _git(root, "ls-tree", "-r", commit, "--", path)
+        if listed is None:
+            continue
+        tree = {}
+        for row in listed.decode("utf-8").splitlines():
+            meta, name = row.split("\t", 1)
+            name = name[len(path) + 1:]
+            if "__pycache__" not in name and not name.endswith(".pyc"):
+                tree[name] = meta.split()[2]
+        if set(tree) != set(mine) or any(tree[name] not in blobs for name, blobs in wanted.items()):
+            continue
+        if MANIFEST in mine:
+            theirs = _git(root, "cat-file", "blob", tree[MANIFEST])
+            if theirs is None or not _same(MANIFEST, mine[MANIFEST], theirs):
+                continue
+        return {"commit": commit[:8], "date": date, "changes": later}
+    return None
+
+
+def status(dest, inference=INFERENCE, limit=500):
+    """How the plugins of the engine's plugins folder `dest`, and the code under dest/_sources, stand to the library
+    they were copied from: [{name, state, files, ...}], one per plugin and per source folder. state `current`: the
+    library's files as they are now; `behind`: a copy of an earlier library version (commit, date, and `changes`,
+    the library commits that changed it since), which the engine did not change, so crit plugins add --update
+    brings the library's; `changed`: a copy of none of the library's last `limit` versions, so the engine changed
+    it; `differs`: not the library's files, and the library is no git checkout whose history could say which of the
+    two it is; `own`: no library plugin; `gone`: code the library holds no more. files: the paths that differ from
+    the library now."""
+    dest, inference = Path(dest), Path(inference).resolve()
+    registry, engine = library(inference), Registry.discover(dest)
+    checkout = _checkout(inference)
+    place = {m["id"]: Path(m["folder"]).resolve() for m in registry}
+
+    def compare(name, folder, theirs, relative):
+        mine, current = _tree(folder), _tree(theirs)
+        files = sorted(path for path in set(mine) | set(current)
+                       if path not in mine or path not in current or not _same(path, mine[path], current[path]))
+        if not files:
+            return {"name": name, "state": "current", "files": []}
+        found = _version(checkout, relative, mine, limit) if checkout else None
+        if found:
+            return {"name": name, "state": "behind", "files": files, **found}
+        return {"name": name, "state": "changed" if checkout else "differs", "files": files}
+
+    rows = []
+    for manifest in engine:
+        plugin_id = manifest["id"]
+        if plugin_id not in place:
+            rows.append({"name": plugin_id, "state": "own", "files": []})
+            continue
+        rows.append(compare(plugin_id, manifest["folder"], place[plugin_id],
+                            place[plugin_id].relative_to(inference).as_posix()))
+    sources = dest / SOURCES
+    for folder in sorted(path for path in sources.glob("*/*") if path.is_dir()) if sources.is_dir() else ():
+        relative = folder.relative_to(sources).as_posix()
+        name = f"{SOURCES}/{relative}"
+        rows.append(compare(name, folder, inference / relative, relative) if (inference / relative).is_dir()
+                    else {"name": name, "state": "gone", "files": []})
+    return rows
+
+
+def update(dest, inference=INFERENCE, dry_run=False):
+    """Bring the engine's copies that are behind the library up to it: each plugin and each folder of dest/_sources
+    that status() calls `behind`, a copy of an earlier library version the engine did not change, is replaced by
+    the library's current one (a plugin as crit plugins add --update replaces it, with the plugins its tests and
+    reference now name). A copy the engine changed, its own plugins and a copy that only `differs` stay as they
+    are; so does a plugin that is behind while code under _sources it imports is the engine's changed copy, which
+    the replacement would overwrite. Returns {updated: [name], kept: [(name, why)], added: [(id, why)]}; with
+    dry_run nothing is written and `updated` says what would be."""
+    dest, inference = Path(dest), Path(inference).resolve()
+    registry = library(inference)
+    rows = {row["name"]: row for row in status(dest, inference)}
+    behind = [name for name, row in rows.items() if row["state"] == "behind"]
+    kept = [(name, "the engine changed it") for name, row in rows.items() if row["state"] == "changed"]
+    kept += [(name, "not the library's files, and the library is no checkout to say whether the engine changed it")
+             for name, row in rows.items() if row["state"] == "differs"]
+    plugins, lent = [], set()
+    for name in behind:
+        if name.startswith(SOURCES + "/"):
+            continue
+        # The code under _sources the library's plugin imports, which its replacement copies again.
+        folder = Path(registry[name]["folder"]).resolve()
+        imports = {f"{SOURCES}/{Path(source['folder']).resolve().relative_to(inference).as_posix()}"
+                   for source in registry[name]["sources"].values()
+                   if not Path(source["folder"]).resolve().is_relative_to(folder)}
+        changed = sorted(other for other in imports if rows.get(other, {}).get("state") in ("changed", "differs"))
+        if changed:
+            kept.append((name, f"it is behind, but it imports {', '.join(changed)}, which the engine changed"))
+            continue
+        plugins.append(name)
+        lent |= imports
+    sources = [name for name in behind if name.startswith(SOURCES + "/")]
+    if dry_run:
+        return {"updated": plugins + sources, "kept": kept, "added": []}
+    added = []
+    if plugins:
+        report = add(dest, plugins, inference, update=True)
+        added = [(plugin_id, why) for plugin_id, why in report["added"] if plugin_id not in plugins]
+    for name in sources:
+        relative = name[len(SOURCES) + 1:]
+        target = dest / SOURCES / relative
+        shutil.rmtree(target)
+        shutil.copytree(inference / relative, target, ignore=IGNORE)
+    return {"updated": plugins + sources, "kept": kept, "added": added}
+
+
+def _print_status(rows, folder):
+    def files(row):
+        shown = ", ".join(row["files"][:4])
+        return shown + (f" and {len(row['files']) - 4} more" if len(row["files"]) > 4 else "")
+
+    for row in rows:
+        detail = {
+            "current": "",
+            "behind": lambda: (f"the library's of {row['date']} ({row['commit']}); {row['changes']} library "
+                               f"change{'s' if row['changes'] != 1 else ''} since: {files(row)}"),
+            "changed": lambda: f"the engine changed it, or it is older than the library's history read: {files(row)}",
+            "differs": lambda: f"not the library's files, and the library is no checkout to say why: {files(row)}",
+            "own": "the engine's own",
+            "gone": "the library holds this code no more",
+        }[row["state"]]
+        print(f"{row['state']:<8} {row['name']:<38} {detail() if callable(detail) else detail}".rstrip())
+    counts = {state: sum(row["state"] == state for row in rows) for state in ("current", "behind", "changed", "differs")}
+    print(", ".join(f"{count} {state}" for state, count in counts.items() if count) or "no library plugins")
+    if any(row["state"] == "behind" for row in rows):
+        print(f"crit plugins update {folder} replaces the copies that are behind with the library's; the engine's "
+              "tests and its Eval then say whether it keeps its results")
 
 
 def _selection(path):
@@ -238,7 +430,30 @@ def main(argv=None):
     added.add_argument("--update", action="store_true",
                        help="Replace the engine's copies of the named library plugins with the library's current ones "
                             "(a copy the engine changed is replaced too)")
+    stood = subs.add_parser("status", help="How an engine's copies of library plugins stand to the library: "
+                                             "current, behind (the library changed, the engine did not), changed "
+                                             "by the engine, or the engine's own")
+    stood.add_argument("folder", type=Path, help="The engine's plugins folder")
+    stood.add_argument("--inference", type=Path, default=INFERENCE,
+                       help="The Inference folder the copies came from (default: crit's)")
+    stood.add_argument("--json", action="store_true", help="Print the rows as JSON")
+    updated = subs.add_parser("update", help="Replace the engine's copies that are behind the library (status) "
+                                               "with the library's current ones; copies the engine changed stay")
+    updated.add_argument("folder", type=Path, help="The engine's plugins folder")
+    updated.add_argument("--inference", type=Path, default=INFERENCE,
+                         help="The Inference folder the copies came from (default: crit's)")
+    updated.add_argument("--dry-run", action="store_true", help="Say what would be replaced, and write nothing")
+    from . import audit, decisions, offload
+    offload.add_parser(subs)
+    audit.add_parser(subs)
+    decisions.add_parser(subs)
     args = parser.parse_args(argv)
+    if args.action in ("offload", "memory", "decisions"):
+        try:
+            return {"offload": offload, "memory": audit, "decisions": decisions}[args.action].main(args)
+        except (OSError, ValueError, ImportError, PluginError) as error:
+            print(f"crit plugins {args.action}: {error}", file=sys.stderr)
+            return 1
     try:
         if args.action == "add":
             report = add(args.folder, args.ids, args.inference, update=args.update)
@@ -254,6 +469,27 @@ def main(argv=None):
                 print(f"needs   {need:<30} " + (f"from the engine, or a plugin: {', '.join(providers)}" if providers
                                                   else "from the engine (no library plugin provides it)"))
             print(f"crit plugins test {args.folder} runs their tests in the engine")
+            return 0
+        if args.action == "update":
+            report = update(args.folder, args.inference, dry_run=args.dry_run)
+            for name in report["updated"]:
+                print(f"{'would update' if args.dry_run else 'updated'} {name}")
+            for plugin_id, why in report["added"]:
+                print(f"added   {plugin_id:<30} {why}")
+            for name, why in report["kept"]:
+                print(f"kept    {name:<30} {why}")
+            if not report["updated"]:
+                print("no copy is behind the library")
+            elif not args.dry_run:
+                print(f"crit plugins test {args.folder} runs their tests in the engine; its Eval says whether it "
+                      "keeps its results")
+            return 0
+        if args.action == "status":
+            rows = status(args.folder, args.inference)
+            if args.json:
+                print(json.dumps(rows, indent=2))
+            else:
+                _print_status(rows, args.folder)
             return 0
         registry = library() if args.folder is None else Registry.discover(args.folder)
         if args.action == "list" and (args.model or args.device):

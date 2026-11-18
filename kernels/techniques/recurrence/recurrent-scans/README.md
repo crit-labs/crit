@@ -85,7 +85,7 @@ inverse, the gates and the state in FP32. FP16 has TF32's 11-bit significand at 
 same algorithm (the final state past 1e-3 + 1e-3|x| of the FP64 recurrence at 2,048 tokens). Values and states must lie
 within FP16's range (|x| < 65504; keys and queries are normalized). On the bench's prompts the outputs are within 8.3e-5
 and the final state within 8.5e-4 of the FP64 recurrence (1e-3 + 1e-3|x| allowed). Another summation order and rounding
-than `delta-prefill-rb`, so `row_invariant` is false like the FP32 prefill's: a prompt row's bits follow the prompt's
+than `delta-prefill-rb`, and `exactness` repeatable like the FP32 prefill's: a prompt row's bits follow the prompt's
 length. dk 64 or 128, dv a multiple of 16; scratch `delta_tc_scratch_bytes` (FP16 K, Q, Tb, P and FP32 G per chunk).
 
 ## Structures and knobs

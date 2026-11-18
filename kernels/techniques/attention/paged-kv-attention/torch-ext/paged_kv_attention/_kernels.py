@@ -501,7 +501,9 @@ def _merge_kernel(po_ptr, pm_ptr, pl_ptr, out_ptr, lse_ptr, start_ptr, count_ptr
 
 
 # -- prompt chunks ----------------------------------------------------------------------------------------------------
-@triton.jit
+# A chunk's length, position, first fresh position and window are values, never constants of the kernel: a chunk of
+# one token, or one at position 1, launches the kernel every other chunk does.
+@triton.jit(do_not_specialize=["win", "T", "pos0", "first0"])
 def _prefill_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, out_ptr, lse_ptr, pos_ptr, fk_ptr, fv_ptr, first_ptr,
                     sink_ptr, win, T, pos0, first0, sm_scale, k_mult, v_mult, stride_qt, stride_qh, stride_ot, stride_oh, stride_fk,
                     stride_fv,

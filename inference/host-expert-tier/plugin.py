@@ -98,8 +98,7 @@ class HostTierExperts:
             o = self.options
             native = {"on": True, "off": False}.get(o["native"])
             self.tiers[key] = cpu_tier.CpuTier(hidden, inter, format, self.arithmetic, self.quantized, native=native,
-                                               workers=o["workers"], pin=o["pin"], spin_us=o["spin_us"],
-                                               rows_per_task=o["rows_per_task"], spin_max_us=o["spin_max_us"])
+                                               workers=o["workers"], pin=o["pin"], rows_per_task=o["rows_per_task"])
         return self.tiers[key]
 
     def load(self, layer, expert, gate_up, down, format="nvfp4"):

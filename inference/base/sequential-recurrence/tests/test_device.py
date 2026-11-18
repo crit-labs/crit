@@ -278,6 +278,45 @@ class DeviceRecurrenceTests(PluginTestCase):
                         ref, _ = rig.reference("a", 150, 1, state)
                         torch.testing.assert_close(after[0][0].double(), ref, **PROMPT)
 
+    def test_an_elastic_pool_backs_the_sequences_that_are_open_and_keeps_every_bit(self):
+        torch = self.torch
+        from crit_plugins import memory
+        if self.device() != "cuda" or not memory.of("cuda").elastic_ranges:
+            self.skipTest("an elastic range is the CUDA driver's")
+        plain = self.assemble(options={"exact_rows": 64})["recurrence"]
+        elastic = self.assemble(options={"exact_rows": 64, "elastic": True})["recurrence"]
+        rig = Rig(torch, "cuda", *self.shapes()[-1], channels=16, tokens=30, seed=11)
+        pools = rig.pool(plain, widest=2), rig.pool(elastic, widest=2)
+        backed = pools[1].elastic
+        self.assertIsNone(pools[0].elastic)
+        self.assertEqual(backed.backed, 1)                 # sequence 0, which a padding prompt chunk reads
+
+        def both(act):
+            return [act(plugin, pool) for plugin, pool in zip((plain, elastic), pools)]
+
+        def same(parts):
+            first, second = both(lambda plugin, pool: rig.step(plugin, pool, parts))
+            for layer in (0, 1):
+                self.assertTrue(torch.equal(first[layer][0], second[layer][0]))
+                self.assertTrue(torch.equal(first[layer][1], second[layer][1]))
+                for sequence, _, _ in parts:
+                    states = both(lambda plugin, pool: pool.state(layer, sequence))
+                    self.assertTrue(torch.equal(*states))
+        for sequence in "abc":
+            both(lambda plugin, pool: pool.open(sequence))
+        self.assertEqual(backed.backed, 3)                 # a sequence's states are backed when it opens
+        same([("a", 0, 12), ("b", 0, 1), ("c", 0, 3)])
+        same([("a", 12, 1), ("b", 1, 1), ("c", 3, 1)])
+        both(lambda plugin, pool: pool.close("c"))
+        self.assertEqual(backed.backed, 3)                 # one sequence's room stays past the highest open one
+        both(lambda plugin, pool: pool.close("b"))
+        self.assertEqual(backed.backed, 2)
+        both(lambda plugin, pool: pool.open("d"))          # the lowest free sequence: where b was, zeroed
+        same([("a", 13, 2), ("d", 0, 9)])
+        both(lambda plugin, pool: pool.close("a"))
+        both(lambda plugin, pool: pool.close("d"))
+        self.assertEqual(backed.backed, 1)
+
     def test_a_prompt_row_through_the_scan_has_the_bits_of_the_serial_decode(self):
         torch = self.torch
         for name, plugin in self.plugins(exact_rows=64):
@@ -364,6 +403,46 @@ class DeviceRecurrenceTests(PluginTestCase):
                                 for t in range(3):
                                     self.assertTrue(torch.equal(after[t][layer][0][r:r + 1], steps[2 + kept + t][layer][0]))
                                     self.assertTrue(torch.equal(after[t][layer][1][r:r + 1], steps[2 + kept + t][layer][1]))
+                                self.assertTrue(torch.equal(pool.state(layer, s), serial.state(layer, s)))
+                                self.assertTrue(torch.equal(pool.window(layer, s), serial.window(layer, s)))
+
+    def test_a_prompt_chunk_after_a_round_that_rejected_drafts_starts_from_the_kept_tokens(self):
+        # The next turn's prompt can be the first thing a sequence computes after a verify window whose drafts were
+        # partly rejected. Its chunk (past the exact rows too: another kernel than a decode row's) reads the state
+        # of the tokens kept, as a sequence that decoded them one by one does, whatever the commit strategy left
+        # pending.
+        torch = self.torch
+        width, chunk = 3, 20
+        for commit in COMMITS:
+            for name, plugin in self.plugins(commit=commit):
+                for n in (0, 1, width):
+                    with self.subTest(commit=commit, kernel=name, n=n):
+                        rig = Rig(torch, self.device(), *self.shapes()[-1], channels=40, tokens=2 + width + chunk,
+                                  seed=17)
+                        pool = rig.pool(plugin, widest=width)
+                        for s in "ab":
+                            pool.open(s)
+                        for t in range(2):
+                            rig.step(plugin, pool, [(s, t, 1) for s in "ab"])
+                        for r, s in enumerate("ab"):
+                            pool.bind(r, s)
+                        rig.round(plugin, pool, rig.round_batch(2, width, [2, 2]),
+                                  rig.round_inputs([(s, 2) for s in "ab"], width))
+                        counts = [n, max(n - 1, 0)]
+                        pool.commit_round(View(2, width, torch.tensor(counts, dtype=torch.int64, device=self.device())))
+                        for r in range(2):
+                            pool.unbind(r)
+                        prompt = rig.step(plugin, pool, [(s, 2 + kept, chunk) for s, kept in zip("ab", counts)])
+                        for r, (s, kept) in enumerate(zip("ab", counts)):
+                            serial = rig.pool(plugin)
+                            serial.open(s)
+                            for t in range(2 + kept):
+                                rig.step(plugin, serial, [(s, t, 1)])
+                            expected = rig.step(plugin, serial, [(s, 2 + kept, chunk)])
+                            rows = slice(r * chunk, (r + 1) * chunk)
+                            for layer in (0, 1):
+                                self.assertTrue(torch.equal(prompt[layer][0][rows], expected[layer][0]))
+                                self.assertTrue(torch.equal(prompt[layer][1][rows], expected[layer][1]))
                                 self.assertTrue(torch.equal(pool.state(layer, s), serial.state(layer, s)))
                                 self.assertTrue(torch.equal(pool.window(layer, s), serial.window(layer, s)))
 
@@ -623,6 +702,9 @@ class DeviceRecurrenceTests(PluginTestCase):
                         batch = StepBatch.build([("a", 0, tokens)], self.device())
                         plan = pool._plan(batch)
                         self.assertEqual(pool.delta_rows(plan, pool.scan_rows, kind)[1], [states.FINAL])
+                        # its final states wait for their accept in the pool's lowest free unit: no allocation
+                        self.assertEqual((pool.delta_rows(plan, pool.scan_rows, kind)[3], pool.final_units),
+                                         (True, {"a": 1}))
                         long = StepBatch.build([("a", 0, pool.scan_rows + 1)], self.device())
                         self.assertEqual(pool.delta_rows(pool._plan(long), pool.scan_rows, kind)[1], [states.FLUSH])
                         for p in (pool, serial, other):
@@ -638,6 +720,43 @@ class DeviceRecurrenceTests(PluginTestCase):
                         torch.testing.assert_close(pool.state(layer, "a"), other.state(layer, "a"), **PROMPT)
                         torch.testing.assert_close(found[layer][0], via[layer][0], **PROMPT)
                         self.assertTrue(torch.equal(pool.window(layer, "a"), other.window(layer, "a")))
+
+    def test_prompt_rows_auto_follows_the_level_the_engine_asks_of_its_prompt_rows(self):
+        """prompt_rows auto: the chunked kernel past exact_rows where the engine asks repeatable prompt rows or
+        nothing, the scan for every prompt row where it asks more; a scanned row past exact_rows has the bits of the
+        serial decode, and the plugin states the level its pools' prompt rows keep."""
+        from crit_plugins import kernels
+        torch = self.torch
+        self.addCleanup(kernels.use_exactness, None)
+        for asked, prompt in ((None, "two_pass"), ("repeatable", "two_pass"), ("row-exact", "scan"), ("exact", "scan"),
+                              ("declared", "scan")):
+            kernels.use_exactness(asked and {"decode": "row-exact", "prompt": asked})
+            plugin = self.assemble(options={})["recurrence"]
+            self.assertEqual(plugin.prompt, prompt, asked)
+            self.assertEqual(plugin.exactness(), {})   # no pool made: it states no level yet
+        # An option set to one way is that way, whatever is asked; fla, where the option names it, is kept by auto.
+        self.assertEqual(self.assemble(options={"prompt_rows": "chunked"})["recurrence"].prompt, "two_pass")
+        self.assertEqual(self.assemble(options={"fla": True})["recurrence"].prompt, "fla")
+        kernels.use_exactness(None)
+        self.assertEqual(self.assemble(options={"prompt_rows": "scan", "fla": True})["recurrence"].prompt, "scan")
+        scanned = self.assemble(options={"prompt_rows": "scan", "exact_rows": 4})["recurrence"]
+        chunked = self.assemble(options={"prompt_rows": "chunked", "exact_rows": 4})["recurrence"]
+        states = sys.modules[type(scanned).__module__].device_states
+        rig = Rig(torch, self.device(), 2, 6, 64, 64, channels=32, tokens=600, seed=47, dtype=torch.bfloat16)
+        pool, serial, other = rig.pool(scanned), rig.pool(scanned), rig.pool(chunked)
+        self.assertIsNone(scanned.facts()["recurrence_prompts"]["pools"][-1]["chunked"])
+        self.assertEqual(scanned.exactness(), {"decode": "row-exact", "prompt": "exact"})
+        kind = states.chunked_kind(other, rig.geometry, chunked.prompt)
+        self.assertEqual(chunked.exactness(), {"decode": "row-exact", "prompt": "repeatable" if kind else "exact"})
+        for p in (pool, serial):
+            p.open("a")
+        tokens = 48   # past exact_rows 4: the chunked kernel's rows but for prompt_rows scan
+        found = rig.step(scanned, pool, [("a", 0, tokens)])
+        steps = [rig.step(scanned, serial, [("a", t, 1)]) for t in range(tokens)]
+        for layer in (0, 1):
+            self.assertTrue(torch.equal(found[layer][0], torch.cat([s[layer][0] for s in steps])))
+            self.assertTrue(torch.equal(pool.state(layer, "a"), serial.state(layer, "a")))
+            self.assertTrue(torch.equal(pool.window(layer, "a"), serial.window(layer, "a")))
 
     def test_the_same_prompt_gives_the_same_rows_whatever_the_machine_load(self):
         """Pools made while the machine's timings say the scan is ten times slower, then ten times faster, than it is

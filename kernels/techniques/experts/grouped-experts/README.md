@@ -47,6 +47,7 @@ expert pass, the plans and the declared order.
 from crit_kernels.build import load      # a plugin: crit_plugins.kernels.load_kernel("grouped-experts", folder=...)
 gx = load("grouped-experts")
 ws = gx.Workspace(tokens, top, experts, hidden, inter, device)     # the buffers of one call shape, made once
+# rows=f: its row buffers come from f(name, count, width, dtype), for a caller whose shapes share them
 out = gx.forward(x, ids, weights, store, slots, layout, ws, a4)    # [tokens][hidden] FP32
 y = gx.route_outputs(x, ids, store, slots, layout, ws, a4)        # unweighted rows [tokens * top][hidden]
 y = gx.route_outputs(x, ids, store, slots, layout, ws, arithmetic="declared")   # nvfp4 W4A4 / int4 W4A8, CPU-exact
@@ -66,19 +67,21 @@ id is out of range or whose slot is negative is skipped (its rows of y keep what
 One structure per item width, each keyed by the format, W4A4 or not, the pass (gate/up or down), hidden and inter, and
 the call's token count:
 
-| Structure | Items | Tuned at (tokens) | WARPS | TILES | DEPTH | CHUNK |
-| --- | --- | --- | --- | --- | --- | --- |
-| `decode` | 8 routes, operands from global memory | 1, 2, 4, 8, 32 | 2, 4, 8 (4) | 1, 2, 4 (1) | 0-4, 6, 8 (0) | |
-| `prompt` | 32 routes, operands staged by cp.async | 256, 1,024, 4,096 | 2, 4, 8 (4) | 1, 2, 4 (2) | 0-4 (0) | 64, 128, 256 (256) |
-| `prompt-wide` | 64 routes (`Workspace(width=64)`) | 1,024, 4,096 | 2, 4, 8 (4) | 1, 2, 4 (1) | 0-4 (0) | 64, 128 (128) |
-| `declared` | the integer block order | | | | | |
-| `plan-combine` | grouping and the route-order sum | | | | | |
+| Structure | Items | Tuned at (tokens) | WARPS | TILES | DEPTH | CHUNK | READ |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `decode` | 8 routes, operands from global memory | 1, 2, 4, 8, 32 | 2, 4, 8 (4) | 1, 2, 4 (1) | 0-4, 6, 8 (0) | | 0, 1, 2 (0) |
+| `prompt` | 32 routes, operands staged by cp.async | 256, 1,024, 4,096 | 2, 4, 8 (4) | 1, 2, 4 (2) | 0-4 (0) | 64, 128, 256 (256) | |
+| `prompt-wide` | 64 routes (`Workspace(width=64)`) | 1,024, 4,096 | 2, 4, 8 (4) | 1, 2, 4 (1) | 0-4 (0) | 64, 128 (128) | |
+| `declared` | the integer block order | | | | | | |
+| `plan-combine` | grouping and the route-order sum | | | | | | |
 
 WARPS: warps a block; TILES: MMA row tiles a warp owns (gate/up 8 inter rows each, down 16 output rows), sharing each
 B fragment; DEPTH: 64-k blocks of weights in flight a warp (0 is the format's own depth, 2 to 6); CHUNK: k values of the
-inputs staged a pass (two halves of shared memory). Defaults in parentheses: the launches the kernel had before it had
-knobs. No knob changes a route's MMA chain or any other operation (no order knob), so every configuration gives the
-same bits; the sweep keeps one only when every route equals the untuned build's. `declared` and `plan-combine` have
+inputs staged a pass (two halves of shared memory); READ: how a decode warp asks for its weights, 1 a 64-k block at a
+time (32 bytes of a row of a 4-bit format, 64 of FP8), 2 128 bytes of a row at a time (4 blocks of a 4-bit format, 2
+of FP8, loaded together; BF16 is 128 bytes a block either way), 0 the launch's choice (2 for a pass of 256 k values or
+more). Defaults in parentheses: the launches the kernel had before it had knobs, but for READ, which before was 1. No
+knob changes a route's MMA chain or any other operation (no order knob), so every configuration gives the same bits; the sweep keeps one only when every route equals the untuned build's. `declared` and `plan-combine` have
 no knobs. Which width a call takes stays the caller's (`width_for`, or `Workspace(width=...)`).
 
 ## Build, test, tune
@@ -103,17 +106,28 @@ combine) and the weight bytes it moves. Prompt: one call of a chunk.
 
 | Experts | Decode 1 / 2 / 4 / 8 tokens (us, weight GB/s) | Prompt 2,048 / 8,192 tokens (ms, TFLOPS) |
 | --- | --- | --- |
-| nvfp4 W4A16, 512 x top 10, 2560 x 640 | 42.2 (659) / 73.0 (753) / 131.3 (821) / 242.8 (858) | 3.84 (52.4) / 10.25 (78.6) |
-| nvfp4 W4A4, same | 45.9 (605) / 76.8 (715) / 136.2 (791) / 247.9 (840) | 4.17 (48.3) / 10.60 (75.9) |
-| mxfp4, same | 41.3 / 72.0 / 127.2 / 237.4 | |
-| int4, same | 42.0 / 72.4 / 130.3 / 242.1 | |
-| fp8 channel, 128 x top 8, 4096 x 1536 | 120.6 (1254) / 226.8 (1293) / 407.1 (1349) / 692.2 (1419) | 6.42 (96.3) / 22.16 (111.6) |
-| fp8 128 x 128 block, same | 140.3 (1077) / 276.6 (1059) / 481.4 (1140) / 831.1 (1180) | 7.67 (80.6) / 23.97 (103.2) |
-| bf16, same | 196.4 (1538) / 369.8 (1585) / 668.2 (1642) / 1183.2 (1658) | 6.58 (94.0) / 22.91 (108.0) |
+| nvfp4 W4A16, 512 x top 10, 2560 x 640 | 30.4 (916) / 48.9 (1136) / 84.9 (1310) / 152.3 (1460) | 3.84 (52.4) / 10.25 (78.6) |
+| nvfp4 W4A4, same | 33.9 (820) / 52.8 (1052) / 90.1 (1234) / 159.6 (1394) | 4.17 (48.3) / 10.60 (75.9) |
+| mxfp4, same | 27.8 / 44.7 / 78.1 / 140.2 | |
+| int4, same | 30.5 / 48.7 / 84.8 / 152.0 | |
+| fp8 channel, 113 x top 8, 4096 x 1536 | 109.1 (1386) / 189.6 / 340.7 / 589.7 | 6.42 (96.3) / 22.16 (111.6) |
+| fp8 128 x 128 block, same | 106.7 (1416) / 184.0 / 334.2 / 581.0 | 7.67 (80.6) / 23.97 (103.2) |
+| bf16, 128 x top 8, same shape | 196.4 (1538) / 369.8 (1585) / 668.2 (1642) / 1183.2 (1658) | 6.58 (94.0) / 22.91 (108.0) |
 
-Per-kernel (nvfp4 W4A16, 512 experts): one decode token: gate/up 27.8 us, down 9.6, plan 2.9, combine 2.2. The
-small experts' gate/up pass (a k loop of 2,560 against down's 640) moves weights at about 600 GB/s against down's
-about 1 TB/s: the decode limit of this baseline at that shape.
+The decode columns of the 4-bit and FP8 rows are with READ's default (128 bytes of a row a request), measured
+2026-11-15 on the same GPU (the FP8 store holds 113 experts in the bench's 2 GB, so calls of 2 tokens and more reuse
+some and their GB/s is not given). With READ 1, the kernel's reads until then, the same runs took: nvfp4 W4A16 42.9 /
+74.3 / 131.7 / 243.2 us (648 to 914 GB/s), W4A4 46.8 / 78.1 / 136.6 / 248.4, mxfp4 43.9 / 74.5 / 132.6 / 244.1, int4
+43.0 / 75.0 / 132.8 / 244.9, fp8 channel 122.2 / 227.0 / 398.9 / 681.3, fp8 block 141.7 / 263.3 / 464.4 / 787.6: a
+layer call is 29 to 43% shorter for the 4-bit formats, 11 to 30% for FP8.
+
+Per-kernel (nvfp4 W4A16, 512 experts, weights from DRAM), one decode token: gate/up 16.8 us, down 10.2, plan 2.9,
+combine 2.2 (READ 1: gate/up 28.4, down 10.5); gate/up at 2 / 4 / 8 tokens 28.2 / 50.2 / 95.9 us (READ 1: 51.8 / 93.2
+/ 182.5). A decode pass is a few warps a multiprocessor (one token's gate/up: 800 warps on 170), each waiting on its
+own chain of weight requests, and what a request brings is the pass's rate: 32 bytes of a row a request moved the
+weights at 0.6 to 0.9 TB/s, 64 bytes (FP8's blocks, or two 4-bit blocks) at 1.25 to 1.4, 128 bytes at 1.4 to 1.7, where
+the BF16 experts (128 bytes a block) always were; 192 and 256 bytes a request are no faster, and neither are more
+blocks in flight (DEPTH), a prefetch instruction or copies ahead through shared memory.
 
 ## Against the library
 

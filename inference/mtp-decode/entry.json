@@ -2,8 +2,8 @@
   "id": "mtp-decode",
   "category": "speculation",
   "summary": "Indexed token-history proposals and native greedy/probability-preserving speculation with transactional state and tagged budgets; independent physical batch/workspace integration",
-  "implementation_status": "native_source",
-  "implementation_scope": "Python indexed copy helpers and a portable C++20 incremental accepted-history index plus C++20 greedy and dense/sparse sampled target/draft verification, branch repair, private RNG and publication controllers; temperature/top-k/top-p/min-p filtering, canonical sparse supports with complete dense fallback and tagged supported-width cost policy. Device verification of sampled rounds is token-sampling's enqueue_verify (this loop is its oracle); model arithmetic, device sparse supports and learned MTP heads are engine supplied. Runnable synthetic native integration of separate target/draft physical caps and scratch, ordered catch-up, transactional recovery and recorded cap selection.",
+  "implementation_status": "reference",
+  "implementation_scope": "Python indexed copy proposals over accepted context, the greedy verification rule and its commit plan; on the device, drafts and verification inside captured rounds (device_drafts.py, device_verify.py). Device verification of sampled rounds is token-sampling's; model arithmetic and learned MTP heads are engine supplied.",
   "agent_guidance": {
     "use_when": "Cheap copy or trained-model drafts can amortize causal target verification while private target/draft state and probability-correct publication remain available",
     "avoid_when": "The engine cannot isolate and settle branches, or complete draft/verification/repair costs exceed ordinary decoding; or routed experts stream from host memory, where verifying several tokens loads the union of their experts",
@@ -60,30 +60,6 @@
       "purpose": "Bounded exact-window prompt/history index, rewind and rectangular verification budgeting"
     },
     {
-      "path": "inference/mtp-decode/code/speculative.h",
-      "purpose": "Complete native greedy prepare/verify/rewind/correction/commit controller, synchronous isolated target interface and bounded stateless copy proposer"
-    },
-    {
-      "path": "inference/mtp-decode/code/speculative_example.cpp",
-      "purpose": "Runnable multi-round copy/verification/repair example with a synthetic cycle target and ordinary-greedy-equivalent output"
-    },
-    {
-      "path": "inference/mtp-decode/code/sampled.h",
-      "purpose": "Dense/canonical sparse probability owners and exact sampled transactions with private RNG, ordered min-p and issued supported-width timing/preparation policy"
-    },
-    {
-      "path": "inference/mtp-decode/code/sampled_example.cpp",
-      "purpose": "Runnable min-p sampled loop with sparse draft/complete dense target fallback, tagged supported-width observations and same-draw dense comparison"
-    },
-    {
-      "path": "inference/mtp-decode/code/prompt_copy.h",
-      "purpose": "Bounded exact-window native history index, incremental append/rewind and limited prompt/history proposal search"
-    },
-    {
-      "path": "inference/mtp-decode/code/physical_batches_example.cpp",
-      "purpose": "Complete synthetic greedy host integration of independent physical caps, real scratch allocation, ordered draft catch-up, failure recovery and measured recorded selection"
-    },
-    {
       "path": "inference/mtp-decode/code/device_drafts.py",
       "purpose": "Drafting inside a captured round in torch: the chain over a model's device draft head, prompt_copy's copy proposals from each round slot's token history ring, and override_drafts' copies over a chain"
     },
@@ -93,7 +69,7 @@
     }
   ],
   "requires": {
-    "hardware": "Python 3.11+ for indexed host helpers; C++20 standard library for native loop, with engine-selected synchronous target hardware",
+    "hardware": "Python 3.11+ for the host helpers; PyTorch for the device forms",
     "model": "Autoregressive greedy or probability target, plus compatible probability draft for sampled mode; isolated materialized prefixes, complete rewind/append and causal D+1 verification; no learned MTP heads supplied",
     "workload": "Bounded greedy or sampled speculative rounds with private state, partial publication and explicit probability filtering"
   },
@@ -105,8 +81,7 @@
     "core_boundary": "Return prepared tokens from Session.advance; call native commit(id, accepted) from Session.commit. Core copies borrowed accepted output and publishes only after successful state repair; account branch and temporary storage explicitly."
   },
   "dependencies": [
-    "Python standard library",
-    "C++20 standard library; native target arithmetic and physical completion supplied by engine"
+    "Python standard library"
   ],
   "symbols": [
     "CommitPlan",
@@ -114,26 +89,7 @@
     "commit",
     "PromptCopyIndex",
     "CopyBatch",
-    "propose_batch",
-    "GreedyTargetState",
-    "GreedySpeculator",
-    "PromptCopyProposer",
-    "SpeculationLimits",
-    "SpeculativeRound",
-    "SpeculativeCommit",
-    "Distribution",
-    "ProbabilityMass",
-    "SparseDistribution",
-    "ProbabilityState",
-    "SparseProbabilityState",
-    "SampledSpeculator",
-    "SparseSampledSpeculator",
-    "AdaptiveDraftBudget",
-    "DraftObservation",
-    "DraftBudgetStatistics",
-    "acceptance_probability",
-    "rejection_distribution",
-    "IndexedPromptCopy"
+    "propose_batch"
   ],
   "interactions": [
     "attention-state",
@@ -149,7 +105,7 @@
   ],
   "validation": {
     "host": "Prompt/history lookup, repeat bounds, append/rewind, stop/vocabulary caps, shared batch costs, greedy mismatch/bonus and commit handoff",
-    "native": "Greedy transactions and Core synthetic paged-cache integration, including independent interleaved requests with accepted drafts followed by empty proposals or zero budgets at page boundaries; sampled exhaustive sparse capacity/support and conditional path mass, duplicate permutations, score/filter/tie/min-p combinations, 90000 two-token Markov histories, dense/sparse same-draw transactions, partial/cancelled/failed repair, RNG rollback and issued/stale/foreign/replayed adaptive observations. Generic fixtures do not qualify learned heads or device/model performance.; indexed history: 1000 append/rewind mutations and 8000 proposals against an independent scan oracle at two capacities, aliased input, stop/vocabulary bounds and invalid mutations; physical batching example: independent scratch payloads, caps 1-17, fixed proposals, ordinary-greedy output and recurrent-state/rewind equivalence, padding, partial/zero-budget rounds, failed ingestion/verification/repair, cancellation, retries and recorded-choice replay",
+    "native": "No native code; the device forms' tests run with the plugin's tests",
     "performance": "No native-engine speed claim; serial fallback, history checks/copies, proposal cost, target verification and repair must be measured together"
   }
 }

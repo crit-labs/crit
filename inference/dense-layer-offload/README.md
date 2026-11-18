@@ -39,17 +39,6 @@ saved per byte. The fastest prediction ranks them and `select_measured` times ev
 candidate within a slack of it and keeps the measured fastest, so a wrong rate can
 reorder candidates but never picks a slower plan than one that was measured.
 
-**Host execution.** `gemv` splits a BF16 matrix's rows over a persistent thread pool;
-each row is a dot product on the widest ISA the CPU and OS report
-([host-expert-arithmetic](../host-expert-arithmetic/README.md)'s `host_isa.h`; AVX2
-and AVX-512 files are compiled with their own flags and share no inline code with the
-rest), with 8 or 16 FP32 lanes per activation row. Rows are
-independent, so results do not depend on the thread split. `host_block` composes one
-pre-norm block from it: RMSNorm, QKV, split-half rotary embedding, a host KV append,
-grouped-query attention, O, the SiLU product and down, rounding to BF16 where a BF16
-device layer stores its intermediates (the normed input, rotated Q and K, V, the
-attention output and the SiLU product).
-
 ## Worked example
 
 From `code/`:
@@ -68,25 +57,6 @@ assert candidates([10] * 8, 50, m)[0][0] == "host"
 assert predict([10, 10], [HOST, HOST], m) == 85 and predict([10], [DEVICE], m) == 10
 ```
 
-The native pieces ([offload_plan.h](code/offload_plan.h), [offload_exec.h](code/offload_exec.h),
-[host_dense.h](code/host_dense.h)):
-
-```cpp
-namespace od = crit::dense_offload;
-od::Measurements m;
-m.device_gbs = probe_bandwidth_gbs;                                   // crit eval probe
-m.upload_gbs = od::measure_upload_gbs(256 << 20, 8);
-m.host_gbs = od::measure_host_gemv_gbs(pool, od::best_isa(), hidden, ffn, 1, 10);
-m.host_layer_ns = od::measure_round_trip_ns(hidden * sizeof(float), 50);
-const auto plans = od::candidates(layer_bytes, budget, m);
-const auto plan = od::select_measured(plans, 4.0, 5, run_steps);      // times the leading candidates
-od::WeightStream stream(largest_layer_bytes, copy_stream);
-od::run_layers(plan, store, runner, &stream, compute_stream);         // each step; runner is the engine's LayerRunner
-```
-
-The engine supplies the `LayerRunner`: each layer's device form on its own kernels and
-its host form, for which `host_block` gives a pre-norm layer.
-
 ## Invariants
 
 - A streamed layer is read only after its upload's event and its slot is reused only
@@ -99,19 +69,7 @@ its host form, for which `host_block` gives a pre-norm layer.
 
 ## Costs and validation
 
-`tests/inference/dense_offload_tests.cpp` checks the planner's candidates and
-predictions (and that measured selection overrides the predicted order), and every host
-GEMV path the CPU supports against an FP64 product (within 1e-5) and bit for bit across
-thread splits. Its `host_block` case runs a grouped-query block over a host KV cache: bit
-for bit across thread splits, three tokens in one call within 1e-5 of three single-token
-calls, and the cache holding exactly the positions written. On a CUDA device its `stream`
-case runs `run_layers` with a recording `LayerRunner` over six layers placed device,
-stream, stream, host, stream, device: the calls come in step order with the host run
-between `to_host` and `to_device`, each device or streamed layer reads its own bytes
-(the third streamed layer reusing the first one's slot of the two-slot `WeightStream`),
-and the measurement helpers return positive rates. The fixture has no model, so it
-checks what each layer is handed, not a model's output. `test_reusable_techniques.py`
-checks the Python planner on the same scenario.
+`test_reusable_techniques.py` checks the planner's candidates and predictions.
 
 Measured with an earlier fixture's synthetic model, on one machine (RTX 5090, 12 host
 threads with AVX-512), with 16 layers of 436 MB (7 GB of BF16 weights) and the device budget

@@ -16,7 +16,7 @@ from crit.run.store import ROOT, RunStore
 
 from crit_core.serving import (COMPLETION_CAPABILITY, CONCURRENT_CAPABILITY, CONSTRAINTS_CAPABILITY,
                                CONTINUE_CAPABILITY, FIT_OUTPUT_CAPABILITY, GRAMMAR_CAPABILITY, IMAGES_CAPABILITY,
-                               MIN_LOGPROB, PLAIN_CAPABILITY, REQUEST_FACTS, SCORE_CAPABILITY, STREAM_CAPABILITY,
+                               MIN_LOGPROB, PLAIN_CAPABILITY, PROMPT_CACHE_CAPABILITY, REQUEST_FACTS, SCORE_CAPABILITY, STREAM_CAPABILITY,
                                THINKING_BUDGET_CAPABILITY,
                                TOKENIZE_CAPABILITY, unpacked_scores)
 
@@ -636,13 +636,15 @@ class ServedEngine:
     def generate(self, messages, max_tokens, stop, on_text=None, candidate_id=None, response_format=None,
                  sampling=None, tool_options=None, on_tools=None, on_reasoning=None, on_started=None, logprobs=None,
                  decode=None, template_kwargs=None, fit_output=False, on_admitted=None, priority=0, request_id=None,
-                 timeout=None, continue_final_message=False, prompt=None, echo=False, thinking_tokens=None):
+                 timeout=None, continue_final_message=False, prompt=None, echo=False, thinking_tokens=None,
+                 prompt_cache=None):
         """Run one request. `on_text(text)` receives each piece of accepted text as the adapter streams it.
         `response_format` (from crit_api.server.response_format or structured_outputs) goes into the request record
         for adapters that declare chat-constraints-v1, and also chat-constraints-grammar-v1 for type grammar.
         Sampling and tool options are capability-gated request overrides; logprobs n asks a chat-logprobs-v1 adapter
         for every token's log-probability with n alternatives; decode "plain" asks a chat-plain-v1 adapter to decode
-        one token per target pass; template_kwargs set the chat-template variables a chat-template-kwargs-v1 adapter
+        one token per target pass; prompt_cache False asks a chat-prompt-cache-v1 adapter to prefill every prompt
+        token, whatever its prompt cache holds; template_kwargs set the chat-template variables a chat-template-kwargs-v1 adapter
         declares; fit_output asks a chat-fit-output-v1 adapter to cut max_tokens to the room the prompt leaves in the
         context, and the telemetry then carries the cap it applied as max_output_tokens; continue_final_message asks
         a chat-continue-v1 adapter to continue the final assistant message, its reply only what follows it;
@@ -689,6 +691,7 @@ class ServedEngine:
             for used, capability in ((image_input, IMAGES_CAPABILITY), (response_format is not None, CONSTRAINTS_CAPABILITY),
                                      ((response_format or {}).get("type") == "grammar", GRAMMAR_CAPABILITY),
                                      (decode is not None, PLAIN_CAPABILITY), (fit_output, FIT_OUTPUT_CAPABILITY),
+                                     (prompt_cache is not None, PROMPT_CACHE_CAPABILITY),
                                      (continue_final_message, CONTINUE_CAPABILITY),
                                      (thinking_tokens is not None, THINKING_BUDGET_CAPABILITY),
                                      (prompt is not None, COMPLETION_CAPABILITY),
@@ -705,6 +708,8 @@ class ServedEngine:
             extra = {} if response_format is None else {"response_format": response_format}
             if decode is not None:
                 extra["decode"] = decode
+            if prompt_cache is not None:
+                extra["prompt_cache"] = bool(prompt_cache)
             if continue_final_message:
                 extra["continue_final_message"] = True
             try:

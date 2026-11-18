@@ -203,6 +203,31 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(moved["state"], "failed", moved)
         self.assertIn("prefix of 17 tokens", moved["detail"])
 
+    def test_an_engine_that_asks_exact_rows_is_judged_by_them(self):
+        """The level an engine asks of its rows (its facts' exactness.asked) decides where smoke is strict: decode
+        against prefill for exact prompt rows, prefill against prefill from row-exact up; lower levels by the profile."""
+        def asked(decode, prompt):
+            return {"exactness": {"asked": {"decode": decode, "prompt": prompt}}}
+        tests = {"causal", "decode_matches_prefill"}
+        # Decode rounding of a W4A4 engine's size: the drift a lower level allows, not the bits exact prompt rows have.
+        for levels, state in ((asked("repeatable", "repeatable"), "passed"), (asked("row-exact", "row-exact"), "passed"),
+                              (asked("row-exact", "exact"), "failed"), (asked("declared", "declared"), "failed"),
+                              (asked("repeatable", "exact"), "passed")):   # decode rows that follow the row count
+            with self.subTest(levels=levels):
+                found = self.results("decode_rounding", facts=levels, only=tests)
+                self.assertEqual((found["causal"]["state"], found["decode_matches_prefill"]["state"]),
+                                 ("passed", state), found)
+        failed = self.results("decode_rounding", facts=asked("row-exact", "exact"), only=tests)["decode_matches_prefill"]
+        self.assertIn("judged strictly: the engine asks exact prompt rows", failed["detail"])
+        # A working engine passes at every level, and rows that move with the prompt's length fail from row-exact up
+        # with the level named.
+        for levels in (asked("row-exact", "exact"), asked("row-exact", "row-exact"), asked("repeatable", "repeatable")):
+            found = self.results(facts=levels, only=tests)
+            self.assertEqual({i["state"] for i in found.values()}, {"passed"}, found)
+        moved = self.results("length_rounding", facts=asked("row-exact", "row-exact"), only={"causal"})["causal"]
+        self.assertEqual(moved["state"], "failed", moved)
+        self.assertIn("judged strictly: the engine asks row-exact prompt rows", moved["detail"])
+
     def test_a_failed_causal_test_names_the_prompt_paths_the_engine_reports(self):
         from crit_smoke.suite import row_paths
         facts = {"row_invariance": {"rows": 16, "prompt_rows": False},

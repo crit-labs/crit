@@ -20,6 +20,18 @@ class HostExpertArithmeticTests(PluginTestCase):
             p = self.assemble(options=options)["projections"]
             self.assertClose(p.project(p.prepare(w), x), want, atol=1e-5, rtol=1e-5)
 
+    def test_prompt_gemm_auto_follows_the_level_the_engine_asks_of_its_prompt_rows(self):
+        from crit_plugins import kernels
+        self.addCleanup(kernels.use_exactness, None)
+        for asked, gemm in ((None, "native"), ("repeatable", "native"), ("row-exact", "declared"),
+                            ("exact", "declared"), ("declared", "declared")):
+            kernels.use_exactness(asked and {"decode": "row-exact", "prompt": asked})
+            p = self.assemble()["projections"]
+            self.assertEqual(p.prompt_gemm, gemm, asked)
+            self.assertEqual(p.exactness(), {})   # no matrix loaded: it states no level yet
+        kernels.use_exactness("declared")   # an option set to one GEMM is that GEMM, whatever is asked
+        self.assertEqual(self.assemble(options={"prompt_gemm": "native"})["projections"].prompt_gemm, "native")
+
     def test_the_order_is_deterministic(self):
         p = self.assemble()["projections"]
         w = p.prepare(matrix(2, 32))

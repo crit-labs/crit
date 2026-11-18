@@ -154,6 +154,7 @@ class DeviceExpertsTests(PluginTestCase):
                 alone = experts.forward(3, x[4:5].clone(), ids[4:5].clone(), w[4:5].clone())
                 self.assertTrue(torch.equal(alone[0], out[4]))
                 self.assertEqual(experts.facts()["experts"]["arithmetic"], "declared")
+                self.assertEqual(experts.exactness(), {"decode": "declared", "prompt": "declared"})
 
     def test_the_declared_arithmetic_is_refused_without_the_kernel(self):
         with self.assertRaisesRegex(ValueError, f"declared runs only on crit's kernel {KERNEL}.*kernel is false"):
@@ -229,6 +230,10 @@ class DeviceExpertsTests(PluginTestCase):
         self.assertLess(float((fa - fb).abs().max() / fb.abs().max()), 3e-2)
         self.assertEqual(a.facts()["experts"]["path"], "kernel")
         self.assertEqual(b.facts()["experts"]["path"], "torch")
+        # What the rows keep: a prompt row has the bits of the same route decoded, on the kernel (its prompt
+        # structures have the decode structure's bits) and in torch (one computation for both).
+        self.assertEqual(a.exactness(), {"decode": "row-exact", "prompt": "exact"})
+        self.assertEqual(b.exactness(), {"decode": "row-exact", "prompt": "exact"})
 
     def test_a_workspace_a_capture_used_outlives_later_prompt_shapes(self):
         torch = self.torch

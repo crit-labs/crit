@@ -51,7 +51,7 @@
         "N",
         "K"
       ],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "GROUPS": {
           "values": [
@@ -131,7 +131,7 @@
         "N",
         "K"
       ],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "WARPS": {
           "values": [
@@ -193,7 +193,8 @@
         "N",
         "K"
       ],
-      "row_invariant": true,
+      "exactness": "exact",
+      "bits_of": "decode-tile",
       "knobs": {
         "PW": {
           "values": [
@@ -218,8 +219,62 @@
       },
       "bench": "bench.py:PromptTile"
     },
+    "fp4-prompt-tile": {
+      "what": "any number of W4A4 rows with the FP4 MMA decode tile's bits (mm_prompt with acts nvfp4_mma): each output the chain of block-scaled m16n8k64 MMAs fp4-tile runs, with its splits. Warp-specialized: a producer warp's TMA tile copies of a step of the CTA's 16 PW PR matrix rows and of its PT tokens (and both operands' scale tiles) into a ring of mbarrier-guarded stages; PW consumer warps of PR 16-row tiles each over the CTA's tokens, their fragments read by ldmatrix ahead of the MMAs; a split's chains join running totals (half in registers, half in shared memory) inside the MMA stream; whole BF16 / F16 tiles leave through shared memory in 16-byte stores",
+      "call": "mm_prompt",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        64,
+        512,
+        2048,
+        8192
+      ],
+      "key": [
+        "N",
+        "K"
+      ],
+      "exactness": "exact",
+      "bits_of": "fp4-tile",
+      "knobs": {
+        "PW": {
+          "values": [
+            4,
+            6,
+            7,
+            8
+          ],
+          "default": 8,
+          "what": "consumer warps a CTA (beside the producer warp)"
+        },
+        "PR": {
+          "values": [
+            1,
+            2
+          ],
+          "default": 1,
+          "what": "16-row tiles a warp (each token fragment read once for them)"
+        },
+        "PT": {
+          "values": [
+            32,
+            64,
+            128
+          ],
+          "default": 128,
+          "what": "tokens a CTA (8 an MMA column)"
+        }
+      },
+      "yardstick": {
+        "library": "cuBLASLt's block-scaled NVFP4 GEMM (torch._scaled_mm), as fp4-tile's: the same W4A4 arithmetic on the same weight bytes, the activations quantized once outside its timed call"
+      },
+      "bench": "bench.py:Fp4PromptTile"
+    },
     "quantizers": {
       "what": "the activations' quantizers alone (FP8 rows: one CTA a row; NVFP4 blocks: one thread a 16-value block into cuBLASLt's tiled scale layout), for a provider's GEMM on the same activations",
+      "exactness": "row-exact",
       "call": "quantize_fp8_rows"
     }
   }

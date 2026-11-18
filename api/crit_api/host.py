@@ -7,12 +7,13 @@ import threading
 import traceback
 
 if __package__ in {None, ""}:
-    # Launched by path: make crit_api and, in a checkout, crit, crit_core and the crit Eval checkout beside it
-    # importable (crit Eval gives Core the GGUF config rules a lone GGUF's model text needs).
+    # Launched by path: make crit_api and, in a checkout, crit, crit_core, crit_kernels and the crit Eval checkout
+    # beside it importable (crit Eval gives Core the GGUF config rules a lone GGUF's model text needs; crit_kernels
+    # the exactness levels a configuration asks and the kernels its plugins build).
     root = Path(__file__).resolve().parents[2]
-    for folder in (Path(__file__).resolve().parents[1], root / "cli", root / "core" / "python",
+    for folder in (Path(__file__).resolve().parents[1], root / "cli", root / "core" / "python", root / "kernels",
                    root.parent / "crit-eval"):
-        if any((folder / name).is_dir() for name in ("crit_api", "crit", "crit_core", "crit_eval")):
+        if any((folder / name).is_dir() for name in ("crit_api", "crit", "crit_core", "crit_kernels", "crit_eval")):
             sys.path.insert(0, str(folder))
 from crit.records import MAX_JSON_BYTES, digest, read_json
 from crit_api import channel

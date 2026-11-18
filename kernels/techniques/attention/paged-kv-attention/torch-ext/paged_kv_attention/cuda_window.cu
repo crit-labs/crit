@@ -36,6 +36,7 @@
 
 #include "crit_kcore/arch.cuh"
 #include "crit_kcore/attention_softmax.cuh"
+#include "crit_kcore/device.cuh"
 #include "crit_kcore/formats.cuh"
 #include "crit_kcore/load.cuh"
 #include "crit_kcore/mma.cuh"
@@ -405,7 +406,8 @@ __device__ __forceinline__ void cw_tile(const Params& p, const Work w, unsigned 
             };
             unsigned long long a = 1ull << col[h];
             long long par = parent(col[h]);
-            for(int s = 0; s < p.cols && par >= 0; ++s) {
+            // (a parent past the window's columns ends the walk: no shift past the mask, no read past the row)
+            for(int s = 0; s < p.cols && par >= 0 && par < p.cols; ++s) {
                 a |= 1ull << par;
                 par = parent(par);
             }
@@ -1372,13 +1374,12 @@ using Launch = int (*)(const Params*, cudaStream_t, int, int, int);
 template <int DVP, int BN, int WARPS, int VW, int STAGES, bool IREG, bool FUSED>
 int launch_tile(const Params* p, cudaStream_t stream, int gx, int gy, int gz) {
     using C = Tile<DVP, BN, WARPS, VW, STAGES, IREG, FUSED>;
-    static bool ready = false;
-    if(!ready) {
-        const cudaError_t e = cudaFuncSetAttribute(cw_window<DVP, BN, WARPS, VW, STAGES, IREG, FUSED>,
-                                                   cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM);
-        if(e != cudaSuccess) return int(e);
-        ready = true;
-    }
+    // The tile's shared memory, raised once a device (the limit is the function's on the device it is loaded on, and
+    // one library serves every GPU of its kind in the process).
+    static kc::PerDevice<cudaError_t> optin;
+    if(const cudaError_t e = kc::shared_memory_optin(optin, cw_window<DVP, BN, WARPS, VW, STAGES, IREG, FUSED>, C::SMEM);
+       e != cudaSuccess)
+        return int(e);
     // fused: gy splits times the value split's programs
     cw_window<DVP, BN, WARPS, VW, STAGES, IREG, FUSED><<<dim3(gx, FUSED ? gy * (DV / DVP) : gy, gz), C::THREADS,
                                                          C::SMEM, stream>>>(*p);
@@ -1514,16 +1515,10 @@ extern "C" int crit_cw_launch(int structure, int entry, const Params* p, void* s
 
 extern "C" int crit_cw_merge(const Params* p, void* stream, int gx, int gy, int gz) {
     if(p->merge) {   // the staged merge (rows of many splits)
-        static bool ready = false;
-        if(!ready) {
-            cudaError_t e = cudaFuncSetAttribute(cw_merge2<32, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                 merge2_smem<32, 4>());
-            if(e == cudaSuccess)
-                e = cudaFuncSetAttribute(cw_merge2<16, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                         merge2_smem<16, 3>());
-            if(e != cudaSuccess) return int(e);
-            ready = true;
-        }
+        static kc::PerDevice<cudaError_t> wide, narrow;   // the two merges' shared memory, raised once a device
+        cudaError_t e = kc::shared_memory_optin(wide, cw_merge2<32, 4>, merge2_smem<32, 4>());
+        if(e == cudaSuccess) e = kc::shared_memory_optin(narrow, cw_merge2<16, 3>, merge2_smem<16, 3>());
+        if(e != cudaSuccess) return int(e);
         if(p->merge == 1)
             cw_merge2<32, 4><<<dim3(gx, gy, gz), MERGE2_THREADS, merge2_smem<32, 4>(),
                                static_cast<cudaStream_t>(stream)>>>(*p);

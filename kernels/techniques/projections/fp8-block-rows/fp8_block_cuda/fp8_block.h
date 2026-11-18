@@ -93,4 +93,10 @@ cudaError_t enqueue_gemm_native_channel(const Matrix* matrices, const GemmJob* j
 cudaError_t enqueue_quantize(const void* x, bool bf16, int ld_x, int rows, int cols, ScaleKind kind, const Acts& acts,
                              cudaStream_t stream);
 
+// The same quantizer's values in one launch: out [row][ld_out] BF16, each element its E4M3 code times its group's
+// scale (the FP32 product rounded to BF16: exact for MXFP8's powers of two), for a caller that multiplies 16-bit
+// rows of quantized activations and wants neither the codes nor the scales.
+cudaError_t enqueue_quantized_values(const void* x, bool bf16, int ld_x, int rows, int cols, int group, ScaleKind kind,
+                                     void* out, int ld_out, cudaStream_t stream);
+
 }  // namespace crit::techniques::fp8_block

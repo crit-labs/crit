@@ -3,14 +3,16 @@
 Run host work in the middle of a CUDA stream, including a captured graph, without a host round trip on the
 decision path: a device kernel posts a job into mapped pinned memory, a host service thread runs it, and the
 stream waits for the answer only where it reads the result. Host-computed experts, host lookups and
-host-issued copies that the device decides on mid-graph all fit this shape. The entry supplies the doorbell
-protocol, two capturable waits chosen by measurement, an eager fallback, release and failure handling.
+host-issued copies that the device decides on mid-graph all fit this shape. Core runs it for every plugin:
+`crit_plugins.host` hands out a handoff (the mailbox: its slots in mapped pinned memory, the doorbell protocol, two
+capturable waits chosen by measurement, an eager fallback, release and failure handling) served by the process's one
+service thread.
 
 ## When to use it
 
 Use it when a graph-captured step needs work only the host can do, and the device decides at run time what
-that work is (which experts missed, which rows to fetch). Without it the engine either splits the graph at
-every such point and synchronizes, or writes its own mailbox. Don't use it when the host work is known before
+that work is (which experts missed, which rows to fetch). Without it the engine splits the graph at
+every such point and synchronizes. Don't use it when the host work is known before
 launch (enqueue it ahead), when the work fits on the device, or when the join would come right after the post
 with nothing for the device to do meanwhile and the measured join cost exceeds the work it moves.
 
@@ -52,28 +54,28 @@ answered at once with `status = failed`, and the handler is never called again. 
 doorbells in any order, so slices of one layer, out-of-order posts and windows aborted between post and join
 never desynchronize it. After an aborted window, call `rearm()` before the next one.
 
-## What the code supplies
+## What Core supplies
 
 | File | Supplies |
 | --- | --- |
-| [`mailbox.h`](code/mailbox.h), [`mailbox.cu`](code/mailbox.cu) | `Mailbox` over caller-owned mapped bytes (`MappedRegion`, `region_bytes`): slots, service thread, `post`/`skip`/`join` stream operations, `release`, `rearm`, terminal failure; `probe_joins` and `measure_joins` with `JoinCosts::choice()`. Driver entry points are resolved through the runtime, so nothing links the driver library. |
-| [`mailbox_device.cuh`](code/mailbox_device.cuh) | `post_job`, `skip_job`, `read_result`, `read_status` for posting and reading from the engine's own kernels |
+| [`crit_plugins.host`](../../core/python/crit_plugins/host/__init__.py) | `handoff(device, owner, name, slots, payload_bytes, serve, context)`: a `Handoff` with `words(slot)` (the slot's device addresses), `post`/`skip`/`join` on torch's current stream, `release`, `rearm`, `failed`; `joins(device)`, the capturable joins measured once a device; the service thread on the first core of Core's plan; every handoff in the engine's telemetry (`"host"`) |
+| [`handoff.h`](../../core/python/crit_plugins/host/handoff.h), [`handoff.cu`](../../core/python/crit_plugins/host/handoff.cu) | `Handoff` over mapped bytes (`MappedRegion`, `region_bytes`): slots, the stream operations, `release`, `rearm`, terminal failure; `Service`, the one thread a process that answers every handoff's doorbells; `probe_joins` and `measure_joins` with `JoinCosts::choice()`. Driver entry points are resolved through the runtime, so nothing links the driver library. Built at first use for the device's architecture (`crit_plugins.native`) |
+| [`handoff_device.cuh`](../../core/python/crit_plugins/host/handoff_device.cuh) | `DeviceSlot`, `post_job`, `skip_job`, `read_result`, `read_status` for posting and reading from a plugin's own kernels (`crit_plugins.host.INCLUDE` is its folder) |
 | [`implementation.py`](code/implementation.py) | Host reference of the protocol with captured programs replayed in order |
 
-## What the engine supplies
+## What a plugin supplies
 
-- **Mapped bytes**, allocated through Core so they are accounted for: `CudaBackend::allocate(Memory::host,
-  region_bytes(slots, payload))` with `device_address()`, or `cuda_map_host`. Keep the owner alive past the
-  mailbox.
-- **The payload layout and the handler**, which runs on the service thread. A handler that fans out to a
-  worker pool owns that pool. A handler must return, because a job that never returns blocks destruction. Its
-  outputs must be complete before it returns, since the service writes `done` after it.
+- **The payload layout and the handler**, a C function of its host library that runs on the service thread. A
+  handler that fans out runs its batches on the host's worker pool (`crit_plugins.host`'s `pool().native`), of
+  which the service thread is then the caller. A handler must return, because a job that never returns blocks
+  the handoff's close. Its outputs must be complete before it returns, since the service writes `done` after it.
 - **Posting from its kernels** after every payload write is system-fenced: a fence in each writing thread and
   then a block barrier, or writes from an earlier kernel in stream order. One slot per concurrently
   outstanding job. A slot can be reused for the next job once the stream has joined the previous one.
-- **The join choice**, from `measure_joins` on the target machine, ideally re-checked inside the engine's own
-  step, because concurrent kernels change both costs. Then a capture with that join, and `release()` from its
-  cancellation or watchdog path.
+- **The join in its step**, `handoff.join(slot)` where the device reads the result. Core measured which
+  capturable join is cheaper on the device; a plugin may name one (`join=`), ideally after checking it inside
+  the engine's own step, because concurrent kernels change both costs. `release()` belongs in its cancellation
+  or watchdog path, `close()` before its handler's library goes.
 - **Reading results** with volatile loads after the join, and discarding the window's outputs when `status` is
   not `served` or `skipped`.
 
@@ -133,8 +135,8 @@ assert box.failed and not box.rearm()
 Preserve the device-side reset of `done` before `ready`, the system fence between the payload and the
 doorbell, the host writing `status` before `done`, one outstanding job per slot, the device answering skipped
 slots itself, terminal failure answering, and `rearm()` only after the joining streams are drained. You can
-change the number of slots, the payload layout, the polling and back-off policy, posting from a stream
-operation or a kernel, and the handler's threading. A different join is fine if it waits for the same word.
+change the number of slots, the payload layout, posting from a stream operation or a kernel, and the handler's
+threading. A different join is fine if it waits for the same word.
 
 With [heterogeneous expert dispatch](../heterogeneous-expert-dispatch/README.md), the device's plan decides
 which misses the host computes and posts them. The host share comes from the measured split, and the host must
@@ -146,8 +148,8 @@ released answer discards the result instead of publishing a partial one.
 ## Costs and validation
 
 A post costs a few device writes and two system fences. The join costs what `measure_joins` reports, and that
-depends on the platform. The service thread spins while jobs arrive and backs off to short sleeps after
-`idle_after`, so leave it a core. For scale only: on one RTX 5090 (driver 596.49, CUDA 13.1), with native
+depends on the platform. The service thread spins while jobs arrive and backs off to short sleeps 2 ms after
+the last one; Core's plan gives it the first physical core, and the pool's workers the others. For scale only: on one RTX 5090 (driver 596.49, CUDA 13.1), with native
 Windows and with WSL2, the fixture measured post plus join at 37-41 µs with `stream_wait` and 2.7-2.8 µs with
 `device_poll`. A separate probe showed the stream wait's extra 50-60 µs stays even when the word is already
 set and does not hide behind longer device work. On that machine, a join per layer favours the poll kernel. In

@@ -20,3 +20,5 @@ void gemm_native_channel(const torch::Tensor& table, const torch::Tensor& jobs, 
                          const torch::Tensor& codes, const torch::Tensor& scales, torch::Tensor& out);
 // x [rows, cols] fp32 or bf16 -> codes uint8 E4M3 and scales fp32 per group (kind 0: MXFP8, 1: amax / 448).
 void quantize(const torch::Tensor& x, int64_t group, int64_t kind, torch::Tensor& codes, torch::Tensor& scales);
+// The same codes times their scales, out [rows, cols] bf16, in one launch.
+void quantized_values(const torch::Tensor& x, int64_t group, int64_t kind, torch::Tensor& out);

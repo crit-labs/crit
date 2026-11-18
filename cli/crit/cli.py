@@ -148,7 +148,7 @@ def main(argv=None):
         return inference.main(args.arguments)
     if not checkout(default_project()):
         parser.error("Run repository maintenance commands from the crit repository")
-    print("core/include/crit/core.h\ncore/include/crit/cuda.h\ncore/contracts/README.md")
+    print("core/include/crit/core.h\ncore/contracts/README.md")
     return 0
 
 

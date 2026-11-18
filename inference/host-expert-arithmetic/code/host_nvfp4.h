@@ -4,7 +4,7 @@
 // accumulator lane k % lanes; each term is fma(e2m1(code) * scale[k / 16], x[k], lane) with the product rounded
 // to FP32 first; blocks run in order; the lanes are reduced by a halving tree ((i, i + lanes/2), then /4, ...,
 // leaving lane 0) or sequentially (lane 0 + lane 1 + ...); the sum is multiplied by `post`. A device kernel that
-// declares the same order (host_nvfp4_device.cuh is one) gives the same bits, so an expert's contribution does
+// declares the same order (crit's kernels of these rows are) gives the same bits, so an expert's contribution does
 // not depend on which processor computed it. The scalar path is the oracle; the AVX2 and AVX-512 paths are
 // chosen at run time from the CPU's features and match it exactly.
 //

@@ -1,8 +1,7 @@
 // Structured-output constraints: byte vocabularies, finite choices, JSON-object syntax, byte grammars and their
-// artifacts, private forks/rewinds, limits, the allowed-set readout and constrained sampling through Sampler. The
+// artifacts, private forks/rewinds, limits, the allowed-set readout. The
 // json_corpus and grammar_corpus modes answer the independent Python oracles (tests/core/*_constraint_oracle.py).
 #include <crit/constraints.h>
-#include <crit/sampling.h>
 #include <array>
 #include <cmath>
 #include <fstream>
@@ -362,46 +361,6 @@ void readout() {
     bad[0] = std::numeric_limits<float>::infinity();
     rejects([&] { (void)constraint_readout(bad, ids); });
 }
-
-// A toy causal model: logits depend only on the last token. Sampling through the matcher's allowed set must stay in
-// the language and give each complete answer its causal probability (products of the restricted softmax).
-void sampling() {
-    const std::vector<std::string> pieces{"{\"x\":", "true}", "false}", "", "{}", "invalid"};
-    const auto v = vocabulary(pieces, 3);
-    const auto logits = [](const Ids& output) {
-        std::vector<float> row{1, 3, 0, 2, 4, 99};
-        if(!output.empty() && output.back() == 0) { row[0] = -1000; row[4] = -1000; }
-        return row;
-    };
-    // Independent answer probabilities: first {0, 4} (logits 1 and 4), then {1, 2} after token 0 (logits 3 and 0).
-    const double first = 1/(1 + std::exp(3.0)), yes = 1/(1 + std::exp(-3.0));
-    const std::map<std::string, double> expected{{"{}", 1 - first}, {"{\"x\":true}", first*yes}, {"{\"x\":false}", first*(1 - yes)}};
-    std::map<std::string, std::size_t> counts;
-    Sampler sampler(6);
-    constexpr int runs = 4000;
-    for(int seed = 0; seed < runs; ++seed) {
-        JsonObjectMatcher matcher(v);
-        SamplingParams params;
-        params.seed = std::uint64_t(seed);
-        TokenHistory history({});
-        Ids output;
-        std::string answer;
-        while(!matcher.ended()) {
-            const auto allowed = matcher.allowed();
-            const Token token = sampler.sample(logits(output), AllowedTokens{allowed}, params, history).token;
-            matcher.append(token);
-            history.stage(std::span<const Token>(&token, 1));
-            history.commit(1);
-            output.push_back(token);
-            if(token != 3) answer += pieces[std::size_t(token)];
-        }
-        require(json_accepts(answer), "constrained sampling left the language");
-        ++counts[answer];
-    }
-    require(counts.size() == expected.size(), "unexpected constrained answers");
-    for(const auto& [answer, p]:expected)
-        require(std::abs(double(counts[answer])/runs - p) < 0.025, "constraint changed the causal answer law");
-}
 }
 
 int main(int argc, char** argv) {
@@ -412,7 +371,7 @@ int main(int argc, char** argv) {
         const std::vector<std::pair<std::string_view, std::function<void()>>> cases{
             {"constraint_vocabulary", vocabularies}, {"constraint_choices", choice_matcher},
             {"constraint_json", json_matcher}, {"constraint_grammar", grammar_matcher},
-            {"constraint_readout", readout}, {"constraint_sampling", sampling}, {"constraint_trie", trie_walks},
+            {"constraint_readout", readout}, {"constraint_trie", trie_walks},
             {"constraint_cache", allowed_cache}};
         bool found = false;
         for(const auto& [case_name, run]:cases) if(name == "all" || name == case_name) {

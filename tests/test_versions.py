@@ -20,8 +20,6 @@ PLACES = {
     "core/contracts/README.md": [r"the current source version is " + NUMBER],
     "core/README.md": [r"The SDK is version " + NUMBER, r"find_package\(critCore " + NUMBER + " EXACT"],
     "inference/CMakeLists.txt": [r"project\(crit_inference VERSION " + NUMBER, r"find_package\(critCore " + NUMBER],
-    "inference/recurrent-state-recovery/code/CMakeLists.txt": [r"find_package\(critCore " + NUMBER],
-    "tests/core/sdk_consumer/CMakeLists.txt": [r"find_package\(critCore " + NUMBER + " EXACT"],
     "tests/core/concurrency_consumer/CMakeLists.txt": [r"find_package\(critCore " + NUMBER + " EXACT"],
     "tests/core/concurrency_consumer/main.cpp": [r"crit " + NUMBER + " installed SDK"],
     "docs/CONTRIBUTING.md": [r"crit-" + NUMBER + r"-py3-none-any\.whl"],

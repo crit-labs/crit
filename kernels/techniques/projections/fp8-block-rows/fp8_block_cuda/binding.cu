@@ -117,6 +117,21 @@ void gemm_native_channel(const torch::Tensor& table, const torch::Tensor& jobs, 
              "gemm_native_channel");
 }
 
+void quantized_values(const torch::Tensor& x, int64_t group, int64_t kind, torch::Tensor& out) {
+    const c10::cuda::CUDAGuard guard(x.device());
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() == 2, "x must be a contiguous 2-D CUDA tensor");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32 || x.scalar_type() == torch::kBFloat16, "x must be fp32 or bf16");
+    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == torch::kBFloat16 && out.sizes() == x.sizes(),
+                "out must be a contiguous bf16 CUDA tensor of x's shape");
+    TORCH_CHECK(kind == 0 || kind == 1, "kind: 0 for MXFP8 scales, 1 for amax / 448");
+    TORCH_CHECK(group > 0 && x.size(1) % group == 0, "the columns must be whole groups");
+    check_ok(fb::enqueue_quantized_values(x.data_ptr(), x.scalar_type() == torch::kBFloat16, static_cast<int>(x.size(1)),
+                                          static_cast<int>(x.size(0)), static_cast<int>(x.size(1)),
+                                          static_cast<int>(group), static_cast<fb::ScaleKind>(kind), out.data_ptr(),
+                                          static_cast<int>(out.size(1)), at::cuda::getCurrentCUDAStream()),
+             "quantized_values");
+}
+
 void quantize(const torch::Tensor& x, int64_t group, int64_t kind, torch::Tensor& codes, torch::Tensor& scales) {
     const c10::cuda::CUDAGuard guard(x.device());
     TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() == 2, "x must be a contiguous 2-D CUDA tensor");

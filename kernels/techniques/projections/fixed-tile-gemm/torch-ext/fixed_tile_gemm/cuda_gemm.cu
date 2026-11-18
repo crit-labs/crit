@@ -25,6 +25,7 @@
 #include <type_traits>
 
 #include "crit_tuning.h"
+#include "crit_kcore/device.cuh"
 #include "crit_kcore/gemm_epilogue.cuh"
 #include "crit_kcore/mma.cuh"
 #include "crit_kcore/tile.cuh"
@@ -232,33 +233,18 @@ __global__ void split_sum_kernel(Params p) {
     }
 }
 
-int g_sms = 0;
-int sms() {
-    if(!g_sms) {
-        int device = 0;
-        (void)cudaGetDevice(&device);
-        (void)cudaDeviceGetAttribute(&g_sms, cudaDevAttrMultiProcessorCount, device);
-        if(g_sms <= 0) g_sms = 1;
-    }
-    return g_sms;
-}
+// The current device's multiprocessors (the kernel core's count, one a device: the library serves every GPU of the
+// build's kind in the process).
+int sms() { return kc::multiprocessors(); }
 
 template <int TM, int TN, int WM, int WN, int BK, int STAGES, int GROUP, int EPI, class OUT>
 int launch(Params p, cudaStream_t stream) {
     using C = Cfg<TM, TN, WM, WN, BK, STAGES>;
     auto kernel = gemm_kernel<C, OUT, TM, TN, WM, BK, STAGES, GROUP, EPI>;
-    static const cudaError_t attribute =
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, C::kSmem);
-    if(attribute != cudaSuccess) {
-        (void)cudaGetLastError();
-        return 3;
-    }
-    static const int resident = [kernel] {
-        int per = 0;
-        (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, kernel, C::kThreads, C::kSmem);
-        (void)cudaGetLastError();
-        return sms() * (per > 0 ? per : 1);
-    }();
+    static kc::PerDevice<cudaError_t> optin;   // the kernel's shared memory, raised once a device
+    if(kc::shared_memory_optin(optin, kernel, C::kSmem) != cudaSuccess) return 3;
+    static kc::PerDevice<int> held;            // the CTAs the device holds at once
+    const int resident = kc::resident_ctas(held, kernel, C::kThreads, C::kSmem);
     const long long items = (long long)((p.M + TM - 1) / TM) * ((p.N + TN - 1) / TN) * p.splits;
     if(items <= 0) return 0;
     if(items > 0x7fffffffLL) return 4;

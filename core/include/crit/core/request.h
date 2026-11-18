@@ -14,7 +14,7 @@ inline constexpr std::uint32_t top_logprobs_limit = 64;
 struct LogitBias { Token token = 0; float bias = 0; };
 struct SamplingOptions {
     // Unset uses the adapter default. Temperature zero requests greedy output;
-    // top_k zero disables that filter. crit/sampling.h implements these rules.
+    // top_k zero disables that filter. core/src/sampling/README.md states these rules.
     std::optional<double> temperature, top_p;
     std::optional<std::uint32_t> top_k;
     std::optional<std::uint64_t> seed;
@@ -49,14 +49,6 @@ struct RequestOptions {
     // log-probability plus its n most likely alternatives. Requires
     // ModelInfo::token_logprobs and n <= ModelInfo::max_top_logprobs.
     std::optional<std::uint32_t> logprobs = {};
-    // Text stops matched on the decoded output (at most 16 non-empty strings of at
-    // most 256 bytes). Requires an independent text frontend. A match ends the
-    // request with Finish::stop after the token that completed it; Result::text
-    // excludes the stop text.
-    std::vector<std::string> stop_strings = {};
-    // Decode accepted tokens into Result::text and OutputEvent::text. Implied by
-    // non-empty stop_strings; requires an independent text frontend.
-    bool text = false;
 };
 // A token and its natural-log probability under the raw logits of the pass that
 // produced or scored the position: before temperature, penalties, bias and filters,

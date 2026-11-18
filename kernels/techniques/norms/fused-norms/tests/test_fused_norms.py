@@ -509,6 +509,20 @@ OTHER = {"rows": {"ELEMENTS": 1024, "SPAN": 128}, "rope": {"ELEMENTS": 16384, "S
 ELEMENTWISE = {"silu_mul", "gelu_mul", "sigmoid_mul", "stream_sum", "stream_add", "softplus_decay"}
 
 
+def test_a_shapes_first_call_compiles_what_its_other_row_counts_launch():
+    """The activation products read their knobs by the row count (untuned: four row ranges). A width's first call
+    compiles the kernel for all of them, so calls at other row counts compile nothing."""
+    from crit_plugins.testing import compiles
+    g = gen(11)
+    width = 1736   # a width no other test calls
+    fn.silu_mul(normal(g, 4, 2 * width, dtype=torch.bfloat16), out_dtype=torch.float32)
+    with compiles() as found:
+        for rows in (2, 20, 64, 130, 300):
+            x = normal(g, rows, 2 * width, scale=3, dtype=torch.bfloat16)
+            close(fn.silu_mul(x, out_dtype=torch.float32), ref_act("silu", x[:, :width]) * x[:, width:].double())
+    assert found == []
+
+
 def test_the_default_knobs_are_the_launches_from_before_the_knobs():
     # values a program 4,096 and a warp per 512 of them: (block, rows a program, warps) as the constants gave them
     for width, expected in ((64, (64, 64, 8)), (128, (128, 32, 8)), (2560, (4096, 1, 8)), (5120, (8192, 1, 16)),

@@ -25,15 +25,14 @@ Handle::Impl::~Impl() {
 // Ends this handle's use of its done request, with the request lock held; returns with it released. The caller
 // keeps its own reference. Completion was the worker's last access to the request's owners, so they are freed
 // and their charges returned here, on the consuming thread: usage() read on this thread after wait() returns or
-// the handle is destroyed no longer includes them. A retained request keeps its charges with the quarantined
-// runtime. The worker may still drop its own reference afterwards; that releases nothing.
+// the handle is destroyed no longer includes them. The worker may still drop its own reference afterwards; that
+// releases nothing.
 void Handle::Impl::settle(std::unique_lock<std::mutex>& lock) noexcept {
     const auto held = std::move(request);
-    const bool retained = held->retained;
     // An unconsumed error ends on this thread too, after the lock: its destructor may be user code.
     const auto unconsumed = std::move(held->error);
     lock.unlock();
-    if(!retained) held->release();
+    held->release();
 }
 // Waits for completion and moves the result out. With `streaming`, the published tokens are copied under the request
 // lock by `copy(result, index)`, which takes the tokens from `index` on (one, or every token published so far) and
@@ -101,14 +100,13 @@ Result Handle::wait_tokens(TokensSink sink) {
 Result Handle::wait_output(OutputSink sink) {
     if(!impl_ || !impl_->request) throw std::logic_error("request handle is empty/consumed");
     auto state = std::move(impl_);
-    // Options and the text flag are immutable after submission. The row and the text piece are copied under the
-    // lock: publication may grow the result while the sink runs.
+    // Options are immutable after submission. The row is copied under the lock: publication may grow the result
+    // while the sink runs.
     const auto& request = *state->request;
-    const bool logprobs = request.options.logprobs.has_value(), text = request.text;
+    const bool logprobs = request.options.logprobs.has_value();
     const std::size_t width = request.options.logprobs.value_or(0);
     OutputEvent event;
     std::vector<TokenLogprob> top;
-    std::string piece;
     top.reserve(width);
     return state->consume(bool(sink),[&](const Result& r,std::size_t i) {
         event.index = i; event.token = r.tokens[i];
@@ -116,13 +114,9 @@ Result Handle::wait_output(OutputSink sink) {
             event.logprob = r.logprobs[i];
             top.assign(r.top_logprobs.begin()+std::ptrdiff_t(i*width),r.top_logprobs.begin()+std::ptrdiff_t((i+1)*width));
         }
-        if(text) {
-            const std::size_t begin = i ? r.text_ends[i-1] : 0;
-            piece.assign(r.text,begin,r.text_ends[i]-begin);
-        }
         return std::size_t(1);
     },[&]{
-        event.top_logprobs = top; event.text = piece;
+        event.top_logprobs = top;
         sink(std::as_const(event));
     });
 }

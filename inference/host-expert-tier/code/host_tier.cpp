@@ -37,7 +37,7 @@ void interleave_matrix(const hi::IntMatrix& m, std::uint8_t* out) {
     for(std::size_t r = 0; r < m.rows; ++r) hi::interleave_row(m.codes + r * stride, m.cols, out + r * bytes);
 }
 
-HostExpertTier::HostExpertTier(std::vector<TierExpert> experts, ExpertPool& pool, hi::Isa isa,
+HostExpertTier::HostExpertTier(std::vector<TierExpert> experts, PoolRef pool, hi::Isa isa,
                                std::size_t rows_per_task)
     : pool_(pool), isa_(isa), rows_per_task_(std::max<std::size_t>(64, rows_per_task)) {
     if(experts.empty()) throw std::invalid_argument("host_tier: no experts");
@@ -47,7 +47,7 @@ HostExpertTier::HostExpertTier(std::vector<TierExpert> experts, ExpertPool& pool
     for(std::size_t i = 0; i < experts.size(); ++i) set_expert(i, experts[i]);
 }
 
-HostExpertTier::HostExpertTier(std::size_t hidden, std::size_t inter, ExpertPool& pool, hi::Isa isa,
+HostExpertTier::HostExpertTier(std::size_t hidden, std::size_t inter, PoolRef pool, hi::Isa isa,
                                std::size_t rows_per_task)
     : pool_(pool), isa_(isa), rows_per_task_(std::max<std::size_t>(64, rows_per_task)), hidden_(hidden), inter_(inter) {
     if(!hidden_ || !inter_ || hidden_ % 64 || inter_ % 64)
@@ -193,7 +193,7 @@ void HostExpertTier::run_chunks(float* out, std::size_t ldo) {
         h.resize(k1 - k0);
         for(int t = 0; t < tokens; ++t) {
             const float* g = gu + std::size_t(t) * gu_rows;
-            for(std::size_t k = k0; k < k1; ++k) h[k - k0] = hi::swiglu_declared(g[k], g[inter_ + k]);
+            hi::swiglu_rows(g + k0, g + inter_ + k0, k1 - k0, h.data());
             std::int8_t* values = &h_values_[(c * hi::kMaxTokens + std::size_t(t)) * ldh];
             float* scales = &h_scales_[(c * hi::kMaxTokens + std::size_t(t)) * hs_ld];
             if(e.intermediate == Intermediate::e2m1x2)

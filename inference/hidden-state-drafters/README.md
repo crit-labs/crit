@@ -82,7 +82,6 @@ the first would keep drafts accepted a quarter of the time.
 confidence in FP64, `truncate`, and `ConfidenceCut` as `DeviceCut`: bins of decayed (tested, accepted) counts, a
 round's labels staged by `commit_round` (overwritten by a truncation's second commit) and folded in at the next
 round's draft before its threshold, all on the device, so the cut learns without the host. A round's rows decay in one product where the host decays after each row: the sums differ by FP64 rounding.
-The CUDA glue in hidden_drafters.cu (over device-speculative-round's control block) is not needed by it.
 
 ## What the code supplies
 
@@ -90,7 +89,7 @@ The CUDA glue in hidden_drafters.cu (over device-speculative-round's control blo
 | --- | --- |
 | [crit_core/model/drafters.py](../../core/python/crit_core/model/drafters.py) | `read_drafter`, `read_drafter_file`, `Drafter` (Core): every published format, one tap convention |
 | [drafting.py](code/drafting.py) | Host reference: `eagle_inputs`, `block_input`, `block_drafts`, `map_tokens`, `scatter_law`, `truncate` |
-| [hidden_drafters.h](code/hidden_drafters.h) / [.cu](code/hidden_drafters.cu) | CUDA `enqueue_eagle_ingest`, `enqueue_block_input`, `enqueue_map_tokens`, `enqueue_scatter_law`, `enqueue_truncate_drafts` over device-speculative-round's control block and packed result |
+
 
 ## What the engine supplies
 
@@ -151,6 +150,5 @@ passes per round, a block drafter one pass over `block_size` positions.
 [test_hidden_drafters.py](../../tests/test_hidden_drafters.py) checks Core's reader on
 speculators EAGLE-3 / DFlash / DSpark, native EAGLE-3 (default taps), native DFlash and DSpark
 (one tap convention across formats), rejected and foreign configs and a drafter directory,
-plus the drafting rules. [hidden_drafter_tests.cpp](../../tests/inference/hidden_drafter_tests.cpp)
-checks the kernels against those rules, including catch-up after a Core truncation. No
+plus the drafting rules. No
 drafter arithmetic or speedup is qualified here.

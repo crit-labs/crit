@@ -580,7 +580,7 @@ def test_one_expert_limit_for_both_plans():
             gx.Workspace(tokens, 1, gx.MAX_EXPERTS + 1, 64, 64, dev)
 
 
-OTHER = {"decode": {"WARPS": 8, "TILES": 4, "DEPTH": 2}, "prompt": {"WARPS": 2, "TILES": 4, "DEPTH": 1, "CHUNK": 64},
+OTHER = {"decode": {"WARPS": 8, "TILES": 4, "DEPTH": 2, "READ": 1}, "prompt": {"WARPS": 2, "TILES": 4, "DEPTH": 1, "CHUNK": 64},
          "prompt-wide": {"WARPS": 8, "TILES": 2, "DEPTH": 3, "CHUNK": 64}}
 
 

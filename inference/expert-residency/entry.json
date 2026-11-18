@@ -1,9 +1,9 @@
 {
   "id": "expert-residency",
   "category": "experts",
-  "summary": "Complete expert bundles, phase-aware admission, bank planning and temporary cache memory loans",
-  "implementation_status": "native_source",
-  "implementation_scope": "Python cache/bundle ownership, phase-aware host admission, physical bank/copy planning and C++ slot/region-loan state machines; actual backend transfers and projection are external",
+  "summary": "Complete expert bundles, phase-aware admission and bank planning",
+  "implementation_status": "reference",
+  "implementation_scope": "Python cache/bundle ownership, phase-aware host admission and physical bank/copy planning; actual backend transfers and projection are external",
   "agent_guidance": {
     "use_when": "Routed weight reuse can repay cache management when preferred-device capacity is limited",
     "avoid_when": "Reuse is poor, weights already fit, or exact direct access/static placement is cheaper",
@@ -11,8 +11,6 @@
       "Byte-bounded ready-object cache with leases and settled-only eviction",
       "Fixed-slot complete-component upload/publication and protected uses",
       "C++ slot generations, upload/use identities and sequence exhaustion guards",
-      "Temporary contiguous cache-region loans, transactional survivor relocation, private operation owners, settled return and graph-binding invalidation",
-      "Slot loans over any set of slots so an owner that lent memory to the cache (unreachable KV positions, an idle workspace) reclaims it with the same lifecycle and gets it back empty",
       "Phase-aware population/read-only reuse with protected reads that preserve replacement ages",
       "Compatible-layout bank budgets including guards/alignment and dual-contiguous component copy runs",
       "Original-demand occurrence/unique counts with caller-measured phase/mode transfer and synchronization costs"
@@ -44,14 +42,6 @@
       "purpose": "Python byte-cache leases and complete-component bundle directory with retained upload/use identities"
     },
     {
-      "path": "inference/expert-residency/code/settled_slots.h",
-      "purpose": "C++ content directory with protected acquisitions, settled publication, transactional region loans/relocation, retained operation owners and binding generations"
-    },
-    {
-      "path": "inference/expert-residency/code/loan_example.cpp",
-      "purpose": "Runnable native host copy/scratch/refill example with one retained Core backing reservation"
-    },
-    {
       "path": "inference/expert-residency/code/planning.py",
       "purpose": "Phase-aware exact cache admission, compatible bank sizing, coalesced component ranges and cost observations"
     },
@@ -61,36 +51,24 @@
     }
   ],
   "requires": {
-    "hardware": "Python 3.11+ for reference protocols; C++20 for the slot directory; device integration requires its chosen backend",
+    "hardware": "Python 3.11+ for reference protocols; device integration requires its chosen backend",
     "model": "Expert-routed computation with caller-defined revisions, layouts, encodings and complete bundles",
     "workload": "Repeated routed demands under a bounded memory envelope; profitability depends on locality and miss costs"
   },
   "contract": {
     "input": "Representation-complete expert keys and exact extents; fixed slot-indexed component encodings/extents, reserved backing owners and ticket-bound enqueue receipts; explicit workload phase, complete bank geometry/budget and unique expert/slot copy pairs",
-    "output": "Owner leases or ready slot/generation maps and unique bundle upload/use identities; admission, physically sized bank spans, component transfer ranges and phase/mode observations; generation-bound loan/copy/borrow handles and exclusive scratch extents",
-    "ownership": "Directory owns serialized metadata and retains caller-reserved backing/staging owners. Every read remains protected until settlement; complete upload publication waits for all component copies. Register loan copies/borrowers before enqueue and retain the directory until close succeeds. Ambiguous submissions require physical quiescence before settlement; loans keep their backing reservation charged once.",
+    "output": "Owner leases or ready slot/generation maps and unique bundle upload/use identities; admission, physically sized bank spans, component transfer ranges and phase/mode observations",
+    "ownership": "Directory owns serialized metadata and retains caller-reserved backing/staging owners. Every read remains protected until settlement; complete upload publication waits for all component copies. Retain the directory until close succeeds. Ambiguous submissions require physical quiescence before settlement.",
     "failure": "Reject protected/loading exhaustion, duplicate or foreign tickets/uses, missing components, stale receipts, encoding/extent mismatch and unsettled publication. Failed copies leave overwritten content empty. C++ sequence exhaustion cannot wrap identities.",
     "core_boundary": "Consumer owns expert representation/reuse policy. Core supplies byte reservations, allocation and CUDA readiness."
   },
   "dependencies": [
-    "Python standard library",
-    "C++20 standard library for settled_slots.h",
-    "crit Core resources for loan_example.cpp only"
+    "Python standard library"
   ],
   "symbols": [
     "ExpertKey",
     "ExpertCache",
     "ExpertLease",
-    "crit::techniques::SettledSlots",
-    "begin_loan",
-    "begin_slot_loan",
-    "on_loan",
-    "begin_relocation",
-    "activate_loan",
-    "acquire_loan",
-    "settle_loan_use",
-    "begin_return",
-    "reclaim_loan",
     "BundleComponent",
     "BundleTicket",
     "BundleReceipt",
@@ -119,7 +97,7 @@
     "heterogeneous-expert-dispatch"
   ],
   "validation": {
-    "host": "Python fixtures cover bundle publication, phase/bank/copy planning and failures. Native CPU fixtures cover loan admission, overlap/fragmentation, protected regions, partial relocation failure, independent sessions, retained owners, binding invalidation and 1,250 real byte-copy loan/return cycles, and reverse slot loans (scattered slots, a live reader blocking a reclaim, survivor relocation, empty return, 500 repeated requests); the example checks Core reservation lifetime.",
+    "host": "Python fixtures cover bundle publication, phase/bank/copy planning and failures.",
     "native": "Native cache transfers, device publication, encoded projections and model behavior remain unqualified by host fixtures",
     "performance": "Unmeasured for a native engine; host fixture success is not a speed claim"
   },

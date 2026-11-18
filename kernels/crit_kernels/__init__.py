@@ -37,7 +37,9 @@ def parser():
                            "names: a simple, correct "
                            "gemv/gemm in bf16 and fp8); allowed from a run's fourth candidate on")
     make.add_argument("--run", type=Path, help="the run folder, for --starter")
-    sub.add_parser("list", help="crit's kernels (kernels/techniques/<family>/<id>/kernel.json): their operations and structures")
+    sub.add_parser("list", help="crit's kernels (kernels/techniques/<family>/<id>/kernel.json): their operations and "
+                                "structures, each structure's exactness level (declared, exact, row-exact, "
+                                "repeatable) and, for an exact one, the structure whose bits it has")
     built = sub.add_parser("build", help="Build one of crit's kernels for this machine's GPU (with a tuning table, or "
                                          "its default knobs) and print where it went")
     built.add_argument("kernel")
@@ -109,9 +111,14 @@ def main(argv=None):
                          None if args.column_invariant is None else args.column_invariant == "yes", args.tolerance,
                          args.starter, args.run, repeatable=args.repeatable == "yes")
         elif args.command == "list":
+            from . import exactness
             from .build import manifests
             result = {kid: {"family": m["family"], "title": m.get("title"), "language": m["language"],
                             "operations": m.get("operations", []), "structures": sorted(m.get("structures", {})),
+                            "exactness": {s: exactness.level(spec)
+                                          for s, spec in sorted(m.get("structures", {}).items())},
+                            "bits_of": {s: spec["bits_of"] for s, spec in sorted(m.get("structures", {}).items())
+                                        if spec.get("bits_of") is not None},
                             "folder": str(folder)} for kid, (folder, m) in manifests().items()}
         elif args.command == "build":
             from .build import build, read_tuning

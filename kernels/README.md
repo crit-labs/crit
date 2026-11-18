@@ -50,14 +50,14 @@ level 1 for every engine.
 | Family | Kernels |
 | --- | --- |
 | `projections` | [decode-gemv](techniques/projections/decode-gemv/README.md) (CUDA GEMVs and gemv-triton, one Triton GEMV for every weight format), [mma-rows](techniques/projections/mma-rows/README.md), [pinned-gemm](techniques/projections/pinned-gemm/README.md), [fixed-tile-gemm](techniques/projections/fixed-tile-gemm/README.md), [fp8-block-rows](techniques/projections/fp8-block-rows/README.md), [exl3-rows](techniques/projections/exl3-rows/README.md) (EXL3 checkpoints at their stored bits), [gguf-rows](techniques/projections/gguf-rows/README.md) (GGUF block formats at their stored bits) |
-| `attention` | [paged-kv-attention](techniques/attention/paged-kv-attention/README.md), [latent-attention](techniques/attention/latent-attention/README.md) (latent (MLA) decode and verify windows over a paged cache of compressed rows) |
+| `attention` | [paged-kv-attention](techniques/attention/paged-kv-attention/README.md), [latent-attention](techniques/attention/latent-attention/README.md) (latent (MLA) decode and verify windows over a paged cache of compressed rows), [sparse-indexer](techniques/attention/sparse-indexer/README.md) (a sparse attention's key selection: index heads' weighted ReLU scores, top k by radix select) |
 | `recurrence` | [recurrent-scans](techniques/recurrence/recurrent-scans/README.md) |
 | `experts` | [grouped-experts](techniques/experts/grouped-experts/README.md), [int-block-experts](techniques/experts/int-block-experts/README.md), [topk-routing](techniques/experts/topk-routing/README.md) |
 | `norms` | [fused-norms](techniques/norms/fused-norms/README.md) |
 | `starters` | [workbench-starter](starters/workbench-starter/README.md) (the workbench's starter matmul) |
 
 ```sh
-crit kernels list                                        # every kernel: operations, structures
+crit kernels list                                        # every kernel: operations, structures, their exactness
 crit kernels build ID                                    # build for this GPU with the default knobs (cached)
 crit kernels sweep ID --model CHECKPOINT --out TUNING    # tune the knobs for a model on this GPU
 crit kernels gates ID --model CHECKPOINT                 # NaN, repeats, tile edges, FP32 sums, every arch's limits
@@ -67,7 +67,8 @@ CRIT_KERNEL_TUNING=TUNING crit serve ...                 # or, for a try, a fold
 ```
 
 `crit kernels sweep` builds every knob configuration of each structure a kernel declares (many configurations a
-build, picked at run time), checks each against the operation's reference and against crit's row-invariance contract
+build, picked at run time), checks each against the operation's reference and, for a structure that is
+[row-exact or higher](#exactness), against crit's row-invariance contract
 (a row's bits never depend on the rows beside it), times it on the checkpoint's own shapes (and the stacked matrices engines load, such as q, k and v together) with a cold L2 (`--matrices` with a candidate's serve --check report: exactly the shapes its engine loaded,
 from quantized-projections' `matrices` fact), and writes
 `TUNING/<ID>.json` (the table per shape and row count) and a report against the default knobs. A knob that changes
@@ -88,6 +89,40 @@ A mechanism mined from an engineered kernel is welcome as a core block or a stru
 better](#salvage)), with the notice its license asks for where code is adapted.
 [TEMPLATES.md](TEMPLATES.md) is the contract: the folder, kernel.json, knobs in CUDA and Triton code, the core, the
 sweep's bench.
+
+<a id="exactness"></a>
+
+## Exactness and speed
+
+The fastest way to compute a row is often not the most exact one: a GEMM that splits K by the row count fills a
+narrow matrix's tiles, the tensor cores sum a tile in their own order, a prompt reader reduces a whole chunk at once.
+So every structure states what the bits of a row may depend on, its `exactness` in kernel.json, and an engine
+chooses between a kernel's structures by the level it asks for:
+
+| Level | A row's bits | Examples |
+| --- | --- | --- |
+| `declared` | the kernel's declared order: the same on the CPU tier, in the decode rows and in a prompt GEMM of that order | int-block-experts' and fp8-block-rows' `rows`, `gemm` and `gemm-staged`, gguf-rows |
+| `exact` | another structure's, named by `bits_of`: a prompt row has the bits of the same token decoded | mma-rows' `prompt-tile` (of `decode-tile`), paged-kv-attention's `fused` (of `window`), grouped-experts' `prompt` (of `decode`) |
+| `row-exact` | fixed by the shape and the tuning: never the rows beside it, the row count or a prompt chunk's length | decode-gemv's GEMVs, fixed-tile-gemm's `mm`, pinned-gemm, paged-kv-attention's `prefill`, fused-norms |
+| `repeatable` | the same for the same call; they may follow the row count, the chunk's length or the tile | fixed-tile-gemm's `mm-split`, the `gemm-native` structures, paged-kv-attention's `flash-prefill`, recurrent-scans' chunked prefills |
+
+A level keeps what the levels below it keep, and no structure is below `repeatable`. Of the 80 structures 12 are
+declared, 12 exact, 43 row-exact and 13 repeatable; `crit kernels list` shows each one's level (`exactness`, and
+`bits_of` for the exact ones). An engine asks for a level per phase, `decode` (its decode and verify rows) and
+`prompt` (its prompt rows), and where it asks for none the run's quality mode gives it: `preserve` asks `exact`,
+`speed` asks `repeatable` (`crit_kernels.exactness`: `setting()`, `for_quality_mode()`, and `choices()` for the
+structures of a kernel a phase may then run). For the decode rows `exact` and `row-exact` are one level, the bits a
+prompt row is compared with. An engine package states its levels in its configuration (`"exactness"`), Core tells
+them to the plugins before any is made, the engine's facts say what was asked and what each plugin keeps, and an
+engine that keeps less than it asks is refused ([plugins and exactness](../docs/PLUGINS.md#exactness)); `crit run`
+writes the quality mode's level into every candidate's configuration for a phase it states none for. A plugin that
+can run a phase's rows through more than one structure chooses by the level where its option is left `auto`
+(quantized-projections' and host-expert-arithmetic's `prompt_gemm`, the attention plugins' `prompt_reader`,
+gguf-projections' `prompt`, the expert plugins' `prompt_arithmetic`, the recurrences' `prompt_rows`), and every
+plugin states the level its loaded rows keep ([the table](../docs/PLUGINS.md#exactness)).
+
+The level is about the order of the sums, not the precision of the operands: W4A4 or W8A8 activations, 8-bit KV pages
+and FP16 operands are a structure's arithmetic, which its `what` and its operation state.
 
 <a id="one-gpu"></a>
 
@@ -165,9 +200,6 @@ kernel in the workbench, with the library as its yardstick. Three checks catch m
   varies (plain steps, shorter verify passes near the end of a reply) gives the same token other arithmetic. Running
   every decode step at one width, the unused columns as padding, removes the dependence for every kernel in the step
   at once. crit's templates keep a row's bits independent of the row count by contract (order knobs).
-- **Native integration.** A native engine calls a library or a built template on its own streams and buffers
-  ([foreign stream](examples/foreign-stream/README.md): a scoped binding for a native launcher's thread-local stream
-  slot).
 
 The [kernel profile](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md#kernel-profile) shows which
 operations cost most.

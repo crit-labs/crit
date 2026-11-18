@@ -9,6 +9,9 @@ SCORE = "chat-score-v1"
 LOGPROBS = "chat-logprobs-v1"
 TOKENIZE = "chat-tokenize-v1"
 PLAIN = "chat-plain-v1"
+# A server that declares it takes crit.prompt_cache false: smoke's requests prefill every prompt token, so each
+# test reads the paths it names whatever the engine's prompt cache holds.
+PROMPT_CACHE = "chat-prompt-cache-v1"
 CONCURRENT = "chat-concurrent-v1"
 
 
@@ -90,8 +93,10 @@ class Client:
         alternatives, reasoning tokens included, the stop token left out."""
         body = {"model": self._model(), "messages": messages, "temperature": 0, "max_tokens": max_tokens,
                 "logprobs": True, "top_logprobs": top}
-        if plain:
-            body["crit"] = {"decode": "plain"}
+        crit = {**({"decode": "plain"} if plain else {}),
+                **({"prompt_cache": False} if PROMPT_CACHE in self.capabilities() else {})}
+        if crit:
+            body["crit"] = crit
         data = self.call("/v1/chat/completions", body)
         entries = ((data["choices"][0].get("logprobs") or {}).get("content")) or []
         rows = [(e["crit_token_id"], e["logprob"],

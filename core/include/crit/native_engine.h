@@ -22,7 +22,7 @@ void* open_bound(BoundFactory, const void* context, const char* configuration_js
 }
 // What a BoundFactory builds from its configuration (Core's step engine: its "engine" settings and "facts").
 struct NativeEngine {
-    // The native bridge retains this with the runtime, including quarantine after a failed final drain.
+    // The native bridge retains this with the runtime.
     // For example, model files or allocations the engine borrows. Construction work must already be owned
     // by the backend/model: the bridge can attach this owner only after the factory returns successfully.
     std::shared_ptr<void> owner;
@@ -75,7 +75,7 @@ struct HostAttachment final : RequestContext {
 };
 
 namespace native_api {
-inline constexpr int abi_version = 5;
+inline constexpr int abi_version = 7;
 // Called with the tokens published since its last call (a step's or a round's, in order); nonzero cancels the request.
 // request_wait takes a null callback for a request nobody listens to: its waiter then wakes only when it ends.
 using TokenCallback = int (*)(void* user, const std::int32_t* tokens, int count);
@@ -119,7 +119,7 @@ const char* last_error() noexcept;
 // The C ABI crit_core_steps exports (src/runtime/step_library.cpp), which crit_core.native.StepEngine loads. An engine
 // is never a library of its own: Core's loader (crit_core.engine) assembles a package's plugins and opens their model
 // on Core's step engine with crit_engine_open_steps (crit/step_engine.h). Functions:
-//   int   crit_engine_abi()                     ABI version (5)
+//   int   crit_engine_abi()                     ABI version (7)
 //   void* crit_engine_open_steps(config_json, callbacks)
 //   void* crit_engine_open_steps_rounds(config_json, callbacks, rounds)
 //                                               engine handle, or null (crit_engine_last_error)

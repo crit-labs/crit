@@ -1,6 +1,7 @@
 // EXL3 projections (exl3_rows.h): the Hadamard rotations, the tiles decoded into a GEMV, and a decode of the tiles.
 #include "exl3_rows.h"
 #include "crit_tuning.h"
+#include "crit_kcore/device.cuh"
 #include "crit_kcore/exl3.cuh"
 #include "crit_kcore/mma.cuh"
 #include "crit_kcore/load.cuh"
@@ -203,20 +204,23 @@ __global__ void __launch_bounds__(WARPS * 32) tiles_kernel(const std::uint16_t* 
 }
 
 // Shared bytes a block of this configuration takes.
+constexpr int shared_bytes(int words, int cta, int rows, int stages, int g) {
+    return stages * rows * (cta * words + 8 * g * 8) * 4;
+}
 template <int BITS, bool HALF, int WARPS, int STRIPS, int ROWS, int STAGES, int G>
-constexpr int tiles_shared() { return STAGES * ROWS * (WARPS * STRIPS * kc::exl3_words(BITS, HALF) + 8 * G * 8) * 4; }
+constexpr int tiles_shared() {
+    return shared_bytes(kc::exl3_words(BITS, HALF), WARPS * STRIPS, ROWS, STAGES, G);
+}
+constexpr int kWideGroups = kPromptRows / 8;   // row groups of a prompt's slab
+constexpr int kBlockShared = 99 * 1024;        // the shared memory a block may take on every architecture built
 
 template <int CB, int BITS, bool HALF, int WARPS, int STRIPS, int ROWS, int STAGES, int G>
 cudaError_t launch_one(const Matrix& w, const __half* xh, int M, float* yr, int parts, cudaStream_t stream) {
     constexpr int bytes = tiles_shared<BITS, HALF, WARPS, STRIPS, ROWS, STAGES, G>();
     auto kernel = tiles_kernel<CB, BITS, HALF, WARPS, STRIPS, ROWS, STAGES, G>;
     if constexpr (bytes > 48 * 1024) {
-        static bool raised = false;   // the opt-in above 48 KiB, once a process and configuration
-        if (!raised) {
-            const cudaError_t e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
-            if (e != cudaSuccess) return e;
-            raised = true;
-        }
+        static kc::PerDevice<cudaError_t> optin;   // the opt-in above 48 KiB, once a device and configuration
+        if (const cudaError_t e = kc::shared_memory_optin(optin, kernel, bytes); e != cudaSuccess) return e;
     }
     const int tiles_out = w.out / 16;
     const dim3 grid((tiles_out + WARPS * STRIPS - 1) / (WARPS * STRIPS), parts);
@@ -224,11 +228,22 @@ cudaError_t launch_one(const Matrix& w, const __half* xh, int M, float* yr, int 
                                    w.in, yr, w.out);
 }
 
+// A prompt's slab: the configuration with kWideGroups row groups a tile, where its block fits.
+template <int CB, int BITS, bool HALF, int WARPS, int STRIPS, int ROWS, int STAGES>
+cudaError_t launch_wide(const Matrix& w, const __half* xh, int M, float* yr, int parts, cudaStream_t stream) {
+    if constexpr (tiles_shared<BITS, HALF, WARPS, STRIPS, ROWS, STAGES, kWideGroups>() <= kBlockShared)
+        return launch_one<CB, BITS, HALF, WARPS, STRIPS, ROWS, STAGES, kWideGroups>(w, xh, M, yr, parts, stream);
+    else
+        return cudaErrorInvalidConfiguration;   // slab_rows() said kMaxRows
+}
+
 template <int CB, int BITS, bool HALF>
 cudaError_t launch_rate(const Matrix& w, const __half* xh, int M, float* yr, int parts, cudaStream_t stream) {
-    switch (crit_lookup_gemv(w.out, w.in, M)) {
+    switch (crit_lookup_gemv(w.out, w.in, M > kMaxRows ? kMaxRows : M)) {
 #define CRIT_EXL3_CASE(index, warps, split_knob, strips, rows, stages)                                       \
     case index:                                                                                              \
+        if (M > kMaxRows)                                                                                    \
+            return launch_wide<CB, BITS, HALF, warps, strips, rows, stages>(w, xh, M, yr, parts, stream);     \
         return M > 8 ? launch_one<CB, BITS, HALF, warps, strips, rows, stages, 2>(w, xh, M, yr, parts, stream) \
                      : launch_one<CB, BITS, HALF, warps, strips, rows, stages, 1>(w, xh, M, yr, parts, stream);
         CRIT_CONFIGS_gemv(CRIT_EXL3_CASE)
@@ -283,14 +298,15 @@ cudaError_t enqueue_rotate(const void* rows, int in_kind, int64_t ld_in, int M, 
                                    ld_out, parts, part_stride);
 }
 
-// The (block's strips, rows a stage, knob SPLITS) of this matrix's configuration at `rows` rows.
-void plan_of(const Matrix& w, int rows, int& cta, int& per_stage, int& knob, int& warps_a_block) {
-    cta = 8, per_stage = 4, knob = 0, warps_a_block = 4;
-    switch (crit_lookup_gemv(w.out, w.in, rows < 1 ? 1 : rows)) {
+// The (block's strips, rows a stage, knob SPLITS, warps, stages in flight) of this matrix's configuration at `rows`
+// rows.
+void plan_of(const Matrix& w, int rows, int& cta, int& per_stage, int& knob, int& warps_a_block, int& in_flight) {
+    cta = 8, per_stage = 4, knob = 0, warps_a_block = 4, in_flight = 3;
+    switch (crit_lookup_gemv(w.out, w.in, rows < 1 ? 1 : rows > kMaxRows ? kMaxRows : rows)) {
 #define CRIT_EXL3_PLAN(index, warps, split_knob, strips, stage_rows, stages) \
     case index:                                                              \
         cta = warps * strips, per_stage = stage_rows, knob = split_knob;     \
-        warps_a_block = warps;                                               \
+        warps_a_block = warps, in_flight = stages;                           \
         break;
         CRIT_CONFIGS_gemv(CRIT_EXL3_PLAN)
 #undef CRIT_EXL3_PLAN
@@ -301,8 +317,8 @@ void plan_of(const Matrix& w, int rows, int& cta, int& per_stage, int& knob, int
 
 int splits(const Matrix& w, int rows, int multiprocessors) {
     const int tiles_in = w.in / 16, tiles_out = w.out / 16;
-    int cta = 8, per_stage = 4, knob = 0, warps = 4;
-    plan_of(w, rows, cta, per_stage, knob, warps);
+    int cta = 8, per_stage = 4, knob = 0, warps = 4, stages = 3;
+    plan_of(w, rows, cta, per_stage, knob, warps, stages);
     const int blocks = (tiles_out + cta - 1) / cta;
     // 0: enough blocks for 48 warps a multiprocessor, each split holding at least two stages' rows
     int s = knob > 0 ? knob : (48 * multiprocessors / warps + blocks - 1) / blocks;
@@ -311,8 +327,17 @@ int splits(const Matrix& w, int rows, int multiprocessors) {
     return s < 1 ? 1 : s > tiles_in ? tiles_in : s > 65535 ? 65535 : s;
 }
 
+int slab_rows(const Matrix& w) {
+    if (!valid(w)) return kMaxRows;
+    int cta = 8, per_stage = 4, knob = 0, warps = 4, stages = 3;
+    plan_of(w, kMaxRows, cta, per_stage, knob, warps, stages);
+    const int wide = shared_bytes(kc::exl3_words(w.bits, w.half_bit), cta, per_stage, stages, kWideGroups);
+    return wide <= kBlockShared ? kPromptRows : kMaxRows;
+}
+
 cudaError_t enqueue_tiles(const Matrix& w, const void* xh, int M, float* yr, int parts, cudaStream_t stream) {
-    if (!valid(w) || !xh || !yr || M < 1 || M > kMaxRows || parts < 1 || parts > w.in / 16) return cudaErrorInvalidValue;
+    if (!valid(w) || !xh || !yr || M < 1 || M > slab_rows(w) || parts < 1 || parts > w.in / 16)
+        return cudaErrorInvalidValue;
     const auto* x = static_cast<const __half*>(xh);
     if (w.codebook == 0) return launch_tiles<kc::kExl3Inst>(w, x, M, yr, parts, stream);
     if (w.codebook == 1) return launch_tiles<kc::kExl3Mcg>(w, x, M, yr, parts, stream);

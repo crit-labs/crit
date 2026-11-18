@@ -9,8 +9,8 @@ exports of [constraint_library.cpp](../runtime/constraint_library.cpp) (listed i
 on the model plugin's `StepRow.allowed`, checks the token the row produced and
 appends the one Core keeps. Native code:
 [constraints.h](../../include/crit/constraints.h), [constraints.cpp](constraints.cpp)
-and [grammar.cpp](grammar.cpp); masks reach sampling through
-`Sampler::sample(logits, AllowedTokens{...}, ...)` in [sampling.h](../../include/crit/sampling.h).
+and [grammar.cpp](grammar.cpp); masks reach sampling before the
+[sampling rules](../sampling/README.md).
 Python: [`crit_core.constraints`](../../python/crit_core/constraints). Tests:
 [constraints_tests.cpp](../../../tests/core/constraints_tests.cpp) and
 [test_core_constraints.py](../../../tests/test_core_constraints.py), among others.
@@ -24,7 +24,6 @@ Python: [`crit_core.constraints`](../../python/crit_core/constraints). Tests:
 | `ChoiceGrammar`, `ChoiceMatcher` | A finite set of byte strings, whatever the token segmentation |
 | `JsonObjectMatcher`, `JsonLimits` | One JSON object of any shape (JSON mode) |
 | `ByteGrammar`, `GrammarMatcher`, `GrammarLimits` | A compiled byte grammar (JSON schema, regex, EBNF) through a bounded Earley recognizer |
-| `AllowedTokens`, `Sampler::sample`/`distribution` overloads | Mask everything outside `allowed()` before the sampling rules |
 | `constraint_readout` | Restricted probabilities and the allowed set's mass under the raw softmax |
 | `crit_core.constraints` (Python) | `compile_language`, `CompilerCache`, `PreparationService`, `byte_vocabulary(Tokenizer)`, `matches`, `json_object_matches` |
 
@@ -32,7 +31,6 @@ Python: [`crit_core.constraints`](../../python/crit_core/constraints). Tests:
 
 ```cpp
 #include <crit/constraints.h>
-#include <crit/sampling.h>
 using namespace crit::core;
 
 // Once per model: the decoded bytes of every token (crit_core.constraints.byte_vocabulary gives them in Python).
@@ -41,9 +39,8 @@ auto vocabulary = std::make_shared<const ByteVocabulary>(decoded_pieces, eos);
 std::unique_ptr<TokenMatcher> matcher = std::make_unique<JsonObjectMatcher>(vocabulary);
 // matcher = std::make_unique<GrammarMatcher>(ByteGrammar::load(artifact), vocabulary);
 // Per position, after reading logits:
-const std::vector<Token> allowed = matcher->allowed();
-const Choice choice = sampler.sample(logits, AllowedTokens{allowed}, params, history);
-matcher->append(choice.token);   // on accept; rewind(n) together with KV on rollback
+const std::vector<Token> allowed = matcher->allowed();   // every other id is masked before the sampling rules
+matcher->append(token);          // the sampled token, on accept; rewind(n) together with KV on rollback
 ```
 
 The matcher and the model describe the same accepted output: append, rewind and
@@ -110,14 +107,11 @@ On the device, `allowed_bits` fills a bitmask (bit `t % 32` of word `t / 32`) th
 [token-sampling](../../../inference/token-sampling/README.md)'s `enqueue_mask` applies
 to logits before selection.
 
-
-`Sampler::sample(logits, AllowedTokens{ids}, params, history, column, top)` and
-the matching `distribution` overload mask every id outside `ids` to -inf before
+Every id outside the allowed set is masked to -inf before
 step 2 (bias) of the [sampling order](../sampling/README.md), so temperature,
 top_k, top_p and min_p see only allowed tokens. Greedy ties go to the lowest
-allowed id. The reported log-probability and `top` alternatives stay raw over
-the whole row. Ids must be nonempty, sorted, unique and in range. The overloads
-allocate nothing per call.
+allowed id. The reported log-probability and alternatives stay raw over
+the whole row.
 
 ## Compiling languages (Python)
 

@@ -96,8 +96,11 @@ Triton kernels for attention over paged KV caches, used by crit's attention-stat
   page kind, `BLOCK_N` and `CHUNK` only: not on the rows beside it, the warps or the tile (the same alone, in any
   window, packed, fused or split). Prompt chunks (`prefill`): the chunk as one row, its positions split on the device
   over `SPLITS` programs a tile (merged) or one; a token's bits follow its chunk's length (int8_qk chunks stay on the
-  Triton flash prompt chunk). A fused launch's sync words live in a module workspace of the device: fused launches of
-  one device run on one stream at a time.
+  Triton flash prompt chunk). The module's workspaces (a split launch's partials where the caller gives none, a fused
+  launch's ring of states and sync words, a prompt chunk's state between its passes) are one a device and owner:
+  launches inside `with owner(key):` take workspaces of their own, so two engines of a process may launch, and replay
+  their captured graphs, side by side (`release(key)` drops them once the owner's graphs are gone). Launches of one
+  owner, and the launches outside any owner, run one at a time on a device.
 
 - **Sliding windows** (`attend(..., sliding=W)`, `prefill(..., sliding=W)`, every structure but block lists): a
   token at position t sees positions t - W + 1 .. t, as models with local layers define their window. The pieces,
@@ -132,7 +135,9 @@ bits).
 
 `kernel.json` lists thirteen structures; their knobs are read at each call from the build's tuning
 (`_crit_tuning.knobs()`). Every default reproduces the kernel's hand-set rules, so an untuned build runs exactly what
-it ran before; a knob of 0 means "the rule".
+it ran before; a knob of 0 means "the rule". `write` and `prefill` read their knobs by a row count that is no constant
+of their kernels (the tokens of a step or a prompt chunk): a shape's first call compiles the kernel for every knob set
+its row counts can read, so a prompt chunk of another length compiles nothing.
 
 | Structure | Key | Rows | Knobs |
 | --- | --- | --- | --- |
@@ -145,10 +150,10 @@ it ran before; a knob of 0 means "the rule".
 | `prefill` | D, HQ, HKV, PAGE, KIND, INT8 | chunk tokens | `BLOCK_M` (64), `BLOCK_N` (0: 64 up to 128-wide heads, 32 past), `WARPS` (4): order knobs; `STAGES` (0: three with int8_qk, two) |
 | `flash-window` | D, DV, HQ, HKV, PAGE, KIND | columns | `CHUNK` (0: 1,024), `BLOCK_N` (0: 32), `ROWS` (0: 32), `WARPS` (0: four): order knobs; `STAGES` (0: one past 128-wide heads, two up to them) |
 | `flash-fused` | D, DV, HQ, HKV, PAGE, KIND | columns | `STAGES` as `flash-window`'s, `VSPLIT` (0: two from 128 value columns, else one); the tile, block and chunk `flash-window`'s |
-| `flash-prefill` | D, HQ, HKV, PAGE, KIND, INT8 | chunk tokens | `BLOCK_M`, `BLOCK_N` (0: 32), `WARPS` (0: four), `STAGES` (0: one past 128-wide heads, two up to them), `SPLITS` (0: about two programs an SM); `row_invariant: false` |
+| `flash-prefill` | D, HQ, HKV, PAGE, KIND, INT8 | chunk tokens | `BLOCK_M`, `BLOCK_N` (0: 32), `WARPS` (0: four), `STAGES` (0: one past 128-wide heads, two up to them), `SPLITS` (0: about two programs an SM); `exactness: repeatable` |
 | `cuda-window` | D, DV, HQ, HKV, PAGE, KIND | columns | `CHUNK` (0: the GPU's rule, below), `BLOCK_N` (0: 16 over 16-bit pages, 32 over 8-bit pages): order knobs; `WARPS` (row groups of 16 rows; 0: the rule's tile shape, below), `STAGES` (0: one over 16-bit pages and 8-bit pages read in registers, keys and values in buffers of their own; two over 8-bit pages), `VWARPS` (warps a row group; 0: the rule's), `CONVERT` (8-bit pages; 0: in registers, 1: a shared 16-bit block), `RAMP` (0: none; an order knob, below) |
 | `cuda-fused` | D, DV, HQ, HKV, PAGE, KIND | columns | `WARPS`, `STAGES`, `VWARPS`, `CONVERT` as `cuda-window`'s, `VSPLIT` (0: one); the block and chunk `cuda-window`'s |
-| `cuda-prefill` | D, HQ, HKV, PAGE, KIND, INT8 | chunk tokens | `BLOCK_N` (0: 32), `WARPS` (0: four), `STAGES` (0: two), `SPLITS` (0: about two programs an SM); `row_invariant: false` |
+| `cuda-prefill` | D, HQ, HKV, PAGE, KIND, INT8 | chunk tokens | `BLOCK_N` (0: 32), `WARPS` (0: four), `STAGES` (0: two), `SPLITS` (0: about two programs an SM); `exactness: repeatable` |
 
 KIND is the page kind's number (0 16-bit, 1 `fp8`, 2 `fp8:row`, 3 `int8`), INT8 whether the chunk takes `int8_qk`.
 

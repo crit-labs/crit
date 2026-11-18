@@ -59,8 +59,8 @@ activation quantizations.
 | [`implementation.py`](code/implementation.py) | `ResidencyGroup`, `ResidencyPlan`, `prefix_residency_plans`; `Route`, `partition`, `combine`; `ReadySlot`, `MixedRoute`, `MixedSourcePlan`, `mixed_source_plan`; `execute_mixed`, which calls `quantize(activations)` once then `project(encoded, plan)` once |
 | [`measured_dispatch.py`](code/measured_dispatch.py) | `CalibrationKey`, `TimingCurve`, `DispatchCalibration`, `plan_dispatch` returning a `DispatchDecision` of every `DispatchCandidate`; optional `HostMemoryCosts`, `admit_host` and `revalidate_memory` |
 | [`routing.py`](code/routing.py) | `Routing`, one description of top-k routing; `route`, its host reference for one token; `routing_from_config`, which maps the config.json fields Core parses |
-| [`cpu_routes.cu`](code/cpu_routes.cu) | The post and scatter kernels of a layer's CPU routes over host-work-mailbox's `Mailbox`, and their torch binding (built at load) |
-| [`device_dispatch.py`](code/device_dispatch.py) | `DeviceDispatch` (post, forward, calibrate, status), `DeclaredRoutes` (the baseline device part), the extension's build |
+| [`cpu_routes.cu`](code/cpu_routes.cu) | The post and scatter kernels of a layer's CPU routes over the slots of one of the host's handoffs (Core's `crit_plugins.host`), and their torch binding (built at load) |
+| [`device_dispatch.py`](code/device_dispatch.py) | `DeviceDispatch` (post, forward, calibrate, status), `KernelRoutes` (the grouped-experts kernel device part, `kernel_part` checks the bundle layouts), `DeclaredRoutes` (the torch fallback), the extension's build |
 
 `decision.best` is `None` when no feasible measured split exists; the engine then
 uses its ordinary exact path. Rejected splits keep their bytes and reasons. The
@@ -110,9 +110,10 @@ The experts slot's device form splits a layer between the device and
 [host-expert-tier](../host-expert-tier/README.md)'s CPU tier by the slot table an expert cache's plan writes
 ([experts:bundles](../../docs/PLUGINS.md#device-extensions)): a slot >= 0 is the device part's, -2 the CPU's. One post kernel (`cpu_routes.cu`) lists the layer's -2
 routes in route order, writes their expert keys, tokens and the tokens' FP32 rows into a
-[host-work-mailbox](../host-work-mailbox/README.md) slot and posts it (or answers it itself when the layer has none);
-the mailbox's service thread runs the tier's C handler (`crit_tier_serve`) on the tier's worker pool; the stream joins
-(the capturable join `measure_joins` finds cheaper here) and a scatter kernel copies the CPU's rows into the device
+slot of a handoff (Core's `crit_plugins.host`, the [host-work-mailbox](../host-work-mailbox/README.md) technique)
+and posts it (or answers it itself when the layer has none); the host's service thread runs the tier's C handler
+(`crit_tier_serve`) on the host's worker pool; the stream joins (the capturable join the host measured cheaper on
+the device) and a scatter kernel copies the CPU's rows into the device
 part's route rows, which its combine then sums in route order. One post and one join a layer: the next layer's input
 needs this layer's sum, so a decode step cannot join less often; a layer with no CPU routes pays its post kernel and a
 join that passes at once. `post(layer, x, ids, slots)` posts early, right after the slot table is known and before the
@@ -123,8 +124,17 @@ Both parts compute host-expert-arithmetic's declared integer block order (NVFP4 
 `declared` arithmetic), so a token's bits never depend on which part computed which route: the plugin's tests check
 random admission quotas against the all-device result bit for bit, eagerly and in replayed graphs. The device part is
 an object with `route_outputs(layer, x, ids, store, slots)` and `combine(y, ids, weights)` (the experts plugin's
-`experts:routes`); the baseline here, `DeclaredRoutes`, is the declared order in torch on the device (exact, slow), a
-baseline to replace with the experts plugin's own declared kernel. `forward_bundles` takes a cache's store and slot
+`experts:routes`). By default (`device_part: auto`) it is `KernelRoutes`, crit's grouped-experts kernel in its
+declared arithmetic, reading the CPU tier's bundles where they are (both use the experts:bundles layout); where the
+kernel does not build, `DeclaredRoutes`, the declared order in torch one route at a time (exact, far too slow to
+serve), and the facts say which runs and why. A prompt chunk sends no route to the CPU (an expert cache stages its
+misses), so it need not match the CPU's bits: with `prompt_arithmetic: tensor` a call past `max_tokens` without -2
+routes runs the kernel's tensor arithmetic (BF16 tensor cores, W4A4 for NVFP4 bundles) instead of the integer order,
+the prompt path's time where the declared order bounds prefill. Its rows differ from the decode rows' in the last
+bits, which a `speed` engine's honesty bound allows and a `preserve` engine's exact one does not, so the option's
+default `auto` is `tensor` only where the engine asks `repeatable` prompt rows
+([exactness](../../docs/PLUGINS.md#exactness)) and the device kernel is there; decode rows and
+any call with CPU routes keep the declared order. `forward_bundles` takes a cache's store and slot
 table; `forward` uses the plugin's own: the first `resident` experts of each layer in a device store, the rest on the
 CPU. `quota_table(tokens)` measures, with the loaded experts on this machine, a layer's time with k misses copied over
 the link, j computed on the CPU (plus the join) and both at once, and returns
@@ -298,9 +308,9 @@ resident. Measure such a split against the exact one: it pays when the host's fa
 or the saved copies outweigh the drift, which the run's quality budget judges.
 
 **Host work inside a captured decode.** To run the host share mid-graph, post it
-through the [host-work mailbox](../host-work-mailbox/README.md), which supplies the
-doorbell protocol, measured join choice, release and failure answering, and the
-rules for host worker pools fed from the device.
+through one of the host's handoffs (Core's `crit_plugins.host`; the
+[host-work mailbox](../host-work-mailbox/README.md) technique), which supplies the
+doorbell protocol, measured join choice, release and failure answering.
 
 ## Costs and validation
 
@@ -328,7 +338,7 @@ saturate host DRAM bandwidth, the device pays each miss's transfer at the measur
 host-to-device rate (`crit eval probe`), and past the share where host time exceeds
 the transfer it replaces, decode slows down. Sweep the share on the mixed suite. Where
 the first CPU read of host memory registered with the device is slow (seen under
-WSL2), touch every page once at load (Core's `HostBlock::touch`). (For scale only: on
+WSL2), touch every page once at load. (For scale only: on
 one machine with 6 Ryzen 5 9600 cores, an engine with 3.1 MB NVFP4 experts reached
 about 36 GB/s with six threads, near the host's DRAM rate, and gained most with about
 60% of its misses on the CPU, while a second engine on the same machine measured its

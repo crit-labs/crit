@@ -35,7 +35,7 @@ void logit_rows(const torch::Tensor& logits, int64_t rows) {
     TORCH_CHECK(logits.size(0) == rows, "token-sampling: ", rows, " logits rows, not ", logits.size(0));
 }
 
-// One Request row, as Core's resolve_sampling would hold a request of the sampler slot's rules: no bias, penalties
+// One Request row of the sampler slot's rules: no bias, penalties
 // or suppression (repetition 1). position is the draw position of column 0; a round rewrites it on the device.
 torch::Tensor pack_request(double temperature, double top_p, double min_p, int64_t top_k, uint64_t seed, int64_t stream,
                            int64_t position) {

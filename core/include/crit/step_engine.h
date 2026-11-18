@@ -1,5 +1,5 @@
 #pragma once
-// Step engines: a ConcurrentModel whose model code lives behind C callbacks, for engines written in another language
+// Step engines: a Model whose model code lives behind C callbacks, for engines written in another language
 // (crit_core.native.StepEngine drives one from Python through ctypes). Core's runtime keeps everything else: the
 // scheduler with mixed prefill/decode batches, admission, request options, stop tokens, cancellation, retirement and
 // the scoring barrier. The engine implements a step: given one row per scheduled request, it computes them together
@@ -48,15 +48,13 @@ struct StepProgress {
     std::int32_t prefill_complete = 0, drafted = 0;
 };
 // Core's CommitDecision for one row of the last step: the tokens Core kept (stops and the output limit trim them),
-// whether the request ends or was cancelled (or failed). `discard` is always 0 for a step engine: Core discards only a
-// descendant of a step still in flight when its predecessor ended, and a step engine runs one step at a time (it
-// declares no async batches, so its profile runs none in flight), so every step it ran is kept, or its request ends
-// and retire() drops the sequence. Core fails the engine if a discard ever reached one: a model need not undo a step
-// (a replayed prompt chunk's state written in place, crit_plugins.prompt_graphs).
+// whether the request ends or was cancelled (or failed). Core runs one step at a time, so every step it ran is kept,
+// or its request ends and retire() drops the sequence. A model need not undo a step (a replayed prompt chunk's state
+// written in place, crit_plugins.prompt_graphs).
 struct StepDecision {
     std::uint64_t session = 0;
     std::uint32_t accepted = 0;
-    std::int32_t terminal = 0, cancelled = 0, discard = 0;
+    std::int32_t terminal = 0, cancelled = 0;
 };
 // Native decode rounds (optional: step_engine's `rounds`, crit_engine_open_steps_rounds). A decode step whose rows' sessions all sit in the round's
 // slots runs without the step callback: Core launches the engine's round for those slots (a captured device graph
@@ -65,7 +63,7 @@ struct StepDecision {
 // packed in slots 0 .. rows - 1 and names their sessions in slot_session (0 for a slot Core must not run natively);
 // every other step (prompt chunks, a row outside the slots, a constrained request, a request asking for more
 // alternatives than the rounds rank) goes to `step` as before. After a native round Core calls `commit` only when a
-// decision trims, ends, cancels or discards a row, with last = {rows, width, 1} naming that round (last[2] is 0 after
+// decision trims, ends or cancels a row, with last = {rows, width, 1} naming that round (last[2] is 0 after
 // a `step`).
 struct StepRounds {
     void* user = nullptr;
@@ -105,6 +103,10 @@ struct StepRounds {
     const std::int64_t* top_ids = nullptr;
     const float* top_logprobs = nullptr;
     std::uint32_t top = 0;
+    // Optional, written by the engine from any thread: while the word is nonzero a decode step goes to `step` although
+    // a round could run it, so the engine's own code runs between two rounds (to hand device memory another program
+    // took back, say). The engine clears the word in that step.
+    const std::uint32_t* boundary = nullptr;
 };
 
 // Every callback but release returns 0 on success; any other value fails the engine, with error()'s message. Optional

@@ -21,14 +21,14 @@ from .. import jsonfile
 from ..files import ModelFilesError, _read_regular, model_files
 
 CONFIG_NAME = "config.json"
-MAX_CONFIG_BYTES = jsonfile.MAX_CONFIG_BYTES   # 16 MiB, shared with crit_core.text and the native loaders
+MAX_CONFIG_BYTES = jsonfile.MAX_CONFIG_BYTES   # 16 MiB, shared with crit_core.text
 MAX_CONFIG_DEPTH = 128   # nested objects and arrays, the root included (the native JSON reader's default)
 MAX_LAYERS = 1 << 16
 MAX_PATH_SHOWN = 200   # characters of a nested key path named in an error
 U32_MAX = (1 << 32) - 1
 TOKEN_MIN, TOKEN_MAX = -(1 << 31), (1 << 31) - 1
 INT64_MIN, UINT64_END = -(1 << 63), 1 << 64   # the integers the native reader can type
-# Which keys spell each field, in order: config_keys.json, the one table this reader and the C++ reader share.
+# Which keys spell each field, in order: config_keys.json.
 _KEYS = json.loads((Path(__file__).with_name("config_keys.json")).read_text(encoding="utf-8"))
 TEXT_SECTION_KEYS = tuple(_KEYS["text_sections"])
 LENGTH_KEYS = tuple(_KEYS["position_lengths"])

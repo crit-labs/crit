@@ -38,6 +38,13 @@ class FusedNorms(rows.Rows):
             found["kernel_lacks"] = self.lacking
         return {"norms": found}
 
+    def exactness(self):
+        """The level its rows keep where crit's kernel runs them (crit_kernels.exactness): every structure of
+        fused-norms is row-exact, its order set by the row's width alone, and decode and prompt calls run the same
+        structures, so a prompt row has the bits of the same row decoded: exact, beside row-exact decode rows. The
+        torch fallback states nothing."""
+        return {"decode": "row-exact", "prompt": "exact"} if self.kernel is not None else {}
+
 
 def create(context, options, parts):
     return FusedNorms(load_kernel(KERNEL, folder=Path(__file__).parent))

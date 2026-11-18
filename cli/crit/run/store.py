@@ -130,6 +130,39 @@ def plugin_package(folder, model_path, configuration, what, device_file=None):
                          "(docs/PLUGINS.md)") from None
 
 
+def _exactness_rank(level):
+    """A row exactness level's place on the kernels' scale (a higher rank keeps more)."""
+    from crit_kernels.exactness import rank
+    return rank(level)
+
+
+def _asked_rows(evidence):
+    """The exactness an origin engine asked of its rows when a result was measured, for the brief; empty where the
+    card's result states none."""
+    asked = evidence.get("exactness")
+    return f", decode rows {asked['decode']}, prompt rows {asked['prompt']}" if asked else ""
+
+
+def with_exactness(configuration, mode):
+    """A plugin package's configuration with the exactness of its rows stated in full, {"decode": level, "prompt":
+    level} (crit_kernels.exactness): the levels the configuration asks, and for a phase it leaves out the level of
+    the run's quality mode (preserve: exact; speed: repeatable, the fastest way of every plugin). So every candidate
+    says the level it was built and measured at, and Core holds the engine to it wherever it is served
+    (docs/PLUGINS.md#exactness). An external engine's configuration, which Core does not load, is left as it is."""
+    from .external import spec_of
+    if not isinstance(configuration, dict) or spec_of(configuration) is not None:
+        return configuration
+    from crit_kernels.exactness import setting
+    asked = configuration.get("exactness")
+    if asked is not None and not isinstance(asked, (str, dict)):
+        raise ValueError('configuration.exactness is a level (declared, exact, row-exact, repeatable) or '
+                         '{"decode": level, "prompt": level}')
+    try:
+        return {**configuration, "exactness": setting(asked, mode)}
+    except ValueError as exc:
+        raise ValueError(f"configuration.exactness: {exc}") from None
+
+
 def configuration_text(configuration):
     """A candidate's configuration.json as crit writes it: into a build folder before the recipe's command runs, and
     into a package that supplies none."""
@@ -529,6 +562,9 @@ class RunStore:
                     raise ValueError(f"configuration.recon differs from {recon.RECON_JSON}; change its frozen block, with "
                                      f"the reason in {recon.RECON_MD}, before the candidate")
                 configuration, extensions = {**configuration, "recon": frozen}, {**extensions, "recon": recon_ref}
+            # The exactness of the engine's rows, stated in full: what the configuration asks, and the run's quality
+            # mode's level for a phase it leaves out.
+            configuration = with_exactness(configuration, quality_mode(run["spec"]["correctness"]))
             engine_package(source, run["spec"]["model_path"], configuration, "The candidate's source",
                            run_device_file(run), launchable=False)
             plans.check_engine(plan, configuration)
@@ -665,7 +701,13 @@ class RunStore:
             # can read it; a supplied copy must be exactly that configuration.
             supplied = source / "configuration.json"
             if supplied.is_file() and read_json(supplied) != candidate["configuration"]:
-                raise ValueError("Package configuration.json differs from the candidate configuration")
+                held = read_json(supplied)
+                differs = sorted(key for key in set(held) | set(candidate["configuration"])
+                                 if held.get(key) != candidate["configuration"].get(key)) if isinstance(held, dict) else []
+                raise ValueError("Package configuration.json differs from the candidate configuration"
+                                 + (f" in {', '.join(differs)}" if differs else "") + ": the package carries "
+                                 "candidate.json's configuration, which crit completed with the recon's frozen block "
+                                 "and the exactness of its rows, or no configuration.json (crit then writes it)")
             destination = safe_path(folder, "package")
             manifest_path = safe_path(folder, "package/manifest.json")
             with staging(root, "package") as staged:
@@ -952,6 +994,8 @@ class RunStore:
         amended = amendments(root, bounds["segment_id"])
         quality_budget, exactness = quality_terms(correctness, amended)
         mode = quality_mode(correctness)
+        from crit_kernels.exactness import setting
+        levels = setting(None, mode)
         policy = correctness.get("weights_policy")
         capacity = run["spec"]["hardware_constraints"]["kv_tokens"]
         basis = run["spec"]["hardware_constraints"].get("context")
@@ -974,6 +1018,15 @@ class RunStore:
                 f"; these terms amend the request (approved by {amended[-1]['approved_by']})" if amended else "") +
             f". Spend it on speed. crit run ... eval applies it; pass --quality-mode {mode} --quality-budget "
             f"'{json.dumps(quality_budget)}' --exactness {exactness} to the crit eval commands you run yourself.",
+            f"- Row exactness (configuration.exactness, apart from the speculative exactness above): this mode gives a "
+            f"candidate that sets none decode rows {levels['decode']} and prompt rows {levels['prompt']}, " + (
+                "so each prompt row has the bits of the same token decoded and every plugin takes its exact path. Ask "
+                "a lower level for a phase (\"prompt\": \"row-exact\" or \"repeatable\") only with its drift measured "
+                "inside the budget" if mode == "preserve" else
+                "so every plugin takes its fastest way. Ask a higher level for a phase (\"prompt\": \"row-exact\" or "
+                "\"exact\") where the drift costs more than the speed gains") +
+            ". crit writes the levels into the candidate's configuration, the engine's facts state what each plugin "
+            "keeps, and Core refuses an engine that keeps less than it asks (docs/PLUGINS.md#exactness).",
             f"- Context: every candidate serves {capacity:,} tokens of prompt plus output, {context}. Pass --context "
             f"{capacity} to the crit eval commands you run yourself.",
             "- Weights policy: " + ({"as_stored": "the target weights are used as stored; declare weights in every "
@@ -996,13 +1049,19 @@ class RunStore:
                 f", folder {source['path']}" if source["path"] else "")
             other = sorted({e["quality_mode"] for e in origin["evidence"]} - {mode})
             evidence = ", ".join(f"{e['path']} ({e['measured_with']}, {e['gpu']}, {e['model']}, quality mode "
-                                 f"{e['quality_mode']})" for e in origin["evidence"]) or "none published"
+                                 f"{e['quality_mode']}{_asked_rows(e)})" for e in origin["evidence"]) or "none published"
+            lower = sorted({f"{phase} rows {e['exactness'][phase]}" for e in origin["evidence"] if e.get("exactness")
+                            for phase in ("decode", "prompt")
+                            if _exactness_rank(e["exactness"][phase]) < _exactness_rank(levels[phase])})
             origin_line = (
                 f"\nOrigin engine: this run starts from the crit-hub engine {origin['engine']} ({origin['title']}), source "
                 f"{where}. Make it the first candidate as imported (\"lineage\": \"{LINEAGE}\" in the proposal): its "
                 f"small Eval is the run's baseline. Its published results: {evidence}"
                 + (f". Results judged in quality mode {' and '.join(other)} are not judged in this run's, {mode}: their "
                    "numbers do not compare with this run's Evals" if other else "")
+                + (f". It was measured asking {' and '.join(lower)}, below the {levels['decode']} decode rows and "
+                   f"{levels['prompt']} prompt rows this run's mode gives: as imported it keeps its own level only if "
+                   "its configuration states it" if lower else "")
                 + ". resolve records whether this run's model is the exact checkpoint it was measured on; when not, "
                 "recon --compare says what candidate 1 must absorb.\n")
         budget = bounds["limits"].get("candidate_budget")

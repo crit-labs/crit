@@ -189,3 +189,18 @@ def test_the_blocks_gemm_is_within_fp32_accumulation_of_the_exact_product():
         half = torch.full((tokens, rows), float("nan"), device=dev, dtype=torch.bfloat16)
         fb.gemm_native(table, jobs, rows, tokens - tokens // 3, act_codes, act_scales, group, half, mx=False)
         assert torch.equal(half, out.to(torch.bfloat16)), case   # one rounding of the same sums
+
+
+def test_the_quantized_values_are_the_codes_times_their_scales():
+    """quantized_values: one launch gives, bit for bit, quantize()'s codes times their group scales as BF16, for FP32
+    and BF16 rows, both scale kinds, an all-zero group and values that saturate."""
+    g = torch.Generator().manual_seed(11)
+    for dtype in (torch.float32, torch.bfloat16):
+        for kind, group in ((fb.MX, 32), (fb.AMAX, 32), (fb.AMAX, 64)):
+            x = (torch.randn(19, 704, generator=g) * torch.rand(19, 1, generator=g) * 40).to(dev, dtype)
+            x[3, 64:96] = 0
+            x[5, 7] = 3.0e4
+            codes, scales = fb.quantize(x, group, kind)
+            want = (codes.view(torch.float8_e4m3fn).float().view(19, -1, group) * scales[..., None]).view(19, 704)
+            found = fb.quantized_values(x, group, kind)
+            assert found.dtype == torch.bfloat16 and torch.equal(found, want.to(torch.bfloat16)), (dtype, kind, group)

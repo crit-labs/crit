@@ -27,7 +27,7 @@
   "libraries": [],
   "structures": {
     "decode": {
-      "what": "items of 8 routes (decode rows): a warp owns row tiles of one expert, 4-bit codes decoded through a shared byte table, the routes' operands read straight from global memory, weights DEPTH blocks ahead",
+      "what": "items of 8 routes (decode rows): a warp owns row tiles of one expert, 4-bit codes decoded through a shared byte table, the routes' operands read straight from global memory, weights DEPTH blocks ahead, 128 bytes of a row a request (READ)",
       "call": "route_outputs",
       "rows": [
         1,
@@ -47,7 +47,7 @@
         "hidden",
         "inter"
       ],
-      "row_invariant": true,
+      "exactness": "row-exact",
       "knobs": {
         "WARPS": {
           "values": [
@@ -79,6 +79,15 @@
           ],
           "default": 0,
           "what": "64-k blocks of weights in flight a warp (0: the format's depth, 2-6 by format and tiles)"
+        },
+        "READ": {
+          "values": [
+            0,
+            1,
+            2
+          ],
+          "default": 0,
+          "what": "how a warp asks for its weights: 1 a 64-k block at a time (32 bytes of a row of a 4-bit format, 64 of FP8), 2 128 bytes of a row at a time (4 blocks of a 4-bit format, 2 of FP8; BF16 is 128 bytes a block either way), 0 the launch's choice: 2 for a pass of 256 k values or more"
         }
       },
       "yardstick": {
@@ -105,7 +114,8 @@
         "hidden",
         "inter"
       ],
-      "row_invariant": true,
+      "exactness": "exact",
+      "bits_of": "decode",
       "knobs": {
         "WARPS": {
           "values": [
@@ -169,7 +179,8 @@
         "hidden",
         "inter"
       ],
-      "row_invariant": true,
+      "exactness": "exact",
+      "bits_of": "decode",
       "knobs": {
         "WARPS": {
           "values": [
@@ -215,10 +226,12 @@
       "bench": "bench.py:PromptWide"
     },
     "declared": {
-      "what": "crit's integer block order (nvfp4 W4A4, int4 W4A8) for the CPU tier's bits: a half-warp per output row, dp4a block sums, the halving tree; the declared quantizers and SwiGLU"
+      "what": "crit's integer block order (nvfp4 W4A4, int4 W4A8) for the CPU tier's bits: a half-warp per output row, dp4a block sums, the halving tree; the declared quantizers and SwiGLU",
+      "exactness": "declared"
     },
     "plan-combine": {
-      "what": "the routes grouped by expert (a one-block bitonic sort up to 1,024 routes, items from a stable sort beyond) and each token's routes summed in route order"
+      "what": "the routes grouped by expert (a one-block bitonic sort up to 1,024 routes, items from a stable sort beyond) and each token's routes summed in route order",
+      "exactness": "row-exact"
     }
   }
 }

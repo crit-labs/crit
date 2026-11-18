@@ -3,8 +3,10 @@
 // token. One call computes one layer's CPU routes: each distinct expert's gate/up rows once for all of its tokens,
 // the declared SwiGLU, the intermediate quantized as declared, then the down rows; every route's unweighted output
 // row, which the device sums with its routing weights in its own route order (async-expert-contributions). The work
-// is split into row ranges of experts over an ExpertPool, so a layer with a few experts streams each at every
-// core's rate; any split gives the same bits.
+// is split into row ranges of experts over the host's worker pool (Core's, crit_plugins.host: pool.h), so a layer
+// with a few experts streams each at every core's rate; any split gives the same bits. The rows are DRAM-bound, so
+// the pool's job is to keep one thread per physical core streaming expert bytes for the whole layer at a cost far
+// below one expert's rows.
 //
 // Inputs come quantized (compute: a TierBatch of int8 values and block scales, as a device quantized them) or as FP32
 // token rows (compute_inputs: an InputBatch), which the tier quantizes per route with that route's expert's declared
@@ -15,12 +17,12 @@
 // one rounding, the device's `v * post[n]`.
 //
 // Wiring (README): the device expert cache's admission limits (a quota by miss count from split.py on this tier's
-// measured times) send the misses past the link's share here; the device posts them through a host-work-mailbox slot,
-// the handler calls compute_inputs() on the service thread, and the stream's join (measure_joins()) waits only where
-// the layer reads the rows.
+// measured times) send the misses past the link's share here; the device posts them through a slot of one of the
+// host's handoffs (crit_plugins.host), the handler calls compute_inputs() on the host's service thread, and the
+// stream's join waits only where the layer reads the rows.
 #pragma once
-#include "expert_pool.h"
 #include "host_int.h"
+#include "pool.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +34,7 @@ namespace crit::techniques::host_tier {
 
 namespace hi = crit::techniques::host_int;
 namespace hn = crit::techniques::host_nvfp4;
+using crit::host::PoolRef;
 
 // How a matrix's input is quantized, as the device quantizes it: E2M1 x 2 per 16 under a global divisor (W4A4), or
 // INT8 per block of 16 or 32 (W4A8).
@@ -92,11 +95,12 @@ struct TierStats {
 
 class HostExpertTier {
 public:
-    // isa: the integer path (default the fastest this CPU runs). rows_per_task: rows of one expert in a pool task.
-    HostExpertTier(std::vector<TierExpert> experts, ExpertPool& pool, hi::Isa isa = hi::best_int_isa(),
+    // pool: the host's worker pool (a PoolRef; a crit::host::Pool where the pool is linked). isa: the integer
+    // path (default the fastest this CPU runs). rows_per_task: rows of one expert in a pool task.
+    HostExpertTier(std::vector<TierExpert> experts, PoolRef pool, hi::Isa isa = hi::best_int_isa(),
                    std::size_t rows_per_task = 128);
     // An empty table for experts of [2 * inter][hidden] and [hidden][inter], filled by set_expert.
-    HostExpertTier(std::size_t hidden, std::size_t inter, ExpertPool& pool, hi::Isa isa = hi::best_int_isa(),
+    HostExpertTier(std::size_t hidden, std::size_t inter, PoolRef pool, hi::Isa isa = hi::best_int_isa(),
                    std::size_t rows_per_task = 128);
     // Expert `index` of the table (grown as needed). Throws std::invalid_argument for other shapes.
     void set_expert(std::size_t index, const TierExpert& expert);
@@ -105,7 +109,7 @@ public:
 
     void compute(const TierBatch& batch);
     void compute_inputs(const InputBatch& batch);
-    // A copy of the counters (taken under their lock: a mailbox's service thread computes while others read).
+    // A copy of the counters (taken under their lock: the host's service thread computes while others read).
     TierStats stats() const {
         const std::lock_guard lock(stats_mutex_);
         return stats_;
@@ -118,7 +122,7 @@ public:
     std::size_t inter() const noexcept { return inter_; }
     hi::Isa isa() const noexcept { return isa_; }
 
-    // A host-work-mailbox payload of FP32 token rows (InputBatch): header {count, tokens, route capacity, token
+    // A handoff slot's payload of FP32 token rows (InputBatch): header {count, tokens, route capacity, token
     // capacity} (four uint32; serve_inputs reads the first two), experts int32 [routes], token
     // int32 [routes], x FP32 [tokens][hidden], out FP32 [routes][hidden], each part 64-byte aligned; `routes` and
     // `tokens` its capacities.
@@ -135,7 +139,7 @@ private:
     void run_chunks(float* out, std::size_t ldo);
     std::vector<TierExpert> experts_;
     std::vector<bool> present_;
-    ExpertPool& pool_;
+    PoolRef pool_;
     hi::Isa isa_;
     std::size_t rows_per_task_, hidden_ = 0, inter_ = 0;
     TierStats stats_;

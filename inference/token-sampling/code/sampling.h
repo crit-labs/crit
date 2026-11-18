@@ -1,8 +1,7 @@
 // Token selection on the device after the head: greedy, or Core's sampling law over the
 // full vocabulary. Draws are Core's counter-based uniform (crit/sampling.h), so the device
-// follows crit::core::Sampler's rules and draw for the same row, parameters and history.
-// Rules are held in double as Core's SamplingParams holds them and processing runs in IEEE
-// double as Core's does. Speculative verification uses the same law per column.
+// follows Core's sampling rules (core/src/sampling/README.md) and draw for the same row, parameters and
+// history. Rules are held in double and processing runs in IEEE double, as the rules state. Speculative verification uses the same law per column.
 //
 // Every row picks its path on the device, so one captured launch serves every request:
 //   * the fast path, greedy rows and 1 <= top_k <= kMaxTopK: ceil(vocab / 4096) stage blocks per
@@ -33,7 +32,7 @@ struct Params {
     double temperature = 0.;    // <= 0 selects greedily
     double top_p = 1.;          // in (0, 1]
     int top_k = 0;              // 0 = no top-k filter (the full vocabulary)
-    std::uint32_t stream = 0;   // Core's draw stream (SamplingParams::stream), e.g. the choice index
+    std::uint32_t stream = 0;   // Core's draw stream, e.g. the choice index
     std::uint64_t seed = 0;
     std::uint64_t position = 0; // Core's draw position: committed outputs before this selection
 };
@@ -56,9 +55,8 @@ cudaError_t enqueue_mask(float* logits, int vocab, int stride, const std::uint32
                          cudaStream_t stream);
 
 // ---- Core's whole law on the device -------------------------------------------------------------
-// Device-resident, one per sequence, set from crit::core::resolve_sampling (the rules as Core's
-// SamplingParams holds them, in double). Steps 2 to 5 and 7 to 12 of Core's Sampler
-// (core/src/sampling/README.md) run on the device; constraint masks go through enqueue_mask first.
+// Device-resident, one per sequence: a request's resolved rules, in double. Steps 2 to 5 and 7 to 12 of
+// Core's sampling rules (core/src/sampling/README.md) run on the device; constraint masks go through enqueue_mask first.
 // Pointers are device memory owned by the engine and borrowed by every launch.
 struct Request {
     double temperature = 0.;            // <= 0 greedy (lowest id on ties)
@@ -100,7 +98,7 @@ struct Rows {
     const std::uint64_t* tree = nullptr;      // [requests][columns] path masks, columns <= 64; overrides staged
     const std::int32_t* tree_tokens = nullptr; // [requests][columns] node tokens
     // [requests][columns], may be null: nonzero where min_tokens suppression yields for the row, the
-    // answer of crit::core::suppression_yields for the row's constraint (a mask that allows only stops).
+    // rule of step 3 for the row's constraint (a mask that allows only suppressed tokens, such as stops).
     const std::uint8_t* yield = nullptr;
 };
 // The full law's processed rows (vocab floats per row) plus the fast path's candidate lists and results.
@@ -122,8 +120,7 @@ struct SparseLaw {
 // [requests][columns][vocab] receives the law as dense FP32 probabilities (zero outside the kept set);
 // with `sparse` non-null, sparse[r * columns + c] receives it as kept pairs: either is the q a sampled
 // draft passes to enqueue_verify.
-// Generation log-probabilities (Core's TokenLogprob over the raw rows as passed, as crit::core::Sampler
-// reports them): per row the chosen token's log-probability and the n (0..kMaxTopK) best alternatives,
+// Generation log-probabilities (Core's TokenLogprob over the raw rows as passed): per row the chosen token's log-probability and the n (0..kMaxTopK) best alternatives,
 // ranked by log-probability descending then id ascending (-1 and -inf past a row's entries). Off when
 // chosen and top_ids are null. The exps are FP32 with FP64 sums, so values agree with Core's double
 // accumulation to ~1e-6 and the rankings are Core's, ties at the boundary included. Rows masked by

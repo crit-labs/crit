@@ -39,6 +39,10 @@ first, and every page at or past the floor (one past the highest page in use) ho
 borrows that memory (lendable(): the allocation, each page tensor's place in it, the spare bytes, the floor) and hears of
 the floor through on_reserve(callback): before a page at or past the bound it last returned is handed out, and after the
 floor falls to its low bound, so it reclaims a slot before the pages under it are written.
+
+Room: a pool whose pages are all in use asks on_exhausted(callback)'s callback for some before it fails: Core's
+prompt cache (crit_plugins.prompt_cache) closes the sequence it kept longest ago, so kept sequences never cost a
+request its pages.
 """
 from crit_plugins.device import capturing
 import heapq
@@ -52,6 +56,10 @@ KERNEL_KINDS = ("bf16", "fp16", "fp8", "fp8:row", "int8")
 # Page types that store keys and values at a lower precision than the projections gave them: a prompt chunk's own
 # keys and values are kept fresh beside them for its attention (fresh_rows).
 QUANTIZED = ("fp8", "fp8:row", "int8")
+
+
+# An elastic pool backs its pages BACK at a time (4,096 tokens of 16-token pages).
+BACK = 256
 
 
 class FreshBuffer:
@@ -74,8 +82,14 @@ class KVPool:
 
     def __init__(self, layers, kv_heads, head_dim, tokens, device, dtype="bf16", *, page=16, value_dim=None,
                  step_rows=0, step_tokens=0, window=16, round_rows=8, kernels=None, spare=0, fresh=None, sliding=0,
-                 span=None, positions=None):
+                 span=None, positions=None, elastic=False, host_bytes=0):
         """spare: bytes after the pages, in the same allocation, that no page uses: a borrower's own (lendable()).
+        elastic: the pages in one elastic range of the device's memory (crit_plugins.memory) of which only the pages
+        sequences hold are backed, BACK pages of every layer at a time: a pool sized for the longest context takes
+        device memory as its sequences grow and gives it back as they close, asking the device's givers (an expert
+        cache) for the bytes first (the device memory's need()); a device that has none left refuses the page as a
+        pool whose pages are all in use does. Such a pool lends nothing (spare is 0): what it does not hold is the
+        device's. Where the driver has no virtual memory API it is one allocation as before.
         fresh: a FreshBuffer (the kv_cache plugin's, declared in its memory()) a pool of FP8 or INT8 pages keeps a
         prompt chunk's keys and values in, in the compute dtype, as write() was given them (fresh_rows). sliding: the
         layers' sliding window (0: none), which makes each sequence a ring of pages (the module's description); span:
@@ -122,14 +136,30 @@ class KVPool:
             offsets.append(end)
             end = -(-(end + math.prod(shape) * torch.empty(0, dtype=kind).element_size()) // 256) * 256
         self.spare = (end, end + int(spare))
-        self.memory = torch.zeros(end + int(spare), dtype=torch.uint8, device=self.device)
         # Each page tensor of each layer in memory: (first byte, bytes per page, pages), page p at first + p * bytes.
-        self.regions = []
+        self.regions, sizes = [], []
         for first, (shape, kind) in zip(offsets, shapes):
-            size = math.prod(shape) * torch.empty(0, dtype=kind).element_size()
-            tensors.append(self.memory[first:first + size].view(kind).view(shape))
-            per_page = size // (n * stored)
+            sizes.append(math.prod(shape) * torch.empty(0, dtype=kind).element_size())
+            per_page = sizes[-1] // (n * stored)
             self.regions += [(first + i * stored * per_page, per_page, self.pages) for i in range(n)]
+        # An elastic pool (the device memory's paged range, crit_plugins.memory): pages [0, backed) of every layer's
+        # tensors are backed, and each tensor's dump page, which every page table names for the positions a sequence
+        # does not hold.
+        self.elastic = None
+        if elastic:
+            if spare:
+                raise ValueError("an elastic pool lends nothing: the pages no sequence holds are not backed (spare 0)")
+            from crit_plugins.memory import of
+            memory = of(self.device)
+            if memory.elastic_ranges:
+                dumps = [(first + pages * per_page, first + (pages + 1) * per_page)
+                         for first, per_page, pages in self.regions if per_page]
+                self.elastic = memory.paged("attention-state", "pages", end, self.regions, kept=dumps,
+                                            host_bytes=host_bytes)
+        self.memory = self.elastic.tensor if self.elastic is not None else torch.zeros(
+            end + int(spare), dtype=torch.uint8, device=self.device)
+        for first, size, (shape, kind) in zip(offsets, sizes, shapes):
+            tensors.append(self.memory[first:first + size].view(kind).view(shape))
         self.k, self.v = tensors[0], tensors[1]
         # FP8 pools: per layer key and value scales (stored = value / scale), on the device and as numbers.
         self.scales = torch.ones(len(self.layers), 2, dtype=torch.float32, device=self.device)
@@ -144,6 +174,7 @@ class KVPool:
         self.refs = [0] * self.pages
         self.floor = 0                        # pages [floor, pages) hold no KV
         self._lender, self._bounds = None, (-1, None)
+        self._room = None                     # on_exhausted's callback: frees pages when none is left
         self.tables, self.lengths = {}, {}
         self.kernels = kernels if self.device.type == "cuda" and dtype in KERNEL_KINDS else None
         # A prompt chunk's keys and values as write() got them (pools of FP8 or INT8 pages with a fresh buffer): the
@@ -716,9 +747,26 @@ class KVPool:
         except KeyError:
             raise ValueError(f"sequence {sequence!r} is not open") from None
 
+    def on_exhausted(self, callback):
+        """callback() -> whether it freed anything: called while a page is needed and none is free, so whatever
+        keeps sequences it can do without (Core's prompt cache) closes one before the pool refuses the page."""
+        self._room = callback
+
     def _take(self):
+        while not self.free and self._room is not None and self._room():
+            pass
         if not self.free:
             raise MemoryError(f"the KV pool's {self.pages} pages of {self.page} tokens are all in use")
+        # An elastic pool backs the page before it is handed out: the device's givers make room first, and where the
+        # device has none, what keeps sequences it can do without closes one, as when no page is free.
+        while self.elastic is not None and self.free[0] >= self.backed and not self._back(self.free[0] + 1):
+            if self._room is None or not self._room():
+                # Nothing left to close: host memory holds the pages the device cannot (host_pages_mib), read
+                # through the pool's addresses over the link.
+                if self._back(self.free[0] + 1, host=True):
+                    break
+                raise MemoryError(f"the device has no memory to back more of the KV pool's pages ({self.backed} of "
+                                  f"{self.pages} pages of {self.page} tokens are backed)")
         page = self.free[0]
         if page >= self.floor:
             high = self._bounds[1]
@@ -729,6 +777,35 @@ class KVPool:
         self.refs[page] = 1
         return page
 
+    @property
+    def backed(self):
+        """The pages of every layer's tensors an elastic pool has backed (0 for a pool of one allocation)."""
+        return self.elastic.backed if self.elastic is not None else 0
+
+    def _back(self, pages, host=False):
+        """An elastic pool backs pages [0, pages) of every layer's tensors, rounded up to BACK pages: the givers of the
+        device release what its free memory lacks first (and keep free what the step in flight still takes), so the
+        pool's growth never overcommits the device. False when the device has no memory for it: nothing is backed
+        then. host: from host memory instead, within the pool's host bytes. Host work between steps (reserve, bind,
+        stage_prompt), never captured."""
+        return self.elastic.back(min(self.pages, -(-int(pages) // BACK) * BACK), host=host)
+
+    @property
+    def host_bytes(self):
+        """The bytes of the pool's pages that lie in host memory (an elastic pool that ran out of device memory)."""
+        return self.elastic.range.host_mapped if self.elastic is not None else 0
+
+    def _unback(self):
+        """An elastic pool whose sequences closed gives the backing of the pages past its floor back (keeping BACK
+        pages of room), and the device's givers grow into it."""
+        keep = min(self.pages, -(-self.floor // BACK) * BACK + BACK)
+        if self.elastic is not None and keep + BACK <= self.backed:
+            self.elastic.trim(keep)
+        elif self.host_bytes:   # pages in host memory are no room worth keeping: the next ones try the device again
+            keep = min(self.pages, -(-self.floor // BACK) * BACK)
+            if keep < self.backed:
+                self.elastic.trim(keep)
+
     def _drop(self, page):
         self.refs[page] -= 1
         if self.refs[page] == 0:
@@ -738,6 +815,7 @@ class KVPool:
                     self.floor -= 1
                 if self._lender is not None and self.floor <= self._bounds[0]:
                     self._bounds = self._lender(self.floor)
+                self._unback()
 
     def _lend_ahead(self, batch):
         """The borrower hears once of the floor a reserve will reach (the pages it takes are the lowest free ones):
@@ -763,6 +841,10 @@ class KVPool:
                 self._bounds = self._lender(top + 1)
 
     # -- lending -------------------------------------------------------------------------------------------------------
+    def backed_bytes(self):
+        """The device bytes the pool's pages take now: an elastic pool's backing, else its whole allocation."""
+        return self.elastic.bytes if self.elastic is not None else self.memory.numel()
+
     def lendable(self):
         """What a borrower may use: {"memory": the pool's one uint8 allocation, "regions": [(first byte, bytes per page,
         pages)] of each page tensor of each layer, "spare": (first, end) bytes no page ever uses, "floor": pages

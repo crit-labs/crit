@@ -5,16 +5,18 @@ A model plugin reads a matrix's stored bytes with crit_core.model.gguf_blocks.Gg
 "gguf:<TYPE>" (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, MXFP4) with tensors {"weight": uint8 [N][row bytes]}, or a stack of
 experts [E][N][row bytes] (matmul_experts); a GGUF file's dense tensors (F32, F16, BF16) load as "bf16". Decode rows
 (calls of up to DECODE_ROWS rows) run gguf-rows' gemv: int8 activations per 32 values against the stored blocks, each
-row's bits its own. Prompt rows (longer calls, or prompt=True) take the `prompt` option: dequantize (the default: the
-matrix decoded to BF16 a call, cuBLAS's GEMM; fastest today) or exact (gguf-rows' gemm: every prompt row with the bits
-it has as a decode row). Where the kernel cannot be built here, the stored values decoded on the host at load (Core's
-exact decoders) run as a BF16 matrix through torch, one row a call for decode rows, and the facts say so."""
+row's bits its own. Prompt rows (longer calls, or prompt=True) take the `prompt` option: dequantize (the matrix
+decoded to BF16 a call, cuBLAS's GEMM; fastest today) or exact (gguf-rows' gemm: every prompt row with the bits it has
+as a decode row); auto, the default, is dequantize where the engine's configuration asks repeatable prompt rows or
+nothing and exact where it asks more (its exactness, crit_plugins.kernels.asks). Where the kernel cannot be built
+here, the stored values decoded on the host at load (Core's exact decoders) run as a BF16 matrix through torch, one
+row a call for decode rows, and the facts say so."""
 from pathlib import Path
 
 from .gguf.host import GgufWeight, check_rows, dense_rows, encode_q8_0, project_rows
 
 DECODE_ROWS = 8
-PROMPTS = ("dequantize", "exact")
+PROMPTS = ("auto", "dequantize", "exact")
 
 
 class GgufMatrix:
@@ -29,10 +31,14 @@ class GgufMatrix:
 class GgufProjections:
     def __init__(self, context, options):
         self.device = getattr(context, "device", None) or "cuda"
-        self.prompt = options.get("prompt", "dequantize")
+        self.prompt = options.get("prompt", "auto")
         if self.prompt not in PROMPTS:
             raise ValueError(f"gguf-projections: prompt is one of {', '.join(PROMPTS)}, not {self.prompt!r}")
-        from crit_plugins.kernels import load_kernel
+        from crit_plugins.kernels import asks, load_kernel
+        if self.prompt == "auto":
+            # The fastest prompt path that keeps the level the engine asks of its prompt rows: cuBLAS's GEMM over the
+            # decoded matrix follows the row count (repeatable); gguf-rows' gemm has the decode rows' bits.
+            self.prompt = "dequantize" if asks("prompt") in (None, "repeatable") else "exact"
         self.kernel = load_kernel("gguf-rows", folder=Path(__file__).parent)
         self.formats = set()
         self.shapes = set()   # (N, K, format) of every matrix loaded, for crit kernels sweep --matrices
@@ -118,6 +124,19 @@ class GgufProjections:
         x16 = x.to(torch.bfloat16)
         return torch.cat([torch.mm(x16[t:t + 1], matrix.dense[int(e)].t(), out_dtype=torch.float32)
                           for t, e in enumerate(ids.tolist())]).to(dtype)
+
+    def exactness(self):
+        """The level the loaded matrices' rows keep (crit_kernels.exactness; Core compares it with the level the
+        configuration asks). On gguf-rows, decode rows are its gemv, the kernel's declared order, and prompt rows
+        its gemm in the same order with prompt exact, or cuBLAS's GEMM over the decoded matrix with dequantize, whose
+        sums follow the row count: repeatable. A dense (bf16) matrix, and every matrix where the kernel does not
+        build, runs through torch: one row a call for decode rows (row-exact), cuBLAS's GEMM for prompt rows
+        (repeatable). Nothing before a matrix is loaded."""
+        if not self.formats:
+            return {}
+        torch_rows = self.kernel is None or "bf16" in self.formats
+        return {"decode": "row-exact" if torch_rows else "declared",
+                "prompt": "repeatable" if torch_rows or self.prompt != "exact" else "declared"}
 
     def facts(self):
         exact = self.kernel is not None and self.prompt == "exact"

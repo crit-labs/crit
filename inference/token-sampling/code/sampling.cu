@@ -130,8 +130,8 @@ __device__ Proc load_proc(Lists& ls, const Request& q, const std::int32_t* stage
     return P;
 }
 
-// Core's steps 2 to 5 for token t of raw logit x in IEEE double as Core computes them (core/src/sampling/sampling.cpp,
-// prepare and penalize; explicit rounding, no contraction): bias, min_tokens suppression, repetition over the prompt
+// Core's steps 2 to 5 for token t of raw logit x in IEEE double as Core's rules state them (core/src/sampling/README.md;
+// explicit rounding, no contraction): bias, min_tokens suppression, repetition over the prompt
 // and outputs, frequency and presence over committed plus staged outputs. touched: a step changed or masked the value.
 __device__ double process_value(const Proc& P, std::int32_t t, float x, bool& touched) {
     double v = double(x);

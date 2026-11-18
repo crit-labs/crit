@@ -38,6 +38,17 @@ class HostFormTests(PluginTestCase):
         for options in ({}, {"prompt": "exact"}):
             self.assertImplements(self.assemble(options=options))
 
+    def test_prompt_auto_follows_the_level_the_engine_asks_of_its_prompt_rows(self):
+        self.addCleanup(kernels.use_exactness, None)
+        for asked, prompt in ((None, "dequantize"), ("repeatable", "dequantize"), ("row-exact", "exact"),
+                              ("exact", "exact"), ("declared", "exact")):
+            kernels.use_exactness(asked and {"decode": "row-exact", "prompt": asked})
+            plugin = self.assemble()["projections"]
+            self.assertEqual(plugin.prompt, prompt, asked)
+            self.assertEqual(plugin.exactness(), {})   # no matrix loaded: it states no level yet
+        kernels.use_exactness("exact")   # an option set to one path is that path, whatever is asked
+        self.assertEqual(self.assemble(options={"prompt": "dequantize"})["projections"].prompt, "dequantize")
+
     def test_it_projects_its_stored_values_as_the_dense_projection_does(self):
         dense = self.reference()["projections"]
         plugin = self.assemble()["projections"]
@@ -102,6 +113,9 @@ class DeviceTests(PluginTestCase):
             want3 = torch.mm(p[:3], values.t(), out_dtype=torch.float32).to(torch.bfloat16)
             self.assertTrue(torch.equal(plugin.matmul(p[:3], matrix, prompt=True), want3), name)
         self.assertEqual(set(plugin.facts()["gguf_formats"]), set(TYPES))
+        # What its rows keep: the kernel's declared order for decode rows, cuBLAS's row count for dequantized prompts.
+        self.assertEqual(plugin.exactness(), {"decode": "declared" if plugin.kernel is not None else "row-exact",
+                                              "prompt": "repeatable"})
         # The shapes crit kernels sweep --matrices tunes: every matrix as loaded.
         self.assertEqual(plugin.facts()["matrices"], [{"N": 48, "K": 512, "format": name} for name in sorted(TYPES)])
 
@@ -116,6 +130,7 @@ class DeviceTests(PluginTestCase):
         prompt = plugin.matmul(x, matrix)
         self.assertTrue(torch.equal(prompt[:8], plugin.matmul(x[:8], matrix)))
         self.assertEqual(plugin.facts()["row_invariance"], {"rows": 8, "prompt_rows": True, "prompt_exact": True})
+        self.assertEqual(plugin.exactness(), {"decode": "declared", "prompt": "declared"})
 
     def test_an_expert_stacks_rows_each_have_the_plain_calls_bits(self):
         torch = self.torch
@@ -142,6 +157,7 @@ class DeviceTests(PluginTestCase):
         y = plugin.matmul(x, matrix)
         self.assertTrue(torch.equal(y[1:2], plugin.matmul(x[1:2], matrix)))
         self.assertEqual(plugin.facts()["prompt"], "fallback")
+        self.assertEqual(plugin.exactness(), {"decode": "row-exact", "prompt": "repeatable"})
 
     def test_dense_tensors_load_as_bf16_and_other_formats_are_refused(self):
         torch = self.torch

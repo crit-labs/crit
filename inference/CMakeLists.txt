@@ -1,23 +1,17 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_inference VERSION 0.19.0 LANGUAGES CXX)
-# Inference's native examples and fixtures. Inference uses Core only through its public SDK
-# (crit::core, crit::cuda); Core never builds or includes Inference code.
+project(crit_inference VERSION 0.20.0 LANGUAGES CXX)
+# The fixtures of Inference's native code (what plugins build at load) and of its host references. Inference uses Core only through its public SDK
+# (crit::core); Core never builds or includes Inference code.
 find_package(Threads REQUIRED)
 include(CTest)
-option(CRIT_INFERENCE_CUDA "Build Inference's CUDA reference kernels and their fixtures; needs Core's CUDA backend" OFF)
+option(CRIT_INFERENCE_CUDA "Build Inference's CUDA reference kernels and their fixtures" OFF)
 option(CRIT_INFERENCE_INSTALLED_CORE "Use an installed Core SDK (CMAKE_PREFIX_PATH) instead of this checkout's core/" OFF)
 if(NOT TARGET crit::core)
   if(CRIT_INFERENCE_INSTALLED_CORE)
-    find_package(critCore 0.19.0 CONFIG REQUIRED)
+    find_package(critCore 0.20.0 CONFIG REQUIRED)
   else()
-    if(CRIT_INFERENCE_CUDA)
-      set(CRIT_CORE_CUDA ON CACHE BOOL "Build the explicit CUDA backend services" FORCE)
-    endif()
     add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../core" "${CMAKE_CURRENT_BINARY_DIR}/core")
   endif()
-endif()
-if(CRIT_INFERENCE_CUDA AND NOT TARGET crit::cuda)
-  message(FATAL_ERROR "CRIT_INFERENCE_CUDA needs Core's CUDA backend (crit::cuda); build or install Core with CRIT_CORE_CUDA=ON")
 endif()
 
 set(INFERENCE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -63,44 +57,9 @@ if(NOT BUILD_TESTING)
 endif()
 
 # Host examples and fixtures.
-crit_inference_executable(crit_recurrent_recovery_example SOURCES ${INFERENCE}/recurrent-state-recovery/code/example.cpp LINK crit::core)
-crit_inference_test(crit_recurrent_recovery_example 30 crit_recurrent_recovery_example)
-crit_inference_executable(crit_recurrent_recovery_tests SOURCES ${FIXTURES}/recurrent_recovery_tests.cpp
-  INCLUDES ${INFERENCE}/recurrent-state-recovery/code LINK crit::core)
-crit_inference_test(crit_recurrent_recovery 30 crit_recurrent_recovery_tests)
-
-crit_inference_executable(crit_grouped_example SOURCES ${INFERENCE}/quantized-projections/code/grouped_example.cpp
-  INCLUDES ${INFERENCE}/quantized-projections/code ${INFERENCE}/attention-state/code LINK Threads::Threads)
-add_test(NAME crit_grouped_example COMMAND crit_grouped_example)
-crit_inference_executable(crit_encoded_example SOURCES ${INFERENCE}/attention-state/code/encoded_example.cpp
-  INCLUDES ${INFERENCE}/quantized-projections/code ${INFERENCE}/attention-state/code LINK crit::core)
-add_test(NAME crit_encoded_example COMMAND crit_encoded_example)
 crit_inference_executable(crit_quantized_tests SOURCES ${FIXTURES}/quantized_tests.cpp
-  INCLUDES ${INFERENCE}/quantized-projections/code ${INFERENCE}/attention-state/code LINK crit::core)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
-  target_compile_definitions(crit_quantized_tests PRIVATE CRIT_GROUPED_INT_AVX2=1)
-  if(MSVC)
-    target_compile_options(crit_quantized_tests PRIVATE /arch:AVX2)
-  else()
-    target_compile_options(crit_quantized_tests PRIVATE -mavx2)
-  endif()
-endif()
-crit_inference_tests(crit_quantized_tests crit_quantized 45 arithmetic failures kv fp8_block)
-
-crit_inference_executable(crit_sampled_example SOURCES ${INFERENCE}/mtp-decode/code/sampled_example.cpp)
-add_test(NAME crit_sampled_example COMMAND crit_sampled_example)
-crit_inference_executable(crit_sampled_tests SOURCES ${FIXTURES}/sampled_tests.cpp INCLUDES ${INFERENCE}/mtp-decode/code)
-crit_inference_tests(crit_sampled_tests crit_sampled 60 arithmetic statistical transactions adaptive)
-
-crit_inference_executable(crit_constraint_example SOURCES ${INFERENCE}/token-constraints/code/example.cpp LINK crit::core)
-add_test(NAME crit_constraint_example COMMAND crit_constraint_example)
-crit_inference_executable(crit_constraint_tests SOURCES ${FIXTURES}/constraint_tests.cpp INCLUDES ${INFERENCE}/token-constraints/code
-  LINK crit::core)
-crit_inference_tests(crit_constraint_tests crit_constraint 60 arithmetic transactions sampled json_sampled grammar)
-
-crit_inference_executable(crit_inference_io_codec_tests SOURCES ${FIXTURES}/inference_io_codec_tests.cpp
-  INCLUDES ${INFERENCE}/quantized-projections/code ${INFERENCE}/ssd-expert-materialization/code LINK crit::core Threads::Threads)
-crit_inference_test(crit_inference_io_codec 30 crit_inference_io_codec_tests "${CMAKE_CURRENT_BINARY_DIR}/gather-fixture")
+  INCLUDES ${INFERENCE}/quantized-projections/code)
+crit_inference_tests(crit_quantized_tests crit_quantized 45 fp8_block)
 
 crit_inference_executable(crit_nvfp4_tests SOURCES ${FIXTURES}/nvfp4_tests.cpp INCLUDES ${INFERENCE}/quantized-projections/code)
 crit_inference_test(crit_nvfp4 30 crit_nvfp4_tests ${FIXTURES}/e4m3_scale_vectors.txt)
@@ -164,11 +123,19 @@ crit_inference_executable(crit_host_nvfp4_tests SOURCES ${FIXTURES}/host_nvfp4_t
 crit_inference_test(crit_host_nvfp4 60 crit_host_nvfp4_tests)
 crit_inference_executable(crit_host_int_tests SOURCES ${FIXTURES}/host_int_tests.cpp LINK crit_host_nvfp4 Threads::Threads)
 crit_inference_test(crit_host_int 60 crit_host_int_tests)
-# A CPU expert tier over the integer rows: a worker pool and one layer's CPU routes.
+# The host's worker pool, which is Core's (crit_plugins.host builds it on the machine at first use): its source is
+# compiled here for the fixtures that run on it.
+set(_core_host ${CMAKE_CURRENT_SOURCE_DIR}/../core/python/crit_plugins/host)
+add_library(crit_host_pool STATIC ${_core_host}/pool.cpp)
+target_include_directories(crit_host_pool PUBLIC ${_core_host})
+target_link_libraries(crit_host_pool PUBLIC Threads::Threads)
+target_compile_features(crit_host_pool PUBLIC cxx_std_20)
+crit_inference_warnings(crit_host_pool)
+# A CPU expert tier over the integer rows: one layer's CPU routes on the host's pool.
 set(_host_tier ${INFERENCE}/host-expert-tier/code)
-add_library(crit_host_tier STATIC ${_host_tier}/expert_pool.cpp ${_host_tier}/host_tier.cpp ${_host_tier}/tier_capi.cpp)
+add_library(crit_host_tier STATIC ${_host_tier}/host_tier.cpp ${_host_tier}/tier_capi.cpp)
 target_include_directories(crit_host_tier PUBLIC ${_host_tier})
-target_link_libraries(crit_host_tier PUBLIC crit_host_nvfp4 Threads::Threads)
+target_link_libraries(crit_host_tier PUBLIC crit_host_nvfp4 crit_host_pool Threads::Threads)
 target_compile_features(crit_host_tier PUBLIC cxx_std_20)
 crit_inference_warnings(crit_host_tier)
 if(MSVC)
@@ -179,76 +146,6 @@ endif()
 crit_inference_executable(crit_host_expert_tier_tests SOURCES ${FIXTURES}/host_expert_tier_tests.cpp LINK crit_host_tier)
 crit_inference_test(crit_host_expert_tier 120 crit_host_expert_tier_tests)
 
-crit_inference_executable(crit_selection_tests SOURCES ${FIXTURES}/selection_tests.cpp INCLUDES ${INFERENCE}/recorded-selection/code)
-crit_inference_test(crit_selection 30 crit_selection_tests)
-
-crit_inference_executable(crit_speculative_example SOURCES ${INFERENCE}/mtp-decode/code/speculative_example.cpp)
-crit_inference_test(crit_speculative_example 30 crit_speculative_example)
-crit_inference_executable(crit_speculative_tests SOURCES ${FIXTURES}/speculative_tests.cpp
-  INCLUDES ${INFERENCE}/mtp-decode/code ${INFERENCE}/attention-state/code LINK crit::core)
-crit_inference_tests(crit_speculative_tests crit_speculative 45 transactions failures copy attention matrix core)
-
-crit_inference_executable(crit_attention_example SOURCES ${INFERENCE}/attention-state/code/attention_example.cpp LINK crit::core)
-crit_inference_test(crit_attention_example 30 crit_attention_example)
-crit_inference_executable(crit_paged_batch_example SOURCES ${INFERENCE}/attention-state/code/batch_example.cpp LINK crit::core)
-crit_inference_test(crit_paged_batch_example 30 crit_paged_batch_example)
-crit_inference_executable(crit_recovery_scheduler_tests SOURCES ${FIXTURES}/recovery_scheduler_tests.cpp
-  INCLUDES ${INFERENCE}/attention-state/code LINK crit::core)
-crit_inference_test(crit_recovery_scheduler 30 crit_recovery_scheduler_tests)
-crit_inference_tests(crit_recovery_scheduler_tests crit_recovery_scheduler 30
-  cancel_suspended cancel_restore suspend_failure restore_failure quarantine)
-crit_inference_executable(crit_dependent_steps_tests SOURCES ${FIXTURES}/dependent_steps_tests.cpp
-  INCLUDES ${INFERENCE}/concurrent-request-execution/code LINK crit::core)
-crit_inference_tests(crit_dependent_steps_tests crit_dependent_steps 30 compare ahead cancel recovery stale commit quarantine immovable)
-crit_inference_executable(crit_attention_tests SOURCES ${FIXTURES}/attention_tests.cpp
-  INCLUDES ${INFERENCE}/attention-state/code
-  LINK crit::core ${CMAKE_DL_LIBS})
-crit_inference_tests(crit_attention_tests crit_attention 45 batches arithmetic rotary integration failures)
-crit_inference_executable(crit_rope_table_tests SOURCES ${FIXTURES}/rope_table_tests.cpp
-  INCLUDES ${INFERENCE}/attention-state/code LINK crit::core)
-crit_inference_tests(crit_rope_table_tests crit_rope_table 30 rules)
-if(Python3_Interpreter_FOUND)
-  # rope_table.h against its Python twin, rope_table.py, on the same configs.
-  add_test(NAME crit_rope_table_oracle COMMAND "${Python3_EXECUTABLE}" -B
-    "${FIXTURES}/rope_oracle.py" $<TARGET_FILE:crit_rope_table_tests>)
-  set_tests_properties(crit_rope_table_oracle PROPERTIES TIMEOUT 120)
-endif()
-
-crit_inference_executable(crit_state_pages_tests SOURCES ${FIXTURES}/state_pages_tests.cpp
-  INCLUDES ${INFERENCE}/attention-state/code LINK crit::core)
-crit_inference_tests(crit_state_pages_tests crit_state_pages 30 transactions prefixes numerics failures randomized poison)
-crit_inference_executable(crit_host_page_tier_tests SOURCES ${FIXTURES}/host_page_tier_tests.cpp
-  INCLUDES ${INFERENCE}/attention-state/code LINK crit::core)
-crit_inference_tests(crit_host_page_tier_tests crit_host_page_tier 30 restore rules)
-crit_inference_executable(crit_paged_kv_example SOURCES ${INFERENCE}/attention-state/code/paged_example.cpp LINK crit::core)
-crit_inference_test(crit_paged_kv_example 30 crit_paged_kv_example)
-
-crit_inference_executable(crit_settled_slots_tests SOURCES ${FIXTURES}/settled_slots_tests.cpp INCLUDES ${INFERENCE}/expert-residency/code)
-crit_inference_test(crit_settled_slots 30 crit_settled_slots_tests)
-crit_inference_executable(crit_table_rows_tests SOURCES ${FIXTURES}/table_rows_tests.cpp INCLUDES ${INFERENCE}/lookup-table-rows/code
-  LINK Threads::Threads)
-crit_inference_test(crit_table_rows 30 crit_table_rows_tests)
-crit_inference_executable(crit_host_tier_tests SOURCES ${FIXTURES}/host_tier_tests.cpp
-  INCLUDES ${INFERENCE}/ssd-expert-materialization/code LINK crit::core Threads::Threads)
-crit_inference_test(crit_host_tier 30 crit_host_tier_tests)
-crit_inference_executable(crit_device_metadata_tests SOURCES ${FIXTURES}/device_metadata_tests.cpp
-  INCLUDES ${INFERENCE}/concurrent-request-execution/code LINK crit::core)
-crit_inference_test(crit_device_metadata 30 crit_device_metadata_tests)
-crit_inference_executable(crit_cache_loan_example SOURCES ${INFERENCE}/expert-residency/code/loan_example.cpp LINK crit::core)
-crit_inference_test(crit_cache_loan_example 30 crit_cache_loan_example)
-
-crit_inference_executable(crit_scheduling_tests SOURCES ${FIXTURES}/scheduling_tests.cpp INCLUDES ${INFERENCE}/session-scheduling/code)
-add_test(NAME crit_scheduling_policy COMMAND crit_scheduling_tests)
-crit_inference_executable(crit_physical_batches_tests SOURCES ${FIXTURES}/physical_batches_tests.cpp
-  INCLUDES ${INFERENCE}/session-scheduling/code LINK Threads::Threads)
-crit_inference_test(crit_physical_batches 30 crit_physical_batches_tests)
-crit_inference_executable(crit_physical_speculative_example SOURCES ${INFERENCE}/mtp-decode/code/physical_batches_example.cpp)
-crit_inference_test(crit_physical_speculative_example 30 crit_physical_speculative_example)
-crit_inference_executable(crit_pipeline_tests SOURCES ${FIXTURES}/pipeline_tests.cpp
-  INCLUDES ${INFERENCE}/concurrent-request-execution/code LINK crit::core)
-crit_inference_test(crit_inference_pipeline 30 crit_pipeline_tests)
-crit_inference_executable(crit_prompt_copy_tests SOURCES ${FIXTURES}/prompt_copy_tests.cpp INCLUDES ${INFERENCE}/mtp-decode/code)
-add_test(NAME crit_prompt_copy COMMAND crit_prompt_copy_tests)
 
 if(NOT CRIT_INFERENCE_CUDA)
   return()
@@ -261,12 +158,6 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES native)
 endif()
 enable_language(CUDA)
-add_executable(crit_cuda_ahead_example ${INFERENCE}/concurrent-request-execution/code/cuda_ahead_example.cu)
-target_compile_features(crit_cuda_ahead_example PRIVATE cxx_std_20 cuda_std_20)
-target_link_libraries(crit_cuda_ahead_example PRIVATE crit::cuda)
-crit_inference_test(crit_cuda_ahead 60 crit_cuda_ahead_example)
-include(CheckLinkerFlag)
-check_linker_flag(CXX "LINKER:--wrap=crit_link_probe" CRIT_INFERENCE_HAS_LINKER_WRAP)
 
 # crit_inference_kernels(target code_dir source...): a static CUDA library exporting its code folder.
 function(crit_inference_kernels target code source)
@@ -280,94 +171,21 @@ function(crit_inference_kernels target code source)
   target_link_libraries(${target} PUBLIC CUDA::cudart)
 endfunction()
 
-set(_round_code ${INFERENCE}/device-speculative-round/code)
-crit_inference_kernels(crit_device_round_kernels ${_round_code} greedy_accept.cu)
-add_library(crit_device_round STATIC ${_round_code}/device_round.cpp)
-target_link_libraries(crit_device_round PUBLIC crit::cuda crit_device_round_kernels)
-crit_inference_warnings(crit_device_round)
-add_library(crit_device_round_fixture STATIC ${FIXTURES}/device_round_fixture.cu)
-target_link_libraries(crit_device_round_fixture PUBLIC crit_device_round_kernels)
-crit_inference_executable(crit_device_round_tests SOURCES ${FIXTURES}/device_round_tests.cpp
-  INCLUDES ${INFERENCE}/mtp-decode/code ${FIXTURES} LINK crit_device_round crit_device_round_fixture)
-crit_inference_tests(crit_device_round_tests crit_device_round 60 accept graphs readback budget)
-
-crit_inference_kernels(crit_draft_trees ${INFERENCE}/draft-trees/code draft_tree.cu)
-target_link_libraries(crit_draft_trees PUBLIC crit_device_round_kernels)
-crit_inference_executable(crit_draft_tree_tests SOURCES ${FIXTURES}/draft_tree_tests.cpp LINK crit_draft_trees)
-crit_inference_tests(crit_draft_tree_tests crit_draft_trees 120 build accept compact ranks)
-crit_inference_kernels(crit_hidden_drafters ${INFERENCE}/hidden-state-drafters/code hidden_drafters.cu)
-target_link_libraries(crit_hidden_drafters PUBLIC crit_device_round_kernels)
-crit_inference_executable(crit_hidden_drafter_tests SOURCES ${FIXTURES}/hidden_drafter_tests.cpp LINK crit_hidden_drafters)
-crit_inference_test(crit_hidden_drafters 60 crit_hidden_drafter_tests)
-
-add_executable(crit_programmatic_launch_tests ${FIXTURES}/programmatic_launch_tests.cu)
-target_compile_features(crit_programmatic_launch_tests PRIVATE cxx_std_20 cuda_std_20)
-target_link_libraries(crit_programmatic_launch_tests PRIVATE crit::cuda)
-crit_inference_test(crit_programmatic_launch 60 crit_programmatic_launch_tests)
-
-set(_recurrent_code ${INFERENCE}/recurrent-state-recovery/code)
-crit_inference_kernels(crit_recurrent_cuda ${_recurrent_code} recurrent_cuda.cu)
-crit_inference_executable(crit_recurrent_cuda_tests SOURCES ${FIXTURES}/recurrent_cuda_tests.cpp LINK crit::cuda crit_recurrent_cuda)
-crit_inference_tests(crit_recurrent_cuda_tests crit_recurrent_cuda 120 select record rejects)
-
-crit_inference_kernels(crit_draft_subset ${INFERENCE}/draft-vocabulary-subset/code subset_argmax.cu)
-crit_inference_executable(crit_draft_subset_tests SOURCES ${FIXTURES}/draft_subset_tests.cpp LINK crit::cuda crit_draft_subset)
-crit_inference_test(crit_draft_subset 60 crit_draft_subset_tests)
-
-crit_inference_kernels(crit_device_expert_cache ${INFERENCE}/device-expert-cache/code device_cache.cu runtime.cu)
-crit_inference_executable(crit_device_expert_cache_tests SOURCES ${FIXTURES}/device_expert_cache_tests.cpp LINK crit_device_expert_cache)
-crit_inference_test(crit_device_expert_cache 120 crit_device_expert_cache_tests)
-crit_inference_executable(crit_expert_store_tests SOURCES ${FIXTURES}/expert_store_tests.cpp
-  INCLUDES ${INFERENCE}/device-expert-cache/code LINK crit::core CUDA::cudart)
-crit_inference_test(crit_expert_store 60 crit_expert_store_tests)
-
 crit_inference_kernels(crit_token_sampling ${INFERENCE}/token-sampling/code sampling.cu)
-target_link_libraries(crit_token_sampling PUBLIC crit::core)
+# The fixtures' host oracle of Core's sampling rules (tests/inference/host_sampler.h).
+add_library(crit_host_sampler STATIC ${FIXTURES}/host_sampler.cpp)
+target_include_directories(crit_host_sampler PUBLIC ${FIXTURES})
+target_link_libraries(crit_host_sampler PUBLIC crit::core)
+crit_inference_warnings(crit_host_sampler)
+target_link_libraries(crit_token_sampling PUBLIC crit_host_sampler)
 crit_inference_executable(crit_token_sampling_tests SOURCES ${FIXTURES}/token_sampling_tests.cpp LINK crit_token_sampling)
 crit_inference_test(crit_token_sampling 120 crit_token_sampling_tests)
 crit_inference_executable(crit_token_law_tests SOURCES ${FIXTURES}/token_law_tests.cpp LINK crit_token_sampling)
 crit_inference_test(crit_token_law 300 crit_token_law_tests)
-crit_inference_executable(crit_sampled_round_tests SOURCES ${FIXTURES}/sampled_round_tests.cpp
-  LINK crit_token_sampling crit_device_round_kernels)
-crit_inference_test(crit_sampled_round 300 crit_sampled_round_tests)
 
-crit_inference_kernels(crit_host_mailbox ${INFERENCE}/host-work-mailbox/code mailbox.cu)
+# The host's handoffs, Core's too (crit_plugins.host): the mailbox of the host-work-mailbox entry.
+crit_inference_kernels(crit_host_mailbox ${_core_host} handoff.cu)
 add_library(crit_host_mailbox_fixture STATIC ${FIXTURES}/host_mailbox_fixture.cu)
 target_link_libraries(crit_host_mailbox_fixture PUBLIC crit_host_mailbox)
 crit_inference_executable(crit_host_mailbox_tests SOURCES ${FIXTURES}/host_mailbox_tests.cpp LINK crit_host_mailbox_fixture)
 crit_inference_test(crit_host_mailbox 300 crit_host_mailbox_tests)
-
-set(_offload ${INFERENCE}/dense-layer-offload/code)
-add_library(crit_dense_offload STATIC ${_offload}/host_dense.cpp ${_offload}/offload_exec.cpp)
-target_include_directories(crit_dense_offload PUBLIC ${_offload})
-target_link_libraries(crit_dense_offload PUBLIC CUDA::cudart Threads::Threads)
-target_compile_features(crit_dense_offload PUBLIC cxx_std_20)
-crit_inference_warnings(crit_dense_offload)
-crit_inference_isa_sources(crit_dense_offload ${_offload}/host_dense_avx2.cpp ${_offload}/host_dense_avx512.cpp)
-crit_inference_executable(crit_dense_offload_tests SOURCES ${FIXTURES}/dense_offload_tests.cpp LINK crit_dense_offload)
-crit_inference_tests(crit_dense_offload_tests crit_dense_offload 300 plan host host_block stream)
-
-add_executable(crit_host_nvfp4_cuda_tests ${FIXTURES}/host_nvfp4_cuda_tests.cu)
-target_compile_features(crit_host_nvfp4_cuda_tests PRIVATE cxx_std_20 cuda_std_20)
-target_link_libraries(crit_host_nvfp4_cuda_tests PRIVATE crit_host_nvfp4 CUDA::cudart)
-crit_inference_test(crit_host_nvfp4_cuda 120 crit_host_nvfp4_cuda_tests)
-add_executable(crit_host_int_cuda_tests ${FIXTURES}/host_int_cuda_tests.cu)
-target_compile_features(crit_host_int_cuda_tests PRIVATE cxx_std_20 cuda_std_20)
-target_link_libraries(crit_host_int_cuda_tests PRIVATE crit_host_nvfp4 CUDA::cudart)
-crit_inference_test(crit_host_int_cuda 120 crit_host_int_cuda_tests)
-
-add_library(crit_device_round_toy STATIC ${_round_code}/toy_model.cu)
-target_link_libraries(crit_device_round_toy PUBLIC crit_device_round_kernels crit_recurrent_cuda)
-crit_inference_executable(crit_toy_round_example SOURCES ${_round_code}/toy_example.cpp LINK crit_device_round crit_device_round_toy)
-crit_inference_test(crit_toy_round_example 120 crit_toy_round_example)
-
-# MSVC's linker accepts an unknown --wrap with a warning, so the probe passes there but nothing is wrapped.
-if(CRIT_INFERENCE_HAS_LINKER_WRAP AND NOT MSVC)
-  target_compile_definitions(crit_device_round_tests PRIVATE CRIT_TEST_LINKER_WRAP=1)
-  target_link_options(crit_device_round_tests PRIVATE -Wl,--wrap=cudaMemcpyAsync
-    -Wl,--wrap=cudaStreamSynchronize -Wl,--wrap=cudaEventSynchronize -Wl,--wrap=cudaDeviceSynchronize)
-  target_compile_definitions(crit_toy_round_example PRIVATE CRIT_TOY_COUNT_COPIES=1)
-  target_link_options(crit_toy_round_example PRIVATE -Wl,--wrap=cudaMemcpyAsync)
-else()
-  message(STATUS "Inference CUDA fixtures enabled; linker-injected failure fixtures require --wrap and are omitted.")
-endif()

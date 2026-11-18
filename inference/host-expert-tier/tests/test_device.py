@@ -92,6 +92,28 @@ class HostTierDeviceTests(PluginTestCase):
                 self.assertIn("native", native.facts()["cpu_expert_rows"])
                 self.assertIn("torch", fallback.facts()["cpu_expert_rows"])
 
+    def test_interleaved_codes_give_the_rows_layouts_bits(self):
+        for format in ("nvfp4", "int4"):
+            with self.subTest(format=format):
+                experts, _ = self.experts(format, "auto")
+                tier = experts._tier(format, HIDDEN, INTER)
+                if not tier.native:
+                    self.skipTest("the native tier does not build here")
+                plan, keys = tier.plan["components"], sorted(tier.entries)
+                for key in keys:   # the same experts again under new keys, their codes interleaved
+                    bundle = tier.entries[key][0]
+                    gate_up = bundle[plan["gate_up"][0]:plan["gate_up"][0] + 2 * INTER * HIDDEN // 2]
+                    down = bundle[plan["down"][0]:plan["down"][0] + HIDDEN * INTER // 2]
+                    tier.add(key + 1000, bundle, (tier.interleave(gate_up, 2 * INTER, HIDDEN),
+                                                  tier.interleave(down, HIDDEN, INTER)))
+                x = torch.randn(4, HIDDEN, generator=torch.Generator().manual_seed(3))
+                rng = random.Random(4)
+                picked = [rng.choice(keys) for _ in range(12)]
+                tokens = torch.tensor([rng.randrange(4) for _ in picked], dtype=torch.int32)
+                rows = tier.compute(torch.tensor(picked, dtype=torch.int32), tokens, x)
+                interleaved = tier.compute(torch.tensor([k + 1000 for k in picked], dtype=torch.int32), tokens, x)
+                self.assertTrue(torch.equal(rows.view(torch.int32), interleaved.view(torch.int32)))
+
     def test_a_token_alone_gives_its_bits_beside_other_rows(self):
         experts, _ = self.experts()
         x, ids, weights = self.routes(seed=3, tokens=8, top=6)

@@ -1,9 +1,7 @@
-// Core files: strict JSON, SHA-256, read-only files (identity, exact and chunked reads, mapping)
-// and host memory admission. Every fixture is generated at runtime in a temporary directory.
+// Core files: strict JSON and read-only files (identity, exact and chunked reads, mapping).
+// Every fixture is generated at runtime in a temporary directory.
 #include <crit/file.h>
-#include <crit/host_memory.h>
 #include <crit/json.h>
-#include <crit/sha256.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -61,7 +59,6 @@ template<class E, class F> void rejects_as(F action, std::string_view message) {
         }
     }, message);
 }
-std::span<const std::byte> bytes_of(std::string_view text) { return std::as_bytes(std::span<const char>(text.data(), text.size())); }
 std::string text_of(std::span<const std::byte> bytes) { return {reinterpret_cast<const char*>(bytes.data()), bytes.size()}; }
 
 struct TempDir {
@@ -744,91 +741,6 @@ void json_random() {
     require(accepted > 1000 && rejected > 1000, "mutation fuzz covered both verdicts");
 }
 
-// ---------------------------------------------------------------------------------------------- SHA-256
-void sha256_vectors() {
-    require(sha256_hex({}) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "empty message");
-    require(sha256_hex(bytes_of("abc")) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "abc");
-    require(sha256_hex(bytes_of("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")) ==
-            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1", "448-bit message");
-    require(sha256_hex(bytes_of("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu")) ==
-            "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1", "896-bit message");
-    const std::string million(1000000, 'a');
-    require(sha256_hex(bytes_of(million)) == "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0", "one million a");
-    Sha256 hasher;
-    for(int i = 0; i < 1000; ++i) hasher.update(bytes_of(std::string_view(million).substr(0, 1000)));
-    const auto digest = hasher.finish();
-    require(to_hex(digest) == "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0", "one million a in pieces");
-    // Padding boundaries (Python hashlib digests of bytes(i % 251 for i in range(n))).
-    const std::vector<std::pair<std::size_t, const char*>> lengths = {
-        {55, "463eb28e72f82e0a96c0a4cc53690c571281131f672aa229e0d45ae59b598b59"}, {56, "da2ae4d6b36748f2a318f23e7ab1dfdf45acdc9d049bd80e59de82a60895f562"},
-        {57, "2fe741af801cc238602ac0ec6a7b0c3a8a87c7fc7d7f02a3fe03d1c12eac4d8f"}, {63, "29af2686fd53374a36b0846694cc342177e428d1647515f078784d69cdb9e488"},
-        {64, "fdeab9acf3710362bd2658cdc9a29e8f9c757fcf9811603a8c447cd1d9151108"}, {65, "4bfd2c8b6f1eec7a2afeb48b934ee4b2694182027e6d0fc075074f2fabb31781"},
-        {119, "da18797ed7c3a777f0847f429724a2d8cd5138e6ed2895c3fa1a6d39d18f7ec6"}, {120, "f52b23db1fbb6ded89ef42a23ce0c8922c45f25c50b568a93bf1c075420bbb7c"},
-        {128, "471fb943aa23c511f6f72f8d1652d9c880cfa392ad80503120547703e56a2be5"}, {1000, "4e4c294b331f7a2099a379bec34b9f9fc03dc46ab465d998f4d683da53487e6d"}};
-    for(const auto& [n, hex]:lengths) {
-        std::string data(n, '\0');
-        for(std::size_t i = 0; i < n; ++i) data[i] = char(i % 251);
-        require(sha256_hex(bytes_of(data)) == hex, "padding boundary digest " + std::to_string(n));
-    }
-}
-
-void sha256_chunked() {
-    const auto data = random_bytes(70000, 5);
-    const auto whole = sha256_hex(bytes_of(data));
-    std::mt19937 random(9);
-    Sha256 hasher;
-    for(int round = 0; round < 200; ++round) {
-        for(std::size_t at = 0; at < data.size();) {
-            const std::size_t n = std::min<std::size_t>(data.size() - at, random() % 4 == 0 ? random() % 200 : random() % 7000);
-            hasher.update(bytes_of(std::string_view(data).substr(at, n)));
-            at += n;
-        }
-        const auto digest = hasher.finish();   // also resets the hasher for the next round
-        require(to_hex(digest) == whole, "chunked update equals one shot");
-    }
-    hasher.update({});
-    const auto empty = hasher.finish();
-    require(to_hex(empty) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "reset after finish");
-    // Empty spans (null data) between partial blocks are no-ops.
-    hasher.update(bytes_of("ab"));
-    hasher.update({});
-    hasher.update(std::span<const std::byte>(static_cast<const std::byte*>(nullptr), 0));
-    hasher.update(bytes_of("c"));
-    hasher.update({});
-    const auto abc = hasher.finish();
-    require(to_hex(abc) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "empty updates after a partial block");
-    TempDir dir;
-    write_file(dir.path / "weights.bin", data);
-    const auto file = ReadOnlyFile::open(dir.path / "weights.bin");
-    require(sha256_file(file) == whole, "sha256_file direct");
-    ReadOptions buffered;
-    buffered.direct = false;
-    buffered.chunk_bytes = 4096;
-    require(sha256_file(file, buffered) == whole, "sha256_file buffered");
-    write_file(dir.path / "empty.bin", "");
-    require(sha256_file(ReadOnlyFile::open(dir.path / "empty.bin")) == sha256_hex({}), "empty file digest");
-#ifndef _WIN32
-    // Same size, new bytes and a later time: every chunk reads fine, so only verify_unchanged() can
-    // refuse to return the digest of the modified content.
-    write_file(dir.path / "same.bin", data);
-    const auto held = ReadOnlyFile::open(dir.path / "same.bin");
-    auto changed = data;
-    changed[100] = char(changed[100] ^ 1);
-    write_file(dir.path / "same.bin", changed);
-    fs::last_write_time(dir.path / "same.bin", fs::last_write_time(dir.path / "same.bin") + std::chrono::seconds(3));
-    for(bool direct:{true, false}) {
-        ReadOptions o;
-        o.direct = direct;
-        rejects_as<std::runtime_error>([&] { (void)sha256_file(held, o); }, "same.bin: file changed since open (modified time");
-    }
-    write_file(dir.path / "weights.bin", data.substr(0, 1000));   // shrunk after open
-    rejects_as<std::runtime_error>([&] { (void)sha256_file(file, buffered); }, "weights.bin: unexpected end of file at offset 1000");
-#else
-    std::ofstream writer(dir.path / "weights.bin", std::ios::binary | std::ios::trunc);
-    require(!writer, "a held file refuses writers, so it cannot change while hashed");
-#endif
-}
-
 // ---------------------------------------------------------------------------------------------- Files
 void file_identity() {
     TempDir dir;
@@ -939,7 +851,9 @@ void file_change() {
         fs::current_path(dir.path / "b");
         file.verify_unchanged();
         require(file.path_identity() == file.identity(), "path identity after a directory change");
-        require(sha256_file(file) == sha256_hex(bytes_of("relative")), "relative path hashes after a directory change");
+        std::array<std::byte, 8> relative{};
+        file.read_exact(0, relative);
+        require(std::string(reinterpret_cast<const char*>(relative.data()), relative.size()) == "relative", "relative path reads after a directory change");
     }
     {
         write_file(path, "0123456789");
@@ -1249,275 +1163,6 @@ void file_open_errors() {
     fs::permissions(dir.path / "secret.bin", fs::perms::owner_all);
 #endif
 }
-
-// ---------------------------------------------------------------------------------------------- Host memory
-void put(const fs::path& path, const std::string& text) { write_file(path, text); }
-bool has_note(const HostMemoryObservation& o, std::string_view text) {
-    return std::any_of(o.notes.begin(), o.notes.end(), [&](const std::string& n) { return n.find(text) != std::string::npos; });
-}
-HostWorkingSet anonymous(std::uint64_t bytes) { return {bytes, 0, 0}; }
-
-void host_memory_v2() {
-    TempDir dir;
-    const auto& root = dir.path;
-    put(root / "proc/meminfo", "MemTotal: 1000 kB\nMemAvailable:      800 kB\nCommitLimit: 900 kB\nCommitted_AS: 600 kB\n");
-    put(root / "proc/sys/vm/overcommit_memory", "2\n");
-    put(root / "proc/self/cgroup", "0::/app/worker\n");
-    // The parent limit is tighter after counting only clean file pages as reclaimable.
-    put(root / "sys/fs/cgroup/app/worker/memory.max", "max\n");
-    put(root / "sys/fs/cgroup/app/worker/memory.current", "100\n");
-    put(root / "sys/fs/cgroup/app/memory.max", "500000\n");
-    put(root / "sys/fs/cgroup/app/memory.current", "450000\n");
-    put(root / "sys/fs/cgroup/app/memory.stat", "anon 300000\nfile 60000\nfile_dirty 15000\nfile_writeback 5000\n");
-    auto o = observe_host_memory_linux(root);
-    require(o.physical == 800u * 1024 && o.commit == 300u * 1024 && o.cgroup == 90000u && o.notes.empty(), "v2 observations");
-    // Nested limits: the tightest level wins wherever it sits.
-    put(root / "sys/fs/cgroup/app/worker/memory.max", "80100\n");
-    put(root / "sys/fs/cgroup/app/worker/memory.stat", "file 10\nfile_dirty 20\n");
-    o = observe_host_memory_linux(root);
-    require(o.cgroup == 80000u, "child limit tighter than parent");
-    put(root / "sys/fs/cgroup/memory.max", "450050\n");
-    put(root / "sys/fs/cgroup/memory.current", "450000\n");
-    o = observe_host_memory_linux(root);
-    require(o.cgroup == 50u, "root level considered");
-    put(root / "sys/fs/cgroup/app/worker/memory.max", "max\n");
-    put(root / "sys/fs/cgroup/memory.max", "max\n");
-    put(root / "proc/self/cgroup", "1:name=systemd:/x\n0::/app/worker\n");
-    require(observe_host_memory_linux(root).cgroup == 90000u, "v2 line found among others");
-    // Usage above the limit floors at zero.
-    put(root / "sys/fs/cgroup/app/memory.current", "999999\n");
-    require(observe_host_memory_linux(root).cgroup == 0u, "headroom floors at zero");
-    // Overcommit not enforced: commit unknown; no cgroup limit: cgroup unknown.
-    put(root / "proc/sys/vm/overcommit_memory", "0\n");
-    put(root / "sys/fs/cgroup/app/memory.max", "max\n");
-    o = observe_host_memory_linux(root);
-    require(!o.commit && !o.cgroup && o.physical && o.notes.size() == 2, "unknown commit and cgroup");
-    require(has_note(o, "commit not enforced (overcommit_memory=0)") && has_note(o, "no cgroup v2 memory limit"), "unknown reasons");
-    // tmpfs/shmem pages sit in file but are swap-backed: only the file LRUs, else file - shmem, are reclaimable.
-    put(root / "sys/fs/cgroup/app/memory.max", "500000\n");
-    put(root / "sys/fs/cgroup/app/memory.current", "450000\n");
-    put(root / "sys/fs/cgroup/app/memory.stat", "file 60000\nshmem 50000\nfile_dirty 1000\nfile_writeback 0\n");
-    require(observe_host_memory_linux(root).cgroup == 59000u, "file minus shmem without the file LRUs");
-    put(root / "sys/fs/cgroup/app/memory.stat",
-        "file 60000\nshmem 50000\nactive_file 4000\ninactive_file 6000\nfile_dirty 1000\nfile_writeback 500\n");
-    require(observe_host_memory_linux(root).cgroup == 58500u, "file LRUs preferred");
-    // A cgroup at its limit holding mostly shmem has no reclaimable headroom for a large request.
-    constexpr std::uint64_t gib = std::uint64_t(1) << 30;
-    put(root / "sys/fs/cgroup/app/memory.max", std::to_string(8 * gib) + "\n");
-    put(root / "sys/fs/cgroup/app/memory.current", std::to_string(8 * gib) + "\n");
-    put(root / "sys/fs/cgroup/app/memory.stat", "anon " + std::to_string(2 * gib) + "\nfile " + std::to_string(6 * gib) +
-        "\nshmem " + std::to_string(6 * gib) + "\nactive_file 0\ninactive_file 0\nfile_dirty 0\nfile_writeback 0\n");
-    o = observe_host_memory_linux(root);
-    const auto shmem = admit_host(anonymous(5 * gib), o);
-    require(o.cgroup == 0u && !shmem.admitted && shmem.binding == "cgroup", "shmem is not reclaimable");
-    // memory.high limits too: the effective limit is min(memory.max, memory.high).
-    put(root / "sys/fs/cgroup/app/memory.max", "max\n");
-    put(root / "sys/fs/cgroup/app/memory.high", "460000\n");
-    put(root / "sys/fs/cgroup/app/memory.current", "450000\n");
-    put(root / "sys/fs/cgroup/app/memory.stat", "active_file 4000\ninactive_file 6000\nfile_dirty 1000\nfile_writeback 500\n");
-    require(observe_host_memory_linux(root).cgroup == 18500u, "memory.high alone limits");
-    put(root / "sys/fs/cgroup/app/memory.max", "455000\n");
-    require(observe_host_memory_linux(root).cgroup == 13500u, "memory.max below memory.high");
-    put(root / "sys/fs/cgroup/app/memory.max", "max\n");
-    put(root / "sys/fs/cgroup/app/memory.high", "max\n");
-    o = observe_host_memory_linux(root);
-    require(!o.cgroup && has_note(o, "no cgroup v2 memory limit"), "memory.max and memory.high both max");
-}
-
-void host_memory_v1() {
-    TempDir dir;
-    const auto& root = dir.path;
-    put(root / "proc/meminfo", "MemAvailable: 4 kB\n");
-    put(root / "proc/self/cgroup", "4:memory:/job\n1:cpu:/job\n");
-    put(root / "sys/fs/cgroup/memory/job/memory.usage_in_bytes", "700\n");
-    put(root / "sys/fs/cgroup/memory/job/memory.stat", "cache 100\ndirty 30\nwriteback 10\nhierarchical_memory_limit 1000\n");
-    auto o = observe_host_memory_linux(root);
-    require(o.cgroup == 1000u - 700u + 60u && o.physical == 4096u, "v1 hierarchical limit");
-    require(has_note(o, "commit not enforced (overcommit_memory=unknown)"), "missing overcommit file");
-    put(root / "sys/fs/cgroup/memory/job/memory.stat",
-        "cache 100\ndirty 30\nwriteback 10\ntotal_cache 500\ntotal_dirty 100\ntotal_writeback 50\nhierarchical_memory_limit 1000\n");
-    require(observe_host_memory_linux(root).cgroup == 1000u - 700u + 350u, "hierarchical totals preferred");
-    put(root / "proc/self/cgroup", "7:cpuacct,memory,cpu:/job\n");
-    require(observe_host_memory_linux(root).cgroup == 650u, "memory among several controllers");
-    put(root / "sys/fs/cgroup/memory/job/memory.stat", "cache 1\nhierarchical_memory_limit 9223372036854771712\n");
-    o = observe_host_memory_linux(root);
-    require(!o.cgroup && has_note(o, "no cgroup v1 memory limit"), "unlimited v1 cgroup");
-    put(root / "proc/self/cgroup", "3:cpu:/job\n");
-    o = observe_host_memory_linux(root);
-    require(!o.cgroup && has_note(o, "no memory cgroup"), "no memory controller");
-    // systemd hybrid hosts list the unified hierarchy (0::) while the memory controller stays on v1:
-    // with no limited v2 level the v1 limit still applies, so admission cannot overshoot it.
-    put(root / "proc/meminfo", "MemAvailable: 1000000 kB\n");
-    put(root / "proc/self/cgroup", "12:memory:/job\n1:name=systemd:/job\n0::/job\n");
-    put(root / "sys/fs/cgroup/memory/job/memory.stat", "hierarchical_memory_limit 1000\n");
-    put(root / "sys/fs/cgroup/memory/job/memory.usage_in_bytes", "700\n");
-    o = observe_host_memory_linux(root);
-    require(o.cgroup == 300u && !has_note(o, "cgroup v2") && !has_note(o, "no cgroup"), "hybrid host uses the v1 limit");
-    const auto hybrid = admit_host(anonymous(500000), o);
-    require(!hybrid.admitted && hybrid.binding == "cgroup" && hybrid.limit == 300u, "hybrid admission bound by the v1 limit");
-    put(root / "sys/fs/cgroup/job/memory.max", "max\n");   // unified levels without a limit change nothing
-    put(root / "sys/fs/cgroup/job/memory.current", "5\n");
-    require(observe_host_memory_linux(root).cgroup == 300u, "unlimited unified level falls through to v1");
-    put(root / "sys/fs/cgroup/job/memory.max", "105\n");   // a limited v2 level is the memory controller
-    require(observe_host_memory_linux(root).cgroup == 100u, "limited v2 level wins");
-    put(root / "sys/fs/cgroup/job/memory.max", "max\n");
-    put(root / "sys/fs/cgroup/memory/job/memory.stat", "hierarchical_memory_limit 9223372036854771712\n");
-    o = observe_host_memory_linux(root);
-    require(!o.cgroup && has_note(o, "no cgroup v1 memory limit") && has_note(o, "no cgroup v2 memory limit"), "hybrid without limits");
-    put(root / "proc/self/cgroup", "0::/job\n12:memory:/job\n");   // line order does not matter
-    put(root / "sys/fs/cgroup/memory/job/memory.stat", "hierarchical_memory_limit 1000\n");
-    require(observe_host_memory_linux(root).cgroup == 300u, "hybrid membership in either order");
-    // v1 shmem is in cache but not reclaimable: the file LRUs, else cache - shmem, each preferring total_.
-    put(root / "sys/fs/cgroup/memory/job/memory.stat", "cache 500\nshmem 300\ndirty 50\nhierarchical_memory_limit 1000\n");
-    require(observe_host_memory_linux(root).cgroup == 450u, "v1 cache minus shmem");
-    put(root / "sys/fs/cgroup/memory/job/memory.stat",
-        "cache 500\nshmem 300\ntotal_cache 900\ntotal_shmem 800\ndirty 50\nhierarchical_memory_limit 1000\n");
-    require(observe_host_memory_linux(root).cgroup == 350u, "v1 hierarchical shmem preferred");
-    put(root / "sys/fs/cgroup/memory/job/memory.stat", "cache 500\nshmem 300\ntotal_active_file 100\n"
-        "total_inactive_file 60\ninactive_file 1\ntotal_dirty 20\nhierarchical_memory_limit 1000\n");
-    require(observe_host_memory_linux(root).cgroup == 440u, "v1 file LRUs preferred");
-}
-
-void host_memory_malformed() {
-    TempDir dir;
-    const auto& root = dir.path;
-    // Nothing readable: unknown everywhere, never an exception.
-    auto o = observe_host_memory_linux(root);
-    require(!o.physical && !o.commit && !o.cgroup, "empty tree is unknown");
-    require(has_note(o, "MemAvailable unavailable") && has_note(o, "cgroup membership unreadable"), "empty tree notes");
-    put(root / "proc/meminfo", "MemAvailable: 12x kB\nCommitLimit: -5 kB\nCommitted_AS: 1 kB\nBad line\n");
-    put(root / "proc/sys/vm/overcommit_memory", "2\n");
-    put(root / "proc/self/cgroup", "garbage\n0::/a/b\n");
-    put(root / "sys/fs/cgroup/a/b/memory.max", "12z\n");
-    put(root / "sys/fs/cgroup/a/b/memory.current", "5\n");
-    put(root / "sys/fs/cgroup/a/memory.max", "1000\n");
-    put(root / "sys/fs/cgroup/a/memory.current", "400\n");
-    put(root / "sys/fs/cgroup/a/memory.stat", "file 100\nfile_dirty lots\n");
-    o = observe_host_memory_linux(root);
-    require(!o.physical && has_note(o, "MemAvailable malformed"), "malformed MemAvailable");
-    require(!o.commit && has_note(o, "commit headroom unknown"), "malformed commit counters");
-    require(o.cgroup == 600u, "malformed level skipped; malformed stat counts no reclaimable pages");
-    require(has_note(o, "memory.max, memory.high or memory.current malformed") && has_note(o, "memory.stat malformed"), "cgroup notes");
-    for(const char* counters:{"file 100\nshmem x\n", "active_file 100\ninactive_file -1\n", "active_file 100\nfile_writeback 1.5\n"}) {
-        put(root / "sys/fs/cgroup/a/memory.stat", counters);
-        o = observe_host_memory_linux(root);
-        require(o.cgroup == 600u && has_note(o, "memory.stat malformed"), "malformed reclaimable counters count nothing");
-    }
-    put(root / "sys/fs/cgroup/a/memory.stat", "file 100\n");
-    put(root / "sys/fs/cgroup/a/memory.high", "lots\n");
-    o = observe_host_memory_linux(root);
-    require(!o.cgroup && has_note(o, "memory.max, memory.high or memory.current malformed"), "malformed memory.high skips the level");
-    fs::remove(root / "sys/fs/cgroup/a/memory.high");
-    put(root / "proc/meminfo", "MemAvailable: 18446744073709551615 kB\nCommitLimit: 99999999999999999999999\nCommitted_AS: 1\n");
-    put(root / "proc/sys/vm/overcommit_memory", "two\n");
-    o = observe_host_memory_linux(root);
-    require(!o.physical && has_note(o, "MemAvailable malformed") && has_note(o, "overcommit_memory malformed"), "overflowing values");
-    put(root / "proc/meminfo", "MemAvailable: 18446744073709551615\n");
-    require(observe_host_memory_linux(root).physical == std::numeric_limits<std::uint64_t>::max(), "largest value without a unit");
-    put(root / "proc/self/cgroup", "5:memory:/v1\n");
-    put(root / "sys/fs/cgroup/memory/v1/memory.usage_in_bytes", "10\n");
-    put(root / "sys/fs/cgroup/memory/v1/memory.stat", "hierarchical_memory_limit 1e9\n");
-    o = observe_host_memory_linux(root);
-    require(!o.cgroup && has_note(o, "hierarchical_memory_limit malformed"), "malformed v1 limit");
-    put(root / "sys/fs/cgroup/memory/v1/memory.stat", "hierarchical_memory_limit 100\ncache x\n");
-    put(root / "sys/fs/cgroup/memory/v1/memory.usage_in_bytes", "10\n");
-    o = observe_host_memory_linux(root);
-    require(o.cgroup == 90u && has_note(o, "memory.stat malformed"), "malformed v1 cache counts nothing reclaimable");
-    put(root / "sys/fs/cgroup/memory/v1/memory.usage_in_bytes", "ten\n");
-    o = observe_host_memory_linux(root);
-    require(!o.cgroup && has_note(o, "memory.usage_in_bytes malformed"), "malformed v1 usage");
-    put(root / "sys/fs/cgroup/memory/v1/memory.stat", std::string(std::size_t(1) << 20, 'x') + "\n");
-    o = observe_host_memory_linux(root);
-    require(!o.cgroup && has_note(o, "exceeds 1 MiB"), "oversized source file");
-}
-
-void host_memory_admission() {
-    // The single-extent fixture of the native header: anonymous demand pays every domain.
-    HostMemoryObservation o{800u * 1024, 300u * 1024, 90000u, {}};
-    auto d = admit_host(anonymous(95000), o);
-    require(!d.admitted && d.binding == "cgroup" && d.limit == 90000u, "cgroup binds");
-    require(d.reason.find("exceeds cgroup working-set headroom") != std::string::npos, "denial reason");
-    d = admit_host(anonymous(80000), o, 5000);
-    require(d.admitted && d.limit == 85000u && d.reason == "fits cgroup working-set headroom", "fits after reserve");
-    d = admit_host(anonymous(80001), o, 10000);
-    require(!d.admitted && d.limit == 80000u, "one byte over");
-    require(admit_host(anonymous(80000), o, 10000).admitted, "exactly fits");
-    d = admit_host(anonymous(1), o, 90001);
-    require(!d.admitted && d.limit == 0u, "reserve above headroom");
-    // Working sets (memory.py admit_working_set): file pages never pay commit.
-    const HostWorkingSet mixed{21, 3, 40};
-    for(const auto& [observation, binding]:{std::pair<HostMemoryObservation, std::string>{{1000u, 23u, 1000u, {}}, "commit"},
-                                            {{1000u, 1000u, 63u, {}}, "cgroup"}, {{63u, 1000u, 1000u, {}}, "physical"}}) {
-        d = admit_host(mixed, observation);
-        require(!d.admitted && d.binding == binding, "every domain can bind: " + binding);
-    }
-    d = admit_host({0, 0, 40}, HostMemoryObservation{100u, 0u, std::nullopt, {}});
-    require(d.admitted && d.binding == "commit" && d.limit == 0u, "file working set does not consume commit");
-    require(admit_host(mixed, HostMemoryObservation{64u, 24u, 64u, {}}).admitted, "exact fit in every domain");
-    require(admit_host({30, 0, 0}, HostMemoryObservation{30u, std::nullopt, std::nullopt, {}}).admitted, "anonymous fits physical");
-    require(!admit_host({11, 6, 40}, HostMemoryObservation{30u, 1000u, std::nullopt, {}}).admitted, "physical rejects the split");
-    // Unknown observations fail closed unless demand is zero.
-    d = admit_host({}, HostMemoryObservation{});
-    require(d.admitted && d.binding.empty() && !d.limit && d.reason == "no incremental host working set", "zero demand");
-    HostMemoryObservation unknown;
-    unknown.notes = {"MemAvailable unavailable"};
-    d = admit_host(anonymous(1), unknown);
-    require(!d.admitted && d.binding.empty() && !d.limit && d.reason.find("unknown; MemAvailable unavailable") != std::string::npos, "unknown denies");
-    require(!admit_host(anonymous(1), unknown, 0, false).admitted, "nothing known denies even without the physical requirement");
-    const HostMemoryObservation commit_only{std::nullopt, 1000u, std::nullopt, {}};
-    require(!admit_host(anonymous(1), commit_only).admitted, "physical required by default");
-    d = admit_host(anonymous(1), commit_only, 0, false);
-    require(d.admitted && d.binding == "commit", "commit alone when physical is optional");
-    // Ties name the alphabetically first domain; the binding is the smallest margin, not the smallest headroom.
-    require(admit_host(anonymous(10), HostMemoryObservation{100u, 100u, 100u, {}}).binding == "cgroup", "tie order");
-    require(admit_host(anonymous(10), HostMemoryObservation{100u, 100u, std::nullopt, {}}).binding == "commit", "tie order without cgroup");
-    require(admit_host({0, 0, 50}, HostMemoryObservation{100u, 60u, std::nullopt, {}}).binding == "physical", "margin, not headroom");
-    // Exact for extreme values: sums beyond 64 bits never wrap into admission.
-    constexpr auto max = std::numeric_limits<std::uint64_t>::max();
-    const HostMemoryObservation huge{max, max, max, {}};
-    require(!admit_host({max, max, max}, huge).admitted && !admit_host({max, 0, 0}, huge, 1).admitted, "no wraparound");
-    require(admit_host({max, 0, 0}, huge).admitted && admit_host({max - 5, 0, 0}, huge, 5).admitted, "largest exact fit");
-    d = admit_host({max, max, 0}, huge);
-    require(!d.admitted && d.reason.find("more than 2^64") != std::string::npos, "oversized demand reported");
-    // Randomized oracle with values small enough for exact signed arithmetic.
-    std::mt19937_64 random(77);
-    for(int round = 0; round < 20000; ++round) {
-        auto pick = [&] { return std::uint64_t(random() % 4 == 0 ? random() % 4 : random() % 2000); };
-        const HostWorkingSet demand{pick(), pick(), pick()};
-        HostMemoryObservation obs;
-        if(random() % 4) obs.physical = pick();
-        if(random() % 3) obs.commit = pick();
-        if(random() % 3) obs.cgroup = pick();
-        const auto reserve = random() % 3 ? std::uint64_t(0) : pick();
-        const bool require_physical = random() % 2 != 0;
-        const auto got = admit_host(demand, obs, reserve, require_physical);
-        const std::int64_t total = std::int64_t(demand.anonymous + demand.pinned + demand.file);
-        std::vector<std::pair<std::string, std::pair<std::int64_t, std::int64_t>>> known;   // name -> (headroom, need)
-        if(obs.cgroup) known.push_back({"cgroup", {std::int64_t(*obs.cgroup), total}});
-        if(obs.commit) known.push_back({"commit", {std::int64_t(*obs.commit), std::int64_t(demand.anonymous + demand.pinned)}});
-        if(obs.physical) known.push_back({"physical", {std::int64_t(*obs.physical), total}});
-        if(total == 0) { require(got.admitted && got.binding.empty(), "oracle: zero demand"); continue; }
-        if(known.empty() || (require_physical && !obs.physical)) { require(!got.admitted && got.binding.empty(), "oracle: unknown"); continue; }
-        std::size_t best = 0;
-        bool fits = true;
-        for(std::size_t i = 0; i < known.size(); ++i) {
-            const auto margin = known[i].second.first - std::int64_t(reserve) - known[i].second.second;
-            if(margin < known[best].second.first - std::int64_t(reserve) - known[best].second.second) best = i;
-            fits = fits && known[i].second.second + std::int64_t(reserve) <= known[i].second.first;
-        }
-        const auto limit = std::max<std::int64_t>(0, known[best].second.first - std::int64_t(reserve));
-        require(got.admitted == fits && got.binding == known[best].first && got.limit == std::uint64_t(limit), "oracle: admission");
-    }
-}
-
-void host_memory_live() {
-    const auto live = observe_host_memory();
-#if defined(__linux__) || defined(_WIN32)
-    require(live.physical && *live.physical > 0, "live physical memory");
-#else
-    require(!live.notes.empty(), "unsupported platform explains itself");
-#endif
-}
 }
 
 int main(int argc, char** argv) {
@@ -1527,12 +1172,10 @@ int main(int argc, char** argv) {
             {"json_valid", json_valid}, {"json_rejects", json_rejects}, {"json_utf8", json_utf8}, {"json_strings", json_strings},
             {"json_numbers", json_numbers}, {"json_limits", json_limits}, {"json_access", json_access}, {"json_file", json_file},
             {"json_nonfinite", json_nonfinite},
-            {"json_random", json_random}, {"sha256_vectors", sha256_vectors}, {"sha256_chunked", sha256_chunked},
+            {"json_random", json_random},
             {"file_identity", file_identity}, {"file_change", file_change}, {"file_read_exact", file_read_exact}, {"file_read_slots", file_read_slots},
             {"file_read_chunks", file_read_chunks}, {"file_read_errors", file_read_errors}, {"file_map", file_map},
-            {"file_open_errors", file_open_errors}, {"host_memory_v2", host_memory_v2}, {"host_memory_v1", host_memory_v1},
-            {"host_memory_malformed", host_memory_malformed}, {"host_memory_admission", host_memory_admission},
-            {"host_memory_live", host_memory_live}};
+            {"file_open_errors", file_open_errors}};
         bool found = false;
         for(const auto& [name, run]:tests) if(test == "all" || test == name) {
             run();

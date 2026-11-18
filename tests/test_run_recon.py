@@ -184,7 +184,7 @@ class ReconTests(unittest.TestCase):
         self.assertIn("placement sparse_device_host (2)", notes)
         self.assertIn("misses computed on the CPU", notes)
         self.assertIn("device expert cache", notes)
-        self.assertIn("Reserve no fixed prompt workspace: prompt (prefill) buffers are lent from cache slots", notes)
+        self.assertIn("a device expert cache that takes every byte the device has free", notes)
         self.assertIn("together they come at most at its read rate", notes)
         self.assertIn("hit rate under real routing is the main lever", notes)
         self.assertIn("no read-ahead", notes)
@@ -291,7 +291,8 @@ class ReconTests(unittest.TestCase):
         run_id = store.create({"model_path": str(single), "correctness_criteria": "Fixture gates",
                                "budget_minutes": 1, "kv_tokens": 8192})["run"]["run_id"]
         self.store, self.run_id, self.directory = store, run_id, store.directory(run_id)
-        self.assertEqual(self.candidate({"batch": 1})["configuration"], {"batch": 1, "plugins": selection()})
+        self.assertEqual(self.candidate({"batch": 1})["configuration"],
+                         {"batch": 1, "plugins": selection(), "exactness": {"decode": "repeatable", "prompt": "repeatable"}})
 
 
 if __name__ == "__main__":
