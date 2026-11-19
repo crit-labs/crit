@@ -223,3 +223,24 @@ class TensorBytesTests(GgufFiles):
             self.assertEqual(stored_values(np.array(rows), 12, 256).shape, (4, 256))
             with self.assertRaisesRegex(KeyError, "no tensor 'missing'"):
                 reader.rows("missing")
+
+    def test_q1_0_and_q2_0_values_as_their_reference_decoder_gives_them(self):
+        # Q2_0: d (FP16), 16 bytes of 2-bit codes a 64-value block, value j ((byte j / 4 >> 2 (j % 4)) & 3) - 1 times
+        # d; Q1_0: d and 16 bytes of sign bits a 128-value block, value j +d where bit j % 8 of byte j / 8 is set.
+        import numpy as np
+        from crit_core.model.gguf_blocks import TYPES, row_bytes, stored_values
+        g = np.random.default_rng(7)
+        for name, block in (("Q2_0", 64), ("Q1_0", 128)):
+            k, n = 3 * block, 4
+            raw = g.integers(0, 256, (n, row_bytes(TYPES[name], k)), dtype=np.uint8)
+            scales = g.normal(size=(n, 3)).astype(np.float16)
+            raw.reshape(n, 3, 18)[..., :2] = scales.view(np.uint8).reshape(n, 3, 2)
+            want = np.zeros((n, k), np.float32)
+            for r in range(n):
+                for b in range(3):
+                    d, qs = np.float32(scales[r, b]), raw[r, 18 * b + 2:18 * b + 18]
+                    for j in range(block):
+                        want[r, block * b + j] = (np.float32(int(qs[j // 4] >> 2 * (j % 4) & 3) - 1) * d
+                                                  if name == "Q2_0" else d if qs[j // 8] >> (j % 8) & 1 else -d)
+            got = stored_values(raw, TYPES[name], k)
+            self.assertTrue(np.array_equal(got.view(np.uint32), want.view(np.uint32)), name)

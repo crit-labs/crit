@@ -5,6 +5,7 @@ copied) and the block formats' exact host decoders, the reference every device f
         raw = reader.rows("blk.0.ffn_up.weight")      # uint8 [N][row bytes] (or [experts][N][row bytes])
         q, s0, s1, m = subblocks(raw, TYPES["Q4_K"], k)  # each 32-value sub-block's codes and FP32 scales
         w = stored_values(raw, TYPES["Q4_K"], k)          # W [N][K] FP32: the stored values
+        y = declared_rows(raw, TYPES["Q4_K"], k, x, 1)    # x W^T in the declared order of int8 rows (torch)
 
 A row of a quantized matrix is its blocks in order; a block holds 32 values, or a 256-value superblock of eight 32-value
 sub-blocks. subblocks() gives every sub-block's 32 values as integer codes and its scales: value e is
@@ -13,7 +14,10 @@ rounded once, so stored_values() is the stored value bit for bit as the format's
 FP32. crit's kernel core decoders (crit_kcore/gguf.cuh) give the same codes and scales.
 
 Formats (TYPES: GGUF type ids): Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS,
-IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, MXFP4 (E2M1 doubled, its E8M0 byte e as 2^(e - 128), exact). IQ1's
+IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0 (ternary: codes 0, 1, 2 less 1, one FP16 scale d a
+256-value block, so s = d for every sub-block), MXFP4 (E2M1 doubled, its E8M0 byte e as 2^(e - 128), exact), Q1_0 (a
+sign bit a value, +-d, d one FP16 scale a 128-value block) and Q2_0 (2-bit codes 0..3 less 1 times d, a 64-value
+block). IQ1's
 offset of an eighth is in the codes (8 g +- 1, the scale d l / 8,
 exact). Q4_1's
 and Q5_1's stored offset is added to s q, so m is its negation (exact). Q2_K has a minimum a 16 values:
@@ -27,14 +31,16 @@ from .gguf import GgufError
 
 TYPES = {"Q4_0": 2, "Q4_1": 3, "Q5_0": 6, "Q5_1": 7, "Q8_0": 8, "Q2_K": 10, "Q3_K": 11, "Q4_K": 12, "Q5_K": 13, "Q6_K": 14,
          "IQ2_XXS": 16, "IQ2_XS": 17, "IQ3_XXS": 18, "IQ1_S": 19, "IQ4_NL": 20, "IQ3_S": 21, "IQ2_S": 22, "IQ4_XS": 23,
-         "IQ1_M": 29, "MXFP4": 39}
+         "IQ1_M": 29, "TQ1_0": 34, "TQ2_0": 35, "MXFP4": 39, "Q1_0": 41, "Q2_0": 42}
 # Per type id: (values, bytes) a block.
 BLOCKS = {2: (32, 18), 3: (32, 20), 6: (32, 22), 7: (32, 24), 8: (32, 34), 10: (256, 84), 11: (256, 110), 12: (256, 144),
           13: (256, 176), 14: (256, 210), 16: (256, 66), 17: (256, 74), 18: (256, 98), 19: (256, 50), 20: (32, 18),
-          21: (256, 110), 22: (256, 82), 23: (256, 136), 29: (256, 56), 39: (32, 17)}
+          21: (256, 110), 22: (256, 82), 23: (256, 136), 29: (256, 56), 34: (256, 54), 35: (256, 66), 39: (32, 17),
+          41: (128, 18), 42: (64, 18)}
 # Where each format keeps its FP16 scales in a block.
 SCALE_BYTES = {2: (0,), 3: (0, 2), 6: (0,), 7: (0, 2), 8: (0,), 10: (80, 82), 11: (108,), 12: (0, 2), 13: (0, 2), 14: (208,),
-               16: (0,), 17: (0,), 18: (0,), 19: (0,), 20: (0,), 21: (0,), 22: (0,), 23: (0,), 29: (), 39: ()}
+               16: (0,), 17: (0,), 18: (0,), 19: (0,), 20: (0,), 21: (0,), 22: (0,), 23: (0,), 29: (), 34: (52,), 35: (64,),
+               39: (), 41: (0,), 42: (0,)}
 # Whether value e's scale is s0 for e < 16 and s1 for e >= 16, whether the format has a minimum, and whether its
 # minimum is m0 for e < 16 and m1 for e >= 16.
 TWO_SCALES = frozenset({10, 11, 14, 17, 22, 29})
@@ -150,6 +156,39 @@ def subblocks(raw, type_id, k, halves=False):
         ib = np.arange(8).reshape(1, 1, 8, 1)
         high = (hm >> ib) & 1                                                       # [n][blocks][ib][32]
         q = (low.reshape(n, -1, 8, 32) + 4 * high - 4).astype(np.int8)
+        m = zero
+    elif type_id == 35:
+        # 64 bytes of 2-bit codes: sub-block ib = 4 h + g, value l is bits 2 g, 2 g + 1 of qs[32 h + l]; then d.
+        d = _f16(blocks, 64)[..., None]
+        qs = blocks[..., 0:64].reshape(n, -1, 2, 1, 32)                              # half h, l
+        q = (((qs >> (2 * np.arange(4, dtype=np.uint8)).reshape(1, 1, 1, 4, 1)) & 3).astype(np.int8) - 1
+             ).astype(np.int8).reshape(n, -1, 8, 32)
+        s0 = s1 = d
+        m = zero
+    elif type_id == 34:
+        # 48 bytes of five base-3 codes a byte (values 0..159 from bytes 0..31, 160..239 from 32..47), 4 bytes of four
+        # (240..255), then d. Code j of a byte: the byte times 3^j kept to 8 bits, times 3, shifted right by 8 (the
+        # format's rule, as gguf-py decodes it).
+        d = _f16(blocks, 52)[..., None]
+        powers = np.array([1, 3, 9, 27, 81], dtype=np.uint8)
+        qs0 = (blocks[..., None, 0:32] * powers.reshape(5, 1)).reshape(n, -1, 160)
+        qs1 = (blocks[..., None, 32:48] * powers.reshape(5, 1)).reshape(n, -1, 80)
+        qh = (blocks[..., None, 48:52] * powers[:4].reshape(4, 1)).reshape(n, -1, 16)
+        codes = np.concatenate([qs0, qs1, qh], axis=-1).astype(np.uint16)
+        q = (((codes * 3) >> 8).astype(np.int8) - 1).astype(np.int8).reshape(n, -1, 8, 32)
+        s0 = s1 = d
+        m = zero
+    elif type_id in (41, 42):
+        # d, then 16 bytes: Q2_0's value j is bits 2 (j % 4), 2 (j % 4) + 1 of byte j / 4, less 1; Q1_0's is +1 where
+        # bit j % 8 of byte j / 8 is set, else -1.
+        d = _f16(blocks, 0)[..., None]
+        qs = blocks[..., 2:18, None]
+        if type_id == 42:
+            codes = ((qs >> (2 * np.arange(4, dtype=np.uint8))) & 3).astype(np.int8) - 1
+        else:
+            codes = 2 * ((qs >> np.arange(8, dtype=np.uint8)) & 1).astype(np.int8) - 1
+        q = codes.astype(np.int8).reshape(n, -1, per, 32)
+        s0 = s1 = d
         m = zero
     elif type_id == 39:
         e = blocks[..., 0].astype(np.uint32)
@@ -302,6 +341,73 @@ def stored_values(raw, type_id, k):
     return ((s * q.astype(np.float32)).astype(np.float32) - m).astype(np.float32).reshape(raw.shape[0], k)
 
 
+def quantize_rows(x):
+    """The declared order's step 1 in torch FP32: each row's 32-value blocks as int8 codes, q = rint(x / d) with
+    d = max |x| / 127 (0 where d is 0): (q int64 [M][J][32], d FP32 [M][J], sum int64 [M][J])."""
+    import torch
+    x = x.float().cpu().reshape(x.shape[0], -1, 32)
+    d = x.abs().amax(-1) / 127.0
+    q = torch.where(d[..., None] == 0, torch.zeros_like(x), torch.round(x / d[..., None]).clamp(-127, 127))
+    q = q.to(torch.int64)
+    return q, d, q.sum(-1)
+
+
+def declared_rows(raw, fmt, k, x, parts):
+    """y [M][N] FP32: x [M][K] times the stored rows raw (uint8 [N][row bytes] of GGUF type fmt) in the declared
+    order exactly, in torch FP32 on the CPU: the rows quantized by quantize_rows, each stored sub-block's exact integer
+    dot weighted by its FP32 scales, the sub-blocks in `parts` contiguous parts, each part's 32 lanes added in order
+    and reduced by the xor butterfly, the parts added in order. A kernel that declares this order (and its parts for
+    a matrix) gives these bits; its tests, and a host that computes what it computes, read them here."""
+    import torch
+    q, s0, s1, m0, m1 = (torch.from_numpy(a) for a in subblocks(raw, fmt, k, halves=True))
+    xq, xd, xs = quantize_rows(x)
+    q = q.to(torch.int64)
+    lo = torch.einsum("njs,mjs->mnj", q[..., :16], xq[..., :16])
+    hi = torch.einsum("njs,mjs->mnj", q[..., 16:], xq[..., 16:])
+    d = xd[:, None, :]
+    if fmt in TWO_SCALES:
+        t = (s0[None] * d) * lo.float() + (s1[None] * d) * hi.float()
+    else:
+        t = (s0[None] * d) * (lo + hi).float()
+    if fmt == 10:   # Q2_K's integer form: fmul(dx, fsub(fmul(dw, isum), fmul(dmin, imin)))
+        dw, dmin, sc, mn = _q2k_integers(raw, k)
+        isum = torch.einsum("njs,mjs->mnj", q * sc, xq)
+        first = xq[..., :16].sum(-1)[:, None, :]
+        imin = mn[None, ..., 0] * first + mn[None, ..., 1] * (xs[:, None, :] - first)
+        t = d * ((dw[None] * isum.float()) - (dmin[None] * imin.float()))
+    elif fmt in HAS_MIN:
+        t = t - (m0[None] * d) * xs[:, None, :].float()
+    j = t.shape[-1]
+    out = None
+    for p in range(parts):
+        part = t[..., j * p // parts:j * (p + 1) // parts]
+        steps = -(-part.shape[-1] // 32)
+        part = torch.nn.functional.pad(part, (0, 32 * steps - part.shape[-1])).reshape(*part.shape[:-1], steps, 32)
+        acc = torch.zeros(part.shape[:-2] + (32,))
+        for s in range(steps):
+            acc = acc + part[..., s, :]
+        lanes = torch.arange(32)
+        for off in (16, 8, 4, 2, 1):
+            acc = acc + acc[..., lanes ^ off]
+        out = acc[..., 0] if out is None else out + acc[..., 0]
+    return out
+
+
+def _q2k_integers(raw, k):
+    """Q2_K's integer form a sub-block: (d, dmin FP32 [N][J], the 4-bit scales int64 [N][J][32] a value, the 4-bit
+    minimums int64 [N][J][2] a half)."""
+    import numpy as np
+    import torch
+    n = raw.shape[0]
+    b = torch.from_numpy(np.ascontiguousarray(raw).reshape(n, k // 256, 84).astype(np.int64))
+    f16 = np.ascontiguousarray(raw).reshape(n, k // 256, 84)
+    d = torch.from_numpy(f16[..., 80:82].copy().view(np.float16)[..., 0].astype(np.float32))
+    dmin = torch.from_numpy(f16[..., 82:84].copy().view(np.float16)[..., 0].astype(np.float32))
+    sc = b[..., :16].reshape(n, -1, 2)                                     # [N][J][half]
+    scale = (sc & 15).repeat_interleave(16, dim=-1)                         # [N][J][32]
+    return (d.repeat_interleave(8, dim=-1), dmin.repeat_interleave(8, dim=-1), scale, sc >> 4)
+
+
 class GgufTensors:
     """Read-only access to an inspected GGUF model's tensor bytes (crit_core.model.GgufModel), each file mapped once.
     rows(name) is a numpy view uint8 [rows][row bytes] of a 2-D tensor ([experts][rows][row bytes] of a 3-D one, as
@@ -363,5 +469,5 @@ def _count(dims):
     return out
 
 
-__all__ = ["BLOCKS", "GgufTensors", "HAS_MIN", "TWO_MINS", "TWO_SCALES", "TYPES", "grid", "iq3s_grid", "row_bytes", "stored_values",
-           "subblocks"]
+__all__ = ["BLOCKS", "GgufTensors", "HAS_MIN", "TWO_MINS", "TWO_SCALES", "TYPES", "declared_rows", "grid", "iq3s_grid",
+           "quantize_rows", "row_bytes", "stored_values", "subblocks"]

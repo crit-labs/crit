@@ -79,6 +79,7 @@ plugins/
 | `needs_when` | Needs that hold only where a fact does: `{"stored:nvfp4": ["cuda:fp4"]}` for a plugin that decodes NVFP4 only on FP4 tensor cores |
 | `conflicts` | Facts it cannot run beside: a selection where another plugin provides one is refused |
 | `requires` | Other slots its code calls, which a selection using it must fill: a `model` plugin of a hybrid architecture requires `recurrence`, one of a mixture of experts the expert slots |
+| `requires_when` | Slots it requires only where a fact holds: `{"model_type:qwen3_next": ["recurrence", "router", "experts"]}` for a model plugin of several architectures |
 | `devices` | The devices it runs on: `cuda`, `rocm`, `metal`, `vulkan`, `cpu`, or `host` for a plugin of a policy slot (`placement`, `graphs`, `expert_residency`, `expert_source`, `drafter`, `verifier`), whose code decides rather than computes. A plugin without devices is a host reference: the oracle device plugins are tested against, which no engine serves |
 | `options` | Its settings, each `{type, default}` (`int`, `float`, `bool`, `str` or `choice` with `choices`; numbers may have `min` and `max`) |
 | `entry` | `FILE.py:FUNCTION`, its factory: `create(context, options, parts)` returns the plugin's object |
@@ -175,7 +176,7 @@ slot's device form as the plugin is created: the host form is an oracle, and dec
 
 | Slot | Device form |
 | --- | --- |
-| `projections` | `load(tensors, format, role=None, encode=None)` (bf16, fp8:channel, fp8:tensor, mxfp8, nvfp4 as stored, `{weight, scale, global_scale, input_scale}`; awq and gptq as stored, `{qweight, qzeros, scales}` (gptq also `g_idx`); role, the matrix's part in the model's own words, where the model plugin gives one; encode, for a matrix only a drafter reads, the format the plugin re-encodes it to, recorded in its facts as `draft_encoding`), `matmul(x, matrix, out_dtype=None, prompt=False)` (each row's bits those of the row alone in a call of up to `invariant_rows(plugin)` rows: [row invariance](#row-invariance); `prompt=True` for a prompt chunk, which takes the prompt rows' arithmetic at every length, so a short prompt is not multiplied as decode rows) |
+| `projections` | `load(tensors, format, role=None, encode=None)` (bf16, fp8:channel, fp8:tensor, mxfp8, nvfp4 as stored, `{weight, scale, global_scale, input_scale}`; awq and gptq as stored, `{qweight, qzeros, scales}` (gptq also `g_idx`); role, the matrix's part in the model's own words, where the model plugin gives one (`head` is the output head, which quantized-projections holds in FP8 in quality mode `speed`: [precision](#precision)); encode, for a matrix only a drafter reads, the format the plugin re-encodes it to, recorded in its facts as `draft_encoding`), `matmul(x, matrix, out_dtype=None, prompt=False)` (each row's bits those of the row alone in a call of up to `invariant_rows(plugin)` rows: [row invariance](#row-invariance); `prompt=True` for a prompt chunk, which takes the prompt rows' arithmetic at every length, so a short prompt is not multiplied as decode rows) |
 | `kv_cache` | `pool(layers, kv_heads, head_dim, tokens, device, dtype, *, value_dim=None)`: a KV pool (`crit_plugins.device.KV_POOL`) with `open`, `close`, `fork`, `length`, `reserve(batch)` (each token's KV slot), `write(layer, slots, keys, values)` (a slot below 0 skipped), `keep(sequence, length)` and `gather(layer, sequence, count)` (a sequence's keys and values), and `kv_heads`, `head_dim`, `value_dim` (0: a pool of keys only, with `kv:keys`); `assertImplements` writes, forks, rolls back and gathers through it |
 | `attention` | `forward(layer, queries, pool, batch, scale=None)`: each token attends its sequence's KV up to its position, over a StepBatch or (with `rounds:attention`) a RoundBatch; with the attention facts also `blocks` and `block_size` (`attention:blocks`: each token reads only its listed KV blocks, chosen canonically by `crit_plugins.device.topk_blocks`), `parents` (`attention:tree`: a verify window's columns see their ancestors in the draft tree), `lse=True` (`attention:lse`: each token's log-sum-exp beside its output) , `sinks` (`attention:sinks`: each query head's sink logit, one more position with no value in every token's softmax), `sliding` (`attention:sliding`: a sliding window, a token's last positions) and `latent=R` (`attention:latent`: latent attention over a pool of keys only whose rows are each position's latent then its rotary key, the latent the value too) |
 | `recurrence` | `pool(layers, heads, keys, values, device, sequences=None, widest=0, conv=None, key_heads=None, rows=None)`: a state pool with `open`, `close`, `fork`, `accept(sequence, count)` (any prefix of a row of up to widest + 1 tokens), `state`, `window` and `flush`; `forward(layer, query, key, value, log_decay, beta, pool, batch, geometry)` over a StepBatch or RoundBatch, each decode or verify row's bits its own; `convolve(layer, x, weight, bias, pool, batch, activation='silu')`, the causal depthwise convolution over each sequence's window in the pool (`conv=(channels, kernel)` or `(channels, kernel, dilation)`: the window the last (kernel - 1) * dilation inputs) |
@@ -365,7 +366,56 @@ their own (a pinned GEMM beside a decode GEMV, the split reader's prompt launch)
 
 A candidate of a run always asks: `crit run ... candidate` completes its configuration's `exactness` to a level for
 each phase, with the run's [quality mode's](RUN_RECORDS.md#quality-modes) level where the configuration states none
-(`preserve`: `exact`; `speed`: `repeatable`), and the package carries it.
+(`exact` in `preserve` and in `speed`), and the package carries it. Both modes start exact because the serving
+checks compare a prefix with its prompt and decoding with prefilling: an engine whose rows multiply quantized
+activations turns an order's last bit into tenths of a nat, so below `exact` its sound rows and a broken path's read
+alike (a Qwen3.8-Flash-Next engine at `repeatable` failed `causal` at 0.38 nats, at `row-exact`
+`decode_matches_prefill` at 0.57, and at `exact` measured 0.0000, its prefill and its decode 2 to 3% slower
+than at `repeatable`). A speed
+engine lowers a phase's level where an ablation measures the gain and `serve --check` still passes.
+
+<a id="precision"></a>
+
+### Precision
+
+Exactness is the order of a row's sums. The precision of what is summed follows the engine's
+[quality mode](RUN_RECORDS.md#quality-modes), which its configuration states:
+
+```json
+"quality_mode": "speed"
+```
+
+`crit run ... candidate` writes the run's mode into every candidate's configuration, beside its `exactness`, and the
+package carries it. Core's loader reads it before any plugin is made (`crit_plugins.kernels.use_quality_mode`), and a
+plugin whose precision option is left to choose (`auto`) reads `crit_plugins.kernels.quality_mode()`: in `speed` it
+takes the lower precision the mode's budget starts from, in `preserve` the stored one. An option set to one way is
+that way in every mode, and an engine whose configuration states no mode (one built outside a run, or before the
+setting) keeps the stored precision.
+
+| Plugin | Option | `speed` | `preserve`, or no mode stated |
+|---|---|---|---|
+| quantized-projections | `head` | `fp8` | `stored` |
+| quantized-projections | `mxfp8_activations` | `mxfp8` (W8A8, the checkpoint's own activations) | `bf16` (W8A16) |
+
+The output head is the vocabulary-wide matrix that makes the logits, and every decode step reads all of it. A model
+plugin loads it with role `head` (`projections.load(tensors, format, role="head")`). With `head` `fp8`,
+quantized-projections re-encodes a head stored in 16 bits to FP8 rows at load (E4M3 codes and one FP32 scale a row,
+half the bytes), and from then on it is an FP8 matrix like a stored one, under `fp8_activations` and
+`decode_activations`. A head stored quantized stays as stored. The plugin's facts record a re-encoded head under
+`head_encoding` (stored and encoded format, bytes before and after, what chose it), and the model plugin's memory plan
+counts the head at the bytes it is held in. Three things to know:
+
+- An FP8 head re-encodes target weights. In a run whose `weights_policy` is `as_stored`, set `head` to `stored`.
+- A model whose embeddings share the head's tensor keeps its 16-bit table for the lookup beside the FP8 head, so
+  there the option saves time and no memory.
+- A model plugin with a head option of its own drops it: the library's option does the same with the FP64 encoder.
+
+In `preserve` an FP8 head is a precision change like any other: set `head` to `fp8` and measure it.
+
+MXFP8 matrices multiply the activations the checkpoint declares for them (`mxfp8_activations` `mxfp8`: each 32
+inputs of a row in E4M3 under a shared power of two) in `speed`, where a quantized format's prompt rows start at its
+stored activations and a run's plan declares them so, and 16-bit activations (`bf16`, the stored weights exact)
+otherwise. The plugin's facts say what the option became under `chosen`.
 
 ### When two plugins only pay together
 
@@ -438,7 +488,11 @@ engine runs:
 3. It creates the plugins (`assemble`), the model plugin last, with a `LoadContext`: the package, the checkpoint
    (`model`, `config`), the configuration, the served context (`context_tokens`), the device, whether the engine
    drafts, and under crit serve its model context (`serving`: verified model files, device leases that stay loaded
-   when the engine is built again).
+   when the engine is built again). `context.cache` is a folder for files a plugin can build again from the
+   checkpoint and reopen at the next load (expert-offload's bundle store): the `CRIT_PLUGIN_CACHE` environment
+   variable's, which crit run sets to `.plugin-cache` in the run's folder unless it is set already (empty: none);
+   `crit run stop` removes that folder. It is None where no host gave one, and a plugin then keeps nothing between
+   loads.
 4. It refuses a model plugin that cannot batch (`crit_plugins.model_problems`) or falls short of what every engine
    serves (`crit_core.engine.serving_problems`): token log-probabilities with 20 alternatives, fixed-text scores
    (`scoring`, `query_scoring`, `replay`), Core's sampling fields (`temperature`, `top_p`, `top_k`, `min_p`, `seed`,
@@ -525,7 +579,9 @@ the plan's count honest:
 `crit_plugins.memory.of(device)`, the same for Core and for every plugin (a plugin's factory also finds it as
 `context.memory`). Core's loader and the plugins read and move device memory through it and nowhere else.
 
-- **Readings.** `total`, `free()` (the driver's free bytes; blocks torch's allocator holds unused count as taken),
+- **Readings.** `total`, `free()` (the driver's free bytes, and never more than the card has left by its own
+  count, `card_free`: on Windows and under WSL the driver's reading is the process's budget and does not see
+  other programs; blocks torch's allocator holds unused count as taken),
   `torch()` (its allocator here: allocated, reserved, and `unused`, the whole blocks nothing uses and
   `release()` hands back; the empty segments of captured graphs' own pools are not among them), `release()`
   (hand those back; `release(below=n)` only when fewer than n bytes are free), `mark()` and `peak()` (the most
@@ -576,7 +632,11 @@ the plan's count honest:
   it keeps free (bytes, or a callable that follows the requests in flight); whoever is about to take device memory
   it cannot do without calls `need(bytes)` first, and the givers release what the device lacks to hold those bytes
   with what they keep still free; `settle()` lets them grow back down to what they keep. Nothing is taken from a
-  giver while the device has room.
+  giver while the device has room. A settle is bounded: backing device memory costs the driver time by the granule
+  (a second for two gigabytes under WSL), a settle runs inside a step's frames, and a step must end inside the
+  cancel grace. So `settle()` grows the givers back 64 MiB at a time for 50 ms at most and says whether more is
+  left (`owed`); the next steps' settles go on, and while memory is owed Core's `watch()` asks the engine for a
+  step of its own, as it does for another program's memory (below).
 - **Load, then serve.** While an engine loads, what its plugins left free at their creation is the load's (graphs,
   workspaces, first prompts) and `settle()` does nothing. Once the warm requests ran, Core calls `serve()`: torch's
   unused blocks go back to the driver and the givers take what is left. No plugin is called for it.
@@ -636,13 +696,15 @@ every byte the requests in flight do not need and none they do, Core also tells 
 
 - **Step frames** (`crit_plugins.device.STEP_FRAMES`). A plugin object of any slot that has the method is told of
   every step Core runs: `begin_step(prompt_tokens)` before the model's `step()` (the prompt tokens its rows
-  prefill, 0 for decode rows alone) or its `score()`, and `end_step(prompts_open)` after it (whether a row is
-  still prefilling, so another prompt step follows). The model plugin makes neither call. Native rounds run no
+  prefill, 0 for decode rows alone) or its `score()` (the text's tokens, with `score=True` where the method takes
+  the argument: a score holds its rows' logits beside its chunks' temporaries, so what it takes is no prompt
+  step's measure), and `end_step(prompts_open)` after it (whether a row is still prefilling, so another prompt
+  step follows). The model plugin makes neither call. Native rounds run no
   Python, so a frame is a step the model runs: prompt chunks, scores, eager decode.
 
 expert-offload's cache is the first giver: it opens with a reserve, takes every free byte but its margin (the
 run's VRAM headroom) once the load is over, makes room for a prompt step out of what a chunk of its size was
-measured to take, and grows back after the prompt's last step. A probed step's free device memory (the run's
+measured to take, and grows back after the prompt's last step, a settle at a time. A probed step's free device memory (the run's
 full-context checks) is read when the model's step returns, before the end frames.
 
 ### The host
@@ -732,7 +794,7 @@ lists, its count of a round counter adds to the native rounds', and its other fa
 device expert cache's `{"expert_cache": {slots, resident, lent, reads, hits, fills, fill_bytes}}`, the round
 driver's `{"drafts": {rounds, drafted, offered_by_depth, accepted_by_depth}}`, the first plugin in creation order
 winning a key); Core exposes it as `StepEngine.telemetry()` with its own `"core"` counters (`steps`, `rows`,
-`native_rounds`, `step_seconds`) and the load's memory (`"load"`, above). crit serve's `/health` answers it as
+`native_rounds`, `prompt_tokens`, `step_seconds`) and the load's memory (`"load"`, above). crit serve's `/health` answers it as
 `engine_telemetry` (None when the engine reports none or its report fails), and the eval-v1 adapter's `telemetry()`
 returns it to Eval. `telemetry()` runs on a thread of its own while the engine steps and its native rounds run, so it
 reads counters only: no state a step changes, no device synchronization and no wait on the device (device counters
@@ -901,7 +963,9 @@ column, `[rows][width + 1][vocabulary]` FP32. One round of R rows at width W the
 
 - start: `start_round(view)` on every part that has it;
 - draft: the drafter's `draft(view, head, sampler)` (`draft:device`, called at every width so a stateful head never
-  misses a round's tokens) writes W drafts per row from the model's draft head;
+  misses a round's tokens) writes W drafts per row from the model's draft head. A drafter whose configuration never
+  asks the head (mtp-decode's copy drafts alone, `override` 0) says so with `uses_head = False`: a model plugin
+  that loads a draft layer for its drafter refuses that selection instead of keeping the layer up for nothing;
 - verify and predict: the model's `verify(view, batch)`, then the sampler's `predictions_device(view, logits,
   draft_laws)` (`rounds:sampler`: greedy argmax or rejection sampling with Core's draws);
 - accept: the verifier's `accept_device(view)` (`verify:device`) or the driver's chain accept writes each row's
@@ -910,7 +974,10 @@ column, `[rows][width + 1][vocabulary]` FP32. One round of R rows at width W the
   the drafter's and the head's `commit_round(view)` keep each row's accepted prefix (idempotent from the round's
   start: a truncation commits again);
 - count and pack: `count_round(view)` on every part that has it adds the part's counts of the round into the engine's
-  named counters (`view.counter(name)`), and one block of results reaches pinned host memory.
+  named counters (`view.counter(name)`), and one block of results reaches pinned host memory. A part names the
+  counters it adds to in `round_counters` (a tuple of names: an experts plugin with a cache names `expert_reads` and
+  `expert_hits`), and the driver has them beside the model's own `counters=` (`rounds.counter_names`), so a model
+  plugin need not know what the plugins of its slots count.
 
 The parts are the model, sampler, drafter, head, verifier, every pool, the plugins of the slots the round uses
 (expert-offload in the experts slot) and the extra parts the model registers (`extra_parts`: a device expert cache
@@ -948,7 +1015,8 @@ the model's verify calls (`uses`, by default every computing slot) provides `rou
 (`RoundsRefused`, naming the plugin), `native_rounds` returns None and the model decodes through `step()`: correct,
 slower; the driver's `problems` lists the reasons after loading. A model plugin serving rounds returns
 `rounds.native_rounds(library, widths)` from its `native_rounds(library)`, declares `max_row_tokens` and
-`decode_token_work` of widest + 1 and `round_counters` naming the driver's counters in its info (Core refuses to open an
+`decode_token_work` of widest + 1 and `round_counters` naming the driver's counters (`rounds.counter_names`: its own
+and those its parts name) in its info (Core refuses to open an
 engine whose settings cannot hold its rounds), and keeps `step()` for prompts and whatever rounds do not cover
 (constrained requests, replays, rows past the captured widths); bind a session to a round slot when its prompt completes
 and unbind it as it retires. [test_device_engine_rounds.py](../tests/test_device_engine_rounds.py) shows it: the
@@ -1019,7 +1087,7 @@ that use its code.
 
 | Slot | Base plugin | Techniques (the plugin each is compared with) |
 | --- | --- | --- |
-| `model` | | One model plugin per architecture family, checked against the transformers reference |
+| `model` | | `model-template` (composed from blocks by a layout per architecture family, against transformers on a small checkpoint of each) |
 | `placement` | `device-placement` (every tensor on the device, runs on the host) | |
 | `attention` | `softmax-attention` | `partitioned-attention` (against `softmax-attention`) |
 | `kv_cache` | | `attention-state` |
@@ -1073,8 +1141,8 @@ under `_sources` too, and leaves the copies the engine changed and its own plugi
 what it would replace). An engine that took a library plugin unchanged gets the library's fixes that way; its
 tests and its Eval then say whether it keeps its results.
 
-Every slot but `model` has library plugins that run on the device, each with its host form as before and the slot's
-[device form](#device-form) in torch, over providers where one covers the arithmetic and crit's own kernels
+Every slot has library plugins that run on the device; those of every slot but `model` have their host form as before
+and the slot's [device form](#device-form) in torch, over providers where one covers the arithmetic and crit's own kernels
 where none does, each with its torch fallback ([kernels and plugins](#kernels-and-plugins)). Their facts say which
 [device extensions](#device-extensions) they provide (each plugin.json's `provides`):
 
@@ -1095,9 +1163,19 @@ where none does, each with its torch fallback ([kernels and plugins](#kernels-an
 | `graphs` | `eager-graphs` (base), `recorded-selection` | The capture a step or prompt chunk runs, from the model plugin's offers: always eager, or the least run time per use among the measured offers that compute the arithmetic its options name (host policy code) |
 | `drafter`, `verifier` | `greedy-head-drafter`, `chain-verifier` (base); `mtp-decode`, `hidden-state-drafters`, `draft-vocabulary-subset`, `draft-trees` | Host policy over the engine's draft head (`draft:head`), and inside captured rounds `draft:device` / `verify:device`: the chain over the model's device draft head, copies from device token histories (mtp-decode, `override` putting long copies over the head's chain), d2t mapping and the confidence cut on the device, subset rows chosen again on the device, trees; the chain accept and the tree walk on the device |
 
-A model plugin for a checkpoint's architecture is the engine's: the layer arithmetic of one family is no general
-mechanism (see [What belongs in crit](CONTRIBUTION_CRITERIA.md)), so the library holds none. It calls the other slots'
-plugins, and [test_device_engine.py](../tests/test_device_engine.py) shows the whole: the KV pool, attention,
+The library's model plugin is [model-template](../inference/model-template/README.md): the architecture as blocks
+(grouped-query and gated softmax attention, block-sparse attention with an indexer, latent attention, gated
+delta-rule layers, hashed n-gram table rows, SwiGLU MLPs, mixtures of experts over any experts plugin, the checkpoint's MTP layer as the device
+draft head) over one pre-norm residual stream or several mixed streams, composed by a layout, data for each architecture family
+the layer kinds of several families share ([What belongs in crit](CONTRIBUTION_CRITERIA.md)), on the serving contracts
+every model plugin keeps: exact rows, prompt spans timed at load within crit serve's cancel grace and the device's
+room, a placement plan of every device tensor, captured rounds and prompt chunks, the prompt cache, fixed-text scores
+in the prompt's spans. An engine whose checkpoint a layout covers starts from it with no model code of its own; one
+whose architecture none covers composes its model plugin from the same code, with a layout file and block classes of
+its own (`compose(context, options, parts, layout=, blocks=)`), and writes a model plugin from scratch only where the
+layer loop itself differs. Each layout is tested as a whole engine through Core's loader against transformers on a
+small random checkpoint. [test_device_engine.py](../tests/test_device_engine.py) shows a hand-written model plugin
+whole, as Core's tests use one: the KV pool, attention,
 projections, sampling, fused-norms and placement plugins copied with `crit plugins add` beside a Llama-layout model
 plugin, run by Core's loader on a GPU, give transformers' log-probabilities and greedy choices for the same checkpoint,
 decode the same tokens batched as alone, and decode the same tokens with torch-norms in fused-norms' place.

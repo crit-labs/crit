@@ -1,7 +1,9 @@
 """gguf-rows on this GPU, every format: the stored values (dequantize in FP32, and bench.py's host decoders) equal the
-format's own reference decoder (gguf-py's dequantize) bit for bit; gemv equals the declared order (bench.product) bit
+format's own reference decoder (gguf-py's dequantize; Core's host decoders for Q1_0 and Q2_0 where the installed gguf-py
+has none, which Core's tests check against the formats' rules) bit for bit; gemv equals the declared order (bench.product) bit
 for bit for 1 to 8 rows and any split; a row's bits are the same alone and among others; a gathered row equals the plain
-call on its expert; and what the kernel cannot read is refused."""
+call on its expert, also read in place from slots that hold other bytes beside each expert; and what the kernel cannot
+read is refused."""
 import sys
 from pathlib import Path
 
@@ -22,9 +24,15 @@ SHAPES = [(64, 256), (96, 1024), (40, 4608)]
 
 
 def reference_values(raw, fmt, k):
-    """gguf-py's dequantize of the stored blocks, FP32 [N][K]."""
+    """gguf-py's dequantize of the stored blocks, FP32 [N][K] (Core's decoders where gguf-py has no decoder for the
+    type)."""
     from gguf import GGMLQuantizationType, quants
-    return quants.dequantize(raw, GGMLQuantizationType(fmt)).astype(np.float32).reshape(raw.shape[0], k)
+    try:
+        return quants.dequantize(raw, GGMLQuantizationType(fmt)).astype(np.float32).reshape(raw.shape[0], k)
+    except (ValueError, NotImplementedError, KeyError):
+        if fmt not in (41, 42):
+            raise
+        return stored_values(raw, fmt, k)
 
 
 @pytest.mark.parametrize("fmt", sorted(BLOCKS))
@@ -59,6 +67,24 @@ def test_gemv_is_the_declared_order_bit_for_bit_and_a_rows_bits_its_own(fmt):
             assert torch.equal(gr.gemv(xd, w).cpu(), product(raw, fmt, k, xd, gr.splits(w)).to(dtype))
 
 
+@pytest.mark.parametrize("fmt", sorted(BLOCKS))
+def test_a_matrix_at_any_byte_offset_has_the_same_bits(fmt):
+    # The decoders read a block's fields by wider loads when its address allows (gguf.cuh's low_iq, IQ1_M) and byte by
+    # byte otherwise: the same values either way.
+    n, k = 40, 4608
+    raw = blocks(fmt, n, k, seed=fmt * 13)
+    aligned = gr.GgufMatrix(torch.from_numpy(raw).to(dev), fmt, k)
+    x = activations(3, k, dev)
+    want_y, want_v = gr.gemv(x, aligned).cpu(), gr.dequantize(aligned, torch.float32).cpu()
+    buffer = torch.zeros(raw.nbytes + 16, dtype=torch.uint8, device=dev)
+    for offset in (1, 2, 4):
+        view = buffer[offset:offset + raw.nbytes].view(raw.shape)
+        view.copy_(torch.from_numpy(raw).to(dev))
+        w = gr.GgufMatrix(view, fmt, k)
+        assert torch.equal(gr.gemv(x, w).cpu(), want_y), (NAMES[fmt], offset)
+        assert torch.equal(gr.dequantize(w, torch.float32).cpu().view(torch.int32), want_v.view(torch.int32))
+
+
 @pytest.mark.parametrize("parts", [1, 2, 3, 8])
 def test_every_split_is_its_own_declared_order(parts):
     # The part count is part of the order: each one the reference reproduces.
@@ -86,6 +112,28 @@ def test_a_gathered_row_equals_the_plain_call_on_its_expert(fmt):
         one = gr.GgufMatrix(stack.blocks[e].contiguous(), fmt, k)
         assert torch.equal(got[r:r + 1], gr.gemv(x[r:r + 1], one)), (NAMES[fmt], r)
         assert torch.equal(gr.dequantize(stack, torch.float32, expert=e), gr.dequantize(one, torch.float32))
+
+
+@pytest.mark.parametrize("fmt", [8, 16, 20, 22, 29, 42])
+def test_a_stack_in_slots_with_other_bytes_reads_as_the_contiguous_stack(fmt):
+    # An expert cache's slots: each expert's rows at the start of a slot of more bytes (another layer's larger
+    # matrices, a down projection after them); the kernel reads the stack at the slots' stride, in place.
+    n, k, experts = 24, 512, 5
+    raw = blocks(fmt, n, k, seed=fmt + 3, experts=experts)
+    size = raw.shape[1] * raw.shape[2] + 192   # a slot: the expert's rows and 192 other bytes
+    slots = torch.randint(0, 256, (experts, size), dtype=torch.uint8, device=dev)
+    slots[:, :raw.shape[1] * raw.shape[2]] = torch.from_numpy(raw.reshape(experts, -1)).to(dev)
+    strided = slots.view(-1).as_strided((experts, n, raw.shape[2]), (size, raw.shape[2], 1))
+    plain = gr.GgufMatrix(torch.from_numpy(raw).to(dev), fmt, k)
+    ids = torch.tensor([4, 0, 2, 2, 1, 3], dtype=torch.int32, device=dev)
+    x = activations(6, k, dev)
+    assert torch.equal(gr.gemv(x, gr.GgufMatrix(strided, fmt, k), ids), gr.gemv(x, plain, ids)), NAMES[fmt]
+    for e in range(experts):
+        assert torch.equal(gr.dequantize(gr.GgufMatrix(strided, fmt, k), torch.float32, expert=e),
+                           gr.dequantize(plain, torch.float32, expert=e))
+    with pytest.raises(RuntimeError, match="do not overlap"):
+        gr.gemv(x, gr.GgufMatrix(slots.view(-1).as_strided((experts, n, raw.shape[2]), (8, raw.shape[2], 1)), fmt,
+                                 k), ids)
 
 
 def test_a_nan_reaches_its_rows_outputs_and_no_others():
@@ -129,8 +177,8 @@ def test_the_device_iq_grids_are_cores():
 def test_what_the_kernel_cannot_read_is_refused():
     raw = torch.from_numpy(blocks(12, 8, 256, seed=2)).to(dev)
     x = activations(1, 256, dev)
-    with pytest.raises(RuntimeError, match="GGUF type 34 is not one of"):
-        gr.gemv(x, gr.GgufMatrix(raw, 34, 256))
+    with pytest.raises(RuntimeError, match="GGUF type 1 is not one of"):
+        gr.gemv(x, gr.GgufMatrix(raw, 1, 256))
     with pytest.raises(RuntimeError, match="multiple of the format's 256"):
         gr.dequantize(gr.GgufMatrix(raw[:, :72].contiguous(), 12, 128))
     with pytest.raises(RuntimeError, match="holds 288 bytes, not 144"):
@@ -165,3 +213,24 @@ def test_the_prompt_gemm_staged_in_chunks_has_the_same_bits(fmt):
     y = torch.empty(37, n, dtype=x.dtype, device=dev)
     gr.ops.gemm(w.blocks, fmt, k, xq, xd, xs, gr.splits(w), y, 16)
     assert torch.equal(y, gr.gemm(x, w)) and torch.equal(y[:8], gr.gemv(x[:8], w)), NAMES[fmt]
+
+
+@pytest.mark.parametrize("fmt", sorted(BLOCKS))
+def test_the_grouped_prompt_gemm_gives_each_row_its_experts_gemm_bits(fmt):
+    # A mixture of experts' prompt rows sorted by expert: groups of rows, each times its own expert of a stack read in
+    # place from slots (experts in any order, one appearing once, groups shorter and longer than a tile), staged in
+    # one launch and multiplied in one: every output the plain gemm's bits for its row on its expert.
+    n, k, experts = 48, 1024, 6
+    raw = blocks(fmt, n, k, seed=fmt * 7 + 1, experts=experts)
+    size = raw.shape[1] * raw.shape[2] + 128
+    slots = torch.randint(0, 256, (experts, size), dtype=torch.uint8, device=dev)
+    slots[:, :raw.shape[1] * raw.shape[2]] = torch.from_numpy(raw.reshape(experts, -1)).to(dev)
+    stack = gr.GgufMatrix(slots.view(-1).as_strided((experts, n, raw.shape[2]), (size, raw.shape[2], 1)), fmt, k)
+    ids, counts = [4, 0, 5, 2], [3, 70, 1, 130]
+    x = activations(sum(counts), k, dev)
+    got = gr.gemm_experts(x, stack, ids, counts)
+    start = 0
+    for e, c in zip(ids, counts):
+        one = gr.GgufMatrix(torch.from_numpy(raw[e]).to(dev), fmt, k)
+        assert torch.equal(got[start:start + c], gr.gemm(x[start:start + c], one)), (NAMES[fmt], e)
+        start += c

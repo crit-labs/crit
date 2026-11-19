@@ -25,7 +25,7 @@ from crit_core.serving import SAMPLING, ScoreRows
 from crit_plugins.device import Allowed
 from crit_plugins.memory import of as memory_of
 
-ABI = 7
+ABI = 8
 NONFINITE = "nonfinite"   # a round counter of that name fails the request it is not zero for
 RESULT_BYTES = 1 << 20  # a generation's result JSON: finish, timing and the engine's request facts
 TOKEN_CALLBACK = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_int)
@@ -483,9 +483,9 @@ STEP_LIBRARY_FOLDERS = ("build/core-steps", "build/core-steps/Release", "build/c
 
 def step_cache():
     """Where `crit core build` builds this Core's library outside a checkout: CRIT_CORE_CACHE (default
-    ~/.cache/crit/core), one folder a Core version."""
-    from . import __version__
-    return Path(os.environ.get("CRIT_CORE_CACHE") or Path.home() / ".cache" / "crit" / "core") / __version__
+    crit_core.cache_home()'s core), one folder a Core version."""
+    from . import __version__, cache_home
+    return Path(os.environ.get("CRIT_CORE_CACHE") or cache_home("core")) / __version__
 
 
 def step_library():
@@ -523,13 +523,13 @@ class _StepRow(ctypes.Structure):
 class _StepProgress(ctypes.Structure):
     _fields_ = [("prompt_tokens", ctypes.c_uint32), ("reused_prompt_tokens", ctypes.c_uint32),
                 ("token_work", ctypes.c_uint32), ("tokens", ctypes.c_uint32), ("prefill_complete", ctypes.c_int32),
-                ("drafted", ctypes.c_int32)]
+                ("drafted", ctypes.c_int32), ("pass_tokens", ctypes.c_uint32)]
 
 
 # The rows, progress and decisions of a step as packed bytes (their structures' layouts), which _step and _commit read
 # and write in one call each instead of a ctypes field access per value.
 _ROW = struct.Struct("=QIIIi")
-_PROGRESS = struct.Struct("=IIIIii")
+_PROGRESS = struct.Struct("=IIIIiiI")
 _DECISION = struct.Struct("=QIii4x")
 
 
@@ -706,10 +706,16 @@ StepRow = namedtuple("StepRow", "session prefill_tokens output_tokens token_work
 # What step() returns per row, in the rows' order: prompt tokens consumed (reused ones included), the tokens produced
 # (at most max_row_tokens), whether prefill is complete, the reused prefix, the token work computed (0: the prompt
 # tokens computed, or one per token), for requests asking for them one (logprob, [(token, logprob), ...]) per token,
-# and for a decode row the drafts its round verified (None: not reported), which the request's facts list per round.
+# for a decode row the drafts its round verified (None: not reported), which the request's facts list per round, and
+# the prompt tokens the row holds in a prefill pass after the step. A model whose info() gives "prefill_pass_tokens"
+# and "prefill_pass_steps" may work on a span of the prompt over several steps (layer by layer, say) and report no
+# prompt token consumed until the pass ends: each such step reports the span as pass_tokens, the step that ends the
+# pass reports its tokens as prompt_tokens (they may exceed that step's grant by the pass), and Core fails an engine
+# whose row passes more than prefill_pass_steps steps in a row.
 StepResult = namedtuple("StepResult",
-                        "prompt_tokens tokens prefill_complete reused_prompt_tokens token_work logprobs drafted",
-                        defaults=(0, (), False, 0, 0, None, None))
+                        "prompt_tokens tokens prefill_complete reused_prompt_tokens token_work logprobs drafted "
+                        "pass_tokens",
+                        defaults=(0, (), False, 0, 0, None, None, 0))
 
 
 # Facts Core keeps per round: the model's own list of them covers its step() rounds.
@@ -764,15 +770,22 @@ def _keep_thread_state(ident, threads):
 
 
 def _frame(method):
-    """A step frame's method as Core calls it, with one argument: a plugin whose method takes none (an engine's
-    older copy of a library plugin) is called without it."""
+    """A step frame's method as Core calls it, with one argument and, for a begin frame of a score, score=True: a
+    plugin whose method takes no argument or no `score` (an engine's older copy of a library plugin) is called
+    without them."""
     import inspect
     try:
+        parameters = inspect.signature(method).parameters
         takes = any(p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.VAR_POSITIONAL)
-                    for p in inspect.signature(method).parameters.values())
+                    for p in parameters.values())
+        scored = "score" in parameters or any(p.kind == p.VAR_KEYWORD for p in parameters.values())
     except (TypeError, ValueError):
-        takes = True
-    return method if takes else (lambda _argument: method())
+        takes, scored = True, False
+    if takes and scored:
+        return lambda argument, score=False: method(argument, score=score)
+    if takes:
+        return lambda argument, score=False: method(argument)
+    return lambda _argument, score=False: method()
 
 
 class StepEngine(_Runtime):
@@ -782,7 +795,8 @@ class StepEngine(_Runtime):
 
         info()                 facts as a Python engine's (implementation, stop_tokens, sampling, speculative, replay,
                                ...) plus Core's settings: "vocabulary" and "context" (required), "max_concurrency",
-                               "max_pending", "max_batch_tokens", "prefill_chunk", "batch_policy", "max_row_tokens",
+                               "max_pending", "max_batch_tokens", "prefill_chunk", "prefill_pass_tokens" and
+                               "prefill_pass_steps" (prefill passes: StepResult), "batch_policy", "max_row_tokens",
                                "token_logprobs", "max_top_logprobs", "scoring" (STEP_SETTINGS)
         open(request)          a session for a StepRequest
         step(rows)             one StepResult per StepRow, computed together
@@ -829,7 +843,7 @@ class StepEngine(_Runtime):
         self._telemetry = telemetry if telemetry is not None else (own if callable(own) else None)
         self._request_facts = getattr(model, "request_facts", None)
         self._request_facts = self._request_facts if callable(self._request_facts) else None
-        self._counted = {"steps": 0, "rows": 0, "step_s": 0.0}
+        self._counted = {"steps": 0, "rows": 0, "step_s": 0.0, "prompt_tokens": 0, "pass_steps": 0}
         self._probed = {} if os.environ.get(STEP_PROBE) == "1" else None   # StepEngine.probe's samples
         self._no_allocations = os.environ.get(STEP_ALLOCATIONS) == "0"
         # A tool's view of the engine's work, on the engine's thread (the memory audit): audit.step(rows) is called
@@ -1030,15 +1044,20 @@ class StepEngine(_Runtime):
         memory = memory_of("cuda")
         return int(memory.free() - max(0, memory.peak() - memory.torch()["reserved"]))
 
-    def _probe_end(self, torch, kind, started, free, made=None):
+    def _probe_end(self, torch, kind, started, free, made=None, parts=None):
         """At a probed step's end: its seconds with its device work finished, the free device memory at its peak
-        (_probe_free) and the device allocations it made, kept per kind."""
+        (_probe_free) and the device allocations it made, kept per kind. parts: the seconds the step's begin frames
+        and the model's step took on the host; the slowest step's are kept with what was left of it (its end frames
+        and the device work still queued then), so a step past the cancel grace says which part took it there."""
         if torch is not None:
             torch.cuda.synchronize()
         seconds = round(time.perf_counter() - started, 6)
         found = self._probed.setdefault(kind, {"steps": 0, "slowest_seconds": 0.0,
                                                "recent": deque(maxlen=PROBE_RECENT)})
         found["steps"] += 1
+        if parts is not None and seconds > found["slowest_seconds"]:
+            found["slowest_parts"] = {"begin_frames": round(parts[0], 6), "model": round(parts[1], 6),
+                                      "end_frames": round(max(0.0, seconds - parts[0] - parts[1]), 6)}
         found["slowest_seconds"] = max(found["slowest_seconds"], seconds)
         if made is not None:
             found["allocations"] = found.get("allocations", 0) + made
@@ -1069,16 +1088,17 @@ class StepEngine(_Runtime):
                 self._relieve()
             memory = memory_of("cuda") if probing or self._no_allocations else None
             made = memory.made() if memory is not None else None
-            if self._begin:
-                prompt_tokens = sum(row.prefill_tokens for row in scheduled)
-                for begin in self._begin:
-                    begin(prompt_tokens)
+            prompt_tokens = sum(row.prefill_tokens for row in scheduled)
+            for begin in self._begin:
+                begin(prompt_tokens)
             results = free = None
+            entered = stepped = time.perf_counter()
             try:
                 results = self.model.step(scheduled)
                 if not isinstance(results, (list, tuple)):
                     results = list(results)
             finally:
+                stepped = time.perf_counter()
                 if probing:
                     free = self._probe_free(torch)
                 if self._end:   # a row still prefilling after the step (StepResult.prefill_complete): another follows
@@ -1100,9 +1120,12 @@ class StepEngine(_Runtime):
             width, top = self._row_tokens, self._top
             out = (ctypes.c_char * (count * _PROGRESS.size)).from_address(ctypes.addressof(progress.contents))
             ids = (ctypes.c_int32 * (count * width)).from_address(ctypes.addressof(tokens.contents))
+            prefilled = passing = 0   # the prompt tokens the step computed, and whether a row of it only passed
             for i, result in enumerate(results):
                 if not isinstance(result, StepResult):
                     result = StepResult(*result)
+                prefilled += result.prompt_tokens - result.reused_prompt_tokens
+                passing = passing or (result.pass_tokens and not result.prompt_tokens)
                 produced = result.tokens if isinstance(result.tokens, list) else list(result.tokens)
                 n = len(produced)
                 if n > width:
@@ -1110,7 +1133,7 @@ class StepEngine(_Runtime):
                 drafted = result.drafted
                 _PROGRESS.pack_into(out, i * _PROGRESS.size, result.prompt_tokens, result.reused_prompt_tokens,
                                     result.token_work, n, 1 if result.prefill_complete else 0,
-                                    0 if drafted is None else int(drafted) + 1)
+                                    0 if drafted is None else int(drafted) + 1, result.pass_tokens)
                 if n:
                     try:
                         ids[i * width:i * width + n] = produced
@@ -1127,10 +1150,12 @@ class StepEngine(_Runtime):
             counted = self._counted
             counted["steps"] += 1
             counted["rows"] += count
+            counted["prompt_tokens"] += prefilled
+            counted["pass_steps"] += 1 if passing else 0
             counted["step_s"] += time.perf_counter() - started
             if probing:
                 # A step that prefills any row is a prompt step: Core settles a cancel only between steps.
-                self._probe_end(torch, kind, started, free, made)
+                self._probe_end(torch, kind, started, free, made, (entered - started, stepped - entered))
         return self._guard(run)
 
     def _commit(self, _user, decisions, count):
@@ -1186,10 +1211,14 @@ class StepEngine(_Runtime):
     def telemetry(self):
         """The engine's work so far, for crit serve's /health and Eval (docs/PLUGINS.md): what its plugins report
         (the assembly's telemetry(), crit_plugins.Assembly) and Core's own counters ("core": steps and rows, native
-        rounds included, the native rounds alone, those of them in the log-probability form, and the seconds the
-        Python steps took, the model's step included). A probed engine (STEP_PROBE) adds "probe": per kind of step
+        rounds included, the native rounds alone, those of them in the log-probability form, the prompt tokens the
+        steps computed and their rows consumed ("prompt_tokens": a caller reads a prefill's rate from it while the
+        request runs; a prefill pass's tokens count in the step that ends the pass, and "pass_steps" are the steps
+        in which a row worked on a pass and consumed nothing), and the seconds the Python steps took, the model's
+        step included). A probed engine (STEP_PROBE) adds "probe": per kind of step
         ("prompt": any row prefills, else "decode") the steps probed, the slowest one's seconds with its device work
-        finished, the least free device memory at a step's peak (torch's reservations; CUDA only), the device
+        finished and its parts ("slowest_parts": the host seconds of its begin frames and of the model's step, and
+        what was left, its end frames with the device work still queued), the least free device memory at a step's peak (torch's reservations; CUDA only), the device
         allocations the steps made and the most one made ("allocations", "most_allocations": 0 for steps that only
         replay captured graphs; CUDA only), and "recent": the
         last PROBE_RECENT steps' [seconds, free bytes or None], so a caller can judge the steps of one request (those
@@ -1202,7 +1231,9 @@ class StepEngine(_Runtime):
         native = self.rounds.runs if getattr(self, "rounds", None) is not None else (0, 0, 0)
         found["core"] = {**(found.get("core") or {}), "steps": counted["steps"] + native[0],
                          "rows": counted["rows"] + native[1], "native_rounds": native[0],
-                         "native_logprob_rounds": native[2], "step_seconds": round(counted["step_s"], 6)}
+                         "native_logprob_rounds": native[2], "prompt_tokens": counted["prompt_tokens"],
+                         "pass_steps": counted["pass_steps"],
+                         "step_seconds": round(counted["step_s"], 6)}
         if counted.get("nonfinite_requests"):   # requests failed for logits that were not finite
             found["core"]["nonfinite_requests"] = counted["nonfinite_requests"]
         if self._probed is not None:
@@ -1231,7 +1262,7 @@ class StepEngine(_Runtime):
             rows = ([[queries[t * per_target + j] for j in range(per_target)] for t in range(targets)]
                     if per_target else None)
             for begin in self._begin:   # a score runs its text through the prompt path
-                begin(count)
+                begin(count, score=True)
             try:
                 scored = self.model.score(ids[:count], first_target, (path or b"").decode("utf-8"), queries=rows,
                                           top_k=top_k)

@@ -59,7 +59,9 @@ far back the match goes, over the ring's last `capacity - (widest + 1)` position
 `widest + 1` positions past its frontier, and fewer again after a truncation, never into the searched span). A slot's history starts at `seed(slot, tokens)` (the prompt and the first output token),
 which the model calls after the round driver binds the slot. `commit_round` writes the round's emitted tokens into the ring from the device's counts, so
 copies need no host between rounds (Core's native rounds). The copies equal the host index's wherever the sequence
-fits that span (`capacity`, default 16,384 tokens). With `override` the model's draft head drafts the chain
+fits that span (`capacity`, default 16,384 tokens). Without `override` (0, the default) the plugin proposes copies alone and never asks the model's draft head: a
+checkpoint's draft layer is not used at all, so a model plugin that loads one refuses this selection
+(`uses_head` is False). For the draft layer's chain alone select `greedy-head-drafter`. With `override` the model's draft head drafts the chain
 (`head_chain`) and a copy matching at least `override` tokens replaces its first drafts. The override is a bet that
 the copy is right where the head is not: a short match occurs by chance in a long context (a few common tokens recur
 throughout code, markup and prose), and the copy then replaces drafts the head had right, so a round that would have

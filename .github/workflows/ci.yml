@@ -17,7 +17,9 @@ concurrency:
 
 jobs:
   host:
-    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    # The host tests in shards, each its own runner: a shard's units are filled by their recorded times
+    # (tests/durations.json), so the shards of a platform end together. Windows runs them about twice as slow.
+    name: ${{ matrix.os }} / Python ${{ matrix.python }} / shard ${{ matrix.shard }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -25,12 +27,19 @@ jobs:
       matrix:
         os: [ubuntu-24.04, windows-2022]
         python: ['3.11', '3.14']
+        shard: [1, 2, 3, 4]
+        exclude:
+          - os: ubuntu-24.04
+            shard: 3
+          - os: ubuntu-24.04
+            shard: 4
     defaults:
       run:
         shell: bash
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       PYTHONUTF8: '1'
+      SHARDS: ${{ matrix.os == 'windows-2022' && 4 || 2 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -38,17 +47,34 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           python-version: ${{ matrix.python }}
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        # Core's step runtime is C++ alone: one build serves every Python and shard until core/ changes.
+        id: core-steps
+        with:
+          path: build/core-steps
+          key: core-steps-${{ runner.os }}-${{ hashFiles('core/**') }}
       - name: Build Core's step runtime
         # Core's loader runs every engine on crit_core_steps: the host tests load the toy engine's plugin package on it.
         run: |
-          cmake -S core -B build/core-steps -DCMAKE_BUILD_TYPE=Release
-          cmake --build build/core-steps --config Release --target crit_core_steps --parallel 2
+          if [ "${{ steps.core-steps.outputs.cache-hit }}" != true ]; then
+            cmake -S core -B build/core-steps -DCMAKE_BUILD_TYPE=Release
+            cmake --build build/core-steps --config Release --target crit_core_steps --parallel 4
+          fi
           library=$(find build/core-steps \( -name 'libcrit_core_steps.so' -o -name 'crit_core_steps.dll' \) | head -n 1)
           echo "CRIT_CORE_STEP_LIBRARY=$(python -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' "$library")" >> "$GITHUB_ENV"
       - name: Host contracts and chat processes
-        # One process per test module, four at a time: most tests wait on served engines' processes.
-        run: python -B tests/run_parallel.py --jobs 4
+        # One process per test module or recorded class, four at a time: most tests wait on served engines' processes.
+        run: python -B tests/run_parallel.py --jobs 4 --shard ${{ matrix.shard }}/$SHARDS --record "$RUNNER_TEMP/durations.json"
+      - name: Keep the units' times
+        # main's runs record what each unit took, failed or not; the durations job folds them into tests/durations.json.
+        if: github.event_name == 'push' && !cancelled()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: durations-${{ matrix.os }}-${{ matrix.python }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/durations.json
       - name: Build and install Python package from a disposable snapshot
+        # Once per platform and Python: the package does not depend on the shard.
+        if: matrix.shard == 1
         run: |
           python -m pip install setuptools==84.0.0 wheel==0.48.0
           mkdir -p build/package-source
@@ -64,6 +90,28 @@ jobs:
           crit inference check
       - name: Verify source stayed unchanged
         run: git diff --exit-code
+
+  durations:
+    # The units' times main's shards recorded, folded into tests/durations.json (artifact test-durations): committing
+    # it keeps the shards even as tests are added and grow.
+    name: Recorded test times
+    needs: host
+    if: github.event_name == 'push' && !cancelled()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: durations-*
+          path: ${{ runner.temp }}/durations
+      - run: python3 -B tests/run_parallel.py --merge "$RUNNER_TEMP"/durations/*/durations.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-durations
+          path: tests/durations.json
 
   lint:
     name: Lint
@@ -121,15 +169,22 @@ jobs:
         run: git diff --exit-code
 
   native:
-    # The native SDK, Inference and Kernels builds do not depend on the Python version: once per OS.
-    name: ${{ matrix.os }} / native
+    # The native SDK builds do not depend on the Python version: once per OS and compiler, each its own runner. The
+    # installed SDK's consumers (Inference against it, the concurrency consumer) build in the job that installed it.
+    name: ${{ matrix.os }} / native ${{ matrix.compiler }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2022]
-        python: ['3.14']
+        include:
+          - os: ubuntu-24.04
+            compiler: gcc
+          # GCC -Wshadow misses a local that hides an anonymous-namespace variable; Clang -Wshadow reports it.
+          - os: ubuntu-24.04
+            compiler: clang
+          - os: windows-2022
+            compiler: msvc
     defaults:
       run:
         shell: bash
@@ -142,35 +197,59 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup
         with:
-          python-version: ${{ matrix.python }}
+          python-version: '3.14'
       - name: Build native host SDK
         run: |
-          cmake -S core -B build/core -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release
-          cmake --build build/core --config Release --parallel 2
+          cmake -S core -B build/core -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release \
+            ${{ matrix.compiler == 'clang' && '-DCMAKE_CXX_COMPILER=clang++' || '' }}
+          cmake --build build/core --config Release --parallel 4
           ctest --test-dir build/core -C Release --output-on-failure
+      - name: Install native host SDK
+        if: matrix.compiler != 'clang'
+        run: |
           cmake --install build/core --config Release --prefix "$PWD/build/core-install"
           cmp LICENSE build/core-install/share/licenses/crit/LICENSE
-      - name: Build native host SDK with Clang
-        # GCC -Wshadow misses a local that hides an anonymous-namespace variable; Clang -Wshadow reports it.
-        if: runner.os == 'Linux'
+      - name: Inference against the installed Core SDK
+        if: matrix.compiler != 'clang'
         run: |
-          cmake -S core -B build/core-clang -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++
-          cmake --build build/core-clang --config Release --parallel 2
-          ctest --test-dir build/core-clang -C Release --output-on-failure
+          cmake -S inference -B build/inference-installed -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release -DCRIT_INFERENCE_INSTALLED_CORE=ON -DCMAKE_PREFIX_PATH="$PWD/build/core-install"
+          cmake --build build/inference-installed --config Release --parallel 4
+          ctest --test-dir build/inference-installed -C Release --output-on-failure
+      - name: Independent installed SDK consumers
+        if: matrix.compiler != 'clang'
+        run: |
+          cmake -S tests/core/concurrency_consumer -B build/consumer -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$PWD/build/core-install"
+          cmake --build build/consumer --config Release --parallel 4
+          ctest --test-dir build/consumer -C Release --output-on-failure
+      - name: Verify source stayed unchanged
+        run: git diff --exit-code
+
+  inference:
+    # Inference's native examples and fixtures, built in the tree against Core: beside the native SDK jobs, not after.
+    name: ${{ matrix.os }} / Inference native
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          python-version: '3.14'
       - name: Build Inference native examples and fixtures against Core
         run: |
           cmake -S inference -B build/inference -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release
-          cmake --build build/inference --config Release --parallel 2
+          cmake --build build/inference --config Release --parallel 4
           ctest --test-dir build/inference -C Release --output-on-failure
-      - name: Inference against the installed Core SDK
-        run: |
-          cmake -S inference -B build/inference-installed -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release -DCRIT_INFERENCE_INSTALLED_CORE=ON -DCMAKE_PREFIX_PATH="$PWD/build/core-install"
-          cmake --build build/inference-installed --config Release --parallel 2
-          ctest --test-dir build/inference-installed -C Release --output-on-failure
-      - name: Independent installed SDK consumers
-        run: |
-          cmake -S tests/core/concurrency_consumer -B build/consumer -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$PWD/build/core-install"
-          cmake --build build/consumer --config Release --parallel 2
-          ctest --test-dir build/consumer -C Release --output-on-failure
       - name: Verify source stayed unchanged
         run: git diff --exit-code

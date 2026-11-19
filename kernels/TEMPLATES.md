@@ -227,4 +227,4 @@ crit kernels gates ID --model CHECKPOINT [--tuning FILE]       # the gates beyon
 
 A plugin loads a kernel by id (`crit_plugins.kernels.load_kernel`), built with the engine's tuning
 (`CRIT_KERNEL_TUNING=TUNING_DIR`) or the default knobs, and falls back to its torch path when it cannot be built.
-Builds are cached in `CRIT_KERNEL_CACHE` (default `~/.cache/crit/kernels`).
+Builds are cached in `CRIT_KERNEL_CACHE` (default `kernels` under `CRIT_CACHE_HOME`, itself `~/.cache/crit` by default).

@@ -15,7 +15,8 @@
   ],
   "provides": [
     "rounds:experts",
-    "prompts:experts"
+    "prompts:experts",
+    "experts:activations"
   ],
   "test_with": [
     "expert-tensors"

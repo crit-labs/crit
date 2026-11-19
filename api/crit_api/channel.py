@@ -12,6 +12,7 @@ import queue
 import socket
 import struct
 import threading
+import time
 
 HEADER = struct.Struct("!I")
 STATUS_BYTES = 1 << 20  # a status, stream piece or result without a response
@@ -96,6 +97,7 @@ class Supervisor:
         self.port = self.listener.getsockname()[1]
         self.lock = threading.Lock()
         self.boxes, self.status, self.failure = {}, None, None
+        self.work, self.worked = None, None   # a load's newest reported work, and when it last changed (monotonic)
         self.connection = self.pid = None
         self.connected = threading.Event()
         self.outbox = queue.SimpleQueue()
@@ -183,6 +185,9 @@ class Supervisor:
                         raise ValueError("Invalid resident status")
                     with self.lock:
                         self.status = message["status"]
+                        work = self.status.get("work")
+                        if work is not None and work != self.work:
+                            self.work, self.worked = work, time.monotonic()
                     continue
                 if kind not in {"progress", "result"}:
                     raise ValueError("Unknown resident message " + repr(kind)[:40])

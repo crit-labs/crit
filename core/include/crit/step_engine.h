@@ -39,13 +39,16 @@ struct StepRow {
 };
 // What the engine reports per row (Core's Progress): prompt tokens consumed this step (reused ones included), the
 // reused prefix, the token work actually computed (mixed batches; zero takes the prompt tokens computed, or one per
-// token), the tokens produced, whether prefill is complete and, for a decode row, the drafts its round verified plus
-// one (0: not reported). The tokens go to tokens[row * max_row_tokens ...]; with token log-probabilities, each token's
+// token), the tokens produced, whether prefill is complete, for a decode row the drafts its round verified plus
+// one (0: not reported), and the prompt tokens the row holds in a prefill pass after the step (Progress::pass_tokens:
+// an engine that declares "prefill_pass_tokens" and "prefill_pass_steps" may work on a span of the prompt over
+// several steps and report its tokens consumed in the step that ends the pass). The tokens go to tokens[row * max_row_tokens ...]; with token log-probabilities, each token's
 // into logprobs[row * max_row_tokens + i] and its alternatives into top_ids/top_logprobs[(row * max_row_tokens + i) *
 // max_top_logprobs ...], ranked as Core's TokenLogprob rows are.
 struct StepProgress {
     std::uint32_t prompt_tokens = 0, reused_prompt_tokens = 0, token_work = 0, tokens = 0;
     std::int32_t prefill_complete = 0, drafted = 0;
+    std::uint32_t pass_tokens = 0;
 };
 // Core's CommitDecision for one row of the last step: the tokens Core kept (stops and the output limit trim them),
 // whether the request ends or was cancelled (or failed). Core runs one step at a time, so every step it ran is kept,

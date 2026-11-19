@@ -570,6 +570,123 @@ class DraftEncodingTests(PluginTestCase):
                          {"stored": "bf16", "encoded": "bf16", "matrices": 1, "stored_bytes": 40 * 96 * 2,
                           "encoded_bytes": 40 * 96 * 2})
 
+    def test_the_output_head_is_held_in_fp8_in_quality_mode_speed_and_as_stored_otherwise(self):
+        from crit_plugins import kernels
+        self.addCleanup(kernels.use_quality_mode, None)
+        torch = self.torch
+        w = self.weight().to(self.where)[:32]   # cuBLASLt: rows % 16
+        codes = self.matrices.reencode({"weight": w}, "bf16", "fp8")[0]
+        size = {"stored": "bf16", "encoded": "fp8:channel", "matrices": 1, "stored_bytes": 32 * 96 * 2,
+                "encoded_bytes": 32 * 96 + 32 * 4}
+        for mode, options, chosen in ((None, {}, None), ("preserve", {}, None), ("speed", {"head": "stored"}, None),
+                                      ("speed", {}, "head auto in quality mode speed"),
+                                      ("preserve", {"head": "fp8"}, "the head option"),
+                                      (None, {"head": "fp8"}, "the head option")):
+            with self.subTest(mode=mode, options=options):
+                kernels.use_quality_mode(mode)
+                plugin = self.assemble(options=options)["projections"]
+                head = plugin.load({"weight": w}, "bf16", role="head")
+                body = plugin.load({"weight": w}, "bf16", role="down")   # the head alone: no other role is touched
+                self.assertEqual(body.format, "bf16")
+                facts = plugin.facts()
+                if chosen is None:   # as the checkpoint stores it
+                    self.assertEqual(head.format, "bf16")
+                    self.assertNotIn("head_encoding", facts)
+                    continue
+                # The FP64 encoder's codes and row scales, held as an FP8 target matrix like a stored one.
+                self.assertEqual(head.format, "fp8:channel")
+                self.assertTrue(torch.equal(head.tensors["weight"].view(torch.uint8),
+                                            codes["weight"].view(torch.uint8)))
+                self.assertEqual(facts["head_encoding"], {**size, "chosen": chosen})
+                self.assertNotIn("draft_encoding", facts)
+                self.assertIn("fp8", facts["prompt_activations"])
+                if self.where == "cuda":   # the logits stay within FP8's rounding of the 16-bit head's
+                    x = torch.randn(9, 96, generator=torch.Generator().manual_seed(2)).to(self.where).to(torch.bfloat16)
+                    want = x.double() @ w.double().t()
+                    got = plugin.matmul(x, head, torch.float32).double()
+                    self.assertLess(float((got - want).abs().max() / want.abs().max()), 5e-2)
+                    for r in range(9):   # each decode row's bits are its own
+                        self.assertTrue(torch.equal(plugin.matmul(x[r:r + 1].clone(), head, torch.float32)[0],
+                                                    plugin.matmul(x, head, torch.float32)[r]), r)
+        # A head stored quantized stays as stored, and a draft-only head is the drafter's (encode) in every mode.
+        kernels.use_quality_mode("speed")
+        plugin = self.assemble()["projections"]
+        self.assertEqual(plugin.load(codes, "fp8:channel", role="head").format, "fp8:channel")
+        plugin.load({"weight": w}, "bf16", role="draft_head", encode="fp8")
+        facts = plugin.facts()
+        self.assertNotIn("head_encoding", facts)
+        self.assertEqual(list(facts["draft_encoding"]), ["draft_head"])
+        with self.assertRaisesRegex(Exception, "head"):
+            self.assemble(options={"head": "fp4"})
+
+    def test_mxfp8_matrices_take_their_stored_activations_in_quality_mode_speed_and_16_bit_ones_otherwise(self):
+        from crit_plugins import kernels
+        self.addCleanup(kernels.use_quality_mode, None)
+        for mode, options, activations, by in ((None, {}, "bf16", None), ("preserve", {}, "bf16", None),
+                                               ("speed", {}, "mxfp8", "speed"),
+                                               ("speed", {"mxfp8_activations": "bf16"}, "bf16", None),
+                                               ("preserve", {"mxfp8_activations": "mxfp8"}, "mxfp8", None)):
+            with self.subTest(mode=mode, options=options):
+                kernels.use_quality_mode(mode)
+                plugin = self.assemble(options=options)["projections"]
+                self.assertEqual((plugin.mx_activations, plugin.mx_by), (activations, by))
+        with self.assertRaisesRegex(Exception, "mxfp8_activations"):
+            self.assemble(options={"mxfp8_activations": "fp8"})
+
+    def test_a_re_encoded_head_s_stored_copy_is_handed_back_at_the_next_call_after_its_holder_dropped_it(self):
+        import gc
+        from crit_plugins import kernels
+        self.addCleanup(kernels.use_quality_mode, None)
+        kernels.use_quality_mode("speed")
+        plugin = self.assemble()["projections"]
+        stored = {"weight": self.weight().to(self.where)[:32]}   # as a model plugin holds it until its load returns
+        self.assertEqual(plugin.load(stored, "bf16", role="head").format, "fp8:channel")
+        self.assertEqual(len(plugin.stored_heads), 1)
+        plugin.load({"weight": self.weight().to(self.where)}, "bf16", role="down")
+        self.assertEqual(len(plugin.stored_heads), 1)   # still held: waited for
+        del stored
+        gc.collect()
+        plugin.facts()
+        self.assertEqual(plugin.stored_heads, ())
+        # A head the plugin does not re-encode is not watched.
+        kernels.use_quality_mode("preserve")
+        plugin = self.assemble()["projections"]
+        stored = {"weight": self.weight().to(self.where)[:32]}
+        plugin.load(stored, "bf16", role="head")
+        self.assertEqual(plugin.stored_heads, ())
+
+    def test_a_re_encoded_head_leaves_none_of_its_load_s_memory_reserved(self):
+        if self.where != "cuda":
+            self.skipTest("torch's caching allocator on CUDA")
+        import gc
+        from crit_plugins import kernels
+        self.addCleanup(kernels.use_quality_mode, None)
+        torch = self.torch
+
+        def cached():
+            return torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+
+        kernels.use_quality_mode("speed")
+        plugin = self.assemble()["projections"]
+        plugin.load({"weight": self.weight().to(self.where)[:32]}, "bf16", role="head")   # the shared buffers exist
+        gc.collect()
+        torch.cuda.empty_cache()
+        # A 64 MiB head on the device, as a model plugin holds it until its load call returns.
+        stored = {"weight": (torch.randn(4096, 8192, generator=torch.Generator().manual_seed(4)) * 0.05)
+                  .to(torch.bfloat16).to(self.where)}
+        before = cached()   # partly used segments: what an empty cache still counts
+        head = plugin.load(stored, "bf16", role="head")
+        self.assertEqual(head.format, "fp8:channel")
+        # The encoders' FP64 slices (three of 256 MiB for this head) and the load's warm-up went back to the device.
+        self.assertLessEqual(cached(), before + 4 * 2 ** 20)
+        del stored   # the model plugin's load call returns: the 16-bit copy has no holder
+        gc.collect()
+        reserved = torch.cuda.memory_reserved()
+        # The plugin's next call (a load, or the facts) hands the copy's block back, before a matrix is cut from it.
+        plugin.facts()
+        self.assertLessEqual(torch.cuda.memory_reserved(), reserved - 48 * 2 ** 20)
+        self.assertLessEqual(cached(), before + 4 * 2 ** 20)
+
 
 if __name__ == "__main__":
     unittest.main()

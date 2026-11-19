@@ -652,7 +652,9 @@ source and its revision.
 ## Reference implementation
 
 TODO. The transformers modeling file and its revision: rope scaling, MTP or draft heads, norm and
-attention quirks. Cite file and line.
+attention quirks. Cite file and line. Its configuration class too: the defaults it gives the keys
+config.json leaves out (a router's `norm_topk_prob` or scoring function, say). crit reads a key the
+file leaves out as unset, never as the reference's default.
 
 ## Placement scenario
 

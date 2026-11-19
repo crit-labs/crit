@@ -115,6 +115,22 @@ Triton kernels for attention over paged KV caches, used by crit's attention-stat
   that carries no value, `out = sum p v / (sum p + e^sink)`, as attention with learned sinks computes it. It is folded
   into a row's final state once, after its partials (the kernel core's `sink` / `softmax_sink2`), so a fused launch
   keeps its split launch's bits; the log-sum-exp counts it; sinks of -inf keep every bit of a launch without them.
+- **Derived keys** (`attend(..., derive=)` split and fused, `prefill(..., derive=)`): for a layer that caches one row
+  per position and KV head and uses it as both value and key. The cache holds value pages only
+  (`write(None, values, slots, None, value_pages, ...)`), and each row is read as its value and, on read, as its key
+  `k = rope(rms_norm(r) * w, p)`: `r` the row at its page kind's precision (codes times their scale or multiplier),
+  `rms_norm(r) = r / sqrt(mean(r * r) + eps)` and the weight in FP32, `rope` the "half" rotation over the first
+  `rotary_dim` values at the angle `fp32(p) * freqs[i]` (fused-norms' `rms_norm_rope`, `freqs` from attention-state's
+  `rope_table`), the FP32 key multiplied on the tensor cores as two parts in the queries' dtype (its rounding, then
+  the rounding of the rest: about 16 bits of its mantissa, two dots where a plain key takes one). `derive` is a `Derive(weight, eps,
+  freqs, rotary_dim)` (`weight` FP32 `[dim]` or None for all ones, `freqs` FP32 `[rotary_dim / 2]`); `derive(weight,
+  eps, freqs, rotary_dim)` builds one with its tables packed once on the device, so a call allocates nothing (a plain
+  tuple of the four is packed at each call). `key_pages` and `key_scales` are None; `fresh` rows are `(None, values,
+  shift, first)` for attend and `(None, values[, first])` for prefill, derived the same way. It composes with sliding
+  windows, sinks, trees, `lse`, `offsets` and every page kind, and a column's bits are the same alone, in any window,
+  fused or split, as with plain keys; block lists, `int8_qk` and the flash structures (`flash=True`, `flash="cuda"`)
+  refuse it. Each piece's rows are read three times (their squares, then each column with its rotation partner), so a
+  derived launch reads the value pages about three times where a plain one reads keys and values once each.
 
 ## Numerics
 
@@ -129,7 +145,10 @@ columns or rows its launch reads (a token decoded alone equals the same token in
 launch given another tile or warp count keeps that only where the GPU multiplies it with mma.sync as well. Errors
 against float64 attention over the stored values: within 8e-3 absolute (BF16 queries and probabilities), log-sum-exps
 within 1e-3. E4M3 codes convert with the hardware conversion from sm_89 and with integer arithmetic before (the same
-bits).
+bits). Derived keys: a row's sum of squares in FP32 over chunks of the head width in order (the window launches' 64,
+the prompt chunk's whole width), `rsqrt`, the weight and the rotation in FP32 (libdevice's `cos` and `sin`), the key's
+two 16-bit parts multiplied in order; against float64 attention over keys derived in float64 from the stored rows, the
+same tolerances as plain keys (`tests/test_derived_keys.py`).
 
 ## Structures and knobs
 

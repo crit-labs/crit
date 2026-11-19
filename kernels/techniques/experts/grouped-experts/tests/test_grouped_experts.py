@@ -139,15 +139,17 @@ def quantize_codes(v, g):
 
 
 class Experts:
-    def __init__(self, fmt, E=6, H=256, I=128, seed=0, a4=False):
+    def __init__(self, fmt, E=6, H=256, I=128, seed=0, a4=False, activation="silu"):
         g = torch.Generator().manual_seed(seed)
-        self.fmt, self.E, self.H, self.I, self.a4 = fmt, E, H, I, a4
+        self.fmt, self.E, self.H, self.I, self.a4, self.activation = fmt, E, H, I, a4, activation
         self.inputs = [(float(torch.rand(1, generator=g)) * 200 + 300, float(torch.rand(1, generator=g)) * 40 + 20)
                        for _ in range(E)]
         made = [bundle(fmt, H, I, g, self.inputs[e]) for e in range(E)]
         self.store = torch.stack([m[0] for m in made]).to(dev)
         self.gate_up, self.down = [m[1] for m in made], [m[2] for m in made]
         self.layout = layout(fmt, H, I)
+        if activation != "silu":   # a layout's 13th integer, after the int4_zp group (0 for none)
+            self.layout += [0] * (12 - len(self.layout)) + [gx.ACTIVATIONS[activation]]
 
     def reference(self, x, ids, weights, slots=None):
         x = x.bfloat16().double().cpu()
@@ -159,7 +161,9 @@ class Experts:
                     continue
                 xin = quantize(x[t:t + 1].float(), self.inputs[e][0])[0] if self.a4 else x[t]
                 gu = self.gate_up[e] @ xin
-                h = torch.nn.functional.silu(gu[:self.I]) * gu[self.I:]
+                gate = (torch.nn.functional.silu(gu[:self.I]) if self.activation == "silu"
+                        else torch.nn.functional.gelu(gu[:self.I], approximate="tanh"))
+                h = gate * gu[self.I:]
                 h = quantize(h[None].float(), self.inputs[e][1])[0] if self.a4 else h.float().bfloat16().double()
                 out[t] += float(weights[t, j]) * (self.down[e] @ h)
         return out
@@ -196,6 +200,31 @@ def test_every_format_matches_the_fp64_reference(fmt, a4):
     ref = experts.reference(x, ids.cpu(), w.cpu())
     scale = ref.abs().max()
     assert (out - ref).abs().max() <= (3e-2 if a4 else 5e-3) * scale, (fmt, a4, float((out - ref).abs().max() / scale))
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("fmt,a4", [("bf16", False), ("nvfp4", True), ("int4_zp", False)])
+def test_a_block_gated_by_gelu_matches_the_fp64_reference_and_keeps_a_routes_bits(fmt, a4):
+    # A layout's activation: gelu(gate) * up in GELU's tanh form instead of SwiGLU, in the tensor arithmetic. The
+    # sums and the weights are the same; a route's bits are its own in either item width; the declared order, whose
+    # host twin computes SwiGLU, refuses it.
+    experts, swiglu = Experts(fmt, a4=a4, activation="gelu_tanh"), Experts(fmt, a4=a4)
+    g = torch.Generator().manual_seed(3)
+    x = (torch.randn(40, experts.H, generator=g)).bfloat16().to(dev)
+    ids, w = routes(40, 3, experts.E, g)
+    out = experts.forward(x, ids, w).double().cpu()
+    ref = experts.reference(x, ids.cpu(), w.cpu())
+    scale = ref.abs().max()
+    assert (out - ref).abs().max() <= (3e-2 if a4 else 5e-3) * scale, (fmt, a4, float((out - ref).abs().max() / scale))
+    assert (out - swiglu.forward(x, ids, w).double().cpu()).abs().max() > 0.05 * scale   # another gate, other rows
+    full, valid = experts.rows(x, ids), (ids.reshape(-1) >= 0).cpu()
+    for width in (8, 32):
+        part = experts.rows(x[11:19].clone(), ids[11:19].clone(), width=width)
+        assert torch.equal(part[valid[33:57]], full[33:57][valid[33:57]]), (fmt, width)
+    if fmt == "nvfp4":
+        ws = gx.Workspace(40, 3, experts.E, experts.H, experts.I, dev)
+        with pytest.raises(ValueError, match="declared arithmetic is SwiGLU"):
+            gx.route_outputs(x, ids, experts.store, None, experts.layout, ws, True, "declared")
 
 
 @pytest.mark.kernels_ci

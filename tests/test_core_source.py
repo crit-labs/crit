@@ -132,6 +132,21 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(json.loads(source.files.read("generation_config.json"))["eos_token_id"], [1, 0])
         self.assertEqual([f.path.name for f in source.weight_files()], [path.name])
 
+    def test_an_engine_reads_a_lone_ggufs_derived_config_and_its_facts(self):
+        # The package check's facts and a load's context.config come from the config Core derives for a GGUF, so a
+        # plugin that requires a model_type finds it on a GGUF as on the base model's folder.
+        from crit_core.engine import architecture_facts, model_config
+        folder = self.root / "lone"
+        folder.mkdir()
+        path = folder / "model-Q8_0.gguf"
+        path.write_bytes(gguf_bytes(metadata(), TENSORS))
+        for model in (folder, path):
+            self.assertEqual(model_config(model)["model_type"], "crit_test")
+            self.assertEqual(architecture_facts(model), ["stored:gguf", "model_type:crit_test"])
+        (self.root / "config.json").write_text(json.dumps({"model_type": "plain_one"}))
+        self.assertEqual(architecture_facts(self.root), ["stored:plain", "model_type:plain_one"])   # its own file
+        self.assertEqual((model_config(self.root / "absent"), architecture_facts(self.root / "absent")), ({}, []))
+
     def test_a_folder_supplies_whole_groups_and_the_gguf_the_rest(self):
         self.gguf()
         tokenizer = derive_tokenizer(inspect_gguf_model(self.root))

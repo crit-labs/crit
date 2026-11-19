@@ -15,8 +15,8 @@ A level keeps what every level below it keeps, and none is below repeatable. The
 lower ones (a split of K that follows the row count, the tensor cores' own order, a reduction over a whole chunk), so
 the level is the trade an engine makes between exactness and speed: it asks for one per phase ("decode": its decode
 and verify rows; "prompt": its prompt rows), and without one the run's quality mode gives it (for_quality_mode:
-preserve asks exact, speed repeatable). For the decode rows exact and row-exact are one level: they are the bits a
-prompt row is compared with.
+both modes ask exact). For the decode rows exact and row-exact are one level: they are the bits a prompt row is
+compared with.
 
 The level is about the order of the sums, not the operands' precision: activations quantized to 4 or 8 bits, 8-bit KV
 pages or FP16 operands are a structure's arithmetic, which its "what" and its operation say.
@@ -24,7 +24,14 @@ pages or FP16 operands are a structure's arithmetic, which its "what" and its op
 
 LEVELS = ("repeatable", "row-exact", "exact", "declared")   # from the least exact
 PHASES = ("decode", "prompt")
-QUALITY_MODES = {"preserve": "exact", "speed": "repeatable"}   # the level each of a run's quality modes asks
+# The level each of a run's quality modes asks where an engine states none: exact in both. A prompt row then has the
+# bits of the same token decoded, which is what the serving checks hold an engine to (crit smoke: a prefix against
+# its prompt, decoding against prefilling), and what they can only judge without a tolerance: an engine whose rows
+# multiply quantized activations turns an order's last bit into tenths of a nat (a 4-bit rounding that falls the
+# other way), so at a lower level its sound rows and a broken path's read alike. The modes differ in the precision
+# of what is summed, not in the order. A lower level is a lever an engine pulls itself, with its speed measured and
+# its checks passed.
+QUALITY_MODES = {"preserve": "exact", "speed": "exact"}
 
 
 def rank(level):
@@ -87,8 +94,8 @@ def choices(manifest, asked, decode=None):
 
 
 def for_quality_mode(mode):
-    """The level each phase gets from a run's quality mode when the engine asks for none: preserve exact, speed
-    repeatable."""
+    """The level each phase gets from a run's quality mode when the engine asks for none: exact in both modes
+    (QUALITY_MODES)."""
     if mode not in QUALITY_MODES:
         raise ValueError(f"quality mode {mode!r} is not one of {', '.join(QUALITY_MODES)}")
     return {phase: QUALITY_MODES[mode] for phase in PHASES}

@@ -100,6 +100,32 @@ class BuildTests(RunFixture, unittest.TestCase):
         self.assertEqual(read_json(packaged), configuration)
         self.assertNotIn("configuration.json", [d["path"] for d in result["package"]["build"]["dependencies"]])
 
+    def test_a_source_that_carries_its_configuration_as_written_builds_into_the_candidates(self):
+        # A source keeps the configuration.json the candidate was made from, before crit completed it (the exactness
+        # of its rows, the quality mode): the build folder gets the candidate's, so the package carries that one and
+        # nothing has to be dropped. A source whose copy names other values is still refused, with what to do.
+        if not (self.directory / "inputs.json").exists():
+            self.resolve()
+        proposal = self.proposal()
+        source = with_plugins(self.root / "engine-source")
+        (source / "build.py").write_text(BUILD, encoding="utf-8")
+        (source / "kernel.cu").write_text(KERNEL, encoding="utf-8")
+        (source / "configuration.json").write_text(json.dumps(proposal["configuration"]), encoding="utf-8")
+        candidate = self.store.candidate(self.run_id, source, proposal)["candidate_id"]
+        configuration = read_json(self.directory / "candidates" / candidate / "candidate.json")["configuration"]
+        self.assertNotEqual(configuration, proposal["configuration"])   # crit completed it
+        result = build(self.store, self.run_id, candidate, self.recipe(), drop=["tmp"], log=lambda m: None)
+        self.assertEqual(result["attempt"]["outcome"], "completed")
+        self.assertEqual(read_json(self.directory / "candidates" / candidate / "package/configuration.json"),
+                         configuration)
+        (source / "configuration.json").write_text(json.dumps({**proposal["configuration"], "batch": 9}),
+                                                   encoding="utf-8")
+        other = self.store.candidate(self.run_id, source, self.proposal(configuration={**proposal["configuration"],
+                                                                                        "batch": 2}))["candidate_id"]
+        with self.assertRaisesRegex(ValueError, "differs from the candidate configuration in batch.*"
+                                                "--drop configuration.json"):
+            build(self.store, self.run_id, other, self.recipe(), drop=["tmp"], log=lambda m: None)
+
     def test_a_failed_build_is_settled_failed_with_its_log_and_not_packaged(self):
         candidate = self.built_candidate()
         with self.assertRaisesRegex(ValueError, "Build failed: .* exited 3 \\(log candidates/.*build-attempt-0001.log\\)"
@@ -192,6 +218,25 @@ class FromEvalTests(RunFixture, unittest.TestCase):
         self.assertIn("check needs --record or --from-eval", err.getvalue())
 
 
+class RunCacheTests(unittest.TestCase):
+    def test_a_runs_engines_get_the_runs_plugin_cache_unless_the_user_named_one(self):
+        # The engine's host inherits the environment: crit run names a folder of the run there for files plugins can
+        # build again (an expert store), a later run its own, and a value the user set stays (empty: no cache).
+        import os
+        from pathlib import Path
+        from crit_core.engine import PLUGIN_CACHE
+        with patch.dict(os.environ), patch.object(served.run_cache, "given", None):
+            os.environ.pop(PLUGIN_CACHE, None)
+            served.run_cache(Path("runs") / "run-a")
+            self.assertEqual(os.environ[PLUGIN_CACHE], str(Path("runs") / "run-a" / ".plugin-cache"))
+            served.run_cache(Path("runs") / "run-b")
+            self.assertEqual(os.environ[PLUGIN_CACHE], str(Path("runs") / "run-b" / ".plugin-cache"))
+            for own in ("", "/srv/stores"):
+                os.environ[PLUGIN_CACHE] = own
+                served.run_cache(Path("runs") / "run-c")
+                self.assertEqual(os.environ[PLUGIN_CACHE], own)
+
+
 class ServeCheckTests(run_measure.MeasureFixture, unittest.TestCase):
     def test_serve_check_runs_the_serving_checks_and_records_a_functional_check(self):
         candidate = self.served()
@@ -212,12 +257,44 @@ class ServeCheckTests(run_measure.MeasureFixture, unittest.TestCase):
         self.assertEqual({k: v for k, v in items.items() if k not in smoke and k not in tested},
                          {"consecutive": "passed", "system_message": "passed", "streaming": "passed",
                           "stop_string": "passed", "cancel": "passed", "draft_bytes": "passed", "stop_engine": "passed",
+                          # The candidate's plan declared its prompt activations, and this engine has none to differ.
+                          "plan_activations": "passed",
                           # A scripted adapter's steps are not Core's, so nothing probes them.
                           "full_context_prompt_step": "unverified", "full_context_device_memory": "unverified"})
         self.assertEqual(check["evidence"][1]["path"], f"candidates/{candidate}/logs/serve-attempt-0001.log")
         self.assertEqual(check["package_sha256"],
                          digest(read_json(self.directory / "candidates" / candidate / "package/manifest.json")))
         self.assertEqual(self.store.get(self.run_id)["errors"], [])
+
+    def test_an_engine_that_serves_other_prompt_activations_than_its_plan_declared_fails_the_check(self):
+        from crit.run import checks
+
+        def run(planned, served):
+            class Client:
+                def __init__(self, port, timeout):
+                    pass
+
+                def chat(self, body):
+                    return {"choices": [{"message": {"content": "a plain reply"}, "finish_reason": "stop"}],
+                            "usage": {"completion_tokens": 3}}
+
+                def stream(self, body, cancel_after_first=False):
+                    return "a plain reply", "stop"
+
+                def models(self):
+                    return [{"id": "m", "engine_facts": {"prompt_activations": served} if served else {}}]
+            with patch.object(checks, "Client", Client):
+                items = checks.serve_checks(0, [], {}, 60, lambda line: None, planned_activations=planned)
+            return {i["name"]: i for i in items}.get("plan_activations")
+        # One activation for every quantized format, or one a format, against what the engine's facts declare.
+        self.assertEqual(run("stored", {"mxfp8": "stored", "nvfp4": "stored"})["state"], "passed")
+        self.assertEqual(run({"mxfp8": "bf16", "nvfp4": "stored"}, {"mxfp8": "bf16", "nvfp4": "stored"})["state"],
+                         "passed")
+        found = run("stored", {"mxfp8": "bf16", "nvfp4": "stored"})
+        self.assertEqual(found["state"], "failed")
+        self.assertIn('"mxfp8": "bf16"', found["detail"])
+        self.assertEqual(run("stored", None)["state"], "passed")   # no quantized format's prompt GEMMs
+        self.assertIsNone(run(None, {"mxfp8": "bf16"}))            # no plan declared any: nothing to hold it to
 
     def test_the_full_context_pass_judges_the_slowest_prompt_step_and_the_least_free_memory(self):
         from crit.run import checks
@@ -257,10 +334,107 @@ class ServeCheckTests(run_measure.MeasureFixture, unittest.TestCase):
         self.assertIn("up to a 967-token prompt, took 0.400 s", found["full_context_prompt_step"]["detail"])
         slow = {**fits, "prompt": {**fits["prompt"], "slowest_seconds": 1.3}}
         self.assertEqual(run(slow)["full_context_prompt_step"]["state"], "failed")
-        self.assertIn("prefill in smaller chunks", run(slow)["full_context_prompt_step"]["detail"])
+        self.assertIn("prefill in shorter steps", run(slow)["full_context_prompt_step"]["detail"])
         # Below the headroom on a prompt step, or reporting no probe at all.
         self.assertEqual(run(fits, headroom=4 << 30)["full_context_device_memory"]["state"], "failed")
         self.assertEqual({i["state"] for i in run(None).values()}, {"unverified"})
+
+    def test_the_full_context_wait_fails_a_prefill_that_cannot_finish_in_the_time_left(self):
+        import threading
+        from crit.run import checks
+        clock, counted, lines = [0.0], [0], []
+        engine = SimpleNamespace(telemetry=lambda: {"core": {"prompt_tokens": counted[0], "steps": 1}})
+
+        def polls(rate, left, seconds, engine=engine):
+            # The wait's polls, every five seconds, of an engine prefilling `rate` tokens a second.
+            clock[0], counted[0] = 0.0, 1000   # tokens of earlier requests are not this prompt's
+            watch = checks._prefill_watch(engine, 1000, 200_000, lambda: left - clock[0], lines.append,
+                                          clock=lambda: clock[0])
+            for second in range(5, seconds + 1, 5):
+                clock[0], counted[0] = float(second), 1000 + rate * second
+                watch()
+        # 37 tokens a second: the 200,000-token prompt needs an hour and a half, the reservation has 45 minutes. The
+        # wait says so once the prompt steps it timed span 30 seconds, not at the deadline.
+        with self.assertRaisesRegex(checks.PrefillTooSlow, r"prefill too slow, about 37 tok/s: 1,295 of about "
+                                                           r"200,000 prompt tokens are in, the rest needs \d+ min"):
+            polls(37, 2700, 600)
+        self.assertEqual(clock[0], 35.0)
+        # 1,700 tokens a second fits: the wait logs the rate every minute and lets the request run.
+        polls(1700, 2700, 100)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("about 1,700 tok/s", lines[0])
+        # An engine that reports no count is not judged.
+        polls(37, 2700, 600, engine=SimpleNamespace(telemetry=lambda: {"core": {"steps": 1}}))
+        # What the watch raises closes the request's connection (crit serve cancels it) and is the wait's error.
+        closed = threading.Event()
+        client = SimpleNamespace(abort=closed.set)
+
+        def hung():
+            closed.wait(5)
+            raise OSError("connection closed")
+
+        def slow():
+            raise checks.PrefillTooSlow("prefill too slow, about 37 tok/s")
+        with self.assertRaisesRegex(checks.PrefillTooSlow, "about 37 tok/s"):
+            checks._progressing(hung, client, engine, stall=5, poll=0.02, watch=slow)
+        self.assertTrue(closed.is_set())
+
+    def test_the_full_context_request_waits_while_the_engine_steps_and_fails_when_it_stalls(self):
+        import threading
+        import time
+        from crit.run import checks
+
+        class Steps:
+            # Core's step count: moving while `moving` is set.
+            def __init__(self):
+                self.count, self.moving = 0, threading.Event()
+                self.moving.set()
+
+            def telemetry(self):
+                if self.moving.is_set():
+                    self.count += 1
+                return {"core": {"steps": self.count}}
+
+        class Waited:
+            # The client: abort closes the connection its request waits on.
+            def __init__(self):
+                self.aborted, self.closed = False, threading.Event()
+
+            def abort(self):
+                self.aborted = True
+                self.closed.set()
+
+            def hung(self):
+                self.closed.wait(5)
+                raise OSError("connection closed")
+
+        # A request lasting many times `stall` returns while the steps keep moving.
+        engine, client = Steps(), Waited()
+
+        def slow():
+            time.sleep(0.3)
+            return "answered"
+        self.assertEqual(checks._progressing(slow, client, engine, stall=0.1, poll=0.02), "answered")
+        self.assertFalse(client.aborted)
+        # A request whose engine stops stepping is aborted (crit serve cancels it) after `stall` without a step.
+        engine.moving.clear()
+
+        started = time.perf_counter()
+        with self.assertRaisesRegex(TimeoutError, "no engine step finished in 0.1 s"):
+            checks._progressing(client.hung, client, engine, stall=0.1, poll=0.02)
+        self.assertTrue(client.aborted)
+        self.assertLess(time.perf_counter() - started, 2)
+
+        # The request's own error is its error.
+        def refused():
+            raise ValueError("crit serve answered 500")
+        with self.assertRaisesRegex(ValueError, "answered 500"):
+            checks._progressing(refused, Waited(), engine, stall=0.1, poll=0.02)
+        # An engine that reports no step count is waited for `stall` seconds in all.
+        quiet = Waited()
+        with self.assertRaisesRegex(TimeoutError, "reports no step count"):
+            checks._progressing(quiet.hung, quiet, SimpleNamespace(telemetry=lambda: None), stall=0.1, poll=0.02)
+        self.assertTrue(quiet.aborted)
 
     def test_serve_check_runs_crit_smoke_at_the_run_context_and_a_quarter_of_it(self):
         candidate = self.served()
@@ -280,6 +454,24 @@ class ServeCheckTests(run_measure.MeasureFixture, unittest.TestCase):
             result = served.serve(self.store, self.run_id, candidate, port=0, check=True, smoke=False)
         self.assertEqual(len(calls), 1)
         self.assertEqual(result["checks"][0]["status"], "passed", result["checks"][0]["rationale"])
+
+    def test_smoke_starts_at_the_context_the_engine_is_open_at_and_ends_at_the_runs(self):
+        # After the gate pre-check the engine is open at the lower context: smoke's second pass runs there first,
+        # and one reopen brings it back, where it ran full, lower, full before (two reopens beside the pre-check's).
+        opened = []
+        fake = SimpleNamespace(kv_tokens=262144, opened_at=65536, timeout=60,
+                               open=lambda tokens=None: opened.append(tokens) or (None, None, 9))
+        ran = []
+        with patch("crit_smoke.run", lambda client, log=None: ran.append(client) or
+                   [{"name": "causal", "state": "passed", "detail": ""}]):
+            items = served._smoke(fake, 9, lambda line: None)
+        self.assertEqual([item["name"] for item in items], ["smoke_causal@65536", "smoke_causal"])
+        self.assertEqual(opened, [262144])
+        fake.opened_at, opened[:] = 262144, []
+        with patch("crit_smoke.run", lambda client, log=None: [{"name": "causal", "state": "passed", "detail": ""}]):
+            items = served._smoke(fake, 9, lambda line: None)
+        self.assertEqual([item["name"] for item in items], ["smoke_causal", "smoke_causal@65536"])
+        self.assertEqual(opened, [65536, None])
 
     def test_serve_check_with_data_adds_the_gate_precheck(self):
         candidate = self.served()

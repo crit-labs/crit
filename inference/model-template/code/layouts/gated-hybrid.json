@@ -1,0 +1,14 @@
+{
+  "schema": "crit-model-layout-v1",
+  "name": "gated-hybrid",
+  "description": "A hybrid decoder of gated delta-rule layers and gated softmax attention (an output gate per head, query/key norms, partial rotary positions) with zero-centred RMSNorms (1 + weight), a SwiGLU MLP or a mixture of experts with a gated shared expert, and a multi-token-prediction layer the model drafts from",
+  "model_types": ["qwen3_next", "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"],
+  "norm_offset": 1.0,
+  "defaults": {"norm_topk_prob": true},
+  "mixers": {
+    "full_attention": {"block": "attention", "prefix": "self_attn.", "output_gate": "sigmoid"},
+    "linear_attention": {"block": "gated-delta", "prefix": "linear_attn."}
+  },
+  "ffn": {"block": "auto", "prefix": "mlp."},
+  "draft": {"block": "mtp", "prefix": "mtp."}
+}

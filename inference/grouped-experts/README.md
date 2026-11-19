@@ -17,7 +17,11 @@ act order is refused, since the kernel reads x and h in order). It serves at can
 arithmetic is the stored format's, its decode and prompt paths are one kernel, and a call at a fixed token count is
 captured in a CUDA graph (rounds:experts).
 
-Don't use it for experts that are not SwiGLU or shapes that are not multiples of 64; a provider's grouped GEMM that is
+The gate of the block's product, `act(gate) * up`, is SiLU unless the model plugin says otherwise: `activate(name)`
+(the fact `experts:activations`) sets it for every layer, `silu` or `gelu_tanh` (GELU in its tanh form, Gemma's), in
+the kernel's tensor arithmetic and in the fallback alike. The declared W4A4 order is SiLU's alone.
+
+Don't use it for experts gated otherwise, or shapes that are not multiples of 64; a provider's grouped GEMM that is
 faster on the target is worth measuring against it, but only one that keeps a route's bits independent of the rows
 beside it can replace it without changing what batched requests decode.
 

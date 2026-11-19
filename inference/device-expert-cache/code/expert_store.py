@@ -22,7 +22,6 @@ import mmap
 import os
 from pathlib import Path
 
-from crit_plugins.files import pwrite
 
 KIND = "device-expert-cache-store"
 ALIGNMENT = 16  # bundle components start at multiples of 16 bytes (the cache copies 16-byte words)
@@ -183,33 +182,9 @@ def open_store(path):
 BUNDLES = "crit-bundle-store"
 
 
-def csf_decode(fixed, exceptions=None):
-    """E4M3 scale bytes [rows][groups] (uint8) from ModelOpt's CSF encoding (crit_core.model.schemes.csf_scale_shape):
-    fixed uint8 [rows / 16][16 * (1 + groups / 2)], per slab of 16 rows one base byte per row, then each row's 4-bit
-    codes (the low nibble first), scale = base + code (mod 256); exceptions (int32 or uint32 words: position row *
-    groups + col in the low 24 bits, the scale byte in the high 8) replace single scales. On fixed's device (torch), so
-    a store builder decodes on the host and a fill on the device by the same rule; leading dimensions (stacked
-    matrices) decode each."""
-    import torch
-    lead, (slabs, width) = tuple(fixed.shape[:-2]), tuple(fixed.shape[-2:])
-    if width % 16 or width < 32:
-        raise ValueError("CSF fixed rows are 16 * (1 + groups / 2) bytes")
-    groups = (width // 16 - 1) * 2
-    f = fixed.reshape(-1, slabs, width).view(torch.uint8)
-    m, size = f.shape[0], slabs * 16 * groups
-    base = f[:, :, :16].to(torch.int32)
-    packed = f[:, :, 16:].reshape(m, slabs, 16, groups // 2).to(torch.int32)
-    codes = torch.stack((packed & 15, packed >> 4), -1).reshape(m, slabs, 16, groups)
-    out = ((base[..., None] + codes) & 255).to(torch.uint8).reshape(m * size)
-    if exceptions is not None and exceptions.numel():
-        words = exceptions.reshape(m, -1).contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
-        pos = words & 0xFFFFFF
-        valid = (words != 0xFFFFFFFF) & (pos < size)   # -1: an unused word of a fixed-capacity list
-        index = torch.where(valid, pos + torch.arange(m, device=f.device)[:, None] * size, m * size)
-        padded = torch.cat([out, out.new_zeros(1)])
-        padded.index_copy_(0, index.reshape(-1), (words >> 24).to(torch.uint8).reshape(-1))
-        out = padded[:-1]
-    return out.reshape(*lead, slabs * 16, groups)
+# The decode of ModelOpt's CSF scales is Core's (crit_plugins.device): a model plugin that loads a checkpoint's
+# compressed scales into plain matrices decodes by the same rule as a store builder here and a fill on the device.
+from crit_plugins.device import csf_decode  # noqa: E402,F401
 
 
 def csf_stack(parts):
@@ -391,13 +366,27 @@ def _host_memory():
     return host_memory
 
 
+READ_PIECE = 64 << 20    # a store file is read into memory in direct reads of this many bytes each
+READ_BATCH = 32          # and the seal says how far it is after this many of them
+
+
 class BundleStore:
     """Bundles of every (layer, expert) key in host memory a device reads (crit_plugins.device DEVICE_EXTENSIONS
     "experts:store"): key = layer * experts + expert, bundle_bytes each, in key order, as the experts plugin's layout()
-    and pack() define them. Built by put() into anonymous memory, or into a file at `path` (written with positioned
-    writes, then mapped read-only; a complete file with the same layout is opened as it is, without puts). The first
-    region() or address() seals it: the memory is registered as mapped memory for `device` (a file read-only where the
-    device allows it, else read into anonymous memory that is), and from then on put() is refused.
+    and pack() define them. Its bytes are anonymous host memory of its own, built by put(), its pages kept in host
+    memory from the moment they are written (host_memory.lock). With `path` the seal writes the built store to a
+    file, once and past the OS's page cache (Core's write_memory), and a complete file with the same layout is not
+    built again: the seal reads it into the store's memory, by direct reads at a queue depth (Core's host reads).
+    The first region() or address() seals the store: its memory is registered as mapped memory for `device`, and
+    from then on put() is refused.
+
+    The file is how the bundles outlast the process, never the memory the device reads. A file's mapping is the
+    OS's page cache, which a registration faults in a page at a time and which the OS may drop meanwhile (one that
+    returns unused cache to its host does): a 65 GiB store just written, or read in ahead of the registration, came
+    off the disk again at 40 MB/s, 27 minutes of a load. Read past the page cache into memory of its own it takes
+    20 seconds, at the drive's rate, and a store just built is registered where put() left it. Nor does the file
+    pass through the page cache on its way out: a store that fills host memory, written through it bundle by
+    bundle, left the host its swap to make room in.
 
     region() -> (host uint8 tensor [keys * bundle_bytes], CUDA uint8 tensor over its device address); address(layer,
     expert) -> a bundle's device address; read(keys, into) copies bundles into a host or device tensor [n][bundle_bytes].
@@ -428,9 +417,10 @@ class BundleStore:
         self.device = device
         self.path = Path(path) if path else None
         self._memory = _host_memory()
-        self._mapping = self._fd = None
+        self._mapping = None
         self._host = self._device = None
         self._registered = None
+        self.working = None        # the owner's working(what, done, total): the seal says how far its read is
         self.left = frozenset()    # keys whose bundles the host does not hold (leave())
         self.left_bytes = 0        # the host bytes that saved
         self._file = None          # the store file's reads (left bundles; peek())
@@ -440,13 +430,12 @@ class BundleStore:
         if self.path is not None:
             _claim(self.path)
         if self.path is not None and self._matches():
-            self.complete = True
-        elif self.path is not None:
+            self.complete = True    # its memory is made and read in at the seal (leave() says what stays out first)
+            return
+        if self.path is not None:
             _unlink(Path(str(self.path) + ".json"))   # an index names complete bytes only: gone before they change
-            self._fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o644)
-            os.ftruncate(self._fd, self.size)
-        else:
-            self._mapping = self._memory.map_anonymous(self.size)
+        self._mapping = self._memory.map_anonymous(self.size)
+        self._memory.lock(self._mapping)
 
     def _matches(self):
         index = Path(str(self.path) + ".json")
@@ -473,10 +462,7 @@ class BundleStore:
         if len(data) != self.bundle_bytes:
             raise ValueError(f"a bundle is {self.bundle_bytes} bytes, not {len(data)}")
         at = self.key(layer, expert) * self.bundle_bytes
-        if self._fd is not None:
-            pwrite(self._fd, data, at)
-        else:
-            ctypes.memmove(self._mapping.address + at, data, len(data))
+        ctypes.memmove(self._mapping.address + at, data, len(data))
 
     def leave(self, keys):
         """Bundles the host is not to hold (a cache's pinned core, layers kept whole on the device). Before the
@@ -498,7 +484,8 @@ class BundleStore:
 
     def _reader(self):
         """The store file's reads (Core's host: positioned reads at a queue depth, past the OS's page cache where
-        the file system allows, so a bundle the host is not to hold does not stay in the cache either)."""
+        the file system allows: a file read into the store's memory is not held twice, and a bundle the host is not
+        to hold does not stay in the cache either)."""
         if self._file is None:
             from crit_plugins.host import current
             self._file = current().reads("device-expert-cache", self.path, direct=True)
@@ -518,39 +505,46 @@ class BundleStore:
             return None
         return self._from_file(self.key(layer, expert))
 
+    def _read_file(self):
+        """A complete store file into the store's memory, the left bundles' whole pages apart (the filler's): direct
+        reads of READ_PIECE bytes at a queue depth, each landing where it goes."""
+        B = self.bundle_bytes
+        left = self._memory.whole_pages([(key * B, (key + 1) * B) for key in self.left], self.size)
+        pieces, at = [], 0
+        for first, end in left + [(self.size, self.size)]:
+            while at < first:   # up to the next left range (or the end), a piece at a time
+                n = min(READ_PIECE, first - at)
+                pieces.append((at, n))
+                at += n
+            at = max(at, end)
+        reads, address, total, done = self._reader(), self._mapping.address, sum(n for _, n in pieces), 0
+        for first in range(0, len(pieces), READ_BATCH):
+            batch = pieces[first:first + READ_BATCH]
+            reads.read([(start, (ctypes.c_uint8 * n).from_address(address + start)) for start, n in batch])
+            done += sum(n for _, n in batch)
+            if self.working is not None:
+                self.working("expert store: read into host memory, MiB", done >> 20, total >> 20)
+
     def _seal(self):
         if self._registered is not None:
             return
         memory = self._memory
-        if self._fd is not None:
-            os.fsync(self._fd)
-            os.close(self._fd)
-            self._fd = None
+        if self.path is not None and not self.complete:   # built here: the file a later load reads in
+            from crit_plugins.host import write_memory
+            report = self.working
+            write_memory(self.path, self._mapping.address, self.size, None if report is None else (
+                lambda done, total: report("expert store: written to its file, MiB", done >> 20, total >> 20)))
             Path(str(self.path) + ".json").write_text(json.dumps(self._index, indent=1), encoding="utf-8")
             self.complete = True
-        if self._mapping is None:
-            self._mapping = memory.map_file(self.path, self.size)
+        stored = self._mapping is None   # a complete file opened without puts: read into memory now
+        if stored:
+            self._mapping = memory.map_anonymous(self.size)
+            memory.lock(self._mapping)
+        self._leave_out()                # before the registration, which holds the pages it finds
+        if stored:
+            self._read_file()
         cuda = str(self.device).startswith("cuda")
-        address = None
-        if cuda:
-            import torch
-            index = torch.device(self.device).index or 0
-            self._leave_out()
-            if not self._mapping.writable and memory.read_only_supported(index):
-                try:
-                    address = memory.register(self._mapping.address, self.size, read_only=True)
-                except RuntimeError:
-                    address = None
-            if address is None:
-                if not self._mapping.writable:   # read the file into memory the device may register
-                    copy = memory.map_anonymous(self.size)
-                    ctypes.memmove(copy.address, self._mapping.address, self.size)
-                    self._mapping.close()
-                    self._mapping = copy
-                    self._leave_out()
-                address = memory.register(self._mapping.address, self.size)
-        else:
-            self._leave_out()
+        address = memory.register(self._mapping.address, self.size) if cuda else None
         self._registered = address if address is not None else 0
         self._host = memory.host_tensor(self._mapping.address, self.size)
         self._device = memory.device_tensor(address, self.size, self.device) if cuda else None
@@ -590,9 +584,6 @@ class BundleStore:
                 into[i].copy_(self._from_file(key))
 
     def close(self):
-        if self._fd is not None:
-            os.close(self._fd)
-            self._fd = None
         if self._file is not None:
             self._file.close()
             self._file = None

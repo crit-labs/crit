@@ -76,7 +76,7 @@ Core needs no CUDA toolkit: it loads the device's driver at run time ([CUDA back
 false positive).
 
 `crit core build` builds just the runtime engines load, `crit_core_steps`, into `build/core-steps` (from a crit
-installed without a checkout: into Core's cache, `CRIT_CORE_CACHE`, default `~/.cache/crit/core/VERSION`, from the
+installed without a checkout: into Core's cache, `CRIT_CORE_CACHE`, default `core/VERSION` under `CRIT_CACHE_HOME` (`~/.cache/crit`), from the
 release's tag), where `crit_core.native.step_library()` finds it when `CRIT_CORE_STEP_LIBRARY` names none. The full
 build with its tests:
 
@@ -99,10 +99,10 @@ cmake --build build/consumer
 ctest --test-dir build/consumer --output-on-failure
 ```
 
-The SDK is version 0.20.0. Include `<crit/core.h>` and link the installed target:
+The SDK is version 0.21.0. Include `<crit/core.h>` and link the installed target:
 
 ```cmake
-find_package(critCore 0.20.0 EXACT CONFIG REQUIRED)
+find_package(critCore 0.21.0 EXACT CONFIG REQUIRED)
 target_link_libraries(your_engine PRIVATE crit::core)
 ```
 

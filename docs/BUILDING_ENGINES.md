@@ -5,6 +5,11 @@ measurement must look like, and how to read what Eval reports. AGENTS.md says wh
 `crit run ... next` says which step comes next; [Run records](RUN_RECORDS.md) defines every command and payload.
 Commands below omit crit run's global options (`--project CRIT_ROOT --root RUN_ROOT --id RUN_ID`, before the action).
 
+An engine build, like a release, starts only from a crit commit where the checkpoint manifest test
+(`tests/test_checkpoint_manifests.py`) and the stress test (`python tests/stress.py`) pass ([real
+checkpoints](CONTRIBUTING.md#real-checkpoints)): a toolkit bug they catch is one the build would otherwise spend its
+candidates finding.
+
 ## 1. The request
 
 Probe the device (`crit eval probe --out device.json`, or `device` in `settings.toml`) and `create` sizes the
@@ -81,8 +86,9 @@ package --candidate ID --source PACKAGE_DIR --record recipe.json
 check --candidate ID --record check.json
 ```
 
-The library's plugins are meant to give a fast engine from candidate 1 with only the model plugin written for the
-checkpoint ([the model plugin](PLUGINS.md#the-model-plugin)): decode rounds captured through Core's round driver,
+The library's plugins are meant to give a fast engine from candidate 1 with no model code at all for a checkpoint
+[model-template](../inference/model-template/README.md)'s layouts cover, and a model plugin composed from its blocks for
+another ([the model plugin](PLUGINS.md#the-model-plugin)): decode rounds captured through Core's round driver,
 short prompt chunks through Core's prompt graphs, the drafter over the model's device draft head, and the KV pool,
 attention, projections, recurrence and experts plugins each in its stored format with crit's kernel (built for the
 GPU, tuned by `crit kernels sweep`) or its torch fallback. A mixture of experts larger than the device needs no engine

@@ -81,7 +81,7 @@ def write_plugins(root, plugins=None, tests=None):
         manifest = {"schema": "crit-plugin-v1", "id": plugin_id, "title": f"Fixture {plugin_id}",
                     "fills": spec["fills"], "entry": "plugin.py:create",
                     **{key: spec[key] for key in ("provides", "needs", "needs_when", "conflicts", "options", "reference",
-                                                  "requires", "devices")
+                                                  "requires", "requires_when", "devices")
                        if key in spec}}
         (folder / "plugin.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
         (folder / "plugin.py").write_text(PLUGIN.format(id=plugin_id, memory=spec.get("memory", {}),

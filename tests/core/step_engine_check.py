@@ -1,9 +1,9 @@
 """Drive a toy Python step model through crit_core.native.StepEngine and Core's concurrent runtime (crit/step_engine.h,
 the crit_core_steps library): requests decode the same tokens batched as one at a time, steps hold several requests
 and mix prompt chunks with decode rows, cancellation and retirement reach the model and release every session,
-page-reserving admission defers requests, log-probabilities, replay and stop tokens pass through, scores run as Core's
-barrier, parts with step frames hear of every step and score, and a failing step fails the engine. Core's loader and
-its adapters over a model plugin are tests/test_core_engine.py's."""
+page-reserving admission defers requests, log-probabilities, replay and stop tokens pass through, prompts run in
+prefill passes, scores run as Core's barrier, parts with step frames hear of every step and score, and a failing step
+fails the engine. Core's loader and its adapters over a model plugin are tests/test_core_engine.py's."""
 import ctypes
 import sys
 import threading
@@ -402,8 +402,11 @@ def native_rounds(library):
         return launch(user, rows, width, logprobs)
     model._launch = _LAUNCH(asking)   # before the engine opens: its rounds launch through it
     engine = StepEngine(model, library, relieve=lambda: relieved.append(model.native_rounds_run))
-    got = run_all(engine, 12)
-    expect(got == [oracle(p, 12) for p in prompts()], "a step asked for between rounds keeps the tokens")
+    # One request: its prompt is done before the first round, so the step asked for can only be a decode step (beside
+    # other requests a later one's prompt step would take the asking, by the threads' timing).
+    asked = prompts()[3]
+    got = engine.generate(asked, 12, stop_tokens=[])[0]
+    expect(got == oracle(asked, 12), "a step asked for between rounds keeps the tokens")
     expect(model.decode_steps == 1 and model.native_rounds_run > 2, ("one decode step through step()",
                                                                      model.decode_steps, model.native_rounds_run))
     expect(2 in relieved and not model.native.asked(), ("relieve ran in the step that was asked for", relieved))
@@ -550,6 +553,99 @@ def prefill_quantum(library):
         engine.close()
 
 
+class PassModel(ToyStepModel):
+    """ToyStepModel whose prompts run in prefill passes: a span of up to SPAN prompt tokens takes LAYERS steps, of
+    which all but the last report the span as a pass and consume nothing, and the last consumes the whole span,
+    whatever that step's grant. `declared`: the pass steps in a row it tells Core of (LAYERS - 1 is what it takes)."""
+
+    SPAN, LAYERS = 24, 3
+
+    def __init__(self, declared=LAYERS - 1):
+        super().__init__(concurrency=4)
+        self.declared, self.passed, self.spans, self.mixed = declared, 0, [], 0
+        self.gate, self.held = None, False   # a test's gate: a step waits at it until the test opens it
+
+    def info(self):
+        return {**super().info(), "prefill_pass_tokens": self.SPAN, "prefill_pass_steps": self.declared}
+
+    def step(self, rows):
+        if self.gate is not None and not self.gate.is_set():
+            self.held = True
+            self.gate.wait(30)
+        results, decoding = [None] * len(rows), []
+        for i, row in enumerate(rows):
+            s = row.session
+            if row.prefill_complete:
+                decoding.append(i)
+                continue
+            start = len(s.rows)
+            span = min(self.SPAN, len(s.prompt) - start)
+            s.layer = getattr(s, "layer", 0) + 1
+            if s.layer < self.LAYERS:   # a layer of the span: nothing consumed yet
+                s.staged, self.passed = None, self.passed + 1
+                results[i] = StepResult(pass_tokens=span)
+                continue
+            s.layer, s.staged, s.produced = 0, s.prompt[start:start + span], []
+            self.spans.append((span, row.prefill_tokens))
+            ends = start + span == len(s.prompt)
+            if ends:
+                s.produced = [successor(s.rows + s.staged)]
+            results[i] = StepResult(span, s.produced, ends)
+        self.mixed += 0 < len(decoding) < len(rows)
+        for i, result in zip(decoding, super().step([rows[i] for i in decoding]) if decoding else ()):
+            results[i] = result
+        return results
+
+
+def prefill_passes(library):
+    """A step model that declares prefill passes works on a span of the prompt over several steps: the steps of a
+    pass consume no prompt token, the step that ends it consumes the span past its grant, the requests sharing its
+    steps decode on, and the tokens are the oracle's. A model whose pass takes more steps than it declared fails."""
+    model = PassModel()
+    engine = StepEngine(model, library)
+    try:
+        expect(run_all(engine, 6) == [oracle(p, 6) for p in prompts()], "the tokens of prompts run in passes")
+        expect(model.passed == 2 * len(model.spans) and any(span > grant for span, grant in model.spans),
+               ("every span took two pass steps, and spans exceed a step's grant", model.passed, model.spans))
+        # A short request that arrives while a long one's first step runs decodes beside the long one's later pass
+        # steps (the gate holds that first step until the short request is queued: no timing decides it).
+        model.mixed, model.gate = 0, threading.Event()
+        long, short = list(range(2 * model.SPAN)), [5, 6]
+        with ThreadPoolExecutor(2) as pool:
+            first = pool.submit(engine.generate, long, 2, stop_tokens=[])
+            while not model.held:
+                time.sleep(0.001)
+            second = pool.submit(engine.generate, short, 8, stop_tokens=[])
+            time.sleep(0.2)
+            model.gate.set()
+            expect((first.result(timeout=30)[0], second.result(timeout=30)[0]) == (oracle(long, 2), oracle(short, 8)),
+                   "the tokens of a short request beside a long one's passes")
+        model.gate = None
+        expect(model.mixed, "decode rows share the steps of a pass")
+        long, before = list(range(40)), model.passed   # cancelled from its first pass step on, whenever Core asks
+        expect(engine.generate(long, 4, stop_tokens=[], cancelled=lambda: model.passed > before)
+               == (None, {"cancelled": True}), "a request is cancelled between the steps of its pass")
+        expect(engine.generate([5, 6], 4, stop_tokens=[])[0] == oracle([5, 6], 4), "the engine serves on")
+    finally:
+        engine.close()
+    engine = StepEngine(PassModel(declared=1), library)
+    try:
+        engine.generate([1, 2, 3], 2, stop_tokens=[])
+    except NativeError as error:
+        expect("invalid or stalled concurrent progress" in str(error), error)
+    else:
+        raise AssertionError("a pass of more steps than declared must fail the engine")
+    finally:
+        engine.close()
+    try:
+        StepEngine(types.SimpleNamespace(info=lambda: {**ToyStepModel().info(), "prefill_pass_tokens": 8},
+                                         open=lambda request: None, step=lambda rows: []), library)
+    except NativeError as error:
+        expect("prefill passes need" in str(error), error)
+    else:
+        raise AssertionError("passes without prefill_pass_steps must not open")
+
+
 def request_facts(library):
     """Every generation's result carries its rounds' facts: Core counts each decode row as a round, takes accepted
     drafts, the width and the engine's named counters from a native round's words, and merges the model's
@@ -636,8 +732,16 @@ def step_frames(library):
         def end_step(self):
             self.ended += 1
 
-    model, frame, older = ToyStepModel(1), Frame(), Older()
-    engine = StepEngine(model, library, frames=[frame, older, object()])   # a part without the methods is left alone
+    class Scored:   # a part that tells a score's frame from a prompt step's
+        def __init__(self):
+            self.calls = []
+
+        def begin_step(self, prompt_tokens, score=False):
+            self.calls.append((prompt_tokens, score))
+
+    model, frame, older, scored = ToyStepModel(1), Frame(), Older(), Scored()
+    # a part without the methods is left alone
+    engine = StepEngine(model, library, frames=[frame, older, scored, object()])
     try:
         prompt = list(range(10, 30))   # 20 tokens: prompt chunks of 8, 8 and 4
         tokens, _ = engine.generate(prompt, 3, stop_tokens=[])
@@ -651,6 +755,7 @@ def step_frames(library):
         frame.calls.clear()
         engine.score([1, 2, 3, 4], 2, "prefill", top_k=2)
         expect(frame.calls == [("begin", 4), ("end", False)], frame.calls)
+        expect(scored.calls[-1] == (4, True) and not any(score for _, score in scored.calls[:-1]), scored.calls)
         frame.calls.clear()
         model.fail_on = 2
         try:
@@ -668,6 +773,7 @@ def main(library):
     native_round_forms(library)
     request_facts(library)
     prefill_quantum(library)
+    prefill_passes(library)
     cancellation_and_retirement(library)
     admission(library)
     options(library)

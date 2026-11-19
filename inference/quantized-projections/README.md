@@ -169,8 +169,10 @@ quantized values, exact in BF16, through the W8A16 paths), decode rows with `dec
 quantized values through the W8A16 GEMV or the tile (facts `prompt_activations` mxfp8: stored, `decode_activations`
 mxfp8). The quantized values come from one launch of fp8-block-rows' `quantized_values` (each code times its
 group's power of two, written as BF16); until it existed a call ran the quantizer and three torch kernels for them,
-which on Qwen3.8-Flash-Next's 264 MXFP8 products a decode round cost 2.1 of the round's 21.6 ms. The default stays
-`bf16` (facts mxfp8: bf16).
+which on Qwen3.8-Flash-Next's 264 MXFP8 products a decode round cost 2.1 of the round's 21.6 ms. The default,
+`auto`, follows the engine's [quality mode](../../docs/PLUGINS.md#precision): `mxfp8` in `speed`, where a quantized
+format's prompt rows start at its stored activations (a speed run's plans declare them so), `bf16` in `preserve` and
+where no mode is stated (facts mxfp8: stored or bf16, and `chosen` where auto decided).
 
 **AWQ and GPTQ (INT4 with a zero point a group).** Formats `awq` (`qweight` int32 [in][out / 8] in AWQ's nibble order
 0, 2, 4, 6, 1, 3, 5, 7, `qzeros` [in / group][out / 8] alike, FP16 `scales` [in / group][out]) and `gptq` (`qweight`
@@ -406,6 +408,21 @@ The model plugin passes `encode` only for draft-only roles, the stored target st
 `as_stored` weights rule covers target weights, not draft-only ones), and the facts record each re-encoded role under
 `draft_encoding` (stored and encoded format, matrices, bytes before and after). A draft step reading an MTP layer and
 head of a 27B model (hidden 5,120, vocabulary 248,320) moves about 0.95 GB as NVFP4 instead of 1.7 GB as FP8.
+
+**The output head in FP8.** The model's own output head, the matrix the model plugin loads with role `head`, is held
+as option `head` says: `stored`, as the checkpoint stores it; `fp8`, a head stored in 16 bits re-encoded at load by
+the same FP64 encoder as `encode="fp8"` (E4M3 codes, one FP32 scale a row), after which it is an FP8 target matrix
+like a stored one, under `fp8_activations` and `decode_activations`; `auto`, the default, `fp8` where the engine's
+configuration states quality mode `speed` and `stored` in `preserve` or where it states none
+([precision](../../docs/PLUGINS.md#precision)). Every decode step reads the whole head, so the 27B model's head
+moves about 1.3 GB a step in FP8 instead of 2.5 GB in BF16, and the device holds that much less: the encoder's
+slices and the load's warm-up go back to the device when the head's load returns, and the 16-bit copy at the plugin's
+next call after the model plugin dropped it (`release_dropped`), rather than staying in torch's cache, so what
+sizes itself by the device's free memory (an expert cache) can use the bytes. The facts record it
+under `head_encoding` (stored and encoded format, matrices, bytes before and after, what chose it). Unlike a
+draft-only matrix this is a target weight: every published token is computed with it, so the FP8 head belongs to
+the `speed` mode's starting arithmetic, is a measured precision change in `preserve`, and is set to `stored` in a
+run whose `weights_policy` is `as_stored`. A head stored quantized stays as stored.
 
 ## Worked example
 

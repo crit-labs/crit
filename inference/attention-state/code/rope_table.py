@@ -8,7 +8,7 @@ from typing import NamedTuple
 from crit_core.model import ConfigError
 
 DEFAULT_THETA = 10000.0   # Hugging Face's default rope_theta when a config declares none
-TYPES = ("default", "mrope", "linear", "dynamic", "yarn", "llama3", "longrope")
+TYPES = ("default", "mrope", "linear", "dynamic", "yarn", "llama3", "longrope", "proportional")
 
 
 class RopeTable(NamedTuple):
@@ -40,6 +40,20 @@ def rope_table(rope, head_dim, max_position_embeddings=None, sequence_length=Non
     kind = rope.type or "default"
     if kind not in TYPES:
         raise ConfigError(f"rope: type {kind!r} has no table; supported: {', '.join(TYPES)}")
+    if kind == "proportional":
+        # A table as wide as the head whatever share of it rotates: the first int(share x head_dim / 2) pairs turn
+        # at base ** (-2 i / head_dim), the rest at frequency 0 (they keep their values), each pair a value of the
+        # head's first half with the one head_dim / 2 after it.
+        if type(head_dim) is not int or head_dim < 2 or head_dim % 2:
+            raise ConfigError(f"rope: head dimension {head_dim!r} is not a positive even integer")
+        share = 1.0 if rope.partial_rotary_factor is None else rope.partial_rotary_factor
+        base = DEFAULT_THETA if rope.theta is None else rope.theta
+        if not 0 < share <= 1 or not base > 1:
+            raise ConfigError(f"rope: proportional needs a share in (0, 1] and a base above 1, not {share!r}, {base!r}")
+        angles = int(share * head_dim // 2)
+        factor = 1.0 if rope.factor is None else rope.factor
+        return RopeTable(tuple(1.0 / base ** (2 * i / head_dim) / factor for i in range(angles))
+                         + (0.0,) * (head_dim // 2 - angles), 1.0)
     dim = rotary_dim(rope, head_dim)
     base = DEFAULT_THETA if rope.theta is None else rope.theta
     if not base > 1:

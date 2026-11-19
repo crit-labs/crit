@@ -17,6 +17,11 @@ void gemv(const torch::Tensor& blocks, int64_t type, int64_t k, const torch::Ten
 // splits); the matrix's rows decoded chunk_rows at a time (0: as many as a 128 MiB staging buffer holds).
 void gemm(const torch::Tensor& blocks, int64_t type, int64_t k, const torch::Tensor& xq, const torch::Tensor& xd,
           const torch::Tensor& xs, int64_t parts, torch::Tensor& y, int64_t chunk_rows);
+// y [M][N]: the rows (by sub-block) in groups of counts[g] in order, group g's rows times expert experts[g] of
+// blocks [experts][N][row bytes], each output gemm's bits for its row and expert.
+void gemm_experts(const torch::Tensor& blocks, int64_t type, int64_t k, const std::vector<int64_t>& experts,
+                  const std::vector<int64_t>& counts, const torch::Tensor& xq, const torch::Tensor& xd,
+                  const torch::Tensor& xs, int64_t parts, torch::Tensor& y);
 // y [M][N] = yp's parts added in part order, rounded once to y's dtype.
 void sum_parts(const torch::Tensor& yp, torch::Tensor& y);
 // out [N][K] (FP32, BF16, FP16): the stored values of expert `expert` (0 for a plain matrix).

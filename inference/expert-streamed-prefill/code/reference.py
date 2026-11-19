@@ -69,10 +69,21 @@ def silu(v):
     return v / (1.0 + math.exp(-v))
 
 
-def moe_block(x, ids, weights, gate_up, down, inter, tokens=None):
-    """[token][hidden] outputs of a routed SwiGLU block. x [tokens][hidden]; ids, weights [tokens][top_k]; gate_up(e)
-    and down(e) return expert e's decoded [2 * inter][hidden] and [hidden][inter] matrices (decode_matrix), called once
-    per expert used. tokens: the token rows to compute (all by default)."""
+ACTIVATIONS = ("silu", "gelu_tanh")   # a routed block's gate: silu(gate) * up (SwiGLU) or GELU's tanh form
+
+
+def gelu_tanh(v):
+    return 0.5 * v * (1.0 + math.tanh(math.sqrt(2.0 / math.pi) * (v + 0.044715 * v * v * v)))
+
+
+def moe_block(x, ids, weights, gate_up, down, inter, tokens=None, activation="silu"):
+    """[token][hidden] outputs of a routed gated block (SwiGLU by default). x [tokens][hidden]; ids, weights [tokens]
+    [top_k]; gate_up(e) and down(e) return expert e's decoded [2 * inter][hidden] and [hidden][inter] matrices
+    (decode_matrix), called once per expert used. tokens: the token rows to compute (all by default). activation: the
+    gate of the block's product, act(gate) * up (ACTIVATIONS)."""
+    if activation not in ACTIVATIONS:
+        raise ValueError(f"a routed block's activation is {' or '.join(ACTIVATIONS)}, not {activation!r}")
+    silu = globals()["silu"] if activation == "silu" else gelu_tanh
     cache_gu, cache_dn = {}, {}
     rows = range(len(x)) if tokens is None else tokens
     out = {}

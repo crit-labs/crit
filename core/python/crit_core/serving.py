@@ -500,6 +500,24 @@ class PreparedPrompt:
     token_count: int | None = None
 
 
+# The model's generation fields a served request takes where it names none of its own (served_sampling).
+SERVED_DEFAULTS = ("temperature", "top_p", "top_k", "min_p", "repetition_penalty")
+
+
+def served_sampling(defaults, request, applied):
+    """A request's sampling over the served default: `defaults` is the model's own generation settings (the run's
+    frozen recon's "sampling", else generation_config.json's explicit fields), `request` the fields the request set,
+    `applied` the fields the engine applies. A model that samples by default (do_sample) gives a request its
+    temperature, filters and repetition penalty for each of those the request leaves out; one that does not is
+    decoded greedily, as its own generate() does. A request that asks for temperature 0 takes none of them: it is
+    the greedy protocol's (Eval, crit smoke, the serving checks), whose options stay exactly what it sent."""
+    request = dict(request or {})
+    if not (defaults or {}).get("do_sample") or request.get("temperature") == 0:
+        return request
+    served = {key: defaults[key] for key in SERVED_DEFAULTS if defaults.get(key) is not None and key in applied}
+    return {**served, **request}
+
+
 # The prompt-token caches of the process by the identity (path and sha256) of the files the text layer read, so every
 # ResidentChat of one tokenizer shares one: they hold tokenizer output only, bounded per cache.
 _PROMPT_TOKEN_CACHES = {}
@@ -526,7 +544,8 @@ class ResidentChat:
     (crit_core.text.PromptTokenCache); False encodes every prompt in full. `loop_stop` True (or a dict of
     crit_core.text.LoopDetector options) ends a reply that has settled into repeating one span exactly, through the
     generator's cancelled(), as "stop" with the tokens so far; a grammar-constrained reply is never cut. Off (None)
-    by default."""
+    by default. A request takes the model's own sampling for the fields it does not set (served_sampling): the
+    served default is the run's frozen recon's, else generation_config.json's."""
     sampling = ()
     logprobs = False
     scores = False
@@ -574,6 +593,9 @@ class ResidentChat:
             template_variables = (self.configuration["chat_template_kwargs"] if "chat_template_kwargs" in self.configuration
                                   else (self.configuration.get("recon") or {}).get("template_variables"))
         self.template_variables = dict(template_variables or {})
+        # The served default sampling: what the run's recon froze, else the model's generation defaults as read.
+        frozen = (self.configuration.get("recon") or {}).get("sampling")
+        self.default_sampling = dict(self.text.generation.sampling_defaults() if frozen is None else frozen)
         self.kept_special = None   # tool-marker special tokens, found on the first request with tools
         self.calls_format = None   # tool_format, else the template's registered format, found with them
         unknown = sorted(set(self.sampling) - set(SAMPLING))
@@ -761,6 +783,7 @@ class ResidentChat:
         unsupported = sorted(set(sampling) - set(self.sampling))
         if unsupported:
             raise ValueError("This engine does not apply sampling field(s): " + ", ".join(unsupported))
+        sampling = served_sampling(getattr(self, "default_sampling", None), sampling, self.sampling)
         alternatives = request.get("logprobs")
         if alternatives is not None and not self.logprobs:
             raise ValueError("This engine does not report log-probabilities")

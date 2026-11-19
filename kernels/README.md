@@ -78,7 +78,7 @@ stopped during its builds, it ends them and writes the table of every structure'
 (`crit_plugins.kernels.load_kernel`), built with the engine's tuning or with the default knobs, which reproduce the
 kernel as it was hand-tuned, and falls back to its torch path when the kernel cannot be built here (no CUDA toolkit,
 an architecture it does not cover). Builds need torch with CUDA, the CUDA toolkit (nvcc) and ninja; they are cached
-in `CRIT_KERNEL_CACHE` (default `~/.cache/crit/kernels`).
+in `CRIT_KERNEL_CACHE` (default `kernels` under `CRIT_CACHE_HOME`, itself `~/.cache/crit` by default).
 
 **Contributing.** A kernel template is welcome where an operation lacks one, and so is a new structure in an
 existing kernel (a faster tile shape, another split, a fused path) or a knob value the sweep should try, when it meets
@@ -109,9 +109,10 @@ chooses between a kernel's structures by the level it asks for:
 A level keeps what the levels below it keep, and no structure is below `repeatable`. Of the 80 structures 12 are
 declared, 12 exact, 43 row-exact and 13 repeatable; `crit kernels list` shows each one's level (`exactness`, and
 `bits_of` for the exact ones). An engine asks for a level per phase, `decode` (its decode and verify rows) and
-`prompt` (its prompt rows), and where it asks for none the run's quality mode gives it: `preserve` asks `exact`,
-`speed` asks `repeatable` (`crit_kernels.exactness`: `setting()`, `for_quality_mode()`, and `choices()` for the
-structures of a kernel a phase may then run). For the decode rows `exact` and `row-exact` are one level, the bits a
+`prompt` (its prompt rows), and where it asks for none the run's quality mode gives it: both `preserve` and `speed`
+ask `exact` (`crit_kernels.exactness`: `setting()`, `for_quality_mode()`, and `choices()` for the structures of a
+kernel a phase may then run), so the modes differ in the precision of what is summed and a lower level is a lever an
+engine pulls itself. For the decode rows `exact` and `row-exact` are one level, the bits a
 prompt row is compared with. An engine package states its levels in its configuration (`"exactness"`), Core tells
 them to the plugins before any is made, the engine's facts say what was asked and what each plugin keeps, and an
 engine that keeps less than it asks is refused ([plugins and exactness](../docs/PLUGINS.md#exactness)); `crit run`

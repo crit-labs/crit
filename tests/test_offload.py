@@ -46,18 +46,17 @@ class OffloadTests(unittest.TestCase):
         self.assertEqual(offload.expert_format({}), "bf16")
         self.assertIsNone(offload.expert_shape({"hidden_size": 8}))
 
-    def test_misses_go_to_the_cpu_where_its_floor_wins(self):
+    def test_the_plugin_times_the_miss_path_where_the_cpus_floor_wins(self):
         value = self.plan(placement(cache_bytes=100 * self.size + 5, floors={"link": 30.0, "cpu": 17.0, "split": 15.0}),
                           cores=6)
         self.assertEqual(value["miss_path"], "cpu")
         self.assertEqual(value["selection"], {"experts": "expert-offload", "expert_source": "expert-tensors"})
         self.assertEqual(value["options"]["expert-offload"],
-                         {"misses": "cpu", "policy": "recent", "prompt_arithmetic": "tensor", "workers": 5,
-                          "margin_mib": 1024})
+                         {"misses": "auto", "workers": 5, "margin_mib": 1024})   # timed in the loaded engine
         self.assertEqual(value["cache"]["slots"], 100)
         preserve = self.plan(placement(cache_bytes=self.size, floors={"cpu": 1.0}), quality_mode="preserve",
                              vram_headroom_bytes=3 << 29)
-        self.assertEqual(preserve["options"]["expert-offload"]["prompt_arithmetic"], "declared")
+        self.assertNotIn("prompt_arithmetic", preserve["options"]["expert-offload"])   # the plugin's own choice
         self.assertEqual(preserve["options"]["expert-offload"]["margin_mib"], 1536)   # the run's VRAM headroom
 
     def test_the_link_alone_copies_misses_where_it_wins_or_the_cpu_cannot_compute_them(self):

@@ -8,6 +8,8 @@ context against the run's VRAM headroom. One check per case and gate cites the r
 """
 import http.client
 import json
+import socket
+import threading
 import time
 
 from crit_core.serving import LOGPROBS_CAPABILITY, TEMPLATE_KWARGS_CAPABILITY, TOOL_CHOICE_CAPABILITY, TOOLS_CAPABILITY
@@ -113,9 +115,11 @@ REQUIRED = ("consecutive", "system_message", "streaming", "stop_string", "cancel
 class Client:
     def __init__(self, port, timeout):
         self.port, self.timeout = port, timeout
+        self.connection = None   # chat's connection while it waits, for abort
 
     def chat(self, body):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=self.timeout)
+        self.connection = connection
         try:
             connection.request("POST", "/v1/chat/completions", json.dumps({"temperature": 0, "max_tokens": 48, **body}),
                                {"Content-Type": "application/json"})
@@ -126,6 +130,16 @@ class Client:
         if response.status != 200:
             raise ValueError(f"crit serve answered {response.status}: {(data.get('error') or {}).get('message', data)}")
         return data
+
+    def abort(self):
+        """Close the connection chat waits on (from another thread): crit serve cancels a request whose client
+        disconnects, and chat raises."""
+        connection = self.connection
+        if connection is not None and connection.sock is not None:
+            try:
+                connection.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     def post(self, path, body):
         """POST a JSON body to crit serve; its JSON answer, ValueError for any status but 200."""
@@ -193,12 +207,29 @@ FILLER = ("The river runs past the old mill and under the stone bridge, where th
           "Saturdays. Farmers bring apples, cheese and bread, and the children watch the boats go by. ")
 # Tokens the full-context pass decodes after its prompt.
 FULL_CONTEXT_DECODE = 16
+# Seconds a serving check waits for its request; the full-context request, for the engine's next step.
+CHECK_SECONDS = 600
+# Seconds between the full-context wait's reads of the engine's step count.
+PROGRESS_POLL_SECONDS = 5.0
+# Seconds of prompt steps the full-context wait times before it projects the prefill, and between its progress lines.
+PREFILL_SETTLE_SECONDS = 30.0
+PREFILL_REPORT_SECONDS = 60.0
 
 
-def full_context_checks(port, engine, kv_tokens, headroom, grace, timeout, log):
+class PrefillTooSlow(Exception):
+    """At the rate its first prompt steps ran, the full-context prompt cannot finish before the check's deadline."""
+
+
+def full_context_checks(port, engine, kv_tokens, headroom, grace, timeout, log, left=None):
     """One chat request at the full context: a user message of repeated FILLER, as many copies as fit in kv_tokens
     less FULL_CONTEXT_DECODE tokens (sized from the prompt tokens the engine counts for one copy and two), then up to
     FULL_CONTEXT_DECODE decoded tokens, on an engine whose Core steps are probed (crit_core.native.STEP_PROBE).
+    That request takes as long as the engine's prefill of the whole context, which on a slow link or a small device
+    can be many times `timeout`: it waits while the engine keeps finishing steps (_progressing) and fails when
+    none finishes for `timeout` seconds, crit serve's own bound on it being the attempt's deadline. With `left`
+    (() -> the seconds the attempt has left) it also fails as soon as the prefill cannot end in them at the rate the
+    engine's first prompt steps ran (_prefill_watch: "prefill too slow, about N tok/s", after PREFILL_SETTLE_SECONDS
+    of prompt steps instead of at the deadline), and logs the rate while it waits.
     From Core's probe in the engine's telemetry, of this request's steps alone (_since): full_context_prompt_step
     passes when the slowest prompt step finishes within `grace` (a cancel settles only between steps, and the host is
     retired with its weights when a cancel does not settle within crit serve's grace), full_context_device_memory
@@ -221,10 +252,17 @@ def full_context_checks(port, engine, kv_tokens, headroom, grace, timeout, log):
         if per <= 0:
             raise ValueError(f"two copies of the filler counted {one + per} prompt tokens, one {one}")
         copies = 1 + (kv_tokens - FULL_CONTEXT_DECODE - one) // per
-        log(f"serve check full context: a prompt of about {one + (copies - 1) * per:,} tokens and up to "
+        expected = one + (copies - 1) * per
+        log(f"serve check full context: a prompt of about {expected:,} tokens and up to "
             f"{FULL_CONTEXT_DECODE} decoded tokens")
-        before = _probe(engine)
-        prompted = complete(copies, FULL_CONTEXT_DECODE)
+        core = (engine.telemetry() or {}).get("core") or {}   # before the request: its probe and prompt tokens
+        before = core.get("probe")
+        waiting = Client(port, None)   # bounded by the engine's steps instead (_progressing)
+        body = {"model": model, "messages": [{"role": "user", "content": FILLER * copies}],
+                "max_tokens": FULL_CONTEXT_DECODE}
+        watch = _prefill_watch(engine, core.get("prompt_tokens") or 0, expected, left, log)
+        prompted = _progressing(lambda: waiting.chat(body), waiting, engine, timeout,
+                                watch=watch)["usage"]["prompt_tokens"]
         probe = _since(before, _probe(engine))
     except Exception as exc:
         detail = f"{type(exc).__name__}: {exc}"[:2000]
@@ -236,6 +274,104 @@ def full_context_checks(port, engine, kv_tokens, headroom, grace, timeout, log):
         item["seconds"] = seconds
         log(f"serve check {item['name']}: {item['state']} ({item['detail']})")
     return items
+
+
+def _prefill_watch(engine, start, expected, left, log, settle=None, report=None, clock=time.perf_counter):
+    """The full-context wait's look at the prefill, called at every poll: from Core's count of prefilled prompt tokens
+    (its telemetry's core.prompt_tokens, `start` before the request) it times the prompt steps after the first one it
+    sees finish, and once they span `settle` seconds projects the rest of the `expected`-token prompt at that rate.
+    The projection is a floor (prefill slows as the context grows), so when it already passes the seconds `left()`
+    gives, the prompt cannot finish: PrefillTooSlow, with the rate. It logs the rate every `report` seconds. An engine
+    that reports no count is not judged."""
+    settle = PREFILL_SETTLE_SECONDS if settle is None else settle
+    report = PREFILL_REPORT_SECONDS if report is None else report
+    first = {}
+
+    def watch():
+        counted = _prompt_tokens(engine)
+        if counted is None or counted <= start:
+            return
+        now, done = clock(), counted - start
+        if not first:
+            first.update(at=now, done=done, said=now)
+            return
+        if done <= first["done"] or now - first["at"] < settle:
+            return
+        rate = (done - first["done"]) / (now - first["at"])
+        seconds = max(0, expected - done) / rate
+        if left is not None and seconds > left():
+            raise PrefillTooSlow(
+                f"prefill too slow, about {rate:,.0f} tok/s: {done:,} of about {expected:,} prompt tokens are in, "
+                f"the rest needs {_minutes(seconds)} or more at that rate (prefill slows as the context grows) and "
+                f"the check's reservation has {_minutes(max(0.0, left()))} left. Make prefill faster (larger prompt "
+                "steps within the cancel grace, fewer copies a step) before checking again")
+        if now - first["said"] >= report:
+            first["said"] = now
+            log(f"serve check full context: {done:,} of about {expected:,} prompt tokens, about {rate:,.0f} tok/s, "
+                f"{_minutes(seconds)} or more to go")
+    return watch
+
+
+def _minutes(seconds):
+    return f"{seconds / 60:.0f} min" if seconds >= 90 else f"{seconds:.0f} s"
+
+
+def _prompt_tokens(engine):
+    """The prompt tokens Core's steps prefilled so far (telemetry's core.prompt_tokens), None when the engine
+    reports none or its report fails."""
+    try:
+        return ((engine.telemetry() or {}).get("core") or {}).get("prompt_tokens")
+    except Exception:
+        return None
+
+
+def _progressing(call, client, engine, stall, poll=None, watch=None):
+    """call()'s result, run on a thread and waited for while the engine keeps stepping: Core's step count (its
+    telemetry's core.steps, prompt and decode steps alike) read every `poll` seconds. When it has not moved for `stall`
+    seconds, or for an engine that reports none `stall` seconds have passed, the client's connection is closed (crit
+    serve cancels the request) and TimeoutError raised; so it is when `watch()`, called at every poll, raises, and
+    that error is raised. call()'s own error is raised as it is."""
+    poll = PROGRESS_POLL_SECONDS if poll is None else poll
+    found = {}
+
+    def run():
+        try:
+            found["value"] = call()
+        except BaseException as exc:   # re-raised on the caller's thread
+            found["error"] = exc
+    thread = threading.Thread(target=run, name="crit full-context request", daemon=True)
+    thread.start()
+    steps, moved = None, time.perf_counter()
+    while True:
+        thread.join(poll)
+        if not thread.is_alive():
+            break
+        if watch is not None:
+            try:
+                watch()
+            except Exception:
+                client.abort()
+                thread.join(poll)
+                raise
+        counted = _steps(engine)
+        if counted is not None and counted != steps:
+            steps, moved = counted, time.perf_counter()
+        elif time.perf_counter() - moved >= stall:
+            client.abort()
+            thread.join(poll)
+            raise TimeoutError(f"no engine step finished in {stall:g} s" if steps is not None else
+                               f"timed out after {stall:g} s (the engine reports no step count)")
+    if "error" in found:
+        raise found["error"]
+    return found["value"]
+
+
+def _steps(engine):
+    """Core's steps so far (telemetry's core.steps), None when the engine reports none or its report fails."""
+    try:
+        return ((engine.telemetry() or {}).get("core") or {}).get("steps")
+    except Exception:
+        return None
 
 
 def _probe(engine):
@@ -270,7 +406,9 @@ def _prompt_step(probe, grace, prompted):
             "detail": f"the slowest of {prompt['steps']} prompt steps, up to a {prompted:,}-token prompt, took "
                       f"{slowest:.3f} s; "
                       f"a cancel settles between steps and crit serve retires the host after {grace:g} s"
-                      + ("" if slowest < grace else ": prefill in smaller chunks")}
+                      + ("" if slowest < grace else ": prefill in shorter steps (smaller chunks; where a step's "
+                         "time is bringing weights to the device, experts kept in host memory, a model plugin "
+                         "that runs its prompt spans layer by layer over several steps: model-template's passes)")}
 
 
 def _device_memory(probe, headroom):
@@ -283,12 +421,20 @@ def _device_memory(probe, headroom):
     shown = ", ".join(f"{kind} {value / 2**30:.2f} GiB" for kind, value in sorted(found.items()))
     return {"name": "full_context_device_memory", "state": "passed" if least >= headroom else "failed",
             "detail": f"least free device memory at a step's peak up to the full context: {shown}; the run's VRAM "
-                      f"headroom is {headroom / 2**30:.2f} GiB"}
+                      f"headroom is {headroom / 2**30:.2f} GiB"
+                      + ("" if least >= headroom else
+                         ": a step took device memory that no plugin of crit_plugins.memory's ledger made room "
+                         "for (an elastic cache grows into whatever a smaller KV cache or shorter chunks free, so "
+                         "those do not move this; `crit plugins memory PACKAGE --model MODEL` lists what holds "
+                         "the device)")}
 
 
-def serve_checks(port, capabilities, variables, timeout, log):
+def serve_checks(port, capabilities, variables, timeout, log, planned_activations=None):
     """Run the standard serving checks against crit serve at `port`; returns their items (name, state, detail)
-    without the final stop_engine item, which the caller adds once the engine has stopped."""
+    without the final stop_engine item, which the caller adds once the engine has stopped. planned_activations: the
+    prompt activations the candidate's plan declared (its prompt_activations), which the engine's facts must match
+    (plan_activations): a candidate that serves other activations than it planned is caught at its first check, not
+    at the next plan after a whole Eval."""
     client, items = Client(port, timeout), []
 
     def check(name, run):
@@ -387,6 +533,20 @@ def serve_checks(port, capabilities, variables, timeout, log):
     # The served engine's facts beside the check, for what reads them later (crit kernels sweep --matrices).
     if seen.get("facts"):
         items[-1]["engine_facts"] = seen["facts"]
+
+    if planned_activations is not None:
+        def plan_activations():
+            from .plans import activations_served
+            served = (seen.get("facts") or {}).get("prompt_activations")
+            if served is None:
+                return "passed", "the engine declares no prompt activations: no quantized format's prompt GEMMs"
+            if not activations_served(planned_activations, served):
+                return "failed", (f"the engine serves prompt activations {json.dumps(served)}, the candidate's plan "
+                                  f"declared {json.dumps(planned_activations)}: set the projections plugin's options "
+                                  "to what the plan declares (its facts' prompt_activations say what each option "
+                                  "gave), or plan what is served")
+            return "passed", f"the engine serves the prompt activations its plan declared ({json.dumps(served)})"
+        check("plan_activations", plan_activations)
 
     switches = {k: not v for k, v in variables.items() if isinstance(v, bool)}
     if switches and TEMPLATE_KWARGS_CAPABILITY in capabilities:

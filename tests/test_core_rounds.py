@@ -397,6 +397,29 @@ class RoundsTests(unittest.TestCase):
         self.assertTrue(all(a >= b for a, b in zip(accepted, accepted[1:])), "a deeper draft is kept less often")
         self.assertEqual(sum(accepted) + drafts["rounds"], 2 * 119, "a row round emits its accepted drafts and one")
 
+    def test_a_cut_draft_reaches_verify_as_a_token_a_table_has_a_row_for(self):
+        # A drafter cuts a row's drafts with -1, which no prediction matches. verify's columns hold token 0 there,
+        # so a model looks every column up (inside a capture a lookup cannot check its ids); the rounds still emit
+        # plain greedy, one token past the last draft kept.
+        class Cutting(ToyDrafter):
+            def draft(self, view, head, sampler):
+                super().draft(view, head, sampler)
+                view.drafts[:, 1:] = -1
+        rounds = self.build(2, 3)
+        rounds.drafter = Cutting()
+        verify, least = self.model.verify, []
+
+        def checked(view, batch):
+            least.append((int(batch.tokens_t.min()), int(view.columns().min()), int(view.drafts[:, 1:3].max())))
+            return verify(view, batch)
+        self.model.verify = checked
+        prompts, log = [[3, 1, 4], [1, 5]], {}
+        outputs, _ = self.decode(rounds, prompts, [12, 12], [3], log=log)
+        self.assertEqual(outputs, [plain(prompt, 12) for prompt in prompts])
+        self.assertEqual({(batch, columns) for batch, columns, _ in least}, {(0, 0)})
+        self.assertEqual({cut for _, _, cut in least}, {-1})         # the drafts themselves stay cut
+        self.assertLessEqual(max(max(counts) for counts in log.values()), 2)
+
     def test_a_row_keeps_only_its_own_widths_drafts_and_emits_plain_greedy(self):
         # Rows of their own widths in rounds of width 6: a row at width 0 (a request that does not draft) emits one
         # token a round, one at width 2 at most three, and each decodes plain greedy; only drafts a row's width keeps
@@ -906,6 +929,42 @@ class RoundsTests(unittest.TestCase):
         self.assertEqual([c for c in calls if c[0] == "start"], [("start", n) for n in names], "once each: the pool too")
         self.assertEqual([c for c in calls if c[0] == "count"], [("count", n) for n in names])
         self.assertLess(calls.index(("start", "extra")), calls.index(("count", "sampler")))
+
+    def test_a_round_has_the_counters_its_parts_name(self):
+        # A part that counts in count_round names its counters (round_counters): the driver has them beside the
+        # model's own, each once, so a model plugin need not know what its slots' plugins count. A counter no one
+        # named is refused by name.
+        from crit_plugins import PluginError
+        from crit_plugins.rounds import Rounds
+
+        class Counting:
+            round_counters = ("expert_reads", "expert_hits")
+
+            def count_round(self, view):
+                view.counter("expert_reads").add_(3)
+                view.counter("expert_hits").add_(2)
+        model = ToyModel(1, 2, "cpu")
+        model.count_round = lambda view: None
+        use = {**USE, "experts": "toy-experts"}
+        facts = {**ROUNDS_FACTS, "toy-experts": ["rounds:experts"]}
+        for given in ({"extra_parts": [Counting()]}, {"parts": Parts(use, facts, {"experts": Counting()})}):
+            rounds = Rounds(model, ToySampler(), rows=1, widest=2, device="cpu", drafter=ToyDrafter(),
+                            head=ToyHead(model), pools=[ToyPool(1, "cpu")], counters=("own", "expert_reads"), **given)
+            self.assertEqual(rounds.counter_names, ("own", "expert_reads", "expert_hits"))
+            rounds.bind(0, 0, 2, model.prefill(0, [1, 2]), 8, capacity=16)
+            rounds.launch(1, 2)
+            (found,) = rounds.read()
+            self.assertEqual((found["own"], found["expert_reads"], found["expert_hits"]), (0, 3, 2))
+        Counting.round_counters = ()
+        rounds = Rounds(model, ToySampler(), rows=1, widest=2, device="cpu", drafter=ToyDrafter(), head=ToyHead(model),
+                        pools=[ToyPool(1, "cpu")], extra_parts=[Counting()])
+        rounds.bind(0, 0, 2, model.prefill(0, [1, 2]), 8, capacity=16)
+        with self.assertRaisesRegex(PluginError, "no counter 'expert_reads'.*round_counters"):
+            rounds.launch(1, 2)
+        Counting.round_counters = "expert_reads"
+        with self.assertRaisesRegex(PluginError, "tuple of counter names"):
+            Rounds(model, ToySampler(), rows=1, widest=2, device="cpu", pools=[ToyPool(1, "cpu")],
+                   extra_parts=[Counting()])
 
     def test_a_plugin_in_a_slot_the_round_uses_takes_part_without_being_registered(self):
         from crit_plugins.rounds import Rounds

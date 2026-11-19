@@ -1,7 +1,7 @@
 """GGUF projections (a GGUF checkpoint's quantized matrices), crit's kernel gguf-rows, built on this GPU with the
 engine's tuning or the default knobs: y = x W^T for W [N][K] in a GGUF block format (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0,
-Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, MXFP4), read at
-its stored bits.
+Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, MXFP4,
+Q1_0, Q2_0), read at its stored bits.
 
     w = GgufMatrix(blocks, "Q4_K", k)           # blocks: uint8 [N][row bytes] as the file stores them
     y = gemv(x, w)                              # 1 to 8 rows: int8 activations, dp4a over the stored blocks
@@ -21,22 +21,24 @@ import torch
 
 from ._ops import ops
 
-__all__ = ["BLOCKS", "FORMATS", "GgufMatrix", "MAX_ROWS", "dequantize", "gemm", "gemv", "matmul", "quantize",
-           "splits"]
+__all__ = ["BLOCKS", "FORMATS", "GgufMatrix", "MAX_ROWS", "dequantize", "gemm", "gemm_experts", "gemv", "matmul",
+           "quantize", "splits"]
 
 MAX_ROWS = 8
 # GGUF type ids of the formats, and each one's (values, bytes) a block.
 FORMATS = {"Q4_0": 2, "Q4_1": 3, "Q5_0": 6, "Q5_1": 7, "Q8_0": 8, "Q2_K": 10, "Q3_K": 11, "Q4_K": 12, "Q5_K": 13, "Q6_K": 14,
            "IQ2_XXS": 16, "IQ2_XS": 17, "IQ3_XXS": 18, "IQ1_S": 19, "IQ4_NL": 20, "IQ3_S": 21, "IQ2_S": 22,
-           "IQ4_XS": 23, "IQ1_M": 29, "MXFP4": 39}
+           "IQ4_XS": 23, "IQ1_M": 29, "TQ1_0": 34, "TQ2_0": 35, "MXFP4": 39,
+           "Q1_0": 41, "Q2_0": 42}
 BLOCKS = {2: (32, 18), 3: (32, 20), 6: (32, 22), 7: (32, 24), 8: (32, 34), 10: (256, 84), 11: (256, 110), 12: (256, 144),
           13: (256, 176), 14: (256, 210), 16: (256, 66), 17: (256, 74), 18: (256, 98), 19: (256, 50), 20: (32, 18),
-          21: (256, 110), 22: (256, 82), 23: (256, 136), 29: (256, 56), 39: (32, 17)}
+          21: (256, 110), 22: (256, 82), 23: (256, 136), 29: (256, 56), 34: (256, 54), 35: (256, 66), 39: (32, 17),
+          41: (128, 18), 42: (64, 18)}
 
 
 @dataclass
 class GgufMatrix:
-    blocks: torch.Tensor    # uint8 [N][row bytes], or [experts][N][row bytes]
+    blocks: torch.Tensor    # uint8 [N][row bytes], or [experts][N][row bytes] (rows contiguous, any expert stride)
     type: int               # GGUF type id (FORMATS)
     k: int                  # inputs
 
@@ -92,6 +94,19 @@ def gemm(x: torch.Tensor, w: GgufMatrix, out: Optional[torch.Tensor] = None) -> 
     xq, xd, xs = quantize(x, by_subblock=True)
     out = torch.empty(rows, w.n, dtype=x.dtype, device=x.device) if out is None else out
     ops.gemm(w.blocks, int(w.type), int(w.k), xq, xd, xs, splits(w), out)
+    return out
+
+
+def gemm_experts(x: torch.Tensor, experts: GgufMatrix, ids, counts, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """y [M][N] in x's dtype: x's rows (any M) in groups of counts[g] in order, group g's rows times expert ids[g] of
+    the stack (GgufMatrix over [E][N][row bytes], experts at any stride), each output gemm's bits (and so gemv's) for
+    its row and expert: a mixture of experts' prompt rows sorted by expert, in one staging and one GEMM launch for each
+    batch of experts that fits the staging buffer."""
+    rows = x.shape[0]
+    xq, xd, xs = quantize(x, by_subblock=True)
+    out = torch.empty(rows, experts.n, dtype=x.dtype, device=x.device) if out is None else out
+    ops.gemm_experts(experts.blocks, int(experts.type), int(experts.k), [int(i) for i in ids], [int(c) for c in counts],
+                     xq, xd, xs, splits(experts), out)
     return out
 
 

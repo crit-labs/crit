@@ -9,6 +9,709 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-18
+
+### Overview
+
+crit 0.21.0 adds the library's first model plugin and runs GGUF checkpoints end to end. model-template composes a
+model plugin from tested blocks by a layout, so an agent picks a layout instead of writing a model: Llama and Qwen
+decoders, Qwen3-Next and Qwen3.5 hybrids, Qwen4Exp (Qwen3.8-Flash-Next's architecture), DeepSeek V3's latent attention
+and Gemma 4, with their draft layers. It reads GGUF files under the names its blocks read (llama, qwen2/3, their MoE
+forms, qwen35, qwen4exp, gemma4 and deepseek2, and every file's draft block), and expert-offload caches, streams and
+computes GGUF experts as stored, in one grouped GEMM a batch of experts and on the CPU tier in the kernel's declared
+order. Unsloth's 68 GB UD-IQ1_M Qwen3.8-Flash-Next serves on an RTX 5090 at 131,072 tokens of context at 63.7 tok/s
+sampled and 1,377 tok/s prefill at 16,384 prompt tokens. gguf-rows reads the ternary TQ1_0 and TQ2_0 and the Q1_0 and
+Q2_0 formats bit for bit and decodes IQ1 and IQ2 faster, and crit serve opens a lone GGUF. Core's step contract has
+prefill passes, so a model runs a long prompt layer by layer where its experts live off the device while a cancel
+still settles between short steps (the engine ABI is 8: rebuild `crit_core_steps`). Quality mode `speed` holds the
+output head in FP8 and both modes now ask exact prompt rows unless a candidate states otherwise. Checkpoints of tens
+of gigabytes load reliably: the expert store owns locked host memory written and read past the page cache, a load that
+reports progress is not timed out, and the expert cache keeps its margin at a prompt step's real peak. A pre-build
+stress test serves layer-cut and whole real checkpoints under VRAM pressure, and builds and releases start only from a
+commit where it and the manifest test pass. Plugin caches share one machine-wide ledger with a size cap and a
+free-space floor, every cache lives under `CRIT_CACHE_HOME`, and CI runs in shards with uv and a cached Core runtime.
+crit 0.21.0 needs crit-eval 0.7.2.
+
+### Added
+
+- A machine-wide bound on the files plugins keep in their caches (`crit_plugins.disk_cache`): every kept file of any
+  run or clone is entered in one ledger (`~/.cache/crit/plugin-cache.json`), and before a new one is written the
+  least recently used are removed until those kept stay under `CRIT_PLUGIN_CACHE_GIB` (default 100) and the disk
+  keeps `CRIT_DISK_FLOOR_GIB` (default 50) free after the write; where it cannot, the plugin builds in memory.
+  expert-offload's stores go through it. A run that was never stopped kept its 65 GB store before, and a few of them
+  filled the disk; the old rule only asked for twice the store's size free at the time of the write.
+- `CRIT_CACHE_HOME` names the one folder every cache crit keeps lives under (default `~/.cache/crit`: kernels, Core
+  builds, native libraries, plugin test results and the plugin cache ledger), through `crit_core.cache_home()`; each
+  cache's own variable still overrides it. Every path built its own `~/.cache/crit` default before.
+- Importing crit_core turns off core files for the process (a soft limit of 1 byte; `CRIT_CORE_FILES=1` keeps the
+  system's), as crit serve's host already did: a crashed test or script holding a model's mapped weights wrote a
+  69 GB WSL crash dump to the Windows disk.
+- model-template keeps a GGUF's quantized token embeddings as the file stores their rows, through an embeddings plugin
+  that decodes the rows a lookup reads (`embeddings:gguf`: lookup-table-rows), on the device or read in place from
+  the file where the plan puts the table off it; they were decoded whole to BF16 on the device before (1.2 GiB on
+  Qwen3.8-Flash-Next). The n-gram table's GGUF path and the embeddings' share one helper (`gguf_table`).
+- expert-offload sizes GGUF bundle slots for the layers most experts are in, not the widest: the slot is the smallest
+  layer bundle past which the wider layers hold at most a sixteenth of the experts' bytes, and those layers (a file's
+  few layers in a wider format, Qwen3.8-Flash-Next UD-IQ1_M's two IQ4_NL layers) are stored in pieces of a slot in
+  extra store layers and kept whole on the device at their own size, outside the cache (`reasons.outsized`). Every
+  slot was padded to the widest layer's bundle before (about 30% of a slot on that checkpoint). The device tier holds
+  each layer at its own size.
+- expert-offload runs a GGUF prompt chunk's routes through gguf-rows' grouped GEMM: the routes sorted by slot and
+  multiplied in one staging and one GEMM launch for each batch of experts (two calls a matrix), where each slot's rows
+  took their own kernel calls and Python steps before (up to a layer's 512 experts, two matrices each). The bits are
+  the same: each row the plain call's on its expert.
+- expert-offload's CPU tier computes GGUF experts' misses: `GgufCpuTier` runs gguf-rows' declared order on the host
+  (Core's new `crit_core.model.gguf_blocks.declared_rows`, the kernel's host reference moved out of gguf-rows'
+  bench.py, with the splits the kernel takes on the device) over the bundles in place in the store, so a route it
+  serves has the bits a slot gives it; it is in torch, so its rows join after a synchronization and rounds with it are
+  not captured (`round_problems` says so). With misses on auto it serves where the cache is too small for link misses
+  (a CPU tier the decision tree had no way to give GGUF experts before) and where it is timed faster than the link.
+- model-template reads GGUF files of the gemma4 and deepseek2 architectures and every GGUF's draft (nextn) block:
+  Gemma 4's norms in pairs around each block, its layer scalar (layer_output_scale), the router's scale and each
+  expert's scale (.scale tensors) and its experts as one gate-up stack at the layer's prefix; DeepSeek V2 and V3's
+  latent attention matrices, kv_b_proj joined back from the converter's attn_k_b (transposed) and attn_v_b and
+  decoded, the router's score correction (exp_probs_b.bias) and the shared experts; the draft block after the text
+  layers as the layout's MTP layer (eh_proj as its fc or, for Qwen4Exp, as fc_embedding and fc_hidden by whole blocks
+  of their input columns; enorm, hnorm and shared_head_norm as its norms), with a draft layer's GGUF experts handed to
+  expert-offload in their own formats. `tests/gguf_checkpoint.py` writes those architectures and draft blocks as
+  llama.cpp's converter does; new whole-engine tests against transformers run the Gemma 4 MoE, DeepSeek V3, Qwen3.5
+  drafting from its MTP layer and Qwen4Exp with its draft layer from GGUF copies. A GGUF draft layer's experts loaded
+  through any experts plugin no longer fail on the re-encoding argument.
+- gguf-rows multiplies a mixture of experts' prompt rows grouped by expert (`gemm_experts(x, experts, ids, counts)`):
+  the rows sorted into groups, each group's rows times its own expert of a stack read in place (any stride, as slots
+  hold them), the experts staged a batch at a time into the 128 MiB staging buffer by one launch and multiplied by one
+  launch of the prompt GEMM over every group's token tiles. Each output has the plain gemm's bits for its row and
+  expert (so gemv's), tested in every format for groups shorter and longer than a tile. The plain gemm's code path is
+  the same kernel with no groups.
+- Measured: Unsloth's UD-IQ1_M Qwen3.8-Flash-Next GGUF (three files, 68 GB: 34.8 GB of experts, its n-gram table
+  IQ4_NL in the file) loads and serves through the library's plugins at their defaults (model-template,
+  gguf-projections, expert-offload with the experts in host memory, lookup-table-rows reading the tables in place) on
+  an RTX 5090 at 131,072 tokens of context: a coherent chat reply, 63.7 tok/s sampled and 65.8 greedy decode, 210,
+  835 and 1,377 tok/s prefill at 1,024, 4,096 and 16,384 prompt tokens (254, 406 and 411 before the grouped expert
+  GEMM), a cancel settled in 0.49 s, the expert cache 22.3 GiB in 13,589 to 15,863 slots of 1.51 MB (12,792 of 1.97
+  MB before the wide layers were kept whole) beside 5.8 GiB of weights and pools, the link at 25.9 GiB/s
+  (expert-offload's README has the numbers).
+- model-template reads GGUF checkpoints (a `.gguf` file, a split set, or a folder holding one): `code/gguf.py` gives
+  the blocks the file's tensors under the Hugging Face names they read, from its general.architecture and the
+  converters' naming convention (`blk.N.attn_q`, `blk.N.ffn_up_exps`, `blk.N.ssm_out`, `blk.N.hc_attn_down`,
+  `token_embd`, `output`, ...), and undoes what a converter changed: norms stored as 1 + w and A_log as -exp(A_log)
+  inverted in FP32, Llama's permuted query and key rows and a gated delta net's tiled value heads moved back as whole
+  rows or, along a matrix's inputs, as whole blocks of its stored format (no quantized matrix is decoded for it),
+  merged tensors read as their halves and the split indexer query and key rows as one, the n-gram table and its hash
+  constants (moved to metadata) as the checkpoint's, routed expert stacks as each expert's matrices. Its rules are
+  data a GGUF architecture: llama, qwen2, qwen3, qwen2moe, qwen3moe, qwen35, qwen35moe and qwen4exp
+  (Qwen3.8-Flash-Next's GGUFs); a tensor that maps to no name is refused at load. Quantized matrices load as stored
+  (`gguf:<TYPE>`, gguf-projections), experts as stored into an experts plugin that takes them (`experts:gguf`:
+  expert-offload) and as their BF16 values into any other, a table stored in a block format through an embeddings
+  plugin that decodes it (`embeddings:gguf`), and the end tokens come from Core's derived generation_config.json. The
+  gated-delta block loads its in_proj_qkv and in_proj_z (and in_proj_b and in_proj_a) as the fewest matrices of one
+  format, since a GGUF may store the halves in two (Q5_K beside Q6_K). Tested by `tests/test_gguf.py` (every tensor
+  of each architecture's rules read back from a file written as the converter writes it, `tests/gguf_checkpoint.py`)
+  and as whole engines against transformers on GGUF copies of the harness's checkpoints, their matrices Q8_0: Llama,
+  Qwen3-MoE through expert-offload in host memory, Qwen3.5-MoE and Qwen4Exp, on CUDA and on the CPU.
+- expert-offload caches and streams experts as a GGUF checkpoint stores them (format `gguf`, the fact
+  `experts:gguf`): `begin(..., "gguf", ..., formats={layer: (gate_up, down)})` takes each layer's block formats (a
+  GGUF quantizes every layer's stacks in its own: IQ2_XXS, IQ2_XS or IQ2_S gate-up rows beside Q2_0 or IQ4_NL down
+  rows in Unsloth's UD-IQ1_M Qwen3.8-Flash-Next), a bundle is an expert's stored rows (`code/gguf_experts.py`), and
+  every tier, store file, cache, ring and the link carry them as any bundle. Their rows run on gguf-rows in the slots
+  they lie in: decode rows its gathered gemv, prompt chunks grouped by slot on its matmul (the same bits, so a prompt
+  row has its decode row's bits). The CPU tier computes no GGUF format, so every miss goes over the link.
+- lookup-table-rows reads tables a GGUF stores in a block format (`format="gguf:<TYPE>"`, the fact `embeddings:gguf`):
+  its rows are read and gathered as stored, from the device, host memory or the file in place, and a lookup decodes
+  the rows it read on the device with gguf-rows' `dequantize` (Core's host decoders where it does not build, which
+  `round_problems()` names). Qwen3.8-Flash-Next's GGUFs store its 320-million-row n-gram table IQ4_NL (26.8 GiB): it
+  stays in the file and its rows are decoded as they are read.
+- gguf-projections runs on a CPU device through its fallback (the stored values decoded on the host by Core's
+  decoders, a BF16 matrix through torch with FP32 sums), so an engine on a GGUF checkpoint, and the tests of one, run
+  where there is no GPU; on CUDA nothing changed.
+- An engine reads a lone GGUF (a `.gguf` file, or a folder holding one and no config.json) as the model it is: its
+  load context's `config` and the package check's facts (`crit_core.engine.architecture_facts`) come from the
+  config.json Core derives from the GGUF's metadata (`crit_core.engine.model_config`), so a plugin that requires a
+  `model_type` (model-template's layouts) finds it, and its matrices are `stored:gguf` (not `stored:plain`).
+- gguf-rows reads a stack of experts in place from slots that hold other bytes beside each expert: `[experts][N][row
+  bytes]` with contiguous rows at any stride between the experts (refused where experts would overlap), so an expert
+  cache's slot array is multiplied where its bundles lie, a layer's gate-up or down rows a view of it.
+- GGUF's Q1_0 (type 41: a sign bit a value, +-d, one FP16 scale d a 128-value block) and Q2_0 (42: 2-bit codes 0
+  to 3 less 1 times one FP16 scale d a 64-value block) are read wherever the other GGUF formats are: Core's host
+  decoders (`crit_core.model.gguf_blocks`), the kernel core's (`crit_kcore/gguf.cuh`), gguf-rows (`gemv` plain and
+  gathered, `gemm`, `dequantize`) and gguf-projections (`gguf:Q1_0`, `gguf:Q2_0`). Unsloth's UD-IQ1_M quantization of
+  Qwen3.8-Flash-Next stores 46 of its 48 layers' routed down projections Q2_0. The installed gguf-py has no decoder for
+  either yet, so gguf-rows' tests check them against Core's decoders, which Core's tests check against the formats'
+  own rules (llama.cpp's dequantize_row_q1_0 and dequantize_row_q2_0).
+- A pre-build stress test, `python tests/stress.py`, that finds toolkit bugs before an engine build or a release
+  does. It serves layer-cut copies of both Qwen3.8-Flash-Next checkpoints (NVFP4 and FP4-Local, four decoder layers
+  and the draft layer, every tensor as stored) as `crit run serve --check` serves a candidate of the library's
+  plugins at their defaults: speed and preserve, four device memory pressures made by the VRAM ballast (natural; tight,
+  the experts in host memory behind a cache of about three quarters of them; extreme; floor), short, 32k and
+  262,144-token prompts, a cancel inside a prefill, reopening at a lower context, drafting from the draft layer and
+  through the drafter seam (mtp-decode over it), crit smoke, `--data` with crit-eval's gate pre-check, and that
+  pre-check repeated to show its spread. Gates that judge the text against a working model's (smoke's `fluent` and
+  `recall`, the tool-call check) are left out and say why. Core's build, the runs and their packages, crit-eval's
+  data, expert-offload's store and the plugin tests are built once per commit and cached; each load takes the
+  machine's shared GPU lock and crit's engine lock and gives them back after; the report is `stress.json` and
+  `stress.md`, a scenario a row, and the exit status fails on any failed scenario.
+- A VRAM ballast for tests: `CRIT_VRAM_BALLAST=leave:SIZE` (or `take:SIZE`) makes the device's memory object, when a
+  process first asks for it, hold all but SIZE of the device's free memory (or SIZE) in an elastic range owned by
+  `ballast`, the driver's memory outside torch's allocator, never given back. Every free-memory reading (the
+  ledger's, the driver's, the card's) counts it as taken, as it counts another program's, so an engine loads and
+  serves as on a smaller device: expert-offload places its experts off the device at a chosen pressure without a
+  filler process. `memory.ballast(take=, leave=)` makes one in code.
+- Layer-cut checkpoints for tests on real weights (`tests/support/layer_cut.py SOURCE TARGET [--layers ...]`): a
+  checkpoint with only the decoder layers that cover every kind of layer it has (by default its first layers up to
+  the first of each kind), every kept tensor byte for byte, the draft layer, embeddings, head, norms and lookup
+  tables kept, vision and audio towers left out, and config.json, its text config, the quantization configs and the
+  index rewritten to the kept layers. A shard whose tensors are all kept is hard-linked, so a cut of Qwen3.8-Flash-Next
+  (its 47.7 GB n-gram table in shards of its own) writes 5.4 GB for NVFP4 and 10.5 GB for FP4-Local.
+- Checkpoint manifests and a test that plans model-template over every real checkpoint crit targets, without the
+  weights. `tests/support/manifests.py` writes a manifest from a checkpoint's safetensors headers and configs (names,
+  dtypes and shapes compacted by their numbers, the bytes of small tensors a model reads values of; 1.1 MB for eight
+  checkpoints) into `tests/manifests`; `tests/test_checkpoint_manifests.py` runs model-template's own load over each
+  one on the CPU (`tests/support/dry_plan.py`: its ComposedModel over the headers, meta tensors in place of weights,
+  the slots filled by stand-ins that take the formats the library's plugins take), with its lookup tables on the
+  device and off it, and fails on a tensor the load cannot read and on one no part of the model reads (outside
+  vision and audio towers). A model's context may hand its checkpoint (`context.checkpoint`). Today's manifests:
+  both Qwen3.8-Flash-Next checkpoints (NVFP4 and FP4-Local), Qwen3.8-27B NVFP4, Gemma 4 26B and 31B NVFP4,
+  Nanbeige4.3-33B NVFP4, and DeepSeek V4 Flash and Nemotron 3.5 Super, which no layout covers yet (listed, not
+  failed). It found the three load gaps fixed above.
+- model-template runs a prompt layer by layer where the experts live off the device (passes). Chunk by chunk, every
+  prompt chunk of a hundred tokens or more brings nearly every expert of every layer over the link again: gigabytes
+  a chunk whatever its size, so prefill ran at the link's rate divided by the experts' size and a single chunk's
+  step passed the cancel grace. Where the experts plugin stages prompt chunks (`stages_prompts()`: expert-offload
+  with experts in host memory or a file) the template now runs every chunk of a span through one layer before the
+  next layer, over as many of Core's steps as that takes (Core's prefill passes; a step ends within `span_seconds`
+  and half the cancel grace), keeping each chunk's residual state between layers in device memory the device's
+  givers make room for (`pass_mib`). Nothing is tuned by the engine's author: option `passes` is `auto`. Replies
+  and scores are the same bits in both orders (tested on every layout, and on both real checkpoints below). On an
+  RTX 5090 at 131,072 tokens of context with 1,024-token chunks, prefill tokens a second chunk by chunk against
+  layer by layer: Qwen3.8-Flash-Next (68 GB of NVFP4 experts) 557 against 1,266 at 4,096 prompt tokens, 555 against
+  2,131 at 16,384, 2,285 at 65,536, the slowest prompt step 2.18 s against 0.62 s; Gemma 4 26B (46 GB of BF16
+  experts) 968 against 2,445, 1,050 against 4,727, 4,323 at 65,536, the slowest step 1.39 s against 0.56 s and a
+  cancel inside a long prompt settling after 2.16 s against 0.16 to 0.54 s.
+- model-template composes Gemma 4 (layout `sandwich` for gemma4 and gemma4_text), from parts any layout may use: a
+  `sandwich` residual (each block between two norms, a scalar a layer), a `parallel-moe` block (a dense MLP and a
+  mixture of experts side by side, the router scoring the residual stream with a scale an expert), attention whose
+  layer kinds differ in head width, key/value heads and rotary table, with value norms, a fixed scale and values
+  taken from the key projection's rows where a layer stores no value projection, GELU-gated MLPs and experts,
+  embeddings scaled by the square root of the hidden width (`embed_scale`), logits capped by a tanh
+  (`logit_softcap`), the family's switch for its experts (`routed_if`) and config values a layout refuses
+  (`requires`: the smaller Gemma 4 variants' shared keys and values, per-layer input and double-wide MLP are not
+  computed). Tested as a whole engine against transformers on a small Gemma 4 with experts (experts-reference, and
+  expert-offload with the experts in host memory), and on Gemma 4 26B itself with its 46 GB of experts in host
+  memory: the answer tokens of a chat turn score within 0.002 nats of transformers' own BF16 on average. Its decode
+  runs at 20 tokens a second there: the device's time is the attention plugin's (softmax-attention is the one that
+  serves sliding windows, and its kernel takes heads up to 256 wide where the full layers' are 512), not the
+  experts'.
+- expert-offload brings a prompt's experts to the device once a span, and says so. `stages_prompts()` tells the
+  model plugin that prompt chunks stage their layers' experts, so a model plugin that runs a prompt's spans layer by
+  layer has each layer's experts cross the link once for the span instead of once a chunk; the ring stays staged
+  while a prompt goes on (`end_step(prompts_open=True)`) and goes back when it ends or is cancelled. Its facts and
+  telemetry carry `prompts`: the link's rate as measured at `open()` and a sweep, the bytes and seconds of bringing
+  every expert the cache does not hold to the device once. Where the CPU tier serves decode misses, a short prompt
+  chunk's missed routes go to it when they cost less there than their experts' copies.
+- device-expert-cache serves a staged layer to every prompt chunk that reads it, across steps. `prompt(layer, ...)`
+  staged the layer's non-resident experts for one chunk and the next chunk's call for the same layer staged them
+  again. The calls after the first now read the layer's experts where the first found them, `end_prompt(hold=True)`
+  ends a step and keeps the ring with what is staged in it (decode plans of other requests run in the slots beside
+  it), and the next step's first call stages only what left the cache since. `prompt_cpu(layer, ids, cpu_us,
+  link_us)` gives a short chunk a table that sends its missed routes to a CPU tier where they cost less there than
+  their experts' copies by the caller's two measured times, copying nothing and borrowing no ring.
+- Routed experts can be gated by GELU. The experts slot's blocks computed `silu(gate) * up` alone, and Gemma 4's
+  experts and MLPs are gated by GELU in its tanh form. A model plugin now calls `activate(name)` on an experts
+  plugin that provides the fact `experts:activations` (grouped-experts, expert-offload, experts-reference): the
+  grouped-experts kernel takes the gate in its gate/up epilogue (`Layout.activation`, `crit_kcore`'s
+  `gelu_tanh_mul`), its fallback and the FP64 reference compute the same, and the declared W4A4 order and
+  expert-offload's CPU tier stay SiLU's (a GELU-gated layer's misses go over the link).
+- attention-state derives `proportional` rotary tables, and a config that keys its rope by layer type gives each type
+  its own table (Gemma 4: its full-attention layers turn the first quarter of a 512-wide head at base 1,000,000,
+  its sliding layers a whole 256-wide head at 10,000). A proportional table is as wide as the head: the first
+  `partial_rotary_factor` share of its pairs turns at `base ** (-2 i / head_dim)`, the rest keeps its values.
+- Core's step contract has prefill passes. A cancel settles between steps, so a step must stay short, and until now
+  every prefill step had to consume prompt tokens: a model could not work on a long span of a prompt over several
+  steps. A model whose layers' weights do not all fit on the device needs exactly that, to bring each layer's weights
+  to the device once for a span run layer after layer instead of once for every chunk. A model now declares
+  `prefill_pass_tokens` (the most prompt tokens a request holds in a pass) and `prefill_pass_steps` (the most steps in
+  a row its prefill takes without consuming a prompt token); a step of a pass reports the span (`pass_tokens` of
+  `Progress`, `StepProgress` and a step model's `StepResult`) and consumes nothing, and the step that ends the pass
+  reports its tokens consumed, past that step's grant by the pass. Core schedules, cancels and retires such a request
+  between its steps as any other, and fails an engine whose row passes more steps than declared or stalls without a
+  pass. Core knows nothing of what a pass is made of. `StepProgress` grew, so the engine ABI is 8: rebuild
+  `crit_core_steps` (`crit core build`); an older library is refused at load with both versions named.
+- model-template's test harness sharpens attention (`sharp_attention` on an `Engines` class: the query and key norms'
+  weights set to 3, the value and output projections scaled by 3). A small random model attends every position almost
+  alike, so a test of a model that limits what a token attends passed whatever the limit picked: with the indexer of
+  the gated-streams layout made to take its lowest-scoring blocks, every check of the sparse-attention class still
+  passed. That class now sets it, and the same mutation fails three of its checks, on the CPU and through the
+  sparse-indexer kernel alike.
+- A run's engines keep expert-offload's bundle store between loads. Building the store reads and packs every routed
+  expert, minutes for tens of gigabytes, and without a `store_dir` every load did it again (9 to 16 minutes a load
+  measured on Qwen3.8-Flash-Next, at every check, Eval and ablation of a candidate). Core's load context now names a
+  folder for files a plugin can build again (`context.cache`, the `CRIT_PLUGIN_CACHE` environment variable's), crit
+  run sets it to `.plugin-cache` in the run's folder for every engine it serves (a value set already stays; empty:
+  none), and expert-offload keeps its store there when no `store_dir` or `store_path` is given: the first load builds
+  the file, later loads reopen it and the model skips its expert loads. In the cache the file is keyed by the
+  checkpoint, the layout and the code of the package's plugins, the cache holds one store a checkpoint, and a new file
+  is written only on a local disk that keeps as much free again as the store takes (`reasons.store` says which
+  applied). `crit run stop` removes the run's cache. An engine loaded outside a run has no cache unless the variable
+  names one, and behaves as before.
+- The library has a model plugin: `model-template` (Inference entry model-template). An agent composes a model plugin
+  from tested blocks instead of writing one: `attention` (grouped-query softmax attention, biases and query/key norms
+  where the checkpoint stores them, rotary positions from the config's rope table, partial rotation, sliding windows,
+  sinks, a sigmoid output gate), `gated-delta` (the delta rule through the recurrence slot, either projection layout),
+  `swiglu`, `moe` (the router slot with the router's rule checked against the config, any experts plugin, expert-offload
+  included, a gated shared expert) and the checkpoint's MTP layer as the device draft head, arranged by a layout (JSON:
+  `decoder` for llama, qwen2, qwen3 and their mixtures of experts, `gated-hybrid` for qwen3_next and qwen3_5), on the
+  serving contracts in one place: exact rows (each prompt chunk alone with `prompt=True`, one-token rows in calls of at
+  most `invariant_rows`, a step's decode rows and prompt chunks apart in expert-offload), prompt spans timed at load (a
+  measured decision: a short and a full chunk at position 0, a full one at the deepest position served) so every prompt
+  step finishes within `span_seconds` and the device's room at every context, every device tensor planned, Core's
+  captured rounds (greedy, sampled, drafted), captured prompt chunks, the prompt cache, fixed-text scores in the
+  prompt's spans. An engine whose architecture no layout covers passes its own layout and blocks to `compose()`.
+  Tested as whole engines through Core's loader against transformers on Llama, Qwen3 with a sliding-window layer,
+  Qwen3-MoE (experts-reference and expert-offload), Qwen3-Next and Qwen3.5 with an MTP layer drafting in captured rounds.
+- model-template composes Qwen4Exp (Qwen3.8-Flash-Next's architecture, layout `gated-streams` for qwen4_exp and
+  qwen4_exp_text) and DeepSeek V3 (layout `latent`), from layer parts any layout or engine may use as blocks:
+  - **Residuals.** How blocks join the residual is a part of the layout (`residual`): `pre-norm`, one stream as
+    before, or `streams`, several residual streams (hyper-connections): each block reads a row mixed from the
+    streams' norms by weights the streams compute themselves and its output is added to every stream by weights of
+    its own, through the norms slot's stream operations (`rms_norm` with a weight a stream, `stream_sum`,
+    `stream_add`, the fused `stream_add_norm`), the low-rank maps through the step's row groups.
+  - **`indexed-attention`.** Block-sparse attention: an indexer scores the complete blocks of positions before a
+    token (the mean of their raw index keys, normed and rotated at the block's first position) and the token reads
+    its best ones within a budget and its own block, by Core's canonical choice (`topk_blocks`) or crit's kernel
+    sparse-indexer with the keys read in place. The layers keep one pool of keys only, a row a position, and a
+    complete block's key takes the place of its last position's raw key, so the pool follows a sequence through
+    steps, rounds, forks and truncations exactly as its KV does. Where the engine's context cannot pass the budget
+    the block is plain attention; otherwise every token reads a block list, below the budget too, so a row's
+    arithmetic is one whatever shares its step.
+  - **`ngram-rows`.** A block ahead of a layer (`before`): rows of a hashed n-gram table (the hash the checkpoint
+    stores, or derived as its reference derives it; n-grams stop at an end token) gated into every stream, with a
+    dilated causal convolution through the recurrence slot. The table is planned as a lookup table: on the device
+    where it fits, else read where the checkpoint stores it (its shards' files, NVFP4 rows decoded on lookup)
+    through an embeddings plugin with `embeddings:host`. A step's token windows come from the request on the host
+    and from a `TokenRing` inside captured rounds.
+  - **The draft layer over streams**: every stream of the target's feature through `fc_hidden`, the next token's
+    normed embedding through `fc_embedding` added to each, one decoder layer with pools of its own (its indexer's
+    keys too), its own last mix. transformers runs no draft layer for this architecture, so it is tested for what
+    can be: drafted replies are the plain ones.
+  - **`latent-attention`** and the layout `latent` (deepseek_v3): multi-head latent attention in its absorbed form.
+    A position caches one row, its latent and a rotary key every head shares, in a pool of keys only; the queries'
+    part without positions is multiplied into the latent space, the attention slot attends with `latent=`, and the
+    values' up-projection follows; interleaved rotary pairs and the YaRN magnitude scale by the config. The router's
+    rule check knows sigmoid scores within the best groups (a group's score its two best experts').
+  - Blocks declare what they keep beside their layer's pool (`pools`, `tables`), which the model plans, makes and
+    follows through steps, rounds and the prompt cache (a mixer with `keeps_kv = False` keeps no KV in the model's
+    pools); a layout may key its mixers by the config's own layer type names and gives the config values its
+    family's reference assumes where config.json is silent (`defaults`).
+  - The indexer scores a prompt step's tokens in groups whose scores fit a bound (`score_bytes`, 64 MiB; the
+    kernel's workspace the same), since a step's scores are a row of every earlier block a token: a 4,096-token
+    step over 50,000 blocks would hold gigabytes at once. A token's choice is its own, so the grouping changes none.
+  - It loads MXFP8 matrices (FP8 with one E8M0 exponent per 32 inputs of a row) and NVFP4 matrices whose scales the
+    checkpoint keeps CSF-compressed, as the projections and experts slots take them.
+  - It serves on the CPU too (its blocks over the slots' CPU forms, decoding through `step()`), which is how its
+    engine tests run where there is no GPU: `tests/test_model_template.py` and the plugin's own tests run a whole
+    engine of every layout against transformers on CUDA or on the CPU.
+  Tested as whole engines against transformers' Qwen4Exp and DeepSeek V3 on the CPU and on CUDA: scores, greedy
+  choices, requests together as alone, prompts in steps of other sizes and with end tokens inside, below and past
+  the indexer's budget.
+- A captured round has the counters its parts name. A part that adds to counters in `count_round` names them in
+  `round_counters` (device-expert-cache's cache and expert-offload name `expert_reads` and `expert_hits`), and
+  `crit_plugins.rounds.Rounds` has them beside the model's own `counters`, so a model plugin puts an experts plugin
+  with a cache into its rounds without knowing what it counts; the model's info names `rounds.counter_names` as its
+  `round_counters`.
+- `crit_plugins.device.csf_decode`: the decode of ModelOpt's CSF-compressed NVFP4 scales, one definition for a model
+  plugin that loads such a checkpoint's matrices and for device-expert-cache's stores and fills (it lived in
+  device-expert-cache's `expert_store`, out of a model plugin's reach).
+- A plugin's manifest may require slots only where a fact holds (`requires_when`, as `needs_when` does for needs):
+  `crit plugins check` refuses a selection that leaves such a slot empty, naming the fact.
+- `crit_core.model.routed_layers` (and `ModelConfig.routed_layers()`): the layers whose MLP routes experts, from
+  `first_k_dense_replace`, `decoder_sparse_step` and `mlp_only_layers`, one rule for every reader; `crit plugins offload`
+  counts routed layers by it (it ignored `mlp_only_layers`).
+- paged-kv-attention derives keys from cached values on read (`derive=`, a `Derive(weight, eps, freqs, rotary_dim)`;
+  `derive()` packs its tables once): a layer that caches one row per position and KV head keeps value pages only
+  (`write(None, values, ...)`), and `attend` (split and fused) and `prefill` read each row as its value and as the key
+  `rope(rms_norm(r) * w, position)` in FP32, multiplied as two 16-bit parts, with sliding windows, sinks, trees,
+  `lse`, fresh rows and every page kind; a column keeps its bits alone, in any window, fused or split. The flash
+  structures, block lists and `int8_qk` refuse it (Dualshok3, #75).
+- gguf-rows reads the ternary TQ1_0 (type 34) and TQ2_0 (35) in every call (`gemv` plain and gathered, `gemm`,
+  `dequantize`), bit for bit with gguf-py's decoder, with one scale `d` for every 32-value sub-block and codes -1, 0
+  and 1; Core's host decoders (`crit_core.model.gguf_blocks`) and the kernel core's (`crit_kcore/gguf.cuh`) read them,
+  and gguf-projections takes `gguf:TQ1_0` and `gguf:TQ2_0` matrices (Dualshok3, #74).
+- In quality mode `speed` the output head is held in FP8 without the model plugin doing anything for it. An
+  engine's configuration states its `quality_mode` (`speed` or `preserve`): `crit run ... candidate` writes the run's
+  mode into every candidate beside its `exactness`, Core's loader tells the plugins before any is made
+  (`crit_plugins.kernels.use_quality_mode`, `quality_mode()`), and a plugin's precision option left on `auto` follows
+  it. quantized-projections gains the first such option, `head` (`auto`, `stored`, `fp8`; default `auto`): a head
+  the model plugin loads with role `head` and stores in 16 bits is re-encoded to FP8 rows at load in `speed` (E4M3
+  codes and one FP32 scale a row, the FP64 encoder draft-only matrices use), and stays as stored in `preserve` and
+  in an engine that states no mode, so engines built before this run as they did. Its facts record the head under
+  `head_encoding`. Before, the mode's FP8 head was guidance only and each model plugin had to encode its own. An FP8
+  head re-encodes target weights: set `head` to `stored` in a run whose `weights_policy` is `as_stored`.
+  The encoder's slices, the head load's warm-up and, at the plugin's next call after the model plugin dropped it,
+  the 16-bit copy go back to the device and not into torch's cache (a head of 248,320 by 2,560 left about 7 GiB
+  cached otherwise, and a re-encoded draft-only matrix up to 768 MiB of slices), so what sizes itself by the device's
+  free memory can use what the head gave up. docs/PLUGINS.md#precision has the rule.
+
+### Changed
+
+- The stress test's full tier ends with one load of a whole checkpoint (Qwen3.8-Flash-Next FP4-Local at 200,000
+  tokens, every gate kept): the first load's expert store, the device memory left at the full context and
+  decode-against-prefill drift at the model's own depth showed in no layer cut. A ladder of prompt lengths
+  (`prompt_ladder`, in that load and at the tight pressure) fails where a longer prompt is prefilled at a lower rate
+  than a shorter one, which is how a cost every prompt pays shows. The loads give attention-state's KV pools
+  `elastic`, as `crit plugins offload` tells builds to, and report how long after `serve --check` began the engine
+  answered (`ready`).
+- A candidate that states no exactness asks exact prompt rows in `speed` as in `preserve` (decode rows `row-exact`,
+  prompt rows `exact`; `crit_kernels.exactness.QUALITY_MODES`). `speed` gave `repeatable`, every plugin's fastest
+  way, and no engine whose rows multiply quantized activations could pass crit's own serving check so: on
+  Qwen3.8-Flash-Next FP4-Local the library's plugins at their defaults failed `causal` (a 17-token prefix 0.38 nats
+  from its prompt, limit 0.15: the native prompt GEMM's sums follow the row count, and a 4-bit rounding turns their
+  last bit into tenths of a nat), with pinned GEMMs `decode_matches_prefill` (0.57, limit 0.5), and passed only
+  asking exact (every row 0.0000 nats from its prompt's, prefill and decode 2 to 3% slower: 1,465 against 1,495
+  and 63.0 against 65.2 tok/s). The modes now differ in the precision of what is summed, and a
+  lower level is a lever an engine pulls itself, with its speed measured and `serve --check` passed.
+- `python tests/stress.py --tier quick` runs one speed load a checkpoint at the natural pressure and the first
+  checkpoint at the tight pressure, for every commit; the full tier (the default) runs every scenario before an
+  engine build or a release. The first load no longer repeats crit-eval's gate pre-check for its spread (it samples
+  each case three times itself since crit-eval's statistical lower-context item); `--spread` still does.
+- The stress test measures each prompt arithmetic of expert-offload where the CPU tier computes decode misses, on
+  the twelve-layer cut with its experts in host memory: tensor (the speed mode's default) prefills a 32k prompt at
+  5,962 tok/s with smoke's decode-against-prefill mean delta 0.110 / 0.157 (after 16 and 200 tokens); declared
+  (the decode rows' order) at 2,916 tok/s with 0.149 / 0.110. The drift does not come from that choice, and the
+  default stays.
+- `crit run serve --check --data` opens the engine again twice for crit smoke's lower-context pass and the gate
+  pre-check, where it took three reopens: the pre-check now runs first and ends at the lower context, where smoke's
+  second pass starts, and smoke leaves the engine at the run's context. Each reopen of a host builds the engine
+  again (about a minute on a layer-cut Qwen3.8-Flash-Next).
+- The stress test also serves a twelve-layer cut of the NVFP4 Qwen3.8-Flash-Next (`fnext-nvfp4-deep`: nine
+  gated delta layers and three attention layers with their indexer, every layer's experts, the draft layer), where
+  an error that grows with depth shows: smoke's decode-against-prefill mean delta is 0.14 there against 0.05 on four
+  layers, and `causal` fails at 0.152 against its 0.15. `--no-store-cache` builds expert stores in host memory
+  instead of the plugin cache, for a disk without the room, and the ballast leaves the lookup tables out of what the
+  device must hold, as the selection places them.
+- The stress test's cache follows the code it builds from (core, inference, cli, api, smoke, models, kernels), not
+  the commit, so a commit to the harness, the docs or the tests keeps it warm; and its pre-check spread compares
+  every run of the load, `crit run serve --check`'s own among them.
+- The docs say how crit is checked on real checkpoints (Contributing: the manifest test and the stress test), and
+  Building engines that a build, like a release, starts only from a commit where both pass.
+- One re-encoder for matrices only a drafter reads, `crit_plugins.encodings`: a stored matrix's exact values (BF16,
+  FP8 per row, per tensor and in blocks) and their NVFP4 or FP8-per-row encoding, code for code what
+  quantized-projections' reference codec gives. quantized-projections' draft re-encoding (`load(..., encode=)`) is
+  now this module, and model-template uses it for a draft layer stored in a format no slot loads.
+- The kernels workflow builds, for a pull request, only the kernels whose folders it changes, and every kernel when it
+  changes anything else under `kernels/` (Core's kernel headers, crit_kernels) or the workflow; Markdown outside a
+  kernel's folder builds none. Each kernel's job installs torch and the CUDA toolkit before building, for 2.5 to 11
+  minutes.
+- CI's native builds run side by side: Core's SDK with GCC, Clang and MSVC each on its own runner (Inference against
+  the installed SDK and the SDK's consumers in the GCC and MSVC jobs, which install it), and Inference's in-tree build
+  in a job of its own, every build on the runners' four cores. One job an OS ran them one after another, 6.5 to 10
+  minutes on Windows.
+- The host tests run in shards, each on its own runner: four on Windows and two on Linux, for each Python.
+  `tests/run_parallel.py --shard I/N` fills the shards by the time each unit took
+  ([tests/durations.json](tests/durations.json)), longest first, so a platform's shards end together, and every unit
+  runs in exactly one of them. A unit is a test module, or one test class of a module the recorded times split (twenty
+  of them: `test_api_dialects` alone took 430 to 515 s on Windows, more than a shard's share). Windows' 2,600 to
+  3,200 s of tests, four at a time on one runner, set CI's pace at 17 to 18 minutes; a Windows shard now holds about
+  840 s of them. main's runs record each unit's time and fold them into the artifact `test-durations`
+  (`run_parallel.py --merge`); committing it keeps the shards even as tests grow. The wheel is built and checked once
+  per platform and Python, in shard 1.
+- CI keeps Core's step runtime (`crit_core_steps`) between runs, keyed by `core/`'s files, and builds it on the
+  runners' four cores when `core/` changed: every host job built it again, for 35 to 75 s.
+- CI installs its pinned Python dependencies with uv (0.13.8) rather than pip, and keeps uv's cache between runs: the
+  setup every host and native job starts with took 100 to 120 s on Windows, most of it pip installing torch, and the
+  kernels workflow's torch, CUDA toolkit and ninja about 100 s a job. The documented-install jobs still install crit
+  with pip, as Contributing gives it.
+- The device ledger's `settle()` is bounded, and a score's step frame says it is a score's. Backing device memory
+  costs the driver time by the granule (half a millisecond each under WSL), and an elastic expert cache grew back
+  everything a prompt had borrowed in one call, inside the frames of the prompt's last step and of a cancel: two
+  gigabytes took 0.56 s there, on Qwen3.8-Flash-Next the difference between a prompt step of 0.6 s and one of
+  1.17 s, past crit serve's one-second cancel grace. `settle()` now grows the givers back 64 MiB at a time for 50 ms
+  at most and says whether more is left (`owed`); the following steps' settles go on, and while memory is owed
+  Core's watch asks the engine for a step of its own between native rounds, as it does when another program takes
+  memory. `serve()` still takes everything at once (no step waits on it). Core also tells a begin frame that takes
+  the argument that its step is a score (`begin_step(prompt_tokens, score=True)`): a score holds its rows' logits
+  beside its chunks' temporaries, and expert-offload had learned that peak as the room of a prompt chunk of as many
+  tokens, so every prompt gave back and took again 1.7 GB it never used. The telemetry's `core.prompt_tokens` counts
+  the tokens a step computed (a prefill pass's in the step that ends it), `core.pass_steps` the steps in which a row
+  worked on a pass, and a probed engine's slowest step of each kind names its parts (`slowest_parts`: begin frames,
+  the model's step, end frames). The device contract gains what the experts slot's plugins say of themselves for
+  the changes that follow: `stages_prompts()` of `experts:offload` and the fact `experts:activations`.
+- The recon scaffold asks for the reference's configuration class beside its modeling file: the defaults it gives the
+  keys config.json leaves out. Core reads such a key as unset (`MoeConfig.norm_topk_prob` None) and fills in no
+  family's default, which a model plugin written from the config alone took for false where the reference renormalizes
+  (model-template's layouts state these defaults, `defaults`).
+- gguf-rows: faster decode GEMVs for IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS and IQ2_S, bit for bit: the kernel core's IQ
+  decoders read a block's fields with 16-bit loads (IQ1_M's scales with one 8-byte load) where the address allows and
+  apply the signs and IQ1's offset with one 32-bit add a word; gemv's new knobs `COLS` (output columns a warp) and
+  `GRID` (the format's grid in shared memory, persistent blocks) and `WARPS` 16, swept per format, shape and GPU.
+  bench.py checks each configuration against the declared order of its own split count (Dualshok3, #76).
+
+### Fixed
+
+- `crit run plan` no longer leaves a speed run with no way past a parent plan whose `prompt_activations` misstated
+  what its engine served when no format ran at BF16, for example the shorthand `"stored"` beside a Q6_K format that
+  has no kernel for its stored activations and serves FP8. The check asked for a quality rejection of the stored
+  format that was never measured. The next plan now states what was served and why with a gaps entry
+  `activation:served` (answer `cause`), recorded as `inputs.served_activations`. A parent that served BF16 still needs
+  a measured rejection (`activation:stored`) (Dualshok3, #79).
+- `crit run plan` accepts a `check:resources` repair of a parent whose benchmark failed the resources gate by its own
+  memory samples (free host or device memory below the run's headroom) while every check record of it passed. A
+  candidate that passes its Eval and every check but runs the host short of RAM during `crit run measure` is never
+  eligible, and its repair was refused as "did not fail: resources". The plan now cites the benchmark in
+  `inputs.objective.check_repairs` (Dualshok3, #80).
+- `crit plugins offload` leaves two choices to expert-offload that it used to pin. `prompt_arithmetic`: the plugin's
+  `auto` picks the faster arithmetic that keeps the level the engine asks of its prompt rows; the plan set `tensor`
+  in every speed run, which with the CPU tier computing decode misses is the pair that failed
+  `decode_matches_prefill`. `misses`: where the placement prices the CPU below the link the plan gives `auto`, so
+  the plugin times a missed expert both ways in the loaded engine and takes the faster; the plan pinned `cpu` on
+  floors measured on an idle device, where the loaded Qwen3.8-Flash-Next engine measured the CPU tier at 502 us a
+  missed expert (415 of it the rows' turn to the host and back) against 103 over the link.
+- model-template sizes the spans of a prompt run layer by layer (a pass) by what a chunk takes through one layer,
+  the unit a pass's step ends after (`Spans(units=)`), not by the fit's seconds through the whole model with its
+  fixed part left out. The fit times whole chunks with the experts plugin's copies in them and reads a short
+  chunk's fewer copies as the rows' cost: with routed staging it cut Qwen3.8-Flash-Next's chunks from 512 rows to
+  160 and an 8,192-token prompt's prefill from 1,400 to 660 tok/s.
+- device-expert-cache stages for a prompt chunk of up to a few hundred tokens only the experts the chunk routes,
+  where those are at most 85% of the layer's experts that are not resident; a later chunk of the span has what it
+  routes beyond them staged beside, and once a span's chunks together route more than that share the later layers
+  are staged whole, ahead, as before. Every chunk of 52 tokens or more had every non-resident expert of every layer
+  copied: about 2.4 s on Qwen3.8-Flash-Next (54 GB over the link) whatever the prompt's length. A 96-token prompt
+  there now takes 0.8 s and a 192-token one 1.1 s.
+- expert-offload's elastic cache keeps `margin_mib` free by looking at the step in flight, not by predicting it. A
+  prompt step was given the room such steps had taken before, and one that took more (the first of its kind, a
+  recurrence scan's workspace, attention at a deeper position) ate into the margin: Qwen3.8-Flash-Next engines left
+  0.23 to 0.43 GiB free at the full context against 0.25 asked, a different figure every load, and builds answered
+  by raising `margin_mib`. The cache now looks before each routed layer of each prompt chunk (torch's own count of
+  its blocks: no call into the driver where nothing grew), gives slots back where the device has less free than the
+  margin and a reserve, and sizes that reserve by the largest growth between two looks of the last 64 prompt steps
+  (64 MiB at least). The facts count the looks and the times one gave memory back (`elastic.looks`, `extends`,
+  `reserve_bytes`). `margin_mib` is the run's VRAM headroom and nothing a build tunes.
+- model-template gives its recurrence pools the rounds' rows, so sequential-recurrence's `commit: checkpoints` and
+  `recompute` load in captured rounds. They keep a state per round slot and were refused ("give the round's rows"):
+  an option the plugin offers could not be selected with the template.
+- expert-offload packs its bundles on the host (`host_loads`: model-template hands the plugin CPU tensors), from a
+  checkpoint whose layer is read past the page cache (`Checkpoint.hold`: direct reads of the layer's tensors, after
+  the checkpoint's hashed pages are dropped). Every expert went to the device and back before, 8 to 36 ms an expert
+  against 1.5 ms on the host, and its pages came through the checkpoint's mapping, which under memory pressure
+  reads at a fraction of the disk's rate. On Qwen3.8-Flash-Next a first load serves after 11 minutes with the
+  65 GiB store built and written.
+- expert-offload's store of off-device experts lives in anonymous host memory that the store locks as it fills, is
+  written to its file once, past the page cache (`crit_plugins.host.write_memory`), and is read back from a complete
+  file the same way (direct reads into the memory, `Reads`' whole-block path), saying how far it is
+  (`LoadContext.working`). It was a mapping of the file: on WSL2 the kernel dropped the mapping's clean pages while
+  the load went on, so registering 65 GiB for the device read them back from the disk at tens of MB a second and
+  the first `crit run serve --check` of a Qwen3.8-Flash-Next build timed out. A later load now opens the store in
+  about 70 s.
+- quantized-projections' `mxfp8_activations` has `auto`, its default: MXFP8's own activations (`mxfp8`, W8A8) in
+  quality mode `speed`, 16-bit ones (`bf16`) in `preserve` and where no mode is stated, as it was; the facts say
+  what auto became (`chosen`). A speed run's plan must declare a quantized format's stored activations, and the
+  library's default was the 16-bit ones: a candidate of the library's defaults served other activations than its
+  plan declared.
+- A load that reports its work is not timed out while the work advances, and one that runs out says why. crit serve
+  bounds a load by 600 s plus the model's bytes at 200 MB/s and cancelled it at that bound whatever it was doing; the
+  failure read "Reply timed out". A plugin now says what a long step of its load is doing
+  (`context.working(what, done, total)`, Core's `LoadContext`), the host passes it on as the loading status's `work`,
+  crit serve prints it every 30 seconds ("loading: expert store: experts packed 12,032 of 25,088") and lets the load
+  go on past its bound while the work last advanced under 5 minutes ago. A load that does run out says "The engine
+  did not load within N s", where the bound comes from and what the load last reported.
+- `crit run ... stop` refuses while an attempt is reserved and has no result, naming it and the `settle` that records
+  its outcome. It was accepted with a check attempt still open, and it removes the run's plugin cache, which that
+  attempt's engine may still have mapped.
+- `crit run ... next` says before a candidate's seal that a sealed candidate takes no attempt, so the options the
+  next plan needs measured on that engine are swept first (`ablate --set`), and the refusals of `ablate` and `serve`
+  on a sealed candidate say what to do instead (`serve` prints the `crit serve` command that serves it). A build
+  that sealed a candidate and then wanted an option sweep had to package a copy and seal it as a draft.
+- A candidate's proposal that names no `parent_candidate_id` takes its plan's. It had to repeat the parent the plan
+  already names, and one that left it out was refused as starting "from None".
+- `crit run serve --check` compares the prompt activations the candidate's plan declared (`prompt_activations`) with
+  the ones the served engine's facts state (`plan_activations`). A candidate whose configuration left an option at
+  another activation than its plan named (a plan of stored activations over an MXFP8 checkpoint whose projections
+  stayed at 16-bit ones) was only refused at the next plan, after a whole Eval of the wrong engine.
+- A served request that names no sampling takes the model's own (`crit_core.serving.served_sampling`): the run's
+  frozen recon's `sampling`, else `generation_config.json`'s temperature, filters and repetition penalty where the
+  model samples by default, for each field the request leaves out and the engine applies. Core's chat adapter passed
+  such a request on with no sampling at all, so every engine answered it greedily, whatever AGENTS.md said of the
+  served default. A request with temperature 0 stays exactly what it sent (Eval, crit smoke, the serving checks).
+- expert-offload's elastic cache keeps `margin_mib` free at a prompt step's peak: it gives a step the device bytes
+  such steps took from the device at their peak (what the device holds outside the memory ledger's elastic ranges
+  over the step's start, and torch's blocks at the peak over its end), the reading the run's device-memory checks
+  make; a step of the load is measured from an emptied allocator, as a served prompt starts. It counted torch's
+  reserved bytes instead, with the blocks the allocator kept unused from the prompt's earlier steps as room in use;
+  a block a larger tensor cannot reuse (attention's grow with the context) is not room, and the step took new device
+  memory beside it. Every long-context engine missed `full_context_device_memory` by a few tens of MB
+  (Qwen3.8-Flash-Next at 200,000 tokens: 0.22 GiB free at the peak against 0.25), and no other setting moved it: the
+  cache takes back whatever a smaller KV cache or shorter prompt chunks free. Only raising `margin_mib` hid it.
+- gguf-projections made without a device in its context loads on the CPU where the host has no CUDA (the fallback),
+  where it loaded onto `cuda` and failed: its own interface test failed on a CPU-only host.
+- expert-offload makes the `store_dir` folder it is given when it is not there yet: a ram-tier store in a folder that
+  did not exist failed to open with FileNotFoundError (the disk tier's store made its folder already).
+- crit serve serves a lone GGUF checkpoint: the resident engine opened the served model at the folder of its
+  config.json, which a GGUF without its base model's files does not have (Core derives it), and the load failed with
+  `KeyError: 'config.json'`; it now opens the folder the verified files are held in (`ModelContext.model_folder`).
+- A paged range asks the device's ledger for the granules its growth maps, not its units' bytes. A unit smaller
+  than a granule backs a whole one, a plane at a time, so a KV pool of many layers took up to a granule a plane more
+  than its givers had made room for: on a layer-cut Qwen3.8-Flash-Next with its experts in host memory the free
+  memory at a full-context prompt step fell 10 MiB under the 0.25 GiB headroom the expert cache keeps. Found by the
+  stress test.
+- A score's logits come out of the device's free memory only after its experts plugin made room for them. A score
+  holds a slice of 128 rows' FP32 logits beside their log-softmax and, with top_k, the sorted rows and their int64
+  order: on Qwen3.8-Flash-Next's 248,320-token vocabulary about 1.5 GB a slice, which no prompt step of its size
+  takes, so an elastic expert cache that keeps its margin and a step's measured room left the first score of a load
+  1.2 GB short (the driver then moves allocations to system memory, under WDDM silently), and `crit run serve
+  --check` measured 0.22 GiB free at a prompt step's peak against a 0.25 GiB headroom. model-template now asks the
+  device's ledger for each slice's bytes first (`crit_plugins.memory`'s need), as KV pages are asked for: the cache
+  gives them back before the slice is made. Found by the stress test.
+- expert-offload takes the CPU tier for the misses where the device cache is too small for them over the link. Over
+  the link every miss takes a slot, so a decode plan keeps a layer's experts beside the prompt ring's; with fewer
+  slots, misses `auto` chose the link by its timing and the cache could not be made. Where the CPU tier computes the
+  experts (W4A4 NVFP4, INT4) misses `auto` now takes it, which needs no slots beside the ring, and the facts say why
+  (`reasons.misses_small`); with misses pinned to the link such a cache is refused at `open()`. Found by the stress
+  test.
+- An expert cache that could stage no prompt is refused when it is made. A cache too small for a prompt ring of a
+  layer's experts beside the slots a decode plan keeps (a layer's again, without a CPU tier) took a ring of 0 slots,
+  opened, and failed at its first prompt with "the cache has no prompt ring (ring_slots 0): it serves decode plans
+  only": inside model-template's span calibration, at load, on a layer-cut Flash-Next with 11.0 GiB free and its
+  experts in host memory. It now names the slots prompts take, their bytes, and the remedies; a decode-only cache is
+  asked for with `ring_slots` 0 (expert-offload passes it from its settings file). Found by the stress test.
+- model-template reads the token embeddings where the plan puts them. A placement that puts the lookup tables off
+  the device (device-placement's `off_device: "tables."`, as an engine for a checkpoint whose n-gram table is larger
+  than the device sets it) put `tables.embed_tokens` there too, and the template stored the rows on the device
+  anyway: 1.2 GB the plan did not count. On a layer-cut Qwen3.8-Flash-Next the speed mode's FP8 head hid it (half the
+  head's planned bytes), and every preserve load failed Core's plan check ("its factory took 402.1 MiB of device
+  memory beyond the placement plans"). Off the device the rows are now read in place through an embeddings plugin
+  with `embeddings:host`; token embeddings that cannot be read so (not BF16 rows in a file) are planned as a device
+  weight. Found by the stress test.
+- model-template loads a draft layer whose routed experts are stored in another format than the decoder's, as
+  NVIDIA's NVFP4 Qwen3.8-Flash-Next stores its MTP layer's experts FP8 in 128 x 128 blocks beside NVFP4 decoder
+  experts. They are re-encoded at load to the format the experts slot holds the others in (NVFP4 without input
+  scales there, W4A16; BF16 where the decoder's are BF16) through `crit_plugins.encodings`; the target verifies every
+  draft, and the model's facts say so (`mtp.experts`). FP8 in blocks is now read as stored (`fp8:block`, with its
+  multipliers); a projection still refuses it by name unless it is a draft matrix re-encoded by `mtp_encode`. The load
+  failed with "FP8 in blocks of (128, 128), which the projections slot does not load".
+- model-template reads a hashed n-gram table stored as FP8 (E4M3 codes with one multiplier for the table,
+  `weight_scale`), as NVIDIA's NVFP4 Qwen3.8-Flash-Next stores its 47.7 GB table, and lookup-table-rows serves FP8
+  rows (format `fp8`: a byte a value, decoded on lookup times the table's scale) on the device, in host memory and
+  from files. The table off the device failed the load (`KeyError: 'F8_E4M3'`); on the device it was read as its
+  codes cast to BF16 with the scale left behind.
+- model-template drafts from a checkpoint whose decoder stores static KV scales and whose draft layer does not.
+  With `kv auto` the target's pages take FP8 with the stored `k_scale` and `v_scale`, and the draft layer's attention
+  asked for its own as well, though its pool keeps `mtp_kv` pages that take none: loading Qwen3.8-27B NVFP4 with its
+  MTP layer failed on `mtp.layers.0.self_attn.k_scale`. Found by the checkpoint manifest test.
+- expert-offload timed a missed expert wrong at load, and its `misses: auto` then chose the CPU tier on a machine
+  whose link serves a miss three times sooner. Three things skewed the link's time, each by several times: the
+  CPU tier's threads, awake from their own timing, took the processor the copies' host side runs on; a device left
+  idle while the engine loaded had its link at its lowest speed (an RTX 5090: 3.5 GiB/s for the first 0.2 to 0.4 s
+  under load, then 25), and its first batches agreed with each other at that speed; and the CPU tier's time left out
+  the way of a layer's rows to the host and back, which a decode layer with a miss there pays (180 to 240 us under
+  WSL) and a copy never does. The link is now timed once, before the tier exists, until its rate has stopped
+  doubling, and a CPU miss counts its computing and its handoff (`miss_times_us`: `compute`, `handoff`; every timed
+  batch in `miss_trials_us`). Qwen3.8-Flash-Next on an RTX 5090: 100 us over the link against 275 to 365 on the CPU
+  tier, where the old timing read 740 against 90; with the misses on the link, decode without drafts went from 16
+  to 31 tokens a second to 50, and prefill, whose rows no longer run the CPU tier's declared order, from 945 to
+  2,285 at a 65,536-token prompt.
+- expert-offload's elastic cache grew back everything a prompt had borrowed inside the prompt's last step and
+  inside a cancel (0.56 s for two gigabytes under WSL, a 1.17 s step), and learned a score's memory, its rows'
+  logits, as the room of a prompt chunk of as many tokens, so every prompt gave back and took again 1.7 GB it did
+  not use. It now grows back a bounded settle at a time (the device ledger's) and keeps a score's peak apart from
+  the prompt chunks'.
+- Three of Core's step engine checks were decided by the threads' timing and failed about one run in four: a request
+  cancelled inside a prefill pass was asked to cancel only while a pass was half done, decode rows shared a pass's
+  steps only if the requests happened to arrive together, and a step asked for between native rounds was taken by a
+  late request's prompt step. Each now sets up the order it checks (a cancel from the first pass step on, a gate that
+  holds a step until the second request is queued, one request alone); thirty runs in a row pass.
+- model-template refuses a drafter that never asks its draft layer. mtp-decode at its default (`override` 0) proposes
+  prompt copies alone: selected beside a checkpoint's MTP layer it left that layer loaded, written at every prompt
+  position and caught up every round while every draft was a copy or cut, so no draft was ever the layer's
+  (Qwen3.8-Flash-Next: 0 of 285 drafts accepted, 22 tokens a second). A drafter now says whether its configuration
+  asks the model's draft head (`uses_head`), and the template refuses one that does not, naming what to select:
+  greedy-head-drafter for the layer's chain, or mtp-decode with an `override`. With the chain the same engine accepts
+  81% of a greedy reply's drafts and 58% of a sampled one's, 62 tokens a second sampled. A new test gives the
+  gated-streams draft layer weights whose drafts are known, since transformers runs no draft layer for that
+  architecture.
+- model-template plans a large checkpoint's tensors in seconds. Its load built the set of the offloaded experts'
+  tensor names once for every tensor it planned: on Qwen3.8-Flash-Next (375,487 tensors, most of them routed experts')
+  the load spent over half an hour there before reading its first weight, and had not finished when it was stopped.
+  The set is built once.
+- A plan whose lever leaves a field out is refused with the lever's place and id and what each field is (`group`: the
+  group it pays in, or null where it pays alone) instead of `Missing required fields: group`.
+- `crit run build` packages a source that carries its own `configuration.json`. A candidate's source often holds the
+  configuration the candidate was made from, as it was written; crit completes the candidate's (the recon's frozen
+  block, the exactness of its rows, the quality mode), so the package step refused the source's copy as another
+  configuration until the build was run with `--drop configuration.json`. The build folder now gets the candidate's
+  completed configuration wherever the source's copy differs in nothing but what crit completes. A copy that names
+  other values is still refused, and the refusal now says what to do.
+- `crit run serve --check` no longer waits out a prefill that cannot finish. Its full-context request waits while the
+  engine keeps finishing steps, bounded only by the attempt's deadline, so an engine that prefilled a 200,000-token
+  prompt at 37 tokens a second held the check for 43 minutes until that deadline stopped it. After 30 seconds of
+  prompt steps the wait now projects the rest of the prompt at the rate measured so far (a floor: prefill slows as the
+  context grows), logs that rate every minute, and fails both full-context items with `prefill too slow, about N
+  tok/s` as soon as the projection passes what the attempt has left. The rate comes from a new Core counter, the
+  prompt tokens its steps prefilled (`StepEngine.telemetry()`'s `core.prompt_tokens`).
+- model-template reads a checkpoint's shards where its index names them. Its reader took the safetensors files at the
+  top of the model folder only, so a checkpoint that keeps its shards in a subfolder (`tensors/`, named by
+  `model.safetensors.index.json`) had no tensors for it. It now reads the index through Core's inspector
+  (`crit_core.model.safetensors.inspect_model`), adds the files beside the index that the index does not list (a draft
+  layer stored apart), and refuses a tensor that two files hold.
+- A captured round gives a cut draft a token id a table has a row for. A drafter cuts a row's drafts with -1
+  (mtp-decode's copy drafts before a slot has tokens, for one), and the round's batch carried that -1 to the model's
+  verify: an embedding lookup raised `a row outside the table` in the capture's warm-up rounds, and inside the
+  capture, where a lookup cannot check its ids, read outside its table. The batch's columns (and `view.columns()`) now
+  hold token 0 for a cut draft; `view.drafts` keeps the -1, which no prediction matches, so nothing past a cut draft
+  is kept.
+- expert-offload loads a checkpoint whose draft layer's experts are weight-only NVFP4 (W4A16) beside decoder experts
+  that carry input scales (W4A4), in every tier. With the experts in host memory and no store file to leave that
+  layer out of, `open()` added the layer's experts to the CPU tier, which computes W4A4 experts only and refused
+  them: the engine did not load (with a `store_dir` it did, since the layer was left out of host memory and so out
+  of the tier). In a file tier the same checkpoint was refused outright (`W4A16 layers beside W4A4 ones need a mapped
+  store`), although every miss there goes over the link, whose tensor arithmetic reads each layer as it is stored.
+  The layer stays whole on the device only where the CPU tier may serve misses, is never the tier's (nor timed when
+  `misses: auto` times a missed expert), and is cached as the others where the link serves. A tier that refuses an
+  expert sends the misses over the link with the reason unless `misses: cpu` asked for it.
+- An elastic expert cache asked for more memory than it can spare keeps the slots a plan needs. Without a CPU tier
+  (misses over the link) a miss must find a slot, so the cache keeps a layer's every expert beside its ring; a shrink
+  went down to the ring and one slot, and after a large release (a KV pool backing a long context's pages through the
+  ledger) the next decode plan found no victim and failed the request (`the cache lost a route`). A cache that keeps
+  its size (`elastic: false`, no elastic ranges on the device, or one that holds every expert) now leaves the model's
+  elastic pools the bytes they have reserved and not backed yet (it took them at `open()` and could not give them
+  back, so a KV pool sized for the whole context ran out of device memory as its sequences grew); its facts say how
+  much.
+- expert-offload over a store that keeps scale components CSF-compressed (the expert source's `csf_scales`) no longer
+  builds its CPU tier over bundles of another layout: on `misses: auto` the misses go over the link, with the
+  reason, and `misses: cpu` is refused by name before the tier reads a byte.
+- model-template's `gated-hybrid` layout routes Qwen3.5-MoE as its reference does: that router always renormalizes
+  the kept probabilities and its config has no key for it, so the template's router check demanded
+  `renormalize=False` and an engine either was refused with the right router options or served unnormalized expert
+  weights with the wrong ones. The layout states it (`defaults`), and a Qwen3.5-MoE engine is tested against
+  transformers.
+- A model plugin whose rounds ran an experts plugin with a device cache (expert-offload with its experts in host
+  memory) failed to capture them unless it happened to name the cache's counters: `count_round` asked the round for
+  `expert_reads` and got a ValueError from a tuple lookup. model-template was such a plugin, so its engines captured
+  no round over a host-memory tier. The round driver now takes the counters from the parts (above), and a counter no
+  one named is refused by name, saying where to name it.
+- model-template's prompt spans account for a step's fixed part, such as an experts plugin's copies of a chunk's
+  routed experts (expert-offload over host memory: gigabytes a step, whatever the chunk's size past a few dozen
+  tokens). The budget was half a second and the rule took the shortest span whenever no span met it: with about
+  half a second of copies a step that is every position, so an engine prefilled in 16-token steps, each paying most
+  of the copies again (37 tokens a second measured on Qwen3.8-Flash-Next with its experts in host memory; a
+  200,000-token prompt takes over an hour so). `span_seconds` now defaults to 0.75, three quarters of crit serve's
+  cancel grace: the fixed part is paid once a step, so the budget sets the rate (with 0.45 s of copies and 0.48 ms a
+  token, 0.5 s gives 96-token steps and 190 tokens a second, 0.75 s gives 624-token steps and 830). Where the fixed
+  part alone passes the budget, the span is the one that prefills fastest by the fit, among those predicted to end
+  inside the grace where any does, never the shortest. The spans' facts give each step's predicted seconds and rate
+  and how much of it no span changes (`steps`, `over_budget`).
+- Core's free device memory is never more than the card has left. On Windows and under WSL the driver's free
+  reading is the process's own budget: it does not fall when another program takes memory (measured: with other
+  programs holding 9.7 GiB of an RTX 5090, a fresh process was told 30.09 GiB were free where the card had 21.32
+  GiB left). A cache sized from that reading, or a giver growing back into it, took memory another program held
+  and the driver moved somebody's bytes to system memory. `crit_plugins.memory`'s `free()` is now the lesser of
+  the driver's reading and the card's own count (`card_free`: NVML through ctypes, the device found by its UUID;
+  0.12 ms a reading, no new dependency), so `relieve()`, `watch()`, the givers and expert-offload's sizing at
+  `open()` all see what other programs hold. Where the card cannot be asked the driver's reading stands alone.
+- `crit run serve --check`'s full-context request no longer fails at a fixed 600 s: it waits while the engine keeps
+  finishing steps and fails only when none finishes for 600 s, and crit serve bounds it by the check attempt's
+  deadline, as for Eval. An engine whose prefill of the run's whole context takes longer than ten minutes (a large
+  context on a small device or a slow link) failed `full_context_prompt_step` and `full_context_device_memory` with
+  `TimeoutError` before any step was judged, and the cancel then retired its host (Dualshok3, #77).
+
 ## [0.20.0] - 2026-11-18
 
 ### Overview
@@ -4610,7 +5313,8 @@ to each engine; model quality and device performance require target validation.
 
 ---
 
-[Unreleased]: https://github.com/crit-labs/crit/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/crit-labs/crit/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/crit-labs/crit/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/crit-labs/crit/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/crit-labs/crit/compare/v0.17.2...v0.18.0

@@ -119,6 +119,35 @@ class LedgerTests(unittest.TestCase):
         self.readings.bytes = 2000
         self.assertEqual(self.memory.settle(), 0)
 
+    def test_a_settle_grows_the_givers_back_for_a_bounded_time_and_owes_the_rest(self):
+        from unittest import mock
+        unit = memory.SETTLE_SLICE // 4
+        self.readings.total, self.readings.bytes = 100 * unit, 0
+        cache = Giver(self.readings, 10 * unit, unit)
+        self.memory.give("cache", cache.release, cache.regrow, keep=0)
+        self.memory.serve()
+        self.readings.bytes = 40 * unit                           # a prompt's room came back
+        ticks = iter(range(100))
+        with mock.patch.object(memory.time, "perf_counter", lambda: next(ticks) * 0.03):
+            self.assertEqual(self.memory.settle(), 8 * unit)      # two slices of four units inside SETTLE_S
+        self.assertTrue(self.memory.owed)
+        self.assertEqual(self.memory.settle(None), 32 * unit)     # no bound: the rest
+        self.assertFalse(self.memory.owed)
+        self.assertEqual(self.memory.settle(), 0)
+
+    def test_free_is_never_more_than_the_card_has_left(self):
+        # A driver whose free reading is the process's own budget (Windows, Linux under WSL) does not see what
+        # another program took: the card's count of what every program holds bounds the reading.
+        import sys
+        import types
+        from unittest import mock
+        fake = types.SimpleNamespace(cuda=types.SimpleNamespace(mem_get_info=lambda index: (900, 1000)))
+        readings = memory._Torch(0)
+        with mock.patch.dict(sys.modules, {"torch": fake}):
+            for left, free in ((None, 900), (950, 900), (600, 600), (0, 0)):
+                with mock.patch.object(memory, "card_free", lambda index, left=left: left):
+                    self.assertEqual(readings.free(), free, left)
+
     def test_memory_another_program_takes_is_given_back_between_steps_and_not_taken_again_at_once(self):
         now = [100.0]
         self.memory.clock = lambda: now[0]
@@ -199,6 +228,15 @@ class LedgerTests(unittest.TestCase):
 
 @unittest.skipIf(torch is None or not torch.cuda.is_available(), "no CUDA device")
 class DeviceTests(unittest.TestCase):
+    def test_the_card_counts_at_least_what_this_process_holds(self):
+        held = torch.zeros(8 << 20, dtype=torch.uint8, device="cuda")
+        left = memory.card_free(0)
+        if left is None:
+            self.skipTest("the card's management library is not reachable here")
+        self.assertLessEqual(left, memory.of("cuda").total - torch.cuda.memory_reserved())
+        self.assertLessEqual(memory.of("cuda").free(), left + (64 << 20))   # read a moment apart
+        del held
+
     def setUp(self):
         self.memory = memory.of("cuda")
         if not self.memory.elastic_ranges:
@@ -221,6 +259,27 @@ class DeviceTests(unittest.TestCase):
         held.fill_(1)                                              # ... and work in a tensor that exists makes none
         self.assertEqual(self.memory.made() - made, 1)
         self.assertEqual(self.memory.release(below=0), 0)
+
+    def test_a_ballast_takes_a_share_of_the_device_away_from_every_reading(self):
+        # A test's ballast: an elastic range of the driver's memory, outside torch's allocator, that every reading
+        # of free memory counts as taken until it is closed. leave: all but that much of what is free.
+        gran, before = self.gran, self.memory.free(release=True)
+        leave = before // 2 // gran * gran
+        held = self.memory.ballast(leave=leave)
+        try:
+            self.assertIn("ballast/test", self.memory.report()["elastic"])
+            self.assertLess(abs(self.memory.free() - leave), (256 << 20))
+            left = memory.card_free(torch.cuda.current_device())
+            if left is not None:
+                self.assertLess(left, leave + (256 << 20))
+        finally:
+            held.close()
+        self.assertGreater(self.memory.free(), before - (256 << 20))
+        with self.assertRaisesRegex(ValueError, "leave:SIZE or take:SIZE"):
+            self.memory._ballast_from("half")
+        held = self.memory._ballast_from("take:0.5GiB")
+        self.assertGreaterEqual(held.mapped, (1 << 29) - gran)
+        held.close()
 
     def test_a_range_grows_and_shrinks_with_its_addresses_and_contents_in_place(self):
         gran = self.gran
@@ -336,6 +395,22 @@ class DeviceTests(unittest.TestCase):
             self.assertFalse(p.back(3))
         self.assertEqual((p.backed, p.bytes), (1, 3 * gran))               # nothing was backed for it
         self.assertIn("test/paged", self.memory.report()["elastic"])
+
+    def test_a_paged_range_asks_the_ledger_for_the_granules_it_will_map(self):
+        # A unit smaller than a granule backs a whole granule: the givers are asked for that, or the device's free
+        # memory falls under what they keep by a granule a plane (KV pools of many layers: megabytes a step).
+        from unittest import mock
+        gran = self.gran
+        planes = [(0, gran // 4, 8), (4 * gran, gran // 4, 8), (8 * gran, 0, 8)]   # two planes of quarter units
+        p = self.memory.paged("test", "granules", 12 * gran, planes)
+        self.addCleanup(p.close)
+        asked = []
+        with mock.patch.object(self.memory, "need", asked.append):
+            self.assertTrue(p.back(1))      # granule 0 is the range's first, backed already: granule 4 is new
+            self.assertTrue(p.back(3))      # within the granules backed: nothing new
+            self.assertTrue(p.back(5))      # a granule more in each plane
+        self.assertEqual(asked, [gran, 0, 2 * gran])
+        self.assertEqual(p.bytes, 4 * gran)
 
     def test_units_the_device_has_no_memory_for_are_backed_from_host_memory_and_read_through_the_range(self):
         from unittest import mock

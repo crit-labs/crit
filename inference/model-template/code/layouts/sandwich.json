@@ -1,0 +1,19 @@
+{
+  "schema": "crit-model-layout-v1",
+  "name": "sandwich",
+  "description": "A decoder whose blocks sit between two RMSNorms each (plain weights), its attention with query, key and value norms at scale 1, sliding-window layers beside full ones of another head shape and rotary table (the full layers' values the key projection's rows where the checkpoint stores no value projection), a GELU-gated MLP, and where the config routes experts a mixture of experts beside the MLP with a router that scores the residual stream; embeddings scaled by the square root of the hidden width, logits capped by a tanh",
+  "model_types": ["gemma4", "gemma4_text"],
+  "norm_offset": 0.0,
+  "embed_scale": "sqrt_hidden",
+  "logit_softcap": "final_logit_softcapping",
+  "routed_if": "enable_moe_block",
+  "requires": {"num_kv_shared_layers": 0, "hidden_size_per_layer_input": 0, "use_double_wide_mlp": false},
+  "defaults": {"norm_topk_prob": true, "scoring_func": "softmax"},
+  "residual": {"block": "sandwich"},
+  "mixers": {
+    "full_attention": {"block": "attention", "prefix": "self_attn.", "scale": 1.0, "value_norm": true,
+                       "head_dim": "global_head_dim", "kv_heads": "num_global_key_value_heads"},
+    "sliding_attention": {"block": "attention", "prefix": "self_attn.", "scale": 1.0, "value_norm": true}
+  },
+  "ffn": {"block": "auto", "prefix": "mlp.", "routed": "parallel-moe"}
+}

@@ -45,7 +45,7 @@ reply = client.chat.completions.create(model="default", messages=[{"role": "user
 | `--max-concurrency N` | Run at most N requests at once, below the engine's declared capacity ([concurrent requests](#concurrent-requests)); default the engine's |
 | `--queue-timeout SECONDS` | Limit on a request's wait for the engine, after which it is refused; default none |
 | `--sse-ping-interval SECONDS` | [Keep-alive ping](#keep-alive-pings) on an OpenAI or Anthropic stream after this many seconds without output; default 15, 0 sends none |
-| `--load-timeout SECONDS` | Limit on loading the starting candidate; default 600 plus the model's bytes at 200 MB/s (50 MB/s with `--verify-model`) |
+| `--load-timeout SECONDS` | Limit on loading the starting candidate; default 600 plus the model's bytes at 200 MB/s (50 MB/s with `--verify-model`). A load whose plugins report their work (`context.working(what, done, total)`: a store of tens of gigabytes being built) goes on past it while that work advances, at most 5 minutes between two reports, and crit serve prints where it stands every 30 seconds; a load that runs out says what it last reported |
 | `--idle-unload SECONDS` | [Unload the engine](#unloading-the-engine) once no request has used it for this many seconds; the next request loads it again. Default: it stays loaded |
 | `--verify-model` | Before loading, read and SHA-256 every model file against the run's frozen manifest, and give engines without `chat-model-file-v1` a private read-only copy. By default the host only checks each file's size against the manifest and maps it in place, so the engine starts loading at once; a checkpoint with the same sizes but other bytes (another revision, corruption) is then served unnoticed |
 | `--resident-ram-gib N`, `--resident-vram-gib N` | Optional caps on pool-owned model bytes, not total process/device memory |
@@ -283,7 +283,7 @@ refuses them ([a busy engine](#a-busy-engine): `--max-queue`, `--queue-timeout`)
 | `n` | Must be 1; omitted or null keeps 1 |
 | `response_format` | `text`, `json_object` or `json_schema` ([structured output](#structured-output)); with tools only when `tool_choice` is `none` |
 | `structured_outputs` | A constraint, an extension to the OpenAI API: one of `regex`, `choice`, `grammar` or `json` ([structured output](#structured-output)); the earlier names `guided_regex`, `guided_choice`, `guided_grammar` and `guided_json` too; with tools only when `tool_choice` is `none` |
-| `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`, `min_tokens` (an extension: no stop token before that many tokens) | Per-request overrides when the package declares support for that field; otherwise 400 (ignored with `--lenient`). Omitted or null fields keep engine defaults |
+| `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`, `min_tokens` (an extension: no stop token before that many tokens) | Per-request overrides when the package declares support for that field; otherwise 400 (ignored with `--lenient`). Omitted or null fields take the model's own sampling, the served default: the run's frozen recon's, else `generation_config.json`'s temperature, filters and repetition penalty where the model samples by default (`do_sample`), greedy where it does not. A request with `temperature` 0 is greedy and takes none of them |
 | `typical_p`, `tfs_z`, `mirostat`, `dry_multiplier`, `xtc_probability` | Samplers other servers offer, which crit's sampling law does not have: the value that turns one off (1, 1, 0, 0 and 0) is a no-op, any other valid value 400 (ignored with `--lenient`) |
 | `tools`, `tool_choice`, `parallel_tool_calls` | Function calls for packages declaring `chat-tools-v1`; `tool_choice` `auto` or `none`, and `required` or a named function for packages that also declare `chat-tool-choice-v1` (otherwise 400 `unsupported_parameter`; [ResidentChat](#forced-calls) declares it when its engine decodes to a grammar). Tool-result history is preserved |
 | `logprobs`, `top_logprobs` | [Token log-probabilities](#token-log-probabilities) for packages declaring `chat-logprobs-v1`: every token's own and up to 20 alternatives. Not with `stop` |
@@ -334,7 +334,13 @@ serves, and every decode step must finish in well under a second. A slower chunk
 loses the resident weights on any cancel, and the next turn loads them again.
 `crit run serve --check` measures it: one request at the run's full context, on Core's
 steps probed (`CRIT_CORE_STEP_PROBE`), fails `full_context_prompt_step` when its slowest
-prompt step takes the grace or longer. crit
+prompt step takes the grace or longer. That request waits as long as the engine keeps
+finishing steps (its prefill of the whole context may take many minutes) and fails when
+no step finishes for 600 seconds; crit serve bounds it by the check attempt's deadline. It
+does not wait for a prefill that cannot finish: after 30 seconds of prompt steps it projects
+the rest of the prompt at the rate measured so far, logs that rate every minute, and fails
+with `prefill too slow, about N tok/s` as soon as the projection passes what the attempt
+has left. crit
 serve prints one line on stderr whenever it retires or closes an engine host, saying
 why (a cancel not settled within the grace, an engine error, shutdown).
 Streaming writes also honor the command's deadline and shutdown while a connected

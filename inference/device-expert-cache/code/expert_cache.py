@@ -21,10 +21,24 @@ A step plans every routed layer with plan() or every one with prompt(), on one s
 `stage_routes` routes (by default as many as the layer has experts) routes nearly every expert of a layer, so the host
 stages every expert its residency snapshot (read once per prompt step) says is not resident, by the copy engine on a
 side stream into ring slots, the next layer under the current one; a ring segment is reused only after the layer that
-read it ran (events). A shorter chunk copies its routed misses into ring slots on the device. The ring is borrowed from
-the own slots for a prompt step and given back by end_prompt() at its end (ring="borrow": the whole ring for a staged
-chunk, as many slots as it has routes for a shorter one, so a short prompt costs the cache few experts), or kept
-apart (ring="fixed"). A decode plan outside a capture ends a prompt step the model left open.
+read it ran (events). A shorter chunk copies its routed misses into ring slots on the device, and one of a few
+times stage_routes routes that leaves experts of its layer unrouted has only those it routes staged
+(_routes_few, _partial_table). The ring is
+borrowed from the own slots for a prompt step and given back by end_prompt() at its end (ring="borrow": the whole
+ring for a staged chunk, as many slots as it has routes for a shorter one, so a short prompt costs the cache few
+experts), or kept apart (ring="fixed"). A decode plan outside a capture ends a prompt step the model left open.
+
+A staged layer serves every chunk that reads it. A model that runs a span of a prompt layer by layer calls
+prompt(layer, ...) once a chunk for the same layer: the calls after the first read the layer's experts where the
+first found them, and nothing is copied again, so the layer's experts cross the link once for the whole span instead
+of once a chunk. Such a span takes several steps: end_prompt(hold=True) ends a step and keeps the ring and what is
+staged in it, decode plans (captured rounds too) run meanwhile in the slots beside it, and the next step's first
+prompt() reads the residency again and stages only what left the cache since. end_prompt() gives the ring back.
+
+A short chunk's misses may go to the CPU tier instead (prompt_cpu(), with a CPU tier): its table marks the experts
+that are not resident -2, as a plan's that sends a miss to the CPU tier, nothing is copied and no ring is borrowed.
+The caller gives what it measured, a missed route on the CPU tier and a bundle over the link, and the chunk takes
+the CPU where its missed routes cost less there than their experts over the link.
 
 Rounds (crit_plugins.rounds): start_round(view) at a round's start keeps the policy's residency on the device;
 count_round(view) adds each row's reads and hits into the round's counters. plan() outside a capture calls start_round
@@ -47,6 +61,19 @@ try:
 except ImportError:   # run from code/
     import device_directory as dd
     import host_memory
+
+
+# A prompt chunk of stage_routes routes or more has every non-resident expert of its layer staged: a long chunk
+# routes nearly all of them. One of fewer than ROUTED_CHECK times that many routes may still leave some unrouted
+# (a few hundred tokens of ordinary text keep to the experts their topic uses), so its routes are looked at first:
+# where it routes at most ROUTED_SHARE of the layer's non-resident experts, only the experts it routes are staged
+# (_partial_table), and a later chunk of the span that reads the layer has the ones it routes beyond them staged
+# beside. Staging a whole layer has the next layer's copies run under this layer's rows, which routes known a layer
+# at a time cannot: that pays where the rows take as long as the copies they hide, so a chunk that routes nearly
+# all the experts anyway is staged whole (a chunk this short computes in a fraction of its copies' time: the share
+# is high), and so are the later layers of a span whose chunks together came to route more than that share.
+ROUTED_CHECK = 8
+ROUTED_SHARE = 0.85
 
 
 def residency_profile_keys(path, layers, experts):
@@ -75,6 +102,10 @@ class _Segment:
 
 
 class ExpertCache:
+    # The round counters count_round adds to: the round driver has them without the model naming them
+    # (crit_plugins.rounds.Rounds).
+    round_counters = ("expert_reads", "expert_hits")
+
     def __init__(self, layers, experts, layout, slots, device, source, lend=None, policy="clock", admit_quota=-1,
                  quota_tables=None, second_touch=False, cpu_tier=False, ring_slots=None, ring="borrow",
                  stage_routes=None, fill_blocks=0, fill_vector=16, decay=0.85, period=3, max_swaps=96,
@@ -164,9 +195,19 @@ class ExpertCache:
             raise ValueError("a cache needs at least one slot of its own")
         swaps = max(burst_swaps, max_swaps) if policy == "ranked" else 0
         keep = 0 if cpu_tier else self.experts + swaps     # own slots a plan may need beside the ring
+        self.plan_slots = keep   # which a shrink leaves too: without a CPU tier a miss with no slot is a lost route
         room = int(slots) if self.elastic is not None else len(self.own)   # an elastic cache: the slots backed first
         if ring_slots is None:
             ring_slots = ring_for(room, self.experts, keep, self.elastic is not None)
+            if not ring_slots:   # a cache asked to serve prompts that could stage none fails at its first prompt
+                need = self.experts + keep + (1 if self.elastic is not None else 0)
+                raise ValueError(
+                    f"a cache of {room} own slots holds no prompt ring: a ring takes a layer's {self.experts} experts "
+                    + (f"beside the {keep} slots a plan may need without a CPU tier (every miss takes a slot), "
+                       if keep else "")
+                    + f"so prompts take {need} slots or more ({need * B / 2**30:.2f} GiB of bundles); give the "
+                    "cache that much device memory" + (", or the CPU tier the misses" if keep else "")
+                    + ", or make a decode-only cache with ring_slots 0")
         ring_slots = int(ring_slots)
         if ring_slots and ring_slots < self.experts:
             raise ValueError(f"a prompt ring holds a layer's every expert: {self.experts} slots or more, not "
@@ -211,6 +252,8 @@ class ExpertCache:
         self._ring_now = list(self.ring_slots) if ring == "fixed" else []   # the ring slots this prompt step holds
         self._snapshot = None
         self._prompt_layer = None
+        self._table = None          # the staged slot table of _prompt_layer, which every chunk of that layer reads
+        self.holding = False        # the ring is kept past a step's end (end_prompt(hold=True)): a span of many steps
         self._ring = deque()        # live segments, oldest first
         self._ring_head = self._ring_used = 0
         self._staged = {}           # layer -> segment staged ahead
@@ -221,6 +264,11 @@ class ExpertCache:
         self._table_events = [None] * 4
         self._table_next = 0
         self.staged_copies = 0
+        self.prompt_cpu_routes = 0   # prompt routes whose missed expert the CPU tier was given (prompt_cpu)
+        self._few = {}               # this prompt step's chunk sizes whose routed misses are copied alone (_routes_few)
+        self._needed = None          # the layer staged for its chunks' routes alone: the experts they routed so far
+        self._whole = False          # a span's chunks together came to route most of a layer: later layers whole
+        self.routed_chunks = 0       # the prompt steps' chunk sizes decided so
         self._last_layer = None
         self._ranked = self._recent = None
         self.pinned = {}            # slot -> key: the pinned core (pin()), which no plan, shrink or preload takes
@@ -268,10 +316,13 @@ class ExpertCache:
     def shrink(self, slots):
         """An elastic cache gives back own slots past `slots`. Under the ranked policy the experts in those slots
         that outrank the coldest experts kept first move into those experts' slots (device to device), so a shrink
-        loses the coldest experts, not whatever the last slots held. Between steps."""
+        loses the coldest experts, not whatever the last slots held. It keeps its ring and, without a CPU tier, the
+        own slots a plan may need beside it (a layer's every expert and its swaps: a miss finds a slot or the route
+        is lost), so a cache asked for more than it can give gives what it can. Between steps."""
         if self.elastic is None:
             return len(self.own)
-        want = max(1 + len(self.ring_slots) + 1, 1 + int(slots), max(self.pinned, default=0) + 2)
+        want = max(1 + len(self.ring_slots) + max(1, self.plan_slots), 1 + int(slots),
+                   max(self.pinned, default=0) + 2)
         if want >= self.backed:
             return self.backed_slots()
         self.torch.cuda.synchronize(self.device)
@@ -338,7 +389,7 @@ class ExpertCache:
         torch = self.torch
         capturing = self.device.type == "cuda" and torch.cuda.is_current_stream_capturing()
         if not capturing:
-            if self._prompt_open and self.ring_mode == "borrow":
+            if self._prompt_open and self.ring_mode == "borrow" and not self.holding:
                 self.end_prompt()
             if (self._last_layer is not None and layer <= self._last_layer) or \
                     (self._recent is not None and not self._recent.listed):
@@ -472,6 +523,16 @@ class ExpertCache:
                                "cannot be captured: a prompt forward that calls it runs eagerly (the cache provides no "
                                "prompts:expert_residency; name expert_residency among the prompt forward's slots)")
         stream = stream or (torch.cuda.current_stream(self.device) if self.device.type == "cuda" else None)
+        if self._prompt_open and self._table is not None and layer == self._prompt_layer:
+            # The layer is staged: another chunk of a span run layer by layer reads its experts where the first
+            # chunk found them. After a step's end (a held ring) the residency is read again: decode plans ran
+            # meanwhile, and what left the cache since is staged beside what the ring holds. A layer staged for its
+            # chunks' routes alone has what this chunk routes beyond them staged beside.
+            if self._needed is not None:
+                self._table = self._partial_table(layer, ids, stream)
+            elif self._snapshot is None:
+                self._table = self._restaged(layer, stream)
+            return self.store, self._table
         staged = ids.numel() >= self.stage_routes and self._region is not None and self.copy_stream is not None
         want = len(self.ring_slots) if staged else min(len(self.ring_slots), self.experts, max(1, ids.numel()))
         if self._prompt_open and want > len(self._ring_now):
@@ -480,13 +541,134 @@ class ExpertCache:
             self._open_prompt(want)
         if self._prompt_layer is not None and layer <= self._prompt_layer:
             self._snapshot = None      # a new prompt step: rounds may have run since (captured ones too)
-        self._prompt_layer = layer
+        self._prompt_layer, self._table = layer, None
         for segment in self._reading:  # the layer before read its segments: everything on the stream so far
             segment.consumed = self._event(stream) or True
         self._reading = []
+        self._needed = None
+        if (staged and ids.numel() < ROUTED_CHECK * self.stage_routes and not self._whole
+                and self._routes_few(layer, ids, stream)):
+            self._needed = [False] * self.experts
+            self._table = self._partial_table(layer, ids, stream)
+            return self.store, self._table
         if staged:
-            return self.store, self._prompt_staged(layer, stream)
+            self._table = self._prompt_staged(layer, stream)
+            return self.store, self._table
         return self.store, self._prompt_routed(layer, ids, stream)
+
+    def _routed(self, ids):
+        """[experts] booleans on the host: the experts a chunk's routes name (an id below 0 names none)."""
+        routed = self.torch.zeros(self.experts + 1, dtype=self.torch.bool, device=ids.device)
+        routed[ids.reshape(-1).long().clamp(-1, self.experts - 1)] = True   # an id of -1: the spare last entry
+        return routed[:self.experts].cpu().tolist()
+
+    def _routes_few(self, layer, ids, stream):
+        """Whether a prompt chunk of a few times stage_routes routes is one for which only the experts it routes
+        are staged: it routes at most ROUTED_SHARE of the layer's experts that are not resident. Decided at a
+        prompt step's first such layer for the chunks of that size in the step (a text routes its layers alike, and
+        a staged layer's copies for the next would be thrown away where the next decided otherwise)."""
+        size = int(ids.numel())
+        found = self._few.get(size)
+        if found is None:
+            missing = self._missing(layer, self._residency(stream))
+            routed = self._routed(ids)
+            need = sum(1 for e in missing if routed[e])
+            found = self._few[size] = bool(missing) and need <= ROUTED_SHARE * len(missing)
+            self.routed_chunks += found
+        return found
+
+    def _partial_table(self, layer, ids, stream):
+        """The slot table of a layer staged for its chunks' routes alone, with this chunk's: the experts the layer's
+        chunks routed so far (_needed) each at its cache slot where resident, else at a ring slot it was staged
+        into; what this chunk routes beyond them, and what left the cache since (a held ring: decode plans ran
+        between a span's steps), is staged beside. An expert no chunk routed has no slot: no row reads it."""
+        routed, needed = self._routed(ids), self._needed
+        fresh = not any(needed)
+        new = [e for e in range(self.experts) if routed[e] and not needed[e]]
+        if not new and not fresh and self._snapshot is not None:
+            return self._table   # nothing beyond what the layer's chunks before it had staged
+        for e in new:
+            needed[e] = True
+        for segment in self._staged.values():   # staged ahead for a whole layer: this one reads its routes only
+            stream.wait_event(segment.staged)
+            segment.consumed = self._event(stream) or True
+        self._staged.clear()
+        if self._recent is not None and self._snapshot is None:
+            self._recent.settle()
+        snapshot = self._residency(stream)
+        base, key_slot = layer * self.experts, snapshot[0]
+        segments = [] if fresh else self._reading
+        missing = [e for e in range(self.experts) if needed[e] and key_slot[base + e] < 0
+                   and not any(e in s.ring_of for s in segments)]
+        if missing:
+            segment = self._stage(layer, missing)
+            if segment is None:
+                raise RuntimeError("the prompt ring is held by segments not yet read: give it twice the experts of a "
+                                   "layer")
+            segments.append(segment)
+        table, away, staged = [], 0, 0
+        for e in range(self.experts):
+            slot = key_slot[base + e]
+            if slot < 0:
+                away += 1
+                slot = next((s.ring_of[e] for s in segments if e in s.ring_of), dd.NOT_ROUTED)
+                staged += slot != dd.NOT_ROUTED
+            table.append(slot)
+        if not fresh and staged > ROUTED_SHARE * away:   # a span's chunks together route them: later layers whole
+            self._whole = True
+        for segment in segments:
+            stream.wait_event(segment.staged)
+        self._reading = segments
+        return self._upload(table, stream)
+
+    def prompt_cpu(self, layer, ids, cpu_us, link_us, wins=1.0, stream=None):
+        """The slot table of a short prompt chunk whose misses the CPU tier computes: each resident expert's slot and
+        -2 for the others ([experts] int32, as a plan's that sends a miss to the CPU tier), nothing copied, nothing
+        admitted, no ring borrowed. None where the link serves the chunk sooner, and the caller then asks prompt():
+        cpu_us is a missed route on the CPU tier and link_us a bundle over the link, as the caller measured them, and
+        the CPU takes the chunk where its missed routes cost under `wins` of their experts' copies (a route of an
+        expert the tier has just read costs it less than the first, so the CPU's side is an upper bound). None also
+        for a chunk of stage_routes routes or more (it routes nearly every expert of the layer, each for many rows:
+        the link's), for a layer that is staged, and without a CPU tier. Host-driven, not captured."""
+        torch = self.torch
+        if (not self.cpu_tier or ids.numel() >= self.stage_routes
+                or (self.device.type == "cuda" and torch.cuda.is_current_stream_capturing())
+                or (self._prompt_open and self._table is not None and layer == self._prompt_layer)):
+            return None
+        stream = stream or (torch.cuda.current_stream(self.device) if self.device.type == "cuda" else None)
+        if self._prompt_layer is None or layer <= self._prompt_layer:
+            self._snapshot = None      # a new prompt step: rounds may have run since (captured ones too)
+        if self._recent is not None and self._snapshot is None:
+            self._recent.settle()
+        snapshot = self._residency(stream)
+        routes = [int(e) for e in ids.reshape(-1).tolist() if 0 <= int(e) < self.experts]
+        missing = set(self._missing(layer, snapshot, sorted(set(routes))))
+        missed = sum(1 for e in routes if e in missing)
+        if missed * float(cpu_us) >= float(wins) * len(missing) * float(link_us) and missing:
+            return None
+        self._prompt_layer, self._table = layer, None
+        for segment in self._reading:  # the layer before read its segments: everything on the stream so far
+            segment.consumed = self._event(stream) or True
+        self._reading = []
+        base, key_slot = layer * self.experts, snapshot[0]
+        self.prompt_cpu_routes += missed
+        return self._upload([key_slot[base + e] if key_slot[base + e] >= 0 else dd.CPU for e in range(self.experts)],
+                            stream)
+
+    def _upload(self, table, stream):
+        """A host-made slot table on the device, through a pinned buffer no copy still reads."""
+        torch = self.torch
+        if self.device.type != "cuda":
+            return torch.tensor(table, dtype=torch.int32, device=self.device)
+        i = self._table_next
+        self._table_next = (i + 1) % len(self._pinned)
+        if self._table_events[i] is not None:
+            self._table_events[i].synchronize()
+        self._pinned[i].copy_(torch.tensor(table, dtype=torch.int32))
+        with torch.cuda.stream(stream):
+            self._tables[i].copy_(self._pinned[i], non_blocking=True)
+        self._table_events[i] = self._event(stream)
+        return self._tables[i]
 
     def _event(self, stream):
         if stream is None:
@@ -503,11 +685,15 @@ class ExpertCache:
         self.directory.set_unavailable(self._ring_now)
         self._snapshot = None
         self._prompt_open = True
+        self._few, self._needed, self._whole = {}, None, False
 
-    def end_prompt(self):
+    def end_prompt(self, hold=False):
         """The prompt step is over (the model calls it at the end of every step that called prompt()): staged copies
         land before anything later on the stream, later staging waits for the layers that read the ring, a borrowed
-        ring goes back to the cache."""
+        ring goes back to the cache. hold: the prompt goes on in a later step (a span run layer by layer over several
+        steps), so the ring stays borrowed with what is staged in it; the residency is read again by the next step's
+        first prompt(), since decode plans may run in the slots beside the ring meanwhile."""
+        self._snapshot = None      # the next step reads the residency again, whatever this one read
         if not self._prompt_open:
             return
         cuda = self.device.type == "cuda"
@@ -517,6 +703,10 @@ class ExpertCache:
                 stream.wait_event(segment.staged)
         if cuda:
             self.copy_stream.wait_event(self._event(stream))
+        self.holding = bool(hold) and self.ring_mode == "borrow"
+        if self.holding:
+            return
+        self._table = self._needed = None
         self._ring.clear()
         self._staged.clear()
         self._reading = []
@@ -606,7 +796,6 @@ class ExpertCache:
         return [e for e in (range(self.experts) if experts is None else experts) if key_slot[base + e] < 0]
 
     def _prompt_staged(self, layer, stream):
-        torch = self.torch
         snapshot = self._residency(stream)
         missing = self._missing(layer, snapshot)
         segments = []
@@ -624,6 +813,18 @@ class ExpertCache:
                 raise RuntimeError("the prompt ring is held by segments not yet read: give it twice the experts of a "
                                    "layer")
             segments.append(segment)
+        table = self._layer_table(layer, snapshot, segments, stream)
+        self._reading = segments
+        following = layer + 1    # the next layer of this step, staged under this one
+        if following < self.layers and following not in self._staged:
+            ahead = self._stage(following, self._missing(following, snapshot))
+            if ahead is not None:
+                self._staged[following] = ahead
+        return table
+
+    def _layer_table(self, layer, snapshot, segments, stream):
+        """The slot table of a staged layer on the device: each expert's cache slot where the snapshot has it
+        resident, else its ring slot in `segments`, read once their copies landed."""
         base, key_slot = layer * self.experts, snapshot[0]
         table = []
         for e in range(self.experts):
@@ -633,21 +834,33 @@ class ExpertCache:
             table.append(slot)
         for segment in segments:
             stream.wait_event(segment.staged)
-        i = self._table_next
-        self._table_next = (i + 1) % len(self._pinned)
-        if self._table_events[i] is not None:
-            self._table_events[i].synchronize()
-        self._pinned[i].copy_(torch.tensor(table, dtype=torch.int32))
-        with torch.cuda.stream(stream):
-            self._tables[i].copy_(self._pinned[i], non_blocking=True)
-        self._table_events[i] = self._event(stream)
-        self._reading = segments
-        following = layer + 1    # the next layer of this step, staged under this one
-        if following < self.layers and following not in self._staged:
-            ahead = self._stage(following, self._missing(following, snapshot))
-            if ahead is not None:
-                self._staged[following] = ahead
-        return self._tables[i]
+        return self._upload(table, stream)
+
+    def _restaged(self, layer, stream):
+        """The staged layer's table after the residency moved (a held ring: decode plans ran since the layer was
+        staged): the experts that left the cache meanwhile are staged beside the layer's segments, in the ring
+        slots of the next layer, which was staged ahead and is staged again when its turn comes."""
+        if self._recent is not None:
+            self._recent.settle()
+        snapshot = self._residency(stream)
+        segments = self._reading
+        missing = [e for e in self._missing(layer, snapshot) if not any(e in s.ring_of for s in segments)]
+        if missing:
+            # The ring's newest segment is the next layer's, staged ahead, which nothing read: its slots are taken
+            # back first, so the layer's own segments stay the ring's newest and what left the cache always finds
+            # room beside them (the copy stream runs in order: what is staged there now lands after it).
+            for other in self._staged.values():
+                if self._ring and self._ring[-1] is other:
+                    self._ring.pop()
+                    self._ring_head = (self._ring_head - len(other.positions)) % len(self._ring_now)
+                    self._ring_used -= len(other.positions)
+            self._staged.clear()
+            segment = self._stage(layer, missing)
+            if segment is None:
+                raise RuntimeError("the prompt ring has no room for the experts that left the cache while a layer "
+                                   "was held staged: give it twice the experts of a layer")
+            segments.append(segment)
+        return self._layer_table(layer, snapshot, segments, stream)
 
     def _prompt_routed(self, layer, ids, stream):
         torch = self.torch
@@ -856,6 +1069,7 @@ class ExpertCache:
         return {"slots": c["slots"], "resident": c["resident"], "lent": len(self._lent), "reads": c["reads"],
                 "hits": c["hits"], "fills": c["fills"], "fill_bytes": fills * self.bundle_bytes, "cpu": c["cpu"],
                 "prompt_reads": c["prompt_reads"], "prompt_hits": c["prompt_hits"], "prompt_copies": prompt_copies,
+                "prompt_cpu_routes": self.prompt_cpu_routes, "routed_chunks": self.routed_chunks,
                 "failure": c["failure"], "swaps": c["swaps"], "kernel": self.directory.kernel is not None,
                 "pinned": len(self.pinned)}
 

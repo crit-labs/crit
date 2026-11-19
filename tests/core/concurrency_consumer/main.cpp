@@ -68,6 +68,6 @@ int main() {
            engine.usage(Memory::host).live!=0)
             throw std::runtime_error("installed SDK request isolation/ownership failed");
       }
-        std::cout<<"crit 0.20.0 installed SDK concurrent consumer passed\n";
+        std::cout<<"crit 0.21.0 installed SDK concurrent consumer passed\n";
     } catch(const std::exception& e) {std::cerr<<e.what()<<'\n';return 1;}
 }

@@ -296,6 +296,85 @@ class LoadBoundTests(ServeFixture, unittest.TestCase):
         self.assertEqual(self.engine(open=False, load_timeout=1234).load_seconds(spec), 1234)
 
 
+class LoadWorkTests(unittest.TestCase):
+    """The supervisor's bound on a command whose host reports work (a load), against a host that is only its
+    channel: work reported at given seconds after the command, a result at another."""
+
+    def load(self, reports, finishes, timeout, stall):
+        from types import SimpleNamespace
+        began = time.monotonic()
+
+        class Link:
+            failure = None
+
+            def seen(self):
+                return [(at, work) for at, work in reports if time.monotonic() - began >= at]
+
+            @property
+            def work(self):
+                return self.seen()[-1][1] if self.seen() else None
+
+            @property
+            def worked(self):
+                return began + self.seen()[-1][0] if self.seen() else None
+
+            def register(self, command_id, limit):
+                self.command_id = command_id
+                return SimpleNamespace(ready=threading.Event())
+
+            def unregister(self, command_id):
+                pass
+
+            def send(self, message, limit=None):
+                pass
+
+            def take(self, box):
+                if time.monotonic() - began < finishes:
+                    return [], None
+                return [], {"kind": "result", "command_id": self.command_id, "status": "completed", "error": None,
+                            "max_concurrent_requests": 1, "cleanup_settled": True}
+        with tempfile.TemporaryDirectory() as temporary:
+            (Path(temporary) / "runtime.log").write_bytes(b"")
+            runtime = ResidentRuntime(None, 0, 0)
+            tree = SimpleNamespace(process=SimpleNamespace(poll=lambda: None))
+            with contextlib.redirect_stderr(io.StringIO()) as printed:
+                result = runtime._call("c", "load", {}, threading.Event(), timeout, None, None, Path(temporary), tree,
+                                       Link(), stall=stall)
+        return result["status"], runtime.last_work, printed.getvalue()
+
+    def test_a_load_whose_reported_work_advances_outlasts_its_bound(self):
+        steps = [(0.1 * n, {"what": "store: parts built", "done": n, "total": 9}) for n in range(1, 10)]
+        with patch("crit_api.residency.WORK_REPORT_SECONDS", 0.25):
+            status, work, printed = self.load(steps, finishes=1.0, timeout=0.3, stall=0.4)
+        self.assertEqual((status, work["done"]), ("completed", 9))
+        self.assertIn("crit serve: loading: store: parts built", printed)   # where the load stands, now and then
+
+    def test_a_load_that_reports_nothing_or_stalls_ends_at_its_bound(self):
+        self.assertEqual(self.load([], finishes=30, timeout=0.3, stall=0.4)[:2], ("timed_out", None))
+        stalled = [(0.1, {"what": "store: parts built", "done": 1, "total": 9})]
+        status, work, _ = self.load(stalled, finishes=30, timeout=0.3, stall=0.4)
+        self.assertEqual((status, work["done"]), ("timed_out", 1))
+        # Without a stall (every command but a load) reported work changes nothing.
+        steps = [(0.1 * n, {"what": "store", "done": n}) for n in range(1, 20)]
+        self.assertEqual(self.load(steps, finishes=30, timeout=0.3, stall=None)[0], "timed_out")
+
+
+class LoadFailureTests(ServeFixture, unittest.TestCase):
+    """An engine whose load takes two seconds and says nothing."""
+    adapter_suffix = r"""
+_made = Engine.__init__
+def _slow(self, context):
+    _made(self, context)
+    time.sleep(2)
+Engine.__init__ = _slow
+"""
+
+    def test_a_load_past_its_bound_says_what_ran_out(self):
+        engine = self.engine(open=False, load_timeout=0.5)
+        with self.assertRaisesRegex(ValueError, r"did not load within 0\.5 s \(--load-timeout.*it reported no work"):
+            engine.open()
+
+
 class LifecycleTests(ServeFixture, unittest.TestCase):
     def test_cleanup_failure_blocks_requests_and_other_clients_until_closed(self):
         engine = self.engine()
@@ -435,6 +514,19 @@ class ModelPoolTests(unittest.TestCase):
         context.close(); pool.close()
         self.source.write_bytes(b'new!')
         self.pool.close()
+
+    def test_the_model_folder_is_where_the_held_files_are_without_a_config(self):
+        # a lone GGUF's checkpoint has no config.json (Core derives it): the folder is the held files' own
+        pool = ModelPool(self.root / 'folder', 4, 8)
+        pool.load(self.source, self.manifest)
+        context = ModelContext(pool, {})
+        self.assertEqual(context.model_folder(), self.root)   # in place: the source's folder
+        with self.assertRaises(KeyError):
+            context.model_file('config.json')
+        context.close(); pool.close()
+        copied = ModelContext(self.pool, {})                  # a verified private copy: the copy's folder
+        self.assertEqual(copied.model_folder(), Path(copied.model_file('weights')).parent)
+        copied.close(); self.pool.close()   # Windows deletes no file a pool still holds open
 
     def test_default_load_checks_sizes_and_maps_in_place_without_reading(self):
         pool = ModelPool(self.root / 'fast', 4, 8)

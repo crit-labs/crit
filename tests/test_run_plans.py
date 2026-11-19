@@ -8,7 +8,7 @@ import unittest
 from support.runs import RunFixture
 from crit.run import plans
 from crit.run.cli import main
-from crit.run.records import digest, file_sha, now, read_json, write_json
+from crit.run.records import GIB, digest, file_sha, now, read_json, write_json
 
 # Eval's budget for each quality mode, a run's unless it sets its own.
 PRESERVE_BUDGET = {"ppl_ratio_max": 1.05, "kld_mean_max": 0.05, "kld_p99_max": 0.5}
@@ -245,6 +245,10 @@ class PlanRecordTests(PlanFixture, unittest.TestCase):
             ({**good, "levers": [lever(changes={"decode": {"change": "big", "source": "estimate"}})]}, "decode change"),
             ({**good, "levers": [lever(changes={"decode": {"change": 0.3, "source": "a hunch"}})]}, "eval-gap:<gap name>, measured:"),
             ({**good, "levers": [lever(), lever()]}, "appears twice"),
+            # a lever that leaves a field out is named, with what the field is (group: null where it pays alone)
+            ({**good, "levers": [lever(), {k: v for k, v in lever("alone").items() if k != "group"}]},
+             r"levers\[1\] \(alone\): Missing required fields: group\. Every lever states .*or null where it "
+             "pays alone"),
             ({**good, "levers": [lever(changes={"decode": {"change": 0.3, "source": "eval-gap:imaginary"}})]},
              "names no decode gap"),
             # 2. the parent exists
@@ -329,14 +333,20 @@ class PlanRecordTests(PlanFixture, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown plan plan-0042"):
             self.candidate(parent_candidate_id=parent, plan_id="plan-0042")
         recorded = self.store.plan(self.run_id, plan(parent))
-        with self.assertRaisesRegex(ValueError, f"starts from {parent}, the proposal from None"):
-            self.candidate(plan_id=recorded["plan_id"])
+        with self.assertRaisesRegex(ValueError, f"starts from {parent}, the proposal from candidate-0042"):
+            self.candidate(parent_candidate_id="candidate-0042", plan_id=recorded["plan_id"])
         stop = self.store.plan(self.run_id, plan(parent, decision="stop", decode=False, prefill=False, levers=[],
                                                  forecast=None, gaps=limit_causes("decode", "prefill")))
         self.assertIsNone(stop["priorities"])
         with self.assertRaisesRegex(ValueError, "is a stop plan"):
             self.candidate(parent_candidate_id=parent, plan_id=stop["plan_id"])
         self.assertEqual(list((self.directory / "candidates").glob("candidate-0002")), [])
+
+    def test_a_proposal_that_names_no_parent_takes_its_plans(self):
+        parent = self.first()["candidate_id"]
+        recorded = self.store.plan(self.run_id, plan(parent))
+        found = self.candidate(plan_id=recorded["plan_id"])
+        self.assertEqual(found["parent_candidate_id"], parent)
 
     def test_the_outcome_compares_the_forecast_with_the_measured_eval(self):
         parent = self.first()["candidate_id"]
@@ -1105,6 +1115,36 @@ class ObjectiveTests(PlanFixture, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "candidate-0001 is not eligible: required gate resources is failed"):
             self.store.select(self.run_id, parent)
 
+    def test_a_resources_repair_cites_the_parents_benchmark_below_the_host_headroom(self):
+        # Every check of the parent passed, resources included (its Eval measured the device), but its benchmark kept
+        # less host memory free than the run's headroom: the benchmark fails resources by its own samples, select
+        # refuses the parent, and the repair cites that benchmark.
+        parent, attempt = self.packaged_parent()
+        checks = []
+        for gate in ("arithmetic", "functional", "resources"):
+            check_id = self.check(parent, attempt, gate, "passed")
+            path = self.directory / "candidates" / parent / "checks" / f"{check_id}.json"
+            checks.append({"path": path.relative_to(self.directory).as_posix(), "sha256": file_sha(path)})
+        package = read_json(self.directory / "candidates" / parent / "package/manifest.json")
+        with self.assertRaisesRegex(ValueError, "did not fail: resources \\(its newest, check-0003 for case-0001, "
+                                                "passed\\)"):
+            self.store.plan(self.run_id, plan(parent, forecast=self.SAME, levers=[self.CHECK_REPAIR]))
+        within = self.benchmark_data(package, checks)
+        self.store.append(self.run_id, parent, "benchmark", within)
+        with self.assertRaisesRegex(ValueError, "did not fail: resources"):
+            self.store.plan(self.run_id, plan(parent, forecast=self.SAME, levers=[self.CHECK_REPAIR]))
+        short = self.benchmark_data(package, checks)
+        short["metrics"]["minimum_free_ram_bytes"] = {"samples": [GIB // 5] * 3, "unit": "bytes"}
+        bench = self.store.append(self.run_id, parent, "benchmark", short)["benchmark_id"]
+        recorded = self.store.plan(self.run_id, plan(parent, forecast=self.SAME, levers=[self.CHECK_REPAIR]))
+        path = f"candidates/{parent}/benchmarks/{bench}.json"
+        self.assertEqual(recorded["inputs"]["objective"]["check_repairs"], {"resources": [
+            {"path": path, "sha256": file_sha(self.directory / path), "benchmark_id": bench, "case_id": "case-0001",
+             "recorded_by": "benchmark"}]})
+        self.store.seal(self.run_id, parent, "completed")
+        with self.assertRaisesRegex(ValueError, f"{parent} is not eligible: required gate resources is failed"):
+            self.store.select(self.run_id, parent)
+
     def test_a_check_repair_follows_the_parents_newest_check(self):
         # The run's first plan has no parent whose check it could repair.
         with self.assertRaisesRegex(ValueError, "A check repair names a failed check of the parent: the run's first "
@@ -1463,6 +1503,44 @@ class PromptActivationTests(PlanFixture, unittest.TestCase):
         self.evaluated(parent, status(), engine={"prompt_activations": self.stored})
         self.assertEqual(self.store.plan(self.run_id, follow)["prompt_activations"], self.stored)
 
+    def test_a_parent_that_served_no_bf16_beside_its_declaration_is_stated_not_rejected(self):
+        """A plan declared "stored" for every format while one format, having no kernel for its stored activations,
+        served FP8: the next plan states what was served (activation:served, answer cause). No quality rejection
+        is asked for it, but one is still asked where the parent served BF16."""
+        recorded = self.store.plan(self.run_id, {**plan(levers=[], forecast=None), "prompt_activations": "stored"})
+        parent = self.candidate(plan_id=recorded["plan_id"])["candidate_id"]
+        served = {"nvfp4": "stored", "fp8": "fp8"}
+        self.evaluated(parent, status(), engine={"prompt_activations": served})
+        forecast = {**plan()["forecast"], "prefill": {"low": 1100.0, "expected": 1500.0, "high": 2000.0}}
+        follow = {**plan(parent, forecast=forecast), "prompt_activations": served}
+        with self.assertRaisesRegex(ValueError, f"{parent} served prompt activations .*, its plan plan-0001 declared "
+                                                ".*state what it served and why \\(gaps entry activation:served"):
+            self.store.plan(self.run_id, follow)
+        stated = {"kpi": "prefill", "gap": "activation:served", "answer": "cause",
+                  "detail": "fp8 has no kernel for its stored activations; plan-0001's \"stored\" misstated it"}
+        with self.assertRaisesRegex(ValueError, "activation:served' states what the parent served .*answer cause"):
+            self.store.plan(self.run_id, {**follow, "gaps": [{**stated, "answer": "rejected"}]})
+        accepted = self.store.plan(self.run_id, {**follow, "gaps": [stated]})
+        self.assertEqual(accepted["inputs"]["served_activations"],
+                         {"plan_id": "plan-0001", "declared": {"nvfp4": "stored", "fp8": "stored"}, "served": served})
+
+    def test_activation_served_needs_a_difference_without_bf16(self):
+        recorded = self.store.plan(self.run_id, {**plan(levers=[], forecast=None), "prompt_activations": self.stored})
+        parent = self.candidate(plan_id=recorded["plan_id"])["candidate_id"]
+        forecast = {**plan()["forecast"], "prefill": {"low": 1100.0, "expected": 1500.0, "high": 2000.0}}
+        stated = {"kpi": "prefill", "gap": "activation:served", "answer": "cause", "detail": "what it served"}
+        follow = {**plan(parent, forecast=forecast), "prompt_activations": self.stored, "gaps": [stated]}
+        self.evaluated(parent, status(), engine={"prompt_activations": self.stored})
+        with self.assertRaisesRegex(ValueError, f"states a difference, but {parent} served the prompt activations"):
+            self.store.plan(self.run_id, follow)
+        self.evaluated(parent, status(), engine={"prompt_activations": {"nvfp4": "bf16", "fp8": "fp8"}})
+        with self.assertRaisesRegex(ValueError, f"activation:served: {parent} served nvfp4 at bf16, which stands "
+                                                "only on a measured rejection"):
+            self.store.plan(self.run_id, follow)
+        with self.assertRaises(ValueError) as refused:
+            self.store.plan(self.run_id, {**follow, "gaps": []})
+        self.assertNotIn("activation:served", str(refused.exception))
+
     def test_one_planned_activation_holds_for_every_served_format(self):
         recorded = self.store.plan(self.run_id, {**plan(levers=[], forecast=None), "prompt_activations": "stored"})
         parent = self.candidate(plan_id=recorded["plan_id"])["candidate_id"]
@@ -1493,6 +1571,8 @@ class PromptActivationPreserveTests(PromptActivationTests):
     test_candidate_1_starts_at_the_checkpoints_activation_format = None
     test_bf16_stands_on_a_measured_rejection_of_the_stored_format = None
     test_a_candidate_serves_what_its_plan_declared = None
+    test_a_parent_that_served_no_bf16_beside_its_declaration_is_stated_not_rejected = None
+    test_activation_served_needs_a_difference_without_bf16 = None
 
 
 class RoundAccountTests(PlanFixture, unittest.TestCase):

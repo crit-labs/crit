@@ -50,6 +50,9 @@ void Engine::Impl::initialize(Factory factory) {
     if(!declaration.prefill_work_quantum ||
        (profile.max_batch_tokens && declaration.prefill_work_quantum>profile.max_batch_tokens))
         throw std::invalid_argument("prefill work quantum must fit the mixed batch budget");
+    if(bool(declaration.prefill_pass_tokens) != bool(declaration.prefill_pass_steps) ||
+       declaration.prefill_pass_tokens > declaration.context)
+        throw std::invalid_argument("prefill passes need prefill_pass_tokens within the context and prefill_pass_steps");
     detail::validate_tokens(declaration.stop_tokens,declaration.vocabulary);
     if(!declaration.max_concurrency || declaration.max_concurrency > max_request_concurrency || declaration.max_concurrency < profile.max_concurrency)
         throw std::invalid_argument("model concurrency declaration does not cover core profile");

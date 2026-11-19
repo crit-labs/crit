@@ -392,8 +392,9 @@ def test_key(registry, manifest):
 
 
 def cache_folder():
-    """Where passing plugin test results are kept: CRIT_PLUGIN_TEST_CACHE, else ~/.cache/crit/plugin-tests."""
-    return Path(os.environ.get("CRIT_PLUGIN_TEST_CACHE") or Path.home() / ".cache" / "crit" / "plugin-tests")
+    """Where passing plugin test results are kept: CRIT_PLUGIN_TEST_CACHE, else crit_core.cache_home()'s plugin-tests."""
+    from crit_core import cache_home
+    return Path(os.environ.get("CRIT_PLUGIN_TEST_CACHE") or cache_home("plugin-tests"))
 
 
 def run_tests(registry, only=None, timeout=600, log=print, cache=False):
@@ -450,7 +451,7 @@ def run_tests(registry, only=None, timeout=600, log=print, cache=False):
             passed = done.returncode == 0 and count > 0
             skipped = _skips(output)
             detail = (f"{count} tests" + (f", {len(skipped)} skipped" if skipped else "") if passed
-                      else (output.strip()[-2000:] or f"exit code {done.returncode}"))
+                      else f"exit code {done.returncode}\n{output.strip()[-2000:]}".rstrip())
         except subprocess.TimeoutExpired:
             passed, detail, skipped = False, f"the tests ran past {timeout:g} s", []
         seconds = time.perf_counter() - started

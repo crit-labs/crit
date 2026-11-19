@@ -8,6 +8,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("splits(Tensor blocks, int type, int k) -> int");
   ops.def("gemv(Tensor blocks, int type, int k, Tensor xq, Tensor xd, Tensor xs, Tensor? ids, Tensor! yp) -> ()");
   ops.def("gemm(Tensor blocks, int type, int k, Tensor xq, Tensor xd, Tensor xs, int parts, Tensor! y, int chunk_rows=0) -> ()");
+  ops.def("gemm_experts(Tensor blocks, int type, int k, int[] experts, int[] counts, Tensor xq, Tensor xd, Tensor xs, int parts, Tensor! y) -> ()");
   ops.def("sum_parts(Tensor yp, Tensor! y) -> ()");
   ops.def("dequantize(Tensor blocks, int type, int k, int expert, Tensor! out) -> ()");
 #if defined(CUDA_KERNEL)
@@ -15,6 +16,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("splits", torch::kCUDA, &splits);
   ops.impl("gemv", torch::kCUDA, &gemv);
   ops.impl("gemm", torch::kCUDA, &gemm);
+  ops.impl("gemm_experts", torch::kCUDA, &gemm_experts);
   ops.impl("sum_parts", torch::kCUDA, &sum_parts);
   ops.impl("dequantize", torch::kCUDA, &dequantize);
 #endif

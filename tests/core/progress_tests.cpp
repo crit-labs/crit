@@ -19,6 +19,7 @@ struct Step {
     std::vector<Token> tokens = {};
     std::uint32_t reused = 0;
     std::optional<std::uint32_t> work = {};
+    std::uint32_t pass = 0;   // the prompt tokens held in a prefill pass after the step
 };
 struct Record {
     std::vector<Step> steps;
@@ -37,6 +38,7 @@ struct Driver {
         const auto& step=record->steps.at(record->advances++);
         tokens=step.tokens;
         Progress p{step.prompt,step.complete,tokens,step.reused};
+        p.pass_tokens=step.pass;
         if(budget.token_work) {
             // Most cases isolate the common progress rules. Explicit work overrides
             // also exercise the mixed path's separate accounting and error precedence.
@@ -51,10 +53,12 @@ struct Driver {
         std::fill(tokens.begin(),tokens.end(),-1);
     }
 };
-ModelInfo info(Path path) {
+// passes: the model declares prefill passes of up to 4 prompt tokens over at most 2 steps in a row.
+ModelInfo info(Path path,bool passes) {
     ModelInfo m{"progress.contract.fixture",16,32,2,{}};
     m.valid_vocabulary=12; m.max_concurrency=1;
     m.mixed_batches=path==Path::mixed; m.decode_token_work=4;
+    if(passes) { m.prefill_pass_tokens=4; m.prefill_pass_steps=2; }
     return m;
 }
 struct Lane final:Session {
@@ -64,9 +68,10 @@ struct Lane final:Session {
 struct BatchedModel final:Model {
     std::shared_ptr<Record> record;
     Path path;
+    bool passes;
     Lane* lane=nullptr;
-    BatchedModel(std::shared_ptr<Record> r,Path p):record(std::move(r)),path(p) {}
-    ModelInfo info() const override { return ::info(path); }
+    BatchedModel(std::shared_ptr<Record> r,Path p,bool pass):record(std::move(r)),path(p),passes(pass) {}
+    ModelInfo info() const override { return ::info(path,passes); }
     std::unique_ptr<Session> open(const RequestView&) override {
         auto session=std::make_unique<Lane>(record); lane=session.get(); return session;
     }
@@ -86,12 +91,14 @@ struct BatchedModel final:Model {
     }
 };
 enum class Error { none, progress, work, vocabulary };
-void check(Path path,const char* name,std::vector<Step> steps,Error error=Error::none) {
+void check(Path path,const char* name,std::vector<Step> steps,Error error=Error::none,bool passes=false) {
     try {
         auto r=std::make_shared<Record>(); r->steps=std::move(steps);
         Profile p{32,2,1<<20,1<<20};
         if(path==Path::mixed) p.max_batch_tokens=4;
-        Engine e(p,[r,path](const Profile&,Resources&)->std::unique_ptr<Model> { return std::make_unique<BatchedModel>(r,path); });
+        Engine e(p,[r,path,passes](const Profile&,Resources&)->std::unique_ptr<Model> {
+            return std::make_unique<BatchedModel>(r,path,passes);
+        });
         const auto live=e.usage(Memory::host).live;
         std::vector<Token> published;
         std::string diagnostic;
@@ -147,6 +154,24 @@ void cases(Path path) {
     check(path,"output over grant",{reuse,{0,true,{7,8,9,10}}},Error::progress);
     check(path,"remaining output grant",{reuse,{0,true,{7}},{0,true,{8,9,10}}},Error::progress);
     check(path,"padding token",{reuse,{0,true,{12}}},Error::vocabulary);
+    // Prefill passes: a span of the prompt worked on over several steps counts in the step that ends its pass, past
+    // that step's grant of 2 by the pass the row held; a step without prompt tokens or output is progress only while
+    // it reports a pass the model declared, for the declared steps in a row. Mixed work stays within each step's grant.
+    const auto passing=[](std::uint32_t tokens) { return Step{0,false,{},0,0,tokens}; };
+    const auto ending=[](std::uint32_t tokens,bool complete,std::uint32_t pass=0) { return Step{tokens,complete,{},0,2,pass}; };
+    const auto over=path==Path::mixed ? Error::work : Error::progress;
+    check(path,"a pass of two steps",{passing(4),passing(4),ending(4,false),{1,true},output},Error::none,true);
+    check(path,"a pass ends with its step's grant",{passing(3),ending(5,true),output},Error::none,true);
+    check(path,"a pass ends in part",{passing(4),ending(2,false,2),passing(2),ending(3,true),output},Error::none,true);
+    check(path,"passes one after another",{passing(2),ending(2,false,2),ending(2,false),{1,true},output},Error::none,true);
+    check(path,"a pass not declared",{passing(2)},Error::progress);
+    check(path,"a pass of too many steps",{passing(4),passing(4),passing(4)},Error::progress,true);
+    check(path,"a pass past the declared tokens",{passing(5)},Error::progress,true);
+    check(path,"a pass past the prompt",{ending(2,false),passing(4)},Error::progress,true);
+    check(path,"more than the pass and the grant",{passing(2),ending(5,true)},over,true);
+    check(path,"a pass kept at the prompt's end",{passing(3),ending(5,true,1)},Error::progress,true);
+    check(path,"a pass after prefill",{reuse,{0,true,{7},0,{},1}},Error::progress,true);
+    check(path,"a step without a pass stalls",{passing(4),{0,false}},Error::progress,true);
     if(path==Path::mixed) {
         check(path,"mixed over grant",{{1,false,{},0,5}},Error::work);
         check(path,"mixed omitted computation",{{1,false,{},0,0}},Error::work);

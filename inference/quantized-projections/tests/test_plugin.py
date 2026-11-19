@@ -60,6 +60,20 @@ class QuantizedProjectionsTests(PluginTestCase):
                                                 "in bf16, not fp8"):
             self.assemble(options={"activations": "bf16", "prompt": "fp8"})
 
+    def test_head_auto_follows_the_quality_mode_the_engine_states(self):
+        from crit_plugins import kernels
+        self.addCleanup(kernels.use_quality_mode, None)
+        for mode, option, head, by in ((None, "auto", "stored", None), ("preserve", "auto", "stored", None),
+                                       ("speed", "auto", "fp8", "speed"), ("speed", "stored", "stored", None),
+                                       ("preserve", "fp8", "fp8", None), (None, "fp8", "fp8", None)):
+            kernels.use_quality_mode(mode)
+            p = self.assemble(options={"head": option})["projections"]
+            self.assertEqual((p.head, p.head_by), (head, by), (mode, option))
+        kernels.use_quality_mode("speed")   # auto is the default
+        self.assertEqual(self.assemble()["projections"].head, "fp8")
+        with self.assertRaisesRegex(ValueError, "quality mode 'fast' is not one of speed, preserve"):
+            kernels.use_quality_mode("fast")
+
     def test_the_formats_differ(self):
         w = matrix(2, 64, seed=4)
         decoded = {options.get("format", "int8"): self.assemble(options=options)["projections"]

@@ -6,8 +6,19 @@ import os
 import struct
 import tempfile
 
+from pathlib import Path
+
 from .memory import host_memory
 from .table import device_rows, table_rows
+
+HERE = Path(__file__).resolve().parent
+
+
+def _gguf_kernel():
+    """crit's kernel gguf-rows (its dequantize decodes a GGUF table's rows on the device), or None where it does not
+    build: Core's host decoders then."""
+    from crit_plugins.kernels import load_kernel
+    return load_kernel("gguf-rows", folder=HERE)
 
 
 class FileTableRows:
@@ -16,7 +27,8 @@ class FileTableRows:
         self.directory = options["directory"] or None
         self.table, self.path, self.width = None, None, 0
         self.device_rows = device_rows.HostRows(options["readers"], options["prefetch_rows"], options["ring"],
-                                                memory=host_memory, native=options["native"])
+                                                memory=host_memory, native=options["native"],
+                                                gguf_kernel=_gguf_kernel)
 
     # -- host form -----------------------------------------------------------------------------------------------
     def load(self, table):

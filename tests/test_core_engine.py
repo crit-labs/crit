@@ -324,9 +324,12 @@ class LoadTests(PackageFixture, unittest.TestCase):
         self.assertNotIn("probe", self.open().telemetry()["core"])
         with mock.patch.dict(os.environ, {native.STEP_PROBE: "1"}):
             engine = self.open()
+        before = engine.telemetry()["core"]["prompt_tokens"]   # the load's own steps prefill too
         engine.generate(list(range(5, 45)), 4, stop_tokens=[])
         probe = engine.telemetry()["core"]["probe"]
         self.assertEqual(set(probe), {"prompt", "decode"})
+        # Probed or not, Core counts the prompt tokens its steps prefilled: a prefill's rate while its request runs.
+        self.assertEqual(engine.telemetry()["core"]["prompt_tokens"] - before, 40)
         for kind in ("prompt", "decode"):
             self.assertGreater(probe[kind]["steps"], 0)
             self.assertGreater(probe[kind]["slowest_seconds"], 0)
@@ -736,6 +739,16 @@ class PackageExactnessTests(PackageFixture, unittest.TestCase):
         from crit_plugins import kernels
         self.kernels = kernels
         self.addCleanup(kernels.use_exactness, None)
+
+    def test_the_quality_mode_is_told_to_the_plugins(self):
+        self.addCleanup(self.kernels.use_quality_mode, None)
+        self.assertEqual(core_engine.package_quality_mode({"quality_mode": "speed"}), "speed")
+        self.assertEqual(self.kernels.quality_mode(), "speed")
+        self.assertIsNone(core_engine.package_quality_mode({}))   # a package that states none: every option decides
+        self.assertIsNone(self.kernels.quality_mode())
+        with self.assertRaisesRegex(PluginError, 'configuration "quality_mode" is one of speed, preserve, '
+                                                 "not 'fast'"):
+            core_engine.package_quality_mode({"quality_mode": "fast"})
 
     def test_the_levels_are_told_to_the_plugins(self):
         self.assertEqual(core_engine.package_exactness({"exactness": {"decode": "row-exact", "prompt": "repeatable"}}),

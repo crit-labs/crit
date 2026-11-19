@@ -16,6 +16,7 @@
   "provides": [
     "experts:bundles",
     "experts:routes",
+    "experts:activations",
     "rounds:experts",
     "prompts:experts"
   ],

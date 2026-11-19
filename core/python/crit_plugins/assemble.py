@@ -193,6 +193,11 @@ def check(selection, registry, facts=(), strict_options=True, device=None):
         for fact in manifest["conflicts"]:
             if fact in provided:
                 raise PluginError(f"{plugin_id} conflicts with {fact}, which {provided[fact]} provides")
+        for fact, slots in manifest["requires_when"].items():
+            empty = [slot for slot in slots if use.get(slot) is None]
+            if fact in provided and empty:
+                raise PluginError(f"{plugin_id} requires {', '.join(empty)} where {provided[fact]} provides {fact}, "
+                                  "which the selection leaves empty: its step calls a plugin there")
         when = [(fact, needs) for fact, needs in manifest["needs_when"].items() if fact in provided]
         for alternatives, because in ([(a, None) for a in manifest["needs"]]
                                       + [(a, fact) for fact, needs in when for a in needs]):

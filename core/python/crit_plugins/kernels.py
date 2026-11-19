@@ -42,18 +42,25 @@ crit_kernels.exactness for the decode rows and one for the prompt rows). A plugi
 more than one way reads the level asked (asks("prompt")) where its own option leaves the choice open, takes the fastest
 way that keeps it, and says what its rows keep in its exactness(); Core refuses an engine whose plugin keeps less than
 the configuration asks. Where the configuration asks nothing, asks() is None and the plugin's options decide alone.
+
+Exactness is the order of a row's sums. The precision of what is summed follows the quality mode the engine states
+(use_quality_mode(), from the configuration's "quality_mode": speed or preserve, the mode of the run that built it): a
+plugin whose precision option is left to choose (a projections plugin's head) reads quality_mode() and takes the
+lower precision the speed mode starts from, and the stored precision in preserve or where no mode is stated.
 """
 import os
 import threading
 from pathlib import Path
 
 SOURCES = ("tuned", "built", "fallback")
+QUALITY_MODES = ("speed", "preserve")
 
 _lock = threading.RLock()   # re-entered when a kernel's alias loads its target during a load
 _loaded = {}     # kernel id -> the record of its last request
 _modules = {}    # (kernel id, tuning file) -> module
 _tuning = None   # the folder use_tuning() named
 _exactness = None   # the levels the engine asks ({"decode": level, "prompt": level}), None when it asks none
+_quality_mode = None   # the quality mode the engine states (QUALITY_MODES), None when it states none
 
 
 def use_tuning(folder):
@@ -75,7 +82,7 @@ def tuning_file(name):
 def use_exactness(value, quality_mode=None):
     """The exactness the engine asks of its rows (crit_kernels.exactness: declared, exact, row-exact, repeatable):
     one level for both phases or {"decode": level, "prompt": level}; a phase left out takes the quality mode's level
-    when one is given (preserve: exact; speed: repeatable). None with no quality mode: the engine asks nothing.
+    when one is given (exact in both modes). None with no quality mode: the engine asks nothing.
     Returns the levels asked, or None; ValueError for a level or phase that does not exist."""
     global _exactness
     if value is None and quality_mode is None:
@@ -89,6 +96,22 @@ def use_exactness(value, quality_mode=None):
 def exactness():
     """The levels the engine asks, {"decode": level, "prompt": level}, or None when it asks none."""
     return None if _exactness is None else dict(_exactness)
+
+
+def use_quality_mode(mode):
+    """The quality mode the engine states (QUALITY_MODES: speed or preserve, the mode of the run that built it), or
+    None: it states none. Returns the mode; ValueError for another name."""
+    global _quality_mode
+    if mode is not None and mode not in QUALITY_MODES:
+        raise ValueError(f"quality mode {mode!r} is not one of {', '.join(QUALITY_MODES)}")
+    _quality_mode = mode
+    return mode
+
+
+def quality_mode():
+    """The quality mode the engine states (speed or preserve), or None when it states none: a precision option left
+    to choose then keeps the stored precision, as it does in preserve."""
+    return _quality_mode
 
 
 def asks(phase):
@@ -294,5 +317,6 @@ def forget():
         _declared.clear()
 
 
-__all__ = ["SOURCES", "UNTUNED", "allows", "asks", "declared", "exactness", "fallbacks", "forget", "load_kernel", "loaded",
-           "record_fallback", "tuning_file", "use_exactness", "use_tuning"]
+__all__ = ["QUALITY_MODES", "SOURCES", "UNTUNED", "allows", "asks", "declared", "exactness", "fallbacks", "forget",
+           "load_kernel", "loaded", "quality_mode", "record_fallback", "tuning_file", "use_exactness",
+           "use_quality_mode", "use_tuning"]

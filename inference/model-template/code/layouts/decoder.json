@@ -1,0 +1,12 @@
+{
+  "schema": "crit-model-layout-v1",
+  "name": "decoder",
+  "description": "A pre-norm decoder of grouped-query softmax attention (rotary positions, query/key norms and biases where stored, sliding-window layers where the config's layer_types name them) and a SwiGLU MLP, or a mixture of experts on the layers the config routes (a shared expert and its gate where stored)",
+  "model_types": ["llama", "qwen2", "qwen3", "qwen2_moe", "qwen3_moe"],
+  "norm_offset": 0.0,
+  "mixers": {
+    "full_attention": {"block": "attention", "prefix": "self_attn."},
+    "sliding_attention": {"block": "attention", "prefix": "self_attn."}
+  },
+  "ffn": {"block": "auto", "prefix": "mlp."}
+}

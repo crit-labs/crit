@@ -21,15 +21,18 @@ void typed(const torch::Tensor& t, const char* name, torch::ScalarType type) {
     TORCH_CHECK(t.scalar_type() == type, name, " has dtype ", t.scalar_type(), ", not ", type);
 }
 gx::Layout layout_of(c10::ArrayRef<int64_t> v) {
-    TORCH_CHECK(v.size() == 11 || v.size() == 12, "a layout is 11 integers (12: an int4_zp group last)");
+    TORCH_CHECK(v.size() >= 11 && v.size() <= 13,
+                "a layout is 11 integers (12: an int4_zp group after them, 0 for none; 13: the activation last)");
     gx::Layout L;
     L.format = static_cast<gx::Format>(v[0]);
     L.bytes = v[1];
     L.gate_up = v[2], L.gate_up_scale = v[3], L.gate_up_inverse = v[4];
     L.down = v[5], L.down_scale = v[6], L.down_inverse = v[7], L.input = v[8];
     L.hidden = static_cast<int>(v[9]), L.inter = static_cast<int>(v[10]);
-    L.group = v.size() == 12 ? static_cast<int>(v[11]) : 0;
+    L.group = v.size() >= 12 ? static_cast<int>(v[11]) : 0;
+    L.activation = v.size() == 13 ? static_cast<int>(v[12]) : 0;
     TORCH_CHECK(v[0] >= 0 && v[0] <= 6, "unknown format ", v[0]);
+    TORCH_CHECK(L.activation == 0 || L.activation == 1, "unknown activation ", L.activation, " (0 silu, 1 gelu_tanh)");
     return L;
 }
 gx::Items items_of(const torch::Tensor& slot, const torch::Tensor& routes, const torch::Tensor& count) {

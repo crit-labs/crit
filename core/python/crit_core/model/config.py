@@ -117,7 +117,9 @@ class RopeLayer:
 
 @dataclass(frozen=True)
 class MoeConfig:
-    """Mixture-of-experts fields; experts_key names the key the expert count came from."""
+    """Mixture-of-experts fields; experts_key names the key the expert count came from. A field config.json leaves
+    out is None, 0 or empty here (norm_topk_prob None, scoring_func ""): Core fills in no family's default, so a
+    model plugin states what its reference assumes for it (the reference's own config class has the default)."""
     experts: int = 0
     experts_key: str = ""
     experts_per_token: int = 0
@@ -238,6 +240,9 @@ class ModelConfig(_Picklable):
 
     def effective_head_dim(self):
         return effective_head_dim(self.section, source=self.source)
+
+    def routed_layers(self):
+        return routed_layers(self.section, source=self.source)
 
     def effective_kv_heads(self):
         return effective_kv_heads(self.section, source=self.source)
@@ -693,6 +698,22 @@ def layer_kinds(config, source=CONFIG_NAME):
     if interval:
         return tuple(FULL_ATTENTION if (index + 1) % interval == 0 else LINEAR_ATTENTION for index in range(layers))
     return (FULL_ATTENTION,) * layers
+
+
+def routed_layers(config, source=CONFIG_NAME):
+    """The indices of the layers whose MLP routes experts, in order (() for a model without routed experts): every
+    layer from first_k_dense_replace on whose (index + 1) is a multiple of decoder_sparse_step (default 1), less the
+    mlp_only_layers, as the checkpoints' reference code places its sparse blocks."""
+    config = _mapping_of(config, source)
+    if _moe(config, source) is None:
+        return ()
+    layers = _layer_count(config, source) if "num_hidden_layers" not in config else None
+    if not layers:
+        layers = _positive(config, "num_hidden_layers", source)
+    dense = _integer(config, "first_k_dense_replace", source) or 0
+    step = _integer(config, "decoder_sparse_step", source) or 1
+    dense_only = set(_integers(config, "mlp_only_layers", source) or ())
+    return tuple(i for i in range(dense, layers) if (i + 1) % step == 0 and i not in dense_only)
 
 
 def effective_head_dim(config, source=CONFIG_NAME):

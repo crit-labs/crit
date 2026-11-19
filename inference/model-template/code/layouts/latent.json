@@ -1,0 +1,24 @@
+{
+  "schema": "crit-model-layout-v1",
+  "name": "latent",
+  "description": "A pre-norm decoder of multi-head latent attention (each position one cached latent row and one rotary key every head shares, low-rank queries, interleaved rotary pairs) with a SwiGLU MLP on its first layers and, on the rest, a mixture of experts routed by sigmoid scores within the best groups, with shared experts",
+  "model_types": [
+    "deepseek_v3"
+  ],
+  "norm_offset": 0.0,
+  "defaults": {
+    "scoring_func": "sigmoid",
+    "group_score_top": 2,
+    "rope_interleave": true
+  },
+  "mixers": {
+    "full_attention": {
+      "block": "latent-attention",
+      "prefix": "self_attn."
+    }
+  },
+  "ffn": {
+    "block": "auto",
+    "prefix": "mlp."
+  }
+}

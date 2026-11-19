@@ -121,6 +121,57 @@ class HostRowsTests(PluginTestCase):
         with self.assertRaisesRegex(ValueError, "multiple of 16"):
             rows.open(codes, 24, torch.bfloat16, device, format="nvfp4", scales=scales)
 
+    def test_gguf_rows_decode_to_their_stored_values(self):
+        # A table a GGUF stores in a block format (an n-gram table IQ4_NL, token rows Q8_0): its rows gathered as
+        # stored and decoded on lookup (gguf-rows' dequantize on CUDA, Core's decoders on the CPU) to Core's values.
+        import numpy as np
+        from crit_core.model.gguf_blocks import BLOCKS, TYPES, stored_values
+        torch, device = self.torch, self.device()
+        g = np.random.default_rng(11)
+        for name, width in (("IQ4_NL", 160), ("Q8_0", 64), ("Q4_K", 256)):
+            values, size = BLOCKS[TYPES[name]]
+            raw = g.integers(0, 256, (300, width // values, size), dtype=np.uint8)
+            scale = (g.uniform(1, 2, (300, width // values)) * 2.0 ** -8).astype(np.float16).view(np.uint8)
+            raw[..., 0:2] = scale.reshape(300, -1, 2)
+            if name == "Q4_K":
+                raw[..., 2:4] = scale.reshape(300, -1, 2)
+            raw = np.ascontiguousarray(raw.reshape(300, -1))
+            expected = torch.from_numpy(stored_values(raw, TYPES[name], width)).bfloat16()
+            path = os.path.join(self.folder.name, f"{name}.bin")
+            with open(path, "wb") as f:
+                f.write(raw.tobytes())
+            rows = self.plugin(prefetch_rows=32)
+            want = [3, 299, 0, 3, 150]
+            for table in (rows.store(torch.from_numpy(raw).to(device), format="gguf:" + name),
+                          rows.open(path, width, torch.bfloat16, device, format="gguf:" + name)):
+                got = table.lookup(self.ids(want)).cpu()
+                self.assertEqual(tuple(got.shape), (len(want), width))
+                self.assertTrue(torch.equal(got.view(torch.int16), expected[want].view(torch.int16)), (name, table.mode))
+                self.assertEqual(table.round_problems(), [] if device == "cuda" else table.round_problems())
+        with self.assertRaisesRegex(ValueError, "gguf:<TYPE>|is one of"):
+            rows.open(path, 64, torch.bfloat16, device, format="gguf:Q9_9")
+
+    def test_fp8_rows_decode_to_their_codes_times_the_tables_scale(self):
+        # A table stored as E4M3 codes with one multiplier (an NVFP4 checkpoint's hashed n-gram table): each value is
+        # the code's E4M3 value times the scale, rounded once to the rows' dtype, from the device and from files.
+        torch, device = self.torch, self.device()
+        g = torch.Generator().manual_seed(9)
+        codes = torch.randint(0, 0x7F, (300, 24), dtype=torch.uint8, generator=g)
+        codes[::2] |= 0x80                                             # negative values too
+        scale = 0.0002050399780273   # a BF16 value, as the checkpoint stores it
+        want = [0, 299, 17, 0]
+        expected = (codes[want].view(torch.float8_e4m3fn).float() * scale).bfloat16()
+        path = os.path.join(self.folder.name, "fp8.bin")
+        with open(path, "wb") as f:
+            f.write(codes.numpy().tobytes())
+        rows = self.plugin(prefetch_rows=32)
+        made = [rows.store(codes.view(torch.float8_e4m3fn).to(device), format="fp8", scale=scale),
+                rows.open(path, 24, torch.bfloat16, device, format="fp8", scale=scale)]
+        for table in made:
+            got = table.lookup(self.ids(want)).cpu()
+            self.assertEqual(got.dtype, torch.bfloat16)
+            self.assertTrue(torch.equal(got.view(torch.int16), expected.view(torch.int16)), table.mode)
+
     def test_a_lookup_captures_in_a_cuda_graph(self):
         if self.device() != "cuda":
             self.skipTest("CUDA graphs")

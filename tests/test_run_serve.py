@@ -73,7 +73,8 @@ class RunServeTests(MeasureFixture, unittest.TestCase):
             served.serve(self.store, self.run_id, unpackaged, port=0)
         candidate = self.served()
         self.store.seal(self.run_id, candidate, "built")
-        with self.assertRaisesRegex(ValueError, "sealed: serve it with crit serve"):
+        with self.assertRaisesRegex(ValueError, "sealed and takes no attempt: crit serve serves it .crit serve "
+                                                "--workspace .* --candidate candidate-"):
             served.serve(self.store, self.run_id, candidate, port=0)
 
 

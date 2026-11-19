@@ -56,7 +56,7 @@ import threading
 from pathlib import Path
 
 from ..native import NativeUnavailable, built, extension, library
-from .files import Reads
+from .files import Reads, write_memory
 
 HERE = Path(__file__).resolve().parent
 INCLUDE = HERE   # pool.h (PoolRef) and handoff_device.cuh, for a plugin's native code
@@ -420,4 +420,5 @@ def current():
         return _current
 
 
-__all__ = ["Handoff", "Host", "INCLUDE", "NativeUnavailable", "Pool", "Reads", "current", "memory_bytes"]
+__all__ = ["Handoff", "Host", "INCLUDE", "NativeUnavailable", "Pool", "Reads", "current", "memory_bytes",
+           "write_memory"]

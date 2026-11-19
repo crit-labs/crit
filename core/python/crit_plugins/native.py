@@ -70,11 +70,13 @@ def compiler():
 
 
 def cache_root():
-    """Where libraries are kept: CRIT_NATIVE_CACHE, else beside torch's extensions, else ~/.cache/crit/native."""
+    """Where libraries are kept: CRIT_NATIVE_CACHE, else beside torch's extensions, else crit_core.cache_home()'s
+    native."""
+    from crit_core import cache_home
     root = os.environ.get("CRIT_NATIVE_CACHE")
     if not root:
         torch_ext = os.environ.get("TORCH_EXTENSIONS_DIR")
-        root = os.path.join(torch_ext, "crit-native") if torch_ext else os.path.join(Path.home(), ".cache", "crit", "native")
+        root = os.path.join(torch_ext, "crit-native") if torch_ext else str(cache_home("native"))
     return Path(root)
 
 

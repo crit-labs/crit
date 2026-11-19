@@ -15,7 +15,10 @@ and replay take: one plan per routed layer of each decoded token.
 from collections import Counter
 import json
 
-from device_cache import ClockDirectory, simulate
+try:
+    from .device_cache import ClockDirectory, simulate
+except ImportError:   # run from code/
+    from device_cache import ClockDirectory, simulate
 
 KIND = "device-expert-cache-profile"
 

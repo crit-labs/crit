@@ -44,10 +44,8 @@ def expert_shape(config):
     hidden, layers = text.get("hidden_size"), text.get("num_hidden_layers")
     if not (experts and top and inter and hidden and layers):
         return None
-    dense = int(text.get("first_k_dense_replace") or 0)
-    every = int(text.get("decoder_sparse_step") or 1)
-    routed = sum(1 for layer in range(dense, int(layers)) if (layer + 1) % every == 0) if every > 1 else int(layers) - dense
-    return routed, int(experts), int(top), int(hidden), int(inter)
+    from crit_core.model import routed_layers
+    return len(routed_layers(text)), int(experts), int(top), int(hidden), int(inter)
 
 
 def expert_format(config):
@@ -182,11 +180,11 @@ def plan(model, device, tokens, quality_mode="speed", vram_headroom_bytes=None, 
     out["miss_path"] = "cpu" if cpu else "link"
     workers = -1 if cores is None else max(1, int(cores) - 1)
     # The cache leaves the run's VRAM headroom free at every moment (its margin): what the run's checks measure.
-    plugin = {"misses": "cpu" if cpu else "link",
-              "prompt_arithmetic": "tensor" if quality_mode == "speed" else "declared",
-              "margin_mib": math.ceil(vram_headroom_bytes / (1 << 20))}
-    if cpu:
-        plugin["policy"] = "recent"
+    # A prompt chunk's arithmetic is the plugin's own choice (prompt_arithmetic auto): the faster one that keeps the
+    # level the engine asks of its prompt rows. So is the miss path where the placement prices the CPU first (misses
+    # auto): the floors are lower bounds from a probe of an idle device, and the plugin times a missed expert both
+    # ways in the loaded engine, where a turn to the host costs what it costs there, and takes the faster.
+    plugin = {"misses": "auto" if cpu else "link", "margin_mib": math.ceil(vram_headroom_bytes / (1 << 20))}
     if cores is not None:
         plugin["workers"] = workers
     # The KV pools hold only the pages sequences use (attention-state's elastic pools): the expert cache the rest.
@@ -204,8 +202,10 @@ def plan(model, device, tokens, quality_mode="speed", vram_headroom_bytes=None, 
                             f"take {GIB // size:,} cache slots: the model plans each as a `tables.` group and opens "
                             "it through the embeddings slot (lookup-table-rows' open(): a tensor's rows in "
                             "registered host memory, gathered over the link at a device table's cost, or files)")
-    out["notes"].append("the CPU tier computes every miss while the link copies it into the cache beside the round: "
-                        "it serves from the next round" if cpu else
+    out["notes"].append("the placement prices misses computed on the CPU below misses copied over the link; "
+                        "expert-offload times both in the loaded engine and takes the faster (misses auto; its "
+                        "facts say which and why). On the CPU tier every miss is computed while the link copies it "
+                        "into the cache beside the round: it serves from the next round" if cpu else
                         "every miss is copied over the link into a cache slot before its layer reads it")
     out["notes"].append(f"about {slots:,} cache slots ({slots * size / 1e9:.1f} GB of the experts' "
                         f"{layers * experts * size / 1e9:.1f} GB, {slots / (layers * experts):.0%}) at Eval's margins: "
@@ -242,7 +242,9 @@ def render(value):
     if floors:
         lines.append("plain-pass ceilings at even routing: " + ", ".join(f"{k} {v} tok/s" for k, v in floors.items()))
     if value.get("miss_path"):
-        lines.append(f"misses: {value['miss_path']}")
+        lines.append(f"misses: {value['miss_path']} by the placement's floors"
+                     + (" (the plugin times both in the loaded engine and takes the faster)"
+                        if value["miss_path"] == "cpu" else ""))
     for plugin, options in value["options"].items():
         lines.append(f"  {plugin}: " + ", ".join(f"{k}={json.dumps(v)}" for k, v in options.items()))
     trace = value.get("trace")

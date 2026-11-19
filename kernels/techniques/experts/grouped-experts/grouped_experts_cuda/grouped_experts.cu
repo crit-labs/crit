@@ -522,7 +522,9 @@ __global__ void __launch_bounds__(WARPS * 32) expert_kernel(Pass p) {
                 float hv[TILES];
 #pragma unroll
                 for(int t = 0; t < TILES; ++t)
-                    hv[t] = kc::swiglu_declared(__fmul_rn(acc[t][n][c], fg[t]), __fmul_rn(acc[t][n][2 + c], fu[t]));
+                    hv[t] = L.activation == 1
+                        ? kc::gelu_tanh_mul(__fmul_rn(acc[t][n][c], fg[t]), __fmul_rn(acc[t][n][2 + c], fu[t]))
+                        : kc::swiglu_declared(__fmul_rn(acc[t][n][c], fg[t]), __fmul_rn(acc[t][n][2 + c], fu[t]));
                 if constexpr(A4) {   // a 16-row block of inter rows of this route: one block of the down's input
                     // Tiles 2q and 2q + 1 (rows r0 + 16q .. + 15) are one block; with one tile a warp, the block's other
                     // 8 rows are the paired warp's (warp ^ 1).
@@ -987,7 +989,7 @@ cudaError_t dispatch(const Pass& p, bool a4, const Items& items, int tokens, cud
 
 bool valid(const Layout& L) {
     return L.bytes > 0 && L.bytes % 16 == 0 && L.hidden >= 64 && L.inter >= 64 && L.hidden % 64 == 0 &&
-           L.inter % 64 == 0 && L.gate_up >= 0 && L.down >= 0 &&
+           L.inter % 64 == 0 && L.gate_up >= 0 && L.down >= 0 && (L.activation == 0 || L.activation == 1) &&
            (L.format != Format::int4_zp ||
             (L.group >= 16 && L.group % 16 == 0 && L.hidden % L.group == 0 && L.inter % L.group == 0 &&
              L.gate_up_scale >= 0 && L.gate_up_inverse >= 0 && L.down_scale >= 0 && L.down_inverse >= 0));
@@ -1094,9 +1096,9 @@ cudaError_t enqueue_declared_rows(const std::int8_t* values, const float* scales
 cudaError_t enqueue_declared_intermediate(const float* gate_up, const std::uint8_t* store, const Layout& layout,
                                           const Items& items, std::int8_t* values, float* scales, cudaStream_t stream) {
     const bool int4 = layout.format == Format::int4;
-    if(!gate_up || !store || !values || !scales || !valid(layout) || !valid(items) ||
+    if(!gate_up || !store || !values || !scales || !valid(layout) || !valid(items) || layout.activation != 0 ||
        (!int4 && (layout.format != Format::nvfp4 || layout.input < 0)))
-        return cudaErrorInvalidValue;
+        return cudaErrorInvalidValue;   // the declared order is SwiGLU's: its host twin computes no other gate
     if(items.capacity == 0) return cudaSuccess;
     const int per = items.width * (layout.inter / (int4 ? 32 : 16));
     const dim3 grid(items.capacity, (per + kDeclaredThreads - 1) / kDeclaredThreads);

@@ -141,6 +141,26 @@ def package_exactness(configuration):
     return use_exactness(exactness_levels(configuration))
 
 
+def quality_mode_of(configuration):
+    """The quality mode a configuration states, "speed" or "preserve" (configuration "quality_mode": the mode of the
+    run that built the engine, which crit run writes into every candidate), or None where it states none.
+    PluginError for anything else."""
+    from crit_plugins.kernels import QUALITY_MODES
+    mode = configuration.get("quality_mode")
+    if mode is not None and mode not in QUALITY_MODES:
+        raise PluginError(f'configuration "quality_mode" is one of {", ".join(QUALITY_MODES)}, not {mode!r}')
+    return mode
+
+
+def package_quality_mode(configuration):
+    """The quality mode a package states (quality_mode_of), told to the plugins before any is made
+    (crit_plugins.kernels.use_quality_mode): a plugin whose precision option is left to choose takes the lower
+    precision the speed mode starts from (an output head in FP8), and the stored precision in preserve. Without it
+    every such option keeps the stored precision. Returns the mode or None."""
+    from crit_plugins.kernels import use_quality_mode
+    return use_quality_mode(quality_mode_of(configuration))
+
+
 def selection(configuration, speculative=True):
     """The configuration's plugin selection in its full form (crit_plugins.assemble.normalize); speculative False
     empties the drafting slots, for an engine that decodes one token per target pass."""
@@ -159,15 +179,37 @@ def selection(configuration, speculative=True):
     return chosen
 
 
-def architecture_facts(model):
-    """What the checkpoint's config.json says of it, as facts plugins need: model_type:<type> (top level and
-    text_config), architecture:<class> for each of its architectures, and the formats its matrices are stored in
-    (stored_facts)."""
+def model_config(model):
+    """The checkpoint's config.json as a dict: the folder's, else the one Core derives from a GGUF's metadata
+    (crit_core.model.open_model: a lone .gguf, or a folder holding one, is a whole model), else {}."""
     path = Path(model) / "config.json"
-    if not path.is_file():
+    if path.is_file():
+        return json.loads(path.read_text(encoding="utf-8"))
+    if not _is_gguf(model):
+        return {}
+    from .model import open_model
+    return json.loads(open_model(model).files.read("config.json"))
+
+
+def _is_gguf(model):
+    from .model.gguf import SUFFIX, find_gguf
+    path = Path(model)
+    if path.is_file():
+        return path.suffix == SUFFIX
+    try:
+        return path.is_dir() and not any(path.glob("*.safetensors")) and find_gguf(path) is not None
+    except ValueError:   # several models in one folder: not one GGUF
+        return False
+
+
+def architecture_facts(model):
+    """What the checkpoint's config.json (model_config: a GGUF's derived one) says of it, as facts plugins need:
+    model_type:<type> (top level and text_config), architecture:<class> for each of its architectures, and the
+    formats its matrices are stored in (stored_facts; stored:gguf for a GGUF's block formats)."""
+    config = model_config(model)
+    if not config:
         return []
-    config = json.loads(path.read_text(encoding="utf-8"))
-    facts = stored_facts(config)
+    facts = ["stored:gguf"] if _is_gguf(model) else stored_facts(config)
     for section in (config, config.get("text_config") or {}):
         if isinstance(section, dict) and isinstance(section.get("model_type"), str) and section["model_type"]:
             facts.append("model_type:" + section["model_type"])
@@ -287,6 +329,7 @@ def check_package(package, model, configuration=None, device=None, probe=None):
     options)."""
     configuration = read_configuration(package) if configuration is None else configuration
     exactness_levels(configuration)
+    quality_mode_of(configuration)
     chosen, registry = selection(configuration), registry_of(package)
     device = device or engine_device(registry, chosen["use"], configuration)
     return check(chosen, registry, architecture_facts(model) + machine_facts(device, probe), device=device)
@@ -378,6 +421,10 @@ def serving_problems(info, speculative, fields):
     return problems
 
 
+# A folder for files plugins can build again (LoadContext.cache): the host sets it, crit run to a folder of the run.
+PLUGIN_CACHE = "CRIT_PLUGIN_CACHE"
+
+
 class LoadContext:
     """What every plugin's factory and memory() get as `context`: the package, the checkpoint (`model`, its
     config.json as `config`), the configuration, the context the engine serves (`context_tokens`, None for the
@@ -385,22 +432,25 @@ class LoadContext:
     plugin reads and moves device memory through), the engine's scratch on it (`scratch`: crit_plugins.memory's
     Scratch, the bytes every plugin's calls compute in, one after another), its graph pool (`graphs`: the one
     memory pool Core's round driver and prompt graphs capture the engine's graphs into), the host (`host`:
-    crit_plugins.host's object, the process's cores, worker pool and in-stream handoffs), whether it drafts
-    (`speculative`) and, under crit serve, crit
+    crit_plugins.host's object, the process's cores, worker pool and in-stream handoffs), a folder for files a
+    plugin can build again from the checkpoint and reopen at the next load (`cache`: the PLUGIN_CACHE environment
+    variable's, which crit run sets to a folder of the run; None where none is given, and a plugin then keeps
+    nothing between loads), whether it drafts (`speculative`) and, under crit serve, crit
     serve's model context (`serving`: verified model files, device leases that stay loaded when the engine is built
-    again; None in process)."""
+    again; None in process). A plugin says what a long step of its load is doing with `working(what, done=None,
+    total=None)`."""
 
     def __init__(self, package, model, configuration, context_tokens=None, device=DEVICE, speculative=True,
                  serving=None):
         self.package, self.model = Path(package), Path(model)
-        path = self.model / "config.json"
-        self.config = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        self.config = model_config(self.model)
         self.configuration = dict(configuration)
         self.context_tokens = int(context_tokens) if context_tokens else None
         self.device, self.speculative, self.serving = device, bool(speculative), serving
         self.memory = memory_of(device)
         self.scratch = self.memory.scratch()
         self.host = host_of()
+        self.cache = Path(os.environ[PLUGIN_CACHE]) if os.environ.get(PLUGIN_CACHE) else None
         self._graphs = None
 
     @property
@@ -415,6 +465,15 @@ class LoadContext:
     def model_file(self, name):
         """A file of the checkpoint: crit serve's verified copy when served, else the model folder's."""
         return Path(self.serving.model_file(name)) if self.serving is not None else self.model / name
+
+    def working(self, what, done=None, total=None):
+        """A plugin's word on a long step of the load (a store of tens of gigabytes built from the checkpoint,
+        kernels compiled): what it is doing and, where it counts, how far it is. Under crit serve the host passes it
+        on: crit serve prints where the load stands, and a load that keeps reporting is not timed out while its work
+        advances. In process it does nothing. Cheap to call often: the host sends at most one a second."""
+        report = getattr(self.serving, "working", None)
+        if callable(report):
+            report(what, done, total)
 
 
 def load(package, model, configuration=None, *, context_tokens=None, speculative=True, device=None, serving=None,
@@ -439,6 +498,7 @@ def load(package, model, configuration=None, *, context_tokens=None, speculative
     package_tuning(package, configuration)
     package_decisions(package, configuration)
     package_exactness(configuration)
+    package_quality_mode(configuration)
     chosen = selection(configuration, speculative)
     registry = registry_of(package)
     device = device or engine_device(registry, chosen["use"], configuration)
@@ -867,7 +927,9 @@ class ResidentEngine(ResidentChat):
 
     def __init__(self, context, package):
         configuration = {**read_configuration(package), **(context.configuration or {})}
-        model = Path(context.model_file("config.json")).parent
+        # the served checkpoint's folder (a lone GGUF has no config.json file: Core derives it)
+        folder = getattr(context, "model_folder", None)
+        model = Path(folder()) if folder is not None else Path(context.model_file("config.json")).parent
         super().__init__(context, model, configuration=configuration)
         limits = getattr(context, "limits", {}) or {}
         self.native = load(package, model, self.configuration, context_tokens=limits.get("kv_tokens"),

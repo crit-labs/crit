@@ -13,7 +13,7 @@ core's decoders.
 
 ## Formats
 
-Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4 (`crit_core.model.gguf_blocks.TYPES`): a matrix's rows as the file stores
+Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, MXFP4, Q1_0 and Q2_0 (`crit_core.model.gguf_blocks.TYPES`): a matrix's rows as the file stores
 them, uint8 `[N][row bytes]`, or a stack of experts `[E][N][row bytes]` (`matmul_experts`). A GGUF file's dense
 tensors (F32, F16, BF16) load as `bf16`. Other GGUF types are refused.
 
@@ -59,8 +59,8 @@ and which matrices to stack are the model plugin's: this plugin multiplies rows 
   gguf-rows' `gemm` in the decode rows' order, every prompt row with its decode row's bits (the facts'
   `prompt_exact`), which on an RTX 5090 is faster at a few hundred prompt rows and level or a little behind at
   thousands (gguf-rows' README gives the numbers).
-- **Fallback**: where gguf-rows cannot be built, the stored values decoded on the host at load (Core's exact
-  decoders) run as a BF16 matrix through torch, one row a call for decode rows.
+- **Fallback**: where gguf-rows cannot be built, and on a CPU device, the stored values decoded on the host at load
+  (Core's exact decoders) run as a BF16 matrix through torch (FP32 sums), one row a call for decode rows.
 
 ## Host form
 
